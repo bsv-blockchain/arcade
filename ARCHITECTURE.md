@@ -423,8 +423,5 @@ Status history is immutable. Current status is derived by querying the most rece
 **Token-Based Routing:**
 Callback tokens isolate event streams for multi-tenant use cases. SSE and webhooks filter by token.
 
-**State Transition Guards:**
-Invalid state transitions are prevented at the database level using disallowed previous status checks.
-
 **Arc Compatibility:**
 API endpoints, headers, and response formats match Arc specification for drop-in replacement scenarios.
