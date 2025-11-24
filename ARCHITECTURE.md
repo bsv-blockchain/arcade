@@ -87,10 +87,6 @@ flowchart TD
 | `REQUESTED_BY_NETWORK` | P2P network details not tracked at this granularity |
 | `SEEN_IN_ORPHAN_MEMPOOL` | Does not map to Arcade's architecture |
 
-**Key Differences:**
-- **Granularity:** Arc tracks detailed P2P network progression (ANNOUNCED, REQUESTED, etc.). Arcade simplifies to major state changes only.
-- **Orphan Tracking:** Arc tracks orphan mempool status. Arcade does not.
-
 ## System Communication Overview
 
 ```mermaid
