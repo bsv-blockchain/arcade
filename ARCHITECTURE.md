@@ -319,42 +319,77 @@ Application startup sequence ([cmd/arcade/main.go](cmd/arcade/main.go)):
 
 ### Transaction Submission
 
-```
-1. Client → POST /v1/tx with X-CallbackUrl and X-CallbackToken
-2. API Server → Validator.ValidateTransaction()
-3. API Server → StatusStore.InsertStatus() [RECEIVED]
-4. API Server → SubmissionStore.InsertSubmission()
-5. API Server → TeranodeClient.SubmitTransaction() (async, fan-out)
-6. API Server → Return HTTP 200 with txid
-7. Teranode Client → StatusStore.UpdateStatus() [SENT_TO_NETWORK]
-8. Teranode Response → StatusStore.UpdateStatus() [ACCEPTED_BY_NETWORK]
-9. StatusStore → EventPublisher.Publish()
-10. WebhookHandler → HTTP POST to callback URL
-11. SSEHandler → Stream event to connected clients
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API as API Server
+    participant Validator
+    participant StatusStore
+    participant SubmissionStore
+    participant Teranode as Teranode Client
+    participant Events as Event Publisher
+    participant Webhook as Webhook Handler
+    participant SSE as SSE Handler
+
+    Client->>API: POST /v1/tx (X-CallbackUrl, X-CallbackToken)
+    API->>Validator: ValidateTransaction()
+    Validator-->>API: Valid
+    API->>StatusStore: InsertStatus() [RECEIVED]
+    API->>SubmissionStore: InsertSubmission()
+    API->>Teranode: SubmitTransaction() (async)
+    API-->>Client: HTTP 200 (txid)
+    Teranode->>StatusStore: UpdateStatus() [SENT_TO_NETWORK]
+    Teranode->>StatusStore: UpdateStatus() [ACCEPTED_BY_NETWORK]
+    StatusStore->>Events: Publish(StatusUpdate)
+    Events->>Webhook: StatusUpdate
+    Webhook->>Client: HTTP POST (callback URL)
+    Events->>SSE: StatusUpdate
+    SSE->>Client: Stream event
 ```
 
 ### P2P Status Update
 
-```
-1. P2P Network → Gossip message (subtree/block/rejected-tx)
-2. P2P Subscriber → Parse message
-3. P2P Subscriber → ChainTracks query for transaction IDs (if needed)
-4. P2P Subscriber → StatusStore.UpdateStatus() [SEEN_ON_NETWORK/MINED/REJECTED]
-5. StatusStore → EventPublisher.Publish()
-6. WebhookHandler → Query submissions by txid
-7. WebhookHandler → HTTP POST to callback URLs
-8. SSEHandler → Stream event to connected clients with matching tokens
+```mermaid
+sequenceDiagram
+    participant P2P as P2P Network
+    participant Sub as P2P Subscriber
+    participant StatusStore
+    participant Events as Event Publisher
+    participant Webhook as Webhook Handler
+    participant SubmissionStore
+    participant SSE as SSE Handler
+    participant Client as User Service
+
+    P2P->>Sub: Gossip message (subtree/block/rejected-tx)
+    Sub->>Sub: Parse message
+    Sub->>StatusStore: UpdateStatus() [SEEN_ON_NETWORK/MINED/REJECTED]
+    StatusStore->>Events: Publish(StatusUpdate)
+    Events->>Webhook: StatusUpdate
+    Webhook->>SubmissionStore: Query submissions by txid
+    SubmissionStore-->>Webhook: Submissions
+    Webhook->>Client: HTTP POST (callback URLs)
+    Events->>SSE: StatusUpdate
+    SSE->>Client: Stream event (filtered by token)
 ```
 
 ### SSE Streaming with Catchup
 
-```
-1. Client → GET /v1/events/:token with Last-Event-ID header
-2. SSE Handler → Subscribe to event publisher
-3. SSE Handler → StatusStore.GetStatusesSince(lastEventID)
-4. SSE Handler → Stream missed events first
-5. SSE Handler → Stream real-time events as they arrive
-6. On disconnect → Client reconnects with updated Last-Event-ID
+```mermaid
+sequenceDiagram
+    participant Client
+    participant SSE as SSE Handler
+    participant Events as Event Publisher
+    participant StatusStore
+
+    Client->>SSE: GET /v1/events/:callbackToken (Last-Event-ID)
+    SSE->>Events: Subscribe()
+    SSE->>StatusStore: GetStatusesSince(lastEventID)
+    StatusStore-->>SSE: Missed events
+    SSE->>Client: Stream missed events
+    Events->>SSE: Real-time StatusUpdate
+    SSE->>Client: Stream real-time event
+    Note over Client,SSE: On disconnect...
+    Client->>SSE: Reconnect with updated Last-Event-ID
 ```
 
 ## Configuration
