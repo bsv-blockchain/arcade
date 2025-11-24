@@ -44,8 +44,8 @@ flowchart TD
     Client -->|POST /v1/tx| API
     API -->|Set Status| RECEIVED[RECEIVED]
     API -->|Submit TX| Teranode
-    Teranode -->|Submitted| SENT[SENT_TO_NETWORK]
-    Teranode -->|200/202 Response| ACCEPTED[ACCEPTED_BY_NETWORK]
+    Teranode -->|202 Response| SENT[SENT_TO_NETWORK]
+    Teranode -->|200 Response| ACCEPTED[ACCEPTED_BY_NETWORK]
     Teranode -->|Error Response| REJ1[REJECTED]
 
     SubtreeGossip -->|Gossip Message| SEEN[SEEN_ON_NETWORK]
