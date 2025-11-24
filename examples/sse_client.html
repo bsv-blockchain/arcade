@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Arcade SSE Example</title>
+</head>
+<body>
+    <h1>Arcade SSE Status Stream</h1>
+    <div id="log"></div>
+
+    <script>
+        const callbackToken = "example-token-123";
+        const url = `http://localhost:8080/v1/events/${callbackToken}`;
+
+        const eventSource = new EventSource(url);
+        const log = document.getElementById('log');
+
+        eventSource.addEventListener('status', (e) => {
+            const data = JSON.parse(e.data);
+            const entry = document.createElement('div');
+            entry.textContent = `[${data.timestamp}] ${data.txid}: ${data.status}`;
+            log.appendChild(entry);
+
+            console.log('Event ID:', e.lastEventId);
+            console.log('Status:', data);
+        });
+
+        eventSource.onerror = (e) => {
+            console.error('SSE Error:', e);
+            log.appendChild(document.createTextNode('Connection error - will auto-reconnect\n'));
+        };
+
+        eventSource.onopen = () => {
+            log.appendChild(document.createTextNode('Connected to SSE stream\n'));
+        };
+    </script>
+</body>
+</html>
