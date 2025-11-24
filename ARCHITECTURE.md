@@ -404,7 +404,6 @@ Configuration is managed via Viper with YAML files and environment variable over
 - `p2p` - Peer list, topic prefix
 - `validator` - Size limits, fee validation, script validation
 - `webhook` - Retry policy, max retries, expiration
-- `auth` - Token-based authentication (future)
 
 ## Architecture Patterns
 
