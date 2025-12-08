@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/bitcoin-sv/arcade/models"
+	"github.com/bsv-blockchain/arcade/models"
 )
 
 // StatusStore handles transaction status persistence

@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/arcade/models"
-	"github.com/bitcoin-sv/arcade/teranode"
-	"github.com/bitcoin-sv/arcade/validator"
+	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/teranode"
+	"github.com/bsv-blockchain/arcade/validator"
 	"github.com/labstack/echo/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -356,7 +356,7 @@ func TestHandlePostTransaction_WithCallback(t *testing.T) {
 	err = json.Unmarshal(rec.Body.Bytes(), &resp)
 	require.NoError(t, err)
 
-	subs, err := submissionStore.GetSubmissionsByTxID(context.Background(), resp.TxID)
+	subs, err := submissionStore.GetSubmissionsByTxID(t.Context(), resp.TxID)
 	require.NoError(t, err)
 	require.Len(t, subs, 1)
 

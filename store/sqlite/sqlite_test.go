@@ -1,13 +1,12 @@
 package sqlite
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/arcade/models"
+	"github.com/bsv-blockchain/arcade/models"
 )
 
 func setupTestDB(t *testing.T) (string, func()) {
@@ -30,7 +29,7 @@ func TestStatusStore_InsertAndUpdate(t *testing.T) {
 	}
 	defer store.Close()
 
-	ctx := context.Background()
+	ctx := t.Context()
 	txid := "abc123"
 
 	status1 := &models.TransactionStatus{
@@ -76,7 +75,7 @@ func TestStatusStore_GetStatusesSince(t *testing.T) {
 	}
 	defer store.Close()
 
-	ctx := context.Background()
+	ctx := t.Context()
 	now := time.Now()
 
 	statuses := []*models.TransactionStatus{
@@ -123,7 +122,7 @@ func TestStatusStore_WithBlockData(t *testing.T) {
 	}
 	defer store.Close()
 
-	ctx := context.Background()
+	ctx := t.Context()
 	txid := "mined123"
 
 	status := &models.TransactionStatus{
@@ -212,7 +211,7 @@ func TestSubmissionStore_InsertAndGet(t *testing.T) {
 	}
 	defer store.Close()
 
-	ctx := context.Background()
+	ctx := t.Context()
 	txid := "tx456"
 
 	sub := &models.Submission{
@@ -262,7 +261,7 @@ func TestSubmissionStore_UpdateDeliveryStatus(t *testing.T) {
 	}
 	defer store.Close()
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	sub := &models.Submission{
 		SubmissionID:      "sub456",
@@ -317,7 +316,7 @@ func TestSubmissionStore_MultipleSubmissions(t *testing.T) {
 	}
 	defer store.Close()
 
-	ctx := context.Background()
+	ctx := t.Context()
 	txid := "tx_multi"
 
 	submissions := []*models.Submission{

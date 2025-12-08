@@ -5,14 +5,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/arcade/models"
+	// Note: context import kept for context.WithCancel and context.Canceled usage
+
+	"github.com/bsv-blockchain/arcade/models"
 )
 
 func TestInMemoryPublisher_PublishSubscribe(t *testing.T) {
 	pub := NewInMemoryPublisher(10)
 	defer pub.Close()
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	ch, err := pub.Subscribe(ctx)
 	if err != nil {
@@ -46,7 +48,7 @@ func TestInMemoryPublisher_MultipleSubscribers(t *testing.T) {
 	pub := NewInMemoryPublisher(10)
 	defer pub.Close()
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	ch1, err := pub.Subscribe(ctx)
 	if err != nil {
@@ -83,7 +85,7 @@ func TestInMemoryPublisher_SlowSubscriber(t *testing.T) {
 	pub := NewInMemoryPublisher(2)
 	defer pub.Close()
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	ch, err := pub.Subscribe(ctx)
 	if err != nil {
@@ -119,7 +121,7 @@ func TestInMemoryPublisher_SlowSubscriber(t *testing.T) {
 func TestInMemoryPublisher_Close(t *testing.T) {
 	pub := NewInMemoryPublisher(10)
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	ch, err := pub.Subscribe(ctx)
 	if err != nil {
@@ -140,7 +142,7 @@ func TestInMemoryPublisher_ContextCancellation(t *testing.T) {
 	pub := NewInMemoryPublisher(0)
 	defer pub.Close()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 
 	ch, err := pub.Subscribe(ctx)
 	if err != nil {

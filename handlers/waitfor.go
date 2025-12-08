@@ -5,8 +5,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bitcoin-sv/arcade/events"
-	"github.com/bitcoin-sv/arcade/models"
+	"github.com/bsv-blockchain/arcade/events"
+	"github.com/bsv-blockchain/arcade/models"
 )
 
 // WaitForHandler manages per-transaction channels for synchronous status waiting

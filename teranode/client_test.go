@@ -9,6 +9,8 @@ import (
 	"time"
 )
 
+// Note: context import kept for context.WithTimeout usage
+
 func TestSubmitTransaction(t *testing.T) {
 	called := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -42,9 +44,8 @@ func TestSubmitTransaction(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL)
-	ctx := context.Background()
 
-	err := client.SubmitTransaction(ctx, []byte("test_transaction_bytes"))
+	err := client.SubmitTransaction(t.Context(), []byte("test_transaction_bytes"))
 	if err != nil {
 		t.Fatalf("SubmitTransaction failed: %v", err)
 	}
@@ -62,9 +63,8 @@ func TestSubmitTransaction_Error(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL)
-	ctx := context.Background()
 
-	err := client.SubmitTransaction(ctx, []byte("test_tx"))
+	err := client.SubmitTransaction(t.Context(), []byte("test_tx"))
 	if err == nil {
 		t.Fatal("Expected error, got nil")
 	}
@@ -103,7 +103,6 @@ func TestSubmitTransactions(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL)
-	ctx := context.Background()
 
 	txs := [][]byte{
 		[]byte("tx1"),
@@ -111,7 +110,7 @@ func TestSubmitTransactions(t *testing.T) {
 		[]byte("tx3"),
 	}
 
-	err := client.SubmitTransactions(ctx, txs)
+	err := client.SubmitTransactions(t.Context(), txs)
 	if err != nil {
 		t.Fatalf("SubmitTransactions failed: %v", err)
 	}
@@ -141,9 +140,8 @@ func TestFetchBlockData(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL)
-	ctx := context.Background()
 
-	data, err := client.FetchBlockData(ctx, server.URL, blockHash)
+	data, err := client.FetchBlockData(t.Context(), server.URL, blockHash)
 	if err != nil {
 		t.Fatalf("FetchBlockData failed: %v", err)
 	}
@@ -160,9 +158,8 @@ func TestFetchBlockData_NotFound(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL)
-	ctx := context.Background()
 
-	_, err := client.FetchBlockData(ctx, server.URL, "nonexistent")
+	_, err := client.FetchBlockData(t.Context(), server.URL, "nonexistent")
 	if err == nil {
 		t.Fatal("Expected error for 404 response, got nil")
 	}
@@ -188,9 +185,8 @@ func TestFetchSubtreeData(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL)
-	ctx := context.Background()
 
-	data, err := client.FetchSubtreeData(ctx, server.URL, subtreeHash)
+	data, err := client.FetchSubtreeData(t.Context(), server.URL, subtreeHash)
 	if err != nil {
 		t.Fatalf("FetchSubtreeData failed: %v", err)
 	}
@@ -208,9 +204,8 @@ func TestClientWithTimeout(t *testing.T) {
 	defer server.Close()
 
 	client := NewClientWithTimeout(server.URL, 50*time.Millisecond)
-	ctx := context.Background()
 
-	err := client.SubmitTransaction(ctx, []byte("test"))
+	err := client.SubmitTransaction(t.Context(), []byte("test"))
 	if err == nil {
 		t.Fatal("Expected timeout error, got nil")
 	}
@@ -224,7 +219,7 @@ func TestContextCancellation(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL)
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
 
 	err := client.SubmitTransaction(ctx, []byte("test"))

@@ -9,9 +9,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/bitcoin-sv/arcade/events"
-	"github.com/bitcoin-sv/arcade/models"
-	"github.com/bitcoin-sv/arcade/store"
+	"github.com/bsv-blockchain/arcade/events"
+	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/store"
 )
 
 // WebhookHandler handles webhook delivery for transaction status updates
@@ -26,7 +26,6 @@ type WebhookHandler struct {
 	maxAge          time.Duration
 	maxRetries      int
 }
-
 
 // WebhookPayload represents the payload sent to webhook endpoints
 type WebhookPayload struct {

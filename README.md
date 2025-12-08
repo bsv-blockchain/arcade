@@ -7,7 +7,7 @@ A P2P-first Bitcoin transaction broadcast client for Teranode with Arc-compatibl
 Arcade is a lightweight transaction broadcast service that:
 - Listens to Bitcoin network events via libp2p gossip
 - Provides Arc-compatible HTTP API for easy migration
-- Supports pluggable storage (SQLite, PostgreSQL) and event backends (in-memory, Redis)
+- Supports pluggable storage (SQLite) and event backends (in-memory)
 - Tracks transaction status through the complete lifecycle
 - Delivers notifications via webhooks and Server-Sent Events (SSE)
 
@@ -28,7 +28,7 @@ Arcade is a lightweight transaction broadcast service that:
 ### Installation
 
 ```bash
-go install github.com/bitcoin-sv/arcade/cmd/arcade@latest
+go install github.com/bsv-blockchain/arcade/cmd/arcade@latest
 ```
 
 ### Configuration
@@ -269,7 +269,7 @@ All packages are public and designed for extension:
 ### Custom Storage Backend
 
 ```go
-import "github.com/bitcoin-sv/arcade/store"
+import "github.com/bsv-blockchain/arcade/store"
 
 type MyStore struct {}
 
@@ -283,7 +283,7 @@ func (s *MyStore) InsertStatus(ctx context.Context, status *models.TransactionSt
 ### Custom Event Handler
 
 ```go
-import "github.com/bitcoin-sv/arcade/events"
+import "github.com/bsv-blockchain/arcade/events"
 
 type MyHandler struct {
     publisher events.Publisher
@@ -313,4 +313,4 @@ Open BSV License
 
 - [Design Documentation](DESIGN.md)
 - [Teranode Documentation](https://docs.bitcoinsv.io/)
-- [Arc API Reference](https://github.com/bitcoin-sv/arc)
+- [Arc API Reference](https://github.com/bsv-blockchain/arc)

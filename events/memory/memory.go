@@ -4,8 +4,8 @@ import (
 	"context"
 	"sync"
 
-	"github.com/bitcoin-sv/arcade/events"
-	"github.com/bitcoin-sv/arcade/models"
+	"github.com/bsv-blockchain/arcade/events"
+	"github.com/bsv-blockchain/arcade/models"
 )
 
 // InMemoryPublisher implements events.Publisher using Go channels

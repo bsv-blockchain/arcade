@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitcoin-sv/arcade/models"
+	"github.com/bsv-blockchain/arcade/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -102,7 +102,7 @@ func (m *MockEventPublisher) Close() error {
 }
 
 func TestNewSubscriber(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	validConfig := &Config{
@@ -119,32 +119,32 @@ func TestNewSubscriber(t *testing.T) {
 	mockEventPublisher := new(MockEventPublisher)
 
 	t.Run("nil config", func(t *testing.T) {
-		_, err := NewSubscriber(ctx, nil, mockStatusStore, mockNetworkStore, mockEventPublisher, logger)
+		_, err := NewSubscriber(ctx, nil, mockStatusStore, mockNetworkStore, mockEventPublisher, logger, nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "config is nil")
 	})
 
 	t.Run("nil statusStore", func(t *testing.T) {
-		_, err := NewSubscriber(ctx, validConfig, nil, mockNetworkStore, mockEventPublisher, logger)
+		_, err := NewSubscriber(ctx, validConfig, nil, mockNetworkStore, mockEventPublisher, logger, nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "statusStore is nil")
 	})
 
 	t.Run("nil networkStore", func(t *testing.T) {
-		_, err := NewSubscriber(ctx, validConfig, mockStatusStore, nil, mockEventPublisher, logger)
+		_, err := NewSubscriber(ctx, validConfig, mockStatusStore, nil, mockEventPublisher, logger, nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "networkStore is nil")
 	})
 
 	t.Run("nil eventPublisher", func(t *testing.T) {
-		_, err := NewSubscriber(ctx, validConfig, mockStatusStore, mockNetworkStore, nil, logger)
+		_, err := NewSubscriber(ctx, validConfig, mockStatusStore, mockNetworkStore, nil, logger, nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "eventPublisher is nil")
 	})
 }
 
 func TestHandleBlockTopic(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	blockHash := "0000000000000000000000000000000000000000000000000000000000000001"
@@ -304,7 +304,7 @@ func TestHandleBlockTopic(t *testing.T) {
 }
 
 func TestHandleSubtreeTopic(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	subtreeHash := "subtree1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
@@ -465,7 +465,7 @@ func TestHandleSubtreeTopic(t *testing.T) {
 }
 
 func TestHandleRejectedTxTopic(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	txID := "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
@@ -633,7 +633,7 @@ func TestHandleRejectedTxTopic(t *testing.T) {
 }
 
 func TestHandleNodeStatusTopic(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	t.Run("valid node status message", func(t *testing.T) {
@@ -650,9 +650,9 @@ func TestHandleNodeStatusTopic(t *testing.T) {
 		}
 
 		nodeStatus := map[string]interface{}{
-			"peer_id":    "test-peer",
+			"peer_id":     "test-peer",
 			"best_height": 12345,
-			"fsm_state":  "READY",
+			"fsm_state":   "READY",
 		}
 
 		msgBytes, err := json.Marshal(nodeStatus)
@@ -685,7 +685,7 @@ func TestHandleNodeStatusTopic(t *testing.T) {
 }
 
 func TestFetchBlockTxIDs(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	blockHash := "0000000000000000000000000000000000000000000000000000000000000001"
@@ -813,7 +813,7 @@ func TestFetchBlockTxIDs(t *testing.T) {
 }
 
 func TestFetchSubtreeTxIDs(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	subtreeHash := "subtree1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
@@ -927,7 +927,7 @@ func TestSlogAdapter(t *testing.T) {
 }
 
 func TestHTTPClientRetry(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	t.Run("malformed URL", func(t *testing.T) {
@@ -943,7 +943,7 @@ func TestHTTPClientRetry(t *testing.T) {
 }
 
 func TestMultipleTxIDsProcessing(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	blockHash := "0000000000000000000000000000000000000000000000000000000000000001"

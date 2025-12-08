@@ -8,17 +8,16 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/bitcoin-sv/arcade/api"
-	"github.com/bitcoin-sv/arcade/config"
-	"github.com/bitcoin-sv/arcade/events"
-	"github.com/bitcoin-sv/arcade/events/memory"
-	redisEvents "github.com/bitcoin-sv/arcade/events/redis"
-	"github.com/bitcoin-sv/arcade/handlers"
-	"github.com/bitcoin-sv/arcade/p2p"
-	"github.com/bitcoin-sv/arcade/store"
-	"github.com/bitcoin-sv/arcade/store/sqlite"
-	"github.com/bitcoin-sv/arcade/teranode"
-	"github.com/bitcoin-sv/arcade/validator"
+	"github.com/bsv-blockchain/arcade/api"
+	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/events/memory"
+	"github.com/bsv-blockchain/arcade/handlers"
+	"github.com/bsv-blockchain/arcade/p2p"
+	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/arcade/store/sqlite"
+	"github.com/bsv-blockchain/arcade/teranode"
+	"github.com/bsv-blockchain/arcade/validator"
+	terap2p "github.com/bsv-blockchain/go-teranode-p2p-client"
 )
 
 func main() {
@@ -63,20 +62,8 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	}
 
 	logger.Info("Initializing event publisher", slog.String("type", cfg.Events.Type))
-	var eventPublisher events.Publisher
-
-	switch cfg.Events.Type {
-	case "redis":
-		var redisErr error
-		eventPublisher, redisErr = redisEvents.NewRedisPublisher(cfg.Events.RedisURL)
-		if redisErr != nil {
-			return fmt.Errorf("failed to create Redis event publisher: %w", redisErr)
-		}
-		logger.Info("Using Redis event publisher", slog.String("url", cfg.Events.RedisURL))
-	default:
-		eventPublisher = memory.NewInMemoryPublisher(cfg.Events.BufferSize)
-		logger.Info("Using in-memory event publisher", slog.Int("buffer", cfg.Events.BufferSize))
-	}
+	eventPublisher := memory.NewInMemoryPublisher(cfg.Events.BufferSize)
+	logger.Info("Using in-memory event publisher", slog.Int("buffer", cfg.Events.BufferSize))
 
 	logger.Info("Initializing Teranode client")
 	var endpoints []string
@@ -98,23 +85,35 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	}
 	txValidator := validator.NewValidator(validatorPolicy)
 
-	logger.Info("Initializing P2P subscriber")
-	p2pConfig := &p2p.Config{
-		ProcessName:    cfg.P2P.ProcessName,
-		Port:           cfg.P2P.Port,
+	logger.Info("Initializing P2P client")
+	p2pClient, err := terap2p.NewClient(terap2p.Config{
+		Name:           cfg.P2P.ProcessName,
+		StoragePath:    cfg.P2P.PeerCacheFile,
+		Network:        cfg.P2P.TopicPrefix,
 		BootstrapPeers: cfg.P2P.BootstrapPeers,
-		PrivateKey:     cfg.P2P.PrivateKey,
-		TopicPrefix:    cfg.P2P.TopicPrefix,
-		PeerCacheFile:  cfg.P2P.PeerCacheFile,
+		Logger:         logger,
+		Port:           cfg.P2P.Port,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create P2P client: %w", err)
 	}
 
+	logger.Info("Initializing P2P subscriber")
 	subscriber, err := p2p.NewSubscriber(
 		ctx,
-		p2pConfig,
+		&p2p.Config{
+			ProcessName:    cfg.P2P.ProcessName,
+			Port:           cfg.P2P.Port,
+			BootstrapPeers: cfg.P2P.BootstrapPeers,
+			PrivateKey:     cfg.P2P.PrivateKey,
+			TopicPrefix:    cfg.P2P.TopicPrefix,
+			PeerCacheFile:  cfg.P2P.PeerCacheFile,
+		},
 		statusStore,
 		networkStore,
 		eventPublisher,
 		logger,
+		p2pClient,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create P2P subscriber: %w", err)
