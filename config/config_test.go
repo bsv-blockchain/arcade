@@ -16,7 +16,7 @@ func TestDefault(t *testing.T) {
 	home, _ := os.UserHomeDir()
 	expectedDataDir := filepath.Join(home, ".arcade")
 
-	assert.Equal(t, ":8080", cfg.Server.Address)
+	assert.Equal(t, ":3011", cfg.Server.Address)
 	assert.Equal(t, 30*time.Second, cfg.Server.ReadTimeout)
 	assert.Equal(t, "sqlite", cfg.Database.Type)
 	assert.Equal(t, filepath.Join(expectedDataDir, "arcade.db"), cfg.Database.SQLitePath)

@@ -115,7 +115,7 @@ func Default() *Config {
 		StoragePath: dataDir,
 
 		Server: ServerConfig{
-			Address:         ":8080",
+			Address:         ":3011",
 			ReadTimeout:     30 * time.Second,
 			WriteTimeout:    30 * time.Second,
 			ShutdownTimeout: 10 * time.Second,
