@@ -12,7 +12,7 @@
 //	@license.name	Open BSV License
 //	@license.url	https://github.com/bsv-blockchain/arcade/blob/main/LICENSE
 //
-//	@host		localhost:8080
+//	@host
 //	@BasePath	/
 //
 //	@securityDefinitions.apikey	BearerAuth
