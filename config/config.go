@@ -8,12 +8,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bsv-blockchain/arcade/p2p"
+	msgbus "github.com/bsv-blockchain/go-p2p-message-bus"
 	"github.com/mitchellh/mapstructure"
 	"github.com/spf13/viper"
 )
 
 // Config holds all application configuration
 type Config struct {
+	Network     string // "main", "test", "stn" - Bitcoin network
+	StoragePath string // Data directory for persistent files
+
 	Server        ServerConfig
 	Database      DatabaseConfig
 	Events        EventsConfig
@@ -35,16 +40,16 @@ type ServerConfig struct {
 
 // DatabaseConfig holds database configuration
 type DatabaseConfig struct {
-	Type             string // "sqlite" or "postgres"
-	SQLitePath       string
-	PostgresConnStr  string
+	Type            string // "sqlite" or "postgres"
+	SQLitePath      string
+	PostgresConnStr string
 }
 
 // EventsConfig holds event publisher configuration
 type EventsConfig struct {
-	Type        string // "memory" or "redis"
-	BufferSize  int
-	RedisURL    string
+	Type       string // "memory" or "redis"
+	BufferSize int
+	RedisURL   string
 }
 
 // TeranodeConfig holds teranode client configuration
@@ -54,14 +59,8 @@ type TeranodeConfig struct {
 	Timeout  time.Duration
 }
 
-// P2PConfig holds libp2p subscriber configuration
-type P2PConfig struct {
-	ProcessName    string
-	Port           int
-	BootstrapPeers []string
-	Network        string
-	StoragePath    string
-}
+// P2PConfig is an alias for msgbus.Config
+type P2PConfig = msgbus.Config
 
 // ValidatorConfig holds transaction validator configuration
 type ValidatorConfig struct {
@@ -107,7 +106,14 @@ func defaultDataDir() string {
 // Default returns default configuration
 func Default() *Config {
 	dataDir := defaultDataDir()
+	network := "main"
+
+	privKey, _ := p2p.LoadOrGeneratePrivateKey(dataDir)
+
 	return &Config{
+		Network:     network,
+		StoragePath: dataDir,
+
 		Server: ServerConfig{
 			Address:         ":8080",
 			ReadTimeout:     30 * time.Second,
@@ -123,16 +129,18 @@ func Default() *Config {
 			BufferSize: 1000,
 		},
 		Teranode: TeranodeConfig{
-			BaseURL:  "http://localhost:8080",
+			BaseURL:  "https://mainnet.gorillanode.io/api/v1",
 			BaseURLs: []string{},
 			Timeout:  30 * time.Second,
 		},
 		P2P: P2PConfig{
-			ProcessName:    "arcade",
-			Port:           9999,
-			BootstrapPeers: []string{},
-			Network:        "main",
-			StoragePath:    dataDir,
+			Name:               "arcade",
+			PrivateKey:         privKey,
+			PeerCacheFile:      filepath.Join(dataDir, "peer_cache.json"),
+			BootstrapPeers:     p2p.BootstrapPeers(network),
+			Port:               9999,
+			DHTMode:            "off",
+			DHTCleanupInterval: 24 * time.Hour,
 		},
 		Validator: ValidatorConfig{
 			MaxTxSize:     4 * 1024 * 1024 * 1024, // 4 GB

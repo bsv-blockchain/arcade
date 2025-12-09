@@ -32,7 +32,6 @@ import (
 	"syscall"
 
 	"github.com/bsv-blockchain/arcade"
-	"github.com/bsv-blockchain/arcade/api"
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/docs"
 	"github.com/bsv-blockchain/arcade/events"
@@ -58,7 +57,7 @@ var (
 	teranodeClient  *teranode.Client
 	txValidator     *validator.Validator
 	arcadeInstance  *arcade.Arcade
-	policy          *api.PolicyResponse
+	policy          *PolicyResponse
 	authToken       string
 	log             *slog.Logger
 
@@ -141,19 +140,11 @@ func run(ctx context.Context, cfg *config.Config) error {
 	txValidator = validator.NewValidator(&validator.Policy{
 		MaxTxSizePolicy:         cfg.Validator.MaxTxSize,
 		MaxTxSigopsCountsPolicy: cfg.Validator.MaxSigOps,
-		MaxScriptSizePolicy:     cfg.Validator.MaxScriptSize,
 		MinFeePerKB:             cfg.Validator.MinFeePerKB,
 	})
 
 	log.Info("Initializing P2P client")
-	p2pClient, err := p2p.NewClient(p2p.Config{
-		Name:           cfg.P2P.ProcessName,
-		StoragePath:    cfg.P2P.StoragePath,
-		Network:        cfg.P2P.Network,
-		BootstrapPeers: cfg.P2P.BootstrapPeers,
-		Logger:         log,
-		Port:           cfg.P2P.Port,
-	})
+	p2pClient, err := p2p.NewClient(cfg.P2P, cfg.Network, log)
 	if err != nil {
 		return fmt.Errorf("failed to create P2P client: %w", err)
 	}
@@ -173,11 +164,10 @@ func run(ctx context.Context, cfg *config.Config) error {
 
 	log.Info("Initializing Arcade")
 	arcadeInstance, err = arcade.NewArcade(ctx, arcade.Config{
-		Network:          cfg.P2P.Network,
-		LocalStoragePath: cfg.P2P.StoragePath,
+		Network:          cfg.Network,
+		LocalStoragePath: cfg.StoragePath,
 		Logger:           log,
 		P2PClient:        p2pClient,
-		Subscriptions:    arcade.DefaultFullSubscriptions(),
 		BootstrapURL:     cfg.Teranode.BaseURL,
 		TxTracker:        txTracker,
 		StatusStore:      statusStore,
@@ -187,12 +177,11 @@ func run(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("failed to create arcade: %w", err)
 	}
 
-	tipChan, err := arcadeInstance.Start(ctx)
-	if err != nil {
+	if err := arcadeInstance.Start(ctx); err != nil {
 		return fmt.Errorf("failed to start arcade: %w", err)
 	}
 
-	go broadcastTipUpdates(ctx, tipChan)
+	go broadcastTipUpdates(ctx, arcadeInstance.SubscribeTip(ctx))
 
 	log.Info("Performing gap filling check")
 	if err := performGapFilling(ctx, networkStore); err != nil {
@@ -214,11 +203,11 @@ func run(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("failed to start webhook handler: %w", err)
 	}
 
-	policy = &api.PolicyResponse{
+	policy = &PolicyResponse{
 		MaxTxSizePolicy:         uint64(cfg.Validator.MaxTxSize),
 		MaxTxSigOpsCountsPolicy: uint64(cfg.Validator.MaxSigOps),
 		MaxScriptSizePolicy:     uint64(cfg.Validator.MaxScriptSize),
-		MiningFee: api.FeeAmount{
+		MiningFee: FeeAmount{
 			Bytes:    1000,
 			Satoshis: cfg.Validator.MinFeePerKB,
 		},
@@ -317,6 +306,10 @@ func setupServer() *fiber.App {
 	app.Get("/header/hash/:hash", handleGetHeaderByHash)
 	app.Get("/headers", handleGetHeaders)
 
+	// Status dashboard
+	app.Get("/", handleDashboard)
+	app.Get("/status", handleDashboard)
+
 	// API docs (Scalar UI)
 	app.Get("/docs/openapi.json", func(c *fiber.Ctx) error {
 		return c.Type("json").SendString(docs.SwaggerInfo.ReadDoc())
@@ -330,7 +323,7 @@ func setupServer() *fiber.App {
 
 func authMiddleware(c *fiber.Ctx) error {
 	path := c.Path()
-	if path == "/health" || path == "/policy" || path == "/docs" || path == "/docs/*" {
+	if path == "/health" || path == "/policy" || path == "/status" || path == "/docs" || path == "/docs/*" {
 		return c.Next()
 	}
 

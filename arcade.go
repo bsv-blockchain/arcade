@@ -4,12 +4,15 @@ package arcade
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"math"
 	"math/big"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +21,7 @@ import (
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/p2p"
 	"github.com/bsv-blockchain/arcade/store"
+	msgbus "github.com/bsv-blockchain/go-p2p-message-bus"
 	"github.com/bsv-blockchain/go-sdk/block"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
@@ -31,11 +35,17 @@ import (
 type Chaintracks interface {
 	chaintracker.ChainTracker
 
-	// Start begins the service and returns a channel for block tip notifications
-	Start(ctx context.Context) (<-chan *BlockHeader, error)
+	// SubscribeTip returns a channel for chain tip updates.
+	// Multiple subscribers receive the same updates (fan-out).
+	// Channel is closed when the context is cancelled.
+	SubscribeTip(ctx context.Context) <-chan *BlockHeader
 
-	// Stop gracefully shuts down the service
-	Stop() error
+	// SubscribeStatus returns a channel for transaction status updates.
+	// If token is empty, all status updates are returned.
+	// If token is provided, only updates for transactions with that callback token are returned.
+	// Channel is closed when the context is cancelled.
+	// Returns nil if transaction tracking is not configured.
+	SubscribeStatus(ctx context.Context, token string) <-chan *models.TransactionStatus
 
 	// GetHeight returns the current blockchain height
 	GetHeight(ctx context.Context) uint32
@@ -61,35 +71,26 @@ type BlockHeader struct {
 	ChainWork *big.Int       `json:"-"`
 }
 
-// SubscriptionOptions configures which P2P topics to subscribe to
-type SubscriptionOptions struct {
-	// Blocks subscribes to block announcements (required for chain tracking)
-	Blocks bool
-
-	// Subtrees subscribes to subtree announcements (for "seen on network" status)
-	Subtrees bool
-
-	// RejectedTxs subscribes to rejected transaction messages
-	RejectedTxs bool
-
-	// NodeStatus subscribes to node status messages
-	NodeStatus bool
+// CDNMetadata represents the JSON metadata file structure for header checkpoints
+type CDNMetadata struct {
+	RootFolder     string         `json:"rootFolder"`
+	JSONFilename   string         `json:"jsonFilename"`
+	HeadersPerFile int            `json:"headersPerFile"`
+	Files          []CDNFileEntry `json:"files"`
 }
 
-// DefaultChainTrackingSubscriptions returns options for chain tracking only (no tx status)
-func DefaultChainTrackingSubscriptions() SubscriptionOptions {
-	return SubscriptionOptions{
-		Blocks: true,
-	}
-}
-
-// DefaultFullSubscriptions returns options for full transaction status tracking
-func DefaultFullSubscriptions() SubscriptionOptions {
-	return SubscriptionOptions{
-		Blocks:      true,
-		Subtrees:    true,
-		RejectedTxs: true,
-	}
+// CDNFileEntry represents a single file entry in the metadata
+type CDNFileEntry struct {
+	Chain         string         `json:"chain"`
+	Count         int            `json:"count"`
+	FileHash      string         `json:"fileHash"`
+	FileName      string         `json:"fileName"`
+	FirstHeight   uint32         `json:"firstHeight"`
+	LastChainWork string         `json:"lastChainWork"`
+	LastHash      chainhash.Hash `json:"lastHash"`
+	PrevChainWork string         `json:"prevChainWork"`
+	PrevHash      chainhash.Hash `json:"prevHash"`
+	SourceURL     string         `json:"sourceUrl"`
 }
 
 // Config holds configuration for the ChainTracker
@@ -106,16 +107,14 @@ type Config struct {
 	// P2PClient for network communication (required)
 	P2PClient *p2p.Client
 
-	// Subscriptions configures which P2P topics to listen to
-	Subscriptions SubscriptionOptions
-
 	// BootstrapURL for initial sync (optional)
 	BootstrapURL string
 
 	// Transaction tracking (optional - only needed for tx status management)
-	TxTracker      *store.TxTracker
-	StatusStore    store.StatusStore
-	EventPublisher events.Publisher
+	TxTracker       *store.TxTracker
+	StatusStore     store.StatusStore
+	SubmissionStore store.SubmissionStore
+	EventPublisher  events.Publisher
 }
 
 // Arcade is the P2P-based implementation that tracks blockchain headers
@@ -129,61 +128,109 @@ type Arcade struct {
 	tip      *BlockHeader                    // Current chain tip
 
 	// Configuration
-	localStoragePath string
-	network          string
-	subscriptions    SubscriptionOptions
-	logger           *slog.Logger
-	httpClient       *http.Client
+	localStoragePath  string
+	network           string
+	txTrackingEnabled bool
+	logger            *slog.Logger
+	httpClient        *http.Client
 
 	// P2P
 	p2pClient *p2p.Client
 
 	// Transaction tracking (optional)
-	txTracker      *store.TxTracker
-	statusStore    store.StatusStore
-	eventPublisher events.Publisher
+	txTracker       *store.TxTracker
+	statusStore     store.StatusStore
+	submissionStore store.SubmissionStore
+	eventPublisher  events.Publisher
 
-	// Notification channel
-	tipChan chan *BlockHeader
+	// Subscribers (fan-out channels)
+	subMu         sync.RWMutex
+	tipSubs       []*tipSubscriber
+	statusSubs    []*statusSubscriber
+	statusSubDone chan struct{}
+}
+
+// tipSubscriber holds a tip channel and its context for cleanup
+type tipSubscriber struct {
+	ch  chan *BlockHeader
+	ctx context.Context
+}
+
+// statusSubscriber holds a status channel, context, and optional token filter
+type statusSubscriber struct {
+	ch    chan *models.TransactionStatus
+	ctx   context.Context
+	token string // empty means all updates
 }
 
 // NewArcade creates a new P2P-based Arcade instance.
 // For chain tracking only, omit TxTracker/StatusStore/EventPublisher.
 // For full transaction status management, provide all dependencies.
+// If P2PClient is nil, a default client will be created using Network and LocalStoragePath.
 func NewArcade(ctx context.Context, cfg Config) (*Arcade, error) {
-	if cfg.P2PClient == nil {
-		return nil, fmt.Errorf("P2P client is required")
-	}
-
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
 
+	// Auto-create P2P client if not provided
+	if cfg.P2PClient == nil {
+		storagePath := cfg.LocalStoragePath
+		if storagePath == "" {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				storagePath = ".arcade"
+			} else {
+				storagePath = filepath.Join(home, ".arcade")
+			}
+			_ = os.MkdirAll(storagePath, 0o750)
+			cfg.LocalStoragePath = storagePath
+		}
+
+		network := cfg.Network
+		if network == "" {
+			network = "main"
+			cfg.Network = network
+		}
+
+		privKey, err := p2p.LoadOrGeneratePrivateKey(storagePath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load P2P private key: %w", err)
+		}
+
+		cfg.P2PClient, err = p2p.NewClient(msgbus.Config{
+			Name:           "arcade",
+			PrivateKey:     privKey,
+			PeerCacheFile:  filepath.Join(storagePath, "peer_cache.json"),
+			BootstrapPeers: p2p.BootstrapPeers(network),
+			Port:           9999,
+			DHTMode:        "off",
+		}, network, cfg.Logger)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create P2P client: %w", err)
+		}
+	}
+
 	// Validate tx tracking dependencies - all or none
-	hasTxTracking := cfg.TxTracker != nil || cfg.StatusStore != nil || cfg.EventPublisher != nil
-	if hasTxTracking {
+	txTrackingEnabled := cfg.TxTracker != nil || cfg.StatusStore != nil || cfg.EventPublisher != nil
+	if txTrackingEnabled {
 		if cfg.TxTracker == nil || cfg.StatusStore == nil || cfg.EventPublisher == nil {
 			return nil, fmt.Errorf("for transaction tracking, TxTracker, StatusStore, and EventPublisher are all required")
-		}
-		// TX tracking requires subtrees subscription
-		if !cfg.Subscriptions.Subtrees {
-			cfg.Logger.Warn("enabling Subtrees subscription (required for transaction tracking)")
-			cfg.Subscriptions.Subtrees = true
 		}
 	}
 
 	a := &Arcade{
-		byHeight:         make([]chainhash.Hash, 0, 1000000),
-		byHash:           make(map[chainhash.Hash]*BlockHeader),
-		network:          cfg.Network,
-		localStoragePath: cfg.LocalStoragePath,
-		subscriptions:    cfg.Subscriptions,
-		logger:           cfg.Logger,
-		p2pClient:        cfg.P2PClient,
-		txTracker:        cfg.TxTracker,
-		statusStore:      cfg.StatusStore,
-		eventPublisher:   cfg.EventPublisher,
-		httpClient:       &http.Client{Timeout: 30 * time.Second},
+		byHeight:          make([]chainhash.Hash, 0, 1000000),
+		byHash:            make(map[chainhash.Hash]*BlockHeader),
+		network:           cfg.Network,
+		localStoragePath:  cfg.LocalStoragePath,
+		txTrackingEnabled: txTrackingEnabled,
+		logger:            cfg.Logger,
+		p2pClient:         cfg.P2PClient,
+		txTracker:         cfg.TxTracker,
+		statusStore:       cfg.StatusStore,
+		submissionStore:   cfg.SubmissionStore,
+		eventPublisher:    cfg.EventPublisher,
+		httpClient:        &http.Client{Timeout: 30 * time.Second},
 	}
 
 	// Load chain state from local files
@@ -199,36 +246,22 @@ func NewArcade(ctx context.Context, cfg Config) (*Arcade, error) {
 	return a, nil
 }
 
-// Start begins listening for P2P messages and returns a channel for tip updates
-func (a *Arcade) Start(ctx context.Context) (<-chan *BlockHeader, error) {
-	a.mu.Lock()
-	a.tipChan = make(chan *BlockHeader, 1)
-	a.mu.Unlock()
-
+// Start begins listening for P2P messages
+func (a *Arcade) Start(ctx context.Context) error {
 	a.logger.Info("Starting ChainTracker P2P subscriptions",
-		slog.Bool("blocks", a.subscriptions.Blocks),
-		slog.Bool("subtrees", a.subscriptions.Subtrees),
-		slog.Bool("rejectedTxs", a.subscriptions.RejectedTxs))
+		slog.Bool("txTracking", a.txTrackingEnabled))
 
-	// Subscribe to configured P2P topics
-	if a.subscriptions.Blocks {
-		blockChan := a.p2pClient.SubscribeBlocks(ctx)
-		go a.handleBlockMessages(ctx, blockChan)
-	}
+	// Always subscribe to blocks for chain tracking
+	blockChan := a.p2pClient.SubscribeBlocks(ctx)
+	go a.handleBlockMessages(ctx, blockChan)
 
-	if a.subscriptions.Subtrees {
+	// Subscribe to tx status topics only if tx tracking is enabled
+	if a.txTrackingEnabled {
 		subtreeChan := a.p2pClient.SubscribeSubtrees(ctx)
 		go a.handleSubtreeMessages(ctx, subtreeChan)
-	}
 
-	if a.subscriptions.RejectedTxs {
 		rejectedTxChan := a.p2pClient.SubscribeRejectedTxs(ctx)
 		go a.handleRejectedTxMessages(ctx, rejectedTxChan)
-	}
-
-	if a.subscriptions.NodeStatus {
-		nodeStatusChan := a.p2pClient.SubscribeNodeStatus(ctx)
-		go a.handleNodeStatusMessages(ctx, nodeStatusChan)
 	}
 
 	// Periodic orphan check (only if tracking transactions)
@@ -236,20 +269,187 @@ func (a *Arcade) Start(ctx context.Context) (<-chan *BlockHeader, error) {
 		go a.periodicOrphanCheck(ctx)
 	}
 
+	// Forward status updates from EventPublisher to status subscribers
+	if a.eventPublisher != nil {
+		a.statusSubDone = make(chan struct{})
+		go a.forwardStatusUpdates(ctx)
+	}
+
 	a.logger.Info("ChainTracker started", slog.String("peerID", a.p2pClient.GetID()))
 
-	return a.tipChan, nil
+	return nil
 }
 
-// Stop gracefully shuts down the ChainTracker
-func (a *Arcade) Stop() error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+// SubscribeTip returns a channel for chain tip updates.
+// Multiple subscribers can call this method; all receive the same updates.
+// Channel is closed when the context is cancelled.
+func (a *Arcade) SubscribeTip(ctx context.Context) <-chan *BlockHeader {
+	ch := make(chan *BlockHeader, 1)
+	sub := &tipSubscriber{ch: ch, ctx: ctx}
 
-	if a.tipChan != nil {
-		close(a.tipChan)
-		a.tipChan = nil
+	a.subMu.Lock()
+	a.tipSubs = append(a.tipSubs, sub)
+	a.subMu.Unlock()
+
+	// Cleanup when context is cancelled
+	go func() {
+		<-ctx.Done()
+		a.subMu.Lock()
+		for i, s := range a.tipSubs {
+			if s == sub {
+				a.tipSubs = append(a.tipSubs[:i], a.tipSubs[i+1:]...)
+				close(ch)
+				break
+			}
+		}
+		a.subMu.Unlock()
+	}()
+
+	return ch
+}
+
+// SubscribeStatus returns a channel for transaction status updates.
+// If token is empty, all status updates are returned.
+// If token is provided, only updates for transactions with that callback token are returned.
+// Channel is closed when the context is cancelled.
+// Returns nil if transaction tracking is not configured.
+func (a *Arcade) SubscribeStatus(ctx context.Context, token string) <-chan *models.TransactionStatus {
+	if a.eventPublisher == nil {
+		return nil
 	}
+	ch := make(chan *models.TransactionStatus, 100)
+	sub := &statusSubscriber{ch: ch, ctx: ctx, token: token}
+
+	a.subMu.Lock()
+	a.statusSubs = append(a.statusSubs, sub)
+	a.subMu.Unlock()
+
+	// Cleanup when context is cancelled
+	go func() {
+		<-ctx.Done()
+		a.subMu.Lock()
+		for i, s := range a.statusSubs {
+			if s == sub {
+				a.statusSubs = append(a.statusSubs[:i], a.statusSubs[i+1:]...)
+				close(ch)
+				break
+			}
+		}
+		a.subMu.Unlock()
+	}()
+
+	return ch
+}
+
+// forwardStatusUpdates reads from EventPublisher and fans out to status subscribers
+func (a *Arcade) forwardStatusUpdates(ctx context.Context) {
+	eventCh, err := a.eventPublisher.Subscribe(ctx)
+	if err != nil {
+		a.logger.Error("failed to subscribe to event publisher", slog.String("error", err.Error()))
+		return
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-a.statusSubDone:
+			return
+		case status, ok := <-eventCh:
+			if !ok {
+				return
+			}
+			a.notifyStatusSubscribers(status)
+		}
+	}
+}
+
+// notifyStatusSubscribers sends a status update to matching status subscribers
+func (a *Arcade) notifyStatusSubscribers(status *models.TransactionStatus) {
+	a.subMu.RLock()
+	subs := a.statusSubs
+	a.subMu.RUnlock()
+
+	for _, sub := range subs {
+		// If subscriber has a token filter, check if this txid belongs to that token
+		if sub.token != "" {
+			if !a.txBelongsToToken(status.TxID, sub.token) {
+				continue
+			}
+		}
+		select {
+		case sub.ch <- status:
+		default:
+			// Subscriber slow, skip
+		}
+	}
+}
+
+// txBelongsToToken checks if a transaction belongs to a callback token
+func (a *Arcade) txBelongsToToken(txid, token string) bool {
+	if a.submissionStore == nil {
+		return false
+	}
+	subs, err := a.submissionStore.GetSubmissionsByToken(context.Background(), token)
+	if err != nil {
+		return false
+	}
+	for _, sub := range subs {
+		if sub.TxID == txid {
+			return true
+		}
+	}
+	return false
+}
+
+// notifyTipSubscribers sends a tip update to all tip subscribers
+func (a *Arcade) notifyTipSubscribers(tip *BlockHeader) {
+	a.subMu.RLock()
+	subs := a.tipSubs
+	a.subMu.RUnlock()
+
+	for _, sub := range subs {
+		// Skip if subscriber's context is cancelled
+		select {
+		case <-sub.ctx.Done():
+			continue
+		default:
+		}
+
+		select {
+		case sub.ch <- tip:
+		default:
+			// Channel full, replace with latest
+			select {
+			case <-sub.ch:
+			default:
+			}
+			select {
+			case sub.ch <- tip:
+			default:
+			}
+		}
+	}
+}
+
+// Stop gracefully shuts down the ChainTracker and closes all subscription channels
+func (a *Arcade) Stop() error {
+	// Stop status forwarder
+	if a.statusSubDone != nil {
+		close(a.statusSubDone)
+	}
+
+	// Close all subscriber channels
+	a.subMu.Lock()
+	for _, sub := range a.tipSubs {
+		close(sub.ch)
+	}
+	a.tipSubs = nil
+	for _, sub := range a.statusSubs {
+		close(sub.ch)
+	}
+	a.statusSubs = nil
+	a.subMu.Unlock()
 
 	return nil
 }
@@ -329,20 +529,22 @@ func (a *Arcade) processBlockMessage(ctx context.Context, blockMsg p2p.BlockMess
 
 // processHeader adds a header to chain state and returns whether it's the new tip
 func (a *Arcade) processHeader(ctx context.Context, header *block.Header, height uint32, dataHubURL string) (bool, []*BlockHeader, error) {
+	blockHash := header.Hash()
 	parentHash := header.PrevHash
-	parentHeader, err := a.GetHeaderByHash(ctx, &parentHash)
 
+	// Check if parent exists
+	parentHeader, err := a.GetHeaderByHash(ctx, &parentHash)
 	if err != nil {
-		// Parent not found, need to crawl back
+		// Parent not found - crawl back from datahub to find common ancestor and sync
 		a.logger.Info("parent not found, crawling back", slog.String("parent", parentHash.String()))
 		if err := a.crawlBackAndMerge(ctx, header, height, dataHubURL); err != nil {
 			return false, nil, err
 		}
-		parentHeader, _ = a.GetHeaderByHash(ctx, &parentHash)
-	}
 
-	if parentHeader == nil {
-		return false, nil, fmt.Errorf("parent header still not found after crawl")
+		// syncFromRemoteTip added all headers including this block
+		existing, _ := a.GetHeaderByHash(ctx, &blockHash)
+		a.notifyTipSubscribers(existing)
+		return true, nil, nil
 	}
 
 	// Calculate chainwork
@@ -352,7 +554,7 @@ func (a *Arcade) processHeader(ctx context.Context, header *block.Header, height
 	blockHeader := &BlockHeader{
 		Header:    header,
 		Height:    height,
-		Hash:      header.Hash(),
+		Hash:      blockHash,
 		ChainWork: chainWork,
 	}
 
@@ -373,25 +575,8 @@ func (a *Arcade) processHeader(ctx context.Context, header *block.Header, height
 			}
 		}
 
-		// Notify tip change
-		a.mu.RLock()
-		tipChan := a.tipChan
-		a.mu.RUnlock()
-		if tipChan != nil {
-			select {
-			case tipChan <- blockHeader:
-			default:
-				// Channel full, replace with latest
-				select {
-				case <-tipChan:
-				default:
-				}
-				select {
-				case tipChan <- blockHeader:
-				default:
-				}
-			}
-		}
+		// Notify tip subscribers
+		a.notifyTipSubscribers(blockHeader)
 
 		return true, reorgedBlocks, nil
 	}
@@ -613,7 +798,7 @@ func (a *Arcade) handleSubtreeMessages(ctx context.Context, subtreeChan <-chan p
 }
 
 func (a *Arcade) processSubtreeMessage(ctx context.Context, subtreeMsg p2p.SubtreeMessage) {
-	if a.txTracker == nil {
+	if a.txTracker == nil || a.txTracker.Count() == 0 {
 		return
 	}
 
@@ -775,9 +960,8 @@ func (a *Arcade) periodicOrphanCheck(ctx context.Context) {
 }
 
 // setChainTip updates the chain tip and returns orphaned blocks and newly canonical blocks
-func (a *Arcade) setChainTip(_ context.Context, newTip *BlockHeader) (orphaned []*BlockHeader, newCanonical []*BlockHeader) {
+func (a *Arcade) setChainTip(ctx context.Context, newTip *BlockHeader) (orphaned []*BlockHeader, newCanonical []*BlockHeader) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 
 	oldTip := a.tip
 
@@ -810,6 +994,21 @@ func (a *Arcade) setChainTip(_ context.Context, newTip *BlockHeader) (orphaned [
 
 	a.tip = newTip
 	a.pruneOrphans()
+
+	a.mu.Unlock()
+
+	a.logger.Info("new chain tip",
+		slog.Uint64("height", uint64(newTip.Height)),
+		slog.String("hash", newTip.Hash.String()))
+
+	// Persist new headers to disk (outside lock)
+	if len(newCanonical) > 0 {
+		if err := a.writeHeadersToFiles(newCanonical); err != nil {
+			a.logger.Error("failed to write headers to files", slog.String("error", err.Error()))
+		} else if err := a.updateMetadataForTip(ctx); err != nil {
+			a.logger.Error("failed to update metadata", slog.String("error", err.Error()))
+		}
+	}
 
 	return orphaned, newCanonical
 }
@@ -921,6 +1120,16 @@ func (a *Arcade) GetNetwork(_ context.Context) (string, error) {
 	return a.network, nil
 }
 
+// GetPeers returns information about connected P2P peers
+func (a *Arcade) GetPeers() []p2p.PeerInfo {
+	return a.p2pClient.GetPeers()
+}
+
+// GetPeerID returns this node's P2P peer ID
+func (a *Arcade) GetPeerID() string {
+	return a.p2pClient.GetID()
+}
+
 // IsValidRootForHeight implements chaintracker.ChainTracker interface
 func (a *Arcade) IsValidRootForHeight(ctx context.Context, root *chainhash.Hash, height uint32) (bool, error) {
 	header, err := a.GetHeaderByHeight(ctx, height)
@@ -988,23 +1197,553 @@ func (a *Arcade) fetchHashes(ctx context.Context, url string) ([]chainhash.Hash,
 	return hashes, nil
 }
 
-// Placeholder methods
+// loadFromLocalFiles restores the chain from local header files.
+// First checks the storage path for user's saved state, then falls back to embedded checkpoint files.
+func (a *Arcade) loadFromLocalFiles(ctx context.Context) error {
+	// Determine metadata path - check storage path first, then embedded checkpoints
+	metadataPath := filepath.Join(a.localStoragePath, a.network+"NetBlockHeaders.json")
+	basePath := a.localStoragePath
 
-func (a *Arcade) loadFromLocalFiles(_ context.Context) error {
-	// TODO: Load chain state from local files
+	if _, err := os.Stat(metadataPath); os.IsNotExist(err) {
+		// Fall back to embedded checkpoint files
+		checkpointPath := filepath.Join("data", "headers")
+		checkpointMetadata := filepath.Join(checkpointPath, a.network+"NetBlockHeaders.json")
+
+		if _, err := os.Stat(checkpointMetadata); os.IsNotExist(err) {
+			a.logger.Info("No checkpoint files found, starting with empty chain",
+				slog.String("storagePath", metadataPath),
+				slog.String("checkpointPath", checkpointMetadata))
+			return nil
+		}
+
+		a.logger.Info("Loading from embedded checkpoint", slog.String("path", checkpointMetadata))
+		metadataPath = checkpointMetadata
+		basePath = checkpointPath
+	} else {
+		a.logger.Info("Loading from storage path", slog.String("path", metadataPath))
+	}
+
+	metadata, err := parseMetadata(metadataPath)
+	if err != nil {
+		return fmt.Errorf("failed to parse metadata: %w", err)
+	}
+
+	a.logger.Info("Found checkpoint files to load", slog.Int("files", len(metadata.Files)))
+
+	for _, fileEntry := range metadata.Files {
+		filePath := filepath.Join(basePath, fileEntry.FileName)
+		headers, err := loadHeadersFromFile(filePath)
+		if err != nil {
+			return fmt.Errorf("failed to load file %s: %w", fileEntry.FileName, err)
+		}
+
+		// Calculate chainwork incrementally
+		var prevChainWork *big.Int
+		if fileEntry.FirstHeight == 0 {
+			prevChainWork = big.NewInt(0)
+		} else {
+			prevHeader, err := a.GetHeaderByHeight(ctx, fileEntry.FirstHeight-1)
+			if err != nil {
+				return fmt.Errorf("failed to get previous header at height %d: %w", fileEntry.FirstHeight-1, err)
+			}
+			prevChainWork = prevHeader.ChainWork
+		}
+
+		a.mu.Lock()
+		for i, header := range headers {
+			height := fileEntry.FirstHeight + uint32(i)
+
+			var chainWork *big.Int
+			if height == 0 {
+				chainWork = big.NewInt(0)
+			} else {
+				work := calculateWork(header.Bits)
+				chainWork = new(big.Int).Add(prevChainWork, work)
+				prevChainWork = chainWork
+			}
+
+			blockHeader := &BlockHeader{
+				Header:    header,
+				Height:    height,
+				Hash:      header.Hash(),
+				ChainWork: chainWork,
+			}
+
+			// Ensure slice is large enough
+			for uint32(len(a.byHeight)) <= height {
+				a.byHeight = append(a.byHeight, chainhash.Hash{})
+			}
+
+			a.byHeight[height] = blockHeader.Hash
+			a.byHash[blockHeader.Hash] = blockHeader
+			a.tip = blockHeader
+		}
+		a.mu.Unlock()
+
+		a.logger.Info("Loaded headers from file",
+			slog.String("file", fileEntry.FileName),
+			slog.Int("count", len(headers)))
+	}
+
+	if a.tip != nil {
+		a.logger.Info("Chain loaded",
+			slog.Uint64("height", uint64(a.tip.Height)),
+			slog.String("tip", a.tip.Hash.String()))
+	}
+
 	return nil
 }
 
-func (a *Arcade) runBootstrapSync(_ context.Context, _ string) {
-	// TODO: Bootstrap sync from remote
+// parseMetadata reads and parses the metadata JSON file
+func parseMetadata(path string) (*CDNMetadata, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read metadata: %w", err)
+	}
+
+	var metadata CDNMetadata
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return nil, fmt.Errorf("failed to parse metadata JSON: %w", err)
+	}
+
+	return &metadata, nil
 }
 
-func (a *Arcade) crawlBackAndMerge(_ context.Context, _ *block.Header, _ uint32, _ string) error {
-	// TODO: Crawl back to find common ancestor
+// loadHeadersFromFile reads a binary .headers file and returns a slice of headers
+func loadHeadersFromFile(path string) ([]*block.Header, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file: %w", err)
+	}
+
+	if len(data)%80 != 0 {
+		return nil, fmt.Errorf("invalid file size: %d bytes (not multiple of 80)", len(data))
+	}
+
+	headerCount := len(data) / 80
+	headers := make([]*block.Header, 0, headerCount)
+
+	for i := 0; i < headerCount; i++ {
+		headerBytes := data[i*80 : (i+1)*80]
+		header, err := block.NewHeaderFromBytes(headerBytes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse header at index %d: %w", i, err)
+		}
+		headers = append(headers, header)
+	}
+
+	return headers, nil
+}
+
+// writeHeadersToFiles writes headers to the appropriate .headers files for persistence
+func (a *Arcade) writeHeadersToFiles(headers []*BlockHeader) error {
+	if a.localStoragePath == "" {
+		return nil
+	}
+
+	if err := os.MkdirAll(a.localStoragePath, 0o750); err != nil {
+		return fmt.Errorf("failed to create storage directory: %w", err)
+	}
+
+	// Group headers by file (100,000 headers per file)
+	fileHeaders := make(map[uint32][]*BlockHeader)
+	for _, header := range headers {
+		fileIndex := header.Height / 100000
+		fileHeaders[fileIndex] = append(fileHeaders[fileIndex], header)
+	}
+
+	// Write to each file
+	for fileIndex, hdrs := range fileHeaders {
+		fileName := fmt.Sprintf("%s_%d.headers", a.network, fileIndex)
+		filePath := filepath.Join(a.localStoragePath, fileName)
+
+		f, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, 0o600)
+		if err != nil {
+			return fmt.Errorf("failed to open file %s: %w", fileName, err)
+		}
+
+		for _, header := range hdrs {
+			positionInFile := (header.Height % 100000) * 80
+			if _, err := f.Seek(int64(positionInFile), 0); err != nil {
+				_ = f.Close()
+				return fmt.Errorf("failed to seek in file: %w", err)
+			}
+
+			if _, err := f.Write(header.Bytes()); err != nil {
+				_ = f.Close()
+				return fmt.Errorf("failed to write header: %w", err)
+			}
+		}
+
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("failed to close file: %w", err)
+		}
+	}
+
 	return nil
 }
 
-func calculateWork(_ uint32) *big.Int {
-	// TODO: Implement work calculation from bits
-	return big.NewInt(1)
+// updateMetadataForTip updates the metadata JSON with current chain tip info
+func (a *Arcade) updateMetadataForTip(ctx context.Context) error {
+	if a.localStoragePath == "" {
+		return nil
+	}
+
+	metadataPath := filepath.Join(a.localStoragePath, a.network+"NetBlockHeaders.json")
+
+	// Read existing metadata or create new
+	var metadata *CDNMetadata
+	if _, err := os.Stat(metadataPath); os.IsNotExist(err) {
+		metadata = &CDNMetadata{
+			RootFolder:     "",
+			JSONFilename:   a.network + "NetBlockHeaders.json",
+			HeadersPerFile: 100000,
+			Files:          []CDNFileEntry{},
+		}
+	} else {
+		var err error
+		metadata, err = parseMetadata(metadataPath)
+		if err != nil {
+			return fmt.Errorf("failed to parse existing metadata: %w", err)
+		}
+	}
+
+	tip := a.GetTip(ctx)
+	if tip == nil {
+		return nil
+	}
+
+	fileIndex := tip.Height / 100000
+
+	// Ensure we have entries for all files up to the current tip
+	for i := uint32(len(metadata.Files)); i <= fileIndex; i++ {
+		metadata.Files = append(metadata.Files, CDNFileEntry{
+			Chain:         a.network,
+			Count:         0,
+			FileHash:      "",
+			FileName:      fmt.Sprintf("%s_%d.headers", a.network, i),
+			FirstHeight:   i * 100000,
+			LastChainWork: "0000000000000000000000000000000000000000000000000000000000000000",
+			PrevChainWork: "0000000000000000000000000000000000000000000000000000000000000000",
+			SourceURL:     "",
+		})
+	}
+
+	// Update the last file entry with current tip info
+	lastFileEntry := &metadata.Files[fileIndex]
+	lastFileEntry.Count = int((tip.Height % 100000) + 1)
+	lastFileEntry.LastChainWork = chainWorkToHex(tip.ChainWork)
+	lastFileEntry.LastHash = tip.Hash
+
+	// Get previous header for prevChainWork and prevHash
+	if tip.Height > 0 {
+		prevHeader, err := a.GetHeaderByHeight(ctx, tip.Height-1)
+		if err == nil {
+			lastFileEntry.PrevChainWork = chainWorkToHex(prevHeader.ChainWork)
+			lastFileEntry.PrevHash = prevHeader.Hash
+		}
+	}
+
+	// Write updated metadata
+	data, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal metadata: %w", err)
+	}
+
+	if err := os.WriteFile(metadataPath, data, 0o600); err != nil {
+		return fmt.Errorf("failed to write metadata: %w", err)
+	}
+
+	return nil
+}
+
+const (
+	maxHeadersPerRequest = 1000
+	headerSize           = 80
+)
+
+func (a *Arcade) runBootstrapSync(ctx context.Context, baseURL string) {
+	if baseURL == "" {
+		return
+	}
+
+	remoteTipHash, err := a.fetchLatestBlock(ctx, baseURL)
+	if err != nil {
+		a.logger.Error("failed to fetch latest block for bootstrap", slog.String("error", err.Error()))
+		return
+	}
+
+	a.logger.Info("Starting bootstrap sync", slog.String("remoteTip", remoteTipHash.String()))
+
+	if err := a.syncFromRemoteTip(ctx, remoteTipHash, baseURL); err != nil {
+		a.logger.Error("bootstrap sync failed", slog.String("error", err.Error()))
+	}
+}
+
+func (a *Arcade) crawlBackAndMerge(ctx context.Context, header *block.Header, _ uint32, dataHubURL string) error {
+	return a.syncFromRemoteTip(ctx, header.Hash(), dataHubURL)
+}
+
+// syncFromRemoteTip walks backwards from a remote tip to find common ancestor,
+// then imports the entire branch. Used for both bootstrap sync and P2P block
+// messages with unknown parents.
+func (a *Arcade) syncFromRemoteTip(ctx context.Context, remoteTipHash chainhash.Hash, baseURL string) error {
+	// Check if we already have the remote tip
+	if _, err := a.GetHeaderByHash(ctx, &remoteTipHash); err == nil {
+		a.logger.Debug("already have block", slog.String("hash", remoteTipHash.String()))
+		return nil
+	}
+
+	a.logger.Info("Walking backwards to find common ancestor", slog.String("remoteTip", remoteTipHash.String()))
+
+	branch := make([]*block.Header, 0, 10000)
+	currentHash := remoteTipHash
+	var commonAncestor *BlockHeader
+
+	startTime := time.Now()
+	for {
+		// Check if we have this block in our chain
+		if existingHeader, err := a.GetHeaderByHash(ctx, &currentHash); err == nil {
+			commonAncestor = existingHeader
+			a.logger.Info("Found common ancestor",
+				slog.Uint64("height", uint64(commonAncestor.Height)),
+				slog.Duration("elapsed", time.Since(startTime)))
+			break
+		}
+
+		// Fetch batch of headers walking backwards
+		headers, err := a.fetchHeadersBackward(ctx, baseURL, currentHash.String(), maxHeadersPerRequest)
+		if err != nil {
+			return fmt.Errorf("failed to fetch headers backward from %s: %w", currentHash.String(), err)
+		}
+
+		if len(headers) == 0 {
+			return fmt.Errorf("no headers returned from %s/headers/%s", baseURL, currentHash.String())
+		}
+
+		a.logger.Debug("Fetched headers batch",
+			slog.Int("count", len(headers)),
+			slog.String("from", currentHash.String()))
+
+		// Add headers to branch (they're in reverse order - newest first)
+		branch = append(branch, headers...)
+
+		// Check if any of the fetched headers exist in our chain
+		found := false
+		for i, header := range headers {
+			hash := header.Hash()
+			if existingHeader, err := a.GetHeaderByHash(ctx, &hash); err == nil {
+				commonAncestor = existingHeader
+				// Trim the branch to only include headers after the common ancestor
+				branch = branch[:len(branch)-len(headers)+i]
+				found = true
+				a.logger.Info("Found common ancestor",
+					slog.Uint64("height", uint64(commonAncestor.Height)),
+					slog.Duration("elapsed", time.Since(startTime)))
+				break
+			}
+		}
+
+		if found {
+			break
+		}
+
+		// Continue from the last header's parent
+		currentHash = headers[len(headers)-1].PrevHash
+	}
+
+	if commonAncestor == nil {
+		return fmt.Errorf("common ancestor not found")
+	}
+
+	if len(branch) == 0 {
+		a.logger.Debug("No new headers to sync")
+		return nil
+	}
+
+	a.logger.Info("Importing new headers", slog.Int("count", len(branch)))
+
+	// Reverse branch (it's currently newest to oldest, we need oldest to newest)
+	for i := 0; i < len(branch)/2; i++ {
+		branch[i], branch[len(branch)-1-i] = branch[len(branch)-1-i], branch[i]
+	}
+
+	// Calculate heights and chainwork for the entire branch
+	blockHeaders := make([]*BlockHeader, len(branch))
+	currentHeight := commonAncestor.Height + 1
+	currentChainWork := commonAncestor.ChainWork
+
+	for i, header := range branch {
+		work := calculateWork(header.Bits)
+		currentChainWork = new(big.Int).Add(currentChainWork, work)
+
+		blockHeaders[i] = &BlockHeader{
+			Header:    header,
+			Height:    currentHeight,
+			Hash:      header.Hash(),
+			ChainWork: new(big.Int).Set(currentChainWork),
+		}
+		currentHeight++
+	}
+
+	// Import headers to chain state
+	a.mu.Lock()
+	for _, bh := range blockHeaders {
+		for uint32(len(a.byHeight)) <= bh.Height {
+			a.byHeight = append(a.byHeight, chainhash.Hash{})
+		}
+		a.byHeight[bh.Height] = bh.Hash
+		a.byHash[bh.Hash] = bh
+	}
+	a.tip = blockHeaders[len(blockHeaders)-1]
+	a.mu.Unlock()
+
+	// Persist to disk
+	if err := a.writeHeadersToFiles(blockHeaders); err != nil {
+		a.logger.Error("failed to write headers to files", slog.String("error", err.Error()))
+	} else if err := a.updateMetadataForTip(ctx); err != nil {
+		a.logger.Error("failed to update metadata", slog.String("error", err.Error()))
+	}
+
+	a.logger.Info("Sync complete",
+		slog.Uint64("tipHeight", uint64(a.tip.Height)),
+		slog.String("tipHash", a.tip.Hash.String()),
+		slog.Int("headersAdded", len(blockHeaders)))
+
+	return nil
+}
+
+// fetchLatestBlock gets the latest block hash from the node's bestblockheader endpoint
+func (a *Arcade) fetchLatestBlock(ctx context.Context, baseURL string) (chainhash.Hash, error) {
+	url := fmt.Sprintf("%s/bestblockheader", strings.TrimSuffix(baseURL, "/"))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return chainhash.Hash{}, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		return chainhash.Hash{}, fmt.Errorf("failed to fetch best block header: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return chainhash.Hash{}, fmt.Errorf("best block header request failed: status %d", resp.StatusCode)
+	}
+
+	headerBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return chainhash.Hash{}, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if len(headerBytes) != headerSize {
+		return chainhash.Hash{}, fmt.Errorf("invalid header size: expected %d, got %d", headerSize, len(headerBytes))
+	}
+
+	header, err := block.NewHeaderFromBytes(headerBytes)
+	if err != nil {
+		return chainhash.Hash{}, fmt.Errorf("failed to parse header: %w", err)
+	}
+
+	return header.Hash(), nil
+}
+
+// fetchHeadersBackward fetches headers walking backwards from a starting hash.
+// Returns headers in reverse chronological order (newest first).
+func (a *Arcade) fetchHeadersBackward(ctx context.Context, baseURL, startHash string, count int) ([]*block.Header, error) {
+	url := fmt.Sprintf("%s/headers/%s?n=%d", strings.TrimSuffix(baseURL, "/"), startHash, count)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch headers: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch headers failed: status %d", resp.StatusCode)
+	}
+
+	headerBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if len(headerBytes)%headerSize != 0 {
+		return nil, fmt.Errorf("invalid header data length: %d bytes", len(headerBytes))
+	}
+
+	numHeaders := len(headerBytes) / headerSize
+	headers := make([]*block.Header, numHeaders)
+
+	for i := 0; i < numHeaders; i++ {
+		start := i * headerSize
+		end := start + headerSize
+		headerData := headerBytes[start:end]
+
+		header, err := block.NewHeaderFromBytes(headerData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse header %d: %w", i, err)
+		}
+
+		headers[i] = header
+	}
+
+	return headers, nil
+}
+
+// oneLsh256 is 1 shifted left 256 bits (used for chainwork calculation)
+var oneLsh256 = new(big.Int).Lsh(big.NewInt(1), 256)
+
+// compactToBig converts a compact representation of a 256-bit number (as used in Bitcoin difficulty)
+// to a big.Int. The compact format is a special floating point notation where:
+// - The first byte is the exponent (number of bytes)
+// - The remaining 3 bytes are the mantissa
+// - The sign bit (0x00800000) indicates if the number is negative
+func compactToBig(compact uint32) *big.Int {
+	mantissa := compact & 0x007fffff
+	isNegative := compact&0x00800000 != 0
+	exponent := uint(compact >> 24)
+
+	var bn *big.Int
+	if exponent <= 3 {
+		mantissa >>= 8 * (3 - exponent)
+		bn = big.NewInt(int64(mantissa))
+	} else {
+		bn = big.NewInt(int64(mantissa))
+		bn.Lsh(bn, 8*(exponent-3))
+	}
+
+	if isNegative {
+		bn = bn.Neg(bn)
+	}
+
+	return bn
+}
+
+// calculateWork calculates the work represented by a given difficulty target (bits).
+// Work is calculated as: work = 2^256 / (target + 1)
+func calculateWork(bits uint32) *big.Int {
+	target := compactToBig(bits)
+
+	if target.Sign() <= 0 {
+		return big.NewInt(0)
+	}
+
+	denominator := new(big.Int).Add(target, big.NewInt(1))
+	return new(big.Int).Div(oneLsh256, denominator)
+}
+
+// chainWorkToHex converts chainwork to a 64-character hex string (padded)
+func chainWorkToHex(work *big.Int) string {
+	hexStr := work.Text(16)
+	for len(hexStr) < 64 {
+		hexStr = "0" + hexStr
+	}
+	return hexStr
 }

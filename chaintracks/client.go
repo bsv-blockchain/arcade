@@ -10,17 +10,18 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/bsv-blockchain/arcade"
+	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 )
 
-// Client is an HTTP client for arcade server with SSE support
+// Client is an HTTP client for arcade server with SSE support.
+// It implements the arcade.Chaintracks interface.
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
-	currentTip *BlockHeader
+	currentTip *arcade.BlockHeader
 	tipMu      sync.RWMutex
-	msgChan    chan *BlockHeader
-	cancelFunc context.CancelFunc
 }
 
 // NewClient creates a new HTTP client for arcade server
@@ -36,44 +37,41 @@ func NewClient(baseURL string) *Client {
 	}
 }
 
-// Start connects to the SSE stream and returns a channel for tip updates
-func (cc *Client) Start(ctx context.Context) (<-chan *BlockHeader, error) {
-	cc.msgChan = make(chan *BlockHeader, 1)
+// SubscribeTip returns a channel for chain tip updates via SSE.
+// The SSE connection is closed when the context is cancelled.
+func (c *Client) SubscribeTip(ctx context.Context) <-chan *arcade.BlockHeader {
+	ch := make(chan *arcade.BlockHeader, 1)
 
-	childCtx, cancel := context.WithCancel(ctx)
-	cc.cancelFunc = cancel
+	go func() {
+		defer close(ch)
 
-	req, err := http.NewRequestWithContext(childCtx, "GET", cc.baseURL+"/tip/stream", nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create SSE request: %w", err)
-	}
+		req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+"/tip/stream", nil)
+		if err != nil {
+			return
+		}
 
-	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("Cache-Control", "no-cache")
-	req.Header.Set("Connection", "keep-alive")
+		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("Cache-Control", "no-cache")
+		req.Header.Set("Connection", "keep-alive")
 
-	resp, err := cc.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to SSE stream: %w", err)
-	}
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusOK {
-		_ = resp.Body.Close()
-		return nil, fmt.Errorf("%w: status %d", ErrSSEStreamFailed, resp.StatusCode)
-	}
+		if resp.StatusCode != http.StatusOK {
+			return
+		}
 
-	go cc.readSSE(childCtx, resp.Body)
+		c.readTipSSE(ctx, resp.Body, ch)
+	}()
 
-	return cc.msgChan, nil
+	return ch
 }
 
-// readSSE reads Server-Sent Events from the response body
-//
-//nolint:gocyclo // Inherent complexity of SSE parsing logic
-func (cc *Client) readSSE(ctx context.Context, body io.ReadCloser) {
-	defer func() { _ = body.Close() }()
-	defer close(cc.msgChan)
-
+// readTipSSE reads tip updates from an SSE stream
+func (c *Client) readTipSSE(ctx context.Context, body io.Reader, ch chan<- *arcade.BlockHeader) {
 	reader := bufio.NewReader(body)
 	var lastHash *chainhash.Hash
 
@@ -86,9 +84,6 @@ func (cc *Client) readSSE(ctx context.Context, body io.ReadCloser) {
 
 		line, err := reader.ReadString('\n')
 		if err != nil {
-			if err != io.EOF {
-				return
-			}
 			return
 		}
 
@@ -102,7 +97,7 @@ func (cc *Client) readSSE(ctx context.Context, body io.ReadCloser) {
 			continue
 		}
 
-		var blockHeader BlockHeader
+		var blockHeader arcade.BlockHeader
 		if err := json.Unmarshal([]byte(data), &blockHeader); err != nil {
 			continue
 		}
@@ -113,54 +108,124 @@ func (cc *Client) readSSE(ctx context.Context, body io.ReadCloser) {
 
 		lastHash = &blockHeader.Hash
 
-		cc.tipMu.Lock()
-		cc.currentTip = &blockHeader
-		cc.tipMu.Unlock()
+		c.tipMu.Lock()
+		c.currentTip = &blockHeader
+		c.tipMu.Unlock()
 
 		select {
-		case cc.msgChan <- &blockHeader:
+		case ch <- &blockHeader:
 		case <-ctx.Done():
 			return
 		default:
+			// Channel full, skip
 		}
 	}
 }
 
-// Stop closes the SSE connection
-func (cc *Client) Stop() error {
-	if cc.cancelFunc != nil {
-		cc.cancelFunc()
+// SubscribeStatus returns a channel for transaction status updates via SSE.
+// If token is empty, subscribes to all status updates.
+// If token is provided, subscribes to updates for that callback token.
+// The SSE connection is closed when the context is cancelled.
+func (c *Client) SubscribeStatus(ctx context.Context, token string) <-chan *models.TransactionStatus {
+	ch := make(chan *models.TransactionStatus, 100)
+
+	go func() {
+		defer close(ch)
+
+		url := c.baseURL + "/events/" + token
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			return
+		}
+
+		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("Cache-Control", "no-cache")
+		req.Header.Set("Connection", "keep-alive")
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		if resp.StatusCode != http.StatusOK {
+			return
+		}
+
+		c.readStatusSSE(ctx, resp.Body, ch)
+	}()
+
+	return ch
+}
+
+// readStatusSSE reads status updates from an SSE stream
+func (c *Client) readStatusSSE(ctx context.Context, body io.Reader, ch chan<- *models.TransactionStatus) {
+	reader := bufio.NewReader(body)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return
+		}
+
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "" {
+			continue
+		}
+
+		var status models.TransactionStatus
+		if err := json.Unmarshal([]byte(data), &status); err != nil {
+			continue
+		}
+
+		select {
+		case ch <- &status:
+		case <-ctx.Done():
+			return
+		default:
+			// Channel full, skip
+		}
 	}
-	return nil
 }
 
-// GetTip returns the current chain tip
-func (cc *Client) GetTip(_ context.Context) *BlockHeader {
-	cc.tipMu.RLock()
-	defer cc.tipMu.RUnlock()
-	return cc.currentTip
+// GetTip returns the current chain tip (cached from last SSE update)
+func (c *Client) GetTip(_ context.Context) *arcade.BlockHeader {
+	c.tipMu.RLock()
+	defer c.tipMu.RUnlock()
+	return c.currentTip
 }
 
-// GetHeight returns the current chain height
-func (cc *Client) GetHeight(_ context.Context) uint32 {
-	cc.tipMu.RLock()
-	defer cc.tipMu.RUnlock()
-	if cc.currentTip == nil {
+// GetHeight returns the current chain height (cached from last SSE update)
+func (c *Client) GetHeight(_ context.Context) uint32 {
+	c.tipMu.RLock()
+	defer c.tipMu.RUnlock()
+	if c.currentTip == nil {
 		return 0
 	}
-	return cc.currentTip.Height
+	return c.currentTip.Height
 }
 
 // GetHeaderByHeight retrieves a header by height from the server
-func (cc *Client) GetHeaderByHeight(ctx context.Context, height uint32) (*BlockHeader, error) {
-	url := fmt.Sprintf("%s/header/height/%d", cc.baseURL, height)
+func (c *Client) GetHeaderByHeight(ctx context.Context, height uint32) (*arcade.BlockHeader, error) {
+	url := fmt.Sprintf("%s/header/height/%d", c.baseURL, height)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	resp, err := cc.httpClient.Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch header: %w", err)
 	}
@@ -170,7 +235,7 @@ func (cc *Client) GetHeaderByHeight(ctx context.Context, height uint32) (*BlockH
 		return nil, fmt.Errorf("%w: status %d", ErrServerRequestFailed, resp.StatusCode)
 	}
 
-	var header BlockHeader
+	var header arcade.BlockHeader
 	if err := json.NewDecoder(resp.Body).Decode(&header); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
@@ -179,15 +244,15 @@ func (cc *Client) GetHeaderByHeight(ctx context.Context, height uint32) (*BlockH
 }
 
 // GetHeaderByHash retrieves a header by hash from the server
-func (cc *Client) GetHeaderByHash(ctx context.Context, hash *chainhash.Hash) (*BlockHeader, error) {
-	url := fmt.Sprintf("%s/header/hash/%s", cc.baseURL, hash.String())
+func (c *Client) GetHeaderByHash(ctx context.Context, hash *chainhash.Hash) (*arcade.BlockHeader, error) {
+	url := fmt.Sprintf("%s/header/hash/%s", c.baseURL, hash.String())
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	resp, err := cc.httpClient.Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch header: %w", err)
 	}
@@ -197,7 +262,7 @@ func (cc *Client) GetHeaderByHash(ctx context.Context, hash *chainhash.Hash) (*B
 		return nil, fmt.Errorf("%w: status %d", ErrServerRequestFailed, resp.StatusCode)
 	}
 
-	var header BlockHeader
+	var header arcade.BlockHeader
 	if err := json.NewDecoder(resp.Body).Decode(&header); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
@@ -206,8 +271,8 @@ func (cc *Client) GetHeaderByHash(ctx context.Context, hash *chainhash.Hash) (*B
 }
 
 // IsValidRootForHeight implements the ChainTracker interface
-func (cc *Client) IsValidRootForHeight(ctx context.Context, root *chainhash.Hash, height uint32) (bool, error) {
-	header, err := cc.GetHeaderByHeight(ctx, height)
+func (c *Client) IsValidRootForHeight(ctx context.Context, root *chainhash.Hash, height uint32) (bool, error) {
+	header, err := c.GetHeaderByHeight(ctx, height)
 	if err != nil {
 		return false, err
 	}
@@ -215,18 +280,18 @@ func (cc *Client) IsValidRootForHeight(ctx context.Context, root *chainhash.Hash
 }
 
 // CurrentHeight implements the ChainTracker interface
-func (cc *Client) CurrentHeight(ctx context.Context) (uint32, error) {
-	return cc.GetHeight(ctx), nil
+func (c *Client) CurrentHeight(ctx context.Context) (uint32, error) {
+	return c.GetHeight(ctx), nil
 }
 
 // GetNetwork returns the network name from the server
-func (cc *Client) GetNetwork(ctx context.Context) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", cc.baseURL+"/network", nil)
+func (c *Client) GetNetwork(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+"/network", nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}
 
-	resp, err := cc.httpClient.Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch network: %w", err)
 	}

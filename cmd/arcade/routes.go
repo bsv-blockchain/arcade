@@ -11,8 +11,6 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/arcade"
-	"github.com/bsv-blockchain/arcade/api"
-	"github.com/bsv-blockchain/arcade/beef"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
@@ -21,28 +19,66 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-// Error response
+// ErrorResponse represents an error response
 // @Description Error response
 type ErrorResponse struct {
 	Error string `json:"error" example:"Invalid request"`
 }
 
-// Network response
+// NetworkResponse represents the network name response
 // @Description Network name response
 type NetworkResponse struct {
 	Network string `json:"network" example:"main"`
 }
 
-// Height response
+// HeightResponse represents the current blockchain height
 // @Description Current blockchain height
 type HeightResponse struct {
 	Height uint32 `json:"height" example:"873421"`
 }
 
-// Headers response
+// HeadersResponse represents concatenated raw headers in hex
 // @Description Concatenated raw headers in hex
 type HeadersResponse struct {
 	Headers string `json:"headers" example:"0100000000000000..."`
+}
+
+// TransactionRequest represents a transaction submission request
+type TransactionRequest struct {
+	RawTx string `json:"rawTx"`
+}
+
+// PolicyResponse represents the policy configuration
+type PolicyResponse struct {
+	MaxScriptSizePolicy     uint64    `json:"maxscriptsizepolicy"`
+	MaxTxSigOpsCountsPolicy uint64    `json:"maxtxsigopscountspolicy"`
+	MaxTxSizePolicy         uint64    `json:"maxtxsizepolicy"`
+	MiningFee               FeeAmount `json:"miningFee"`
+}
+
+// FeeAmount represents fee amount in bytes and satoshis
+type FeeAmount struct {
+	Bytes    uint64 `json:"bytes"`
+	Satoshis uint64 `json:"satoshis"`
+}
+
+// HealthResponse represents the health check response
+type HealthResponse struct {
+	Healthy bool   `json:"healthy"`
+	Reason  string `json:"reason,omitempty"`
+	Version string `json:"version,omitempty"`
+}
+
+// RequestHeaders contains Arc-compatible request headers
+type RequestHeaders struct {
+	CallbackURL          string
+	CallbackToken        string
+	CallbackBatch        bool
+	FullStatusUpdates    bool
+	WaitFor              string
+	MaxTimeout           int
+	SkipFeeValidation    bool
+	SkipScriptValidation bool
 }
 
 // handlePostTx submits a transaction
@@ -52,7 +88,7 @@ type HeadersResponse struct {
 // @Accept json
 // @Accept application/octet-stream
 // @Produce json
-// @Param transaction body api.TransactionRequest true "Transaction request"
+// @Param transaction body TransactionRequest true "Transaction request"
 // @Param X-CallbackUrl header string false "Webhook callback URL"
 // @Param X-CallbackToken header string false "Callback token for SSE/webhook auth"
 // @Param X-FullStatusUpdates header boolean false "Receive all status updates"
@@ -63,37 +99,44 @@ type HeadersResponse struct {
 func handlePostTx(c *fiber.Ctx) error {
 	ctx := c.UserContext()
 
-	var rawTx []byte
+	// Extract raw bytes based on content type
+	var data []byte
 	var err error
-
-	if c.Get("Content-Type") == "application/octet-stream" {
-		rawTx = c.Body()
-		if beef.IsBeef(rawTx) {
-			tx, err := beef.ParseAndValidate(rawTx)
-			if err != nil {
-				return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": fmt.Sprintf("Invalid BEEF format: %v", err)})
-			}
-			rawTx = tx.Bytes()
+	switch c.Get("Content-Type") {
+	case "application/octet-stream":
+		data = c.Body()
+	case "text/plain":
+		data, err = hex.DecodeString(string(c.Body()))
+		if err != nil {
+			return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Invalid transaction hex"})
 		}
-	} else {
-		var req api.TransactionRequest
+	default: // application/json
+		var req TransactionRequest
 		if err := c.BodyParser(&req); err != nil {
 			return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request body"})
 		}
-		rawTx, err = hex.DecodeString(req.RawTx)
+		data, err = hex.DecodeString(req.RawTx)
 		if err != nil {
 			return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Invalid transaction hex"})
 		}
 	}
 
-	if err := txValidator.ValidateTransaction(rawTx); err != nil {
+	// Parse transaction - try BEEF first, then raw tx
+	_, tx, _, err := sdkTx.ParseBeef(data)
+	if err != nil || tx == nil {
+		tx, err = sdkTx.NewTransactionFromBytes(data)
+		if err != nil {
+			return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Failed to parse transaction"})
+		}
+	}
+
+	// Validate transaction
+	skipFees := c.Get("X-SkipFeeValidation") == "true"
+	skipScripts := c.Get("X-SkipScriptValidation") == "true"
+	if err := txValidator.ValidateTransaction(ctx, tx, skipFees, skipScripts); err != nil {
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": fmt.Sprintf("Validation failed: %v", err)})
 	}
 
-	tx, err := sdkTx.NewTransactionFromBytes(rawTx)
-	if err != nil {
-		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Failed to parse transaction"})
-	}
 	txid := tx.TxID().String()
 
 	if err := statusStore.InsertStatus(ctx, &models.TransactionStatus{
@@ -121,7 +164,7 @@ func handlePostTx(c *fiber.Ctx) error {
 	}
 
 	for _, endpoint := range teranodeClient.GetEndpoints() {
-		go submitToTeranode(ctx, endpoint, rawTx, txid)
+		go submitToTeranode(ctx, endpoint, tx.Bytes(), txid)
 	}
 
 	status, err := statusStore.GetStatus(ctx, txid)
@@ -138,30 +181,41 @@ func handlePostTx(c *fiber.Ctx) error {
 // @Tags Transactions
 // @Accept json
 // @Produce json
-// @Param transactions body []api.TransactionRequest true "Array of transactions"
+// @Param transactions body []TransactionRequest true "Array of transactions"
 // @Success 200 {array} models.TransactionStatus
 // @Failure 400 {object} ErrorResponse
 // @Router /txs [post]
 func handlePostTxs(c *fiber.Ctx) error {
 	ctx := c.UserContext()
 
-	var reqs []api.TransactionRequest
+	var reqs []TransactionRequest
 	if err := c.BodyParser(&reqs); err != nil {
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request body"})
 	}
 
-	var rawTxs [][]byte
+	skipFees := c.Get("X-SkipFeeValidation") == "true"
+	skipScripts := c.Get("X-SkipScriptValidation") == "true"
+
+	var txs []*sdkTx.Transaction
 	for _, req := range reqs {
-		rawTx, err := hex.DecodeString(req.RawTx)
+		data, err := hex.DecodeString(req.RawTx)
 		if err != nil {
 			return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Invalid transaction hex"})
 		}
-		if err := txValidator.ValidateTransaction(rawTx); err != nil {
+
+		_, tx, _, err := sdkTx.ParseBeef(data)
+		if err != nil || tx == nil {
+			tx, err = sdkTx.NewTransactionFromBytes(data)
+			if err != nil {
+				return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Failed to parse transaction"})
+			}
+		}
+
+		if err := txValidator.ValidateTransaction(ctx, tx, skipFees, skipScripts); err != nil {
 			return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": fmt.Sprintf("Validation failed: %v", err)})
 		}
-		rawTxs = append(rawTxs, rawTx)
 
-		tx, _ := sdkTx.NewTransactionFromBytes(rawTx)
+		txs = append(txs, tx)
 		txid := tx.TxID().String()
 		statusStore.InsertStatus(ctx, &models.TransactionStatus{
 			TxID:      txid,
@@ -170,17 +224,15 @@ func handlePostTxs(c *fiber.Ctx) error {
 		txTracker.Add(txid, models.StatusReceived)
 	}
 
-	for _, rawTx := range rawTxs {
-		tx, _ := sdkTx.NewTransactionFromBytes(rawTx)
+	for _, tx := range txs {
 		txid := tx.TxID().String()
 		for _, endpoint := range teranodeClient.GetEndpoints() {
-			go submitToTeranode(ctx, endpoint, rawTx, txid)
+			go submitToTeranode(ctx, endpoint, tx.Bytes(), txid)
 		}
 	}
 
 	var responses []*models.TransactionStatus
-	for _, rawTx := range rawTxs {
-		tx, _ := sdkTx.NewTransactionFromBytes(rawTx)
+	for _, tx := range txs {
 		status, _ := statusStore.GetStatus(ctx, tx.TxID().String())
 		responses = append(responses, status)
 	}
@@ -214,7 +266,7 @@ func handleGetTx(c *fiber.Ctx) error {
 // @Description Get transaction validation policy and fee requirements
 // @Tags Info
 // @Produce json
-// @Success 200 {object} api.PolicyResponse
+// @Success 200 {object} PolicyResponse
 // @Router /policy [get]
 func handleGetPolicy(c *fiber.Ctx) error {
 	return c.JSON(policy)
@@ -225,7 +277,7 @@ func handleGetPolicy(c *fiber.Ctx) error {
 // @Description Check server health and database connectivity
 // @Tags Info
 // @Produce json
-// @Success 200 {object} api.HealthResponse
+// @Success 200 {object} HealthResponse
 // @Router /health [get]
 func handleGetHealth(c *fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(c.UserContext(), 2*time.Second)
@@ -238,7 +290,7 @@ func handleGetHealth(c *fiber.Ctx) error {
 		reason = "Database connection failed"
 	}
 
-	return c.JSON(api.HealthResponse{Healthy: healthy, Reason: reason, Version: "0.1.0"})
+	return c.JSON(HealthResponse{Healthy: healthy, Reason: reason, Version: "0.1.0"})
 }
 
 // handleTxSSE streams transaction status updates via SSE

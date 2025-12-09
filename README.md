@@ -15,6 +15,7 @@ Arcade is a lightweight transaction broadcast service that:
 
 - **Arc-Compatible API** - Drop-in replacement for Arc clients
 - **P2P Network Listening** - Direct gossip subscription for real-time updates
+- **Chain Tracking** - Blockchain header management with merkle proof validation
 - **Flexible Storage** - SQLite for simple deployments, PostgreSQL for distributed setups
 - **Event Streaming** - In-memory or Redis pub/sub for distributed architectures
 - **Webhook Delivery** - Async notifications with retry logic
@@ -121,12 +122,56 @@ See [DESIGN.md](DESIGN.md) for detailed architecture documentation.
 - **HTTP API Server** - Arc-compatible REST endpoints
 - **P2P Subscriber** - LibP2P gossip listener (block, subtree, rejected-tx topics)
 - **Teranode Client** - HTTP client for transaction submission with fan-out
+- **Chain Tracker** - Blockchain header management with local persistence
 - **Status Store** - Append-only transaction status log
 - **Submission Store** - Client subscription tracking
 - **Event System** - Global status update channel with multiple handlers
 - **Webhook Handler** - Async notification delivery with retry logic
 - **SSE Handler** - Real-time status streaming with catchup support
 - **WaitFor Handler** - Synchronous status waiting for HTTP requests
+
+## Chain Tracking
+
+Arcade includes blockchain header tracking for merkle proof validation. Headers are loaded from embedded checkpoint files on startup and updated via P2P block announcements.
+
+### Header API Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /network` | Returns the network name (mainnet, testnet, etc.) |
+| `GET /height` | Returns current blockchain height |
+| `GET /tip` | Returns current chain tip header |
+| `GET /tip/stream` | SSE stream of chain tip updates |
+| `GET /header/height/:height` | Get header by block height |
+| `GET /header/hash/:hash` | Get header by block hash |
+| `GET /headers?height=N&count=M` | Get M headers starting at height N |
+
+### Remote Client
+
+For applications that need chain tracking without running a full Arcade server, use the HTTP client:
+
+```go
+import "github.com/bsv-blockchain/arcade/chaintracks"
+
+client := chaintracks.NewClient("http://arcade-server:8080")
+
+// Subscribe to tip updates via SSE (closes when ctx is cancelled)
+tipChan := client.SubscribeTip(ctx)
+for tip := range tipChan {
+    fmt.Printf("New tip: %d %s\n", tip.Height, tip.Hash)
+}
+
+// Subscribe to transaction status updates for a callback token
+statusChan := client.SubscribeStatus(ctx, "my-callback-token")
+
+// Query headers
+header, err := client.GetHeaderByHeight(ctx, 870000)
+tip := client.GetTip(ctx)
+height := client.GetHeight(ctx)
+
+// Implements go-sdk's ChainTracker interface
+valid, err := client.IsValidRootForHeight(ctx, merkleRoot, height)
+```
 
 ## Development
 

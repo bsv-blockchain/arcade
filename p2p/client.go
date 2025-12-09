@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	msgbus "github.com/bsv-blockchain/go-p2p-message-bus"
-	"github.com/libp2p/go-libp2p/core/crypto"
 )
 
 // mapNetwork converts user-friendly network names to P2P topic network names.
@@ -33,49 +32,14 @@ type Client struct {
 	network string // P2P network name (e.g., "mainnet", "testnet")
 }
 
-// Config holds configuration for creating a new Client.
-type Config struct {
-	// Name identifies this client on the P2P network
-	Name string
-	// StoragePath is the directory for storing persistent data (p2p_key.hex, peer_cache.json)
-	StoragePath string
-	// Network is the Teranode network to connect to (e.g., "mainnet", "testnet", "stn")
-	Network string
-	// BootstrapPeers overrides the default bootstrap peers for the network
-	BootstrapPeers []string
-	// Logger for debug/info output (optional)
-	Logger *slog.Logger
-	// Port to listen on (0 for random)
-	Port int
-}
-
 // NewClient creates a new Teranode P2P client.
-func NewClient(cfg Config) (*Client, error) {
-	logger := cfg.Logger
+// The cfg.PrivateKey and cfg.PeerCacheFile must be populated before calling.
+func NewClient(cfg msgbus.Config, network string, logger *slog.Logger) (*Client, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
-	// Load or generate persistent private key
-	privKey, err := LoadOrGeneratePrivateKey(cfg.StoragePath)
-	if err != nil {
-		return nil, err
-	}
-
-	// Determine bootstrap peers
-	bootstrapPeers := cfg.BootstrapPeers
-	if len(bootstrapPeers) == 0 {
-		bootstrapPeers = BootstrapPeers(cfg.Network)
-	}
-
-	// Create underlying P2P client
-	p2pClient, err := msgbus.NewClient(msgbus.Config{
-		Name:           cfg.Name,
-		PrivateKey:     privKey,
-		Port:           cfg.Port,
-		PeerCacheFile:  cfg.StoragePath + "/peer_cache.json",
-		BootstrapPeers: bootstrapPeers,
-	})
+	p2pClient, err := msgbus.NewClient(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -83,37 +47,7 @@ func NewClient(cfg Config) (*Client, error) {
 	return &Client{
 		msgbus:  p2pClient,
 		logger:  logger,
-		network: mapNetwork(cfg.Network),
-	}, nil
-}
-
-// NewClientWithKey creates a new client with an existing private key.
-func NewClientWithKey(cfg Config, privKey crypto.PrivKey) (*Client, error) {
-	logger := cfg.Logger
-	if logger == nil {
-		logger = slog.Default()
-	}
-
-	bootstrapPeers := cfg.BootstrapPeers
-	if len(bootstrapPeers) == 0 {
-		bootstrapPeers = BootstrapPeers(cfg.Network)
-	}
-
-	p2pClient, err := msgbus.NewClient(msgbus.Config{
-		Name:           cfg.Name,
-		PrivateKey:     privKey,
-		Port:           cfg.Port,
-		PeerCacheFile:  cfg.StoragePath + "/peer_cache.json",
-		BootstrapPeers: bootstrapPeers,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return &Client{
-		msgbus:  p2pClient,
-		logger:  logger,
-		network: mapNetwork(cfg.Network),
+		network: mapNetwork(network),
 	}, nil
 }
 

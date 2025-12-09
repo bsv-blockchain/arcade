@@ -35,3 +35,8 @@ Thumbs.db
 *.local.yaml
 *.local.yml
 config.yaml
+
+# Runtime cache
+peer_cache.json
+
+*.log
