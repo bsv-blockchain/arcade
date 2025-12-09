@@ -501,40 +501,34 @@ func handleGetHeaders(c *fiber.Ctx) error {
 func submitToTeranode(ctx context.Context, endpoint string, rawTx []byte, txid string) {
 	statusCode, err := teranodeClient.SubmitTransaction(ctx, endpoint, rawTx)
 	if err != nil {
-		statusStore.UpdateStatus(ctx, &models.TransactionStatus{
+		status := &models.TransactionStatus{
 			TxID:      txid,
 			Status:    models.StatusRejected,
 			Timestamp: time.Now(),
 			ExtraInfo: err.Error(),
-		})
-		eventPublisher.Publish(ctx, models.StatusUpdate{
-			TxID:      txid,
-			Status:    models.StatusRejected,
-			Timestamp: time.Now(),
-		})
+		}
+		statusStore.UpdateStatus(ctx, status)
+		eventPublisher.Publish(ctx, status)
 		return
 	}
 
-	var status models.Status
+	var txStatus models.Status
 	switch statusCode {
 	case http.StatusOK:
-		status = models.StatusAcceptedByNetwork
+		txStatus = models.StatusAcceptedByNetwork
 	case http.StatusNoContent:
-		status = models.StatusSentToNetwork
+		txStatus = models.StatusSentToNetwork
 	default:
 		return
 	}
 
-	statusStore.UpdateStatus(ctx, &models.TransactionStatus{
+	status := &models.TransactionStatus{
 		TxID:      txid,
-		Status:    status,
+		Status:    txStatus,
 		Timestamp: time.Now(),
-	})
-	eventPublisher.Publish(ctx, models.StatusUpdate{
-		TxID:      txid,
-		Status:    status,
-		Timestamp: time.Now(),
-	})
+	}
+	statusStore.UpdateStatus(ctx, status)
+	eventPublisher.Publish(ctx, status)
 }
 
 

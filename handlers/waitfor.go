@@ -16,7 +16,7 @@ var ErrTimeout = errors.New("wait timeout exceeded")
 // WaitForHandler manages per-transaction channels for synchronous status waiting
 type WaitForHandler struct {
 	publisher  events.Publisher
-	txChannels map[string][]chan models.StatusUpdate
+	txChannels map[string][]chan *models.TransactionStatus
 	mu         sync.RWMutex
 	logger     *slog.Logger
 	stopCh     chan struct{}
@@ -26,7 +26,7 @@ type WaitForHandler struct {
 func NewWaitForHandler(publisher events.Publisher, logger *slog.Logger) *WaitForHandler {
 	return &WaitForHandler{
 		publisher:  publisher,
-		txChannels: make(map[string][]chan models.StatusUpdate),
+		txChannels: make(map[string][]chan *models.TransactionStatus),
 		logger:     logger,
 		stopCh:     make(chan struct{}),
 	}
@@ -43,25 +43,25 @@ func (h *WaitForHandler) Start(ctx context.Context) error {
 	return nil
 }
 
-func (h *WaitForHandler) processEvents(ctx context.Context, eventCh <-chan models.StatusUpdate) {
+func (h *WaitForHandler) processEvents(ctx context.Context, eventCh <-chan *models.TransactionStatus) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-h.stopCh:
 			return
-		case event, ok := <-eventCh:
+		case status, ok := <-eventCh:
 			if !ok {
 				return
 			}
-			h.routeEvent(event)
+			h.routeStatus(status)
 		}
 	}
 }
 
-func (h *WaitForHandler) routeEvent(event models.StatusUpdate) {
+func (h *WaitForHandler) routeStatus(status *models.TransactionStatus) {
 	h.mu.RLock()
-	channels, exists := h.txChannels[event.TxID]
+	channels, exists := h.txChannels[status.TxID]
 	h.mu.RUnlock()
 
 	if !exists {
@@ -70,7 +70,7 @@ func (h *WaitForHandler) routeEvent(event models.StatusUpdate) {
 
 	for _, ch := range channels {
 		select {
-		case ch <- event:
+		case ch <- status:
 		default:
 			// Channel full or closed, skip
 		}
@@ -79,7 +79,7 @@ func (h *WaitForHandler) routeEvent(event models.StatusUpdate) {
 
 // Wait creates a channel for a specific transaction and waits for target status or timeout
 func (h *WaitForHandler) Wait(ctx context.Context, txid string, targetStatus models.Status, timeout time.Duration) (models.Status, error) {
-	ch := make(chan models.StatusUpdate, 10)
+	ch := make(chan *models.TransactionStatus, 10)
 
 	h.mu.Lock()
 	h.txChannels[txid] = append(h.txChannels[txid], ch)
@@ -97,16 +97,16 @@ func (h *WaitForHandler) Wait(ctx context.Context, txid string, targetStatus mod
 			return lastStatus, ctx.Err()
 		case <-timer.C:
 			return lastStatus, ErrTimeout
-		case event := <-ch:
-			lastStatus = event.Status
-			if statusReached(event.Status, targetStatus) {
-				return event.Status, nil
+		case status := <-ch:
+			lastStatus = status.Status
+			if statusReached(status.Status, targetStatus) {
+				return status.Status, nil
 			}
 		}
 	}
 }
 
-func (h *WaitForHandler) removeChannel(txid string, ch chan models.StatusUpdate) {
+func (h *WaitForHandler) removeChannel(txid string, ch chan *models.TransactionStatus) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 

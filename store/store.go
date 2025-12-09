@@ -31,8 +31,8 @@ type StatusStore interface {
 	InsertMerklePath(ctx context.Context, txid, blockHash string, blockHeight uint64, merklePath []byte) error
 
 	// SetMinedByBlockHash joins merkle_paths to set transactions as MINED for a canonical block.
-	// Returns the txids that were updated.
-	SetMinedByBlockHash(ctx context.Context, blockHash string, blockHeight uint64) ([]string, error)
+	// Returns full status objects for all affected transactions.
+	SetMinedByBlockHash(ctx context.Context, blockHash string) ([]*models.TransactionStatus, error)
 
 	// Close closes the database connection
 	Close() error

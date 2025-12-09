@@ -74,7 +74,7 @@ func (h *WebhookHandler) Stop() {
 }
 
 // processEvents processes incoming status update events
-func (h *WebhookHandler) processEvents(ctx context.Context, eventCh <-chan models.StatusUpdate) {
+func (h *WebhookHandler) processEvents(ctx context.Context, eventCh <-chan *models.TransactionStatus) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -83,22 +83,22 @@ func (h *WebhookHandler) processEvents(ctx context.Context, eventCh <-chan model
 		case <-h.stopCh:
 			h.logger.Info("Stop signal received, stopping event processing")
 			return
-		case event, ok := <-eventCh:
+		case status, ok := <-eventCh:
 			if !ok {
 				h.logger.Info("Event channel closed, stopping event processing")
 				return
 			}
-			h.handleEvent(ctx, event)
+			h.handleStatus(ctx, status)
 		}
 	}
 }
 
-// handleEvent handles a single status update event
-func (h *WebhookHandler) handleEvent(ctx context.Context, event models.StatusUpdate) {
-	submissions, err := h.submissionStore.GetSubmissionsByTxID(ctx, event.TxID)
+// handleStatus handles a single status update
+func (h *WebhookHandler) handleStatus(ctx context.Context, status *models.TransactionStatus) {
+	submissions, err := h.submissionStore.GetSubmissionsByTxID(ctx, status.TxID)
 	if err != nil {
 		h.logger.Error("Failed to get submissions",
-			slog.String("txid", event.TxID),
+			slog.String("txid", status.TxID),
 			slog.String("error", err.Error()))
 		return
 	}
@@ -108,11 +108,11 @@ func (h *WebhookHandler) handleEvent(ctx context.Context, event models.StatusUpd
 			continue
 		}
 
-		if sub.LastDeliveredStatus == event.Status {
+		if sub.LastDeliveredStatus == status.Status {
 			continue
 		}
 
-		go h.deliverWebhook(ctx, *sub, event)
+		go h.deliverWebhook(ctx, *sub, status)
 	}
 }
 
@@ -139,16 +139,8 @@ func (h *WebhookHandler) performPruning(ctx context.Context) {
 }
 
 // deliverWebhook delivers a webhook for a specific submission
-func (h *WebhookHandler) deliverWebhook(ctx context.Context, sub models.Submission, event models.StatusUpdate) {
-	statusDetail, err := h.statusStore.GetStatus(ctx, event.TxID)
-	if err != nil {
-		h.logger.Error("Failed to get status detail",
-			slog.String("txid", event.TxID),
-			slog.String("error", err.Error()))
-		return
-	}
-
-	payloadBytes, err := json.Marshal(statusDetail)
+func (h *WebhookHandler) deliverWebhook(ctx context.Context, sub models.Submission, status *models.TransactionStatus) {
+	payloadBytes, err := json.Marshal(status)
 	if err != nil {
 		h.logger.Error("Failed to marshal payload",
 			slog.String("submission_id", sub.SubmissionID),
@@ -185,10 +177,10 @@ func (h *WebhookHandler) deliverWebhook(ctx context.Context, sub models.Submissi
 		h.logger.Info("Webhook delivered successfully",
 			slog.String("submission_id", sub.SubmissionID),
 			slog.String("url", sub.CallbackURL),
-			slog.String("status", string(event.Status)),
+			slog.String("status", string(status.Status)),
 			slog.Int("http_status", resp.StatusCode))
 
-		if err := h.submissionStore.UpdateDeliveryStatus(ctx, sub.SubmissionID, event.Status, 0, nil); err != nil {
+		if err := h.submissionStore.UpdateDeliveryStatus(ctx, sub.SubmissionID, status.Status, 0, nil); err != nil {
 			h.logger.Error("Failed to update submission after successful delivery",
 				slog.String("submission_id", sub.SubmissionID),
 				slog.String("error", err.Error()))

@@ -21,26 +21,26 @@ func TestInMemoryPublisher_PublishSubscribe(t *testing.T) {
 		t.Fatalf("Subscribe failed: %v", err)
 	}
 
-	event := models.StatusUpdate{
+	status := &models.TransactionStatus{
 		TxID:      "abc123",
 		Status:    models.StatusReceived,
 		Timestamp: time.Now(),
 	}
 
-	if err := pub.Publish(ctx, event); err != nil {
+	if err := pub.Publish(ctx, status); err != nil {
 		t.Fatalf("Publish failed: %v", err)
 	}
 
 	select {
 	case received := <-ch:
-		if received.TxID != event.TxID {
-			t.Errorf("Expected TxID %s, got %s", event.TxID, received.TxID)
+		if received.TxID != status.TxID {
+			t.Errorf("Expected TxID %s, got %s", status.TxID, received.TxID)
 		}
-		if received.Status != event.Status {
-			t.Errorf("Expected Status %s, got %s", event.Status, received.Status)
+		if received.Status != status.Status {
+			t.Errorf("Expected Status %s, got %s", status.Status, received.Status)
 		}
 	case <-time.After(1 * time.Second):
-		t.Fatal("Timeout waiting for event")
+		t.Fatal("Timeout waiting for status")
 	}
 }
 
@@ -60,24 +60,24 @@ func TestInMemoryPublisher_MultipleSubscribers(t *testing.T) {
 		t.Fatalf("Subscribe 2 failed: %v", err)
 	}
 
-	event := models.StatusUpdate{
+	status := &models.TransactionStatus{
 		TxID:      "def456",
 		Status:    models.StatusMined,
 		Timestamp: time.Now(),
 	}
 
-	if err := pub.Publish(ctx, event); err != nil {
+	if err := pub.Publish(ctx, status); err != nil {
 		t.Fatalf("Publish failed: %v", err)
 	}
 
 	received1 := <-ch1
-	if received1.TxID != event.TxID {
-		t.Errorf("Subscriber 1: Expected TxID %s, got %s", event.TxID, received1.TxID)
+	if received1.TxID != status.TxID {
+		t.Errorf("Subscriber 1: Expected TxID %s, got %s", status.TxID, received1.TxID)
 	}
 
 	received2 := <-ch2
-	if received2.TxID != event.TxID {
-		t.Errorf("Subscriber 2: Expected TxID %s, got %s", event.TxID, received2.TxID)
+	if received2.TxID != status.TxID {
+		t.Errorf("Subscriber 2: Expected TxID %s, got %s", status.TxID, received2.TxID)
 	}
 }
 
@@ -93,12 +93,12 @@ func TestInMemoryPublisher_SlowSubscriber(t *testing.T) {
 	}
 
 	for i := 0; i < 10; i++ {
-		event := models.StatusUpdate{
+		status := &models.TransactionStatus{
 			TxID:      "slow123",
 			Status:    models.StatusReceived,
 			Timestamp: time.Now(),
 		}
-		if err := pub.Publish(ctx, event); err != nil {
+		if err := pub.Publish(ctx, status); err != nil {
 			t.Fatalf("Publish %d failed: %v", i, err)
 		}
 	}
@@ -151,13 +151,13 @@ func TestInMemoryPublisher_ContextCancellation(t *testing.T) {
 
 	cancel()
 
-	event := models.StatusUpdate{
+	status := &models.TransactionStatus{
 		TxID:      "cancel123",
 		Status:    models.StatusReceived,
 		Timestamp: time.Now(),
 	}
 
-	err = pub.Publish(ctx, event)
+	err = pub.Publish(ctx, status)
 	if err != context.Canceled {
 		t.Errorf("Expected context.Canceled error, got %v", err)
 	}

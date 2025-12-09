@@ -88,13 +88,6 @@ type Submission struct {
 	CreatedAt           time.Time
 }
 
-// StatusUpdate represents a notification that a transaction status has changed
-type StatusUpdate struct {
-	TxID      string
-	Status    Status
-	Timestamp time.Time
-}
-
 // BlockReorg represents a notification that a block was orphaned due to a chain reorganization
 type BlockReorg struct {
 	BlockHash   string

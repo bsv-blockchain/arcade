@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -124,19 +125,34 @@ func TestStatusStore_WithBlockData(t *testing.T) {
 
 	ctx := t.Context()
 	txid := "mined123"
+	blockHash := "00000000000000000001"
+	blockHeight := uint64(800000)
+	merklePath := []byte("proof123")
 
+	// Insert the transaction status
 	status := &models.TransactionStatus{
-		TxID:        txid,
-		Status:      models.StatusMined,
-		Timestamp:   time.Now(),
-		BlockHash:   "00000000000000000001",
-		BlockHeight: 800000,
-		MerklePath:  "proof123",
-		ExtraInfo:   "some extra data",
+		TxID:      txid,
+		Status:    models.StatusReceived,
+		Timestamp: time.Now(),
+		ExtraInfo: "some extra data",
 	}
 
 	if err := store.InsertStatus(ctx, status); err != nil {
 		t.Fatalf("Failed to insert status: %v", err)
+	}
+
+	// Insert merkle path (this is where block_height and merkle_path are stored)
+	if err := store.InsertMerklePath(ctx, txid, blockHash, blockHeight, merklePath); err != nil {
+		t.Fatalf("Failed to insert merkle path: %v", err)
+	}
+
+	// Set mined status (this joins merkle_paths to transactions)
+	minedStatuses, err := store.SetMinedByBlockHash(ctx, blockHash)
+	if err != nil {
+		t.Fatalf("Failed to set mined by block hash: %v", err)
+	}
+	if len(minedStatuses) != 1 {
+		t.Fatalf("Expected 1 mined status, got %d", len(minedStatuses))
 	}
 
 	retrieved, err := store.GetStatus(ctx, txid)
@@ -144,16 +160,16 @@ func TestStatusStore_WithBlockData(t *testing.T) {
 		t.Fatalf("Failed to get status: %v", err)
 	}
 
-	if retrieved.BlockHash != status.BlockHash {
-		t.Errorf("Expected block hash %s, got %s", status.BlockHash, retrieved.BlockHash)
+	if retrieved.BlockHash != blockHash {
+		t.Errorf("Expected block hash %s, got %s", blockHash, retrieved.BlockHash)
 	}
 
-	if retrieved.BlockHeight != status.BlockHeight {
-		t.Errorf("Expected block height %d, got %d", status.BlockHeight, retrieved.BlockHeight)
+	if retrieved.BlockHeight != blockHeight {
+		t.Errorf("Expected block height %d, got %d", blockHeight, retrieved.BlockHeight)
 	}
 
-	if retrieved.MerklePath != status.MerklePath {
-		t.Errorf("Expected merkle path %s, got %s", status.MerklePath, retrieved.MerklePath)
+	if !bytes.Equal(retrieved.MerklePath, merklePath) {
+		t.Errorf("Expected merkle path %s, got %s", merklePath, retrieved.MerklePath)
 	}
 
 	if len(retrieved.CompetingTxs) != 0 {

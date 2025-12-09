@@ -364,7 +364,14 @@ func (a *Arcade) processHeader(ctx context.Context, header *block.Header, height
 	// Check if this is the new tip
 	currentTip := a.GetTip(ctx)
 	if currentTip == nil || blockHeader.ChainWork.Cmp(currentTip.ChainWork) > 0 {
-		reorgedBlocks := a.setChainTip(ctx, blockHeader)
+		reorgedBlocks, newCanonicalBlocks := a.setChainTip(ctx, blockHeader)
+
+		// Set MINED status for transactions in all newly canonical blocks
+		if a.txTracker != nil {
+			for _, canonicalBlock := range newCanonicalBlocks {
+				a.setMinedForBlock(ctx, canonicalBlock)
+			}
+		}
 
 		// Notify tip change
 		a.mu.RLock()
@@ -436,6 +443,31 @@ func (a *Arcade) processBlockTransactions(ctx context.Context, blockMsg p2p.Bloc
 	return nil
 }
 
+// setMinedForBlock sets MINED status for all tracked transactions in a block
+func (a *Arcade) setMinedForBlock(ctx context.Context, block *BlockHeader) {
+	if a.statusStore == nil {
+		return
+	}
+
+	statuses, err := a.statusStore.SetMinedByBlockHash(ctx, block.Hash.String())
+	if err != nil {
+		a.logger.Error("failed to set mined status for block",
+			slog.String("blockHash", block.Hash.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+
+	for _, status := range statuses {
+		a.eventPublisher.Publish(ctx, status)
+	}
+
+	if len(statuses) > 0 {
+		a.logger.Info("set transactions to MINED",
+			slog.String("blockHash", block.Hash.String()),
+			slog.Int("count", len(statuses)))
+	}
+}
+
 // pruneConfirmedTransactions marks deeply confirmed transactions as IMMUTABLE
 func (a *Arcade) pruneConfirmedTransactions(ctx context.Context, currentHeight uint32) {
 	immutableTxs := a.txTracker.PruneConfirmed(uint64(currentHeight))
@@ -452,14 +484,7 @@ func (a *Arcade) pruneConfirmedTransactions(ctx context.Context, currentHeight u
 			a.logger.Error("failed to update immutable status",
 				slog.String("txID", txID),
 				slog.String("error", err.Error()))
-			continue
 		}
-
-		a.eventPublisher.Publish(ctx, models.StatusUpdate{
-			TxID:      txID,
-			Status:    models.StatusImmutable,
-			Timestamp: time.Now(),
-		})
 	}
 
 	if len(immutableTxs) > 0 {
@@ -467,7 +492,8 @@ func (a *Arcade) pruneConfirmedTransactions(ctx context.Context, currentHeight u
 	}
 }
 
-// buildMerklePathsForSubtree constructs merkle paths for tracked transactions
+// buildMerklePathsForSubtree constructs and stores merkle paths for tracked transactions.
+// This only stores the merkle paths - status is set separately when the block becomes canonical.
 func (a *Arcade) buildMerklePathsForSubtree(
 	ctx context.Context,
 	blockMsg p2p.BlockMessage,
@@ -538,33 +564,15 @@ func (a *Arcade) buildMerklePathsForSubtree(
 		// Compute intermediate hashes
 		mp.ComputeMissingHashes()
 
-		// Extract minimal path
+		// Extract minimal path and store it
 		minimalPath := a.extractMinimalPath(mp, txOffset)
 
-		// Update transaction status
-		status := &models.TransactionStatus{
-			TxID:        trackedHash.String(),
-			Status:      models.StatusMined,
-			Timestamp:   time.Now(),
-			BlockHash:   blockMsg.Hash,
-			BlockHeight: uint64(blockMsg.Height),
-			MerklePath:  minimalPath.Bytes(),
-		}
-
-		if err := a.statusStore.UpdateStatus(ctx, status); err != nil {
-			a.logger.Error("failed to update mined status",
+		if err := a.statusStore.InsertMerklePath(ctx, trackedHash.String(), blockMsg.Hash, uint64(blockMsg.Height), minimalPath.Bytes()); err != nil {
+			a.logger.Error("failed to store merkle path",
 				slog.String("txID", trackedHash.String()),
+				slog.String("blockHash", blockMsg.Hash),
 				slog.String("error", err.Error()))
-			continue
 		}
-
-		a.txTracker.SetMinedHash(trackedHash, uint64(blockMsg.Height))
-
-		a.eventPublisher.Publish(ctx, models.StatusUpdate{
-			TxID:      trackedHash.String(),
-			Status:    models.StatusMined,
-			Timestamp: time.Now(),
-		})
 	}
 }
 
@@ -642,12 +650,7 @@ func (a *Arcade) processSubtreeMessage(ctx context.Context, subtreeMsg p2p.Subtr
 		}
 
 		a.txTracker.UpdateStatusHash(hash, models.StatusSeenOnNetwork)
-
-		a.eventPublisher.Publish(ctx, models.StatusUpdate{
-			TxID:      txID,
-			Status:    models.StatusSeenOnNetwork,
-			Timestamp: time.Now(),
-		})
+		a.eventPublisher.Publish(ctx, status)
 	}
 }
 
@@ -694,11 +697,7 @@ func (a *Arcade) processRejectedTxMessage(ctx context.Context, rejectedMsg p2p.R
 		return
 	}
 
-	a.eventPublisher.Publish(ctx, models.StatusUpdate{
-		TxID:      rejectedMsg.TxID,
-		Status:    txStatus,
-		Timestamp: time.Now(),
-	})
+	a.eventPublisher.Publish(ctx, status)
 }
 
 // handleNodeStatusMessages processes node status messages
@@ -741,7 +740,7 @@ func (a *Arcade) handleReorg(ctx context.Context, orphanedBlocks []*BlockHeader)
 		for _, txID := range revertedTxIDs {
 			a.txTracker.UpdateStatus(txID, models.StatusSeenOnNetwork)
 
-			a.eventPublisher.Publish(ctx, models.StatusUpdate{
+			a.eventPublisher.Publish(ctx, &models.TransactionStatus{
 				TxID:      txID,
 				Status:    models.StatusSeenOnNetwork,
 				Timestamp: time.Now(),
@@ -775,20 +774,19 @@ func (a *Arcade) periodicOrphanCheck(ctx context.Context) {
 	}
 }
 
-// setChainTip updates the chain tip and returns any reorged blocks
-func (a *Arcade) setChainTip(_ context.Context, newTip *BlockHeader) []*BlockHeader {
+// setChainTip updates the chain tip and returns orphaned blocks and newly canonical blocks
+func (a *Arcade) setChainTip(_ context.Context, newTip *BlockHeader) (orphaned []*BlockHeader, newCanonical []*BlockHeader) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	var reorgedBlocks []*BlockHeader
 	oldTip := a.tip
 
 	if oldTip != nil && newTip.Header.PrevHash != oldTip.Hash {
-		reorgedBlocks = a.findReorgedBlocks(oldTip, newTip)
+		orphaned = a.findReorgedBlocks(oldTip, newTip)
 	}
 
-	// Update byHeight
-	headers := []*BlockHeader{newTip}
+	// Find all blocks being added to the canonical chain
+	newCanonical = []*BlockHeader{newTip}
 	current := newTip
 	for {
 		if int(current.Height) < len(a.byHeight) && a.byHeight[current.Height] == current.Hash {
@@ -798,11 +796,12 @@ func (a *Arcade) setChainTip(_ context.Context, newTip *BlockHeader) []*BlockHea
 		if !ok {
 			break
 		}
-		headers = append([]*BlockHeader{parent}, headers...)
+		newCanonical = append([]*BlockHeader{parent}, newCanonical...)
 		current = parent
 	}
 
-	for _, h := range headers {
+	// Update byHeight
+	for _, h := range newCanonical {
 		for len(a.byHeight) <= int(h.Height) {
 			a.byHeight = append(a.byHeight, chainhash.Hash{})
 		}
@@ -812,7 +811,7 @@ func (a *Arcade) setChainTip(_ context.Context, newTip *BlockHeader) []*BlockHea
 	a.tip = newTip
 	a.pruneOrphans()
 
-	return reorgedBlocks
+	return orphaned, newCanonical
 }
 
 func (a *Arcade) findReorgedBlocks(oldTip, newTip *BlockHeader) []*BlockHeader {
