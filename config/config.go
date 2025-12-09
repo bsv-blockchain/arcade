@@ -3,6 +3,8 @@ package config
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -57,9 +59,8 @@ type P2PConfig struct {
 	ProcessName    string
 	Port           int
 	BootstrapPeers []string
-	PrivateKey     string
-	TopicPrefix    string
-	PeerCacheFile  string
+	Network        string
+	StoragePath    string
 }
 
 // ValidatorConfig holds transaction validator configuration
@@ -92,8 +93,20 @@ type WebhookConfig struct {
 	MaxRetries    int
 }
 
+// defaultDataDir returns ~/.arcade as the default data directory, creating it if needed
+func defaultDataDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ".arcade"
+	}
+	dir := filepath.Join(home, ".arcade")
+	_ = os.MkdirAll(dir, 0o750)
+	return dir
+}
+
 // Default returns default configuration
 func Default() *Config {
+	dataDir := defaultDataDir()
 	return &Config{
 		Server: ServerConfig{
 			Address:         ":8080",
@@ -103,7 +116,7 @@ func Default() *Config {
 		},
 		Database: DatabaseConfig{
 			Type:       "sqlite",
-			SQLitePath: "./arcade.db",
+			SQLitePath: filepath.Join(dataDir, "arcade.db"),
 		},
 		Events: EventsConfig{
 			Type:       "memory",
@@ -118,9 +131,8 @@ func Default() *Config {
 			ProcessName:    "arcade",
 			Port:           9999,
 			BootstrapPeers: []string{},
-			PrivateKey:     "",
-			TopicPrefix:    "mainnet",
-			PeerCacheFile:  "peer_cache.json",
+			Network:        "main",
+			StoragePath:    dataDir,
 		},
 		Validator: ValidatorConfig{
 			MaxTxSize:     4 * 1024 * 1024 * 1024, // 4 GB

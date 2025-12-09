@@ -16,6 +16,13 @@ import (
 const (
 	schemaVersion = 1
 
+	// SQLite pragmas for better concurrency
+	sqlitePragmas = `
+PRAGMA journal_mode=WAL;
+PRAGMA busy_timeout=5000;
+PRAGMA synchronous=NORMAL;
+`
+
 	createTransactionsTable = `
 CREATE TABLE IF NOT EXISTS transactions (
 	txid TEXT PRIMARY KEY,
@@ -23,13 +30,25 @@ CREATE TABLE IF NOT EXISTS transactions (
 	timestamp DATETIME NOT NULL,
 	block_hash TEXT,
 	block_height INTEGER,
-	merkle_path TEXT,
 	extra_info TEXT,
 	competing_txs TEXT DEFAULT '{}',
 	created_at DATETIME NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_transactions_timestamp ON transactions(timestamp);
 CREATE INDEX IF NOT EXISTS idx_transactions_status ON transactions(status);
+CREATE INDEX IF NOT EXISTS idx_transactions_block_hash ON transactions(block_hash);
+`
+
+	createMerklePathsTable = `
+CREATE TABLE IF NOT EXISTS merkle_paths (
+	txid TEXT NOT NULL,
+	block_hash TEXT NOT NULL,
+	block_height INTEGER NOT NULL,
+	merkle_path BLOB NOT NULL,
+	created_at DATETIME NOT NULL,
+	PRIMARY KEY (txid, block_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_merkle_paths_block_hash ON merkle_paths(block_hash);
 `
 
 	createSubmissionsTable = `
@@ -71,12 +90,20 @@ func NewStatusStore(dbPath string) (store.StatusStore, error) {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
+	if _, err := db.Exec(sqlitePragmas); err != nil {
+		return nil, fmt.Errorf("failed to set pragmas: %w", err)
+	}
+
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
 	if err := initializeSchema(db, createTransactionsTable); err != nil {
-		return nil, fmt.Errorf("failed to initialize schema: %w", err)
+		return nil, fmt.Errorf("failed to initialize transactions schema: %w", err)
+	}
+
+	if err := initializeSchema(db, createMerklePathsTable); err != nil {
+		return nil, fmt.Errorf("failed to initialize merkle_paths schema: %w", err)
 	}
 
 	return &StatusStore{db: db}, nil
@@ -88,8 +115,8 @@ func (s *StatusStore) InsertStatus(ctx context.Context, status *models.Transacti
 	}
 
 	query := `
-INSERT INTO transactions (txid, status, timestamp, block_hash, block_height, merkle_path, extra_info, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO transactions (txid, status, timestamp, block_hash, block_height, extra_info, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
 `
 	_, err := s.db.ExecContext(ctx, query,
 		status.TxID,
@@ -97,7 +124,6 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		status.Timestamp,
 		nullString(status.BlockHash),
 		nullUint64(status.BlockHeight),
-		nullString(status.MerklePath),
 		nullString(status.ExtraInfo),
 		status.CreatedAt,
 	)
@@ -126,7 +152,6 @@ SET status = ?,
 	timestamp = ?,
 	block_hash = ?,
 	block_height = ?,
-	merkle_path = ?,
 	extra_info = ?,
 	competing_txs = json_set(competing_txs, '$.' || ?, json('true'))
 WHERE txid = ?
@@ -138,7 +163,6 @@ WHERE txid = ?
 			status.Timestamp,
 			nullString(status.BlockHash),
 			nullUint64(status.BlockHeight),
-			nullString(status.MerklePath),
 			nullString(status.ExtraInfo),
 			status.CompetingTxs[0],
 			status.TxID,
@@ -158,7 +182,6 @@ SET status = ?,
 	timestamp = ?,
 	block_hash = ?,
 	block_height = ?,
-	merkle_path = ?,
 	extra_info = ?
 WHERE txid = ?
   AND status NOT IN (%s)
@@ -169,7 +192,6 @@ WHERE txid = ?
 			status.Timestamp,
 			nullString(status.BlockHash),
 			nullUint64(status.BlockHeight),
-			nullString(status.MerklePath),
 			nullString(status.ExtraInfo),
 			status.TxID,
 		}
@@ -188,9 +210,10 @@ WHERE txid = ?
 
 func (s *StatusStore) GetStatus(ctx context.Context, txid string) (*models.TransactionStatus, error) {
 	query := `
-SELECT txid, status, timestamp, block_hash, block_height, merkle_path, extra_info, competing_txs, created_at
-FROM transactions
-WHERE txid = ?
+SELECT t.txid, t.status, t.timestamp, t.block_hash, t.block_height, mp.merkle_path, t.extra_info, t.competing_txs, t.created_at
+FROM transactions t
+LEFT JOIN merkle_paths mp ON t.txid = mp.txid AND t.block_hash = mp.block_hash
+WHERE t.txid = ?
 `
 	row := s.db.QueryRowContext(ctx, query, txid)
 	return scanTransactionStatus(row)
@@ -198,10 +221,11 @@ WHERE txid = ?
 
 func (s *StatusStore) GetStatusesSince(ctx context.Context, since time.Time) ([]*models.TransactionStatus, error) {
 	query := `
-SELECT txid, status, timestamp, block_hash, block_height, merkle_path, extra_info, competing_txs, created_at
-FROM transactions
-WHERE timestamp > ?
-ORDER BY timestamp ASC
+SELECT t.txid, t.status, t.timestamp, t.block_hash, t.block_height, mp.merkle_path, t.extra_info, t.competing_txs, t.created_at
+FROM transactions t
+LEFT JOIN merkle_paths mp ON t.txid = mp.txid AND t.block_hash = mp.block_hash
+WHERE t.timestamp > ?
+ORDER BY t.timestamp ASC
 `
 	rows, err := s.db.QueryContext(ctx, query, since)
 	if err != nil {
@@ -210,6 +234,99 @@ ORDER BY timestamp ASC
 	defer rows.Close()
 
 	return scanTransactionStatuses(rows)
+}
+
+func (s *StatusStore) SetStatusByBlockHash(ctx context.Context, blockHash string, newStatus models.Status) ([]string, error) {
+	var query string
+
+	// For unmined statuses, clear block fields. For IMMUTABLE, keep them.
+	if newStatus == models.StatusSeenOnNetwork || newStatus == models.StatusReceived {
+		query = `
+UPDATE transactions
+SET status = ?,
+    timestamp = ?,
+    block_hash = NULL,
+    block_height = NULL
+WHERE block_hash = ?
+RETURNING txid
+`
+	} else {
+		query = `
+UPDATE transactions
+SET status = ?,
+    timestamp = ?
+WHERE block_hash = ?
+RETURNING txid
+`
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, newStatus, time.Now(), blockHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to set status by block hash: %w", err)
+	}
+	defer rows.Close()
+
+	var txids []string
+	for rows.Next() {
+		var txid string
+		if err := rows.Scan(&txid); err != nil {
+			return nil, fmt.Errorf("failed to scan txid: %w", err)
+		}
+		txids = append(txids, txid)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating rows: %w", err)
+	}
+
+	return txids, nil
+}
+
+func (s *StatusStore) InsertMerklePath(ctx context.Context, txid, blockHash string, blockHeight uint64, merklePath []byte) error {
+	query := `
+INSERT INTO merkle_paths (txid, block_hash, block_height, merkle_path, created_at)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT (txid, block_hash) DO NOTHING
+`
+	_, err := s.db.ExecContext(ctx, query, txid, blockHash, blockHeight, merklePath, time.Now())
+	if err != nil {
+		return fmt.Errorf("failed to insert merkle path: %w", err)
+	}
+	return nil
+}
+
+func (s *StatusStore) SetMinedByBlockHash(ctx context.Context, blockHash string, blockHeight uint64) ([]string, error) {
+	query := `
+UPDATE transactions
+SET status = ?,
+    timestamp = ?,
+    block_hash = ?,
+    block_height = ?
+FROM merkle_paths mp
+WHERE transactions.txid = mp.txid
+  AND mp.block_hash = ?
+RETURNING transactions.txid
+`
+	rows, err := s.db.QueryContext(ctx, query, models.StatusMined, time.Now(), blockHash, blockHeight, blockHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to set mined by block hash: %w", err)
+	}
+	defer rows.Close()
+
+	var txids []string
+	for rows.Next() {
+		var txid string
+		if err := rows.Scan(&txid); err != nil {
+			return nil, fmt.Errorf("failed to scan txid: %w", err)
+		}
+		txids = append(txids, txid)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating rows: %w", err)
+	}
+
+	return txids, nil
 }
 
 func (s *StatusStore) Close() error {
@@ -229,6 +346,10 @@ func NewSubmissionStore(dbPath string) (store.SubmissionStore, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+
+	if _, err := db.Exec(sqlitePragmas); err != nil {
+		return nil, fmt.Errorf("failed to set pragmas: %w", err)
 	}
 
 	if err := db.Ping(); err != nil {
@@ -334,8 +455,9 @@ func initializeSchema(db *sql.DB, schema string) error {
 
 func scanTransactionStatus(row *sql.Row) (*models.TransactionStatus, error) {
 	var status models.TransactionStatus
-	var blockHash, merklePath, extraInfo, competingTxsJSON sql.NullString
+	var blockHash, extraInfo, competingTxsJSON sql.NullString
 	var blockHeight sql.NullInt64
+	var merklePath []byte
 
 	err := row.Scan(
 		&status.TxID,
@@ -357,7 +479,7 @@ func scanTransactionStatus(row *sql.Row) (*models.TransactionStatus, error) {
 
 	status.BlockHash = blockHash.String
 	status.BlockHeight = uint64(blockHeight.Int64)
-	status.MerklePath = merklePath.String
+	status.MerklePath = merklePath
 	status.ExtraInfo = extraInfo.String
 
 	if competingTxsJSON.Valid && competingTxsJSON.String != "" {
@@ -382,8 +504,9 @@ func scanTransactionStatuses(rows *sql.Rows) ([]*models.TransactionStatus, error
 
 	for rows.Next() {
 		var status models.TransactionStatus
-		var blockHash, merklePath, extraInfo, competingTxsJSON sql.NullString
+		var blockHash, extraInfo, competingTxsJSON sql.NullString
 		var blockHeight sql.NullInt64
+		var merklePath []byte
 
 		err := rows.Scan(
 			&status.TxID,
@@ -402,7 +525,7 @@ func scanTransactionStatuses(rows *sql.Rows) ([]*models.TransactionStatus, error
 
 		status.BlockHash = blockHash.String
 		status.BlockHeight = uint64(blockHeight.Int64)
-		status.MerklePath = merklePath.String
+		status.MerklePath = merklePath
 		status.ExtraInfo = extraInfo.String
 
 		if competingTxsJSON.Valid && competingTxsJSON.String != "" {
@@ -508,6 +631,10 @@ func NewNetworkStateStore(dbPath string) (store.NetworkStateStore, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+
+	if _, err := db.Exec(sqlitePragmas); err != nil {
+		return nil, fmt.Errorf("failed to set pragmas: %w", err)
 	}
 
 	if err := db.Ping(); err != nil {

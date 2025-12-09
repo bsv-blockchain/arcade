@@ -27,18 +27,6 @@ type WebhookHandler struct {
 	maxRetries      int
 }
 
-// WebhookPayload represents the payload sent to webhook endpoints
-type WebhookPayload struct {
-	TxID         string    `json:"txid"`
-	Status       string    `json:"status"`
-	Timestamp    time.Time `json:"timestamp"`
-	BlockHash    string    `json:"blockHash,omitempty"`
-	BlockHeight  uint64    `json:"blockHeight,omitempty"`
-	MerklePath   string    `json:"merklePath,omitempty"`
-	ExtraInfo    string    `json:"extraInfo,omitempty"`
-	CompetingTxs []string  `json:"competingTxs,omitempty"`
-}
-
 // NewWebhookHandler creates a new webhook handler
 func NewWebhookHandler(
 	eventPublisher events.Publisher,
@@ -160,18 +148,7 @@ func (h *WebhookHandler) deliverWebhook(ctx context.Context, sub models.Submissi
 		return
 	}
 
-	payload := WebhookPayload{
-		TxID:         event.TxID,
-		Status:       string(event.Status),
-		Timestamp:    event.Timestamp,
-		BlockHash:    statusDetail.BlockHash,
-		BlockHeight:  statusDetail.BlockHeight,
-		MerklePath:   statusDetail.MerklePath,
-		ExtraInfo:    statusDetail.ExtraInfo,
-		CompetingTxs: statusDetail.CompetingTxs,
-	}
-
-	payloadBytes, err := json.Marshal(payload)
+	payloadBytes, err := json.Marshal(statusDetail)
 	if err != nil {
 		h.logger.Error("Failed to marshal payload",
 			slog.String("submission_id", sub.SubmissionID),

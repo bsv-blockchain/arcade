@@ -9,8 +9,6 @@ import (
 	"time"
 )
 
-// Note: context import kept for context.WithTimeout usage
-
 func TestSubmitTransaction(t *testing.T) {
 	called := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -43,15 +41,38 @@ func TestSubmitTransaction(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL)
+	client := NewClient([]string{server.URL})
 
-	err := client.SubmitTransaction(t.Context(), []byte("test_transaction_bytes"))
+	statusCode, err := client.SubmitTransaction(t.Context(), server.URL, []byte("test_transaction_bytes"))
 	if err != nil {
 		t.Fatalf("SubmitTransaction failed: %v", err)
 	}
 
+	if statusCode != http.StatusOK {
+		t.Errorf("Expected status code %d, got %d", http.StatusOK, statusCode)
+	}
+
 	if !called {
 		t.Error("Server handler was not called")
+	}
+}
+
+func TestSubmitTransaction_Accepted(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+		w.Write([]byte("Queued"))
+	}))
+	defer server.Close()
+
+	client := NewClient([]string{server.URL})
+
+	statusCode, err := client.SubmitTransaction(t.Context(), server.URL, []byte("test_tx"))
+	if err != nil {
+		t.Fatalf("SubmitTransaction failed: %v", err)
+	}
+
+	if statusCode != http.StatusAccepted {
+		t.Errorf("Expected status code %d, got %d", http.StatusAccepted, statusCode)
 	}
 }
 
@@ -62,9 +83,9 @@ func TestSubmitTransaction_Error(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL)
+	client := NewClient([]string{server.URL})
 
-	err := client.SubmitTransaction(t.Context(), []byte("test_tx"))
+	_, err := client.SubmitTransaction(t.Context(), server.URL, []byte("test_tx"))
 	if err == nil {
 		t.Fatal("Expected error, got nil")
 	}
@@ -74,140 +95,19 @@ func TestSubmitTransaction_Error(t *testing.T) {
 	}
 }
 
-func TestSubmitTransactions(t *testing.T) {
-	called := false
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		called = true
+func TestGetEndpoints(t *testing.T) {
+	endpoints := []string{"http://node1:8080", "http://node2:8080"}
+	client := NewClient(endpoints)
 
-		if r.Method != http.MethodPost {
-			t.Errorf("Expected POST method, got %s", r.Method)
-		}
-
-		if r.URL.Path != "/txs" {
-			t.Errorf("Expected path /txs, got %s", r.URL.Path)
-		}
-
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Fatalf("Failed to read request body: %v", err)
-		}
-
-		expected := "tx1tx2tx3"
-		if string(body) != expected {
-			t.Errorf("Expected concatenated body %s, got %s", expected, body)
-		}
-
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	}))
-	defer server.Close()
-
-	client := NewClient(server.URL)
-
-	txs := [][]byte{
-		[]byte("tx1"),
-		[]byte("tx2"),
-		[]byte("tx3"),
+	result := client.GetEndpoints()
+	if len(result) != len(endpoints) {
+		t.Errorf("Expected %d endpoints, got %d", len(endpoints), len(result))
 	}
 
-	err := client.SubmitTransactions(t.Context(), txs)
-	if err != nil {
-		t.Fatalf("SubmitTransactions failed: %v", err)
-	}
-
-	if !called {
-		t.Error("Server handler was not called")
-	}
-}
-
-func TestFetchBlockData(t *testing.T) {
-	blockHash := "00000000000000000001"
-	expectedData := []byte("block_data_here")
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			t.Errorf("Expected GET method, got %s", r.Method)
+	for i, ep := range endpoints {
+		if result[i] != ep {
+			t.Errorf("Endpoint %d: expected %s, got %s", i, ep, result[i])
 		}
-
-		expectedPath := "/block/" + blockHash
-		if r.URL.Path != expectedPath {
-			t.Errorf("Expected path %s, got %s", expectedPath, r.URL.Path)
-		}
-
-		w.WriteHeader(http.StatusOK)
-		w.Write(expectedData)
-	}))
-	defer server.Close()
-
-	client := NewClient(server.URL)
-
-	data, err := client.FetchBlockData(t.Context(), server.URL, blockHash)
-	if err != nil {
-		t.Fatalf("FetchBlockData failed: %v", err)
-	}
-
-	if string(data) != string(expectedData) {
-		t.Errorf("Expected data %s, got %s", expectedData, data)
-	}
-}
-
-func TestFetchBlockData_NotFound(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer server.Close()
-
-	client := NewClient(server.URL)
-
-	_, err := client.FetchBlockData(t.Context(), server.URL, "nonexistent")
-	if err == nil {
-		t.Fatal("Expected error for 404 response, got nil")
-	}
-}
-
-func TestFetchSubtreeData(t *testing.T) {
-	subtreeHash := "subtree123"
-	expectedData := []byte("subtree_data_here")
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			t.Errorf("Expected GET method, got %s", r.Method)
-		}
-
-		expectedPath := "/subtree/" + subtreeHash
-		if r.URL.Path != expectedPath {
-			t.Errorf("Expected path %s, got %s", expectedPath, r.URL.Path)
-		}
-
-		w.WriteHeader(http.StatusOK)
-		w.Write(expectedData)
-	}))
-	defer server.Close()
-
-	client := NewClient(server.URL)
-
-	data, err := client.FetchSubtreeData(t.Context(), server.URL, subtreeHash)
-	if err != nil {
-		t.Fatalf("FetchSubtreeData failed: %v", err)
-	}
-
-	if string(data) != string(expectedData) {
-		t.Errorf("Expected data %s, got %s", expectedData, data)
-	}
-}
-
-func TestClientWithTimeout(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(200 * time.Millisecond)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-
-	client := NewClientWithTimeout(server.URL, 50*time.Millisecond)
-
-	err := client.SubmitTransaction(t.Context(), []byte("test"))
-	if err == nil {
-		t.Fatal("Expected timeout error, got nil")
 	}
 }
 
@@ -218,11 +118,11 @@ func TestContextCancellation(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL)
+	client := NewClient([]string{server.URL})
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
 
-	err := client.SubmitTransaction(ctx, []byte("test"))
+	_, err := client.SubmitTransaction(ctx, server.URL, []byte("test"))
 	if err == nil {
 		t.Fatal("Expected context deadline error, got nil")
 	}

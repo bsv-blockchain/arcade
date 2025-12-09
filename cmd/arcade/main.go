@@ -1,15 +1,41 @@
+// Arcade API Server
+//
+// Transaction broadcast and blockchain header service for BSV.
+//
+//	@title			Arcade API
+//	@version		0.1.0
+//	@description	BSV transaction broadcast service with ARC-compatible endpoints and blockchain header queries.
+//
+//	@contact.name	BSV Blockchain
+//	@contact.url	https://github.com/bsv-blockchain/arcade
+//
+//	@license.name	Open BSV License
+//	@license.url	https://github.com/bsv-blockchain/arcade/blob/main/LICENSE
+//
+//	@host		localhost:8080
+//	@BasePath	/
+//
+//	@securityDefinitions.apikey	BearerAuth
+//	@in							header
+//	@name						Authorization
+//	@description				Bearer token authentication
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
+	"github.com/bsv-blockchain/arcade"
 	"github.com/bsv-blockchain/arcade/api"
 	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/docs"
+	"github.com/bsv-blockchain/arcade/events"
 	"github.com/bsv-blockchain/arcade/events/memory"
 	"github.com/bsv-blockchain/arcade/handlers"
 	"github.com/bsv-blockchain/arcade/p2p"
@@ -17,41 +43,76 @@ import (
 	"github.com/bsv-blockchain/arcade/store/sqlite"
 	"github.com/bsv-blockchain/arcade/teranode"
 	"github.com/bsv-blockchain/arcade/validator"
-	terap2p "github.com/bsv-blockchain/go-teranode-p2p-client"
+	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/cors"
+	"github.com/gofiber/fiber/v2/middleware/logger"
+	"github.com/gofiber/fiber/v2/middleware/recover"
 )
 
+// Server state accessible to route handlers
+var (
+	statusStore     store.StatusStore
+	submissionStore store.SubmissionStore
+	txTracker       *store.TxTracker
+	eventPublisher  events.Publisher
+	teranodeClient  *teranode.Client
+	txValidator     *validator.Validator
+	arcadeInstance  *arcade.Arcade
+	policy          *api.PolicyResponse
+	authToken       string
+	log             *slog.Logger
+
+	// SSE clients for tip streaming
+	tipClients   = make(map[int64]*bufio.Writer)
+	tipClientsMu sync.RWMutex
+)
+
+const scalarHTML = `<!DOCTYPE html>
+<html>
+<head>
+  <title>Arcade API</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+</head>
+<body>
+  <script id="api-reference" data-url="/docs/openapi.json"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
+</body>
+</html>`
+
 func main() {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+	log = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
 
-	logger.Info("Starting Arcade - P2P Transaction Broadcast Client", slog.String("version", "0.1.0"))
+	log.Info("Starting Arcade", slog.String("version", "0.1.0"))
 
 	cfg := config.Default()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := run(ctx, cfg, logger); err != nil {
-		logger.Error("Application error", slog.String("error", err.Error()))
+	if err := run(ctx, cfg); err != nil {
+		log.Error("Application error", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
-	logger.Info("Initializing stores", slog.String("db", cfg.Database.SQLitePath))
+func run(ctx context.Context, cfg *config.Config) error {
+	log.Info("Initializing stores", slog.String("db", cfg.Database.SQLitePath))
 
-	logger.Info("Running database migrations")
+	log.Info("Running database migrations")
 	if err := store.RunMigrations(cfg.Database.SQLitePath); err != nil {
 		return fmt.Errorf("failed to run migrations: %w", err)
 	}
 
-	statusStore, err := sqlite.NewStatusStore(cfg.Database.SQLitePath)
+	var err error
+	statusStore, err = sqlite.NewStatusStore(cfg.Database.SQLitePath)
 	if err != nil {
 		return fmt.Errorf("failed to create status store: %w", err)
 	}
 
-	submissionStore, err := sqlite.NewSubmissionStore(cfg.Database.SQLitePath)
+	submissionStore, err = sqlite.NewSubmissionStore(cfg.Database.SQLitePath)
 	if err != nil {
 		return fmt.Errorf("failed to create submission store: %w", err)
 	}
@@ -61,79 +122,89 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 		return fmt.Errorf("failed to create network state store: %w", err)
 	}
 
-	logger.Info("Initializing event publisher", slog.String("type", cfg.Events.Type))
-	eventPublisher := memory.NewInMemoryPublisher(cfg.Events.BufferSize)
-	logger.Info("Using in-memory event publisher", slog.Int("buffer", cfg.Events.BufferSize))
+	log.Info("Initializing event publisher", slog.String("type", cfg.Events.Type))
+	eventPublisher = memory.NewInMemoryPublisher(cfg.Events.BufferSize)
+	log.Info("Using in-memory event publisher", slog.Int("buffer", cfg.Events.BufferSize))
 
-	logger.Info("Initializing Teranode client")
+	log.Info("Initializing Teranode client")
 	var endpoints []string
 	if len(cfg.Teranode.BaseURLs) > 0 {
 		endpoints = cfg.Teranode.BaseURLs
-		logger.Info("Using multiple Teranode endpoints", slog.Int("count", len(endpoints)))
+		log.Info("Using multiple Teranode endpoints", slog.Int("count", len(endpoints)))
 	} else {
 		endpoints = []string{cfg.Teranode.BaseURL}
-		logger.Info("Using single Teranode endpoint", slog.String("url", cfg.Teranode.BaseURL))
+		log.Info("Using single Teranode endpoint", slog.String("url", cfg.Teranode.BaseURL))
 	}
-	teranodeClient := teranode.NewClient(endpoints)
+	teranodeClient = teranode.NewClient(endpoints)
 
-	logger.Info("Initializing validator")
-	validatorPolicy := &validator.Policy{
+	log.Info("Initializing validator")
+	txValidator = validator.NewValidator(&validator.Policy{
 		MaxTxSizePolicy:         cfg.Validator.MaxTxSize,
 		MaxTxSigopsCountsPolicy: cfg.Validator.MaxSigOps,
 		MaxScriptSizePolicy:     cfg.Validator.MaxScriptSize,
 		MinFeePerKB:             cfg.Validator.MinFeePerKB,
-	}
-	txValidator := validator.NewValidator(validatorPolicy)
+	})
 
-	logger.Info("Initializing P2P client")
-	p2pClient, err := terap2p.NewClient(terap2p.Config{
+	log.Info("Initializing P2P client")
+	p2pClient, err := p2p.NewClient(p2p.Config{
 		Name:           cfg.P2P.ProcessName,
-		StoragePath:    cfg.P2P.PeerCacheFile,
-		Network:        cfg.P2P.TopicPrefix,
+		StoragePath:    cfg.P2P.StoragePath,
+		Network:        cfg.P2P.Network,
 		BootstrapPeers: cfg.P2P.BootstrapPeers,
-		Logger:         logger,
+		Logger:         log,
 		Port:           cfg.P2P.Port,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create P2P client: %w", err)
 	}
 
-	logger.Info("Initializing P2P subscriber")
-	subscriber, err := p2p.NewSubscriber(
-		ctx,
-		&p2p.Config{
-			ProcessName:    cfg.P2P.ProcessName,
-			Port:           cfg.P2P.Port,
-			BootstrapPeers: cfg.P2P.BootstrapPeers,
-			PrivateKey:     cfg.P2P.PrivateKey,
-			TopicPrefix:    cfg.P2P.TopicPrefix,
-			PeerCacheFile:  cfg.P2P.PeerCacheFile,
-		},
-		statusStore,
-		networkStore,
-		eventPublisher,
-		logger,
-		p2pClient,
-	)
+	log.Info("Initializing transaction tracker")
+	txTracker = store.NewTxTracker()
+	var currentHeight uint64
+	if state, err := networkStore.GetNetworkState(ctx); err == nil && state != nil {
+		currentHeight = state.CurrentHeight
+	}
+	trackedCount, err := txTracker.LoadFromStore(ctx, statusStore, currentHeight)
 	if err != nil {
-		return fmt.Errorf("failed to create P2P subscriber: %w", err)
+		log.Warn("Failed to load tracked transactions", slog.String("error", err.Error()))
+	} else {
+		log.Info("Loaded tracked transactions", slog.Int("count", trackedCount))
 	}
 
-	if err := subscriber.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start P2P subscriber: %w", err)
+	log.Info("Initializing Arcade")
+	arcadeInstance, err = arcade.NewArcade(ctx, arcade.Config{
+		Network:          cfg.P2P.Network,
+		LocalStoragePath: cfg.P2P.StoragePath,
+		Logger:           log,
+		P2PClient:        p2pClient,
+		Subscriptions:    arcade.DefaultFullSubscriptions(),
+		BootstrapURL:     cfg.Teranode.BaseURL,
+		TxTracker:        txTracker,
+		StatusStore:      statusStore,
+		EventPublisher:   eventPublisher,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create arcade: %w", err)
 	}
 
-	logger.Info("Performing gap filling check")
-	if err := performGapFilling(ctx, networkStore, logger); err != nil {
-		logger.Warn("Gap filling failed", slog.String("error", err.Error()))
+	tipChan, err := arcadeInstance.Start(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to start arcade: %w", err)
 	}
 
-	logger.Info("Initializing webhook handler")
+	go broadcastTipUpdates(ctx, tipChan)
+
+	log.Info("Performing gap filling check")
+	if err := performGapFilling(ctx, networkStore); err != nil {
+		log.Warn("Gap filling failed", slog.String("error", err.Error()))
+	}
+
+	log.Info("Initializing webhook handler")
 	webhookHandler := handlers.NewWebhookHandler(
 		eventPublisher,
 		submissionStore,
 		statusStore,
-		logger,
+		log,
 		cfg.Webhook.PruneInterval,
 		cfg.Webhook.MaxAge,
 		cfg.Webhook.MaxRetries,
@@ -143,8 +214,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 		return fmt.Errorf("failed to start webhook handler: %w", err)
 	}
 
-	logger.Info("Initializing API server", slog.String("address", cfg.Server.Address))
-	apiPolicy := &api.PolicyResponse{
+	policy = &api.PolicyResponse{
 		MaxTxSizePolicy:         uint64(cfg.Validator.MaxTxSize),
 		MaxTxSigOpsCountsPolicy: uint64(cfg.Validator.MaxSigOps),
 		MaxScriptSizePolicy:     uint64(cfg.Validator.MaxScriptSize),
@@ -154,82 +224,145 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 		},
 	}
 
-	authToken := ""
 	if cfg.Auth.Enabled {
 		authToken = cfg.Auth.Token
-		logger.Info("API authentication enabled")
+		log.Info("API authentication enabled")
 	}
 
-	apiServer := api.NewServer(
-		statusStore,
-		submissionStore,
-		networkStore,
-		eventPublisher,
-		teranodeClient,
-		txValidator,
-		apiPolicy,
-		authToken,
-		logger,
-	)
+	log.Info("Starting HTTP server", slog.String("address", cfg.Server.Address))
+	app := setupServer()
 
 	errCh := make(chan error, 1)
 	go func() {
-		if err := apiServer.Start(cfg.Server.Address); err != nil {
-			errCh <- fmt.Errorf("API server error: %w", err)
+		if err := app.Listen(cfg.Server.Address); err != nil {
+			errCh <- fmt.Errorf("server error: %w", err)
 		}
 	}()
 
-	logger.Info("Arcade started successfully")
+	log.Info("Arcade started successfully")
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
 	select {
 	case <-sigCh:
-		logger.Info("Received shutdown signal")
+		log.Info("Received shutdown signal")
 	case err := <-errCh:
-		logger.Error("Server error", slog.String("error", err.Error()))
+		log.Error("Server error", slog.String("error", err.Error()))
 		return err
 	case <-ctx.Done():
-		logger.Info("Context cancelled")
+		log.Info("Context cancelled")
 	}
 
-	logger.Info("Shutting down gracefully")
+	log.Info("Shutting down gracefully")
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
 	defer shutdownCancel()
 
-	if err := apiServer.Stop(shutdownCtx); err != nil {
-		logger.Error("Error during shutdown", slog.String("error", err.Error()))
+	if err := app.ShutdownWithContext(shutdownCtx); err != nil {
+		log.Error("Error during server shutdown", slog.String("error", err.Error()))
 	}
 
 	webhookHandler.Stop()
 
-	if err := subscriber.Stop(); err != nil {
-		logger.Error("Error stopping P2P subscriber", slog.String("error", err.Error()))
+	if err := arcadeInstance.Stop(); err != nil {
+		log.Error("Error stopping arcade", slog.String("error", err.Error()))
+	}
+
+	if err := p2pClient.Close(); err != nil {
+		log.Error("Error closing P2P client", slog.String("error", err.Error()))
 	}
 
 	if err := eventPublisher.Close(); err != nil {
-		logger.Error("Error closing event publisher", slog.String("error", err.Error()))
+		log.Error("Error closing event publisher", slog.String("error", err.Error()))
 	}
 
-	logger.Info("Shutdown complete")
+	log.Info("Shutdown complete")
 	return nil
 }
 
-// performGapFilling checks for missing blocks and attempts to fill gaps
-func performGapFilling(ctx context.Context, networkStore store.NetworkStateStore, logger *slog.Logger) error {
+func setupServer() *fiber.App {
+	app := fiber.New(fiber.Config{
+		DisableStartupMessage: true,
+	})
+
+	app.Use(logger.New(logger.Config{
+		Format: "${method} ${path} - ${status} (${latency})\n",
+	}))
+	app.Use(recover.New())
+	app.Use(cors.New(cors.Config{
+		AllowOrigins: "*",
+		AllowHeaders: "*",
+		AllowMethods: "GET,POST,OPTIONS",
+	}))
+
+	if authToken != "" {
+		app.Use(authMiddleware)
+	}
+
+	// Transaction endpoints (ARC-compatible)
+	app.Post("/tx", handlePostTx)
+	app.Post("/txs", handlePostTxs)
+	app.Get("/tx/:txid", handleGetTx)
+	app.Get("/policy", handleGetPolicy)
+	app.Get("/health", handleGetHealth)
+	app.Get("/events/:callbackToken", handleTxSSE)
+
+	// Header endpoints
+	app.Get("/network", handleGetNetwork)
+	app.Get("/height", handleGetHeight)
+	app.Get("/tip", handleGetTip)
+	app.Get("/tip/stream", handleTipStream)
+	app.Get("/header/height/:height", handleGetHeaderByHeight)
+	app.Get("/header/hash/:hash", handleGetHeaderByHash)
+	app.Get("/headers", handleGetHeaders)
+
+	// API docs (Scalar UI)
+	app.Get("/docs/openapi.json", func(c *fiber.Ctx) error {
+		return c.Type("json").SendString(docs.SwaggerInfo.ReadDoc())
+	})
+	app.Get("/docs", func(c *fiber.Ctx) error {
+		return c.Type("html").SendString(scalarHTML)
+	})
+
+	return app
+}
+
+func authMiddleware(c *fiber.Ctx) error {
+	path := c.Path()
+	if path == "/health" || path == "/policy" || path == "/docs" || path == "/docs/*" {
+		return c.Next()
+	}
+
+	auth := c.Get("Authorization")
+	if auth == "" {
+		return c.Status(401).JSON(fiber.Map{"error": "Missing authorization header"})
+	}
+
+	const bearerPrefix = "Bearer "
+	if len(auth) < len(bearerPrefix) || auth[:len(bearerPrefix)] != bearerPrefix {
+		return c.Status(401).JSON(fiber.Map{"error": "Invalid authorization header format"})
+	}
+
+	if auth[len(bearerPrefix):] != authToken {
+		return c.Status(401).JSON(fiber.Map{"error": "Invalid token"})
+	}
+
+	return c.Next()
+}
+
+func performGapFilling(ctx context.Context, networkStore store.NetworkStateStore) error {
 	state, err := networkStore.GetNetworkState(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get network state: %w", err)
 	}
 
 	if state == nil {
-		logger.Info("No previous network state, skipping gap filling")
+		log.Info("No previous network state, skipping gap filling")
 		return nil
 	}
 
-	logger.Info("Current network state",
+	log.Info("Current network state",
 		slog.Uint64("height", state.CurrentHeight),
 		slog.String("hash", state.LastBlockHash))
 

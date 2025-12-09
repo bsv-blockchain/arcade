@@ -1,19 +1,5 @@
 package api
 
-import "time"
-
-// TransactionResponse is the Arc-compatible transaction response
-type TransactionResponse struct {
-	Timestamp    time.Time `json:"timestamp"`
-	TxID         string    `json:"txid"`
-	TxStatus     string    `json:"txStatus"`
-	BlockHash    string    `json:"blockHash,omitempty"`
-	BlockHeight  uint64    `json:"blockHeight,omitempty"`
-	MerklePath   string    `json:"merklePath,omitempty"`
-	ExtraInfo    string    `json:"extraInfo,omitempty"`
-	CompetingTxs []string  `json:"competingTxs,omitempty"`
-}
-
 // TransactionRequest represents a transaction submission request
 type TransactionRequest struct {
 	RawTx string `json:"rawTx"`

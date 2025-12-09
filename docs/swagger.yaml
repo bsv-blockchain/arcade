@@ -1,0 +1,426 @@
+basePath: /
+definitions:
+  api.FeeAmount:
+    properties:
+      bytes:
+        type: integer
+      satoshis:
+        type: integer
+    type: object
+  api.HealthResponse:
+    properties:
+      healthy:
+        type: boolean
+      reason:
+        type: string
+      version:
+        type: string
+    type: object
+  api.PolicyResponse:
+    properties:
+      maxscriptsizepolicy:
+        type: integer
+      maxtxsigopscountspolicy:
+        type: integer
+      maxtxsizepolicy:
+        type: integer
+      miningFee:
+        $ref: '#/definitions/api.FeeAmount'
+    type: object
+  api.TransactionRequest:
+    properties:
+      rawTx:
+        type: string
+    type: object
+  api.TransactionResponse:
+    properties:
+      blockHash:
+        type: string
+      blockHeight:
+        type: integer
+      competingTxs:
+        items:
+          type: string
+        type: array
+      extraInfo:
+        type: string
+      merklePath:
+        type: string
+      timestamp:
+        type: string
+      txStatus:
+        type: string
+      txid:
+        type: string
+    type: object
+  chaintracks.BlockHeader:
+    properties:
+      bits:
+        description: 4 bytes - Difficulty target
+        type: integer
+      hash:
+        items:
+          type: integer
+        type: array
+      height:
+        description: Block height in the chain
+        type: integer
+      merkleRoot:
+        description: 32 bytes - Merkle root hash
+        items:
+          type: integer
+        type: array
+      nonce:
+        description: 4 bytes - Nonce
+        type: integer
+      previousHash:
+        description: 32 bytes - Previous block hash
+        items:
+          type: integer
+        type: array
+      time:
+        description: 4 bytes - Block timestamp (Unix time)
+        type: integer
+      version:
+        description: 4 bytes - Block version
+        type: integer
+    type: object
+  cmd_arcade.ErrorResponse:
+    description: Error response
+    properties:
+      error:
+        example: Invalid request
+        type: string
+    type: object
+  cmd_arcade.HeadersResponse:
+    description: Concatenated raw headers in hex
+    properties:
+      headers:
+        example: 0100000000000000...
+        type: string
+    type: object
+  cmd_arcade.HeightResponse:
+    description: Current blockchain height
+    properties:
+      height:
+        example: 873421
+        type: integer
+    type: object
+  cmd_arcade.NetworkResponse:
+    description: Network name response
+    properties:
+      network:
+        example: main
+        type: string
+    type: object
+host: localhost:8080
+info:
+  contact:
+    name: BSV Blockchain
+    url: https://github.com/bsv-blockchain/arcade
+  description: BSV transaction broadcast service with ARC-compatible endpoints and
+    blockchain header queries.
+  license:
+    name: Open BSV License
+    url: https://github.com/bsv-blockchain/arcade/blob/main/LICENSE
+  title: Arcade API
+  version: 0.1.0
+paths:
+  /events/{callbackToken}:
+    get:
+      description: Subscribe to transaction status updates via Server-Sent Events
+      parameters:
+      - description: Callback token from transaction submission
+        in: path
+        name: callbackToken
+        required: true
+        type: string
+      - description: Resume from event ID
+        in: header
+        name: Last-Event-ID
+        type: string
+      produces:
+      - text/event-stream
+      responses:
+        "200":
+          description: SSE stream
+          schema:
+            type: string
+      summary: Transaction status stream
+      tags:
+      - Transactions
+  /header/hash/{hash}:
+    get:
+      description: Get a block header with the specified hash
+      parameters:
+      - description: Block hash (hex)
+        in: path
+        name: hash
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/chaintracks.BlockHeader'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/cmd_arcade.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/cmd_arcade.ErrorResponse'
+      summary: Get header by hash
+      tags:
+      - Chain
+  /header/height/{height}:
+    get:
+      description: Get a block header at the specified height
+      parameters:
+      - description: Block height
+        in: path
+        name: height
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/chaintracks.BlockHeader'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/cmd_arcade.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/cmd_arcade.ErrorResponse'
+      summary: Get header by height
+      tags:
+      - Chain
+  /headers:
+    get:
+      description: Get multiple consecutive block headers as concatenated raw hex
+      parameters:
+      - description: Starting height
+        in: query
+        name: height
+        required: true
+        type: integer
+      - description: Number of headers
+        in: query
+        name: count
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/cmd_arcade.HeadersResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/cmd_arcade.ErrorResponse'
+      summary: Get multiple headers
+      tags:
+      - Chain
+  /health:
+    get:
+      description: Check server health and database connectivity
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.HealthResponse'
+      summary: Health check
+      tags:
+      - Info
+  /height:
+    get:
+      description: Get the current blockchain height
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/cmd_arcade.HeightResponse'
+      summary: Get height
+      tags:
+      - Chain
+  /network:
+    get:
+      description: Get the BSV network name (main, test, etc.)
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/cmd_arcade.NetworkResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/cmd_arcade.ErrorResponse'
+      summary: Get network
+      tags:
+      - Chain
+  /policy:
+    get:
+      description: Get transaction validation policy and fee requirements
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.PolicyResponse'
+      summary: Get policy
+      tags:
+      - Info
+  /tip:
+    get:
+      description: Get the current chain tip block header
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/chaintracks.BlockHeader'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/cmd_arcade.ErrorResponse'
+      summary: Get chain tip
+      tags:
+      - Chain
+  /tip/stream:
+    get:
+      description: Subscribe to chain tip updates via Server-Sent Events
+      produces:
+      - text/event-stream
+      responses:
+        "200":
+          description: SSE stream
+          schema:
+            type: string
+      summary: Chain tip stream
+      tags:
+      - Chain
+  /tx:
+    post:
+      consumes:
+      - application/json
+      - application/octet-stream
+      description: Submit a raw transaction for broadcast to the network
+      parameters:
+      - description: Transaction request
+        in: body
+        name: transaction
+        required: true
+        schema:
+          $ref: '#/definitions/api.TransactionRequest'
+      - description: Webhook callback URL
+        in: header
+        name: X-CallbackUrl
+        type: string
+      - description: Callback token for SSE/webhook auth
+        in: header
+        name: X-CallbackToken
+        type: string
+      - description: Receive all status updates
+        in: header
+        name: X-FullStatusUpdates
+        type: boolean
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.TransactionResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/cmd_arcade.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/cmd_arcade.ErrorResponse'
+      summary: Submit transaction
+      tags:
+      - Transactions
+  /tx/{txid}:
+    get:
+      description: Get the current status of a submitted transaction
+      parameters:
+      - description: Transaction ID
+        in: path
+        name: txid
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.TransactionResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/cmd_arcade.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/cmd_arcade.ErrorResponse'
+      summary: Get transaction status
+      tags:
+      - Transactions
+  /txs:
+    post:
+      consumes:
+      - application/json
+      description: Submit multiple raw transactions for broadcast
+      parameters:
+      - description: Array of transactions
+        in: body
+        name: transactions
+        required: true
+        schema:
+          items:
+            $ref: '#/definitions/api.TransactionRequest'
+          type: array
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/api.TransactionResponse'
+            type: array
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/cmd_arcade.ErrorResponse'
+      summary: Submit multiple transactions
+      tags:
+      - Transactions
+securityDefinitions:
+  BearerAuth:
+    description: Bearer token authentication
+    in: header
+    name: Authorization
+    type: apiKey
+swagger: "2.0"

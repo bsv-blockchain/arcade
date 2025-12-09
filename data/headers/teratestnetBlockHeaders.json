@@ -1,0 +1,19 @@
+{
+    "files": [
+        {
+            "chain": "teratest",
+            "count": 1,
+            "fileHash": "",
+            "fileName": "teratestNet_0.headers",
+            "firstHeight": 0,
+            "lastChainWork": "0000000000000000000000000000000000000000000000000000000100010001",
+            "lastHash": "000000000499eabba0a88f5b3747231c74b9191c1a4a04b2c2ea817976b7776d",
+            "prevChainWork": "0000000000000000000000000000000000000000000000000000000000000000",
+            "prevHash": "0000000000000000000000000000000000000000000000000000000000000000",
+            "sourceUrl": ""
+        }
+    ],
+    "headersPerFile": 100000,
+    "jsonFilename": "teratestNetBlockHeaders.json",
+    "rootFolder": ""
+}

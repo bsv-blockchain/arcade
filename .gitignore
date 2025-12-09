@@ -34,3 +34,4 @@ Thumbs.db
 # Local config
 *.local.yaml
 *.local.yml
+config.yaml

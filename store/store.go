@@ -21,6 +21,19 @@ type StatusStore interface {
 	// GetStatusesSince retrieves all transactions updated since a given timestamp
 	GetStatusesSince(ctx context.Context, since time.Time) ([]*models.TransactionStatus, error)
 
+	// SetStatusByBlockHash updates all transactions with the given block hash to a new status.
+	// Returns the txids that were updated. For unmined statuses (SEEN_ON_NETWORK),
+	// block fields are cleared. For IMMUTABLE, block fields are preserved.
+	SetStatusByBlockHash(ctx context.Context, blockHash string, newStatus models.Status) ([]string, error)
+
+	// InsertMerklePath stores a merkle path for a transaction in a specific block.
+	// The path is stored in binary format.
+	InsertMerklePath(ctx context.Context, txid, blockHash string, blockHeight uint64, merklePath []byte) error
+
+	// SetMinedByBlockHash joins merkle_paths to set transactions as MINED for a canonical block.
+	// Returns the txids that were updated.
+	SetMinedByBlockHash(ctx context.Context, blockHash string, blockHeight uint64) ([]string, error)
+
 	// Close closes the database connection
 	Close() error
 }

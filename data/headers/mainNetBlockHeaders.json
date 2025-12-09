@@ -1,0 +1,127 @@
+{
+    "files": [
+        {
+            "chain": "main",
+            "count": 100000,
+            "fileHash": "DMXYETHMphmYRh5y0+qsJhj67ML5Ui4LE1eEZDYbnZE=",
+            "fileName": "mainNet_0.headers",
+            "firstHeight": 0,
+            "lastChainWork": "000000000000000000000000000000000000000000000000064492e9f00e251f",
+            "lastHash": "000000000002d01c1fccc21636b607dfd930d31d01c3a62104612a1719011250",
+            "prevChainWork": "00000000000000000000000000000000000000000000000006445a558de941a1",
+            "prevHash": "0000000000002103637910d267190996687fb095880d432c6531a527c8ec53d1",
+            "sourceUrl": "http://localhost:3012"
+        },
+        {
+            "chain": "main",
+            "count": 100000,
+            "fileHash": "IID8O84Uny22i10fWHTQr6f9+9eFZ8dhVyegYPGSg+Q=",
+            "fileName": "mainNet_1.headers",
+            "firstHeight": 100000,
+            "lastChainWork": "00000000000000000000000000000000000000000000001ac0479f325781cb7f",
+            "lastHash": "00000000000003a20def7a05a77361b9657ff954b2f2080e135ea6f5970da215",
+            "prevChainWork": "00000000000000000000000000000000000000000000001ac01beafa2149aee3",
+            "prevHash": "000000000000017a86f33937e38281248ed65512f390bf175b60a50f321c85bf",
+            "sourceUrl": "http://localhost:3012"
+        },
+        {
+            "chain": "main",
+            "count": 100000,
+            "fileHash": "wbfV/ZuPvLKHtRJN4QlHiKlpNncuqWA1dMJ6O9mhisc=",
+            "fileName": "mainNet_2.headers",
+            "firstHeight": 200000,
+            "lastChainWork": "000000000000000000000000000000000000000000005a795f5d6edd10bb6d5f",
+            "lastHash": "000000000000000067ecc744b5ae34eebbde14d21ca4db51652e4d67e155f07e",
+            "prevChainWork": "000000000000000000000000000000000000000000005a778277f32f9d3465d6",
+            "prevHash": "0000000000000000449a446363530b0b9c93ecce99601f8443a50f753bf53ef3",
+            "sourceUrl": "http://localhost:3012"
+        },
+        {
+            "chain": "main",
+            "count": 100000,
+            "fileHash": "5pklz64as2MG6y9lQiiClZaA82f6xoK1xdzkSqOZLsA=",
+            "fileName": "mainNet_3.headers",
+            "firstHeight": 300000,
+            "lastChainWork": "0000000000000000000000000000000000000000001229fea679a4ccc26d745f",
+            "lastHash": "0000000000000000030034b661aed920a9bdf6bbfa6d2e7a021f78481882fa39",
+            "prevChainWork": "0000000000000000000000000000000000000000001229d89576e6cd0edb9be1",
+            "prevHash": "0000000000000000042e53d6fb5b1f8361504f6e5962c90eae68df31e2f2f7ec",
+            "sourceUrl": "http://localhost:3012"
+        },
+        {
+            "chain": "main",
+            "count": 100000,
+            "fileHash": "2X78/S+Z/h5ELA63aC3xt6/o4G8JMcAOEiZ00ycKHsM=",
+            "fileName": "mainNet_4.headers",
+            "firstHeight": 400000,
+            "lastChainWork": "0000000000000000000000000000000000000000007ae4707601d47ac6685486",
+            "lastHash": "0000000000000000043831d6ebb013716f0580287ee5e5687e27d0ed72e6e523",
+            "prevChainWork": "0000000000000000000000000000000000000000007ae45621bcc542432411f9",
+            "prevHash": "0000000000000000093228f3e7bb234ad402139a332f2a51be3bc2f1b5a963be",
+            "sourceUrl": "http://localhost:3012"
+        },
+        {
+            "chain": "main",
+            "count": 100000,
+            "fileHash": "Tzm60n66tIuq7wNdP6M1BH77iFzGCPbOMIl6smJ/LRg=",
+            "fileName": "mainNet_5.headers",
+            "firstHeight": 500000,
+            "lastChainWork": "000000000000000000000000000000000000000000e8f2ea21f069a114057ed6",
+            "lastHash": "0000000000000000078f57b9a986b53b73f007c6b27b6f16409ca4eda83034e8",
+            "prevChainWork": "000000000000000000000000000000000000000000e8f2cd17929c513006de0c",
+            "prevHash": "0000000000000000078b1d10232500335ccc48fcf41e32ef909841dc7b59674e",
+            "sourceUrl": "http://localhost:3012"
+        },
+        {
+            "chain": "main",
+            "count": 100000,
+            "fileHash": "O7SoyIDxhejB0Qs4rBO4OkfBK2yVZKhxra6YxZMhiIk=",
+            "fileName": "mainNet_6.headers",
+            "firstHeight": 600000,
+            "lastChainWork": "0000000000000000000000000000000000000000012f32fb33b26aa139bd0fc2",
+            "lastHash": "000000000000000013abf3ab026610ed70e023476db8ce96f68637acdcbcf3cb",
+            "prevChainWork": "0000000000000000000000000000000000000000012f32ee7ff572c5dbdbfd56",
+            "prevHash": "00000000000000000ba342a0ccf66a687d8172c203c8a4fbba373d8a50c6fee3",
+            "sourceUrl": "http://localhost:3012"
+        },
+        {
+            "chain": "main",
+            "count": 100000,
+            "fileHash": "+0Wu2GrKgCv4o1yZfdWl60aAgvBj6Rt3xlWj8TQprUw=",
+            "fileName": "mainNet_7.headers",
+            "firstHeight": 700000,
+            "lastChainWork": "000000000000000000000000000000000000000001483b2995af390b20b4831f",
+            "lastHash": "00000000000000000b6ae23bbe9f549844c20943d8c20b8ceedbae8aa1dde8e0",
+            "prevChainWork": "000000000000000000000000000000000000000001483b16a99e364aa5d731ab",
+            "prevHash": "0000000000000000069dd6f39d453de28396613b78174ea37f7a39aff2dd43fa",
+            "sourceUrl": "http://localhost:3012"
+        },
+        {
+            "chain": "main",
+            "count": 100000,
+            "fileHash": "xKYCsMzfbWdwq6RtEos4+4w7F3FroFMXb4tk4Z2gn5s=",
+            "fileName": "mainNet_8.headers",
+            "firstHeight": 800000,
+            "lastChainWork": "000000000000000000000000000000000000000001664db1f2d50326927f07df",
+            "lastHash": "00000000000000000e7dcc27c06ee353bd37260b2e7e664314c204f0324a5087",
+            "prevChainWork": "000000000000000000000000000000000000000001664da4e04be1ec0feb904d",
+            "prevHash": "00000000000000000fb8180eb9910d087aad6b8aea5a5c4a165b3ff6d3437029",
+            "sourceUrl": "http://localhost:3012"
+        },
+        {
+            "chain": "main",
+            "count": 16818,
+            "fileHash": "NyI9Nqnq/I47IljvfaZEpOB/IlPMk8eC9PWCTkHh3IQ=",
+            "fileName": "mainNet_9.headers",
+            "firstHeight": 900000,
+            "lastChainWork": "00000000000000000000000000000000000000000168f8ae21396bd500d01ab6",
+            "lastHash": "00000000000000002530fb16feba5e3beffd243e5ba89264f27f0f425cbd5436",
+            "prevChainWork": "00000000000000000000000000000000000000000168f8a74d62bd1d56f3a1af",
+            "prevHash": "0000000000000000009c617ac7158a4b49f8fae658adceaca72b42eed7687931",
+            "sourceUrl": "http://localhost:3012"
+        }
+    ],
+    "headersPerFile": 100000,
+    "jsonFilename": "mainNetBlockHeaders.json",
+    "rootFolder": "http://localhost:3012"
+}

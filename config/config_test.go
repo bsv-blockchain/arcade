@@ -13,15 +13,19 @@ import (
 func TestDefault(t *testing.T) {
 	cfg := Default()
 
+	home, _ := os.UserHomeDir()
+	expectedDataDir := filepath.Join(home, ".arcade")
+
 	assert.Equal(t, ":8080", cfg.Server.Address)
 	assert.Equal(t, 30*time.Second, cfg.Server.ReadTimeout)
 	assert.Equal(t, "sqlite", cfg.Database.Type)
-	assert.Equal(t, "./arcade.db", cfg.Database.SQLitePath)
+	assert.Equal(t, filepath.Join(expectedDataDir, "arcade.db"), cfg.Database.SQLitePath)
 	assert.Equal(t, "memory", cfg.Events.Type)
 	assert.Equal(t, 1000, cfg.Events.BufferSize)
 	assert.Equal(t, "arcade", cfg.P2P.ProcessName)
 	assert.Equal(t, 9999, cfg.P2P.Port)
-	assert.Equal(t, "mainnet", cfg.P2P.TopicPrefix)
+	assert.Equal(t, "main", cfg.P2P.Network)
+	assert.Equal(t, expectedDataDir, cfg.P2P.StoragePath)
 	assert.Equal(t, 4*1024*1024*1024, cfg.Validator.MaxTxSize)
 	assert.Equal(t, uint64(50), cfg.Validator.MinFeePerKB)
 }
@@ -54,7 +58,7 @@ teranode:
 p2p:
   processName: "arcade-test"
   port: 8888
-  topicPrefix: "testnet"
+  network: "test"
 
 validator:
   minFeePerKB: 100
@@ -75,7 +79,7 @@ validator:
 	assert.Equal(t, 60*time.Second, cfg.Teranode.Timeout)
 	assert.Equal(t, "arcade-test", cfg.P2P.ProcessName)
 	assert.Equal(t, 8888, cfg.P2P.Port)
-	assert.Equal(t, "testnet", cfg.P2P.TopicPrefix)
+	assert.Equal(t, "test", cfg.P2P.Network)
 	assert.Equal(t, uint64(100), cfg.Validator.MinFeePerKB)
 }
 
