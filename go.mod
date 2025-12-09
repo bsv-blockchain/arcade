@@ -2,8 +2,6 @@ module github.com/bsv-blockchain/arcade
 
 go 1.25.4
 
-replace github.com/bsv-blockchain/go-sdk => ../go-sdk
-
 require (
 	github.com/bsv-blockchain/go-p2p-message-bus v0.1.7
 	github.com/bsv-blockchain/go-sdk v1.2.13
@@ -172,3 +170,5 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
+
+replace github.com/bsv-blockchain/go-sdk => github.com/bsv-blockchain/go-sdk v1.2.13-0.20251209215739-b6f7f75a3d9d
