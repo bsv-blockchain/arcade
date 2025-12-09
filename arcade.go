@@ -1197,40 +1197,28 @@ func (a *Arcade) fetchHashes(ctx context.Context, url string) ([]chainhash.Hash,
 	return hashes, nil
 }
 
-// loadFromLocalFiles restores the chain from local header files.
-// First checks the storage path for user's saved state, then falls back to embedded checkpoint files.
+// loadFromLocalFiles restores the chain from local header files in the storage directory.
+// If no persisted state exists, initializes from the embedded genesis block.
 func (a *Arcade) loadFromLocalFiles(ctx context.Context) error {
-	// Determine metadata path - check storage path first, then embedded checkpoints
 	metadataPath := filepath.Join(a.localStoragePath, a.network+"NetBlockHeaders.json")
-	basePath := a.localStoragePath
 
 	if _, err := os.Stat(metadataPath); os.IsNotExist(err) {
-		// Fall back to embedded checkpoint files
-		checkpointPath := filepath.Join("data", "headers")
-		checkpointMetadata := filepath.Join(checkpointPath, a.network+"NetBlockHeaders.json")
-
-		if _, err := os.Stat(checkpointMetadata); os.IsNotExist(err) {
-			a.logger.Info("No checkpoint files found, initializing from genesis block",
-				slog.String("network", a.network))
-			return a.initializeFromGenesis()
-		}
-
-		a.logger.Info("Loading from embedded checkpoint", slog.String("path", checkpointMetadata))
-		metadataPath = checkpointMetadata
-		basePath = checkpointPath
-	} else {
-		a.logger.Info("Loading from storage path", slog.String("path", metadataPath))
+		a.logger.Info("No persisted chain state found, initializing from genesis block",
+			slog.String("network", a.network))
+		return a.initializeFromGenesis()
 	}
+
+	a.logger.Info("Loading from storage path", slog.String("path", metadataPath))
 
 	metadata, err := parseMetadata(metadataPath)
 	if err != nil {
 		return fmt.Errorf("failed to parse metadata: %w", err)
 	}
 
-	a.logger.Info("Found checkpoint files to load", slog.Int("files", len(metadata.Files)))
+	a.logger.Info("Loading persisted headers", slog.Int("files", len(metadata.Files)))
 
 	for _, fileEntry := range metadata.Files {
-		filePath := filepath.Join(basePath, fileEntry.FileName)
+		filePath := filepath.Join(a.localStoragePath, fileEntry.FileName)
 		headers, err := loadHeadersFromFile(filePath)
 		if err != nil {
 			return fmt.Errorf("failed to load file %s: %w", fileEntry.FileName, err)
