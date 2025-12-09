@@ -1210,10 +1210,9 @@ func (a *Arcade) loadFromLocalFiles(ctx context.Context) error {
 		checkpointMetadata := filepath.Join(checkpointPath, a.network+"NetBlockHeaders.json")
 
 		if _, err := os.Stat(checkpointMetadata); os.IsNotExist(err) {
-			a.logger.Info("No checkpoint files found, starting with empty chain",
-				slog.String("storagePath", metadataPath),
-				slog.String("checkpointPath", checkpointMetadata))
-			return nil
+			a.logger.Info("No checkpoint files found, initializing from genesis block",
+				slog.String("network", a.network))
+			return a.initializeFromGenesis()
 		}
 
 		a.logger.Info("Loading from embedded checkpoint", slog.String("path", checkpointMetadata))
@@ -1290,6 +1289,40 @@ func (a *Arcade) loadFromLocalFiles(ctx context.Context) error {
 			slog.Uint64("height", uint64(a.tip.Height)),
 			slog.String("tip", a.tip.Hash.String()))
 	}
+
+	return nil
+}
+
+// initializeFromGenesis sets up the chain with just the genesis block for the configured network.
+func (a *Arcade) initializeFromGenesis() error {
+	header, err := getGenesisHeader(a.network)
+	if err != nil {
+		return fmt.Errorf("failed to get genesis header: %w", err)
+	}
+
+	genesis := &BlockHeader{
+		Header:    header,
+		Height:    0,
+		Hash:      header.Hash(),
+		ChainWork: big.NewInt(0),
+	}
+
+	a.mu.Lock()
+	a.byHeight = append(a.byHeight, genesis.Hash)
+	a.byHash[genesis.Hash] = genesis
+	a.tip = genesis
+	a.mu.Unlock()
+
+	// Persist to storage so subsequent runs load from local files
+	if err := a.writeHeadersToFiles([]*BlockHeader{genesis}); err != nil {
+		return fmt.Errorf("failed to persist genesis block: %w", err)
+	}
+	if err := a.updateMetadataForTip(context.Background()); err != nil {
+		return fmt.Errorf("failed to update metadata: %w", err)
+	}
+
+	a.logger.Info("Initialized from genesis block",
+		slog.String("hash", genesis.Hash.String()))
 
 	return nil
 }
