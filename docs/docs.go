@@ -80,19 +80,19 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/chaintracks.BlockHeader"
+                            "$ref": "#/definitions/arcade.BlockHeader"
                         }
                     },
                     "400": {
                         "description": "Bad Request",
                         "schema": {
-                            "$ref": "#/definitions/cmd_arcade.ErrorResponse"
+                            "$ref": "#/definitions/main.ErrorResponse"
                         }
                     },
                     "404": {
                         "description": "Not Found",
                         "schema": {
-                            "$ref": "#/definitions/cmd_arcade.ErrorResponse"
+                            "$ref": "#/definitions/main.ErrorResponse"
                         }
                     }
                 }
@@ -121,19 +121,19 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/chaintracks.BlockHeader"
+                            "$ref": "#/definitions/arcade.BlockHeader"
                         }
                     },
                     "400": {
                         "description": "Bad Request",
                         "schema": {
-                            "$ref": "#/definitions/cmd_arcade.ErrorResponse"
+                            "$ref": "#/definitions/main.ErrorResponse"
                         }
                     },
                     "404": {
                         "description": "Not Found",
                         "schema": {
-                            "$ref": "#/definitions/cmd_arcade.ErrorResponse"
+                            "$ref": "#/definitions/main.ErrorResponse"
                         }
                     }
                 }
@@ -169,13 +169,13 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/cmd_arcade.HeadersResponse"
+                            "$ref": "#/definitions/main.HeadersResponse"
                         }
                     },
                     "400": {
                         "description": "Bad Request",
                         "schema": {
-                            "$ref": "#/definitions/cmd_arcade.ErrorResponse"
+                            "$ref": "#/definitions/main.ErrorResponse"
                         }
                     }
                 }
@@ -195,7 +195,7 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/api.HealthResponse"
+                            "$ref": "#/definitions/main.HealthResponse"
                         }
                     }
                 }
@@ -215,7 +215,7 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/cmd_arcade.HeightResponse"
+                            "$ref": "#/definitions/main.HeightResponse"
                         }
                     }
                 }
@@ -235,13 +235,13 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/cmd_arcade.NetworkResponse"
+                            "$ref": "#/definitions/main.NetworkResponse"
                         }
                     },
                     "500": {
                         "description": "Internal Server Error",
                         "schema": {
-                            "$ref": "#/definitions/cmd_arcade.ErrorResponse"
+                            "$ref": "#/definitions/main.ErrorResponse"
                         }
                     }
                 }
@@ -261,7 +261,7 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/api.PolicyResponse"
+                            "$ref": "#/definitions/main.PolicyResponse"
                         }
                     }
                 }
@@ -281,13 +281,13 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/chaintracks.BlockHeader"
+                            "$ref": "#/definitions/arcade.BlockHeader"
                         }
                     },
                     "404": {
                         "description": "Not Found",
                         "schema": {
-                            "$ref": "#/definitions/cmd_arcade.ErrorResponse"
+                            "$ref": "#/definitions/main.ErrorResponse"
                         }
                     }
                 }
@@ -334,7 +334,7 @@ const docTemplate = `{
                         "in": "body",
                         "required": true,
                         "schema": {
-                            "$ref": "#/definitions/api.TransactionRequest"
+                            "$ref": "#/definitions/main.TransactionRequest"
                         }
                     },
                     {
@@ -360,19 +360,19 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/api.TransactionResponse"
+                            "$ref": "#/definitions/models.TransactionStatus"
                         }
                     },
                     "400": {
                         "description": "Bad Request",
                         "schema": {
-                            "$ref": "#/definitions/cmd_arcade.ErrorResponse"
+                            "$ref": "#/definitions/main.ErrorResponse"
                         }
                     },
                     "500": {
                         "description": "Internal Server Error",
                         "schema": {
-                            "$ref": "#/definitions/cmd_arcade.ErrorResponse"
+                            "$ref": "#/definitions/main.ErrorResponse"
                         }
                     }
                 }
@@ -401,19 +401,19 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/api.TransactionResponse"
+                            "$ref": "#/definitions/models.TransactionStatus"
                         }
                     },
                     "404": {
                         "description": "Not Found",
                         "schema": {
-                            "$ref": "#/definitions/cmd_arcade.ErrorResponse"
+                            "$ref": "#/definitions/main.ErrorResponse"
                         }
                     },
                     "500": {
                         "description": "Internal Server Error",
                         "schema": {
-                            "$ref": "#/definitions/cmd_arcade.ErrorResponse"
+                            "$ref": "#/definitions/main.ErrorResponse"
                         }
                     }
                 }
@@ -441,7 +441,7 @@ const docTemplate = `{
                         "schema": {
                             "type": "array",
                             "items": {
-                                "$ref": "#/definitions/api.TransactionRequest"
+                                "$ref": "#/definitions/main.TransactionRequest"
                             }
                         }
                     }
@@ -452,14 +452,14 @@ const docTemplate = `{
                         "schema": {
                             "type": "array",
                             "items": {
-                                "$ref": "#/definitions/api.TransactionResponse"
+                                "$ref": "#/definitions/models.TransactionStatus"
                             }
                         }
                     },
                     "400": {
                         "description": "Bad Request",
                         "schema": {
-                            "$ref": "#/definitions/cmd_arcade.ErrorResponse"
+                            "$ref": "#/definitions/main.ErrorResponse"
                         }
                     }
                 }
@@ -467,89 +467,7 @@ const docTemplate = `{
         }
     },
     "definitions": {
-        "api.FeeAmount": {
-            "type": "object",
-            "properties": {
-                "bytes": {
-                    "type": "integer"
-                },
-                "satoshis": {
-                    "type": "integer"
-                }
-            }
-        },
-        "api.HealthResponse": {
-            "type": "object",
-            "properties": {
-                "healthy": {
-                    "type": "boolean"
-                },
-                "reason": {
-                    "type": "string"
-                },
-                "version": {
-                    "type": "string"
-                }
-            }
-        },
-        "api.PolicyResponse": {
-            "type": "object",
-            "properties": {
-                "maxscriptsizepolicy": {
-                    "type": "integer"
-                },
-                "maxtxsigopscountspolicy": {
-                    "type": "integer"
-                },
-                "maxtxsizepolicy": {
-                    "type": "integer"
-                },
-                "miningFee": {
-                    "$ref": "#/definitions/api.FeeAmount"
-                }
-            }
-        },
-        "api.TransactionRequest": {
-            "type": "object",
-            "properties": {
-                "rawTx": {
-                    "type": "string"
-                }
-            }
-        },
-        "api.TransactionResponse": {
-            "type": "object",
-            "properties": {
-                "blockHash": {
-                    "type": "string"
-                },
-                "blockHeight": {
-                    "type": "integer"
-                },
-                "competingTxs": {
-                    "type": "array",
-                    "items": {
-                        "type": "string"
-                    }
-                },
-                "extraInfo": {
-                    "type": "string"
-                },
-                "merklePath": {
-                    "type": "string"
-                },
-                "timestamp": {
-                    "type": "string"
-                },
-                "txStatus": {
-                    "type": "string"
-                },
-                "txid": {
-                    "type": "string"
-                }
-            }
-        },
-        "chaintracks.BlockHeader": {
+        "arcade.BlockHeader": {
             "type": "object",
             "properties": {
                 "bits": {
@@ -563,7 +481,6 @@ const docTemplate = `{
                     }
                 },
                 "height": {
-                    "description": "Block height in the chain",
                     "type": "integer"
                 },
                 "merkleRoot": {
@@ -594,7 +511,7 @@ const docTemplate = `{
                 }
             }
         },
-        "cmd_arcade.ErrorResponse": {
+        "main.ErrorResponse": {
             "description": "Error response",
             "type": "object",
             "properties": {
@@ -604,7 +521,18 @@ const docTemplate = `{
                 }
             }
         },
-        "cmd_arcade.HeadersResponse": {
+        "main.FeeAmount": {
+            "type": "object",
+            "properties": {
+                "bytes": {
+                    "type": "integer"
+                },
+                "satoshis": {
+                    "type": "integer"
+                }
+            }
+        },
+        "main.HeadersResponse": {
             "description": "Concatenated raw headers in hex",
             "type": "object",
             "properties": {
@@ -614,7 +542,21 @@ const docTemplate = `{
                 }
             }
         },
-        "cmd_arcade.HeightResponse": {
+        "main.HealthResponse": {
+            "type": "object",
+            "properties": {
+                "healthy": {
+                    "type": "boolean"
+                },
+                "reason": {
+                    "type": "string"
+                },
+                "version": {
+                    "type": "string"
+                }
+            }
+        },
+        "main.HeightResponse": {
             "description": "Current blockchain height",
             "type": "object",
             "properties": {
@@ -624,13 +566,98 @@ const docTemplate = `{
                 }
             }
         },
-        "cmd_arcade.NetworkResponse": {
+        "main.NetworkResponse": {
             "description": "Network name response",
             "type": "object",
             "properties": {
                 "network": {
                     "type": "string",
                     "example": "main"
+                }
+            }
+        },
+        "main.PolicyResponse": {
+            "type": "object",
+            "properties": {
+                "maxscriptsizepolicy": {
+                    "type": "integer"
+                },
+                "maxtxsigopscountspolicy": {
+                    "type": "integer"
+                },
+                "maxtxsizepolicy": {
+                    "type": "integer"
+                },
+                "miningFee": {
+                    "$ref": "#/definitions/main.FeeAmount"
+                }
+            }
+        },
+        "main.TransactionRequest": {
+            "type": "object",
+            "properties": {
+                "rawTx": {
+                    "type": "string"
+                }
+            }
+        },
+        "models.Status": {
+            "type": "string",
+            "enum": [
+                "UNKNOWN",
+                "RECEIVED",
+                "SENT_TO_NETWORK",
+                "ACCEPTED_BY_NETWORK",
+                "SEEN_ON_NETWORK",
+                "DOUBLE_SPEND_ATTEMPTED",
+                "REJECTED",
+                "MINED",
+                "IMMUTABLE"
+            ],
+            "x-enum-varnames": [
+                "StatusUnknown",
+                "StatusReceived",
+                "StatusSentToNetwork",
+                "StatusAcceptedByNetwork",
+                "StatusSeenOnNetwork",
+                "StatusDoubleSpendAttempted",
+                "StatusRejected",
+                "StatusMined",
+                "StatusImmutable"
+            ]
+        },
+        "models.TransactionStatus": {
+            "type": "object",
+            "properties": {
+                "blockHash": {
+                    "type": "string"
+                },
+                "blockHeight": {
+                    "type": "integer"
+                },
+                "competingTxs": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "extraInfo": {
+                    "type": "string"
+                },
+                "merklePath": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "timestamp": {
+                    "type": "string"
+                },
+                "txStatus": {
+                    "$ref": "#/definitions/models.Status"
+                },
+                "txid": {
+                    "type": "string"
                 }
             }
         }

@@ -1,59 +1,6 @@
 basePath: /
 definitions:
-  api.FeeAmount:
-    properties:
-      bytes:
-        type: integer
-      satoshis:
-        type: integer
-    type: object
-  api.HealthResponse:
-    properties:
-      healthy:
-        type: boolean
-      reason:
-        type: string
-      version:
-        type: string
-    type: object
-  api.PolicyResponse:
-    properties:
-      maxscriptsizepolicy:
-        type: integer
-      maxtxsigopscountspolicy:
-        type: integer
-      maxtxsizepolicy:
-        type: integer
-      miningFee:
-        $ref: '#/definitions/api.FeeAmount'
-    type: object
-  api.TransactionRequest:
-    properties:
-      rawTx:
-        type: string
-    type: object
-  api.TransactionResponse:
-    properties:
-      blockHash:
-        type: string
-      blockHeight:
-        type: integer
-      competingTxs:
-        items:
-          type: string
-        type: array
-      extraInfo:
-        type: string
-      merklePath:
-        type: string
-      timestamp:
-        type: string
-      txStatus:
-        type: string
-      txid:
-        type: string
-    type: object
-  chaintracks.BlockHeader:
+  arcade.BlockHeader:
     properties:
       bits:
         description: 4 bytes - Difficulty target
@@ -63,7 +10,6 @@ definitions:
           type: integer
         type: array
       height:
-        description: Block height in the chain
         type: integer
       merkleRoot:
         description: 32 bytes - Merkle root hash
@@ -85,35 +31,111 @@ definitions:
         description: 4 bytes - Block version
         type: integer
     type: object
-  cmd_arcade.ErrorResponse:
+  main.ErrorResponse:
     description: Error response
     properties:
       error:
         example: Invalid request
         type: string
     type: object
-  cmd_arcade.HeadersResponse:
+  main.FeeAmount:
+    properties:
+      bytes:
+        type: integer
+      satoshis:
+        type: integer
+    type: object
+  main.HeadersResponse:
     description: Concatenated raw headers in hex
     properties:
       headers:
         example: 0100000000000000...
         type: string
     type: object
-  cmd_arcade.HeightResponse:
+  main.HealthResponse:
+    properties:
+      healthy:
+        type: boolean
+      reason:
+        type: string
+      version:
+        type: string
+    type: object
+  main.HeightResponse:
     description: Current blockchain height
     properties:
       height:
         example: 873421
         type: integer
     type: object
-  cmd_arcade.NetworkResponse:
+  main.NetworkResponse:
     description: Network name response
     properties:
       network:
         example: main
         type: string
     type: object
-host: ""
+  main.PolicyResponse:
+    properties:
+      maxscriptsizepolicy:
+        type: integer
+      maxtxsigopscountspolicy:
+        type: integer
+      maxtxsizepolicy:
+        type: integer
+      miningFee:
+        $ref: '#/definitions/main.FeeAmount'
+    type: object
+  main.TransactionRequest:
+    properties:
+      rawTx:
+        type: string
+    type: object
+  models.Status:
+    enum:
+    - UNKNOWN
+    - RECEIVED
+    - SENT_TO_NETWORK
+    - ACCEPTED_BY_NETWORK
+    - SEEN_ON_NETWORK
+    - DOUBLE_SPEND_ATTEMPTED
+    - REJECTED
+    - MINED
+    - IMMUTABLE
+    type: string
+    x-enum-varnames:
+    - StatusUnknown
+    - StatusReceived
+    - StatusSentToNetwork
+    - StatusAcceptedByNetwork
+    - StatusSeenOnNetwork
+    - StatusDoubleSpendAttempted
+    - StatusRejected
+    - StatusMined
+    - StatusImmutable
+  models.TransactionStatus:
+    properties:
+      blockHash:
+        type: string
+      blockHeight:
+        type: integer
+      competingTxs:
+        items:
+          type: string
+        type: array
+      extraInfo:
+        type: string
+      merklePath:
+        items:
+          type: integer
+        type: array
+      timestamp:
+        type: string
+      txStatus:
+        $ref: '#/definitions/models.Status'
+      txid:
+        type: string
+    type: object
 info:
   contact:
     name: BSV Blockchain
@@ -164,15 +186,15 @@ paths:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/chaintracks.BlockHeader'
+            $ref: '#/definitions/arcade.BlockHeader'
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/cmd_arcade.ErrorResponse'
+            $ref: '#/definitions/main.ErrorResponse'
         "404":
           description: Not Found
           schema:
-            $ref: '#/definitions/cmd_arcade.ErrorResponse'
+            $ref: '#/definitions/main.ErrorResponse'
       summary: Get header by hash
       tags:
       - Chain
@@ -191,15 +213,15 @@ paths:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/chaintracks.BlockHeader'
+            $ref: '#/definitions/arcade.BlockHeader'
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/cmd_arcade.ErrorResponse'
+            $ref: '#/definitions/main.ErrorResponse'
         "404":
           description: Not Found
           schema:
-            $ref: '#/definitions/cmd_arcade.ErrorResponse'
+            $ref: '#/definitions/main.ErrorResponse'
       summary: Get header by height
       tags:
       - Chain
@@ -223,11 +245,11 @@ paths:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/cmd_arcade.HeadersResponse'
+            $ref: '#/definitions/main.HeadersResponse'
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/cmd_arcade.ErrorResponse'
+            $ref: '#/definitions/main.ErrorResponse'
       summary: Get multiple headers
       tags:
       - Chain
@@ -240,7 +262,7 @@ paths:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/api.HealthResponse'
+            $ref: '#/definitions/main.HealthResponse'
       summary: Health check
       tags:
       - Info
@@ -253,7 +275,7 @@ paths:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/cmd_arcade.HeightResponse'
+            $ref: '#/definitions/main.HeightResponse'
       summary: Get height
       tags:
       - Chain
@@ -266,11 +288,11 @@ paths:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/cmd_arcade.NetworkResponse'
+            $ref: '#/definitions/main.NetworkResponse'
         "500":
           description: Internal Server Error
           schema:
-            $ref: '#/definitions/cmd_arcade.ErrorResponse'
+            $ref: '#/definitions/main.ErrorResponse'
       summary: Get network
       tags:
       - Chain
@@ -283,7 +305,7 @@ paths:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/api.PolicyResponse'
+            $ref: '#/definitions/main.PolicyResponse'
       summary: Get policy
       tags:
       - Info
@@ -296,11 +318,11 @@ paths:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/chaintracks.BlockHeader'
+            $ref: '#/definitions/arcade.BlockHeader'
         "404":
           description: Not Found
           schema:
-            $ref: '#/definitions/cmd_arcade.ErrorResponse'
+            $ref: '#/definitions/main.ErrorResponse'
       summary: Get chain tip
       tags:
       - Chain
@@ -329,7 +351,7 @@ paths:
         name: transaction
         required: true
         schema:
-          $ref: '#/definitions/api.TransactionRequest'
+          $ref: '#/definitions/main.TransactionRequest'
       - description: Webhook callback URL
         in: header
         name: X-CallbackUrl
@@ -348,15 +370,15 @@ paths:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/api.TransactionResponse'
+            $ref: '#/definitions/models.TransactionStatus'
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/cmd_arcade.ErrorResponse'
+            $ref: '#/definitions/main.ErrorResponse'
         "500":
           description: Internal Server Error
           schema:
-            $ref: '#/definitions/cmd_arcade.ErrorResponse'
+            $ref: '#/definitions/main.ErrorResponse'
       summary: Submit transaction
       tags:
       - Transactions
@@ -375,15 +397,15 @@ paths:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/api.TransactionResponse'
+            $ref: '#/definitions/models.TransactionStatus'
         "404":
           description: Not Found
           schema:
-            $ref: '#/definitions/cmd_arcade.ErrorResponse'
+            $ref: '#/definitions/main.ErrorResponse'
         "500":
           description: Internal Server Error
           schema:
-            $ref: '#/definitions/cmd_arcade.ErrorResponse'
+            $ref: '#/definitions/main.ErrorResponse'
       summary: Get transaction status
       tags:
       - Transactions
@@ -399,7 +421,7 @@ paths:
         required: true
         schema:
           items:
-            $ref: '#/definitions/api.TransactionRequest'
+            $ref: '#/definitions/main.TransactionRequest'
           type: array
       produces:
       - application/json
@@ -408,12 +430,12 @@ paths:
           description: OK
           schema:
             items:
-              $ref: '#/definitions/api.TransactionResponse'
+              $ref: '#/definitions/models.TransactionStatus'
             type: array
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/cmd_arcade.ErrorResponse'
+            $ref: '#/definitions/main.ErrorResponse'
       summary: Submit multiple transactions
       tags:
       - Transactions
