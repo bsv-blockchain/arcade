@@ -1,6 +1,6 @@
 basePath: /
 definitions:
-  arcade.BlockHeader:
+  chaintracks.BlockHeader:
     properties:
       bits:
         description: 4 bytes - Difficulty target
@@ -10,6 +10,7 @@ definitions:
           type: integer
         type: array
       height:
+        description: Block height in the chain
         type: integer
       merkleRoot:
         description: 32 bytes - Merkle root hash
@@ -31,28 +32,20 @@ definitions:
         description: 4 bytes - Block version
         type: integer
     type: object
-  main.ErrorResponse:
-    description: Error response
+  fiber.ErrorResponse:
     properties:
       error:
-        example: Invalid request
+        example: Header not found
         type: string
     type: object
-  main.FeeAmount:
+  fiber.FeeAmount:
     properties:
       bytes:
         type: integer
       satoshis:
         type: integer
     type: object
-  main.HeadersResponse:
-    description: Concatenated raw headers in hex
-    properties:
-      headers:
-        example: 0100000000000000...
-        type: string
-    type: object
-  main.HealthResponse:
+  fiber.HealthResponse:
     properties:
       healthy:
         type: boolean
@@ -61,21 +54,19 @@ definitions:
       version:
         type: string
     type: object
-  main.HeightResponse:
-    description: Current blockchain height
+  fiber.HeightResponse:
     properties:
       height:
-        example: 873421
+        example: 874123
         type: integer
     type: object
-  main.NetworkResponse:
-    description: Network name response
+  fiber.NetworkResponse:
     properties:
       network:
-        example: main
+        example: mainnet
         type: string
     type: object
-  main.PolicyResponse:
+  fiber.PolicyResponse:
     properties:
       maxscriptsizepolicy:
         type: integer
@@ -84,11 +75,12 @@ definitions:
       maxtxsizepolicy:
         type: integer
       miningFee:
-        $ref: '#/definitions/main.FeeAmount'
+        $ref: '#/definitions/fiber.FeeAmount'
     type: object
-  main.TransactionRequest:
+  fiber.TransactionRequest:
     properties:
       rawTx:
+        example: 0100000001...
         type: string
     type: object
   models.Status:
@@ -140,8 +132,7 @@ info:
   contact:
     name: BSV Blockchain
     url: https://github.com/bsv-blockchain/arcade
-  description: BSV transaction broadcast service with ARC-compatible endpoints and
-    blockchain header queries.
+  description: BSV transaction broadcast service with ARC-compatible endpoints.
   license:
     name: Open BSV License
     url: https://github.com/bsv-blockchain/arcade/blob/main/LICENSE
@@ -150,220 +141,86 @@ info:
 paths:
   /events/{callbackToken}:
     get:
-      description: Subscribe to transaction status updates via Server-Sent Events
+      description: Server-Sent Events stream of transaction status updates for transactions
+        associated with the callback token
       parameters:
       - description: Callback token from transaction submission
         in: path
         name: callbackToken
         required: true
         type: string
-      - description: Resume from event ID
-        in: header
-        name: Last-Event-ID
-        type: string
       produces:
       - text/event-stream
       responses:
         "200":
-          description: SSE stream
+          description: SSE stream of transaction status updates
           schema:
             type: string
-      summary: Transaction status stream
+      summary: Stream transaction events
       tags:
-      - Transactions
-  /header/hash/{hash}:
-    get:
-      description: Get a block header with the specified hash
-      parameters:
-      - description: Block hash (hex)
-        in: path
-        name: hash
-        required: true
-        type: string
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/arcade.BlockHeader'
-        "400":
-          description: Bad Request
-          schema:
-            $ref: '#/definitions/main.ErrorResponse'
-        "404":
-          description: Not Found
-          schema:
-            $ref: '#/definitions/main.ErrorResponse'
-      summary: Get header by hash
-      tags:
-      - Chain
-  /header/height/{height}:
-    get:
-      description: Get a block header at the specified height
-      parameters:
-      - description: Block height
-        in: path
-        name: height
-        required: true
-        type: integer
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/arcade.BlockHeader'
-        "400":
-          description: Bad Request
-          schema:
-            $ref: '#/definitions/main.ErrorResponse'
-        "404":
-          description: Not Found
-          schema:
-            $ref: '#/definitions/main.ErrorResponse'
-      summary: Get header by height
-      tags:
-      - Chain
-  /headers:
-    get:
-      description: Get multiple consecutive block headers as concatenated raw hex
-      parameters:
-      - description: Starting height
-        in: query
-        name: height
-        required: true
-        type: integer
-      - description: Number of headers
-        in: query
-        name: count
-        required: true
-        type: integer
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/main.HeadersResponse'
-        "400":
-          description: Bad Request
-          schema:
-            $ref: '#/definitions/main.ErrorResponse'
-      summary: Get multiple headers
-      tags:
-      - Chain
+      - transactions
   /health:
     get:
-      description: Check server health and database connectivity
+      description: Returns the health status of the service
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/main.HealthResponse'
+            $ref: '#/definitions/fiber.HealthResponse'
       summary: Health check
       tags:
-      - Info
-  /height:
-    get:
-      description: Get the current blockchain height
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/main.HeightResponse'
-      summary: Get height
-      tags:
-      - Chain
-  /network:
-    get:
-      description: Get the BSV network name (main, test, etc.)
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/main.NetworkResponse'
-        "500":
-          description: Internal Server Error
-          schema:
-            $ref: '#/definitions/main.ErrorResponse'
-      summary: Get network
-      tags:
-      - Chain
+      - info
   /policy:
     get:
-      description: Get transaction validation policy and fee requirements
+      description: Returns the transaction policy configuration including fee rates
+        and limits
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/main.PolicyResponse'
+            $ref: '#/definitions/fiber.PolicyResponse'
       summary: Get policy
       tags:
-      - Info
-  /tip:
-    get:
-      description: Get the current chain tip block header
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/arcade.BlockHeader'
-        "404":
-          description: Not Found
-          schema:
-            $ref: '#/definitions/main.ErrorResponse'
-      summary: Get chain tip
-      tags:
-      - Chain
-  /tip/stream:
-    get:
-      description: Subscribe to chain tip updates via Server-Sent Events
-      produces:
-      - text/event-stream
-      responses:
-        "200":
-          description: SSE stream
-          schema:
-            type: string
-      summary: Chain tip stream
-      tags:
-      - Chain
+      - info
   /tx:
     post:
       consumes:
       - application/json
       - application/octet-stream
-      description: Submit a raw transaction for broadcast to the network
+      - text/plain
+      description: Submit a single transaction for broadcast. Accepts raw transaction
+        bytes, hex string, or JSON with rawTx field.
       parameters:
-      - description: Transaction request
+      - description: Transaction data
         in: body
         name: transaction
         required: true
         schema:
-          $ref: '#/definitions/main.TransactionRequest'
-      - description: Webhook callback URL
+          $ref: '#/definitions/fiber.TransactionRequest'
+      - description: URL for status callbacks
         in: header
         name: X-CallbackUrl
         type: string
-      - description: Callback token for SSE/webhook auth
+      - description: Token for SSE event filtering
         in: header
         name: X-CallbackToken
         type: string
-      - description: Receive all status updates
+      - description: Send all status updates (true/false)
         in: header
         name: X-FullStatusUpdates
-        type: boolean
+        type: string
+      - description: Skip fee validation (true/false)
+        in: header
+        name: X-SkipFeeValidation
+        type: string
+      - description: Skip script validation (true/false)
+        in: header
+        name: X-SkipScriptValidation
+        type: string
       produces:
       - application/json
       responses:
@@ -374,14 +231,18 @@ paths:
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/main.ErrorResponse'
+            additionalProperties:
+              type: string
+            type: object
         "500":
           description: Internal Server Error
           schema:
-            $ref: '#/definitions/main.ErrorResponse'
+            additionalProperties:
+              type: string
+            type: object
       summary: Submit transaction
       tags:
-      - Transactions
+      - transactions
   /tx/{txid}:
     get:
       description: Get the current status of a submitted transaction
@@ -401,19 +262,23 @@ paths:
         "404":
           description: Not Found
           schema:
-            $ref: '#/definitions/main.ErrorResponse'
+            additionalProperties:
+              type: string
+            type: object
         "500":
           description: Internal Server Error
           schema:
-            $ref: '#/definitions/main.ErrorResponse'
+            additionalProperties:
+              type: string
+            type: object
       summary: Get transaction status
       tags:
-      - Transactions
+      - transactions
   /txs:
     post:
       consumes:
       - application/json
-      description: Submit multiple raw transactions for broadcast
+      description: Submit multiple transactions for broadcast
       parameters:
       - description: Array of transactions
         in: body
@@ -421,8 +286,16 @@ paths:
         required: true
         schema:
           items:
-            $ref: '#/definitions/main.TransactionRequest'
+            $ref: '#/definitions/fiber.TransactionRequest'
           type: array
+      - description: Skip fee validation (true/false)
+        in: header
+        name: X-SkipFeeValidation
+        type: string
+      - description: Skip script validation (true/false)
+        in: header
+        name: X-SkipScriptValidation
+        type: string
       produces:
       - application/json
       responses:
@@ -435,10 +308,156 @@ paths:
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/main.ErrorResponse'
+            additionalProperties:
+              type: string
+            type: object
       summary: Submit multiple transactions
       tags:
-      - Transactions
+      - transactions
+  /v2/header/hash/{hash}:
+    get:
+      description: Returns a block header with the specified hash
+      parameters:
+      - description: Block hash (hex)
+        in: path
+        name: hash
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/chaintracks.BlockHeader'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/fiber.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/fiber.ErrorResponse'
+      summary: Get header by hash
+      tags:
+      - chaintracks
+  /v2/header/height/{height}:
+    get:
+      description: Returns a block header at the specified height
+      parameters:
+      - description: Block height
+        in: path
+        name: height
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/chaintracks.BlockHeader'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/fiber.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/fiber.ErrorResponse'
+      summary: Get header by height
+      tags:
+      - chaintracks
+  /v2/headers:
+    get:
+      description: Returns block headers starting from height as binary data (80 bytes
+        per header)
+      parameters:
+      - description: Starting block height
+        in: query
+        name: height
+        required: true
+        type: integer
+      - description: Number of headers to return
+        in: query
+        name: count
+        required: true
+        type: integer
+      produces:
+      - application/octet-stream
+      responses:
+        "200":
+          description: Concatenated 80-byte headers
+          schema:
+            type: string
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/fiber.ErrorResponse'
+      summary: Get multiple headers
+      tags:
+      - chaintracks
+  /v2/height:
+    get:
+      description: Returns the current blockchain height
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/fiber.HeightResponse'
+      summary: Get chain height
+      tags:
+      - chaintracks
+  /v2/network:
+    get:
+      description: Returns the Bitcoin network this service is connected to
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/fiber.NetworkResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/fiber.ErrorResponse'
+      summary: Get network name
+      tags:
+      - chaintracks
+  /v2/tip:
+    get:
+      description: Returns the current chain tip block header
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/chaintracks.BlockHeader'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/fiber.ErrorResponse'
+      summary: Get chain tip
+      tags:
+      - chaintracks
+  /v2/tip/stream:
+    get:
+      description: Server-Sent Events stream of chain tip updates. Sends the current
+        tip immediately, then broadcasts new tips as they arrive.
+      produces:
+      - text/event-stream
+      responses:
+        "200":
+          description: SSE stream of BlockHeader JSON objects
+          schema:
+            type: string
+      summary: Stream chain tip updates
+      tags:
+      - chaintracks
 securityDefinitions:
   BearerAuth:
     description: Bearer token authentication

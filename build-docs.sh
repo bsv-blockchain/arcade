@@ -8,4 +8,4 @@ if ! command -v swag &> /dev/null && [ ! -f "$SWAG" ]; then
     go install github.com/swaggo/swag/cmd/swag@latest
 fi
 
-"$SWAG" init -g cmd/arcade/main.go -o docs --parseDependency
+"$SWAG" init -g cmd/arcade/main.go -o docs --parseDependency --parseDependencyLevel 3

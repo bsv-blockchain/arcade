@@ -4,32 +4,25 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/bsv-blockchain/arcade/p2p"
+	"github.com/bsv-blockchain/arcade"
+	msgbus "github.com/bsv-blockchain/go-p2p-message-bus"
 	"github.com/gofiber/fiber/v2"
 )
 
-// handleDashboard renders the status dashboard
-func handleDashboard(c *fiber.Ctx) error {
-	tip := arcadeInstance.GetTip(c.UserContext())
-	height := arcadeInstance.GetHeight(c.UserContext())
+// Dashboard provides HTTP handlers for the status dashboard
+type Dashboard struct {
+	arcade *arcade.Arcade
+}
 
-	var tipHash string
-	var tipChainwork string
-	if tip != nil {
-		tipHash = tip.Hash.String()
-		tipChainwork = tip.ChainWork.String()
-	} else {
-		tipHash = "N/A"
-		tipChainwork = "N/A"
-	}
+// NewDashboard creates a new dashboard handler
+func NewDashboard(a *arcade.Arcade) *Dashboard {
+	return &Dashboard{arcade: a}
+}
 
-	network, err := arcadeInstance.GetNetwork(c.UserContext())
-	if err != nil {
-		network = "unknown"
-	}
-
-	peers := arcadeInstance.GetPeers()
-	peerID := arcadeInstance.GetPeerID()
+// HandleDashboard renders the status dashboard
+func (d *Dashboard) HandleDashboard(c *fiber.Ctx) error {
+	peers := d.arcade.GetPeers()
+	peerID := d.arcade.GetPeerID()
 
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html>
@@ -72,10 +65,6 @@ func handleDashboard(c *fiber.Ctx) error {
         .value {
             color: #00ff00;
             font-weight: bold;
-        }
-        .hash {
-            font-family: 'Courier New', monospace;
-            word-break: break-all;
         }
         .peer-list {
             margin-top: 10px;
@@ -126,14 +115,6 @@ func handleDashboard(c *fiber.Ctx) error {
         <h1><span class="status-indicator"></span>Arcade Status Dashboard</h1>
 
         <div class="section">
-            <h2>Chain Status</h2>
-            <div><span class="label">Network:</span><span class="value">%s</span></div>
-            <div><span class="label">Current Height:</span><span class="value">%d</span></div>
-            <div><span class="label">Tip Hash:</span><span class="value hash">%s</span></div>
-            <div><span class="label">Chainwork:</span><span class="value">%s</span></div>
-        </div>
-
-        <div class="section">
             <h2>P2P Network</h2>
             <div><span class="label">Node ID:</span><span class="self-id">%s</span></div>
             <div><span class="label">Connected Peers:</span><span class="value">%d</span></div>
@@ -148,10 +129,6 @@ func handleDashboard(c *fiber.Ctx) error {
     </div>
 </body>
 </html>`,
-		network,
-		height,
-		tipHash,
-		tipChainwork,
 		peerID,
 		len(peers),
 		renderPeerList(peers),
@@ -163,7 +140,7 @@ func handleDashboard(c *fiber.Ctx) error {
 }
 
 // renderPeerList generates HTML for the peer list
-func renderPeerList(peers []p2p.PeerInfo) string {
+func renderPeerList(peers []msgbus.PeerInfo) string {
 	if len(peers) == 0 {
 		return `<div style="color: #808080; font-style: italic;">No peers connected</div>`
 	}

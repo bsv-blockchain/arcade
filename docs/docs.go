@@ -24,14 +24,14 @@ const docTemplate = `{
     "paths": {
         "/events/{callbackToken}": {
             "get": {
-                "description": "Subscribe to transaction status updates via Server-Sent Events",
+                "description": "Server-Sent Events stream of transaction status updates for transactions associated with the callback token",
                 "produces": [
                     "text/event-stream"
                 ],
                 "tags": [
-                    "Transactions"
+                    "transactions"
                 ],
-                "summary": "Transaction status stream",
+                "summary": "Stream transaction events",
                 "parameters": [
                     {
                         "type": "string",
@@ -39,143 +39,13 @@ const docTemplate = `{
                         "name": "callbackToken",
                         "in": "path",
                         "required": true
-                    },
-                    {
-                        "type": "string",
-                        "description": "Resume from event ID",
-                        "name": "Last-Event-ID",
-                        "in": "header"
                     }
                 ],
                 "responses": {
                     "200": {
-                        "description": "SSE stream",
+                        "description": "SSE stream of transaction status updates",
                         "schema": {
                             "type": "string"
-                        }
-                    }
-                }
-            }
-        },
-        "/header/hash/{hash}": {
-            "get": {
-                "description": "Get a block header with the specified hash",
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "Chain"
-                ],
-                "summary": "Get header by hash",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Block hash (hex)",
-                        "name": "hash",
-                        "in": "path",
-                        "required": true
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "$ref": "#/definitions/arcade.BlockHeader"
-                        }
-                    },
-                    "400": {
-                        "description": "Bad Request",
-                        "schema": {
-                            "$ref": "#/definitions/main.ErrorResponse"
-                        }
-                    },
-                    "404": {
-                        "description": "Not Found",
-                        "schema": {
-                            "$ref": "#/definitions/main.ErrorResponse"
-                        }
-                    }
-                }
-            }
-        },
-        "/header/height/{height}": {
-            "get": {
-                "description": "Get a block header at the specified height",
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "Chain"
-                ],
-                "summary": "Get header by height",
-                "parameters": [
-                    {
-                        "type": "integer",
-                        "description": "Block height",
-                        "name": "height",
-                        "in": "path",
-                        "required": true
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "$ref": "#/definitions/arcade.BlockHeader"
-                        }
-                    },
-                    "400": {
-                        "description": "Bad Request",
-                        "schema": {
-                            "$ref": "#/definitions/main.ErrorResponse"
-                        }
-                    },
-                    "404": {
-                        "description": "Not Found",
-                        "schema": {
-                            "$ref": "#/definitions/main.ErrorResponse"
-                        }
-                    }
-                }
-            }
-        },
-        "/headers": {
-            "get": {
-                "description": "Get multiple consecutive block headers as concatenated raw hex",
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "Chain"
-                ],
-                "summary": "Get multiple headers",
-                "parameters": [
-                    {
-                        "type": "integer",
-                        "description": "Starting height",
-                        "name": "height",
-                        "in": "query",
-                        "required": true
-                    },
-                    {
-                        "type": "integer",
-                        "description": "Number of headers",
-                        "name": "count",
-                        "in": "query",
-                        "required": true
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "$ref": "#/definitions/main.HeadersResponse"
-                        }
-                    },
-                    "400": {
-                        "description": "Bad Request",
-                        "schema": {
-                            "$ref": "#/definitions/main.ErrorResponse"
                         }
                     }
                 }
@@ -183,65 +53,19 @@ const docTemplate = `{
         },
         "/health": {
             "get": {
-                "description": "Check server health and database connectivity",
+                "description": "Returns the health status of the service",
                 "produces": [
                     "application/json"
                 ],
                 "tags": [
-                    "Info"
+                    "info"
                 ],
                 "summary": "Health check",
                 "responses": {
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/main.HealthResponse"
-                        }
-                    }
-                }
-            }
-        },
-        "/height": {
-            "get": {
-                "description": "Get the current blockchain height",
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "Chain"
-                ],
-                "summary": "Get height",
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "$ref": "#/definitions/main.HeightResponse"
-                        }
-                    }
-                }
-            }
-        },
-        "/network": {
-            "get": {
-                "description": "Get the BSV network name (main, test, etc.)",
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "Chain"
-                ],
-                "summary": "Get network",
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "$ref": "#/definitions/main.NetworkResponse"
-                        }
-                    },
-                    "500": {
-                        "description": "Internal Server Error",
-                        "schema": {
-                            "$ref": "#/definitions/main.ErrorResponse"
+                            "$ref": "#/definitions/fiber.HealthResponse"
                         }
                     }
                 }
@@ -249,65 +73,19 @@ const docTemplate = `{
         },
         "/policy": {
             "get": {
-                "description": "Get transaction validation policy and fee requirements",
+                "description": "Returns the transaction policy configuration including fee rates and limits",
                 "produces": [
                     "application/json"
                 ],
                 "tags": [
-                    "Info"
+                    "info"
                 ],
                 "summary": "Get policy",
                 "responses": {
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/main.PolicyResponse"
-                        }
-                    }
-                }
-            }
-        },
-        "/tip": {
-            "get": {
-                "description": "Get the current chain tip block header",
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "Chain"
-                ],
-                "summary": "Get chain tip",
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "$ref": "#/definitions/arcade.BlockHeader"
-                        }
-                    },
-                    "404": {
-                        "description": "Not Found",
-                        "schema": {
-                            "$ref": "#/definitions/main.ErrorResponse"
-                        }
-                    }
-                }
-            }
-        },
-        "/tip/stream": {
-            "get": {
-                "description": "Subscribe to chain tip updates via Server-Sent Events",
-                "produces": [
-                    "text/event-stream"
-                ],
-                "tags": [
-                    "Chain"
-                ],
-                "summary": "Chain tip stream",
-                "responses": {
-                    "200": {
-                        "description": "SSE stream",
-                        "schema": {
-                            "type": "string"
+                            "$ref": "#/definitions/fiber.PolicyResponse"
                         }
                     }
                 }
@@ -315,44 +93,57 @@ const docTemplate = `{
         },
         "/tx": {
             "post": {
-                "description": "Submit a raw transaction for broadcast to the network",
+                "description": "Submit a single transaction for broadcast. Accepts raw transaction bytes, hex string, or JSON with rawTx field.",
                 "consumes": [
                     "application/json",
-                    "application/octet-stream"
+                    "application/octet-stream",
+                    "text/plain"
                 ],
                 "produces": [
                     "application/json"
                 ],
                 "tags": [
-                    "Transactions"
+                    "transactions"
                 ],
                 "summary": "Submit transaction",
                 "parameters": [
                     {
-                        "description": "Transaction request",
+                        "description": "Transaction data",
                         "name": "transaction",
                         "in": "body",
                         "required": true,
                         "schema": {
-                            "$ref": "#/definitions/main.TransactionRequest"
+                            "$ref": "#/definitions/fiber.TransactionRequest"
                         }
                     },
                     {
                         "type": "string",
-                        "description": "Webhook callback URL",
+                        "description": "URL for status callbacks",
                         "name": "X-CallbackUrl",
                         "in": "header"
                     },
                     {
                         "type": "string",
-                        "description": "Callback token for SSE/webhook auth",
+                        "description": "Token for SSE event filtering",
                         "name": "X-CallbackToken",
                         "in": "header"
                     },
                     {
-                        "type": "boolean",
-                        "description": "Receive all status updates",
+                        "type": "string",
+                        "description": "Send all status updates (true/false)",
                         "name": "X-FullStatusUpdates",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Skip fee validation (true/false)",
+                        "name": "X-SkipFeeValidation",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Skip script validation (true/false)",
+                        "name": "X-SkipScriptValidation",
                         "in": "header"
                     }
                 ],
@@ -366,13 +157,19 @@ const docTemplate = `{
                     "400": {
                         "description": "Bad Request",
                         "schema": {
-                            "$ref": "#/definitions/main.ErrorResponse"
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
                         }
                     },
                     "500": {
                         "description": "Internal Server Error",
                         "schema": {
-                            "$ref": "#/definitions/main.ErrorResponse"
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
                         }
                     }
                 }
@@ -385,7 +182,7 @@ const docTemplate = `{
                     "application/json"
                 ],
                 "tags": [
-                    "Transactions"
+                    "transactions"
                 ],
                 "summary": "Get transaction status",
                 "parameters": [
@@ -407,13 +204,19 @@ const docTemplate = `{
                     "404": {
                         "description": "Not Found",
                         "schema": {
-                            "$ref": "#/definitions/main.ErrorResponse"
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
                         }
                     },
                     "500": {
                         "description": "Internal Server Error",
                         "schema": {
-                            "$ref": "#/definitions/main.ErrorResponse"
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
                         }
                     }
                 }
@@ -421,7 +224,7 @@ const docTemplate = `{
         },
         "/txs": {
             "post": {
-                "description": "Submit multiple raw transactions for broadcast",
+                "description": "Submit multiple transactions for broadcast",
                 "consumes": [
                     "application/json"
                 ],
@@ -429,7 +232,7 @@ const docTemplate = `{
                     "application/json"
                 ],
                 "tags": [
-                    "Transactions"
+                    "transactions"
                 ],
                 "summary": "Submit multiple transactions",
                 "parameters": [
@@ -441,9 +244,21 @@ const docTemplate = `{
                         "schema": {
                             "type": "array",
                             "items": {
-                                "$ref": "#/definitions/main.TransactionRequest"
+                                "$ref": "#/definitions/fiber.TransactionRequest"
                             }
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "Skip fee validation (true/false)",
+                        "name": "X-SkipFeeValidation",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Skip script validation (true/false)",
+                        "name": "X-SkipScriptValidation",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -459,7 +274,226 @@ const docTemplate = `{
                     "400": {
                         "description": "Bad Request",
                         "schema": {
-                            "$ref": "#/definitions/main.ErrorResponse"
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/v2/header/hash/{hash}": {
+            "get": {
+                "description": "Returns a block header with the specified hash",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "chaintracks"
+                ],
+                "summary": "Get header by hash",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Block hash (hex)",
+                        "name": "hash",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/chaintracks.BlockHeader"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/fiber.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/fiber.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/v2/header/height/{height}": {
+            "get": {
+                "description": "Returns a block header at the specified height",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "chaintracks"
+                ],
+                "summary": "Get header by height",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Block height",
+                        "name": "height",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/chaintracks.BlockHeader"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/fiber.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/fiber.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/v2/headers": {
+            "get": {
+                "description": "Returns block headers starting from height as binary data (80 bytes per header)",
+                "produces": [
+                    "application/octet-stream"
+                ],
+                "tags": [
+                    "chaintracks"
+                ],
+                "summary": "Get multiple headers",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Starting block height",
+                        "name": "height",
+                        "in": "query",
+                        "required": true
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Number of headers to return",
+                        "name": "count",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Concatenated 80-byte headers",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/fiber.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/v2/height": {
+            "get": {
+                "description": "Returns the current blockchain height",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "chaintracks"
+                ],
+                "summary": "Get chain height",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/fiber.HeightResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/v2/network": {
+            "get": {
+                "description": "Returns the Bitcoin network this service is connected to",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "chaintracks"
+                ],
+                "summary": "Get network name",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/fiber.NetworkResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/fiber.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/v2/tip": {
+            "get": {
+                "description": "Returns the current chain tip block header",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "chaintracks"
+                ],
+                "summary": "Get chain tip",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/chaintracks.BlockHeader"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/fiber.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/v2/tip/stream": {
+            "get": {
+                "description": "Server-Sent Events stream of chain tip updates. Sends the current tip immediately, then broadcasts new tips as they arrive.",
+                "produces": [
+                    "text/event-stream"
+                ],
+                "tags": [
+                    "chaintracks"
+                ],
+                "summary": "Stream chain tip updates",
+                "responses": {
+                    "200": {
+                        "description": "SSE stream of BlockHeader JSON objects",
+                        "schema": {
+                            "type": "string"
                         }
                     }
                 }
@@ -467,7 +501,7 @@ const docTemplate = `{
         }
     },
     "definitions": {
-        "arcade.BlockHeader": {
+        "chaintracks.BlockHeader": {
             "type": "object",
             "properties": {
                 "bits": {
@@ -481,6 +515,7 @@ const docTemplate = `{
                     }
                 },
                 "height": {
+                    "description": "Block height in the chain",
                     "type": "integer"
                 },
                 "merkleRoot": {
@@ -511,17 +546,16 @@ const docTemplate = `{
                 }
             }
         },
-        "main.ErrorResponse": {
-            "description": "Error response",
+        "fiber.ErrorResponse": {
             "type": "object",
             "properties": {
                 "error": {
                     "type": "string",
-                    "example": "Invalid request"
+                    "example": "Header not found"
                 }
             }
         },
-        "main.FeeAmount": {
+        "fiber.FeeAmount": {
             "type": "object",
             "properties": {
                 "bytes": {
@@ -532,17 +566,7 @@ const docTemplate = `{
                 }
             }
         },
-        "main.HeadersResponse": {
-            "description": "Concatenated raw headers in hex",
-            "type": "object",
-            "properties": {
-                "headers": {
-                    "type": "string",
-                    "example": "0100000000000000..."
-                }
-            }
-        },
-        "main.HealthResponse": {
+        "fiber.HealthResponse": {
             "type": "object",
             "properties": {
                 "healthy": {
@@ -556,27 +580,25 @@ const docTemplate = `{
                 }
             }
         },
-        "main.HeightResponse": {
-            "description": "Current blockchain height",
+        "fiber.HeightResponse": {
             "type": "object",
             "properties": {
                 "height": {
                     "type": "integer",
-                    "example": 873421
+                    "example": 874123
                 }
             }
         },
-        "main.NetworkResponse": {
-            "description": "Network name response",
+        "fiber.NetworkResponse": {
             "type": "object",
             "properties": {
                 "network": {
                     "type": "string",
-                    "example": "main"
+                    "example": "mainnet"
                 }
             }
         },
-        "main.PolicyResponse": {
+        "fiber.PolicyResponse": {
             "type": "object",
             "properties": {
                 "maxscriptsizepolicy": {
@@ -589,15 +611,16 @@ const docTemplate = `{
                     "type": "integer"
                 },
                 "miningFee": {
-                    "$ref": "#/definitions/main.FeeAmount"
+                    "$ref": "#/definitions/fiber.FeeAmount"
                 }
             }
         },
-        "main.TransactionRequest": {
+        "fiber.TransactionRequest": {
             "type": "object",
             "properties": {
                 "rawTx": {
-                    "type": "string"
+                    "type": "string",
+                    "example": "0100000001..."
                 }
             }
         },
@@ -679,7 +702,7 @@ var SwaggerInfo = &swag.Spec{
 	BasePath:         "/",
 	Schemes:          []string{},
 	Title:            "Arcade API",
-	Description:      "BSV transaction broadcast service with ARC-compatible endpoints and blockchain header queries.",
+	Description:      "BSV transaction broadcast service with ARC-compatible endpoints.",
 	InfoInstanceName: "swagger",
 	SwaggerTemplate:  docTemplate,
 	LeftDelim:        "{{",

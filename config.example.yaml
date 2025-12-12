@@ -1,66 +1,43 @@
-# Arcade Configuration Example
-# Copy this file to config.yaml and modify as needed
+# Arcade Server Configuration
 # Environment variables can override any setting using ARCADE_ prefix
 # Example: ARCADE_SERVER_ADDRESS=:9090 overrides server.address
 
-# API Server Configuration
+network: main
+storage_path: ~/.arcade
+
 server:
-  address: ":8080"
-  readTimeout: 30s
-  writeTimeout: 30s
-  shutdownTimeout: 10s
-
-  # Transaction submission headers:
-  # - X-CallbackUrl: Webhook URL for status notifications (optional)
-  # - X-CallbackToken: Token for both webhook auth AND SSE streaming (optional)
-  # - X-FullStatusUpdates: Receive all status updates vs. final only (default: false)
-  # - X-WaitFor: Status to wait for before returning (default: SENT_TO_NETWORK)
-  # - X-MaxTimeout: Max seconds to wait (default: 5, max: 30)
-
-  # SSE Endpoint:
-  # GET /v1/events/{callbackToken}
-  # - Streams real-time status updates for all transactions with matching callback token
-  # - Supports catchup via Last-Event-ID header (nanosecond timestamp)
-  # - Standard EventSource API compatible
-  #
-  # Example:
-  # 1. Submit transaction with X-CallbackToken: "my-unique-token"
-  # 2. Connect SSE client: GET /v1/events/my-unique-token
-  # 3. Receive events: id: {nanos}\nevent: status\ndata: {...}
-  # 4. On reconnect, browser sends Last-Event-ID for catchup
+  address: ":3011"
+  read_timeout: 30s
+  write_timeout: 30s
+  shutdown_timeout: 10s
 
 database:
-  type: "sqlite"  # or "postgres"
-  sqlitePath: "./arcade.db"
-  # postgresConnStr: "host=localhost port=5432 user=arcade password=secret dbname=arcade sslmode=disable"
+  type: sqlite
+  sqlite_path: ~/.arcade/arcade.db
 
 events:
-  type: "memory"  # or "redis"
-  bufferSize: 1000
-  # redisURL: "redis://localhost:6379/0"
+  type: memory
+  buffer_size: 1000
 
 teranode:
-  baseURL: "http://localhost:8080"
+  # base_url: Set via ARCADE_TERANODE_BASE_URL environment variable
   timeout: 30s
 
-p2p:
-  processName: "arcade"
-  listenAddresses: []
-  port: 9999
-  bootstrapAddresses: []
-  staticPeers: []
-  topicPrefix: "mainnet"  # or "testnet", "stn"
-  privateKey: ""  # Leave empty to generate random key
-
 validator:
-  maxTxSize: 4294967296  # 4 GB
-  maxScriptSize: 500000
-  maxSigOps: 4294967295
-  minFeePerKB: 50
+  max_tx_size: 4294967296
+  max_script_size: 500000
+  max_sig_ops: 4294967295
+  min_fee_per_kb: 50
 
-rebroadcaster:
-  frequentInterval: 1m
-  frequentMinAge: 30s
-  frequentMaxRetries: 20
-  blockBasedMaxRetries: 100
-  batchSize: 100
+auth:
+  enabled: false
+
+webhook:
+  prune_interval: 1h
+  max_age: 24h
+  max_retries: 10
+
+chaintracks:
+  # Arcade always runs chaintracks in embedded mode using its P2P client
+  storage_path: ~/.arcade/chaintracks
+  # bootstrap_url: https://example.com/headers.bin  # Optional: URL for initial header sync
