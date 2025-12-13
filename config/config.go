@@ -148,7 +148,9 @@ type Services struct {
 }
 
 // Initialize creates and returns all application services.
-func (c *Config) Initialize(ctx context.Context, logger *slog.Logger) (*Services, error) {
+// If chaintracker is provided, it will be used instead of creating a new one.
+// This allows the caller to share a Chaintracks instance across services.
+func (c *Config) Initialize(ctx context.Context, logger *slog.Logger, chaintracker chaintracks.Chaintracks) (*Services, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -223,17 +225,6 @@ func (c *Config) Initialize(ctx context.Context, logger *slog.Logger) (*Services
 		MinFeePerKB:             c.Validator.MinFeePerKB,
 	})
 
-	// Initialize P2P client
-	logger.Info("Initializing P2P client")
-	c.P2P.Network = c.Network
-	if c.P2P.StoragePath == "" {
-		c.P2P.StoragePath = c.StoragePath
-	}
-	p2pClient, err := c.P2P.Initialize(ctx, "arcade")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create P2P client: %w", err)
-	}
-
 	// Initialize transaction tracker
 	logger.Info("Initializing transaction tracker")
 	txTracker := store.NewTxTracker()
@@ -244,15 +235,32 @@ func (c *Config) Initialize(ctx context.Context, logger *slog.Logger) (*Services
 		logger.Info("Loaded tracked transactions", slog.Int("count", trackedCount))
 	}
 
-	// Initialize Chaintracks (always embedded, sharing arcade's P2P client)
-	logger.Info("Initializing Chaintracks")
-	if c.Chaintracks.StoragePath == "" {
-		c.Chaintracks.StoragePath = path.Join(c.StoragePath, "chaintracks")
-	}
-	chaintracker, err := c.Chaintracks.Initialize(ctx, "arcade", p2pClient)
-	if err != nil {
-		_ = p2pClient.Close()
-		return nil, fmt.Errorf("failed to initialize chaintracks: %w", err)
+	// Use provided Chaintracks or create one
+	var p2pClient *p2p.Client
+	if chaintracker == nil {
+		// Initialize P2P client
+		logger.Info("Initializing P2P client")
+		c.P2P.Network = c.Network
+		if c.P2P.StoragePath == "" {
+			c.P2P.StoragePath = c.StoragePath
+		}
+		p2pClient, err = c.P2P.Initialize(ctx, "arcade")
+		if err != nil {
+			return nil, fmt.Errorf("failed to create P2P client: %w", err)
+		}
+
+		// Initialize Chaintracks (sharing arcade's P2P client)
+		logger.Info("Initializing Chaintracks")
+		if c.Chaintracks.StoragePath == "" {
+			c.Chaintracks.StoragePath = path.Join(c.StoragePath, "chaintracks")
+		}
+		chaintracker, err = c.Chaintracks.Initialize(ctx, "arcade", p2pClient)
+		if err != nil {
+			_ = p2pClient.Close()
+			return nil, fmt.Errorf("failed to initialize chaintracks: %w", err)
+		}
+	} else {
+		logger.Info("Using provided Chaintracks instance")
 	}
 
 	return &Services{

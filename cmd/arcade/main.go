@@ -79,8 +79,8 @@ func main() {
 }
 
 func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
-	// Initialize all services
-	services, err := cfg.Initialize(ctx, log)
+	// Initialize all services (nil for chaintracker = arcade creates its own)
+	services, err := cfg.Initialize(ctx, log, nil)
 	if err != nil {
 		return fmt.Errorf("failed to initialize services: %w", err)
 	}
