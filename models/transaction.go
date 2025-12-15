@@ -95,9 +95,20 @@ type BlockReorg struct {
 	Timestamp   time.Time
 }
 
-// NetworkState tracks the current network block height
-type NetworkState struct {
-	CurrentHeight uint64
-	LastBlockHash string
-	LastBlockTime time.Time
+// SubmitOptions contains options for transaction submission
+type SubmitOptions struct {
+	CallbackURL          string // Webhook URL for status callbacks
+	CallbackToken        string // Token for SSE event filtering
+	FullStatusUpdates    bool   // Send all status updates (not just final)
+	SkipFeeValidation    bool   // Skip fee validation
+	SkipScriptValidation bool   // Skip script validation
+}
+
+// Policy represents the transaction policy configuration
+type Policy struct {
+	MaxScriptSizePolicy     uint64 `json:"maxscriptsizepolicy"`
+	MaxTxSigOpsCountsPolicy uint64 `json:"maxtxsigopscountspolicy"`
+	MaxTxSizePolicy         uint64 `json:"maxtxsizepolicy"`
+	MiningFeeBytes          uint64 `json:"miningFeeBytes"`
+	MiningFeeSatoshis       uint64 `json:"miningFeeSatoshis"`
 }

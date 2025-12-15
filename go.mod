@@ -4,13 +4,14 @@ go 1.25.4
 
 require (
 	github.com/bsv-blockchain/go-chaintracks v0.0.0
+	github.com/bsv-blockchain/go-p2p-message-bus v0.1.7
 	github.com/bsv-blockchain/go-sdk v1.2.13
 	github.com/bsv-blockchain/go-teranode-p2p-client v0.0.0
+	github.com/bsv-blockchain/teranode v0.0.0
 	github.com/gofiber/fiber/v2 v2.52.10
 	github.com/golang-migrate/migrate/v4 v4.19.0
 	github.com/google/uuid v1.6.0
 	github.com/spf13/viper v1.21.0
-	github.com/stretchr/testify v1.11.1
 	github.com/swaggo/swag v1.16.6
 	github.com/valyala/fasthttp v1.68.0
 	modernc.org/sqlite v1.40.0
@@ -47,12 +48,10 @@ require (
 	github.com/bsv-blockchain/go-bt/v2 v2.5.1 // indirect
 	github.com/bsv-blockchain/go-chaincfg v1.4.0 // indirect
 	github.com/bsv-blockchain/go-lockfree-queue v1.0.0 // indirect
-	github.com/bsv-blockchain/go-p2p-message-bus v0.1.7 // indirect
 	github.com/bsv-blockchain/go-safe-conversion v1.1.0 // indirect
 	github.com/bsv-blockchain/go-subtree v1.1.2 // indirect
 	github.com/bsv-blockchain/go-tx-map v1.2.1 // indirect
 	github.com/bsv-blockchain/go-wire v1.0.6 // indirect
-	github.com/bsv-blockchain/teranode v0.0.0 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash v1.1.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
@@ -217,6 +216,7 @@ require (
 	github.com/spf13/cast v1.10.0 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/stretchr/objx v0.5.3 // indirect
+	github.com/stretchr/testify v1.11.1 // indirect
 	github.com/subosito/gotenv v1.6.0 // indirect
 	github.com/uber/jaeger-client-go v2.30.0+incompatible // indirect
 	github.com/uber/jaeger-lib v2.4.1+incompatible // indirect

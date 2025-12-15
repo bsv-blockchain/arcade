@@ -36,10 +36,9 @@ type Config struct {
 	Logger *slog.Logger
 
 	// Transaction tracking stores (required)
-	TxTracker       *store.TxTracker
-	StatusStore     store.StatusStore
-	SubmissionStore store.SubmissionStore
-	EventPublisher  events.Publisher
+	TxTracker      *store.TxTracker
+	Store          store.Store
+	EventPublisher events.Publisher
 }
 
 // Arcade tracks transaction statuses via P2P network messages.
@@ -50,10 +49,9 @@ type Arcade struct {
 	httpClient   *http.Client
 
 	// Transaction tracking
-	txTracker       *store.TxTracker
-	statusStore     store.StatusStore
-	submissionStore store.SubmissionStore
-	eventPublisher  events.Publisher
+	txTracker      *store.TxTracker
+	store          store.Store
+	eventPublisher events.Publisher
 
 	// Status subscribers (fan-out)
 	subMu         sync.RWMutex
@@ -79,8 +77,8 @@ func NewArcade(cfg Config) (*Arcade, error) {
 	if cfg.TxTracker == nil {
 		return nil, fmt.Errorf("TxTracker is required")
 	}
-	if cfg.StatusStore == nil {
-		return nil, fmt.Errorf("StatusStore is required")
+	if cfg.Store == nil {
+		return nil, fmt.Errorf("Store is required")
 	}
 	if cfg.EventPublisher == nil {
 		return nil, fmt.Errorf("EventPublisher is required")
@@ -91,14 +89,13 @@ func NewArcade(cfg Config) (*Arcade, error) {
 	}
 
 	return &Arcade{
-		p2pClient:       cfg.P2PClient,
-		chainTracker:    cfg.ChainTracker,
-		logger:          cfg.Logger,
-		httpClient:      &http.Client{Timeout: 30 * time.Second},
-		txTracker:       cfg.TxTracker,
-		statusStore:     cfg.StatusStore,
-		submissionStore: cfg.SubmissionStore,
-		eventPublisher:  cfg.EventPublisher,
+		p2pClient:      cfg.P2PClient,
+		chainTracker:   cfg.ChainTracker,
+		logger:         cfg.Logger,
+		httpClient:     &http.Client{Timeout: 30 * time.Second},
+		txTracker:      cfg.TxTracker,
+		store:          cfg.Store,
+		eventPublisher: cfg.EventPublisher,
 	}, nil
 }
 
@@ -219,10 +216,10 @@ func (a *Arcade) notifyStatusSubscribers(status *models.TransactionStatus) {
 }
 
 func (a *Arcade) txBelongsToToken(txid, token string) bool {
-	if a.submissionStore == nil {
+	if a.store == nil {
 		return false
 	}
-	subs, err := a.submissionStore.GetSubmissionsByToken(context.Background(), token)
+	subs, err := a.store.GetSubmissionsByToken(context.Background(), token)
 	if err != nil {
 		return false
 	}
@@ -268,7 +265,7 @@ func (a *Arcade) processBlockMessage(ctx context.Context, blockMsg teranode.Bloc
 	}
 
 	// Set MINED status for transactions with merkle proofs in this block
-	statuses, err := a.statusStore.SetMinedByBlockHash(ctx, blockMsg.Hash)
+	statuses, err := a.store.SetMinedByBlockHash(ctx, blockMsg.Hash)
 	if err != nil {
 		a.logger.Error("failed to set mined status",
 			slog.String("blockHash", blockMsg.Hash),
@@ -392,7 +389,7 @@ func (a *Arcade) buildMerklePathsForSubtree(
 		mp.ComputeMissingHashes()
 		minimalPath := a.extractMinimalPath(mp, txOffset)
 
-		if err := a.statusStore.InsertMerklePath(ctx, trackedHash.String(), blockMsg.Hash, uint64(blockMsg.Height), minimalPath.Bytes()); err != nil {
+		if err := a.store.InsertMerklePath(ctx, trackedHash.String(), blockMsg.Hash, uint64(blockMsg.Height), minimalPath.Bytes()); err != nil {
 			a.logger.Error("failed to store merkle path",
 				slog.String("txID", trackedHash.String()),
 				slog.String("blockHash", blockMsg.Hash),
@@ -430,7 +427,7 @@ func (a *Arcade) pruneConfirmedTransactions(ctx context.Context, currentHeight u
 			Status:    models.StatusImmutable,
 			Timestamp: time.Now(),
 		}
-		if err := a.statusStore.UpdateStatus(ctx, status); err != nil {
+		if err := a.store.UpdateStatus(ctx, status); err != nil {
 			a.logger.Error("failed to update immutable status",
 				slog.String("txID", txID),
 				slog.String("error", err.Error()))
@@ -487,7 +484,7 @@ func (a *Arcade) processSubtreeMessage(ctx context.Context, subtreeMsg teranode.
 			Timestamp: time.Now(),
 		}
 
-		if err := a.statusStore.UpdateStatus(ctx, status); err != nil {
+		if err := a.store.UpdateStatus(ctx, status); err != nil {
 			a.logger.Error("failed to update seen status",
 				slog.String("txID", txID),
 				slog.String("error", err.Error()))
@@ -531,7 +528,7 @@ func (a *Arcade) processRejectedTxMessage(ctx context.Context, rejectedMsg teran
 		ExtraInfo: rejectedMsg.Reason,
 	}
 
-	if err := a.statusStore.UpdateStatus(ctx, status); err != nil {
+	if err := a.store.UpdateStatus(ctx, status); err != nil {
 		a.logger.Error("failed to update rejected status",
 			slog.String("txID", rejectedMsg.TxID),
 			slog.String("error", err.Error()))

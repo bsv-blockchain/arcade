@@ -20,11 +20,11 @@ func setupTestDB(t *testing.T) (string, func()) {
 	return dbPath, cleanup
 }
 
-func TestStatusStore_InsertAndUpdate(t *testing.T) {
+func TestStore_InsertAndUpdate(t *testing.T) {
 	dbPath, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	store, err := NewStatusStore(dbPath)
+	store, err := NewStore(dbPath)
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -66,11 +66,11 @@ func TestStatusStore_InsertAndUpdate(t *testing.T) {
 	}
 }
 
-func TestStatusStore_GetStatusesSince(t *testing.T) {
+func TestStore_GetStatusesSince(t *testing.T) {
 	dbPath, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	store, err := NewStatusStore(dbPath)
+	store, err := NewStore(dbPath)
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -113,11 +113,11 @@ func TestStatusStore_GetStatusesSince(t *testing.T) {
 	}
 }
 
-func TestStatusStore_WithBlockData(t *testing.T) {
+func TestStore_WithBlockData(t *testing.T) {
 	dbPath, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	store, err := NewStatusStore(dbPath)
+	store, err := NewStore(dbPath)
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -217,11 +217,11 @@ func TestStatusStore_WithBlockData(t *testing.T) {
 	}
 }
 
-func TestSubmissionStore_InsertAndGet(t *testing.T) {
+func TestStore_InsertAndGetSubmission(t *testing.T) {
 	dbPath, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	store, err := NewSubmissionStore(dbPath)
+	store, err := NewStore(dbPath)
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -267,11 +267,11 @@ func TestSubmissionStore_InsertAndGet(t *testing.T) {
 	}
 }
 
-func TestSubmissionStore_UpdateDeliveryStatus(t *testing.T) {
+func TestStore_UpdateDeliveryStatus(t *testing.T) {
 	dbPath, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	store, err := NewSubmissionStore(dbPath)
+	store, err := NewStore(dbPath)
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -322,11 +322,11 @@ func TestSubmissionStore_UpdateDeliveryStatus(t *testing.T) {
 	}
 }
 
-func TestSubmissionStore_MultipleSubmissions(t *testing.T) {
+func TestStore_MultipleSubmissions(t *testing.T) {
 	dbPath, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	store, err := NewSubmissionStore(dbPath)
+	store, err := NewStore(dbPath)
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}

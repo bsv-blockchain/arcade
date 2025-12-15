@@ -38,22 +38,6 @@ definitions:
         example: Header not found
         type: string
     type: object
-  fiber.FeeAmount:
-    properties:
-      bytes:
-        type: integer
-      satoshis:
-        type: integer
-    type: object
-  fiber.HealthResponse:
-    properties:
-      healthy:
-        type: boolean
-      reason:
-        type: string
-      version:
-        type: string
-    type: object
   fiber.HeightResponse:
     properties:
       height:
@@ -66,7 +50,13 @@ definitions:
         example: mainnet
         type: string
     type: object
-  fiber.PolicyResponse:
+  fiber.TransactionRequest:
+    properties:
+      rawTx:
+        example: 0100000001...
+        type: string
+    type: object
+  models.Policy:
     properties:
       maxscriptsizepolicy:
         type: integer
@@ -74,14 +64,10 @@ definitions:
         type: integer
       maxtxsizepolicy:
         type: integer
-      miningFee:
-        $ref: '#/definitions/fiber.FeeAmount'
-    type: object
-  fiber.TransactionRequest:
-    properties:
-      rawTx:
-        example: 0100000001...
-        type: string
+      miningFeeBytes:
+        type: integer
+      miningFeeSatoshis:
+        type: integer
     type: object
   models.Status:
     enum:
@@ -139,15 +125,14 @@ info:
   title: Arcade API
   version: 0.1.0
 paths:
-  /events/{callbackToken}:
+  /arc/events:
     get:
-      description: Server-Sent Events stream of transaction status updates for transactions
-        associated with the callback token
+      description: Server-Sent Events stream of transaction status updates. If callbackToken
+        is provided, only events for that token are streamed.
       parameters:
       - description: Callback token from transaction submission
-        in: path
+        in: query
         name: callbackToken
-        required: true
         type: string
       produces:
       - text/event-stream
@@ -158,21 +143,8 @@ paths:
             type: string
       summary: Stream transaction events
       tags:
-      - transactions
-  /health:
-    get:
-      description: Returns the health status of the service
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/fiber.HealthResponse'
-      summary: Health check
-      tags:
-      - info
-  /policy:
+      - arcade
+  /arc/policy:
     get:
       description: Returns the transaction policy configuration including fee rates
         and limits
@@ -182,11 +154,11 @@ paths:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/fiber.PolicyResponse'
+            $ref: '#/definitions/models.Policy'
       summary: Get policy
       tags:
-      - info
-  /tx:
+      - arcade
+  /arc/tx:
     post:
       consumes:
       - application/json
@@ -242,8 +214,8 @@ paths:
             type: object
       summary: Submit transaction
       tags:
-      - transactions
-  /tx/{txid}:
+      - arcade
+  /arc/tx/{txid}:
     get:
       description: Get the current status of a submitted transaction
       parameters:
@@ -273,8 +245,8 @@ paths:
             type: object
       summary: Get transaction status
       tags:
-      - transactions
-  /txs:
+      - arcade
+  /arc/txs:
     post:
       consumes:
       - application/json
@@ -288,6 +260,18 @@ paths:
           items:
             $ref: '#/definitions/fiber.TransactionRequest'
           type: array
+      - description: URL for status callbacks
+        in: header
+        name: X-CallbackUrl
+        type: string
+      - description: Token for SSE event filtering
+        in: header
+        name: X-CallbackToken
+        type: string
+      - description: Send all status updates (true/false)
+        in: header
+        name: X-FullStatusUpdates
+        type: string
       - description: Skip fee validation (true/false)
         in: header
         name: X-SkipFeeValidation
@@ -313,8 +297,8 @@ paths:
             type: object
       summary: Submit multiple transactions
       tags:
-      - transactions
-  /v2/header/hash/{hash}:
+      - arcade
+  /block/header/hash/{hash}:
     get:
       description: Returns a block header with the specified hash
       parameters:
@@ -341,7 +325,7 @@ paths:
       summary: Get header by hash
       tags:
       - chaintracks
-  /v2/header/height/{height}:
+  /block/header/height/{height}:
     get:
       description: Returns a block header at the specified height
       parameters:
@@ -368,7 +352,7 @@ paths:
       summary: Get header by height
       tags:
       - chaintracks
-  /v2/headers:
+  /block/headers:
     get:
       description: Returns block headers starting from height as binary data (80 bytes
         per header)
@@ -397,7 +381,7 @@ paths:
       summary: Get multiple headers
       tags:
       - chaintracks
-  /v2/height:
+  /block/height:
     get:
       description: Returns the current blockchain height
       produces:
@@ -410,7 +394,7 @@ paths:
       summary: Get chain height
       tags:
       - chaintracks
-  /v2/network:
+  /block/network:
     get:
       description: Returns the Bitcoin network this service is connected to
       produces:
@@ -427,7 +411,7 @@ paths:
       summary: Get network name
       tags:
       - chaintracks
-  /v2/tip:
+  /block/tip:
     get:
       description: Returns the current chain tip block header
       produces:
@@ -444,7 +428,7 @@ paths:
       summary: Get chain tip
       tags:
       - chaintracks
-  /v2/tip/stream:
+  /block/tip/stream:
     get:
       description: Server-Sent Events stream of chain tip updates. Sends the current
         tip immediately, then broadcasts new tips as they arrive.
@@ -458,6 +442,23 @@ paths:
       summary: Stream chain tip updates
       tags:
       - chaintracks
+  /health:
+    get:
+      description: Returns the health status of the service
+      produces:
+      - text/plain
+      responses:
+        "200":
+          description: OK
+          schema:
+            type: string
+        "503":
+          description: Service Unavailable
+          schema:
+            type: string
+      summary: Health check
+      tags:
+      - arcade
 securityDefinitions:
   BearerAuth:
     description: Bearer token authentication

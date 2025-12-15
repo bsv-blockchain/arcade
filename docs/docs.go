@@ -22,14 +22,14 @@ const docTemplate = `{
     "host": "{{.Host}}",
     "basePath": "{{.BasePath}}",
     "paths": {
-        "/events/{callbackToken}": {
+        "/arc/events": {
             "get": {
-                "description": "Server-Sent Events stream of transaction status updates for transactions associated with the callback token",
+                "description": "Server-Sent Events stream of transaction status updates. If callbackToken is provided, only events for that token are streamed.",
                 "produces": [
                     "text/event-stream"
                 ],
                 "tags": [
-                    "transactions"
+                    "arcade"
                 ],
                 "summary": "Stream transaction events",
                 "parameters": [
@@ -37,8 +37,7 @@ const docTemplate = `{
                         "type": "string",
                         "description": "Callback token from transaction submission",
                         "name": "callbackToken",
-                        "in": "path",
-                        "required": true
+                        "in": "query"
                     }
                 ],
                 "responses": {
@@ -51,47 +50,27 @@ const docTemplate = `{
                 }
             }
         },
-        "/health": {
-            "get": {
-                "description": "Returns the health status of the service",
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "info"
-                ],
-                "summary": "Health check",
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "$ref": "#/definitions/fiber.HealthResponse"
-                        }
-                    }
-                }
-            }
-        },
-        "/policy": {
+        "/arc/policy": {
             "get": {
                 "description": "Returns the transaction policy configuration including fee rates and limits",
                 "produces": [
                     "application/json"
                 ],
                 "tags": [
-                    "info"
+                    "arcade"
                 ],
                 "summary": "Get policy",
                 "responses": {
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/fiber.PolicyResponse"
+                            "$ref": "#/definitions/models.Policy"
                         }
                     }
                 }
             }
         },
-        "/tx": {
+        "/arc/tx": {
             "post": {
                 "description": "Submit a single transaction for broadcast. Accepts raw transaction bytes, hex string, or JSON with rawTx field.",
                 "consumes": [
@@ -103,7 +82,7 @@ const docTemplate = `{
                     "application/json"
                 ],
                 "tags": [
-                    "transactions"
+                    "arcade"
                 ],
                 "summary": "Submit transaction",
                 "parameters": [
@@ -175,14 +154,14 @@ const docTemplate = `{
                 }
             }
         },
-        "/tx/{txid}": {
+        "/arc/tx/{txid}": {
             "get": {
                 "description": "Get the current status of a submitted transaction",
                 "produces": [
                     "application/json"
                 ],
                 "tags": [
-                    "transactions"
+                    "arcade"
                 ],
                 "summary": "Get transaction status",
                 "parameters": [
@@ -222,7 +201,7 @@ const docTemplate = `{
                 }
             }
         },
-        "/txs": {
+        "/arc/txs": {
             "post": {
                 "description": "Submit multiple transactions for broadcast",
                 "consumes": [
@@ -232,7 +211,7 @@ const docTemplate = `{
                     "application/json"
                 ],
                 "tags": [
-                    "transactions"
+                    "arcade"
                 ],
                 "summary": "Submit multiple transactions",
                 "parameters": [
@@ -247,6 +226,24 @@ const docTemplate = `{
                                 "$ref": "#/definitions/fiber.TransactionRequest"
                             }
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "URL for status callbacks",
+                        "name": "X-CallbackUrl",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Token for SSE event filtering",
+                        "name": "X-CallbackToken",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Send all status updates (true/false)",
+                        "name": "X-FullStatusUpdates",
+                        "in": "header"
                     },
                     {
                         "type": "string",
@@ -283,7 +280,7 @@ const docTemplate = `{
                 }
             }
         },
-        "/v2/header/hash/{hash}": {
+        "/block/header/hash/{hash}": {
             "get": {
                 "description": "Returns a block header with the specified hash",
                 "produces": [
@@ -324,7 +321,7 @@ const docTemplate = `{
                 }
             }
         },
-        "/v2/header/height/{height}": {
+        "/block/header/height/{height}": {
             "get": {
                 "description": "Returns a block header at the specified height",
                 "produces": [
@@ -365,7 +362,7 @@ const docTemplate = `{
                 }
             }
         },
-        "/v2/headers": {
+        "/block/headers": {
             "get": {
                 "description": "Returns block headers starting from height as binary data (80 bytes per header)",
                 "produces": [
@@ -407,7 +404,7 @@ const docTemplate = `{
                 }
             }
         },
-        "/v2/height": {
+        "/block/height": {
             "get": {
                 "description": "Returns the current blockchain height",
                 "produces": [
@@ -427,7 +424,7 @@ const docTemplate = `{
                 }
             }
         },
-        "/v2/network": {
+        "/block/network": {
             "get": {
                 "description": "Returns the Bitcoin network this service is connected to",
                 "produces": [
@@ -453,7 +450,7 @@ const docTemplate = `{
                 }
             }
         },
-        "/v2/tip": {
+        "/block/tip": {
             "get": {
                 "description": "Returns the current chain tip block header",
                 "produces": [
@@ -479,7 +476,7 @@ const docTemplate = `{
                 }
             }
         },
-        "/v2/tip/stream": {
+        "/block/tip/stream": {
             "get": {
                 "description": "Server-Sent Events stream of chain tip updates. Sends the current tip immediately, then broadcasts new tips as they arrive.",
                 "produces": [
@@ -492,6 +489,32 @@ const docTemplate = `{
                 "responses": {
                     "200": {
                         "description": "SSE stream of BlockHeader JSON objects",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/health": {
+            "get": {
+                "description": "Returns the health status of the service",
+                "produces": [
+                    "text/plain"
+                ],
+                "tags": [
+                    "arcade"
+                ],
+                "summary": "Health check",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "503": {
+                        "description": "Service Unavailable",
                         "schema": {
                             "type": "string"
                         }
@@ -555,31 +578,6 @@ const docTemplate = `{
                 }
             }
         },
-        "fiber.FeeAmount": {
-            "type": "object",
-            "properties": {
-                "bytes": {
-                    "type": "integer"
-                },
-                "satoshis": {
-                    "type": "integer"
-                }
-            }
-        },
-        "fiber.HealthResponse": {
-            "type": "object",
-            "properties": {
-                "healthy": {
-                    "type": "boolean"
-                },
-                "reason": {
-                    "type": "string"
-                },
-                "version": {
-                    "type": "string"
-                }
-            }
-        },
         "fiber.HeightResponse": {
             "type": "object",
             "properties": {
@@ -598,7 +596,16 @@ const docTemplate = `{
                 }
             }
         },
-        "fiber.PolicyResponse": {
+        "fiber.TransactionRequest": {
+            "type": "object",
+            "properties": {
+                "rawTx": {
+                    "type": "string",
+                    "example": "0100000001..."
+                }
+            }
+        },
+        "models.Policy": {
             "type": "object",
             "properties": {
                 "maxscriptsizepolicy": {
@@ -610,17 +617,11 @@ const docTemplate = `{
                 "maxtxsizepolicy": {
                     "type": "integer"
                 },
-                "miningFee": {
-                    "$ref": "#/definitions/fiber.FeeAmount"
-                }
-            }
-        },
-        "fiber.TransactionRequest": {
-            "type": "object",
-            "properties": {
-                "rawTx": {
-                    "type": "string",
-                    "example": "0100000001..."
+                "miningFeeBytes": {
+                    "type": "integer"
+                },
+                "miningFeeSatoshis": {
+                    "type": "integer"
                 }
             }
         },

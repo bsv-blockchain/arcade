@@ -16,31 +16,28 @@ import (
 
 // WebhookHandler handles webhook delivery for transaction status updates
 type WebhookHandler struct {
-	eventPublisher  events.Publisher
-	submissionStore store.SubmissionStore
-	statusStore     store.StatusStore
-	httpClient      *http.Client
-	logger          *slog.Logger
-	stopCh          chan struct{}
-	pruneInterval   time.Duration
-	maxAge          time.Duration
-	maxRetries      int
+	eventPublisher events.Publisher
+	store          store.Store
+	httpClient     *http.Client
+	logger         *slog.Logger
+	stopCh         chan struct{}
+	pruneInterval  time.Duration
+	maxAge         time.Duration
+	maxRetries     int
 }
 
 // NewWebhookHandler creates a new webhook handler
 func NewWebhookHandler(
 	eventPublisher events.Publisher,
-	submissionStore store.SubmissionStore,
-	statusStore store.StatusStore,
+	store store.Store,
 	logger *slog.Logger,
 	pruneInterval time.Duration,
 	maxAge time.Duration,
 	maxRetries int,
 ) *WebhookHandler {
 	return &WebhookHandler{
-		eventPublisher:  eventPublisher,
-		submissionStore: submissionStore,
-		statusStore:     statusStore,
+		eventPublisher: eventPublisher,
+		store:          store,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -95,7 +92,7 @@ func (h *WebhookHandler) processEvents(ctx context.Context, eventCh <-chan *mode
 
 // handleStatus handles a single status update
 func (h *WebhookHandler) handleStatus(ctx context.Context, status *models.TransactionStatus) {
-	submissions, err := h.submissionStore.GetSubmissionsByTxID(ctx, status.TxID)
+	submissions, err := h.store.GetSubmissionsByTxID(ctx, status.TxID)
 	if err != nil {
 		h.logger.Error("Failed to get submissions",
 			slog.String("txid", status.TxID),
@@ -180,7 +177,7 @@ func (h *WebhookHandler) deliverWebhook(ctx context.Context, sub models.Submissi
 			slog.String("status", string(status.Status)),
 			slog.Int("http_status", resp.StatusCode))
 
-		if err := h.submissionStore.UpdateDeliveryStatus(ctx, sub.SubmissionID, status.Status, 0, nil); err != nil {
+		if err := h.store.UpdateDeliveryStatus(ctx, sub.SubmissionID, status.Status, 0, nil); err != nil {
 			h.logger.Error("Failed to update submission after successful delivery",
 				slog.String("submission_id", sub.SubmissionID),
 				slog.String("error", err.Error()))
@@ -199,7 +196,7 @@ func (h *WebhookHandler) scheduleRetry(ctx context.Context, sub models.Submissio
 	retryCount := sub.RetryCount + 1
 	nextRetry := time.Now().Add(time.Duration(retryCount) * time.Minute)
 
-	if err := h.submissionStore.UpdateDeliveryStatus(ctx, sub.SubmissionID, sub.LastDeliveredStatus, retryCount, &nextRetry); err != nil {
+	if err := h.store.UpdateDeliveryStatus(ctx, sub.SubmissionID, sub.LastDeliveredStatus, retryCount, &nextRetry); err != nil {
 		h.logger.Error("Failed to schedule retry",
 			slog.String("submission_id", sub.SubmissionID),
 			slog.String("error", err.Error()))

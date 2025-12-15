@@ -29,7 +29,6 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/bsv-blockchain/arcade"
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/docs"
 	"github.com/bsv-blockchain/arcade/handlers"
@@ -79,43 +78,28 @@ func main() {
 }
 
 func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
-	// Initialize all services (nil for chaintracker = arcade creates its own)
-	services, err := cfg.Initialize(ctx, log, nil)
+	// Initialize all services (nil for chaintracker and p2pClient = arcade creates its own)
+	services, err := cfg.Initialize(ctx, log, nil, nil)
 	if err != nil {
 		return fmt.Errorf("failed to initialize services: %w", err)
 	}
+	defer func() {
+		if err := services.Close(); err != nil {
+			log.Error("Error closing services", slog.String("error", err.Error()))
+		}
+	}()
 
 	// Subscribe to chaintracks tip updates
 	tipChan := services.Chaintracks.Subscribe(ctx)
 
-	chaintracksRoutes := chaintracksRoutes.NewRoutes(services.Chaintracks)
-	chaintracksRoutes.StartBroadcasting(ctx, tipChan)
-
-	// Initialize Arcade
-	log.Info("Initializing Arcade")
-	arcadeInstance, err := arcade.NewArcade(arcade.Config{
-		P2PClient:       services.P2PClient,
-		ChainTracker:    services.Chaintracks,
-		Logger:          log,
-		TxTracker:       services.TxTracker,
-		StatusStore:     services.StatusStore,
-		SubmissionStore: services.SubmissionStore,
-		EventPublisher:  services.EventPublisher,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create arcade: %w", err)
-	}
-
-	if err := arcadeInstance.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start arcade: %w", err)
-	}
+	ctRoutes := chaintracksRoutes.NewRoutes(services.Chaintracks)
+	ctRoutes.StartBroadcasting(ctx, tipChan)
 
 	// Initialize webhook handler
 	log.Info("Initializing webhook handler")
 	webhookHandler := handlers.NewWebhookHandler(
 		services.EventPublisher,
-		services.SubmissionStore,
-		services.StatusStore,
+		services.Store,
 		log,
 		cfg.Webhook.PruneInterval,
 		cfg.Webhook.MaxAge,
@@ -125,26 +109,15 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	if err := webhookHandler.Start(ctx); err != nil {
 		return fmt.Errorf("failed to start webhook handler: %w", err)
 	}
+	defer webhookHandler.Stop()
 
 	// Setup routes
 	arcadeRoutes := fiberRoutes.NewRoutes(fiberRoutes.Config{
-		StatusStore:     services.StatusStore,
-		SubmissionStore: services.SubmissionStore,
-		TxTracker:       services.TxTracker,
-		EventPublisher:  services.EventPublisher,
-		TeranodeClient:  services.TeranodeClient,
-		TxValidator:     services.Validator,
-		Arcade:          arcadeInstance,
-		Policy: &fiberRoutes.PolicyResponse{
-			MaxTxSizePolicy:         uint64(cfg.Validator.MaxTxSize),
-			MaxTxSigOpsCountsPolicy: uint64(cfg.Validator.MaxSigOps),
-			MaxScriptSizePolicy:     uint64(cfg.Validator.MaxScriptSize),
-			MiningFee: fiberRoutes.FeeAmount{
-				Bytes:    1000,
-				Satoshis: cfg.Validator.MinFeePerKB,
-			},
-		},
-		Logger: log,
+		Service:        services.ArcadeService,
+		Store:          services.Store,
+		EventPublisher: services.EventPublisher,
+		Arcade:         services.Arcade,
+		Logger:         log,
 	})
 
 	if cfg.Auth.Enabled {
@@ -153,11 +126,11 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	}
 
 	// Setup dashboard
-	dashboard := NewDashboard(arcadeInstance)
+	dashboard := NewDashboard(services.Arcade)
 
 	// Setup and start HTTP server
 	log.Info("Starting HTTP server", slog.String("address", cfg.Server.Address))
-	app := setupServer(arcadeRoutes, chaintracksRoutes, dashboard)
+	app := setupServer(arcadeRoutes, ctRoutes, dashboard)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -192,22 +165,6 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		log.Error("Error during server shutdown", slog.String("error", err.Error()))
 	}
 
-	webhookHandler.Stop()
-
-	if err := arcadeInstance.Stop(); err != nil {
-		log.Error("Error stopping arcade", slog.String("error", err.Error()))
-	}
-
-	// Chaintracks cleanup happens via context cancellation
-
-	if err := services.P2PClient.Close(); err != nil {
-		log.Error("Error closing P2P client", slog.String("error", err.Error()))
-	}
-
-	if err := services.EventPublisher.Close(); err != nil {
-		log.Error("Error closing event publisher", slog.String("error", err.Error()))
-	}
-
 	log.Info("Shutdown complete")
 	return nil
 }
@@ -233,6 +190,9 @@ func setupServer(arcadeRoutes *fiberRoutes.Routes, chaintracksRoutes *chaintrack
 
 	// Transaction endpoints (ARC-compatible)
 	arcadeRoutes.Register(app)
+
+	// Health check (standalone arcade server only)
+	app.Get("/health", arcadeRoutes.HandleGetHealth)
 
 	// Chaintracks endpoints (under /v2 prefix)
 	chaintracksGroup := app.Group("/v2")

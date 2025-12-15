@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
 	_ "modernc.org/sqlite"
 )
 
@@ -66,24 +65,15 @@ CREATE INDEX IF NOT EXISTS idx_submissions_txid ON submissions(txid);
 CREATE INDEX IF NOT EXISTS idx_submissions_callback_token ON submissions(callback_token);
 CREATE INDEX IF NOT EXISTS idx_next_retry ON submissions(next_retry_at);
 `
-
-	createNetworkStateTable = `
-CREATE TABLE IF NOT EXISTS network_state (
-	id INTEGER PRIMARY KEY CHECK (id = 1),
-	current_height INTEGER NOT NULL,
-	last_block_hash TEXT NOT NULL,
-	last_block_time DATETIME NOT NULL
-);
-`
 )
 
-// StatusStore implements store.StatusStore using SQLite
-type StatusStore struct {
+// Store implements store.StatusStore and store.SubmissionStore using SQLite
+type Store struct {
 	db *sql.DB
 }
 
-// NewStatusStore creates a new SQLite status store
-func NewStatusStore(dbPath string) (store.StatusStore, error) {
+// NewStore creates a new unified SQLite store
+func NewStore(dbPath string) (*Store, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
@@ -105,10 +95,16 @@ func NewStatusStore(dbPath string) (store.StatusStore, error) {
 		return nil, fmt.Errorf("failed to initialize merkle_paths schema: %w", err)
 	}
 
-	return &StatusStore{db: db}, nil
+	if err := initializeSchema(db, createSubmissionsTable); err != nil {
+		return nil, fmt.Errorf("failed to initialize submissions schema: %w", err)
+	}
+
+	return &Store{db: db}, nil
 }
 
-func (s *StatusStore) InsertStatus(ctx context.Context, status *models.TransactionStatus) error {
+// StatusStore methods
+
+func (s *Store) InsertStatus(ctx context.Context, status *models.TransactionStatus) error {
 	if status.CreatedAt.IsZero() {
 		status.CreatedAt = time.Now()
 	}
@@ -132,7 +128,7 @@ VALUES (?, ?, ?, ?, ?, ?)
 	return nil
 }
 
-func (s *StatusStore) UpdateStatus(ctx context.Context, status *models.TransactionStatus) error {
+func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStatus) error {
 	disallowed := status.Status.DisallowedPreviousStatuses()
 
 	var query string
@@ -202,7 +198,7 @@ WHERE txid = ?
 	return nil
 }
 
-func (s *StatusStore) GetStatus(ctx context.Context, txid string) (*models.TransactionStatus, error) {
+func (s *Store) GetStatus(ctx context.Context, txid string) (*models.TransactionStatus, error) {
 	query := `
 SELECT t.txid, t.status, t.timestamp, t.block_hash, mp.block_height, mp.merkle_path, t.extra_info, t.competing_txs, t.created_at
 FROM transactions t
@@ -213,7 +209,7 @@ WHERE t.txid = ?
 	return scanTransactionStatus(row)
 }
 
-func (s *StatusStore) GetStatusesSince(ctx context.Context, since time.Time) ([]*models.TransactionStatus, error) {
+func (s *Store) GetStatusesSince(ctx context.Context, since time.Time) ([]*models.TransactionStatus, error) {
 	query := `
 SELECT t.txid, t.status, t.timestamp, t.block_hash, mp.block_height, mp.merkle_path, t.extra_info, t.competing_txs, t.created_at
 FROM transactions t
@@ -230,7 +226,7 @@ ORDER BY t.timestamp ASC
 	return scanTransactionStatuses(rows)
 }
 
-func (s *StatusStore) SetStatusByBlockHash(ctx context.Context, blockHash string, newStatus models.Status) ([]string, error) {
+func (s *Store) SetStatusByBlockHash(ctx context.Context, blockHash string, newStatus models.Status) ([]string, error) {
 	var query string
 
 	// For unmined statuses, clear block fields. For IMMUTABLE, keep them.
@@ -275,7 +271,7 @@ RETURNING txid
 	return txids, nil
 }
 
-func (s *StatusStore) InsertMerklePath(ctx context.Context, txid, blockHash string, blockHeight uint64, merklePath []byte) error {
+func (s *Store) InsertMerklePath(ctx context.Context, txid, blockHash string, blockHeight uint64, merklePath []byte) error {
 	query := `
 INSERT INTO merkle_paths (txid, block_hash, block_height, merkle_path, created_at)
 VALUES (?, ?, ?, ?, ?)
@@ -288,7 +284,7 @@ ON CONFLICT (txid, block_hash) DO NOTHING
 	return nil
 }
 
-func (s *StatusStore) SetMinedByBlockHash(ctx context.Context, blockHash string) ([]*models.TransactionStatus, error) {
+func (s *Store) SetMinedByBlockHash(ctx context.Context, blockHash string) ([]*models.TransactionStatus, error) {
 	now := time.Now()
 
 	// Update transactions that have merkle paths for this block
@@ -343,41 +339,9 @@ WHERE block_hash = ?
 	return statuses, nil
 }
 
-func (s *StatusStore) Close() error {
-	if s.db != nil {
-		return s.db.Close()
-	}
-	return nil
-}
+// SubmissionStore methods
 
-// SubmissionStore implements store.SubmissionStore using SQLite
-type SubmissionStore struct {
-	db *sql.DB
-}
-
-// NewSubmissionStore creates a new SQLite submission store
-func NewSubmissionStore(dbPath string) (store.SubmissionStore, error) {
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open database: %w", err)
-	}
-
-	if _, err := db.Exec(sqlitePragmas); err != nil {
-		return nil, fmt.Errorf("failed to set pragmas: %w", err)
-	}
-
-	if err := db.Ping(); err != nil {
-		return nil, fmt.Errorf("failed to ping database: %w", err)
-	}
-
-	if err := initializeSchema(db, createSubmissionsTable); err != nil {
-		return nil, fmt.Errorf("failed to initialize schema: %w", err)
-	}
-
-	return &SubmissionStore{db: db}, nil
-}
-
-func (s *SubmissionStore) InsertSubmission(ctx context.Context, sub *models.Submission) error {
+func (s *Store) InsertSubmission(ctx context.Context, sub *models.Submission) error {
 	query := `
 INSERT INTO submissions (submission_id, txid, callback_url, callback_token, full_status_updates, last_delivered_status, retry_count, next_retry_at, created_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -400,7 +364,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	return nil
 }
 
-func (s *SubmissionStore) GetSubmissionsByTxID(ctx context.Context, txid string) ([]*models.Submission, error) {
+func (s *Store) GetSubmissionsByTxID(ctx context.Context, txid string) ([]*models.Submission, error) {
 	query := `
 SELECT submission_id, txid, callback_url, callback_token, full_status_updates, last_delivered_status, retry_count, next_retry_at, created_at
 FROM submissions
@@ -415,7 +379,7 @@ WHERE txid = ?
 	return scanSubmissions(rows)
 }
 
-func (s *SubmissionStore) GetSubmissionsByToken(ctx context.Context, callbackToken string) ([]*models.Submission, error) {
+func (s *Store) GetSubmissionsByToken(ctx context.Context, callbackToken string) ([]*models.Submission, error) {
 	query := `
 SELECT submission_id, txid, callback_url, callback_token, full_status_updates, last_delivered_status, retry_count, next_retry_at, created_at
 FROM submissions
@@ -431,7 +395,7 @@ ORDER BY created_at ASC
 	return scanSubmissions(rows)
 }
 
-func (s *SubmissionStore) UpdateDeliveryStatus(ctx context.Context, submissionID string, lastStatus models.Status, retryCount int, nextRetry *time.Time) error {
+func (s *Store) UpdateDeliveryStatus(ctx context.Context, submissionID string, lastStatus models.Status, retryCount int, nextRetry *time.Time) error {
 	query := `
 UPDATE submissions
 SET last_delivered_status = ?, retry_count = ?, next_retry_at = ?
@@ -445,7 +409,7 @@ WHERE submission_id = ?
 	return nil
 }
 
-func (s *SubmissionStore) Close() error {
+func (s *Store) Close() error {
 	if s.db != nil {
 		return s.db.Close()
 	}
@@ -629,75 +593,4 @@ func nullTime(t *time.Time) sql.NullTime {
 		return sql.NullTime{Valid: false}
 	}
 	return sql.NullTime{Time: *t, Valid: true}
-}
-
-// NetworkStateStore implements store.NetworkStateStore using SQLite
-type NetworkStateStore struct {
-	db *sql.DB
-}
-
-// NewNetworkStateStore creates a new SQLite network state store
-func NewNetworkStateStore(dbPath string) (store.NetworkStateStore, error) {
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open database: %w", err)
-	}
-
-	if _, err := db.Exec(sqlitePragmas); err != nil {
-		return nil, fmt.Errorf("failed to set pragmas: %w", err)
-	}
-
-	if err := db.Ping(); err != nil {
-		return nil, fmt.Errorf("failed to ping database: %w", err)
-	}
-
-	if err := initializeSchema(db, createNetworkStateTable); err != nil {
-		return nil, fmt.Errorf("failed to initialize network state schema: %w", err)
-	}
-
-	return &NetworkStateStore{db: db}, nil
-}
-
-func (s *NetworkStateStore) UpdateNetworkState(ctx context.Context, state *models.NetworkState) error {
-	query := `
-INSERT INTO network_state (id, current_height, last_block_hash, last_block_time)
-VALUES (1, ?, ?, ?)
-ON CONFLICT(id) DO UPDATE SET
-	current_height = excluded.current_height,
-	last_block_hash = excluded.last_block_hash,
-	last_block_time = excluded.last_block_time
-`
-	_, err := s.db.ExecContext(ctx, query, state.CurrentHeight, state.LastBlockHash, state.LastBlockTime)
-	if err != nil {
-		return fmt.Errorf("failed to update network state: %w", err)
-	}
-
-	return nil
-}
-
-func (s *NetworkStateStore) GetNetworkState(ctx context.Context) (*models.NetworkState, error) {
-	query := `
-SELECT current_height, last_block_hash, last_block_time
-FROM network_state
-WHERE id = 1
-`
-	row := s.db.QueryRowContext(ctx, query)
-
-	var state models.NetworkState
-	err := row.Scan(&state.CurrentHeight, &state.LastBlockHash, &state.LastBlockTime)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to get network state: %w", err)
-	}
-
-	return &state, nil
-}
-
-func (s *NetworkStateStore) Close() error {
-	if s.db != nil {
-		return s.db.Close()
-	}
-	return nil
 }

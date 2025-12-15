@@ -35,9 +35,9 @@ func NewTxTracker() *TxTracker {
 	}
 }
 
-// LoadFromStore populates the tracker from the status store.
+// LoadFromStore populates the tracker from the store.
 // Loads all transactions that aren't deeply confirmed (mined for 100+ blocks).
-func (t *TxTracker) LoadFromStore(ctx context.Context, store StatusStore, currentHeight uint64) (int, error) {
+func (t *TxTracker) LoadFromStore(ctx context.Context, store Store, currentHeight uint64) (int, error) {
 	statuses, err := store.GetStatusesSince(ctx, time.Time{})
 	if err != nil {
 		return 0, err

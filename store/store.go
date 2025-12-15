@@ -7,8 +7,8 @@ import (
 	"github.com/bsv-blockchain/arcade/models"
 )
 
-// StatusStore handles transaction status persistence
-type StatusStore interface {
+// Store handles all persistence operations for transactions and submissions
+type Store interface {
 	// InsertStatus inserts a new transaction status (used when client submits via REST API)
 	InsertStatus(ctx context.Context, status *models.TransactionStatus) error
 
@@ -34,12 +34,6 @@ type StatusStore interface {
 	// Returns full status objects for all affected transactions.
 	SetMinedByBlockHash(ctx context.Context, blockHash string) ([]*models.TransactionStatus, error)
 
-	// Close closes the database connection
-	Close() error
-}
-
-// SubmissionStore handles client submission and subscription tracking
-type SubmissionStore interface {
 	// InsertSubmission creates a new submission record
 	InsertSubmission(ctx context.Context, sub *models.Submission) error
 
@@ -56,14 +50,3 @@ type SubmissionStore interface {
 	Close() error
 }
 
-// NetworkStateStore handles network state persistence
-type NetworkStateStore interface {
-	// UpdateNetworkState updates the current network block height and hash
-	UpdateNetworkState(ctx context.Context, state *models.NetworkState) error
-
-	// GetNetworkState retrieves the current network state
-	GetNetworkState(ctx context.Context) (*models.NetworkState, error)
-
-	// Close closes the store
-	Close() error
-}

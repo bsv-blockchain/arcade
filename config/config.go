@@ -2,39 +2,31 @@
 package config
 
 import (
-	"context"
-	"fmt"
-	"log/slog"
-	"os"
-	"path"
 	"time"
 
-	"github.com/bsv-blockchain/arcade/events"
-	"github.com/bsv-blockchain/arcade/events/memory"
-	"github.com/bsv-blockchain/arcade/store"
-	"github.com/bsv-blockchain/arcade/store/sqlite"
-	"github.com/bsv-blockchain/arcade/teranode"
-	"github.com/bsv-blockchain/arcade/validator"
 	chaintracksconfig "github.com/bsv-blockchain/go-chaintracks/config"
-	"github.com/bsv-blockchain/go-chaintracks/chaintracks"
 	p2p "github.com/bsv-blockchain/go-teranode-p2p-client"
 	"github.com/spf13/viper"
 )
 
 // Config holds all application configuration
 type Config struct {
+	Mode Mode   `mapstructure:"mode"` // "embedded" or "remote"
+	URL  string `mapstructure:"url"`  // Required for remote mode
+
+	// Embedded mode fields (ignored when Mode is "remote")
 	Network     string `mapstructure:"network"`      // "main", "test", "stn" - Bitcoin network
 	StoragePath string `mapstructure:"storage_path"` // Data directory for persistent files
 
-	Server        ServerConfig             `mapstructure:"server"`
-	Database      DatabaseConfig           `mapstructure:"database"`
-	Events        EventsConfig             `mapstructure:"events"`
-	Teranode      TeranodeConfig           `mapstructure:"teranode"`
-	P2P           p2p.Config               `mapstructure:"p2p"`
-	Validator ValidatorConfig `mapstructure:"validator"`
-	Auth      AuthConfig      `mapstructure:"auth"`
-	Webhook       WebhookConfig            `mapstructure:"webhook"`
-	Chaintracks   chaintracksconfig.Config `mapstructure:"chaintracks"`
+	Server      ServerConfig             `mapstructure:"server"`
+	Database    DatabaseConfig           `mapstructure:"database"`
+	Events      EventsConfig             `mapstructure:"events"`
+	Teranode    TeranodeConfig           `mapstructure:"teranode"`
+	P2P         p2p.Config               `mapstructure:"p2p"`
+	Validator   ValidatorConfig          `mapstructure:"validator"`
+	Auth        AuthConfig               `mapstructure:"auth"`
+	Webhook     WebhookConfig            `mapstructure:"webhook"`
+	Chaintracks chaintracksconfig.Config `mapstructure:"chaintracks"`
 }
 
 // SetDefaults sets viper defaults for arcade configuration when used as an embedded library.
@@ -44,7 +36,11 @@ func (c *Config) SetDefaults(v *viper.Viper, prefix string) {
 		p = prefix + "."
 	}
 
-	// Top-level defaults
+	// Mode defaults
+	v.SetDefault(p+"mode", "embedded")
+	v.SetDefault(p+"url", "")
+
+	// Embedded mode defaults
 	v.SetDefault(p+"network", "main")
 	v.SetDefault(p+"storage_path", "~/.arcade")
 
@@ -132,146 +128,4 @@ type WebhookConfig struct {
 	PruneInterval time.Duration `mapstructure:"prune_interval"`
 	MaxAge        time.Duration `mapstructure:"max_age"`
 	MaxRetries    int           `mapstructure:"max_retries"`
-}
-
-// Services holds initialized application services.
-type Services struct {
-	P2PClient       *p2p.Client
-	Chaintracks     chaintracks.Chaintracks
-	StatusStore     store.StatusStore
-	SubmissionStore store.SubmissionStore
-	TxTracker       *store.TxTracker
-	EventPublisher  events.Publisher
-	TeranodeClient  *teranode.Client
-	Validator       *validator.Validator
-	Logger          *slog.Logger
-}
-
-// Initialize creates and returns all application services.
-// If chaintracker is provided, it will be used instead of creating a new one.
-// This allows the caller to share a Chaintracks instance across services.
-func (c *Config) Initialize(ctx context.Context, logger *slog.Logger, chaintracker chaintracks.Chaintracks) (*Services, error) {
-	if logger == nil {
-		logger = slog.Default()
-	}
-
-	// Expand ~ in storage path
-	if len(c.StoragePath) >= 2 && c.StoragePath[:2] == "~/" {
-		homeDir, err := os.UserHomeDir()
-		if err != nil {
-			return nil, fmt.Errorf("failed to resolve home directory: %w", err)
-		}
-		c.StoragePath = path.Join(homeDir, c.StoragePath[2:])
-	}
-
-	// Ensure storage directory exists
-	if err := os.MkdirAll(c.StoragePath, 0o750); err != nil {
-		return nil, fmt.Errorf("failed to create storage directory: %w", err)
-	}
-
-	// Expand ~ in database path
-	dbPath := c.Database.SQLitePath
-	if len(dbPath) >= 2 && dbPath[:2] == "~/" {
-		homeDir, err := os.UserHomeDir()
-		if err != nil {
-			return nil, fmt.Errorf("failed to resolve home directory for database: %w", err)
-		}
-		dbPath = path.Join(homeDir, dbPath[2:])
-	}
-
-	// Run database migrations
-	logger.Info("Running database migrations", slog.String("path", dbPath))
-	if err := store.RunMigrations(dbPath); err != nil {
-		return nil, fmt.Errorf("failed to run migrations: %w", err)
-	}
-
-	// Initialize stores
-	logger.Info("Initializing stores")
-	statusStore, err := sqlite.NewStatusStore(dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create status store: %w", err)
-	}
-
-	submissionStore, err := sqlite.NewSubmissionStore(dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create submission store: %w", err)
-	}
-
-	// Initialize event publisher
-	logger.Info("Initializing event publisher", slog.String("type", c.Events.Type))
-	var eventPublisher events.Publisher
-	switch c.Events.Type {
-	case "memory", "":
-		eventPublisher = memory.NewInMemoryPublisher(c.Events.BufferSize)
-	default:
-		return nil, fmt.Errorf("unsupported event publisher type: %s", c.Events.Type)
-	}
-
-	// Initialize Teranode client
-	logger.Info("Initializing Teranode client")
-	var endpoints []string
-	if len(c.Teranode.BaseURLs) > 0 {
-		endpoints = c.Teranode.BaseURLs
-	} else {
-		endpoints = []string{c.Teranode.BaseURL}
-	}
-	teranodeClient := teranode.NewClient(endpoints)
-
-	// Initialize validator
-	logger.Info("Initializing validator")
-	txValidator := validator.NewValidator(&validator.Policy{
-		MaxTxSizePolicy:         c.Validator.MaxTxSize,
-		MaxTxSigopsCountsPolicy: c.Validator.MaxSigOps,
-		MinFeePerKB:             c.Validator.MinFeePerKB,
-	})
-
-	// Initialize transaction tracker
-	logger.Info("Initializing transaction tracker")
-	txTracker := store.NewTxTracker()
-	trackedCount, err := txTracker.LoadFromStore(ctx, statusStore, 0)
-	if err != nil {
-		logger.Warn("Failed to load tracked transactions", slog.String("error", err.Error()))
-	} else {
-		logger.Info("Loaded tracked transactions", slog.Int("count", trackedCount))
-	}
-
-	// Use provided Chaintracks or create one
-	var p2pClient *p2p.Client
-	if chaintracker == nil {
-		// Initialize P2P client
-		logger.Info("Initializing P2P client")
-		c.P2P.Network = c.Network
-		if c.P2P.StoragePath == "" {
-			c.P2P.StoragePath = c.StoragePath
-		}
-		p2pClient, err = c.P2P.Initialize(ctx, "arcade")
-		if err != nil {
-			return nil, fmt.Errorf("failed to create P2P client: %w", err)
-		}
-
-		// Initialize Chaintracks (sharing arcade's P2P client)
-		logger.Info("Initializing Chaintracks")
-		if c.Chaintracks.StoragePath == "" {
-			c.Chaintracks.StoragePath = path.Join(c.StoragePath, "chaintracks")
-		}
-		chaintracker, err = c.Chaintracks.Initialize(ctx, "arcade", p2pClient)
-		if err != nil {
-			_ = p2pClient.Close()
-			return nil, fmt.Errorf("failed to initialize chaintracks: %w", err)
-		}
-	} else {
-		logger.Info("Using provided Chaintracks instance")
-	}
-
-	return &Services{
-		P2PClient:       p2pClient,
-		Chaintracks:     chaintracker,
-		StatusStore:     statusStore,
-		SubmissionStore: submissionStore,
-		TxTracker:       txTracker,
-		EventPublisher:  eventPublisher,
-		TeranodeClient:  teranodeClient,
-		Validator:       txValidator,
-		Logger:          logger,
-	}, nil
 }
