@@ -33,11 +33,12 @@ import (
 	"github.com/bsv-blockchain/arcade/docs"
 	"github.com/bsv-blockchain/arcade/handlers"
 	fiberRoutes "github.com/bsv-blockchain/arcade/routes/fiber"
-	chaintracksRoutes "github.com/bsv-blockchain/go-chaintracks/routes/fiber"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"
+
+	chaintracksRoutes "github.com/bsv-blockchain/go-chaintracks/routes/fiber"
 )
 
 var authToken string
@@ -90,10 +91,10 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	}()
 
 	// Subscribe to chaintracks tip updates
-	tipChan := services.Chaintracks.Subscribe(ctx)
+	// tipChan := services.Chaintracks.Subscribe(ctx)
 
-	ctRoutes := chaintracksRoutes.NewRoutes(services.Chaintracks)
-	ctRoutes.StartBroadcasting(ctx, tipChan)
+	ctRoutes := chaintracksRoutes.NewRoutes(ctx, services.Chaintracks)
+	// ctRoutes.StartBroadcasting(ctx, tipChan)
 
 	// Initialize webhook handler
 	log.Info("Initializing webhook handler")
