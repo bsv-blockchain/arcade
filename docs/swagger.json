@@ -1,0 +1,690 @@
+{
+    "swagger": "2.0",
+    "info": {
+        "description": "BSV transaction broadcast service with ARC-compatible endpoints.",
+        "title": "Arcade API",
+        "contact": {
+            "name": "BSV Blockchain",
+            "url": "https://github.com/bsv-blockchain/arcade"
+        },
+        "license": {
+            "name": "Open BSV License",
+            "url": "https://github.com/bsv-blockchain/arcade/blob/main/LICENSE"
+        },
+        "version": "0.1.0"
+    },
+    "basePath": "/",
+    "paths": {
+        "/arc/events": {
+            "get": {
+                "description": "Server-Sent Events stream of transaction status updates. If callbackToken is provided, only events for that token are streamed.",
+                "produces": [
+                    "text/event-stream"
+                ],
+                "tags": [
+                    "arcade"
+                ],
+                "summary": "Stream transaction events",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Callback token from transaction submission",
+                        "name": "callbackToken",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "SSE stream of transaction status updates",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/arc/policy": {
+            "get": {
+                "description": "Returns the transaction policy configuration including fee rates and limits",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "arcade"
+                ],
+                "summary": "Get policy",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/models.Policy"
+                        }
+                    }
+                }
+            }
+        },
+        "/arc/tx": {
+            "post": {
+                "description": "Submit a single transaction for broadcast. Accepts raw transaction bytes, hex string, or JSON with rawTx field.",
+                "consumes": [
+                    "application/json",
+                    "application/octet-stream",
+                    "text/plain"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "arcade"
+                ],
+                "summary": "Submit transaction",
+                "parameters": [
+                    {
+                        "description": "Transaction data",
+                        "name": "transaction",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/fiber.TransactionRequest"
+                        }
+                    },
+                    {
+                        "type": "string",
+                        "description": "URL for status callbacks",
+                        "name": "X-CallbackUrl",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Token for SSE event filtering",
+                        "name": "X-CallbackToken",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Send all status updates (true/false)",
+                        "name": "X-FullStatusUpdates",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Skip fee validation (true/false)",
+                        "name": "X-SkipFeeValidation",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Skip script validation (true/false)",
+                        "name": "X-SkipScriptValidation",
+                        "in": "header"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/models.TransactionStatus"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/arc/tx/{txid}": {
+            "get": {
+                "description": "Get the current status of a submitted transaction",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "arcade"
+                ],
+                "summary": "Get transaction status",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Transaction ID",
+                        "name": "txid",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/models.TransactionStatus"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/arc/txs": {
+            "post": {
+                "description": "Submit multiple transactions for broadcast",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "arcade"
+                ],
+                "summary": "Submit multiple transactions",
+                "parameters": [
+                    {
+                        "description": "Array of transactions",
+                        "name": "transactions",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/fiber.TransactionRequest"
+                            }
+                        }
+                    },
+                    {
+                        "type": "string",
+                        "description": "URL for status callbacks",
+                        "name": "X-CallbackUrl",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Token for SSE event filtering",
+                        "name": "X-CallbackToken",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Send all status updates (true/false)",
+                        "name": "X-FullStatusUpdates",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Skip fee validation (true/false)",
+                        "name": "X-SkipFeeValidation",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Skip script validation (true/false)",
+                        "name": "X-SkipScriptValidation",
+                        "in": "header"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/models.TransactionStatus"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/block/header/hash/{hash}": {
+            "get": {
+                "description": "Returns a block header with the specified hash",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "chaintracks"
+                ],
+                "summary": "Get header by hash",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Block hash (hex)",
+                        "name": "hash",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/chaintracks.BlockHeader"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/fiber.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/fiber.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/block/header/height/{height}": {
+            "get": {
+                "description": "Returns a block header at the specified height",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "chaintracks"
+                ],
+                "summary": "Get header by height",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Block height",
+                        "name": "height",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/chaintracks.BlockHeader"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/fiber.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/fiber.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/block/headers": {
+            "get": {
+                "description": "Returns block headers starting from height as binary data (80 bytes per header)",
+                "produces": [
+                    "application/octet-stream"
+                ],
+                "tags": [
+                    "chaintracks"
+                ],
+                "summary": "Get multiple headers",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Starting block height",
+                        "name": "height",
+                        "in": "query",
+                        "required": true
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Number of headers to return",
+                        "name": "count",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Concatenated 80-byte headers",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/fiber.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/block/height": {
+            "get": {
+                "description": "Returns the current blockchain height",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "chaintracks"
+                ],
+                "summary": "Get chain height",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/fiber.HeightResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/block/network": {
+            "get": {
+                "description": "Returns the Bitcoin network this service is connected to",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "chaintracks"
+                ],
+                "summary": "Get network name",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/fiber.NetworkResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/fiber.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/block/tip": {
+            "get": {
+                "description": "Returns the current chain tip block header",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "chaintracks"
+                ],
+                "summary": "Get chain tip",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/chaintracks.BlockHeader"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/fiber.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/block/tip/stream": {
+            "get": {
+                "description": "Server-Sent Events stream of chain tip updates. Sends the current tip immediately, then broadcasts new tips as they arrive.",
+                "produces": [
+                    "text/event-stream"
+                ],
+                "tags": [
+                    "chaintracks"
+                ],
+                "summary": "Stream chain tip updates",
+                "responses": {
+                    "200": {
+                        "description": "SSE stream of BlockHeader JSON objects",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/health": {
+            "get": {
+                "description": "Returns the health status of the service",
+                "produces": [
+                    "text/plain"
+                ],
+                "tags": [
+                    "arcade"
+                ],
+                "summary": "Health check",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "503": {
+                        "description": "Service Unavailable",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "definitions": {
+        "chaintracks.BlockHeader": {
+            "type": "object",
+            "properties": {
+                "bits": {
+                    "description": "4 bytes - Difficulty target",
+                    "type": "integer"
+                },
+                "hash": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "height": {
+                    "description": "Block height in the chain",
+                    "type": "integer"
+                },
+                "merkleRoot": {
+                    "description": "32 bytes - Merkle root hash",
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "nonce": {
+                    "description": "4 bytes - Nonce",
+                    "type": "integer"
+                },
+                "previousHash": {
+                    "description": "32 bytes - Previous block hash",
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "time": {
+                    "description": "4 bytes - Block timestamp (Unix time)",
+                    "type": "integer"
+                },
+                "version": {
+                    "description": "4 bytes - Block version",
+                    "type": "integer"
+                }
+            }
+        },
+        "fiber.ErrorResponse": {
+            "type": "object",
+            "properties": {
+                "error": {
+                    "type": "string",
+                    "example": "Header not found"
+                }
+            }
+        },
+        "fiber.HeightResponse": {
+            "type": "object",
+            "properties": {
+                "height": {
+                    "type": "integer",
+                    "example": 874123
+                }
+            }
+        },
+        "fiber.NetworkResponse": {
+            "type": "object",
+            "properties": {
+                "network": {
+                    "type": "string",
+                    "example": "mainnet"
+                }
+            }
+        },
+        "fiber.TransactionRequest": {
+            "type": "object",
+            "properties": {
+                "rawTx": {
+                    "type": "string",
+                    "example": "0100000001..."
+                }
+            }
+        },
+        "models.Policy": {
+            "type": "object",
+            "properties": {
+                "maxscriptsizepolicy": {
+                    "type": "integer"
+                },
+                "maxtxsigopscountspolicy": {
+                    "type": "integer"
+                },
+                "maxtxsizepolicy": {
+                    "type": "integer"
+                },
+                "miningFeeBytes": {
+                    "type": "integer"
+                },
+                "miningFeeSatoshis": {
+                    "type": "integer"
+                }
+            }
+        },
+        "models.Status": {
+            "type": "string",
+            "enum": [
+                "UNKNOWN",
+                "RECEIVED",
+                "SENT_TO_NETWORK",
+                "ACCEPTED_BY_NETWORK",
+                "SEEN_ON_NETWORK",
+                "DOUBLE_SPEND_ATTEMPTED",
+                "REJECTED",
+                "MINED",
+                "IMMUTABLE"
+            ],
+            "x-enum-varnames": [
+                "StatusUnknown",
+                "StatusReceived",
+                "StatusSentToNetwork",
+                "StatusAcceptedByNetwork",
+                "StatusSeenOnNetwork",
+                "StatusDoubleSpendAttempted",
+                "StatusRejected",
+                "StatusMined",
+                "StatusImmutable"
+            ]
+        },
+        "models.TransactionStatus": {
+            "type": "object",
+            "properties": {
+                "blockHash": {
+                    "type": "string"
+                },
+                "blockHeight": {
+                    "type": "integer"
+                },
+                "competingTxs": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "extraInfo": {
+                    "type": "string"
+                },
+                "merklePath": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "timestamp": {
+                    "type": "string"
+                },
+                "txStatus": {
+                    "$ref": "#/definitions/models.Status"
+                },
+                "txid": {
+                    "type": "string"
+                }
+            }
+        }
+    },
+    "securityDefinitions": {
+        "BearerAuth": {
+            "description": "Bearer token authentication",
+            "type": "apiKey",
+            "name": "Authorization",
+            "in": "header"
+        }
+    }
+}

@@ -87,10 +87,6 @@ flowchart TD
 | `REQUESTED_BY_NETWORK` | P2P network details not tracked at this granularity |
 | `SEEN_IN_ORPHAN_MEMPOOL` | Does not map to Arcade's architecture |
 
-**Key Differences:**
-- **Granularity:** Arc tracks detailed P2P network progression (ANNOUNCED, REQUESTED, etc.). Arcade simplifies to major state changes only.
-- **Orphan Tracking:** Arc tracks orphan mempool status. Arcade does not.
-
 ## System Communication Overview
 
 ```mermaid
@@ -207,6 +203,18 @@ Authorization: Bearer {callbackToken}
 - Subtree messages contain transaction IDs, mark transactions as `SEEN_ON_NETWORK`
 - Rejected-tx messages parse rejection reason and mark as `REJECTED` or `DOUBLE_SPEND_ATTEMPTED` based on the rejection type
 
+**Merkle Path Computation:**
+
+When building merkle proofs from block data, special handling is required for subtree 0:
+
+- Subtree 0 position 0 contains a placeholder transaction (`0xFF...`) when broadcast
+- The block message includes the actual coinbase transaction in its `Coinbase` field
+- To compute valid merkle paths, the placeholder in subtree 0 position 0 must be replaced with the coinbase transaction hash
+- The subtree hash itself doesn't change - the entire merkle tree must be rebuilt from transaction hashes
+- This applies regardless of whether any tracked transactions exist in subtree 0
+
+Reference: [Teranode Block Header Data Model](https://github.com/bsv-blockchain/teranode/blob/main/docs/topics/datamodel/block_header_data_model.md)
+
 **ChainTracks Integration:**
 - Maintains blockchain state (current height, block hashes)
 - Used to detect chain reorganizations for `MINED_IN_STALE_BLOCK` status
@@ -262,13 +270,7 @@ type StatusUpdate struct {
 - Go channels with configurable buffer size
 - Fan-out to multiple goroutine subscribers
 - Non-blocking publish (drops slow consumers)
-- Single-node deployments only
-
-**Redis Publisher:**
-- Redis Pub/Sub on channel `arcade:status_updates`
-- JSON-serialized events
-- Supports multi-node distributed deployments
-- Events survive service restarts if subscribers reconnect
+- Single-node deployments
 
 ## Storage Layer
 
@@ -299,11 +301,6 @@ type StatusUpdate struct {
 - Indexes: `txid`, `timestamp`, `callback_token`
 - JSON storage for competing transaction arrays
 
-**PostgreSQL:**
-- Same schema as SQLite
-- Better for multi-node deployments with Redis events
-- Connection pooling for concurrent access
-
 ## Component Initialization
 
 Application startup sequence ([cmd/arcade/main.go](cmd/arcade/main.go)):
@@ -323,42 +320,77 @@ Application startup sequence ([cmd/arcade/main.go](cmd/arcade/main.go)):
 
 ### Transaction Submission
 
-```
-1. Client → POST /v1/tx with X-CallbackUrl and X-CallbackToken
-2. API Server → Validator.ValidateTransaction()
-3. API Server → StatusStore.InsertStatus() [RECEIVED]
-4. API Server → SubmissionStore.InsertSubmission()
-5. API Server → TeranodeClient.SubmitTransaction() (async, fan-out)
-6. API Server → Return HTTP 200 with txid
-7. Teranode Client → StatusStore.UpdateStatus() [SENT_TO_NETWORK]
-8. Teranode Response → StatusStore.UpdateStatus() [ACCEPTED_BY_NETWORK]
-9. StatusStore → EventPublisher.Publish()
-10. WebhookHandler → HTTP POST to callback URL
-11. SSEHandler → Stream event to connected clients
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API as API Server
+    participant Validator
+    participant StatusStore
+    participant SubmissionStore
+    participant Teranode as Teranode Client
+    participant Events as Event Publisher
+    participant Webhook as Webhook Handler
+    participant SSE as SSE Handler
+
+    Client->>API: POST /v1/tx (X-CallbackUrl, X-CallbackToken)
+    API->>Validator: ValidateTransaction()
+    Validator-->>API: Valid
+    API->>StatusStore: InsertStatus() [RECEIVED]
+    API->>SubmissionStore: InsertSubmission()
+    API->>Teranode: SubmitTransaction() (async)
+    API-->>Client: HTTP 200 (txid)
+    Teranode->>StatusStore: UpdateStatus() [SENT_TO_NETWORK]
+    Teranode->>StatusStore: UpdateStatus() [ACCEPTED_BY_NETWORK]
+    StatusStore->>Events: Publish(StatusUpdate)
+    Events->>Webhook: StatusUpdate
+    Webhook->>Client: HTTP POST (callback URL)
+    Events->>SSE: StatusUpdate
+    SSE->>Client: Stream event
 ```
 
 ### P2P Status Update
 
-```
-1. P2P Network → Gossip message (subtree/block/rejected-tx)
-2. P2P Subscriber → Parse message
-3. P2P Subscriber → ChainTracks query for transaction IDs (if needed)
-4. P2P Subscriber → StatusStore.UpdateStatus() [SEEN_ON_NETWORK/MINED/REJECTED]
-5. StatusStore → EventPublisher.Publish()
-6. WebhookHandler → Query submissions by txid
-7. WebhookHandler → HTTP POST to callback URLs
-8. SSEHandler → Stream event to connected clients with matching tokens
+```mermaid
+sequenceDiagram
+    participant P2P as P2P Network
+    participant Sub as P2P Subscriber
+    participant StatusStore
+    participant Events as Event Publisher
+    participant Webhook as Webhook Handler
+    participant SubmissionStore
+    participant SSE as SSE Handler
+    participant Client as User Service
+
+    P2P->>Sub: Gossip message (subtree/block/rejected-tx)
+    Sub->>Sub: Parse message
+    Sub->>StatusStore: UpdateStatus() [SEEN_ON_NETWORK/MINED/REJECTED]
+    StatusStore->>Events: Publish(StatusUpdate)
+    Events->>Webhook: StatusUpdate
+    Webhook->>SubmissionStore: Query submissions by txid
+    SubmissionStore-->>Webhook: Submissions
+    Webhook->>Client: HTTP POST (callback URLs)
+    Events->>SSE: StatusUpdate
+    SSE->>Client: Stream event (filtered by token)
 ```
 
 ### SSE Streaming with Catchup
 
-```
-1. Client → GET /v1/events/:token with Last-Event-ID header
-2. SSE Handler → Subscribe to event publisher
-3. SSE Handler → StatusStore.GetStatusesSince(lastEventID)
-4. SSE Handler → Stream missed events first
-5. SSE Handler → Stream real-time events as they arrive
-6. On disconnect → Client reconnects with updated Last-Event-ID
+```mermaid
+sequenceDiagram
+    participant Client
+    participant SSE as SSE Handler
+    participant Events as Event Publisher
+    participant StatusStore
+
+    Client->>SSE: GET /v1/events/:callbackToken (Last-Event-ID)
+    SSE->>Events: Subscribe()
+    SSE->>StatusStore: GetStatusesSince(lastEventID)
+    StatusStore-->>SSE: Missed events
+    SSE->>Client: Stream missed events
+    Events->>SSE: Real-time StatusUpdate
+    SSE->>Client: Stream real-time event
+    Note over Client,SSE: On disconnect...
+    Client->>SSE: Reconnect with updated Last-Event-ID
 ```
 
 ## Configuration
@@ -373,7 +405,6 @@ Configuration is managed via Viper with YAML files and environment variable over
 - `p2p` - Peer list, topic prefix
 - `validator` - Size limits, fee validation, script validation
 - `webhook` - Retry policy, max retries, expiration
-- `auth` - Token-based authentication (future)
 
 ## Architecture Patterns
 
@@ -391,9 +422,6 @@ Status history is immutable. Current status is derived by querying the most rece
 
 **Token-Based Routing:**
 Callback tokens isolate event streams for multi-tenant use cases. SSE and webhooks filter by token.
-
-**State Transition Guards:**
-Invalid state transitions are prevented at the database level using disallowed previous status checks.
 
 **Arc Compatibility:**
 API endpoints, headers, and response formats match Arc specification for drop-in replacement scenarios.
