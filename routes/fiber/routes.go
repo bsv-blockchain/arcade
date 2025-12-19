@@ -74,7 +74,7 @@ func (r *Routes) Register(router fiber.Router) {
 // @Tags arcade
 // @Produce json
 // @Success 200 {object} models.Policy
-// @Router /arc/policy [get]
+// @Router /arcade/policy [get]
 func (r *Routes) handleGetPolicy(c *fiber.Ctx) error {
 	policy, err := r.service.GetPolicy(c.UserContext())
 	if err != nil {
@@ -98,7 +98,7 @@ func (r *Routes) handleGetPolicy(c *fiber.Ctx) error {
 // @Success 200 {object} models.TransactionStatus
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /arc/tx [post]
+// @Router /arcade/tx [post]
 func (r *Routes) handlePostTx(c *fiber.Ctx) error {
 	ctx := c.UserContext()
 
@@ -137,7 +137,7 @@ func (r *Routes) handlePostTx(c *fiber.Ctx) error {
 // @Param X-SkipScriptValidation header string false "Skip script validation (true/false)"
 // @Success 200 {array} models.TransactionStatus
 // @Failure 400 {object} map[string]string
-// @Router /arc/txs [post]
+// @Router /arcade/txs [post]
 func (r *Routes) handlePostTxs(c *fiber.Ctx) error {
 	ctx := c.UserContext()
 
@@ -180,7 +180,7 @@ func (r *Routes) handlePostTxs(c *fiber.Ctx) error {
 // @Success 200 {object} models.TransactionStatus
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /arc/tx/{txid} [get]
+// @Router /arcade/tx/{txid} [get]
 func (r *Routes) handleGetTx(c *fiber.Ctx) error {
 	status, err := r.service.GetStatus(c.UserContext(), c.Params("txid"))
 	if err != nil {
@@ -199,7 +199,7 @@ func (r *Routes) handleGetTx(c *fiber.Ctx) error {
 // @Produce text/event-stream
 // @Param callbackToken query string false "Callback token from transaction submission"
 // @Success 200 {string} string "SSE stream of transaction status updates"
-// @Router /arc/events [get]
+// @Router /arcade/events [get]
 func (r *Routes) handleTxSSE(c *fiber.Ctx) error {
 	callbackToken := c.Query("callbackToken")
 
