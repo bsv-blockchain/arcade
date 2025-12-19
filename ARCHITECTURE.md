@@ -203,6 +203,18 @@ Authorization: Bearer {callbackToken}
 - Subtree messages contain transaction IDs, mark transactions as `SEEN_ON_NETWORK`
 - Rejected-tx messages parse rejection reason and mark as `REJECTED` or `DOUBLE_SPEND_ATTEMPTED` based on the rejection type
 
+**Merkle Path Computation:**
+
+When building merkle proofs from block data, special handling is required for subtree 0:
+
+- Subtree 0 position 0 contains a placeholder transaction (`0xFF...`) when broadcast
+- The block message includes the actual coinbase transaction in its `Coinbase` field
+- To compute valid merkle paths, the placeholder in subtree 0 position 0 must be replaced with the coinbase transaction hash
+- The subtree hash itself doesn't change - the entire merkle tree must be rebuilt from transaction hashes
+- This applies regardless of whether any tracked transactions exist in subtree 0
+
+Reference: [Teranode Block Header Data Model](https://github.com/bsv-blockchain/teranode/blob/main/docs/topics/datamodel/block_header_data_model.md)
+
 **ChainTracks Integration:**
 - Maintains blockchain state (current height, block hashes)
 - Used to detect chain reorganizations for `MINED_IN_STALE_BLOCK` status
@@ -258,13 +270,7 @@ type StatusUpdate struct {
 - Go channels with configurable buffer size
 - Fan-out to multiple goroutine subscribers
 - Non-blocking publish (drops slow consumers)
-- Single-node deployments only
-
-**Redis Publisher:**
-- Redis Pub/Sub on channel `arcade:status_updates`
-- JSON-serialized events
-- Supports multi-node distributed deployments
-- Events survive service restarts if subscribers reconnect
+- Single-node deployments
 
 ## Storage Layer
 
@@ -294,11 +300,6 @@ type StatusUpdate struct {
 - Append-only transaction status log
 - Indexes: `txid`, `timestamp`, `callback_token`
 - JSON storage for competing transaction arrays
-
-**PostgreSQL:**
-- Same schema as SQLite
-- Better for multi-node deployments with Redis events
-- Connection pooling for concurrent access
 
 ## Component Initialization
 

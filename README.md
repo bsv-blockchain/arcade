@@ -16,8 +16,8 @@ Arcade is a lightweight transaction broadcast service that:
 - **Arc-Compatible API** - Drop-in replacement for Arc clients
 - **P2P Network Listening** - Direct gossip subscription for real-time updates
 - **Chain Tracking** - Blockchain header management with merkle proof validation
-- **Flexible Storage** - SQLite for simple deployments, PostgreSQL for distributed setups
-- **Event Streaming** - In-memory or Redis pub/sub for distributed architectures
+- **Flexible Storage** - SQLite for persistent storage
+- **Event Streaming** - In-memory pub/sub for event distribution
 - **Webhook Delivery** - Async notifications with retry logic
 - **SSE Streaming** - Real-time status updates with automatic catchup on reconnect
 - **Transaction Validation** - Local validation before network submission
@@ -34,32 +34,30 @@ go install github.com/bsv-blockchain/arcade/cmd/arcade@latest
 
 ### Configuration
 
-Create `config.yaml`:
+Create `config.yaml` (see `config.example.yaml` for a complete example):
 
 ```yaml
+network: main
+storage_path: ~/.arcade
+
 server:
-  address: ":8080"
+  address: ":3011"
 
 database:
-  type: "sqlite"
-  sqlite_path: "./arcade.db"
+  type: sqlite
+  sqlite_path: ~/.arcade/arcade.db
 
 events:
-  type: "memory"
+  type: memory
   buffer_size: 1000
 
 teranode:
-  base_urls:
-    - "http://teranode1.example.com:8080"
-    - "http://teranode2.example.com:8080"
-  timeout: "30s"
+  # Set via ARCADE_TERANODE_BASE_URL environment variable
+  timeout: 30s
 
-p2p:
-  process_name: "arcade-node-1"
-  private_key: ""  # Generated on first run if empty
-  bootstrap_peers:
-    - "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ"
-  topic_prefix: "mainnet"
+validator:
+  max_tx_size: 4294967296
+  min_fee_per_kb: 50
 ```
 
 ### Run
@@ -115,7 +113,7 @@ DOUBLE_SPEND_ATTEMPTED (from rejected-tx gossip with specific reason)
 
 ## Architecture
 
-See [DESIGN.md](DESIGN.md) for detailed architecture documentation.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed architecture documentation.
 
 ### Key Components
 
@@ -148,38 +146,32 @@ Arcade includes blockchain header tracking for merkle proof validation. Headers 
 
 ### Remote Client
 
-For applications that need chain tracking without running a full Arcade server, use the HTTP client:
+For applications that need Arcade functionality without running a full server, use the REST client:
 
 ```go
-import "github.com/bsv-blockchain/arcade/chaintracks"
+import "github.com/bsv-blockchain/arcade/client"
 
-client := chaintracks.NewClient("http://arcade-server:8080")
+c := client.New("http://arcade-server:8080")
 
-// Subscribe to tip updates via SSE (closes when ctx is cancelled)
-tipChan := client.SubscribeTip(ctx)
-for tip := range tipChan {
-    fmt.Printf("New tip: %d %s\n", tip.Height, tip.Hash)
+// Submit a transaction
+status, err := c.SubmitTransaction(ctx, rawTxBytes, nil)
+
+// Get transaction status
+status, err := c.GetStatus(ctx, "txid...")
+
+// Subscribe to transaction status updates
+statusChan, err := c.Subscribe(ctx, "my-callback-token")
+for status := range statusChan {
+    fmt.Printf("Status: %s %s\n", status.TxID, status.Status)
 }
-
-// Subscribe to transaction status updates for a callback token
-statusChan := client.SubscribeStatus(ctx, "my-callback-token")
-
-// Query headers
-header, err := client.GetHeaderByHeight(ctx, 870000)
-tip := client.GetTip(ctx)
-height := client.GetHeight(ctx)
-
-// Implements go-sdk's ChainTracker interface
-valid, err := client.IsValidRootForHeight(ctx, merkleRoot, height)
 ```
 
 ## Development
 
 ### Prerequisites
 
-- Go 1.21+
-- SQLite or PostgreSQL (optional)
-- Redis (optional)
+- Go 1.22+
+- SQLite
 
 ### Build
 
@@ -197,24 +189,24 @@ go test ./...
 
 | Section | Field | Description | Default |
 |---------|-------|-------------|---------|
-| `server.address` | string | HTTP server listen address | `:8080` |
-| `database.type` | string | Database type: `sqlite` or `postgres` | `sqlite` |
-| `database.sqlite_path` | string | SQLite database file path | `./arcade.db` |
-| `database.postgres_conn_str` | string | PostgreSQL connection string | - |
-| `events.type` | string | Event backend: `memory` or `redis` | `memory` |
+| `network` | string | Bitcoin network: `main`, `test`, `stn` | `main` |
+| `storage_path` | string | Data directory for persistent files | `~/.arcade` |
+| `server.address` | string | HTTP server listen address | `:3011` |
+| `server.read_timeout` | duration | HTTP read timeout | `30s` |
+| `server.write_timeout` | duration | HTTP write timeout | `30s` |
+| `database.type` | string | Database type: `sqlite` | `sqlite` |
+| `database.sqlite_path` | string | SQLite database file path | `~/.arcade/arcade.db` |
+| `events.type` | string | Event backend: `memory` | `memory` |
 | `events.buffer_size` | int | Event channel buffer size | `1000` |
-| `events.redis_url` | string | Redis connection URL | - |
-| `teranode.base_urls` | []string | Teranode propagation service URLs (fan-out) | `[]` |
+| `teranode.base_url` | string | Teranode propagation service URL | - |
 | `teranode.timeout` | duration | HTTP request timeout | `30s` |
-| `p2p.process_name` | string | P2P node identifier | - |
-| `p2p.private_key` | string | P2P private key (hex) for consistent peer ID | - |
-| `p2p.bootstrap_peers` | []string | Initial P2P peers (multiaddrs) | `[]` |
-| `p2p.topic_prefix` | string | Gossip topic prefix: `mainnet`, `testnet` | `mainnet` |
-| `validator.max_tx_size` | uint64 | Maximum transaction size (bytes) | `10000000` |
-| `validator.enable_fee_check` | bool | Enable fee validation | `true` |
-| `validator.enable_script_exec` | bool | Enable script execution validation | `false` |
-| `callbacks.max_retries` | int | Max webhook retry attempts | `10` |
-| `callbacks.max_age_hours` | int | Hours to keep retrying webhooks | `168` |
+| `validator.max_tx_size` | int | Maximum transaction size (bytes) | `4294967296` |
+| `validator.max_script_size` | int | Maximum script size (bytes) | `500000` |
+| `validator.max_sig_ops` | int64 | Maximum signature operations | `4294967295` |
+| `validator.min_fee_per_kb` | uint64 | Minimum fee per KB (satoshis) | `50` |
+| `webhook.max_retries` | int | Max webhook retry attempts | `10` |
+| `webhook.max_age` | duration | Max age to keep retrying webhooks | `24h` |
+| `auth.enabled` | bool | Enable authentication | `false` |
 
 ## HTTP Headers
 
@@ -356,6 +348,6 @@ Open BSV License
 
 ## Resources
 
-- [Design Documentation](DESIGN.md)
+- [Architecture Documentation](ARCHITECTURE.md)
 - [Teranode Documentation](https://docs.bitcoinsv.io/)
 - [Arc API Reference](https://github.com/bsv-blockchain/arc)

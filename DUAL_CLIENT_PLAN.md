@@ -182,43 +182,7 @@ This document tracks the implementation of a dual-client pattern for Arcade, sim
 
 ## Phase 5: TypeScript Client
 
-### 5.1 Package Setup
-**Directory:** `arcade-ts-client/`
-
-- [x] Initialize npm package
-- [x] Configure TypeScript, ESLint, build tooling
-- [x] Configure for both ESM and CommonJS output
-
-### 5.2 Type Definitions
-**File:** `src/types.ts`
-
-- [x] `TransactionStatus` interface
-- [x] `Status` type (union of status strings)
-- [x] `SubmitOptions` interface
-- [x] `Policy` interface
-
-### 5.3 Client Implementation
-**File:** `src/client.ts`
-
-- [x] `ArcadeClient` class
-- [x] Constructor with baseURL and options
-- [x] `submitTransaction(rawTx: string | Uint8Array, opts?: SubmitOptions): Promise<TransactionStatus>`
-- [x] `submitTransactions(rawTxs: Array<string | Uint8Array>, opts?: SubmitOptions): Promise<TransactionStatus[]>`
-- [x] `getStatus(txid: string): Promise<TransactionStatus>`
-- [x] `getPolicy(): Promise<Policy>`
-
-### 5.4 SSE Subscription
-**File:** `src/client.ts` (integrated in client)
-
-- [x] `subscribe(callbackToken?: string): AsyncIterable<TransactionStatus>`
-- [x] Fetch-based SSE support for browser and Node.js
-- [x] Automatic reconnection with Last-Event-ID
-- [x] AbortController integration for cancellation
-
-### 5.5 Package Publishing
-- [x] Export types and client
-- [ ] README with usage examples
-- [ ] Publish to npm (if separate package)
+**Status:** Moved to external library. See separate TypeScript SDK repository.
 
 ---
 
@@ -274,7 +238,6 @@ data: {"txid":"...","txStatus":"...","timestamp":"..."}
 
 - [ ] Unit tests for Go interface implementations
 - [ ] Integration tests for REST client against running server
-- [ ] Unit tests for TypeScript client
 - [ ] E2E tests for SSE subscription lifecycle
 
 ---
@@ -284,7 +247,6 @@ data: {"txid":"...","txStatus":"...","timestamp":"..."}
 - Pattern based on go-chaintracks implementation
 - Both implementations must behave identically for consumers
 - SSE reconnection should use Last-Event-ID for catchup
-- TypeScript client should work in both browser and Node.js environments
 
 ## Implementation Summary
 
@@ -297,12 +259,6 @@ data: {"txid":"...","txStatus":"...","timestamp":"..."}
 - `client/client.go` - REST client implementation
 - `client/sse.go` - SSE subscription handling
 - `client/options.go` - Client options
-- `factory/factory.go` - Factory for creating services
 - `routes/fiber/routes.go` - Refactored to use service interface
 
-**TypeScript:**
-- `arcade-ts-client/package.json` - NPM package config
-- `arcade-ts-client/tsconfig*.json` - TypeScript configs
-- `arcade-ts-client/src/types.ts` - Type definitions
-- `arcade-ts-client/src/client.ts` - Client implementation with SSE
-- `arcade-ts-client/src/index.ts` - Package exports
+**TypeScript:** Moved to external library.

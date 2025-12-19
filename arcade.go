@@ -17,10 +17,10 @@ import (
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
 	msgbus "github.com/bsv-blockchain/go-p2p-message-bus"
-	p2p "github.com/bsv-blockchain/go-teranode-p2p-client"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/bsv-blockchain/go-sdk/transaction/chaintracker"
+	p2p "github.com/bsv-blockchain/go-teranode-p2p-client"
 	teranode "github.com/bsv-blockchain/teranode/services/p2p"
 )
 
@@ -313,8 +313,16 @@ func (a *Arcade) processBlockTransactions(ctx context.Context, blockMsg teranode
 			continue
 		}
 
+		// Subtree 0 contains a coinbase placeholder that must be replaced with the
+		// real coinbase txid. The subtree 0 root will be computed by ComputeMissingHashes.
+		if subtreeIdx == 0 && len(txHashes) > 0 {
+			if coinbaseTxID := a.parseCoinbaseTxID(blockMsg); coinbaseTxID != nil {
+				txHashes[0] = *coinbaseTxID
+			}
+		}
+
 		tracked := a.txTracker.FilterTrackedHashes(txHashes)
-		if len(tracked) == 0 {
+		if len(tracked) == 0 && subtreeIdx > 0 {
 			continue
 		}
 
@@ -322,6 +330,32 @@ func (a *Arcade) processBlockTransactions(ctx context.Context, blockMsg teranode
 	}
 
 	return nil
+}
+
+// parseCoinbaseTxID extracts the txid from the coinbase transaction in a block message.
+// Returns nil if the coinbase cannot be parsed.
+func (a *Arcade) parseCoinbaseTxID(blockMsg teranode.BlockMessage) *chainhash.Hash {
+	if blockMsg.Coinbase == "" {
+		return nil
+	}
+
+	coinbaseBytes, err := hex.DecodeString(blockMsg.Coinbase)
+	if err != nil {
+		a.logger.Error("failed to decode coinbase hex",
+			slog.String("blockHash", blockMsg.Hash),
+			slog.String("error", err.Error()))
+		return nil
+	}
+
+	tx, err := transaction.NewTransactionFromBytes(coinbaseBytes)
+	if err != nil {
+		a.logger.Error("failed to parse coinbase transaction",
+			slog.String("blockHash", blockMsg.Hash),
+			slog.String("error", err.Error()))
+		return nil
+	}
+
+	return tx.TxID()
 }
 
 func (a *Arcade) buildMerklePathsForSubtree(
@@ -379,6 +413,9 @@ func (a *Arcade) buildMerklePathsForSubtree(
 
 		subtreeBaseOffset := uint64(subtreeIdx) << uint(internalHeight-1)
 		for i, subHash := range subtreeHashes {
+			if i == 0 {
+				continue // Subtree 0 root is computed from txHashes (with corrected coinbase)
+			}
 			hashCopy := subHash
 			mp.AddLeaf(internalHeight, &transaction.PathElement{
 				Offset: subtreeBaseOffset + uint64(i),
