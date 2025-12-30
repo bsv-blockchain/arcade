@@ -32,10 +32,11 @@ import (
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/docs"
 	"github.com/bsv-blockchain/arcade/handlers"
+	"github.com/bsv-blockchain/arcade/logging"
 	fiberRoutes "github.com/bsv-blockchain/arcade/routes/fiber"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
-	"github.com/gofiber/fiber/v2/middleware/logger"
+	fiberlogger "github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 
 	chaintracksRoutes "github.com/bsv-blockchain/go-chaintracks/routes/fiber"
@@ -57,17 +58,17 @@ const scalarHTML = `<!DOCTYPE html>
 </html>`
 
 func main() {
-	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
-
-	log.Info("Starting Arcade", slog.String("version", "0.1.0"))
-
+	// Load config first to get log level
 	cfg, err := Load()
 	if err != nil {
-		log.Error("Failed to load configuration", slog.String("error", err.Error()))
+		slog.Error("Failed to load configuration", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
+
+	// Create logger with configured level
+	log := logging.NewLogger(cfg.GetLogLevel())
+
+	log.Info("Starting Arcade", slog.String("version", "0.1.0"), slog.String("log_level", cfg.GetLogLevel()))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -175,7 +176,7 @@ func setupServer(arcadeRoutes *fiberRoutes.Routes, chaintracksRoutes *chaintrack
 		DisableStartupMessage: true,
 	})
 
-	app.Use(logger.New(logger.Config{
+	app.Use(fiberlogger.New(fiberlogger.Config{
 		Format: "${method} ${path} - ${status} (${latency})\n",
 	}))
 	app.Use(recover.New())

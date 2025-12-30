@@ -57,7 +57,7 @@ teranode:
 
 validator:
   max_tx_size: 4294967296
-  min_fee_per_kb: 50
+  min_fee_per_kb: 100
 ```
 
 ### Run
@@ -203,7 +203,7 @@ go test ./...
 | `validator.max_tx_size` | int | Maximum transaction size (bytes) | `4294967296` |
 | `validator.max_script_size` | int | Maximum script size (bytes) | `500000` |
 | `validator.max_sig_ops` | int64 | Maximum signature operations | `4294967295` |
-| `validator.min_fee_per_kb` | uint64 | Minimum fee per KB (satoshis) | `50` |
+| `validator.min_fee_per_kb` | uint64 | Minimum fee per KB (satoshis) | `100` |
 | `webhook.max_retries` | int | Max webhook retry attempts | `10` |
 | `webhook.max_age` | duration | Max age to keep retrying webhooks | `24h` |
 | `auth.enabled` | bool | Enable authentication | `false` |

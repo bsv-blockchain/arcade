@@ -39,6 +39,10 @@ type Config struct {
 	TxTracker      *store.TxTracker
 	Store          store.Store
 	EventPublisher events.Publisher
+
+	// DataHubURLs are fallback URLs for fetching block/subtree data
+	// when the URL in P2P messages fails
+	DataHubURLs []string
 }
 
 // Arcade tracks transaction statuses via P2P network messages.
@@ -52,6 +56,9 @@ type Arcade struct {
 	txTracker      *store.TxTracker
 	store          store.Store
 	eventPublisher events.Publisher
+
+	// Fallback DataHub URLs for fetching block/subtree data
+	dataHubURLs []string
 
 	// Status subscribers (fan-out)
 	subMu         sync.RWMutex
@@ -96,6 +103,7 @@ func NewArcade(cfg Config) (*Arcade, error) {
 		txTracker:      cfg.TxTracker,
 		store:          cfg.Store,
 		eventPublisher: cfg.EventPublisher,
+		dataHubURLs:    cfg.DataHubURLs,
 	}, nil
 }
 
@@ -283,6 +291,10 @@ func (a *Arcade) processBlockMessage(ctx context.Context, blockMsg teranode.Bloc
 
 	// Prune deeply confirmed transactions
 	a.pruneConfirmedTransactions(ctx, blockMsg.Height)
+
+	a.logger.Info("processed block message",
+		slog.String("hash", blockMsg.Hash),
+		slog.Uint64("height", uint64(blockMsg.Height)))
 
 	return nil
 }
@@ -504,6 +516,10 @@ func (a *Arcade) processSubtreeMessage(ctx context.Context, subtreeMsg teranode.
 		return
 	}
 
+	a.logger.Debug("processed subtree message",
+		slog.String("hash", subtreeMsg.Hash),
+		slog.Int("txCount", len(hashes)))
+
 	tracked := a.txTracker.FilterTrackedHashes(hashes)
 	if len(tracked) == 0 {
 		return
@@ -579,12 +595,46 @@ func (a *Arcade) processRejectedTxMessage(ctx context.Context, rejectedMsg teran
 
 func (a *Arcade) fetchBlockSubtreeHashes(ctx context.Context, dataHubURL, blockHash string) ([]chainhash.Hash, error) {
 	url := fmt.Sprintf("%s/block/%s", strings.TrimSuffix(dataHubURL, "/"), blockHash)
-	return a.fetchHashes(ctx, url)
+	hashes, err := a.fetchHashes(ctx, url)
+	if err == nil {
+		return hashes, nil
+	}
+
+	// Try fallback URLs
+	for _, fallbackURL := range a.dataHubURLs {
+		if fallbackURL == dataHubURL {
+			continue // Skip if same as original
+		}
+		url = fmt.Sprintf("%s/block/%s", strings.TrimSuffix(fallbackURL, "/"), blockHash)
+		hashes, fallbackErr := a.fetchHashes(ctx, url)
+		if fallbackErr == nil {
+			return hashes, nil
+		}
+	}
+
+	return nil, err // Return original error
 }
 
 func (a *Arcade) fetchSubtreeHashes(ctx context.Context, dataHubURL, subtreeHash string) ([]chainhash.Hash, error) {
 	url := fmt.Sprintf("%s/subtree/%s", strings.TrimSuffix(dataHubURL, "/"), subtreeHash)
-	return a.fetchHashes(ctx, url)
+	hashes, err := a.fetchHashes(ctx, url)
+	if err == nil {
+		return hashes, nil
+	}
+
+	// Try fallback URLs
+	for _, fallbackURL := range a.dataHubURLs {
+		if fallbackURL == dataHubURL {
+			continue // Skip if same as original
+		}
+		url = fmt.Sprintf("%s/subtree/%s", strings.TrimSuffix(fallbackURL, "/"), subtreeHash)
+		hashes, fallbackErr := a.fetchHashes(ctx, url)
+		if fallbackErr == nil {
+			return hashes, nil
+		}
+	}
+
+	return nil, err // Return original error
 }
 
 func (a *Arcade) fetchHashes(ctx context.Context, url string) ([]chainhash.Hash, error) {

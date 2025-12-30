@@ -12,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/arcade/client"
 	"github.com/bsv-blockchain/arcade/events"
 	"github.com/bsv-blockchain/arcade/events/memory"
+	"github.com/bsv-blockchain/arcade/logging"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/service"
 	"github.com/bsv-blockchain/arcade/service/embedded"
@@ -46,9 +47,8 @@ type Services struct {
 // If p2pClient is provided, it will be shared instead of creating a new one.
 // This allows the caller to share instances across services.
 func (c *Config) Initialize(ctx context.Context, logger *slog.Logger, chaintracker chaintracks.Chaintracks, p2pClient *p2p.Client) (*Services, error) {
-	if logger == nil {
-		logger = slog.Default()
-	}
+	// Create arcade-specific logger with configured log level
+	logger = logging.NewLogger(c.GetLogLevel())
 
 	switch c.Mode {
 	case ModeRemote:
@@ -126,15 +126,12 @@ func (c *Config) initializeEmbedded(ctx context.Context, logger *slog.Logger, ch
 		return nil, fmt.Errorf("unsupported event publisher type: %s", c.Events.Type)
 	}
 
-	// Initialize Teranode client
+	// Initialize Teranode client for broadcasting
 	logger.Info("Initializing Teranode client")
-	var endpoints []string
-	if len(c.Teranode.BaseURLs) > 0 {
-		endpoints = c.Teranode.BaseURLs
-	} else {
-		endpoints = []string{c.Teranode.BaseURL}
+	if len(c.Teranode.BroadcastURLs) == 0 {
+		return nil, fmt.Errorf("no teranode broadcast endpoints configured: set teranode.broadcast_urls")
 	}
-	teranodeClient := teranode.NewClient(endpoints)
+	teranodeClient := teranode.NewClient(c.Teranode.BroadcastURLs, c.Teranode.AuthToken)
 
 	// Initialize validator
 	logger.Info("Initializing validator")
@@ -197,6 +194,7 @@ func (c *Config) initializeEmbedded(ctx context.Context, logger *slog.Logger, ch
 		TxTracker:      txTracker,
 		Store:          sqliteStore,
 		EventPublisher: eventPublisher,
+		DataHubURLs:    c.Teranode.DataHubURLs,
 	})
 	if err != nil {
 		if ownsP2PClient {

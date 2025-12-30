@@ -20,14 +20,19 @@ events:
   buffer_size: 1000
 
 teranode:
-  # base_url: Set via ARCADE_TERANODE_BASE_URL environment variable
+  # broadcast_urls: URLs for submitting transactions to Teranode
+  broadcast_urls:
+    - https://teranode-mainnet.taal.com/api/v1
+  # datahub_urls: Fallback URLs for fetching block/subtree data when P2P message URLs fail
+  datahub_urls:
+    - https://teranode-eks-mainnet-us-1.bsvb.tech/api/v1
   timeout: 30s
 
 validator:
   max_tx_size: 4294967296
   max_script_size: 500000
   max_sig_ops: 4294967295
-  min_fee_per_kb: 50
+  min_fee_per_kb: 100
 
 auth:
   enabled: false

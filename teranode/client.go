@@ -16,13 +16,15 @@ const (
 // Client handles communication with teranode endpoints
 type Client struct {
 	endpoints  []string
+	authToken  string
 	httpClient *http.Client
 }
 
 // NewClient creates a new teranode client
-func NewClient(endpoints []string) *Client {
+func NewClient(endpoints []string, authToken string) *Client {
 	return &Client{
 		endpoints: endpoints,
+		authToken: authToken,
 		httpClient: &http.Client{
 			Timeout: defaultTimeout,
 		},
@@ -40,6 +42,9 @@ func (c *Client) SubmitTransaction(ctx context.Context, endpoint string, rawTx [
 	}
 
 	req.Header.Set("Content-Type", "application/octet-stream")
+	if c.authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.authToken)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
