@@ -46,6 +46,23 @@ type Store interface {
 	// UpdateDeliveryStatus updates the delivery tracking for a submission
 	UpdateDeliveryStatus(ctx context.Context, submissionID string, lastStatus models.Status, retryCount int, nextRetry *time.Time) error
 
+	// Block tracking for catch-up and reorg handling
+
+	// IsBlockOnChain checks if a block is processed AND on the canonical chain
+	IsBlockOnChain(ctx context.Context, blockHash string) (bool, error)
+
+	// MarkBlockProcessed records a block as processed with its chain status
+	MarkBlockProcessed(ctx context.Context, blockHash string, blockHeight uint64, onChain bool) error
+
+	// HasAnyProcessedBlocks checks if there are any blocks in the processed_blocks table
+	HasAnyProcessedBlocks(ctx context.Context) (bool, error)
+
+	// GetOnChainBlockAtHeight returns the block hash at the given height that is on_chain (for reorg detection)
+	GetOnChainBlockAtHeight(ctx context.Context, height uint64) (blockHash string, found bool, err error)
+
+	// MarkBlockOffChain marks a block as off-chain (orphaned due to reorg)
+	MarkBlockOffChain(ctx context.Context, blockHash string) error
+
 	// Close closes the database connection
 	Close() error
 }

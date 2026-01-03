@@ -409,6 +409,68 @@ WHERE submission_id = ?
 	return nil
 }
 
+// Block tracking methods
+
+func (s *Store) IsBlockOnChain(ctx context.Context, blockHash string) (bool, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM processed_blocks WHERE block_hash = ? AND on_chain = 1",
+		blockHash).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("failed to check if block is on chain: %w", err)
+	}
+	return count > 0, nil
+}
+
+func (s *Store) MarkBlockProcessed(ctx context.Context, blockHash string, blockHeight uint64, onChain bool) error {
+	onChainInt := 0
+	if onChain {
+		onChainInt = 1
+	}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO processed_blocks (block_hash, block_height, on_chain) VALUES (?, ?, ?)
+		 ON CONFLICT(block_hash) DO UPDATE SET on_chain = excluded.on_chain`,
+		blockHash, blockHeight, onChainInt)
+	if err != nil {
+		return fmt.Errorf("failed to mark block as processed: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) HasAnyProcessedBlocks(ctx context.Context) (bool, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM processed_blocks LIMIT 1").Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("failed to check for processed blocks: %w", err)
+	}
+	return count > 0, nil
+}
+
+func (s *Store) GetOnChainBlockAtHeight(ctx context.Context, height uint64) (string, bool, error) {
+	var blockHash string
+	err := s.db.QueryRowContext(ctx,
+		"SELECT block_hash FROM processed_blocks WHERE block_height = ? AND on_chain = 1",
+		height).Scan(&blockHash)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("failed to get on-chain block at height: %w", err)
+	}
+	return blockHash, true, nil
+}
+
+func (s *Store) MarkBlockOffChain(ctx context.Context, blockHash string) error {
+	_, err := s.db.ExecContext(ctx,
+		"UPDATE processed_blocks SET on_chain = 0 WHERE block_hash = ?",
+		blockHash)
+	if err != nil {
+		return fmt.Errorf("failed to mark block off-chain: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) Close() error {
 	if s.db != nil {
 		return s.db.Close()

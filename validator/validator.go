@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
+	arcerrors "github.com/bsv-blockchain/arcade/errors"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/script"
 	"github.com/bsv-blockchain/go-sdk/script/interpreter"
@@ -107,7 +109,7 @@ func (v *Validator) MinFeePerKB() uint64 {
 // ValidateTransaction validates policy, and optionally fees and scripts
 func (v *Validator) ValidateTransaction(ctx context.Context, tx *sdkTx.Transaction, skipFees, skipScripts bool) error {
 	if err := v.ValidatePolicy(tx); err != nil {
-		return err
+		return v.wrapPolicyError(err)
 	}
 
 	if skipFees && skipScripts {
@@ -122,16 +124,63 @@ func (v *Validator) ValidateTransaction(ctx context.Context, tx *sdkTx.Transacti
 	if skipScripts {
 		// Fee validation only - use spv.Verify with fee model but gullible headers
 		if _, err := spv.Verify(ctx, tx, &spv.GullibleHeadersClient{}, feeModel); err != nil {
-			return err
+			return v.wrapSPVError(err)
 		}
 	} else {
 		// Script validation (and fees if not skipped)
 		if _, err := spv.Verify(ctx, tx, nil, feeModel); err != nil {
-			return err
+			return v.wrapSPVError(err)
 		}
 	}
 
 	return nil
+}
+
+// wrapPolicyError wraps policy validation errors with ARC-compatible status codes.
+func (v *Validator) wrapPolicyError(err error) error {
+	switch {
+	case errors.Is(err, ErrNoInputsOrOutputs):
+		return arcerrors.NewArcError(err, arcerrors.StatusMalformed)
+	case errors.Is(err, ErrTxSizeGreaterThanMax), errors.Is(err, ErrTxSizeLessThanMinSize):
+		return arcerrors.NewArcError(err, arcerrors.StatusTxSize)
+	case errors.Is(err, ErrTxInputInvalid):
+		return arcerrors.NewArcError(err, arcerrors.StatusInputs)
+	case errors.Is(err, ErrTxOutputInvalid):
+		return arcerrors.NewArcError(err, arcerrors.StatusOutputs)
+	case errors.Is(err, ErrUnlockingScriptHasTooManySigOps),
+		errors.Is(err, ErrEmptyUnlockingScript),
+		errors.Is(err, ErrUnlockingScriptNotPushOnly):
+		return arcerrors.NewArcError(err, arcerrors.StatusUnlockingScripts)
+	default:
+		return arcerrors.NewArcError(err, arcerrors.StatusMalformed)
+	}
+}
+
+// wrapSPVError wraps SPV verification errors with ARC-compatible status codes.
+func (v *Validator) wrapSPVError(err error) error {
+	errStr := err.Error()
+
+	// Check for fee-related errors
+	if strings.Contains(errStr, "fee") ||
+		strings.Contains(errStr, "satoshis inputted") ||
+		strings.Contains(errStr, "satoshis outputted") {
+		return arcerrors.NewArcErrorWithInfo(err, arcerrors.StatusFees, errStr)
+	}
+
+	// Check for script validation errors
+	if strings.Contains(errStr, "script") ||
+		strings.Contains(errStr, "signature") ||
+		strings.Contains(errStr, "unlock") {
+		return arcerrors.NewArcError(err, arcerrors.StatusUnlockingScripts)
+	}
+
+	// Check for input-related errors
+	if strings.Contains(errStr, "input") {
+		return arcerrors.NewArcError(err, arcerrors.StatusInputs)
+	}
+
+	// Default to generic validation error
+	return arcerrors.NewArcError(err, arcerrors.StatusGeneric)
 }
 
 func (v *Validator) checkOutputs(tx *sdkTx.Transaction) error {

@@ -189,7 +189,7 @@ func (c *Config) initializeEmbedded(ctx context.Context, logger *slog.Logger, ch
 	logger.Info("Initializing Arcade P2P listener")
 	arcadeInstance, err := arcade.NewArcade(arcade.Config{
 		P2PClient:      p2pClient,
-		ChainTracker:   chaintracker,
+		Chaintracks:    chaintracker,
 		Logger:         logger,
 		TxTracker:      txTracker,
 		Store:          sqliteStore,
