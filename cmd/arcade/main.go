@@ -31,15 +31,12 @@ import (
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/docs"
-	"github.com/bsv-blockchain/arcade/handlers"
 	"github.com/bsv-blockchain/arcade/logging"
 	fiberRoutes "github.com/bsv-blockchain/arcade/routes/fiber"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	fiberlogger "github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"
-
-	chaintracksRoutes "github.com/bsv-blockchain/go-chaintracks/routes/fiber"
 )
 
 var authToken string
@@ -81,6 +78,7 @@ func main() {
 
 func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	// Initialize all services (nil for chaintracker and p2pClient = arcade creates its own)
+	// This also starts the webhook handler for callback delivery
 	services, err := cfg.Initialize(ctx, log, nil, nil)
 	if err != nil {
 		return fmt.Errorf("failed to initialize services: %w", err)
@@ -90,28 +88,6 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			log.Error("Error closing services", slog.String("error", err.Error()))
 		}
 	}()
-
-	// Subscribe to chaintracks tip updates
-	// tipChan := services.Chaintracks.Subscribe(ctx)
-
-	ctRoutes := chaintracksRoutes.NewRoutes(ctx, services.Chaintracks)
-	// ctRoutes.StartBroadcasting(ctx, tipChan)
-
-	// Initialize webhook handler
-	log.Info("Initializing webhook handler")
-	webhookHandler := handlers.NewWebhookHandler(
-		services.EventPublisher,
-		services.Store,
-		log,
-		cfg.Webhook.PruneInterval,
-		cfg.Webhook.MaxAge,
-		cfg.Webhook.MaxRetries,
-	)
-
-	if err := webhookHandler.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start webhook handler: %w", err)
-	}
-	defer webhookHandler.Stop()
 
 	// Setup routes
 	arcadeRoutes := fiberRoutes.NewRoutes(fiberRoutes.Config{
@@ -132,7 +108,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 
 	// Setup and start HTTP server
 	log.Info("Starting HTTP server", slog.String("address", cfg.Server.Address))
-	app := setupServer(arcadeRoutes, ctRoutes, dashboard)
+	app := setupServer(arcadeRoutes, dashboard)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -171,7 +147,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	return nil
 }
 
-func setupServer(arcadeRoutes *fiberRoutes.Routes, chaintracksRoutes *chaintracksRoutes.Routes, dashboard *Dashboard) *fiber.App {
+func setupServer(arcadeRoutes *fiberRoutes.Routes, dashboard *Dashboard) *fiber.App {
 	app := fiber.New(fiber.Config{
 		DisableStartupMessage: true,
 	})
@@ -195,10 +171,6 @@ func setupServer(arcadeRoutes *fiberRoutes.Routes, chaintracksRoutes *chaintrack
 
 	// Health check (standalone arcade server only)
 	app.Get("/health", arcadeRoutes.HandleGetHealth)
-
-	// Chaintracks endpoints (under /v2 prefix)
-	chaintracksGroup := app.Group("/v2")
-	chaintracksRoutes.Register(chaintracksGroup)
 
 	// Status dashboard
 	app.Get("/", dashboard.HandleDashboard)

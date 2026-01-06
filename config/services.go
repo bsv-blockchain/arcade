@@ -12,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/arcade/client"
 	"github.com/bsv-blockchain/arcade/events"
 	"github.com/bsv-blockchain/arcade/events/memory"
+	"github.com/bsv-blockchain/arcade/handlers"
 	"github.com/bsv-blockchain/arcade/logging"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/service"
@@ -38,6 +39,7 @@ type Services struct {
 	EventPublisher events.Publisher
 	TeranodeClient *teranode.Client
 	Validator      *validator.Validator
+	WebhookHandler *handlers.WebhookHandler
 	Logger         *slog.Logger
 	Config         *Config
 }
@@ -238,6 +240,24 @@ func (c *Config) initializeEmbedded(ctx context.Context, logger *slog.Logger, ch
 		return nil, fmt.Errorf("failed to create embedded service: %w", err)
 	}
 
+	// Initialize webhook handler for outbound callback delivery
+	logger.Info("Initializing webhook handler")
+	webhookHandler := handlers.NewWebhookHandler(
+		eventPublisher,
+		sqliteStore,
+		logger,
+		c.Webhook.PruneInterval,
+		c.Webhook.MaxAge,
+		c.Webhook.MaxRetries,
+	)
+	if err := webhookHandler.Start(ctx); err != nil {
+		_ = arcadeInstance.Stop()
+		if ownsP2PClient {
+			_ = p2pClient.Close()
+		}
+		return nil, fmt.Errorf("failed to start webhook handler: %w", err)
+	}
+
 	return &Services{
 		ArcadeService:  embeddedService,
 		P2PClient:      p2pClient,
@@ -248,6 +268,7 @@ func (c *Config) initializeEmbedded(ctx context.Context, logger *slog.Logger, ch
 		EventPublisher: eventPublisher,
 		TeranodeClient: teranodeClient,
 		Validator:      txValidator,
+		WebhookHandler: webhookHandler,
 		Logger:         logger,
 		Config:         c,
 	}, nil
@@ -260,6 +281,11 @@ func (s *Services) Close() error {
 	}
 
 	var errs []error
+
+	// Stop webhook handler first (depends on event publisher)
+	if s.WebhookHandler != nil {
+		s.WebhookHandler.Stop()
+	}
 
 	// Stop Arcade P2P listener
 	if s.Arcade != nil {

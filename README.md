@@ -43,21 +43,10 @@ storage_path: ~/.arcade
 server:
   address: ":3011"
 
-database:
-  type: sqlite
-  sqlite_path: ~/.arcade/arcade.db
-
-events:
-  type: memory
-  buffer_size: 1000
-
 teranode:
-  # Set via ARCADE_TERANODE_BASE_URL environment variable
+  broadcast_urls:
+    - "https://arc.taal.com"
   timeout: 30s
-
-validator:
-  max_tx_size: 4294967296
-  min_fee_per_kb: 100
 ```
 
 ### Run
@@ -70,11 +59,11 @@ arcade -config config.yaml
 
 ### Submit Transaction
 
+Arcade accepts transactions as hex-encoded strings, raw bytes, or BEEF format:
+
 ```bash
-curl -X POST http://localhost:8080/v1/tx \
+curl -X POST http://localhost:3011/tx \
   -H "Content-Type: text/plain" \
-  -H "X-WaitFor: SEEN_ON_NETWORK" \
-  -H "X-MaxTimeout: 10" \
   -H "X-CallbackUrl: https://myapp.com/webhook" \
   --data "<hex-encoded-transaction>"
 ```
@@ -82,13 +71,27 @@ curl -X POST http://localhost:8080/v1/tx \
 ### Get Transaction Status
 
 ```bash
-curl http://localhost:8080/v1/tx/{txid}
+curl http://localhost:3011/tx/{txid}
 ```
 
 ### Get Policy
 
 ```bash
-curl http://localhost:8080/v1/policy
+curl http://localhost:3011/policy
+```
+
+### Submit Multiple Transactions
+
+```bash
+curl -X POST http://localhost:3011/txs \
+  -H "Content-Type: application/json" \
+  --data '[{"rawTx": "0100000001..."}, {"rawTx": "0100000001..."}]'
+```
+
+### Health Check
+
+```bash
+curl http://localhost:3011/health
 ```
 
 ## Transaction Status Flow
@@ -96,11 +99,13 @@ curl http://localhost:8080/v1/policy
 ```
 Client → Arcade
    ↓
-QUEUED/STORED (validated locally)
+RECEIVED (validated locally)
    ↓
 SENT_TO_NETWORK (submitted to Teranode via HTTP)
    ↓
-SEEN_ON_NETWORK (heard in subtree gossip - validated, in mempool)
+ACCEPTED_BY_NETWORK (acknowledged by Teranode)
+   ↓
+SEEN_ON_NETWORK (heard in subtree gossip - in mempool)
    ↓
 MINED (heard in block gossip - included in block)
 ```
@@ -117,32 +122,18 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed architecture documentation.
 
 ### Key Components
 
-- **HTTP API Server** - Arc-compatible REST endpoints
-- **P2P Subscriber** - LibP2P gossip listener (block, subtree, rejected-tx topics)
-- **Teranode Client** - HTTP client for transaction submission with fan-out
-- **Chain Tracker** - Blockchain header management with local persistence
-- **Status Store** - Append-only transaction status log
-- **Submission Store** - Client subscription tracking
-- **Event System** - Global status update channel with multiple handlers
-- **Webhook Handler** - Async notification delivery with retry logic
-- **SSE Handler** - Real-time status streaming with catchup support
-- **WaitFor Handler** - Synchronous status waiting for HTTP requests
+- **Arcade** (`arcade.go`) - Core P2P listener that subscribes to block, subtree, and rejected-tx gossip topics, processes messages, and updates transaction statuses
+- **Store** (`store/`) - SQLite storage for transaction statuses, webhook submissions, and delivery tracking
+- **TxTracker** (`store/tracker.go`) - In-memory index of transactions being monitored, with persistence
+- **Event Publisher** (`events/`) - In-memory pub/sub for distributing status updates to handlers
+- **Webhook Handler** (`handlers/webhook.go`) - Delivers status updates to client callback URLs with retry logic
+- **HTTP Routes** (`routes/fiber/`) - Arc-compatible REST API including SSE streaming
 
 ## Chain Tracking
 
-Arcade includes blockchain header tracking for merkle proof validation. Headers are loaded from embedded checkpoint files on startup and updated via P2P block announcements.
+Arcade uses [go-chaintracks](https://github.com/bsv-blockchain/go-chaintracks) for blockchain header tracking and merkle proof validation. Headers are loaded from embedded checkpoint files on startup and updated via P2P block announcements.
 
-### Header API Endpoints
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /network` | Returns the network name (mainnet, testnet, etc.) |
-| `GET /height` | Returns current blockchain height |
-| `GET /tip` | Returns current chain tip header |
-| `GET /tip/stream` | SSE stream of chain tip updates |
-| `GET /header/height/:height` | Get header by block height |
-| `GET /header/hash/:hash` | Get header by block hash |
-| `GET /headers?height=N&count=M` | Get M headers starting at height N |
+For applications that need both transaction broadcast and header endpoints, see the [combined server example](examples/combined_server/).
 
 ### Remote Client
 
@@ -151,7 +142,8 @@ For applications that need Arcade functionality without running a full server, u
 ```go
 import "github.com/bsv-blockchain/arcade/client"
 
-c := client.New("http://arcade-server:8080")
+c := client.New("http://arcade-server:3011")
+defer c.Close()
 
 // Submit a transaction
 status, err := c.SubmitTransaction(ctx, rawTxBytes, nil)
@@ -159,7 +151,7 @@ status, err := c.SubmitTransaction(ctx, rawTxBytes, nil)
 // Get transaction status
 status, err := c.GetStatus(ctx, "txid...")
 
-// Subscribe to transaction status updates
+// Subscribe to status updates for a callback token
 statusChan, err := c.Subscribe(ctx, "my-callback-token")
 for status := range statusChan {
     fmt.Printf("Status: %s %s\n", status.TxID, status.Status)
@@ -187,38 +179,35 @@ go test ./...
 
 ## Configuration Options
 
-| Section | Field | Description | Default |
-|---------|-------|-------------|---------|
-| `network` | string | Bitcoin network: `main`, `test`, `stn` | `main` |
-| `storage_path` | string | Data directory for persistent files | `~/.arcade` |
-| `server.address` | string | HTTP server listen address | `:3011` |
-| `server.read_timeout` | duration | HTTP read timeout | `30s` |
-| `server.write_timeout` | duration | HTTP write timeout | `30s` |
-| `database.type` | string | Database type: `sqlite` | `sqlite` |
-| `database.sqlite_path` | string | SQLite database file path | `~/.arcade/arcade.db` |
-| `events.type` | string | Event backend: `memory` | `memory` |
-| `events.buffer_size` | int | Event channel buffer size | `1000` |
-| `teranode.base_url` | string | Teranode propagation service URL | - |
-| `teranode.timeout` | duration | HTTP request timeout | `30s` |
-| `validator.max_tx_size` | int | Maximum transaction size (bytes) | `4294967296` |
-| `validator.max_script_size` | int | Maximum script size (bytes) | `500000` |
-| `validator.max_sig_ops` | int64 | Maximum signature operations | `4294967295` |
-| `validator.min_fee_per_kb` | uint64 | Minimum fee per KB (satoshis) | `100` |
-| `webhook.max_retries` | int | Max webhook retry attempts | `10` |
-| `webhook.max_age` | duration | Max age to keep retrying webhooks | `24h` |
-| `auth.enabled` | bool | Enable authentication | `false` |
+| Field | Description | Default |
+|-------|-------------|---------|
+| `network` | Bitcoin network: `main`, `test`, `stn` | `main` |
+| `storage_path` | Data directory for persistent files | `~/.arcade` |
+| `log_level` | Log level: `debug`, `info`, `warn`, `error` | `info` |
+| `server.address` | HTTP server listen address | `:3011` |
+| `server.shutdown_timeout` | Graceful shutdown timeout | `30s` |
+| `teranode.broadcast_urls` | Teranode broadcast service URLs (array) | - |
+| `teranode.datahub_urls` | DataHub URLs for fetching block data (array) | - |
+| `teranode.timeout` | HTTP request timeout | `30s` |
+| `validator.max_tx_size` | Maximum transaction size (bytes) | `4294967296` |
+| `validator.max_script_size` | Maximum script size (bytes) | `500000` |
+| `validator.max_sig_ops` | Maximum signature operations | `4294967295` |
+| `validator.min_fee_per_kb` | Minimum fee per KB (satoshis) | `100` |
+| `webhook.max_retries` | Max webhook retry attempts | `10` |
+| `webhook.max_age` | Max age to keep retrying webhooks | `24h` |
+| `webhook.prune_interval` | How often to prune expired webhooks | `1h` |
+| `auth.enabled` | Enable Bearer token authentication | `false` |
+| `auth.token` | Bearer token (required if auth enabled) | - |
 
 ## HTTP Headers
 
 Arcade supports Arc-compatible headers:
 
-- `X-CallbackUrl` - Webhook URL for async updates
+- `X-CallbackUrl` - Webhook URL for async status updates
 - `X-CallbackToken` - Token for webhook auth and SSE stream filtering
 - `X-FullStatusUpdates` - Include all intermediate statuses (default: final only)
-- `X-WaitFor` - Status to wait for before returning
-- `X-MaxTimeout` - Wait timeout in seconds (max 30)
 - `X-SkipFeeValidation` - Skip fee validation
-- `X-SkipScriptValidation` - Skip script execution
+- `X-SkipScriptValidation` - Skip script validation
 
 ## Webhook Notifications
 
@@ -248,15 +237,15 @@ Arcade provides real-time transaction status updates via SSE, offering an altern
 
 1. **Submit Transaction with Callback Token:**
    ```bash
-   curl -X POST http://localhost:8080/v1/tx \
-     -H "Content-Type: application/json" \
+   curl -X POST http://localhost:3011/tx \
+     -H "Content-Type: text/plain" \
      -H "X-CallbackToken: my-token-123" \
-     -d '{"rawTx": "01000000..."}'
+     --data "<hex-encoded-transaction>"
    ```
 
 2. **Connect SSE Client:**
    ```javascript
-   const eventSource = new EventSource('http://localhost:8080/v1/events/my-token-123');
+   const eventSource = new EventSource('http://localhost:3011/events?callbackToken=my-token-123');
 
    eventSource.addEventListener('status', (e) => {
      const update = JSON.parse(e.data);
@@ -336,11 +325,10 @@ func (h *MyHandler) Start(ctx context.Context) error {
 
 ## Differences from Arc
 
-- **Simpler Deployment** - Single binary, no PostgreSQL/NATS required by default
+- **Simpler Deployment** - Single binary with SQLite, no PostgreSQL/NATS required
 - **P2P-First** - Direct gossip listening instead of node callbacks
-- **Pluggable Backends** - Swap components without code changes
-- **Teranode-Only** - No legacy node support
-- **Open & Extensible** - All packages public
+- **Teranode-Only** - Designed for Teranode, no legacy node support
+- **Extensible** - All packages public for customization
 
 ## License
 

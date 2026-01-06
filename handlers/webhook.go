@@ -92,6 +92,10 @@ func (h *WebhookHandler) processEvents(ctx context.Context, eventCh <-chan *mode
 
 // handleStatus handles a single status update
 func (h *WebhookHandler) handleStatus(ctx context.Context, status *models.TransactionStatus) {
+	h.logger.Debug("Processing status update for webhooks",
+		slog.String("txid", status.TxID),
+		slog.String("status", string(status.Status)))
+
 	submissions, err := h.store.GetSubmissionsByTxID(ctx, status.TxID)
 	if err != nil {
 		h.logger.Error("Failed to get submissions",
@@ -100,12 +104,26 @@ func (h *WebhookHandler) handleStatus(ctx context.Context, status *models.Transa
 		return
 	}
 
+	if len(submissions) == 0 {
+		h.logger.Debug("No webhook submissions for transaction",
+			slog.String("txid", status.TxID))
+		return
+	}
+
+	h.logger.Debug("Found webhook submissions",
+		slog.String("txid", status.TxID),
+		slog.Int("count", len(submissions)))
+
 	for _, sub := range submissions {
 		if sub.CallbackURL == "" {
 			continue
 		}
 
 		if sub.LastDeliveredStatus == status.Status {
+			h.logger.Debug("Skipping webhook - status already delivered",
+				slog.String("txid", status.TxID),
+				slog.String("submission_id", sub.SubmissionID),
+				slog.String("status", string(status.Status)))
 			continue
 		}
 
@@ -137,6 +155,12 @@ func (h *WebhookHandler) performPruning(ctx context.Context) {
 
 // deliverWebhook delivers a webhook for a specific submission
 func (h *WebhookHandler) deliverWebhook(ctx context.Context, sub models.Submission, status *models.TransactionStatus) {
+	h.logger.Info("Delivering webhook",
+		slog.String("txid", status.TxID),
+		slog.String("submission_id", sub.SubmissionID),
+		slog.String("url", sub.CallbackURL),
+		slog.String("status", string(status.Status)))
+
 	payloadBytes, err := json.Marshal(status)
 	if err != nil {
 		h.logger.Error("Failed to marshal payload",

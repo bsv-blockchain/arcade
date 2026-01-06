@@ -9,7 +9,7 @@
 
     <script>
         const callbackToken = "example-token-123";
-        const url = `http://localhost:8080/v1/events/${callbackToken}`;
+        const url = `http://localhost:3011/events?callbackToken=${callbackToken}`;
 
         const eventSource = new EventSource(url);
         const log = document.getElementById('log');

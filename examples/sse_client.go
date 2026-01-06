@@ -10,7 +10,7 @@ import (
 
 func main() {
 	callbackToken := "example-token-123"
-	url := fmt.Sprintf("http://localhost:8080/v1/events/%s", callbackToken)
+	url := fmt.Sprintf("http://localhost:3011/events?callbackToken=%s", callbackToken)
 
 	// Create request with optional Last-Event-ID for catchup
 	req, err := http.NewRequest("GET", url, nil)
