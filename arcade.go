@@ -16,10 +16,10 @@ import (
 	"github.com/bsv-blockchain/arcade/events"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/go-chaintracks/chaintracks"
 	msgbus "github.com/bsv-blockchain/go-p2p-message-bus"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
-	"github.com/bsv-blockchain/go-sdk/transaction/chaintracker"
 	p2p "github.com/bsv-blockchain/go-teranode-p2p-client"
 	teranode "github.com/bsv-blockchain/teranode/services/p2p"
 )
@@ -29,8 +29,8 @@ type Config struct {
 	// P2PClient for network communication (required)
 	P2PClient *p2p.Client
 
-	// ChainTracker for merkle root validation (required)
-	ChainTracker chaintracker.ChainTracker
+	// Chaintracks for tip updates, block header lookups, and merkle root validation (required)
+	Chaintracks chaintracks.Chaintracks
 
 	// Logger for structured logging
 	Logger *slog.Logger
@@ -39,19 +39,26 @@ type Config struct {
 	TxTracker      *store.TxTracker
 	Store          store.Store
 	EventPublisher events.Publisher
+
+	// DataHubURLs are fallback URLs for fetching block/subtree data
+	// when the URL in P2P messages fails
+	DataHubURLs []string
 }
 
 // Arcade tracks transaction statuses via P2P network messages.
 type Arcade struct {
-	p2pClient    *p2p.Client
-	chainTracker chaintracker.ChainTracker
-	logger       *slog.Logger
-	httpClient   *http.Client
+	p2pClient   *p2p.Client
+	chaintracks chaintracks.Chaintracks
+	logger      *slog.Logger
+	httpClient  *http.Client
 
 	// Transaction tracking
 	txTracker      *store.TxTracker
 	store          store.Store
 	eventPublisher events.Publisher
+
+	// Fallback DataHub URLs for fetching block/subtree data
+	dataHubURLs []string
 
 	// Status subscribers (fan-out)
 	subMu         sync.RWMutex
@@ -71,8 +78,8 @@ func NewArcade(cfg Config) (*Arcade, error) {
 	if cfg.P2PClient == nil {
 		return nil, fmt.Errorf("P2PClient is required")
 	}
-	if cfg.ChainTracker == nil {
-		return nil, fmt.Errorf("ChainTracker is required")
+	if cfg.Chaintracks == nil {
+		return nil, fmt.Errorf("Chaintracks is required")
 	}
 	if cfg.TxTracker == nil {
 		return nil, fmt.Errorf("TxTracker is required")
@@ -90,12 +97,13 @@ func NewArcade(cfg Config) (*Arcade, error) {
 
 	return &Arcade{
 		p2pClient:      cfg.P2PClient,
-		chainTracker:   cfg.ChainTracker,
+		chaintracks:    cfg.Chaintracks,
 		logger:         cfg.Logger,
 		httpClient:     &http.Client{Timeout: 30 * time.Second},
 		txTracker:      cfg.TxTracker,
 		store:          cfg.Store,
 		eventPublisher: cfg.EventPublisher,
+		dataHubURLs:    cfg.DataHubURLs,
 	}, nil
 }
 
@@ -118,6 +126,17 @@ func (a *Arcade) Start(ctx context.Context) error {
 	// Forward status updates from EventPublisher to status subscribers
 	a.statusSubDone = make(chan struct{})
 	go a.forwardStatusUpdates(ctx)
+
+	// Initialize block tracking
+	if err := a.initializeBlockTracking(ctx); err != nil {
+		a.logger.Warn("failed to initialize block tracking",
+			slog.String("error", err.Error()))
+		// Continue anyway - tip updates will handle catch-up
+	}
+
+	// Subscribe to chaintracks tip updates - this drives all catch-up
+	tipChan := a.chaintracks.Subscribe(ctx)
+	go a.handleTipUpdates(ctx, tipChan)
 
 	a.logger.Info("Arcade started", slog.String("peerID", a.p2pClient.GetID()))
 	return nil
@@ -251,38 +270,50 @@ func (a *Arcade) handleBlockMessages(ctx context.Context, blockChan <-chan teran
 }
 
 func (a *Arcade) processBlockMessage(ctx context.Context, blockMsg teranode.BlockMessage) error {
-	if a.txTracker.Count() == 0 {
-		return nil
-	}
-
 	a.logger.Info("received block message",
 		slog.String("hash", blockMsg.Hash),
 		slog.Uint64("height", uint64(blockMsg.Height)))
 
-	// Process transactions to extract merkle proofs
-	if err := a.processBlockTransactions(ctx, blockMsg); err != nil {
-		return err
+	// Only do transaction scanning if we have transactions to track
+	if a.txTracker.Count() > 0 {
+		// Process transactions to extract merkle proofs
+		if err := a.processBlockTransactions(ctx, blockMsg); err != nil {
+			return err
+		}
+
+		// Set MINED status for transactions with merkle proofs in this block
+		statuses, err := a.store.SetMinedByBlockHash(ctx, blockMsg.Hash)
+		if err != nil {
+			a.logger.Error("failed to set mined status",
+				slog.String("blockHash", blockMsg.Hash),
+				slog.String("error", err.Error()))
+		} else {
+			for _, status := range statuses {
+				a.eventPublisher.Publish(ctx, status)
+			}
+			if len(statuses) > 0 {
+				a.logger.Info("set transactions to MINED",
+					slog.String("blockHash", blockMsg.Hash),
+					slog.Int("count", len(statuses)))
+			}
+		}
+
+		// Prune deeply confirmed transactions
+		a.pruneConfirmedTransactions(ctx, blockMsg.Height)
 	}
 
-	// Set MINED status for transactions with merkle proofs in this block
-	statuses, err := a.store.SetMinedByBlockHash(ctx, blockMsg.Hash)
-	if err != nil {
-		a.logger.Error("failed to set mined status",
+	// Mark block as processed but NOT on_chain
+	// P2P block messages may arrive out of order or for blocks not yet connected to our chain
+	// The tip catch-up handler will mark blocks as on_chain when it connects them
+	if err := a.store.MarkBlockProcessed(ctx, blockMsg.Hash, uint64(blockMsg.Height), false); err != nil {
+		a.logger.Warn("failed to mark block as processed",
 			slog.String("blockHash", blockMsg.Hash),
 			slog.String("error", err.Error()))
-	} else {
-		for _, status := range statuses {
-			a.eventPublisher.Publish(ctx, status)
-		}
-		if len(statuses) > 0 {
-			a.logger.Info("set transactions to MINED",
-				slog.String("blockHash", blockMsg.Hash),
-				slog.Int("count", len(statuses)))
-		}
 	}
 
-	// Prune deeply confirmed transactions
-	a.pruneConfirmedTransactions(ctx, blockMsg.Height)
+	a.logger.Info("processed block message",
+		slog.String("hash", blockMsg.Hash),
+		slog.Uint64("height", uint64(blockMsg.Height)))
 
 	return nil
 }
@@ -295,14 +326,19 @@ func (a *Arcade) processBlockTransactions(ctx context.Context, blockMsg teranode
 
 	numSubtrees := len(subtreeHashes)
 	if numSubtrees == 0 {
+		a.logger.Debug("block has no subtrees",
+			slog.String("hash", blockMsg.Hash))
 		return nil
 	}
 
 	a.logger.Debug("processing block transactions",
 		slog.String("hash", blockMsg.Hash),
-		slog.Int("subtrees", numSubtrees))
+		slog.Int("subtrees", numSubtrees),
+		slog.Int("trackedTxCount", a.txTracker.Count()))
 
 	subtreeRootLayer := int(math.Ceil(math.Log2(float64(numSubtrees))))
+	totalTxsScanned := 0
+	totalMatched := 0
 
 	for subtreeIdx, subtreeHash := range subtreeHashes {
 		txHashes, err := a.fetchSubtreeHashes(ctx, blockMsg.DataHubURL, subtreeHash.String())
@@ -313,6 +349,8 @@ func (a *Arcade) processBlockTransactions(ctx context.Context, blockMsg teranode
 			continue
 		}
 
+		totalTxsScanned += len(txHashes)
+
 		// Subtree 0 contains a coinbase placeholder that must be replaced with the
 		// real coinbase txid. The subtree 0 root will be computed by ComputeMissingHashes.
 		if subtreeIdx == 0 && len(txHashes) > 0 {
@@ -322,12 +360,33 @@ func (a *Arcade) processBlockTransactions(ctx context.Context, blockMsg teranode
 		}
 
 		tracked := a.txTracker.FilterTrackedHashes(txHashes)
+		totalMatched += len(tracked)
+
+		if len(tracked) > 0 {
+			a.logger.Info("matched tracked transactions in subtree",
+				slog.String("blockHash", blockMsg.Hash),
+				slog.Int("subtreeIdx", subtreeIdx),
+				slog.Int("subtreeTxCount", len(txHashes)),
+				slog.Int("matchedCount", len(tracked)))
+			for _, h := range tracked {
+				a.logger.Debug("matched txid",
+					slog.String("txid", h.String()),
+					slog.String("blockHash", blockMsg.Hash))
+			}
+		}
+
 		if len(tracked) == 0 && subtreeIdx > 0 {
 			continue
 		}
 
 		a.buildMerklePathsForSubtree(ctx, blockMsg, subtreeIdx, subtreeRootLayer, subtreeHashes, txHashes, tracked)
 	}
+
+	a.logger.Debug("block transaction scan complete",
+		slog.String("hash", blockMsg.Hash),
+		slog.Int("subtreesProcessed", numSubtrees),
+		slog.Int("totalTxsScanned", totalTxsScanned),
+		slog.Int("totalMatched", totalMatched))
 
 	return nil
 }
@@ -476,6 +535,278 @@ func (a *Arcade) pruneConfirmedTransactions(ctx context.Context, currentHeight u
 	}
 }
 
+// Block tracking and catch-up methods
+
+const startupSyncDepth = 1000 // How many blocks to mark as on_chain on first run
+
+// initializeBlockTracking marks recent blocks as on_chain on first run (empty DB)
+func (a *Arcade) initializeBlockTracking(ctx context.Context) error {
+	// Check if we have any processed blocks already
+	hasProcessedBlocks, err := a.store.HasAnyProcessedBlocks(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to check for processed blocks: %w", err)
+	}
+
+	if hasProcessedBlocks {
+		// Not first run - tip updates will handle any catch-up
+		return nil
+	}
+
+	// First run - mark last 1000 blocks as on_chain
+	tip := a.chaintracks.GetTip(ctx)
+	if tip == nil {
+		return fmt.Errorf("chaintracks has no tip")
+	}
+
+	startHeight := uint32(0)
+	if tip.Height > startupSyncDepth {
+		startHeight = tip.Height - startupSyncDepth
+	}
+
+	headers, err := a.chaintracks.GetHeaders(ctx, startHeight, startupSyncDepth)
+	if err != nil {
+		return fmt.Errorf("failed to get headers: %w", err)
+	}
+
+	a.logger.Info("first run - marking recent blocks as on_chain",
+		slog.Int("count", len(headers)),
+		slog.Uint64("fromHeight", uint64(startHeight)))
+
+	for _, header := range headers {
+		if err := a.store.MarkBlockProcessed(ctx, header.Hash.String(), uint64(header.Height), true); err != nil {
+			a.logger.Warn("failed to mark block as on_chain",
+				slog.String("hash", header.Hash.String()),
+				slog.String("error", err.Error()))
+		}
+	}
+
+	a.logger.Info("block tracking initialized", slog.Int("blocksMarked", len(headers)))
+	return nil
+}
+
+// handleTipUpdates listens for chaintracks tip updates and processes catch-up
+func (a *Arcade) handleTipUpdates(ctx context.Context, tipChan <-chan *chaintracks.BlockHeader) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case tip, ok := <-tipChan:
+			if !ok {
+				return
+			}
+			if err := a.processNewTip(ctx, tip); err != nil {
+				a.logger.Error("failed to process new tip",
+					slog.String("hash", tip.Hash.String()),
+					slog.Uint64("height", uint64(tip.Height)),
+					slog.String("error", err.Error()))
+			}
+		}
+	}
+}
+
+// processNewTip handles a new chain tip from chaintracks
+func (a *Arcade) processNewTip(ctx context.Context, tip *chaintracks.BlockHeader) error {
+	// Find blocks not yet on our canonical chain and detect reorgs
+	unprocessedBlocks, orphanedBlocks, err := a.findUnprocessedAndOrphanedBlocks(ctx, tip)
+	if err != nil {
+		return fmt.Errorf("failed to find unprocessed blocks: %w", err)
+	}
+
+	// Handle orphaned blocks (reorg) - reset transaction statuses
+	for _, orphan := range orphanedBlocks {
+		if err := a.handleOrphanedBlock(ctx, orphan); err != nil {
+			a.logger.Error("failed to handle orphaned block",
+				slog.String("hash", orphan.Hash),
+				slog.Uint64("height", orphan.Height),
+				slog.String("error", err.Error()))
+		}
+	}
+
+	if len(unprocessedBlocks) == 0 {
+		return nil
+	}
+
+	a.logger.Info("catching up blocks",
+		slog.Int("count", len(unprocessedBlocks)),
+		slog.Int("orphaned", len(orphanedBlocks)),
+		slog.String("tipHash", tip.Hash.String()))
+
+	// Process blocks oldest to newest to maintain chain continuity
+	for i := len(unprocessedBlocks) - 1; i >= 0; i-- {
+		header := unprocessedBlocks[i]
+		if err := a.processBlockByHeader(ctx, header); err != nil {
+			a.logger.Error("failed to process block",
+				slog.String("hash", header.Hash.String()),
+				slog.Uint64("height", uint64(header.Height)),
+				slog.String("error", err.Error()))
+			return err
+		}
+	}
+
+	return nil
+}
+
+// OrphanedBlock represents a block that was reorged out
+type OrphanedBlock struct {
+	Hash   string
+	Height uint64
+}
+
+// findUnprocessedAndOrphanedBlocks walks back from tip to find blocks not on our chain and detect reorgs
+func (a *Arcade) findUnprocessedAndOrphanedBlocks(ctx context.Context, tip *chaintracks.BlockHeader) ([]*chaintracks.BlockHeader, []OrphanedBlock, error) {
+	var unprocessed []*chaintracks.BlockHeader
+	var orphaned []OrphanedBlock
+	current := tip
+
+	for {
+		blockHash := current.Hash.String()
+
+		// Check if this block is already on our canonical chain
+		onChain, err := a.store.IsBlockOnChain(ctx, blockHash)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to check block %s: %w", blockHash, err)
+		}
+
+		if onChain {
+			// Found a block on our canonical chain - we're connected!
+			break
+		}
+
+		// Check for reorg: is there a DIFFERENT block at this height that's on_chain?
+		existingHash, found, err := a.store.GetOnChainBlockAtHeight(ctx, uint64(current.Height))
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to check height %d: %w", current.Height, err)
+		}
+		if found && existingHash != blockHash {
+			// Reorg detected! The existing block at this height is now orphaned
+			orphaned = append(orphaned, OrphanedBlock{
+				Hash:   existingHash,
+				Height: uint64(current.Height),
+			})
+		}
+
+		unprocessed = append(unprocessed, current)
+
+		// Don't go past genesis
+		if current.Height == 0 {
+			break
+		}
+
+		// Get parent block from chaintracks
+		parent, err := a.chaintracks.GetHeaderByHash(ctx, &current.PrevHash)
+		if err != nil {
+			// Can't walk back further (might be at our sync start point)
+			a.logger.Debug("can't get parent block, stopping walk-back",
+				slog.String("hash", current.PrevHash.String()),
+				slog.String("error", err.Error()))
+			break
+		}
+		current = parent
+	}
+
+	return unprocessed, orphaned, nil
+}
+
+// handleOrphanedBlock resets transaction statuses when a block is reorged out
+func (a *Arcade) handleOrphanedBlock(ctx context.Context, orphan OrphanedBlock) error {
+	a.logger.Info("handling orphaned block (reorg)",
+		slog.String("hash", orphan.Hash),
+		slog.Uint64("height", orphan.Height))
+
+	// Mark block as off-chain
+	if err := a.store.MarkBlockOffChain(ctx, orphan.Hash); err != nil {
+		return fmt.Errorf("failed to mark block off-chain: %w", err)
+	}
+
+	// Reset transaction statuses to SEEN_ON_NETWORK
+	txids, err := a.store.SetStatusByBlockHash(ctx, orphan.Hash, models.StatusSeenOnNetwork)
+	if err != nil {
+		return fmt.Errorf("failed to reset transaction statuses: %w", err)
+	}
+
+	// Publish status change events
+	for _, txid := range txids {
+		status := &models.TransactionStatus{
+			TxID:      txid,
+			Status:    models.StatusSeenOnNetwork,
+			Timestamp: time.Now(),
+			ExtraInfo: fmt.Sprintf("reorg: block %s orphaned", orphan.Hash),
+		}
+		a.eventPublisher.Publish(ctx, status)
+		hash, _ := chainhash.NewHashFromHex(txid)
+		if hash != nil {
+			a.txTracker.UpdateStatusHash(*hash, models.StatusSeenOnNetwork)
+		}
+	}
+
+	if len(txids) > 0 {
+		a.logger.Info("reset transactions due to reorg",
+			slog.String("blockHash", orphan.Hash),
+			slog.Int("count", len(txids)))
+	}
+
+	return nil
+}
+
+// processBlockByHeader processes a block from tip catch-up
+func (a *Arcade) processBlockByHeader(ctx context.Context, header *chaintracks.BlockHeader) error {
+	blockHash := header.Hash.String()
+
+	a.logger.Debug("processing block from tip catch-up",
+		slog.String("hash", blockHash),
+		slog.Uint64("height", uint64(header.Height)))
+
+	trackedCount := a.txTracker.Count()
+	dataHubCount := len(a.dataHubURLs)
+
+	a.logger.Debug("block processing gate check",
+		slog.String("hash", blockHash),
+		slog.Int("trackedTxCount", trackedCount),
+		slog.Int("dataHubURLCount", dataHubCount))
+
+	// Only do transaction scanning if we have transactions to track
+	// AND we have DataHub URLs configured
+	if trackedCount > 0 && dataHubCount > 0 {
+		// Create block message using configured DataHub URL
+		blockMsg := teranode.BlockMessage{
+			Hash:       blockHash,
+			Height:     header.Height,
+			DataHubURL: a.dataHubURLs[0],
+			// Coinbase not available - merkle paths for subtree 0 position 0 may be incomplete
+		}
+
+		// Process block transactions (fetch subtrees, scan for tracked txs)
+		if err := a.processBlockTransactions(ctx, blockMsg); err != nil {
+			return fmt.Errorf("failed to process block transactions: %w", err)
+		}
+
+		// Set MINED status for any transactions found in this block
+		statuses, err := a.store.SetMinedByBlockHash(ctx, blockHash)
+		if err != nil {
+			return fmt.Errorf("failed to set mined status: %w", err)
+		}
+		for _, status := range statuses {
+			a.eventPublisher.Publish(ctx, status)
+		}
+		if len(statuses) > 0 {
+			a.logger.Info("set transactions to MINED (catch-up)",
+				slog.String("blockHash", blockHash),
+				slog.Int("count", len(statuses)))
+		}
+	}
+
+	// Mark block as on_chain only after successful processing
+	if err := a.store.MarkBlockProcessed(ctx, blockHash, uint64(header.Height), true); err != nil {
+		return fmt.Errorf("failed to mark block as on_chain: %w", err)
+	}
+
+	a.logger.Debug("marked block as on_chain",
+		slog.String("hash", blockHash),
+		slog.Uint64("height", uint64(header.Height)))
+
+	return nil
+}
+
 // handleSubtreeMessages processes subtree announcements
 func (a *Arcade) handleSubtreeMessages(ctx context.Context, subtreeChan <-chan teranode.SubtreeMessage) {
 	for {
@@ -503,6 +834,10 @@ func (a *Arcade) processSubtreeMessage(ctx context.Context, subtreeMsg teranode.
 			slog.String("error", err.Error()))
 		return
 	}
+
+	a.logger.Debug("processed subtree message",
+		slog.String("hash", subtreeMsg.Hash),
+		slog.Int("txCount", len(hashes)))
 
 	tracked := a.txTracker.FilterTrackedHashes(hashes)
 	if len(tracked) == 0 {
@@ -579,12 +914,143 @@ func (a *Arcade) processRejectedTxMessage(ctx context.Context, rejectedMsg teran
 
 func (a *Arcade) fetchBlockSubtreeHashes(ctx context.Context, dataHubURL, blockHash string) ([]chainhash.Hash, error) {
 	url := fmt.Sprintf("%s/block/%s", strings.TrimSuffix(dataHubURL, "/"), blockHash)
-	return a.fetchHashes(ctx, url)
+	hashes, err := a.fetchBlockSubtrees(ctx, url)
+	if err == nil {
+		return hashes, nil
+	}
+
+	// Try fallback URLs
+	for _, fallbackURL := range a.dataHubURLs {
+		if fallbackURL == dataHubURL {
+			continue // Skip if same as original
+		}
+		url = fmt.Sprintf("%s/block/%s", strings.TrimSuffix(fallbackURL, "/"), blockHash)
+		hashes, fallbackErr := a.fetchBlockSubtrees(ctx, url)
+		if fallbackErr == nil {
+			return hashes, nil
+		}
+	}
+
+	return nil, err // Return original error
+}
+
+// fetchBlockSubtrees fetches a block from teranode and extracts subtree hashes from the binary format.
+// Teranode block binary format:
+// - Block header (80 bytes)
+// - Transaction count (varint)
+// - Size in bytes (varint)
+// - Subtree count (varint)
+// - Subtree hashes (32 bytes each)
+// - Coinbase transaction
+// - Height (varint)
+func (a *Arcade) fetchBlockSubtrees(ctx context.Context, url string) ([]chainhash.Hash, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	// Skip block header (80 bytes)
+	header := make([]byte, 80)
+	if _, err := io.ReadFull(resp.Body, header); err != nil {
+		return nil, fmt.Errorf("failed to read block header: %w", err)
+	}
+
+	// Read transaction count (varint)
+	if _, err := readVarInt(resp.Body); err != nil {
+		return nil, fmt.Errorf("failed to read transaction count: %w", err)
+	}
+
+	// Read size in bytes (varint)
+	if _, err := readVarInt(resp.Body); err != nil {
+		return nil, fmt.Errorf("failed to read size in bytes: %w", err)
+	}
+
+	// Read subtree count (varint)
+	subtreeCount, err := readVarInt(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read subtree count: %w", err)
+	}
+
+	// Read subtree hashes
+	hashes := make([]chainhash.Hash, 0, subtreeCount)
+	hashBuf := make([]byte, 32)
+
+	for i := uint64(0); i < subtreeCount; i++ {
+		if _, err := io.ReadFull(resp.Body, hashBuf); err != nil {
+			return nil, fmt.Errorf("failed to read subtree hash %d: %w", i, err)
+		}
+		hash, err := chainhash.NewHash(hashBuf)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create hash: %w", err)
+		}
+		hashes = append(hashes, *hash)
+	}
+
+	return hashes, nil
+}
+
+// readVarInt reads a variable-length integer from a reader (Bitcoin varint format)
+func readVarInt(r io.Reader) (uint64, error) {
+	var buf [1]byte
+	if _, err := io.ReadFull(r, buf[:]); err != nil {
+		return 0, err
+	}
+
+	switch buf[0] {
+	case 0xfd:
+		var v [2]byte
+		if _, err := io.ReadFull(r, v[:]); err != nil {
+			return 0, err
+		}
+		return uint64(v[0]) | uint64(v[1])<<8, nil
+	case 0xfe:
+		var v [4]byte
+		if _, err := io.ReadFull(r, v[:]); err != nil {
+			return 0, err
+		}
+		return uint64(v[0]) | uint64(v[1])<<8 | uint64(v[2])<<16 | uint64(v[3])<<24, nil
+	case 0xff:
+		var v [8]byte
+		if _, err := io.ReadFull(r, v[:]); err != nil {
+			return 0, err
+		}
+		return uint64(v[0]) | uint64(v[1])<<8 | uint64(v[2])<<16 | uint64(v[3])<<24 |
+			uint64(v[4])<<32 | uint64(v[5])<<40 | uint64(v[6])<<48 | uint64(v[7])<<56, nil
+	default:
+		return uint64(buf[0]), nil
+	}
 }
 
 func (a *Arcade) fetchSubtreeHashes(ctx context.Context, dataHubURL, subtreeHash string) ([]chainhash.Hash, error) {
 	url := fmt.Sprintf("%s/subtree/%s", strings.TrimSuffix(dataHubURL, "/"), subtreeHash)
-	return a.fetchHashes(ctx, url)
+	hashes, err := a.fetchHashes(ctx, url)
+	if err == nil {
+		return hashes, nil
+	}
+
+	// Try fallback URLs
+	for _, fallbackURL := range a.dataHubURLs {
+		if fallbackURL == dataHubURL {
+			continue // Skip if same as original
+		}
+		url = fmt.Sprintf("%s/subtree/%s", strings.TrimSuffix(fallbackURL, "/"), subtreeHash)
+		hashes, fallbackErr := a.fetchHashes(ctx, url)
+		if fallbackErr == nil {
+			return hashes, nil
+		}
+	}
+
+	return nil, err // Return original error
 }
 
 func (a *Arcade) fetchHashes(ctx context.Context, url string) ([]chainhash.Hash, error) {
@@ -618,7 +1084,7 @@ func (a *Arcade) fetchHashes(ctx context.Context, url string) ([]chainhash.Hash,
 			return nil, fmt.Errorf("invalid hash size: %d", n)
 		}
 
-		hash, err := chainhash.NewHashFromHex(hex.EncodeToString(hashBuf))
+		hash, err := chainhash.NewHash(hashBuf)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create hash: %w", err)
 		}

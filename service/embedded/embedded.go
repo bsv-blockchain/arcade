@@ -102,12 +102,48 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 	if err != nil || tx == nil {
 		tx, err = sdkTx.NewTransactionFromBytes(rawTx)
 		if err != nil {
+			e.logger.Debug("failed to parse transaction",
+				"error", err.Error(),
+				"rawTxSize", len(rawTx),
+			)
 			return nil, fmt.Errorf("failed to parse transaction: %w", err)
 		}
 	}
 
 	// Validate transaction
 	if err := e.txValidator.ValidateTransaction(ctx, tx, opts.SkipFeeValidation, opts.SkipScriptValidation); err != nil {
+		// Calculate actual fee for logging
+		var inputSats, outputSats uint64
+		for _, input := range tx.Inputs {
+			if input.SourceTxSatoshis() != nil {
+				inputSats += *input.SourceTxSatoshis()
+			}
+		}
+		for _, output := range tx.Outputs {
+			outputSats += output.Satoshis
+		}
+		actualFee := int64(inputSats) - int64(outputSats)
+		txSize := tx.Size()
+		var feePerKB float64
+		if txSize > 0 {
+			feePerKB = float64(actualFee) / float64(txSize) * 1000
+		}
+
+		e.logger.Debug("transaction validation failed",
+			"txid", tx.TxID().String(),
+			"error", err.Error(),
+			"skipFeeValidation", opts.SkipFeeValidation,
+			"skipScriptValidation", opts.SkipScriptValidation,
+			"txSize", txSize,
+			"inputCount", len(tx.Inputs),
+			"outputCount", len(tx.Outputs),
+			"inputSatoshis", inputSats,
+			"outputSatoshis", outputSats,
+			"actualFee", actualFee,
+			"feePerKB", feePerKB,
+			"minFeePerKB", e.txValidator.MinFeePerKB(),
+			"rawTxHex", tx.Hex(),
+		)
 		return nil, fmt.Errorf("validation failed: %w", err)
 	}
 
@@ -138,13 +174,30 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 		}
 	}
 
-	// Submit to all teranode endpoints
+	// Submit to teranode endpoints synchronously with timeout
+	// Wait for first success/rejection, or timeout after 15 seconds
+	resultCh := make(chan *models.TransactionStatus, len(e.teranodeClient.GetEndpoints()))
+	submitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
 	for _, endpoint := range e.teranodeClient.GetEndpoints() {
-		go e.submitToTeranode(ctx, endpoint, tx.Bytes(), txid)
+		go func(ep string) {
+			status := e.submitToTeranodeSync(submitCtx, ep, tx.Bytes(), txid)
+			select {
+			case resultCh <- status:
+			default:
+			}
+		}(endpoint)
 	}
 
-	// Return current status
-	return e.store.GetStatus(ctx, txid)
+	// Wait for first result or timeout
+	select {
+	case status := <-resultCh:
+		return status, nil
+	case <-submitCtx.Done():
+		// Timeout - return current status (RECEIVED)
+		return e.store.GetStatus(ctx, txid)
+	}
 }
 
 // SubmitTransactions submits multiple transactions for broadcast.
@@ -166,6 +219,37 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 
 		// Validate transaction
 		if err := e.txValidator.ValidateTransaction(ctx, tx, opts.SkipFeeValidation, opts.SkipScriptValidation); err != nil {
+			// Calculate actual fee for logging
+			var inputSats, outputSats uint64
+			for _, input := range tx.Inputs {
+				if input.SourceTxSatoshis() != nil {
+					inputSats += *input.SourceTxSatoshis()
+				}
+			}
+			for _, output := range tx.Outputs {
+				outputSats += output.Satoshis
+			}
+			actualFee := int64(inputSats) - int64(outputSats)
+			txSize := tx.Size()
+			var feePerKB float64
+			if txSize > 0 {
+				feePerKB = float64(actualFee) / float64(txSize) * 1000
+			}
+
+			e.logger.Debug("transaction validation failed",
+				"txid", tx.TxID().String(),
+				"error", err.Error(),
+				"skipFeeValidation", opts.SkipFeeValidation,
+				"skipScriptValidation", opts.SkipScriptValidation,
+				"txSize", txSize,
+				"inputCount", len(tx.Inputs),
+				"outputCount", len(tx.Outputs),
+				"inputSatoshis", inputSats,
+				"outputSatoshis", outputSats,
+				"actualFee", actualFee,
+				"feePerKB", feePerKB,
+				"minFeePerKB", e.txValidator.MinFeePerKB(),
+			)
 			return nil, fmt.Errorf("validation failed: %w", err)
 		}
 
@@ -192,19 +276,35 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 		}
 	}
 
-	// Submit all to teranode
-	for _, tx := range txs {
-		txid := tx.TxID().String()
-		for _, endpoint := range e.teranodeClient.GetEndpoints() {
-			go e.submitToTeranode(ctx, endpoint, tx.Bytes(), txid)
-		}
-	}
+	// Submit all to teranode synchronously with timeout
+	submitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
 
-	// Collect statuses
 	var responses []*models.TransactionStatus
 	for _, tx := range txs {
-		status, _ := e.store.GetStatus(ctx, tx.TxID().String())
-		responses = append(responses, status)
+		txid := tx.TxID().String()
+		rawTx := tx.Bytes()
+
+		resultCh := make(chan *models.TransactionStatus, len(e.teranodeClient.GetEndpoints()))
+		for _, endpoint := range e.teranodeClient.GetEndpoints() {
+			go func(ep string) {
+				status := e.submitToTeranodeSync(submitCtx, ep, rawTx, txid)
+				select {
+				case resultCh <- status:
+				default:
+				}
+			}(endpoint)
+		}
+
+		// Wait for first result or timeout
+		select {
+		case status := <-resultCh:
+			responses = append(responses, status)
+		case <-submitCtx.Done():
+			// Timeout - get current status
+			status, _ := e.store.GetStatus(ctx, txid)
+			responses = append(responses, status)
+		}
 	}
 
 	return responses, nil
@@ -258,8 +358,8 @@ func (e *Embedded) GetPolicy(ctx context.Context) (*models.Policy, error) {
 	return e.policy, nil
 }
 
-// submitToTeranode submits a transaction to a teranode endpoint and updates status.
-func (e *Embedded) submitToTeranode(ctx context.Context, endpoint string, rawTx []byte, txid string) {
+// submitToTeranodeSync submits a transaction to a teranode endpoint, updates status, and returns the result.
+func (e *Embedded) submitToTeranodeSync(ctx context.Context, endpoint string, rawTx []byte, txid string) *models.TransactionStatus {
 	statusCode, err := e.teranodeClient.SubmitTransaction(ctx, endpoint, rawTx)
 	if err != nil {
 		status := &models.TransactionStatus{
@@ -270,7 +370,7 @@ func (e *Embedded) submitToTeranode(ctx context.Context, endpoint string, rawTx 
 		}
 		e.store.UpdateStatus(ctx, status)
 		e.eventPublisher.Publish(ctx, status)
-		return
+		return status
 	}
 
 	var txStatus models.Status
@@ -280,7 +380,7 @@ func (e *Embedded) submitToTeranode(ctx context.Context, endpoint string, rawTx 
 	case http.StatusNoContent:
 		txStatus = models.StatusSentToNetwork
 	default:
-		return
+		return nil
 	}
 
 	status := &models.TransactionStatus{
@@ -290,4 +390,5 @@ func (e *Embedded) submitToTeranode(ctx context.Context, endpoint string, rawTx 
 	}
 	e.store.UpdateStatus(ctx, status)
 	e.eventPublisher.Publish(ctx, status)
+	return status
 }

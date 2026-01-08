@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/arcade"
+	arcerrors "github.com/bsv-blockchain/arcade/errors"
 	"github.com/bsv-blockchain/arcade/events"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/service"
@@ -74,7 +75,7 @@ func (r *Routes) Register(router fiber.Router) {
 // @Tags arcade
 // @Produce json
 // @Success 200 {object} models.Policy
-// @Router /arcade/policy [get]
+// @Router /policy [get]
 func (r *Routes) handleGetPolicy(c *fiber.Ctx) error {
 	policy, err := r.service.GetPolicy(c.UserContext())
 	if err != nil {
@@ -96,16 +97,17 @@ func (r *Routes) handleGetPolicy(c *fiber.Ctx) error {
 // @Param X-SkipFeeValidation header string false "Skip fee validation (true/false)"
 // @Param X-SkipScriptValidation header string false "Skip script validation (true/false)"
 // @Success 200 {object} models.TransactionStatus
-// @Failure 400 {object} map[string]string
+// @Failure 400 {object} arcerrors.ErrorFields
+// @Failure 465 {object} errors.ErrorFields "ARC validation error"
 // @Failure 500 {object} map[string]string
-// @Router /arcade/tx [post]
+// @Router /tx [post]
 func (r *Routes) handlePostTx(c *fiber.Ctx) error {
 	ctx := c.UserContext()
 
 	// Parse raw transaction from request body
 	data, err := r.parseTransactionBody(c)
 	if err != nil {
-		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		return c.Status(http.StatusBadRequest).JSON(arcerrors.NewErrorFields(arcerrors.StatusBadRequest, err.Error()))
 	}
 
 	// Extract options from headers
@@ -114,10 +116,7 @@ func (r *Routes) handlePostTx(c *fiber.Ctx) error {
 	// Delegate to service
 	status, err := r.service.SubmitTransaction(ctx, data, opts)
 	if err != nil {
-		if strings.Contains(err.Error(), "validation failed") || strings.Contains(err.Error(), "failed to parse") {
-			return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
-		}
-		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+		return r.handleSubmitError(c, err)
 	}
 
 	return c.JSON(status)
@@ -136,14 +135,15 @@ func (r *Routes) handlePostTx(c *fiber.Ctx) error {
 // @Param X-SkipFeeValidation header string false "Skip fee validation (true/false)"
 // @Param X-SkipScriptValidation header string false "Skip script validation (true/false)"
 // @Success 200 {array} models.TransactionStatus
-// @Failure 400 {object} map[string]string
-// @Router /arcade/txs [post]
+// @Failure 400 {object} arcerrors.ErrorFields
+// @Failure 465 {object} errors.ErrorFields "ARC validation error"
+// @Router /txs [post]
 func (r *Routes) handlePostTxs(c *fiber.Ctx) error {
 	ctx := c.UserContext()
 
 	var reqs []TransactionRequest
 	if err := c.BodyParser(&reqs); err != nil {
-		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request body"})
+		return c.Status(http.StatusBadRequest).JSON(arcerrors.NewErrorFields(arcerrors.StatusBadRequest, "Invalid request body"))
 	}
 
 	// Convert to raw bytes
@@ -151,7 +151,7 @@ func (r *Routes) handlePostTxs(c *fiber.Ctx) error {
 	for _, req := range reqs {
 		data, err := hex.DecodeString(req.RawTx)
 		if err != nil {
-			return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Invalid transaction hex"})
+			return c.Status(http.StatusBadRequest).JSON(arcerrors.NewErrorFields(arcerrors.StatusBadRequest, "Invalid transaction hex"))
 		}
 		rawTxs = append(rawTxs, data)
 	}
@@ -162,13 +162,27 @@ func (r *Routes) handlePostTxs(c *fiber.Ctx) error {
 	// Delegate to service
 	statuses, err := r.service.SubmitTransactions(ctx, rawTxs, opts)
 	if err != nil {
-		if strings.Contains(err.Error(), "validation failed") || strings.Contains(err.Error(), "failed to parse") {
-			return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
-		}
-		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+		return r.handleSubmitError(c, err)
 	}
 
 	return c.JSON(statuses)
+}
+
+// handleSubmitError returns an appropriate HTTP response for transaction submission errors.
+// It checks for ARC-compatible errors and returns the corresponding status code.
+func (r *Routes) handleSubmitError(c *fiber.Ctx, err error) error {
+	// Check if this is an ARC-typed error
+	if arcErr := arcerrors.GetArcError(err); arcErr != nil {
+		return c.Status(int(arcErr.StatusCode)).JSON(arcErr.ToErrorFields())
+	}
+
+	// Fallback for untyped errors
+	errStr := err.Error()
+	if strings.Contains(errStr, "validation failed") || strings.Contains(errStr, "failed to parse") {
+		return c.Status(http.StatusBadRequest).JSON(arcerrors.NewErrorFields(arcerrors.StatusBadRequest, errStr))
+	}
+
+	return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": errStr})
 }
 
 // handleGetTx retrieves transaction status
@@ -180,7 +194,7 @@ func (r *Routes) handlePostTxs(c *fiber.Ctx) error {
 // @Success 200 {object} models.TransactionStatus
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /arcade/tx/{txid} [get]
+// @Router /tx/{txid} [get]
 func (r *Routes) handleGetTx(c *fiber.Ctx) error {
 	status, err := r.service.GetStatus(c.UserContext(), c.Params("txid"))
 	if err != nil {
@@ -199,7 +213,7 @@ func (r *Routes) handleGetTx(c *fiber.Ctx) error {
 // @Produce text/event-stream
 // @Param callbackToken query string false "Callback token from transaction submission"
 // @Success 200 {string} string "SSE stream of transaction status updates"
-// @Router /arcade/events [get]
+// @Router /events [get]
 func (r *Routes) handleTxSSE(c *fiber.Ctx) error {
 	callbackToken := c.Query("callbackToken")
 

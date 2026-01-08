@@ -1,53 +1,16 @@
 basePath: /
 definitions:
-  chaintracks.BlockHeader:
+  errors.ErrorFields:
     properties:
-      bits:
-        description: 4 bytes - Difficulty target
-        type: integer
-      hash:
-        items:
-          type: integer
-        type: array
-      height:
-        description: Block height in the chain
-        type: integer
-      merkleRoot:
-        description: 32 bytes - Merkle root hash
-        items:
-          type: integer
-        type: array
-      nonce:
-        description: 4 bytes - Nonce
-        type: integer
-      previousHash:
-        description: 32 bytes - Previous block hash
-        items:
-          type: integer
-        type: array
-      time:
-        description: 4 bytes - Block timestamp (Unix time)
-        type: integer
-      version:
-        description: 4 bytes - Block version
-        type: integer
-    type: object
-  fiber.ErrorResponse:
-    properties:
-      error:
-        example: Header not found
+      detail:
         type: string
-    type: object
-  fiber.HeightResponse:
-    properties:
-      height:
-        example: 874123
+      extraInfo:
+        type: string
+      status:
         type: integer
-    type: object
-  fiber.NetworkResponse:
-    properties:
-      network:
-        example: mainnet
+      title:
+        type: string
+      type:
         type: string
     type: object
   fiber.TransactionRequest:
@@ -125,7 +88,7 @@ info:
   title: Arcade API
   version: 0.1.0
 paths:
-  /arc/events:
+  /events:
     get:
       description: Server-Sent Events stream of transaction status updates. If callbackToken
         is provided, only events for that token are streamed.
@@ -144,7 +107,24 @@ paths:
       summary: Stream transaction events
       tags:
       - arcade
-  /arc/policy:
+  /health:
+    get:
+      description: Returns the health status of the service
+      produces:
+      - text/plain
+      responses:
+        "200":
+          description: OK
+          schema:
+            type: string
+        "503":
+          description: Service Unavailable
+          schema:
+            type: string
+      summary: Health check
+      tags:
+      - arcade
+  /policy:
     get:
       description: Returns the transaction policy configuration including fee rates
         and limits
@@ -158,7 +138,7 @@ paths:
       summary: Get policy
       tags:
       - arcade
-  /arc/tx:
+  /tx:
     post:
       consumes:
       - application/json
@@ -203,9 +183,11 @@ paths:
         "400":
           description: Bad Request
           schema:
-            additionalProperties:
-              type: string
-            type: object
+            $ref: '#/definitions/errors.ErrorFields'
+        "465":
+          description: ARC validation error
+          schema:
+            $ref: '#/definitions/errors.ErrorFields'
         "500":
           description: Internal Server Error
           schema:
@@ -215,7 +197,7 @@ paths:
       summary: Submit transaction
       tags:
       - arcade
-  /arc/tx/{txid}:
+  /tx/{txid}:
     get:
       description: Get the current status of a submitted transaction
       parameters:
@@ -246,7 +228,7 @@ paths:
       summary: Get transaction status
       tags:
       - arcade
-  /arc/txs:
+  /txs:
     post:
       consumes:
       - application/json
@@ -292,171 +274,12 @@ paths:
         "400":
           description: Bad Request
           schema:
-            additionalProperties:
-              type: string
-            type: object
+            $ref: '#/definitions/errors.ErrorFields'
+        "465":
+          description: ARC validation error
+          schema:
+            $ref: '#/definitions/errors.ErrorFields'
       summary: Submit multiple transactions
-      tags:
-      - arcade
-  /block/header/hash/{hash}:
-    get:
-      description: Returns a block header with the specified hash
-      parameters:
-      - description: Block hash (hex)
-        in: path
-        name: hash
-        required: true
-        type: string
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/chaintracks.BlockHeader'
-        "400":
-          description: Bad Request
-          schema:
-            $ref: '#/definitions/fiber.ErrorResponse'
-        "404":
-          description: Not Found
-          schema:
-            $ref: '#/definitions/fiber.ErrorResponse'
-      summary: Get header by hash
-      tags:
-      - chaintracks
-  /block/header/height/{height}:
-    get:
-      description: Returns a block header at the specified height
-      parameters:
-      - description: Block height
-        in: path
-        name: height
-        required: true
-        type: integer
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/chaintracks.BlockHeader'
-        "400":
-          description: Bad Request
-          schema:
-            $ref: '#/definitions/fiber.ErrorResponse'
-        "404":
-          description: Not Found
-          schema:
-            $ref: '#/definitions/fiber.ErrorResponse'
-      summary: Get header by height
-      tags:
-      - chaintracks
-  /block/headers:
-    get:
-      description: Returns block headers starting from height as binary data (80 bytes
-        per header)
-      parameters:
-      - description: Starting block height
-        in: query
-        name: height
-        required: true
-        type: integer
-      - description: Number of headers to return
-        in: query
-        name: count
-        required: true
-        type: integer
-      produces:
-      - application/octet-stream
-      responses:
-        "200":
-          description: Concatenated 80-byte headers
-          schema:
-            type: string
-        "400":
-          description: Bad Request
-          schema:
-            $ref: '#/definitions/fiber.ErrorResponse'
-      summary: Get multiple headers
-      tags:
-      - chaintracks
-  /block/height:
-    get:
-      description: Returns the current blockchain height
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/fiber.HeightResponse'
-      summary: Get chain height
-      tags:
-      - chaintracks
-  /block/network:
-    get:
-      description: Returns the Bitcoin network this service is connected to
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/fiber.NetworkResponse'
-        "500":
-          description: Internal Server Error
-          schema:
-            $ref: '#/definitions/fiber.ErrorResponse'
-      summary: Get network name
-      tags:
-      - chaintracks
-  /block/tip:
-    get:
-      description: Returns the current chain tip block header
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/chaintracks.BlockHeader'
-        "404":
-          description: Not Found
-          schema:
-            $ref: '#/definitions/fiber.ErrorResponse'
-      summary: Get chain tip
-      tags:
-      - chaintracks
-  /block/tip/stream:
-    get:
-      description: Server-Sent Events stream of chain tip updates. Sends the current
-        tip immediately, then broadcasts new tips as they arrive.
-      produces:
-      - text/event-stream
-      responses:
-        "200":
-          description: SSE stream of BlockHeader JSON objects
-          schema:
-            type: string
-      summary: Stream chain tip updates
-      tags:
-      - chaintracks
-  /health:
-    get:
-      description: Returns the health status of the service
-      produces:
-      - text/plain
-      responses:
-        "200":
-          description: OK
-          schema:
-            type: string
-        "503":
-          description: Service Unavailable
-          schema:
-            type: string
-      summary: Health check
       tags:
       - arcade
 securityDefinitions:

@@ -18,6 +18,7 @@ type Config struct {
 	Network     string `mapstructure:"network"`      // "main", "test", "stn" - Bitcoin network
 	StoragePath string `mapstructure:"storage_path"` // Data directory for persistent files
 
+	LogLevel string `mapstructure:"log_level"` // Log level (debug, info, warn, error)
 	Server      ServerConfig             `mapstructure:"server"`
 	Database    DatabaseConfig           `mapstructure:"database"`
 	Events      EventsConfig             `mapstructure:"events"`
@@ -43,6 +44,7 @@ func (c *Config) SetDefaults(v *viper.Viper, prefix string) {
 	// Embedded mode defaults
 	v.SetDefault(p+"network", "main")
 	v.SetDefault(p+"storage_path", "~/.arcade")
+	v.SetDefault(p+"log_level", "info")
 
 	// Server defaults
 	v.SetDefault(p+"server.address", ":3011")
@@ -65,7 +67,7 @@ func (c *Config) SetDefaults(v *viper.Viper, prefix string) {
 	v.SetDefault(p+"validator.max_tx_size", 4294967296)
 	v.SetDefault(p+"validator.max_script_size", 500000)
 	v.SetDefault(p+"validator.max_sig_ops", 4294967295)
-	v.SetDefault(p+"validator.min_fee_per_kb", 50)
+	v.SetDefault(p+"validator.min_fee_per_kb", 100)
 
 	// Auth defaults
 	v.SetDefault(p+"auth.enabled", false)
@@ -104,9 +106,10 @@ type EventsConfig struct {
 
 // TeranodeConfig holds teranode client configuration
 type TeranodeConfig struct {
-	BaseURL  string        `mapstructure:"base_url"`
-	BaseURLs []string      `mapstructure:"base_urls"`
-	Timeout  time.Duration `mapstructure:"timeout"`
+	BroadcastURLs []string      `mapstructure:"broadcast_urls"` // URLs for submitting transactions
+	DataHubURLs   []string      `mapstructure:"datahub_urls"`   // URLs for fetching block/subtree data (fallback)
+	AuthToken     string        `mapstructure:"auth_token"`
+	Timeout       time.Duration `mapstructure:"timeout"`
 }
 
 // ValidatorConfig holds transaction validator configuration
@@ -128,4 +131,12 @@ type WebhookConfig struct {
 	PruneInterval time.Duration `mapstructure:"prune_interval"`
 	MaxAge        time.Duration `mapstructure:"max_age"`
 	MaxRetries    int           `mapstructure:"max_retries"`
+}
+
+// GetLogLevel returns the log level, defaulting to "info".
+func (c *Config) GetLogLevel() string {
+	if c.LogLevel != "" {
+		return c.LogLevel
+	}
+	return "info"
 }

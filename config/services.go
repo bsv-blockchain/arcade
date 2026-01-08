@@ -12,6 +12,8 @@ import (
 	"github.com/bsv-blockchain/arcade/client"
 	"github.com/bsv-blockchain/arcade/events"
 	"github.com/bsv-blockchain/arcade/events/memory"
+	"github.com/bsv-blockchain/arcade/handlers"
+	"github.com/bsv-blockchain/arcade/logging"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/service"
 	"github.com/bsv-blockchain/arcade/service/embedded"
@@ -37,6 +39,7 @@ type Services struct {
 	EventPublisher events.Publisher
 	TeranodeClient *teranode.Client
 	Validator      *validator.Validator
+	WebhookHandler *handlers.WebhookHandler
 	Logger         *slog.Logger
 	Config         *Config
 }
@@ -46,9 +49,8 @@ type Services struct {
 // If p2pClient is provided, it will be shared instead of creating a new one.
 // This allows the caller to share instances across services.
 func (c *Config) Initialize(ctx context.Context, logger *slog.Logger, chaintracker chaintracks.Chaintracks, p2pClient *p2p.Client) (*Services, error) {
-	if logger == nil {
-		logger = slog.Default()
-	}
+	// Create arcade-specific logger with configured log level
+	logger = logging.NewLogger(c.GetLogLevel())
 
 	switch c.Mode {
 	case ModeRemote:
@@ -126,15 +128,12 @@ func (c *Config) initializeEmbedded(ctx context.Context, logger *slog.Logger, ch
 		return nil, fmt.Errorf("unsupported event publisher type: %s", c.Events.Type)
 	}
 
-	// Initialize Teranode client
+	// Initialize Teranode client for broadcasting
 	logger.Info("Initializing Teranode client")
-	var endpoints []string
-	if len(c.Teranode.BaseURLs) > 0 {
-		endpoints = c.Teranode.BaseURLs
-	} else {
-		endpoints = []string{c.Teranode.BaseURL}
+	if len(c.Teranode.BroadcastURLs) == 0 {
+		return nil, fmt.Errorf("no teranode broadcast endpoints configured: set teranode.broadcast_urls")
 	}
-	teranodeClient := teranode.NewClient(endpoints)
+	teranodeClient := teranode.NewClient(c.Teranode.BroadcastURLs, c.Teranode.AuthToken)
 
 	// Initialize validator
 	logger.Info("Initializing validator")
@@ -192,11 +191,12 @@ func (c *Config) initializeEmbedded(ctx context.Context, logger *slog.Logger, ch
 	logger.Info("Initializing Arcade P2P listener")
 	arcadeInstance, err := arcade.NewArcade(arcade.Config{
 		P2PClient:      p2pClient,
-		ChainTracker:   chaintracker,
+		Chaintracks:    chaintracker,
 		Logger:         logger,
 		TxTracker:      txTracker,
 		Store:          sqliteStore,
 		EventPublisher: eventPublisher,
+		DataHubURLs:    c.Teranode.DataHubURLs,
 	})
 	if err != nil {
 		if ownsP2PClient {
@@ -240,6 +240,24 @@ func (c *Config) initializeEmbedded(ctx context.Context, logger *slog.Logger, ch
 		return nil, fmt.Errorf("failed to create embedded service: %w", err)
 	}
 
+	// Initialize webhook handler for outbound callback delivery
+	logger.Info("Initializing webhook handler")
+	webhookHandler := handlers.NewWebhookHandler(
+		eventPublisher,
+		sqliteStore,
+		logger,
+		c.Webhook.PruneInterval,
+		c.Webhook.MaxAge,
+		c.Webhook.MaxRetries,
+	)
+	if err := webhookHandler.Start(ctx); err != nil {
+		_ = arcadeInstance.Stop()
+		if ownsP2PClient {
+			_ = p2pClient.Close()
+		}
+		return nil, fmt.Errorf("failed to start webhook handler: %w", err)
+	}
+
 	return &Services{
 		ArcadeService:  embeddedService,
 		P2PClient:      p2pClient,
@@ -250,6 +268,7 @@ func (c *Config) initializeEmbedded(ctx context.Context, logger *slog.Logger, ch
 		EventPublisher: eventPublisher,
 		TeranodeClient: teranodeClient,
 		Validator:      txValidator,
+		WebhookHandler: webhookHandler,
 		Logger:         logger,
 		Config:         c,
 	}, nil
@@ -262,6 +281,11 @@ func (s *Services) Close() error {
 	}
 
 	var errs []error
+
+	// Stop webhook handler first (depends on event publisher)
+	if s.WebhookHandler != nil {
+		s.WebhookHandler.Stop()
+	}
 
 	// Stop Arcade P2P listener
 	if s.Arcade != nil {
