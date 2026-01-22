@@ -41,7 +41,7 @@ func TestSubmitTransaction(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient([]string{server.URL})
+	client := NewClient([]string{server.URL}, "")
 
 	statusCode, err := client.SubmitTransaction(t.Context(), server.URL, []byte("test_transaction_bytes"))
 	if err != nil {
@@ -64,7 +64,7 @@ func TestSubmitTransaction_Accepted(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient([]string{server.URL})
+	client := NewClient([]string{server.URL}, "")
 
 	statusCode, err := client.SubmitTransaction(t.Context(), server.URL, []byte("test_tx"))
 	if err != nil {
@@ -83,7 +83,7 @@ func TestSubmitTransaction_Error(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient([]string{server.URL})
+	client := NewClient([]string{server.URL}, "")
 
 	_, err := client.SubmitTransaction(t.Context(), server.URL, []byte("test_tx"))
 	if err == nil {
@@ -97,7 +97,7 @@ func TestSubmitTransaction_Error(t *testing.T) {
 
 func TestGetEndpoints(t *testing.T) {
 	endpoints := []string{"http://node1:8080", "http://node2:8080"}
-	client := NewClient(endpoints)
+	client := NewClient(endpoints, "")
 
 	result := client.GetEndpoints()
 	if len(result) != len(endpoints) {
@@ -118,7 +118,7 @@ func TestContextCancellation(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient([]string{server.URL})
+	client := NewClient([]string{server.URL}, "")
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
 
