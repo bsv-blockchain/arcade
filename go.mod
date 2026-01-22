@@ -279,14 +279,14 @@ require (
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
 
-// Disabling to test
-// replace github.com/bsv-blockchain/go-sdk => github.com/bsv-blockchain/go-sdk v1.2.15-0.20251229224150-16c656d138fd
-
-// Custom package needs to be used
+// Custom package needs to be used as the main package is not publicly available
 replace github.com/bsv-blockchain/go-teranode-p2p-client => github.com/shruggr/go-teranode-p2p-client v0.0.0-20251219052644-3b9eba1f195f
 
-// Disabling to test
+// Disabled this replace to test with official sdk
+// replace github.com/bsv-blockchain/go-sdk => github.com/bsv-blockchain/go-sdk v1.2.15-0.20251229224150-16c656d138fd
+
+// Disabled this replace to test with official sdk
 // replace github.com/bsv-blockchain/go-chaintracks => github.com/bsv-blockchain/go-chaintracks v1.0.2-0.20251230043839-6b524e72389d
 
-// Disabling to test
+// Disabled this replace to test with official sdk
 // replace github.com/bsv-blockchain/teranode => github.com/bsv-blockchain/teranode v0.13.0-beta-3.0.20251211185306-7879a2f59199
