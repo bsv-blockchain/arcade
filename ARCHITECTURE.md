@@ -65,27 +65,27 @@ flowchart TD
 
 ### Status Definitions
 
-| Status | Set By | Trigger |
-|--------|--------|---------|
-| `RECEIVED` | API Server | Transaction accepted via POST /v1/tx |
-| `SENT_TO_NETWORK` | Teranode Client | Teranode returns 202 (queued) |
-| `ACCEPTED_BY_NETWORK` | Teranode Client | Teranode returns 200 (accepted) |
-| `SEEN_ON_NETWORK` | P2P Subscriber | Subtree gossip message received |
-| `MINED` | P2P Subscriber | Block gossip message contains transaction |
-| `MINED_IN_STALE_BLOCK` | P2P Subscriber | ChainTracks detects block reorganization |
-| `REJECTED` | Teranode Client / P2P Subscriber | Teranode error or P2P rejected-tx message |
-| `DOUBLE_SPEND_ATTEMPTED` | P2P Subscriber | P2P rejected-tx with double spend reason |
+| Status                   | Set By                           | Trigger                                   |
+|--------------------------|----------------------------------|-------------------------------------------|
+| `RECEIVED`               | API Server                       | Transaction accepted via POST /v1/tx      |
+| `SENT_TO_NETWORK`        | Teranode Client                  | Teranode returns 202 (queued)             |
+| `ACCEPTED_BY_NETWORK`    | Teranode Client                  | Teranode returns 200 (accepted)           |
+| `SEEN_ON_NETWORK`        | P2P Subscriber                   | Subtree gossip message received           |
+| `MINED`                  | P2P Subscriber                   | Block gossip message contains transaction |
+| `MINED_IN_STALE_BLOCK`   | P2P Subscriber                   | ChainTracks detects block reorganization  |
+| `REJECTED`               | Teranode Client / P2P Subscriber | Teranode error or P2P rejected-tx message |
+| `DOUBLE_SPEND_ATTEMPTED` | P2P Subscriber                   | P2P rejected-tx with double spend reason  |
 
 **Arc Statuses Not Implemented in Arcade:**
 
-| Arc Status | Reason Not Implemented |
-|------------|------------------------|
-| `UNKNOWN` | Arcade uses explicit initial state (`RECEIVED`) |
-| `QUEUED` | Arcade has no queue timeout - returns immediately |
-| `STORED` | Not needed - storage is implicit |
-| `ANNOUNCED_TO_NETWORK` | P2P network details not tracked at this granularity |
-| `REQUESTED_BY_NETWORK` | P2P network details not tracked at this granularity |
-| `SEEN_IN_ORPHAN_MEMPOOL` | Does not map to Arcade's architecture |
+| Arc Status               | Reason Not Implemented                              |
+|--------------------------|-----------------------------------------------------|
+| `UNKNOWN`                | Arcade uses explicit initial state (`RECEIVED`)     |
+| `QUEUED`                 | Arcade has no queue timeout - returns immediately   |
+| `STORED`                 | Not needed - storage is implicit                    |
+| `ANNOUNCED_TO_NETWORK`   | P2P network details not tracked at this granularity |
+| `REQUESTED_BY_NETWORK`   | P2P network details not tracked at this granularity |
+| `SEEN_IN_ORPHAN_MEMPOOL` | Does not map to Arcade's architecture               |
 
 ## System Communication Overview
 
