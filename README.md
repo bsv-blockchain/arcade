@@ -25,7 +25,7 @@
        &nbsp;&nbsp;&nbsp;&nbsp; <code>Quality</code> &nbsp;&nbsp;
     </td>
     <td align="left">
-       <a href="https://goreportcard.com/report/github.com/bsv-blockchain/arcade"><img src="https://goreportcard.com/badge/github.com/bsv-blockchain/arcade?style=flat-square" alt="Go Report"></a>
+       <a href="https://goreportcard.com/report/github.com/bsv-blockchain/arcade"><img src="https://goreportcard.com/badge/github.com/bsv-blockchain/arcade?style=flat-square&v=1" alt="Go Report"></a>
        <a href="https://codecov.io/gh/bsv-blockchain/arcade"><img src="https://codecov.io/gh/bsv-blockchain/arcade/branch/main/graph/badge.svg?style=flat-square" alt="Coverage"></a>
     </td>
   </tr>
