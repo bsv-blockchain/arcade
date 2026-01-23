@@ -1,11 +1,11 @@
 # 🔐 Security Policy
 
-Security is a priority. We maintain a proactive stance to identify and fix vulnerabilities in **go-template**.
+Security is a priority. We maintain a proactive stance to identify and fix vulnerabilities in **arcade**.
 
 <br/>
 
 ## 🛠️ Supported & Maintained Versions
-Any released version of **go-template** that is not marked as deprecated is actively supported and maintained.
+Any released version of **arcade** that is not marked as deprecated is actively supported and maintained.
 
 <br/>
 

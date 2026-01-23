@@ -21,7 +21,7 @@
                 "sections": [
                     "standard",
                     "default",
-                    "prefix(github.com/bsv-blockchain/go-template)"
+                    "prefix(github.com/bsv-blockchain/arcade)"
                 ]
             },
             "gofmt": {
@@ -32,7 +32,7 @@
             },
             "goimports": {
                 "local-prefixes": [
-                    "github.com/bsv-blockchain/go-template"
+                    "github.com/bsv-blockchain/arcade"
                 ]
             }
         }
@@ -43,7 +43,10 @@
     "linters": {
         "disable": [
             "gocritic",
-            "godot"
+            "godot",
+            "gocognit",
+            "wsl_v5",
+            "funcorder"
         ],
         "enable": [
             "asasalint",
@@ -64,12 +67,10 @@
             "errorlint",
             "exhaustive",
             "forbidigo",
-            "funcorder",
             "gocheckcompilerdirectives",
             "gochecknoglobals",
             "gochecknoinits",
             "gochecksumtype",
-            "gocognit",
             "goconst",
             "gocyclo",
             "godox",
@@ -108,7 +109,6 @@
             "unparam",
             "unused",
             "wastedassign",
-            "wsl_v5",
             "zerologlint"
         ],
         "settings": {
