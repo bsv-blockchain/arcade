@@ -94,6 +94,31 @@ curl -X POST http://localhost:3011/txs \
 curl http://localhost:3011/health
 ```
 
+### Status Dashboard
+
+View real-time P2P network status and connected peers:
+
+```bash
+curl http://localhost:3011/status
+```
+
+Or visit `http://localhost:3011/` in a browser for the HTML dashboard.
+
+### API Documentation
+
+Interactive API documentation (Scalar UI):
+
+```bash
+# View in browser
+open http://localhost:3011/docs
+```
+
+OpenAPI specification:
+
+```bash
+curl http://localhost:3011/docs/openapi.json
+```
+
 ## Transaction Status Flow
 
 ```
@@ -143,13 +168,19 @@ For applications that need Arcade functionality without running a full server, u
 import "github.com/bsv-blockchain/arcade/client"
 
 c := client.New("http://arcade-server:3011")
-defer c.Close()
+defer c.Close() // Always close when done to clean up SSE connections
 
-// Submit a transaction
+// Submit a single transaction
 status, err := c.SubmitTransaction(ctx, rawTxBytes, nil)
+
+// Submit multiple transactions
+statuses, err := c.SubmitTransactions(ctx, [][]byte{rawTx1, rawTx2}, nil)
 
 // Get transaction status
 status, err := c.GetStatus(ctx, "txid...")
+
+// Get policy configuration
+policy, err := c.GetPolicy(ctx)
 
 // Subscribe to status updates for a callback token
 statusChan, err := c.Subscribe(ctx, "my-callback-token")
@@ -181,13 +212,24 @@ go test ./...
 
 | Field                       | Description                                  | Default      |
 |-----------------------------|----------------------------------------------|--------------|
+| `mode`                      | Operating mode: `embedded`, `remote`         | `embedded`   |
+| `url`                       | Arcade server URL (required for remote mode) | -            |
 | `network`                   | Bitcoin network: `main`, `test`, `stn`       | `main`       |
 | `storage_path`              | Data directory for persistent files          | `~/.arcade`  |
 | `log_level`                 | Log level: `debug`, `info`, `warn`, `error`  | `info`       |
 | `server.address`            | HTTP server listen address                   | `:3011`      |
-| `server.shutdown_timeout`   | Graceful shutdown timeout                    | `30s`        |
+| `server.read_timeout`       | HTTP read timeout                            | `30s`        |
+| `server.write_timeout`      | HTTP write timeout                           | `30s`        |
+| `server.shutdown_timeout`   | Graceful shutdown timeout                    | `10s`        |
+| `database.type`             | Storage backend: `sqlite`, `postgres`        | `sqlite`     |
+| `database.sqlite_path`      | SQLite database file path                    | `~/.arcade/arcade.db` |
+| `database.postgres_conn_str`| PostgreSQL connection string                 | -            |
+| `events.type`               | Event backend: `memory`, `redis`             | `memory`     |
+| `events.buffer_size`        | Event channel buffer size                    | `1000`       |
+| `events.redis_url`          | Redis URL for distributed events             | -            |
 | `teranode.broadcast_urls`   | Teranode broadcast service URLs (array)      | -            |
 | `teranode.datahub_urls`     | DataHub URLs for fetching block data (array) | -            |
+| `teranode.auth_token`       | Authentication token for Teranode API        | -            |
 | `teranode.timeout`          | HTTP request timeout                         | `30s`        |
 | `validator.max_tx_size`     | Maximum transaction size (bytes)             | `4294967296` |
 | `validator.max_script_size` | Maximum script size (bytes)                  | `500000`     |
@@ -225,7 +267,7 @@ When you provide `X-CallbackUrl`, Arcade will POST status updates:
 ```
 
 **Features:**
-- Automatic retries with exponential backoff
+- Automatic retries with linear backoff (1min, 2min, 3min, etc.)
 - Configurable expiration and max retries
 - Delivery tracking
 
