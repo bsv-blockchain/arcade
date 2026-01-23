@@ -175,6 +175,8 @@ Arcade is a lightweight transaction broadcast service that:
 
 **What is [Teranode](https://bsv-blockchain.github.io/teranode/topics/teranodeIntro/)?** Teranode is the next-generation BSV node implementation designed for enterprise-scale transaction processing. Arcade acts as a bridge between your application and the Teranode network, handling transaction submission and status tracking.
 
+<br>
+
 ### Features
 
 - **Arc-Compatible API** - Drop-in replacement for Arc clients
@@ -188,6 +190,8 @@ Arcade is a lightweight transaction broadcast service that:
 - **Status Tracking** - Complete audit trail of transaction lifecycle
 - **Extensible** - All packages public, easy to customize
 - **API Reference** – Dive into the godocs at [pkg.go.dev/github.com/bsv-blockchain/arcade](https://pkg.go.dev/github.com/bsv-blockchain/arcade)
+
+<br>
 
 ### API Usage
 
@@ -537,8 +541,8 @@ Read the [AI Usage & Assistant Guidelines](.github/tech-conventions/ai-complianc
 ## 📚 Resources
 
 - [Architecture Documentation](docs/ARCHITECTURE.md)
-- [Teranode Documentation](https://docs.bitcoinsv.io/)
-- [Arc API Reference](https://github.com/bsv-blockchain/arc)
+- [Teranode Documentation](https://docs.bsvblockchain.org/)
+- [Arc API Reference](https://github.com/bitcoin-sv/arc)
 
 <br/>
 
