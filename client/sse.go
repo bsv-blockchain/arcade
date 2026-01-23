@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -12,6 +13,9 @@ import (
 
 	"github.com/bsv-blockchain/arcade/models"
 )
+
+// ErrUnexpectedSSEStatus is returned when SSE returns an unexpected status code.
+var ErrUnexpectedSSEStatus = errors.New("unexpected SSE status code")
 
 // sseManager manages SSE connections and fan-out to subscribers.
 type sseManager struct {
@@ -26,7 +30,7 @@ type sseManager struct {
 // sseConnection represents an active SSE connection.
 type sseConnection struct {
 	token       string
-	ctx         context.Context
+	ctx         context.Context //nolint:containedctx // context needed for connection lifecycle
 	cancel      context.CancelFunc
 	lastEventID string
 	subscribers map[int]*subscriber
@@ -37,7 +41,7 @@ type sseConnection struct {
 type subscriber struct {
 	id     int
 	ch     chan *models.TransactionStatus
-	ctx    context.Context
+	ctx    context.Context //nolint:containedctx // context needed for subscriber lifecycle
 	cancel context.CancelFunc
 	token  string
 }
@@ -173,6 +177,8 @@ func (m *sseManager) runConnection(conn *sseConnection) {
 }
 
 // connectSSE establishes an SSE connection and processes events.
+//
+//nolint:gocyclo // complex SSE connection handling logic
 func (m *sseManager) connectSSE(conn *sseConnection) error {
 	// Build URL
 	url := m.client.baseURL + "/events"
@@ -197,10 +203,12 @@ func (m *sseManager) connectSSE(conn *sseConnection) error {
 	if err != nil {
 		return fmt.Errorf("failed to connect: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status: %d", resp.StatusCode)
+		return ErrUnexpectedSSEStatus
 	}
 
 	// Process SSE events

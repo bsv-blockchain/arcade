@@ -263,7 +263,7 @@ type StatusUpdate struct {
    - Webhook Handler queries submissions and delivers notifications
    - SSE Handler filters by token and streams to connected clients
    - Future: WaitFor handler blocks HTTP responses until target status
-   
+
 ### Backends
 
 **In-Memory Publisher:**

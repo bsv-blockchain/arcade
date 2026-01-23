@@ -21,6 +21,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -75,7 +76,8 @@ func loadConfig() (*config.Config, error) {
 	cfg.SetDefaults(v, "")
 
 	if err := v.ReadInConfig(); err != nil {
-		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
+		var cfgErr viper.ConfigFileNotFoundError
+		if !errors.As(err, &cfgErr) {
 			return nil, fmt.Errorf("failed to read config: %w", err)
 		}
 		// Config file not found is OK, use defaults + env
@@ -155,7 +157,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	})
 
 	// Simple status page
-	app.Get("/", func(c *fiber.Ctx) error {
+	app.Get("/", func(c *fiber.Ctx) error { //nolint:contextcheck // request context available via c.UserContext()
 		tip := services.Chaintracks.GetTip(c.UserContext())
 		height := uint32(0)
 		if tip != nil {
@@ -233,7 +235,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	case err := <-errCh:
 		return err
 	case <-ctx.Done():
-		log.Info("Context cancelled")
+		log.Info("Context canceled")
 	}
 
 	// Graceful shutdown

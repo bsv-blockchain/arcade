@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -10,7 +11,9 @@ import (
 
 func TestInMemoryPublisher_PublishSubscribe(t *testing.T) {
 	pub := NewInMemoryPublisher(10)
-	defer pub.Close()
+	defer func() {
+		_ = pub.Close()
+	}()
 
 	ctx := t.Context()
 
@@ -44,7 +47,9 @@ func TestInMemoryPublisher_PublishSubscribe(t *testing.T) {
 
 func TestInMemoryPublisher_MultipleSubscribers(t *testing.T) {
 	pub := NewInMemoryPublisher(10)
-	defer pub.Close()
+	defer func() {
+		_ = pub.Close()
+	}()
 
 	ctx := t.Context()
 
@@ -81,7 +86,9 @@ func TestInMemoryPublisher_MultipleSubscribers(t *testing.T) {
 
 func TestInMemoryPublisher_SlowSubscriber(t *testing.T) {
 	pub := NewInMemoryPublisher(2)
-	defer pub.Close()
+	defer func() {
+		_ = pub.Close()
+	}()
 
 	ctx := t.Context()
 
@@ -138,7 +145,9 @@ func TestInMemoryPublisher_Close(t *testing.T) {
 
 func TestInMemoryPublisher_ContextCancellation(t *testing.T) {
 	pub := NewInMemoryPublisher(0)
-	defer pub.Close()
+	defer func() {
+		_ = pub.Close()
+	}()
 
 	ctx, cancel := context.WithCancel(t.Context())
 
@@ -156,7 +165,7 @@ func TestInMemoryPublisher_ContextCancellation(t *testing.T) {
 	}
 
 	err = pub.Publish(ctx, status)
-	if err != context.Canceled {
+	if !errors.Is(err, context.Canceled) {
 		t.Errorf("Expected context.Canceled error, got %v", err)
 	}
 

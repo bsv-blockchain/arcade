@@ -37,7 +37,7 @@ func TestSubmitTransaction(t *testing.T) {
 		}
 
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
+		_, _ = w.Write([]byte("OK"))
 	}))
 	defer server.Close()
 
@@ -58,9 +58,9 @@ func TestSubmitTransaction(t *testing.T) {
 }
 
 func TestSubmitTransaction_Accepted(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusAccepted)
-		w.Write([]byte("Queued"))
+		_, _ = w.Write([]byte("Queued"))
 	}))
 	defer server.Close()
 
@@ -77,9 +77,9 @@ func TestSubmitTransaction_Accepted(t *testing.T) {
 }
 
 func TestSubmitTransaction_Error(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("Failed to process transaction"))
+		_, _ = w.Write([]byte("Failed to process transaction"))
 	}))
 	defer server.Close()
 
@@ -112,7 +112,7 @@ func TestGetEndpoints(t *testing.T) {
 }
 
 func TestContextCancellation(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		time.Sleep(200 * time.Millisecond)
 		w.WriteHeader(http.StatusOK)
 	}))
