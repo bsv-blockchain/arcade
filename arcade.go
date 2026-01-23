@@ -13,15 +13,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bsv-blockchain/arcade/events"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/go-chaintracks/chaintracks"
 	msgbus "github.com/bsv-blockchain/go-p2p-message-bus"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 	p2p "github.com/bsv-blockchain/go-teranode-p2p-client"
 	teranode "github.com/bsv-blockchain/teranode/services/p2p"
+
+	"github.com/bsv-blockchain/arcade/events"
+	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/store"
 )
 
 // Config holds configuration for Arcade

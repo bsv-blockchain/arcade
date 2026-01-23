@@ -27,14 +27,15 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/bsv-blockchain/arcade/config"
-	arcadeRoutes "github.com/bsv-blockchain/arcade/routes/fiber"
 	chaintracksRoutes "github.com/bsv-blockchain/go-chaintracks/routes/fiber"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/spf13/viper"
+
+	"github.com/bsv-blockchain/arcade/config"
+	arcadeRoutes "github.com/bsv-blockchain/arcade/routes/fiber"
 )
 
 func main() {

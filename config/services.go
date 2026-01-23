@@ -8,6 +8,9 @@ import (
 	"os"
 	"path"
 
+	"github.com/bsv-blockchain/go-chaintracks/chaintracks"
+	p2p "github.com/bsv-blockchain/go-teranode-p2p-client"
+
 	"github.com/bsv-blockchain/arcade"
 	"github.com/bsv-blockchain/arcade/client"
 	"github.com/bsv-blockchain/arcade/events"
@@ -21,8 +24,6 @@ import (
 	"github.com/bsv-blockchain/arcade/store/sqlite"
 	"github.com/bsv-blockchain/arcade/teranode"
 	"github.com/bsv-blockchain/arcade/validator"
-	"github.com/bsv-blockchain/go-chaintracks/chaintracks"
-	p2p "github.com/bsv-blockchain/go-teranode-p2p-client"
 )
 
 // Services holds initialized application services.

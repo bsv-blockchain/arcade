@@ -8,8 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bsv-blockchain/arcade/models"
 	_ "modernc.org/sqlite"
+
+	"github.com/bsv-blockchain/arcade/models"
 )
 
 const (

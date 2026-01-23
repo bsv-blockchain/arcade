@@ -5,8 +5,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
+
+	"github.com/bsv-blockchain/arcade/models"
 )
 
 const (

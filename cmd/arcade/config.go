@@ -4,8 +4,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/bsv-blockchain/arcade/config"
 	"github.com/spf13/viper"
+
+	"github.com/bsv-blockchain/arcade/config"
 )
 
 // Load reads configuration from file and environment variables.

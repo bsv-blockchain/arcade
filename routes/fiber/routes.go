@@ -12,14 +12,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gofiber/fiber/v2"
+	"github.com/valyala/fasthttp"
+
 	"github.com/bsv-blockchain/arcade"
 	arcerrors "github.com/bsv-blockchain/arcade/errors"
 	"github.com/bsv-blockchain/arcade/events"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/service"
 	"github.com/bsv-blockchain/arcade/store"
-	"github.com/gofiber/fiber/v2"
-	"github.com/valyala/fasthttp"
 )
 
 // TransactionRequest represents a transaction submission request.

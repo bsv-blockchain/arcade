@@ -6,13 +6,14 @@ import (
 	"fmt"
 	"strings"
 
-	arcerrors "github.com/bsv-blockchain/arcade/errors"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/script"
 	"github.com/bsv-blockchain/go-sdk/script/interpreter"
 	"github.com/bsv-blockchain/go-sdk/spv"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 	feemodel "github.com/bsv-blockchain/go-sdk/transaction/fee_model"
+
+	arcerrors "github.com/bsv-blockchain/arcade/errors"
 )
 
 const (

@@ -9,6 +9,9 @@ import (
 	"sync"
 	"time"
 
+	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
+	"github.com/google/uuid"
+
 	"github.com/bsv-blockchain/arcade"
 	"github.com/bsv-blockchain/arcade/events"
 	"github.com/bsv-blockchain/arcade/models"
@@ -16,8 +19,6 @@ import (
 	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/teranode"
 	"github.com/bsv-blockchain/arcade/validator"
-	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
-	"github.com/google/uuid"
 )
 
 // Ensure Embedded implements service.ArcadeService
