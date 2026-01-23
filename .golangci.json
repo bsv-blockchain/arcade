@@ -111,6 +111,17 @@
             "wastedassign",
             "zerologlint"
         ],
+        "exclusions": {
+            "rules": [
+                {
+                    "linters": [
+                        "gomoddirectives"
+                    ],
+                    "path": "go\\.mod",
+                    "text": "github.com/opencontainers/runc"
+                }
+            ]
+        },
         "settings": {
             "dogsled": {
                 "max-blank-identifiers": 2
