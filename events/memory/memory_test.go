@@ -5,8 +5,6 @@ import (
 	"testing"
 	"time"
 
-	// Note: context import kept for context.WithCancel and context.Canceled usage
-
 	"github.com/bsv-blockchain/arcade/models"
 )
 

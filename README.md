@@ -118,7 +118,7 @@ DOUBLE_SPEND_ATTEMPTED (from rejected-tx gossip with specific reason)
 
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed architecture documentation.
+See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed architecture documentation.
 
 ### Key Components
 
@@ -179,25 +179,25 @@ go test ./...
 
 ## Configuration Options
 
-| Field | Description | Default |
-|-------|-------------|---------|
-| `network` | Bitcoin network: `main`, `test`, `stn` | `main` |
-| `storage_path` | Data directory for persistent files | `~/.arcade` |
-| `log_level` | Log level: `debug`, `info`, `warn`, `error` | `info` |
-| `server.address` | HTTP server listen address | `:3011` |
-| `server.shutdown_timeout` | Graceful shutdown timeout | `30s` |
-| `teranode.broadcast_urls` | Teranode broadcast service URLs (array) | - |
-| `teranode.datahub_urls` | DataHub URLs for fetching block data (array) | - |
-| `teranode.timeout` | HTTP request timeout | `30s` |
-| `validator.max_tx_size` | Maximum transaction size (bytes) | `4294967296` |
-| `validator.max_script_size` | Maximum script size (bytes) | `500000` |
-| `validator.max_sig_ops` | Maximum signature operations | `4294967295` |
-| `validator.min_fee_per_kb` | Minimum fee per KB (satoshis) | `100` |
-| `webhook.max_retries` | Max webhook retry attempts | `10` |
-| `webhook.max_age` | Max age to keep retrying webhooks | `24h` |
-| `webhook.prune_interval` | How often to prune expired webhooks | `1h` |
-| `auth.enabled` | Enable Bearer token authentication | `false` |
-| `auth.token` | Bearer token (required if auth enabled) | - |
+| Field                       | Description                                  | Default      |
+|-----------------------------|----------------------------------------------|--------------|
+| `network`                   | Bitcoin network: `main`, `test`, `stn`       | `main`       |
+| `storage_path`              | Data directory for persistent files          | `~/.arcade`  |
+| `log_level`                 | Log level: `debug`, `info`, `warn`, `error`  | `info`       |
+| `server.address`            | HTTP server listen address                   | `:3011`      |
+| `server.shutdown_timeout`   | Graceful shutdown timeout                    | `30s`        |
+| `teranode.broadcast_urls`   | Teranode broadcast service URLs (array)      | -            |
+| `teranode.datahub_urls`     | DataHub URLs for fetching block data (array) | -            |
+| `teranode.timeout`          | HTTP request timeout                         | `30s`        |
+| `validator.max_tx_size`     | Maximum transaction size (bytes)             | `4294967296` |
+| `validator.max_script_size` | Maximum script size (bytes)                  | `500000`     |
+| `validator.max_sig_ops`     | Maximum signature operations                 | `4294967295` |
+| `validator.min_fee_per_kb`  | Minimum fee per KB (satoshis)                | `100`        |
+| `webhook.max_retries`       | Max webhook retry attempts                   | `10`         |
+| `webhook.max_age`           | Max age to keep retrying webhooks            | `24h`        |
+| `webhook.prune_interval`    | How often to prune expired webhooks          | `1h`         |
+| `auth.enabled`              | Enable Bearer token authentication           | `false`      |
+| `auth.token`                | Bearer token (required if auth enabled)      | -            |
 
 ## HTTP Headers
 
@@ -336,6 +336,6 @@ Open BSV License
 
 ## Resources
 
-- [Architecture Documentation](ARCHITECTURE.md)
+- [Architecture Documentation](docs/ARCHITECTURE.md)
 - [Teranode Documentation](https://docs.bitcoinsv.io/)
 - [Arc API Reference](https://github.com/bsv-blockchain/arc)

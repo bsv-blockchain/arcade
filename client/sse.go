@@ -17,10 +17,10 @@ import (
 type sseManager struct {
 	client *Client
 
-	mu           sync.RWMutex
-	connections  map[string]*sseConnection // key is callbackToken (empty string for all events)
-	subscribers  map[<-chan *models.TransactionStatus]*subscriber
-	nextSubID    int
+	mu          sync.RWMutex
+	connections map[string]*sseConnection // key is callbackToken (empty string for all events)
+	subscribers map[<-chan *models.TransactionStatus]*subscriber
+	nextSubID   int
 }
 
 // sseConnection represents an active SSE connection.

@@ -16,21 +16,21 @@ const (
 	StatusNotFound   StatusCode = 404
 
 	// ARC-specific error codes (460-499 range)
-	StatusTxFormat                  StatusCode = 460 // Not extended format
-	StatusUnlockingScripts          StatusCode = 461 // Malformed unlocking scripts
-	StatusInputs                    StatusCode = 462 // Invalid inputs
-	StatusMalformed                 StatusCode = 463 // Malformed transaction
-	StatusOutputs                   StatusCode = 464 // Invalid outputs
-	StatusFees                      StatusCode = 465 // Fee too low
-	StatusConflict                  StatusCode = 466 // Conflicting transaction
-	StatusGeneric                   StatusCode = 467 // Generic validation error
-	StatusBeefInvalid               StatusCode = 468 // BEEF validation failed
-	StatusMerkleRoots               StatusCode = 469 // Merkle roots validation failed
-	StatusFrozenPolicy              StatusCode = 471 // Input frozen (policy)
-	StatusFrozenConsensus           StatusCode = 472 // Input frozen (consensus)
-	StatusCumulativeFees            StatusCode = 473 // Cumulative fee validation failed
-	StatusTxSize                    StatusCode = 474 // Transaction size validation failed
-	StatusMinedAncestorsNotInBUMP   StatusCode = 475 // Mined ancestors not found in BUMPs
+	StatusTxFormat                StatusCode = 460 // Not extended format
+	StatusUnlockingScripts        StatusCode = 461 // Malformed unlocking scripts
+	StatusInputs                  StatusCode = 462 // Invalid inputs
+	StatusMalformed               StatusCode = 463 // Malformed transaction
+	StatusOutputs                 StatusCode = 464 // Invalid outputs
+	StatusFees                    StatusCode = 465 // Fee too low
+	StatusConflict                StatusCode = 466 // Conflicting transaction
+	StatusGeneric                 StatusCode = 467 // Generic validation error
+	StatusBeefInvalid             StatusCode = 468 // BEEF validation failed
+	StatusMerkleRoots             StatusCode = 469 // Merkle roots validation failed
+	StatusFrozenPolicy            StatusCode = 471 // Input frozen (policy)
+	StatusFrozenConsensus         StatusCode = 472 // Input frozen (consensus)
+	StatusCumulativeFees          StatusCode = 473 // Cumulative fee validation failed
+	StatusTxSize                  StatusCode = 474 // Transaction size validation failed
+	StatusMinedAncestorsNotInBUMP StatusCode = 475 // Mined ancestors not found in BUMPs
 )
 
 // arcDocURL is the base URL for ARC error documentation.
