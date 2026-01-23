@@ -280,6 +280,9 @@ require (
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
 
+// CVE-2025-52881
+replace github.com/opencontainers/runc => github.com/opencontainers/runc v1.4.0
+
 // Disabled this replace to test with official sdk
 // replace github.com/bsv-blockchain/go-sdk => github.com/bsv-blockchain/go-sdk v1.2.15-0.20251229224150-16c656d138fd
 
