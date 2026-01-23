@@ -1,3 +1,4 @@
+// Package events provides interfaces for publishing and subscribing to transaction status updates.
 package events
 
 import (

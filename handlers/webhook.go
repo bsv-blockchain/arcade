@@ -75,7 +75,7 @@ func (h *WebhookHandler) processEvents(ctx context.Context, eventCh <-chan *mode
 	for {
 		select {
 		case <-ctx.Done():
-			h.logger.Info("Context cancelled, stopping event processing")
+			h.logger.Info("Context canceled, stopping event processing")
 			return
 		case <-h.stopCh:
 			h.logger.Info("Stop signal received, stopping event processing")
@@ -149,7 +149,7 @@ func (h *WebhookHandler) pruneExpiredSubmissions(ctx context.Context) {
 }
 
 // performPruning removes expired and failed submissions
-func (h *WebhookHandler) performPruning(ctx context.Context) {
+func (h *WebhookHandler) performPruning(_ context.Context) {
 	h.logger.Info("Pruning expired submissions")
 }
 
@@ -192,7 +192,9 @@ func (h *WebhookHandler) deliverWebhook(ctx context.Context, sub models.Submissi
 		h.scheduleRetry(ctx, sub)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		h.logger.Info("Webhook delivered successfully",

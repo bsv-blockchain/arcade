@@ -4,6 +4,7 @@ package arcade
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,15 +14,28 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bsv-blockchain/arcade/events"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/go-chaintracks/chaintracks"
 	msgbus "github.com/bsv-blockchain/go-p2p-message-bus"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 	p2p "github.com/bsv-blockchain/go-teranode-p2p-client"
 	teranode "github.com/bsv-blockchain/teranode/services/p2p"
+
+	"github.com/bsv-blockchain/arcade/events"
+	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/store"
+)
+
+// Static error variables for configuration validation.
+var (
+	errP2PClientRequired      = errors.New("p2p client is required")
+	errChaintracksRequired    = errors.New("chaintracks is required")
+	errTxTrackerRequired      = errors.New("tx tracker is required")
+	errStoreRequired          = errors.New("store is required")
+	errEventPublisherRequired = errors.New("event publisher is required")
+	errChaintracksNoTip       = errors.New("chaintracks has no tip")
+	errUnexpectedStatusCode   = errors.New("unexpected status code")
+	errInvalidHashSize        = errors.New("invalid hash size")
 )
 
 // Config holds configuration for Arcade
@@ -69,26 +83,26 @@ type Arcade struct {
 // statusSubscriber holds a status channel, context, and optional token filter
 type statusSubscriber struct {
 	ch    chan *models.TransactionStatus
-	ctx   context.Context
-	token string // empty means all updates
+	ctx   context.Context //nolint:containedctx // context needed for subscriber lifecycle
+	token string          // empty means all updates
 }
 
 // NewArcade creates a new Arcade instance.
 func NewArcade(cfg Config) (*Arcade, error) {
 	if cfg.P2PClient == nil {
-		return nil, fmt.Errorf("P2PClient is required")
+		return nil, errP2PClientRequired
 	}
 	if cfg.Chaintracks == nil {
-		return nil, fmt.Errorf("Chaintracks is required")
+		return nil, errChaintracksRequired
 	}
 	if cfg.TxTracker == nil {
-		return nil, fmt.Errorf("TxTracker is required")
+		return nil, errTxTrackerRequired
 	}
 	if cfg.Store == nil {
-		return nil, fmt.Errorf("Store is required")
+		return nil, errStoreRequired
 	}
 	if cfg.EventPublisher == nil {
-		return nil, fmt.Errorf("EventPublisher is required")
+		return nil, errEventPublisherRequired
 	}
 
 	if cfg.Logger == nil {
@@ -213,18 +227,18 @@ func (a *Arcade) forwardStatusUpdates(ctx context.Context) {
 			if !ok {
 				return
 			}
-			a.notifyStatusSubscribers(status)
+			a.notifyStatusSubscribers(ctx, status)
 		}
 	}
 }
 
-func (a *Arcade) notifyStatusSubscribers(status *models.TransactionStatus) {
+func (a *Arcade) notifyStatusSubscribers(ctx context.Context, status *models.TransactionStatus) {
 	a.subMu.RLock()
 	subs := a.statusSubs
 	a.subMu.RUnlock()
 
 	for _, sub := range subs {
-		if sub.token != "" && !a.txBelongsToToken(status.TxID, sub.token) {
+		if sub.token != "" && !a.txBelongsToToken(ctx, status.TxID, sub.token) {
 			continue
 		}
 		select {
@@ -234,11 +248,11 @@ func (a *Arcade) notifyStatusSubscribers(status *models.TransactionStatus) {
 	}
 }
 
-func (a *Arcade) txBelongsToToken(txid, token string) bool {
+func (a *Arcade) txBelongsToToken(ctx context.Context, txid, token string) bool {
 	if a.store == nil {
 		return false
 	}
-	subs, err := a.store.GetSubmissionsByToken(context.Background(), token)
+	subs, err := a.store.GetSubmissionsByToken(ctx, token)
 	if err != nil {
 		return false
 	}
@@ -275,6 +289,7 @@ func (a *Arcade) processBlockMessage(ctx context.Context, blockMsg teranode.Bloc
 		slog.Uint64("height", uint64(blockMsg.Height)))
 
 	// Only do transaction scanning if we have transactions to track
+	//nolint:nestif // complex nested logic for conditional transaction processing
 	if a.txTracker.Count() > 0 {
 		// Process transactions to extract merkle proofs
 		if err := a.processBlockTransactions(ctx, blockMsg); err != nil {
@@ -289,7 +304,7 @@ func (a *Arcade) processBlockMessage(ctx context.Context, blockMsg teranode.Bloc
 				slog.String("error", err.Error()))
 		} else {
 			for _, status := range statuses {
-				a.eventPublisher.Publish(ctx, status)
+				_ = a.eventPublisher.Publish(ctx, status)
 			}
 			if len(statuses) > 0 {
 				a.logger.Info("set transactions to MINED",
@@ -318,7 +333,7 @@ func (a *Arcade) processBlockMessage(ctx context.Context, blockMsg teranode.Bloc
 	return nil
 }
 
-func (a *Arcade) processBlockTransactions(ctx context.Context, blockMsg teranode.BlockMessage) error {
+func (a *Arcade) processBlockTransactions(ctx context.Context, blockMsg teranode.BlockMessage) error { //nolint:gocyclo // complex business logic for merkle path construction
 	subtreeHashes, err := a.fetchBlockSubtreeHashes(ctx, blockMsg.DataHubURL, blockMsg.Hash)
 	if err != nil {
 		return fmt.Errorf("failed to fetch subtree hashes: %w", err)
@@ -417,6 +432,7 @@ func (a *Arcade) parseCoinbaseTxID(blockMsg teranode.BlockMessage) *chainhash.Ha
 	return tx.TxID()
 }
 
+//nolint:gocyclo // complex business logic for merkle path construction
 func (a *Arcade) buildMerklePathsForSubtree(
 	ctx context.Context,
 	blockMsg teranode.BlockMessage,
@@ -442,7 +458,7 @@ func (a *Arcade) buildMerklePathsForSubtree(
 		var txOffset uint64
 		for i, h := range txHashes {
 			if h == trackedHash {
-				txOffset = uint64(i)
+				txOffset = uint64(i) //nolint:gosec // safe: i is from slice iteration
 				break
 			}
 		}
@@ -456,7 +472,7 @@ func (a *Arcade) buildMerklePathsForSubtree(
 			hashCopy := h
 			isTxid := true
 			mp.AddLeaf(0, &transaction.PathElement{
-				Offset: uint64(i),
+				Offset: uint64(i), //nolint:gosec // safe: i is from slice iteration
 				Hash:   &hashCopy,
 				Txid:   &isTxid,
 			})
@@ -470,14 +486,14 @@ func (a *Arcade) buildMerklePathsForSubtree(
 			})
 		}
 
-		subtreeBaseOffset := uint64(subtreeIdx) << uint(internalHeight-1)
+		subtreeBaseOffset := uint64(subtreeIdx) << uint(internalHeight-1) //nolint:gosec // safe: subtreeIdx is from slice iteration
 		for i, subHash := range subtreeHashes {
 			if i == 0 {
 				continue // Subtree 0 root is computed from txHashes (with corrected coinbase)
 			}
 			hashCopy := subHash
 			mp.AddLeaf(internalHeight, &transaction.PathElement{
-				Offset: subtreeBaseOffset + uint64(i),
+				Offset: subtreeBaseOffset + uint64(i), //nolint:gosec // safe: i is from slice iteration
 				Hash:   &hashCopy,
 			})
 		}
@@ -555,7 +571,7 @@ func (a *Arcade) initializeBlockTracking(ctx context.Context) error {
 	// First run - mark last 1000 blocks as on_chain
 	tip := a.chaintracks.GetTip(ctx)
 	if tip == nil {
-		return fmt.Errorf("chaintracks has no tip")
+		return errChaintracksNoTip
 	}
 
 	startHeight := uint32(0)
@@ -732,7 +748,7 @@ func (a *Arcade) handleOrphanedBlock(ctx context.Context, orphan OrphanedBlock) 
 			Timestamp: time.Now(),
 			ExtraInfo: fmt.Sprintf("reorg: block %s orphaned", orphan.Hash),
 		}
-		a.eventPublisher.Publish(ctx, status)
+		_ = a.eventPublisher.Publish(ctx, status)
 		hash, _ := chainhash.NewHashFromHex(txid)
 		if hash != nil {
 			a.txTracker.UpdateStatusHash(*hash, models.StatusSeenOnNetwork)
@@ -786,7 +802,7 @@ func (a *Arcade) processBlockByHeader(ctx context.Context, header *chaintracks.B
 			return fmt.Errorf("failed to set mined status: %w", err)
 		}
 		for _, status := range statuses {
-			a.eventPublisher.Publish(ctx, status)
+			_ = a.eventPublisher.Publish(ctx, status)
 		}
 		if len(statuses) > 0 {
 			a.logger.Info("set transactions to MINED (catch-up)",
@@ -864,7 +880,11 @@ func (a *Arcade) processSubtreeMessage(ctx context.Context, subtreeMsg teranode.
 		}
 
 		a.txTracker.UpdateStatusHash(hash, models.StatusSeenOnNetwork)
-		a.eventPublisher.Publish(ctx, status)
+		if err := a.eventPublisher.Publish(ctx, status); err != nil {
+			a.logger.Error("failed to publish status",
+				slog.String("txID", txID),
+				slog.String("error", err.Error()))
+		}
 	}
 }
 
@@ -907,7 +927,11 @@ func (a *Arcade) processRejectedTxMessage(ctx context.Context, rejectedMsg teran
 		return
 	}
 
-	a.eventPublisher.Publish(ctx, status)
+	if err := a.eventPublisher.Publish(ctx, status); err != nil {
+		a.logger.Error("failed to publish status",
+			slog.String("txID", rejectedMsg.TxID),
+			slog.String("error", err.Error()))
+	}
 }
 
 // HTTP fetching methods
@@ -943,6 +967,8 @@ func (a *Arcade) fetchBlockSubtreeHashes(ctx context.Context, dataHubURL, blockH
 // - Subtree hashes (32 bytes each)
 // - Coinbase transaction
 // - Height (varint)
+//
+//nolint:gocyclo // complex business logic for parsing merkle tree data
 func (a *Arcade) fetchBlockSubtrees(ctx context.Context, url string) ([]chainhash.Hash, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -953,26 +979,28 @@ func (a *Arcade) fetchBlockSubtrees(ctx context.Context, url string) ([]chainhas
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return nil, fmt.Errorf("%w: %d", errUnexpectedStatusCode, resp.StatusCode)
 	}
 
 	// Skip block header (80 bytes)
 	header := make([]byte, 80)
-	if _, err := io.ReadFull(resp.Body, header); err != nil {
-		return nil, fmt.Errorf("failed to read block header: %w", err)
+	if _, readErr := io.ReadFull(resp.Body, header); readErr != nil {
+		return nil, fmt.Errorf("failed to read block header: %w", readErr)
 	}
 
 	// Read transaction count (varint)
-	if _, err := readVarInt(resp.Body); err != nil {
-		return nil, fmt.Errorf("failed to read transaction count: %w", err)
+	if _, countErr := readVarInt(resp.Body); countErr != nil {
+		return nil, fmt.Errorf("failed to read transaction count: %w", countErr)
 	}
 
 	// Read size in bytes (varint)
-	if _, err := readVarInt(resp.Body); err != nil {
-		return nil, fmt.Errorf("failed to read size in bytes: %w", err)
+	if _, sizeErr := readVarInt(resp.Body); sizeErr != nil {
+		return nil, fmt.Errorf("failed to read size in bytes: %w", sizeErr)
 	}
 
 	// Read subtree count (varint)
@@ -1027,7 +1055,7 @@ func readVarInt(r io.Reader) (uint64, error) {
 		return uint64(v[0]) | uint64(v[1])<<8 | uint64(v[2])<<16 | uint64(v[3])<<24 |
 			uint64(v[4])<<32 | uint64(v[5])<<40 | uint64(v[6])<<48 | uint64(v[7])<<56, nil
 	default:
-		return uint64(buf[0]), nil
+		return uint64(buf[0]), nil //nolint:gosec // safe: buf is always initialized
 	}
 }
 
@@ -1063,10 +1091,12 @@ func (a *Arcade) fetchHashes(ctx context.Context, url string) ([]chainhash.Hash,
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return nil, fmt.Errorf("%w: %d", errUnexpectedStatusCode, resp.StatusCode)
 	}
 
 	hashes := make([]chainhash.Hash, 0)
@@ -1074,14 +1104,14 @@ func (a *Arcade) fetchHashes(ctx context.Context, url string) ([]chainhash.Hash,
 
 	for {
 		n, err := io.ReadFull(resp.Body, hashBuf)
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
 			return nil, fmt.Errorf("failed to read hash: %w", err)
 		}
 		if n != 32 {
-			return nil, fmt.Errorf("invalid hash size: %d", n)
+			return nil, fmt.Errorf("%w: %d", errInvalidHashSize, n)
 		}
 
 		hash, err := chainhash.NewHash(hashBuf)

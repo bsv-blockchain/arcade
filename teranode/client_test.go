@@ -37,11 +37,11 @@ func TestSubmitTransaction(t *testing.T) {
 		}
 
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
+		_, _ = w.Write([]byte("OK"))
 	}))
 	defer server.Close()
 
-	client := NewClient([]string{server.URL})
+	client := NewClient([]string{server.URL}, "")
 
 	statusCode, err := client.SubmitTransaction(t.Context(), server.URL, []byte("test_transaction_bytes"))
 	if err != nil {
@@ -58,13 +58,13 @@ func TestSubmitTransaction(t *testing.T) {
 }
 
 func TestSubmitTransaction_Accepted(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusAccepted)
-		w.Write([]byte("Queued"))
+		_, _ = w.Write([]byte("Queued"))
 	}))
 	defer server.Close()
 
-	client := NewClient([]string{server.URL})
+	client := NewClient([]string{server.URL}, "")
 
 	statusCode, err := client.SubmitTransaction(t.Context(), server.URL, []byte("test_tx"))
 	if err != nil {
@@ -77,13 +77,13 @@ func TestSubmitTransaction_Accepted(t *testing.T) {
 }
 
 func TestSubmitTransaction_Error(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("Failed to process transaction"))
+		_, _ = w.Write([]byte("Failed to process transaction"))
 	}))
 	defer server.Close()
 
-	client := NewClient([]string{server.URL})
+	client := NewClient([]string{server.URL}, "")
 
 	_, err := client.SubmitTransaction(t.Context(), server.URL, []byte("test_tx"))
 	if err == nil {
@@ -97,7 +97,7 @@ func TestSubmitTransaction_Error(t *testing.T) {
 
 func TestGetEndpoints(t *testing.T) {
 	endpoints := []string{"http://node1:8080", "http://node2:8080"}
-	client := NewClient(endpoints)
+	client := NewClient(endpoints, "")
 
 	result := client.GetEndpoints()
 	if len(result) != len(endpoints) {
@@ -112,13 +112,13 @@ func TestGetEndpoints(t *testing.T) {
 }
 
 func TestContextCancellation(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		time.Sleep(200 * time.Millisecond)
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
 
-	client := NewClient([]string{server.URL})
+	client := NewClient([]string{server.URL}, "")
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
 

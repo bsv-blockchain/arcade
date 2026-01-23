@@ -1,20 +1,24 @@
+// Package sqlite provides SQLite-based storage implementation.
 package sqlite
 
 import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
-	"github.com/bsv-blockchain/arcade/models"
+	// SQLite driver for database/sql.
 	_ "modernc.org/sqlite"
+
+	"github.com/bsv-blockchain/arcade/models"
 )
 
-const (
-	schemaVersion = 1
+var errNotFound = errors.New("not found")
 
+const (
 	// SQLite pragmas for better concurrency
 	sqlitePragmas = `
 PRAGMA journal_mode=WAL;
@@ -79,11 +83,11 @@ func NewStore(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
-	if _, err := db.Exec(sqlitePragmas); err != nil {
+	if _, err := db.ExecContext(context.Background(), sqlitePragmas); err != nil {
 		return nil, fmt.Errorf("failed to set pragmas: %w", err)
 	}
 
-	if err := db.Ping(); err != nil {
+	if err := db.PingContext(context.Background()); err != nil {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
@@ -104,6 +108,7 @@ func NewStore(dbPath string) (*Store, error) {
 
 // StatusStore methods
 
+// InsertStatus inserts a new transaction status.
 func (s *Store) InsertStatus(ctx context.Context, status *models.TransactionStatus) error {
 	if status.CreatedAt.IsZero() {
 		status.CreatedAt = time.Now()
@@ -128,6 +133,7 @@ VALUES (?, ?, ?, ?, ?, ?)
 	return nil
 }
 
+// UpdateStatus updates an existing transaction status.
 func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStatus) error {
 	disallowed := status.Status.DisallowedPreviousStatuses()
 
@@ -151,14 +157,15 @@ WHERE txid = ?
   AND status NOT IN (%s)
 `, strings.Join(placeholders, ","))
 
-		args = []interface{}{
+		args = make([]interface{}, 0, 6+len(disallowed))
+		args = append(args,
 			status.Status,
 			status.Timestamp,
 			nullString(status.BlockHash),
 			nullString(status.ExtraInfo),
 			status.CompetingTxs[0],
 			status.TxID,
-		}
+		)
 		for _, s := range disallowed {
 			args = append(args, s)
 		}
@@ -178,13 +185,14 @@ WHERE txid = ?
   AND status NOT IN (%s)
 `, strings.Join(placeholders, ","))
 
-		args = []interface{}{
+		args = make([]interface{}, 0, 5+len(disallowed))
+		args = append(args,
 			status.Status,
 			status.Timestamp,
 			nullString(status.BlockHash),
 			nullString(status.ExtraInfo),
 			status.TxID,
-		}
+		)
 		for _, s := range disallowed {
 			args = append(args, s)
 		}
@@ -198,6 +206,7 @@ WHERE txid = ?
 	return nil
 }
 
+// GetStatus retrieves a transaction status by transaction ID.
 func (s *Store) GetStatus(ctx context.Context, txid string) (*models.TransactionStatus, error) {
 	query := `
 SELECT t.txid, t.status, t.timestamp, t.block_hash, mp.block_height, mp.merkle_path, t.extra_info, t.competing_txs, t.created_at
@@ -209,6 +218,7 @@ WHERE t.txid = ?
 	return scanTransactionStatus(row)
 }
 
+// GetStatusesSince retrieves all transaction statuses since a given time.
 func (s *Store) GetStatusesSince(ctx context.Context, since time.Time) ([]*models.TransactionStatus, error) {
 	query := `
 SELECT t.txid, t.status, t.timestamp, t.block_hash, mp.block_height, mp.merkle_path, t.extra_info, t.competing_txs, t.created_at
@@ -221,11 +231,14 @@ ORDER BY t.timestamp ASC
 	if err != nil {
 		return nil, fmt.Errorf("failed to query statuses since: %w", err)
 	}
-	defer rows.Close()
+	defer func() {
+		_ = rows.Close()
+	}()
 
 	return scanTransactionStatuses(rows)
 }
 
+// SetStatusByBlockHash sets status for all transactions with a given block hash.
 func (s *Store) SetStatusByBlockHash(ctx context.Context, blockHash string, newStatus models.Status) ([]string, error) {
 	var query string
 
@@ -253,7 +266,9 @@ RETURNING txid
 	if err != nil {
 		return nil, fmt.Errorf("failed to set status by block hash: %w", err)
 	}
-	defer rows.Close()
+	defer func() {
+		_ = rows.Close()
+	}()
 
 	var txids []string
 	for rows.Next() {
@@ -271,6 +286,7 @@ RETURNING txid
 	return txids, nil
 }
 
+// InsertMerklePath inserts a merkle path for a transaction.
 func (s *Store) InsertMerklePath(ctx context.Context, txid, blockHash string, blockHeight uint64, merklePath []byte) error {
 	query := `
 INSERT INTO merkle_paths (txid, block_hash, block_height, merkle_path, created_at)
@@ -284,6 +300,7 @@ ON CONFLICT (txid, block_hash) DO NOTHING
 	return nil
 }
 
+// SetMinedByBlockHash marks transactions as mined for a given block hash.
 func (s *Store) SetMinedByBlockHash(ctx context.Context, blockHash string) ([]*models.TransactionStatus, error) {
 	now := time.Now()
 
@@ -312,7 +329,9 @@ WHERE block_hash = ?
 	if err != nil {
 		return nil, fmt.Errorf("failed to query merkle paths: %w", err)
 	}
-	defer rows.Close()
+	defer func() {
+		_ = rows.Close()
+	}()
 
 	var statuses []*models.TransactionStatus
 	for rows.Next() {
@@ -341,6 +360,7 @@ WHERE block_hash = ?
 
 // SubmissionStore methods
 
+// InsertSubmission inserts a new submission record.
 func (s *Store) InsertSubmission(ctx context.Context, sub *models.Submission) error {
 	query := `
 INSERT INTO submissions (submission_id, txid, callback_url, callback_token, full_status_updates, last_delivered_status, retry_count, next_retry_at, created_at)
@@ -364,6 +384,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	return nil
 }
 
+// GetSubmissionsByTxID retrieves submissions for a given transaction ID.
 func (s *Store) GetSubmissionsByTxID(ctx context.Context, txid string) ([]*models.Submission, error) {
 	query := `
 SELECT submission_id, txid, callback_url, callback_token, full_status_updates, last_delivered_status, retry_count, next_retry_at, created_at
@@ -374,11 +395,14 @@ WHERE txid = ?
 	if err != nil {
 		return nil, fmt.Errorf("failed to query submissions: %w", err)
 	}
-	defer rows.Close()
+	defer func() {
+		_ = rows.Close()
+	}()
 
 	return scanSubmissions(rows)
 }
 
+// GetSubmissionsByToken retrieves submissions for a given callback token.
 func (s *Store) GetSubmissionsByToken(ctx context.Context, callbackToken string) ([]*models.Submission, error) {
 	query := `
 SELECT submission_id, txid, callback_url, callback_token, full_status_updates, last_delivered_status, retry_count, next_retry_at, created_at
@@ -390,11 +414,14 @@ ORDER BY created_at ASC
 	if err != nil {
 		return nil, fmt.Errorf("failed to query submissions by token: %w", err)
 	}
-	defer rows.Close()
+	defer func() {
+		_ = rows.Close()
+	}()
 
 	return scanSubmissions(rows)
 }
 
+// UpdateDeliveryStatus updates delivery status for a submission.
 func (s *Store) UpdateDeliveryStatus(ctx context.Context, submissionID string, lastStatus models.Status, retryCount int, nextRetry *time.Time) error {
 	query := `
 UPDATE submissions
@@ -411,6 +438,7 @@ WHERE submission_id = ?
 
 // Block tracking methods
 
+// IsBlockOnChain checks if a block is on chain.
 func (s *Store) IsBlockOnChain(ctx context.Context, blockHash string) (bool, error) {
 	var count int
 	err := s.db.QueryRowContext(ctx,
@@ -422,6 +450,7 @@ func (s *Store) IsBlockOnChain(ctx context.Context, blockHash string) (bool, err
 	return count > 0, nil
 }
 
+// MarkBlockProcessed marks a block as processed.
 func (s *Store) MarkBlockProcessed(ctx context.Context, blockHash string, blockHeight uint64, onChain bool) error {
 	onChainInt := 0
 	if onChain {
@@ -437,6 +466,7 @@ func (s *Store) MarkBlockProcessed(ctx context.Context, blockHash string, blockH
 	return nil
 }
 
+// HasAnyProcessedBlocks returns whether any blocks have been processed.
 func (s *Store) HasAnyProcessedBlocks(ctx context.Context) (bool, error) {
 	var count int
 	err := s.db.QueryRowContext(ctx,
@@ -447,12 +477,13 @@ func (s *Store) HasAnyProcessedBlocks(ctx context.Context) (bool, error) {
 	return count > 0, nil
 }
 
+// GetOnChainBlockAtHeight retrieves the block hash for an on-chain block at the given height.
 func (s *Store) GetOnChainBlockAtHeight(ctx context.Context, height uint64) (string, bool, error) {
 	var blockHash string
 	err := s.db.QueryRowContext(ctx,
 		"SELECT block_hash FROM processed_blocks WHERE block_height = ? AND on_chain = 1",
 		height).Scan(&blockHash)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
 	if err != nil {
@@ -461,6 +492,7 @@ func (s *Store) GetOnChainBlockAtHeight(ctx context.Context, height uint64) (str
 	return blockHash, true, nil
 }
 
+// MarkBlockOffChain marks a block as off-chain.
 func (s *Store) MarkBlockOffChain(ctx context.Context, blockHash string) error {
 	_, err := s.db.ExecContext(ctx,
 		"UPDATE processed_blocks SET on_chain = 0 WHERE block_hash = ?",
@@ -471,6 +503,7 @@ func (s *Store) MarkBlockOffChain(ctx context.Context, blockHash string) error {
 	return nil
 }
 
+// Close closes the database connection.
 func (s *Store) Close() error {
 	if s.db != nil {
 		return s.db.Close()
@@ -486,7 +519,7 @@ func initializeSchema(db *sql.DB, schema string) error {
 		if stmt == "" {
 			continue
 		}
-		if _, err := db.Exec(stmt); err != nil {
+		if _, err := db.ExecContext(context.Background(), stmt); err != nil {
 			return fmt.Errorf("failed to execute schema statement: %w", err)
 		}
 	}
@@ -510,15 +543,15 @@ func scanTransactionStatus(row *sql.Row) (*models.TransactionStatus, error) {
 		&competingTxsJSON,
 		&status.CreatedAt,
 	)
-	if err == sql.ErrNoRows {
-		return nil, nil
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, errNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan transaction status: %w", err)
 	}
 
 	status.BlockHash = blockHash.String
-	status.BlockHeight = uint64(blockHeight.Int64)
+	status.BlockHeight = uint64(blockHeight.Int64) //nolint:gosec // safe: database constraints ensure non-negative
 	status.MerklePath = merklePath
 	status.ExtraInfo = extraInfo.String
 
@@ -564,7 +597,7 @@ func scanTransactionStatuses(rows *sql.Rows) ([]*models.TransactionStatus, error
 		}
 
 		status.BlockHash = blockHash.String
-		status.BlockHeight = uint64(blockHeight.Int64)
+		status.BlockHeight = uint64(blockHeight.Int64) //nolint:gosec // safe: database constraints ensure non-negative // safe: database constraints ensure non-negative
 		status.MerklePath = merklePath
 		status.ExtraInfo = extraInfo.String
 

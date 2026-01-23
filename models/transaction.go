@@ -1,3 +1,4 @@
+// Package models contains data structures for transaction and status management.
 package models
 
 import (
@@ -8,6 +9,7 @@ import (
 // HexBytes is a byte slice that marshals to/from hex strings in JSON
 type HexBytes []byte
 
+// MarshalJSON converts HexBytes to a JSON-encoded hex string.
 func (h HexBytes) MarshalJSON() ([]byte, error) {
 	if h == nil {
 		return []byte("null"), nil
@@ -15,6 +17,7 @@ func (h HexBytes) MarshalJSON() ([]byte, error) {
 	return []byte(`"` + hex.EncodeToString(h) + `"`), nil
 }
 
+// UnmarshalJSON decodes a JSON-encoded hex string into HexBytes.
 func (h *HexBytes) UnmarshalJSON(data []byte) error {
 	if string(data) == "null" {
 		*h = nil
@@ -49,26 +52,37 @@ type TransactionStatus struct {
 type Status string
 
 const (
-	StatusUnknown              Status = "UNKNOWN"
-	StatusReceived             Status = "RECEIVED"
-	StatusSentToNetwork        Status = "SENT_TO_NETWORK"
-	StatusAcceptedByNetwork    Status = "ACCEPTED_BY_NETWORK"
-	StatusSeenOnNetwork        Status = "SEEN_ON_NETWORK"
-	StatusDoubleSpendAttempted Status = "DOUBLE_SPEND_ATTEMPTED"
-	StatusRejected             Status = "REJECTED"
-	StatusMined                Status = "MINED"
-	StatusImmutable            Status = "IMMUTABLE"
+	// StatusUnknown indicates the transaction status is unknown.
+	StatusUnknown = Status("UNKNOWN")
+	// StatusReceived indicates the transaction was received.
+	StatusReceived = Status("RECEIVED")
+	// StatusSentToNetwork indicates the transaction was sent to the network.
+	StatusSentToNetwork = Status("SENT_TO_NETWORK")
+	// StatusAcceptedByNetwork indicates the transaction was accepted by the network.
+	StatusAcceptedByNetwork = Status("ACCEPTED_BY_NETWORK")
+	// StatusSeenOnNetwork indicates the transaction was seen on the network.
+	StatusSeenOnNetwork = Status("SEEN_ON_NETWORK")
+	// StatusDoubleSpendAttempted indicates a double spend was attempted.
+	StatusDoubleSpendAttempted = Status("DOUBLE_SPEND_ATTEMPTED")
+	// StatusRejected indicates the transaction was rejected.
+	StatusRejected = Status("REJECTED")
+	// StatusMined indicates the transaction was mined.
+	StatusMined = Status("MINED")
+	// StatusImmutable indicates the transaction is immutable.
+	StatusImmutable = Status("IMMUTABLE")
 )
 
 // DisallowedPreviousStatuses returns statuses that CANNOT transition to this status
 // Used in UPDATE queries to prevent invalid status transitions
 func (s Status) DisallowedPreviousStatuses() []Status {
 	switch s {
+	case StatusUnknown, StatusReceived:
+		return []Status{}
 	case StatusSentToNetwork:
 		return []Status{StatusSentToNetwork, StatusAcceptedByNetwork, StatusSeenOnNetwork, StatusRejected, StatusDoubleSpendAttempted, StatusMined}
 	case StatusAcceptedByNetwork:
 		return []Status{StatusAcceptedByNetwork, StatusSeenOnNetwork, StatusRejected, StatusDoubleSpendAttempted, StatusMined}
-	case StatusSeenOnNetwork, StatusRejected, StatusDoubleSpendAttempted, StatusMined:
+	case StatusSeenOnNetwork, StatusRejected, StatusDoubleSpendAttempted, StatusMined, StatusImmutable:
 		return []Status{}
 	default:
 		return []Status{}

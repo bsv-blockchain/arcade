@@ -21,20 +21,22 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
 
-	"github.com/bsv-blockchain/arcade/config"
-	arcadeRoutes "github.com/bsv-blockchain/arcade/routes/fiber"
 	chaintracksRoutes "github.com/bsv-blockchain/go-chaintracks/routes/fiber"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/spf13/viper"
+
+	"github.com/bsv-blockchain/arcade/config"
+	arcadeRoutes "github.com/bsv-blockchain/arcade/routes/fiber"
 )
 
 func main() {
@@ -74,7 +76,8 @@ func loadConfig() (*config.Config, error) {
 	cfg.SetDefaults(v, "")
 
 	if err := v.ReadInConfig(); err != nil {
-		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
+		var cfgErr viper.ConfigFileNotFoundError
+		if !errors.As(err, &cfgErr) {
 			return nil, fmt.Errorf("failed to read config: %w", err)
 		}
 		// Config file not found is OK, use defaults + env
@@ -154,7 +157,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	})
 
 	// Simple status page
-	app.Get("/", func(c *fiber.Ctx) error {
+	app.Get("/", func(c *fiber.Ctx) error { //nolint:contextcheck // request context available via c.UserContext()
 		tip := services.Chaintracks.GetTip(c.UserContext())
 		height := uint32(0)
 		if tip != nil {
@@ -232,7 +235,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	case err := <-errCh:
 		return err
 	case <-ctx.Done():
-		log.Info("Context cancelled")
+		log.Info("Context canceled")
 	}
 
 	// Graceful shutdown

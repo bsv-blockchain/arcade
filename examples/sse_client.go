@@ -1,19 +1,23 @@
+// Package main contains an SSE client example.
 package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"log"
 	"net/http"
 	"strings"
 )
 
+//nolint:gocyclo // example client with multiple error handling paths
 func main() {
 	callbackToken := "example-token-123"
 	url := fmt.Sprintf("http://localhost:3011/events?callbackToken=%s", callbackToken)
 
 	// Create request with optional Last-Event-ID for catchup
-	req, err := http.NewRequest("GET", url, nil)
+	ctx := context.Background()
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -28,13 +32,13 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		log.Fatalf("Failed to connect: %s", resp.Status)
 	}
 
-	fmt.Println("Connected to SSE stream...")
+	log.Println("Connected to SSE stream...")
 
 	scanner := bufio.NewScanner(resp.Body)
 	var eventID, eventType, eventData string
@@ -45,7 +49,7 @@ func main() {
 		if line == "" {
 			// Empty line signals end of event
 			if eventData != "" {
-				fmt.Printf("[ID: %s] [Type: %s] %s\n", eventID, eventType, eventData)
+				log.Printf("[ID: %s] [Type: %s] %s\n", eventID, eventType, eventData)
 				eventID, eventType, eventData = "", "", ""
 			}
 			continue

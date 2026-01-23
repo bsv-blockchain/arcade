@@ -29,17 +29,16 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/docs"
-	"github.com/bsv-blockchain/arcade/logging"
-	fiberRoutes "github.com/bsv-blockchain/arcade/routes/fiber"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	fiberlogger "github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"
-)
 
-var authToken string
+	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/docs"
+	"github.com/bsv-blockchain/arcade/logging"
+	fiberRoutes "github.com/bsv-blockchain/arcade/routes/fiber"
+)
 
 const scalarHTML = `<!DOCTYPE html>
 <html>
@@ -98,17 +97,17 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		Logger:         log,
 	})
 
-	if cfg.Auth.Enabled {
-		authToken = cfg.Auth.Token
-		log.Info("API authentication enabled")
-	}
-
 	// Setup dashboard
 	dashboard := NewDashboard(services.Arcade)
 
 	// Setup and start HTTP server
 	log.Info("Starting HTTP server", slog.String("address", cfg.Server.Address))
-	app := setupServer(arcadeRoutes, dashboard)
+	authToken := ""
+	if cfg.Auth.Enabled {
+		authToken = cfg.Auth.Token
+		log.Info("API authentication enabled")
+	}
+	app := setupServer(arcadeRoutes, dashboard, authToken)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -130,13 +129,13 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		log.Error("Server error", slog.String("error", err.Error()))
 		return err
 	case <-ctx.Done():
-		log.Info("Context cancelled")
+		log.Info("Context canceled")
 	}
 
 	// Graceful shutdown
 	log.Info("Shutting down gracefully")
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
+	shutdownCtx, shutdownCancel := context.WithTimeout(ctx, cfg.Server.ShutdownTimeout)
 	defer shutdownCancel()
 
 	if err := app.ShutdownWithContext(shutdownCtx); err != nil {
@@ -147,7 +146,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	return nil
 }
 
-func setupServer(arcadeRoutes *fiberRoutes.Routes, dashboard *Dashboard) *fiber.App {
+func setupServer(arcadeRoutes *fiberRoutes.Routes, dashboard *Dashboard, authToken string) *fiber.App {
 	app := fiber.New(fiber.Config{
 		DisableStartupMessage: true,
 	})
@@ -163,7 +162,7 @@ func setupServer(arcadeRoutes *fiberRoutes.Routes, dashboard *Dashboard) *fiber.
 	}))
 
 	if authToken != "" {
-		app.Use(authMiddleware)
+		app.Use(authMiddleware(authToken))
 	}
 
 	// Transaction endpoints (ARC-compatible)
@@ -187,25 +186,27 @@ func setupServer(arcadeRoutes *fiberRoutes.Routes, dashboard *Dashboard) *fiber.
 	return app
 }
 
-func authMiddleware(c *fiber.Ctx) error {
-	path := c.Path()
-	if path == "/health" || path == "/policy" || path == "/status" || path == "/docs" || path == "/docs/*" {
+func authMiddleware(token string) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		path := c.Path()
+		if path == "/health" || path == "/policy" || path == "/status" || path == "/docs" || path == "/docs/*" {
+			return c.Next()
+		}
+
+		auth := c.Get("Authorization")
+		if auth == "" {
+			return c.Status(401).JSON(fiber.Map{"error": "Missing authorization header"})
+		}
+
+		const bearerPrefix = "Bearer "
+		if len(auth) < len(bearerPrefix) || auth[:len(bearerPrefix)] != bearerPrefix {
+			return c.Status(401).JSON(fiber.Map{"error": "Invalid authorization header format"})
+		}
+
+		if auth[len(bearerPrefix):] != token {
+			return c.Status(401).JSON(fiber.Map{"error": "Invalid token"})
+		}
+
 		return c.Next()
 	}
-
-	auth := c.Get("Authorization")
-	if auth == "" {
-		return c.Status(401).JSON(fiber.Map{"error": "Missing authorization header"})
-	}
-
-	const bearerPrefix = "Bearer "
-	if len(auth) < len(bearerPrefix) || auth[:len(bearerPrefix)] != bearerPrefix {
-		return c.Status(401).JSON(fiber.Map{"error": "Invalid authorization header format"})
-	}
-
-	if auth[len(bearerPrefix):] != authToken {
-		return c.Status(401).JSON(fiber.Map{"error": "Invalid token"})
-	}
-
-	return c.Next()
 }
