@@ -120,7 +120,7 @@ go get -u github.com/bsv-blockchain/arcade
 
 ### Prerequisites
 
-- **Go 1.23+** (see `go.mod` for exact version)
+- **Go 1.25+** (see `go.mod` for exact version)
 - **SQLite** (included with most systems)
 - **Teranode broadcast URL** (e.g., `https://arc.taal.com`)
 
