@@ -6,7 +6,7 @@ require (
 	github.com/bsv-blockchain/go-chaintracks v1.0.3
 	github.com/bsv-blockchain/go-p2p-message-bus v0.1.8
 	github.com/bsv-blockchain/go-sdk v1.2.14
-	github.com/bsv-blockchain/go-teranode-p2p-client v0.0.0
+	github.com/bsv-blockchain/go-teranode-p2p-client v0.1.0
 	github.com/bsv-blockchain/teranode v0.13.1
 	github.com/gofiber/fiber/v2 v2.52.10
 	github.com/golang-migrate/migrate/v4 v4.19.1
@@ -63,6 +63,7 @@ require (
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0 // indirect
 	github.com/dolthub/maphash v0.1.0 // indirect
 	github.com/dolthub/swiss v0.2.1 // indirect
+	github.com/dunglas/httpsfv v1.1.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/eapache/go-resiliency v1.7.0 // indirect
 	github.com/eapache/go-xerial-snappy v0.0.0-20230731223053-c322873962e3 // indirect
@@ -130,7 +131,7 @@ require (
 	github.com/libp2p/go-buffer-pool v0.1.0 // indirect
 	github.com/libp2p/go-cidranger v1.1.0 // indirect
 	github.com/libp2p/go-flow-metrics v0.3.0 // indirect
-	github.com/libp2p/go-libp2p v0.46.0 // indirect
+	github.com/libp2p/go-libp2p v0.46.1-0.20260122192808-dd26469c52a7 // indirect
 	github.com/libp2p/go-libp2p-asn-util v0.4.1 // indirect
 	github.com/libp2p/go-libp2p-kad-dht v0.37.0 // indirect
 	github.com/libp2p/go-libp2p-kbucket v0.8.0 // indirect
@@ -203,8 +204,8 @@ require (
 	github.com/prometheus/common v0.67.5 // indirect
 	github.com/prometheus/procfs v0.19.2 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	github.com/quic-go/quic-go v0.58.0 // indirect
-	github.com/quic-go/webtransport-go v0.9.0 // indirect
+	github.com/quic-go/quic-go v0.59.0 // indirect
+	github.com/quic-go/webtransport-go v0.10.0 // indirect
 	github.com/rcrowley/go-metrics v0.0.0-20250401214520-65e299d6c5c9 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/rs/zerolog v1.34.0 // indirect
@@ -256,8 +257,8 @@ require (
 	golang.org/x/time v0.14.0 // indirect
 	golang.org/x/tools v0.41.0 // indirect
 	gonum.org/v1/gonum v0.17.0 // indirect
-	google.golang.org/genproto/googleapis/api v0.0.0-20260120221211-b8f7ae30c516 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260120221211-b8f7ae30c516 // indirect
+	google.golang.org/genproto/googleapis/api v0.0.0-20260122232226-8e98ce8d340d // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260122232226-8e98ce8d340d // indirect
 	google.golang.org/grpc v1.78.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
@@ -278,9 +279,6 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.1 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
-
-// Custom package needs to be used as the main package is not publicly available
-replace github.com/bsv-blockchain/go-teranode-p2p-client => github.com/shruggr/go-teranode-p2p-client v0.0.0-20251219052644-3b9eba1f195f
 
 // Disabled this replace to test with official sdk
 // replace github.com/bsv-blockchain/go-sdk => github.com/bsv-blockchain/go-sdk v1.2.15-0.20251229224150-16c656d138fd
