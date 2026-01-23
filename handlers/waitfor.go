@@ -1,3 +1,4 @@
+// Package handlers handles webhook and wait-for functionality.
 package handlers
 
 import (
@@ -11,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/arcade/models"
 )
 
+// ErrTimeout is returned when a wait operation times out.
 var ErrTimeout = errors.New("wait timeout exceeded")
 
 // WaitForHandler manages per-transaction channels for synchronous status waiting

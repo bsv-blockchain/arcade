@@ -4,9 +4,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/bsv-blockchain/arcade"
 	msgbus "github.com/bsv-blockchain/go-p2p-message-bus"
 	"github.com/gofiber/fiber/v2"
+
+	"github.com/bsv-blockchain/arcade"
 )
 
 // Dashboard provides HTTP handlers for the status dashboard

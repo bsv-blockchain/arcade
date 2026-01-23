@@ -1,8 +1,10 @@
+// Package teranode provides a client for communicating with Teranode P2P network.
 package teranode
 
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +14,8 @@ import (
 const (
 	defaultTimeout = 30 * time.Second
 )
+
+var errUnexpectedStatusCode = errors.New("unexpected status code")
 
 // Client handles communication with teranode endpoints
 type Client struct {
@@ -50,11 +54,13 @@ func (c *Client) SubmitTransaction(ctx context.Context, endpoint string, rawTx [
 	if err != nil {
 		return 0, fmt.Errorf("failed to submit transaction: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
 		body, _ := io.ReadAll(resp.Body)
-		return resp.StatusCode, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, string(body))
+		return resp.StatusCode, fmt.Errorf("%w %d: %s", errUnexpectedStatusCode, resp.StatusCode, string(body))
 	}
 
 	return resp.StatusCode, nil

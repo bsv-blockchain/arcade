@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -12,14 +13,21 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gofiber/fiber/v2"
+	"github.com/valyala/fasthttp"
+
 	"github.com/bsv-blockchain/arcade"
 	arcerrors "github.com/bsv-blockchain/arcade/errors"
 	"github.com/bsv-blockchain/arcade/events"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/service"
 	"github.com/bsv-blockchain/arcade/store"
-	"github.com/gofiber/fiber/v2"
-	"github.com/valyala/fasthttp"
+)
+
+// Static errors for routes package
+var (
+	errInvalidTransactionHex = errors.New("invalid transaction hex")
+	errInvalidRequestBody    = errors.New("invalid request body")
 )
 
 // TransactionRequest represents a transaction submission request.
@@ -246,11 +254,11 @@ func (r *Routes) handleTxSSE(c *fiber.Ctx) error {
 				if !ok {
 					return
 				}
-				fmt.Fprintf(w, "id: %d\n", event.Timestamp.UnixNano())
-				fmt.Fprintf(w, "event: status\n")
-				fmt.Fprintf(w, "data: {\"txid\":\"%s\",\"txStatus\":\"%s\",\"timestamp\":\"%s\"}\n\n",
+				_, _ = fmt.Fprintf(w, "id: %d\n", event.Timestamp.UnixNano())
+				_, _ = fmt.Fprintf(w, "event: status\n")
+				_, _ = fmt.Fprintf(w, "data: {\"txid\":\"%s\",\"txStatus\":\"%s\",\"timestamp\":\"%s\"}\n\n",
 					event.TxID, event.Status, event.Timestamp.Format(time.RFC3339))
-				w.Flush()
+				_ = w.Flush()
 			}
 		}
 	}))
@@ -286,17 +294,17 @@ func (r *Routes) parseTransactionBody(c *fiber.Ctx) ([]byte, error) {
 	case "text/plain":
 		data, err := hex.DecodeString(string(c.Body()))
 		if err != nil {
-			return nil, fmt.Errorf("invalid transaction hex")
+			return nil, errInvalidTransactionHex
 		}
 		return data, nil
 	default:
 		var req TransactionRequest
 		if err := c.BodyParser(&req); err != nil {
-			return nil, fmt.Errorf("invalid request body")
+			return nil, errInvalidRequestBody
 		}
 		data, err := hex.DecodeString(req.RawTx)
 		if err != nil {
-			return nil, fmt.Errorf("invalid transaction hex")
+			return nil, errInvalidTransactionHex
 		}
 		return data, nil
 	}
@@ -331,12 +339,12 @@ func (r *Routes) sendTxSSECatchup(ctx context.Context, w *bufio.Writer, callback
 		if err != nil || status == nil || !status.Timestamp.After(since) {
 			continue
 		}
-		fmt.Fprintf(w, "id: %d\n", status.Timestamp.UnixNano())
-		fmt.Fprintf(w, "event: status\n")
-		fmt.Fprintf(w, "data: {\"txid\":\"%s\",\"txStatus\":\"%s\",\"timestamp\":\"%s\"}\n\n",
+		_, _ = fmt.Fprintf(w, "id: %d\n", status.Timestamp.UnixNano())
+		_, _ = fmt.Fprintf(w, "event: status\n")
+		_, _ = fmt.Fprintf(w, "data: {\"txid\":\"%s\",\"txStatus\":\"%s\",\"timestamp\":\"%s\"}\n\n",
 			status.TxID, status.Status, status.Timestamp.Format(time.RFC3339))
 	}
-	w.Flush()
+	_ = w.Flush()
 }
 
 // GetArcade returns the arcade instance for use by dashboard or other handlers.

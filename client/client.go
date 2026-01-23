@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +18,15 @@ import (
 
 // Ensure Client implements service.ArcadeService
 var _ service.ArcadeService = (*Client)(nil)
+
+// Static errors for client package.
+var (
+	errTransactionNotFound  = errors.New("transaction not found")
+	ErrHTTPRequest          = errors.New("HTTP request error")
+	ErrUnexpectedHTTPStatus = errors.New("unexpected HTTP status code")
+	errInvalidJSONResponse  = errors.New("invalid JSON response")
+	errEmptyResponse        = errors.New("empty response body")
+)
 
 // Client is an HTTP client for the Arcade REST API.
 type Client struct {
@@ -64,7 +74,7 @@ func (c *Client) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mode
 	if err != nil {
 		return nil, fmt.Errorf("failed to submit transaction: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, c.parseErrorResponse(resp)
@@ -85,9 +95,9 @@ func (c *Client) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts *
 		RawTx string `json:"rawTx"`
 	}
 
-	var reqs []txRequest
-	for _, rawTx := range rawTxs {
-		reqs = append(reqs, txRequest{RawTx: fmt.Sprintf("%x", rawTx)})
+	reqs := make([]txRequest, len(rawTxs))
+	for i, rawTx := range rawTxs {
+		reqs[i] = txRequest{RawTx: fmt.Sprintf("%x", rawTx)}
 	}
 
 	body, err := json.Marshal(reqs)
@@ -107,7 +117,7 @@ func (c *Client) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts *
 	if err != nil {
 		return nil, fmt.Errorf("failed to submit transactions: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, c.parseErrorResponse(resp)
@@ -132,10 +142,10 @@ func (c *Client) GetStatus(ctx context.Context, txid string) (*models.Transactio
 	if err != nil {
 		return nil, fmt.Errorf("failed to get status: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("transaction not found")
+		return nil, errTransactionNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, c.parseErrorResponse(resp)
@@ -170,7 +180,7 @@ func (c *Client) GetPolicy(ctx context.Context) (*models.Policy, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to get policy: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, c.parseErrorResponse(resp)
@@ -215,15 +225,15 @@ func (c *Client) parseErrorResponse(resp *http.Response) error {
 		Error string `json:"error"`
 	}
 	if json.Unmarshal(body, &errResp) == nil && errResp.Error != "" {
-		return fmt.Errorf("%s: %s", resp.Status, errResp.Error)
+		return errors.Join(ErrUnexpectedHTTPStatus, errInvalidJSONResponse)
 	}
 
 	// Return raw body if not JSON
 	if len(body) > 0 {
-		return fmt.Errorf("%s: %s", resp.Status, string(body))
+		return errors.Join(ErrUnexpectedHTTPStatus, errEmptyResponse)
 	}
 
-	return fmt.Errorf("%s", resp.Status)
+	return ErrUnexpectedHTTPStatus
 }
 
 // Close closes the client and any active connections.

@@ -34,26 +34,26 @@ definitions:
     type: object
   models.Status:
     enum:
-    - UNKNOWN
-    - RECEIVED
-    - SENT_TO_NETWORK
-    - ACCEPTED_BY_NETWORK
-    - SEEN_ON_NETWORK
-    - DOUBLE_SPEND_ATTEMPTED
-    - REJECTED
-    - MINED
-    - IMMUTABLE
+      - UNKNOWN
+      - RECEIVED
+      - SENT_TO_NETWORK
+      - ACCEPTED_BY_NETWORK
+      - SEEN_ON_NETWORK
+      - DOUBLE_SPEND_ATTEMPTED
+      - REJECTED
+      - MINED
+      - IMMUTABLE
     type: string
     x-enum-varnames:
-    - StatusUnknown
-    - StatusReceived
-    - StatusSentToNetwork
-    - StatusAcceptedByNetwork
-    - StatusSeenOnNetwork
-    - StatusDoubleSpendAttempted
-    - StatusRejected
-    - StatusMined
-    - StatusImmutable
+      - StatusUnknown
+      - StatusReceived
+      - StatusSentToNetwork
+      - StatusAcceptedByNetwork
+      - StatusSeenOnNetwork
+      - StatusDoubleSpendAttempted
+      - StatusRejected
+      - StatusMined
+      - StatusImmutable
   models.TransactionStatus:
     properties:
       blockHash:
@@ -90,15 +90,14 @@ info:
 paths:
   /events:
     get:
-      description: Server-Sent Events stream of transaction status updates. If callbackToken
-        is provided, only events for that token are streamed.
+      description: Server-Sent Events stream of transaction status updates. If callbackToken is provided, only events for that token are streamed.
       parameters:
-      - description: Callback token from transaction submission
-        in: query
-        name: callbackToken
-        type: string
+        - description: Callback token from transaction submission
+          in: query
+          name: callbackToken
+          type: string
       produces:
-      - text/event-stream
+        - text/event-stream
       responses:
         "200":
           description: SSE stream of transaction status updates
@@ -106,12 +105,12 @@ paths:
             type: string
       summary: Stream transaction events
       tags:
-      - arcade
+        - arcade
   /health:
     get:
       description: Returns the health status of the service
       produces:
-      - text/plain
+        - text/plain
       responses:
         "200":
           description: OK
@@ -123,13 +122,12 @@ paths:
             type: string
       summary: Health check
       tags:
-      - arcade
+        - arcade
   /policy:
     get:
-      description: Returns the transaction policy configuration including fee rates
-        and limits
+      description: Returns the transaction policy configuration including fee rates and limits
       produces:
-      - application/json
+        - application/json
       responses:
         "200":
           description: OK
@@ -137,44 +135,43 @@ paths:
             $ref: '#/definitions/models.Policy'
       summary: Get policy
       tags:
-      - arcade
+        - arcade
   /tx:
     post:
       consumes:
-      - application/json
-      - application/octet-stream
-      - text/plain
-      description: Submit a single transaction for broadcast. Accepts raw transaction
-        bytes, hex string, or JSON with rawTx field.
+        - application/json
+        - application/octet-stream
+        - text/plain
+      description: Submit a single transaction for broadcast. Accepts raw transaction bytes, hex string, or JSON with rawTx field.
       parameters:
-      - description: Transaction data
-        in: body
-        name: transaction
-        required: true
-        schema:
-          $ref: '#/definitions/fiber.TransactionRequest'
-      - description: URL for status callbacks
-        in: header
-        name: X-CallbackUrl
-        type: string
-      - description: Token for SSE event filtering
-        in: header
-        name: X-CallbackToken
-        type: string
-      - description: Send all status updates (true/false)
-        in: header
-        name: X-FullStatusUpdates
-        type: string
-      - description: Skip fee validation (true/false)
-        in: header
-        name: X-SkipFeeValidation
-        type: string
-      - description: Skip script validation (true/false)
-        in: header
-        name: X-SkipScriptValidation
-        type: string
+        - description: Transaction data
+          in: body
+          name: transaction
+          required: true
+          schema:
+            $ref: '#/definitions/fiber.TransactionRequest'
+        - description: URL for status callbacks
+          in: header
+          name: X-CallbackUrl
+          type: string
+        - description: Token for SSE event filtering
+          in: header
+          name: X-CallbackToken
+          type: string
+        - description: Send all status updates (true/false)
+          in: header
+          name: X-FullStatusUpdates
+          type: string
+        - description: Skip fee validation (true/false)
+          in: header
+          name: X-SkipFeeValidation
+          type: string
+        - description: Skip script validation (true/false)
+          in: header
+          name: X-SkipScriptValidation
+          type: string
       produces:
-      - application/json
+        - application/json
       responses:
         "200":
           description: OK
@@ -196,18 +193,18 @@ paths:
             type: object
       summary: Submit transaction
       tags:
-      - arcade
+        - arcade
   /tx/{txid}:
     get:
       description: Get the current status of a submitted transaction
       parameters:
-      - description: Transaction ID
-        in: path
-        name: txid
-        required: true
-        type: string
+        - description: Transaction ID
+          in: path
+          name: txid
+          required: true
+          type: string
       produces:
-      - application/json
+        - application/json
       responses:
         "200":
           description: OK
@@ -227,43 +224,43 @@ paths:
             type: object
       summary: Get transaction status
       tags:
-      - arcade
+        - arcade
   /txs:
     post:
       consumes:
-      - application/json
+        - application/json
       description: Submit multiple transactions for broadcast
       parameters:
-      - description: Array of transactions
-        in: body
-        name: transactions
-        required: true
-        schema:
-          items:
-            $ref: '#/definitions/fiber.TransactionRequest'
-          type: array
-      - description: URL for status callbacks
-        in: header
-        name: X-CallbackUrl
-        type: string
-      - description: Token for SSE event filtering
-        in: header
-        name: X-CallbackToken
-        type: string
-      - description: Send all status updates (true/false)
-        in: header
-        name: X-FullStatusUpdates
-        type: string
-      - description: Skip fee validation (true/false)
-        in: header
-        name: X-SkipFeeValidation
-        type: string
-      - description: Skip script validation (true/false)
-        in: header
-        name: X-SkipScriptValidation
-        type: string
+        - description: Array of transactions
+          in: body
+          name: transactions
+          required: true
+          schema:
+            items:
+              $ref: '#/definitions/fiber.TransactionRequest'
+            type: array
+        - description: URL for status callbacks
+          in: header
+          name: X-CallbackUrl
+          type: string
+        - description: Token for SSE event filtering
+          in: header
+          name: X-CallbackToken
+          type: string
+        - description: Send all status updates (true/false)
+          in: header
+          name: X-FullStatusUpdates
+          type: string
+        - description: Skip fee validation (true/false)
+          in: header
+          name: X-SkipFeeValidation
+          type: string
+        - description: Skip script validation (true/false)
+          in: header
+          name: X-SkipScriptValidation
+          type: string
       produces:
-      - application/json
+        - application/json
       responses:
         "200":
           description: OK
@@ -281,7 +278,7 @@ paths:
             $ref: '#/definitions/errors.ErrorFields'
       summary: Submit multiple transactions
       tags:
-      - arcade
+        - arcade
 securityDefinitions:
   BearerAuth:
     description: Bearer token authentication

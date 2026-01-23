@@ -1,8 +1,10 @@
+// Package store provides persistence operations for transactions and submissions.
 package store
 
 import (
 	"database/sql"
 	"embed"
+	"errors"
 	"fmt"
 
 	"github.com/golang-migrate/migrate/v4"
@@ -19,7 +21,9 @@ func RunMigrations(dbPath string) error {
 	if err != nil {
 		return fmt.Errorf("failed to open database: %w", err)
 	}
-	defer db.Close()
+	defer func() {
+		_ = db.Close()
+	}()
 
 	sourceDriver, err := iofs.New(migrationsFS, "migrations")
 	if err != nil {
@@ -36,7 +40,7 @@ func RunMigrations(dbPath string) error {
 		return fmt.Errorf("failed to create migrate instance: %w", err)
 	}
 
-	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
 		return fmt.Errorf("failed to run migrations: %w", err)
 	}
 
