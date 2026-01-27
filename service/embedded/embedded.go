@@ -177,9 +177,14 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 		}
 	}
 
-	// If this transaction already exists, return the existing status without re-broadcasting
+	// Skip rebroadcast if already confirmed on network or rejected
 	if !isNew {
-		return existingStatus, nil
+		switch existingStatus.Status {
+		case models.StatusSeenOnNetwork, models.StatusMined, models.StatusImmutable,
+			models.StatusRejected, models.StatusDoubleSpendAttempted:
+			return existingStatus, nil
+		}
+		// Still pending (RECEIVED, SENT_TO_NETWORK, ACCEPTED_BY_NETWORK) - rebroadcast
 	}
 
 	// Publish submission event so subscribers can capture the raw tx before status events
@@ -314,10 +319,15 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 
 	var responses []*models.TransactionStatus
 	for _, info := range txInfos {
-		// If transaction already exists, return existing status without re-broadcasting
+		// Skip rebroadcast if already confirmed on network or rejected
 		if !info.isNew {
-			responses = append(responses, info.status)
-			continue
+			switch info.status.Status {
+			case models.StatusSeenOnNetwork, models.StatusMined, models.StatusImmutable,
+				models.StatusRejected, models.StatusDoubleSpendAttempted:
+				responses = append(responses, info.status)
+				continue
+			}
+			// Still pending (RECEIVED, SENT_TO_NETWORK, ACCEPTED_BY_NETWORK) - rebroadcast
 		}
 
 		// Publish submission event so subscribers can capture the raw tx before status events
