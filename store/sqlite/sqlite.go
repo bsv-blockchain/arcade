@@ -104,7 +104,7 @@ func NewStore(dbPath string) (*Store, error) {
 
 // StatusStore methods
 
-func (s *Store) InsertStatus(ctx context.Context, status *models.TransactionStatus) error {
+func (s *Store) GetOrInsertStatus(ctx context.Context, status *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
 	if status.CreatedAt.IsZero() {
 		status.CreatedAt = time.Now()
 	}
@@ -122,10 +122,21 @@ VALUES (?, ?, ?, ?, ?, ?)
 		status.CreatedAt,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to insert status: %w", err)
+		// Check if this is a unique constraint violation (transaction already exists)
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") || strings.Contains(err.Error(), "PRIMARY KEY constraint failed") {
+			// Return the existing status
+			existing, getErr := s.GetStatus(ctx, status.TxID)
+			if getErr != nil {
+				return nil, false, fmt.Errorf("failed to get existing status: %w", getErr)
+			}
+			return existing, false, nil
+		}
+		return nil, false, fmt.Errorf("failed to insert status: %w", err)
 	}
 
-	return nil
+	// Successfully inserted - return the status we just created
+	status.Status = models.StatusReceived
+	return status, true, nil
 }
 
 func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStatus) error {
