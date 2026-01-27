@@ -149,18 +149,21 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 
 	txid := tx.TxID().String()
 
-	// Insert initial status
-	if err := e.store.InsertStatus(ctx, &models.TransactionStatus{
+	// Get or insert initial status (idempotent - duplicate submissions return existing status)
+	existingStatus, isNew, err := e.store.GetOrInsertStatus(ctx, &models.TransactionStatus{
 		TxID:      txid,
 		Timestamp: time.Now(),
-	}); err != nil {
+	})
+	if err != nil {
 		return nil, fmt.Errorf("failed to store status: %w", err)
 	}
 
-	// Track transaction
-	e.txTracker.Add(txid, models.StatusReceived)
+	// Track transaction in memory
+	e.txTracker.Add(txid, existingStatus.Status)
 
 	// Create submission record if callback URL or token provided
+	// This happens regardless of whether the transaction is new, allowing
+	// multiple clients to register callbacks for the same transaction
 	if opts.CallbackURL != "" || opts.CallbackToken != "" {
 		if err := e.store.InsertSubmission(ctx, &models.Submission{
 			SubmissionID:      uuid.New().String(),
@@ -172,6 +175,19 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 		}); err != nil {
 			return nil, fmt.Errorf("failed to store submission: %w", err)
 		}
+	}
+
+	// If this transaction already exists, return the existing status without re-broadcasting
+	if !isNew {
+		return existingStatus, nil
+	}
+
+	// Publish submission event so subscribers can capture the raw tx before status events
+	if err := e.eventPublisher.PublishSubmission(ctx, &events.Submission{
+		TxID:  txid,
+		RawTx: rawTx,
+	}); err != nil {
+		e.logger.Warn("failed to publish submission event", "txid", txid, "error", err)
 	}
 
 	// Submit to teranode endpoints synchronously with timeout
@@ -206,7 +222,16 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 		opts = &models.SubmitOptions{}
 	}
 
-	var txs []*sdkTx.Transaction
+	// Process each transaction: get or insert status, register callbacks
+	type txInfo struct {
+		tx     *sdkTx.Transaction
+		rawTx  []byte
+		txid   string
+		isNew  bool
+		status *models.TransactionStatus
+	}
+	txInfos := make([]txInfo, 0, len(rawTxs))
+
 	for _, rawTx := range rawTxs {
 		// Parse transaction (try BEEF first, then raw bytes)
 		_, tx, _, err := sdkTx.ParseBeef(rawTx)
@@ -253,17 +278,22 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 			return nil, fmt.Errorf("validation failed: %w", err)
 		}
 
-		txs = append(txs, tx)
 		txid := tx.TxID().String()
 
-		// Insert status and track
-		e.store.InsertStatus(ctx, &models.TransactionStatus{
+		// Get or insert status (idempotent)
+		existingStatus, isNew, err := e.store.GetOrInsertStatus(ctx, &models.TransactionStatus{
 			TxID:      txid,
 			Timestamp: time.Now(),
 		})
-		e.txTracker.Add(txid, models.StatusReceived)
+		if err != nil {
+			// Log error but continue with other transactions
+			continue
+		}
+
+		e.txTracker.Add(txid, existingStatus.Status)
 
 		// Create submission record if callback URL or token provided
+		// This happens regardless of whether the transaction is new
 		if opts.CallbackURL != "" || opts.CallbackToken != "" {
 			e.store.InsertSubmission(ctx, &models.Submission{
 				SubmissionID:      uuid.New().String(),
@@ -274,6 +304,8 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 				CreatedAt:         time.Now(),
 			})
 		}
+
+		txInfos = append(txInfos, txInfo{tx: tx, rawTx: rawTx, txid: txid, isNew: isNew, status: existingStatus})
 	}
 
 	// Submit all to teranode synchronously with timeout
@@ -281,14 +313,27 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 	defer cancel()
 
 	var responses []*models.TransactionStatus
-	for _, tx := range txs {
-		txid := tx.TxID().String()
-		rawTx := tx.Bytes()
+	for _, info := range txInfos {
+		// If transaction already exists, return existing status without re-broadcasting
+		if !info.isNew {
+			responses = append(responses, info.status)
+			continue
+		}
+
+		// Publish submission event so subscribers can capture the raw tx before status events
+		if err := e.eventPublisher.PublishSubmission(ctx, &events.Submission{
+			TxID:  info.txid,
+			RawTx: info.rawTx,
+		}); err != nil {
+			e.logger.Warn("failed to publish submission event", "txid", info.txid, "error", err)
+		}
+
+		rawTx := info.tx.Bytes()
 
 		resultCh := make(chan *models.TransactionStatus, len(e.teranodeClient.GetEndpoints()))
 		for _, endpoint := range e.teranodeClient.GetEndpoints() {
 			go func(ep string) {
-				status := e.submitToTeranodeSync(submitCtx, ep, rawTx, txid)
+				status := e.submitToTeranodeSync(submitCtx, ep, rawTx, info.txid)
 				select {
 				case resultCh <- status:
 				default:
@@ -302,7 +347,7 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 			responses = append(responses, status)
 		case <-submitCtx.Done():
 			// Timeout - get current status
-			status, _ := e.store.GetStatus(ctx, txid)
+			status, _ := e.store.GetStatus(ctx, info.txid)
 			responses = append(responses, status)
 		}
 	}
