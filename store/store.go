@@ -2,10 +2,14 @@ package store
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/bsv-blockchain/arcade/models"
 )
+
+// ErrNotFound is returned when a requested record does not exist.
+var ErrNotFound = errors.New("not found")
 
 // Store handles all persistence operations for transactions and submissions
 type Store interface {

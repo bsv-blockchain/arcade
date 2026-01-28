@@ -14,9 +14,8 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/store"
 )
-
-var errNotFound = errors.New("not found")
 
 const (
 	// SQLite pragmas for better concurrency
@@ -556,7 +555,7 @@ func scanTransactionStatus(row *sql.Row) (*models.TransactionStatus, error) {
 		&status.CreatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, errNotFound
+		return nil, store.ErrNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan transaction status: %w", err)
