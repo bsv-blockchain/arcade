@@ -11,8 +11,8 @@ import (
 	"github.com/bsv-blockchain/go-sdk/script"
 	"github.com/bsv-blockchain/go-sdk/script/interpreter"
 	"github.com/bsv-blockchain/go-sdk/spv"
-	"github.com/bsv-blockchain/go-sdk/transaction/chaintracker"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
+	"github.com/bsv-blockchain/go-sdk/transaction/chaintracker"
 	feemodel "github.com/bsv-blockchain/go-sdk/transaction/fee_model"
 
 	arcerrors "github.com/bsv-blockchain/arcade/errors"

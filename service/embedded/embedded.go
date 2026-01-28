@@ -127,7 +127,7 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 	}
 
 	// Validate transaction
-	if err := e.txValidator.ValidateTransaction(ctx, tx, opts.SkipFeeValidation, opts.SkipScriptValidation); err != nil {
+	if valErr := e.txValidator.ValidateTransaction(ctx, tx, opts.SkipFeeValidation, opts.SkipScriptValidation); valErr != nil {
 		// Calculate actual fee for logging
 		var inputSats, outputSats uint64
 		for _, input := range tx.Inputs {
@@ -147,7 +147,7 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 
 		e.logger.Debug("transaction validation failed",
 			"txid", tx.TxID().String(),
-			"error", err.Error(),
+			"error", valErr.Error(),
 			"skipFeeValidation", opts.SkipFeeValidation,
 			"skipScriptValidation", opts.SkipScriptValidation,
 			"txSize", txSize,
@@ -160,7 +160,7 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 			"minFeePerKB", e.txValidator.MinFeePerKB(),
 			"rawTxHex", tx.Hex(),
 		)
-		return nil, fmt.Errorf("validation failed: %w", err)
+		return nil, fmt.Errorf("validation failed: %w", valErr)
 	}
 
 	txid := tx.TxID().String()
@@ -195,20 +195,14 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 
 	// Skip rebroadcast if already confirmed on network or rejected
 	if !isNew {
+		//nolint:exhaustive // intentionally only handling terminal states
 		switch existingStatus.Status {
 		case models.StatusSeenOnNetwork, models.StatusMined, models.StatusImmutable,
 			models.StatusRejected, models.StatusDoubleSpendAttempted:
 			return existingStatus, nil
+		default:
+			// Still pending (RECEIVED, SENT_TO_NETWORK, ACCEPTED_BY_NETWORK) - rebroadcast
 		}
-		// Still pending (RECEIVED, SENT_TO_NETWORK, ACCEPTED_BY_NETWORK) - rebroadcast
-	}
-
-	// Publish submission event so subscribers can capture the raw tx before status events
-	if err := e.eventPublisher.PublishSubmission(ctx, &events.Submission{
-		TxID:  txid,
-		RawTx: rawTx,
-	}); err != nil {
-		e.logger.Warn("failed to publish submission event", "txid", txid, "error", err)
 	}
 
 	// Submit to teranode endpoints synchronously with timeout
@@ -266,7 +260,7 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 		}
 
 		// Validate transaction
-		if err := e.txValidator.ValidateTransaction(ctx, tx, opts.SkipFeeValidation, opts.SkipScriptValidation); err != nil {
+		if valErr := e.txValidator.ValidateTransaction(ctx, tx, opts.SkipFeeValidation, opts.SkipScriptValidation); valErr != nil {
 			// Calculate actual fee for logging
 			var inputSats, outputSats uint64
 			for _, input := range tx.Inputs {
@@ -277,7 +271,7 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 			for _, output := range tx.Outputs {
 				outputSats += output.Satoshis
 			}
-			actualFee := int64(inputSats) - int64(outputSats) //nolint:gosec // safe: subtraction of uint64 values // safe: subtraction of uint64 values
+			actualFee := int64(inputSats) - int64(outputSats) //nolint:gosec // safe: subtraction of uint64 values
 			txSize := tx.Size()
 			var feePerKB float64
 			if txSize > 0 {
@@ -286,7 +280,7 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 
 			e.logger.Debug("transaction validation failed",
 				"txid", tx.TxID().String(),
-				"error", err.Error(),
+				"error", valErr.Error(),
 				"skipFeeValidation", opts.SkipFeeValidation,
 				"skipScriptValidation", opts.SkipScriptValidation,
 				"txSize", txSize,
@@ -298,7 +292,7 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 				"feePerKB", feePerKB,
 				"minFeePerKB", e.txValidator.MinFeePerKB(),
 			)
-			return nil, fmt.Errorf("validation failed: %w", err)
+			return nil, fmt.Errorf("validation failed: %w", valErr)
 		}
 
 		txid := tx.TxID().String()
@@ -341,21 +335,15 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 	for _, info := range txInfos {
 		// Skip rebroadcast if already confirmed on network or rejected
 		if !info.isNew {
+			//nolint:exhaustive // intentionally only handling terminal states
 			switch info.status.Status {
 			case models.StatusSeenOnNetwork, models.StatusMined, models.StatusImmutable,
 				models.StatusRejected, models.StatusDoubleSpendAttempted:
 				responses = append(responses, info.status)
 				continue
+			default:
+				// Still pending (RECEIVED, SENT_TO_NETWORK, ACCEPTED_BY_NETWORK) - rebroadcast
 			}
-			// Still pending (RECEIVED, SENT_TO_NETWORK, ACCEPTED_BY_NETWORK) - rebroadcast
-		}
-
-		// Publish submission event so subscribers can capture the raw tx before status events
-		if err := e.eventPublisher.PublishSubmission(ctx, &events.Submission{
-			TxID:  info.txid,
-			RawTx: info.rawTx,
-		}); err != nil {
-			e.logger.Warn("failed to publish submission event", "txid", info.txid, "error", err)
 		}
 
 		rawTx := info.tx.Bytes()

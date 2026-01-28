@@ -83,7 +83,9 @@ func TestStore_GetOrInsertStatus_Duplicate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
-	defer store.Close()
+	defer func() {
+		_ = store.Close()
+	}()
 
 	ctx := t.Context()
 	txid := "duplicate123"
@@ -111,8 +113,8 @@ func TestStore_GetOrInsertStatus_Duplicate(t *testing.T) {
 		Status:    models.StatusSeenOnNetwork,
 		Timestamp: time.Now(),
 	}
-	if err := store.UpdateStatus(ctx, updateStatus); err != nil {
-		t.Fatalf("Failed to update status: %v", err)
+	if updateErr := store.UpdateStatus(ctx, updateStatus); updateErr != nil {
+		t.Fatalf("Failed to update status: %v", updateErr)
 	}
 
 	// Second insert attempt (duplicate) - should return existing status
@@ -167,8 +169,8 @@ func TestStore_GetStatusesSince(t *testing.T) {
 	}
 
 	for _, status := range statuses {
-		if _, _, err := store.GetOrInsertStatus(ctx, status); err != nil {
-			t.Fatalf("Failed to insert status: %v", err)
+		if _, _, insErr := store.GetOrInsertStatus(ctx, status); insErr != nil {
+			t.Fatalf("Failed to insert status: %v", insErr)
 		}
 	}
 

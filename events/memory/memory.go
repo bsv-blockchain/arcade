@@ -11,18 +11,16 @@ import (
 
 // InMemoryPublisher implements events.Publisher using Go channels
 type InMemoryPublisher struct {
-	subscribers           []chan *models.TransactionStatus
-	submissionSubscribers []chan *events.Submission
-	mu                    sync.RWMutex
-	bufferSize            int
+	subscribers []chan *models.TransactionStatus
+	mu          sync.RWMutex
+	bufferSize  int
 }
 
 // NewInMemoryPublisher creates a new in-memory event publisher
 func NewInMemoryPublisher(bufferSize int) events.Publisher {
 	return &InMemoryPublisher{
-		subscribers:           make([]chan *models.TransactionStatus, 0),
-		submissionSubscribers: make([]chan *events.Submission, 0),
-		bufferSize:            bufferSize,
+		subscribers: make([]chan *models.TransactionStatus, 0),
+		bufferSize:  bufferSize,
 	}
 }
 
@@ -55,35 +53,6 @@ func (p *InMemoryPublisher) Subscribe(_ context.Context) (<-chan *models.Transac
 	return ch, nil
 }
 
-// PublishSubmission sends a submission event to all submission subscribers
-func (p *InMemoryPublisher) PublishSubmission(ctx context.Context, submission *events.Submission) error {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	for _, sub := range p.submissionSubscribers {
-		select {
-		case sub <- submission:
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-			// Subscriber is slow, skip this update to prevent blocking
-		}
-	}
-
-	return nil
-}
-
-// SubscribeSubmissions returns a channel that receives all submission events
-func (p *InMemoryPublisher) SubscribeSubmissions(ctx context.Context) (<-chan *events.Submission, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	ch := make(chan *events.Submission, p.bufferSize)
-	p.submissionSubscribers = append(p.submissionSubscribers, ch)
-
-	return ch, nil
-}
-
 // Close closes the publisher and all subscriptions
 func (p *InMemoryPublisher) Close() error {
 	p.mu.Lock()
@@ -93,11 +62,6 @@ func (p *InMemoryPublisher) Close() error {
 		close(sub)
 	}
 	p.subscribers = nil
-
-	for _, sub := range p.submissionSubscribers {
-		close(sub)
-	}
-	p.submissionSubscribers = nil
 
 	return nil
 }
