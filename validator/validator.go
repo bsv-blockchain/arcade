@@ -1,3 +1,4 @@
+// Package validator provides transaction validation functionality.
 package validator
 
 import (
@@ -6,13 +7,15 @@ import (
 	"fmt"
 	"strings"
 
-	arcerrors "github.com/bsv-blockchain/arcade/errors"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/script"
 	"github.com/bsv-blockchain/go-sdk/script/interpreter"
 	"github.com/bsv-blockchain/go-sdk/spv"
+	"github.com/bsv-blockchain/go-sdk/transaction/chaintracker"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 	feemodel "github.com/bsv-blockchain/go-sdk/transaction/fee_model"
+
+	arcerrors "github.com/bsv-blockchain/arcade/errors"
 )
 
 const (
@@ -21,20 +24,45 @@ const (
 	maxTxSigopsCountPolicyAfterGenesis = ^uint32(0)
 	minTxSizeBytes                     = 61
 	dustLimit                          = 1
-	DefaultMinFeePerKB                 = uint64(100)
+	// DefaultMinFeePerKB defines the minimum fee per kilobyte.
+	DefaultMinFeePerKB = uint64(100)
 )
 
-var coinbaseTxID = chainhash.Hash{}
-
 var (
-	ErrNoInputsOrOutputs               = errors.New("transaction has no inputs or outputs")
-	ErrTxOutputInvalid                 = errors.New("transaction output is invalid")
-	ErrTxInputInvalid                  = errors.New("transaction input is invalid")
+	// ErrNoInputsOrOutputs indicates a transaction has no inputs or outputs.
+	ErrNoInputsOrOutputs = errors.New("transaction has no inputs or outputs")
+	// ErrTxOutputInvalid indicates a transaction output is invalid.
+	ErrTxOutputInvalid = errors.New("transaction output is invalid")
+	// ErrTxOutputSatoshisInvalid indicates output satoshis are invalid.
+	ErrTxOutputSatoshisInvalid = errors.New("output satoshis is invalid")
+	// ErrTxOutputNonZeroOpReturn indicates an OP_RETURN output has non-zero value.
+	ErrTxOutputNonZeroOpReturn = errors.New("output has non 0 value op return")
+	// ErrTxOutputTotalSatoshisTooHigh indicates output total satoshis exceed the maximum.
+	ErrTxOutputTotalSatoshisTooHigh = errors.New("output total satoshis is too high")
+	// ErrTxInputInvalid indicates a transaction input is invalid.
+	ErrTxInputInvalid = errors.New("transaction input is invalid")
+	// ErrTxInputCoinbaseInput indicates an input is a coinbase input.
+	ErrTxInputCoinbaseInput = errors.New("input is a coinbase input")
+	// ErrTxInputSatoshisTooHigh indicates input satoshis are too high.
+	ErrTxInputSatoshisTooHigh = errors.New("input satoshis is too high")
+	// ErrTxInputTotalSatoshisTooHigh indicates input total satoshis exceed the maximum.
+	ErrTxInputTotalSatoshisTooHigh = errors.New("input total satoshis is too high")
+	// ErrUnlockingScriptHasTooManySigOps indicates unlocking scripts have too many sigops.
 	ErrUnlockingScriptHasTooManySigOps = errors.New("transaction unlocking scripts have too many sigops")
-	ErrEmptyUnlockingScript            = errors.New("transaction input unlocking script is empty")
-	ErrUnlockingScriptNotPushOnly      = errors.New("transaction input unlocking script is not push only")
-	ErrTxSizeLessThanMinSize           = fmt.Errorf("transaction size in bytes is less than %d bytes", minTxSizeBytes)
-	ErrTxSizeGreaterThanMax            = fmt.Errorf("transaction size in bytes is greater than %d bytes", maxBlockSize)
+	// ErrUnlockingScriptHasTooManySigOpsVal indicates sigops are too high.
+	ErrUnlockingScriptHasTooManySigOpsVal = errors.New("sigops too high")
+	// ErrEmptyUnlockingScript indicates a transaction input has an empty unlocking script.
+	ErrEmptyUnlockingScript = errors.New("transaction input unlocking script is empty")
+	// ErrEmptyUnlockingScriptIndex indicates an unlocking script is empty at an index.
+	ErrEmptyUnlockingScriptIndex = errors.New("unlocking script is empty")
+	// ErrUnlockingScriptNotPushOnly indicates an unlocking script is not push-only.
+	ErrUnlockingScriptNotPushOnly = errors.New("transaction input unlocking script is not push only")
+	// ErrUnlockingScriptNotPushOnlyIndex indicates an unlocking script is not push-only at an index.
+	ErrUnlockingScriptNotPushOnlyIndex = errors.New("unlocking script is not push only")
+	// ErrTxSizeLessThanMinSize indicates transaction size is less than minimum.
+	ErrTxSizeLessThanMinSize = fmt.Errorf("transaction size in bytes is less than %d bytes", minTxSizeBytes)
+	// ErrTxSizeGreaterThanMax indicates transaction size exceeds maximum.
+	ErrTxSizeGreaterThanMax = fmt.Errorf("transaction size in bytes is greater than %d bytes", maxBlockSize)
 )
 
 // Policy defines validation policy settings
@@ -46,11 +74,12 @@ type Policy struct {
 
 // Validator performs local transaction validation before submission
 type Validator struct {
-	policy *Policy
+	policy       *Policy
+	chainTracker chaintracker.ChainTracker
 }
 
-// NewValidator creates a new transaction validator with policy
-func NewValidator(policy *Policy) *Validator {
+// NewValidator creates a new transaction validator with policy and optional chaintracker
+func NewValidator(policy *Policy, ct chaintracker.ChainTracker) *Validator {
 	if policy == nil {
 		policy = &Policy{}
 	}
@@ -63,7 +92,10 @@ func NewValidator(policy *Policy) *Validator {
 	if policy.MinFeePerKB == 0 {
 		policy.MinFeePerKB = DefaultMinFeePerKB
 	}
-	return &Validator{policy: policy}
+	return &Validator{
+		policy:       policy,
+		chainTracker: ct,
+	}
 }
 
 // ValidatePolicy validates a transaction against node policy rules
@@ -128,7 +160,7 @@ func (v *Validator) ValidateTransaction(ctx context.Context, tx *sdkTx.Transacti
 		}
 	} else {
 		// Script validation (and fees if not skipped)
-		if _, err := spv.Verify(ctx, tx, nil, feeModel); err != nil {
+		if _, err := spv.Verify(ctx, tx, v.chainTracker, feeModel); err != nil {
 			return v.wrapSPVError(err)
 		}
 	}
@@ -185,27 +217,27 @@ func (v *Validator) wrapSPVError(err error) error {
 
 func (v *Validator) checkOutputs(tx *sdkTx.Transaction) error {
 	total := uint64(0)
-	for index, output := range tx.Outputs {
+	for _, output := range tx.Outputs {
 		isData := output.LockingScript.IsData()
 		switch {
 		case !isData && (output.Satoshis > maxSatoshis || output.Satoshis < dustLimit):
-			return errors.Join(ErrTxOutputInvalid, fmt.Errorf("output %d satoshis is invalid", index))
+			return errors.Join(ErrTxOutputInvalid, ErrTxOutputSatoshisInvalid)
 		case isData && output.Satoshis != 0:
-			return errors.Join(ErrTxOutputInvalid, fmt.Errorf("output %d has non 0 value op return", index))
+			return errors.Join(ErrTxOutputInvalid, ErrTxOutputNonZeroOpReturn)
 		}
 		total += output.Satoshis
 	}
 	if total > maxSatoshis {
-		return errors.Join(ErrTxOutputInvalid, errors.New("output total satoshis is too high"))
+		return errors.Join(ErrTxOutputInvalid, ErrTxOutputTotalSatoshisTooHigh)
 	}
 	return nil
 }
 
 func (v *Validator) checkInputs(tx *sdkTx.Transaction) error {
 	total := uint64(0)
-	for index, input := range tx.Inputs {
-		if *input.SourceTXID == coinbaseTxID {
-			return errors.Join(ErrTxInputInvalid, fmt.Errorf("input %d is a coinbase input", index))
+	for _, input := range tx.Inputs {
+		if *input.SourceTXID == (chainhash.Hash{}) {
+			return errors.Join(ErrTxInputInvalid, ErrTxInputCoinbaseInput)
 		}
 
 		inputSatoshis := uint64(0)
@@ -214,12 +246,12 @@ func (v *Validator) checkInputs(tx *sdkTx.Transaction) error {
 		}
 
 		if inputSatoshis > maxSatoshis {
-			return errors.Join(ErrTxInputInvalid, fmt.Errorf("input %d satoshis is too high", index))
+			return errors.Join(ErrTxInputInvalid, ErrTxInputSatoshisTooHigh)
 		}
 		total += inputSatoshis
 	}
 	if total > maxSatoshis {
-		return errors.Join(ErrTxInputInvalid, errors.New("input total satoshis is too high"))
+		return errors.Join(ErrTxInputInvalid, ErrTxInputTotalSatoshisTooHigh)
 	}
 	return nil
 }
@@ -245,7 +277,7 @@ func (v *Validator) sigOpsCheck(tx *sdkTx.Transaction) error {
 	}
 
 	if numSigOps > v.policy.MaxTxSigopsCountsPolicy {
-		return errors.Join(ErrUnlockingScriptHasTooManySigOps, fmt.Errorf("sigops: %d", numSigOps))
+		return errors.Join(ErrUnlockingScriptHasTooManySigOps, ErrUnlockingScriptHasTooManySigOpsVal)
 	}
 	return nil
 }
@@ -261,9 +293,9 @@ func countSigOps(lockingScript interpreter.ParsedScript) int64 {
 }
 
 func (v *Validator) pushDataCheck(tx *sdkTx.Transaction) error {
-	for index, input := range tx.Inputs {
+	for _, input := range tx.Inputs {
 		if input.UnlockingScript == nil {
-			return errors.Join(ErrEmptyUnlockingScript, fmt.Errorf("input: %d", index))
+			return errors.Join(ErrEmptyUnlockingScript, ErrEmptyUnlockingScriptIndex)
 		}
 		parser := interpreter.DefaultOpcodeParser{}
 		parsedUnlockingScript, err := parser.Parse(input.UnlockingScript)
@@ -271,7 +303,7 @@ func (v *Validator) pushDataCheck(tx *sdkTx.Transaction) error {
 			return err
 		}
 		if !parsedUnlockingScript.IsPushOnly() {
-			return errors.Join(ErrUnlockingScriptNotPushOnly, fmt.Errorf("input: %d", index))
+			return errors.Join(ErrUnlockingScriptNotPushOnly, ErrUnlockingScriptNotPushOnlyIndex)
 		}
 	}
 	return nil

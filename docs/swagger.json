@@ -1,314 +1,7 @@
 {
-    "swagger": "2.0",
-    "info": {
-        "description": "BSV transaction broadcast service with ARC-compatible endpoints.",
-        "title": "Arcade API",
-        "contact": {
-            "name": "BSV Blockchain",
-            "url": "https://github.com/bsv-blockchain/arcade"
-        },
-        "license": {
-            "name": "Open BSV License",
-            "url": "https://github.com/bsv-blockchain/arcade/blob/main/LICENSE"
-        },
-        "version": "0.1.0"
-    },
     "basePath": "/",
-    "paths": {
-        "/events": {
-            "get": {
-                "description": "Server-Sent Events stream of transaction status updates. If callbackToken is provided, only events for that token are streamed.",
-                "produces": [
-                    "text/event-stream"
-                ],
-                "tags": [
-                    "arcade"
-                ],
-                "summary": "Stream transaction events",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Callback token from transaction submission",
-                        "name": "callbackToken",
-                        "in": "query"
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "SSE stream of transaction status updates",
-                        "schema": {
-                            "type": "string"
-                        }
-                    }
-                }
-            }
-        },
-        "/health": {
-            "get": {
-                "description": "Returns the health status of the service",
-                "produces": [
-                    "text/plain"
-                ],
-                "tags": [
-                    "arcade"
-                ],
-                "summary": "Health check",
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "type": "string"
-                        }
-                    },
-                    "503": {
-                        "description": "Service Unavailable",
-                        "schema": {
-                            "type": "string"
-                        }
-                    }
-                }
-            }
-        },
-        "/policy": {
-            "get": {
-                "description": "Returns the transaction policy configuration including fee rates and limits",
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "arcade"
-                ],
-                "summary": "Get policy",
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "$ref": "#/definitions/models.Policy"
-                        }
-                    }
-                }
-            }
-        },
-        "/tx": {
-            "post": {
-                "description": "Submit a single transaction for broadcast. Accepts raw transaction bytes, hex string, or JSON with rawTx field.",
-                "consumes": [
-                    "application/json",
-                    "application/octet-stream",
-                    "text/plain"
-                ],
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "arcade"
-                ],
-                "summary": "Submit transaction",
-                "parameters": [
-                    {
-                        "description": "Transaction data",
-                        "name": "transaction",
-                        "in": "body",
-                        "required": true,
-                        "schema": {
-                            "$ref": "#/definitions/fiber.TransactionRequest"
-                        }
-                    },
-                    {
-                        "type": "string",
-                        "description": "URL for status callbacks",
-                        "name": "X-CallbackUrl",
-                        "in": "header"
-                    },
-                    {
-                        "type": "string",
-                        "description": "Token for SSE event filtering",
-                        "name": "X-CallbackToken",
-                        "in": "header"
-                    },
-                    {
-                        "type": "string",
-                        "description": "Send all status updates (true/false)",
-                        "name": "X-FullStatusUpdates",
-                        "in": "header"
-                    },
-                    {
-                        "type": "string",
-                        "description": "Skip fee validation (true/false)",
-                        "name": "X-SkipFeeValidation",
-                        "in": "header"
-                    },
-                    {
-                        "type": "string",
-                        "description": "Skip script validation (true/false)",
-                        "name": "X-SkipScriptValidation",
-                        "in": "header"
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "$ref": "#/definitions/models.TransactionStatus"
-                        }
-                    },
-                    "400": {
-                        "description": "Bad Request",
-                        "schema": {
-                            "$ref": "#/definitions/errors.ErrorFields"
-                        }
-                    },
-                    "465": {
-                        "description": "ARC validation error",
-                        "schema": {
-                            "$ref": "#/definitions/errors.ErrorFields"
-                        }
-                    },
-                    "500": {
-                        "description": "Internal Server Error",
-                        "schema": {
-                            "type": "object",
-                            "additionalProperties": {
-                                "type": "string"
-                            }
-                        }
-                    }
-                }
-            }
-        },
-        "/tx/{txid}": {
-            "get": {
-                "description": "Get the current status of a submitted transaction",
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "arcade"
-                ],
-                "summary": "Get transaction status",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Transaction ID",
-                        "name": "txid",
-                        "in": "path",
-                        "required": true
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "$ref": "#/definitions/models.TransactionStatus"
-                        }
-                    },
-                    "404": {
-                        "description": "Not Found",
-                        "schema": {
-                            "type": "object",
-                            "additionalProperties": {
-                                "type": "string"
-                            }
-                        }
-                    },
-                    "500": {
-                        "description": "Internal Server Error",
-                        "schema": {
-                            "type": "object",
-                            "additionalProperties": {
-                                "type": "string"
-                            }
-                        }
-                    }
-                }
-            }
-        },
-        "/txs": {
-            "post": {
-                "description": "Submit multiple transactions for broadcast",
-                "consumes": [
-                    "application/json"
-                ],
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "arcade"
-                ],
-                "summary": "Submit multiple transactions",
-                "parameters": [
-                    {
-                        "description": "Array of transactions",
-                        "name": "transactions",
-                        "in": "body",
-                        "required": true,
-                        "schema": {
-                            "type": "array",
-                            "items": {
-                                "$ref": "#/definitions/fiber.TransactionRequest"
-                            }
-                        }
-                    },
-                    {
-                        "type": "string",
-                        "description": "URL for status callbacks",
-                        "name": "X-CallbackUrl",
-                        "in": "header"
-                    },
-                    {
-                        "type": "string",
-                        "description": "Token for SSE event filtering",
-                        "name": "X-CallbackToken",
-                        "in": "header"
-                    },
-                    {
-                        "type": "string",
-                        "description": "Send all status updates (true/false)",
-                        "name": "X-FullStatusUpdates",
-                        "in": "header"
-                    },
-                    {
-                        "type": "string",
-                        "description": "Skip fee validation (true/false)",
-                        "name": "X-SkipFeeValidation",
-                        "in": "header"
-                    },
-                    {
-                        "type": "string",
-                        "description": "Skip script validation (true/false)",
-                        "name": "X-SkipScriptValidation",
-                        "in": "header"
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "type": "array",
-                            "items": {
-                                "$ref": "#/definitions/models.TransactionStatus"
-                            }
-                        }
-                    },
-                    "400": {
-                        "description": "Bad Request",
-                        "schema": {
-                            "$ref": "#/definitions/errors.ErrorFields"
-                        }
-                    },
-                    "465": {
-                        "description": "ARC validation error",
-                        "schema": {
-                            "$ref": "#/definitions/errors.ErrorFields"
-                        }
-                    }
-                }
-            }
-        }
-    },
     "definitions": {
         "errors.ErrorFields": {
-            "type": "object",
             "properties": {
                 "detail": {
                     "type": "string"
@@ -325,19 +18,19 @@
                 "type": {
                     "type": "string"
                 }
-            }
+            },
+            "type": "object"
         },
         "fiber.TransactionRequest": {
-            "type": "object",
             "properties": {
                 "rawTx": {
-                    "type": "string",
-                    "example": "0100000001..."
+                    "example": "0100000001...",
+                    "type": "string"
                 }
-            }
+            },
+            "type": "object"
         },
         "models.Policy": {
-            "type": "object",
             "properties": {
                 "maxscriptsizepolicy": {
                     "type": "integer"
@@ -354,10 +47,10 @@
                 "miningFeeSatoshis": {
                     "type": "integer"
                 }
-            }
+            },
+            "type": "object"
         },
         "models.Status": {
-            "type": "string",
             "enum": [
                 "UNKNOWN",
                 "RECEIVED",
@@ -369,6 +62,7 @@
                 "MINED",
                 "IMMUTABLE"
             ],
+            "type": "string",
             "x-enum-varnames": [
                 "StatusUnknown",
                 "StatusReceived",
@@ -382,7 +76,6 @@
             ]
         },
         "models.TransactionStatus": {
-            "type": "object",
             "properties": {
                 "blockHash": {
                     "type": "string"
@@ -391,19 +84,19 @@
                     "type": "integer"
                 },
                 "competingTxs": {
-                    "type": "array",
                     "items": {
                         "type": "string"
-                    }
+                    },
+                    "type": "array"
                 },
                 "extraInfo": {
                     "type": "string"
                 },
                 "merklePath": {
-                    "type": "array",
                     "items": {
                         "type": "integer"
-                    }
+                    },
+                    "type": "array"
                 },
                 "timestamp": {
                     "type": "string"
@@ -414,15 +107,322 @@
                 "txid": {
                     "type": "string"
                 }
+            },
+            "type": "object"
+        }
+    },
+    "info": {
+        "contact": {
+            "name": "BSV Blockchain",
+            "url": "https://github.com/bsv-blockchain/arcade"
+        },
+        "description": "BSV transaction broadcast service with ARC-compatible endpoints.",
+        "license": {
+            "name": "Open BSV License",
+            "url": "https://github.com/bsv-blockchain/arcade/blob/main/LICENSE"
+        },
+        "title": "Arcade API",
+        "version": "0.1.0"
+    },
+    "paths": {
+        "/events": {
+            "get": {
+                "description": "Server-Sent Events stream of transaction status updates. If callbackToken is provided, only events for that token are streamed.",
+                "parameters": [
+                    {
+                        "description": "Callback token from transaction submission",
+                        "in": "query",
+                        "name": "callbackToken",
+                        "type": "string"
+                    }
+                ],
+                "produces": [
+                    "text/event-stream"
+                ],
+                "responses": {
+                    "200": {
+                        "description": "SSE stream of transaction status updates",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                },
+                "summary": "Stream transaction events",
+                "tags": [
+                    "arcade"
+                ]
+            }
+        },
+        "/health": {
+            "get": {
+                "description": "Returns the health status of the service",
+                "produces": [
+                    "text/plain"
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "503": {
+                        "description": "Service Unavailable",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                },
+                "summary": "Health check",
+                "tags": [
+                    "arcade"
+                ]
+            }
+        },
+        "/policy": {
+            "get": {
+                "description": "Returns the transaction policy configuration including fee rates and limits",
+                "produces": [
+                    "application/json"
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/models.Policy"
+                        }
+                    }
+                },
+                "summary": "Get policy",
+                "tags": [
+                    "arcade"
+                ]
+            }
+        },
+        "/tx": {
+            "post": {
+                "consumes": [
+                    "application/json",
+                    "application/octet-stream",
+                    "text/plain"
+                ],
+                "description": "Submit a single transaction for broadcast. Accepts raw transaction bytes, hex string, or JSON with rawTx field.",
+                "parameters": [
+                    {
+                        "description": "Transaction data",
+                        "in": "body",
+                        "name": "transaction",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/fiber.TransactionRequest"
+                        }
+                    },
+                    {
+                        "description": "URL for status callbacks",
+                        "in": "header",
+                        "name": "X-CallbackUrl",
+                        "type": "string"
+                    },
+                    {
+                        "description": "Token for SSE event filtering",
+                        "in": "header",
+                        "name": "X-CallbackToken",
+                        "type": "string"
+                    },
+                    {
+                        "description": "Send all status updates (true/false)",
+                        "in": "header",
+                        "name": "X-FullStatusUpdates",
+                        "type": "string"
+                    },
+                    {
+                        "description": "Skip fee validation (true/false)",
+                        "in": "header",
+                        "name": "X-SkipFeeValidation",
+                        "type": "string"
+                    },
+                    {
+                        "description": "Skip script validation (true/false)",
+                        "in": "header",
+                        "name": "X-SkipScriptValidation",
+                        "type": "string"
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/models.TransactionStatus"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/errors.ErrorFields"
+                        }
+                    },
+                    "465": {
+                        "description": "ARC validation error",
+                        "schema": {
+                            "$ref": "#/definitions/errors.ErrorFields"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "additionalProperties": {
+                                "type": "string"
+                            },
+                            "type": "object"
+                        }
+                    }
+                },
+                "summary": "Submit transaction",
+                "tags": [
+                    "arcade"
+                ]
+            }
+        },
+        "/tx/{txid}": {
+            "get": {
+                "description": "Get the current status of a submitted transaction",
+                "parameters": [
+                    {
+                        "description": "Transaction ID",
+                        "in": "path",
+                        "name": "txid",
+                        "required": true,
+                        "type": "string"
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/models.TransactionStatus"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "additionalProperties": {
+                                "type": "string"
+                            },
+                            "type": "object"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "additionalProperties": {
+                                "type": "string"
+                            },
+                            "type": "object"
+                        }
+                    }
+                },
+                "summary": "Get transaction status",
+                "tags": [
+                    "arcade"
+                ]
+            }
+        },
+        "/txs": {
+            "post": {
+                "consumes": [
+                    "application/json"
+                ],
+                "description": "Submit multiple transactions for broadcast",
+                "parameters": [
+                    {
+                        "description": "Array of transactions",
+                        "in": "body",
+                        "name": "transactions",
+                        "required": true,
+                        "schema": {
+                            "items": {
+                                "$ref": "#/definitions/fiber.TransactionRequest"
+                            },
+                            "type": "array"
+                        }
+                    },
+                    {
+                        "description": "URL for status callbacks",
+                        "in": "header",
+                        "name": "X-CallbackUrl",
+                        "type": "string"
+                    },
+                    {
+                        "description": "Token for SSE event filtering",
+                        "in": "header",
+                        "name": "X-CallbackToken",
+                        "type": "string"
+                    },
+                    {
+                        "description": "Send all status updates (true/false)",
+                        "in": "header",
+                        "name": "X-FullStatusUpdates",
+                        "type": "string"
+                    },
+                    {
+                        "description": "Skip fee validation (true/false)",
+                        "in": "header",
+                        "name": "X-SkipFeeValidation",
+                        "type": "string"
+                    },
+                    {
+                        "description": "Skip script validation (true/false)",
+                        "in": "header",
+                        "name": "X-SkipScriptValidation",
+                        "type": "string"
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "items": {
+                                "$ref": "#/definitions/models.TransactionStatus"
+                            },
+                            "type": "array"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/errors.ErrorFields"
+                        }
+                    },
+                    "465": {
+                        "description": "ARC validation error",
+                        "schema": {
+                            "$ref": "#/definitions/errors.ErrorFields"
+                        }
+                    }
+                },
+                "summary": "Submit multiple transactions",
+                "tags": [
+                    "arcade"
+                ]
             }
         }
     },
     "securityDefinitions": {
         "BearerAuth": {
             "description": "Bearer token authentication",
-            "type": "apiKey",
+            "in": "header",
             "name": "Authorization",
-            "in": "header"
+            "type": "apiKey"
         }
-    }
+    },
+    "swagger": "2.0"
 }

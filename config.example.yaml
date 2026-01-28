@@ -1,24 +1,19 @@
 # Arcade Server Configuration
 # Environment variables can override any setting using ARCADE_ prefix
 # Example: ARCADE_SERVER_ADDRESS=:9090 overrides server.address
-
 network: main
 storage_path: ~/.arcade
-
 server:
   address: ":3011"
   read_timeout: 30s
   write_timeout: 30s
   shutdown_timeout: 10s
-
 database:
   type: sqlite
   sqlite_path: ~/.arcade/arcade.db
-
 events:
   type: memory
   buffer_size: 1000
-
 teranode:
   # broadcast_urls: URLs for submitting transactions to Teranode
   broadcast_urls:
@@ -27,21 +22,17 @@ teranode:
   datahub_urls:
     - https://teranode-eks-mainnet-us-1.bsvb.tech/api/v1
   timeout: 30s
-
 validator:
   max_tx_size: 4294967296
   max_script_size: 500000
   max_sig_ops: 4294967295
   min_fee_per_kb: 100
-
 auth:
   enabled: false
-
 webhook:
   prune_interval: 1h
   max_age: 24h
   max_retries: 10
-
 chaintracks:
   # Arcade always runs chaintracks in embedded mode using its P2P client
   storage_path: ~/.arcade/chaintracks

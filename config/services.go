@@ -8,6 +8,9 @@ import (
 	"os"
 	"path"
 
+	"github.com/bsv-blockchain/go-chaintracks/chaintracks"
+	p2p "github.com/bsv-blockchain/go-teranode-p2p-client"
+
 	"github.com/bsv-blockchain/arcade"
 	"github.com/bsv-blockchain/arcade/client"
 	"github.com/bsv-blockchain/arcade/events"
@@ -21,8 +24,17 @@ import (
 	"github.com/bsv-blockchain/arcade/store/sqlite"
 	"github.com/bsv-blockchain/arcade/teranode"
 	"github.com/bsv-blockchain/arcade/validator"
-	"github.com/bsv-blockchain/go-chaintracks/chaintracks"
-	p2p "github.com/bsv-blockchain/go-teranode-p2p-client"
+)
+
+var (
+	// ErrUnknownArcadeMode indicates an unknown arcade mode was specified.
+	ErrUnknownArcadeMode = errors.New("unknown arcade mode")
+	// ErrArcadeURLRequired indicates the arcade URL is required for remote mode.
+	ErrArcadeURLRequired = errors.New("arcade URL required for remote mode")
+	// ErrUnsupportedEventPublisherType indicates an unsupported event publisher type was specified.
+	ErrUnsupportedEventPublisherType = errors.New("unsupported event publisher type")
+	// ErrNoTeranodesConfigured indicates no teranode broadcast endpoints were configured.
+	ErrNoTeranodesConfigured = errors.New("no teranode broadcast endpoints configured: set teranode.broadcast_urls")
 )
 
 // Services holds initialized application services.
@@ -48,9 +60,9 @@ type Services struct {
 // If chaintracker is provided, it will be used instead of creating a new one.
 // If p2pClient is provided, it will be shared instead of creating a new one.
 // This allows the caller to share instances across services.
-func (c *Config) Initialize(ctx context.Context, logger *slog.Logger, chaintracker chaintracks.Chaintracks, p2pClient *p2p.Client) (*Services, error) {
+func (c *Config) Initialize(ctx context.Context, _ *slog.Logger, chaintracker chaintracks.Chaintracks, p2pClient *p2p.Client) (*Services, error) {
 	// Create arcade-specific logger with configured log level
-	logger = logging.NewLogger(c.GetLogLevel())
+	logger := logging.NewLogger(c.GetLogLevel())
 
 	switch c.Mode {
 	case ModeRemote:
@@ -58,14 +70,14 @@ func (c *Config) Initialize(ctx context.Context, logger *slog.Logger, chaintrack
 	case ModeEmbedded, "":
 		return c.initializeEmbedded(ctx, logger, chaintracker, p2pClient)
 	default:
-		return nil, fmt.Errorf("unknown arcade mode: %s", c.Mode)
+		return nil, ErrUnknownArcadeMode
 	}
 }
 
 // initializeRemote creates a remote client service.
 func (c *Config) initializeRemote(logger *slog.Logger) (*Services, error) {
 	if c.URL == "" {
-		return nil, fmt.Errorf("arcade URL required for remote mode")
+		return nil, ErrArcadeURLRequired
 	}
 
 	logger.Info("Initializing Arcade in remote mode", slog.String("url", c.URL))
@@ -78,6 +90,8 @@ func (c *Config) initializeRemote(logger *slog.Logger) (*Services, error) {
 }
 
 // initializeEmbedded creates all embedded services.
+//
+//nolint:gocyclo // complex service initialization logic
 func (c *Config) initializeEmbedded(ctx context.Context, logger *slog.Logger, chaintracker chaintracks.Chaintracks, p2pClient *p2p.Client) (*Services, error) {
 	logger.Info("Initializing Arcade in embedded mode")
 
@@ -113,7 +127,7 @@ func (c *Config) initializeEmbedded(ctx context.Context, logger *slog.Logger, ch
 
 	// Initialize store
 	logger.Info("Initializing store")
-	sqliteStore, err := sqlite.NewStore(dbPath)
+	sqliteStore, err := sqlite.NewStore(dbPath) //nolint:contextcheck // initialization code
 	if err != nil {
 		return nil, fmt.Errorf("failed to create store: %w", err)
 	}
@@ -125,23 +139,15 @@ func (c *Config) initializeEmbedded(ctx context.Context, logger *slog.Logger, ch
 	case "memory", "":
 		eventPublisher = memory.NewInMemoryPublisher(c.Events.BufferSize)
 	default:
-		return nil, fmt.Errorf("unsupported event publisher type: %s", c.Events.Type)
+		return nil, ErrUnsupportedEventPublisherType
 	}
 
 	// Initialize Teranode client for broadcasting
 	logger.Info("Initializing Teranode client")
 	if len(c.Teranode.BroadcastURLs) == 0 {
-		return nil, fmt.Errorf("no teranode broadcast endpoints configured: set teranode.broadcast_urls")
+		return nil, ErrNoTeranodesConfigured
 	}
 	teranodeClient := teranode.NewClient(c.Teranode.BroadcastURLs, c.Teranode.AuthToken)
-
-	// Initialize validator
-	logger.Info("Initializing validator")
-	txValidator := validator.NewValidator(&validator.Policy{
-		MaxTxSizePolicy:         c.Validator.MaxTxSize,
-		MaxTxSigopsCountsPolicy: c.Validator.MaxSigOps,
-		MinFeePerKB:             c.Validator.MinFeePerKB,
-	})
 
 	// Initialize transaction tracker
 	logger.Info("Initializing transaction tracker")
@@ -171,6 +177,7 @@ func (c *Config) initializeEmbedded(ctx context.Context, logger *slog.Logger, ch
 	}
 
 	// Use provided Chaintracks or create one
+	//nolint:nestif // necessary nested conditions for service initialization
 	if chaintracker == nil {
 		logger.Info("Initializing Chaintracks")
 		if c.Chaintracks.StoragePath == "" {
@@ -187,9 +194,17 @@ func (c *Config) initializeEmbedded(ctx context.Context, logger *slog.Logger, ch
 		logger.Info("Using provided Chaintracks instance")
 	}
 
+	// Initialize validator (after chaintracker so we can pass it for SPV verification)
+	logger.Info("Initializing validator")
+	txValidator := validator.NewValidator(&validator.Policy{
+		MaxTxSizePolicy:         c.Validator.MaxTxSize,
+		MaxTxSigopsCountsPolicy: c.Validator.MaxSigOps,
+		MinFeePerKB:             c.Validator.MinFeePerKB,
+	}, chaintracker)
+
 	// Initialize Arcade P2P listener
 	logger.Info("Initializing Arcade P2P listener")
-	arcadeInstance, err := arcade.NewArcade(arcade.Config{
+	arcadeInstance, arcErr := arcade.NewArcade(arcade.Config{
 		P2PClient:      p2pClient,
 		Chaintracks:    chaintracker,
 		Logger:         logger,
@@ -198,25 +213,25 @@ func (c *Config) initializeEmbedded(ctx context.Context, logger *slog.Logger, ch
 		EventPublisher: eventPublisher,
 		DataHubURLs:    c.Teranode.DataHubURLs,
 	})
-	if err != nil {
+	if arcErr != nil {
 		if ownsP2PClient {
 			_ = p2pClient.Close()
 		}
-		return nil, fmt.Errorf("failed to create arcade: %w", err)
+		return nil, fmt.Errorf("failed to create arcade: %w", arcErr)
 	}
 
-	if err := arcadeInstance.Start(ctx); err != nil {
+	if startErr := arcadeInstance.Start(ctx); startErr != nil {
 		if ownsP2PClient {
 			_ = p2pClient.Close()
 		}
-		return nil, fmt.Errorf("failed to start arcade: %w", err)
+		return nil, fmt.Errorf("failed to start arcade: %w", startErr)
 	}
 
 	// Create policy
 	policy := &models.Policy{
-		MaxTxSizePolicy:         uint64(c.Validator.MaxTxSize),
-		MaxTxSigOpsCountsPolicy: uint64(c.Validator.MaxSigOps),
-		MaxScriptSizePolicy:     uint64(c.Validator.MaxScriptSize),
+		MaxTxSizePolicy:         uint64(c.Validator.MaxTxSize),     //nolint:gosec // safe: positive int value
+		MaxTxSigOpsCountsPolicy: uint64(c.Validator.MaxSigOps),     //nolint:gosec // safe: positive int value
+		MaxScriptSizePolicy:     uint64(c.Validator.MaxScriptSize), //nolint:gosec // safe: positive int value
 		MiningFeeBytes:          1000,
 		MiningFeeSatoshis:       c.Validator.MinFeePerKB,
 	}

@@ -1,3 +1,4 @@
+// Package memory provides an in-memory implementation of the events.Publisher interface.
 package memory
 
 import (
@@ -44,7 +45,7 @@ func (p *InMemoryPublisher) Publish(ctx context.Context, status *models.Transact
 }
 
 // Subscribe returns a channel that receives all status updates
-func (p *InMemoryPublisher) Subscribe(ctx context.Context) (<-chan *models.TransactionStatus, error) {
+func (p *InMemoryPublisher) Subscribe(_ context.Context) (<-chan *models.TransactionStatus, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 

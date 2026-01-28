@@ -69,4 +69,3 @@ type Store interface {
 	// Close closes the database connection
 	Close() error
 }
-

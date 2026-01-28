@@ -3,11 +3,15 @@ package embedded
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"sync"
 	"time"
+
+	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
+	"github.com/google/uuid"
 
 	"github.com/bsv-blockchain/arcade"
 	"github.com/bsv-blockchain/arcade/events"
@@ -16,12 +20,22 @@ import (
 	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/teranode"
 	"github.com/bsv-blockchain/arcade/validator"
-	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
-	"github.com/google/uuid"
 )
 
 // Ensure Embedded implements service.ArcadeService
 var _ service.ArcadeService = (*Embedded)(nil)
+
+// Static errors for embedded service.
+var (
+	errStoreRequired          = errors.New("store is required")
+	errTxTrackerRequired      = errors.New("TxTracker is required")
+	errEventPublisherRequired = errors.New("EventPublisher is required")
+	errTeranodeClientRequired = errors.New("TeranodeClient is required")
+	errTxValidatorRequired    = errors.New("TxValidator is required")
+	errArcadeRequired         = errors.New("arcade is required")
+	errPolicyRequired         = errors.New("policy is required")
+	errTransactionNotFound    = errors.New("transaction not found")
+)
 
 // Config holds configuration for the embedded service.
 type Config struct {
@@ -54,25 +68,25 @@ type Embedded struct {
 // New creates a new Embedded service instance.
 func New(cfg Config) (*Embedded, error) {
 	if cfg.Store == nil {
-		return nil, fmt.Errorf("Store is required")
+		return nil, errStoreRequired
 	}
 	if cfg.TxTracker == nil {
-		return nil, fmt.Errorf("TxTracker is required")
+		return nil, errTxTrackerRequired
 	}
 	if cfg.EventPublisher == nil {
-		return nil, fmt.Errorf("EventPublisher is required")
+		return nil, errEventPublisherRequired
 	}
 	if cfg.TeranodeClient == nil {
-		return nil, fmt.Errorf("TeranodeClient is required")
+		return nil, errTeranodeClientRequired
 	}
 	if cfg.TxValidator == nil {
-		return nil, fmt.Errorf("TxValidator is required")
+		return nil, errTxValidatorRequired
 	}
 	if cfg.Arcade == nil {
-		return nil, fmt.Errorf("Arcade is required")
+		return nil, errArcadeRequired
 	}
 	if cfg.Policy == nil {
-		return nil, fmt.Errorf("Policy is required")
+		return nil, errPolicyRequired
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -92,6 +106,8 @@ func New(cfg Config) (*Embedded, error) {
 }
 
 // SubmitTransaction submits a single transaction for broadcast.
+//
+//nolint:gocyclo // complex transaction validation logic
 func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *models.SubmitOptions) (*models.TransactionStatus, error) {
 	if opts == nil {
 		opts = &models.SubmitOptions{}
@@ -122,7 +138,7 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 		for _, output := range tx.Outputs {
 			outputSats += output.Satoshis
 		}
-		actualFee := int64(inputSats) - int64(outputSats)
+		actualFee := int64(inputSats) - int64(outputSats) //nolint:gosec // safe: subtraction of uint64 values
 		txSize := tx.Size()
 		var feePerKB float64
 		if txSize > 0 {
@@ -222,6 +238,8 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 }
 
 // SubmitTransactions submits multiple transactions for broadcast.
+//
+//nolint:gocyclo // complex batch transaction validation logic
 func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts *models.SubmitOptions) ([]*models.TransactionStatus, error) {
 	if opts == nil {
 		opts = &models.SubmitOptions{}
@@ -259,7 +277,7 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 			for _, output := range tx.Outputs {
 				outputSats += output.Satoshis
 			}
-			actualFee := int64(inputSats) - int64(outputSats)
+			actualFee := int64(inputSats) - int64(outputSats) //nolint:gosec // safe: subtraction of uint64 values // safe: subtraction of uint64 values
 			txSize := tx.Size()
 			var feePerKB float64
 			if txSize > 0 {
@@ -300,14 +318,16 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 		// Create submission record if callback URL or token provided
 		// This happens regardless of whether the transaction is new
 		if opts.CallbackURL != "" || opts.CallbackToken != "" {
-			e.store.InsertSubmission(ctx, &models.Submission{
+			if err := e.store.InsertSubmission(ctx, &models.Submission{
 				SubmissionID:      uuid.New().String(),
 				TxID:              txid,
 				CallbackURL:       opts.CallbackURL,
 				CallbackToken:     opts.CallbackToken,
 				FullStatusUpdates: opts.FullStatusUpdates,
 				CreatedAt:         time.Now(),
-			})
+			}); err != nil {
+				e.logger.Error("failed to insert submission", slog.String("txID", txid), slog.String("error", err.Error()))
+			}
 		}
 
 		txInfos = append(txInfos, txInfo{tx: tx, rawTx: rawTx, txid: txid, isNew: isNew, status: existingStatus})
@@ -372,7 +392,7 @@ func (e *Embedded) GetStatus(ctx context.Context, txid string) (*models.Transact
 		return nil, fmt.Errorf("failed to get status: %w", err)
 	}
 	if status == nil {
-		return nil, fmt.Errorf("transaction not found")
+		return nil, errTransactionNotFound
 	}
 	return status, nil
 }
@@ -409,7 +429,7 @@ func (e *Embedded) Unsubscribe(ch <-chan *models.TransactionStatus) {
 }
 
 // GetPolicy returns the transaction policy configuration.
-func (e *Embedded) GetPolicy(ctx context.Context) (*models.Policy, error) {
+func (e *Embedded) GetPolicy(_ context.Context) (*models.Policy, error) {
 	return e.policy, nil
 }
 
@@ -423,8 +443,12 @@ func (e *Embedded) submitToTeranodeSync(ctx context.Context, endpoint string, ra
 			Timestamp: time.Now(),
 			ExtraInfo: err.Error(),
 		}
-		e.store.UpdateStatus(ctx, status)
-		e.eventPublisher.Publish(ctx, status)
+		if err := e.store.UpdateStatus(ctx, status); err != nil {
+			e.logger.Error("failed to update status", slog.String("txID", txid), slog.String("error", err.Error()))
+		}
+		if err := e.eventPublisher.Publish(ctx, status); err != nil {
+			e.logger.Error("failed to publish status", slog.String("txID", txid), slog.String("error", err.Error()))
+		}
 		return status
 	}
 
@@ -443,7 +467,11 @@ func (e *Embedded) submitToTeranodeSync(ctx context.Context, endpoint string, ra
 		Status:    txStatus,
 		Timestamp: time.Now(),
 	}
-	e.store.UpdateStatus(ctx, status)
-	e.eventPublisher.Publish(ctx, status)
+	if err := e.store.UpdateStatus(ctx, status); err != nil {
+		e.logger.Error("failed to update status", slog.String("txID", txid), slog.String("error", err.Error()))
+	}
+	if err := e.eventPublisher.Publish(ctx, status); err != nil {
+		e.logger.Error("failed to publish status", slog.String("txID", txid), slog.String("error", err.Error()))
+	}
 	return status
 }

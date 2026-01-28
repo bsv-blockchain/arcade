@@ -15,7 +15,7 @@ func setupTestDB(t *testing.T) (string, func()) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test.db")
 	cleanup := func() {
-		os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(tmpDir)
 	}
 	return dbPath, cleanup
 }
@@ -28,7 +28,9 @@ func TestStore_GetOrInsertAndUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
-	defer store.Close()
+	defer func() {
+		_ = store.Close()
+	}()
 
 	ctx := t.Context()
 	txid := "abc123"
@@ -55,8 +57,8 @@ func TestStore_GetOrInsertAndUpdate(t *testing.T) {
 		Timestamp: time.Now(),
 	}
 
-	if err := store.UpdateStatus(ctx, status2); err != nil {
-		t.Fatalf("Failed to update status: %v", err)
+	if updateErr := store.UpdateStatus(ctx, status2); updateErr != nil {
+		t.Fatalf("Failed to update status: %v", updateErr)
 	}
 
 	current, err := store.GetStatus(ctx, txid)
@@ -140,7 +142,9 @@ func TestStore_GetStatusesSince(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
-	defer store.Close()
+	defer func() {
+		_ = store.Close()
+	}()
 
 	ctx := t.Context()
 	now := time.Now()
@@ -179,6 +183,7 @@ func TestStore_GetStatusesSince(t *testing.T) {
 	}
 }
 
+//nolint:gocyclo // comprehensive test with multiple scenarios
 func TestStore_WithBlockData(t *testing.T) {
 	dbPath, cleanup := setupTestDB(t)
 	defer cleanup()
@@ -187,7 +192,9 @@ func TestStore_WithBlockData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
-	defer store.Close()
+	defer func() {
+		_ = store.Close()
+	}()
 
 	ctx := t.Context()
 	txid := "mined123"
@@ -208,22 +215,22 @@ func TestStore_WithBlockData(t *testing.T) {
 	}
 
 	// Insert merkle path (this is where block_height and merkle_path are stored)
-	if err := store.InsertMerklePath(ctx, txid, blockHash, blockHeight, merklePath); err != nil {
-		t.Fatalf("Failed to insert merkle path: %v", err)
+	if merkErr := store.InsertMerklePath(ctx, txid, blockHash, blockHeight, merklePath); merkErr != nil {
+		t.Fatalf("Failed to insert merkle path: %v", merkErr)
 	}
 
 	// Set mined status (this joins merkle_paths to transactions)
-	minedStatuses, err := store.SetMinedByBlockHash(ctx, blockHash)
-	if err != nil {
-		t.Fatalf("Failed to set mined by block hash: %v", err)
+	minedStatuses, minedErr := store.SetMinedByBlockHash(ctx, blockHash)
+	if minedErr != nil {
+		t.Fatalf("Failed to set mined by block hash: %v", minedErr)
 	}
 	if len(minedStatuses) != 1 {
 		t.Fatalf("Expected 1 mined status, got %d", len(minedStatuses))
 	}
 
-	retrieved, err := store.GetStatus(ctx, txid)
-	if err != nil {
-		t.Fatalf("Failed to get status: %v", err)
+	retrieved, getErr := store.GetStatus(ctx, txid)
+	if getErr != nil {
+		t.Fatalf("Failed to get status: %v", getErr)
 	}
 
 	if retrieved.BlockHash != blockHash {
@@ -249,13 +256,13 @@ func TestStore_WithBlockData(t *testing.T) {
 		CompetingTxs: []string{"competitor1"},
 	}
 
-	if err := store.UpdateStatus(ctx, updateWithCompeting); err != nil {
-		t.Fatalf("Failed to update with competing tx: %v", err)
+	if updErr := store.UpdateStatus(ctx, updateWithCompeting); updErr != nil {
+		t.Fatalf("Failed to update with competing tx: %v", updErr)
 	}
 
-	retrieved, err = store.GetStatus(ctx, txid)
-	if err != nil {
-		t.Fatalf("Failed to get status after update: %v", err)
+	retrieved, getErr2 := store.GetStatus(ctx, txid)
+	if getErr2 != nil {
+		t.Fatalf("Failed to get status after update: %v", getErr2)
 	}
 
 	if len(retrieved.CompetingTxs) != 1 {
@@ -269,13 +276,13 @@ func TestStore_WithBlockData(t *testing.T) {
 		CompetingTxs: []string{"competitor2"},
 	}
 
-	if err := store.UpdateStatus(ctx, updateWithAnotherCompeting); err != nil {
-		t.Fatalf("Failed to update with second competing tx: %v", err)
+	if upd2Err := store.UpdateStatus(ctx, updateWithAnotherCompeting); upd2Err != nil {
+		t.Fatalf("Failed to update with second competing tx: %v", upd2Err)
 	}
 
-	retrieved, err = store.GetStatus(ctx, txid)
-	if err != nil {
-		t.Fatalf("Failed to get status after second update: %v", err)
+	retrieved, getErr3 := store.GetStatus(ctx, txid)
+	if getErr3 != nil {
+		t.Fatalf("Failed to get status after second update: %v", getErr3)
 	}
 
 	if len(retrieved.CompetingTxs) != 2 {
@@ -291,7 +298,9 @@ func TestStore_InsertAndGetSubmission(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
-	defer store.Close()
+	defer func() {
+		_ = store.Close()
+	}()
 
 	ctx := t.Context()
 	txid := "tx456"
@@ -306,13 +315,13 @@ func TestStore_InsertAndGetSubmission(t *testing.T) {
 		CreatedAt:         time.Now(),
 	}
 
-	if err := store.InsertSubmission(ctx, sub); err != nil {
-		t.Fatalf("Failed to insert submission: %v", err)
+	if insSubErr := store.InsertSubmission(ctx, sub); insSubErr != nil {
+		t.Fatalf("Failed to insert submission: %v", insSubErr)
 	}
 
-	submissions, err := store.GetSubmissionsByTxID(ctx, txid)
-	if err != nil {
-		t.Fatalf("Failed to get submissions: %v", err)
+	submissions, getSubErr := store.GetSubmissionsByTxID(ctx, txid)
+	if getSubErr != nil {
+		t.Fatalf("Failed to get submissions: %v", getSubErr)
 	}
 
 	if len(submissions) != 1 {
@@ -341,7 +350,9 @@ func TestStore_UpdateDeliveryStatus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
-	defer store.Close()
+	defer func() {
+		_ = store.Close()
+	}()
 
 	ctx := t.Context()
 
@@ -355,14 +366,14 @@ func TestStore_UpdateDeliveryStatus(t *testing.T) {
 		CreatedAt:         time.Now(),
 	}
 
-	if err := store.InsertSubmission(ctx, sub); err != nil {
-		t.Fatalf("Failed to insert submission: %v", err)
+	if insErr2 := store.InsertSubmission(ctx, sub); insErr2 != nil {
+		t.Fatalf("Failed to insert submission: %v", insErr2)
 	}
 
 	nextRetry := time.Now().Add(5 * time.Minute)
-	err = store.UpdateDeliveryStatus(ctx, "sub456", models.StatusSentToNetwork, 3, &nextRetry)
-	if err != nil {
-		t.Fatalf("Failed to update delivery status: %v", err)
+	updateErr := store.UpdateDeliveryStatus(ctx, "sub456", models.StatusSentToNetwork, 3, &nextRetry)
+	if updateErr != nil {
+		t.Fatalf("Failed to update delivery status: %v", updateErr)
 	}
 
 	submissions, err := store.GetSubmissionsByTxID(ctx, "tx789")
@@ -396,7 +407,9 @@ func TestStore_MultipleSubmissions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
-	defer store.Close()
+	defer func() {
+		_ = store.Close()
+	}()
 
 	ctx := t.Context()
 	txid := "tx_multi"
@@ -428,14 +441,14 @@ func TestStore_MultipleSubmissions(t *testing.T) {
 	}
 
 	for _, sub := range submissions {
-		if err := store.InsertSubmission(ctx, sub); err != nil {
-			t.Fatalf("Failed to insert submission: %v", err)
+		if loopErr := store.InsertSubmission(ctx, sub); loopErr != nil {
+			t.Fatalf("Failed to insert submission: %v", loopErr)
 		}
 	}
 
-	retrieved, err := store.GetSubmissionsByTxID(ctx, txid)
-	if err != nil {
-		t.Fatalf("Failed to get submissions: %v", err)
+	retrieved, retrieveErr := store.GetSubmissionsByTxID(ctx, txid)
+	if retrieveErr != nil {
+		t.Fatalf("Failed to get submissions: %v", retrieveErr)
 	}
 
 	if len(retrieved) != 3 {

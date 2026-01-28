@@ -1,4 +1,6 @@
 // Package errors provides ARC-compatible error types and status codes.
+//
+//nolint:revive // package name conflicts intentionally - aliasing in imports to avoid conflicts
 package errors
 
 import (
@@ -11,26 +13,46 @@ type StatusCode int
 
 const (
 	// Standard HTTP codes
-	StatusOK         StatusCode = 200
+
+	// StatusOK is a successful request.
+	StatusOK StatusCode = 200
+	// StatusBadRequest is a bad request.
 	StatusBadRequest StatusCode = 400
-	StatusNotFound   StatusCode = 404
+	// StatusNotFound is the requested resource was not found.
+	StatusNotFound StatusCode = 404
 
 	// ARC-specific error codes (460-499 range)
-	StatusTxFormat                  StatusCode = 460 // Not extended format
-	StatusUnlockingScripts          StatusCode = 461 // Malformed unlocking scripts
-	StatusInputs                    StatusCode = 462 // Invalid inputs
-	StatusMalformed                 StatusCode = 463 // Malformed transaction
-	StatusOutputs                   StatusCode = 464 // Invalid outputs
-	StatusFees                      StatusCode = 465 // Fee too low
-	StatusConflict                  StatusCode = 466 // Conflicting transaction
-	StatusGeneric                   StatusCode = 467 // Generic validation error
-	StatusBeefInvalid               StatusCode = 468 // BEEF validation failed
-	StatusMerkleRoots               StatusCode = 469 // Merkle roots validation failed
-	StatusFrozenPolicy              StatusCode = 471 // Input frozen (policy)
-	StatusFrozenConsensus           StatusCode = 472 // Input frozen (consensus)
-	StatusCumulativeFees            StatusCode = 473 // Cumulative fee validation failed
-	StatusTxSize                    StatusCode = 474 // Transaction size validation failed
-	StatusMinedAncestorsNotInBUMP   StatusCode = 475 // Mined ancestors not found in BUMPs
+
+	// StatusTxFormat is the transaction is not in extended format.
+	StatusTxFormat StatusCode = 460
+	// StatusUnlockingScripts indicates malformed unlocking scripts.
+	StatusUnlockingScripts StatusCode = 461
+	// StatusInputs indicates invalid inputs.
+	StatusInputs StatusCode = 462
+	// StatusMalformed indicates a malformed transaction.
+	StatusMalformed StatusCode = 463
+	// StatusOutputs indicates invalid outputs.
+	StatusOutputs StatusCode = 464
+	// StatusFees indicates fee is too low.
+	StatusFees StatusCode = 465
+	// StatusConflict indicates a conflicting transaction.
+	StatusConflict StatusCode = 466
+	// StatusGeneric indicates a generic validation error.
+	StatusGeneric StatusCode = 467
+	// StatusBeefInvalid indicates BEEF validation failed.
+	StatusBeefInvalid StatusCode = 468
+	// StatusMerkleRoots indicates merkle roots validation failed.
+	StatusMerkleRoots StatusCode = 469
+	// StatusFrozenPolicy indicates input is frozen due to policy.
+	StatusFrozenPolicy StatusCode = 471
+	// StatusFrozenConsensus indicates input is frozen due to consensus.
+	StatusFrozenConsensus StatusCode = 472
+	// StatusCumulativeFees indicates cumulative fee validation failed.
+	StatusCumulativeFees StatusCode = 473
+	// StatusTxSize indicates transaction size validation failed.
+	StatusTxSize StatusCode = 474
+	// StatusMinedAncestorsNotInBUMP indicates mined ancestors not found in BUMPs.
+	StatusMinedAncestorsNotInBUMP StatusCode = 475
 )
 
 // arcDocURL is the base URL for ARC error documentation.
@@ -101,6 +123,8 @@ func GetArcError(err error) *ArcError {
 }
 
 // NewErrorFields creates ErrorFields for the given status code.
+//
+//nolint:gocyclo // status code validation requires many cases
 func NewErrorFields(status StatusCode, extraInfo string) *ErrorFields {
 	fields := &ErrorFields{
 		Status: int(status),
@@ -112,6 +136,9 @@ func NewErrorFields(status StatusCode, extraInfo string) *ErrorFields {
 	}
 
 	switch status {
+	case StatusOK:
+		fields.Title = "OK"
+		fields.Detail = "Request successful"
 	case StatusBadRequest:
 		fields.Title = "Bad request"
 		fields.Detail = "The request seems to be malformed and cannot be processed"

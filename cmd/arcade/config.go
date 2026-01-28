@@ -1,11 +1,13 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
-	"github.com/bsv-blockchain/arcade/config"
 	"github.com/spf13/viper"
+
+	"github.com/bsv-blockchain/arcade/config"
 )
 
 // Load reads configuration from file and environment variables.
@@ -30,7 +32,8 @@ func Load() (*config.Config, error) {
 
 	// Read config file
 	if err := v.ReadInConfig(); err != nil {
-		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
+		var cfgErr viper.ConfigFileNotFoundError
+		if !errors.As(err, &cfgErr) {
 			return nil, fmt.Errorf("error reading config file: %w", err)
 		}
 	}

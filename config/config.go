@@ -18,7 +18,7 @@ type Config struct {
 	Network     string `mapstructure:"network"`      // "main", "test", "stn" - Bitcoin network
 	StoragePath string `mapstructure:"storage_path"` // Data directory for persistent files
 
-	LogLevel string `mapstructure:"log_level"` // Log level (debug, info, warn, error)
+	LogLevel    string                   `mapstructure:"log_level"` // Log level (debug, info, warn, error)
 	Server      ServerConfig             `mapstructure:"server"`
 	Database    DatabaseConfig           `mapstructure:"database"`
 	Events      EventsConfig             `mapstructure:"events"`

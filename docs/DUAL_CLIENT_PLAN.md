@@ -190,25 +190,25 @@ This document tracks the implementation of a dual-client pattern for Arcade, sim
 
 ### HTTP Endpoints
 
-| Method | Path | Description | In Interface |
-|--------|------|-------------|--------------|
-| POST | /tx | Submit single transaction | ✓ |
-| POST | /txs | Submit multiple transactions | ✓ |
-| GET | /tx/:txid | Get transaction status | ✓ |
-| GET | /events | SSE stream (all events) | ✓ |
-| GET | /events/:token | SSE stream (filtered by token) | ✓ |
-| GET | /policy | Get policy configuration | ✓ |
-| GET | /health | Health check (200 OK / 503) | ✗ (server only) |
+| Method | Path           | Description                    | In Interface    |
+|--------|----------------|--------------------------------|-----------------|
+| POST   | /tx            | Submit single transaction      | ✓               |
+| POST   | /txs           | Submit multiple transactions   | ✓               |
+| GET    | /tx/:txid      | Get transaction status         | ✓               |
+| GET    | /events        | SSE stream (all events)        | ✓               |
+| GET    | /events/:token | SSE stream (filtered by token) | ✓               |
+| GET    | /policy        | Get policy configuration       | ✓               |
+| GET    | /health        | Health check (200 OK / 503)    | ✗ (server only) |
 
 ### Request Headers (POST /tx, /txs)
 
-| Header | Description |
-|--------|-------------|
-| X-CallbackUrl | Webhook URL for status callbacks |
-| X-CallbackToken | Token for SSE event filtering |
-| X-FullStatusUpdates | Send all status updates (true/false) |
-| X-SkipFeeValidation | Skip fee validation (true/false) |
-| X-SkipScriptValidation | Skip script validation (true/false) |
+| Header                 | Description                          |
+|------------------------|--------------------------------------|
+| X-CallbackUrl          | Webhook URL for status callbacks     |
+| X-CallbackToken        | Token for SSE event filtering        |
+| X-FullStatusUpdates    | Send all status updates (true/false) |
+| X-SkipFeeValidation    | Skip fee validation (true/false)     |
+| X-SkipScriptValidation | Skip script validation (true/false)  |
 
 ### SSE Event Format
 
@@ -220,17 +220,17 @@ data: {"txid":"...","txStatus":"...","timestamp":"..."}
 
 ### Transaction Status Values
 
-| Status | Description |
-|--------|-------------|
-| UNKNOWN | Initial/unknown state |
-| RECEIVED | Transaction received by Arcade |
-| SENT_TO_NETWORK | Submitted to Teranode |
-| ACCEPTED_BY_NETWORK | Accepted by Teranode |
-| SEEN_ON_NETWORK | Seen in P2P subtree message |
-| DOUBLE_SPEND_ATTEMPTED | Double spend detected |
-| REJECTED | Transaction rejected |
-| MINED | Included in a block |
-| IMMUTABLE | Deeply confirmed |
+| Status                 | Description                    |
+|------------------------|--------------------------------|
+| UNKNOWN                | Initial/unknown state          |
+| RECEIVED               | Transaction received by Arcade |
+| SENT_TO_NETWORK        | Submitted to Teranode          |
+| ACCEPTED_BY_NETWORK    | Accepted by Teranode           |
+| SEEN_ON_NETWORK        | Seen in P2P subtree message    |
+| DOUBLE_SPEND_ATTEMPTED | Double spend detected          |
+| REJECTED               | Transaction rejected           |
+| MINED                  | Included in a block            |
+| IMMUTABLE              | Deeply confirmed               |
 
 ---
 
