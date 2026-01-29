@@ -207,19 +207,30 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 
 	// Submit to teranode endpoints synchronously with timeout
 	// Wait for first success/rejection, or timeout after 15 seconds
-	resultCh := make(chan *models.TransactionStatus, len(e.teranodeClient.GetEndpoints()))
+	endpoints := e.teranodeClient.GetEndpoints()
+	resultCh := make(chan *models.TransactionStatus, len(endpoints))
 	submitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
-	for _, endpoint := range e.teranodeClient.GetEndpoints() {
+	var wg sync.WaitGroup
+	for _, endpoint := range endpoints {
+		wg.Add(1)
 		go func(ep string) {
+			defer wg.Done()
 			status := e.submitToTeranodeSync(submitCtx, ep, tx.Bytes(), txid)
 			select {
 			case resultCh <- status:
-			default:
+			case <-submitCtx.Done():
+				return
 			}
 		}(endpoint)
 	}
+
+	// Close channel when all goroutines complete
+	go func() {
+		wg.Wait()
+		close(resultCh)
+	}()
 
 	// Wait for first result or timeout
 	select {
@@ -348,16 +359,27 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 
 		rawTx := info.tx.Bytes()
 
-		resultCh := make(chan *models.TransactionStatus, len(e.teranodeClient.GetEndpoints()))
-		for _, endpoint := range e.teranodeClient.GetEndpoints() {
+		endpoints := e.teranodeClient.GetEndpoints()
+		resultCh := make(chan *models.TransactionStatus, len(endpoints))
+		var wg sync.WaitGroup
+		for _, endpoint := range endpoints {
+			wg.Add(1)
 			go func(ep string) {
+				defer wg.Done()
 				status := e.submitToTeranodeSync(submitCtx, ep, rawTx, info.txid)
 				select {
 				case resultCh <- status:
-				default:
+				case <-submitCtx.Done():
+					return
 				}
 			}(endpoint)
 		}
+
+		// Close channel when all goroutines complete
+		go func() {
+			wg.Wait()
+			close(resultCh)
+		}()
 
 		// Wait for first result or timeout
 		select {

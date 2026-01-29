@@ -18,6 +18,7 @@ import (
 	msgbus "github.com/bsv-blockchain/go-p2p-message-bus"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
+	"github.com/bsv-blockchain/go-sdk/util"
 	p2p "github.com/bsv-blockchain/go-teranode-p2p-client"
 	teranode "github.com/bsv-blockchain/teranode/services/p2p"
 
@@ -994,26 +995,28 @@ func (a *Arcade) fetchBlockSubtrees(ctx context.Context, url string) ([]chainhas
 	}
 
 	// Read transaction count (varint)
-	if _, countErr := readVarInt(resp.Body); countErr != nil {
+	var txCount util.VarInt
+	if _, countErr := txCount.ReadFrom(resp.Body); countErr != nil {
 		return nil, fmt.Errorf("failed to read transaction count: %w", countErr)
 	}
 
 	// Read size in bytes (varint)
-	if _, sizeErr := readVarInt(resp.Body); sizeErr != nil {
+	var sizeBytes util.VarInt
+	if _, sizeErr := sizeBytes.ReadFrom(resp.Body); sizeErr != nil {
 		return nil, fmt.Errorf("failed to read size in bytes: %w", sizeErr)
 	}
 
 	// Read subtree count (varint)
-	subtreeCount, err := readVarInt(resp.Body)
-	if err != nil {
+	var subtreeCount util.VarInt
+	if _, err := subtreeCount.ReadFrom(resp.Body); err != nil {
 		return nil, fmt.Errorf("failed to read subtree count: %w", err)
 	}
 
 	// Read subtree hashes
-	hashes := make([]chainhash.Hash, 0, subtreeCount)
+	hashes := make([]chainhash.Hash, 0, uint64(subtreeCount))
 	hashBuf := make([]byte, 32)
 
-	for i := uint64(0); i < subtreeCount; i++ {
+	for i := uint64(0); i < uint64(subtreeCount); i++ {
 		if _, err := io.ReadFull(resp.Body, hashBuf); err != nil {
 			return nil, fmt.Errorf("failed to read subtree hash %d: %w", i, err)
 		}
@@ -1025,38 +1028,6 @@ func (a *Arcade) fetchBlockSubtrees(ctx context.Context, url string) ([]chainhas
 	}
 
 	return hashes, nil
-}
-
-// readVarInt reads a variable-length integer from a reader (Bitcoin varint format)
-func readVarInt(r io.Reader) (uint64, error) {
-	var buf [1]byte
-	if _, err := io.ReadFull(r, buf[:]); err != nil {
-		return 0, err
-	}
-
-	switch buf[0] {
-	case 0xfd:
-		var v [2]byte
-		if _, err := io.ReadFull(r, v[:]); err != nil {
-			return 0, err
-		}
-		return uint64(v[0]) | uint64(v[1])<<8, nil
-	case 0xfe:
-		var v [4]byte
-		if _, err := io.ReadFull(r, v[:]); err != nil {
-			return 0, err
-		}
-		return uint64(v[0]) | uint64(v[1])<<8 | uint64(v[2])<<16 | uint64(v[3])<<24, nil
-	case 0xff:
-		var v [8]byte
-		if _, err := io.ReadFull(r, v[:]); err != nil {
-			return 0, err
-		}
-		return uint64(v[0]) | uint64(v[1])<<8 | uint64(v[2])<<16 | uint64(v[3])<<24 |
-			uint64(v[4])<<32 | uint64(v[5])<<40 | uint64(v[6])<<48 | uint64(v[7])<<56, nil
-	default:
-		return uint64(buf[0]), nil //nolint:gosec // safe: buf is always initialized
-	}
 }
 
 func (a *Arcade) fetchSubtreeHashes(ctx context.Context, dataHubURL, subtreeHash string) ([]chainhash.Hash, error) {

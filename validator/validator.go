@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/script"
@@ -190,25 +189,24 @@ func (v *Validator) wrapPolicyError(err error) error {
 
 // wrapSPVError wraps SPV verification errors with ARC-compatible status codes.
 func (v *Validator) wrapSPVError(err error) error {
-	errStr := err.Error()
-
 	// Check for fee-related errors
-	if strings.Contains(errStr, "fee") ||
-		strings.Contains(errStr, "satoshis inputted") ||
-		strings.Contains(errStr, "satoshis outputted") {
-		return arcerrors.NewArcErrorWithInfo(err, arcerrors.StatusFees, errStr)
+	if errors.Is(err, spv.ErrFeeTooLow) {
+		return arcerrors.NewArcErrorWithInfo(err, arcerrors.StatusFees, err.Error())
 	}
 
 	// Check for script validation errors
-	if strings.Contains(errStr, "script") ||
-		strings.Contains(errStr, "signature") ||
-		strings.Contains(errStr, "unlock") {
+	if errors.Is(err, spv.ErrScriptVerificationFailed) {
 		return arcerrors.NewArcError(err, arcerrors.StatusUnlockingScripts)
 	}
 
-	// Check for input-related errors
-	if strings.Contains(errStr, "input") {
+	// Check for input-related errors (missing source transaction)
+	if errors.Is(err, spv.ErrMissingSourceTransaction) {
 		return arcerrors.NewArcError(err, arcerrors.StatusInputs)
+	}
+
+	// Check for merkle path errors
+	if errors.Is(err, spv.ErrInvalidMerklePath) {
+		return arcerrors.NewArcError(err, arcerrors.StatusGeneric)
 	}
 
 	// Default to generic validation error
