@@ -127,7 +127,7 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 	}
 
 	// Validate transaction
-	if err := e.txValidator.ValidateTransaction(ctx, tx, opts.SkipFeeValidation, opts.SkipScriptValidation); err != nil {
+	if valErr := e.txValidator.ValidateTransaction(ctx, tx, opts.SkipFeeValidation, opts.SkipScriptValidation); valErr != nil {
 		// Calculate actual fee for logging
 		var inputSats, outputSats uint64
 		for _, input := range tx.Inputs {
@@ -147,7 +147,7 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 
 		e.logger.Debug("transaction validation failed",
 			"txid", tx.TxID().String(),
-			"error", err.Error(),
+			"error", valErr.Error(),
 			"skipFeeValidation", opts.SkipFeeValidation,
 			"skipScriptValidation", opts.SkipScriptValidation,
 			"txSize", txSize,
@@ -160,23 +160,26 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 			"minFeePerKB", e.txValidator.MinFeePerKB(),
 			"rawTxHex", tx.Hex(),
 		)
-		return nil, fmt.Errorf("validation failed: %w", err)
+		return nil, fmt.Errorf("validation failed: %w", valErr)
 	}
 
 	txid := tx.TxID().String()
 
-	// Insert initial status
-	if err := e.store.InsertStatus(ctx, &models.TransactionStatus{
+	// Get or insert initial status (idempotent - duplicate submissions return existing status)
+	existingStatus, isNew, err := e.store.GetOrInsertStatus(ctx, &models.TransactionStatus{
 		TxID:      txid,
 		Timestamp: time.Now(),
-	}); err != nil {
+	})
+	if err != nil {
 		return nil, fmt.Errorf("failed to store status: %w", err)
 	}
 
-	// Track transaction
-	e.txTracker.Add(txid, models.StatusReceived)
+	// Track transaction in memory
+	e.txTracker.Add(txid, existingStatus.Status)
 
 	// Create submission record if callback URL or token provided
+	// This happens regardless of whether the transaction is new, allowing
+	// multiple clients to register callbacks for the same transaction
 	if opts.CallbackURL != "" || opts.CallbackToken != "" {
 		if err := e.store.InsertSubmission(ctx, &models.Submission{
 			SubmissionID:      uuid.New().String(),
@@ -187,6 +190,18 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 			CreatedAt:         time.Now(),
 		}); err != nil {
 			return nil, fmt.Errorf("failed to store submission: %w", err)
+		}
+	}
+
+	// Skip rebroadcast if already confirmed on network or rejected
+	if !isNew {
+		//nolint:exhaustive // intentionally only handling terminal states
+		switch existingStatus.Status {
+		case models.StatusSeenOnNetwork, models.StatusMined, models.StatusImmutable,
+			models.StatusRejected, models.StatusDoubleSpendAttempted:
+			return existingStatus, nil
+		default:
+			// Still pending (RECEIVED, SENT_TO_NETWORK, ACCEPTED_BY_NETWORK) - rebroadcast
 		}
 	}
 
@@ -224,7 +239,16 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 		opts = &models.SubmitOptions{}
 	}
 
-	var txs []*sdkTx.Transaction
+	// Process each transaction: get or insert status, register callbacks
+	type txInfo struct {
+		tx     *sdkTx.Transaction
+		rawTx  []byte
+		txid   string
+		isNew  bool
+		status *models.TransactionStatus
+	}
+	txInfos := make([]txInfo, 0, len(rawTxs))
+
 	for _, rawTx := range rawTxs {
 		// Parse transaction (try BEEF first, then raw bytes)
 		_, tx, _, err := sdkTx.ParseBeef(rawTx)
@@ -236,7 +260,7 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 		}
 
 		// Validate transaction
-		if err := e.txValidator.ValidateTransaction(ctx, tx, opts.SkipFeeValidation, opts.SkipScriptValidation); err != nil {
+		if valErr := e.txValidator.ValidateTransaction(ctx, tx, opts.SkipFeeValidation, opts.SkipScriptValidation); valErr != nil {
 			// Calculate actual fee for logging
 			var inputSats, outputSats uint64
 			for _, input := range tx.Inputs {
@@ -247,7 +271,7 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 			for _, output := range tx.Outputs {
 				outputSats += output.Satoshis
 			}
-			actualFee := int64(inputSats) - int64(outputSats) //nolint:gosec // safe: subtraction of uint64 values // safe: subtraction of uint64 values
+			actualFee := int64(inputSats) - int64(outputSats) //nolint:gosec // safe: subtraction of uint64 values
 			txSize := tx.Size()
 			var feePerKB float64
 			if txSize > 0 {
@@ -256,7 +280,7 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 
 			e.logger.Debug("transaction validation failed",
 				"txid", tx.TxID().String(),
-				"error", err.Error(),
+				"error", valErr.Error(),
 				"skipFeeValidation", opts.SkipFeeValidation,
 				"skipScriptValidation", opts.SkipScriptValidation,
 				"txSize", txSize,
@@ -268,22 +292,25 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 				"feePerKB", feePerKB,
 				"minFeePerKB", e.txValidator.MinFeePerKB(),
 			)
-			return nil, fmt.Errorf("validation failed: %w", err)
+			return nil, fmt.Errorf("validation failed: %w", valErr)
 		}
 
-		txs = append(txs, tx)
 		txid := tx.TxID().String()
 
-		// Insert status and track
-		if err := e.store.InsertStatus(ctx, &models.TransactionStatus{
+		// Get or insert status (idempotent)
+		existingStatus, isNew, err := e.store.GetOrInsertStatus(ctx, &models.TransactionStatus{
 			TxID:      txid,
 			Timestamp: time.Now(),
-		}); err != nil {
-			e.logger.Error("failed to insert status", slog.String("txID", txid), slog.String("error", err.Error()))
+		})
+		if err != nil {
+			// Log error but continue with other transactions
+			continue
 		}
-		e.txTracker.Add(txid, models.StatusReceived)
+
+		e.txTracker.Add(txid, existingStatus.Status)
 
 		// Create submission record if callback URL or token provided
+		// This happens regardless of whether the transaction is new
 		if opts.CallbackURL != "" || opts.CallbackToken != "" {
 			if err := e.store.InsertSubmission(ctx, &models.Submission{
 				SubmissionID:      uuid.New().String(),
@@ -296,6 +323,8 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 				e.logger.Error("failed to insert submission", slog.String("txID", txid), slog.String("error", err.Error()))
 			}
 		}
+
+		txInfos = append(txInfos, txInfo{tx: tx, rawTx: rawTx, txid: txid, isNew: isNew, status: existingStatus})
 	}
 
 	// Submit all to teranode synchronously with timeout
@@ -303,14 +332,26 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 	defer cancel()
 
 	var responses []*models.TransactionStatus
-	for _, tx := range txs {
-		txid := tx.TxID().String()
-		rawTx := tx.Bytes()
+	for _, info := range txInfos {
+		// Skip rebroadcast if already confirmed on network or rejected
+		if !info.isNew {
+			//nolint:exhaustive // intentionally only handling terminal states
+			switch info.status.Status {
+			case models.StatusSeenOnNetwork, models.StatusMined, models.StatusImmutable,
+				models.StatusRejected, models.StatusDoubleSpendAttempted:
+				responses = append(responses, info.status)
+				continue
+			default:
+				// Still pending (RECEIVED, SENT_TO_NETWORK, ACCEPTED_BY_NETWORK) - rebroadcast
+			}
+		}
+
+		rawTx := info.tx.Bytes()
 
 		resultCh := make(chan *models.TransactionStatus, len(e.teranodeClient.GetEndpoints()))
 		for _, endpoint := range e.teranodeClient.GetEndpoints() {
 			go func(ep string) {
-				status := e.submitToTeranodeSync(submitCtx, ep, rawTx, txid)
+				status := e.submitToTeranodeSync(submitCtx, ep, rawTx, info.txid)
 				select {
 				case resultCh <- status:
 				default:
@@ -324,7 +365,7 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 			responses = append(responses, status)
 		case <-submitCtx.Done():
 			// Timeout - get current status
-			status, _ := e.store.GetStatus(ctx, txid)
+			status, _ := e.store.GetStatus(ctx, info.txid)
 			responses = append(responses, status)
 		}
 	}

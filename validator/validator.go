@@ -12,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/go-sdk/script/interpreter"
 	"github.com/bsv-blockchain/go-sdk/spv"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
+	"github.com/bsv-blockchain/go-sdk/transaction/chaintracker"
 	feemodel "github.com/bsv-blockchain/go-sdk/transaction/fee_model"
 
 	arcerrors "github.com/bsv-blockchain/arcade/errors"
@@ -73,11 +74,12 @@ type Policy struct {
 
 // Validator performs local transaction validation before submission
 type Validator struct {
-	policy *Policy
+	policy       *Policy
+	chainTracker chaintracker.ChainTracker
 }
 
-// NewValidator creates a new transaction validator with policy
-func NewValidator(policy *Policy) *Validator {
+// NewValidator creates a new transaction validator with policy and optional chaintracker
+func NewValidator(policy *Policy, ct chaintracker.ChainTracker) *Validator {
 	if policy == nil {
 		policy = &Policy{}
 	}
@@ -90,7 +92,10 @@ func NewValidator(policy *Policy) *Validator {
 	if policy.MinFeePerKB == 0 {
 		policy.MinFeePerKB = DefaultMinFeePerKB
 	}
-	return &Validator{policy: policy}
+	return &Validator{
+		policy:       policy,
+		chainTracker: ct,
+	}
 }
 
 // ValidatePolicy validates a transaction against node policy rules
@@ -155,7 +160,7 @@ func (v *Validator) ValidateTransaction(ctx context.Context, tx *sdkTx.Transacti
 		}
 	} else {
 		// Script validation (and fees if not skipped)
-		if _, err := spv.Verify(ctx, tx, nil, feeModel); err != nil {
+		if _, err := spv.Verify(ctx, tx, v.chainTracker, feeModel); err != nil {
 			return v.wrapSPVError(err)
 		}
 	}

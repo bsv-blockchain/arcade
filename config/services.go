@@ -149,14 +149,6 @@ func (c *Config) initializeEmbedded(ctx context.Context, logger *slog.Logger, ch
 	}
 	teranodeClient := teranode.NewClient(c.Teranode.BroadcastURLs, c.Teranode.AuthToken)
 
-	// Initialize validator
-	logger.Info("Initializing validator")
-	txValidator := validator.NewValidator(&validator.Policy{
-		MaxTxSizePolicy:         c.Validator.MaxTxSize,
-		MaxTxSigopsCountsPolicy: c.Validator.MaxSigOps,
-		MinFeePerKB:             c.Validator.MinFeePerKB,
-	})
-
 	// Initialize transaction tracker
 	logger.Info("Initializing transaction tracker")
 	txTracker := store.NewTxTracker()
@@ -201,6 +193,14 @@ func (c *Config) initializeEmbedded(ctx context.Context, logger *slog.Logger, ch
 	} else {
 		logger.Info("Using provided Chaintracks instance")
 	}
+
+	// Initialize validator (after chaintracker so we can pass it for SPV verification)
+	logger.Info("Initializing validator")
+	txValidator := validator.NewValidator(&validator.Policy{
+		MaxTxSizePolicy:         c.Validator.MaxTxSize,
+		MaxTxSigopsCountsPolicy: c.Validator.MaxSigOps,
+		MinFeePerKB:             c.Validator.MinFeePerKB,
+	}, chaintracker)
 
 	// Initialize Arcade P2P listener
 	logger.Info("Initializing Arcade P2P listener")

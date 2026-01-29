@@ -278,8 +278,10 @@ func (r *Routes) HandleGetHealth(c *fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(c.UserContext(), 2*time.Second)
 	defer cancel()
 
-	// Health check uses statusStore directly (not part of interface)
-	if _, err := r.store.GetStatus(ctx, "nonexistent"); err != nil {
+	// Health check: verify database is reachable by executing a query
+	// ErrNotFound is expected for non-existent txid and indicates healthy database
+	// Any other error indicates database connectivity issues
+	if _, err := r.store.GetStatus(ctx, "health-check-probe"); err != nil && !errors.Is(err, store.ErrNotFound) {
 		return c.Status(http.StatusServiceUnavailable).SendString("Database connection failed")
 	}
 

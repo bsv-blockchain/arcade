@@ -2,15 +2,22 @@ package store
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/bsv-blockchain/arcade/models"
 )
 
+// ErrNotFound is returned when a requested record does not exist.
+var ErrNotFound = errors.New("not found")
+
 // Store handles all persistence operations for transactions and submissions
 type Store interface {
-	// InsertStatus inserts a new transaction status (used when client submits via REST API)
-	InsertStatus(ctx context.Context, status *models.TransactionStatus) error
+	// GetOrInsertStatus inserts a new transaction status or returns the existing one if it already exists.
+	// Returns the status, a boolean indicating if it was newly inserted (true) or already existed (false), and any error.
+	// This enables idempotent transaction submission - duplicate submissions return the existing status
+	// and can still register new callbacks.
+	GetOrInsertStatus(ctx context.Context, status *models.TransactionStatus) (existing *models.TransactionStatus, inserted bool, err error)
 
 	// UpdateStatus updates an existing transaction status (used for P2P, blocks, etc.)
 	UpdateStatus(ctx context.Context, status *models.TransactionStatus) error

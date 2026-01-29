@@ -434,11 +434,12 @@ import "github.com/bsv-blockchain/arcade/store"
 
 type MyStore struct {}
 
-func (s *MyStore) InsertStatus(ctx context.Context, status *models.TransactionStatus) error {
-    // Your implementation
+func (s *MyStore) GetOrInsertStatus(ctx context.Context, status *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+    // Your implementation - returns (existing status, was inserted, error)
+    // If transaction already exists, return existing status with inserted=false
 }
 
-// Implement other store.StatusStore methods...
+// Implement other store.Store methods...
 ```
 
 #### Custom Event Handler

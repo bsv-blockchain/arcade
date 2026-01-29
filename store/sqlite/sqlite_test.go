@@ -20,7 +20,7 @@ func setupTestDB(t *testing.T) (string, func()) {
 	return dbPath, cleanup
 }
 
-func TestStore_InsertAndUpdate(t *testing.T) {
+func TestStore_GetOrInsertAndUpdate(t *testing.T) {
 	dbPath, cleanup := setupTestDB(t)
 	defer cleanup()
 
@@ -40,8 +40,15 @@ func TestStore_InsertAndUpdate(t *testing.T) {
 		Timestamp: time.Now().Add(-10 * time.Second),
 	}
 
-	if insertErr := store.InsertStatus(ctx, status1); insertErr != nil {
-		t.Fatalf("Failed to insert status: %v", insertErr)
+	result, inserted, err := store.GetOrInsertStatus(ctx, status1)
+	if err != nil {
+		t.Fatalf("Failed to insert status: %v", err)
+	}
+	if !inserted {
+		t.Error("Expected inserted to be true for new transaction")
+	}
+	if result.Status != models.StatusReceived {
+		t.Errorf("Expected status %s, got %s", models.StatusReceived, result.Status)
 	}
 
 	status2 := &models.TransactionStatus{
@@ -65,6 +72,67 @@ func TestStore_InsertAndUpdate(t *testing.T) {
 
 	if current.Status != models.StatusSentToNetwork {
 		t.Errorf("Expected status %s, got %s", models.StatusSentToNetwork, current.Status)
+	}
+}
+
+func TestStore_GetOrInsertStatus_Duplicate(t *testing.T) {
+	dbPath, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	store, err := NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+	defer func() {
+		_ = store.Close()
+	}()
+
+	ctx := t.Context()
+	txid := "duplicate123"
+
+	// First insert
+	status1 := &models.TransactionStatus{
+		TxID:      txid,
+		Timestamp: time.Now(),
+	}
+
+	result1, inserted1, err := store.GetOrInsertStatus(ctx, status1)
+	if err != nil {
+		t.Fatalf("Failed to insert status: %v", err)
+	}
+	if !inserted1 {
+		t.Error("Expected inserted to be true for first insert")
+	}
+	if result1.Status != models.StatusReceived {
+		t.Errorf("Expected status %s, got %s", models.StatusReceived, result1.Status)
+	}
+
+	// Update the status to something else
+	updateStatus := &models.TransactionStatus{
+		TxID:      txid,
+		Status:    models.StatusSeenOnNetwork,
+		Timestamp: time.Now(),
+	}
+	if updateErr := store.UpdateStatus(ctx, updateStatus); updateErr != nil {
+		t.Fatalf("Failed to update status: %v", updateErr)
+	}
+
+	// Second insert attempt (duplicate) - should return existing status
+	status2 := &models.TransactionStatus{
+		TxID:      txid,
+		Timestamp: time.Now(),
+	}
+
+	result2, inserted2, err := store.GetOrInsertStatus(ctx, status2)
+	if err != nil {
+		t.Fatalf("Failed on duplicate insert: %v", err)
+	}
+	if inserted2 {
+		t.Error("Expected inserted to be false for duplicate")
+	}
+	// Should return the current status (SEEN_ON_NETWORK), not RECEIVED
+	if result2.Status != models.StatusSeenOnNetwork {
+		t.Errorf("Expected existing status %s, got %s", models.StatusSeenOnNetwork, result2.Status)
 	}
 }
 
@@ -101,8 +169,8 @@ func TestStore_GetStatusesSince(t *testing.T) {
 	}
 
 	for _, status := range statuses {
-		if statusErr := store.InsertStatus(ctx, status); statusErr != nil {
-			t.Fatalf("Failed to insert status: %v", statusErr)
+		if _, _, insErr := store.GetOrInsertStatus(ctx, status); insErr != nil {
+			t.Fatalf("Failed to insert status: %v", insErr)
 		}
 	}
 
@@ -144,8 +212,8 @@ func TestStore_WithBlockData(t *testing.T) {
 		ExtraInfo: "some extra data",
 	}
 
-	if insErr := store.InsertStatus(ctx, status); insErr != nil {
-		t.Fatalf("Failed to insert status: %v", insErr)
+	if _, _, err := store.GetOrInsertStatus(ctx, status); err != nil {
+		t.Fatalf("Failed to insert status: %v", err)
 	}
 
 	// Insert merkle path (this is where block_height and merkle_path are stored)

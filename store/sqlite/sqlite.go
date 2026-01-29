@@ -14,9 +14,8 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/store"
 )
-
-var errNotFound = errors.New("not found")
 
 const (
 	// SQLite pragmas for better concurrency
@@ -108,8 +107,9 @@ func NewStore(dbPath string) (*Store, error) {
 
 // StatusStore methods
 
-// InsertStatus inserts a new transaction status.
-func (s *Store) InsertStatus(ctx context.Context, status *models.TransactionStatus) error {
+// GetOrInsertStatus inserts a new transaction status or returns the existing one if it already exists.
+// Returns the status, whether it was newly inserted (true) or already existed (false), and any error.
+func (s *Store) GetOrInsertStatus(ctx context.Context, status *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
 	if status.CreatedAt.IsZero() {
 		status.CreatedAt = time.Now()
 	}
@@ -127,10 +127,21 @@ VALUES (?, ?, ?, ?, ?, ?)
 		status.CreatedAt,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to insert status: %w", err)
+		// Check if this is a unique constraint violation (transaction already exists)
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") || strings.Contains(err.Error(), "PRIMARY KEY constraint failed") {
+			// Return the existing status
+			existing, getErr := s.GetStatus(ctx, status.TxID)
+			if getErr != nil {
+				return nil, false, fmt.Errorf("failed to get existing status: %w", getErr)
+			}
+			return existing, false, nil
+		}
+		return nil, false, fmt.Errorf("failed to insert status: %w", err)
 	}
 
-	return nil
+	// Successfully inserted - return the status we just created
+	status.Status = models.StatusReceived
+	return status, true, nil
 }
 
 // UpdateStatus updates an existing transaction status.
@@ -544,7 +555,7 @@ func scanTransactionStatus(row *sql.Row) (*models.TransactionStatus, error) {
 		&status.CreatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, errNotFound
+		return nil, store.ErrNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan transaction status: %w", err)

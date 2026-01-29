@@ -277,7 +277,7 @@ type StatusUpdate struct {
 ### Store Interfaces
 
 **StatusStore:**
-- `InsertStatus()` - Initial submission (status: RECEIVED)
+- `GetOrInsertStatus()` - Idempotent initial submission (returns existing status if duplicate)
 - `UpdateStatus()` - P2P or Teranode updates
 - `GetStatus()` - Current status for transaction
 - `GetStatusHistory()` - All status changes over time
@@ -335,10 +335,12 @@ sequenceDiagram
     Client->>API: POST /v1/tx (X-CallbackUrl, X-CallbackToken)
     API->>Validator: ValidateTransaction()
     Validator-->>API: Valid
-    API->>StatusStore: InsertStatus() [RECEIVED]
+    API->>StatusStore: GetOrInsertStatus() [RECEIVED or existing]
     API->>SubmissionStore: InsertSubmission()
-    API->>Teranode: SubmitTransaction() (async)
-    API-->>Client: HTTP 200 (txid)
+    alt New transaction
+        API->>Teranode: SubmitTransaction() (async)
+    end
+    API-->>Client: HTTP 200 (txid + status)
     Teranode->>StatusStore: UpdateStatus() [SENT_TO_NETWORK]
     Teranode->>StatusStore: UpdateStatus() [ACCEPTED_BY_NETWORK]
     StatusStore->>Events: Publish(StatusUpdate)
