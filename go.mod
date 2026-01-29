@@ -5,7 +5,7 @@ go 1.25.4
 require (
 	github.com/bsv-blockchain/go-chaintracks v1.0.3
 	github.com/bsv-blockchain/go-p2p-message-bus v0.1.8
-	github.com/bsv-blockchain/go-sdk v1.2.15
+	github.com/bsv-blockchain/go-sdk v1.2.16
 	github.com/bsv-blockchain/go-teranode-p2p-client v0.1.0
 	github.com/bsv-blockchain/teranode v0.13.1
 	github.com/gofiber/fiber/v2 v2.52.10
@@ -282,9 +282,6 @@ require (
 
 // CVE-2025-52881
 replace github.com/opencontainers/runc => github.com/opencontainers/runc v1.4.0
-
-// Disabled this replace to test with official sdk
-// replace github.com/bsv-blockchain/go-sdk => github.com/bsv-blockchain/go-sdk v1.2.15-0.20251229224150-16c656d138fd
 
 // Disabled this replace to test with official sdk
 // replace github.com/bsv-blockchain/go-chaintracks => github.com/bsv-blockchain/go-chaintracks v1.0.2-0.20251230043839-6b524e72389d
