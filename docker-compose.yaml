@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  arcade:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${VERSION:-dev}
+        COMMIT: ${COMMIT:-$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")}
+        BUILD_DATE: ${BUILD_DATE:-$(date -u +"%Y-%m-%dT%H:%M:%SZ")}
+    container_name: arcade
+    ports:
+      - "3011:3011"
+    volumes:
+      # Mount config file
+      - ./config.yaml:/app/config.yaml:ro
+      # Persistent data directory
+      - arcade-data:/data
+    environment:
+      # Override config via environment variables
+      ARCADE_NETWORK: ${ARCADE_NETWORK:-main}
+      ARCADE_LOG_LEVEL: ${ARCADE_LOG_LEVEL:-info}
+      ARCADE_STORAGE_PATH: /data
+      ARCADE_SERVER_ADDRESS: :3011
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3011/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  arcade-data:
+    driver: local
