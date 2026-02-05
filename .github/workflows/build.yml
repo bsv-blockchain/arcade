@@ -50,11 +50,11 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Step 3: Build and push the Docker image
-      - name: Build and push frontend Docker image
+      - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
-          context: ./front # Build context (root directory, adjust if Dockerfile is elsewhere)
-          file: ./front/Dockerfile # Path to Dockerfile
+          context: . # Build context (root directory, adjust if Dockerfile is elsewhere)
+          file: ./Dockerfile # Path to Dockerfile
           push: ${{ github.event_name != 'pull_request' }} # Only push on push events, not PRs
           tags: |
             ghcr.io/bsv-blockchain/arcade:${{ github.sha }}
