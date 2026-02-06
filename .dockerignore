@@ -67,22 +67,6 @@ tmp
 .golangci.yml
 .goreleaser.yml
 .vscode
-docs/*.md
-docs/ARCHITECTURE.md
 LICENSE
 README.md
 codecov.yml
-CLAUDE.md
-DOCKER.md
-docker-compose.yaml
-
-# Build artifacts and caches
-.mage-cache/
-coverage.*
-*.db
-*.db-shm
-*.db-wal
-
-# Example and test files
-examples/
-*_test.go
