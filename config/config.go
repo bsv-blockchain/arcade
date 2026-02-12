@@ -62,6 +62,9 @@ func (c *Config) SetDefaults(v *viper.Viper, prefix string) {
 	v.SetDefault(p+"events.buffer_size", 1000)
 
 	// Teranode defaults
+	v.SetDefault(p+"teranode.broadcast_urls", []string{})
+	v.SetDefault(p+"teranode.datahub_urls", []string{})
+	v.SetDefault(p+"teranode.auth_token", "")
 	v.SetDefault(p+"teranode.timeout", "30s")
 
 	// Validator defaults
@@ -72,6 +75,7 @@ func (c *Config) SetDefaults(v *viper.Viper, prefix string) {
 
 	// Auth defaults
 	v.SetDefault(p+"auth.enabled", false)
+	v.SetDefault(p+"auth.token", "")
 
 	// Webhook defaults
 	v.SetDefault(p+"webhook.prune_interval", "1h")
