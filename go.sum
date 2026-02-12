@@ -72,8 +72,8 @@ github.com/bsv-blockchain/go-bt/v2 v2.5.3 h1:QfVNnlXl4r+Sq+tfG8likv29b85gWcAq6v/
 github.com/bsv-blockchain/go-bt/v2 v2.5.3/go.mod h1:IW4ejL7cKDj3qRb+nZppWeu3/RzgLbDzsnzQrPmhUHc=
 github.com/bsv-blockchain/go-chaincfg v1.5.4 h1:Fm0JCSKIZ6llNCGtrxc62/PXsmWzZ9hrLvpVKTXo6Tk=
 github.com/bsv-blockchain/go-chaincfg v1.5.4/go.mod h1:DKhJO+0sRllMGsnScmPMJEkv4sqmpuwEXisY2DRtxNc=
-github.com/bsv-blockchain/go-chaintracks v1.1.1 h1:alOB2atns4QuCJooIy7sHAQEe0cdUHzl27hilv7dF4A=
-github.com/bsv-blockchain/go-chaintracks v1.1.1/go.mod h1:qiq4X6aUYJbxv5FzJ4uT0pffqC7Wn4qEp39e89G3TJI=
+github.com/bsv-blockchain/go-chaintracks v1.1.2 h1:jDNQiSjvtiO/BKmaKOEMPgJ1Fjj104TTtlJEPkidLDo=
+github.com/bsv-blockchain/go-chaintracks v1.1.2/go.mod h1:7SfVih4/eXA58CQHtPRlRzePH1tADBkG1C1Vc1SqntE=
 github.com/bsv-blockchain/go-lockfree-queue v1.1.2 h1:KjW2TZ9Mewe9xjyf5SV0L5wFjjwJTD7v2yVoFvz4S+A=
 github.com/bsv-blockchain/go-lockfree-queue v1.1.2/go.mod h1:1ah9XaAKnXdZwoAAlBZCX+cd3mMRDTlxKIRY6tVsiOM=
 github.com/bsv-blockchain/go-p2p-message-bus v0.1.9 h1:VSrDBegKXC7YR6Pt9/ZF8UKq60irOGw3JWM3CZi1XJU=
