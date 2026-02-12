@@ -283,9 +283,3 @@ require (
 
 // CVE-2025-52881
 replace github.com/opencontainers/runc => github.com/opencontainers/runc v1.4.0
-
-// Disabled this replace to test with official sdk
-// replace github.com/bsv-blockchain/go-chaintracks => github.com/bsv-blockchain/go-chaintracks v1.0.2-0.20251230043839-6b524e72389d
-
-// Disabled this replace to test with official sdk
-// replace github.com/bsv-blockchain/teranode => github.com/bsv-blockchain/teranode v0.13.0-beta-3.0.20251211185306-7879a2f59199

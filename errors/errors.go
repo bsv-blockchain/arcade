@@ -1,6 +1,4 @@
 // Package errors provides ARC-compatible error types and status codes.
-//
-//nolint:revive // package name conflicts intentionally - aliasing in imports to avoid conflicts
 package errors
 
 import (
