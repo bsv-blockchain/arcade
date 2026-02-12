@@ -33,7 +33,7 @@ jobs:
       deployment_tag: ${{ steps.deployment_tag.outputs.id }}
 
   build-and-push:
-    needs: [ get_tag ]
+    needs: [get_tag]
     runs-on: ubuntu-latest
     permissions:
       contents: read
