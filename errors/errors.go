@@ -1,5 +1,5 @@
-// Package errors provides ARC-compatible error types and status codes.
-package errors
+// Package arcerrors provides ARC-compatible error types and status codes.
+package arcerrors
 
 import (
 	"errors"
