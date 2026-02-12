@@ -18,14 +18,14 @@ type Config struct {
 	Network     string `mapstructure:"network"`      // "main", "test", "stn" - Bitcoin network
 	StoragePath string `mapstructure:"storage_path"` // Data directory for persistent files
 
-	LogLevel    string                   `mapstructure:"log_level"` // Log level (debug, info, warn, error)
-	Server      ServerConfig             `mapstructure:"server"`
-	Database    DatabaseConfig           `mapstructure:"database"`
-	Events      EventsConfig             `mapstructure:"events"`
-	Teranode    TeranodeConfig           `mapstructure:"teranode"`
-	P2P         p2p.Config               `mapstructure:"p2p"`
-	Validator   ValidatorConfig          `mapstructure:"validator"`
-	Auth        AuthConfig               `mapstructure:"auth"`
+	LogLevel          string                   `mapstructure:"log_level"` // Log level (debug, info, warn, error)
+	Server            ServerConfig             `mapstructure:"server"`
+	Database          DatabaseConfig           `mapstructure:"database"`
+	Events            EventsConfig             `mapstructure:"events"`
+	Teranode          TeranodeConfig           `mapstructure:"teranode"`
+	P2P               p2p.Config               `mapstructure:"p2p"`
+	Validator         ValidatorConfig          `mapstructure:"validator"`
+	Auth              AuthConfig               `mapstructure:"auth"`
 	Webhook           WebhookConfig            `mapstructure:"webhook"`
 	ChaintracksServer ChaintracksServerConfig  `mapstructure:"chaintracks_server"`
 	Chaintracks       chaintracksconfig.Config `mapstructure:"chaintracks"`
