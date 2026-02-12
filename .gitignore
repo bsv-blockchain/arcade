@@ -46,4 +46,4 @@ peer_cache.json
 *.log
 
 arcade
-./config.yaml
+config.yaml
