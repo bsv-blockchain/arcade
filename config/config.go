@@ -26,8 +26,9 @@ type Config struct {
 	P2P         p2p.Config               `mapstructure:"p2p"`
 	Validator   ValidatorConfig          `mapstructure:"validator"`
 	Auth        AuthConfig               `mapstructure:"auth"`
-	Webhook     WebhookConfig            `mapstructure:"webhook"`
-	Chaintracks chaintracksconfig.Config `mapstructure:"chaintracks"`
+	Webhook           WebhookConfig            `mapstructure:"webhook"`
+	ChaintracksServer ChaintracksServerConfig  `mapstructure:"chaintracks_server"`
+	Chaintracks       chaintracksconfig.Config `mapstructure:"chaintracks"`
 }
 
 // SetDefaults sets viper defaults for arcade configuration when used as an embedded library.
@@ -76,6 +77,9 @@ func (c *Config) SetDefaults(v *viper.Viper, prefix string) {
 	v.SetDefault(p+"webhook.prune_interval", "1h")
 	v.SetDefault(p+"webhook.max_age", "24h")
 	v.SetDefault(p+"webhook.max_retries", 10)
+
+	// Chaintracks server defaults
+	v.SetDefault(p+"chaintracks_server.enabled", true)
 
 	// Delegate to external libraries
 	c.P2P.SetDefaults(v, p+"p2p")
@@ -131,6 +135,11 @@ type WebhookConfig struct {
 	PruneInterval time.Duration `mapstructure:"prune_interval"`
 	MaxAge        time.Duration `mapstructure:"max_age"`
 	MaxRetries    int           `mapstructure:"max_retries"`
+}
+
+// ChaintracksServerConfig holds configuration for the chaintracks HTTP API routes.
+type ChaintracksServerConfig struct {
+	Enabled bool `mapstructure:"enabled"`
 }
 
 // GetLogLevel returns the log level, defaulting to "info".

@@ -44,3 +44,6 @@ node_modules/
 peer_cache.json
 
 *.log
+
+arcade
+.config.yaml

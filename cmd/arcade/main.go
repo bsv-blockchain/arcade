@@ -34,6 +34,8 @@ import (
 	fiberlogger "github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 
+	chaintracksRoutes "github.com/bsv-blockchain/go-chaintracks/routes/fiber"
+
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/docs"
 	"github.com/bsv-blockchain/arcade/logging"
@@ -97,6 +99,13 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		Logger:         log,
 	})
 
+	// Setup chaintracks routes (if enabled and running in embedded mode)
+	var chaintracksRts *chaintracksRoutes.Routes
+	if cfg.ChaintracksServer.Enabled && services.Chaintracks != nil {
+		chaintracksRts = chaintracksRoutes.NewRoutes(ctx, services.Chaintracks)
+		log.Info("Chaintracks HTTP API enabled", slog.String("routes", "/chaintracks/v1/*, /chaintracks/v2/*"))
+	}
+
 	// Setup dashboard
 	dashboard := NewDashboard(services.Arcade)
 
@@ -107,7 +116,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		authToken = cfg.Auth.Token
 		log.Info("API authentication enabled")
 	}
-	app := setupServer(arcadeRoutes, dashboard, authToken)
+	app := setupServer(arcadeRoutes, chaintracksRts, dashboard, authToken)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -146,7 +155,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	return nil
 }
 
-func setupServer(arcadeRoutes *fiberRoutes.Routes, dashboard *Dashboard, authToken string) *fiber.App {
+func setupServer(arcadeRoutes *fiberRoutes.Routes, chaintracksRts *chaintracksRoutes.Routes, dashboard *Dashboard, authToken string) *fiber.App {
 	app := fiber.New(fiber.Config{
 		DisableStartupMessage: true,
 	})
@@ -167,6 +176,13 @@ func setupServer(arcadeRoutes *fiberRoutes.Routes, dashboard *Dashboard, authTok
 
 	// Transaction endpoints (ARC-compatible)
 	arcadeRoutes.Register(app)
+
+	// Chaintracks endpoints (block header tracking)
+	if chaintracksRts != nil {
+		chaintracksGroup := app.Group("/chaintracks")
+		chaintracksRts.Register(chaintracksGroup.Group("/v2"))
+		chaintracksRts.RegisterLegacy(chaintracksGroup.Group("/v1"))
+	}
 
 	// Health check (standalone arcade server only)
 	app.Get("/health", arcadeRoutes.HandleGetHealth)
