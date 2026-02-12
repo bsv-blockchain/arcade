@@ -155,7 +155,7 @@ func (r *Routes) handlePostTxs(c *fiber.Ctx) error {
 	}
 
 	// Convert to raw bytes
-	var rawTxs [][]byte
+	rawTxs := make([][]byte, 0, len(reqs))
 	for _, req := range reqs {
 		data, err := hex.DecodeString(req.RawTx)
 		if err != nil {

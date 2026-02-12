@@ -127,7 +127,10 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 
 	log.Info("Arcade started successfully")
 
-	// Wait for shutdown signal
+	return waitForShutdown(ctx, cfg, log, app, errCh)
+}
+
+func waitForShutdown(ctx context.Context, cfg *config.Config, log *slog.Logger, app *fiber.App, errCh <-chan error) error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
@@ -141,7 +144,6 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		log.Info("Context canceled")
 	}
 
-	// Graceful shutdown
 	log.Info("Shutting down gracefully")
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(ctx, cfg.Server.ShutdownTimeout)

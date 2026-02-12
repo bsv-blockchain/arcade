@@ -1,6 +1,4 @@
 // Package errors provides ARC-compatible error types and status codes.
-//
-
 package errors
 
 import (
