@@ -29,12 +29,11 @@ import (
 	"os/signal"
 	"syscall"
 
+	chaintracksRoutes "github.com/bsv-blockchain/go-chaintracks/routes/fiber"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	fiberlogger "github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"
-
-	chaintracksRoutes "github.com/bsv-blockchain/go-chaintracks/routes/fiber"
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/docs"
