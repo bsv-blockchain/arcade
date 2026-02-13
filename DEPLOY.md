@@ -33,34 +33,41 @@ The container exposes `GET /health` on port 3011. Use this for readiness/livenes
 
 ## Docker Compose
 
-1. **Create a config file:**
+The `docker-compose.yaml` includes production mainnet configuration by default. All required environment variables are pre-configured.
+
+### Quick Start
 
 ```bash
-cp config.example.yaml config.yaml
-```
-
-Edit `config.yaml` and set your `teranode.broadcast_urls`.
-
-2. **Start Arcade:**
-
-```bash
+# Start Arcade (uses mainnet by default)
 docker compose up -d
-```
 
-3. **Verify it's running:**
-
-```bash
-curl http://localhost:3011/health
+# View logs
 docker compose logs -f arcade
-```
 
-4. **Stop:**
+# Check health
+curl http://localhost:3011/health
 
-```bash
+# Stop
 docker compose down
 ```
 
 Data is persisted in the `arcade-data` Docker volume and survives restarts.
+
+### Using Different Networks
+
+For testnet:
+```bash
+ARCADE_NETWORK=test \
+ARCADE_TERANODE_BROADCAST_URLS="https://teranode-eks-testnet-eu-1-propagation.bsvb.tech,https://teranode-eks-testnet-us-1-propagation.bsvb.tech" \
+docker compose up -d
+```
+
+For teratestnet:
+```bash
+ARCADE_NETWORK=teratestnet \
+ARCADE_TERANODE_BROADCAST_URLS="https://teranode-eks-ttn-eu-1-propagation.bsvb.tech,https://teranode-eks-ttn-us-1-propagation.bsvb.tech" \
+docker compose up -d
+```
 
 ### Environment-only configuration (no config file)
 
