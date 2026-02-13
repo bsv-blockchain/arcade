@@ -17,7 +17,10 @@ Arcade is configured via environment variables or a `config.yaml` file. Environm
 | `ARCADE_STORAGE_PATH` | Root directory for persistent data | `/data` |
 | `ARCADE_DATABASE_SQLITE_PATH` | Path to SQLite database file | `/data/arcade.db` |
 | `ARCADE_CHAINTRACKS_STORAGE_PATH` | Path for chain header storage | `/data/chaintracks` |
+| `ARCADE_CHAINTRACKS_BOOTSTRAP_URL` | URL to headers.bin for initial header sync | _(none)_ |
 | `ARCADE_TERANODE_BROADCAST_URLS` | Comma-separated Teranode propagation URLs | _(none)_ |
+| `ARCADE_TERANODE_DATAHUB_URLS` | Comma-separated Teranode DataHub URLs (fallback) | _(none)_ |
+| `ARCADE_TERANODE_AUTH_TOKEN` | **Bearer token for Teranode authentication (required)** | _(none)_ |
 | `ARCADE_SERVER_ADDRESS` | Listen address | `:3011` |
 | `ARCADE_LOG_LEVEL` | Log level: `debug`, `info`, `warn`, `error` | `info` |
 | `ARCADE_AUTH_ENABLED` | Enable authentication | `false` |
@@ -33,7 +36,15 @@ The container exposes `GET /health` on port 3011. Use this for readiness/livenes
 
 ## Docker Compose
 
-The `docker-compose.yaml` includes production mainnet configuration by default. All required environment variables are pre-configured.
+The `docker-compose.yaml` includes production mainnet configuration by default.
+
+### Authentication Required
+
+⚠️ **You must provide a Teranode authentication token** to submit transactions:
+
+```bash
+export ARCADE_TERANODE_AUTH_TOKEN="your-token-here"
+```
 
 ### Quick Start
 
@@ -59,6 +70,7 @@ For testnet:
 ```bash
 ARCADE_NETWORK=test \
 ARCADE_TERANODE_BROADCAST_URLS="https://teranode-eks-testnet-eu-1-propagation.bsvb.tech,https://teranode-eks-testnet-us-1-propagation.bsvb.tech" \
+ARCADE_TERANODE_DATAHUB_URLS="https://teranode-eks-testnet-eu-1.bsvb.tech/api/v1" \
 docker compose up -d
 ```
 
@@ -66,6 +78,7 @@ For teratestnet:
 ```bash
 ARCADE_NETWORK=teratestnet \
 ARCADE_TERANODE_BROADCAST_URLS="https://teranode-eks-ttn-eu-1-propagation.bsvb.tech,https://teranode-eks-ttn-us-1-propagation.bsvb.tech" \
+ARCADE_TERANODE_DATAHUB_URLS="https://teranode-eks-ttn-eu-1.bsvb.tech/api/v1" \
 docker compose up -d
 ```
 
