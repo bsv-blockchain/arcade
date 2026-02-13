@@ -73,35 +73,45 @@
   </tr>
   <tr>
     <td align="center">
+       🐳&nbsp;<a href="DOCKER.md"><code>Docker&nbsp;Guide</code></a>
+    </td>
+    <td align="center">
+       ☸️&nbsp;<a href="DEPLOY.md"><code>Deployment&nbsp;Guide</code></a>
+    </td>
+    <td align="center">
        🏗️&nbsp;<a href="#-architecture"><code>Architecture</code></a>
     </td>
+  </tr>
+  <tr>
     <td align="center">
        🧪&nbsp;<a href="#-examples--tests"><code>Examples&nbsp;&&nbsp;Tests</code></a>
     </td>
     <td align="center">
        ⚡&nbsp;<a href="#-benchmarks"><code>Benchmarks</code></a>
     </td>
-  </tr>
-  <tr>
     <td align="center">
        🛠️&nbsp;<a href="#-code-standards"><code>Code&nbsp;Standards</code></a>
     </td>
+  </tr>
+  <tr>
     <td align="center">
        🤖&nbsp;<a href="#-ai-usage--assistant-guidelines"><code>AI&nbsp;Usage</code></a>
     </td>
     <td align="center">
        📚&nbsp;<a href="#-resources"><code>Resources</code></a>
     </td>
-  </tr>
-  <tr>
     <td align="center">
        🤝&nbsp;<a href="#-contributing"><code>Contributing</code></a>
     </td>
+  </tr>
+  <tr>
     <td align="center">
        👥&nbsp;<a href="#-maintainers"><code>Maintainers</code></a>
     </td>
     <td align="center">
        📝&nbsp;<a href="#-license"><code>License</code></a>
+    </td>
+    <td align="center">
     </td>
   </tr>
 </table>
