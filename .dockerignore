@@ -67,7 +67,7 @@ tmp
 .golangci.yml
 .goreleaser.yml
 .vscode
-docs/*.md
+docs
 LICENSE
 README.md
 codecov.yml
