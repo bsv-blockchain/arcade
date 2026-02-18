@@ -161,6 +161,7 @@ func (h *WebhookHandler) deliverWebhook(ctx context.Context, sub models.Submissi
 		slog.String("url", sub.CallbackURL),
 		slog.String("status", string(status.Status)))
 
+	status.StatusCode = http.StatusOK
 	payloadBytes, err := json.Marshal(status)
 	if err != nil {
 		h.logger.Error("Failed to marshal payload",

@@ -127,6 +127,7 @@ func (r *Routes) handlePostTx(c *fiber.Ctx) error {
 		return r.handleSubmitError(c, err)
 	}
 
+	status.StatusCode = http.StatusOK
 	return c.JSON(status)
 }
 
@@ -173,6 +174,9 @@ func (r *Routes) handlePostTxs(c *fiber.Ctx) error {
 		return r.handleSubmitError(c, err)
 	}
 
+	for _, s := range statuses {
+		s.StatusCode = http.StatusOK
+	}
 	return c.JSON(statuses)
 }
 
@@ -211,6 +215,7 @@ func (r *Routes) handleGetTx(c *fiber.Ctx) error {
 		}
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to get status"})
 	}
+	status.StatusCode = http.StatusOK
 	return c.JSON(status)
 }
 
