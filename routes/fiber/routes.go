@@ -211,7 +211,7 @@ func (r *Routes) handleGetTx(c *fiber.Ctx) error {
 	status, err := r.service.GetStatus(c.UserContext(), c.Params("txid"))
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
-			return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "Transaction not found"})
+			return c.Status(http.StatusNotFound).JSON(arcerrors.NewErrorFields(arcerrors.StatusNotFound, "Transaction not found"))
 		}
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to get status"})
 	}
