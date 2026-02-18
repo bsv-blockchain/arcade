@@ -106,7 +106,7 @@ func (r *Routes) handleGetPolicy(c *fiber.Ctx) error {
 // @Param X-SkipScriptValidation header string false "Skip script validation (true/false)"
 // @Success 200 {object} models.TransactionStatus
 // @Failure 400 {object} arcerrors.ErrorFields
-// @Failure 465 {object} errors.ErrorFields "ARC validation error"
+// @Failure 465 {object} arcerrors.ErrorFields "ARC validation error"
 // @Failure 500 {object} map[string]string
 // @Router /tx [post]
 func (r *Routes) handlePostTx(c *fiber.Ctx) error {
@@ -145,7 +145,7 @@ func (r *Routes) handlePostTx(c *fiber.Ctx) error {
 // @Param X-SkipScriptValidation header string false "Skip script validation (true/false)"
 // @Success 200 {array} models.TransactionStatus
 // @Failure 400 {object} arcerrors.ErrorFields
-// @Failure 465 {object} errors.ErrorFields "ARC validation error"
+// @Failure 465 {object} arcerrors.ErrorFields "ARC validation error"
 // @Router /txs [post]
 func (r *Routes) handlePostTxs(c *fiber.Ctx) error {
 	ctx := c.UserContext()
@@ -204,7 +204,7 @@ func (r *Routes) handleSubmitError(c *fiber.Ctx, err error) error {
 // @Produce json
 // @Param txid path string true "Transaction ID"
 // @Success 200 {object} models.TransactionStatus
-// @Failure 404 {object} map[string]string
+// @Failure 404 {object} arcerrors.ErrorFields
 // @Failure 500 {object} map[string]string
 // @Router /tx/{txid} [get]
 func (r *Routes) handleGetTx(c *fiber.Ctx) error {
