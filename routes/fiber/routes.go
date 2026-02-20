@@ -106,7 +106,7 @@ func (r *Routes) handleGetPolicy(c *fiber.Ctx) error {
 // @Param X-SkipScriptValidation header string false "Skip script validation (true/false)"
 // @Success 200 {object} models.TransactionStatus
 // @Failure 400 {object} arcerrors.ErrorFields
-// @Failure 465 {object} errors.ErrorFields "ARC validation error"
+// @Failure 465 {object} arcerrors.ErrorFields "ARC validation error"
 // @Failure 500 {object} map[string]string
 // @Router /tx [post]
 func (r *Routes) handlePostTx(c *fiber.Ctx) error {
@@ -127,6 +127,7 @@ func (r *Routes) handlePostTx(c *fiber.Ctx) error {
 		return r.handleSubmitError(c, err)
 	}
 
+	status.StatusCode = http.StatusOK
 	return c.JSON(status)
 }
 
@@ -144,7 +145,7 @@ func (r *Routes) handlePostTx(c *fiber.Ctx) error {
 // @Param X-SkipScriptValidation header string false "Skip script validation (true/false)"
 // @Success 200 {array} models.TransactionStatus
 // @Failure 400 {object} arcerrors.ErrorFields
-// @Failure 465 {object} errors.ErrorFields "ARC validation error"
+// @Failure 465 {object} arcerrors.ErrorFields "ARC validation error"
 // @Router /txs [post]
 func (r *Routes) handlePostTxs(c *fiber.Ctx) error {
 	ctx := c.UserContext()
@@ -173,6 +174,9 @@ func (r *Routes) handlePostTxs(c *fiber.Ctx) error {
 		return r.handleSubmitError(c, err)
 	}
 
+	for _, s := range statuses {
+		s.StatusCode = http.StatusOK
+	}
 	return c.JSON(statuses)
 }
 
@@ -200,17 +204,18 @@ func (r *Routes) handleSubmitError(c *fiber.Ctx, err error) error {
 // @Produce json
 // @Param txid path string true "Transaction ID"
 // @Success 200 {object} models.TransactionStatus
-// @Failure 404 {object} map[string]string
+// @Failure 404 {object} arcerrors.ErrorFields
 // @Failure 500 {object} map[string]string
 // @Router /tx/{txid} [get]
 func (r *Routes) handleGetTx(c *fiber.Ctx) error {
 	status, err := r.service.GetStatus(c.UserContext(), c.Params("txid"))
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
-			return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "Transaction not found"})
+			return c.Status(http.StatusNotFound).JSON(arcerrors.NewErrorFields(arcerrors.StatusNotFound, "Transaction not found"))
 		}
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to get status"})
 	}
+	status.StatusCode = http.StatusOK
 	return c.JSON(status)
 }
 
