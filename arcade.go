@@ -459,7 +459,7 @@ func (a *Arcade) buildMerklePathsForSubtree(
 		var txOffset uint64
 		for i, h := range txHashes {
 			if h == trackedHash {
-				txOffset = uint64(i) //nolint:gosec // safe: i is from slice iteration
+				txOffset = uint64(i)
 				break
 			}
 		}
@@ -473,7 +473,7 @@ func (a *Arcade) buildMerklePathsForSubtree(
 			hashCopy := h
 			isTxid := true
 			mp.AddLeaf(0, &transaction.PathElement{
-				Offset: uint64(i), //nolint:gosec // safe: i is from slice iteration
+				Offset: uint64(i),
 				Hash:   &hashCopy,
 				Txid:   &isTxid,
 			})
@@ -494,7 +494,7 @@ func (a *Arcade) buildMerklePathsForSubtree(
 			}
 			hashCopy := subHash
 			mp.AddLeaf(internalHeight, &transaction.PathElement{
-				Offset: subtreeBaseOffset + uint64(i), //nolint:gosec // safe: i is from slice iteration
+				Offset: subtreeBaseOffset + uint64(i),
 				Hash:   &hashCopy,
 			})
 		}
@@ -976,7 +976,7 @@ func (a *Arcade) fetchBlockSubtrees(ctx context.Context, url string) ([]chainhas
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	resp, err := a.httpClient.Do(req)
+	resp, err := a.httpClient.Do(req) //nolint:gosec // G704: URL is from configured datahub URLs, not user-controlled input
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch: %w", err)
 	}
@@ -1058,7 +1058,7 @@ func (a *Arcade) fetchHashes(ctx context.Context, url string) ([]chainhash.Hash,
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	resp, err := a.httpClient.Do(req)
+	resp, err := a.httpClient.Do(req) //nolint:gosec // G704: URL is from configured datahub URLs, not user-controlled input
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch: %w", err)
 	}

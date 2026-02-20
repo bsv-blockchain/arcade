@@ -28,14 +28,14 @@ func main() {
 	req.Header.Set("Accept", "text/event-stream")
 
 	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := client.Do(req) //nolint:gosec // G704: URL is constructed from a localhost constant, not user input
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Fatalf("Failed to connect: %s", resp.Status)
+		log.Fatalf("Failed to connect: %s", resp.Status) //nolint:gosec // G706: resp.Status is from the HTTP response, not external user input
 	}
 
 	log.Println("Connected to SSE stream...")
@@ -49,7 +49,7 @@ func main() {
 		if line == "" {
 			// Empty line signals end of event
 			if eventData != "" {
-				log.Printf("[ID: %s] [Type: %s] %s\n", eventID, eventType, eventData)
+				log.Printf("[ID: %s] [Type: %s] %s\n", eventID, eventType, eventData) //nolint:gosec // G706: SSE event data is parsed from trusted server response in this example
 				eventID, eventType, eventData = "", "", ""
 			}
 			continue
