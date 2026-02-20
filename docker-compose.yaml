@@ -13,16 +13,28 @@ services:
     ports:
       - "3011:3011"
     volumes:
-      # Mount config file
-      - ./config.yaml:/app/config.yaml:ro
       # Persistent data directory
       - arcade-data:/data
     environment:
-      # Override config via environment variables
+      # Network configuration
       ARCADE_NETWORK: ${ARCADE_NETWORK:-main}
-      ARCADE_LOG_LEVEL: ${ARCADE_LOG_LEVEL:-info}
+
+      # Storage paths
       ARCADE_STORAGE_PATH: /data
+      ARCADE_DATABASE_SQLITE_PATH: /data/arcade.db
+      ARCADE_CHAINTRACKS_STORAGE_PATH: /data/chaintracks
+
+      # Teranode endpoints (production mainnet by default)
+      ARCADE_TERANODE_BROADCAST_URLS: ${ARCADE_TERANODE_BROADCAST_URLS:-https://teranode-eks-mainnet-eu-1-propagation.bsvb.tech,https://teranode-eks-mainnet-us-1-propagation.bsvb.tech}
+      ARCADE_TERANODE_DATAHUB_URLS: ${ARCADE_TERANODE_DATAHUB_URLS:-https://teranode-eks-mainnet-eu-1.bsvb.tech/api/v1}
+      ARCADE_TERANODE_AUTH_TOKEN: ${ARCADE_TERANODE_AUTH_TOKEN:-}  # Required for authentication
+
+      # Server configuration
       ARCADE_SERVER_ADDRESS: :3011
+      ARCADE_LOG_LEVEL: ${ARCADE_LOG_LEVEL:-debug}
+
+      # Optional: Enable chaintracks HTTP API (default: true)
+      ARCADE_CHAINTRACKS_SERVER_ENABLED: ${ARCADE_CHAINTRACKS_SERVER_ENABLED:-true}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3011/health"]
