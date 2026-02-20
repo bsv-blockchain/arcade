@@ -183,7 +183,7 @@ func (h *WebhookHandler) deliverWebhook(ctx context.Context, sub models.Submissi
 		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", sub.CallbackToken))
 	}
 
-	resp, err := h.httpClient.Do(req)
+	resp, err := h.httpClient.Do(req) //nolint:gosec // G704: URL is from a user-registered callback, validated at registration time
 	if err != nil {
 		h.logger.Error("Failed to deliver webhook",
 			slog.String("submission_id", sub.SubmissionID),

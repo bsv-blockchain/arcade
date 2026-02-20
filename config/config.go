@@ -116,7 +116,7 @@ type EventsConfig struct {
 type TeranodeConfig struct {
 	BroadcastURLs []string      `mapstructure:"broadcast_urls"` // URLs for submitting transactions
 	DataHubURLs   []string      `mapstructure:"datahub_urls"`   // URLs for fetching block/subtree data (fallback)
-	AuthToken     string        `mapstructure:"auth_token"`
+	AuthToken     string        `mapstructure:"auth_token"`     //nolint:gosec // G117: this is a config field name, not a hardcoded secret
 	Timeout       time.Duration `mapstructure:"timeout"`
 }
 

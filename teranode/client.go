@@ -50,7 +50,7 @@ func (c *Client) SubmitTransaction(ctx context.Context, endpoint string, rawTx [
 		req.Header.Set("Authorization", "Bearer "+c.authToken)
 	}
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.httpClient.Do(req) //nolint:gosec // G704: URL is from configured teranode broadcast URLs, not user-controlled input
 	if err != nil {
 		return 0, fmt.Errorf("failed to submit transaction: %w", err)
 	}
