@@ -199,7 +199,7 @@ func (m *sseManager) connectSSE(conn *sseConnection) error {
 		req.Header.Set("Last-Event-ID", conn.lastEventID)
 	}
 
-	resp, err := m.client.httpClient.Do(req)
+	resp, err := m.client.httpClient.Do(req) //nolint:gosec // G704: URL is built from configured baseURL, not user-controlled input
 	if err != nil {
 		return fmt.Errorf("failed to connect: %w", err)
 	}

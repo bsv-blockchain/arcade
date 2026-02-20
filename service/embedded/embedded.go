@@ -138,7 +138,7 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 		for _, output := range tx.Outputs {
 			outputSats += output.Satoshis
 		}
-		actualFee := int64(inputSats) - int64(outputSats) //nolint:gosec // safe: subtraction of uint64 values
+		actualFee := int64(inputSats) - int64(outputSats)
 		txSize := tx.Size()
 		var feePerKB float64
 		if txSize > 0 {
@@ -282,7 +282,7 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 			for _, output := range tx.Outputs {
 				outputSats += output.Satoshis
 			}
-			actualFee := int64(inputSats) - int64(outputSats) //nolint:gosec // safe: subtraction of uint64 values
+			actualFee := int64(inputSats) - int64(outputSats)
 			txSize := tx.Size()
 			var feePerKB float64
 			if txSize > 0 {
