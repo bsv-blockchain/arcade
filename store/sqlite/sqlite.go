@@ -161,18 +161,16 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 UPDATE transactions
 SET status = ?,
 	timestamp = ?,
-	block_hash = ?,
 	extra_info = ?,
 	competing_txs = json_set(competing_txs, '$.' || ?, json('true'))
 WHERE txid = ?
   AND status NOT IN (%s)
 `, strings.Join(placeholders, ","))
 
-		args = make([]interface{}, 0, 6+len(disallowed))
+		args = make([]interface{}, 0, 5+len(disallowed))
 		args = append(args,
 			status.Status,
 			status.Timestamp,
-			nullString(status.BlockHash),
 			nullString(status.ExtraInfo),
 			status.CompetingTxs[0],
 			status.TxID,
@@ -190,17 +188,15 @@ WHERE txid = ?
 UPDATE transactions
 SET status = ?,
 	timestamp = ?,
-	block_hash = ?,
 	extra_info = ?
 WHERE txid = ?
   AND status NOT IN (%s)
 `, strings.Join(placeholders, ","))
 
-		args = make([]interface{}, 0, 5+len(disallowed))
+		args = make([]interface{}, 0, 4+len(disallowed))
 		args = append(args,
 			status.Status,
 			status.Timestamp,
-			nullString(status.BlockHash),
 			nullString(status.ExtraInfo),
 			status.TxID,
 		)

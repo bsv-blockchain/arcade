@@ -1,0 +1,1 @@
+-- No-op: we don't want to re-wipe block_hash values.
