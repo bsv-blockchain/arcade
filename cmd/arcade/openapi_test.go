@@ -2,79 +2,93 @@ package main
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
-func TestMergeOpenAPISpecs(t *testing.T) {
-	// Sample arcade spec (minimal)
-	arcadeSpec := `{
-		"swagger": "2.0",
-		"info": {
-			"title": "Arcade API",
-			"version": "0.1.0"
-		},
-		"paths": {
-			"/tx": {
-				"post": {
-					"tags": ["arcade"],
-					"summary": "Submit transaction"
-				}
+const testArcadeSpec = `{
+	"swagger": "2.0",
+	"info": {
+		"title": "Arcade API",
+		"version": "0.1.0"
+	},
+	"paths": {
+		"/tx": {
+			"post": {
+				"tags": ["arcade"],
+				"summary": "Submit transaction"
 			}
-		},
-		"tags": [
-			{"name": "arcade", "description": "Arcade endpoints"}
-		]
-	}`
+		}
+	},
+	"tags": [
+		{"name": "arcade", "description": "Arcade endpoints"}
+	]
+}`
 
-	// Merge with chaintracks
-	merged, err := mergeOpenAPISpecs(arcadeSpec, "/chaintracks")
+func mergeAndParse(t *testing.T) map[string]interface{} {
+	t.Helper()
+
+	merged, err := mergeOpenAPISpecs(testArcadeSpec, "/chaintracks")
 	if err != nil {
 		t.Fatalf("Failed to merge specs: %v", err)
 	}
 
-	// Parse merged spec
 	var spec map[string]interface{}
 	if err := json.Unmarshal([]byte(merged), &spec); err != nil {
 		t.Fatalf("Failed to parse merged spec: %v", err)
 	}
 
-	// Verify arcade paths still exist
-	paths := spec["paths"].(map[string]interface{})
+	return spec
+}
+
+func hasChaintracksPath(paths map[string]interface{}) bool {
+	for path := range paths {
+		if strings.HasPrefix(path, "/chaintracks") {
+			return true
+		}
+	}
+
+	return false
+}
+
+func hasPrefixedChaintracksTag(tags []interface{}) bool {
+	for _, tag := range tags {
+		tagMap, ok := tag.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		name, ok := tagMap["name"].(string)
+		if ok && strings.HasPrefix(name, "chaintracks-") {
+			return true
+		}
+	}
+
+	return false
+}
+
+func TestMergeOpenAPISpecs(t *testing.T) {
+	spec := mergeAndParse(t)
+
+	paths, ok := spec["paths"].(map[string]interface{})
+	if !ok {
+		t.Fatal("paths not found in merged spec")
+	}
+
 	if _, ok := paths["/tx"]; !ok {
 		t.Error("Arcade /tx path not found in merged spec")
 	}
 
-	// Verify chaintracks paths were added with prefix
-	foundChaintracksPaths := false
-	for path := range paths {
-		if len(path) >= 12 && path[:12] == "/chaintracks" {
-			foundChaintracksPaths = true
-			break
-		}
-	}
-	if !foundChaintracksPaths {
+	if !hasChaintracksPath(paths) {
 		t.Error("No chaintracks paths found with /chaintracks prefix")
 	}
 
-	// Verify tags were merged
-	tags := spec["tags"].([]interface{})
-	if len(tags) < 2 {
-		t.Error("Expected at least 2 tags after merge")
+	tags, ok := spec["tags"].([]interface{})
+	if !ok || len(tags) < 2 {
+		t.Errorf("Expected at least 2 tags after merge, got %d", len(tags))
 	}
 
-	// Verify chaintracks tags were prefixed
-	foundPrefixedTag := false
-	for _, tag := range tags {
-		if tagMap, ok := tag.(map[string]interface{}); ok {
-			if name, ok := tagMap["name"].(string); ok {
-				if len(name) >= 12 && name[:12] == "chaintracks-" {
-					foundPrefixedTag = true
-					break
-				}
-			}
-		}
-	}
-	if !foundPrefixedTag {
+	if !hasPrefixedChaintracksTag(tags) {
 		t.Error("No chaintracks- prefixed tags found")
 	}
 

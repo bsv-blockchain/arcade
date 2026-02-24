@@ -10,7 +10,9 @@ import (
 )
 
 //go:embed static/chaintracks-openapi.yaml
-var chaintracksOpenAPIYAML []byte
+var chaintracksOpenAPIYAML []byte //nolint:gochecknoglobals // embed directive requires package-level var
+
+const schemaRefPrefix = "#/components/schemas/"
 
 // OpenAPI Spec Merging
 //
@@ -31,143 +33,17 @@ var chaintracksOpenAPIYAML []byte
 // mergeOpenAPISpecs merges the arcade and chaintracks OpenAPI specifications.
 // It prefixes all chaintracks paths with the given pathPrefix.
 func mergeOpenAPISpecs(arcadeJSON string, pathPrefix string) (string, error) {
-	// Parse arcade spec (JSON from swagger)
-	var arcadeSpec map[string]interface{}
-	if err := json.Unmarshal([]byte(arcadeJSON), &arcadeSpec); err != nil {
-		return "", fmt.Errorf("failed to parse arcade spec: %w", err)
+	arcadeSpec, chaintracksSpec, err := parseSpecs(arcadeJSON)
+	if err != nil {
+		return "", err
 	}
 
-	// Parse chaintracks spec (YAML)
-	var chaintracksSpec map[string]interface{}
-	if err := yaml.Unmarshal(chaintracksOpenAPIYAML, &chaintracksSpec); err != nil {
-		return "", fmt.Errorf("failed to parse chaintracks spec: %w", err)
-	}
+	arcadePaths := getOrCreateMap(arcadeSpec, "paths")
+	mergeChainstacksPaths(arcadePaths, chaintracksSpec, pathPrefix)
+	mergeChaintracksTags(arcadeSpec, chaintracksSpec)
+	mergeChaintracksSchemas(arcadeSpec, chaintracksSpec)
+	updatePrefixedPathTags(arcadePaths, pathPrefix)
 
-	// Get or create paths map in arcade spec
-	arcadePaths, ok := arcadeSpec["paths"].(map[string]interface{})
-	if !ok {
-		arcadePaths = make(map[string]interface{})
-		arcadeSpec["paths"] = arcadePaths
-	}
-
-	// Merge chaintracks paths with prefix
-	if chaintracksPaths, ok := chaintracksSpec["paths"].(map[string]interface{}); ok {
-		for path, pathItem := range chaintracksPaths {
-			// Skip CDN-only health endpoint (arcade has its own /health)
-			if isCDNOnlyPath(path) {
-				continue
-			}
-
-			// Determine if this is a v1 legacy path by checking its tags
-			isLegacyPath := false
-			if pathItemMap, ok := pathItem.(map[string]interface{}); ok {
-				for _, operation := range pathItemMap {
-					if opMap, ok := operation.(map[string]interface{}); ok {
-						if tags, ok := opMap["tags"].([]interface{}); ok {
-							for _, tag := range tags {
-								if tagStr, ok := tag.(string); ok && tagStr == "Legacy" {
-									isLegacyPath = true
-									break
-								}
-							}
-						}
-					}
-					if isLegacyPath {
-						break
-					}
-				}
-			}
-
-			// Add appropriate prefix based on path type
-			var prefixedPath string
-			if isLegacyPath {
-				// v1 legacy paths need /v1 added
-				prefixedPath = pathPrefix + "/v1" + path
-			} else if strings.HasPrefix(path, "/v2/") {
-				// v2 paths already have /v2 prefix
-				prefixedPath = pathPrefix + path
-			} else {
-				// Other paths (shouldn't happen after CDN filtering)
-				prefixedPath = pathPrefix + path
-			}
-
-			arcadePaths[prefixedPath] = pathItem
-		}
-	}
-
-	// Merge tags
-	arcadeTags, _ := arcadeSpec["tags"].([]interface{})
-	if chaintracksTags, ok := chaintracksSpec["tags"].([]interface{}); ok {
-		// Add chaintracks tags with a prefix to avoid confusion
-		for _, tag := range chaintracksTags {
-			if tagMap, ok := tag.(map[string]interface{}); ok {
-				// Prefix tag name with "chaintracks-"
-				if name, ok := tagMap["name"].(string); ok {
-					// Rename "Legacy" to "v1" for consistency
-					if name == "Legacy" {
-						tagMap["name"] = "chaintracks-v1"
-					} else {
-						tagMap["name"] = "chaintracks-" + name
-					}
-				}
-				arcadeTags = append(arcadeTags, tagMap)
-			}
-		}
-		arcadeSpec["tags"] = arcadeTags
-	}
-
-	// Merge components/schemas if they exist
-	arcadeComponents, ok := arcadeSpec["components"].(map[string]interface{})
-	if !ok {
-		arcadeComponents = make(map[string]interface{})
-		arcadeSpec["components"] = arcadeComponents
-	}
-
-	if chaintracksComponents, ok := chaintracksSpec["components"].(map[string]interface{}); ok {
-		if chaintracksSchemas, ok := chaintracksComponents["schemas"].(map[string]interface{}); ok {
-			arcadeSchemas, ok := arcadeComponents["schemas"].(map[string]interface{})
-			if !ok {
-				arcadeSchemas = make(map[string]interface{})
-				arcadeComponents["schemas"] = arcadeSchemas
-			}
-
-			// Prefix chaintracks schema names to avoid conflicts
-			for schemaName, schema := range chaintracksSchemas {
-				arcadeSchemas["Chaintracks"+schemaName] = schema
-			}
-		}
-	}
-
-	// Update all chaintracks path references to use prefixed tags
-	for path, pathItem := range arcadePaths {
-		if pathItemMap, ok := pathItem.(map[string]interface{}); ok {
-			for method, operation := range pathItemMap {
-				if operationMap, ok := operation.(map[string]interface{}); ok {
-					if tags, ok := operationMap["tags"].([]interface{}); ok {
-						for i, tag := range tags {
-							if tagStr, ok := tag.(string); ok {
-								// If it's a chaintracks tag, prefix it (rename Legacy to v1)
-								if tagStr == "v2" || tagStr == "CDN" {
-									tags[i] = "chaintracks-" + tagStr
-								} else if tagStr == "Legacy" {
-									tags[i] = "chaintracks-v1"
-								}
-							}
-						}
-					}
-
-					// Update schema references for chaintracks endpoints
-					if pathPrefix != "" && len(path) >= len(pathPrefix) && path[:len(pathPrefix)] == pathPrefix {
-						updateSchemaRefs(operationMap, "Chaintracks")
-					}
-
-					pathItemMap[method] = operationMap
-				}
-			}
-		}
-	}
-
-	// Marshal back to JSON
 	mergedJSON, err := json.MarshalIndent(arcadeSpec, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal merged spec: %w", err)
@@ -176,27 +52,198 @@ func mergeOpenAPISpecs(arcadeJSON string, pathPrefix string) (string, error) {
 	return string(mergedJSON), nil
 }
 
+func parseSpecs(arcadeJSON string) (map[string]interface{}, map[string]interface{}, error) {
+	var arcadeSpec map[string]interface{}
+	if err := json.Unmarshal([]byte(arcadeJSON), &arcadeSpec); err != nil {
+		return nil, nil, fmt.Errorf("failed to parse arcade spec: %w", err)
+	}
+
+	var chaintracksSpec map[string]interface{}
+	if err := yaml.Unmarshal(chaintracksOpenAPIYAML, &chaintracksSpec); err != nil {
+		return nil, nil, fmt.Errorf("failed to parse chaintracks spec: %w", err)
+	}
+
+	return arcadeSpec, chaintracksSpec, nil
+}
+
+func getOrCreateMap(parent map[string]interface{}, key string) map[string]interface{} {
+	m, ok := parent[key].(map[string]interface{})
+	if !ok {
+		m = make(map[string]interface{})
+		parent[key] = m
+	}
+
+	return m
+}
+
+func mergeChainstacksPaths(arcadePaths map[string]interface{}, chaintracksSpec map[string]interface{}, pathPrefix string) {
+	chaintracksPaths, ok := chaintracksSpec["paths"].(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	for path, pathItem := range chaintracksPaths {
+		if isCDNOnlyPath(path) {
+			continue
+		}
+
+		isLegacy := isLegacyPathItem(pathItem)
+		arcadePaths[buildPrefixedPath(path, pathPrefix, isLegacy)] = pathItem
+	}
+}
+
+func isLegacyPathItem(pathItem interface{}) bool {
+	pathItemMap, ok := pathItem.(map[string]interface{})
+	if !ok {
+		return false
+	}
+
+	for _, operation := range pathItemMap {
+		if isLegacyOperation(operation) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func isLegacyOperation(operation interface{}) bool {
+	opMap, ok := operation.(map[string]interface{})
+	if !ok {
+		return false
+	}
+
+	tags, ok := opMap["tags"].([]interface{})
+	if !ok {
+		return false
+	}
+
+	for _, tag := range tags {
+		if tagStr, ok := tag.(string); ok && tagStr == "Legacy" {
+			return true
+		}
+	}
+
+	return false
+}
+
+func buildPrefixedPath(path, pathPrefix string, isLegacy bool) string {
+	if isLegacy {
+		return pathPrefix + "/v1" + path
+	}
+
+	return pathPrefix + path
+}
+
+func mergeChaintracksTags(arcadeSpec, chaintracksSpec map[string]interface{}) {
+	chaintracksTags, ok := chaintracksSpec["tags"].([]interface{})
+	if !ok {
+		return
+	}
+
+	arcadeTags, _ := arcadeSpec["tags"].([]interface{})
+
+	for _, tag := range chaintracksTags {
+		tagMap, ok := tag.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		if name, ok := tagMap["name"].(string); ok {
+			tagMap["name"] = prefixChaintracksTag(name)
+		}
+
+		arcadeTags = append(arcadeTags, tagMap)
+	}
+
+	arcadeSpec["tags"] = arcadeTags
+}
+
+func prefixChaintracksTag(name string) string {
+	if name == "Legacy" {
+		return "chaintracks-v1"
+	}
+
+	return "chaintracks-" + name
+}
+
+func mergeChaintracksSchemas(arcadeSpec, chaintracksSpec map[string]interface{}) {
+	chaintracksComponents, ok := chaintracksSpec["components"].(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	chaintracksSchemas, ok := chaintracksComponents["schemas"].(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	arcadeComponents := getOrCreateMap(arcadeSpec, "components")
+	arcadeSchemas := getOrCreateMap(arcadeComponents, "schemas")
+
+	for schemaName, schema := range chaintracksSchemas {
+		arcadeSchemas["Chaintracks"+schemaName] = schema
+	}
+}
+
+func updatePrefixedPathTags(arcadePaths map[string]interface{}, pathPrefix string) {
+	for path, pathItem := range arcadePaths {
+		if !strings.HasPrefix(path, pathPrefix) {
+			continue
+		}
+
+		pathItemMap, ok := pathItem.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		for method, operation := range pathItemMap {
+			operationMap, ok := operation.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			updateOperationTags(operationMap)
+			updateSchemaRefs(operationMap, "Chaintracks")
+			pathItemMap[method] = operationMap
+		}
+	}
+}
+
+func updateOperationTags(operationMap map[string]interface{}) {
+	tags, ok := operationMap["tags"].([]interface{})
+	if !ok {
+		return
+	}
+
+	for i, tag := range tags {
+		tagStr, ok := tag.(string)
+		if !ok {
+			continue
+		}
+
+		switch tagStr {
+		case "v2", "CDN":
+			tags[i] = "chaintracks-" + tagStr
+		case "Legacy":
+			tags[i] = "chaintracks-v1"
+		}
+	}
+}
+
 // isCDNOnlyPath returns true if the path is a CDN-only endpoint that should be excluded.
 // We exclude the CDN health check since arcade has its own /health endpoint.
 func isCDNOnlyPath(path string) bool {
-	// Exclude only the CDN-specific health check
-	// (We DO serve the CDN bootstrap files via static file serving)
 	return path == "/health" // CDN health check - arcade has its own /health
 }
 
-// updateSchemaRefs recursively updates schema references by adding a prefix
+// updateSchemaRefs recursively updates schema references by adding a prefix.
 func updateSchemaRefs(obj interface{}, prefix string) {
 	switch v := obj.(type) {
 	case map[string]interface{}:
 		for key, val := range v {
 			if key == "$ref" {
-				if refStr, ok := val.(string); ok {
-					// Update component schema references
-					if len(refStr) > 21 && refStr[:21] == "#/components/schemas/" {
-						schemaName := refStr[21:]
-						v[key] = "#/components/schemas/" + prefix + schemaName
-					}
-				}
+				updateSchemaRef(v, key, val, prefix)
 			} else {
 				updateSchemaRefs(val, prefix)
 			}
@@ -206,4 +253,13 @@ func updateSchemaRefs(obj interface{}, prefix string) {
 			updateSchemaRefs(item, prefix)
 		}
 	}
+}
+
+func updateSchemaRef(m map[string]interface{}, key string, val interface{}, prefix string) {
+	refStr, ok := val.(string)
+	if !ok || !strings.HasPrefix(refStr, schemaRefPrefix) {
+		return
+	}
+
+	m[key] = schemaRefPrefix + prefix + refStr[len(schemaRefPrefix):]
 }
