@@ -10,7 +10,7 @@ import (
 )
 
 //go:embed static/chaintracks-openapi.yaml
-var chaintracksOpenAPIYAML []byte //nolint:gochecknoglobals // embed directive requires package-level var
+var chaintracksOpenAPIYAML []byte
 
 const schemaRefPrefix = "#/components/schemas/"
 
@@ -136,8 +136,8 @@ func buildPrefixedPath(path, pathPrefix string, isLegacy bool) string {
 }
 
 func mergeChaintracksTags(arcadeSpec, chaintracksSpec map[string]interface{}) {
-	chaintracksTags, ok := chaintracksSpec["tags"].([]interface{})
-	if !ok {
+	chaintracksTags, hasTags := chaintracksSpec["tags"].([]interface{})
+	if !hasTags {
 		return
 	}
 

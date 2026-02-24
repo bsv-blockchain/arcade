@@ -75,7 +75,7 @@ func TestMergeOpenAPISpecs(t *testing.T) {
 		t.Fatal("paths not found in merged spec")
 	}
 
-	if _, ok := paths["/tx"]; !ok {
+	if _, hasTx := paths["/tx"]; !hasTx {
 		t.Error("Arcade /tx path not found in merged spec")
 	}
 
