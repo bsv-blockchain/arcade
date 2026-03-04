@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # Build stage
-FROM golang:1.25.4-alpine@sha256:96f36e77302b6982abdd9849dff329feef03b0f2520c24dc2352fc4b33ed776d AS builder
+FROM golang:1.25.4-alpine AS builder
 
 # Install build dependencies
 # build-base: includes gcc, g++, make and other build tools for CGO
@@ -29,18 +29,14 @@ ARG BUILD_DATE=unknown
 # -ldflags explanation:
 #   -s: omit symbol table
 #   -w: omit DWARF debug info
-#   -X: set version variables
 RUN CGO_ENABLED=1 GOOS=linux go build \
-    -ldflags="-s -w \
-    -X main.version=${VERSION} \
-    -X main.commit=${COMMIT} \
-    -X main.buildDate=${BUILD_DATE}" \
+    -ldflags="-s -w" \
     -trimpath \
     -o arcade \
     ./cmd/arcade
 
 # Runtime stage - using Alpine for small size and C library compatibility (SQLite)
-FROM alpine:3.21@sha256:22e0ec13c0db6b3e1ba3280e831fc50ba7bffe58e81f31670a64b1afede247bc
+FROM alpine:3.21
 
 # Install runtime dependencies
 # ca-certificates: for HTTPS connections to Teranode

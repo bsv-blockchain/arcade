@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	chaintracksRoutes "github.com/bsv-blockchain/go-chaintracks/routes/fiber"
 	"github.com/gofiber/fiber/v2"
@@ -115,7 +116,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		authToken = cfg.Auth.Token
 		log.Info("API authentication enabled")
 	}
-	app := setupServer(arcadeRoutes, chaintracksRts, dashboard, authToken)
+	app := setupServer(arcadeRoutes, chaintracksRts, dashboard, authToken, cfg.Chaintracks.StoragePath)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -156,7 +157,7 @@ func waitForShutdown(ctx context.Context, cfg *config.Config, log *slog.Logger, 
 	return nil
 }
 
-func setupServer(arcadeRoutes *fiberRoutes.Routes, chaintracksRts *chaintracksRoutes.Routes, dashboard *Dashboard, authToken string) *fiber.App {
+func setupServer(arcadeRoutes *fiberRoutes.Routes, chaintracksRts *chaintracksRoutes.Routes, dashboard *Dashboard, authToken string, chaintracksStoragePath string) *fiber.App {
 	app := fiber.New(fiber.Config{
 		DisableStartupMessage: true,
 	})
@@ -183,6 +184,15 @@ func setupServer(arcadeRoutes *fiberRoutes.Routes, chaintracksRts *chaintracksRo
 		chaintracksGroup := app.Group("/chaintracks")
 		chaintracksRts.Register(chaintracksGroup.Group("/v2"))
 		chaintracksRts.RegisterLegacy(chaintracksGroup.Group("/v1"))
+
+		// CDN static file serving for bulk header downloads
+		// Serves files like mainNetBlockHeaders.json and mainNet_X.headers
+		chaintracksGroup.Static("/", chaintracksStoragePath, fiber.Static{
+			Compress:      true,
+			ByteRange:     true, // Support Range requests for partial downloads
+			Browse:        false,
+			CacheDuration: 1 * time.Hour,
+		})
 	}
 
 	// Health check (standalone arcade server only)
@@ -194,7 +204,20 @@ func setupServer(arcadeRoutes *fiberRoutes.Routes, chaintracksRts *chaintracksRo
 
 	// API docs (Scalar UI)
 	app.Get("/docs/openapi.json", func(c *fiber.Ctx) error {
-		return c.Type("json").SendString(docs.SwaggerInfo.ReadDoc())
+		arcadeSpec := docs.SwaggerInfo.ReadDoc()
+
+		// Merge with chaintracks spec if chaintracks routes are enabled
+		if chaintracksRts != nil {
+			mergedSpec, err := mergeOpenAPISpecs(arcadeSpec, "/chaintracks")
+			if err != nil {
+				// Log error but fallback to arcade-only spec
+				slog.Error("Failed to merge OpenAPI specs", slog.String("error", err.Error()))
+				return c.Type("json").SendString(arcadeSpec)
+			}
+			return c.Type("json").SendString(mergedSpec)
+		}
+
+		return c.Type("json").SendString(arcadeSpec)
 	})
 	app.Get("/docs", func(c *fiber.Ctx) error {
 		return c.Type("html").SendString(scalarHTML)
