@@ -445,8 +445,12 @@ func (e *Embedded) GetPolicy(_ context.Context) (*models.Policy, error) {
 
 // submitToTeranodeSync submits a transaction to a teranode endpoint, updates status, and returns the result.
 func (e *Embedded) submitToTeranodeSync(ctx context.Context, endpoint string, rawTx []byte, txid string) *models.TransactionStatus {
+	e.logger.Debug("submitting to teranode", slog.String("txid", txid), slog.String("endpoint", endpoint), slog.Int("rawTxSize", len(rawTx)))
+
 	statusCode, err := e.teranodeClient.SubmitTransaction(ctx, endpoint, rawTx)
 	if err != nil {
+		e.logger.Warn("teranode submission failed", slog.String("txid", txid), slog.String("endpoint", endpoint), slog.String("error", err.Error()))
+
 		status := &models.TransactionStatus{
 			TxID:      txid,
 			Status:    models.StatusRejected,
@@ -461,6 +465,8 @@ func (e *Embedded) submitToTeranodeSync(ctx context.Context, endpoint string, ra
 		}
 		return status
 	}
+
+	e.logger.Debug("teranode submission succeeded", slog.String("txid", txid), slog.String("endpoint", endpoint), slog.Int("statusCode", statusCode))
 
 	var txStatus models.Status
 	switch statusCode {
