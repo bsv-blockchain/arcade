@@ -519,8 +519,10 @@ func (a *Arcade) extractMinimalPath(fullPath *transaction.MerklePath, txOffset u
 
 	offset := txOffset
 	for level := 0; level < len(fullPath.Path); level++ {
-		if leaf := fullPath.FindLeafByOffset(level, offset); leaf != nil {
-			mp.AddLeaf(level, leaf)
+		if level == 0 {
+			if leaf := fullPath.FindLeafByOffset(level, offset); leaf != nil {
+				mp.AddLeaf(level, leaf)
+			}
 		}
 		if sibling := fullPath.FindLeafByOffset(level, offset^1); sibling != nil {
 			mp.AddLeaf(level, sibling)
