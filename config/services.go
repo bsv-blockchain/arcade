@@ -54,6 +54,7 @@ type Services struct {
 	WebhookHandler *handlers.WebhookHandler
 	Logger         *slog.Logger
 	Config         *Config
+	ownsP2PClient  bool
 }
 
 // Initialize creates and returns all application services.
@@ -286,6 +287,7 @@ func (c *Config) initializeEmbedded(ctx context.Context, logger *slog.Logger, ch
 		WebhookHandler: webhookHandler,
 		Logger:         logger,
 		Config:         c,
+		ownsP2PClient:  ownsP2PClient,
 	}, nil
 }
 
@@ -316,8 +318,8 @@ func (s *Services) Close() error {
 		}
 	}
 
-	// Close P2P client (also stops Chaintracks via context)
-	if s.P2PClient != nil {
+	// Close P2P client only if we created it (caller owns it otherwise)
+	if s.P2PClient != nil && s.ownsP2PClient {
 		if err := s.P2PClient.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("p2p client close: %w", err))
 		}

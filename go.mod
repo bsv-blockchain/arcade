@@ -281,3 +281,5 @@ require (
 
 // CVE-2025-52881
 replace github.com/opencontainers/runc => github.com/opencontainers/runc v1.4.0
+
+replace github.com/bsv-blockchain/go-sdk => github.com/b-open-io/go-sdk v1.1.25-0.20260306232724-34090fe4ae98

@@ -138,11 +138,10 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 		for _, output := range tx.Outputs {
 			outputSats += output.Satoshis
 		}
-		actualFee := int64(inputSats) - int64(outputSats)
-		txSize := tx.Size()
 		var feePerKB float64
-		if txSize > 0 {
-			feePerKB = float64(actualFee) / float64(txSize) * 1000
+		txSize := tx.Size()
+		if txSize > 0 && inputSats >= outputSats {
+			feePerKB = float64(inputSats-outputSats) / float64(txSize) * 1000
 		}
 
 		e.logger.Debug("transaction validation failed",
@@ -155,7 +154,6 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 			"outputCount", len(tx.Outputs),
 			"inputSatoshis", inputSats,
 			"outputSatoshis", outputSats,
-			"actualFee", actualFee,
 			"feePerKB", feePerKB,
 			"minFeePerKB", e.txValidator.MinFeePerKB(),
 			"rawTxHex", tx.Hex(),
@@ -282,11 +280,10 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 			for _, output := range tx.Outputs {
 				outputSats += output.Satoshis
 			}
-			actualFee := int64(inputSats) - int64(outputSats)
-			txSize := tx.Size()
 			var feePerKB float64
-			if txSize > 0 {
-				feePerKB = float64(actualFee) / float64(txSize) * 1000
+			txSize := tx.Size()
+			if txSize > 0 && inputSats >= outputSats {
+				feePerKB = float64(inputSats-outputSats) / float64(txSize) * 1000
 			}
 
 			e.logger.Debug("transaction validation failed",
@@ -299,7 +296,6 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 				"outputCount", len(tx.Outputs),
 				"inputSatoshis", inputSats,
 				"outputSatoshis", outputSats,
-				"actualFee", actualFee,
 				"feePerKB", feePerKB,
 				"minFeePerKB", e.txValidator.MinFeePerKB(),
 			)

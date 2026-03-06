@@ -39,6 +39,7 @@ func (h *HexBytes) UnmarshalJSON(data []byte) error {
 type TransactionStatus struct {
 	TxID         string    `json:"txid"`
 	Status       Status    `json:"txStatus"`
+	StatusCode   int       `json:"status,omitempty"`
 	Timestamp    time.Time `json:"timestamp"`
 	BlockHash    string    `json:"blockHash,omitempty"`
 	BlockHeight  uint64    `json:"blockHeight,omitempty"`

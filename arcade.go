@@ -459,7 +459,7 @@ func (a *Arcade) buildMerklePathsForSubtree(
 		var txOffset uint64
 		for i, h := range txHashes {
 			if h == trackedHash {
-				txOffset = uint64(i)
+				txOffset = uint64(i) //nolint:gosec // G115: slice index always non-negative
 				break
 			}
 		}
@@ -473,7 +473,7 @@ func (a *Arcade) buildMerklePathsForSubtree(
 			hashCopy := h
 			isTxid := true
 			mp.AddLeaf(0, &transaction.PathElement{
-				Offset: uint64(i),
+				Offset: uint64(i), //nolint:gosec // G115: slice index always non-negative
 				Hash:   &hashCopy,
 				Txid:   &isTxid,
 			})
@@ -494,7 +494,7 @@ func (a *Arcade) buildMerklePathsForSubtree(
 			}
 			hashCopy := subHash
 			mp.AddLeaf(internalHeight, &transaction.PathElement{
-				Offset: subtreeBaseOffset + uint64(i),
+				Offset: subtreeBaseOffset + uint64(i), //nolint:gosec // G115: slice index always non-negative
 				Hash:   &hashCopy,
 			})
 		}
@@ -519,8 +519,10 @@ func (a *Arcade) extractMinimalPath(fullPath *transaction.MerklePath, txOffset u
 
 	offset := txOffset
 	for level := 0; level < len(fullPath.Path); level++ {
-		if leaf := fullPath.FindLeafByOffset(level, offset); leaf != nil {
-			mp.AddLeaf(level, leaf)
+		if level == 0 {
+			if leaf := fullPath.FindLeafByOffset(level, offset); leaf != nil {
+				mp.AddLeaf(level, leaf)
+			}
 		}
 		if sibling := fullPath.FindLeafByOffset(level, offset^1); sibling != nil {
 			mp.AddLeaf(level, sibling)
@@ -976,7 +978,7 @@ func (a *Arcade) fetchBlockSubtrees(ctx context.Context, url string) ([]chainhas
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	resp, err := a.httpClient.Do(req) //nolint:gosec // G704: URL is from configured datahub URLs, not user-controlled input
+	resp, err := a.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch: %w", err)
 	}
@@ -1058,7 +1060,7 @@ func (a *Arcade) fetchHashes(ctx context.Context, url string) ([]chainhash.Hash,
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	resp, err := a.httpClient.Do(req) //nolint:gosec // G704: URL is from configured datahub URLs, not user-controlled input
+	resp, err := a.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch: %w", err)
 	}
