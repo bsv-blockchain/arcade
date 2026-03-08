@@ -126,6 +126,26 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 		}
 	}
 
+	txid := tx.TxID().String()
+
+	// Check for existing status before validation — duplicate submissions return existing status
+	existingStatus, isNew, err := e.store.GetOrInsertStatus(ctx, &models.TransactionStatus{
+		TxID:      txid,
+		Timestamp: time.Now(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to store status: %w", err)
+	}
+
+	if !isNew {
+		e.logger.Debug("duplicate transaction submission",
+			"txid", txid,
+			"existingStatus", existingStatus.Status,
+		)
+		e.txTracker.Add(txid, existingStatus.Status)
+		return existingStatus, nil
+	}
+
 	// Validate transaction
 	if valErr := e.txValidator.ValidateTransaction(ctx, tx, opts.SkipFeeValidation, opts.SkipScriptValidation); valErr != nil {
 		// Calculate actual fee for logging
@@ -145,7 +165,7 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 		}
 
 		e.logger.Debug("transaction validation failed",
-			"txid", tx.TxID().String(),
+			"txid", txid,
 			"error", valErr.Error(),
 			"skipFeeValidation", opts.SkipFeeValidation,
 			"skipScriptValidation", opts.SkipScriptValidation,
@@ -161,23 +181,10 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 		return nil, fmt.Errorf("validation failed: %w", valErr)
 	}
 
-	txid := tx.TxID().String()
-
-	// Get or insert initial status (idempotent - duplicate submissions return existing status)
-	existingStatus, isNew, err := e.store.GetOrInsertStatus(ctx, &models.TransactionStatus{
-		TxID:      txid,
-		Timestamp: time.Now(),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to store status: %w", err)
-	}
-
 	// Track transaction in memory
 	e.txTracker.Add(txid, existingStatus.Status)
 
 	// Create submission record if callback URL or token provided
-	// This happens regardless of whether the transaction is new, allowing
-	// multiple clients to register callbacks for the same transaction
 	if opts.CallbackURL != "" || opts.CallbackToken != "" {
 		if err := e.store.InsertSubmission(ctx, &models.Submission{
 			SubmissionID:      uuid.New().String(),
@@ -188,18 +195,6 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 			CreatedAt:         time.Now(),
 		}); err != nil {
 			return nil, fmt.Errorf("failed to store submission: %w", err)
-		}
-	}
-
-	// Skip rebroadcast if already confirmed on network or rejected
-	if !isNew {
-		//nolint:exhaustive // intentionally only handling terminal states
-		switch existingStatus.Status {
-		case models.StatusSeenOnNetwork, models.StatusMined, models.StatusImmutable,
-			models.StatusRejected, models.StatusDoubleSpendAttempted:
-			return existingStatus, nil
-		default:
-			// Still pending (RECEIVED, SENT_TO_NETWORK, ACCEPTED_BY_NETWORK) - rebroadcast
 		}
 	}
 
@@ -268,7 +263,29 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 			}
 		}
 
-		// Validate transaction
+		txid := tx.TxID().String()
+
+		// Check for existing status before validation — duplicate submissions return existing status
+		existingStatus, isNew, err := e.store.GetOrInsertStatus(ctx, &models.TransactionStatus{
+			TxID:      txid,
+			Timestamp: time.Now(),
+		})
+		if err != nil {
+			// Log error but continue with other transactions
+			continue
+		}
+
+		if !isNew {
+			e.logger.Debug("duplicate transaction submission",
+				"txid", txid,
+				"existingStatus", existingStatus.Status,
+			)
+			e.txTracker.Add(txid, existingStatus.Status)
+			txInfos = append(txInfos, txInfo{tx: tx, rawTx: rawTx, txid: txid, isNew: false, status: existingStatus})
+			continue
+		}
+
+		// Validate transaction (only for new submissions)
 		if valErr := e.txValidator.ValidateTransaction(ctx, tx, opts.SkipFeeValidation, opts.SkipScriptValidation); valErr != nil {
 			// Calculate actual fee for logging
 			var inputSats, outputSats uint64
@@ -287,7 +304,7 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 			}
 
 			e.logger.Debug("transaction validation failed",
-				"txid", tx.TxID().String(),
+				"txid", txid,
 				"error", valErr.Error(),
 				"skipFeeValidation", opts.SkipFeeValidation,
 				"skipScriptValidation", opts.SkipScriptValidation,
@@ -300,18 +317,6 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 				"minFeePerKB", e.txValidator.MinFeePerKB(),
 			)
 			return nil, fmt.Errorf("validation failed: %w", valErr)
-		}
-
-		txid := tx.TxID().String()
-
-		// Get or insert status (idempotent)
-		existingStatus, isNew, err := e.store.GetOrInsertStatus(ctx, &models.TransactionStatus{
-			TxID:      txid,
-			Timestamp: time.Now(),
-		})
-		if err != nil {
-			// Log error but continue with other transactions
-			continue
 		}
 
 		e.txTracker.Add(txid, existingStatus.Status)
