@@ -32,7 +32,7 @@ const schemaRefPrefix = "#/components/schemas/"
 
 // mergeOpenAPISpecs merges the arcade and chaintracks OpenAPI specifications.
 // It prefixes all chaintracks paths with the given pathPrefix.
-func mergeOpenAPISpecs(arcadeJSON string, pathPrefix string) (string, error) {
+func mergeOpenAPISpecs(arcadeJSON, pathPrefix string) (string, error) {
 	arcadeSpec, chaintracksSpec, err := parseSpecs(arcadeJSON)
 	if err != nil {
 		return "", err
@@ -76,7 +76,7 @@ func getOrCreateMap(parent map[string]interface{}, key string) map[string]interf
 	return m
 }
 
-func mergeChainstacksPaths(arcadePaths map[string]interface{}, chaintracksSpec map[string]interface{}, pathPrefix string) {
+func mergeChainstacksPaths(arcadePaths, chaintracksSpec map[string]interface{}, pathPrefix string) {
 	chaintracksPaths, ok := chaintracksSpec["paths"].(map[string]interface{})
 	if !ok {
 		return
