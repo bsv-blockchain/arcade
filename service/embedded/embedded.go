@@ -410,7 +410,7 @@ func (e *Embedded) GetStatus(ctx context.Context, txid string) (*models.Transact
 
 // Subscribe returns a channel for transaction status updates.
 func (e *Embedded) Subscribe(ctx context.Context, callbackToken string) (<-chan *models.TransactionStatus, error) {
-	subCtx, cancel := context.WithCancel(ctx)
+	subCtx, cancel := context.WithCancel(ctx) //nolint:gosec // G118: cancel stored in subChans map, called via Unsubscribe
 	ch := e.arcade.SubscribeStatus(subCtx, callbackToken)
 
 	e.subMu.Lock()

@@ -157,7 +157,7 @@ func waitForShutdown(ctx context.Context, cfg *config.Config, log *slog.Logger, 
 	return nil
 }
 
-func setupServer(arcadeRoutes *fiberRoutes.Routes, chaintracksRts *chaintracksRoutes.Routes, dashboard *Dashboard, authToken string, chaintracksStoragePath string) *fiber.App {
+func setupServer(arcadeRoutes *fiberRoutes.Routes, chaintracksRts *chaintracksRoutes.Routes, dashboard *Dashboard, authToken, chaintracksStoragePath string) *fiber.App {
 	app := fiber.New(fiber.Config{
 		DisableStartupMessage: true,
 	})

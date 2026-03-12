@@ -61,7 +61,7 @@ func (m *sseManager) subscribe(ctx context.Context, callbackToken string) (<-cha
 	defer m.mu.Unlock()
 
 	// Create subscriber
-	subCtx, subCancel := context.WithCancel(ctx)
+	subCtx, subCancel := context.WithCancel(ctx) //nolint:gosec // G118: cancel stored in subscriber struct, called via unsubscribe or parent context cancellation
 	sub := &subscriber{
 		id:     m.nextSubID,
 		ch:     make(chan *models.TransactionStatus, 100),
@@ -132,7 +132,7 @@ func (m *sseManager) removeSubscriber(sub *subscriber) {
 
 // createConnection creates a new SSE connection for the given token.
 func (m *sseManager) createConnection(token string) *sseConnection {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background()) //nolint:gosec // G118: cancel stored in sseConnection struct, called in removeSubscriber
 	conn := &sseConnection{
 		token:       token,
 		ctx:         ctx,
