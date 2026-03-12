@@ -35,7 +35,7 @@ func main() {
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Fatalf("Failed to connect: %d", resp.StatusCode) //nolint:gosec // G706: status code is safe to log
+		log.Fatalf("Failed to connect: %d", resp.StatusCode)
 	}
 
 	log.Println("Connected to SSE stream...")
@@ -49,7 +49,7 @@ func main() {
 		if line == "" {
 			// Empty line signals end of event
 			if eventData != "" {
-				log.Printf("[ID: %s] [Type: %s] %s\n", eventID, eventType, eventData) //nolint:gosec // G706: SSE event data logging in example client
+				log.Printf("[ID: %s] [Type: %s] %s\n", eventID, eventType, eventData)
 				eventID, eventType, eventData = "", "", ""
 			}
 			continue
