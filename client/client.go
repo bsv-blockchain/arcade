@@ -70,7 +70,7 @@ func (c *Client) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mode
 	req.Header.Set("Content-Type", "application/octet-stream")
 	c.setSubmitHeaders(req, opts)
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.httpClient.Do(req) //nolint:gosec // G704: URL constructed from trusted baseURL config
 	if err != nil {
 		return nil, fmt.Errorf("failed to submit transaction: %w", err)
 	}
@@ -113,7 +113,7 @@ func (c *Client) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts *
 	req.Header.Set("Content-Type", "application/json")
 	c.setSubmitHeaders(req, opts)
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.httpClient.Do(req) //nolint:gosec // G704: URL constructed from trusted baseURL config
 	if err != nil {
 		return nil, fmt.Errorf("failed to submit transactions: %w", err)
 	}
@@ -138,7 +138,7 @@ func (c *Client) GetStatus(ctx context.Context, txid string) (*models.Transactio
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.httpClient.Do(req) //nolint:gosec // G704: URL constructed from trusted baseURL config
 	if err != nil {
 		return nil, fmt.Errorf("failed to get status: %w", err)
 	}

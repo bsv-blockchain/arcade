@@ -459,7 +459,7 @@ func (a *Arcade) buildMerklePathsForSubtree(
 		var txOffset uint64
 		for i, h := range txHashes {
 			if h == trackedHash {
-				txOffset = uint64(i) //nolint:gosec // G115: slice index always non-negative
+				txOffset = uint64(i)
 				break
 			}
 		}
@@ -473,7 +473,7 @@ func (a *Arcade) buildMerklePathsForSubtree(
 			hashCopy := h
 			isTxid := true
 			mp.AddLeaf(0, &transaction.PathElement{
-				Offset: uint64(i), //nolint:gosec // G115: slice index always non-negative
+				Offset: uint64(i),
 				Hash:   &hashCopy,
 				Txid:   &isTxid,
 			})
@@ -494,7 +494,7 @@ func (a *Arcade) buildMerklePathsForSubtree(
 			}
 			hashCopy := subHash
 			mp.AddLeaf(internalHeight, &transaction.PathElement{
-				Offset: subtreeBaseOffset + uint64(i), //nolint:gosec // G115: slice index always non-negative
+				Offset: subtreeBaseOffset + uint64(i),
 				Hash:   &hashCopy,
 			})
 		}

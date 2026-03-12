@@ -2,6 +2,8 @@ module github.com/bsv-blockchain/arcade
 
 go 1.25.4
 
+toolchain go1.26.1
+
 require (
 	github.com/bsv-blockchain/go-chaintracks v1.1.2
 	github.com/bsv-blockchain/go-p2p-message-bus v0.1.11
