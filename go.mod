@@ -2,10 +2,12 @@ module github.com/bsv-blockchain/arcade
 
 go 1.25.4
 
+toolchain go1.26.1
+
 require (
 	github.com/bsv-blockchain/go-chaintracks v1.1.2
 	github.com/bsv-blockchain/go-p2p-message-bus v0.1.11
-	github.com/bsv-blockchain/go-sdk v1.2.18
+	github.com/bsv-blockchain/go-sdk v1.2.19
 	github.com/bsv-blockchain/go-teranode-p2p-client v0.2.0
 	github.com/bsv-blockchain/teranode v0.13.2
 	github.com/gofiber/fiber/v2 v2.52.12

@@ -35,7 +35,7 @@ func main() {
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Fatalf("Failed to connect: %s", resp.Status)
+		log.Fatalf("Failed to connect: %d", resp.StatusCode)
 	}
 
 	log.Println("Connected to SSE stream...")
