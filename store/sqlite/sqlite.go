@@ -462,9 +462,6 @@ func (s *Store) Close() error {
 	return nil
 }
 
-// Helper functions
-
-
 func scanTransactionStatus(row *sql.Row) (*models.TransactionStatus, error) {
 	var status models.TransactionStatus
 	var blockHash, extraInfo, competingTxsJSON sql.NullString
