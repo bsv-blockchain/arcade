@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path"
+	"strings"
 
 	"github.com/bsv-blockchain/go-chaintracks/chaintracks"
 	p2p "github.com/bsv-blockchain/go-teranode-p2p-client"
@@ -17,6 +18,7 @@ import (
 	"github.com/bsv-blockchain/arcade/events/memory"
 	"github.com/bsv-blockchain/arcade/handlers"
 	"github.com/bsv-blockchain/arcade/logging"
+	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/service"
 	"github.com/bsv-blockchain/arcade/service/embedded"
@@ -49,12 +51,13 @@ type Services struct {
 	Store          store.Store
 	TxTracker      *store.TxTracker
 	EventPublisher events.Publisher
-	TeranodeClient *teranode.Client
-	Validator      *validator.Validator
-	WebhookHandler *handlers.WebhookHandler
-	Logger         *slog.Logger
-	Config         *Config
-	ownsP2PClient  bool
+	TeranodeClient     *teranode.Client
+	MerkleServiceClient *merkleservice.Client
+	Validator          *validator.Validator
+	WebhookHandler     *handlers.WebhookHandler
+	Logger             *slog.Logger
+	Config             *Config
+	ownsP2PClient      bool
 }
 
 // Initialize creates and returns all application services.
@@ -150,6 +153,13 @@ func (c *Config) initializeEmbedded(ctx context.Context, logger *slog.Logger, ch
 	}
 	teranodeClient := teranode.NewClient(c.Teranode.BroadcastURLs, c.Teranode.AuthToken)
 
+	// Initialize Merkle Service client (optional)
+	var merkleServiceClient *merkleservice.Client
+	if c.MerkleService.URL != "" {
+		logger.Info("Initializing Merkle Service client", slog.String("url", c.MerkleService.URL))
+		merkleServiceClient = merkleservice.NewClient(c.MerkleService.URL, c.MerkleService.AuthToken, c.MerkleService.Timeout)
+	}
+
 	// Initialize transaction tracker
 	logger.Info("Initializing transaction tracker")
 	txTracker := store.NewTxTracker()
@@ -206,13 +216,14 @@ func (c *Config) initializeEmbedded(ctx context.Context, logger *slog.Logger, ch
 	// Initialize Arcade P2P listener
 	logger.Info("Initializing Arcade P2P listener")
 	arcadeInstance, arcErr := arcade.NewArcade(arcade.Config{
-		P2PClient:      p2pClient,
-		Chaintracks:    chaintracker,
-		Logger:         logger,
-		TxTracker:      txTracker,
-		Store:          sqliteStore,
-		EventPublisher: eventPublisher,
-		DataHubURLs:    c.Teranode.DataHubURLs,
+		P2PClient:            p2pClient,
+		Chaintracks:          chaintracker,
+		Logger:               logger,
+		TxTracker:            txTracker,
+		Store:                sqliteStore,
+		EventPublisher:       eventPublisher,
+		DataHubURLs:          c.Teranode.DataHubURLs,
+		MerkleServiceEnabled: merkleServiceClient != nil,
 	})
 	if arcErr != nil {
 		if ownsP2PClient {
@@ -237,16 +248,24 @@ func (c *Config) initializeEmbedded(ctx context.Context, logger *slog.Logger, ch
 		MiningFeeSatoshis:       c.Validator.MinFeePerKB,
 	}
 
+	// Build Merkle Service callback URL
+	var merkleServiceCallbackURL string
+	if c.MerkleService.CallbackBaseURL != "" {
+		merkleServiceCallbackURL = strings.TrimSuffix(c.MerkleService.CallbackBaseURL, "/") + "/api/v1/merkle-service/callback"
+	}
+
 	// Create embedded service
 	embeddedService, err := embedded.New(embedded.Config{
-		Store:          sqliteStore,
-		TxTracker:      txTracker,
-		EventPublisher: eventPublisher,
-		TeranodeClient: teranodeClient,
-		TxValidator:    txValidator,
-		Arcade:         arcadeInstance,
-		Policy:         policy,
-		Logger:         logger,
+		Store:                      sqliteStore,
+		TxTracker:                  txTracker,
+		EventPublisher:             eventPublisher,
+		TeranodeClient:             teranodeClient,
+		MerkleServiceClient:        merkleServiceClient,
+		MerkleServiceCallbackURL:   merkleServiceCallbackURL,
+		TxValidator:                txValidator,
+		Arcade:                     arcadeInstance,
+		Policy:                     policy,
+		Logger:                     logger,
 	})
 	if err != nil {
 		_ = arcadeInstance.Stop()
@@ -275,19 +294,20 @@ func (c *Config) initializeEmbedded(ctx context.Context, logger *slog.Logger, ch
 	}
 
 	return &Services{
-		ArcadeService:  embeddedService,
-		P2PClient:      p2pClient,
-		Chaintracks:    chaintracker,
-		Arcade:         arcadeInstance,
-		Store:          sqliteStore,
-		TxTracker:      txTracker,
-		EventPublisher: eventPublisher,
-		TeranodeClient: teranodeClient,
-		Validator:      txValidator,
-		WebhookHandler: webhookHandler,
-		Logger:         logger,
-		Config:         c,
-		ownsP2PClient:  ownsP2PClient,
+		ArcadeService:       embeddedService,
+		P2PClient:           p2pClient,
+		Chaintracks:         chaintracker,
+		Arcade:              arcadeInstance,
+		Store:               sqliteStore,
+		TxTracker:           txTracker,
+		EventPublisher:      eventPublisher,
+		TeranodeClient:      teranodeClient,
+		MerkleServiceClient: merkleServiceClient,
+		Validator:           txValidator,
+		WebhookHandler:      webhookHandler,
+		Logger:              logger,
+		Config:              c,
+		ownsP2PClient:       ownsP2PClient,
 	}, nil
 }
 

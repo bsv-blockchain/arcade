@@ -15,6 +15,7 @@ import (
 
 	"github.com/bsv-blockchain/arcade"
 	"github.com/bsv-blockchain/arcade/events"
+	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/service"
 	"github.com/bsv-blockchain/arcade/store"
@@ -39,26 +40,30 @@ var (
 
 // Config holds configuration for the embedded service.
 type Config struct {
-	Store          store.Store
-	TxTracker      *store.TxTracker
-	EventPublisher events.Publisher
-	TeranodeClient *teranode.Client
-	TxValidator    *validator.Validator
-	Arcade         *arcade.Arcade
-	Policy         *models.Policy
-	Logger         *slog.Logger
+	Store                      store.Store
+	TxTracker                  *store.TxTracker
+	EventPublisher             events.Publisher
+	TeranodeClient             *teranode.Client
+	MerkleServiceClient        *merkleservice.Client // Optional: nil disables Merkle Service integration
+	MerkleServiceCallbackURL   string                // Full callback URL sent to Merkle Service during registration
+	TxValidator                *validator.Validator
+	Arcade                     *arcade.Arcade
+	Policy                     *models.Policy
+	Logger                     *slog.Logger
 }
 
 // Embedded is an in-process implementation of ArcadeService.
 type Embedded struct {
-	store          store.Store
-	txTracker      *store.TxTracker
-	eventPublisher events.Publisher
-	teranodeClient *teranode.Client
-	txValidator    *validator.Validator
-	arcade         *arcade.Arcade
-	policy         *models.Policy
-	logger         *slog.Logger
+	store                    store.Store
+	txTracker                *store.TxTracker
+	eventPublisher           events.Publisher
+	teranodeClient           *teranode.Client
+	merkleServiceClient      *merkleservice.Client
+	merkleServiceCallbackURL string
+	txValidator              *validator.Validator
+	arcade                   *arcade.Arcade
+	policy                   *models.Policy
+	logger                   *slog.Logger
 
 	// Subscription tracking
 	subMu    sync.RWMutex
@@ -93,15 +98,17 @@ func New(cfg Config) (*Embedded, error) {
 	}
 
 	return &Embedded{
-		store:          cfg.Store,
-		txTracker:      cfg.TxTracker,
-		eventPublisher: cfg.EventPublisher,
-		teranodeClient: cfg.TeranodeClient,
-		txValidator:    cfg.TxValidator,
-		arcade:         cfg.Arcade,
-		policy:         cfg.Policy,
-		logger:         cfg.Logger,
-		subChans:       make(map[<-chan *models.TransactionStatus]context.CancelFunc),
+		store:                    cfg.Store,
+		txTracker:                cfg.TxTracker,
+		eventPublisher:           cfg.EventPublisher,
+		teranodeClient:           cfg.TeranodeClient,
+		merkleServiceClient:      cfg.MerkleServiceClient,
+		merkleServiceCallbackURL: cfg.MerkleServiceCallbackURL,
+		txValidator:              cfg.TxValidator,
+		arcade:                   cfg.Arcade,
+		policy:                   cfg.Policy,
+		logger:                   cfg.Logger,
+		subChans:                 make(map[<-chan *models.TransactionStatus]context.CancelFunc),
 	}, nil
 }
 
@@ -198,6 +205,9 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 		}
 	}
 
+	// Register with Merkle Service before broadcasting (best-effort)
+	e.registerWithMerkleService(ctx, txid)
+
 	// Submit to teranode endpoints synchronously with timeout
 	// Wait for first success/rejection, or timeout after 15 seconds
 	endpoints := e.teranodeClient.GetEndpoints()
@@ -232,6 +242,20 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 	case <-submitCtx.Done():
 		// Timeout - return current status (RECEIVED)
 		return e.store.GetStatus(ctx, txid)
+	}
+}
+
+// registerWithMerkleService registers a transaction with the Merkle Service.
+// Failures are logged but do not block the broadcast.
+func (e *Embedded) registerWithMerkleService(ctx context.Context, txid string) {
+	if e.merkleServiceClient == nil || e.merkleServiceCallbackURL == "" {
+		return
+	}
+
+	if err := e.merkleServiceClient.Register(ctx, txid, e.merkleServiceCallbackURL); err != nil {
+		e.logger.Warn("failed to register transaction with Merkle Service",
+			slog.String("txid", txid),
+			slog.String("error", err.Error()))
 	}
 }
 
@@ -357,6 +381,9 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 				// Still pending (RECEIVED, SENT_TO_NETWORK, ACCEPTED_BY_NETWORK) - rebroadcast
 			}
 		}
+
+		// Register with Merkle Service before broadcasting (best-effort)
+		e.registerWithMerkleService(ctx, info.txid)
 
 		rawTx := info.tx.Bytes()
 

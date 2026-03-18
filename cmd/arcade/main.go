@@ -27,6 +27,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -106,6 +107,20 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		log.Info("Chaintracks HTTP API enabled", slog.String("routes", "/chaintracks/v1/*, /chaintracks/v2/*"))
 	}
 
+	// Setup Merkle Service callback handler (if configured)
+	var callbackHandler *fiberRoutes.CallbackHandler
+	if services.MerkleServiceClient != nil && services.Arcade != nil {
+		callbackHandler = fiberRoutes.NewCallbackHandler(fiberRoutes.CallbackConfig{
+			Store:           services.Store,
+			EventPublisher:  services.EventPublisher,
+			TxTracker:       services.TxTracker,
+			BUMPConstructor: services.Arcade,
+			CallbackToken:   cfg.MerkleService.CallbackToken,
+			Logger:          log,
+		})
+		log.Info("Merkle Service callback endpoint enabled")
+	}
+
 	// Setup dashboard
 	dashboard := NewDashboard(services.Arcade)
 
@@ -116,7 +131,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		authToken = cfg.Auth.Token
 		log.Info("API authentication enabled")
 	}
-	app := setupServer(arcadeRoutes, chaintracksRts, dashboard, authToken, cfg.Chaintracks.StoragePath)
+	app := setupServer(arcadeRoutes, callbackHandler, chaintracksRts, dashboard, authToken, cfg.Chaintracks.StoragePath)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -157,7 +172,7 @@ func waitForShutdown(ctx context.Context, cfg *config.Config, log *slog.Logger, 
 	return nil
 }
 
-func setupServer(arcadeRoutes *fiberRoutes.Routes, chaintracksRts *chaintracksRoutes.Routes, dashboard *Dashboard, authToken, chaintracksStoragePath string) *fiber.App {
+func setupServer(arcadeRoutes *fiberRoutes.Routes, callbackHandler *fiberRoutes.CallbackHandler, chaintracksRts *chaintracksRoutes.Routes, dashboard *Dashboard, authToken, chaintracksStoragePath string) *fiber.App {
 	app := fiber.New(fiber.Config{
 		DisableStartupMessage: true,
 	})
@@ -178,6 +193,11 @@ func setupServer(arcadeRoutes *fiberRoutes.Routes, chaintracksRts *chaintracksRo
 
 	// Transaction endpoints (ARC-compatible)
 	arcadeRoutes.Register(app)
+
+	// Merkle Service callback endpoint (if configured)
+	if callbackHandler != nil {
+		callbackHandler.Register(app)
+	}
 
 	// Chaintracks endpoints (block header tracking)
 	if chaintracksRts != nil {
@@ -229,7 +249,7 @@ func setupServer(arcadeRoutes *fiberRoutes.Routes, chaintracksRts *chaintracksRo
 func authMiddleware(token string) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		path := c.Path()
-		if path == "/health" || path == "/policy" || path == "/status" || path == "/docs" || path == "/docs/*" {
+		if path == "/health" || path == "/policy" || path == "/status" || path == "/docs" || path == "/docs/*" || strings.HasPrefix(path, "/api/v1/merkle-service/") {
 			return c.Next()
 		}
 

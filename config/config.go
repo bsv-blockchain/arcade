@@ -27,6 +27,7 @@ type Config struct {
 	Validator         ValidatorConfig          `mapstructure:"validator"`
 	Auth              AuthConfig               `mapstructure:"auth"`
 	Webhook           WebhookConfig            `mapstructure:"webhook"`
+	MerkleService     MerkleServiceConfig      `mapstructure:"merkle_service"`
 	ChaintracksServer ChaintracksServerConfig  `mapstructure:"chaintracks_server"`
 	Chaintracks       chaintracksconfig.Config `mapstructure:"chaintracks"`
 }
@@ -81,6 +82,13 @@ func (c *Config) SetDefaults(v *viper.Viper, prefix string) {
 	v.SetDefault(p+"webhook.prune_interval", "1h")
 	v.SetDefault(p+"webhook.max_age", "24h")
 	v.SetDefault(p+"webhook.max_retries", 10)
+
+	// Merkle Service defaults
+	v.SetDefault(p+"merkle_service.url", "")
+	v.SetDefault(p+"merkle_service.auth_token", "")
+	v.SetDefault(p+"merkle_service.callback_base_url", "")
+	v.SetDefault(p+"merkle_service.callback_token", "")
+	v.SetDefault(p+"merkle_service.timeout", "30s")
 
 	// Chaintracks server defaults
 	v.SetDefault(p+"chaintracks_server.enabled", true)
@@ -139,6 +147,15 @@ type WebhookConfig struct {
 	PruneInterval time.Duration `mapstructure:"prune_interval"`
 	MaxAge        time.Duration `mapstructure:"max_age"`
 	MaxRetries    int           `mapstructure:"max_retries"`
+}
+
+// MerkleServiceConfig holds configuration for the Merkle Service integration
+type MerkleServiceConfig struct {
+	URL             string        `mapstructure:"url"`              // Merkle Service API base URL
+	AuthToken       string        `mapstructure:"auth_token"`       // Bearer token for authenticating with Merkle Service
+	CallbackBaseURL string        `mapstructure:"callback_base_url"` // Base URL for Arcade's callback endpoint
+	CallbackToken   string        `mapstructure:"callback_token"`   // Bearer token Merkle Service uses when calling back
+	Timeout         time.Duration `mapstructure:"timeout"`          // HTTP request timeout
 }
 
 // ChaintracksServerConfig holds configuration for the chaintracks HTTP API routes.

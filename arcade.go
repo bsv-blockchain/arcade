@@ -58,6 +58,10 @@ type Config struct {
 	// DataHubURLs are fallback URLs for fetching block/subtree data
 	// when the URL in P2P messages fails
 	DataHubURLs []string
+
+	// MerkleServiceEnabled disables subtree P2P listening and legacy block scanning
+	// when Merkle Service integration is active. BUMP construction is driven by callbacks instead.
+	MerkleServiceEnabled bool
 }
 
 // Arcade tracks transaction statuses via P2P network messages.
@@ -74,6 +78,9 @@ type Arcade struct {
 
 	// Fallback DataHub URLs for fetching block/subtree data
 	dataHubURLs []string
+
+	// Merkle Service integration
+	merkleServiceEnabled bool
 
 	// Status subscribers (fan-out)
 	subMu         sync.RWMutex
@@ -111,14 +118,15 @@ func NewArcade(cfg Config) (*Arcade, error) {
 	}
 
 	return &Arcade{
-		p2pClient:      cfg.P2PClient,
-		chaintracks:    cfg.Chaintracks,
-		logger:         cfg.Logger,
-		httpClient:     &http.Client{Timeout: 30 * time.Second},
-		txTracker:      cfg.TxTracker,
-		store:          cfg.Store,
-		eventPublisher: cfg.EventPublisher,
-		dataHubURLs:    cfg.DataHubURLs,
+		p2pClient:            cfg.P2PClient,
+		chaintracks:          cfg.Chaintracks,
+		logger:               cfg.Logger,
+		httpClient:           &http.Client{Timeout: 30 * time.Second},
+		txTracker:            cfg.TxTracker,
+		store:                cfg.Store,
+		eventPublisher:       cfg.EventPublisher,
+		dataHubURLs:          cfg.DataHubURLs,
+		merkleServiceEnabled: cfg.MerkleServiceEnabled,
 	}, nil
 }
 
@@ -126,13 +134,18 @@ func NewArcade(cfg Config) (*Arcade, error) {
 func (a *Arcade) Start(ctx context.Context) error {
 	a.logger.Info("Starting Arcade P2P subscriptions")
 
-	// Subscribe to block messages for merkle proof extraction
+	// Subscribe to block messages for block tracking and (legacy) merkle proof extraction
 	blockChan := a.p2pClient.SubscribeBlocks(ctx)
 	go a.handleBlockMessages(ctx, blockChan)
 
-	// Subscribe to subtree messages for SEEN_ON_NETWORK status
-	subtreeChan := a.p2pClient.SubscribeSubtrees(ctx)
-	go a.handleSubtreeMessages(ctx, subtreeChan)
+	// Subscribe to subtree messages for SEEN_ON_NETWORK status (legacy mode only)
+	// When Merkle Service is enabled, SEEN_ON_NETWORK is driven by callbacks
+	if !a.merkleServiceEnabled {
+		subtreeChan := a.p2pClient.SubscribeSubtrees(ctx)
+		go a.handleSubtreeMessages(ctx, subtreeChan)
+	} else {
+		a.logger.Info("Merkle Service enabled: skipping subtree P2P subscription")
+	}
 
 	// Subscribe to rejected-tx messages
 	rejectedTxChan := a.p2pClient.SubscribeRejectedTxs(ctx)
@@ -289,10 +302,11 @@ func (a *Arcade) processBlockMessage(ctx context.Context, blockMsg teranode.Bloc
 		slog.String("hash", blockMsg.Hash),
 		slog.Uint64("height", uint64(blockMsg.Height)))
 
-	// Only do transaction scanning if we have transactions to track
+	// When Merkle Service is enabled, skip subtree scanning — BUMP construction
+	// is driven by Merkle Service callbacks (STUMP + BLOCK_PROCESSED)
 	//nolint:nestif // complex nested logic for conditional transaction processing
-	if a.txTracker.Count() > 0 {
-		// Process transactions to extract merkle proofs
+	if !a.merkleServiceEnabled && a.txTracker.Count() > 0 {
+		// Legacy mode: scan subtrees for tracked transactions and build merkle proofs
 		if err := a.processBlockTransactions(ctx, blockMsg); err != nil {
 			return err
 		}
@@ -315,6 +329,9 @@ func (a *Arcade) processBlockMessage(ctx context.Context, blockMsg teranode.Bloc
 		}
 
 		// Prune deeply confirmed transactions
+		a.pruneConfirmedTransactions(ctx, blockMsg.Height)
+	} else if a.txTracker.Count() > 0 {
+		// Merkle Service mode: still prune confirmed transactions
 		a.pruneConfirmedTransactions(ctx, blockMsg.Height)
 	}
 
@@ -737,6 +754,13 @@ func (a *Arcade) handleOrphanedBlock(ctx context.Context, orphan OrphanedBlock) 
 		return fmt.Errorf("failed to mark block off-chain: %w", err)
 	}
 
+	// Clean up STUMPs for orphaned block (Merkle Service integration)
+	if err := a.store.DeleteStumpsByBlockHash(ctx, orphan.Hash); err != nil {
+		a.logger.Warn("failed to delete STUMPs for orphaned block",
+			slog.String("blockHash", orphan.Hash),
+			slog.String("error", err.Error()))
+	}
+
 	// Reset transaction statuses to SEEN_ON_NETWORK
 	txids, err := a.store.SetStatusByBlockHash(ctx, orphan.Hash, models.StatusSeenOnNetwork)
 	if err != nil {
@@ -783,10 +807,11 @@ func (a *Arcade) processBlockByHeader(ctx context.Context, header *chaintracks.B
 		slog.Int("trackedTxCount", trackedCount),
 		slog.Int("dataHubURLCount", dataHubCount))
 
-	// Only do transaction scanning if we have transactions to track
-	// AND we have DataHub URLs configured
-	if trackedCount > 0 && dataHubCount > 0 {
-		// Create block message using configured DataHub URL
+	// Only do transaction scanning if we have transactions to track,
+	// DataHub URLs are configured, AND Merkle Service is NOT enabled.
+	// When Merkle Service is enabled, BUMP construction is callback-driven.
+	if !a.merkleServiceEnabled && trackedCount > 0 && dataHubCount > 0 {
+		// Legacy mode: scan subtrees for tracked transactions
 		blockMsg := teranode.BlockMessage{
 			Hash:       blockHash,
 			Height:     header.Height,

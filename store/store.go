@@ -70,6 +70,17 @@ type Store interface {
 	// MarkBlockOffChain marks a block as off-chain (orphaned due to reorg)
 	MarkBlockOffChain(ctx context.Context, blockHash string) error
 
+	// STUMP operations for Merkle Service integration
+
+	// InsertStump stores a STUMP for a transaction in a specific block.
+	InsertStump(ctx context.Context, stump *models.Stump) error
+
+	// GetStumpsByBlockHash retrieves all STUMPs for a given block hash.
+	GetStumpsByBlockHash(ctx context.Context, blockHash string) ([]*models.Stump, error)
+
+	// DeleteStumpsByBlockHash removes all STUMPs for a given block hash (used during reorg cleanup).
+	DeleteStumpsByBlockHash(ctx context.Context, blockHash string) error
+
 	// Close closes the database connection
 	Close() error
 }

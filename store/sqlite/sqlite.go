@@ -68,6 +68,18 @@ CREATE INDEX IF NOT EXISTS idx_submissions_txid ON submissions(txid);
 CREATE INDEX IF NOT EXISTS idx_submissions_callback_token ON submissions(callback_token);
 CREATE INDEX IF NOT EXISTS idx_next_retry ON submissions(next_retry_at);
 `
+
+	createStumpsTable = `
+CREATE TABLE IF NOT EXISTS stumps (
+	txid TEXT NOT NULL,
+	block_hash TEXT NOT NULL,
+	subtree_index INTEGER NOT NULL,
+	stump_data BLOB NOT NULL,
+	created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (txid, block_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_stumps_block_hash ON stumps(block_hash);
+`
 )
 
 // Store implements store.StatusStore and store.SubmissionStore using SQLite
@@ -100,6 +112,10 @@ func NewStore(dbPath string) (*Store, error) {
 
 	if err := initializeSchema(db, createSubmissionsTable); err != nil {
 		return nil, fmt.Errorf("failed to initialize submissions schema: %w", err)
+	}
+
+	if err := initializeSchema(db, createStumpsTable); err != nil {
+		return nil, fmt.Errorf("failed to initialize stumps schema: %w", err)
 	}
 
 	return &Store{db: db}, nil
@@ -506,6 +522,62 @@ func (s *Store) MarkBlockOffChain(ctx context.Context, blockHash string) error {
 		blockHash)
 	if err != nil {
 		return fmt.Errorf("failed to mark block off-chain: %w", err)
+	}
+	return nil
+}
+
+// STUMP operations
+
+// InsertStump stores a STUMP for a transaction in a specific block.
+func (s *Store) InsertStump(ctx context.Context, stump *models.Stump) error {
+	query := `
+INSERT INTO stumps (txid, block_hash, subtree_index, stump_data, created_at)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT (txid, block_hash) DO UPDATE SET
+    subtree_index = excluded.subtree_index,
+    stump_data = excluded.stump_data
+`
+	_, err := s.db.ExecContext(ctx, query, stump.TxID, stump.BlockHash, stump.SubtreeIndex, stump.StumpData, time.Now())
+	if err != nil {
+		return fmt.Errorf("failed to insert stump: %w", err)
+	}
+	return nil
+}
+
+// GetStumpsByBlockHash retrieves all STUMPs for a given block hash.
+func (s *Store) GetStumpsByBlockHash(ctx context.Context, blockHash string) ([]*models.Stump, error) {
+	query := `
+SELECT txid, block_hash, subtree_index, stump_data
+FROM stumps
+WHERE block_hash = ?
+`
+	rows, err := s.db.QueryContext(ctx, query, blockHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query stumps: %w", err)
+	}
+	defer func() {
+		_ = rows.Close()
+	}()
+
+	var stumps []*models.Stump
+	for rows.Next() {
+		var stump models.Stump
+		if err := rows.Scan(&stump.TxID, &stump.BlockHash, &stump.SubtreeIndex, &stump.StumpData); err != nil {
+			return nil, fmt.Errorf("failed to scan stump: %w", err)
+		}
+		stumps = append(stumps, &stump)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating stump rows: %w", err)
+	}
+	return stumps, nil
+}
+
+// DeleteStumpsByBlockHash removes all STUMPs for a given block hash.
+func (s *Store) DeleteStumpsByBlockHash(ctx context.Context, blockHash string) error {
+	_, err := s.db.ExecContext(ctx, "DELETE FROM stumps WHERE block_hash = ?", blockHash)
+	if err != nil {
+		return fmt.Errorf("failed to delete stumps: %w", err)
 	}
 	return nil
 }
