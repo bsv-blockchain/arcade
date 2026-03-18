@@ -519,8 +519,10 @@ func (a *Arcade) extractMinimalPath(fullPath *transaction.MerklePath, txOffset u
 
 	offset := txOffset
 	for level := 0; level < len(fullPath.Path); level++ {
-		if leaf := fullPath.FindLeafByOffset(level, offset); leaf != nil {
-			mp.AddLeaf(level, leaf)
+		if level == 0 {
+			if leaf := fullPath.FindLeafByOffset(level, offset); leaf != nil {
+				mp.AddLeaf(level, leaf)
+			}
 		}
 		if sibling := fullPath.FindLeafByOffset(level, offset^1); sibling != nil {
 			mp.AddLeaf(level, sibling)
@@ -976,7 +978,7 @@ func (a *Arcade) fetchBlockSubtrees(ctx context.Context, url string) ([]chainhas
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	resp, err := a.httpClient.Do(req) //nolint:gosec // G704: URL is from configured datahub URLs, not user-controlled input
+	resp, err := a.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch: %w", err)
 	}
@@ -1058,7 +1060,7 @@ func (a *Arcade) fetchHashes(ctx context.Context, url string) ([]chainhash.Hash,
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	resp, err := a.httpClient.Do(req) //nolint:gosec // G704: URL is from configured datahub URLs, not user-controlled input
+	resp, err := a.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch: %w", err)
 	}
