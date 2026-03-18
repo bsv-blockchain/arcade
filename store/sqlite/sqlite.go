@@ -24,50 +24,6 @@ PRAGMA journal_mode=WAL;
 PRAGMA busy_timeout=5000;
 PRAGMA synchronous=NORMAL;
 `
-
-	createTransactionsTable = `
-CREATE TABLE IF NOT EXISTS transactions (
-	txid TEXT PRIMARY KEY,
-	status TEXT NOT NULL,
-	timestamp DATETIME NOT NULL,
-	block_hash TEXT,
-	extra_info TEXT,
-	competing_txs TEXT DEFAULT '{}',
-	created_at DATETIME NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_transactions_timestamp ON transactions(timestamp);
-CREATE INDEX IF NOT EXISTS idx_transactions_status ON transactions(status);
-CREATE INDEX IF NOT EXISTS idx_transactions_block_hash ON transactions(block_hash);
-`
-
-	createMerklePathsTable = `
-CREATE TABLE IF NOT EXISTS merkle_paths (
-	txid TEXT NOT NULL,
-	block_hash TEXT NOT NULL,
-	block_height INTEGER NOT NULL,
-	merkle_path BLOB NOT NULL,
-	created_at DATETIME NOT NULL,
-	PRIMARY KEY (txid, block_hash)
-);
-CREATE INDEX IF NOT EXISTS idx_merkle_paths_block_hash ON merkle_paths(block_hash);
-`
-
-	createSubmissionsTable = `
-CREATE TABLE IF NOT EXISTS submissions (
-	submission_id TEXT PRIMARY KEY,
-	txid TEXT NOT NULL,
-	callback_url TEXT,
-	callback_token TEXT,
-	full_status_updates INTEGER DEFAULT 0,
-	last_delivered_status TEXT,
-	retry_count INTEGER DEFAULT 0,
-	next_retry_at DATETIME,
-	created_at DATETIME NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_submissions_txid ON submissions(txid);
-CREATE INDEX IF NOT EXISTS idx_submissions_callback_token ON submissions(callback_token);
-CREATE INDEX IF NOT EXISTS idx_next_retry ON submissions(next_retry_at);
-`
 )
 
 // Store implements store.StatusStore and store.SubmissionStore using SQLite
@@ -88,18 +44,6 @@ func NewStore(dbPath string) (*Store, error) {
 
 	if err := db.PingContext(context.Background()); err != nil {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
-	}
-
-	if err := initializeSchema(db, createTransactionsTable); err != nil {
-		return nil, fmt.Errorf("failed to initialize transactions schema: %w", err)
-	}
-
-	if err := initializeSchema(db, createMerklePathsTable); err != nil {
-		return nil, fmt.Errorf("failed to initialize merkle_paths schema: %w", err)
-	}
-
-	if err := initializeSchema(db, createSubmissionsTable); err != nil {
-		return nil, fmt.Errorf("failed to initialize submissions schema: %w", err)
 	}
 
 	return &Store{db: db}, nil
@@ -520,18 +464,6 @@ func (s *Store) Close() error {
 
 // Helper functions
 
-func initializeSchema(db *sql.DB, schema string) error {
-	for _, stmt := range strings.Split(schema, ";") {
-		stmt = strings.TrimSpace(stmt)
-		if stmt == "" {
-			continue
-		}
-		if _, err := db.ExecContext(context.Background(), stmt); err != nil {
-			return fmt.Errorf("failed to execute schema statement: %w", err)
-		}
-	}
-	return nil
-}
 
 func scanTransactionStatus(row *sql.Row) (*models.TransactionStatus, error) {
 	var status models.TransactionStatus
