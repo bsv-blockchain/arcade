@@ -517,7 +517,7 @@ func (a *Arcade) buildMerklePathsForSubtree(
 		}
 
 		mp.ComputeMissingHashes()
-		minimalPath := a.extractMinimalPath(mp, txOffset)
+		minimalPath := ExtractMinimalPath(mp, txOffset)
 
 		if err := a.store.InsertMerklePath(ctx, trackedHash.String(), blockMsg.Hash, uint64(blockMsg.Height), minimalPath.Bytes()); err != nil {
 			a.logger.Error("failed to store merkle path",
@@ -528,26 +528,10 @@ func (a *Arcade) buildMerklePathsForSubtree(
 	}
 }
 
+// extractMinimalPath delegates to the package-level ExtractMinimalPath.
+// Kept for backward compatibility with any callers using the method form.
 func (a *Arcade) extractMinimalPath(fullPath *transaction.MerklePath, txOffset uint64) *transaction.MerklePath {
-	mp := &transaction.MerklePath{
-		BlockHeight: fullPath.BlockHeight,
-		Path:        make([][]*transaction.PathElement, len(fullPath.Path)),
-	}
-
-	offset := txOffset
-	for level := 0; level < len(fullPath.Path); level++ {
-		if level == 0 {
-			if leaf := fullPath.FindLeafByOffset(level, offset); leaf != nil {
-				mp.AddLeaf(level, leaf)
-			}
-		}
-		if sibling := fullPath.FindLeafByOffset(level, offset^1); sibling != nil {
-			mp.AddLeaf(level, sibling)
-		}
-		offset = offset >> 1
-	}
-
-	return mp
+	return ExtractMinimalPath(fullPath, txOffset)
 }
 
 func (a *Arcade) pruneConfirmedTransactions(ctx context.Context, currentHeight uint32) {

@@ -12,10 +12,172 @@ import (
 	"github.com/bsv-blockchain/arcade/models"
 )
 
+// AssembleBUMP constructs a full BUMP (block-level merkle proof) from a STUMP
+// (subtree-level merkle path) and the block's subtree root hashes.
+//
+// Parameters:
+//   - stumpData: BRC-74 binary-encoded STUMP (subtree merkle path with local offsets)
+//   - subtreeIndex: index of the subtree containing the tracked transaction
+//   - subtreeHashes: root hashes for all subtrees in the block
+//   - coinbaseBUMP: BRC-74 binary-encoded merkle path of the coinbase transaction (for subtree 0
+//     placeholder replacement); nil if unavailable. When the tracked tx is in subtree 0, the
+//     coinbase BUMP provides correct intermediate hashes that replace the placeholder-derived hashes.
+//
+// Returns the minimal merkle path for the tracked transaction and the global tx offset.
+func AssembleBUMP(stumpData []byte, subtreeIndex int, subtreeHashes []chainhash.Hash, coinbaseBUMP []byte) (*transaction.MerklePath, uint64, error) {
+	stumpPath, err := transaction.NewMerklePathFromBinary(stumpData)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to parse STUMP: %w", err)
+	}
+
+	internalHeight := len(stumpPath.Path)
+
+	// Handle coinbase placeholder replacement for subtree 0 using the coinbase BUMP.
+	// The coinbase BUMP provides correct intermediate hashes computed with the real coinbase
+	// instead of the placeholder. We walk the coinbase BUMP to compute the correct hash at
+	// each level, then replace the corresponding hash in the STUMP.
+	if subtreeIndex == 0 && len(coinbaseBUMP) > 0 {
+		replaceCoinbasePlaceholder(stumpPath, coinbaseBUMP, internalHeight)
+	}
+
+	numSubtrees := len(subtreeHashes)
+	if numSubtrees <= 1 {
+		// Single subtree: STUMP IS the full BUMP.
+		var txOffset uint64
+		if internalHeight > 0 {
+			for _, leaf := range stumpPath.Path[0] {
+				if leaf.Txid != nil && *leaf.Txid {
+					txOffset = leaf.Offset
+					break
+				}
+			}
+		}
+		return stumpPath, txOffset, nil
+	}
+
+	// Multi-subtree: shift STUMP offsets from local (within subtree) to global (within block).
+	for level := 0; level < internalHeight; level++ {
+		shift := uint64(subtreeIndex) << uint(internalHeight-level) //nolint:gosec // safe
+		for _, elem := range stumpPath.Path[level] {
+			elem.Offset += shift
+		}
+	}
+
+	var txOffset uint64
+	if internalHeight > 0 {
+		for _, leaf := range stumpPath.Path[0] {
+			if leaf.Txid != nil && *leaf.Txid {
+				txOffset = leaf.Offset
+				break
+			}
+		}
+	}
+
+	// Build the full path: STUMP levels (global offsets) + subtree root layer
+	subtreeRootLayer := int(math.Ceil(math.Log2(float64(numSubtrees))))
+	totalHeight := internalHeight + subtreeRootLayer
+	fullPath := &transaction.MerklePath{
+		BlockHeight: stumpPath.BlockHeight,
+		Path:        make([][]*transaction.PathElement, totalHeight),
+	}
+
+	for level := 0; level < internalHeight; level++ {
+		for _, elem := range stumpPath.Path[level] {
+			fullPath.AddLeaf(level, elem)
+		}
+	}
+
+	// Add subtree root hashes at the subtree root layer.
+	for i, subHash := range subtreeHashes {
+		if i == subtreeIndex {
+			continue // our subtree root will be computed from STUMP leaves
+		}
+		hashCopy := subHash
+		fullPath.AddLeaf(internalHeight, &transaction.PathElement{
+			Offset: uint64(i),
+			Hash:   &hashCopy,
+		})
+	}
+
+	fullPath.ComputeMissingHashes()
+	minimalPath := ExtractMinimalPath(fullPath, txOffset)
+	return minimalPath, txOffset, nil
+}
+
+// replaceCoinbasePlaceholder uses the coinbase BUMP to replace placeholder-derived
+// hashes in the STUMP. The coinbase is at offset 0 in subtree 0; its ancestor at
+// each level is always at offset 0. For each STUMP level, if offset 0 has a hash
+// (which was computed from the placeholder), we replace it with the correct hash
+// computed from the real coinbase.
+func replaceCoinbasePlaceholder(stumpPath *transaction.MerklePath, coinbaseBUMP []byte, internalHeight int) {
+	cbPath, err := transaction.NewMerklePathFromBinary(coinbaseBUMP)
+	if err != nil {
+		return
+	}
+
+	// Walk the coinbase BUMP from the bottom to compute the correct hash at each level.
+	// The coinbase is always at offset 0, so its ancestor at level L is at offset 0.
+	// At each level, we compute: correctHash = MTP(left, right) using the coinbase path.
+
+	// First, find the coinbase hash at level 0
+	var currentHash *chainhash.Hash
+	for _, leaf := range cbPath.Path[0] {
+		if leaf.Offset == 0 && leaf.Hash != nil {
+			currentHash = leaf.Hash
+			break
+		}
+	}
+	if currentHash == nil {
+		return
+	}
+
+	// For each level, try to replace the hash at offset 0 in the STUMP
+	for level := 0; level < internalHeight && level < len(cbPath.Path); level++ {
+		// Replace offset 0 in the STUMP at this level with the correct coinbase-derived hash
+		for _, elem := range stumpPath.Path[level] {
+			if elem.Offset == 0 && (elem.Txid == nil || !*elem.Txid) {
+				h := *currentHash
+				elem.Hash = &h
+				break
+			}
+		}
+
+		// Compute the next level's hash using the coinbase path's sibling
+		sibling := cbPath.FindLeafByOffset(level, 1) // coinbase at offset 0, sibling at 1
+		if sibling == nil || sibling.Hash == nil {
+			break
+		}
+		// Coinbase is always on the left (offset 0 at every level → even → left)
+		currentHash = transaction.MerkleTreeParent(currentHash, sibling.Hash)
+	}
+}
+
+// ExtractMinimalPath extracts the minimal set of nodes needed to verify a single
+// transaction at the given offset from a full merkle path.
+func ExtractMinimalPath(fullPath *transaction.MerklePath, txOffset uint64) *transaction.MerklePath {
+	mp := &transaction.MerklePath{
+		BlockHeight: fullPath.BlockHeight,
+		Path:        make([][]*transaction.PathElement, len(fullPath.Path)),
+	}
+
+	offset := txOffset
+	for level := 0; level < len(fullPath.Path); level++ {
+		if level == 0 {
+			if leaf := fullPath.FindLeafByOffset(level, offset); leaf != nil {
+				mp.AddLeaf(level, leaf)
+			}
+		}
+		if sibling := fullPath.FindLeafByOffset(level, offset^1); sibling != nil {
+			mp.AddLeaf(level, sibling)
+		}
+		offset = offset >> 1
+	}
+
+	return mp
+}
+
 // ConstructBUMPsForBlock constructs full BUMPs from accumulated STUMPs for a block.
-// This is called when Merkle Service sends a BLOCK_PROCESSED callback.
 func (a *Arcade) ConstructBUMPsForBlock(ctx context.Context, blockHash string) error {
-	// Get all STUMPs accumulated for this block
 	stumps, err := a.store.GetStumpsByBlockHash(ctx, blockHash)
 	if err != nil {
 		return fmt.Errorf("failed to get stumps for block %s: %w", blockHash, err)
@@ -31,7 +193,6 @@ func (a *Arcade) ConstructBUMPsForBlock(ctx context.Context, blockHash string) e
 		slog.String("blockHash", blockHash),
 		slog.Int("stumpCount", len(stumps)))
 
-	// Fetch block model to get subtree hashes and coinbase
 	subtreeHashes, err := a.fetchBlockSubtreeHashesForBUMP(ctx, blockHash)
 	if err != nil {
 		return fmt.Errorf("failed to fetch block subtree hashes: %w", err)
@@ -43,14 +204,11 @@ func (a *Arcade) ConstructBUMPsForBlock(ctx context.Context, blockHash string) e
 		return nil
 	}
 
-	// Get coinbase txid if available (needed for subtree 0 placeholder replacement)
-	coinbaseTxID := a.getCoinbaseTxIDForBlock(ctx, blockHash)
+	// TODO: fetch coinbase BUMP from block model once Teranode supports it
+	var coinbaseBUMP []byte
 
-	subtreeRootLayer := int(math.Ceil(math.Log2(float64(len(subtreeHashes)))))
-
-	// Construct BUMP for each STUMP
 	for _, stump := range stumps {
-		if err := a.constructSingleBUMP(ctx, blockHash, stump, subtreeHashes, subtreeRootLayer, coinbaseTxID); err != nil {
+		if err := a.constructSingleBUMP(ctx, blockHash, stump, subtreeHashes, coinbaseBUMP); err != nil {
 			a.logger.Error("failed to construct BUMP",
 				slog.String("txid", stump.TxID),
 				slog.String("blockHash", blockHash),
@@ -59,7 +217,6 @@ func (a *Arcade) ConstructBUMPsForBlock(ctx context.Context, blockHash string) e
 		}
 	}
 
-	// Set MINED status for transactions with merkle proofs in this block
 	statuses, err := a.store.SetMinedByBlockHash(ctx, blockHash)
 	if err != nil {
 		a.logger.Error("failed to set mined status",
@@ -76,7 +233,6 @@ func (a *Arcade) ConstructBUMPsForBlock(ctx context.Context, blockHash string) e
 		}
 	}
 
-	// Clean up STUMPs after successful BUMP construction
 	if err := a.store.DeleteStumpsByBlockHash(ctx, blockHash); err != nil {
 		a.logger.Warn("failed to clean up STUMPs",
 			slog.String("blockHash", blockHash),
@@ -86,83 +242,20 @@ func (a *Arcade) ConstructBUMPsForBlock(ctx context.Context, blockHash string) e
 	return nil
 }
 
-// constructSingleBUMP builds a full BUMP from a STUMP + subtree root hashes.
+// constructSingleBUMP is a thin wrapper around AssembleBUMP that handles storage.
 func (a *Arcade) constructSingleBUMP(
 	ctx context.Context,
 	blockHash string,
 	stump *models.Stump,
 	subtreeHashes []chainhash.Hash,
-	subtreeRootLayer int,
-	coinbaseTxID *chainhash.Hash,
+	coinbaseBUMP []byte,
 ) error {
-	// Parse the STUMP (subtree-level merkle path)
-	stumpPath, err := transaction.NewMerklePathFromBinary(stump.StumpData)
+	minimalPath, _, err := AssembleBUMP(stump.StumpData, stump.SubtreeIndex, subtreeHashes, coinbaseBUMP)
 	if err != nil {
-		return fmt.Errorf("failed to parse STUMP: %w", err)
+		return err
 	}
 
-	// Find the transaction's offset in the STUMP
-	var txOffset uint64
-	if len(stumpPath.Path) > 0 {
-		for _, leaf := range stumpPath.Path[0] {
-			if leaf.Txid != nil && *leaf.Txid {
-				txOffset = leaf.Offset
-				break
-			}
-		}
-	}
-
-	// Build the full merkle path: STUMP levels + subtree root level
-	internalHeight := len(stumpPath.Path)
-	totalHeight := internalHeight + subtreeRootLayer
-
-	fullPath := &transaction.MerklePath{
-		BlockHeight: stumpPath.BlockHeight,
-		Path:        make([][]*transaction.PathElement, totalHeight),
-	}
-
-	// Copy STUMP levels into the full path
-	for level := 0; level < internalHeight; level++ {
-		for _, elem := range stumpPath.Path[level] {
-			fullPath.AddLeaf(level, elem)
-		}
-	}
-
-	// Handle coinbase placeholder replacement for subtree 0
-	if stump.SubtreeIndex == 0 && coinbaseTxID != nil {
-		// Replace the placeholder at offset 0, level 0 with the real coinbase txid
-		for _, leaf := range fullPath.Path[0] {
-			if leaf.Offset == 0 && (leaf.Txid == nil || !*leaf.Txid) {
-				coinbaseHash := *coinbaseTxID
-				leaf.Hash = &coinbaseHash
-				break
-			}
-		}
-	}
-
-	// Add subtree root hashes at the subtree root layer
-	subtreeBaseOffset := uint64(stump.SubtreeIndex) << uint(internalHeight-1) //nolint:gosec // safe: subtreeIndex from trusted source
-	for i, subHash := range subtreeHashes {
-		if i == stump.SubtreeIndex {
-			continue // This subtree's root is computed from the STUMP leaves
-		}
-		hashCopy := subHash
-		fullPath.AddLeaf(internalHeight, &transaction.PathElement{
-			Offset: subtreeBaseOffset + uint64(i),
-			Hash:   &hashCopy,
-		})
-	}
-
-	// Compute missing hashes in the tree
-	fullPath.ComputeMissingHashes()
-
-	// Extract the minimal path for this transaction
-	minimalPath := a.extractMinimalPath(fullPath, txOffset)
-
-	// Get block height from the STUMP
-	blockHeight := uint64(stumpPath.BlockHeight)
-
-	// Store the BUMP
+	blockHeight := uint64(minimalPath.BlockHeight)
 	if err := a.store.InsertMerklePath(ctx, stump.TxID, blockHash, blockHeight, minimalPath.Bytes()); err != nil {
 		return fmt.Errorf("failed to store BUMP: %w", err)
 	}
@@ -191,13 +284,7 @@ func (a *Arcade) fetchBlockSubtreeHashesForBUMP(ctx context.Context, blockHash s
 }
 
 // getCoinbaseTxIDForBlock attempts to get the coinbase transaction ID for a block.
-// Returns nil if not available.
 func (a *Arcade) getCoinbaseTxIDForBlock(_ context.Context, _ string) *chainhash.Hash {
-	// The coinbase txid would come from the block message or from fetching the block model.
-	// For now, during block processing via P2P, the coinbase is available in BlockMessage.Coinbase.
-	// When triggered by callback, we need to fetch it from the block model.
-	// This will be enhanced when Teranode returns the coinbase in the block model.
-	//
 	// TODO: fetch coinbase from block model once Teranode supports it
 	return nil
 }
