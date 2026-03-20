@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # Build stage
-FROM golang:1.25.4-alpine AS builder
+FROM golang:1.26.1-alpine AS builder
 
 # Install build dependencies
 # build-base: includes gcc, g++, make and other build tools for CGO
