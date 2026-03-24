@@ -4,7 +4,7 @@ This guide covers deploying Arcade using Docker Compose or Kubernetes.
 
 ## Prerequisites
 
-- A Teranode broadcast URL for the target network
+- A Teranode DataHub URL for the target network (format: `<url>/api/v1`)
 - Arcade container image (`ghcr.io/bsv-blockchain/arcade:<tag>`) or source code to build from
 
 ## Configuration Reference
@@ -18,8 +18,7 @@ Arcade is configured via environment variables or a `config.yaml` file. Environm
 | `ARCADE_DATABASE_SQLITE_PATH` | Path to SQLite database file | `/data/arcade.db` |
 | `ARCADE_CHAINTRACKS_STORAGE_PATH` | Path for chain header storage | `/data/chaintracks` |
 | `ARCADE_CHAINTRACKS_BOOTSTRAP_URL` | URL to headers.bin for initial header sync | _(none)_ |
-| `ARCADE_TERANODE_BROADCAST_URLS` | Comma-separated Teranode propagation URLs | _(none)_ |
-| `ARCADE_TERANODE_DATAHUB_URLS` | Comma-separated Teranode DataHub URLs (fallback) | _(none)_ |
+| `ARCADE_TERANODE_DATAHUB_URLS` | Comma-separated Teranode DataHub URLs used for transaction submission and block/subtree data (format: `<url>/api/v1`) | _(none)_ |
 | `ARCADE_TERANODE_AUTH_TOKEN` | **Bearer token for Teranode authentication (required)** | _(none)_ |
 | `ARCADE_SERVER_ADDRESS` | Listen address | `:3011` |
 | `ARCADE_LOG_LEVEL` | Log level: `debug`, `info`, `warn`, `error` | `info` |
@@ -69,16 +68,14 @@ Data is persisted in the `arcade-data` Docker volume and survives restarts.
 For testnet:
 ```bash
 ARCADE_NETWORK=test \
-ARCADE_TERANODE_BROADCAST_URLS="https://teranode-eks-testnet-eu-1-propagation.bsvb.tech,https://teranode-eks-testnet-us-1-propagation.bsvb.tech" \
-ARCADE_TERANODE_DATAHUB_URLS="https://teranode-eks-testnet-eu-1.bsvb.tech/api/v1" \
+ARCADE_TERANODE_DATAHUB_URLS="https://teranode-eks-testnet-eu-1.bsvb.tech/api/v1,https://teranode-eks-testnet-us-1.bsvb.tech/api/v1" \
 docker compose up -d
 ```
 
 For teratestnet:
 ```bash
 ARCADE_NETWORK=teratestnet \
-ARCADE_TERANODE_BROADCAST_URLS="https://teranode-eks-ttn-eu-1-propagation.bsvb.tech,https://teranode-eks-ttn-us-1-propagation.bsvb.tech" \
-ARCADE_TERANODE_DATAHUB_URLS="https://teranode-eks-ttn-eu-1.bsvb.tech/api/v1" \
+ARCADE_TERANODE_DATAHUB_URLS="https://teranode-eks-ttn-eu-1.bsvb.tech/api/v1,https://teranode-eks-ttn-us-1.bsvb.tech/api/v1" \
 docker compose up -d
 ```
 
@@ -91,7 +88,7 @@ docker run -d \
   --name arcade \
   -p 3011:3011 \
   -e ARCADE_NETWORK=main \
-  -e ARCADE_TERANODE_BROADCAST_URLS="https://teranode-1.example.com,https://teranode-2.example.com" \
+  -e ARCADE_TERANODE_DATAHUB_URLS="https://teranode-1.example.com/api/v1,https://teranode-2.example.com/api/v1" \
   -v arcade-data:/data \
   ghcr.io/bsv-blockchain/arcade:v0.1.6
 ```
@@ -163,8 +160,8 @@ spec:
               value: /data
             - name: ARCADE_DATABASE_SQLITE_PATH
               value: /data/arcade.db
-            - name: ARCADE_TERANODE_BROADCAST_URLS
-              value: "https://teranode-1.example.com,https://teranode-2.example.com"
+            - name: ARCADE_TERANODE_DATAHUB_URLS
+              value: "https://teranode-1.example.com/api/v1,https://teranode-2.example.com/api/v1"
             - name: ARCADE_CHAINTRACKS_STORAGE_PATH
               value: /data/chaintracks
           volumeMounts:
@@ -198,7 +195,7 @@ spec:
 Key points:
 - **`strategy: Recreate`** is required because SQLite does not support concurrent writers.
 - **`fsGroup: 1000`** matches the `arcade` user in the container image so the mounted volume is writable.
-- Set `ARCADE_NETWORK` to `main`, `test`, or `teratestnet` and point `ARCADE_TERANODE_BROADCAST_URLS` to the appropriate Teranode propagation endpoints for that network.
+- Set `ARCADE_NETWORK` to `main`, `test`, or `teratestnet` and point `ARCADE_TERANODE_DATAHUB_URLS` to the appropriate Teranode DataHub endpoints (format: `<url>/api/v1`) for that network.
 
 ### Service
 
@@ -258,9 +255,9 @@ To run mainnet, testnet, and teratestnet side by side, deploy each into its own 
 | Testnet | `arcade-testnet` | `test` |
 | Teratestnet | `arcade-ttn` | `teratestnet` |
 
-Each environment needs its own PVC, Deployment, Service, and (optionally) Ingress. The only differences between environments are the namespace, `ARCADE_NETWORK` value, and `ARCADE_TERANODE_BROADCAST_URLS`.
+Each environment needs its own PVC, Deployment, Service, and (optionally) Ingress. The only differences between environments are the namespace, `ARCADE_NETWORK` value, and `ARCADE_TERANODE_DATAHUB_URLS`.
 
-If you use Kustomize, you can keep the manifests above as a base and create overlays that patch the namespace, network, and broadcast URLs per environment.
+If you use Kustomize, you can keep the manifests above as a base and create overlays that patch the namespace, network, and DataHub URLs per environment.
 
 ---
 

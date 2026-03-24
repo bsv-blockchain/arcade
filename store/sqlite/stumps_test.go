@@ -23,7 +23,6 @@ func TestStore_StumpOperations(t *testing.T) {
 
 	// Insert a STUMP
 	stump := &models.Stump{
-		TxID:         "tx1",
 		BlockHash:    "block1",
 		SubtreeIndex: 2,
 		StumpData:    []byte{0x01, 0x02, 0x03},
@@ -41,9 +40,6 @@ func TestStore_StumpOperations(t *testing.T) {
 	if len(stumps) != 1 {
 		t.Fatalf("expected 1 stump, got %d", len(stumps))
 	}
-	if stumps[0].TxID != "tx1" {
-		t.Errorf("expected txid tx1, got %s", stumps[0].TxID)
-	}
 	if stumps[0].SubtreeIndex != 2 {
 		t.Errorf("expected subtree index 2, got %d", stumps[0].SubtreeIndex)
 	}
@@ -51,9 +47,8 @@ func TestStore_StumpOperations(t *testing.T) {
 		t.Errorf("stump data mismatch")
 	}
 
-	// Insert another STUMP for same block
+	// Insert another STUMP for same block, different subtree
 	stump2 := &models.Stump{
-		TxID:         "tx2",
 		BlockHash:    "block1",
 		SubtreeIndex: 3,
 		StumpData:    []byte{0x04, 0x05},
@@ -70,9 +65,8 @@ func TestStore_StumpOperations(t *testing.T) {
 		t.Fatalf("expected 2 stumps, got %d", len(stumps))
 	}
 
-	// Upsert existing STUMP (idempotent)
+	// Upsert existing STUMP (same block_hash + subtree_index)
 	stumpUpdated := &models.Stump{
-		TxID:         "tx1",
 		BlockHash:    "block1",
 		SubtreeIndex: 2,
 		StumpData:    []byte{0x0a, 0x0b},
@@ -90,9 +84,9 @@ func TestStore_StumpOperations(t *testing.T) {
 	}
 
 	// Verify upserted data
-	for _, s := range stumps {
-		if s.TxID == "tx1" {
-			if !bytes.Equal(s.StumpData, []byte{0x0a, 0x0b}) {
+	for _, st := range stumps {
+		if st.SubtreeIndex == 2 {
+			if !bytes.Equal(st.StumpData, []byte{0x0a, 0x0b}) {
 				t.Errorf("expected updated stump data")
 			}
 		}

@@ -225,15 +225,15 @@ func (c *Client) parseErrorResponse(resp *http.Response) error {
 		Error string `json:"error"`
 	}
 	if json.Unmarshal(body, &errResp) == nil && errResp.Error != "" {
-		return errors.Join(ErrUnexpectedHTTPStatus, errInvalidJSONResponse)
+		return fmt.Errorf("%w: HTTP %d: %s", ErrUnexpectedHTTPStatus, resp.StatusCode, errResp.Error)
 	}
 
 	// Return raw body if not JSON
 	if len(body) > 0 {
-		return errors.Join(ErrUnexpectedHTTPStatus, errEmptyResponse)
+		return fmt.Errorf("%w: HTTP %d: %s", ErrUnexpectedHTTPStatus, resp.StatusCode, string(body))
 	}
 
-	return ErrUnexpectedHTTPStatus
+	return fmt.Errorf("%w: HTTP %d", ErrUnexpectedHTTPStatus, resp.StatusCode)
 }
 
 // Close closes the client and any active connections.

@@ -202,7 +202,7 @@ func TestStore_WithBlockData(t *testing.T) {
 	txid := "mined123"
 	blockHash := "00000000000000000001"
 	blockHeight := uint64(800000)
-	merklePath := []byte("proof123")
+	bumpData := []byte("compound_bump_data")
 
 	// Insert the transaction status
 	status := &models.TransactionStatus{
@@ -216,15 +216,15 @@ func TestStore_WithBlockData(t *testing.T) {
 		t.Fatalf("Failed to insert status: %v", err)
 	}
 
-	// Insert merkle path (this is where block_height and merkle_path are stored)
-	if merkErr := store.InsertMerklePath(ctx, txid, blockHash, blockHeight, merklePath); merkErr != nil {
-		t.Fatalf("Failed to insert merkle path: %v", merkErr)
+	// Insert compound BUMP
+	if bumpErr := store.InsertBUMP(ctx, blockHash, blockHeight, bumpData); bumpErr != nil {
+		t.Fatalf("Failed to insert BUMP: %v", bumpErr)
 	}
 
-	// Set mined status (this joins merkle_paths to transactions)
-	minedStatuses, minedErr := store.SetMinedByBlockHash(ctx, blockHash)
+	// Set mined status by txids
+	minedStatuses, minedErr := store.SetMinedByTxIDs(ctx, blockHash, []string{txid})
 	if minedErr != nil {
-		t.Fatalf("Failed to set mined by block hash: %v", minedErr)
+		t.Fatalf("Failed to set mined by txids: %v", minedErr)
 	}
 	if len(minedStatuses) != 1 {
 		t.Fatalf("Expected 1 mined status, got %d", len(minedStatuses))
@@ -243,8 +243,16 @@ func TestStore_WithBlockData(t *testing.T) {
 		t.Errorf("Expected block height %d, got %d", blockHeight, retrieved.BlockHeight)
 	}
 
-	if !bytes.Equal(retrieved.MerklePath, merklePath) {
-		t.Errorf("Expected merkle path %s, got %s", merklePath, retrieved.MerklePath)
+	// Verify BUMP retrieval
+	gotHeight, gotBump, getBumpErr := store.GetBUMP(ctx, blockHash)
+	if getBumpErr != nil {
+		t.Fatalf("Failed to get BUMP: %v", getBumpErr)
+	}
+	if gotHeight != blockHeight {
+		t.Errorf("Expected BUMP height %d, got %d", blockHeight, gotHeight)
+	}
+	if !bytes.Equal(gotBump, bumpData) {
+		t.Errorf("Expected BUMP data %v, got %v", bumpData, gotBump)
 	}
 
 	if len(retrieved.CompetingTxs) != 0 {

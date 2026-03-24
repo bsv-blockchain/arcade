@@ -24,8 +24,7 @@ services:
       ARCADE_DATABASE_SQLITE_PATH: /data/arcade.db
       ARCADE_CHAINTRACKS_STORAGE_PATH: /data/chaintracks
 
-      # Teranode endpoints (production mainnet by default)
-      ARCADE_TERANODE_BROADCAST_URLS: ${ARCADE_TERANODE_BROADCAST_URLS:-https://teranode-eks-mainnet-eu-1-propagation.bsvb.tech,https://teranode-eks-mainnet-us-1-propagation.bsvb.tech}
+      # Teranode DataHub endpoints (production mainnet by default) - used for tx submission and block/subtree data
       ARCADE_TERANODE_DATAHUB_URLS: ${ARCADE_TERANODE_DATAHUB_URLS:-https://teranode-eks-mainnet-eu-1.bsvb.tech/api/v1}
       ARCADE_TERANODE_AUTH_TOKEN: ${ARCADE_TERANODE_AUTH_TOKEN:-} # Required for authentication
 

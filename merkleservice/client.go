@@ -37,7 +37,7 @@ func NewClient(baseURL, authToken string, timeout time.Duration) *Client {
 // watchRequest is the payload sent to POST /watch
 type watchRequest struct {
 	TxID        string `json:"txid"`
-	CallbackURL string `json:"callback_url"`
+	CallbackURL string `json:"callbackUrl"`
 }
 
 // Register registers a transaction with the Merkle Service for watching.

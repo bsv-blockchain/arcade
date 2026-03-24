@@ -63,7 +63,6 @@ func (c *Config) SetDefaults(v *viper.Viper, prefix string) {
 	v.SetDefault(p+"events.buffer_size", 1000)
 
 	// Teranode defaults
-	v.SetDefault(p+"teranode.broadcast_urls", []string{})
 	v.SetDefault(p+"teranode.datahub_urls", []string{})
 	v.SetDefault(p+"teranode.auth_token", "")
 	v.SetDefault(p+"teranode.timeout", "30s")
@@ -122,10 +121,9 @@ type EventsConfig struct {
 
 // TeranodeConfig holds teranode client configuration
 type TeranodeConfig struct {
-	BroadcastURLs []string      `mapstructure:"broadcast_urls"` // URLs for submitting transactions
-	DataHubURLs   []string      `mapstructure:"datahub_urls"`   // URLs for fetching block/subtree data (fallback)
-	AuthToken     string        `mapstructure:"auth_token"`
-	Timeout       time.Duration `mapstructure:"timeout"`
+	DataHubURLs []string      `mapstructure:"datahub_urls"` // URLs for Teranode DataHub (formatted as <url>/api/v1)
+	AuthToken   string        `mapstructure:"auth_token"`
+	Timeout     time.Duration `mapstructure:"timeout"`
 }
 
 // ValidatorConfig holds transaction validator configuration

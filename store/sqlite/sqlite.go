@@ -4,11 +4,15 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/bsv-blockchain/go-sdk/transaction"
 
 	// SQLite driver for database/sql.
 	_ "modernc.org/sqlite"
@@ -40,18 +44,6 @@ CREATE INDEX IF NOT EXISTS idx_transactions_status ON transactions(status);
 CREATE INDEX IF NOT EXISTS idx_transactions_block_hash ON transactions(block_hash);
 `
 
-	createMerklePathsTable = `
-CREATE TABLE IF NOT EXISTS merkle_paths (
-	txid TEXT NOT NULL,
-	block_hash TEXT NOT NULL,
-	block_height INTEGER NOT NULL,
-	merkle_path BLOB NOT NULL,
-	created_at DATETIME NOT NULL,
-	PRIMARY KEY (txid, block_hash)
-);
-CREATE INDEX IF NOT EXISTS idx_merkle_paths_block_hash ON merkle_paths(block_hash);
-`
-
 	createSubmissionsTable = `
 CREATE TABLE IF NOT EXISTS submissions (
 	submission_id TEXT PRIMARY KEY,
@@ -71,18 +63,25 @@ CREATE INDEX IF NOT EXISTS idx_next_retry ON submissions(next_retry_at);
 
 	createStumpsTable = `
 CREATE TABLE IF NOT EXISTS stumps (
-	txid TEXT NOT NULL,
 	block_hash TEXT NOT NULL,
 	subtree_index INTEGER NOT NULL,
-	stump_data BLOB NOT NULL,
+	stump_data TEXT NOT NULL,
 	created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-	PRIMARY KEY (txid, block_hash)
+	PRIMARY KEY (block_hash, subtree_index)
 );
-CREATE INDEX IF NOT EXISTS idx_stumps_block_hash ON stumps(block_hash);
+`
+
+	createBumpsTable = `
+CREATE TABLE IF NOT EXISTS bumps (
+	block_hash TEXT PRIMARY KEY,
+	block_height INTEGER NOT NULL,
+	bump_data BLOB NOT NULL,
+	created_at DATETIME NOT NULL
+);
 `
 )
 
-// Store implements store.StatusStore and store.SubmissionStore using SQLite
+// Store implements store.Store using SQLite
 type Store struct {
 	db *sql.DB
 }
@@ -106,10 +105,6 @@ func NewStore(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("failed to initialize transactions schema: %w", err)
 	}
 
-	if err := initializeSchema(db, createMerklePathsTable); err != nil {
-		return nil, fmt.Errorf("failed to initialize merkle_paths schema: %w", err)
-	}
-
 	if err := initializeSchema(db, createSubmissionsTable); err != nil {
 		return nil, fmt.Errorf("failed to initialize submissions schema: %w", err)
 	}
@@ -118,13 +113,14 @@ func NewStore(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("failed to initialize stumps schema: %w", err)
 	}
 
+	if err := initializeSchema(db, createBumpsTable); err != nil {
+		return nil, fmt.Errorf("failed to initialize bumps schema: %w", err)
+	}
+
 	return &Store{db: db}, nil
 }
 
-// StatusStore methods
-
 // GetOrInsertStatus inserts a new transaction status or returns the existing one if it already exists.
-// Returns the status, whether it was newly inserted (true) or already existed (false), and any error.
 func (s *Store) GetOrInsertStatus(ctx context.Context, status *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
 	if status.CreatedAt.IsZero() {
 		status.CreatedAt = time.Now()
@@ -143,9 +139,7 @@ VALUES (?, ?, ?, ?, ?, ?)
 		status.CreatedAt,
 	)
 	if err != nil {
-		// Check if this is a unique constraint violation (transaction already exists)
 		if strings.Contains(err.Error(), "UNIQUE constraint failed") || strings.Contains(err.Error(), "PRIMARY KEY constraint failed") {
-			// Return the existing status
 			existing, getErr := s.GetStatus(ctx, status.TxID)
 			if getErr != nil {
 				return nil, false, fmt.Errorf("failed to get existing status: %w", getErr)
@@ -155,7 +149,6 @@ VALUES (?, ?, ?, ?, ?, ?)
 		return nil, false, fmt.Errorf("failed to insert status: %w", err)
 	}
 
-	// Successfully inserted - return the status we just created
 	status.Status = models.StatusReceived
 	return status, true, nil
 }
@@ -232,9 +225,9 @@ WHERE txid = ?
 // GetStatus retrieves a transaction status by transaction ID.
 func (s *Store) GetStatus(ctx context.Context, txid string) (*models.TransactionStatus, error) {
 	query := `
-SELECT t.txid, t.status, t.timestamp, t.block_hash, mp.block_height, mp.merkle_path, t.extra_info, t.competing_txs, t.created_at
+SELECT t.txid, t.status, t.timestamp, t.block_hash, b.block_height, b.bump_data, t.extra_info, t.competing_txs, t.created_at
 FROM transactions t
-LEFT JOIN merkle_paths mp ON t.txid = mp.txid AND t.block_hash = mp.block_hash
+LEFT JOIN bumps b ON t.block_hash = b.block_hash
 WHERE t.txid = ?
 `
 	row := s.db.QueryRowContext(ctx, query, txid)
@@ -244,9 +237,9 @@ WHERE t.txid = ?
 // GetStatusesSince retrieves all transaction statuses since a given time.
 func (s *Store) GetStatusesSince(ctx context.Context, since time.Time) ([]*models.TransactionStatus, error) {
 	query := `
-SELECT t.txid, t.status, t.timestamp, t.block_hash, mp.block_height, mp.merkle_path, t.extra_info, t.competing_txs, t.created_at
+SELECT t.txid, t.status, t.timestamp, t.block_hash, b.block_height, b.bump_data, t.extra_info, t.competing_txs, t.created_at
 FROM transactions t
-LEFT JOIN merkle_paths mp ON t.txid = mp.txid AND t.block_hash = mp.block_hash
+LEFT JOIN bumps b ON t.block_hash = b.block_hash
 WHERE t.timestamp > ?
 ORDER BY t.timestamp ASC
 `
@@ -265,7 +258,6 @@ ORDER BY t.timestamp ASC
 func (s *Store) SetStatusByBlockHash(ctx context.Context, blockHash string, newStatus models.Status) ([]string, error) {
 	var query string
 
-	// For unmined statuses, clear block fields. For IMMUTABLE, keep them.
 	if newStatus == models.StatusSeenOnNetwork || newStatus == models.StatusReceived {
 		query = `
 UPDATE transactions
@@ -309,79 +301,77 @@ RETURNING txid
 	return txids, nil
 }
 
-// InsertMerklePath inserts a merkle path for a transaction.
-func (s *Store) InsertMerklePath(ctx context.Context, txid, blockHash string, blockHeight uint64, merklePath []byte) error {
+// InsertBUMP stores a compound BUMP for a block.
+func (s *Store) InsertBUMP(ctx context.Context, blockHash string, blockHeight uint64, bumpData []byte) error {
 	query := `
-INSERT INTO merkle_paths (txid, block_hash, block_height, merkle_path, created_at)
-VALUES (?, ?, ?, ?, ?)
-ON CONFLICT (txid, block_hash) DO NOTHING
+INSERT INTO bumps (block_hash, block_height, bump_data, created_at)
+VALUES (?, ?, ?, ?)
+ON CONFLICT (block_hash) DO NOTHING
 `
-	_, err := s.db.ExecContext(ctx, query, txid, blockHash, blockHeight, merklePath, time.Now())
+	_, err := s.db.ExecContext(ctx, query, blockHash, blockHeight, bumpData, time.Now())
 	if err != nil {
-		return fmt.Errorf("failed to insert merkle path: %w", err)
+		return fmt.Errorf("failed to insert bump: %w", err)
 	}
 	return nil
 }
 
-// SetMinedByBlockHash marks transactions as mined for a given block hash.
-func (s *Store) SetMinedByBlockHash(ctx context.Context, blockHash string) ([]*models.TransactionStatus, error) {
+// GetBUMP retrieves the compound BUMP for a block.
+func (s *Store) GetBUMP(ctx context.Context, blockHash string) (uint64, []byte, error) {
+	var blockHeight uint64
+	var bumpData []byte
+	err := s.db.QueryRowContext(ctx,
+		"SELECT block_height, bump_data FROM bumps WHERE block_hash = ?",
+		blockHash).Scan(&blockHeight, &bumpData)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil, store.ErrNotFound
+	}
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed to get bump: %w", err)
+	}
+	return blockHeight, bumpData, nil
+}
+
+// SetMinedByTxIDs marks transactions as mined for a given block hash and tx list.
+func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, txids []string) ([]*models.TransactionStatus, error) {
+	if len(txids) == 0 {
+		return nil, nil
+	}
+
 	now := time.Now()
 
-	// Update transactions that have merkle paths for this block
-	updateQuery := `
+	placeholders := make([]string, len(txids))
+	args := make([]interface{}, 0, 3+len(txids))
+	args = append(args, models.StatusMined, now, blockHash)
+	for i, txid := range txids {
+		placeholders[i] = "?"
+		args = append(args, txid)
+	}
+
+	updateQuery := fmt.Sprintf(`
 UPDATE transactions
 SET status = ?,
     timestamp = ?,
     block_hash = ?
-FROM merkle_paths mp
-WHERE transactions.txid = mp.txid
-  AND mp.block_hash = ?
-`
-	_, err := s.db.ExecContext(ctx, updateQuery, models.StatusMined, now, blockHash, blockHash)
+WHERE txid IN (%s)
+`, strings.Join(placeholders, ","))
+
+	_, err := s.db.ExecContext(ctx, updateQuery, args...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to set mined by block hash: %w", err)
+		return nil, fmt.Errorf("failed to set mined by txids: %w", err)
 	}
 
-	// Query merkle paths for this block to build the status objects
-	selectQuery := `
-SELECT txid, block_height, merkle_path
-FROM merkle_paths
-WHERE block_hash = ?
-`
-	rows, err := s.db.QueryContext(ctx, selectQuery, blockHash)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query merkle paths: %w", err)
-	}
-	defer func() {
-		_ = rows.Close()
-	}()
-
-	var statuses []*models.TransactionStatus
-	for rows.Next() {
-		var txid string
-		var blockHeight uint64
-		var merklePath []byte
-		if err := rows.Scan(&txid, &blockHeight, &merklePath); err != nil {
-			return nil, fmt.Errorf("failed to scan merkle path: %w", err)
-		}
+	statuses := make([]*models.TransactionStatus, 0, len(txids))
+	for _, txid := range txids {
 		statuses = append(statuses, &models.TransactionStatus{
-			TxID:        txid,
-			Status:      models.StatusMined,
-			Timestamp:   now,
-			BlockHash:   blockHash,
-			BlockHeight: blockHeight,
-			MerklePath:  merklePath,
+			TxID:      txid,
+			Status:    models.StatusMined,
+			Timestamp: now,
+			BlockHash: blockHash,
 		})
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating rows: %w", err)
 	}
 
 	return statuses, nil
 }
-
-// SubmissionStore methods
 
 // InsertSubmission inserts a new submission record.
 func (s *Store) InsertSubmission(ctx context.Context, sub *models.Submission) error {
@@ -528,16 +518,16 @@ func (s *Store) MarkBlockOffChain(ctx context.Context, blockHash string) error {
 
 // STUMP operations
 
-// InsertStump stores a STUMP for a transaction in a specific block.
+// InsertStump stores a STUMP for a subtree in a specific block.
 func (s *Store) InsertStump(ctx context.Context, stump *models.Stump) error {
 	query := `
-INSERT INTO stumps (txid, block_hash, subtree_index, stump_data, created_at)
-VALUES (?, ?, ?, ?, ?)
-ON CONFLICT (txid, block_hash) DO UPDATE SET
-    subtree_index = excluded.subtree_index,
+INSERT INTO stumps (block_hash, subtree_index, stump_data, created_at)
+VALUES (?, ?, ?, ?)
+ON CONFLICT (block_hash, subtree_index) DO UPDATE SET
     stump_data = excluded.stump_data
 `
-	_, err := s.db.ExecContext(ctx, query, stump.TxID, stump.BlockHash, stump.SubtreeIndex, stump.StumpData, time.Now())
+	encoded := base64.StdEncoding.EncodeToString(stump.StumpData)
+	_, err := s.db.ExecContext(ctx, query, stump.BlockHash, stump.SubtreeIndex, encoded, time.Now())
 	if err != nil {
 		return fmt.Errorf("failed to insert stump: %w", err)
 	}
@@ -547,7 +537,7 @@ ON CONFLICT (txid, block_hash) DO UPDATE SET
 // GetStumpsByBlockHash retrieves all STUMPs for a given block hash.
 func (s *Store) GetStumpsByBlockHash(ctx context.Context, blockHash string) ([]*models.Stump, error) {
 	query := `
-SELECT txid, block_hash, subtree_index, stump_data
+SELECT block_hash, subtree_index, stump_data
 FROM stumps
 WHERE block_hash = ?
 `
@@ -562,9 +552,15 @@ WHERE block_hash = ?
 	var stumps []*models.Stump
 	for rows.Next() {
 		var stump models.Stump
-		if err := rows.Scan(&stump.TxID, &stump.BlockHash, &stump.SubtreeIndex, &stump.StumpData); err != nil {
+		var encodedData string
+		if err := rows.Scan(&stump.BlockHash, &stump.SubtreeIndex, &encodedData); err != nil {
 			return nil, fmt.Errorf("failed to scan stump: %w", err)
 		}
+		decoded, err := base64.StdEncoding.DecodeString(encodedData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode stump data: %w", err)
+		}
+		stump.StumpData = decoded
 		stumps = append(stumps, &stump)
 	}
 	if err := rows.Err(); err != nil {
@@ -609,7 +605,7 @@ func scanTransactionStatus(row *sql.Row) (*models.TransactionStatus, error) {
 	var status models.TransactionStatus
 	var blockHash, extraInfo, competingTxsJSON sql.NullString
 	var blockHeight sql.NullInt64
-	var merklePath []byte
+	var bumpData []byte
 
 	err := row.Scan(
 		&status.TxID,
@@ -617,7 +613,7 @@ func scanTransactionStatus(row *sql.Row) (*models.TransactionStatus, error) {
 		&status.Timestamp,
 		&blockHash,
 		&blockHeight,
-		&merklePath,
+		&bumpData,
 		&extraInfo,
 		&competingTxsJSON,
 		&status.CreatedAt,
@@ -631,8 +627,11 @@ func scanTransactionStatus(row *sql.Row) (*models.TransactionStatus, error) {
 
 	status.BlockHash = blockHash.String
 	status.BlockHeight = uint64(blockHeight.Int64) //nolint:gosec // safe: database constraints ensure non-negative
-	status.MerklePath = merklePath
 	status.ExtraInfo = extraInfo.String
+
+	if len(bumpData) > 0 {
+		status.MerklePath = extractMinimalPathForTx(bumpData, status.TxID)
+	}
 
 	if competingTxsJSON.Valid && competingTxsJSON.String != "" {
 		var competingTxsMap map[string]bool
@@ -658,7 +657,7 @@ func scanTransactionStatuses(rows *sql.Rows) ([]*models.TransactionStatus, error
 		var status models.TransactionStatus
 		var blockHash, extraInfo, competingTxsJSON sql.NullString
 		var blockHeight sql.NullInt64
-		var merklePath []byte
+		var bumpData []byte
 
 		err := rows.Scan(
 			&status.TxID,
@@ -666,7 +665,7 @@ func scanTransactionStatuses(rows *sql.Rows) ([]*models.TransactionStatus, error
 			&status.Timestamp,
 			&blockHash,
 			&blockHeight,
-			&merklePath,
+			&bumpData,
 			&extraInfo,
 			&competingTxsJSON,
 			&status.CreatedAt,
@@ -676,9 +675,12 @@ func scanTransactionStatuses(rows *sql.Rows) ([]*models.TransactionStatus, error
 		}
 
 		status.BlockHash = blockHash.String
-		status.BlockHeight = uint64(blockHeight.Int64) //nolint:gosec // safe: database constraints ensure non-negative // safe: database constraints ensure non-negative
-		status.MerklePath = merklePath
+		status.BlockHeight = uint64(blockHeight.Int64) //nolint:gosec // safe: database constraints ensure non-negative
 		status.ExtraInfo = extraInfo.String
+
+		if len(bumpData) > 0 {
+			status.MerklePath = extractMinimalPathForTx(bumpData, status.TxID)
+		}
 
 		if competingTxsJSON.Valid && competingTxsJSON.String != "" {
 			var competingTxsMap map[string]bool
@@ -702,6 +704,56 @@ func scanTransactionStatuses(rows *sql.Rows) ([]*models.TransactionStatus, error
 	}
 
 	return statuses, nil
+}
+
+// extractMinimalPathForTx extracts a per-tx minimal merkle path from a compound BUMP.
+func extractMinimalPathForTx(bumpData []byte, txid string) []byte {
+	compound, err := transaction.NewMerklePathFromBinary(bumpData)
+	if err != nil {
+		return nil
+	}
+
+	txHash, err := chainhash.NewHashFromHex(txid)
+	if err != nil {
+		return nil
+	}
+
+	// Find the tx at level 0
+	var txOffset uint64
+	found := false
+	if len(compound.Path) > 0 {
+		for _, leaf := range compound.Path[0] {
+			if leaf.Hash != nil && *leaf.Hash == *txHash {
+				txOffset = leaf.Offset
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		return nil
+	}
+
+	// Extract minimal path for this offset
+	mp := &transaction.MerklePath{
+		BlockHeight: compound.BlockHeight,
+		Path:        make([][]*transaction.PathElement, len(compound.Path)),
+	}
+
+	offset := txOffset
+	for level := 0; level < len(compound.Path); level++ {
+		if level == 0 {
+			if leaf := compound.FindLeafByOffset(level, offset); leaf != nil {
+				mp.AddLeaf(level, leaf)
+			}
+		}
+		if sibling := compound.FindLeafByOffset(level, offset^1); sibling != nil {
+			mp.AddLeaf(level, sibling)
+		}
+		offset = offset >> 1
+	}
+
+	return mp.Bytes()
 }
 
 func scanSubmissions(rows *sql.Rows) ([]*models.Submission, error) {

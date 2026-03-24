@@ -18,14 +18,26 @@ const (
 type CallbackMessage struct {
 	Type         CallbackType `json:"type"`
 	TxID         string       `json:"txid,omitempty"`
+	TxIDs        []string     `json:"txids,omitempty"`
 	BlockHash    string       `json:"blockHash,omitempty"`
 	SubtreeIndex int          `json:"subtreeIndex,omitempty"`
 	Stump        HexBytes     `json:"stump,omitempty"`
 }
 
-// Stump represents a stored STUMP (Subtree Unified Merkle Path)
+// ResolveSeenTxIDs returns the list of txids from either the batched TxIDs
+// field or the scalar TxID field, for backward compatibility.
+func (msg *CallbackMessage) ResolveSeenTxIDs() []string {
+	if len(msg.TxIDs) > 0 {
+		return msg.TxIDs
+	}
+	if msg.TxID != "" {
+		return []string{msg.TxID}
+	}
+	return nil
+}
+
+// Stump represents a stored STUMP (Subtree Unified Merkle Path), keyed by subtree.
 type Stump struct {
-	TxID         string
 	BlockHash    string
 	SubtreeIndex int
 	StumpData    []byte

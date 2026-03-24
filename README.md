@@ -132,7 +132,7 @@ go get -u github.com/bsv-blockchain/arcade
 
 - **Go 1.25+** (see `go.mod` for exact version)
 - **SQLite** (included with most systems)
-- **Teranode broadcast URL** (e.g., `https://arc.taal.com`)
+- **Teranode DataHub URL** (e.g., `https://teranode.example.com/api/v1`)
 
 ### Build from Source
 
@@ -144,7 +144,7 @@ go build -o arcade ./cmd/arcade
 
 ### Configuration
 
-Create `config.yaml` with your Teranode broadcast URL:
+Create `config.yaml` with your Teranode DataHub URL:
 
 ```yaml
 # Minimal working configuration
@@ -155,8 +155,8 @@ server:
   address: ":3011"
 
 teranode:
-  broadcast_urls:           # REQUIRED - at least one URL needed
-    - "https://arc.taal.com"
+  datahub_urls:             # REQUIRED - at least one URL needed (used for tx submission and block/subtree data)
+    - "https://teranode.example.com/api/v1"
   timeout: 30s
 ```
 
@@ -266,7 +266,7 @@ DOUBLE_SPEND_ATTEMPTED (from rejected-tx gossip with specific reason)
 
 | Field                     | Description                             | Default      |
 |---------------------------|-----------------------------------------|--------------|
-| `teranode.broadcast_urls` | Teranode broadcast service URLs (array) | **Required** |
+| `teranode.datahub_urls`   | Teranode DataHub URLs used for transaction submission and block/subtree data (array, format: `<url>/api/v1`) | **Required** |
 
 #### Optional Fields
 
@@ -285,7 +285,6 @@ DOUBLE_SPEND_ATTEMPTED (from rejected-tx gossip with specific reason)
 | `database.sqlite_path`      | SQLite database file path                    | `~/.arcade/arcade.db` |
 | `events.type`               | Event backend: `memory`                      | `memory`              |
 | `events.buffer_size`        | Event channel buffer size                    | `1000`                |
-| `teranode.datahub_urls`     | DataHub URLs for fetching block data (array) | -                     |
 | `teranode.auth_token`       | Authentication token for Teranode API        | -                     |
 | `teranode.timeout`          | HTTP request timeout                         | `30s`                 |
 | `validator.max_tx_size`     | Maximum transaction size (bytes)             | `4294967296`          |
@@ -475,10 +474,10 @@ func (h *MyHandler) Start(ctx context.Context) error {
 <summary><strong>Troubleshooting</strong></summary>
 
 **Server fails to start with "no teranodes configured"**
-- Ensure `teranode.broadcast_urls` is set in your config file with at least one valid URL
+- Ensure `teranode.datahub_urls` is set in your config file with at least one valid URL
 
 **Transactions stuck in SENT_TO_NETWORK**
-- Check your Teranode broadcast URL is reachable
+- Check your Teranode DataHub URL is reachable
 - Verify network connectivity and firewall rules
 
 **SQLite errors**

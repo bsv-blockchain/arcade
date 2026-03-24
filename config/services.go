@@ -35,8 +35,8 @@ var (
 	ErrArcadeURLRequired = errors.New("arcade URL required for remote mode")
 	// ErrUnsupportedEventPublisherType indicates an unsupported event publisher type was specified.
 	ErrUnsupportedEventPublisherType = errors.New("unsupported event publisher type")
-	// ErrNoTeranodesConfigured indicates no teranode broadcast endpoints were configured.
-	ErrNoTeranodesConfigured = errors.New("no teranode broadcast endpoints configured: set teranode.broadcast_urls")
+	// ErrNoTeranodesConfigured indicates no teranode DataHub endpoints were configured.
+	ErrNoTeranodesConfigured = errors.New("no teranode DataHub endpoints configured: set teranode.datahub_urls")
 )
 
 // Services holds initialized application services.
@@ -148,10 +148,10 @@ func (c *Config) initializeEmbedded(ctx context.Context, logger *slog.Logger, ch
 
 	// Initialize Teranode client for broadcasting
 	logger.Info("Initializing Teranode client")
-	if len(c.Teranode.BroadcastURLs) == 0 {
+	if len(c.Teranode.DataHubURLs) == 0 {
 		return nil, ErrNoTeranodesConfigured
 	}
-	teranodeClient := teranode.NewClient(c.Teranode.BroadcastURLs, c.Teranode.AuthToken)
+	teranodeClient := teranode.NewClient(c.Teranode.DataHubURLs, c.Teranode.AuthToken)
 
 	// Initialize Merkle Service client (optional)
 	var merkleServiceClient *merkleservice.Client
@@ -222,8 +222,7 @@ func (c *Config) initializeEmbedded(ctx context.Context, logger *slog.Logger, ch
 		TxTracker:            txTracker,
 		Store:                sqliteStore,
 		EventPublisher:       eventPublisher,
-		DataHubURLs:          c.Teranode.DataHubURLs,
-		MerkleServiceEnabled: merkleServiceClient != nil,
+		DataHubURLs: c.Teranode.DataHubURLs,
 	})
 	if arcErr != nil {
 		if ownsP2PClient {

@@ -67,6 +67,8 @@ const (
 	StatusDoubleSpendAttempted = Status("DOUBLE_SPEND_ATTEMPTED")
 	// StatusRejected indicates the transaction was rejected.
 	StatusRejected = Status("REJECTED")
+	// StatusStumpProcessing indicates the transaction has a STUMP and is building the BUMP
+	StatusStumpProcessing = Status("STUMP_PROCESSING")
 	// StatusMined indicates the transaction was mined.
 	StatusMined = Status("MINED")
 	// StatusImmutable indicates the transaction is immutable.

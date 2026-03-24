@@ -15,12 +15,10 @@ events:
   type: memory
   buffer_size: 1000
 teranode:
-  # broadcast_urls: URLs for submitting transactions to Teranode
-  broadcast_urls:
-    - https://teranode-mainnet.taal.com/api/v1
-  # datahub_urls: Fallback URLs for fetching block/subtree data when P2P message URLs fail
+  # datahub_urls: Teranode DataHub URLs (formatted as <url>/api/v1)
+  # Used for both transaction submission and block/subtree data fetching
   datahub_urls:
-    - https://teranode-eks-mainnet-us-1.bsvb.tech/api/v1
+    - https://teranode-mainnet.taal.com/api/v1
   timeout: 30s
 validator:
   max_tx_size: 4294967296
@@ -33,6 +31,12 @@ webhook:
   prune_interval: 1h
   max_age: 24h
   max_retries: 10
+merkle_service:
+  # url: https://merkle-service.example.com  # Merkle Service API base URL (optional, enables merkle proof integration)
+  # auth_token: ""                            # Bearer token for authenticating with Merkle Service
+  # callback_base_url: http://localhost:3011  # Base URL for Arcade's callback endpoint
+  # callback_token: ""                        # Bearer token Merkle Service uses when calling back
+  timeout: 30s
 chaintracks:
   # Arcade always runs chaintracks in embedded mode using its P2P client
   storage_path: ~/.arcade/chaintracks

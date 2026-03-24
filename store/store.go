@@ -15,8 +15,6 @@ var ErrNotFound = errors.New("not found")
 type Store interface {
 	// GetOrInsertStatus inserts a new transaction status or returns the existing one if it already exists.
 	// Returns the status, a boolean indicating if it was newly inserted (true) or already existed (false), and any error.
-	// This enables idempotent transaction submission - duplicate submissions return the existing status
-	// and can still register new callbacks.
 	GetOrInsertStatus(ctx context.Context, status *models.TransactionStatus) (existing *models.TransactionStatus, inserted bool, err error)
 
 	// UpdateStatus updates an existing transaction status (used for P2P, blocks, etc.)
@@ -33,13 +31,15 @@ type Store interface {
 	// block fields are cleared. For IMMUTABLE, block fields are preserved.
 	SetStatusByBlockHash(ctx context.Context, blockHash string, newStatus models.Status) ([]string, error)
 
-	// InsertMerklePath stores a merkle path for a transaction in a specific block.
-	// The path is stored in binary format.
-	InsertMerklePath(ctx context.Context, txid, blockHash string, blockHeight uint64, merklePath []byte) error
+	// InsertBUMP stores a compound BUMP for a block.
+	InsertBUMP(ctx context.Context, blockHash string, blockHeight uint64, bumpData []byte) error
 
-	// SetMinedByBlockHash joins merkle_paths to set transactions as MINED for a canonical block.
+	// GetBUMP retrieves the compound BUMP for a block.
+	GetBUMP(ctx context.Context, blockHash string) (blockHeight uint64, bumpData []byte, err error)
+
+	// SetMinedByTxIDs marks transactions as mined for a given block hash and tx list.
 	// Returns full status objects for all affected transactions.
-	SetMinedByBlockHash(ctx context.Context, blockHash string) ([]*models.TransactionStatus, error)
+	SetMinedByTxIDs(ctx context.Context, blockHash string, txids []string) ([]*models.TransactionStatus, error)
 
 	// InsertSubmission creates a new submission record
 	InsertSubmission(ctx context.Context, sub *models.Submission) error
@@ -72,7 +72,7 @@ type Store interface {
 
 	// STUMP operations for Merkle Service integration
 
-	// InsertStump stores a STUMP for a transaction in a specific block.
+	// InsertStump stores a STUMP for a subtree in a specific block.
 	InsertStump(ctx context.Context, stump *models.Stump) error
 
 	// GetStumpsByBlockHash retrieves all STUMPs for a given block hash.

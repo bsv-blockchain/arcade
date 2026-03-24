@@ -3,12 +3,11 @@ package arcade
 
 import (
 	"context"
-	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -17,7 +16,6 @@ import (
 	"github.com/bsv-blockchain/go-chaintracks/chaintracks"
 	msgbus "github.com/bsv-blockchain/go-p2p-message-bus"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
-	"github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/bsv-blockchain/go-sdk/util"
 	p2p "github.com/bsv-blockchain/go-teranode-p2p-client"
 	teranode "github.com/bsv-blockchain/teranode/services/p2p"
@@ -36,7 +34,6 @@ var (
 	errEventPublisherRequired = errors.New("event publisher is required")
 	errChaintracksNoTip       = errors.New("chaintracks has no tip")
 	errUnexpectedStatusCode   = errors.New("unexpected status code")
-	errInvalidHashSize        = errors.New("invalid hash size")
 )
 
 // Config holds configuration for Arcade
@@ -55,13 +52,8 @@ type Config struct {
 	Store          store.Store
 	EventPublisher events.Publisher
 
-	// DataHubURLs are fallback URLs for fetching block/subtree data
-	// when the URL in P2P messages fails
+	// DataHubURLs are URLs for fetching block/subtree data
 	DataHubURLs []string
-
-	// MerkleServiceEnabled disables subtree P2P listening and legacy block scanning
-	// when Merkle Service integration is active. BUMP construction is driven by callbacks instead.
-	MerkleServiceEnabled bool
 }
 
 // Arcade tracks transaction statuses via P2P network messages.
@@ -76,11 +68,8 @@ type Arcade struct {
 	store          store.Store
 	eventPublisher events.Publisher
 
-	// Fallback DataHub URLs for fetching block/subtree data
+	// DataHub URLs for fetching block/subtree data
 	dataHubURLs []string
-
-	// Merkle Service integration
-	merkleServiceEnabled bool
 
 	// Status subscribers (fan-out)
 	subMu         sync.RWMutex
@@ -125,8 +114,7 @@ func NewArcade(cfg Config) (*Arcade, error) {
 		txTracker:            cfg.TxTracker,
 		store:                cfg.Store,
 		eventPublisher:       cfg.EventPublisher,
-		dataHubURLs:          cfg.DataHubURLs,
-		merkleServiceEnabled: cfg.MerkleServiceEnabled,
+		dataHubURLs: cfg.DataHubURLs,
 	}, nil
 }
 
@@ -134,18 +122,9 @@ func NewArcade(cfg Config) (*Arcade, error) {
 func (a *Arcade) Start(ctx context.Context) error {
 	a.logger.Info("Starting Arcade P2P subscriptions")
 
-	// Subscribe to block messages for block tracking and (legacy) merkle proof extraction
+	// Subscribe to block messages for block tracking
 	blockChan := a.p2pClient.SubscribeBlocks(ctx)
 	go a.handleBlockMessages(ctx, blockChan)
-
-	// Subscribe to subtree messages for SEEN_ON_NETWORK status (legacy mode only)
-	// When Merkle Service is enabled, SEEN_ON_NETWORK is driven by callbacks
-	if !a.merkleServiceEnabled {
-		subtreeChan := a.p2pClient.SubscribeSubtrees(ctx)
-		go a.handleSubtreeMessages(ctx, subtreeChan)
-	} else {
-		a.logger.Info("Merkle Service enabled: skipping subtree P2P subscription")
-	}
 
 	// Subscribe to rejected-tx messages
 	rejectedTxChan := a.p2pClient.SubscribeRejectedTxs(ctx)
@@ -302,36 +281,8 @@ func (a *Arcade) processBlockMessage(ctx context.Context, blockMsg teranode.Bloc
 		slog.String("hash", blockMsg.Hash),
 		slog.Uint64("height", uint64(blockMsg.Height)))
 
-	// When Merkle Service is enabled, skip subtree scanning — BUMP construction
-	// is driven by Merkle Service callbacks (STUMP + BLOCK_PROCESSED)
-	//nolint:nestif // complex nested logic for conditional transaction processing
-	if !a.merkleServiceEnabled && a.txTracker.Count() > 0 {
-		// Legacy mode: scan subtrees for tracked transactions and build merkle proofs
-		if err := a.processBlockTransactions(ctx, blockMsg); err != nil {
-			return err
-		}
-
-		// Set MINED status for transactions with merkle proofs in this block
-		statuses, err := a.store.SetMinedByBlockHash(ctx, blockMsg.Hash)
-		if err != nil {
-			a.logger.Error("failed to set mined status",
-				slog.String("blockHash", blockMsg.Hash),
-				slog.String("error", err.Error()))
-		} else {
-			for _, status := range statuses {
-				_ = a.eventPublisher.Publish(ctx, status)
-			}
-			if len(statuses) > 0 {
-				a.logger.Info("set transactions to MINED",
-					slog.String("blockHash", blockMsg.Hash),
-					slog.Int("count", len(statuses)))
-			}
-		}
-
-		// Prune deeply confirmed transactions
-		a.pruneConfirmedTransactions(ctx, blockMsg.Height)
-	} else if a.txTracker.Count() > 0 {
-		// Merkle Service mode: still prune confirmed transactions
+	// Prune deeply confirmed transactions
+	if a.txTracker.Count() > 0 {
 		a.pruneConfirmedTransactions(ctx, blockMsg.Height)
 	}
 
@@ -349,189 +300,6 @@ func (a *Arcade) processBlockMessage(ctx context.Context, blockMsg teranode.Bloc
 		slog.Uint64("height", uint64(blockMsg.Height)))
 
 	return nil
-}
-
-func (a *Arcade) processBlockTransactions(ctx context.Context, blockMsg teranode.BlockMessage) error { //nolint:gocyclo // complex business logic for merkle path construction
-	subtreeHashes, err := a.fetchBlockSubtreeHashes(ctx, blockMsg.DataHubURL, blockMsg.Hash)
-	if err != nil {
-		return fmt.Errorf("failed to fetch subtree hashes: %w", err)
-	}
-
-	numSubtrees := len(subtreeHashes)
-	if numSubtrees == 0 {
-		a.logger.Debug("block has no subtrees",
-			slog.String("hash", blockMsg.Hash))
-		return nil
-	}
-
-	a.logger.Debug("processing block transactions",
-		slog.String("hash", blockMsg.Hash),
-		slog.Int("subtrees", numSubtrees),
-		slog.Int("trackedTxCount", a.txTracker.Count()))
-
-	subtreeRootLayer := int(math.Ceil(math.Log2(float64(numSubtrees))))
-	totalTxsScanned := 0
-	totalMatched := 0
-
-	for subtreeIdx, subtreeHash := range subtreeHashes {
-		txHashes, err := a.fetchSubtreeHashes(ctx, blockMsg.DataHubURL, subtreeHash.String())
-		if err != nil {
-			a.logger.Error("failed to fetch subtree txids",
-				slog.String("subtreeHash", subtreeHash.String()),
-				slog.String("error", err.Error()))
-			continue
-		}
-
-		totalTxsScanned += len(txHashes)
-
-		// Subtree 0 contains a coinbase placeholder that must be replaced with the
-		// real coinbase txid. The subtree 0 root will be computed by ComputeMissingHashes.
-		if subtreeIdx == 0 && len(txHashes) > 0 {
-			if coinbaseTxID := a.parseCoinbaseTxID(blockMsg); coinbaseTxID != nil {
-				txHashes[0] = *coinbaseTxID
-			}
-		}
-
-		tracked := a.txTracker.FilterTrackedHashes(txHashes)
-		totalMatched += len(tracked)
-
-		if len(tracked) > 0 {
-			a.logger.Info("matched tracked transactions in subtree",
-				slog.String("blockHash", blockMsg.Hash),
-				slog.Int("subtreeIdx", subtreeIdx),
-				slog.Int("subtreeTxCount", len(txHashes)),
-				slog.Int("matchedCount", len(tracked)))
-			for _, h := range tracked {
-				a.logger.Debug("matched txid",
-					slog.String("txid", h.String()),
-					slog.String("blockHash", blockMsg.Hash))
-			}
-		}
-
-		if len(tracked) == 0 && subtreeIdx > 0 {
-			continue
-		}
-
-		a.buildMerklePathsForSubtree(ctx, blockMsg, subtreeIdx, subtreeRootLayer, subtreeHashes, txHashes, tracked)
-	}
-
-	a.logger.Debug("block transaction scan complete",
-		slog.String("hash", blockMsg.Hash),
-		slog.Int("subtreesProcessed", numSubtrees),
-		slog.Int("totalTxsScanned", totalTxsScanned),
-		slog.Int("totalMatched", totalMatched))
-
-	return nil
-}
-
-// parseCoinbaseTxID extracts the txid from the coinbase transaction in a block message.
-// Returns nil if the coinbase cannot be parsed.
-func (a *Arcade) parseCoinbaseTxID(blockMsg teranode.BlockMessage) *chainhash.Hash {
-	if blockMsg.Coinbase == "" {
-		return nil
-	}
-
-	coinbaseBytes, err := hex.DecodeString(blockMsg.Coinbase)
-	if err != nil {
-		a.logger.Error("failed to decode coinbase hex",
-			slog.String("blockHash", blockMsg.Hash),
-			slog.String("error", err.Error()))
-		return nil
-	}
-
-	tx, err := transaction.NewTransactionFromBytes(coinbaseBytes)
-	if err != nil {
-		a.logger.Error("failed to parse coinbase transaction",
-			slog.String("blockHash", blockMsg.Hash),
-			slog.String("error", err.Error()))
-		return nil
-	}
-
-	return tx.TxID()
-}
-
-//nolint:gocyclo // complex business logic for merkle path construction
-func (a *Arcade) buildMerklePathsForSubtree(
-	ctx context.Context,
-	blockMsg teranode.BlockMessage,
-	subtreeIdx int,
-	subtreeRootLayer int,
-	subtreeHashes []chainhash.Hash,
-	txHashes []chainhash.Hash,
-	tracked []chainhash.Hash,
-) {
-	subtreeSize := len(txHashes)
-	if subtreeSize == 0 {
-		return
-	}
-
-	internalHeight := int(math.Ceil(math.Log2(float64(subtreeSize))))
-	if internalHeight == 0 && subtreeSize > 0 {
-		internalHeight = 1
-	}
-
-	totalHeight := internalHeight + subtreeRootLayer
-
-	for _, trackedHash := range tracked {
-		var txOffset uint64
-		for i, h := range txHashes {
-			if h == trackedHash {
-				txOffset = uint64(i)
-				break
-			}
-		}
-
-		mp := &transaction.MerklePath{
-			BlockHeight: blockMsg.Height,
-			Path:        make([][]*transaction.PathElement, totalHeight),
-		}
-
-		for i, h := range txHashes {
-			hashCopy := h
-			isTxid := true
-			mp.AddLeaf(0, &transaction.PathElement{
-				Offset: uint64(i),
-				Hash:   &hashCopy,
-				Txid:   &isTxid,
-			})
-		}
-
-		if subtreeSize%2 == 1 {
-			dup := true
-			mp.AddLeaf(0, &transaction.PathElement{
-				Offset:    uint64(subtreeSize),
-				Duplicate: &dup,
-			})
-		}
-
-		subtreeBaseOffset := uint64(subtreeIdx) << uint(internalHeight-1) //nolint:gosec // safe: subtreeIdx is from slice iteration
-		for i, subHash := range subtreeHashes {
-			if i == 0 {
-				continue // Subtree 0 root is computed from txHashes (with corrected coinbase)
-			}
-			hashCopy := subHash
-			mp.AddLeaf(internalHeight, &transaction.PathElement{
-				Offset: subtreeBaseOffset + uint64(i),
-				Hash:   &hashCopy,
-			})
-		}
-
-		mp.ComputeMissingHashes()
-		minimalPath := ExtractMinimalPath(mp, txOffset)
-
-		if err := a.store.InsertMerklePath(ctx, trackedHash.String(), blockMsg.Hash, uint64(blockMsg.Height), minimalPath.Bytes()); err != nil {
-			a.logger.Error("failed to store merkle path",
-				slog.String("txID", trackedHash.String()),
-				slog.String("blockHash", blockMsg.Hash),
-				slog.String("error", err.Error()))
-		}
-	}
-}
-
-// extractMinimalPath delegates to the package-level ExtractMinimalPath.
-// Kept for backward compatibility with any callers using the method form.
-func (a *Arcade) extractMinimalPath(fullPath *transaction.MerklePath, txOffset uint64) *transaction.MerklePath {
-	return ExtractMinimalPath(fullPath, txOffset)
 }
 
 func (a *Arcade) pruneConfirmedTransactions(ctx context.Context, currentHeight uint32) {
@@ -783,47 +551,7 @@ func (a *Arcade) processBlockByHeader(ctx context.Context, header *chaintracks.B
 		slog.String("hash", blockHash),
 		slog.Uint64("height", uint64(header.Height)))
 
-	trackedCount := a.txTracker.Count()
-	dataHubCount := len(a.dataHubURLs)
-
-	a.logger.Debug("block processing gate check",
-		slog.String("hash", blockHash),
-		slog.Int("trackedTxCount", trackedCount),
-		slog.Int("dataHubURLCount", dataHubCount))
-
-	// Only do transaction scanning if we have transactions to track,
-	// DataHub URLs are configured, AND Merkle Service is NOT enabled.
-	// When Merkle Service is enabled, BUMP construction is callback-driven.
-	if !a.merkleServiceEnabled && trackedCount > 0 && dataHubCount > 0 {
-		// Legacy mode: scan subtrees for tracked transactions
-		blockMsg := teranode.BlockMessage{
-			Hash:       blockHash,
-			Height:     header.Height,
-			DataHubURL: a.dataHubURLs[0],
-			// Coinbase not available - merkle paths for subtree 0 position 0 may be incomplete
-		}
-
-		// Process block transactions (fetch subtrees, scan for tracked txs)
-		if err := a.processBlockTransactions(ctx, blockMsg); err != nil {
-			return fmt.Errorf("failed to process block transactions: %w", err)
-		}
-
-		// Set MINED status for any transactions found in this block
-		statuses, err := a.store.SetMinedByBlockHash(ctx, blockHash)
-		if err != nil {
-			return fmt.Errorf("failed to set mined status: %w", err)
-		}
-		for _, status := range statuses {
-			_ = a.eventPublisher.Publish(ctx, status)
-		}
-		if len(statuses) > 0 {
-			a.logger.Info("set transactions to MINED (catch-up)",
-				slog.String("blockHash", blockHash),
-				slog.Int("count", len(statuses)))
-		}
-	}
-
-	// Mark block as on_chain only after successful processing
+	// Mark block as on_chain
 	if err := a.store.MarkBlockProcessed(ctx, blockHash, uint64(header.Height), true); err != nil {
 		return fmt.Errorf("failed to mark block as on_chain: %w", err)
 	}
@@ -833,71 +561,6 @@ func (a *Arcade) processBlockByHeader(ctx context.Context, header *chaintracks.B
 		slog.Uint64("height", uint64(header.Height)))
 
 	return nil
-}
-
-// handleSubtreeMessages processes subtree announcements
-func (a *Arcade) handleSubtreeMessages(ctx context.Context, subtreeChan <-chan teranode.SubtreeMessage) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case subtreeMsg, ok := <-subtreeChan:
-			if !ok {
-				return
-			}
-			a.processSubtreeMessage(ctx, subtreeMsg)
-		}
-	}
-}
-
-func (a *Arcade) processSubtreeMessage(ctx context.Context, subtreeMsg teranode.SubtreeMessage) {
-	if a.txTracker.Count() == 0 {
-		return
-	}
-
-	hashes, err := a.fetchSubtreeHashes(ctx, subtreeMsg.DataHubURL, subtreeMsg.Hash)
-	if err != nil {
-		a.logger.Error("failed to fetch subtree hashes",
-			slog.String("hash", subtreeMsg.Hash),
-			slog.String("error", err.Error()))
-		return
-	}
-
-	a.logger.Debug("processed subtree message",
-		slog.String("hash", subtreeMsg.Hash),
-		slog.Int("txCount", len(hashes)))
-
-	tracked := a.txTracker.FilterTrackedHashes(hashes)
-	if len(tracked) == 0 {
-		return
-	}
-
-	a.logger.Info("found tracked transactions in subtree",
-		slog.String("hash", subtreeMsg.Hash),
-		slog.Int("tracked", len(tracked)))
-
-	for _, hash := range tracked {
-		txID := hash.String()
-		status := &models.TransactionStatus{
-			TxID:      txID,
-			Status:    models.StatusSeenOnNetwork,
-			Timestamp: time.Now(),
-		}
-
-		if err := a.store.UpdateStatus(ctx, status); err != nil {
-			a.logger.Error("failed to update seen status",
-				slog.String("txID", txID),
-				slog.String("error", err.Error()))
-			continue
-		}
-
-		a.txTracker.UpdateStatusHash(hash, models.StatusSeenOnNetwork)
-		if err := a.eventPublisher.Publish(ctx, status); err != nil {
-			a.logger.Error("failed to publish status",
-				slog.String("txID", txID),
-				slog.String("error", err.Error()))
-		}
-	}
 }
 
 // handleRejectedTxMessages processes rejected transaction messages
@@ -948,40 +611,47 @@ func (a *Arcade) processRejectedTxMessage(ctx context.Context, rejectedMsg teran
 
 // HTTP fetching methods
 
-func (a *Arcade) fetchBlockSubtreeHashes(ctx context.Context, dataHubURL, blockHash string) ([]chainhash.Hash, error) {
-	url := fmt.Sprintf("%s/block/%s", strings.TrimSuffix(dataHubURL, "/"), blockHash)
-	hashes, err := a.fetchBlockSubtrees(ctx, url)
-	if err == nil {
-		return hashes, nil
-	}
-
-	// Try fallback URLs
-	for _, fallbackURL := range a.dataHubURLs {
-		if fallbackURL == dataHubURL {
-			continue // Skip if same as original
-		}
-		url = fmt.Sprintf("%s/block/%s", strings.TrimSuffix(fallbackURL, "/"), blockHash)
-		hashes, fallbackErr := a.fetchBlockSubtrees(ctx, url)
-		if fallbackErr == nil {
-			return hashes, nil
-		}
-	}
-
-	return nil, err // Return original error
+// blockJSONResponse represents the JSON response from the Teranode block JSON endpoint.
+type blockJSONResponse struct {
+	CoinbaseBump string   `json:"coinbase_bump"` // hex-encoded BRC-74
+	Subtrees     []string `json:"subtrees"`      // hex-encoded subtree root hashes
+	Height       int      `json:"height"`
 }
 
-// fetchBlockSubtrees fetches a block from teranode and extracts subtree hashes from the binary format.
-// Teranode block binary format:
-// - Block header (80 bytes)
-// - Transaction count (varint)
-// - Size in bytes (varint)
-// - Subtree count (varint)
-// - Subtree hashes (32 bytes each)
-// - Coinbase transaction
-// - Height (varint)
-//
-//nolint:gocyclo // complex business logic for parsing merkle tree data
-func (a *Arcade) fetchBlockSubtrees(ctx context.Context, url string) ([]chainhash.Hash, error) {
+// fetchBlockJSON fetches block data from the Teranode JSON endpoint.
+func (a *Arcade) fetchBlockJSON(ctx context.Context, dataHubURL, blockHash string) (*blockJSONResponse, error) {
+	url := fmt.Sprintf("%s/block/%s/json", strings.TrimSuffix(dataHubURL, "/"), blockHash)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch: %w", err)
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%w: %d", errUnexpectedStatusCode, resp.StatusCode)
+	}
+
+	var result blockJSONResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode JSON response: %w", err)
+	}
+
+	return &result, nil
+}
+
+// fetchBlockBinarySubtrees fetches subtree hashes from the Teranode binary block endpoint.
+func (a *Arcade) fetchBlockBinarySubtrees(ctx context.Context, dataHubURL, blockHash string) ([]chainhash.Hash, error) {
+	url := fmt.Sprintf("%s/block/%s", strings.TrimSuffix(dataHubURL, "/"), blockHash)
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
@@ -1031,71 +701,6 @@ func (a *Arcade) fetchBlockSubtrees(ctx context.Context, url string) ([]chainhas
 		if _, err := io.ReadFull(resp.Body, hashBuf); err != nil {
 			return nil, fmt.Errorf("failed to read subtree hash %d: %w", i, err)
 		}
-		hash, err := chainhash.NewHash(hashBuf)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create hash: %w", err)
-		}
-		hashes = append(hashes, *hash)
-	}
-
-	return hashes, nil
-}
-
-func (a *Arcade) fetchSubtreeHashes(ctx context.Context, dataHubURL, subtreeHash string) ([]chainhash.Hash, error) {
-	url := fmt.Sprintf("%s/subtree/%s", strings.TrimSuffix(dataHubURL, "/"), subtreeHash)
-	hashes, err := a.fetchHashes(ctx, url)
-	if err == nil {
-		return hashes, nil
-	}
-
-	// Try fallback URLs
-	for _, fallbackURL := range a.dataHubURLs {
-		if fallbackURL == dataHubURL {
-			continue // Skip if same as original
-		}
-		url = fmt.Sprintf("%s/subtree/%s", strings.TrimSuffix(fallbackURL, "/"), subtreeHash)
-		hashes, fallbackErr := a.fetchHashes(ctx, url)
-		if fallbackErr == nil {
-			return hashes, nil
-		}
-	}
-
-	return nil, err // Return original error
-}
-
-func (a *Arcade) fetchHashes(ctx context.Context, url string) ([]chainhash.Hash, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	resp, err := a.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch: %w", err)
-	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%w: %d", errUnexpectedStatusCode, resp.StatusCode)
-	}
-
-	hashes := make([]chainhash.Hash, 0)
-	hashBuf := make([]byte, 32)
-
-	for {
-		n, err := io.ReadFull(resp.Body, hashBuf)
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("failed to read hash: %w", err)
-		}
-		if n != 32 {
-			return nil, fmt.Errorf("%w: %d", errInvalidHashSize, n)
-		}
-
 		hash, err := chainhash.NewHash(hashBuf)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create hash: %w", err)

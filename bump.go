@@ -2,6 +2,7 @@ package arcade
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"math"
@@ -10,6 +11,7 @@ import (
 	"github.com/bsv-blockchain/go-sdk/transaction"
 
 	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/store"
 )
 
 // AssembleBUMP constructs a full BUMP (block-level merkle proof) from a STUMP
@@ -23,7 +25,7 @@ import (
 //     placeholder replacement); nil if unavailable. When the tracked tx is in subtree 0, the
 //     coinbase BUMP provides correct intermediate hashes that replace the placeholder-derived hashes.
 //
-// Returns the minimal merkle path for the tracked transaction and the global tx offset.
+// Returns the full merkle path for the tracked transaction (with global offsets) and the global tx offset.
 func AssembleBUMP(stumpData []byte, subtreeIndex int, subtreeHashes []chainhash.Hash, coinbaseBUMP []byte) (*transaction.MerklePath, uint64, error) {
 	stumpPath, err := transaction.NewMerklePathFromBinary(stumpData)
 	if err != nil {
@@ -33,9 +35,6 @@ func AssembleBUMP(stumpData []byte, subtreeIndex int, subtreeHashes []chainhash.
 	internalHeight := len(stumpPath.Path)
 
 	// Handle coinbase placeholder replacement for subtree 0 using the coinbase BUMP.
-	// The coinbase BUMP provides correct intermediate hashes computed with the real coinbase
-	// instead of the placeholder. We walk the coinbase BUMP to compute the correct hash at
-	// each level, then replace the corresponding hash in the STUMP.
 	if subtreeIndex == 0 && len(coinbaseBUMP) > 0 {
 		replaceCoinbasePlaceholder(stumpPath, coinbaseBUMP, internalHeight)
 	}
@@ -115,11 +114,6 @@ func replaceCoinbasePlaceholder(stumpPath *transaction.MerklePath, coinbaseBUMP 
 		return
 	}
 
-	// Walk the coinbase BUMP from the bottom to compute the correct hash at each level.
-	// The coinbase is always at offset 0, so its ancestor at level L is at offset 0.
-	// At each level, we compute: correctHash = MTP(left, right) using the coinbase path.
-
-	// First, find the coinbase hash at level 0
 	var currentHash *chainhash.Hash
 	for _, leaf := range cbPath.Path[0] {
 		if leaf.Offset == 0 && leaf.Hash != nil {
@@ -131,9 +125,7 @@ func replaceCoinbasePlaceholder(stumpPath *transaction.MerklePath, coinbaseBUMP 
 		return
 	}
 
-	// For each level, try to replace the hash at offset 0 in the STUMP
 	for level := 0; level < internalHeight && level < len(cbPath.Path); level++ {
-		// Replace offset 0 in the STUMP at this level with the correct coinbase-derived hash
 		for _, elem := range stumpPath.Path[level] {
 			if elem.Offset == 0 && (elem.Txid == nil || !*elem.Txid) {
 				h := *currentHash
@@ -142,12 +134,10 @@ func replaceCoinbasePlaceholder(stumpPath *transaction.MerklePath, coinbaseBUMP 
 			}
 		}
 
-		// Compute the next level's hash using the coinbase path's sibling
-		sibling := cbPath.FindLeafByOffset(level, 1) // coinbase at offset 0, sibling at 1
+		sibling := cbPath.FindLeafByOffset(level, 1)
 		if sibling == nil || sibling.Hash == nil {
 			break
 		}
-		// Coinbase is always on the left (offset 0 at every level → even → left)
 		currentHash = transaction.MerkleTreeParent(currentHash, sibling.Hash)
 	}
 }
@@ -176,7 +166,87 @@ func ExtractMinimalPath(fullPath *transaction.MerklePath, txOffset uint64) *tran
 	return mp
 }
 
-// ConstructBUMPsForBlock constructs full BUMPs from accumulated STUMPs for a block.
+// extractLevel0Hashes parses a BRC-74 STUMP binary and returns all level-0 hashes.
+func extractLevel0Hashes(stumpData []byte) []chainhash.Hash {
+	mp, err := transaction.NewMerklePathFromBinary(stumpData)
+	if err != nil || len(mp.Path) == 0 {
+		return nil
+	}
+
+	hashes := make([]chainhash.Hash, 0, len(mp.Path[0]))
+	for _, leaf := range mp.Path[0] {
+		if leaf.Hash != nil {
+			hashes = append(hashes, *leaf.Hash)
+		}
+	}
+	return hashes
+}
+
+// BuildCompoundBUMP merges multiple per-subtree BUMPs into a single compound MerklePath
+// containing all tracked transactions at level 0. The tracker is used to discover
+// which level-0 hashes are tracked transactions.
+func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, coinbaseBUMP []byte, tracker *store.TxTracker) (*transaction.MerklePath, []string, error) {
+	if len(stumps) == 0 {
+		return nil, nil, fmt.Errorf("no stumps to build compound BUMP")
+	}
+
+	// Assemble each STUMP into a full path, collect all elements by level
+	var blockHeight uint32
+	var txids []string
+	allPaths := make([]*transaction.MerklePath, 0, len(stumps))
+
+	for _, stump := range stumps {
+		fullPath, _, err := AssembleBUMP(stump.StumpData, stump.SubtreeIndex, subtreeHashes, coinbaseBUMP)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to assemble BUMP for subtree %d: %w", stump.SubtreeIndex, err)
+		}
+		blockHeight = fullPath.BlockHeight
+
+		// Discover tracked txids from level-0 hashes
+		level0 := extractLevel0Hashes(stump.StumpData)
+		if tracker != nil {
+			tracked := tracker.FilterTrackedHashes(level0)
+			for _, h := range tracked {
+				txids = append(txids, h.String())
+			}
+		}
+
+		allPaths = append(allPaths, fullPath)
+	}
+
+	// Determine total height from the first path
+	totalHeight := len(allPaths[0].Path)
+
+	compound := &transaction.MerklePath{
+		BlockHeight: blockHeight,
+		Path:        make([][]*transaction.PathElement, totalHeight),
+	}
+
+	// Merge all path elements, deduplicating by (level, offset)
+	type key struct {
+		level  int
+		offset uint64
+	}
+	seen := make(map[key]bool)
+
+	for _, mp := range allPaths {
+		for level := 0; level < len(mp.Path); level++ {
+			for _, elem := range mp.Path[level] {
+				k := key{level, elem.Offset}
+				if seen[k] {
+					continue
+				}
+				seen[k] = true
+				compound.AddLeaf(level, elem)
+			}
+		}
+	}
+
+	return compound, txids, nil
+}
+
+// ConstructBUMPsForBlock constructs a compound BUMP from accumulated STUMPs for a block
+// and stores it in the bumps table.
 func (a *Arcade) ConstructBUMPsForBlock(ctx context.Context, blockHash string) error {
 	stumps, err := a.store.GetStumpsByBlockHash(ctx, blockHash)
 	if err != nil {
@@ -189,13 +259,13 @@ func (a *Arcade) ConstructBUMPsForBlock(ctx context.Context, blockHash string) e
 		return nil
 	}
 
-	a.logger.Info("constructing BUMPs from STUMPs",
+	a.logger.Info("constructing compound BUMP from STUMPs",
 		slog.String("blockHash", blockHash),
 		slog.Int("stumpCount", len(stumps)))
 
-	subtreeHashes, err := a.fetchBlockSubtreeHashesForBUMP(ctx, blockHash)
+	subtreeHashes, coinbaseBUMP, err := a.fetchBlockDataForBUMP(ctx, blockHash)
 	if err != nil {
-		return fmt.Errorf("failed to fetch block subtree hashes: %w", err)
+		return fmt.Errorf("failed to fetch block data: %w", err)
 	}
 
 	if len(subtreeHashes) == 0 {
@@ -204,20 +274,17 @@ func (a *Arcade) ConstructBUMPsForBlock(ctx context.Context, blockHash string) e
 		return nil
 	}
 
-	// TODO: fetch coinbase BUMP from block model once Teranode supports it
-	var coinbaseBUMP []byte
-
-	for _, stump := range stumps {
-		if err := a.constructSingleBUMP(ctx, blockHash, stump, subtreeHashes, coinbaseBUMP); err != nil {
-			a.logger.Error("failed to construct BUMP",
-				slog.String("txid", stump.TxID),
-				slog.String("blockHash", blockHash),
-				slog.String("error", err.Error()))
-			continue
-		}
+	compound, txids, err := BuildCompoundBUMP(stumps, subtreeHashes, coinbaseBUMP, a.txTracker)
+	if err != nil {
+		return fmt.Errorf("failed to build compound BUMP: %w", err)
 	}
 
-	statuses, err := a.store.SetMinedByBlockHash(ctx, blockHash)
+	blockHeight := uint64(compound.BlockHeight)
+	if err := a.store.InsertBUMP(ctx, blockHash, blockHeight, compound.Bytes()); err != nil {
+		return fmt.Errorf("failed to store compound BUMP: %w", err)
+	}
+
+	statuses, err := a.store.SetMinedByTxIDs(ctx, blockHash, txids)
 	if err != nil {
 		a.logger.Error("failed to set mined status",
 			slog.String("blockHash", blockHash),
@@ -242,49 +309,59 @@ func (a *Arcade) ConstructBUMPsForBlock(ctx context.Context, blockHash string) e
 	return nil
 }
 
-// constructSingleBUMP is a thin wrapper around AssembleBUMP that handles storage.
-func (a *Arcade) constructSingleBUMP(
-	ctx context.Context,
-	blockHash string,
-	stump *models.Stump,
-	subtreeHashes []chainhash.Hash,
-	coinbaseBUMP []byte,
-) error {
-	minimalPath, _, err := AssembleBUMP(stump.StumpData, stump.SubtreeIndex, subtreeHashes, coinbaseBUMP)
-	if err != nil {
-		return err
-	}
-
-	blockHeight := uint64(minimalPath.BlockHeight)
-	if err := a.store.InsertMerklePath(ctx, stump.TxID, blockHash, blockHeight, minimalPath.Bytes()); err != nil {
-		return fmt.Errorf("failed to store BUMP: %w", err)
-	}
-
-	a.logger.Debug("constructed BUMP",
-		slog.String("txid", stump.TxID),
-		slog.String("blockHash", blockHash),
-		slog.Int("subtreeIndex", stump.SubtreeIndex))
-
-	return nil
-}
-
-// fetchBlockSubtreeHashesForBUMP fetches subtree hashes for a block, trying all DataHub URLs.
-func (a *Arcade) fetchBlockSubtreeHashesForBUMP(ctx context.Context, blockHash string) ([]chainhash.Hash, error) {
+// fetchBlockDataForBUMP fetches subtree hashes and coinbase BUMP for a block,
+// trying all DataHub URLs. Prefers the JSON endpoint (which includes coinbase_bump),
+// falling back to the binary endpoint (no coinbase BUMP).
+func (a *Arcade) fetchBlockDataForBUMP(ctx context.Context, blockHash string) (subtreeHashes []chainhash.Hash, coinbaseBUMP []byte, err error) {
 	for _, dataHubURL := range a.dataHubURLs {
-		hashes, err := a.fetchBlockSubtreeHashes(ctx, dataHubURL, blockHash)
-		if err == nil {
-			return hashes, nil
+		// Try JSON endpoint first (includes coinbase_bump)
+		resp, jsonErr := a.fetchBlockJSON(ctx, dataHubURL, blockHash)
+		if jsonErr == nil {
+			hashes, coinbase, parseErr := parseBlockJSONResponse(resp)
+			if parseErr == nil {
+				return hashes, coinbase, nil
+			}
+			a.logger.Debug("failed to parse JSON block response",
+				slog.String("url", dataHubURL),
+				slog.String("error", parseErr.Error()))
+		} else {
+			a.logger.Debug("JSON block endpoint failed, trying binary",
+				slog.String("url", dataHubURL),
+				slog.String("error", jsonErr.Error()))
 		}
-		a.logger.Debug("failed to fetch block from DataHub",
+
+		// Fall back to binary endpoint (no coinbase BUMP)
+		hashes, binErr := a.fetchBlockBinarySubtrees(ctx, dataHubURL, blockHash)
+		if binErr == nil {
+			return hashes, nil, nil
+		}
+		a.logger.Debug("binary block endpoint also failed",
 			slog.String("url", dataHubURL),
-			slog.String("blockHash", blockHash),
-			slog.String("error", err.Error()))
+			slog.String("error", binErr.Error()))
 	}
-	return nil, fmt.Errorf("all DataHub URLs failed for block %s", blockHash)
+	return nil, nil, fmt.Errorf("all DataHub URLs failed for block %s", blockHash)
 }
 
-// getCoinbaseTxIDForBlock attempts to get the coinbase transaction ID for a block.
-func (a *Arcade) getCoinbaseTxIDForBlock(_ context.Context, _ string) *chainhash.Hash {
-	// TODO: fetch coinbase from block model once Teranode supports it
-	return nil
+// parseBlockJSONResponse converts a blockJSONResponse into typed data.
+func parseBlockJSONResponse(resp *blockJSONResponse) ([]chainhash.Hash, []byte, error) {
+	hashes := make([]chainhash.Hash, 0, len(resp.Subtrees))
+	for _, hexStr := range resp.Subtrees {
+		h, err := chainhash.NewHashFromHex(hexStr)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to parse subtree hash %q: %w", hexStr, err)
+		}
+		hashes = append(hashes, *h)
+	}
+
+	var coinbaseBUMP []byte
+	if resp.CoinbaseBump != "" {
+		var err error
+		coinbaseBUMP, err = hex.DecodeString(resp.CoinbaseBump)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to decode coinbase_bump: %w", err)
+		}
+	}
+
+	return hashes, coinbaseBUMP, nil
 }
+

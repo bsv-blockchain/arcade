@@ -207,6 +207,7 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 
 	// Register with Merkle Service before broadcasting (best-effort)
 	e.registerWithMerkleService(ctx, txid)
+	e.logger.Info("transaction validated and registered with Merkle Service",)
 
 	// Submit to teranode endpoints synchronously with timeout
 	// Wait for first success/rejection, or timeout after 15 seconds
@@ -248,6 +249,7 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 // registerWithMerkleService registers a transaction with the Merkle Service.
 // Failures are logged but do not block the broadcast.
 func (e *Embedded) registerWithMerkleService(ctx context.Context, txid string) {
+	e.logger.Info("registering transaction with Merkle Service",)
 	if e.merkleServiceClient == nil || e.merkleServiceCallbackURL == "" {
 		return
 	}

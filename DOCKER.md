@@ -10,7 +10,7 @@ This guide covers building, running, and deploying Arcade using Docker.
 
 ```bash
 cp config.example.yaml config.yaml
-# Edit config.yaml and set at least one teranode.broadcast_urls
+# Edit config.yaml and set at least one teranode.datahub_urls
 ```
 
 2. **Start Arcade:**
@@ -96,7 +96,7 @@ docker run -d \
   -p 3011:3011 \
   -e ARCADE_NETWORK=main \
   -e ARCADE_LOG_LEVEL=debug \
-  -e ARCADE_TERANODE_BROADCAST_URLS="https://arc.taal.com" \
+  -e ARCADE_TERANODE_DATAHUB_URLS="https://teranode.example.com/api/v1" \
   -e ARCADE_SERVER_ADDRESS=:3011 \
   -v arcade-data:/data \
   arcade:latest
@@ -114,8 +114,8 @@ server:
   address: ":3011"
 
 teranode:
-  broadcast_urls:
-    - "https://arc.taal.com"
+  datahub_urls:
+    - "https://teranode.example.com/api/v1"
   timeout: 30s
 
 database:
