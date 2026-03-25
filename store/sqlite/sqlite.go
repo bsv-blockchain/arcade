@@ -18,11 +18,14 @@ import (
 )
 
 const (
-	// SQLite pragmas for better concurrency
+	// SQLite pragmas for better concurrency and throughput
 	sqlitePragmas = `
 PRAGMA journal_mode=WAL;
 PRAGMA busy_timeout=5000;
 PRAGMA synchronous=NORMAL;
+PRAGMA cache_size=-64000;
+PRAGMA mmap_size=268435456;
+PRAGMA temp_store=MEMORY;
 `
 )
 
@@ -37,6 +40,11 @@ func NewStore(dbPath string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
+
+	// SQLite only allows one writer at a time. Limiting to a single connection
+	// prevents SQLITE_BUSY errors under concurrent HTTP load. WAL mode still
+	// allows concurrent reads from this connection while a write is in progress.
+	db.SetMaxOpenConns(1)
 
 	if _, err := db.ExecContext(context.Background(), sqlitePragmas); err != nil {
 		return nil, fmt.Errorf("failed to set pragmas: %w", err)
