@@ -128,6 +128,7 @@ func (r *Routes) handlePostTx(c *fiber.Ctx) error {
 	}
 
 	status.StatusCode = http.StatusOK
+	status.Title = "OK"
 	return c.JSON(status)
 }
 
@@ -176,6 +177,7 @@ func (r *Routes) handlePostTxs(c *fiber.Ctx) error {
 
 	for _, s := range statuses {
 		s.StatusCode = http.StatusOK
+		s.Title = "OK"
 	}
 	return c.JSON(statuses)
 }
@@ -216,6 +218,7 @@ func (r *Routes) handleGetTx(c *fiber.Ctx) error {
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to get status"})
 	}
 	status.StatusCode = http.StatusOK
+	status.Title = "OK"
 	return c.JSON(status)
 }
 
@@ -319,12 +322,13 @@ func (r *Routes) parseTransactionBody(c *fiber.Ctx) ([]byte, error) {
 
 // extractSubmitOptions extracts SubmitOptions from HTTP headers.
 func (r *Routes) extractSubmitOptions(c *fiber.Ctx) *models.SubmitOptions {
+	skipAll := c.Get("X-SkipTxValidation") == "true"
 	return &models.SubmitOptions{
 		CallbackURL:          c.Get("X-CallbackUrl"),
 		CallbackToken:        c.Get("X-CallbackToken"),
 		FullStatusUpdates:    c.Get("X-FullStatusUpdates") == "true",
-		SkipFeeValidation:    c.Get("X-SkipFeeValidation") == "true",
-		SkipScriptValidation: c.Get("X-SkipScriptValidation") == "true",
+		SkipFeeValidation:    skipAll || c.Get("X-SkipFeeValidation") == "true",
+		SkipScriptValidation: skipAll || c.Get("X-SkipScriptValidation") == "true",
 	}
 }
 

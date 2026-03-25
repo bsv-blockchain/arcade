@@ -2,6 +2,7 @@
 # Environment variables can override any setting using ARCADE_ prefix
 # Example: ARCADE_SERVER_ADDRESS=:9090 overrides server.address
 network: main
+log_level: info  # debug, info, warn, error
 storage_path: ~/.arcade
 server:
   address: ":3011"
