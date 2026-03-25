@@ -365,13 +365,10 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 		txInfos = append(txInfos, txInfo{tx: tx, rawTx: rawTx, txid: txid, isNew: isNew, status: existingStatus})
 	}
 
-	// Submit all to teranode synchronously with timeout
-	submitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-
-	var responses []*models.TransactionStatus
+	// Separate transactions into those that need broadcasting and those that don't
+	responses := make([]*models.TransactionStatus, 0, len(txInfos))
+	var toBroadcast []txInfo
 	for _, info := range txInfos {
-		// Skip rebroadcast if already confirmed on network or rejected
 		if !info.isNew {
 			//nolint:exhaustive // intentionally only handling terminal states
 			switch info.status.Status {
@@ -383,43 +380,84 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 				// Still pending (RECEIVED, SENT_TO_NETWORK, ACCEPTED_BY_NETWORK) - rebroadcast
 			}
 		}
+		toBroadcast = append(toBroadcast, info)
+	}
 
-		// Register with Merkle Service before broadcasting (best-effort)
+	if len(toBroadcast) == 0 {
+		return responses, nil
+	}
+
+	// Register all with Merkle Service before broadcasting (best-effort)
+	for _, info := range toBroadcast {
 		e.registerWithMerkleService(ctx, info.txid)
+	}
 
-		rawTx := info.tx.Bytes()
+	// Collect raw tx bytes for batch submission
+	batchTxs := make([][]byte, len(toBroadcast))
+	for i, info := range toBroadcast {
+		batchTxs[i] = info.tx.Bytes()
+	}
 
-		endpoints := e.teranodeClient.GetEndpoints()
-		resultCh := make(chan *models.TransactionStatus, len(endpoints))
-		var wg sync.WaitGroup
-		for _, endpoint := range endpoints {
-			wg.Add(1)
-			go func(ep string) {
-				defer wg.Done()
-				status := e.submitToTeranodeSync(submitCtx, ep, rawTx, info.txid)
-				select {
-				case resultCh <- status:
-				case <-submitCtx.Done():
-					return
-				}
-			}(endpoint)
+	// Submit batch to each teranode endpoint, use first success
+	submitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	endpoints := e.teranodeClient.GetEndpoints()
+	resultCh := make(chan error, len(endpoints))
+	var wg sync.WaitGroup
+	for _, endpoint := range endpoints {
+		wg.Add(1)
+		go func(ep string) {
+			defer wg.Done()
+			_, err := e.teranodeClient.SubmitTransactions(submitCtx, ep, batchTxs)
+			select {
+			case resultCh <- err:
+			case <-submitCtx.Done():
+			}
+		}(endpoint)
+	}
+	go func() {
+		wg.Wait()
+		close(resultCh)
+	}()
+
+	// Wait for first result
+	var batchErr error
+	select {
+	case err := <-resultCh:
+		batchErr = err
+	case <-submitCtx.Done():
+		batchErr = submitCtx.Err()
+	}
+
+	// Update statuses based on batch result
+	now := time.Now()
+	for _, info := range toBroadcast {
+		var status *models.TransactionStatus
+		if batchErr != nil {
+			e.logger.Debug("transaction rejected by network (batch)",
+				slog.String("txid", info.txid),
+				slog.String("reason", batchErr.Error()))
+			status = &models.TransactionStatus{
+				TxID:      info.txid,
+				Status:    models.StatusRejected,
+				Timestamp: now,
+				ExtraInfo: batchErr.Error(),
+			}
+		} else {
+			status = &models.TransactionStatus{
+				TxID:      info.txid,
+				Status:    models.StatusAcceptedByNetwork,
+				Timestamp: now,
+			}
 		}
-
-		// Close channel when all goroutines complete
-		go func() {
-			wg.Wait()
-			close(resultCh)
-		}()
-
-		// Wait for first result or timeout
-		select {
-		case status := <-resultCh:
-			responses = append(responses, status)
-		case <-submitCtx.Done():
-			// Timeout - get current status
-			status, _ := e.store.GetStatus(ctx, info.txid)
-			responses = append(responses, status)
+		if err := e.store.UpdateStatus(ctx, status); err != nil {
+			e.logger.Error("failed to update status", slog.String("txID", info.txid), slog.String("error", err.Error()))
 		}
+		if err := e.eventPublisher.Publish(ctx, status); err != nil {
+			e.logger.Error("failed to publish status", slog.String("txID", info.txid), slog.String("error", err.Error()))
+		}
+		responses = append(responses, status)
 	}
 
 	return responses, nil
@@ -477,6 +515,10 @@ func (e *Embedded) GetPolicy(_ context.Context) (*models.Policy, error) {
 func (e *Embedded) submitToTeranodeSync(ctx context.Context, endpoint string, rawTx []byte, txid string) *models.TransactionStatus {
 	statusCode, err := e.teranodeClient.SubmitTransaction(ctx, endpoint, rawTx)
 	if err != nil {
+		e.logger.Debug("transaction rejected by network",
+			slog.String("txid", txid),
+			slog.String("endpoint", endpoint),
+			slog.String("reason", err.Error()))
 		status := &models.TransactionStatus{
 			TxID:      txid,
 			Status:    models.StatusRejected,

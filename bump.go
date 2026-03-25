@@ -14,8 +14,9 @@ import (
 	"github.com/bsv-blockchain/arcade/store"
 )
 
-// AssembleBUMP constructs a full BUMP (block-level merkle proof) from a STUMP
+// AssembleBUMP constructs a minimal BUMP (block-level merkle proof) from a STUMP
 // (subtree-level merkle path) and the block's subtree root hashes.
+// The returned path contains only the nodes needed to verify the single tracked transaction.
 //
 // Parameters:
 //   - stumpData: BRC-74 binary-encoded STUMP (subtree merkle path with local offsets)
@@ -25,8 +26,20 @@ import (
 //     placeholder replacement); nil if unavailable. When the tracked tx is in subtree 0, the
 //     coinbase BUMP provides correct intermediate hashes that replace the placeholder-derived hashes.
 //
-// Returns the full merkle path for the tracked transaction (with global offsets) and the global tx offset.
+// Returns the minimal merkle path for the tracked transaction (with global offsets) and the global tx offset.
 func AssembleBUMP(stumpData []byte, subtreeIndex int, subtreeHashes []chainhash.Hash, coinbaseBUMP []byte) (*transaction.MerklePath, uint64, error) {
+	fullPath, txOffset, err := assembleFullPath(stumpData, subtreeIndex, subtreeHashes, coinbaseBUMP)
+	if err != nil {
+		return nil, 0, err
+	}
+	minimalPath := ExtractMinimalPath(fullPath, txOffset)
+	return minimalPath, txOffset, nil
+}
+
+// assembleFullPath constructs a full BUMP from a STUMP, retaining ALL level-0 hashes
+// and intermediate nodes. This is used by BuildCompoundBUMP to preserve data for all
+// tracked transactions, not just one.
+func assembleFullPath(stumpData []byte, subtreeIndex int, subtreeHashes []chainhash.Hash, coinbaseBUMP []byte) (*transaction.MerklePath, uint64, error) {
 	stumpPath, err := transaction.NewMerklePathFromBinary(stumpData)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to parse STUMP: %w", err)
@@ -34,14 +47,18 @@ func AssembleBUMP(stumpData []byte, subtreeIndex int, subtreeHashes []chainhash.
 
 	internalHeight := len(stumpPath.Path)
 
-	// Handle coinbase placeholder replacement for subtree 0 using the coinbase BUMP.
+	// Handle coinbase placeholder replacement for subtree 0.
 	if subtreeIndex == 0 && len(coinbaseBUMP) > 0 {
-		replaceCoinbasePlaceholder(stumpPath, coinbaseBUMP, internalHeight)
+		coinbaseTxID := extractCoinbaseTxID(coinbaseBUMP)
+		if coinbaseTxID != nil {
+			applyCoinbaseToSTUMP(stumpPath, coinbaseTxID, coinbaseBUMP)
+		}
 	}
 
 	numSubtrees := len(subtreeHashes)
 	if numSubtrees <= 1 {
 		// Single subtree: STUMP IS the full BUMP.
+		stumpPath.ComputeMissingHashes()
 		var txOffset uint64
 		if internalHeight > 0 {
 			for _, leaf := range stumpPath.Path[0] {
@@ -99,32 +116,76 @@ func AssembleBUMP(stumpData []byte, subtreeIndex int, subtreeHashes []chainhash.
 	}
 
 	fullPath.ComputeMissingHashes()
-	minimalPath := ExtractMinimalPath(fullPath, txOffset)
-	return minimalPath, txOffset, nil
+	return fullPath, txOffset, nil
 }
 
-// replaceCoinbasePlaceholder uses the coinbase BUMP to replace placeholder-derived
-// hashes in the STUMP. The coinbase is at offset 0 in subtree 0; its ancestor at
-// each level is always at offset 0. For each STUMP level, if offset 0 has a hash
-// (which was computed from the placeholder), we replace it with the correct hash
-// computed from the real coinbase.
-func replaceCoinbasePlaceholder(stumpPath *transaction.MerklePath, coinbaseBUMP []byte, internalHeight int) {
+// extractCoinbaseTxID parses a BRC-74 coinbase BUMP and returns the real
+// coinbase txid (the hash at level 0, offset 0).
+func extractCoinbaseTxID(coinbaseBUMP []byte) *chainhash.Hash {
+	if len(coinbaseBUMP) == 0 {
+		return nil
+	}
 	cbPath, err := transaction.NewMerklePathFromBinary(coinbaseBUMP)
-	if err != nil {
+	if err != nil || len(cbPath.Path) == 0 {
+		return nil
+	}
+	for _, leaf := range cbPath.Path[0] {
+		if leaf.Offset == 0 && leaf.Hash != nil {
+			return leaf.Hash
+		}
+	}
+	return nil
+}
+
+// applyCoinbaseToSTUMP replaces the coinbase placeholder at level 0, offset 0
+// with the real coinbase txid, and removes any stale pre-computed hashes at
+// offset 0 for higher levels so ComputeMissingHashes can recompute them correctly.
+//
+// For full STUMPs (all level-0 leaves present): replaces level 0 offset 0 and
+// clears stale higher-level offset-0 hashes, letting ComputeMissingHashes rebuild them.
+//
+// For minimal STUMPs (only tracked tx path): if level 0 doesn't include offset 0,
+// walks the coinbase BUMP to replace stale higher-level offset-0 hashes directly.
+func applyCoinbaseToSTUMP(stumpPath *transaction.MerklePath, coinbaseTxID *chainhash.Hash, coinbaseBUMP []byte) {
+	if coinbaseTxID == nil || len(stumpPath.Path) == 0 {
 		return
 	}
 
-	var currentHash *chainhash.Hash
-	for _, leaf := range cbPath.Path[0] {
-		if leaf.Offset == 0 && leaf.Hash != nil {
-			currentHash = leaf.Hash
+	// Check if level 0 has offset 0 (full STUMP includes the coinbase slot).
+	level0HasOffset0 := false
+	for _, elem := range stumpPath.Path[0] {
+		if elem.Offset == 0 {
+			h := *coinbaseTxID
+			elem.Hash = &h
+			level0HasOffset0 = true
 			break
 		}
 	}
-	if currentHash == nil {
+
+	if level0HasOffset0 {
+		// Full STUMP: clear stale higher-level offset-0 hashes.
+		// ComputeMissingHashes will recompute them from the corrected level-0 data.
+		for level := 1; level < len(stumpPath.Path); level++ {
+			filtered := make([]*transaction.PathElement, 0, len(stumpPath.Path[level]))
+			for _, elem := range stumpPath.Path[level] {
+				if elem.Offset != 0 {
+					filtered = append(filtered, elem)
+				}
+			}
+			stumpPath.Path[level] = filtered
+		}
 		return
 	}
 
+	// Minimal STUMP: level 0 doesn't contain offset 0, so we can't recompute
+	// higher-level offset-0 hashes from level-0 data. Instead, walk the coinbase
+	// BUMP to compute correct intermediate hashes and replace stale ones.
+	cbPath, err := transaction.NewMerklePathFromBinary(coinbaseBUMP)
+	if err != nil || len(cbPath.Path) == 0 {
+		return
+	}
+	currentHash := coinbaseTxID
+	internalHeight := len(stumpPath.Path)
 	for level := 0; level < internalHeight && level < len(cbPath.Path); level++ {
 		for _, elem := range stumpPath.Path[level] {
 			if elem.Offset == 0 && (elem.Txid == nil || !*elem.Txid) {
@@ -133,13 +194,41 @@ func replaceCoinbasePlaceholder(stumpPath *transaction.MerklePath, coinbaseBUMP 
 				break
 			}
 		}
-
 		sibling := cbPath.FindLeafByOffset(level, 1)
 		if sibling == nil || sibling.Hash == nil {
 			break
 		}
 		currentHash = transaction.MerkleTreeParent(currentHash, sibling.Hash)
 	}
+}
+
+// computeCorrectedSubtreeRoot parses a subtree 0 STUMP, replaces the placeholder
+// with the real coinbase txid, builds the full tree, and returns the corrected root.
+func computeCorrectedSubtreeRoot(stumpData []byte, coinbaseTxID *chainhash.Hash) (*chainhash.Hash, error) {
+	stumpPath, err := transaction.NewMerklePathFromBinary(stumpData)
+	if err != nil {
+		return nil, err
+	}
+	applyCoinbaseToSTUMP(stumpPath, coinbaseTxID, nil)
+
+	// Build full tree from level 0 to get the root.
+	height := len(stumpPath.Path)
+	fullTree := &transaction.MerklePath{
+		BlockHeight: stumpPath.BlockHeight,
+		Path:        make([][]*transaction.PathElement, height),
+	}
+	// Only copy level 0 (all leaves) — let ComputeMissingHashes build the rest.
+	for _, elem := range stumpPath.Path[0] {
+		fullTree.AddLeaf(0, elem)
+	}
+	fullTree.ComputeMissingHashes()
+
+	// The root is the single element at the highest computed level.
+	topLevel := fullTree.Path[height-1]
+	if len(topLevel) > 0 && topLevel[0].Hash != nil {
+		return topLevel[0].Hash, nil
+	}
+	return nil, fmt.Errorf("failed to compute corrected subtree root")
 }
 
 // ExtractMinimalPath extracts the minimal set of nodes needed to verify a single
@@ -190,13 +279,28 @@ func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, c
 		return nil, nil, fmt.Errorf("no stumps to build compound BUMP")
 	}
 
+	coinbaseTxID := extractCoinbaseTxID(coinbaseBUMP)
+
+	// Correct subtreeHashes[0] if coinbase is available.
+	// The original subtreeHashes[0] may be computed from the placeholder, not the real coinbase.
+	if coinbaseTxID != nil && len(subtreeHashes) > 0 {
+		for _, stump := range stumps {
+			if stump.SubtreeIndex == 0 {
+				if correctedRoot, err := computeCorrectedSubtreeRoot(stump.StumpData, coinbaseTxID); err == nil {
+					subtreeHashes[0] = *correctedRoot
+				}
+				break
+			}
+		}
+	}
+
 	// Assemble each STUMP into a full path, collect all elements by level
 	var blockHeight uint32
 	var txids []string
 	allPaths := make([]*transaction.MerklePath, 0, len(stumps))
 
 	for _, stump := range stumps {
-		fullPath, _, err := AssembleBUMP(stump.StumpData, stump.SubtreeIndex, subtreeHashes, coinbaseBUMP)
+		fullPath, _, err := assembleFullPath(stump.StumpData, stump.SubtreeIndex, subtreeHashes, coinbaseBUMP)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to assemble BUMP for subtree %d: %w", stump.SubtreeIndex, err)
 		}

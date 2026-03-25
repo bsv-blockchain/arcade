@@ -93,6 +93,11 @@ func NewStore(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
+	// SQLite only supports one concurrent writer. Limiting to a single open
+	// connection ensures pragmas are applied consistently and eliminates
+	// "database is locked" errors under concurrent access.
+	db.SetMaxOpenConns(1)
+
 	if _, err := db.ExecContext(context.Background(), sqlitePragmas); err != nil {
 		return nil, fmt.Errorf("failed to set pragmas: %w", err)
 	}

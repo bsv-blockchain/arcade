@@ -194,6 +194,7 @@ func (r *Routes) handleSubmitError(c *fiber.Ctx, err error) error {
 		return c.Status(http.StatusBadRequest).JSON(arcerrors.NewErrorFields(arcerrors.StatusBadRequest, errStr))
 	}
 
+	r.logger.Error("transaction submission failed", slog.String("error", errStr))
 	return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": errStr})
 }
 

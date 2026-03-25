@@ -8,6 +8,9 @@ import (
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
+
+	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/store"
 )
 
 // --- Test Helpers ---
@@ -705,6 +708,125 @@ func TestAssembleBUMP_TwoTxs_SameSubtree_SameRoot(t *testing.T) {
 	}
 }
 
+// buildFullSTUMP constructs a STUMP containing ALL level-0 hashes for a subtree,
+// mirroring what Merkle Service actually sends. The txOffset leaf is marked as Txid=true.
+func buildFullSTUMP(leaves []chainhash.Hash, txOffset uint64, blockHeight uint32) []byte {
+	tree := buildMerkleTree(leaves)
+	numLevels := len(tree) - 1
+	if numLevels < 1 {
+		numLevels = 1
+	}
+
+	mp := &transaction.MerklePath{
+		BlockHeight: blockHeight,
+		Path:        make([][]*transaction.PathElement, numLevels),
+	}
+
+	// Add ALL level-0 hashes
+	for i, h := range leaves {
+		hashCopy := h
+		isTxid := (uint64(i) == txOffset)
+		mp.AddLeaf(0, &transaction.PathElement{
+			Offset: uint64(i),
+			Hash:   &hashCopy,
+			Txid:   &isTxid,
+		})
+	}
+
+	// Add sibling hashes at higher levels for the tracked tx path
+	offset := txOffset
+	for level := 1; level < numLevels; level++ {
+		offset = offset >> 1
+		sibOffset := offset ^ 1
+		levelHashes := tree[level]
+		if len(levelHashes)%2 == 1 {
+			levelHashes = append(levelHashes, levelHashes[len(levelHashes)-1])
+		}
+		if sibOffset < uint64(len(levelHashes)) {
+			h := levelHashes[sibOffset]
+			mp.AddLeaf(level, &transaction.PathElement{
+				Offset: sibOffset,
+				Hash:   &h,
+			})
+		}
+	}
+
+	return mp.Bytes()
+}
+
+func TestBuildCompoundBUMP_AllTxsExtractable(t *testing.T) {
+	// 2 subtrees of 4 txs each = 8 txs total
+	allLeaves, subtreeHashes, blockRoot := multiSubtreeTestSetup(2, 4)
+
+	// Build full STUMPs (all level-0 hashes) for each subtree.
+	// Use txOffset=0 as the "tracked" tx for the STUMP Txid marker — doesn't matter which,
+	// because BuildCompoundBUMP uses the tracker to discover txids, not the Txid flag.
+	stump0 := buildFullSTUMP(allLeaves[0], 0, 990000)
+	stump1 := buildFullSTUMP(allLeaves[1], 0, 990000)
+
+	stumps := []*models.Stump{
+		{BlockHash: "blockhash", SubtreeIndex: 0, StumpData: stump0},
+		{BlockHash: "blockhash", SubtreeIndex: 1, StumpData: stump1},
+	}
+
+	// Build a tracker that tracks ALL 8 txids
+	tracker := store.NewTxTracker()
+	for s := range 2 {
+		for i := range 4 {
+			tracker.AddHash(allLeaves[s][i], models.StatusSeenOnNetwork)
+		}
+	}
+
+	compound, txids, err := BuildCompoundBUMP(stumps, subtreeHashes, nil, tracker)
+	if err != nil {
+		t.Fatalf("BuildCompoundBUMP failed: %v", err)
+	}
+
+	if len(txids) != 8 {
+		t.Fatalf("expected 8 tracked txids, got %d", len(txids))
+	}
+
+	// Serialize compound BUMP (as stored in DB) and verify every tx is extractable
+	bumpData := compound.Bytes()
+
+	for s := range 2 {
+		for i := range 4 {
+			txHash := allLeaves[s][i]
+			txid := txHash.String()
+
+			// Re-parse from binary (same as extractMinimalPathForTx does)
+			parsed, parseErr := transaction.NewMerklePathFromBinary(bumpData)
+			if parseErr != nil {
+				t.Fatalf("failed to parse compound BUMP: %v", parseErr)
+			}
+
+			// Find the tx at level 0
+			var txOffset uint64
+			found := false
+			for _, leaf := range parsed.Path[0] {
+				if leaf.Hash != nil && *leaf.Hash == txHash {
+					txOffset = leaf.Offset
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("subtree %d tx %d (%s) not found in compound BUMP level 0", s, i, txid)
+			}
+
+			// Extract minimal path
+			minimal := ExtractMinimalPath(parsed, txOffset)
+			root, rootErr := minimal.ComputeRoot(&txHash)
+			if rootErr != nil {
+				t.Fatalf("ComputeRoot failed for subtree %d tx %d: %v", s, i, rootErr)
+			}
+			if *root != blockRoot {
+				t.Fatalf("root mismatch for subtree %d tx %d: got %s, want %s", s, i, root, blockRoot)
+			}
+		}
+	}
+}
+
 func TestAssembleBUMP_LargeBlock_16Subtrees_32Txs(t *testing.T) {
 	allLeaves, subtreeHashes, blockRoot := multiSubtreeTestSetup(16, 32)
 
@@ -723,5 +845,280 @@ func TestAssembleBUMP_LargeBlock_16Subtrees_32Txs(t *testing.T) {
 	}
 	if *root != blockRoot {
 		t.Fatalf("root mismatch: got %s, want %s", root, blockRoot)
+	}
+}
+
+// --- Coinbase Replacement in Compound BUMP Tests ---
+
+// setupCoinbaseBlock creates a block with numSubtrees subtrees of subtreeSize txs,
+// where subtree 0 has a placeholder at offset 0. Returns the placeholder-based leaves,
+// the true leaves (with real coinbase), subtree hashes (placeholder-based), the real
+// coinbase txid, and the true block merkle root (computed with real coinbase).
+func setupCoinbaseBlock(numSubtrees, subtreeSize int) (
+	allLeaves [][]chainhash.Hash,
+	trueAllLeaves [][]chainhash.Hash,
+	subtreeHashes []chainhash.Hash,
+	coinbaseTxID chainhash.Hash,
+	trueBlockRoot chainhash.Hash,
+) {
+	placeholder := chainhash.Hash{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+	coinbaseTxID = generateTxHashes(1)[0]
+
+	allLeaves = make([][]chainhash.Hash, numSubtrees)
+	trueAllLeaves = make([][]chainhash.Hash, numSubtrees)
+
+	for s := range numSubtrees {
+		allLeaves[s] = make([]chainhash.Hash, subtreeSize)
+		trueAllLeaves[s] = make([]chainhash.Hash, subtreeSize)
+		for i := range subtreeSize {
+			var buf [8]byte
+			binary.BigEndian.PutUint64(buf[:], uint64(5000+s*100+i))
+			h := sha256.Sum256(buf[:])
+			hash, _ := chainhash.NewHash(h[:])
+			allLeaves[s][i] = *hash
+			trueAllLeaves[s][i] = *hash
+		}
+	}
+
+	// Put placeholder in subtree 0, offset 0
+	allLeaves[0][0] = placeholder
+	// Put real coinbase in the true version
+	trueAllLeaves[0][0] = coinbaseTxID
+
+	subtreeHashes = make([]chainhash.Hash, numSubtrees)
+	for s := range numSubtrees {
+		subtreeHashes[s] = computeMerkleRoot(allLeaves[s])
+	}
+
+	trueBlockRoot = computeBlockMerkleRoot(trueAllLeaves)
+	return
+}
+
+func TestBuildCompoundBUMP_CoinbaseReplacement(t *testing.T) {
+	allLeaves, trueAllLeaves, subtreeHashes, coinbaseTxID, trueBlockRoot := setupCoinbaseBlock(2, 4)
+	placeholder := allLeaves[0][0]
+
+	// Build full STUMPs for both subtrees
+	stump0 := buildFullSTUMP(allLeaves[0], 1, 1000000) // tracked tx at offset 1
+	stump1 := buildFullSTUMP(allLeaves[1], 2, 1000000) // tracked tx at offset 2
+
+	stumps := []*models.Stump{
+		{BlockHash: "block1", SubtreeIndex: 0, StumpData: stump0},
+		{BlockHash: "block1", SubtreeIndex: 1, StumpData: stump1},
+	}
+
+	// Track txs in both subtrees
+	tracker := store.NewTxTracker()
+	for s := range 2 {
+		for i := range 4 {
+			tracker.AddHash(allLeaves[s][i], models.StatusSeenOnNetwork)
+		}
+	}
+	// Also track the real coinbase (it replaces placeholder)
+	tracker.AddHash(coinbaseTxID, models.StatusSeenOnNetwork)
+
+	cbBUMP := buildCoinbaseBUMP(allLeaves[0], coinbaseTxID, 1000000)
+
+	compound, txids, err := BuildCompoundBUMP(stumps, subtreeHashes, cbBUMP, tracker)
+	if err != nil {
+		t.Fatalf("BuildCompoundBUMP failed: %v", err)
+	}
+
+	if len(txids) == 0 {
+		t.Fatal("expected tracked txids, got none")
+	}
+
+	// Verify the placeholder is NOT at level 0 offset 0 and the real coinbase IS there
+	bumpData := compound.Bytes()
+	parsed, err := transaction.NewMerklePathFromBinary(bumpData)
+	if err != nil {
+		t.Fatalf("failed to parse compound BUMP: %v", err)
+	}
+	for _, leaf := range parsed.Path[0] {
+		if leaf.Offset == 0 {
+			if leaf.Hash != nil && *leaf.Hash == placeholder {
+				t.Fatal("placeholder still present at level 0 offset 0")
+			}
+			if leaf.Hash == nil || *leaf.Hash != coinbaseTxID {
+				t.Fatalf("expected coinbase txid at level 0 offset 0, got %v", leaf.Hash)
+			}
+			break
+		}
+	}
+
+	// Verify every tracked tx in BOTH subtrees computes the true block root
+	for s := range 2 {
+		for i := range 4 {
+			txHash := trueAllLeaves[s][i]
+			parsed, err := transaction.NewMerklePathFromBinary(bumpData)
+			if err != nil {
+				t.Fatalf("failed to parse compound BUMP: %v", err)
+			}
+			var txOffset uint64
+			found := false
+			for _, leaf := range parsed.Path[0] {
+				if leaf.Hash != nil && *leaf.Hash == txHash {
+					txOffset = leaf.Offset
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("subtree %d tx %d not found in compound BUMP", s, i)
+			}
+			minimal := ExtractMinimalPath(parsed, txOffset)
+			root, err := minimal.ComputeRoot(&txHash)
+			if err != nil {
+				t.Fatalf("ComputeRoot failed for subtree %d tx %d: %v", s, i, err)
+			}
+			if *root != trueBlockRoot {
+				t.Fatalf("root mismatch for subtree %d tx %d: got %s, want %s", s, i, root, trueBlockRoot)
+			}
+		}
+	}
+}
+
+func TestBuildCompoundBUMP_CoinbaseReplacement_SingleSubtree(t *testing.T) {
+	allLeaves, trueAllLeaves, subtreeHashes, coinbaseTxID, trueBlockRoot := setupCoinbaseBlock(1, 4)
+	placeholder := allLeaves[0][0]
+
+	stump0 := buildFullSTUMP(allLeaves[0], 2, 1000001)
+
+	stumps := []*models.Stump{
+		{BlockHash: "block2", SubtreeIndex: 0, StumpData: stump0},
+	}
+
+	tracker := store.NewTxTracker()
+	for i := range 4 {
+		tracker.AddHash(allLeaves[0][i], models.StatusSeenOnNetwork)
+	}
+	tracker.AddHash(coinbaseTxID, models.StatusSeenOnNetwork)
+
+	cbBUMP := buildCoinbaseBUMP(allLeaves[0], coinbaseTxID, 1000001)
+
+	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, cbBUMP, tracker)
+	if err != nil {
+		t.Fatalf("BuildCompoundBUMP failed: %v", err)
+	}
+
+	bumpData := compound.Bytes()
+	parsed, err := transaction.NewMerklePathFromBinary(bumpData)
+	if err != nil {
+		t.Fatalf("failed to parse compound BUMP: %v", err)
+	}
+
+	// Verify placeholder replaced
+	for _, leaf := range parsed.Path[0] {
+		if leaf.Offset == 0 {
+			if leaf.Hash != nil && *leaf.Hash == placeholder {
+				t.Fatal("placeholder still present at level 0 offset 0")
+			}
+			break
+		}
+	}
+
+	// Verify all txs compute correct root
+	for i := range 4 {
+		txHash := trueAllLeaves[0][i]
+		parsed, err := transaction.NewMerklePathFromBinary(bumpData)
+		if err != nil {
+			t.Fatalf("failed to parse compound BUMP: %v", err)
+		}
+		var txOffset uint64
+		found := false
+		for _, leaf := range parsed.Path[0] {
+			if leaf.Hash != nil && *leaf.Hash == txHash {
+				txOffset = leaf.Offset
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("tx %d not found in compound BUMP", i)
+		}
+		minimal := ExtractMinimalPath(parsed, txOffset)
+		root, err := minimal.ComputeRoot(&txHash)
+		if err != nil {
+			t.Fatalf("ComputeRoot failed for tx %d: %v", i, err)
+		}
+		if *root != trueBlockRoot {
+			t.Fatalf("root mismatch for tx %d: got %s, want %s", i, root, trueBlockRoot)
+		}
+	}
+}
+
+func TestApplyCoinbaseToSTUMP_ClearsStaleHashes(t *testing.T) {
+	placeholder := chainhash.Hash{0xff, 0xff, 0xff, 0xff}
+	coinbaseTxID := generateTxHashes(1)[0]
+
+	// Build a STUMP with 4 leaves, placeholder at offset 0
+	leaves := make([]chainhash.Hash, 4)
+	leaves[0] = placeholder
+	for i := 1; i < 4; i++ {
+		var buf [8]byte
+		binary.BigEndian.PutUint64(buf[:], uint64(7000+i))
+		h := sha256.Sum256(buf[:])
+		hash, _ := chainhash.NewHash(h[:])
+		leaves[i] = *hash
+	}
+
+	tree := buildMerkleTree(leaves)
+
+	// Build a STUMP that has pre-computed hashes at offset 0 for all levels
+	// (simulating what Merkle Service might send — stale hashes derived from placeholder)
+	numLevels := len(tree) - 1
+	mp := &transaction.MerklePath{
+		BlockHeight: 100,
+		Path:        make([][]*transaction.PathElement, numLevels),
+	}
+
+	// Level 0: all leaves
+	for i, h := range leaves {
+		hashCopy := h
+		isTxid := (i == 1)
+		mp.AddLeaf(0, &transaction.PathElement{
+			Offset: uint64(i),
+			Hash:   &hashCopy,
+			Txid:   &isTxid,
+		})
+	}
+
+	// Levels 1+: add stale offset-0 hashes (derived from placeholder)
+	for level := 1; level < numLevels; level++ {
+		staleHash := tree[level][0]
+		mp.AddLeaf(level, &transaction.PathElement{
+			Offset: 0,
+			Hash:   &staleHash,
+		})
+	}
+
+	// Apply coinbase replacement
+	applyCoinbaseToSTUMP(mp, &coinbaseTxID, nil)
+
+	// Verify level-0 offset 0 now has the real coinbase
+	found := false
+	for _, leaf := range mp.Path[0] {
+		if leaf.Offset == 0 {
+			if leaf.Hash == nil || *leaf.Hash != coinbaseTxID {
+				t.Fatalf("expected coinbase at level 0 offset 0, got %v", leaf.Hash)
+			}
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("no element at level 0 offset 0")
+	}
+
+	// Verify all offset-0 hashes at levels 1+ are removed
+	for level := 1; level < numLevels; level++ {
+		for _, elem := range mp.Path[level] {
+			if elem.Offset == 0 {
+				t.Fatalf("stale hash at level %d offset 0 was not removed", level)
+			}
+		}
 	}
 }
