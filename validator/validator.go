@@ -23,9 +23,10 @@ const (
 	maxTxSigopsCountPolicyAfterGenesis = ^uint32(0)
 	minTxSizeBytes                     = 61
 	dustLimit                          = 1
-	// DefaultMinFeePerKB defines the minimum fee per kilobyte.
-	DefaultMinFeePerKB = uint64(100)
 )
+
+// DefaultMinFeePerKB defines the minimum fee per kilobyte.
+var DefaultMinFeePerKB = uint64(100)
 
 var (
 	// ErrNoInputsOrOutputs indicates a transaction has no inputs or outputs.
@@ -68,7 +69,7 @@ var (
 type Policy struct {
 	MaxTxSizePolicy         int
 	MaxTxSigopsCountsPolicy int64
-	MinFeePerKB             uint64
+	MinFeePerKB             *uint64
 }
 
 // Validator performs local transaction validation before submission
@@ -88,8 +89,8 @@ func NewValidator(policy *Policy, ct chaintracker.ChainTracker) *Validator {
 	if policy.MaxTxSigopsCountsPolicy == 0 {
 		policy.MaxTxSigopsCountsPolicy = int64(maxTxSigopsCountPolicyAfterGenesis)
 	}
-	if policy.MinFeePerKB == 0 {
-		policy.MinFeePerKB = DefaultMinFeePerKB
+	if policy.MinFeePerKB == nil {
+		policy.MinFeePerKB = &DefaultMinFeePerKB
 	}
 	return &Validator{
 		policy:       policy,
@@ -134,7 +135,7 @@ func (v *Validator) ValidatePolicy(tx *sdkTx.Transaction) error {
 
 // MinFeePerKB returns the configured minimum fee per KB
 func (v *Validator) MinFeePerKB() uint64 {
-	return v.policy.MinFeePerKB
+	return *v.policy.MinFeePerKB
 }
 
 // ValidateTransaction validates policy, and optionally fees and scripts
@@ -149,7 +150,7 @@ func (v *Validator) ValidateTransaction(ctx context.Context, tx *sdkTx.Transacti
 
 	var feeModel *feemodel.SatoshisPerKilobyte
 	if !skipFees {
-		feeModel = &feemodel.SatoshisPerKilobyte{Satoshis: v.policy.MinFeePerKB}
+		feeModel = &feemodel.SatoshisPerKilobyte{Satoshis: *v.policy.MinFeePerKB}
 	}
 
 	if skipScripts {

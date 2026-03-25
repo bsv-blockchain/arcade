@@ -210,7 +210,7 @@ func (c *Config) initializeEmbedded(ctx context.Context, logger *slog.Logger, ch
 	txValidator := validator.NewValidator(&validator.Policy{
 		MaxTxSizePolicy:         c.Validator.MaxTxSize,
 		MaxTxSigopsCountsPolicy: c.Validator.MaxSigOps,
-		MinFeePerKB:             c.Validator.MinFeePerKB,
+		MinFeePerKB:             &c.Validator.MinFeePerKB,
 	}, chaintracker)
 
 	// Initialize Arcade P2P listener

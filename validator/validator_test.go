@@ -29,7 +29,7 @@ func TestNewValidator_CustomPolicy(t *testing.T) {
 	policy := &Policy{
 		MaxTxSizePolicy:         1000000,
 		MaxTxSigopsCountsPolicy: 10000,
-		MinFeePerKB:             100,
+		MinFeePerKB:             ptrUint64(100),
 	}
 
 	v := NewValidator(policy, &spv.GullibleHeadersClient{})
@@ -223,11 +223,21 @@ func TestValidateTransaction_SkipAll(t *testing.T) {
 
 func TestMinFeePerKB(t *testing.T) {
 	v := NewValidator(&Policy{
-		MinFeePerKB: 50,
+		MinFeePerKB: ptrUint64(50),
 	}, &spv.GullibleHeadersClient{})
 
 	if v.MinFeePerKB() != 50 {
 		t.Errorf("expected MinFeePerKB=50, got %d", v.MinFeePerKB())
+	}
+}
+
+func TestMinFeePerKB_Zero(t *testing.T) {
+	v := NewValidator(&Policy{
+		MinFeePerKB: ptrUint64(0),
+	}, &spv.GullibleHeadersClient{})
+
+	if v.MinFeePerKB() != 0 {
+		t.Errorf("expected MinFeePerKB=0, got %d", v.MinFeePerKB())
 	}
 }
 
@@ -238,3 +248,5 @@ func TestMinFeePerKB_Default(t *testing.T) {
 		t.Errorf("expected MinFeePerKB=%d, got %d", DefaultMinFeePerKB, v.MinFeePerKB())
 	}
 }
+
+func ptrUint64(v uint64) *uint64 { return &v }
