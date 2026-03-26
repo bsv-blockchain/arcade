@@ -40,16 +40,16 @@ var (
 
 // Config holds configuration for the embedded service.
 type Config struct {
-	Store                      store.Store
-	TxTracker                  *store.TxTracker
-	EventPublisher             events.Publisher
-	TeranodeClient             *teranode.Client
-	MerkleServiceClient        *merkleservice.Client // Optional: nil disables Merkle Service integration
-	MerkleServiceCallbackURL   string                // Full callback URL sent to Merkle Service during registration
-	TxValidator                *validator.Validator
-	Arcade                     *arcade.Arcade
-	Policy                     *models.Policy
-	Logger                     *slog.Logger
+	Store                    store.Store
+	TxTracker                *store.TxTracker
+	EventPublisher           events.Publisher
+	TeranodeClient           *teranode.Client
+	MerkleServiceClient      *merkleservice.Client // Optional: nil disables Merkle Service integration
+	MerkleServiceCallbackURL string                // Full callback URL sent to Merkle Service during registration
+	TxValidator              *validator.Validator
+	Arcade                   *arcade.Arcade
+	Policy                   *models.Policy
+	Logger                   *slog.Logger
 }
 
 // Embedded is an in-process implementation of ArcadeService.
@@ -207,10 +207,9 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 
 	// Register with Merkle Service before broadcasting (best-effort)
 	e.registerWithMerkleService(ctx, txid)
-	e.logger.Info("transaction validated and registered with Merkle Service",)
+	e.logger.Info("transaction validated and registered with Merkle Service")
 
-	// Submit to teranode endpoints synchronously with timeout
-	// Wait for first success/rejection, or timeout after 15 seconds
+	// Submit to ALL teranode endpoints for maximum propagation
 	endpoints := e.teranodeClient.GetEndpoints()
 	resultCh := make(chan *models.TransactionStatus, len(endpoints))
 	submitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -225,34 +224,40 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 			select {
 			case resultCh <- status:
 			case <-submitCtx.Done():
-				return
 			}
 		}(endpoint)
 	}
 
-	// Close channel when all goroutines complete
 	go func() {
 		wg.Wait()
 		close(resultCh)
 	}()
 
-	// Wait for first result or timeout
-	select {
-	case status := <-resultCh:
-		return status, nil
-	case <-submitCtx.Done():
-		// Timeout - return current status (RECEIVED)
-		return e.store.GetStatus(ctx, txid)
+	// Collect all results and return the best status
+	var best *models.TransactionStatus
+	for status := range resultCh {
+		if status == nil {
+			continue
+		}
+		if best == nil || statusPriority(status.Status) > statusPriority(best.Status) {
+			best = status
+		}
 	}
+
+	if best != nil {
+		return best, nil
+	}
+	// All timed out or returned nil — return current status
+	return e.store.GetStatus(ctx, txid)
 }
 
 // registerWithMerkleService registers a transaction with the Merkle Service.
 // Failures are logged but do not block the broadcast.
 func (e *Embedded) registerWithMerkleService(ctx context.Context, txid string) {
-	e.logger.Info("registering transaction with Merkle Service",)
 	if e.merkleServiceClient == nil || e.merkleServiceCallbackURL == "" {
 		return
 	}
+	e.logger.Debug("registering transaction with Merkle Service")
 
 	if err := e.merkleServiceClient.Register(ctx, txid, e.merkleServiceCallbackURL); err != nil {
 		e.logger.Warn("failed to register transaction with Merkle Service",
@@ -398,7 +403,7 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 		batchTxs[i] = info.tx.Bytes()
 	}
 
-	// Submit batch to each teranode endpoint, use first success
+	// Submit batch to ALL teranode endpoints for maximum propagation
 	submitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
@@ -421,34 +426,32 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 		close(resultCh)
 	}()
 
-	// Wait for first result
-	var batchErr error
-	select {
-	case err := <-resultCh:
-		batchErr = err
-	case <-submitCtx.Done():
-		batchErr = submitCtx.Err()
+	// Collect all results — any success means batch accepted
+	batchAccepted := false
+	for err := range resultCh {
+		if err == nil {
+			batchAccepted = true
+		}
 	}
 
-	// Update statuses based on batch result
+	// Update statuses based on aggregated batch result
 	now := time.Now()
 	for _, info := range toBroadcast {
 		var status *models.TransactionStatus
-		if batchErr != nil {
-			e.logger.Debug("transaction rejected by network (batch)",
-				slog.String("txid", info.txid),
-				slog.String("reason", batchErr.Error()))
-			status = &models.TransactionStatus{
-				TxID:      info.txid,
-				Status:    models.StatusRejected,
-				Timestamp: now,
-				ExtraInfo: batchErr.Error(),
-			}
-		} else {
+		if batchAccepted {
 			status = &models.TransactionStatus{
 				TxID:      info.txid,
 				Status:    models.StatusAcceptedByNetwork,
 				Timestamp: now,
+			}
+		} else {
+			e.logger.Debug("transaction rejected by all endpoints (batch)",
+				slog.String("txid", info.txid))
+			status = &models.TransactionStatus{
+				TxID:      info.txid,
+				Status:    models.StatusRejected,
+				Timestamp: now,
+				ExtraInfo: "rejected by all endpoints",
 			}
 		}
 		if err := e.store.UpdateStatus(ctx, status); err != nil {
@@ -556,4 +559,19 @@ func (e *Embedded) submitToTeranodeSync(ctx context.Context, endpoint string, ra
 		e.logger.Error("failed to publish status", slog.String("txID", txid), slog.String("error", err.Error()))
 	}
 	return status
+}
+
+// statusPriority returns a numeric priority for broadcast result aggregation.
+// Higher value = more favorable status.
+func statusPriority(s models.Status) int {
+	switch s {
+	case models.StatusAcceptedByNetwork:
+		return 3
+	case models.StatusSentToNetwork:
+		return 2
+	case models.StatusRejected:
+		return 1
+	default:
+		return 0
+	}
 }
