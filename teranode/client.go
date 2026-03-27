@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"time"
 )
@@ -50,6 +51,11 @@ func (c *Client) SubmitTransaction(ctx context.Context, endpoint string, rawTx [
 		req.Header.Set("Authorization", "Bearer "+c.authToken)
 	}
 
+	slog.Debug("teranode request",
+		slog.String("url", url),
+		slog.Int("txSize", len(rawTx)),
+	)
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return 0, fmt.Errorf("failed to submit transaction: %w", err)
@@ -57,6 +63,11 @@ func (c *Client) SubmitTransaction(ctx context.Context, endpoint string, rawTx [
 	defer func() {
 		_ = resp.Body.Close()
 	}()
+
+	slog.Debug("teranode response",
+		slog.String("url", url),
+		slog.Int("statusCode", resp.StatusCode),
+	)
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
 		body, _ := io.ReadAll(resp.Body)

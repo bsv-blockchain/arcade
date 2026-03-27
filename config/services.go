@@ -61,9 +61,12 @@ type Services struct {
 // If chaintracker is provided, it will be used instead of creating a new one.
 // If p2pClient is provided, it will be shared instead of creating a new one.
 // This allows the caller to share instances across services.
-func (c *Config) Initialize(ctx context.Context, _ *slog.Logger, chaintracker chaintracks.Chaintracks, p2pClient *p2p.Client) (*Services, error) {
-	// Create arcade-specific logger with configured log level
-	logger := logging.NewLogger(c.GetLogLevel())
+func (c *Config) Initialize(ctx context.Context, parentLogger *slog.Logger, chaintracker chaintracks.Chaintracks, p2pClient *p2p.Client) (*Services, error) {
+	// Use the parent logger if provided, otherwise create one from config
+	logger := parentLogger
+	if logger == nil {
+		logger = logging.NewLogger(c.GetLogLevel())
+	}
 
 	switch c.Mode {
 	case ModeRemote:
