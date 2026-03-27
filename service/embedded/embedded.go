@@ -127,6 +127,10 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 	}
 
 	txid := tx.TxID().String()
+	e.logger.Debug("transaction submitted",
+		slog.String("txid", txid),
+		slog.Int("rawSize", len(rawTx)),
+	)
 
 	// Check for existing status before validation — duplicate submissions return existing status
 	existingStatus, isNew, err := e.store.GetOrInsertStatus(ctx, &models.TransactionStatus{
@@ -139,8 +143,8 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 
 	if !isNew {
 		e.logger.Debug("duplicate transaction submission",
-			"txid", txid,
-			"existingStatus", existingStatus.Status,
+			slog.String("txid", txid),
+			slog.String("existingStatus", string(existingStatus.Status)),
 		)
 		e.txTracker.Add(txid, existingStatus.Status)
 		return existingStatus, nil
@@ -201,16 +205,31 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 	// Submit to teranode endpoints synchronously with timeout
 	// Wait for first success/rejection, or timeout after 15 seconds
 	endpoints := e.teranodeClient.GetEndpoints()
+	e.logger.Debug("broadcasting to teranode",
+		slog.String("txid", txid),
+		slog.Int("endpoints", len(endpoints)),
+		slog.Duration("timeout", 15*time.Second),
+	)
 	resultCh := make(chan *models.TransactionStatus, len(endpoints))
 	submitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
+	broadcastStart := time.Now()
 	var wg sync.WaitGroup
 	for _, endpoint := range endpoints {
 		wg.Add(1)
 		go func(ep string) {
 			defer wg.Done()
+			epStart := time.Now()
 			status := e.submitToTeranodeSync(submitCtx, ep, tx.Bytes(), txid)
+			if status != nil {
+				e.logger.Debug("endpoint responded",
+					slog.String("txid", txid),
+					slog.String("endpoint", ep),
+					slog.String("status", string(status.Status)),
+					slog.Duration("elapsed", time.Since(epStart)),
+				)
+			}
 			select {
 			case resultCh <- status:
 			case <-submitCtx.Done():
@@ -228,9 +247,18 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 	// Wait for first result or timeout
 	select {
 	case status := <-resultCh:
+		e.logger.Debug("broadcast complete",
+			slog.String("txid", txid),
+			slog.String("status", string(status.Status)),
+			slog.Duration("elapsed", time.Since(broadcastStart)),
+		)
 		return status, nil
 	case <-submitCtx.Done():
-		// Timeout - return current status (RECEIVED)
+		e.logger.Warn("broadcast timeout",
+			slog.String("txid", txid),
+			slog.Int("endpoints", len(endpoints)),
+			slog.Duration("elapsed", time.Since(broadcastStart)),
+		)
 		return e.store.GetStatus(ctx, txid)
 	}
 }
@@ -448,6 +476,12 @@ func (e *Embedded) GetPolicy(_ context.Context) (*models.Policy, error) {
 func (e *Embedded) submitToTeranodeSync(ctx context.Context, endpoint string, rawTx []byte, txid string) *models.TransactionStatus {
 	statusCode, err := e.teranodeClient.SubmitTransaction(ctx, endpoint, rawTx)
 	if err != nil {
+		e.logger.Debug("endpoint rejected transaction",
+			slog.String("txid", txid),
+			slog.String("endpoint", endpoint),
+			slog.Int("statusCode", statusCode),
+			slog.String("error", err.Error()),
+		)
 		status := &models.TransactionStatus{
 			TxID:      txid,
 			Status:    models.StatusRejected,
@@ -457,6 +491,10 @@ func (e *Embedded) submitToTeranodeSync(ctx context.Context, endpoint string, ra
 		if err := e.store.UpdateStatus(ctx, status); err != nil {
 			e.logger.Error("failed to update status", slog.String("txID", txid), slog.String("error", err.Error()))
 		}
+		e.logger.Debug("publishing status change",
+			slog.String("txid", txid),
+			slog.String("status", string(status.Status)),
+		)
 		if err := e.eventPublisher.Publish(ctx, status); err != nil {
 			e.logger.Error("failed to publish status", slog.String("txID", txid), slog.String("error", err.Error()))
 		}
@@ -470,6 +508,11 @@ func (e *Embedded) submitToTeranodeSync(ctx context.Context, endpoint string, ra
 	case http.StatusNoContent:
 		txStatus = models.StatusSentToNetwork
 	default:
+		e.logger.Warn("unexpected status code from endpoint",
+			slog.String("txid", txid),
+			slog.String("endpoint", endpoint),
+			slog.Int("statusCode", statusCode),
+		)
 		return nil
 	}
 
@@ -481,6 +524,10 @@ func (e *Embedded) submitToTeranodeSync(ctx context.Context, endpoint string, ra
 	if err := e.store.UpdateStatus(ctx, status); err != nil {
 		e.logger.Error("failed to update status", slog.String("txID", txid), slog.String("error", err.Error()))
 	}
+	e.logger.Debug("publishing status change",
+		slog.String("txid", txid),
+		slog.String("status", string(status.Status)),
+	)
 	if err := e.eventPublisher.Publish(ctx, status); err != nil {
 		e.logger.Error("failed to publish status", slog.String("txID", txid), slog.String("error", err.Error()))
 	}
