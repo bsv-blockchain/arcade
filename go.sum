@@ -127,8 +127,8 @@ github.com/bsv-blockchain/go-sdk v1.2.20 h1:eifeQDIEFCGBpeFUo10sh3eGQVwXo4oE7yRd
 github.com/bsv-blockchain/go-sdk v1.2.20/go.mod h1:5mmw1QLusuAkjWmQgUOurQYCXdIsQEsWXbAZ9zwme3g=
 github.com/bsv-blockchain/go-subtree v1.3.0 h1:RgQbMrRiYNjNPnA4yFjA9YmVlxp4ymyWb5uldobiqOY=
 github.com/bsv-blockchain/go-subtree v1.3.0/go.mod h1:uEQma/PgJrRksUUEzh8ATG60E8NcS1dfqgRZ1bdbQy8=
-github.com/bsv-blockchain/go-teranode-p2p-client v0.2.0 h1:6PkcVDDtX6ypXJfiv2ax4Uzb6xeJS/vMYTdt0v8Tqg0=
-github.com/bsv-blockchain/go-teranode-p2p-client v0.2.0/go.mod h1:58O829ol7/Suqy85xURdg+g6Qe2iV7u5jIGHjTuPk80=
+github.com/bsv-blockchain/go-teranode-p2p-client v0.2.1 h1:Wi+C0sTy56sxFueB4QV8+TZOy522eDZr9AP9s3icjZQ=
+github.com/bsv-blockchain/go-teranode-p2p-client v0.2.1/go.mod h1:Hg+QrMrHzXn3UXnHyKJpDdGmeeDH7fR9/RUL2IcxdYs=
 github.com/bsv-blockchain/go-tx-map v1.3.4 h1:nwR4PdmAt2JJTYkqAlqxxxghYMT0ts2RpqzDq13ohsY=
 github.com/bsv-blockchain/go-tx-map v1.3.4/go.mod h1:AiIQRQWbCz9QWrziCFAi9Fu04EygPN1dPB+z7qEyFbg=
 github.com/bsv-blockchain/go-wire v1.2.2 h1:VVinxKKP4Lryw9t2zM0Td5ky+Jtvnk0y/U6u0T6zJLo=
