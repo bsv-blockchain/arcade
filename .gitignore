@@ -47,3 +47,5 @@ peer_cache.json
 
 /arcade
 config.yaml
+
+.claude/
