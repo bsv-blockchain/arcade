@@ -6,7 +6,7 @@ require (
 	github.com/bsv-blockchain/go-chaintracks v1.2.1
 	github.com/bsv-blockchain/go-p2p-message-bus v0.1.14
 	github.com/bsv-blockchain/go-sdk v1.2.20
-	github.com/bsv-blockchain/go-teranode-p2p-client v0.2.0
+	github.com/bsv-blockchain/go-teranode-p2p-client v0.2.1
 	github.com/bsv-blockchain/teranode v0.14.1-beta-4
 	github.com/gofiber/fiber/v2 v2.52.12
 	github.com/golang-migrate/migrate/v4 v4.19.1
