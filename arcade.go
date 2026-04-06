@@ -3,7 +3,6 @@ package arcade
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -335,16 +334,22 @@ func (a *Arcade) processBlockMessage(ctx context.Context, blockMsg teranode.Bloc
 }
 
 func (a *Arcade) processBlockTransactions(ctx context.Context, blockMsg teranode.BlockMessage) error { //nolint:gocyclo // complex business logic for merkle path construction
-	subtreeHashes, err := a.fetchBlockSubtreeHashes(ctx, blockMsg.DataHubURL, blockMsg.Hash)
+	block, err := a.fetchBlockData(ctx, blockMsg.DataHubURL, blockMsg.Hash)
 	if err != nil {
-		return fmt.Errorf("failed to fetch subtree hashes: %w", err)
+		return fmt.Errorf("failed to fetch block data: %w", err)
 	}
 
-	numSubtrees := len(subtreeHashes)
+	numSubtrees := len(block.SubtreeHashes)
 	if numSubtrees == 0 {
 		a.logger.Debug("block has no subtrees",
 			slog.String("hash", blockMsg.Hash))
 		return nil
+	}
+
+	if block.CoinbaseTxID == nil {
+		a.logger.Error("block data missing coinbase txid, merkle proofs will be incorrect",
+			slog.String("hash", blockMsg.Hash))
+		return fmt.Errorf("block %s missing coinbase txid", blockMsg.Hash)
 	}
 
 	a.logger.Debug("processing block transactions",
@@ -356,7 +361,7 @@ func (a *Arcade) processBlockTransactions(ctx context.Context, blockMsg teranode
 	totalTxsScanned := 0
 	totalMatched := 0
 
-	for subtreeIdx, subtreeHash := range subtreeHashes {
+	for subtreeIdx, subtreeHash := range block.SubtreeHashes {
 		txHashes, err := a.fetchSubtreeHashes(ctx, blockMsg.DataHubURL, subtreeHash.String())
 		if err != nil {
 			a.logger.Error("failed to fetch subtree txids",
@@ -367,12 +372,10 @@ func (a *Arcade) processBlockTransactions(ctx context.Context, blockMsg teranode
 
 		totalTxsScanned += len(txHashes)
 
-		// Subtree 0 contains a coinbase placeholder that must be replaced with the
-		// real coinbase txid. The subtree 0 root will be computed by ComputeMissingHashes.
+		// Subtree 0 contains a coinbase placeholder that must be replaced
+		// with the real coinbase txid from the block data.
 		if subtreeIdx == 0 && len(txHashes) > 0 {
-			if coinbaseTxID := a.parseCoinbaseTxID(blockMsg); coinbaseTxID != nil {
-				txHashes[0] = *coinbaseTxID
-			}
+			txHashes[0] = *block.CoinbaseTxID
 		}
 
 		tracked := a.txTracker.FilterTrackedHashes(txHashes)
@@ -395,7 +398,7 @@ func (a *Arcade) processBlockTransactions(ctx context.Context, blockMsg teranode
 			continue
 		}
 
-		a.buildMerklePathsForSubtree(ctx, blockMsg, subtreeIdx, subtreeRootLayer, subtreeHashes, txHashes, tracked)
+		a.buildMerklePathsForSubtree(ctx, blockMsg, subtreeIdx, subtreeRootLayer, block.SubtreeHashes, txHashes, tracked)
 	}
 
 	a.logger.Debug("block transaction scan complete",
@@ -405,32 +408,6 @@ func (a *Arcade) processBlockTransactions(ctx context.Context, blockMsg teranode
 		slog.Int("totalMatched", totalMatched))
 
 	return nil
-}
-
-// parseCoinbaseTxID extracts the txid from the coinbase transaction in a block message.
-// Returns nil if the coinbase cannot be parsed.
-func (a *Arcade) parseCoinbaseTxID(blockMsg teranode.BlockMessage) *chainhash.Hash {
-	if blockMsg.Coinbase == "" {
-		return nil
-	}
-
-	coinbaseBytes, err := hex.DecodeString(blockMsg.Coinbase)
-	if err != nil {
-		a.logger.Error("failed to decode coinbase hex",
-			slog.String("blockHash", blockMsg.Hash),
-			slog.String("error", err.Error()))
-		return nil
-	}
-
-	tx, err := transaction.NewTransactionFromBytes(coinbaseBytes)
-	if err != nil {
-		a.logger.Error("failed to parse coinbase transaction",
-			slog.String("blockHash", blockMsg.Hash),
-			slog.String("error", err.Error()))
-		return nil
-	}
-
-	return tx.TxID()
 }
 
 //nolint:gocyclo // complex business logic for merkle path construction
@@ -939,11 +916,11 @@ func (a *Arcade) processRejectedTxMessage(ctx context.Context, rejectedMsg teran
 
 // HTTP fetching methods
 
-func (a *Arcade) fetchBlockSubtreeHashes(ctx context.Context, dataHubURL, blockHash string) ([]chainhash.Hash, error) {
+func (a *Arcade) fetchBlockData(ctx context.Context, dataHubURL, blockHash string) (*blockData, error) {
 	url := fmt.Sprintf("%s/block/%s", strings.TrimSuffix(dataHubURL, "/"), blockHash)
-	hashes, err := a.fetchBlockSubtrees(ctx, url)
+	data, err := a.fetchBlock(ctx, url)
 	if err == nil {
-		return hashes, nil
+		return data, nil
 	}
 
 	// Try fallback URLs
@@ -952,27 +929,32 @@ func (a *Arcade) fetchBlockSubtreeHashes(ctx context.Context, dataHubURL, blockH
 			continue // Skip if same as original
 		}
 		url = fmt.Sprintf("%s/block/%s", strings.TrimSuffix(fallbackURL, "/"), blockHash)
-		hashes, fallbackErr := a.fetchBlockSubtrees(ctx, url)
+		data, fallbackErr := a.fetchBlock(ctx, url)
 		if fallbackErr == nil {
-			return hashes, nil
+			return data, nil
 		}
 	}
 
 	return nil, err // Return original error
 }
 
-// fetchBlockSubtrees fetches a block from teranode and extracts subtree hashes from the binary format.
+// blockData holds the parsed result of a datahub block response.
+type blockData struct {
+	SubtreeHashes []chainhash.Hash
+	CoinbaseTxID  *chainhash.Hash
+}
+
+// fetchBlock fetches a block from a datahub and parses subtree hashes and the coinbase txid.
+//
 // Teranode block binary format:
 // - Block header (80 bytes)
 // - Transaction count (varint)
 // - Size in bytes (varint)
 // - Subtree count (varint)
 // - Subtree hashes (32 bytes each)
-// - Coinbase transaction
+// - Coinbase transaction (raw tx bytes)
 // - Height (varint)
-//
-//nolint:gocyclo // complex business logic for parsing merkle tree data
-func (a *Arcade) fetchBlockSubtrees(ctx context.Context, url string) ([]chainhash.Hash, error) {
+func (a *Arcade) fetchBlock(ctx context.Context, url string) (*blockData, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
@@ -1029,7 +1011,18 @@ func (a *Arcade) fetchBlockSubtrees(ctx context.Context, url string) ([]chainhas
 		hashes = append(hashes, *hash)
 	}
 
-	return hashes, nil
+	result := &blockData{SubtreeHashes: hashes}
+
+	// Parse coinbase tx from the remaining stream.
+	// The stream contains: coinbase tx bytes followed by a height varint.
+	// ReadFrom reads exactly the tx and stops, leaving the height unread.
+	coinbaseTx := &transaction.Transaction{}
+	if _, err := coinbaseTx.ReadFrom(resp.Body); err != nil {
+		return nil, fmt.Errorf("failed to read coinbase tx: %w", err)
+	}
+	result.CoinbaseTxID = coinbaseTx.TxID()
+
+	return result, nil
 }
 
 func (a *Arcade) fetchSubtreeHashes(ctx context.Context, dataHubURL, subtreeHash string) ([]chainhash.Hash, error) {
