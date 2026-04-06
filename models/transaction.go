@@ -66,8 +66,10 @@ const (
 	StatusSeenOnNetwork = Status("SEEN_ON_NETWORK")
 	// StatusDoubleSpendAttempted indicates a double spend was attempted.
 	StatusDoubleSpendAttempted = Status("DOUBLE_SPEND_ATTEMPTED")
-	// StatusRejected indicates the transaction was rejected.
+	// StatusRejected indicates the transaction was rejected by the network (invalid tx).
 	StatusRejected = Status("REJECTED")
+	// StatusServiceError indicates a broadcast service failure (not a tx rejection).
+	StatusServiceError = Status("SERVICE_ERROR")
 	// StatusMined indicates the transaction was mined.
 	StatusMined = Status("MINED")
 	// StatusImmutable indicates the transaction is immutable.
@@ -84,6 +86,8 @@ func (s Status) DisallowedPreviousStatuses() []Status {
 		return []Status{StatusSentToNetwork, StatusAcceptedByNetwork, StatusSeenOnNetwork, StatusRejected, StatusDoubleSpendAttempted, StatusMined}
 	case StatusAcceptedByNetwork:
 		return []Status{StatusAcceptedByNetwork, StatusSeenOnNetwork, StatusRejected, StatusDoubleSpendAttempted, StatusMined}
+	case StatusServiceError:
+		return []Status{StatusAcceptedByNetwork, StatusSeenOnNetwork, StatusMined, StatusImmutable}
 	case StatusSeenOnNetwork, StatusRejected, StatusDoubleSpendAttempted, StatusMined, StatusImmutable:
 		return []Status{}
 	default:

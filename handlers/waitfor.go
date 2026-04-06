@@ -130,6 +130,7 @@ func statusReached(current, target models.Status) bool {
 	order := map[models.Status]int{
 		models.StatusUnknown:              0,
 		models.StatusReceived:             1,
+		models.StatusServiceError:         1, // transient — may still succeed
 		models.StatusSentToNetwork:        2,
 		models.StatusAcceptedByNetwork:    3,
 		models.StatusSeenOnNetwork:        4,

@@ -244,28 +244,33 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 		close(resultCh)
 	}()
 
-	// Collect results: return on first success, or last failure after all respond.
-	var lastFailure *models.TransactionStatus
+	// Collect results:
+	// - Success (ACCEPTED/SENT): return immediately
+	// - Rejected (4xx): return immediately, tx is invalid
+	// - Service error (5xx): wait for other endpoints
+	// - All service errors / timeout: return last error
+	var lastError *models.TransactionStatus
 	for {
 		select {
 		case status, ok := <-resultCh:
 			if !ok {
 				// All endpoints responded, none succeeded
-				if lastFailure == nil {
-					lastFailure, _ = e.store.GetStatus(ctx, txid)
+				if lastError == nil {
+					lastError, _ = e.store.GetStatus(ctx, txid)
 				}
-				e.logger.Debug("broadcast complete, no success",
+				e.logger.Debug("broadcast failed on all endpoints",
 					slog.String("txid", txid),
-					slog.String("status", string(lastFailure.Status)),
+					slog.String("status", string(lastError.Status)),
 					slog.Duration("elapsed", time.Since(broadcastStart)),
 				)
-				e.applyBroadcastResult(ctx, txid, lastFailure)
-				return lastFailure, nil
+				e.applyBroadcastResult(ctx, txid, lastError)
+				return lastError, nil
 			}
 			if status == nil {
 				continue
 			}
-			if status.Status == models.StatusAcceptedByNetwork || status.Status == models.StatusSentToNetwork {
+			switch status.Status {
+			case models.StatusAcceptedByNetwork, models.StatusSentToNetwork:
 				e.logger.Debug("broadcast complete",
 					slog.String("txid", txid),
 					slog.String("status", string(status.Status)),
@@ -273,19 +278,28 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 				)
 				e.applyBroadcastResult(ctx, txid, status)
 				return status, nil
+			case models.StatusRejected:
+				e.logger.Debug("transaction rejected by network",
+					slog.String("txid", txid),
+					slog.Duration("elapsed", time.Since(broadcastStart)),
+				)
+				e.applyBroadcastResult(ctx, txid, status)
+				return status, nil
+			default:
+				// Service error — wait for other endpoints
+				lastError = status
 			}
-			lastFailure = status
 		case <-submitCtx.Done():
-			if lastFailure == nil {
-				lastFailure, _ = e.store.GetStatus(ctx, txid)
+			if lastError == nil {
+				lastError, _ = e.store.GetStatus(ctx, txid)
 			}
 			e.logger.Warn("broadcast timeout",
 				slog.String("txid", txid),
 				slog.Int("endpoints", len(endpoints)),
 				slog.Duration("elapsed", time.Since(broadcastStart)),
 			)
-			e.applyBroadcastResult(ctx, txid, lastFailure)
-			return lastFailure, nil
+			e.applyBroadcastResult(ctx, txid, lastError)
+			return lastError, nil
 		}
 	}
 }
@@ -436,27 +450,30 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 			close(resultCh)
 		}()
 
-		// Wait for first success, or last failure after all respond
-		var lastFailure *models.TransactionStatus
+		var lastError *models.TransactionStatus
 		var resolved bool
 		for status := range resultCh {
 			if status == nil {
 				continue
 			}
-			if status.Status == models.StatusAcceptedByNetwork || status.Status == models.StatusSentToNetwork {
+			switch status.Status {
+			case models.StatusAcceptedByNetwork, models.StatusSentToNetwork, models.StatusRejected:
 				e.applyBroadcastResult(ctx, info.txid, status)
 				responses = append(responses, status)
 				resolved = true
+			default:
+				lastError = status
+			}
+			if resolved {
 				break
 			}
-			lastFailure = status
 		}
 		if !resolved {
-			if lastFailure == nil {
-				lastFailure, _ = e.store.GetStatus(ctx, info.txid)
+			if lastError == nil {
+				lastError, _ = e.store.GetStatus(ctx, info.txid)
 			}
-			e.applyBroadcastResult(ctx, info.txid, lastFailure)
-			responses = append(responses, lastFailure)
+			e.applyBroadcastResult(ctx, info.txid, lastError)
+			responses = append(responses, lastError)
 		}
 	}
 
@@ -530,15 +547,21 @@ func (e *Embedded) applyBroadcastResult(ctx context.Context, txid string, status
 func (e *Embedded) submitToTeranodeSync(ctx context.Context, endpoint string, rawTx []byte, txid string) *models.TransactionStatus {
 	statusCode, err := e.teranodeClient.SubmitTransaction(ctx, endpoint, rawTx)
 	if err != nil {
-		e.logger.Debug("endpoint rejected transaction",
+		// Distinguish genuine rejection (4xx) from service failure (5xx / network error)
+		status := models.StatusServiceError
+		if statusCode >= 400 && statusCode < 500 {
+			status = models.StatusRejected
+		}
+		e.logger.Debug("endpoint broadcast failed",
 			slog.String("txid", txid),
 			slog.String("endpoint", endpoint),
 			slog.Int("statusCode", statusCode),
+			slog.String("status", string(status)),
 			slog.String("error", err.Error()),
 		)
 		return &models.TransactionStatus{
 			TxID:      txid,
-			Status:    models.StatusRejected,
+			Status:    status,
 			Timestamp: time.Now(),
 			ExtraInfo: err.Error(),
 		}
