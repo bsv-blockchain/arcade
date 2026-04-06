@@ -244,22 +244,49 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 		close(resultCh)
 	}()
 
-	// Wait for first result or timeout
-	select {
-	case status := <-resultCh:
-		e.logger.Debug("broadcast complete",
-			slog.String("txid", txid),
-			slog.String("status", string(status.Status)),
-			slog.Duration("elapsed", time.Since(broadcastStart)),
-		)
-		return status, nil
-	case <-submitCtx.Done():
-		e.logger.Warn("broadcast timeout",
-			slog.String("txid", txid),
-			slog.Int("endpoints", len(endpoints)),
-			slog.Duration("elapsed", time.Since(broadcastStart)),
-		)
-		return e.store.GetStatus(ctx, txid)
+	// Collect results: return on first success, or last failure after all respond.
+	var lastFailure *models.TransactionStatus
+	for {
+		select {
+		case status, ok := <-resultCh:
+			if !ok {
+				// All endpoints responded, none succeeded
+				if lastFailure == nil {
+					lastFailure, _ = e.store.GetStatus(ctx, txid)
+				}
+				e.logger.Debug("broadcast complete, no success",
+					slog.String("txid", txid),
+					slog.String("status", string(lastFailure.Status)),
+					slog.Duration("elapsed", time.Since(broadcastStart)),
+				)
+				e.applyBroadcastResult(ctx, txid, lastFailure)
+				return lastFailure, nil
+			}
+			if status == nil {
+				continue
+			}
+			if status.Status == models.StatusAcceptedByNetwork || status.Status == models.StatusSentToNetwork {
+				e.logger.Debug("broadcast complete",
+					slog.String("txid", txid),
+					slog.String("status", string(status.Status)),
+					slog.Duration("elapsed", time.Since(broadcastStart)),
+				)
+				e.applyBroadcastResult(ctx, txid, status)
+				return status, nil
+			}
+			lastFailure = status
+		case <-submitCtx.Done():
+			if lastFailure == nil {
+				lastFailure, _ = e.store.GetStatus(ctx, txid)
+			}
+			e.logger.Warn("broadcast timeout",
+				slog.String("txid", txid),
+				slog.Int("endpoints", len(endpoints)),
+				slog.Duration("elapsed", time.Since(broadcastStart)),
+			)
+			e.applyBroadcastResult(ctx, txid, lastFailure)
+			return lastFailure, nil
+		}
 	}
 }
 
@@ -404,20 +431,32 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 			}(endpoint)
 		}
 
-		// Close channel when all goroutines complete
 		go func() {
 			wg.Wait()
 			close(resultCh)
 		}()
 
-		// Wait for first result or timeout
-		select {
-		case status := <-resultCh:
-			responses = append(responses, status)
-		case <-submitCtx.Done():
-			// Timeout - get current status
-			status, _ := e.store.GetStatus(ctx, info.txid)
-			responses = append(responses, status)
+		// Wait for first success, or last failure after all respond
+		var lastFailure *models.TransactionStatus
+		var resolved bool
+		for status := range resultCh {
+			if status == nil {
+				continue
+			}
+			if status.Status == models.StatusAcceptedByNetwork || status.Status == models.StatusSentToNetwork {
+				e.applyBroadcastResult(ctx, info.txid, status)
+				responses = append(responses, status)
+				resolved = true
+				break
+			}
+			lastFailure = status
+		}
+		if !resolved {
+			if lastFailure == nil {
+				lastFailure, _ = e.store.GetStatus(ctx, info.txid)
+			}
+			e.applyBroadcastResult(ctx, info.txid, lastFailure)
+			responses = append(responses, lastFailure)
 		}
 	}
 
@@ -472,7 +511,22 @@ func (e *Embedded) GetPolicy(_ context.Context) (*models.Policy, error) {
 	return e.policy, nil
 }
 
-// submitToTeranodeSync submits a transaction to a teranode endpoint, updates status, and returns the result.
+// applyBroadcastResult persists the final broadcast status and publishes the event.
+// Called once after the fan-out has chosen the definitive result.
+func (e *Embedded) applyBroadcastResult(ctx context.Context, txid string, status *models.TransactionStatus) {
+	if status == nil {
+		return
+	}
+	if err := e.store.UpdateStatus(ctx, status); err != nil {
+		e.logger.Error("failed to update status", slog.String("txID", txid), slog.String("error", err.Error()))
+	}
+	if err := e.eventPublisher.Publish(ctx, status); err != nil {
+		e.logger.Error("failed to publish status", slog.String("txID", txid), slog.String("error", err.Error()))
+	}
+}
+
+// submitToTeranodeSync submits a transaction to a single teranode endpoint and returns the result.
+// Does not persist or publish — the caller chooses the final status across all endpoints.
 func (e *Embedded) submitToTeranodeSync(ctx context.Context, endpoint string, rawTx []byte, txid string) *models.TransactionStatus {
 	statusCode, err := e.teranodeClient.SubmitTransaction(ctx, endpoint, rawTx)
 	if err != nil {
@@ -482,23 +536,12 @@ func (e *Embedded) submitToTeranodeSync(ctx context.Context, endpoint string, ra
 			slog.Int("statusCode", statusCode),
 			slog.String("error", err.Error()),
 		)
-		status := &models.TransactionStatus{
+		return &models.TransactionStatus{
 			TxID:      txid,
 			Status:    models.StatusRejected,
 			Timestamp: time.Now(),
 			ExtraInfo: err.Error(),
 		}
-		if err := e.store.UpdateStatus(ctx, status); err != nil {
-			e.logger.Error("failed to update status", slog.String("txID", txid), slog.String("error", err.Error()))
-		}
-		e.logger.Debug("publishing status change",
-			slog.String("txid", txid),
-			slog.String("status", string(status.Status)),
-		)
-		if err := e.eventPublisher.Publish(ctx, status); err != nil {
-			e.logger.Error("failed to publish status", slog.String("txID", txid), slog.String("error", err.Error()))
-		}
-		return status
 	}
 
 	var txStatus models.Status
@@ -516,20 +559,9 @@ func (e *Embedded) submitToTeranodeSync(ctx context.Context, endpoint string, ra
 		return nil
 	}
 
-	status := &models.TransactionStatus{
+	return &models.TransactionStatus{
 		TxID:      txid,
 		Status:    txStatus,
 		Timestamp: time.Now(),
 	}
-	if err := e.store.UpdateStatus(ctx, status); err != nil {
-		e.logger.Error("failed to update status", slog.String("txID", txid), slog.String("error", err.Error()))
-	}
-	e.logger.Debug("publishing status change",
-		slog.String("txid", txid),
-		slog.String("status", string(status.Status)),
-	)
-	if err := e.eventPublisher.Publish(ctx, status); err != nil {
-		e.logger.Error("failed to publish status", slog.String("txID", txid), slog.String("error", err.Error()))
-	}
-	return status
 }
