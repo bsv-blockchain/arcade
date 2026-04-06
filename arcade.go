@@ -36,6 +36,7 @@ var (
 	errChaintracksNoTip       = errors.New("chaintracks has no tip")
 	errUnexpectedStatusCode   = errors.New("unexpected status code")
 	errInvalidHashSize        = errors.New("invalid hash size")
+	errMissingCoinbaseTxID    = errors.New("block data missing coinbase txid")
 )
 
 // Config holds configuration for Arcade
@@ -349,7 +350,7 @@ func (a *Arcade) processBlockTransactions(ctx context.Context, blockMsg teranode
 	if block.CoinbaseTxID == nil {
 		a.logger.Error("block data missing coinbase txid, merkle proofs will be incorrect",
 			slog.String("hash", blockMsg.Hash))
-		return fmt.Errorf("block %s missing coinbase txid", blockMsg.Hash)
+		return fmt.Errorf("%w: %s", errMissingCoinbaseTxID, blockMsg.Hash)
 	}
 
 	a.logger.Debug("processing block transactions",
@@ -954,7 +955,7 @@ type blockData struct {
 // - Subtree hashes (32 bytes each)
 // - Coinbase transaction (raw tx bytes)
 // - Height (varint)
-func (a *Arcade) fetchBlock(ctx context.Context, url string) (*blockData, error) {
+func (a *Arcade) fetchBlock(ctx context.Context, url string) (*blockData, error) { //nolint:gocyclo // sequential binary parsing
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)

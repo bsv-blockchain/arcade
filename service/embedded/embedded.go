@@ -269,6 +269,7 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 			if status == nil {
 				continue
 			}
+			//nolint:exhaustive // only handling definitive results; service errors fall to default
 			switch status.Status {
 			case models.StatusAcceptedByNetwork, models.StatusSentToNetwork:
 				e.logger.Debug("broadcast complete",
@@ -456,6 +457,7 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 			if status == nil {
 				continue
 			}
+			//nolint:exhaustive // only handling definitive results; service errors fall to default
 			switch status.Status {
 			case models.StatusAcceptedByNetwork, models.StatusSentToNetwork, models.StatusRejected:
 				e.applyBroadcastResult(ctx, info.txid, status)
