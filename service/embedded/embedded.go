@@ -269,7 +269,6 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 			if status == nil {
 				continue
 			}
-			//nolint:exhaustive // only handling definitive results; service errors fall to default
 			switch status.Status {
 			case models.StatusAcceptedByNetwork, models.StatusSentToNetwork:
 				e.logger.Debug("broadcast complete",
@@ -286,8 +285,10 @@ func (e *Embedded) SubmitTransaction(ctx context.Context, rawTx []byte, opts *mo
 				)
 				e.applyBroadcastResult(ctx, txid, status)
 				return status, nil
-			default:
-				// Service error — wait for other endpoints
+			case models.StatusServiceError:
+				lastError = status
+			case models.StatusUnknown, models.StatusReceived, models.StatusSeenOnNetwork,
+				models.StatusDoubleSpendAttempted, models.StatusMined, models.StatusImmutable:
 				lastError = status
 			}
 		case <-submitCtx.Done():
@@ -457,13 +458,15 @@ func (e *Embedded) SubmitTransactions(ctx context.Context, rawTxs [][]byte, opts
 			if status == nil {
 				continue
 			}
-			//nolint:exhaustive // only handling definitive results; service errors fall to default
 			switch status.Status {
 			case models.StatusAcceptedByNetwork, models.StatusSentToNetwork, models.StatusRejected:
 				e.applyBroadcastResult(ctx, info.txid, status)
 				responses = append(responses, status)
 				resolved = true
-			default:
+			case models.StatusServiceError:
+				lastError = status
+			case models.StatusUnknown, models.StatusReceived, models.StatusSeenOnNetwork,
+				models.StatusDoubleSpendAttempted, models.StatusMined, models.StatusImmutable:
 				lastError = status
 			}
 			if resolved {
