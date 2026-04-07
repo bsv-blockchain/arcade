@@ -266,4 +266,4 @@ require (
 )
 
 // CVE-2025-52881
-replace github.com/opencontainers/runc => github.com/opencontainers/runc v1.4.0
+replace github.com/opencontainers/runc => github.com/opencontainers/runc v1.4.2
