@@ -18,7 +18,7 @@ func withCORS(next http.Handler) http.Handler {
 		h := w.Header()
 		h.Set("Access-Control-Allow-Origin", "*")
 		h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		h.Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Last-Event-ID, X-Requested-With")
+		h.Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Last-Event-ID, X-Requested-With, X-CallbackURL, X-FullStatusUpdates")
 		h.Set("Access-Control-Expose-Headers", "Content-Type")
 		h.Set("Access-Control-Max-Age", "86400")
 
