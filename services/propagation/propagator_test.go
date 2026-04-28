@@ -293,7 +293,7 @@ func newPropagator(merkleSrvURL, teranodeSrvURL string, st store.Store) *Propaga
 
 	tc := teranode.NewClient([]string{teranodeSrvURL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
 
-	return New(cfg, zap.NewNop(), nil, st, nil, tc, mc)
+	return New(cfg, zap.NewNop(), nil, nil, st, nil, tc, mc)
 }
 
 // handleAndFlush is a helper that adds a message and flushes (simulating consumer behavior)
@@ -393,7 +393,7 @@ func TestHandleMessage_MerkleTimeout_NoBroadcast(t *testing.T) {
 	cfg.Propagation.MerkleConcurrency = 10
 	mc := merkleservice.NewClient(merkleSrv.URL, "", 100*time.Millisecond)
 	tc := teranode.NewClient([]string{teranodeSrv.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
-	p := New(cfg, zap.NewNop(), nil, ms, nil, tc, mc)
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, mc)
 
 	err := handleAndFlush(t, p, makePropMsg("abc123"))
 	if err == nil {
@@ -494,7 +494,7 @@ func TestHandleMessage_NoCallbackURL_SkipsRegistration(t *testing.T) {
 	cfg.Propagation.MerkleConcurrency = 10
 	mc := merkleservice.NewClient(merkleSrv.URL, "", 5*time.Second)
 	tc := teranode.NewClient([]string{teranodeSrv.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
-	p := New(cfg, zap.NewNop(), nil, ms, nil, tc, mc)
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, mc)
 
 	err := handleAndFlush(t, p, makePropMsg("abc123"))
 	if err != nil {
@@ -579,7 +579,7 @@ func TestProcessBatch_ChunksOversizedBatch(t *testing.T) {
 	cfg.Propagation.MerkleConcurrency = 10
 	cfg.Propagation.TeranodeMaxBatchSize = 10 // small cap so 25 txs → 3 chunks
 	tc := teranode.NewClient([]string{teranodeSrv.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
-	p := New(cfg, zap.NewNop(), nil, ms, nil, tc, nil)
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, nil)
 
 	for i := 0; i < 25; i++ {
 		_ = p.handleMessage(context.Background(), consumerMsg(makePropMsg(fmt.Sprintf("tx%03d", i))))
@@ -776,7 +776,7 @@ func TestBatchTransactions_AnySuccess_AcceptedByNetwork(t *testing.T) {
 	cfg.Propagation.MerkleConcurrency = 10
 	// Two endpoints pointing to the same server (simulates multi-endpoint)
 	tc := teranode.NewClient([]string{teranodeSrv.URL, teranodeSrv.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
-	p := New(cfg, zap.NewNop(), nil, ms, nil, tc, nil)
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, nil)
 
 	for i := 0; i < 3; i++ {
 		_ = p.handleMessage(context.Background(), consumerMsg(makePropMsg(fmt.Sprintf("tx%d", i))))
@@ -910,7 +910,7 @@ func TestRetry_Exhausted_ClearsToRejected(t *testing.T) {
 	cfg.Propagation.RetryMaxAttempts = 2
 	cfg.Propagation.RetryBackoffMs = 1
 	tc := teranode.NewClient([]string{teranodeSrv.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
-	p := New(cfg, zap.NewNop(), nil, ms, nil, tc, nil)
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, nil)
 
 	// Initial broadcast → PENDING_RETRY at retry_count=1.
 	if err := handleAndFlush(t, p, makePropMsg("tx-exhaust")); err != nil {
@@ -1016,7 +1016,7 @@ func newPropagatorWithLeaser(teranodeSrvURL string, st store.Store, leaser store
 	cfg := &config.Config{CallbackURL: "http://localhost:8080/callback"}
 	cfg.Propagation.MerkleConcurrency = 10
 	tc := teranode.NewClient([]string{teranodeSrvURL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
-	return New(cfg, zap.NewNop(), nil, st, leaser, tc, nil)
+	return New(cfg, zap.NewNop(), nil, nil, st, leaser, tc, nil)
 }
 
 // When the leaser refuses to grant leadership, the reaper must not broadcast

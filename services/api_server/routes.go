@@ -58,6 +58,13 @@ var routeDocs = []RouteDoc{
 		RequestFormat:  "JSON CallbackMessage with type field. Optional Bearer token auth.",
 		ResponseFormat: "200 OK",
 	},
+	{
+		Method:         "GET",
+		Path:           "/events",
+		Description:    "Stream transaction status updates as Server-Sent Events. Optional ?callbackToken filters to txids registered under that token. Last-Event-ID header (nanosecond timestamp) replays missed events.",
+		RequestFormat:  "Optional query: callbackToken. Optional header: Last-Event-ID.",
+		ResponseFormat: "text/event-stream — frames: id, event: status, data: {txid, txStatus, timestamp}",
+	},
 }
 
 func (s *Server) registerRoutes(r *gin.Engine) {
@@ -74,6 +81,7 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 	r.GET("/tx/:txid", s.handleGetTransaction)
 	r.POST("/tx", s.handleSubmitTransaction)
 	r.POST("/txs", s.handleSubmitTransactions)
+	r.GET("/events", s.handleEventsSSE)
 
 	s.registerChaintracksRoutes(r)
 }

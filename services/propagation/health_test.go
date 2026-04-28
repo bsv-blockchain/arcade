@@ -45,7 +45,7 @@ func TestBroadcastSingle_FirstSuccessWins_DoesNotWaitForSlowPeer(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Propagation.MerkleConcurrency = 10
 	tc := teranode.NewClient([]string{fastSrv.URL, slowSrv.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
-	p := New(cfg, zap.NewNop(), nil, ms, nil, tc, nil)
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, nil)
 
 	start := time.Now()
 	if err := handleAndFlush(t, p, makePropMsg("tx-race")); err != nil {
@@ -85,7 +85,7 @@ func TestBroadcast_RecordsEndpointOutcomes(t *testing.T) {
 	// Low threshold. If cancellation were incorrectly counted as failure, the
 	// losing endpoint would be tripped within three broadcasts.
 	tc := teranode.NewClient([]string{okSrv.URL, okSrv2.URL}, "", teranode.HealthConfig{FailureThreshold: 3})
-	p := New(cfg, zap.NewNop(), nil, ms, nil, tc, nil)
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, nil)
 
 	// Ten broadcasts — far more than the failure threshold would allow if
 	// cancellation were being miscounted.
@@ -116,7 +116,7 @@ func TestPeerReturning500_StaysHealthy(t *testing.T) {
 	// Low failure threshold so the test would fail fast if any 500 were
 	// miscounted as a transport failure.
 	tc := teranode.NewClient([]string{alwaysFiveHundred.URL}, "", teranode.HealthConfig{FailureThreshold: 2})
-	p := New(cfg, zap.NewNop(), nil, ms, nil, tc, nil)
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, nil)
 
 	// Ten broadcasts, all hitting a 500-returning peer.
 	for i := 0; i < 10; i++ {
@@ -146,7 +146,7 @@ func TestPeerUnreachable_Trips(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Propagation.MerkleConcurrency = 10
 	tc := teranode.NewClient([]string{unreachableURL}, "", teranode.HealthConfig{FailureThreshold: 3})
-	p := New(cfg, zap.NewNop(), nil, ms, nil, tc, nil)
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, nil)
 
 	for i := 0; i < 3; i++ {
 		if err := handleAndFlush(t, p, makePropMsg("tx-"+string(rune('a'+i)))); err != nil {
@@ -183,7 +183,7 @@ func TestBadPeer_SkippedAfterTrip(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Propagation.MerkleConcurrency = 10
 	tc := teranode.NewClient([]string{okSrv.URL, badSrv.URL}, "", teranode.HealthConfig{FailureThreshold: 3})
-	p := New(cfg, zap.NewNop(), nil, ms, nil, tc, nil)
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, nil)
 
 	// Deterministically trip bad to unhealthy.
 	tc.RecordFailure(badSrv.URL)
@@ -225,7 +225,7 @@ func TestBatchPropagatedLog_IncludesSuccessEndpoint(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Propagation.MerkleConcurrency = 10
 	tc := teranode.NewClient([]string{srv.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
-	p := New(cfg, logger, nil, ms, nil, tc, nil)
+	p := New(cfg, logger, nil, nil, ms, nil, tc, nil)
 
 	if err := handleAndFlush(t, p, makePropMsg("tx-logged")); err != nil {
 		t.Fatalf("flush error: %v", err)

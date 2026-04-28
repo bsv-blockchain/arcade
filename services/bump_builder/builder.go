@@ -14,6 +14,7 @@ import (
 
 	"github.com/bsv-blockchain/arcade/bump"
 	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/events"
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
@@ -22,25 +23,43 @@ import (
 )
 
 type Builder struct {
-	cfg      *config.Config
-	logger   *zap.Logger
-	store    store.Store
-	producer *kafka.Producer
-	consumer *kafka.ConsumerGroup
-	teranode *teranode.Client
+	cfg       *config.Config
+	logger    *zap.Logger
+	store     store.Store
+	producer  *kafka.Producer
+	publisher events.Publisher // nil-safe; broadcasts MINED status to SSE / webhooks
+	consumer  *kafka.ConsumerGroup
+	teranode  *teranode.Client
 }
 
 // New constructs a Builder. producer is the shared process-wide producer —
 // the builder reuses it (for DLQ routing) rather than creating a duplicate
-// connection. teranodeClient supplies the live datahub URL list (static +
-// p2p-discovered, refreshed from the shared store) used for block fetches.
-func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, st store.Store, teranodeClient *teranode.Client) *Builder {
+// connection. publisher fans MINED status updates out to subscribers.
+// teranodeClient supplies the live datahub URL list (static + p2p-discovered,
+// refreshed from the shared store) used for block fetches.
+func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publisher events.Publisher, st store.Store, teranodeClient *teranode.Client) *Builder {
 	return &Builder{
-		cfg:      cfg,
-		logger:   logger.Named("bump-builder"),
-		store:    st,
-		producer: producer,
-		teranode: teranodeClient,
+		cfg:       cfg,
+		logger:    logger.Named("bump-builder"),
+		store:     st,
+		producer:  producer,
+		publisher: publisher,
+		teranode:  teranodeClient,
+	}
+}
+
+// publishStatus fans a status update to the events Publisher. Non-fatal —
+// SSE catchup and the durable store row recover any drops.
+func (b *Builder) publishStatus(ctx context.Context, status *models.TransactionStatus) {
+	if b.publisher == nil || status == nil {
+		return
+	}
+	if err := b.publisher.Publish(ctx, status); err != nil {
+		b.logger.Warn("failed to publish status update",
+			zap.String("txid", status.TxID),
+			zap.String("status", string(status.Status)),
+			zap.Error(err),
+		)
 	}
 }
 
@@ -191,12 +210,21 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 
 	// 6. Set tracked transactions to MINED
 	if len(txids) > 0 {
-		if _, err := b.store.SetMinedByTxIDs(ctx, blockHash, txids); err != nil {
+		mined, err := b.store.SetMinedByTxIDs(ctx, blockHash, txids)
+		if err != nil {
 			logger.Error("failed to set mined status", zap.Error(err))
 		} else {
 			logger.Info("set transactions to MINED",
-				zap.Int("count", len(txids)),
+				zap.Int("count", len(mined)),
 			)
+			// SetMinedByTxIDs returns full status objects only for the rows
+			// it actually updated — silently skipping txids without an
+			// existing record. Publish the rich rows directly so SSE
+			// clients receive blockHash / blockHeight / merklePath in their
+			// status updates.
+			for _, st := range mined {
+				b.publishStatus(ctx, st)
+			}
 		}
 	}
 
