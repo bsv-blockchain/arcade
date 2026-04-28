@@ -152,6 +152,56 @@ func TestBatchGetOrInsertStatus_ConcurrentRace(t *testing.T) {
 	}
 }
 
+// Duplicate txids within a single batch must not blow up the multi-row
+// INSERT … ON CONFLICT DO UPDATE (Postgres rejects with SQLSTATE 21000 if
+// the same key appears twice in VALUES). The first occurrence keeps the
+// real Inserted flag; later occurrences must report Inserted=false with
+// Existing populated, so callers like tx_validator don't double-process.
+func TestBatchGetOrInsertStatus_DuplicateInBatch(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	in := []*models.TransactionStatus{
+		{TxID: "pg-dupbatch-1"},
+		{TxID: "pg-dupbatch-2"},
+		{TxID: "pg-dupbatch-1"},
+		{TxID: "pg-dupbatch-1"},
+		{TxID: "pg-dupbatch-2"},
+	}
+	results, err := s.BatchGetOrInsertStatus(ctx, in)
+	if err != nil {
+		t.Fatalf("BatchGetOrInsertStatus with duplicate txids: %v", err)
+	}
+	if len(results) != len(in) {
+		t.Fatalf("len(results) = %d, want %d", len(results), len(in))
+	}
+	wantInserted := []bool{true, true, false, false, false}
+	for i, r := range results {
+		if r.Inserted != wantInserted[i] {
+			t.Errorf("results[%d] (%s).Inserted = %v, want %v",
+				i, in[i].TxID, r.Inserted, wantInserted[i])
+		}
+		if !r.Inserted && r.Existing == nil {
+			t.Errorf("results[%d] (%s): duplicate slot must have Existing populated",
+				i, in[i].TxID)
+		}
+	}
+
+	// Re-running the same input must mark every position as already-existing.
+	results, err = s.BatchGetOrInsertStatus(ctx, in)
+	if err != nil {
+		t.Fatalf("re-run: %v", err)
+	}
+	for i, r := range results {
+		if r.Inserted {
+			t.Errorf("results[%d] (%s).Inserted = true on re-run, want false", i, in[i].TxID)
+		}
+		if r.Existing == nil {
+			t.Errorf("results[%d] (%s).Existing is nil on re-run", i, in[i].TxID)
+		}
+	}
+}
+
 // BatchUpdateStatus: bulk reject. Every row's Status, ExtraInfo, and
 // timestamp must be persisted in a single round-trip. Verified by reading
 // each row back through the single-row API.

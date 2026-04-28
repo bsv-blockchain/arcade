@@ -187,9 +187,15 @@ func (s *Store) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.T
 
 	// Normalise inputs the same way GetOrInsertStatus does — empty Status
 	// becomes RECEIVED, missing timestamps default to now, CreatedAt is set.
+	// Postgres rejects multi-row INSERT…ON CONFLICT DO UPDATE when the same
+	// key appears twice in VALUES (SQLSTATE 21000), so dedupe by txid here
+	// and stitch results back to every duplicate position after the round
+	// trip. firstPos remembers the input slot of the surviving row per txid.
 	now := time.Now()
+	firstPos := make(map[string]int, len(statuses))
+	uniqueIdx := make([]int, 0, len(statuses))
 	args := make([]any, 0, len(statuses)*columnsPerInsertRow)
-	for _, st := range statuses {
+	for i, st := range statuses {
 		if st.Timestamp.IsZero() {
 			st.Timestamp = now
 		}
@@ -197,6 +203,12 @@ func (s *Store) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.T
 			st.Status = models.StatusReceived
 		}
 		st.CreatedAt = now
+
+		if _, seen := firstPos[st.TxID]; seen {
+			continue
+		}
+		firstPos[st.TxID] = i
+		uniqueIdx = append(uniqueIdx, i)
 
 		var competing any
 		if len(st.CompetingTxs) > 0 {
@@ -222,7 +234,7 @@ func (s *Store) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.T
 	// Build the VALUES clause: one (...) tuple per row, NULLIF guards mirror
 	// the single-row insert exactly.
 	var values strings.Builder
-	for i := 0; i < len(statuses); i++ {
+	for i := 0; i < len(uniqueIdx); i++ {
 		if i > 0 {
 			values.WriteString(", ")
 		}
@@ -270,7 +282,16 @@ RETURNING txid, status, status_code, block_hash, block_height, merkle_path,
 
 	out := make([]store.BatchInsertResult, len(statuses))
 	for i, st := range statuses {
-		out[i] = byTxID[st.TxID]
+		res := byTxID[st.TxID]
+		// Only the first input slot for a given txid keeps Inserted=true;
+		// later duplicates report as already-existing so callers don't
+		// double-process the same tx (e.g. tx_validator validating twice).
+		if i != firstPos[st.TxID] && res.Inserted {
+			first := statuses[firstPos[st.TxID]]
+			cp := *first
+			res = store.BatchInsertResult{Inserted: false, Existing: &cp}
+		}
+		out[i] = res
 	}
 	return out, nil
 }
