@@ -190,7 +190,16 @@ func (h *saramaGroupHandler) Setup(sarama.ConsumerGroupSession) error   { return
 func (h *saramaGroupHandler) Cleanup(sarama.ConsumerGroupSession) error { return nil }
 
 func (h *saramaGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
-	neutral := &saramaClaim{session: session, claim: claim}
+	// out is allocated here, before the pump goroutine is scheduled, so the
+	// handler's first call to Messages() never observes a nil channel. A nil
+	// channel read blocks forever, so when sarama assigned multiple partitions
+	// to one consumer the partitions whose handler ran before pump() left the
+	// claim wedged at offset 0 with no log signal.
+	neutral := &saramaClaim{
+		session: session,
+		claim:   claim,
+		out:     make(chan *Message, 256),
+	}
 	go neutral.pump()
 	return h.sub.handler(neutral)
 }
@@ -203,12 +212,9 @@ type saramaClaim struct {
 	session sarama.ConsumerGroupSession
 	claim   sarama.ConsumerGroupClaim
 	out     chan *Message
-	started bool
 }
 
 func (c *saramaClaim) pump() {
-	c.out = make(chan *Message, 256)
-	c.started = true
 	defer close(c.out)
 	for msg := range c.claim.Messages() {
 		headers := make(map[string][]byte, len(msg.Headers))
@@ -228,8 +234,6 @@ func (c *saramaClaim) pump() {
 }
 
 func (c *saramaClaim) Messages() <-chan *Message {
-	// pump() is started before ConsumeClaim hands us to the handler, so out is
-	// non-nil by the time this is called.
 	return c.out
 }
 
