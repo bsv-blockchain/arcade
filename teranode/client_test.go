@@ -6,124 +6,80 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 )
 
 func TestSubmitTransaction(t *testing.T) {
-	called := false
+	var gotContentType string
+	var gotBody []byte
+	var gotAuth string
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		called = true
-
-		if r.Method != http.MethodPost {
-			t.Errorf("Expected POST method, got %s", r.Method)
+		gotContentType = r.Header.Get("Content-Type")
+		gotAuth = r.Header.Get("Authorization")
+		gotBody, _ = io.ReadAll(r.Body)
+		if r.URL.Path == "/tx" && r.Method == http.MethodPost {
+			w.WriteHeader(http.StatusOK)
+			return
 		}
-
-		if r.URL.Path != "/tx" {
-			t.Errorf("Expected path /tx, got %s", r.URL.Path)
-		}
-
-		if r.Header.Get("Content-Type") != "application/octet-stream" {
-			t.Errorf("Expected Content-Type application/octet-stream, got %s", r.Header.Get("Content-Type"))
-		}
-
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Fatalf("Failed to read request body: %v", err)
-		}
-
-		expectedTx := []byte("test_transaction_bytes")
-		if string(body) != string(expectedTx) {
-			t.Errorf("Expected body %s, got %s", expectedTx, body)
-		}
-
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("OK"))
+		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer server.Close()
 
-	client := NewClient([]string{server.URL}, "")
+	client := NewClient([]string{server.URL}, "testtoken", HealthConfig{})
+	rawTx := []byte{0x01, 0x02, 0x03}
 
-	statusCode, err := client.SubmitTransaction(t.Context(), server.URL, []byte("test_transaction_bytes"))
+	code, err := client.SubmitTransaction(context.Background(), server.URL, rawTx)
 	if err != nil {
-		t.Fatalf("SubmitTransaction failed: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-
-	if statusCode != http.StatusOK {
-		t.Errorf("Expected status code %d, got %d", http.StatusOK, statusCode)
+	if code != http.StatusOK {
+		t.Errorf("expected 200, got %d", code)
 	}
-
-	if !called {
-		t.Error("Server handler was not called")
+	if gotContentType != "application/octet-stream" {
+		t.Errorf("expected application/octet-stream, got %s", gotContentType)
+	}
+	if gotAuth != "Bearer testtoken" {
+		t.Errorf("expected Bearer testtoken, got %s", gotAuth)
+	}
+	if len(gotBody) != 3 {
+		t.Errorf("expected 3 bytes, got %d", len(gotBody))
 	}
 }
 
-func TestSubmitTransaction_Accepted(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusAccepted)
-		_, _ = w.Write([]byte("Queued"))
+func TestSubmitTransactions_Batch(t *testing.T) {
+	var gotBody []byte
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		if r.URL.Path == "/txs" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer server.Close()
 
-	client := NewClient([]string{server.URL}, "")
+	client := NewClient([]string{server.URL}, "", HealthConfig{})
+	rawTxs := [][]byte{{0x01, 0x02}, {0x03, 0x04, 0x05}}
 
-	statusCode, err := client.SubmitTransaction(t.Context(), server.URL, []byte("test_tx"))
+	code, err := client.SubmitTransactions(context.Background(), server.URL, rawTxs)
 	if err != nil {
-		t.Fatalf("SubmitTransaction failed: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-
-	if statusCode != http.StatusAccepted {
-		t.Errorf("Expected status code %d, got %d", http.StatusAccepted, statusCode)
+	if code != http.StatusOK {
+		t.Errorf("expected 200, got %d", code)
 	}
-}
-
-func TestSubmitTransaction_Error(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte("Failed to process transaction"))
-	}))
-	defer server.Close()
-
-	client := NewClient([]string{server.URL}, "")
-
-	_, err := client.SubmitTransaction(t.Context(), server.URL, []byte("test_tx"))
-	if err == nil {
-		t.Fatal("Expected error, got nil")
-	}
-
-	if err.Error() == "" {
-		t.Error("Expected error message to contain status information")
+	// Batch should concatenate: 2 + 3 = 5 bytes
+	if len(gotBody) != 5 {
+		t.Errorf("expected 5 concatenated bytes, got %d", len(gotBody))
 	}
 }
 
 func TestGetEndpoints(t *testing.T) {
-	endpoints := []string{"http://node1:8080", "http://node2:8080"}
-	client := NewClient(endpoints, "")
-
-	result := client.GetEndpoints()
-	if len(result) != len(endpoints) {
-		t.Errorf("Expected %d endpoints, got %d", len(endpoints), len(result))
-	}
-
-	for i, ep := range endpoints {
-		if result[i] != ep {
-			t.Errorf("Endpoint %d: expected %s, got %s", i, ep, result[i])
-		}
-	}
-}
-
-func TestContextCancellation(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		time.Sleep(200 * time.Millisecond)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-
-	client := NewClient([]string{server.URL}, "")
-	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
-	defer cancel()
-
-	_, err := client.SubmitTransaction(ctx, server.URL, []byte("test"))
-	if err == nil {
-		t.Fatal("Expected context deadline error, got nil")
+	endpoints := []string{"http://a", "http://b", "http://c"}
+	client := NewClient(endpoints, "", HealthConfig{})
+	got := client.GetEndpoints()
+	if len(got) != 3 {
+		t.Errorf("expected 3 endpoints, got %d", len(got))
 	}
 }

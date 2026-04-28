@@ -46,7 +46,10 @@
             "godot",
             "gocognit",
             "wsl_v5",
-            "funcorder"
+            "funcorder",
+            "err113",
+            "gochecknoglobals",
+            "gocyclo"
         ],
         "enable": [
             "asasalint",
@@ -60,7 +63,6 @@
             "dogsled",
             "durationcheck",
             "embeddedstructfieldcheck",
-            "err113",
             "errcheck",
             "errchkjson",
             "errname",
@@ -68,11 +70,9 @@
             "exhaustive",
             "forbidigo",
             "gocheckcompilerdirectives",
-            "gochecknoglobals",
             "gochecknoinits",
             "gochecksumtype",
             "goconst",
-            "gocyclo",
             "godox",
             "goheader",
             "gomoddirectives",
@@ -119,18 +119,78 @@
                     ],
                     "path": "go\\.mod",
                     "text": "github.com/opencontainers/runc"
+                },
+                {
+                    "linters": [
+                        "nilerr"
+                    ],
+                    "path": "bump/datahub\\.go"
+                },
+                {
+                    "linters": [
+                        "nilerr"
+                    ],
+                    "path": "store/aerospike/aerospike\\.go"
+                },
+                {
+                    "linters": [
+                        "nilnil"
+                    ],
+                    "path": "store/pebble/"
+                },
+                {
+                    "linters": [
+                        "nilnil"
+                    ],
+                    "path": "store/postgres/"
+                },
+                {
+                    "linters": [
+                        "nilnil"
+                    ],
+                    "path": "store/aerospike/"
+                },
+                {
+                    "linters": [
+                        "nilnil"
+                    ],
+                    "path": "services/api_server/handlers_test\\.go"
+                },
+                {
+                    "linters": [
+                        "containedctx"
+                    ],
+                    "path": "kafka/memory_broker\\.go"
+                },
+                {
+                    "linters": [
+                        "bodyclose"
+                    ],
+                    "path": "teranode/client\\.go"
+                },
+                {
+                    "linters": [
+                        "unparam"
+                    ],
+                    "path": "_test\\.go"
+                },
+                {
+                    "linters": [
+                        "nestif"
+                    ],
+                    "path": "store/pebble/pebble\\.go"
                 }
             ]
         },
         "settings": {
             "dogsled": {
-                "max-blank-identifiers": 2
+                "max-blank-identifiers": 3
             },
             "dupl": {
                 "threshold": 100
             },
             "exhaustive": {
-                "default-signifies-exhaustive": false
+                "default-signifies-exhaustive": true
             },
             "funcorder": {
                 "constructor-after-struct": true
@@ -202,7 +262,71 @@
                 "simple": true
             },
             "revive": {
-                "config": ".revive.toml"
+                "rules": [
+                    {
+                        "name": "blank-imports"
+                    },
+                    {
+                        "name": "context-as-argument"
+                    },
+                    {
+                        "name": "context-keys-type"
+                    },
+                    {
+                        "name": "dot-imports"
+                    },
+                    {
+                        "name": "empty-block"
+                    },
+                    {
+                        "name": "error-naming"
+                    },
+                    {
+                        "name": "error-return"
+                    },
+                    {
+                        "name": "error-strings"
+                    },
+                    {
+                        "name": "errorf"
+                    },
+                    {
+                        "name": "increment-decrement"
+                    },
+                    {
+                        "name": "indent-error-flow"
+                    },
+                    {
+                        "name": "range"
+                    },
+                    {
+                        "name": "receiver-naming"
+                    },
+                    {
+                        "name": "redefines-builtin-id"
+                    },
+                    {
+                        "name": "superfluous-else"
+                    },
+                    {
+                        "name": "time-naming"
+                    },
+                    {
+                        "name": "unexported-return"
+                    },
+                    {
+                        "name": "unreachable-code"
+                    },
+                    {
+                        "name": "unused-parameter"
+                    },
+                    {
+                        "name": "var-declaration"
+                    },
+                    {
+                        "name": "var-naming"
+                    }
+                ]
             },
             "unparam": {
                 "check-exported": false

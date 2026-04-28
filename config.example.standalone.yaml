@@ -1,0 +1,115 @@
+# Arcade — standalone / zero-dependency configuration.
+#
+# This profile runs a single arcade binary with no external infrastructure:
+#   - in-memory Kafka replacement (no broker needed)
+#   - Pebble embedded KV store (no Aerospike needed)
+#   - optional libp2p peer discovery using embedded teranode bootstrap peers
+#
+# Copy to config.yaml and adjust. Environment variables prefixed with
+# ARCADE_ override any value (e.g. ARCADE_LOG_LEVEL, ARCADE_STORE_BACKEND).
+
+mode: all
+log_level: info
+
+# Bitcoin network: mainnet | testnet | teratestnet. Drives both the p2p
+# discovery topic and the embedded chaintracks bootstrap peers.
+network: teratestnet
+
+# All on-disk state goes under this root (Pebble DB, chaintracks headers,
+# libp2p key/peer cache). The binary creates subdirectories as needed.
+storage_path: ~/.arcade
+
+api:
+  host: 0.0.0.0
+  port: 8080
+
+health:
+  port: 8081
+
+# In-memory broker: publishes and consumes stay inside the process. No
+# Kafka/Sarama connection is attempted. Messages are at-most-once on crash,
+# which is fine for single-node evaluation and local development.
+kafka:
+  backend: memory
+  consumer_group: arcade
+  max_retries: 5
+  buffer_size: 10000
+
+# Embedded Pebble KV store — pure-Go LSM, single-process exclusive access.
+# Point path at a directory inside storage_path; arcade creates it on first run.
+store:
+  backend: pebble
+  pebble:
+    path: ~/.arcade/pebble
+    memtable_size_mb: 64
+    l0_compaction_threshold: 4
+    sync_writes: false # flushed on shutdown; leave off for throughput
+
+# Alternative: embedded PostgreSQL (SQL surface for migration/query testing).
+# Uncomment to use instead of Pebble — first run extracts the postgres binary
+# which takes a few seconds.
+# store:
+#   backend: postgres
+#   postgres:
+#     embedded: true
+#     embedded_port: 0       # 0 = auto-pick a free port
+#     embedded_data_dir: ""  # defaults to <storage_path>/postgres
+#     embedded_cache_dir: "" # defaults to <storage_path>/postgres-cache
+
+# Statically configured datahub propagation targets. Leave empty to rely
+# entirely on p2p discovery below (requires datahub_discovery: true).
+datahub_urls: []
+# datahub_urls:
+#   - https://datahub1.example.com
+
+teranode:
+  auth_token: ""
+
+merkle_service:
+  url: ""
+  auth_token: ""
+
+# P2P discovery via go-teranode-p2p-client. When enabled, arcade joins the
+# pubsub mesh for the top-level `network` above and auto-registers each peer's
+# advertised datahub URL for propagation. Discovered URLs are additive to
+# datahub_urls and deduplicated.
+p2p:
+  seeds: []
+  datahub_discovery: true
+  # listen_port: 9905
+  # dht_mode: off              # off | client | server (library default: off)
+  # storage_path: ""           # defaults to <storage_path>/p2p; stores p2p_key.hex
+  # bootstrap_peers: []        # override/extend the built-in defaults for the selected network
+  # enable_mdns: false
+  # allow_private_urls: false  # accept loopback/RFC1918 URLs from peers
+
+# Embedded block-header tracker. Serves /chaintracks/v1/* and /chaintracks/v2/*
+# on the api-server. Default storage is <storage_path>/chaintracks.
+chaintracks_server:
+  enabled: true
+
+# Uncomment to customize go-chaintracks. Defaults are usually fine.
+# chaintracks:
+#   mode: embedded
+#   storage_path: ""
+#   bootstrap_url: ""
+#   bootstrap_mode: api
+
+bump_builder:
+  grace_window_ms: 30000
+
+# propagation:
+#   # Per-endpoint circuit-breaker for datahub URLs. Bad peers are sidelined
+#   # after `failure_threshold` consecutive failures and re-probed every
+#   # `probe_interval_ms` via GET /health. `min_healthy_endpoints` is advisory.
+#   endpoint_health:
+#     failure_threshold: 3
+#     probe_interval_ms: 30000
+#     probe_timeout_ms: 2000
+#     min_healthy_endpoints: 0
+#     # Cross-pod URL discovery: the p2p-client pod writes discovered datahub
+#     # URLs to the shared store; every other pod's teranode.Client polls the
+#     # store on this interval to merge them in. Standalone single-process
+#     # mode also runs the loop, but the in-process AddEndpoints fast path
+#     # makes it largely a no-op deduper.
+#     refresh_interval_ms: 30000

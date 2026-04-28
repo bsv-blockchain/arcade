@@ -3,86 +3,99 @@ package config
 import (
 	"strings"
 	"testing"
-
-	"github.com/spf13/viper"
 )
 
-func TestEnvVarBroadcastURLs(t *testing.T) {
-	tests := []struct {
-		name     string
-		envValue string
-		want     []string
-	}{
-		{
-			name:     "single URL",
-			envValue: "https://arc.taal.com",
-			want:     []string{"https://arc.taal.com"},
-		},
-		{
-			name:     "multiple URLs comma separated",
-			envValue: "https://arc.taal.com,https://arc2.taal.com,https://arc3.taal.com",
-			want:     []string{"https://arc.taal.com", "https://arc2.taal.com", "https://arc3.taal.com"},
-		},
-		{
-			name:     "empty value",
-			envValue: "",
-			want:     []string{},
-		},
+// baseValidConfig returns a Config populated with the minimum fields other
+// validate() branches require so each test can focus on the network branch.
+func baseValidConfig() *Config {
+	cfg := &Config{}
+	cfg.Mode = "all"
+	cfg.Kafka.Backend = "memory"
+	cfg.Store.Backend = "pebble"
+	cfg.Store.Pebble.Path = "/tmp/arcade-test"
+	cfg.Network = NetworkMainnet
+	return cfg
+}
+
+// Each canonical network name must validate cleanly. The empty string is also
+// accepted — validate() normalizes it to mainnet so CLI users can omit the key.
+func TestValidate_AcceptsCanonicalNetworks(t *testing.T) {
+	for _, net := range []string{"", NetworkMainnet, NetworkTestnet, NetworkTeratestnet} {
+		cfg := baseValidConfig()
+		cfg.Network = net
+		if err := validate(cfg); err != nil {
+			t.Errorf("network=%q unexpected error: %v", net, err)
+		}
 	}
+}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			v := viper.New()
-			cfg := &Config{}
-			cfg.SetDefaults(v, "")
+// Anything outside the canonical set is rejected — operators who need a
+// private network should override p2p.bootstrap_peers on top of a canonical
+// choice, not invent a new name.
+func TestValidate_RejectsUnknownNetwork(t *testing.T) {
+	for _, net := range []string{"main", "stn", "ttn", "bogus"} {
+		cfg := baseValidConfig()
+		cfg.Network = net
+		err := validate(cfg)
+		if err == nil {
+			t.Fatalf("network=%q should be rejected", net)
+		}
+		if !strings.Contains(err.Error(), "invalid network") {
+			t.Errorf("error should mention invalid network, got: %v", err)
+		}
+	}
+}
 
-			v.SetEnvPrefix("ARCADE")
-			v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
-			v.AutomaticEnv()
-
-			t.Setenv("ARCADE_TERANODE_BROADCAST_URLS", tt.envValue)
-
-			if err := v.Unmarshal(cfg); err != nil {
-				t.Fatalf("failed to unmarshal config: %v", err)
+// ResolveP2PNetwork is the bridge between arcade's canonical names and the
+// values go-teranode-p2p-client actually accepts. Regressing any of these
+// pairings silently breaks bootstrap or topic subscription.
+func TestResolveP2PNetwork(t *testing.T) {
+	cases := []struct {
+		network         string
+		wantTopic       string
+		wantBootstrapIn string
+	}{
+		{NetworkMainnet, NetworkMainnet, "mainnet.bootstrap.teranode.bsvb.tech"},
+		{NetworkTestnet, NetworkTestnet, "testnet.bootstrap.teranode.bsvb.tech"},
+		{NetworkTeratestnet, NetworkTeratestnet, "teratestnet.bootstrap.teranode.bsvb.tech"},
+		{"", NetworkMainnet, "mainnet.bootstrap.teranode.bsvb.tech"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.network, func(t *testing.T) {
+			topic, boots := ResolveP2PNetwork(tc.network)
+			if topic != tc.wantTopic {
+				t.Errorf("topic: got %q, want %q", topic, tc.wantTopic)
 			}
-
-			if len(cfg.Teranode.BroadcastURLs) != len(tt.want) {
-				t.Fatalf("got %d URLs, want %d: %v", len(cfg.Teranode.BroadcastURLs), len(tt.want), cfg.Teranode.BroadcastURLs)
+			if len(boots) == 0 {
+				t.Fatalf("expected at least one bootstrap peer for %q", tc.network)
 			}
-
-			for i, got := range cfg.Teranode.BroadcastURLs {
-				if got != tt.want[i] {
-					t.Errorf("URL[%d] = %q, want %q", i, got, tt.want[i])
-				}
+			if !strings.Contains(boots[0], tc.wantBootstrapIn) {
+				t.Errorf("bootstrap: got %q, want substring %q", boots[0], tc.wantBootstrapIn)
 			}
 		})
 	}
 }
 
-func TestEnvVarDataHubURLs(t *testing.T) {
-	v := viper.New()
-	cfg := &Config{}
-	cfg.SetDefaults(v, "")
-
-	v.SetEnvPrefix("ARCADE")
-	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
-	v.AutomaticEnv()
-
-	t.Setenv("ARCADE_TERANODE_DATAHUB_URLS", "https://hub1.example.com,https://hub2.example.com")
-
-	if err := v.Unmarshal(cfg); err != nil {
-		t.Fatalf("failed to unmarshal config: %v", err)
+// ResolveChaintracksNetwork translates to go-chaintracks's stricter accepted
+// set. Regressing this is the bug that crashed prod with "unknown network:
+// mainnet" — chainmanager.getGenesisHeader is an exact-match switch over
+// "main"/"test"/"teratest"/"teratestnet".
+func TestResolveChaintracksNetwork(t *testing.T) {
+	cases := []struct {
+		network string
+		want    string
+	}{
+		{NetworkMainnet, "main"},
+		{NetworkTestnet, "test"},
+		{NetworkTeratestnet, NetworkTeratestnet},
+		{"", "main"},
 	}
-
-	if len(cfg.Teranode.DataHubURLs) != 2 {
-		t.Fatalf("got %d URLs, want 2: %v", len(cfg.Teranode.DataHubURLs), cfg.Teranode.DataHubURLs)
-	}
-
-	if cfg.Teranode.DataHubURLs[0] != "https://hub1.example.com" {
-		t.Errorf("DataHubURLs[0] = %q, want %q", cfg.Teranode.DataHubURLs[0], "https://hub1.example.com")
-	}
-
-	if cfg.Teranode.DataHubURLs[1] != "https://hub2.example.com" {
-		t.Errorf("DataHubURLs[1] = %q, want %q", cfg.Teranode.DataHubURLs[1], "https://hub2.example.com")
+	for _, tc := range cases {
+		t.Run(tc.network, func(t *testing.T) {
+			got := ResolveChaintracksNetwork(tc.network)
+			if got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

@@ -1,0 +1,117 @@
+# Aerospike StatefulSet — single-node instance for development/staging.
+# For production, use the Aerospike Kubernetes Operator.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aerospike-config
+  namespace: arcade
+  labels:
+    app.kubernetes.io/name: aerospike
+    app.kubernetes.io/part-of: arcade
+data:
+  aerospike.conf: |
+    service {
+      proto-fd-max 1024
+    }
+    logging {
+      console {
+        context any info
+      }
+    }
+    network {
+      service {
+        address any
+        port 3000
+      }
+      heartbeat {
+        mode mesh
+        port 3002
+      }
+      fabric {
+        port 3001
+      }
+    }
+    namespace arcade {
+      replication-factor 1
+      memory-size 1G
+      storage-engine memory
+    }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: aerospike
+  namespace: arcade
+  labels:
+    app.kubernetes.io/name: aerospike
+    app.kubernetes.io/part-of: arcade
+spec:
+  serviceName: aerospike
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aerospike
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: aerospike
+        app.kubernetes.io/part-of: arcade
+    spec:
+      containers:
+        - name: aerospike
+          image: aerospike/aerospike-server:7.0
+          ports:
+            - containerPort: 3000
+              name: service
+              protocol: TCP
+            - containerPort: 3001
+              name: fabric
+              protocol: TCP
+            - containerPort: 3002
+              name: heartbeat
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 3000
+            initialDelaySeconds: 15
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1Gi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          volumeMounts:
+            - name: config
+              mountPath: /opt/aerospike/etc/aerospike.conf
+              subPath: aerospike.conf
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: aerospike-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aerospike
+  namespace: arcade
+  labels:
+    app.kubernetes.io/name: aerospike
+    app.kubernetes.io/part-of: arcade
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: aerospike
+  ports:
+    - port: 3000
+      targetPort: service
+      protocol: TCP
+      name: service

@@ -1,40 +1,124 @@
-# Arcade Server Configuration
-# Environment variables can override any setting using ARCADE_ prefix
-# Example: ARCADE_SERVER_ADDRESS=:9090 overrides server.address
-network: main
-log_level: info # debug, info, warn, error
-storage_path: ~/.arcade
-server:
-  address: ":3011"
-  read_timeout: 30s
-  write_timeout: 30s
-  shutdown_timeout: 10s
-database:
-  type: sqlite
-  sqlite_path: ~/.arcade/arcade.db
-events:
-  type: memory
-  buffer_size: 1000
+# Arcade configuration
+# Copy to config.yaml and adjust for your environment.
+# All values can be overridden with ARCADE_ prefixed env vars
+# (e.g. ARCADE_LOG_LEVEL, ARCADE_KAFKA_BROKERS).
+
+# Service mode: all, api-server, bump-builder, tx-validator, propagation
+mode: all
+
+log_level: info
+
+# Bitcoin network everything in arcade attaches to. One of:
+#   mainnet      — production Bitcoin SV
+#   testnet      — public testnet
+#   teratestnet  — teranode scaling testnet
+# Both the libp2p datahub discovery client and the embedded chaintracks
+# instance derive their pubsub topic and bootstrap peers from this value.
+network: mainnet
+
+# callback_url: "https://example.com/callback"
+# callback_token: "your-callback-token"
+
+api:
+  host: 0.0.0.0
+  port: 8080
+
+kafka:
+  brokers:
+    - localhost:9092
+  consumer_group: arcade
+  max_retries: 5
+  buffer_size: 10000
+  # Minimum partitions required on hot-path topics (transaction, propagation).
+  # Set to the replica count of the largest horizontally-scaled consumer when
+  # running in Kubernetes so arcade fails fast on misconfigured topics. Leave
+  # at 0 for standalone / single-replica deployments.
+  # min_partitions: 0
+
+aerospike:
+  hosts:
+    - localhost:3200
+  namespace: arcade
+  batch_size: 500
+  pool_size: 256
+
+# datahub_urls:
+#   - "https://datahub1.example.com"
+#   - "https://datahub2.example.com"
+
 teranode:
-  # broadcast_urls: URLs for submitting transactions to Teranode
-  broadcast_urls:
-    - https://teranode-mainnet.taal.com/api/v1
-  # datahub_urls: Fallback URLs for fetching block/subtree data when P2P message URLs fail
-  datahub_urls:
-    - https://teranode-eks-mainnet-us-1.bsvb.tech/api/v1
-  timeout: 30s
-validator:
-  max_tx_size: 4294967296
-  max_script_size: 500000
-  max_sig_ops: 4294967295
-  min_fee_per_kb: 100
-auth:
-  enabled: false
-webhook:
-  prune_interval: 1h
-  max_age: 24h
-  max_retries: 10
-chaintracks:
-  # Arcade always runs chaintracks in embedded mode using its P2P client
-  storage_path: ~/.arcade/chaintracks
-  # bootstrap_url: https://example.com/headers.bin  # Optional: URL for initial header sync
+  auth_token: ""
+
+merkle_service:
+  url: ""
+  auth_token: ""
+
+p2p:
+  seeds: []
+  # Peer discovery via go-teranode-p2p-client. When enabled, arcade subscribes
+  # to the canonical node_status topic (e.g. teranode/bitcoin/1.0.0/mainnet-node_status)
+  # and appends each peer's advertised datahub URL to the propagation endpoint
+  # list. Statically configured `datahub_urls` remain first in the list;
+  # discovered URLs are additive and deduplicated (including trailing-slash
+  # variants). Network and its bootstrap peers are derived from the top-level
+  # `network` value above; bootstrap_peers below only needs to be set to
+  # override or extend the built-in defaults (e.g. a private network).
+  # datahub_discovery: false
+  # listen_port: 9905
+  # dht_mode: off              # "server", "client", or "off" (library default is "off")
+  # storage_path: ""           # defaults to <top-level storage_path>/p2p; stores p2p_key.hex for stable peer ID
+  # bootstrap_peers: []        # override or extend the built-in defaults
+  # enable_mdns: false
+  # allow_private_urls: false  # accept loopback/RFC1918/link-local URLs from peers
+
+health:
+  port: 8081
+
+# propagation:
+#   # Per-endpoint circuit-breaker for the datahub URL list. Endpoints that
+#   # accumulate `failure_threshold` consecutive failures are marked unhealthy
+#   # and excluded from broadcasts; a background probe hits GET /health on
+#   # unhealthy endpoints every `probe_interval_ms` to detect recovery. The
+#   # `min_healthy_endpoints` value is advisory — a WARN is logged when the
+#   # healthy count drops below it, but broadcasts are never blocked by it.
+#   endpoint_health:
+#     failure_threshold: 3
+#     probe_interval_ms: 30000
+#     probe_timeout_ms: 2000
+#     min_healthy_endpoints: 0
+#     # How often each pod's teranode.Client polls the shared store for new
+#     # datahub URLs registered by the p2p-client pod. Lower = faster cross-pod
+#     # convergence; higher = less store load. The first refresh runs
+#     # synchronously on Start (capped at 2s) so a freshly started pod sees
+#     # the current registry before serving traffic.
+#     refresh_interval_ms: 30000
+
+tx_validator:
+# Maximum concurrent transactions parsed and validated inside a single flush
+# window. Validation is CPU-bound and stateless, so the sweet spot is around
+# NumCPU. Set 0 to take runtime.NumCPU() at startup.
+# parallelism: 0
+
+bump_builder:
+  # Grace window after BLOCK_PROCESSED before reading STUMPs, to allow for
+  # late merkle-service retries of any STUMPs that initially got a 5xx.
+  grace_window_ms: 30000
+
+# Shared on-disk root for arcade state. Chaintracks headers default to
+# <storage_path>/chaintracks/.
+# storage_path: "~/.arcade"
+
+# Embedded block-header tracker (go-chaintracks). Serves routes under
+# /chaintracks/v1/* and /chaintracks/v2/* on the api-server. Default is on
+# so the refactor is a drop-in replacement for the original arcade binary.
+# Set enabled: false in environments without outbound P2P.
+chaintracks_server:
+  enabled: true
+
+# go-chaintracks library config. See that library's docs for the full set.
+# Defaults are inherited from the library's SetDefaults — uncomment to override.
+# chaintracks:
+#   mode: embedded         # or "remote" with url set to a running chaintracks
+#   storage_path: ""       # defaults to <storage_path>/chaintracks
+#   bootstrap_url: ""
+#   bootstrap_mode: api
