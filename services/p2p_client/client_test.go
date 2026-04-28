@@ -55,7 +55,7 @@ func newFakeTeraClient(id string) *fakeTeraClient {
 	}
 }
 
-func (f *fakeTeraClient) SubscribeNodeStatus(ctx context.Context) <-chan teranodep2p.NodeStatusMessage {
+func (f *fakeTeraClient) SubscribeNodeStatus(_ context.Context) <-chan teranodep2p.NodeStatusMessage {
 	return f.ch
 }
 
@@ -127,7 +127,7 @@ func waitForEndpoints(t *testing.T, tc *teranode.Client, want int) []string {
 }
 
 // captureLibraryConfig returns a clientFactory that sends the config it sees
-// through the returned channel, synchronising between the Start goroutine
+// through the returned channel, synchronizing between the Start goroutine
 // and the test goroutine so the race detector stays happy.
 func captureLibraryConfig(fc teraClient) (clientFactory, <-chan p2pclient.Config) {
 	ch := make(chan p2pclient.Config, 1)
@@ -153,7 +153,6 @@ func TestNetworkThreading_CanonicalToUpstream(t *testing.T) {
 		{config.NetworkTeratestnet, config.NetworkTeratestnet, "teratestnet.bootstrap"},
 	}
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.canonical, func(t *testing.T) {
 			fc := newFakeTeraClient("sender")
 			cfg := &config.Config{}

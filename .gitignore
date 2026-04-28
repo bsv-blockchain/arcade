@@ -49,3 +49,7 @@ peer_cache.json
 config.yaml
 
 .claude/
+
+bin/
+
+.mage-cache/

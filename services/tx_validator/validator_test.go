@@ -86,14 +86,6 @@ func (m *mockStore) UpdateStatus(_ context.Context, status *models.TransactionSt
 	return nil
 }
 
-func (m *mockStore) snapshotInserts() []*models.TransactionStatus {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	out := make([]*models.TransactionStatus, len(m.inserted))
-	copy(out, m.inserted)
-	return out
-}
-
 func (m *mockStore) snapshotUpdates() []*models.TransactionStatus {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -119,13 +111,19 @@ func makeValidTxBytesAndID(t *testing.T) ([]byte, string) {
 func makeTxMsg(rawTxHex string) []byte {
 	rawTx, _ := hex.DecodeString(rawTxHex)
 	msg := txMessage{Action: "submit", RawTx: rawTx}
-	b, _ := json.Marshal(msg)
+	b, err := json.Marshal(msg)
+	if err != nil {
+		panic(err)
+	}
 	return b
 }
 
 func makeTxMsgFromBytes(rawTx []byte) []byte {
 	msg := txMessage{Action: "submit", RawTx: rawTx}
-	b, _ := json.Marshal(msg)
+	b, err := json.Marshal(msg)
+	if err != nil {
+		panic(err)
+	}
 	return b
 }
 
@@ -450,7 +448,7 @@ func TestValidator_ConcurrentFlush_NoDoublePublish(t *testing.T) {
 	}
 }
 
-// Cancelling the claim context partway through a flush must let phases bail
+// Canceling the claim context partway through a flush must let phases bail
 // out cleanly. This is the rebalance-safety guarantee added by the recent
 // FlushFunc(ctx) change.
 func TestValidator_ContextCancel_BailsCleanly(t *testing.T) {
@@ -465,7 +463,7 @@ func TestValidator_ContextCancel_BailsCleanly(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // already cancelled before flush starts
+	cancel() // already canceled before flush starts
 
 	// Flush should return without panicking. Some phases may still run (the
 	// goroutines launch then early-out); the important thing is no panic and

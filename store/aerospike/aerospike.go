@@ -11,7 +11,6 @@ import (
 	"time"
 
 	aero "github.com/aerospike/aerospike-client-go/v7"
-
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 
@@ -25,27 +24,29 @@ func isKeyNotFound(err error) bool {
 }
 
 const (
-	setTransactions    = "transactions"
-	setBumps           = "bumps"
-	setStumps          = "stumps"
-	setSubmissions     = "submissions"
-	setProcessedBlocks = "processed_blocks"
-	setLeases          = "leases"
+	setTransactions     = "transactions"
+	setBumps            = "bumps"
+	setStumps           = "stumps"
+	setSubmissions      = "submissions"
+	setProcessedBlocks  = "processed_blocks"
+	setLeases           = "leases"
 	setDatahubEndpoints = "datahub_endpoints"
 )
 
 // Ensure Store implements the store interfaces.
-var _ store.Store = (*Store)(nil)
-var _ store.Leaser = (*Store)(nil)
+var (
+	_ store.Store  = (*Store)(nil)
+	_ store.Leaser = (*Store)(nil)
+)
 
 // Store is the Aerospike-backed implementation of store.Store and store.Leaser.
 type Store struct {
-	client         *aero.Client
-	namespace      string
-	batchSize      int
-	queryTimeout   time.Duration
-	opTimeout      time.Duration
-	socketTimeout  time.Duration
+	client        *aero.Client
+	namespace     string
+	batchSize     int
+	queryTimeout  time.Duration
+	opTimeout     time.Duration
+	socketTimeout time.Duration
 }
 
 // New creates an Aerospike-backed Store connected to the configured cluster.
@@ -141,7 +142,7 @@ func (s *Store) EnsureIndexes() error {
 	return nil
 }
 
-func (s *Store) key(set string, pk string) (*aero.Key, error) {
+func (s *Store) key(set, pk string) (*aero.Key, error) {
 	return aero.NewKey(s.namespace, set, pk)
 }
 
@@ -290,7 +291,7 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 		bins["block_hash"] = status.BlockHash
 	}
 	if status.BlockHeight > 0 {
-		bins["block_height"] = int(status.BlockHeight)
+		bins["block_height"] = int(status.BlockHeight) //nolint:gosec // block height fits in int on 64-bit platforms (max ~10^9 << math.MaxInt32)
 	}
 	if status.ExtraInfo != "" {
 		bins["extra_info"] = status.ExtraInfo
@@ -329,7 +330,7 @@ func (s *Store) GetStatusesSince(ctx context.Context, _ time.Time) ([]*models.Tr
 	stmt := aero.NewStatement(s.namespace, setTransactions)
 	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
 	if rs != nil {
-		defer rs.Close()
+		defer func() { _ = rs.Close() }()
 	}
 	if err != nil {
 		return nil, fmt.Errorf("query statuses: %w", err)
@@ -368,11 +369,11 @@ func (s *Store) SetStatusByBlockHash(ctx context.Context, blockHash string, newS
 		return nil, err
 	}
 	stmt := aero.NewStatement(s.namespace, setTransactions)
-	stmt.SetFilter(aero.NewEqualFilter("block_hash", blockHash))
+	_ = stmt.SetFilter(aero.NewEqualFilter("block_hash", blockHash))
 
 	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
 	if rs != nil {
-		defer rs.Close()
+		defer func() { _ = rs.Close() }()
 	}
 	if err != nil {
 		return nil, fmt.Errorf("query by block hash: %w", err)
@@ -472,11 +473,11 @@ func (s *Store) GetReadyRetries(ctx context.Context, now time.Time, limit int) (
 		return nil, err
 	}
 	stmt := aero.NewStatement(s.namespace, setTransactions)
-	stmt.SetFilter(aero.NewEqualFilter("status", string(models.StatusPendingRetry)))
+	_ = stmt.SetFilter(aero.NewEqualFilter("status", string(models.StatusPendingRetry)))
 
 	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
 	if rs != nil {
-		defer rs.Close()
+		defer func() { _ = rs.Close() }()
 	}
 	if err != nil {
 		return nil, fmt.Errorf("query pending retry txs: %w", err)
@@ -608,7 +609,7 @@ func (s *Store) InsertBUMP(ctx context.Context, blockHash string, blockHeight ui
 	}
 	bins := aero.BinMap{
 		"block_hash":   blockHash,
-		"block_height": int(blockHeight),
+		"block_height": int(blockHeight), //nolint:gosec // block height fits in int on 64-bit platforms
 		"bump_data":    bumpData,
 	}
 	return s.client.Put(s.writePolicy(ctx), key, bins)
@@ -630,7 +631,7 @@ func (s *Store) GetBUMP(ctx context.Context, blockHash string) (uint64, []byte, 
 	var height uint64
 	if v, ok := rec.Bins["block_height"]; ok {
 		if n, ok := v.(int); ok {
-			height = uint64(n)
+			height = uint64(n) //nolint:gosec // round-trip of a value we wrote as int from a uint64 fitting block height
 		}
 	}
 	var data []byte
@@ -663,11 +664,11 @@ func (s *Store) GetStumpsByBlockHash(ctx context.Context, blockHash string) ([]*
 		return nil, err
 	}
 	stmt := aero.NewStatement(s.namespace, setStumps)
-	stmt.SetFilter(aero.NewEqualFilter("block_hash", blockHash))
+	_ = stmt.SetFilter(aero.NewEqualFilter("block_hash", blockHash))
 
 	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
 	if rs != nil {
-		defer rs.Close()
+		defer func() { _ = rs.Close() }()
 	}
 	if err != nil {
 		return nil, fmt.Errorf("query stumps: %w", err)
@@ -769,11 +770,11 @@ func (s *Store) GetSubmissionsByTxID(ctx context.Context, txid string) ([]*model
 		return nil, err
 	}
 	stmt := aero.NewStatement(s.namespace, setSubmissions)
-	stmt.SetFilter(aero.NewEqualFilter("txid", txid))
+	_ = stmt.SetFilter(aero.NewEqualFilter("txid", txid))
 
 	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
 	if rs != nil {
-		defer rs.Close()
+		defer func() { _ = rs.Close() }()
 	}
 	if err != nil {
 		return nil, err
@@ -810,11 +811,11 @@ func (s *Store) GetSubmissionsByToken(ctx context.Context, token string) ([]*mod
 		return nil, err
 	}
 	stmt := aero.NewStatement(s.namespace, setSubmissions)
-	stmt.SetFilter(aero.NewEqualFilter("callback_token", token))
+	_ = stmt.SetFilter(aero.NewEqualFilter("callback_token", token))
 
 	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
 	if rs != nil {
-		defer rs.Close()
+		defer func() { _ = rs.Close() }()
 	}
 	if err != nil {
 		return nil, err
@@ -870,7 +871,7 @@ func (s *Store) HasAnyProcessedBlocks(ctx context.Context) (bool, error) {
 	stmt := aero.NewStatement(s.namespace, setProcessedBlocks)
 	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
 	if rs != nil {
-		defer rs.Close()
+		defer func() { _ = rs.Close() }()
 	}
 	if err != nil {
 		return false, err
@@ -907,11 +908,11 @@ func (s *Store) GetOnChainBlockAtHeight(ctx context.Context, height uint64) (str
 		return "", false, err
 	}
 	stmt := aero.NewStatement(s.namespace, setProcessedBlocks)
-	stmt.SetFilter(aero.NewEqualFilter("block_height", int(height)))
+	_ = stmt.SetFilter(aero.NewEqualFilter("block_height", int(height))) //nolint:gosec // block height fits in int on 64-bit platforms
 
 	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
 	if rs != nil {
-		defer rs.Close()
+		defer func() { _ = rs.Close() }()
 	}
 	if err != nil {
 		return "", false, err
@@ -988,7 +989,7 @@ func (s *Store) ListDatahubEndpoints(ctx context.Context) ([]store.DatahubEndpoi
 	stmt := aero.NewStatement(s.namespace, setDatahubEndpoints)
 	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
 	if rs != nil {
-		defer rs.Close()
+		defer func() { _ = rs.Close() }()
 	}
 	if err != nil {
 		return nil, fmt.Errorf("query datahub endpoints: %w", err)
@@ -1046,7 +1047,7 @@ func recordToStatus(rec *aero.Record, txid string) *models.TransactionStatus {
 	}
 	if v, ok := rec.Bins["block_height"]; ok {
 		if n, ok := v.(int); ok {
-			status.BlockHeight = uint64(n)
+			status.BlockHeight = uint64(n) //nolint:gosec // round-trip of a value we wrote as int from a uint64 fitting block height
 		}
 	}
 	if v, ok := rec.Bins["extra_info"]; ok {
@@ -1062,9 +1063,9 @@ func recordToStatus(rec *aero.Record, txid string) *models.TransactionStatus {
 	if v, ok := rec.Bins["competing_txs"]; ok {
 		switch ct := v.(type) {
 		case []byte:
-			json.Unmarshal(ct, &status.CompetingTxs)
+			_ = json.Unmarshal(ct, &status.CompetingTxs)
 		case string:
-			json.Unmarshal([]byte(ct), &status.CompetingTxs)
+			_ = json.Unmarshal([]byte(ct), &status.CompetingTxs)
 		}
 	}
 	if v, ok := rec.Bins["timestamp"]; ok {
@@ -1191,7 +1192,7 @@ func recordToSubmission(rec *aero.Record) *models.Submission {
 // --- Lease Operations ---
 
 // TryAcquireOrRenew implements store.Leaser. Uses Aerospike generation-match
-// CAS to serialise acquire / renew across concurrent writers, with the record's
+// CAS to serialize acquire / renew across concurrent writers, with the record's
 // native TTL as the authoritative expiration (no client clock dependency). The
 // expires_at bin is a belt-and-braces hint for the narrow window between TTL
 // lapse and next client scan.

@@ -33,8 +33,10 @@ import (
 //go:embed schema.sql
 var schemaSQL string
 
-var _ store.Store = (*Store)(nil)
-var _ store.Leaser = (*Store)(nil)
+var (
+	_ store.Store  = (*Store)(nil)
+	_ store.Leaser = (*Store)(nil)
+)
 
 // Store is the Postgres-backed implementation of the store interfaces.
 type Store struct {
@@ -49,7 +51,7 @@ func New(ctx context.Context, cfg config.Postgres) (*Store, error) {
 	dsn := cfg.DSN
 	var stopEmbedded func() error
 	if cfg.Embedded {
-		d, stop, err := startEmbedded(cfg)
+		d, stop, err := startEmbedded(cfg) //nolint:contextcheck // bootstrap path; ctx is honored by the pgxpool dial below
 		if err != nil {
 			return nil, err
 		}
@@ -144,7 +146,7 @@ ON CONFLICT (txid) DO NOTHING`
 
 	tag, err := s.pool.Exec(ctx, q,
 		status.TxID, string(status.Status), status.StatusCode,
-		status.BlockHash, int64(status.BlockHeight),
+		status.BlockHash, int64(status.BlockHeight), /* #nosec G115 */
 		[]byte(status.MerklePath), status.ExtraInfo, competing,
 		[]byte(status.RawTx), status.RetryCount,
 		nextRetry, status.Timestamp, status.CreatedAt,
@@ -210,7 +212,7 @@ func (s *Store) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.T
 		}
 		args = append(args,
 			st.TxID, string(st.Status), st.StatusCode,
-			st.BlockHash, int64(st.BlockHeight),
+			st.BlockHash, int64(st.BlockHeight), /* #nosec G115 */
 			[]byte(st.MerklePath), st.ExtraInfo, competing,
 			[]byte(st.RawTx), st.RetryCount,
 			nextRetry, st.Timestamp, st.CreatedAt,
@@ -299,7 +301,7 @@ func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.Transa
 			st.TxID,
 			string(st.Status),
 			st.BlockHash,
-			int64(st.BlockHeight),
+			int64(st.BlockHeight), /* #nosec G115 */
 			st.ExtraInfo,
 			mp,
 			ts,
@@ -353,7 +355,7 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 	}
 	if status.BlockHeight > 0 {
 		sets = append(sets, fmt.Sprintf("block_height = $%d", idx))
-		args = append(args, int64(status.BlockHeight))
+		args = append(args, int64(status.BlockHeight) /* #nosec G115 */)
 		idx++
 	}
 	if status.ExtraInfo != "" {
@@ -364,7 +366,6 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 	if len(status.MerklePath) > 0 {
 		sets = append(sets, fmt.Sprintf("merkle_path = $%d", idx))
 		args = append(args, []byte(status.MerklePath))
-		idx++
 	}
 
 	q := "UPDATE transactions SET "
@@ -497,7 +498,7 @@ func (s *Store) GetReadyRetries(ctx context.Context, now time.Time, limit int) (
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	const q = `
 SELECT txid, raw_tx, retry_count, next_retry_at
@@ -582,7 +583,7 @@ func (s *Store) InsertBUMP(ctx context.Context, blockHash string, blockHeight ui
 	const q = `
 INSERT INTO bumps (block_hash, block_height, bump_data) VALUES ($1,$2,$3)
 ON CONFLICT (block_hash) DO UPDATE SET block_height=EXCLUDED.block_height, bump_data=EXCLUDED.bump_data`
-	_, err := s.pool.Exec(ctx, q, blockHash, int64(blockHeight), bumpData)
+	_, err := s.pool.Exec(ctx, q, blockHash, int64(blockHeight), bumpData) //nolint:gosec // block height fits in int64
 	if err != nil {
 		return fmt.Errorf("insert bump %s: %w", blockHash, err)
 	}
@@ -600,7 +601,7 @@ func (s *Store) GetBUMP(ctx context.Context, blockHash string) (uint64, []byte, 
 	if err != nil {
 		return 0, nil, fmt.Errorf("get bump %s: %w", blockHash, err)
 	}
-	return uint64(h), data, nil
+	return uint64(h), data, nil //nolint:gosec // block height fits in uint64
 }
 
 func (s *Store) InsertStump(ctx context.Context, stump *models.Stump) error {
@@ -823,7 +824,7 @@ func scanStatusWithInserted(row rowScanner) (*models.TransactionStatus, bool, er
 		st.BlockHash = *blockHash
 	}
 	if blockHeight != nil {
-		st.BlockHeight = uint64(*blockHeight)
+		st.BlockHeight = uint64(*blockHeight) //nolint:gosec // block height fits in either signed/unsigned 64-bit
 	}
 	if len(merklePath) > 0 {
 		st.MerklePath = merklePath
@@ -871,7 +872,7 @@ func scanStatus(row rowScanner) (*models.TransactionStatus, error) {
 		st.BlockHash = *blockHash
 	}
 	if blockHeight != nil {
-		st.BlockHeight = uint64(*blockHeight)
+		st.BlockHeight = uint64(*blockHeight) //nolint:gosec // block height fits in either signed/unsigned 64-bit
 	}
 	if len(merklePath) > 0 {
 		st.MerklePath = merklePath

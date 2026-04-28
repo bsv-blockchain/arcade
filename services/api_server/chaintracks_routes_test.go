@@ -41,26 +41,30 @@ func (f *fakeChaintracks) IsValidRootForHeight(_ context.Context, _ *chainhash.H
 }
 func (f *fakeChaintracks) CurrentHeight(context.Context) (uint32, error) { return f.height, nil }
 func (f *fakeChaintracks) GetNetwork(context.Context) (string, error)    { return f.network, nil }
-func (f *fakeChaintracks) GetHeight(context.Context) uint32           { return f.height }
+func (f *fakeChaintracks) GetHeight(context.Context) uint32              { return f.height }
 func (f *fakeChaintracks) GetTip(context.Context) *chaintracks.BlockHeader {
 	return f.tip
 }
+
 func (f *fakeChaintracks) GetHeaderByHeight(_ context.Context, h uint32) (*chaintracks.BlockHeader, error) {
 	if hdr, ok := f.headers[h]; ok {
 		return hdr, nil
 	}
 	return nil, chaintracks.ErrHeaderNotFound
 }
+
 func (f *fakeChaintracks) GetHeaderByHash(context.Context, *chainhash.Hash) (*chaintracks.BlockHeader, error) {
 	return nil, chaintracks.ErrHeaderNotFound
 }
+
 func (f *fakeChaintracks) GetHeaders(context.Context, uint32, uint32) ([]*chaintracks.BlockHeader, error) {
 	return nil, nil
 }
+
 func (f *fakeChaintracks) Subscribe(context.Context) <-chan *chaintracks.BlockHeader {
 	return f.tipCh
 }
-func (f *fakeChaintracks) Unsubscribe(<-chan *chaintracks.BlockHeader)            {}
+func (f *fakeChaintracks) Unsubscribe(<-chan *chaintracks.BlockHeader) {}
 func (f *fakeChaintracks) SubscribeReorg(context.Context) <-chan *chaintracks.ReorgEvent {
 	return f.reorgCh
 }
@@ -109,7 +113,7 @@ func TestServer_ChaintracksDisabled_Returns404ForChaintracksRoutes(t *testing.T)
 	// non-chaintracks routes the server would normally have.
 	r.GET("/health", func(c *gin.Context) { c.Status(http.StatusOK) })
 
-	req := httptest.NewRequest("GET", "/chaintracks/v1/height", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/chaintracks/v1/height", nil)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
@@ -123,7 +127,7 @@ func TestServer_ChaintracksEnabled_MountsRoutes(t *testing.T) {
 	r, _ := setupChaintracksRouter(t, f)
 
 	// /network
-	req := httptest.NewRequest("GET", "/chaintracks/v2/network", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/chaintracks/v2/network", nil)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -140,7 +144,7 @@ func TestServer_ChaintracksEnabled_MountsRoutes(t *testing.T) {
 	}
 
 	// /height
-	req = httptest.NewRequest("GET", "/chaintracks/v2/height", nil)
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/chaintracks/v2/height", nil)
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -165,7 +169,7 @@ func TestChaintracksRoutes_BinaryHeader_Returns80Bytes(t *testing.T) {
 	f.headers[tip.Height] = tip
 	r, _ := setupChaintracksRouter(t, f)
 
-	req := httptest.NewRequest("GET", "/chaintracks/v2/tip.bin", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/chaintracks/v2/tip.bin", nil)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -206,7 +210,7 @@ func TestChaintracksRoutes_TipStream_ForwardsUpdates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open stream: %v", err)
 	}
-	t.Cleanup(func() { resp.Body.Close() })
+	t.Cleanup(func() { _ = resp.Body.Close() })
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("stream status=%d, want 200", resp.StatusCode)
 	}
@@ -238,11 +242,4 @@ func TestChaintracksRoutes_TipStream_ForwardsUpdates(t *testing.T) {
 	// Disconnect; goroutine in the handler should exit (verified implicitly by
 	// the test not leaking — go test -race would catch leaks).
 	reqCancel()
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

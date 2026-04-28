@@ -88,9 +88,9 @@ func padAndComputeBlockLevel(mp *transaction.MerklePath, fromLevel, realNodes in
 	realCount := realNodes
 	for level := fromLevel; level < len(mp.Path)-1; level++ {
 		if realCount%2 == 1 {
-			if findLeafByOffset(mp, level, uint64(realCount)) == nil {
+			if findLeafByOffset(mp, level, uint64(realCount)) == nil { //nolint:gosec // realCount is a non-negative leaf index bounded by tree size
 				addLeaf(mp, level, &transaction.PathElement{
-					Offset:    uint64(realCount),
+					Offset:    uint64(realCount), //nolint:gosec // same: non-negative leaf index
 					Duplicate: &dupTrue,
 				})
 			}

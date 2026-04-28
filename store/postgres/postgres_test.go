@@ -5,7 +5,7 @@
 // ~80MB of bundled binaries on first run, which is too costly for the default
 // `go test ./...` invocation. Run with:
 //
-//     go test -tags=postgres ./store/postgres/...
+//	go test -tags=postgres ./store/postgres/...
 //
 // If ARCADE_POSTGRES_DSN is set the tests use that external Postgres instead
 // of spinning up embedded — useful for CI or running against a real cluster.

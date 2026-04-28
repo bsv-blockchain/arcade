@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,7 +13,7 @@ import (
 )
 
 // ExpandHome rewrites a leading "~" or "~/" to the current user's home dir.
-// Other paths (absolute, relative, or empty) are returned unchanged. Centralised
+// Other paths (absolute, relative, or empty) are returned unchanged. Centralized
 // so every config consumer sees real filesystem paths instead of literal tildes —
 // libraries like cockroachdb/pebble don't expand "~" themselves and will happily
 // create a directory named "~" in cwd.
@@ -86,11 +87,11 @@ func ResolveChaintracksNetwork(network string) string {
 }
 
 type Config struct {
-	Mode          string              `mapstructure:"mode"`
-	LogLevel      string              `mapstructure:"log_level"`
-	CallbackURL   string              `mapstructure:"callback_url"`
-	CallbackToken string              `mapstructure:"callback_token"`
-	StoragePath   string              `mapstructure:"storage_path"`
+	Mode          string `mapstructure:"mode"`
+	LogLevel      string `mapstructure:"log_level"`
+	CallbackURL   string `mapstructure:"callback_url"`
+	CallbackToken string `mapstructure:"callback_token"`
+	StoragePath   string `mapstructure:"storage_path"`
 	// Network selects the Bitcoin network everything downstream participates in.
 	// Canonical values: "mainnet", "testnet", "teratestnet". Propagated to the
 	// libp2p peer-discovery client and to the embedded chaintracks instance so
@@ -311,7 +312,8 @@ func Load(cmd *cobra.Command) (*Config, error) {
 	setDefaults()
 
 	if err := viper.ReadInConfig(); err != nil {
-		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
+		var notFound viper.ConfigFileNotFoundError
+		if !errors.As(err, &notFound) {
 			return nil, fmt.Errorf("reading config: %w", err)
 		}
 	}

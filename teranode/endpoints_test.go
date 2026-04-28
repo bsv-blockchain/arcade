@@ -123,11 +123,10 @@ func TestClient_EndpointsConcurrency(t *testing.T) {
 	wg.Add(writers + readers)
 
 	for w := 0; w < writers; w++ {
-		w := w
 		go func() {
 			defer wg.Done()
 			for i := 0; i < perWorker; i++ {
-				url := "https://w" + string(rune('A'+w)) + "-" + string(rune('a'+i%26)) + ".example"
+				url := "https://w" + string(rune('A'+w)) + "-" + string(rune('a'+i%26)) + ".example" //nolint:gosec // ASCII char range
 				c.AddEndpoints([]string{url})
 			}
 		}()
@@ -136,10 +135,7 @@ func TestClient_EndpointsConcurrency(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < perWorker; i++ {
-				eps := c.GetEndpoints()
-				for range eps {
-					// just iterate
-				}
+				_ = c.GetEndpoints()
 			}
 		}()
 	}

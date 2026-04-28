@@ -67,7 +67,7 @@ func fetchBlockBinary(ctx context.Context, baseURL, blockHash string) ([]chainha
 	if err != nil {
 		return nil, nil, nil, 0, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
@@ -105,32 +105,32 @@ func parseBlockBinary(data []byte) ([]chainhash.Hash, []byte, *chainhash.Hash, e
 
 	// Read transaction count (varint)
 	var txCount util.VarInt
-	if _, err := txCount.ReadFrom(r); err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to read transaction count: %w", err)
+	if _, rErr := txCount.ReadFrom(r); rErr != nil {
+		return nil, nil, nil, fmt.Errorf("failed to read transaction count: %w", rErr)
 	}
 
 	// Read size in bytes (varint)
 	var sizeBytes util.VarInt
-	if _, err := sizeBytes.ReadFrom(r); err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to read size in bytes: %w", err)
+	if _, rErr := sizeBytes.ReadFrom(r); rErr != nil {
+		return nil, nil, nil, fmt.Errorf("failed to read size in bytes: %w", rErr)
 	}
 
 	// Read subtree count (varint)
 	var subtreeCount util.VarInt
-	if _, err := subtreeCount.ReadFrom(r); err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to read subtree count: %w", err)
+	if _, rErr := subtreeCount.ReadFrom(r); rErr != nil {
+		return nil, nil, nil, fmt.Errorf("failed to read subtree count: %w", rErr)
 	}
 
 	// Read subtree hashes (32 bytes each)
 	hashes := make([]chainhash.Hash, 0, uint64(subtreeCount))
 	hashBuf := make([]byte, 32)
 	for i := uint64(0); i < uint64(subtreeCount); i++ {
-		if _, err := io.ReadFull(r, hashBuf); err != nil {
-			return nil, nil, nil, fmt.Errorf("failed to read subtree hash %d: %w", i, err)
+		if _, rErr := io.ReadFull(r, hashBuf); rErr != nil {
+			return nil, nil, nil, fmt.Errorf("failed to read subtree hash %d: %w", i, rErr)
 		}
-		hash, err := chainhash.NewHash(hashBuf)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("failed to create hash: %w", err)
+		hash, hErr := chainhash.NewHash(hashBuf)
+		if hErr != nil {
+			return nil, nil, nil, fmt.Errorf("failed to create hash: %w", hErr)
 		}
 		hashes = append(hashes, *hash)
 	}

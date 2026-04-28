@@ -172,7 +172,7 @@ func (p *Propagator) Stop() error {
 // The consumer's drain-then-flush pattern calls flushBatch after all immediately
 // available messages have been processed, so the batch size naturally matches
 // what the client submitted — no configured threshold needed.
-func (p *Propagator) handleMessage(ctx context.Context, msg *kafka.Message) error {
+func (p *Propagator) handleMessage(_ context.Context, msg *kafka.Message) error {
 	var propMsg propagationMsg
 	if err := json.Unmarshal(msg.Value, &propMsg); err != nil {
 		return fmt.Errorf("unmarshaling propagation message: %w", err)
@@ -193,7 +193,7 @@ func (p *Propagator) handleMessage(ctx context.Context, msg *kafka.Message) erro
 // belongs to the reaper goroutine — it is no longer coupled to the consumer's
 // drain-flush cycle, so live ingest doesn't have to wait on rebroadcasts.
 //
-// The context comes from the current Kafka claim — it is cancelled when the
+// The context comes from the current Kafka claim — it is canceled when the
 // claim ends (shutdown or rebalance). Downstream HTTP broadcasts and store
 // writes observe that cancellation and unwind cleanly, so a revoked partition
 // doesn't keep doing work on behalf of a partition it no longer owns.
@@ -291,6 +291,9 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) e
 			accepted++
 		case models.StatusRejected:
 			rejected++
+		default:
+			// Other statuses (Mined, SeenOnNetwork, etc.) flow through
+			// without affecting the accepted/rejected counters.
 		}
 		if err := p.store.UpdateStatus(ctx, res.status); err != nil {
 			p.logger.Error("failed to update status",
@@ -327,7 +330,7 @@ const fallbackParallelism = 8
 // broadcastInChunks splits a batch into teranodeBatchCap-sized chunks and
 // broadcasts each via /txs, falling back to per-tx /tx within a chunk only
 // when that chunk's batch broadcast is all-rejected. Chunks run in parallel
-// bounded by maxParallelChunks so a large flush doesn't serialise behind one
+// bounded by maxParallelChunks so a large flush doesn't serialize behind one
 // slow endpoint. Returns per-tx results in the same order as the input.
 func (p *Propagator) broadcastInChunks(ctx context.Context, batch []propagationMsg, rawTxs [][]byte) []txResult {
 	results := make([]txResult, len(batch))
@@ -359,7 +362,6 @@ func (p *Propagator) broadcastInChunks(ctx context.Context, batch []propagationM
 	sem := make(chan struct{}, maxParallelChunks)
 	var wg sync.WaitGroup
 	for _, c := range chunks {
-		c := c
 		wg.Add(1)
 		sem <- struct{}{}
 		go func() {
@@ -401,7 +403,7 @@ func (p *Propagator) broadcastChunk(ctx context.Context, chunk []propagationMsg,
 	}
 	metrics.PropagationChunkTotal.WithLabelValues("per_tx_after_all_rejected").Inc()
 
-	// Fallback: per-tx classification for this chunk only. Summarise instead
+	// Fallback: per-tx classification for this chunk only. Summarize instead
 	// of logging per call — one line per fallback, not N.
 	//
 	// Cap concurrency so a 100-tx chunk in all-rejected state doesn't spawn
@@ -412,7 +414,6 @@ func (p *Propagator) broadcastChunk(ctx context.Context, chunk []propagationMsg,
 	sem := make(chan struct{}, fallbackParallelism)
 	var wg sync.WaitGroup
 	for i, msg := range chunk {
-		i, msg := i, msg
 		wg.Add(1)
 		sem <- struct{}{}
 		go func() {
@@ -464,7 +465,7 @@ var inlineRetryDelay = 100 * time.Millisecond
 
 // broadcastSingleToEndpoints submits a single transaction to each healthy
 // teranode endpoint using POST /tx. On the first accepting endpoint (200 OK)
-// the shared broadcast context is cancelled so slower sibling requests don't
+// the shared broadcast context is canceled so slower sibling requests don't
 // gate wall-time on the slowest peer. Per-endpoint outcomes are recorded into
 // the teranode client's circuit-breaker so repeatedly failing peers are
 // sidelined from future broadcasts.
@@ -545,10 +546,10 @@ func (p *Propagator) broadcastSingleOnce(ctx context.Context, rawTx []byte, txid
 	var lastErrMsg string
 	var successEndpoint string
 	for result := range resultCh {
-		// A sibling request cancelled by a winning race is not a real failure —
+		// A sibling request canceled by a winning race is not a real failure —
 		// the peer didn't misbehave, we called off the race. Skip health
 		// recording and status aggregation for that case.
-		if isCancelledByBroadcast(result.err, broadcastCtx) {
+		if isCanceledByBroadcast(broadcastCtx, result.err) {
 			continue
 		}
 		// Health recording is about *reachability*, not about whether the peer
@@ -597,11 +598,11 @@ func (p *Propagator) broadcastSingleOnce(ctx context.Context, rawTx []byte, txid
 	}
 }
 
-// isCancelledByBroadcast reports whether err is a context.Canceled directly
+// isCanceledByBroadcast reports whether err is a context.Canceled directly
 // caused by the broadcast's own cancel signal (i.e. the winning race). A
 // context.Canceled that wasn't triggered by the broadcast cancel still counts
 // as a real failure — e.g. the outer submitCtx timing out.
-func isCancelledByBroadcast(err error, broadcastCtx context.Context) bool {
+func isCanceledByBroadcast(broadcastCtx context.Context, err error) bool {
 	if err == nil {
 		return false
 	}
@@ -672,7 +673,7 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 
 	anySuccess := false
 	for result := range resultCh {
-		if isCancelledByBroadcast(result.err, broadcastCtx) {
+		if isCanceledByBroadcast(broadcastCtx, result.err) {
 			continue
 		}
 		// Reachability-based health: any HTTP response (even 5xx) means the

@@ -94,10 +94,10 @@ health:
 #     refresh_interval_ms: 30000
 
 tx_validator:
-  # Maximum concurrent transactions parsed and validated inside a single flush
-  # window. Validation is CPU-bound and stateless, so the sweet spot is around
-  # NumCPU. Set 0 to take runtime.NumCPU() at startup.
-  # parallelism: 0
+# Maximum concurrent transactions parsed and validated inside a single flush
+# window. Validation is CPU-bound and stateless, so the sweet spot is around
+# NumCPU. Set 0 to take runtime.NumCPU() at startup.
+# parallelism: 0
 
 bump_builder:
   # Grace window after BLOCK_PROCESSED before reading STUMPs, to allow for

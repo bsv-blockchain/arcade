@@ -38,7 +38,7 @@ func (msg *CallbackMessage) ResolveSeenTxIDs() []string {
 
 // Stump represents a stored STUMP (Subtree Unified Merkle Path), keyed by subtree.
 type Stump struct {
-	BlockHash    string
-	SubtreeIndex int
-	StumpData    []byte
+	BlockHash    string `json:"block_hash"`
+	SubtreeIndex int    `json:"subtree_index"`
+	StumpData    []byte `json:"stump_data"`
 }

@@ -94,7 +94,7 @@ func (s Status) DisallowedPreviousStatuses() []Status {
 		return []Status{StatusSentToNetwork, StatusAcceptedByNetwork, StatusSeenOnNetwork, StatusSeenMultipleNodes, StatusRejected, StatusPendingRetry, StatusDoubleSpendAttempted, StatusMined}
 	case StatusAcceptedByNetwork:
 		return []Status{StatusAcceptedByNetwork, StatusSeenOnNetwork, StatusSeenMultipleNodes, StatusRejected, StatusDoubleSpendAttempted, StatusMined}
-	case StatusSeenOnNetwork, StatusSeenMultipleNodes, StatusRejected, StatusDoubleSpendAttempted, StatusMined, StatusImmutable:
+	case StatusSeenOnNetwork, StatusSeenMultipleNodes, StatusRejected, StatusDoubleSpendAttempted, StatusMined, StatusImmutable, StatusPendingRetry, StatusStumpProcessing:
 		return []Status{}
 	default:
 		return []Status{}

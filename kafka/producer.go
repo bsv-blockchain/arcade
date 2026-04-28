@@ -24,7 +24,7 @@ func NewProducer(broker Broker) *Producer {
 }
 
 // Send JSON-marshals value and publishes synchronously.
-func (p *Producer) Send(topic string, key string, value any) error {
+func (p *Producer) Send(topic, key string, value any) error {
 	data, err := marshalValue(value)
 	if err != nil {
 		return fmt.Errorf("marshaling message: %w", err)
@@ -39,7 +39,7 @@ func (p *Producer) Send(topic string, key string, value any) error {
 }
 
 // SendAsync JSON-marshals value and publishes fire-and-forget.
-func (p *Producer) SendAsync(topic string, key string, value any) error {
+func (p *Producer) SendAsync(topic, key string, value any) error {
 	data, err := marshalValue(value)
 	if err != nil {
 		return fmt.Errorf("marshaling message: %w", err)
@@ -64,7 +64,7 @@ func (p *Producer) SendBatch(topic string, msgs []KeyValue) error {
 	return nil
 }
 
-// SendRaw publishes pre-marshalled bytes. Used by consumer DLQ routing so we
+// SendRaw publishes pre-marshaled bytes. Used by consumer DLQ routing so we
 // don't double-encode.
 func (p *Producer) SendRaw(topic, key string, value []byte) error {
 	if err := p.broker.Send(context.Background(), topic, key, value); err != nil {

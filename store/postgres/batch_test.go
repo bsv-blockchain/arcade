@@ -88,8 +88,11 @@ func TestBatchGetOrInsertStatus_MixedPreservesOrder(t *testing.T) {
 	}
 
 	in := []*models.TransactionStatus{
-		{TxID: "pg-mix-1"}, {TxID: "pg-mix-2"}, {TxID: "pg-mix-3"},
-		{TxID: "pg-mix-4"}, {TxID: "pg-mix-5"},
+		{TxID: "pg-mix-1"},
+		{TxID: "pg-mix-2"},
+		{TxID: "pg-mix-3"},
+		{TxID: "pg-mix-4"},
+		{TxID: "pg-mix-5"},
 	}
 	results, err := s.BatchGetOrInsertStatus(ctx, in)
 	if err != nil {

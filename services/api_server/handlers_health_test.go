@@ -35,7 +35,7 @@ func doHealth(t *testing.T, srv *Server) (int, healthResp, []byte) {
 	r := gin.New()
 	srv.registerRoutes(r)
 
-	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/health", nil)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

@@ -133,7 +133,10 @@ func makeBlockProcessedMsg(blockHash string) *kafka.Message {
 		Type:      models.CallbackBlockProcessed,
 		BlockHash: blockHash,
 	}
-	data, _ := json.Marshal(callback)
+	data, err := json.Marshal(callback)
+	if err != nil {
+		panic(err)
+	}
 	return &kafka.Message{
 		Topic: "arcade.block_processed",
 		Value: data,
@@ -163,7 +166,7 @@ func buildBlockHeader(merkleRoot []byte) []byte {
 // what parseBlockBinary expects (it uses chainhash.NewHash on raw bytes, which
 // does not reverse — unlike chainhash.NewHashFromHex).
 func newDatahubServer(merkleRoot []byte, subtreeHashes []chainhash.Hash) *httptest.Server {
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		var buf bytes.Buffer
 
 		buf.Write(buildBlockHeader(merkleRoot))
@@ -193,35 +196,7 @@ func newDatahubServer(merkleRoot []byte, subtreeHashes []chainhash.Hash) *httpte
 		buf.WriteByte(0x00)
 
 		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Write(buf.Bytes())
-	}))
-}
-
-// newDatahubServerWithCoinbaseBUMP creates a test server that includes coinbase BUMP data.
-func newDatahubServerWithCoinbaseBUMP(merkleRoot []byte, subtreeHashes []chainhash.Hash, coinbaseBUMP []byte) *httptest.Server {
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var buf bytes.Buffer
-
-		buf.Write(buildBlockHeader(merkleRoot))                   // header
-		buf.WriteByte(0x01)                                       // txCount
-		buf.WriteByte(0x00)                                       // sizeBytes
-		buf.Write(util.VarInt(len(subtreeHashes)).Bytes()) // subtreeCount
-
-		for i := range subtreeHashes {
-			buf.Write(subtreeHashes[i].CloneBytes())
-		}
-
-		coinbaseTx := transaction.NewTransaction()
-		buf.Write(coinbaseTx.Bytes())
-
-		buf.WriteByte(0x01) // blockHeight
-
-		// Coinbase BUMP length + data
-		buf.Write(util.VarInt(len(coinbaseBUMP)).Bytes())
-		buf.Write(coinbaseBUMP)
-
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Write(buf.Bytes())
+		_, _ = w.Write(buf.Bytes())
 	}))
 }
 
@@ -242,7 +217,7 @@ func mustHash(t *testing.T, hexStr string) chainhash.Hash {
 }
 
 func newFailingDatahubServer() *httptest.Server {
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 }
@@ -272,13 +247,14 @@ func makeMinimalSTUMP(txidHex string) []byte {
 		txidBytes = padded
 	}
 
-	buf := []byte{
+	buf := make([]byte, 0, 5+len(txidBytes))
+	buf = append(buf,
 		0x01, // blockHeight = 1
 		0x01, // treeHeight = 1 (one level)
 		0x01, // nLeaves at level 0 = 1
 		0x00, // offset = 0
 		0x02, // flags: bit 1 = txid (hash follows)
-	}
+	)
 	buf = append(buf, txidBytes...)
 	return buf
 }
@@ -341,13 +317,14 @@ func makeTwoLeafSTUMP(txidHex, siblingHex string) []byte {
 		sibBytes = p
 	}
 
-	buf := []byte{
+	buf := make([]byte, 0, 5+len(txidBytes)+2+len(sibBytes))
+	buf = append(buf,
 		0x01, // blockHeight = 1
 		0x01, // treeHeight = 1
 		0x02, // nLeaves at level 0 = 2
 		0x00, // offset 0
 		0x02, // flags: txid
-	}
+	)
 	buf = append(buf, txidBytes...)
 	buf = append(buf,
 		0x01, // offset 1

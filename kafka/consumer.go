@@ -29,7 +29,7 @@ type ConsumerGroup struct {
 
 // FlushFunc is called after a drain of immediately-ready messages. The
 // context belongs to the current claim — when the claim ends (shutdown or
-// rebalance) the context is already cancelled, so downstream work (broadcasts,
+// rebalance) the context is already canceled, so downstream work (broadcasts,
 // store writes) can abort cleanly instead of running on Background.
 type FlushFunc func(ctx context.Context) error
 
@@ -71,7 +71,7 @@ func NewConsumerGroup(cfg ConsumerConfig) (*ConsumerGroup, error) {
 	}, nil
 }
 
-// Run drives the subscription. Blocks until ctx is cancelled or the broker
+// Run drives the subscription. Blocks until ctx is canceled or the broker
 // closes. Each call to handleClaim preserves the drain-then-flush invariant:
 // all immediately-available messages are processed, then flushFunc fires,
 // then the next iteration waits for new arrivals.

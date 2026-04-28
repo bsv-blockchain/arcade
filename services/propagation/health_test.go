@@ -25,7 +25,7 @@ import (
 // to avoid pinning the test to net/http server-side context propagation
 // internals.
 func TestBroadcastSingle_FirstSuccessWins_DoesNotWaitForSlowPeer(t *testing.T) {
-	fastSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	fastSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer fastSrv.Close()
@@ -66,7 +66,7 @@ func TestBroadcastSingle_FirstSuccessWins_DoesNotWaitForSlowPeer(t *testing.T) {
 // as failures (the ok endpoint should remain healthy across many broadcasts
 // even though its sibling loses the race every time).
 func TestBroadcast_RecordsEndpointOutcomes(t *testing.T) {
-	okSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	okSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer okSrv.Close()
@@ -74,7 +74,7 @@ func TestBroadcast_RecordsEndpointOutcomes(t *testing.T) {
 	// Second fast endpoint — both respond quickly, but only one wins the race
 	// per broadcast. The loser's result arrives just after the winner; the
 	// loser's error/success is still processed (it's not cancellation).
-	okSrv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	okSrv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer okSrv2.Close()
@@ -105,7 +105,7 @@ func TestBroadcast_RecordsEndpointOutcomes(t *testing.T) {
 // circuit-breaker. The peer is reachable — it's just telling us the tx is
 // bad. Tripping on legitimate 500s would sideline a healthy peer.
 func TestPeerReturning500_StaysHealthy(t *testing.T) {
-	alwaysFiveHundred := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	alwaysFiveHundred := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "missing inputs for tx", http.StatusInternalServerError)
 	}))
 	defer alwaysFiveHundred.Close()
@@ -135,12 +135,12 @@ func TestPeerReturning500_StaysHealthy(t *testing.T) {
 // listening) should trip after FailureThreshold consecutive broadcasts.
 func TestPeerUnreachable_Trips(t *testing.T) {
 	// Grab a free port, then close the listener so dials are refused.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("grabbing port: %v", err)
 	}
 	unreachableURL := "http://" + ln.Addr().String()
-	ln.Close()
+	_ = ln.Close()
 
 	ms := newMockStore()
 	cfg := &config.Config{}
@@ -167,13 +167,13 @@ func TestPeerUnreachable_Trips(t *testing.T) {
 func TestBadPeer_SkippedAfterTrip(t *testing.T) {
 	var okHits, badHits atomic.Int32
 
-	okSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	okSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		okHits.Add(1)
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer okSrv.Close()
 
-	badSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	badSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		badHits.Add(1)
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
@@ -213,7 +213,7 @@ func TestBadPeer_SkippedAfterTrip(t *testing.T) {
 // "batch propagated" summary log surfaces which datahub URL actually accepted
 // the batch. This is the operator-visible signal for "who took our traffic".
 func TestBatchPropagatedLog_IncludesSuccessEndpoint(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()

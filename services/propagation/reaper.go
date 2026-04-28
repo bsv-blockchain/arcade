@@ -28,10 +28,13 @@ func (p *Propagator) runReaper(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			// Best-effort release so a successor doesn't wait for TTL.
-			// Use Background since ctx is already done.
+			// Best-effort release so a successor doesn't wait for TTL. ctx is
+			// already done so derive a fresh short-lived context to bound the
+			// release call rather than running unbounded against context.Background.
 			if p.leaser != nil {
-				_ = p.leaser.Release(context.Background(), reaperLeaseName, p.holderID)
+				releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+				_ = p.leaser.Release(releaseCtx, reaperLeaseName, p.holderID)
+				cancel()
 			}
 			return
 		case <-ticker.C:
@@ -111,8 +114,8 @@ type retryResult struct {
 //   - REJECTED + non-retryable error → ClearRetryState(REJECTED, errMsg)
 //   - status == nil (no endpoint gave a verdict — 202, all timed out, etc.)
 //     → leave PENDING_RETRY, just push next_retry_at forward by one base-
-//       backoff step so the reaper doesn't hot-loop on infra blips. retry_count
-//       is left alone — don't punish a tx for a transient outage.
+//     backoff step so the reaper doesn't hot-loop on infra blips. retry_count
+//     is left alone — don't punish a tx for a transient outage.
 func (p *Propagator) resolveRetryOutcome(ctx context.Context, entry *store.PendingRetry, res retryResult) {
 	if res.status != nil && res.status.Status == models.StatusAcceptedByNetwork {
 		if err := p.store.ClearRetryState(ctx, entry.TxID, models.StatusAcceptedByNetwork, ""); err != nil {

@@ -2,6 +2,7 @@ package api_server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -25,7 +26,7 @@ type Server struct {
 	producer    *kafka.Producer
 	store       store.Store
 	txTracker   *store.TxTracker
-	teranode    *teranode.Client        // used by /health for datahub URL inventory; nil in tests
+	teranode    *teranode.Client // used by /health for datahub URL inventory; nil in tests
 	server      *http.Server
 	chaintracks chaintracks.Chaintracks // nil when disabled
 	ctRoutes    *chaintracksRoutes      // nil when disabled
@@ -60,18 +61,19 @@ func (s *Server) Start(ctx context.Context) error {
 
 	addr := fmt.Sprintf("%s:%d", s.cfg.APIServer.Host, s.cfg.APIServer.Port)
 	s.server = &http.Server{
-		Addr:    addr,
-		Handler: router,
+		Addr:              addr,
+		Handler:           router,
+		ReadHeaderTimeout: 30 * time.Second,
 	}
 
 	s.logger.Info("API server listening", zap.String("addr", addr))
 
 	go func() {
 		<-ctx.Done()
-		s.Stop()
+		_ = s.Stop()
 	}()
 
-	if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := s.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("server error: %w", err)
 	}
 	return nil
@@ -79,7 +81,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 // initChaintracks spins up the embedded go-chaintracks instance when
 // ChaintracksServer.Enabled is true. Shutdown is driven by ctx — when the
-// api-server's context is cancelled, chaintracks's P2P subscription and SSE
+// api-server's context is canceled, chaintracks's P2P subscription and SSE
 // broadcasters unwind themselves.
 //
 // Initialization failures are returned as errors so main.go can surface them

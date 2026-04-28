@@ -39,7 +39,6 @@ func BatchGetOrInsertStatusParallel(ctx context.Context, s SingleStore, statuses
 	var firstErr error
 
 	for i, st := range statuses {
-		i, st := i, st
 		select {
 		case sem <- struct{}{}:
 		case <-ctx.Done():
@@ -87,7 +86,6 @@ func BatchUpdateStatusParallel(ctx context.Context, s SingleStore, statuses []*m
 	var firstErr error
 
 	for _, st := range statuses {
-		st := st
 		select {
 		case sem <- struct{}{}:
 		case <-ctx.Done():

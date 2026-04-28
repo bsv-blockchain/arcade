@@ -193,7 +193,7 @@ func (c *Client) consume(ctx context.Context, msgs <-chan teranodep2p.NodeStatus
 			if !ok {
 				return
 			}
-			c.handleNodeStatus(msg)
+			c.handleNodeStatus(ctx, msg)
 		}
 	}
 }
@@ -202,7 +202,7 @@ func (c *Client) consume(ctx context.Context, msgs <-chan teranodep2p.NodeStatus
 // validates it, and registers it with the shared teranode.Client. The
 // wrapper library has already JSON-decoded the payload; spoofing defense is
 // left to the libp2p layer since the wrapper drops FromID before fan-out.
-func (c *Client) handleNodeStatus(msg teranodep2p.NodeStatusMessage) {
+func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatusMessage) {
 	metrics.P2PNodeStatusMessagesTotal.Inc()
 
 	raw := pickDatahubURL(msg)
@@ -248,8 +248,8 @@ func (c *Client) handleNodeStatus(msg teranodep2p.NodeStatusMessage) {
 	// to the local in-memory client. Failure here is a soft warning — the
 	// local pod still works, only cross-pod visibility is delayed.
 	if c.store != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		err := c.store.UpsertDatahubEndpoint(ctx, store.DatahubEndpoint{
+		upsertCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err := c.store.UpsertDatahubEndpoint(upsertCtx, store.DatahubEndpoint{
 			URL:      normalized,
 			Source:   store.DatahubEndpointSourceDiscovered,
 			LastSeen: time.Now(),

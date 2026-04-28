@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
@@ -19,7 +20,6 @@ import (
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
-	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 )
 
 // mockStore implements store.Store for testing callback handlers.
@@ -48,18 +48,23 @@ func (m *mockStore) UpdateStatus(_ context.Context, status *models.TransactionSt
 func (m *mockStore) GetOrInsertStatus(context.Context, *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
 	return nil, false, nil
 }
+
 func (m *mockStore) BatchGetOrInsertStatus(context.Context, []*models.TransactionStatus) ([]store.BatchInsertResult, error) {
 	return nil, nil
 }
+
 func (m *mockStore) BatchUpdateStatus(context.Context, []*models.TransactionStatus) error {
 	return nil
 }
+
 func (m *mockStore) GetStatus(context.Context, string) (*models.TransactionStatus, error) {
 	return nil, nil
 }
+
 func (m *mockStore) GetStatusesSince(context.Context, time.Time) ([]*models.TransactionStatus, error) {
 	return nil, nil
 }
+
 func (m *mockStore) SetStatusByBlockHash(context.Context, string, models.Status) ([]string, error) {
 	return nil, nil
 }
@@ -72,12 +77,15 @@ func (m *mockStore) InsertSubmission(context.Context, *models.Submission) error 
 func (m *mockStore) GetSubmissionsByTxID(context.Context, string) ([]*models.Submission, error) {
 	return nil, nil
 }
+
 func (m *mockStore) GetSubmissionsByToken(context.Context, string) ([]*models.Submission, error) {
 	return nil, nil
 }
+
 func (m *mockStore) UpdateDeliveryStatus(context.Context, string, models.Status, int, *time.Time) error {
 	return nil
 }
+
 func (m *mockStore) InsertStump(_ context.Context, stump *models.Stump) error {
 	if m.insertStumpErr != nil {
 		return m.insertStumpErr
@@ -101,6 +109,7 @@ func (m *mockStore) InsertStump(_ context.Context, stump *models.Stump) error {
 	}
 	return nil
 }
+
 func (m *mockStore) GetStumpsByBlockHash(context.Context, string) ([]*models.Stump, error) {
 	return nil, nil
 }
@@ -109,9 +118,11 @@ func (m *mockStore) BumpRetryCount(context.Context, string) (int, error)   { ret
 func (m *mockStore) SetPendingRetryFields(context.Context, string, []byte, time.Time) error {
 	return nil
 }
+
 func (m *mockStore) GetReadyRetries(context.Context, time.Time, int) ([]*store.PendingRetry, error) {
 	return nil, nil
 }
+
 func (m *mockStore) ClearRetryState(context.Context, string, models.Status, string) error {
 	return nil
 }
@@ -119,14 +130,24 @@ func (m *mockStore) EnsureIndexes() error { return nil }
 func (m *mockStore) UpsertDatahubEndpoint(context.Context, store.DatahubEndpoint) error {
 	return nil
 }
+
 func (m *mockStore) ListDatahubEndpoints(context.Context) ([]store.DatahubEndpoint, error) {
 	return nil, nil
 }
-func (m *mockStore) Close() error         { return nil }
+func (m *mockStore) Close() error { return nil }
 
 func makeMinimalTx() []byte {
 	tx := sdkTx.NewTransaction()
 	return tx.Bytes()
+}
+
+func mustMarshalJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	return b
 }
 
 func setupServerWithStore(broker *kafka.RecordingBroker, ms *mockStore) (*Server, *gin.Engine) {
@@ -178,7 +199,7 @@ func TestHandleSubmitTransactions_BatchPublish(t *testing.T) {
 	txBytes := makeMinimalTx()
 	body := bytes.Repeat(txBytes, 3)
 
-	req := httptest.NewRequest(http.MethodPost, "/txs", bytes.NewReader(body))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/txs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/octet-stream")
 	w := httptest.NewRecorder()
 
@@ -189,7 +210,7 @@ func TestHandleSubmitTransactions_BatchPublish(t *testing.T) {
 	}
 
 	var resp map[string]interface{}
-	json.Unmarshal(w.Body.Bytes(), &resp)
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 	if int(resp["submitted"].(float64)) != 3 {
 		t.Errorf("expected submitted=3, got %v", resp["submitted"])
 	}
@@ -209,7 +230,7 @@ func TestHandleSubmitTransactions_ParseFailure_NoPublish(t *testing.T) {
 	// Valid tx followed by garbage
 	body := append(makeMinimalTx(), 0xff, 0xfe, 0xfd)
 
-	req := httptest.NewRequest(http.MethodPost, "/txs", bytes.NewReader(body))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/txs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/octet-stream")
 	w := httptest.NewRecorder()
 
@@ -232,7 +253,7 @@ func TestHandleSubmitTransactions_100Txs_SingleBatchCall(t *testing.T) {
 	txBytes := makeMinimalTx()
 	body := bytes.Repeat(txBytes, 100)
 
-	req := httptest.NewRequest(http.MethodPost, "/txs", bytes.NewReader(body))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/txs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/octet-stream")
 	w := httptest.NewRecorder()
 
@@ -243,7 +264,7 @@ func TestHandleSubmitTransactions_100Txs_SingleBatchCall(t *testing.T) {
 	}
 
 	var resp map[string]interface{}
-	json.Unmarshal(w.Body.Bytes(), &resp)
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 	if int(resp["submitted"].(float64)) != 100 {
 		t.Errorf("expected submitted=100, got %v", resp["submitted"])
 	}
@@ -262,7 +283,7 @@ func TestHandleSubmitTransactions_KafkaFailure_Returns500(t *testing.T) {
 
 	body := makeMinimalTx()
 
-	req := httptest.NewRequest(http.MethodPost, "/txs", bytes.NewReader(body))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/txs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/octet-stream")
 	w := httptest.NewRecorder()
 
@@ -281,9 +302,9 @@ func TestHandleCallback_SeenMultipleNodes_UpdatesStatus(t *testing.T) {
 		Type:  models.CallbackSeenMultipleNodes,
 		TxIDs: []string{"tx1", "tx2"},
 	}
-	body, _ := json.Marshal(payload)
+	body := mustMarshalJSON(t, payload)
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 
@@ -322,9 +343,9 @@ func TestHandleCallback_Stump_StorageError_Returns500(t *testing.T) {
 		BlockHash: "abc123",
 		Stump:     []byte{0x01, 0x02},
 	}
-	body, _ := json.Marshal(payload)
+	body := mustMarshalJSON(t, payload)
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 
@@ -346,9 +367,9 @@ func TestHandleCallback_SeenMultipleNodes_EmptyTxIDs(t *testing.T) {
 		Type:  models.CallbackSeenMultipleNodes,
 		TxIDs: []string{},
 	}
-	body, _ := json.Marshal(payload)
+	body := mustMarshalJSON(t, payload)
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 
@@ -413,7 +434,6 @@ func TestHandleCallback_FullBlockFlow_20Subtrees(t *testing.T) {
 	var wg sync.WaitGroup
 	errCh := make(chan error, numSubtrees)
 	for i := 0; i < numSubtrees; i++ {
-		i := i
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -428,7 +448,7 @@ func TestHandleCallback_FullBlockFlow_20Subtrees(t *testing.T) {
 				errCh <- fmt.Errorf("marshal subtree %d: %w", i, err)
 				return
 			}
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")
 			// Match merkle-service's delivery headers exactly.
 			req.Header.Set("X-Idempotency-Key", fmt.Sprintf("%s:%d:STUMP", blockHash, i))
@@ -492,7 +512,7 @@ func TestHandleCallback_FullBlockFlow_20Subtrees(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal BLOCK_PROCESSED: %v", err)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Idempotency-Key", blockHash+":BLOCK_PROCESSED")
 	w := httptest.NewRecorder()
@@ -541,8 +561,8 @@ func TestHandleCallback_FullBlockFlow_20Subtrees(t *testing.T) {
 		SubtreeIndex: 0,
 		Stump:        stumpPayloads[0],
 	}
-	retryBody, _ := json.Marshal(retryPayload)
-	retryReq := httptest.NewRequest(http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(retryBody))
+	retryBody := mustMarshalJSON(t, retryPayload)
+	retryReq := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(retryBody))
 	retryReq.Header.Set("Content-Type", "application/json")
 	retryW := httptest.NewRecorder()
 	router.ServeHTTP(retryW, retryReq)
@@ -564,7 +584,7 @@ func TestHandleCallback_FullBlockFlow_20Subtrees(t *testing.T) {
 // transient DEVICE_OVERLOAD / HOT_KEY on a single composite key) while the
 // other 19 succeed.
 //
-// The test locks down the observable behaviour that the bump_builder and
+// The test locks down the observable behavior that the bump_builder and
 // merkle-service both depend on:
 //
 //   - the failing STUMP responds 500 so merkle-service's retry loop
@@ -617,7 +637,6 @@ func TestHandleCallback_FullBlockFlow_PartialStumpFailure(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for i := 0; i < numSubtrees; i++ {
-		i := i
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -627,8 +646,8 @@ func TestHandleCallback_FullBlockFlow_PartialStumpFailure(t *testing.T) {
 				SubtreeIndex: i,
 				Stump:        stumpPayloads[i],
 			}
-			body, _ := json.Marshal(payload)
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
+			body := mustMarshalJSON(t, payload)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")
 			w := httptest.NewRecorder()
 			router.ServeHTTP(w, req)
@@ -676,8 +695,8 @@ func TestHandleCallback_FullBlockFlow_PartialStumpFailure(t *testing.T) {
 		Type:      models.CallbackBlockProcessed,
 		BlockHash: blockHash,
 	}
-	body, _ := json.Marshal(blockMsg)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
+	body := mustMarshalJSON(t, blockMsg)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)

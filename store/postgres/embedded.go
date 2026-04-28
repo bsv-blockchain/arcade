@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -19,10 +20,10 @@ import (
 //
 // Returns the DSN the pgx pool should use, plus a stop func.
 func startEmbedded(cfg config.Postgres) (dsn string, stop func() error, err error) {
-	if err := os.MkdirAll(cfg.EmbeddedDataDir, 0o755); err != nil {
+	if err := os.MkdirAll(cfg.EmbeddedDataDir, 0o750); err != nil {
 		return "", nil, fmt.Errorf("creating embedded postgres data dir: %w", err)
 	}
-	if err := os.MkdirAll(cfg.EmbeddedCacheDir, 0o755); err != nil {
+	if err := os.MkdirAll(cfg.EmbeddedCacheDir, 0o750); err != nil {
 		return "", nil, fmt.Errorf("creating embedded postgres cache dir: %w", err)
 	}
 
@@ -70,11 +71,10 @@ func startEmbedded(cfg config.Postgres) (dsn string, stop func() error, err erro
 // Two concurrent calls could race for the same port, but for a single
 // embedded-postgres startup this is fine — the TOCTOU window is tiny.
 func pickFreePort() (uint32, error) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		return 0, err
 	}
-	defer l.Close()
-	return uint32(l.Addr().(*net.TCPAddr).Port), nil
+	defer func() { _ = l.Close() }()
+	return uint32(l.Addr().(*net.TCPAddr).Port), nil //nolint:gosec // ephemeral local port fits in uint32 by definition
 }
-

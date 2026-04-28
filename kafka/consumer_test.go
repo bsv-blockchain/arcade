@@ -11,7 +11,7 @@ import (
 
 func TestProcessWithRetry_BackoffDelaysBetweenAttempts(t *testing.T) {
 	attempts := 0
-	handler := func(ctx context.Context, msg *Message) error {
+	handler := func(_ context.Context, _ *Message) error {
 		attempts++
 		return errors.New("fail")
 	}
@@ -42,7 +42,7 @@ func TestProcessWithRetry_BackoffDelaysBetweenAttempts(t *testing.T) {
 
 func TestProcessWithRetry_BackoffRespectsContextCancellation(t *testing.T) {
 	attempts := 0
-	handler := func(ctx context.Context, msg *Message) error {
+	handler := func(_ context.Context, _ *Message) error {
 		attempts++
 		return errors.New("fail")
 	}
@@ -71,7 +71,7 @@ func TestProcessWithRetry_BackoffRespectsContextCancellation(t *testing.T) {
 }
 
 func TestProcessWithRetry_SuccessOnFirstAttempt_NoDelay(t *testing.T) {
-	handler := func(ctx context.Context, msg *Message) error {
+	handler := func(_ context.Context, _ *Message) error {
 		return nil
 	}
 

@@ -50,7 +50,7 @@ func run(cmd *cobra.Command, _ []string) error {
 	}
 
 	logger := newLogger(cfg.LogLevel)
-	defer logger.Sync()
+	defer func() { _ = logger.Sync() }()
 
 	logger.Info("starting arcade",
 		zap.String("mode", cfg.Mode),
@@ -63,7 +63,7 @@ func run(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("creating kafka broker: %w", err)
 	}
 	producer := kafka.NewProducer(broker)
-	defer producer.Close()
+	defer func() { _ = producer.Close() }()
 
 	// Validate that the hot-path topics have enough partitions for the
 	// deployment. min_partitions is operator-supplied — leave unset (0/1) in
@@ -71,8 +71,8 @@ func run(cmd *cobra.Command, _ []string) error {
 	// count in K8s. Fails fast on misconfigured horizontally-scaled topics so
 	// the error surfaces before live traffic arrives.
 	if cfg.Kafka.MinPartitions > 1 {
-		if err := kafka.CheckPartitions(broker, []string{kafka.TopicTransaction, kafka.TopicPropagation}, cfg.Kafka.MinPartitions, logger); err != nil {
-			return fmt.Errorf("kafka partition check: %w", err)
+		if pErr := kafka.CheckPartitions(broker, []string{kafka.TopicTransaction, kafka.TopicPropagation}, cfg.Kafka.MinPartitions, logger); pErr != nil {
+			return fmt.Errorf("kafka partition check: %w", pErr)
 		}
 	}
 
@@ -80,7 +80,7 @@ func run(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("creating store: %w", err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	if err := st.EnsureIndexes(); err != nil {
 		return fmt.Errorf("ensuring store indexes: %w", err)
 	}

@@ -21,7 +21,7 @@ type Leaser interface {
 	// TryAcquireOrRenew atomically acquires the named lease, renews it if we
 	// already hold it, or returns a zero heldUntil if another holder currently
 	// owns it. Errors are reserved for infrastructure failures — normal lease
-	// contention is signalled by (time.Time{}, nil).
+	// contention is signaled by (time.Time{}, nil).
 	//
 	// holder is an identifier unique to this process for the lifetime of its
 	// interest in the lease (e.g. hostname + random suffix). Callers should

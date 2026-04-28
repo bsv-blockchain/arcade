@@ -107,7 +107,7 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 		logger.Debug("waiting grace window", zap.Duration("duration", grace))
 		select {
 		case <-ctx.Done():
-			outcome = "context_cancelled"
+			outcome = "context_canceled"
 			return ctx.Err()
 		case <-time.After(grace):
 		}

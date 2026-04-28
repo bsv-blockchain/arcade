@@ -28,20 +28,20 @@ const (
 var DefaultMinFeePerKB = uint64(100)
 
 var (
-	ErrNoInputsOrOutputs              = errors.New("transaction has no inputs or outputs")
-	ErrTxOutputInvalid                = errors.New("transaction output is invalid")
-	ErrTxOutputSatoshisInvalid        = errors.New("output satoshis is invalid")
-	ErrTxOutputNonZeroOpReturn        = errors.New("output has non 0 value op return")
-	ErrTxOutputTotalSatoshisTooHigh   = errors.New("output total satoshis is too high")
-	ErrTxInputInvalid                 = errors.New("transaction input is invalid")
-	ErrTxInputCoinbaseInput           = errors.New("input is a coinbase input")
-	ErrTxInputSatoshisTooHigh         = errors.New("input satoshis is too high")
-	ErrTxInputTotalSatoshisTooHigh    = errors.New("input total satoshis is too high")
+	ErrNoInputsOrOutputs               = errors.New("transaction has no inputs or outputs")
+	ErrTxOutputInvalid                 = errors.New("transaction output is invalid")
+	ErrTxOutputSatoshisInvalid         = errors.New("output satoshis is invalid")
+	ErrTxOutputNonZeroOpReturn         = errors.New("output has non 0 value op return")
+	ErrTxOutputTotalSatoshisTooHigh    = errors.New("output total satoshis is too high")
+	ErrTxInputInvalid                  = errors.New("transaction input is invalid")
+	ErrTxInputCoinbaseInput            = errors.New("input is a coinbase input")
+	ErrTxInputSatoshisTooHigh          = errors.New("input satoshis is too high")
+	ErrTxInputTotalSatoshisTooHigh     = errors.New("input total satoshis is too high")
 	ErrUnlockingScriptHasTooManySigOps = errors.New("transaction unlocking scripts have too many sigops")
-	ErrEmptyUnlockingScript           = errors.New("transaction input unlocking script is empty")
-	ErrUnlockingScriptNotPushOnly     = errors.New("transaction input unlocking script is not push only")
-	ErrTxSizeLessThanMinSize          = fmt.Errorf("transaction size in bytes is less than %d bytes", minTxSizeBytes)
-	ErrTxSizeGreaterThanMax           = fmt.Errorf("transaction size in bytes is greater than %d bytes", maxBlockSize)
+	ErrEmptyUnlockingScript            = errors.New("transaction input unlocking script is empty")
+	ErrUnlockingScriptNotPushOnly      = errors.New("transaction input unlocking script is not push only")
+	ErrTxSizeLessThanMinSize           = fmt.Errorf("transaction size in bytes is less than %d bytes", minTxSizeBytes)
+	ErrTxSizeGreaterThanMax            = fmt.Errorf("transaction size in bytes is greater than %d bytes", maxBlockSize)
 )
 
 // Policy defines validation policy settings
@@ -120,6 +120,8 @@ func (v *Validator) MinFeePerKB() uint64 {
 // ValidateTransaction validates policy, and optionally fees and scripts.
 // Uses go-sdk v1.2.19's spv.Verify which takes a context.Context as its first
 // argument. Callers that don't have a ctx can pass context.TODO().
+//
+//nolint:contextcheck // ctx==nil callers are explicitly supported via TODO fallback below
 func (v *Validator) ValidateTransaction(ctx context.Context, tx *sdkTx.Transaction, skipFees, skipScripts bool) error {
 	if err := v.ValidatePolicy(tx); err != nil {
 		return v.wrapPolicyError(err)

@@ -32,7 +32,7 @@ func TestComputeBackoff_CapsAtMax(t *testing.T) {
 	// attempt=20 with base=500ms would be 500ms * 2^20 ≈ 524288s pre-cap.
 	// Post-cap is 30s, post-jitter is [22.5s, 37.5s].
 	got := ComputeBackoff(500, 20)
-	delay := got.Sub(time.Now())
+	delay := time.Until(got)
 	const jitteredMax = maxBackoffCap + (maxBackoffCap / 4) + 100*time.Millisecond // +slack for wall-clock drift
 	if delay > jitteredMax {
 		t.Errorf("expected capped delay ≤ %v, got %v", jitteredMax, delay)

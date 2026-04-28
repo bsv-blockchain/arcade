@@ -42,11 +42,11 @@ type Broker interface {
 }
 
 // ErrTopicNotFound is returned by PartitionCount when the topic does not exist.
-var ErrTopicNotFound = errBrokerSentinel("topic not found")
+var ErrTopicNotFound = brokerSentinelError("topic not found")
 
-type errBrokerSentinel string
+type brokerSentinelError string
 
-func (e errBrokerSentinel) Error() string { return string(e) }
+func (e brokerSentinelError) Error() string { return string(e) }
 
 // Subscription is a handle on an active consumer-group membership. The Consume
 // method is claim-oriented to preserve the drain-then-flush correctness
@@ -58,7 +58,7 @@ type Subscription interface {
 	// Consume blocks, invoking handler once per claim. The handler drives
 	// reading via Claim.Messages() and is expected to return when the claim
 	// ends (its channel closes or its context is done). Consume returns when
-	// ctx is cancelled or an unrecoverable error occurs.
+	// ctx is canceled or an unrecoverable error occurs.
 	Consume(ctx context.Context, handler func(Claim) error) error
 
 	// Close releases broker-side resources for this subscription.
@@ -71,7 +71,7 @@ type Claim interface {
 	// Messages yields messages from the claim. Closed when the claim ends.
 	Messages() <-chan *Message
 
-	// Context is cancelled when the claim ends (rebalance or shutdown).
+	// Context is canceled when the claim ends (rebalance or shutdown).
 	// Handlers should watch it to terminate their inner drain loop promptly.
 	Context() context.Context
 
@@ -79,7 +79,7 @@ type Claim interface {
 	// this enqueues an offset commit (the actual commit is batched by the
 	// library). In the memory broker this is a no-op — standalone mode is
 	// at-most-once on crash, which is acceptable given it's a single binary.
-	MarkMessage(*Message)
+	MarkMessage(msg *Message)
 }
 
 // Message is the broker-neutral shape services consume. Mirrors the fields of

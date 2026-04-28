@@ -15,13 +15,13 @@
 //     five phases, with parallelism bounded by tx_validator.parallelism:
 //
 //     1. Parse — concurrent BEEF/raw decode + txid computation. Parse failures
-//        become per-tx rejects, not batch failures.
+//     become per-tx rejects, not batch failures.
 //     2. Dedup — concurrent GetOrInsertStatus per tx. Existing rows skip
-//        validation entirely; new rows continue.
+//     validation entirely; new rows continue.
 //     3. Validate — concurrent ValidateTransaction. Stateless on the validator
-//        struct, safe for fan-out.
+//     struct, safe for fan-out.
 //     4. Persist rejects — UpdateStatus for each rejection, also concurrent.
-//        Reject reasons are terminal; no Kafka retry is wanted.
+//     Reject reasons are terminal; no Kafka retry is wanted.
 //     5. Publish accepted — single SendBatch to the propagation topic.
 //
 // Per-message order within a flush window is intentionally NOT preserved.
@@ -245,7 +245,7 @@ func (v *Validator) flushValidations(ctx context.Context) error {
 
 	// Phase 5: single Kafka publish for the accepted set + any carry.
 	if len(publishMsgs) > 0 {
-		if err := v.producer.SendBatch(kafka.TopicPropagation, publishMsgs); err != nil {
+		if err := v.producer.SendBatch(kafka.TopicPropagation, publishMsgs); err != nil { //nolint:contextcheck // Producer.SendBatch wraps context internally; a refactor to plumb ctx is out of scope here
 			// Carry these messages to the next flush. Validation, dedup, and
 			// reject persistence are already done in the store; we only need
 			// the Kafka publish to succeed eventually.
@@ -292,7 +292,6 @@ func (v *Validator) phaseParse(ctx context.Context, batch []pendingTx) []parseRe
 	sem := make(chan struct{}, v.parallelism)
 	var wg sync.WaitGroup
 	for i, p := range batch {
-		i, p := i, p
 		select {
 		case sem <- struct{}{}:
 		case <-ctx.Done():
@@ -311,7 +310,7 @@ func (v *Validator) phaseParse(ctx context.Context, batch []pendingTx) []parseRe
 }
 
 // parseOne tries BEEF first, falls back to raw. Mirrors the previous serial
-// code's behaviour exactly.
+// code's behavior exactly.
 //
 // Wrapped in a panic recover because go-sdk's BEEF parser is known to panic
 // on truncated payloads (slice bounds out of range). A misshapen client body
@@ -352,7 +351,7 @@ func parseOne(rawTx []byte) (res parseResult) {
 // Errors here are logged and the offending batch is dropped — a transient
 // store failure means we don't propagate but don't write a reject either,
 // so clients can retry.
-func (v *Validator) phaseDedup(ctx context.Context, parsed []parseResult) (live []*validatedTx, duplicates []*validatedTx) {
+func (v *Validator) phaseDedup(ctx context.Context, parsed []parseResult) (live, duplicates []*validatedTx) {
 	live = make([]*validatedTx, 0, len(parsed))
 	duplicates = make([]*validatedTx, 0, len(parsed))
 
@@ -442,7 +441,6 @@ func (v *Validator) phaseValidate(ctx context.Context, live []*validatedTx) {
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(v.parallelism)
 	for _, vt := range live {
-		vt := vt
 		g.Go(func() error {
 			if err := v.txValidator.ValidateTransaction(gctx, vt.parsed, true, true); err != nil {
 				vt.rejected = true
@@ -505,4 +503,3 @@ func collectRejects(live []*validatedTx) []*validatedTx {
 	}
 	return out
 }
-

@@ -126,7 +126,7 @@ func TestAddEndpoints_Rediscover_PreservesHealthState(t *testing.T) {
 }
 
 // Concurrent RecordSuccess / RecordFailure + readers — -race must stay silent.
-func TestHealthTracker_Concurrent(t *testing.T) {
+func TestHealthTracker_Concurrent(_ *testing.T) {
 	c := NewClient([]string{"https://a.example", "https://b.example"}, "", HealthConfig{FailureThreshold: 1000})
 
 	const workers = 8
@@ -197,7 +197,7 @@ func TestProbe_Recovers_AfterReachable(t *testing.T) {
 }
 
 func TestProbe_4xxTreatedAsReachable(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		// Any path returns 404. The probe should still treat the peer as reachable.
 		w.WriteHeader(http.StatusNotFound)
 	}))
@@ -256,7 +256,7 @@ func TestGetEndpointStatuses_EmptyReturnsEmptySlice(t *testing.T) {
 }
 
 func TestProbe_StopsOnClose(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()

@@ -11,7 +11,7 @@ import (
 )
 
 // fakeStore implements the SingleStore subset the parallel-loop helpers need.
-// Behaviour is configurable per-txid so tests can exercise all-new / all-dup /
+// Behavior is configurable per-txid so tests can exercise all-new / all-dup /
 // mixed / error scenarios.
 type fakeStore struct {
 	insertCalls atomic.Int64
@@ -164,7 +164,7 @@ func TestBatchGetOrInsertStatusParallel_PartialFailure(t *testing.T) {
 	}
 }
 
-// Cancelling the context mid-call returns ctx.Err() and bails out without
+// Canceling the context mid-call returns ctx.Err() and bails out without
 // waiting for outstanding goroutines to finish.
 func TestBatchGetOrInsertStatusParallel_ContextCancel(t *testing.T) {
 	f := newFakeStore()

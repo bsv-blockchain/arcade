@@ -161,7 +161,7 @@ func (s *saramaSubscription) Consume(ctx context.Context, handler func(Claim) er
 	for {
 		if err := s.group.Consume(ctx, s.topics, adapter); err != nil {
 			if ctx.Err() != nil {
-				return nil
+				return nil //nolint:nilerr // ctx cancellation is a graceful shutdown, not an error to bubble
 			}
 			// transient rebalance errors surface here; the library reconnects
 			// automatically on the next Consume call.
@@ -170,7 +170,7 @@ func (s *saramaSubscription) Consume(ctx context.Context, handler func(Claim) er
 			}
 		}
 		if ctx.Err() != nil {
-			return nil
+			return nil //nolint:nilerr // graceful shutdown
 		}
 	}
 }

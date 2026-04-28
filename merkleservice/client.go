@@ -117,7 +117,6 @@ func (c *Client) RegisterBatch(ctx context.Context, registrations []Registration
 	g.SetLimit(maxConcurrency)
 
 	for _, reg := range registrations {
-		reg := reg
 		g.Go(func() error {
 			return c.Register(gctx, reg.TxID, reg.CallbackURL)
 		})

@@ -13,13 +13,14 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/teranode"
-	"go.uber.org/zap"
 )
 
 // eventLog is a thread-safe ordered list of string events for verifying call ordering.
@@ -59,6 +60,7 @@ func (e *eventLog) count(prefix string) int {
 // interface (panics on nil if called unexpectedly, surfacing missing stubs).
 type mockStore struct {
 	store.Store // embed interface — all unimplemented methods panic if called
+
 	mu             sync.Mutex
 	updates        []*models.TransactionStatus
 	retryCounts    map[string]int
@@ -227,18 +229,6 @@ func (m *mockStore) updateCount() int {
 	return len(m.updates)
 }
 
-func (m *mockStore) updatesForTxid(txid string) []*models.TransactionStatus {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	var result []*models.TransactionStatus
-	for _, u := range m.updates {
-		if u.TxID == txid {
-			result = append(result, u)
-		}
-	}
-	return result
-}
-
 func (m *mockStore) lastUpdateForTxid(txid string) *models.TransactionStatus {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -257,7 +247,10 @@ func makePropMsg(txid string) []byte {
 		TXID:  txid,
 		RawTx: []byte{0xde, 0xad, 0xbe, 0xef},
 	}
-	b, _ := json.Marshal(msg)
+	b, err := json.Marshal(msg)
+	if err != nil {
+		panic(err)
+	}
 	return b
 }
 
@@ -287,7 +280,7 @@ func newTeranodeServer(log *eventLog, statusCode int) *httptest.Server {
 	}))
 }
 
-func newPropagator(merkleSrvURL string, teranodeSrvURL string, st store.Store) *Propagator {
+func newPropagator(merkleSrvURL, teranodeSrvURL string, st store.Store) *Propagator {
 	cfg := &config.Config{
 		CallbackURL: "http://localhost:8080/callback",
 	}
@@ -387,7 +380,7 @@ func TestHandleMessage_MerkleTimeout_NoBroadcast(t *testing.T) {
 	ms := newMockStore()
 
 	done := make(chan struct{})
-	merkleSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	merkleSrv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 		<-done
 	}))
 
@@ -522,14 +515,14 @@ func TestHandleMessage_NoCallbackURL_SkipsRegistration(t *testing.T) {
 // Test 7: Batch of 100 — all registered then broadcast in single call
 func TestProcessBatch_100Transactions(t *testing.T) {
 	var registerCount atomic.Int32
-	merkleSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	merkleSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		registerCount.Add(1)
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer merkleSrv.Close()
 
 	var batchBroadcastCount atomic.Int32
-	teranodeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	teranodeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		batchBroadcastCount.Add(1)
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -609,7 +602,7 @@ func TestProcessBatch_MerkleFailure_AbortsBatch(t *testing.T) {
 	merkleSrv := newMerkleServer(&eventLog{}, http.StatusInternalServerError)
 	defer merkleSrv.Close()
 
-	teranodeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	teranodeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		broadcastCount.Add(1)
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -746,7 +739,7 @@ func TestSingleTransaction_Status200_AcceptedByNetwork(t *testing.T) {
 func TestSingleTransaction_Status202_NoStatusUpdate(t *testing.T) {
 	ms := newMockStore()
 
-	teranodeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	teranodeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusAccepted)
 	}))
 	defer teranodeSrv.Close()
@@ -769,7 +762,7 @@ func TestBatchTransactions_AnySuccess_AcceptedByNetwork(t *testing.T) {
 
 	// First endpoint fails, second succeeds
 	callCount := atomic.Int32{}
-	teranodeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	teranodeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		n := callCount.Add(1)
 		if n == 1 {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -809,7 +802,7 @@ func TestBatchTransactions_AnySuccess_AcceptedByNetwork(t *testing.T) {
 func TestBatchTransactions_AllFail_Rejected(t *testing.T) {
 	ms := newMockStore()
 
-	teranodeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	teranodeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer teranodeSrv.Close()
@@ -840,19 +833,19 @@ func TestBatchTransactions_AllFail_Rejected(t *testing.T) {
 
 // newTeranodeServerWithError returns a server that fails with a specific error message
 func newTeranodeServerWithError(errMsg string) *httptest.Server {
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(errMsg))
+		_, _ = w.Write([]byte(errMsg))
 	}))
 }
 
 // newTeranodeServerToggle fails N times with errMsg, then succeeds
 func newTeranodeServerToggle(failCount *atomic.Int32, maxFails int32, errMsg string) *httptest.Server {
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		n := failCount.Add(1)
 		if n <= maxFails {
 			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte(errMsg))
+			_, _ = w.Write([]byte(errMsg))
 			return
 		}
 		w.WriteHeader(http.StatusOK)

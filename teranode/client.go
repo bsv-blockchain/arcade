@@ -91,8 +91,10 @@ type EndpointSource interface {
 	ListEndpointURLs(ctx context.Context) ([]string, error)
 }
 
-const defaultRefreshInterval = 30 * time.Second
-const refreshStartupTimeout = 2 * time.Second
+const (
+	defaultRefreshInterval = 30 * time.Second
+	refreshStartupTimeout  = 2 * time.Second
+)
 
 // Client handles communication with teranode endpoints. The endpoint list is
 // mutable at runtime (see AddEndpoints) so peer-discovery services can merge
@@ -208,7 +210,7 @@ func (c *Client) refreshEndpointCountMetric() {
 // Start launches the background probe goroutine and (when an EndpointSource
 // is configured) the endpoint refresh goroutine. It is idempotent — calling
 // Start more than once is a no-op after the first call. Both goroutines run
-// until either the provided context is cancelled or Close is called.
+// until either the provided context is canceled or Close is called.
 //
 // When an EndpointSource is configured, Start blocks briefly on a synchronous
 // first refresh so a freshly started pod converges to the current registry

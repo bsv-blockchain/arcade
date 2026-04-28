@@ -36,7 +36,7 @@ type chaintracksRoutes struct {
 	cm chaintracks.Chaintracks
 
 	// SSE fan-out registries. clientID is a monotonic counter assigned on
-	// connect; the value is a thread-safe sseWriter that serialises writes
+	// connect; the value is a thread-safe sseWriter that serializes writes
 	// from the broadcaster goroutine.
 	nextClientID atomic.Int64
 
@@ -47,7 +47,7 @@ type chaintracksRoutes struct {
 	reorgClients map[int64]*sseWriter
 }
 
-// sseWriter serialises writes to a single http.ResponseWriter. Gin does not
+// sseWriter serializes writes to a single http.ResponseWriter. Gin does not
 // promise concurrent-safe writes, and our broadcaster + keepalive goroutines
 // both write to the same writer — a mutex keeps framing intact.
 type sseWriter struct {
@@ -67,7 +67,7 @@ func (s *sseWriter) write(payload string) error {
 }
 
 // newChaintracksRoutes subscribes to tip and reorg channels and starts
-// broadcaster goroutines. Both exit when ctx is cancelled.
+// broadcaster goroutines. Both exit when ctx is canceled.
 func newChaintracksRoutes(ctx context.Context, cm chaintracks.Chaintracks) *chaintracksRoutes {
 	r := &chaintracksRoutes{
 		cm:           cm,
@@ -196,7 +196,7 @@ func (r *chaintracksRoutes) Register(router *gin.RouterGroup) {
 
 // RegisterLegacy mounts the v1 RPC-style routes matching the original
 // chaintracks-server API PLUS the JSON/binary surface (so clients targeting
-// the shorter v1 prefix get the whole API, matching upstream behaviour).
+// the shorter v1 prefix get the whole API, matching upstream behavior).
 func (r *chaintracksRoutes) RegisterLegacy(router *gin.RouterGroup) {
 	router.GET("/getChain", r.handleLegacyGetChain)
 	router.GET("/getPresentHeight", r.handleLegacyGetPresentHeight)
@@ -273,7 +273,7 @@ func (r *chaintracksRoutes) handleGetHeaderByHeight(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	r.setHeightCache(c, uint32(height), ctx)
+	r.setHeightCache(ctx, c, uint32(height))
 
 	header, err := r.cm.GetHeaderByHeight(ctx, uint32(height))
 	if err != nil {
@@ -297,7 +297,7 @@ func (r *chaintracksRoutes) handleGetHeaderByHash(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Header not found"})
 		return
 	}
-	r.setHeightCache(c, header.Height, ctx)
+	r.setHeightCache(ctx, c, header.Height)
 	c.JSON(http.StatusOK, header)
 }
 
@@ -320,7 +320,7 @@ func (r *chaintracksRoutes) handleGetHeaders(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	r.setHeightCache(c, uint32(height), ctx)
+	r.setHeightCache(ctx, c, uint32(height))
 
 	var data []byte
 	for i := uint32(0); i < uint32(count); i++ {
@@ -355,7 +355,7 @@ func (r *chaintracksRoutes) handleGetHeaderByHeightBinary(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	r.setHeightCache(c, uint32(height), ctx)
+	r.setHeightCache(ctx, c, uint32(height))
 
 	header, err := r.cm.GetHeaderByHeight(ctx, uint32(height))
 	if err != nil {
@@ -379,7 +379,7 @@ func (r *chaintracksRoutes) handleGetHeaderByHashBinary(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Header not found"})
 		return
 	}
-	r.setHeightCache(c, header.Height, ctx)
+	r.setHeightCache(ctx, c, header.Height)
 	c.Header("X-Block-Height", strconv.FormatUint(uint64(header.Height), 10))
 	c.Data(http.StatusOK, "application/octet-stream", header.Bytes())
 }
@@ -403,7 +403,7 @@ func (r *chaintracksRoutes) handleGetHeadersBinary(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	r.setHeightCache(c, uint32(height), ctx)
+	r.setHeightCache(ctx, c, uint32(height))
 
 	var data []byte
 	var headerCount uint32
@@ -422,8 +422,8 @@ func (r *chaintracksRoutes) handleGetHeadersBinary(c *gin.Context) {
 
 // setHeightCache marks heights older than ~100 blocks as immutable for an hour
 // so CDNs can cache them; recent heights are marked no-cache because they may
-// still reorg. Matches the upstream Fiber handler behaviour.
-func (r *chaintracksRoutes) setHeightCache(c *gin.Context, height uint32, ctx context.Context) {
+// still reorg. Matches the upstream Fiber handler behavior.
+func (r *chaintracksRoutes) setHeightCache(ctx context.Context, c *gin.Context, height uint32) {
 	tip := r.cm.GetHeight(ctx)
 	if tip > 100 && height < tip-100 {
 		c.Header("Cache-Control", "public, max-age=3600")
@@ -528,6 +528,7 @@ type legacyResponse struct {
 func legacySuccess(value interface{}) legacyResponse {
 	return legacyResponse{Status: "success", Value: value}
 }
+
 func legacyError(code, description string) legacyResponse {
 	return legacyResponse{Status: "error", Code: code, Description: description}
 }
@@ -578,7 +579,7 @@ func (r *chaintracksRoutes) handleLegacyFindHeaderHexForHeight(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	r.setHeightCache(c, uint32(height), ctx)
+	r.setHeightCache(ctx, c, uint32(height))
 
 	header, err := r.cm.GetHeaderByHeight(ctx, uint32(height))
 	if err != nil {
@@ -605,7 +606,7 @@ func (r *chaintracksRoutes) handleLegacyFindHeaderHexForBlockHash(c *gin.Context
 		c.JSON(http.StatusNotFound, legacyError("ERR_NOT_FOUND", "Header not found for hash "+hashStr))
 		return
 	}
-	r.setHeightCache(c, header.Height, ctx)
+	r.setHeightCache(ctx, c, header.Height)
 	c.JSON(http.StatusOK, legacySuccess(header))
 }
 
@@ -627,7 +628,7 @@ func (r *chaintracksRoutes) handleLegacyGetHeaders(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	r.setHeightCache(c, uint32(height), ctx)
+	r.setHeightCache(ctx, c, uint32(height))
 
 	var data []byte
 	for i := uint32(0); i < uint32(count); i++ {

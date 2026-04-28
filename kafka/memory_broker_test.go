@@ -14,13 +14,13 @@ import (
 // test for standalone mode.
 func TestMemoryBroker_PublishSubscribe(t *testing.T) {
 	b := NewMemoryBroker(16)
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	sub, err := b.Subscribe("group-a", []string{"topic-x"})
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
-	defer sub.Close()
+	defer func() { _ = sub.Close() }()
 
 	received := make(chan *Message, 1)
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
@@ -62,7 +62,7 @@ func TestMemoryBroker_PublishSubscribe(t *testing.T) {
 // consumer-group semantics where each group is an independent consumer.
 func TestMemoryBroker_MultipleGroupsBroadcast(t *testing.T) {
 	b := NewMemoryBroker(16)
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	var aCount, bCount atomic.Int32
 	var wg sync.WaitGroup
@@ -114,7 +114,7 @@ func TestMemoryBroker_MultipleGroupsBroadcast(t *testing.T) {
 // a batch of messages is drained, not per-message.
 func TestMemoryBroker_ConsumerGroupDrainThenFlush(t *testing.T) {
 	b := NewMemoryBroker(16)
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	producer := NewProducer(b)
 	var processed atomic.Int32
@@ -124,11 +124,11 @@ func TestMemoryBroker_ConsumerGroupDrainThenFlush(t *testing.T) {
 		Broker:  b,
 		GroupID: "drain-test",
 		Topics:  []string{"drain"},
-		Handler: func(ctx context.Context, msg *Message) error {
+		Handler: func(_ context.Context, _ *Message) error {
 			processed.Add(1)
 			return nil
 		},
-		FlushFunc: func(ctx context.Context) error {
+		FlushFunc: func(_ context.Context) error {
 			flushes.Add(1)
 			return nil
 		},
@@ -141,7 +141,7 @@ func TestMemoryBroker_ConsumerGroupDrainThenFlush(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go cg.Run(ctx)
+	go func() { _ = cg.Run(ctx) }()
 	<-cg.Ready()
 
 	// Publish 5 messages in quick succession. Because the memory broker

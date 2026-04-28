@@ -201,10 +201,12 @@ func setupCoinbaseBlock(numSubtrees, subtreeSize int) (
 	coinbaseTxID chainhash.Hash,
 	trueBlockRoot chainhash.Hash,
 ) {
-	placeholder := chainhash.Hash{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+	placeholder := chainhash.Hash{
 		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+	}
 	coinbaseTxID = generateTxHashes(1)[0]
 
 	allLeaves = make([][]chainhash.Hash, numSubtrees)
@@ -232,7 +234,7 @@ func setupCoinbaseBlock(numSubtrees, subtreeSize int) (
 	}
 
 	trueBlockRoot = computeBlockMerkleRoot(trueAllLeaves)
-	return
+	return allLeaves, trueAllLeaves, subtreeHashes, coinbaseTxID, trueBlockRoot
 }
 
 // --- Sanity Tests for Helpers ---
@@ -1234,7 +1236,6 @@ func TestAssembleBUMP_NonPow2SubtreeCounts(t *testing.T) {
 		{"63subtrees_4txs", 63, 4},
 	}
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			allLeaves, subtreeHashes, blockRoot := multiSubtreeTestSetup(tc.numSubtrees, tc.subtreeSize)
 
@@ -1279,7 +1280,6 @@ func TestBuildCompoundBUMP_NonPow2SubtreeCounts(t *testing.T) {
 		{"63subtrees_4txs", 63, 4},
 	}
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			allLeaves, subtreeHashes, blockRoot := multiSubtreeTestSetup(tc.numSubtrees, tc.subtreeSize)
 
@@ -1355,11 +1355,11 @@ func TestBuildCompoundBUMP_39Subtrees_StructuralShape(t *testing.T) {
 	// and these duplicate-marker offsets. If this test ever starts failing,
 	// padAndComputeBlockLevel has regressed — inspect which level diverges.
 	want := []struct {
-		level    int
-		count    int
-		dupAt    []uint64 // offsets carrying Duplicate:true
-		minReal  uint64   // lowest real-hash offset
-		maxReal  uint64   // highest real-hash offset
+		level   int
+		count   int
+		dupAt   []uint64 // offsets carrying Duplicate:true
+		minReal uint64   // lowest real-hash offset
+		maxReal uint64   // highest real-hash offset
 	}{
 		{level: 0, count: 39 * 4, minReal: 0, maxReal: 39*4 - 1},
 		{level: 1, count: 39 * 2, minReal: 0, maxReal: 39*2 - 1},
@@ -1542,7 +1542,6 @@ func TestBuildCompoundBUMP_CoinbaseReplacement_OrderIndependence(t *testing.T) {
 	}
 
 	for _, order := range orderings {
-		order := order
 		t.Run(fmt.Sprintf("order_%v", order), func(t *testing.T) {
 			// Each run needs a fresh subtreeHashes copy — BuildCompoundBUMP
 			// mutates subtreeHashes[0] via the pre-correction step.
@@ -1595,7 +1594,6 @@ func TestBuildCompoundBUMP_CoinbaseReplacement_OrderIndependence(t *testing.T) {
 func TestComputeCorrectedSubtreeRoot_ReturnsRealRoot(t *testing.T) {
 	sizes := []int{2, 4, 8, 16, 32, 1024}
 	for _, size := range sizes {
-		size := size
 		t.Run(fmt.Sprintf("subtreeSize_%d", size), func(t *testing.T) {
 			allLeaves, trueAllLeaves, _, coinbaseTxID, _ := setupCoinbaseBlock(1, size)
 			stumpData := buildFullSTUMP(allLeaves[0], 0, 700000)

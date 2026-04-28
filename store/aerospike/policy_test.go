@@ -15,11 +15,11 @@ func TestRemaining(t *testing.T) {
 		}
 	})
 
-	t.Run("cancelled ctx returns zero", func(t *testing.T) {
+	t.Run("canceled ctx returns zero", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		if got := remaining(ctx, def); got != 0 {
-			t.Fatalf("want 0 for cancelled ctx, got %v", got)
+			t.Fatalf("want 0 for canceled ctx, got %v", got)
 		}
 	})
 
@@ -56,12 +56,12 @@ func TestPolicyBuilders(t *testing.T) {
 		socketTimeout: 5 * time.Second,
 	}
 
-	t.Run("queryPolicy cancelled ctx sets zero TotalTimeout", func(t *testing.T) {
+	t.Run("queryPolicy canceled ctx sets zero TotalTimeout", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		p := s.queryPolicy(ctx)
 		if p.TotalTimeout != 0 {
-			t.Fatalf("want 0 TotalTimeout for cancelled ctx, got %v", p.TotalTimeout)
+			t.Fatalf("want 0 TotalTimeout for canceled ctx, got %v", p.TotalTimeout)
 		}
 		if p.SocketTimeout != s.socketTimeout {
 			t.Fatalf("want SocketTimeout=%v, got %v", s.socketTimeout, p.SocketTimeout)

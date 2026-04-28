@@ -7,7 +7,7 @@
 //     filter on it cleanly.
 //   - Counters end in `_total`. Histograms end in `_seconds` (latency) or
 //     `_bytes` (sizes). Gauges end in a noun (e.g. `_depth`, `_count`).
-//   - Labels are kept low-cardinality. Endpoint URLs are labelled because the
+//   - Labels are kept low-cardinality. Endpoint URLs are labeled because the
 //     fleet is small (handful of datahubs); txids and Kafka offsets are
 //     never used as labels.
 //   - Buckets for latency histograms span 1ms..30s in coarse Fibonacci-ish

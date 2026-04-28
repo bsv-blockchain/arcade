@@ -9,13 +9,13 @@ import (
 	"strings"
 	"time"
 
+	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/teranode"
-	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 )
 
 // computeTxID returns the canonical Bitcoin transaction ID — little-endian

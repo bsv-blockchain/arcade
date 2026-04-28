@@ -132,7 +132,7 @@ func TestUpdateStatus_ClearsOldStatusIndex(t *testing.T) {
 	// Manually verify no ghost index entry by scanning RECEIVED index.
 	v, closer, err := s.db.Get(idxTxStatusKey(string(models.StatusReceived), txid))
 	if err == nil {
-		closer.Close()
+		_ = closer.Close()
 		t.Fatal("old status index entry was not cleaned up — ghost row risk")
 	}
 	_ = v
@@ -156,8 +156,8 @@ func TestPendingRetryLifecycle(t *testing.T) {
 		t.Fatalf("BumpRetryCount: n=%d err=%v", n, err)
 	}
 
-	if err := s.SetPendingRetryFields(ctx, txid, rawTx, nextRetry); err != nil {
-		t.Fatal(err)
+	if sErr := s.SetPendingRetryFields(ctx, txid, rawTx, nextRetry); sErr != nil {
+		t.Fatal(sErr)
 	}
 
 	ready, err := s.GetReadyRetries(ctx, time.Now(), 10)
@@ -171,8 +171,8 @@ func TestPendingRetryLifecycle(t *testing.T) {
 		t.Fatalf("expected RetryCount=1, got %d", ready[0].RetryCount)
 	}
 
-	if err := s.ClearRetryState(ctx, txid, models.StatusRejected, "final"); err != nil {
-		t.Fatal(err)
+	if cErr := s.ClearRetryState(ctx, txid, models.StatusRejected, "final"); cErr != nil {
+		t.Fatal(cErr)
 	}
 	ready, err = s.GetReadyRetries(ctx, time.Now(), 10)
 	if err != nil {

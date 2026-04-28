@@ -20,7 +20,7 @@ func TestRegister(t *testing.T) {
 		gotPath = r.URL.Path
 		gotAuth = r.Header.Get("Authorization")
 		body, _ := io.ReadAll(r.Body)
-		json.Unmarshal(body, &gotBody)
+		_ = json.Unmarshal(body, &gotBody)
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
@@ -45,7 +45,7 @@ func TestRegister(t *testing.T) {
 }
 
 func TestRegister_Error(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer server.Close()
@@ -59,7 +59,7 @@ func TestRegister_Error(t *testing.T) {
 
 func TestRegisterBatch_AllSucceed(t *testing.T) {
 	var count atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		count.Add(1)
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -108,7 +108,7 @@ func TestRegisterBatch_ConcurrencyBounded(t *testing.T) {
 	var concurrent atomic.Int32
 	var maxConcurrent atomic.Int32
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		cur := concurrent.Add(1)
 		for {
 			old := maxConcurrent.Load()

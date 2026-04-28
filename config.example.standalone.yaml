@@ -43,7 +43,7 @@ store:
     path: ~/.arcade/pebble
     memtable_size_mb: 64
     l0_compaction_threshold: 4
-    sync_writes: false       # flushed on shutdown; leave off for throughput
+    sync_writes: false # flushed on shutdown; leave off for throughput
 
 # Alternative: embedded PostgreSQL (SQL surface for migration/query testing).
 # Uncomment to use instead of Pebble — first run extracts the postgres binary

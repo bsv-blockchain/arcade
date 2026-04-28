@@ -95,7 +95,7 @@ func assembleFullPath(stumpData []byte, subtreeIndex int, subtreeHashes []chainh
 
 	for level := 0; level < internalHeight; level++ {
 		for _, elem := range stumpPath.Path[level] {
-			addLeaf(fullPath,level, elem)
+			addLeaf(fullPath, level, elem)
 		}
 	}
 
@@ -105,7 +105,7 @@ func assembleFullPath(stumpData []byte, subtreeIndex int, subtreeHashes []chainh
 			continue // our subtree root will be computed from STUMP leaves
 		}
 		hashCopy := subHash
-		addLeaf(fullPath,internalHeight, &transaction.PathElement{
+		addLeaf(fullPath, internalHeight, &transaction.PathElement{
 			Offset: uint64(i),
 			Hash:   &hashCopy,
 		})
@@ -200,7 +200,7 @@ func applyCoinbaseToSTUMP(stumpPath *transaction.MerklePath, coinbaseTxID *chain
 				break
 			}
 		}
-		sibling := findLeafByOffset(cbPath,level, 1)
+		sibling := findLeafByOffset(cbPath, level, 1)
 		if sibling == nil || sibling.Hash == nil {
 			break
 		}
@@ -242,12 +242,12 @@ func ExtractMinimalPath(fullPath *transaction.MerklePath, txOffset uint64) *tran
 	offset := txOffset
 	for level := 0; level < len(fullPath.Path); level++ {
 		if level == 0 {
-			if leaf := findLeafByOffset(fullPath,level, offset); leaf != nil {
-				addLeaf(mp,level, leaf)
+			if leaf := findLeafByOffset(fullPath, level, offset); leaf != nil {
+				addLeaf(mp, level, leaf)
 			}
 		}
-		if sibling := findLeafByOffset(fullPath,level, offset^1); sibling != nil {
-			addLeaf(mp,level, sibling)
+		if sibling := findLeafByOffset(fullPath, level, offset^1); sibling != nil {
+			addLeaf(mp, level, sibling)
 		}
 		offset = offset >> 1
 	}
@@ -404,7 +404,7 @@ func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, c
 					continue
 				}
 				seen[k] = true
-				addLeaf(compound,level, elem)
+				addLeaf(compound, level, elem)
 			}
 		}
 	}

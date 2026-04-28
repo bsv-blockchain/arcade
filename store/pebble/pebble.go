@@ -22,9 +22,9 @@ import (
 	"sync"
 	"time"
 
-	pebbledb "github.com/cockroachdb/pebble"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
+	pebbledb "github.com/cockroachdb/pebble"
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/models"
@@ -37,16 +37,18 @@ import (
 // contention cheap.
 const getOrInsertShards = 64
 
-var _ store.Store = (*Store)(nil)
-var _ store.Leaser = (*Store)(nil)
+var (
+	_ store.Store  = (*Store)(nil)
+	_ store.Leaser = (*Store)(nil)
+)
 
 // Store is a Pebble-backed implementation of store.Store and store.Leaser.
 type Store struct {
-	db         *pebbledb.DB
-	writeOpts  *pebbledb.WriteOptions
-	cfg        config.Pebble
-	insertMu   [getOrInsertShards]sync.Mutex
-	leaseMu    sync.Mutex
+	db        *pebbledb.DB
+	writeOpts *pebbledb.WriteOptions
+	cfg       config.Pebble
+	insertMu  [getOrInsertShards]sync.Mutex
+	leaseMu   sync.Mutex
 }
 
 // storedStatus is the persistence shape for TransactionStatus rows. We keep
@@ -152,8 +154,8 @@ func (s storedSubmission) toModel() *models.Submission {
 }
 
 type storedLease struct {
-	Holder          string `json:"holder"`
-	ExpiresUnixNs   int64  `json:"expires_at"`
+	Holder        string `json:"holder"`
+	ExpiresUnixNs int64  `json:"expires_at"`
 }
 
 type storedBump struct {
@@ -162,9 +164,9 @@ type storedBump struct {
 }
 
 type storedDatahubEndpoint struct {
-	URL              string `json:"url"`
-	Source           string `json:"source"`
-	LastSeenUnixNs   int64  `json:"last_seen"`
+	URL            string `json:"url"`
+	Source         string `json:"source"`
+	LastSeenUnixNs int64  `json:"last_seen"`
 }
 
 // New opens a Pebble database at cfg.Path and returns a Store ready to use.
@@ -219,7 +221,7 @@ func (s *Store) GetOrInsertStatus(ctx context.Context, status *models.Transactio
 		return nil, false, err
 	}
 
-	// Serialise per-txid so concurrent callers don't both see "not found"
+	// Serialize per-txid so concurrent callers don't both see "not found"
 	// and both insert. Pebble has no CAS, so the mutex is our ordering.
 	mu := s.shardFor(status.TxID)
 	mu.Lock()
@@ -254,7 +256,7 @@ func (s *Store) readStatus(txid string) (*models.TransactionStatus, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get tx %s: %w", txid, err)
 	}
-	defer closer.Close()
+	defer func() { _ = closer.Close() }()
 	var st storedStatus
 	if err := json.Unmarshal(v, &st); err != nil {
 		return nil, fmt.Errorf("unmarshal tx %s: %w", txid, err)
@@ -272,7 +274,7 @@ func (s *Store) writeStatusNew(status *models.TransactionStatus) error {
 	}
 
 	b := s.db.NewBatch()
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	if err := b.Set(txKey(status.TxID), payload, nil); err != nil {
 		return err
@@ -349,7 +351,7 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 	}
 
 	b := s.db.NewBatch()
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 	if existing != nil {
 		s.removeStatusIndexes(b, *existing)
 	}
@@ -416,7 +418,7 @@ func (s *Store) readStoredStatus(txid string) (*storedStatus, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get tx %s: %w", txid, err)
 	}
-	defer closer.Close()
+	defer func() { _ = closer.Close() }()
 	var st storedStatus
 	if err := json.Unmarshal(v, &st); err != nil {
 		return nil, fmt.Errorf("unmarshal tx %s: %w", txid, err)
@@ -455,7 +457,7 @@ func (s *Store) GetStatusesSince(ctx context.Context, since time.Time) ([]*model
 	if err != nil {
 		return nil, err
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 
 	var results []*models.TransactionStatus
 	sinceNs := since.UnixNano()
@@ -495,7 +497,7 @@ func (s *Store) SetStatusByBlockHash(ctx context.Context, blockHash string, newS
 	var txids []string
 	for iter.First(); iter.Valid(); iter.Next() {
 		if err := ctx.Err(); err != nil {
-			iter.Close()
+			_ = iter.Close()
 			return txids, err
 		}
 		txids = append(txids, lastSegment(iter.Key()))
@@ -531,14 +533,14 @@ func (s *Store) SetStatusByBlockHash(ctx context.Context, blockHash string, newS
 
 		b := s.db.NewBatch()
 		s.removeStatusIndexes(b, *existing)
-		if err := b.Set(txKey(txid), payload, nil); err != nil {
-			b.Close()
+		if setErr := b.Set(txKey(txid), payload, nil); setErr != nil {
+			_ = b.Close()
 			mu.Unlock()
-			return txids, err
+			return txids, setErr
 		}
 		s.addStatusIndexes(b, updated)
 		err = b.Commit(s.writeOpts)
-		b.Close()
+		_ = b.Close()
 		mu.Unlock()
 		if err != nil {
 			return txids, err
@@ -604,7 +606,7 @@ func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []
 	}
 
 	b := s.db.NewBatch()
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 	s.removeStatusIndexes(b, *existing)
 	if err := b.Set(txKey(txid), payload, nil); err != nil {
 		return err
@@ -625,7 +627,7 @@ func (s *Store) GetReadyRetries(ctx context.Context, now time.Time, limit int) (
 	}
 
 	snap := s.db.NewSnapshot()
-	defer snap.Close()
+	defer func() { _ = snap.Close() }()
 
 	prefix := idxTxRetryReadyPrefix()
 	iter, err := snap.NewIter(&pebbledb.IterOptions{
@@ -635,7 +637,7 @@ func (s *Store) GetReadyRetries(ctx context.Context, now time.Time, limit int) (
 	if err != nil {
 		return nil, err
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 
 	nowNs := now.UnixNano()
 	results := make([]*store.PendingRetry, 0, limit)
@@ -669,10 +671,10 @@ func (s *Store) GetReadyRetries(ctx context.Context, now time.Time, limit int) (
 		}
 		var st storedStatus
 		if err := json.Unmarshal(v, &st); err != nil {
-			closer.Close()
+			_ = closer.Close()
 			return results, err
 		}
-		closer.Close()
+		_ = closer.Close()
 		if len(st.RawTx) == 0 {
 			continue
 		}
@@ -717,7 +719,7 @@ func (s *Store) ClearRetryState(ctx context.Context, txid string, finalStatus mo
 	}
 
 	b := s.db.NewBatch()
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 	s.removeStatusIndexes(b, *existing)
 	if err := b.Set(txKey(txid), payload, nil); err != nil {
 		return err
@@ -764,14 +766,14 @@ func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, txids []s
 
 		b := s.db.NewBatch()
 		s.removeStatusIndexes(b, *existing)
-		if err := b.Set(txKey(txid), payload, nil); err != nil {
-			b.Close()
+		if setErr := b.Set(txKey(txid), payload, nil); setErr != nil {
+			_ = b.Close()
 			mu.Unlock()
-			return out, err
+			return out, setErr
 		}
 		s.addStatusIndexes(b, updated)
 		err = b.Commit(s.writeOpts)
-		b.Close()
+		_ = b.Close()
 		mu.Unlock()
 		if err != nil {
 			return out, err
@@ -811,7 +813,7 @@ func (s *Store) GetBUMP(ctx context.Context, blockHash string) (uint64, []byte, 
 	if err != nil {
 		return 0, nil, fmt.Errorf("get bump %s: %w", blockHash, err)
 	}
-	defer closer.Close()
+	defer func() { _ = closer.Close() }()
 	var b storedBump
 	if err := json.Unmarshal(v, &b); err != nil {
 		return 0, nil, err
@@ -828,7 +830,7 @@ func (s *Store) InsertStump(ctx context.Context, stump *models.Stump) error {
 		return err
 	}
 	b := s.db.NewBatch()
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 	if err := b.Set(stumpKey(stump.BlockHash, stump.SubtreeIndex), payload, nil); err != nil {
 		return err
 	}
@@ -850,7 +852,7 @@ func (s *Store) GetStumpsByBlockHash(ctx context.Context, blockHash string) ([]*
 	if err != nil {
 		return nil, err
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 
 	var stumps []*models.Stump
 	for iter.First(); iter.Valid(); iter.Next() {
@@ -892,7 +894,7 @@ func (s *Store) DeleteStumpsByBlockHash(ctx context.Context, blockHash string) e
 	}
 
 	b := s.db.NewBatch()
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 	for _, st := range toDelete {
 		_ = b.Delete(stumpKey(st.BlockHash, st.SubtreeIndex), nil)
 		_ = b.Delete(idxStumpBlockKey(st.BlockHash, st.SubtreeIndex), nil)
@@ -925,7 +927,7 @@ func (s *Store) InsertSubmission(ctx context.Context, sub *models.Submission) er
 		return err
 	}
 	b := s.db.NewBatch()
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 	if err := b.Set(subKey(sub.SubmissionID), payload, nil); err != nil {
 		return err
 	}
@@ -957,7 +959,7 @@ func (s *Store) submissionsByIndex(ctx context.Context, prefix []byte) ([]*model
 	if err != nil {
 		return nil, err
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 
 	var subs []*models.Submission
 	for iter.First(); iter.Valid(); iter.Next() {
@@ -974,10 +976,10 @@ func (s *Store) submissionsByIndex(ctx context.Context, prefix []byte) ([]*model
 		}
 		var ss storedSubmission
 		if err := json.Unmarshal(v, &ss); err != nil {
-			closer.Close()
+			_ = closer.Close()
 			continue
 		}
-		closer.Close()
+		_ = closer.Close()
 		subs = append(subs, ss.toModel())
 	}
 	return subs, nil
@@ -995,11 +997,11 @@ func (s *Store) UpdateDeliveryStatus(ctx context.Context, submissionID string, l
 		return err
 	}
 	var ss storedSubmission
-	if err := json.Unmarshal(v, &ss); err != nil {
-		closer.Close()
-		return err
+	if uErr := json.Unmarshal(v, &ss); uErr != nil {
+		_ = closer.Close()
+		return uErr
 	}
-	closer.Close()
+	_ = closer.Close()
 
 	ss.LastDeliveredStatus = string(lastStatus)
 	ss.RetryCount = retryCount
@@ -1039,12 +1041,12 @@ func (s *Store) TryAcquireOrRenew(ctx context.Context, name, holder string, ttl 
 	if err == nil {
 		var cur storedLease
 		if jerr := json.Unmarshal(v, &cur); jerr == nil {
-			closer.Close()
+			_ = closer.Close()
 			if cur.Holder != holder && cur.ExpiresUnixNs > now.UnixNano() {
 				return time.Time{}, nil
 			}
 		} else {
-			closer.Close()
+			_ = closer.Close()
 		}
 	}
 
@@ -1074,12 +1076,12 @@ func (s *Store) Release(ctx context.Context, name, holder string) error {
 	}
 	var cur storedLease
 	if jerr := json.Unmarshal(v, &cur); jerr == nil {
-		closer.Close()
+		_ = closer.Close()
 		if cur.Holder != holder {
 			return nil
 		}
 	} else {
-		closer.Close()
+		_ = closer.Close()
 	}
 	return s.db.Delete(leaseKey(name), s.writeOpts)
 }
@@ -1119,7 +1121,7 @@ func (s *Store) ListDatahubEndpoints(ctx context.Context) ([]store.DatahubEndpoi
 	if err != nil {
 		return nil, err
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 
 	var out []store.DatahubEndpoint
 	for iter.First(); iter.Valid(); iter.Next() {
@@ -1210,4 +1212,3 @@ func extractMinimalPathForTx(bumpData []byte, txid string) []byte {
 	}
 	return mp.Bytes()
 }
-
