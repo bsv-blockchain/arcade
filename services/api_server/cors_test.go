@@ -1,6 +1,7 @@
 package api_server
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -16,7 +17,7 @@ func TestWithCORS_PreflightShortCircuits(t *testing.T) {
 	srv := httptest.NewServer(withCORS(router))
 	defer srv.Close()
 
-	req, err := http.NewRequest(http.MethodOptions, srv.URL+"/tx", nil)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodOptions, srv.URL+"/tx", nil)
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
@@ -28,7 +29,7 @@ func TestWithCORS_PreflightShortCircuits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("do: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("preflight status = %d, want 204", resp.StatusCode)
@@ -52,11 +53,15 @@ func TestWithCORS_HeadersOnActualRequest(t *testing.T) {
 	srv := httptest.NewServer(withCORS(router))
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/health")
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/health", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
