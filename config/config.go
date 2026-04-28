@@ -108,6 +108,7 @@ type Config struct {
 	Propagation   PropagationConfig   `mapstructure:"propagation"`
 	TxValidator   TxValidatorConfig   `mapstructure:"tx_validator"`
 	BumpBuilder   BumpBuilderConfig   `mapstructure:"bump_builder"`
+	Webhook       WebhookConfig       `mapstructure:"webhook"`
 	// ChaintracksServer gates whether the embedded go-chaintracks HTTP API
 	// runs alongside api-server. Default is on so the refactor is a drop-in
 	// replacement for the original single-binary arcade.
@@ -277,6 +278,29 @@ type BumpBuilderConfig struct {
 	GraceWindowMs int `mapstructure:"grace_window_ms"`
 }
 
+// WebhookConfig tunes the HTTP webhook delivery service. The service
+// subscribes to status updates and POSTs them to each submission's
+// CallbackURL; failures are retried with exponential backoff persisted via
+// the store's UpdateDeliveryStatus.
+type WebhookConfig struct {
+	// MaxRetries caps how many times a failed POST is re-attempted before
+	// the submission is given up on. Mirrors arc's default of 10.
+	MaxRetries int `mapstructure:"max_retries"`
+	// ExpirationMinutes bounds the total wall-clock lifetime of a webhook
+	// delivery. Past this point the service stops retrying even if
+	// MaxRetries hasn't been hit. Defaults to 24 hours.
+	ExpirationMinutes int `mapstructure:"expiration_minutes"`
+	// InitialBackoffMs is the first retry delay; subsequent retries double
+	// it (capped). Defaults to 5s, matching arc.
+	InitialBackoffMs int `mapstructure:"initial_backoff_ms"`
+	// MaxBackoffMs caps how long backoff can grow between retries. Default
+	// 5 minutes.
+	MaxBackoffMs int `mapstructure:"max_backoff_ms"`
+	// HTTPTimeoutMs caps how long a single POST attempt may run. Default
+	// 10s — webhook receivers should ack fast or risk being timed out.
+	HTTPTimeoutMs int `mapstructure:"http_timeout_ms"`
+}
+
 // TxValidatorConfig tunes the parallel batch validation pipeline. Parallelism
 // caps how many transactions are parsed and validated concurrently inside a
 // single flush window — bounded so a huge in-flight batch can't open more
@@ -408,6 +432,12 @@ func setDefaults() {
 	viper.SetDefault("p2p.dht_mode", "off")
 	viper.SetDefault("p2p.enable_mdns", false)
 	viper.SetDefault("p2p.allow_private_urls", false)
+
+	viper.SetDefault("webhook.max_retries", 10)
+	viper.SetDefault("webhook.expiration_minutes", 60*24)
+	viper.SetDefault("webhook.initial_backoff_ms", 5000)
+	viper.SetDefault("webhook.max_backoff_ms", 300000)
+	viper.SetDefault("webhook.http_timeout_ms", 10000)
 
 	viper.SetDefault("storage_path", "~/.arcade")
 	viper.SetDefault("chaintracks_server.enabled", true)

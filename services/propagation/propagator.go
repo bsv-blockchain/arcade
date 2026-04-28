@@ -15,6 +15,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/events"
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/metrics"
@@ -41,6 +42,7 @@ type Propagator struct {
 	cfg            *config.Config
 	logger         *zap.Logger
 	producer       *kafka.Producer
+	publisher      events.Publisher // nil-safe; broadcasts post-broadcast status updates to SSE/webhooks
 	store          store.Store
 	leaser         store.Leaser
 	teranodeClient *teranode.Client
@@ -63,7 +65,7 @@ type Propagator struct {
 // runs unguarded — appropriate for tests and single-process deployments that
 // don't need coordination. In production every replica should receive a
 // non-nil Leaser so only one reaper is active at a time across the cluster.
-func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, st store.Store, leaser store.Leaser, tc *teranode.Client, mc *merkleservice.Client) *Propagator {
+func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publisher events.Publisher, st store.Store, leaser store.Leaser, tc *teranode.Client, mc *merkleservice.Client) *Propagator {
 	merkleConcurrency := cfg.Propagation.MerkleConcurrency
 	if merkleConcurrency <= 0 {
 		merkleConcurrency = 10
@@ -99,6 +101,7 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, st st
 		cfg:               cfg,
 		logger:            logger.Named("propagation"),
 		producer:          producer,
+		publisher:         publisher,
 		store:             st,
 		leaser:            leaser,
 		teranodeClient:    tc,
@@ -131,6 +134,22 @@ func newHolderID() string {
 }
 
 func (p *Propagator) Name() string { return "propagation" }
+
+// publishStatus fans a post-broadcast status update onto the events
+// Publisher. Non-fatal: the durable store row is already written, and SSE
+// catchup recovers any dropped events.
+func (p *Propagator) publishStatus(ctx context.Context, status *models.TransactionStatus) {
+	if p.publisher == nil || status == nil {
+		return
+	}
+	if err := p.publisher.Publish(ctx, status); err != nil {
+		p.logger.Warn("failed to publish status update",
+			zap.String("txid", status.TxID),
+			zap.String("status", string(status.Status)),
+			zap.Error(err),
+		)
+	}
+}
 
 func (p *Propagator) Start(ctx context.Context) error {
 	consumer, err := kafka.NewConsumerGroup(kafka.ConsumerConfig{
@@ -300,7 +319,9 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) e
 				zap.String("txid", batch[i].TXID),
 				zap.Error(err),
 			)
+			continue
 		}
+		p.publishStatus(ctx, res.status)
 	}
 	metrics.PropagationOutcomeTotal.WithLabelValues("accepted").Add(float64(accepted))
 	metrics.PropagationOutcomeTotal.WithLabelValues("rejected").Add(float64(rejected))

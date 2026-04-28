@@ -7,11 +7,18 @@ const (
 	TopicBlockProcessed = "arcade.block_processed"
 	TopicTransaction    = "arcade.transaction"
 	TopicPropagation    = "arcade.propagation"
+	// TopicStatusUpdate carries transaction status mutations from every
+	// service that writes to the store (validator, propagation, bump-builder,
+	// api-server). It exists so the api-server SSE handler and webhook
+	// service can fan out updates to clients without depending on which pod
+	// the mutation originated from.
+	TopicStatusUpdate = "arcade.tx_status"
 
 	// Dead-letter queue topics
 	TopicBlockProcessedDLQ = "arcade.block_processed.dlq"
 	TopicTransactionDLQ    = "arcade.transaction.dlq"
 	TopicPropagationDLQ    = "arcade.propagation.dlq"
+	TopicStatusUpdateDLQ   = "arcade.tx_status.dlq"
 )
 
 // AllTopics returns all primary topics created/managed by arcade.
@@ -20,6 +27,7 @@ func AllTopics() []string {
 		TopicBlockProcessed,
 		TopicTransaction,
 		TopicPropagation,
+		TopicStatusUpdate,
 	}
 }
 

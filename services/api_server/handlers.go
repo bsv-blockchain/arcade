@@ -1,6 +1,8 @@
 package api_server
 
 import (
+	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"html/template"
@@ -17,6 +19,89 @@ import (
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/teranode"
 )
+
+// submitOptions captures the callback subscription preferences a client
+// expressed via the X-CallbackUrl / X-CallbackToken / X-FullStatusUpdates
+// request headers. Empty when the client did not subscribe.
+type submitOptions struct {
+	CallbackURL       string
+	CallbackToken     string
+	FullStatusUpdates bool
+}
+
+// extractSubmitOptions reads the callback-subscription headers off a submit
+// request. Mirrors the old arcade's header contract so existing clients (and
+// the SSE catchup token filter) keep working unchanged.
+func extractSubmitOptions(c *gin.Context) submitOptions {
+	return submitOptions{
+		CallbackURL:       c.GetHeader("X-CallbackUrl"),
+		CallbackToken:     c.GetHeader("X-CallbackToken"),
+		FullStatusUpdates: c.GetHeader("X-FullStatusUpdates") == "true",
+	}
+}
+
+// hasSubscription reports whether the request asked for callback / SSE
+// notifications. Either a URL or a token is enough — token-only clients use
+// the SSE endpoint with no webhook delivery, URL-only clients get webhooks
+// without SSE filtering.
+func (o submitOptions) hasSubscription() bool {
+	return o.CallbackURL != "" || o.CallbackToken != ""
+}
+
+// recordSubmission persists a callback registration for txid. Best-effort:
+// failures are logged and don't fail the submit, since the tx itself is
+// already on Kafka and clients can re-submit if needed.
+func (s *Server) recordSubmission(ctx context.Context, txid string, opts submitOptions) {
+	if !opts.hasSubscription() {
+		return
+	}
+	id, err := newSubmissionID()
+	if err != nil {
+		s.logger.Warn("could not generate submission id", zap.Error(err))
+		return
+	}
+	sub := &models.Submission{
+		SubmissionID:      id,
+		TxID:              txid,
+		CallbackURL:       opts.CallbackURL,
+		CallbackToken:     opts.CallbackToken,
+		FullStatusUpdates: opts.FullStatusUpdates,
+		CreatedAt:         time.Now(),
+	}
+	if err := s.store.InsertSubmission(ctx, sub); err != nil {
+		s.logger.Warn("failed to insert submission",
+			zap.String("txid", txid),
+			zap.Error(err),
+		)
+	}
+}
+
+// newSubmissionID returns a 16-byte random hex identifier. Globally unique
+// per call without coordinating across pods.
+func newSubmissionID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+// publishStatus fans a status update out via the configured Publisher. The
+// Publisher is nil in unit tests and degraded deployments; in those cases
+// the status mutation is still durable in the store and SSE catchup will
+// recover it on reconnect, so this helper is intentionally non-fatal.
+func (s *Server) publishStatus(ctx context.Context, status *models.TransactionStatus) {
+	if s.publisher == nil || status == nil {
+		return
+	}
+	if err := s.publisher.Publish(ctx, status); err != nil {
+		s.logger.Warn("failed to publish status update",
+			zap.String("txid", status.TxID),
+			zap.String("status", string(status.Status)),
+			zap.Error(err),
+		)
+	}
+}
 
 // computeTxID returns the canonical Bitcoin transaction ID — little-endian
 // reversed double-SHA256 of the raw serialized transaction — as lowercase hex.
@@ -189,6 +274,7 @@ func (s *Server) handleSeenOnNetwork(c *gin.Context, msg models.CallbackMessage,
 		if s.txTracker != nil {
 			s.txTracker.UpdateStatus(txid, models.StatusSeenOnNetwork)
 		}
+		s.publishStatus(ctx, status)
 	}
 }
 
@@ -213,6 +299,7 @@ func (s *Server) handleSeenMultipleNodes(c *gin.Context, msg models.CallbackMess
 		if s.txTracker != nil {
 			s.txTracker.UpdateStatus(txid, models.StatusSeenMultipleNodes)
 		}
+		s.publishStatus(ctx, status)
 	}
 }
 
@@ -345,6 +432,15 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// encoding/json) so the validator and propagator never hex-decode the body
 	// and re-encode it downstream.
 	txid := computeTxID(rawTx)
+
+	// Record the subscription BEFORE publishing to Kafka so the validator's
+	// RECEIVED status (and any subsequent updates) can find a matching
+	// submission row when the webhook service / SSE catchup queries by
+	// txid or callbackToken. A late InsertSubmission would race with the
+	// validator and risk silently dropping the first few status events for
+	// fast-path transactions.
+	s.recordSubmission(c.Request.Context(), txid, extractSubmitOptions(c))
+
 	msg := map[string]interface{}{
 		"action": "submit",
 		"raw_tx": rawTx,
@@ -409,6 +505,17 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	if len(msgs) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no transactions parsed"})
 		return
+	}
+
+	// Record one submission per parsed txid before the batch publish so the
+	// downstream services can resolve callback preferences as soon as
+	// status updates start flowing back.
+	opts := extractSubmitOptions(c)
+	if opts.hasSubscription() {
+		ctx := c.Request.Context()
+		for _, m := range msgs {
+			s.recordSubmission(ctx, m.Key, opts)
+		}
 	}
 
 	// Phase 2: Batch publish all parsed transactions in one call

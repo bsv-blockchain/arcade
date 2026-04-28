@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/events"
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/store"
@@ -24,19 +25,22 @@ type Server struct {
 	cfg         *config.Config
 	logger      *zap.Logger
 	producer    *kafka.Producer
+	publisher   events.Publisher // nil-safe; used to fan status updates out to SSE / webhooks
 	store       store.Store
 	txTracker   *store.TxTracker
 	teranode    *teranode.Client // used by /health for datahub URL inventory; nil in tests
 	server      *http.Server
 	chaintracks chaintracks.Chaintracks // nil when disabled
 	ctRoutes    *chaintracksRoutes      // nil when disabled
+	sse         *sseManager             // nil when no publisher is configured
 }
 
-func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, st store.Store, tracker *store.TxTracker, tc *teranode.Client) *Server {
+func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publisher events.Publisher, st store.Store, tracker *store.TxTracker, tc *teranode.Client) *Server {
 	return &Server{
 		cfg:       cfg,
 		logger:    logger.Named("api-server"),
 		producer:  producer,
+		publisher: publisher,
 		store:     st,
 		txTracker: tracker,
 		teranode:  tc,
@@ -52,6 +56,15 @@ func (s *Server) Start(ctx context.Context) error {
 		return fmt.Errorf("initializing chaintracks: %w", err)
 	}
 
+	// Boot the SSE fan-out manager BEFORE registering routes so /events has
+	// a live subscription to attach clients to. nil when no Publisher was
+	// supplied — the handler returns 503 in that case.
+	sse, err := newSSEManager(ctx, s.publisher, s.store, s.logger)
+	if err != nil {
+		return fmt.Errorf("initializing SSE manager: %w", err)
+	}
+	s.sse = sse
+
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
 	router.Use(gin.CustomRecovery(s.recoverPanic))
@@ -62,7 +75,7 @@ func (s *Server) Start(ctx context.Context) error {
 	addr := fmt.Sprintf("%s:%d", s.cfg.APIServer.Host, s.cfg.APIServer.Port)
 	s.server = &http.Server{
 		Addr:              addr,
-		Handler:           router,
+		Handler:           withCORS(router),
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 
