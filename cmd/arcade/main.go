@@ -1,252 +1,269 @@
-// Arcade API Server
-//
-// Transaction broadcast and status tracking service for BSV.
-//
-//	@title			Arcade API
-//	@version		0.1.0
-//	@description	BSV transaction broadcast service with ARC-compatible endpoints.
-//
-//	@contact.name	BSV Blockchain
-//	@contact.url	https://github.com/bsv-blockchain/arcade
-//
-//	@license.name	Open BSV License
-//	@license.url	https://github.com/bsv-blockchain/arcade/blob/main/LICENSE
-//
-//	@host
-//	@BasePath	/
-//
-//	@securityDefinitions.apikey	BearerAuth
-//	@in							header
-//	@name						Authorization
-//	@description				Bearer token authentication
 package main
 
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
-	chaintracksRoutes "github.com/bsv-blockchain/go-chaintracks/routes/fiber"
-	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/middleware/cors"
-	fiberlogger "github.com/gofiber/fiber/v2/middleware/logger"
-	"github.com/gofiber/fiber/v2/middleware/recover"
+	"github.com/spf13/cobra"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 
 	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/docs"
-	"github.com/bsv-blockchain/arcade/logging"
-	fiberRoutes "github.com/bsv-blockchain/arcade/routes/fiber"
+	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/arcade/merkleservice"
+	"github.com/bsv-blockchain/arcade/services"
+	"github.com/bsv-blockchain/arcade/services/api_server"
+	"github.com/bsv-blockchain/arcade/services/bump_builder"
+	"github.com/bsv-blockchain/arcade/services/p2p_client"
+	"github.com/bsv-blockchain/arcade/services/propagation"
+	"github.com/bsv-blockchain/arcade/services/tx_validator"
+	"github.com/bsv-blockchain/arcade/store"
+	storefactory "github.com/bsv-blockchain/arcade/store/factory"
+	"github.com/bsv-blockchain/arcade/teranode"
+	"github.com/bsv-blockchain/arcade/validator"
 )
 
-const scalarHTML = `<!DOCTYPE html>
-<html>
-<head>
-  <title>Arcade API</title>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-</head>
-<body>
-  <script id="api-reference" data-url="/docs/openapi.json"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
-</body>
-</html>`
-
 func main() {
-	// Load config first to get log level
-	cfg, err := Load()
-	if err != nil {
-		slog.Error("Failed to load configuration", slog.String("error", err.Error()))
-		os.Exit(1)
+	rootCmd := &cobra.Command{
+		Use:   "arcade",
+		Short: "Arcade transaction management service",
+		RunE:  run,
 	}
 
-	// Create logger with configured level
-	log := logging.NewLogger(cfg.GetLogLevel())
+	config.BindFlags(rootCmd)
 
-	log.Info("Starting Arcade", slog.String("version", "0.1.0"), slog.String("log_level", cfg.GetLogLevel()))
+	if err := rootCmd.Execute(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run(cmd *cobra.Command, _ []string) error {
+	cfg, err := config.Load(cmd)
+	if err != nil {
+		return fmt.Errorf("loading config: %w", err)
+	}
+
+	logger := newLogger(cfg.LogLevel)
+	defer logger.Sync()
+
+	logger.Info("starting arcade",
+		zap.String("mode", cfg.Mode),
+		zap.String("kafka_backend", cfg.Kafka.Backend),
+		zap.String("store_backend", cfg.Store.Backend),
+	)
+
+	broker, err := kafka.NewBroker(cfg.Kafka)
+	if err != nil {
+		return fmt.Errorf("creating kafka broker: %w", err)
+	}
+	producer := kafka.NewProducer(broker)
+	defer producer.Close()
+
+	// Validate that the hot-path topics have enough partitions for the
+	// deployment. min_partitions is operator-supplied — leave unset (0/1) in
+	// standalone or single-replica deployments; set to the expected replica
+	// count in K8s. Fails fast on misconfigured horizontally-scaled topics so
+	// the error surfaces before live traffic arrives.
+	if cfg.Kafka.MinPartitions > 1 {
+		if err := kafka.CheckPartitions(broker, []string{kafka.TopicTransaction, kafka.TopicPropagation}, cfg.Kafka.MinPartitions, logger); err != nil {
+			return fmt.Errorf("kafka partition check: %w", err)
+		}
+	}
+
+	st, leaser, err := storefactory.New(cfg)
+	if err != nil {
+		return fmt.Errorf("creating store: %w", err)
+	}
+	defer st.Close()
+	if err := st.EnsureIndexes(); err != nil {
+		return fmt.Errorf("ensuring store indexes: %w", err)
+	}
+
+	// Create shared components
+	txTracker := store.NewTxTracker()
+
+	teranodeClient := teranode.NewClient(cfg.DatahubURLs, cfg.Teranode.AuthToken, teranode.HealthConfig{
+		FailureThreshold:    cfg.Propagation.EndpointHealth.FailureThreshold,
+		ProbeInterval:       time.Duration(cfg.Propagation.EndpointHealth.ProbeIntervalMs) * time.Millisecond,
+		ProbeTimeout:        time.Duration(cfg.Propagation.EndpointHealth.ProbeTimeoutMs) * time.Millisecond,
+		MinHealthyEndpoints: cfg.Propagation.EndpointHealth.MinHealthyEndpoints,
+		RefreshInterval:     time.Duration(cfg.Propagation.EndpointHealth.RefreshIntervalMs) * time.Millisecond,
+		Source:              endpointSource{st: st},
+		Logger:              logger,
+	})
+	defer teranodeClient.Close()
+
+	// Seed the registry with statically configured URLs so a freshly started
+	// pod (especially mode=p2p-client which has no static list of its own to
+	// broadcast against) always sees them via the same discovery path. The
+	// upsert is idempotent and refreshes LastSeen on every restart, so this
+	// also works as a heartbeat for the operator-defined seed list.
+	if len(cfg.DatahubURLs) > 0 {
+		seedCtx, seedCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		for _, url := range cfg.DatahubURLs {
+			if err := st.UpsertDatahubEndpoint(seedCtx, store.DatahubEndpoint{
+				URL:      url,
+				Source:   store.DatahubEndpointSourceConfigured,
+				LastSeen: time.Now(),
+			}); err != nil {
+				logger.Warn("failed to seed configured datahub url",
+					zap.String("url", url),
+					zap.Error(err),
+				)
+			}
+		}
+		seedCancel()
+	}
+
+	var merkleClient *merkleservice.Client
+	if cfg.MerkleService.URL != "" {
+		merkleClient = merkleservice.NewClient(cfg.MerkleService.URL, cfg.MerkleService.AuthToken, 0)
+		merkleClient.SetLogger(logger.Named("merkle-client"))
+	}
+
+	txVal := validator.NewValidator(nil, nil) // Default policy, no chain tracker yet
+
+	svcs := buildServices(cfg, logger, producer, st, leaser, txTracker, teranodeClient, merkleClient, txVal)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := run(ctx, cfg, log); err != nil {
-		log.Error("Application error", slog.String("error", err.Error()))
-		os.Exit(1)
-	}
-}
+	// Tie the teranode client's background probe to the service lifecycle so
+	// unhealthy endpoints are re-probed for recovery and the goroutine exits
+	// cleanly on shutdown.
+	teranodeClient.Start(ctx)
 
-func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
-	// Initialize all services (nil for chaintracker and p2pClient = arcade creates its own)
-	// This also starts the webhook handler for callback delivery
-	services, err := cfg.Initialize(ctx, log, nil, nil)
-	if err != nil {
-		return fmt.Errorf("failed to initialize services: %w", err)
-	}
-	defer func() {
-		if err := services.Close(); err != nil {
-			log.Error("Error closing services", slog.String("error", err.Error()))
-		}
-	}()
-
-	// Setup routes
-	arcadeRoutes := fiberRoutes.NewRoutes(fiberRoutes.Config{
-		Service:        services.ArcadeService,
-		Store:          services.Store,
-		EventPublisher: services.EventPublisher,
-		Arcade:         services.Arcade,
-		Logger:         log,
-	})
-
-	// Setup chaintracks routes (if enabled and running in embedded mode)
-	var chaintracksRts *chaintracksRoutes.Routes
-	if cfg.ChaintracksServer.Enabled && services.Chaintracks != nil {
-		chaintracksRts = chaintracksRoutes.NewRoutes(ctx, services.Chaintracks)
-		log.Info("Chaintracks HTTP API enabled", slog.String("routes", "/chaintracks/v1/*, /chaintracks/v2/*"))
+	// Start health server for non-API modes (api-server serves /health on its own port)
+	if cfg.Mode != "api-server" {
+		hs := services.NewHealthServer(cfg.Health.Port, logger)
+		hs.Start(ctx)
 	}
 
-	// Setup dashboard
-	dashboard := NewDashboard(services.Arcade)
-
-	// Setup and start HTTP server
-	log.Info("Starting HTTP server", slog.String("address", cfg.Server.Address))
-	authToken := ""
-	if cfg.Auth.Enabled {
-		authToken = cfg.Auth.Token
-		log.Info("API authentication enabled")
-	}
-	app := setupServer(arcadeRoutes, chaintracksRts, dashboard, authToken, cfg.Chaintracks.StoragePath)
-
-	errCh := make(chan error, 1)
-	go func() {
-		if err := app.Listen(cfg.Server.Address); err != nil {
-			errCh <- fmt.Errorf("server error: %w", err)
-		}
-	}()
-
-	log.Info("Arcade started successfully")
-
-	return waitForShutdown(ctx, cfg, log, app, errCh)
-}
-
-func waitForShutdown(ctx context.Context, cfg *config.Config, log *slog.Logger, app *fiber.App, errCh <-chan error) error {
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(svcs))
+
+	for _, svc := range svcs {
+		wg.Add(1)
+		go func(s services.Service) {
+			defer wg.Done()
+			logger.Info("starting service", zap.String("service", s.Name()))
+			if err := s.Start(ctx); err != nil {
+				logger.Error("service failed", zap.String("service", s.Name()), zap.Error(err))
+				errCh <- fmt.Errorf("service %s: %w", s.Name(), err)
+			}
+		}(svc)
+	}
 
 	select {
-	case <-sigCh:
-		log.Info("Received shutdown signal")
+	case sig := <-sigCh:
+		logger.Info("received signal, shutting down", zap.String("signal", sig.String()))
 	case err := <-errCh:
-		log.Error("Server error", slog.String("error", err.Error()))
-		return err
-	case <-ctx.Done():
-		log.Info("Context canceled")
+		logger.Error("service error, shutting down", zap.Error(err))
 	}
 
-	log.Info("Shutting down gracefully")
+	cancel()
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(ctx, cfg.Server.ShutdownTimeout)
-	defer shutdownCancel()
-
-	if err := app.ShutdownWithContext(shutdownCtx); err != nil {
-		log.Error("Error during server shutdown", slog.String("error", err.Error()))
+	for _, svc := range svcs {
+		logger.Info("stopping service", zap.String("service", svc.Name()))
+		if err := svc.Stop(); err != nil {
+			logger.Error("error stopping service", zap.String("service", svc.Name()), zap.Error(err))
+		}
 	}
 
-	log.Info("Shutdown complete")
+	wg.Wait()
+	logger.Info("arcade stopped")
 	return nil
 }
 
-func setupServer(arcadeRoutes *fiberRoutes.Routes, chaintracksRts *chaintracksRoutes.Routes, dashboard *Dashboard, authToken, chaintracksStoragePath string) *fiber.App {
-	app := fiber.New(fiber.Config{
-		DisableStartupMessage: true,
-	})
+func buildServices(
+	cfg *config.Config,
+	logger *zap.Logger,
+	producer *kafka.Producer,
+	st store.Store,
+	leaser store.Leaser,
+	txTracker *store.TxTracker,
+	teranodeClient *teranode.Client,
+	merkleClient *merkleservice.Client,
+	txVal *validator.Validator,
+) []services.Service {
+	var svcs []services.Service
 
-	app.Use(fiberlogger.New(fiberlogger.Config{
-		Format: "${method} ${path} - ${status} (${latency})\n",
-	}))
-	app.Use(recover.New())
-	app.Use(cors.New(cors.Config{
-		AllowOrigins: "*",
-		AllowHeaders: "*",
-		AllowMethods: "GET,POST,OPTIONS",
-	}))
-
-	if authToken != "" {
-		app.Use(authMiddleware(authToken))
+	shouldRun := func(name string) bool {
+		return cfg.Mode == "all" || cfg.Mode == name
 	}
 
-	// Transaction endpoints (ARC-compatible)
-	arcadeRoutes.Register(app)
-
-	// Chaintracks endpoints (block header tracking)
-	if chaintracksRts != nil {
-		chaintracksGroup := app.Group("/chaintracks")
-		chaintracksRts.Register(chaintracksGroup.Group("/v2"))
-		chaintracksRts.RegisterLegacy(chaintracksGroup.Group("/v1"))
-
-		// CDN static file serving for bulk header downloads
-		// Serves files like mainNetBlockHeaders.json and mainNet_X.headers
-		chaintracksGroup.Static("/", chaintracksStoragePath, fiber.Static{
-			Compress:      true,
-			ByteRange:     true, // Support Range requests for partial downloads
-			Browse:        false,
-			CacheDuration: 1 * time.Hour,
-		})
+	if shouldRun("api-server") {
+		svcs = append(svcs, api_server.New(cfg, logger, producer, st, txTracker, teranodeClient))
+	}
+	if shouldRun("bump-builder") {
+		svcs = append(svcs, bump_builder.New(cfg, logger, producer, st, teranodeClient))
+	}
+	if shouldRun("tx-validator") {
+		svcs = append(svcs, tx_validator.New(cfg, logger, producer, st, txTracker, txVal))
+	}
+	if shouldRun("propagation") {
+		svcs = append(svcs, propagation.New(cfg, logger, producer, st, leaser, teranodeClient, merkleClient))
+	}
+	// p2p_client is its own service; it's needed both by mode=propagation
+	// (where it feeds the local teranode.Client directly) and by mode=p2p-client
+	// (its own pod in the K8s topology, where it publishes discoveries to the
+	// shared store for other pods to pick up via refresh).
+	if shouldRun("propagation") || shouldRun("p2p-client") {
+		svcs = append(svcs, p2p_client.New(cfg, logger, producer, teranodeClient, st))
 	}
 
-	// Health check (standalone arcade server only)
-	app.Get("/health", arcadeRoutes.HandleGetHealth)
-
-	// Status dashboard
-	app.Get("/", dashboard.HandleDashboard)
-	app.Get("/status", dashboard.HandleDashboard)
-
-	// API docs (Scalar UI)
-	app.Get("/docs/openapi.json", func(c *fiber.Ctx) error {
-		arcadeSpec := docs.SwaggerInfo.ReadDoc()
-
-		// Merge with chaintracks spec if chaintracks routes are enabled
-		if chaintracksRts != nil {
-			mergedSpec, err := mergeOpenAPISpecs(arcadeSpec, "/chaintracks")
-			if err != nil {
-				// Log error but fallback to arcade-only spec
-				slog.Error("Failed to merge OpenAPI specs", slog.String("error", err.Error()))
-				return c.Type("json").SendString(arcadeSpec)
-			}
-			return c.Type("json").SendString(mergedSpec)
-		}
-
-		return c.Type("json").SendString(arcadeSpec)
-	})
-	app.Get("/docs", func(c *fiber.Ctx) error {
-		return c.Type("html").SendString(scalarHTML)
-	})
-
-	return app
+	return svcs
 }
 
-func authMiddleware(token string) fiber.Handler {
-	return func(c *fiber.Ctx) error {
-		path := c.Path()
-		if path == "/health" || path == "/policy" || path == "/status" || path == "/docs" || path == "/docs/*" {
-			return c.Next()
-		}
+// endpointSource adapts store.Store to teranode.EndpointSource by extracting
+// just the URL list. Defining the adapter here (rather than in teranode) keeps
+// the teranode package free of a direct store dependency.
+type endpointSource struct {
+	st store.Store
+}
 
-		auth := c.Get("Authorization")
-		if auth == "" {
-			return c.Status(401).JSON(fiber.Map{"error": "Missing authorization header"})
-		}
-
-		const bearerPrefix = "Bearer "
-		if len(auth) < len(bearerPrefix) || auth[:len(bearerPrefix)] != bearerPrefix {
-			return c.Status(401).JSON(fiber.Map{"error": "Invalid authorization header format"})
-		}
-
-		if auth[len(bearerPrefix):] != token {
-			return c.Status(401).JSON(fiber.Map{"error": "Invalid token"})
-		}
-
-		return c.Next()
+func (a endpointSource) ListEndpointURLs(ctx context.Context) ([]string, error) {
+	eps, err := a.st.ListDatahubEndpoints(ctx)
+	if err != nil {
+		return nil, err
 	}
+	out := make([]string, 0, len(eps))
+	for _, ep := range eps {
+		out = append(out, ep.URL)
+	}
+	return out, nil
+}
+
+func newLogger(level string) *zap.Logger {
+	var zapLevel zapcore.Level
+	switch level {
+	case "debug":
+		zapLevel = zap.DebugLevel
+	case "warn":
+		zapLevel = zap.WarnLevel
+	case "error":
+		zapLevel = zap.ErrorLevel
+	default:
+		zapLevel = zap.InfoLevel
+	}
+
+	cfg := zap.Config{
+		Level:            zap.NewAtomicLevelAt(zapLevel),
+		Encoding:         "json",
+		OutputPaths:      []string{"stdout"},
+		ErrorOutputPaths: []string{"stderr"},
+		EncoderConfig:    zap.NewProductionEncoderConfig(),
+	}
+
+	logger, _ := cfg.Build()
+	return logger
 }

@@ -35,18 +35,22 @@ func (h *HexBytes) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// TransactionStatus represents the current status of a transaction
+// TransactionStatus represents the current status of a transaction.
+// RawTx and NextRetryAt are set only while the tx is in PENDING_RETRY and
+// cleared on any terminal transition; they drive the durable retry reaper.
 type TransactionStatus struct {
 	TxID         string    `json:"txid"`
 	Status       Status    `json:"txStatus"`
-	StatusCode   int       `json:"status"`
-	Title        string    `json:"title"`
+	StatusCode   int       `json:"status,omitempty"`
 	Timestamp    time.Time `json:"timestamp"`
 	BlockHash    string    `json:"blockHash,omitempty"`
 	BlockHeight  uint64    `json:"blockHeight,omitempty"`
 	MerklePath   HexBytes  `json:"merklePath,omitempty"`
 	ExtraInfo    string    `json:"extraInfo,omitempty"`
-	CompetingTxs []string  `json:"competingTxs"`
+	CompetingTxs []string  `json:"competingTxs,omitempty"`
+	RawTx        HexBytes  `json:"rawTx,omitempty"`
+	RetryCount   int       `json:"retryCount,omitempty"`
+	NextRetryAt  time.Time `json:"nextRetryAt,omitempty"`
 	CreatedAt    time.Time `json:"-"`
 }
 
@@ -64,12 +68,16 @@ const (
 	StatusAcceptedByNetwork = Status("ACCEPTED_BY_NETWORK")
 	// StatusSeenOnNetwork indicates the transaction was seen on the network.
 	StatusSeenOnNetwork = Status("SEEN_ON_NETWORK")
+	// StatusSeenMultipleNodes indicates the transaction was seen by multiple independent miners.
+	StatusSeenMultipleNodes = Status("SEEN_MULTIPLE_NODES")
 	// StatusDoubleSpendAttempted indicates a double spend was attempted.
 	StatusDoubleSpendAttempted = Status("DOUBLE_SPEND_ATTEMPTED")
-	// StatusRejected indicates the transaction was rejected by the network (invalid tx).
+	// StatusRejected indicates the transaction was rejected.
 	StatusRejected = Status("REJECTED")
-	// StatusServiceError indicates a broadcast service failure (not a tx rejection).
-	StatusServiceError = Status("SERVICE_ERROR")
+	// StatusPendingRetry indicates the transaction broadcast failed with a retryable error and will be retried.
+	StatusPendingRetry = Status("PENDING_RETRY")
+	// StatusStumpProcessing indicates the transaction has a STUMP and is building the BUMP
+	StatusStumpProcessing = Status("STUMP_PROCESSING")
 	// StatusMined indicates the transaction was mined.
 	StatusMined = Status("MINED")
 	// StatusImmutable indicates the transaction is immutable.
@@ -83,12 +91,10 @@ func (s Status) DisallowedPreviousStatuses() []Status {
 	case StatusUnknown, StatusReceived:
 		return []Status{}
 	case StatusSentToNetwork:
-		return []Status{StatusSentToNetwork, StatusAcceptedByNetwork, StatusSeenOnNetwork, StatusRejected, StatusDoubleSpendAttempted, StatusMined}
+		return []Status{StatusSentToNetwork, StatusAcceptedByNetwork, StatusSeenOnNetwork, StatusSeenMultipleNodes, StatusRejected, StatusPendingRetry, StatusDoubleSpendAttempted, StatusMined}
 	case StatusAcceptedByNetwork:
-		return []Status{StatusAcceptedByNetwork, StatusSeenOnNetwork, StatusRejected, StatusDoubleSpendAttempted, StatusMined}
-	case StatusServiceError:
-		return []Status{StatusAcceptedByNetwork, StatusSeenOnNetwork, StatusMined, StatusImmutable}
-	case StatusSeenOnNetwork, StatusRejected, StatusDoubleSpendAttempted, StatusMined, StatusImmutable:
+		return []Status{StatusAcceptedByNetwork, StatusSeenOnNetwork, StatusSeenMultipleNodes, StatusRejected, StatusDoubleSpendAttempted, StatusMined}
+	case StatusSeenOnNetwork, StatusSeenMultipleNodes, StatusRejected, StatusDoubleSpendAttempted, StatusMined, StatusImmutable:
 		return []Status{}
 	default:
 		return []Status{}

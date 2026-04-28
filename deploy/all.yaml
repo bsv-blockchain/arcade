@@ -1,0 +1,59 @@
+# All-in-One Deployment
+#
+# Runs all services in a single pod. Useful for development and testing.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: arcade-all
+  namespace: arcade
+  labels:
+    app.kubernetes.io/name: all
+    app.kubernetes.io/part-of: arcade
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: all
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: all
+        app.kubernetes.io/part-of: arcade
+    spec:
+      containers:
+        - name: arcade
+          image: ghcr.io/galt-tr/arcade-refactor:latest
+          args: ["--mode", "all"]
+          ports:
+            - containerPort: 8080
+              name: http
+              protocol: TCP
+            - containerPort: 8081
+              name: health
+              protocol: TCP
+          env:
+            - name: ARCADE_KAFKA_BROKERS
+              value: "kafka-0.kafka.arcade.svc.cluster.local:9092"
+            - name: ARCADE_AEROSPIKE_HOSTS
+              value: "aerospike-0.aerospike.arcade.svc.cluster.local:3000"
+            - name: ARCADE_AEROSPIKE_NAMESPACE
+              value: "arcade"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
