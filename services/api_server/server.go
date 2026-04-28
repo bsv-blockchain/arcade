@@ -75,7 +75,7 @@ func (s *Server) Start(ctx context.Context) error {
 	addr := fmt.Sprintf("%s:%d", s.cfg.APIServer.Host, s.cfg.APIServer.Port)
 	s.server = &http.Server{
 		Addr:              addr,
-		Handler:           router,
+		Handler:           withCORS(router),
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 
