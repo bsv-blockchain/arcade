@@ -65,7 +65,7 @@ jobs:
         with:
           context: . # Build context (root directory, adjust if Dockerfile is elsewhere)
           file: ./Dockerfile # Path to Dockerfile
-          platforms: linux/amd64, linux/arm64
+          platforms: linux/amd64 #, linux/arm64 Disable ARM for now
           push: ${{ github.event_name != 'pull_request' }} # Only push on push events, not PRs
           tags: |
             ghcr.io/bsv-blockchain/arcade:${{ github.sha }}
