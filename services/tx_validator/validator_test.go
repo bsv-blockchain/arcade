@@ -139,7 +139,7 @@ func newTestValidatorWithValidator(broker *kafka.RecordingBroker, ms *mockStore,
 	producer := kafka.NewProducer(broker)
 	cfg := &config.Config{}
 	tracker := store.NewTxTracker()
-	v := New(cfg, zap.NewNop(), producer, ms, tracker, txValidator)
+	v := New(cfg, zap.NewNop(), producer, nil, ms, tracker, txValidator)
 	// Pin parallelism for deterministic tests so we don't accidentally serialize
 	// on a single-core CI runner.
 	v.parallelism = 8
@@ -482,7 +482,7 @@ func TestValidator_StartLogsParallelism(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.TxValidator.Parallelism = 16
 
-	v := New(cfg, logger, kafka.NewProducer(broker), ms, store.NewTxTracker(), nil)
+	v := New(cfg, logger, kafka.NewProducer(broker), nil, ms, store.NewTxTracker(), nil)
 	if v.parallelism != 16 {
 		t.Errorf("expected parallelism=16 from config, got %d", v.parallelism)
 	}

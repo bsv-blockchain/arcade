@@ -48,6 +48,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/events"
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
@@ -66,6 +67,7 @@ type Validator struct {
 	cfg         *config.Config
 	logger      *zap.Logger
 	producer    *kafka.Producer
+	publisher   events.Publisher // nil-safe; broadcasts RECEIVED / REJECTED to SSE / webhooks
 	store       store.Store
 	txTracker   *store.TxTracker
 	txValidator *validator.Validator
@@ -83,7 +85,7 @@ type Validator struct {
 	publishCarry []kafka.KeyValue
 }
 
-func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, st store.Store, tracker *store.TxTracker, v *validator.Validator) *Validator {
+func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publisher events.Publisher, st store.Store, tracker *store.TxTracker, v *validator.Validator) *Validator {
 	parallelism := cfg.TxValidator.Parallelism
 	if parallelism <= 0 {
 		parallelism = runtime.NumCPU()
@@ -92,10 +94,26 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, st st
 		cfg:         cfg,
 		logger:      logger.Named("tx-validator"),
 		producer:    producer,
+		publisher:   publisher,
 		store:       st,
 		txTracker:   tracker,
 		txValidator: v,
 		parallelism: parallelism,
+	}
+}
+
+// publishStatus fans a status update to the events Publisher. Non-fatal —
+// SSE catchup and the durable store row recover any drops.
+func (v *Validator) publishStatus(ctx context.Context, status *models.TransactionStatus) {
+	if v.publisher == nil || status == nil {
+		return
+	}
+	if err := v.publisher.Publish(ctx, status); err != nil {
+		v.logger.Warn("failed to publish status update",
+			zap.String("txid", status.TxID),
+			zap.String("status", string(status.Status)),
+			zap.Error(err),
+		)
 	}
 }
 
@@ -426,6 +444,22 @@ func (v *Validator) phaseDedup(ctx context.Context, parsed []parseResult) (live,
 			duplicates = append(duplicates, vt)
 		}
 	}
+
+	// Fan RECEIVED out to subscribers for every newly inserted row. We do
+	// this AFTER the BatchGetOrInsertStatus return has populated each
+	// input's defaulted Status so the StatusUpdate carries the correct
+	// value rather than the empty pre-insert zero. The default is set by
+	// the store implementation when the input Status is empty.
+	if v.publisher != nil {
+		for _, vt := range live {
+			v.publishStatus(ctx, &models.TransactionStatus{
+				TxID:      vt.txid,
+				Status:    models.StatusReceived,
+				Timestamp: time.Now(),
+			})
+		}
+	}
+
 	return live, duplicates
 }
 
@@ -481,6 +515,10 @@ func (v *Validator) phasePersistRejects(ctx context.Context, rejects []*validate
 			zap.Int("count", len(rejects)),
 			zap.Error(err),
 		)
+		return
+	}
+	for _, u := range updates {
+		v.publishStatus(ctx, u)
 	}
 }
 

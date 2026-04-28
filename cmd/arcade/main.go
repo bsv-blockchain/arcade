@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap/zapcore"
 
 	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/events"
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/services"
@@ -22,6 +23,7 @@ import (
 	"github.com/bsv-blockchain/arcade/services/p2p_client"
 	"github.com/bsv-blockchain/arcade/services/propagation"
 	"github.com/bsv-blockchain/arcade/services/tx_validator"
+	"github.com/bsv-blockchain/arcade/services/webhook"
 	"github.com/bsv-blockchain/arcade/store"
 	storefactory "github.com/bsv-blockchain/arcade/store/factory"
 	"github.com/bsv-blockchain/arcade/teranode"
@@ -129,7 +131,16 @@ func run(cmd *cobra.Command, _ []string) error {
 
 	txVal := validator.NewValidator(nil, nil) // Default policy, no chain tracker yet
 
-	svcs := buildServices(cfg, logger, producer, st, leaser, txTracker, teranodeClient, merkleClient, txVal)
+	// One process-wide events.Publisher routes status updates from every
+	// service that mutates state (validator, propagation, bump-builder,
+	// api-server) onto a shared Kafka topic. The api-server SSE handler and
+	// the webhook delivery service consume from that topic, so the
+	// transaction-status fan-out works whether the deployment is monolithic
+	// (mode=all) or split across pods.
+	publisher := events.NewKafkaPublisher(producer, logger)
+	defer func() { _ = publisher.Close() }()
+
+	svcs := buildServices(cfg, logger, producer, publisher, st, leaser, txTracker, teranodeClient, merkleClient, txVal)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -188,6 +199,7 @@ func buildServices(
 	cfg *config.Config,
 	logger *zap.Logger,
 	producer *kafka.Producer,
+	publisher events.Publisher,
 	st store.Store,
 	leaser store.Leaser,
 	txTracker *store.TxTracker,
@@ -202,16 +214,22 @@ func buildServices(
 	}
 
 	if shouldRun("api-server") {
-		svcs = append(svcs, api_server.New(cfg, logger, producer, st, txTracker, teranodeClient))
+		svcs = append(svcs, api_server.New(cfg, logger, producer, publisher, st, txTracker, teranodeClient))
 	}
 	if shouldRun("bump-builder") {
-		svcs = append(svcs, bump_builder.New(cfg, logger, producer, st, teranodeClient))
+		svcs = append(svcs, bump_builder.New(cfg, logger, producer, publisher, st, teranodeClient))
 	}
 	if shouldRun("tx-validator") {
-		svcs = append(svcs, tx_validator.New(cfg, logger, producer, st, txTracker, txVal))
+		svcs = append(svcs, tx_validator.New(cfg, logger, producer, publisher, st, txTracker, txVal))
 	}
 	if shouldRun("propagation") {
-		svcs = append(svcs, propagation.New(cfg, logger, producer, st, leaser, teranodeClient, merkleClient))
+		svcs = append(svcs, propagation.New(cfg, logger, producer, publisher, st, leaser, teranodeClient, merkleClient))
+	}
+	// Webhook delivery runs alongside api-server by default (so a single-binary
+	// deployment ships callbacks without extra config) but can be split into
+	// its own pod by setting mode=webhook.
+	if shouldRun("api-server") || shouldRun("webhook") {
+		svcs = append(svcs, webhook.New(cfg.Webhook, logger, publisher, st))
 	}
 	// p2p_client is its own service; it's needed both by mode=propagation
 	// (where it feeds the local teranode.Client directly) and by mode=p2p-client
