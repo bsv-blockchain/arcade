@@ -139,7 +139,7 @@ go get -u github.com/bsv-blockchain/arcade
 ```bash
 git clone https://github.com/bsv-blockchain/arcade.git
 cd arcade
-go build -o arcade ./cmd/arcade
+go build -o arcade cmd/arcade/main.go
 ```
 
 ### Configuration
@@ -147,17 +147,33 @@ go build -o arcade ./cmd/arcade
 Create `config.yaml` with your Teranode broadcast URL:
 
 ```yaml
-# Minimal working configuration
+# Minimal working configuration with no dependencies
+mode: all
 network: main
 storage_path: ~/.arcade
 
-server:
-  address: ":3011"
+callback_url: "https://myhostname.com"
 
-teranode:
-  broadcast_urls:           # REQUIRED - at least one URL needed
-    - "https://arc.taal.com"
-  timeout: 30s
+kafka:
+  backend: memory
+  consumer_group: arcade
+
+store:
+  backend: pebble
+  pebble:
+    path: ~/.arcade/pebble
+    memtable_size_mb: 64
+    l0_compaction_threshold: 4
+    sync_writes: false
+
+merkle_service:
+  url: "https://merkle-service-us-1.bsvb.tech"
+
+p2p:
+  datahub_discovery: true
+
+chaintracks_server:
+  enabled: true
 ```
 
 See `config.example.yaml` for all available options.
@@ -165,10 +181,10 @@ See `config.example.yaml` for all available options.
 ### Run
 
 ```bash
-arcade -config config.yaml
+arcade --config config.yaml
 ```
 
-You should see output indicating the server is running on port 3011.
+You should see output indicating the server is running on port 8080.
 
 <br/>
 
@@ -177,9 +193,9 @@ You should see output indicating the server is running on port 3011.
 ### Overview
 
 Arcade is a lightweight transaction broadcast service that:
-- Listens to Bitcoin network events via libp2p gossip
+- Registers transactions with Merkle Service
 - Provides Arc-compatible HTTP API for easy migration
-- Supports pluggable storage (SQLite) and event backends (in-memory)
+- Supports pluggable storage and event backends (in-memory)
 - Tracks transaction status through the complete lifecycle
 - Delivers notifications via webhooks and Server-Sent Events (SSE)
 
@@ -190,12 +206,11 @@ Arcade is a lightweight transaction broadcast service that:
 ### Features
 
 - **Arc-Compatible API** - Drop-in replacement for Arc clients
-- **P2P Network Listening** - Direct gossip subscription for real-time updates
 - **Chain Tracking** - Blockchain header management with merkle proof validation
-- **Flexible Storage** - SQLite for persistent storage
+- **Flexible Storage** - Storage interface for different scaling needs
 - **Event Streaming** - In-memory pub/sub for event distribution
 - **Webhook Delivery** - Async notifications with retry logic
-- **SSE Streaming** - Real-time status updates with automatic catchup on reconnect
+- [TODO] **SSE Streaming** - Real-time status updates with automatic catchup on reconnect
 - **Transaction Validation** - Local validation before network submission
 - **Status Tracking** - Complete audit trail of transaction lifecycle
 - **Extensible** - All packages public, easy to customize
