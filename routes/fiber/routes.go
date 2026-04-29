@@ -127,9 +127,17 @@ func (r *Routes) handlePostTx(c *fiber.Ctx) error {
 		return r.handleSubmitError(c, err)
 	}
 
-	status.StatusCode = http.StatusOK
-	status.Title = "OK"
-	return c.JSON(status)
+	// Preserve the StatusCode set by the service (which reflects the actual
+	// broadcast outcome — 2xx for success, 4xx for rejection, 5xx for service
+	// failure). Mirror it to the HTTP response so downstream consumers can
+	// distinguish success from failure without parsing txStatus.
+	if status.StatusCode == 0 {
+		status.StatusCode = http.StatusOK
+	}
+	if status.Title == "" {
+		status.Title = defaultTitleForStatus(status.Status)
+	}
+	return c.Status(status.StatusCode).JSON(status)
 }
 
 // handlePostTxs submits multiple transactions
@@ -175,11 +183,40 @@ func (r *Routes) handlePostTxs(c *fiber.Ctx) error {
 		return r.handleSubmitError(c, err)
 	}
 
+	// Per-tx StatusCode is preserved from the service so each entry in the
+	// array reflects its own outcome. The HTTP envelope itself stays 200 —
+	// the batch request succeeded, per-tx results are inside.
 	for _, s := range statuses {
-		s.StatusCode = http.StatusOK
-		s.Title = "OK"
+		if s.StatusCode == 0 {
+			s.StatusCode = http.StatusOK
+		}
+		if s.Title == "" {
+			s.Title = defaultTitleForStatus(s.Status)
+		}
 	}
 	return c.JSON(statuses)
+}
+
+// defaultTitleForStatus returns a human-readable title for a tx outcome when
+// the service did not set one. Used as a fallback so clients see something
+// meaningful in the response Title field.
+func defaultTitleForStatus(s models.Status) string {
+	switch s {
+	case models.StatusMined, models.StatusImmutable, models.StatusSeenOnNetwork,
+		models.StatusAcceptedByNetwork, models.StatusSentToNetwork,
+		models.StatusReceived:
+		return "OK"
+	case models.StatusRejected:
+		return "Transaction rejected"
+	case models.StatusDoubleSpendAttempted:
+		return "Double spend attempted"
+	case models.StatusServiceError:
+		return "Service error"
+	case models.StatusUnknown:
+		return "Unknown"
+	default:
+		return string(s)
+	}
 }
 
 // handleSubmitError returns an appropriate HTTP response for transaction submission errors.
