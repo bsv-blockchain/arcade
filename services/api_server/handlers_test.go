@@ -3,15 +3,18 @@ package api_server
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-sdk/script"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -30,10 +33,11 @@ import (
 // end-to-end STUMP test fires deliveries concurrently to mirror
 // merkle-service's 64-worker delivery pool.
 type mockStore struct {
-	mu                sync.Mutex
-	updateStatusCalls []*models.TransactionStatus
-	stumps            map[string]*models.Stump
-	insertStumpErr    error
+	mu                  sync.Mutex
+	updateStatusCalls   []*models.TransactionStatus
+	stumps              map[string]*models.Stump
+	insertStumpErr      error
+	insertedSubmissions []*models.Submission
 	// insertStumpFn, if set, runs before the default record step and may
 	// return an error to simulate per-key failures (Aerospike RECORD_TOO_BIG,
 	// DEVICE_OVERLOAD, HOT_KEY, etc.). Returning non-nil skips the record.
@@ -73,7 +77,12 @@ func (m *mockStore) GetBUMP(context.Context, string) (uint64, []byte, error)  { 
 func (m *mockStore) SetMinedByTxIDs(context.Context, string, []string) ([]*models.TransactionStatus, error) {
 	return nil, nil
 }
-func (m *mockStore) InsertSubmission(context.Context, *models.Submission) error { return nil }
+func (m *mockStore) InsertSubmission(_ context.Context, sub *models.Submission) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.insertedSubmissions = append(m.insertedSubmissions, sub)
+	return nil
+}
 func (m *mockStore) GetSubmissionsByTxID(context.Context, string) ([]*models.Submission, error) {
 	return nil, nil
 }
@@ -705,5 +714,150 @@ func TestHandleCallback_FullBlockFlow_PartialStumpFailure(t *testing.T) {
 	}
 	if got := totalMessages(broker); got != 1 {
 		t.Errorf("expected 1 Kafka message after BLOCK_PROCESSED, got %d", got)
+	}
+}
+
+// makeRealTx returns a transaction with one funded input and one output so
+// that tx.EF() produces a different byte sequence than tx.Bytes(). Without
+// real source data, EF() returns ErrEmptyPreviousTx and the EF/legacy hashes
+// would collide — defeating the purpose of the EF-vs-legacy regression tests.
+func makeRealTx(t *testing.T) *sdkTx.Transaction {
+	t.Helper()
+	tx := sdkTx.NewTransaction()
+	if err := tx.AddInputFrom(
+		"0000000000000000000000000000000000000000000000000000000000000001",
+		0,
+		"76a914000000000000000000000000000000000000000088ac",
+		1000,
+		nil,
+	); err != nil {
+		t.Fatalf("AddInputFrom: %v", err)
+	}
+	opReturn, err := script.NewFromHex("6a")
+	if err != nil {
+		t.Fatalf("script.NewFromHex: %v", err)
+	}
+	tx.AddOutput(&sdkTx.TransactionOutput{Satoshis: 900, LockingScript: opReturn})
+	return tx
+}
+
+// TestHandleSubmitTransaction_TxID_IsCanonical verifies /tx records the
+// canonical Bitcoin txid (tx.TxID()) — not a hash of the wire bytes — for
+// every accepted content type and for both legacy and Extended Format
+// submissions. Regression test for the EF / canonical txid mismatch that
+// caused submissions.txid to never match transactions.txid, which broke SSE
+// status fan-out for any client posting EF.
+func TestHandleSubmitTransaction_TxID_IsCanonical(t *testing.T) {
+	tx := makeRealTx(t)
+	legacy := tx.Bytes()
+	ef, err := tx.EF()
+	if err != nil {
+		t.Fatalf("tx.EF: %v", err)
+	}
+	canonical := tx.TxID().String()
+
+	if bytes.Equal(legacy, ef) {
+		t.Fatalf("EF and legacy bytes are identical — test would be trivial")
+	}
+
+	cases := []struct {
+		name        string
+		contentType string
+		body        []byte
+	}{
+		{"octet-stream legacy", "application/octet-stream", legacy},
+		{"octet-stream EF", "application/octet-stream", ef},
+		{"text/plain hex legacy", "text/plain", []byte(hex.EncodeToString(legacy))},
+		{"text/plain hex EF", "text/plain", []byte(hex.EncodeToString(ef))},
+		{"json legacy", "application/json", mustMarshalJSON(t, map[string]string{"rawTx": hex.EncodeToString(legacy)})},
+		{"json EF", "application/json", mustMarshalJSON(t, map[string]string{"rawTx": hex.EncodeToString(ef)})},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			broker := &kafka.RecordingBroker{}
+			ms := &mockStore{}
+			_, router := setupServerWithStore(broker, ms)
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/tx", bytes.NewReader(c.body))
+			req.Header.Set("Content-Type", c.contentType)
+			req.Header.Set("X-CallbackToken", "test-token")
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+
+			if w.Code != http.StatusAccepted {
+				t.Fatalf("status %d: %s", w.Code, w.Body.String())
+			}
+
+			if len(broker.Sends) != 1 {
+				t.Fatalf("expected 1 Send, got %d", len(broker.Sends))
+			}
+			if broker.Sends[0].Key != canonical {
+				t.Errorf("kafka key: want %s, got %s", canonical, broker.Sends[0].Key)
+			}
+
+			if len(ms.insertedSubmissions) != 1 {
+				t.Fatalf("expected 1 submission, got %d", len(ms.insertedSubmissions))
+			}
+			if ms.insertedSubmissions[0].TxID != canonical {
+				t.Errorf("submission txid: want %s, got %s", canonical, ms.insertedSubmissions[0].TxID)
+			}
+		})
+	}
+}
+
+// TestHandleSubmitTransactions_TxID_IsCanonical is the bulk-endpoint
+// counterpart. Mixing legacy and EF in a single batch also confirms the
+// parser advances bytesUsed correctly across format changes.
+func TestHandleSubmitTransactions_TxID_IsCanonical(t *testing.T) {
+	txA := makeRealTx(t)
+	txB := makeRealTx(t)
+	txB.Outputs[0].Satoshis = 800 // make B distinct so canonicals differ
+
+	legacyA := txA.Bytes()
+	efB, err := txB.EF()
+	if err != nil {
+		t.Fatalf("EF: %v", err)
+	}
+	canonA := txA.TxID().String()
+	canonB := txB.TxID().String()
+	if canonA == canonB {
+		t.Fatalf("test setup: txA and txB hashed equal")
+	}
+
+	body := append([]byte{}, legacyA...)
+	body = append(body, efB...)
+
+	broker := &kafka.RecordingBroker{}
+	ms := &mockStore{}
+	_, router := setupServerWithStore(broker, ms)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/txs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("X-CallbackToken", "test-token")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+
+	if len(broker.Batches) != 1 || len(broker.Batches[0]) != 2 {
+		t.Fatalf("expected 1 batch of 2, got Batches=%v", broker.Batches)
+	}
+	if got := broker.Batches[0][0].Key; got != canonA {
+		t.Errorf("batch[0]: want %s, got %s", canonA, got)
+	}
+	if got := broker.Batches[0][1].Key; got != canonB {
+		t.Errorf("batch[1]: want %s, got %s", canonB, got)
+	}
+
+	if len(ms.insertedSubmissions) != 2 {
+		t.Fatalf("expected 2 submissions, got %d", len(ms.insertedSubmissions))
+	}
+	got := []string{ms.insertedSubmissions[0].TxID, ms.insertedSubmissions[1].TxID}
+	want := []string{canonA, canonB}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("submissions: want %v, got %v", want, got)
 	}
 }
