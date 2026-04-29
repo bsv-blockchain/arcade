@@ -193,16 +193,29 @@ func (s *Server) handleEventsSSE(c *gin.Context) {
 	writer := &sseWriter{w: c.Writer, f: flusher}
 	ctx := c.Request.Context()
 
-	// Catchup runs BEFORE the live subscription registers, mirroring the old
-	// arcade. It uses GetSubmissionsByToken so callers without a token can't
-	// catch up — there's no way to tell which txids belong to them.
-	if lastEventID := c.GetHeader("Last-Event-ID"); lastEventID != "" && token != "" {
-		s.sendSSECatchup(ctx, writer, token, lastEventID)
-	}
-
+	// Register the live client BEFORE replay so any update published during
+	// the replay lands in the client's buffer rather than being dropped.
+	// Replay can deliver the same status the live feed will deliver shortly
+	// after — that's a tolerable duplicate (each frame carries an `id:` of
+	// the status timestamp, so clients dedupe by latest-per-txid).
 	client := s.sse.newClient(token)
 	s.sse.register(client)
 	defer s.sse.unregister(client.id)
+
+	// Initial-state replay: when a callbackToken is set, emit the current
+	// status of every txid registered under that token. With no Last-Event-ID
+	// (since == zero) every status is emitted; with one set, only statuses
+	// strictly newer than that timestamp are. Without a token there's no way
+	// to scope the replay, so it's skipped — that path remains live-only.
+	if token != "" {
+		var since time.Time
+		if lastEventID := c.GetHeader("Last-Event-ID"); lastEventID != "" {
+			if ns, err := strconv.ParseInt(lastEventID, 10, 64); err == nil {
+				since = time.Unix(0, ns)
+			}
+		}
+		s.sendSSECatchup(ctx, writer, token, since)
+	}
 
 	keepalive := time.NewTicker(15 * time.Second)
 	defer keepalive.Stop()
@@ -226,25 +239,23 @@ func (s *Server) handleEventsSSE(c *gin.Context) {
 	}
 }
 
-// sendSSECatchup replays missed status events between the timestamp encoded
-// in lastEventID (nanoseconds since the Unix epoch) and now, scoped to the
-// txids registered under the supplied token. Matches the old arcade's
-// sendTxSSECatchup behavior verbatim so reconnecting clients see the same
-// frame ordering and content.
-func (s *Server) sendSSECatchup(ctx context.Context, w *sseWriter, token, lastEventID string) {
-	sinceNS, err := strconv.ParseInt(lastEventID, 10, 64)
-	if err != nil {
-		return
-	}
-	since := time.Unix(0, sinceNS)
-
+// sendSSECatchup replays the current persisted status of every txid registered
+// under the supplied token. When `since` is non-zero only statuses with a
+// timestamp strictly after `since` are emitted (the Last-Event-ID reconnect
+// contract). When `since` is zero every status is emitted — used as the
+// initial-state replay on a fresh connect, so a client that connects after
+// arcade has already published events still sees the current state.
+func (s *Server) sendSSECatchup(ctx context.Context, w *sseWriter, token string, since time.Time) {
 	subs, err := s.store.GetSubmissionsByToken(ctx, token)
 	if err != nil {
 		return
 	}
 	for _, sub := range subs {
 		status, err := s.store.GetStatus(ctx, sub.TxID)
-		if err != nil || status == nil || !status.Timestamp.After(since) {
+		if err != nil || status == nil {
+			continue
+		}
+		if !since.IsZero() && !status.Timestamp.After(since) {
 			continue
 		}
 		if err := writeSSEStatus(w, status); err != nil {
