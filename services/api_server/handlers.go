@@ -3,7 +3,6 @@ package api_server
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"html/template"
 	"io"
@@ -101,21 +100,6 @@ func (s *Server) publishStatus(ctx context.Context, status *models.TransactionSt
 			zap.Error(err),
 		)
 	}
-}
-
-// computeTxID returns the canonical Bitcoin transaction ID — little-endian
-// reversed double-SHA256 of the raw serialized transaction — as lowercase hex.
-// Used only for Kafka partition keying at ingress, so a malformed body just
-// hashes to whatever its bytes spell; the downstream validator still parses
-// and can reject.
-func computeTxID(rawTx []byte) string {
-	first := sha256.Sum256(rawTx)
-	second := sha256.Sum256(first[:])
-	// Reverse so the string matches the canonical big-endian txid display.
-	for i, j := 0, len(second)-1; i < j; i, j = i+1, j-1 {
-		second[i], second[j] = second[j], second[i]
-	}
-	return hex.EncodeToString(second[:])
 }
 
 const docsTemplate = `<!DOCTYPE html>
@@ -423,6 +407,18 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		return
 	}
 
+	// Parse the wire bytes so we can derive the canonical txid from the
+	// transaction structure. Hashing the wire bytes directly is wrong when
+	// clients submit Extended Format (which includes per-input source
+	// metadata) — the resulting hash matches the EF blob, not the canonical
+	// Bitcoin txid the validator emits later, so SSE/webhook callbacks
+	// (keyed by submissions.txid) silently fail to match.
+	parsedTx, _, err := sdkTx.NewTransactionFromStream(rawTx)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to parse transaction"})
+		return
+	}
+
 	// Publish to transaction topic for validation. Keying by txid pins the tx
 	// to one Kafka partition, so any re-submission (retry, user double-post)
 	// lands on the same consumer — a future idempotency check can then see the
@@ -431,7 +427,7 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// Raw tx bytes travel as []byte in the JSON payload (encoded as base64 by
 	// encoding/json) so the validator and propagator never hex-decode the body
 	// and re-encode it downstream.
-	txid := computeTxID(rawTx)
+	txid := parsedTx.TxID().String()
 
 	// Record the subscription BEFORE publishing to Kafka so the validator's
 	// RECEIVED status (and any subsequent updates) can find a matching
@@ -473,11 +469,14 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 		return
 	}
 
-	// Phase 1: Parse all transactions upfront
+	// Phase 1: Parse all transactions upfront. We use the parsed tx's
+	// canonical TxID() for the Kafka key (and submissions row) so it matches
+	// what the validator emits later — hashing the wire bytes directly would
+	// be wrong for Extended Format submissions.
 	var msgs []kafka.KeyValue
 	offset := 0
 	for offset < len(body) {
-		_, bytesUsed, parseErr := sdkTx.NewTransactionFromStream(body[offset:])
+		parsedTx, bytesUsed, parseErr := sdkTx.NewTransactionFromStream(body[offset:])
 		if parseErr != nil {
 			s.logger.Error("failed to parse transaction in batch",
 				zap.Int("offset", offset),
@@ -493,7 +492,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 
 		rawTxBytes := body[offset : offset+bytesUsed]
 		msgs = append(msgs, kafka.KeyValue{
-			Key: computeTxID(rawTxBytes),
+			Key: parsedTx.TxID().String(),
 			Value: map[string]interface{}{
 				"action": "submit",
 				"raw_tx": rawTxBytes,
