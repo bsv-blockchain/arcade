@@ -24,13 +24,13 @@ func isKeyNotFound(err error) bool {
 }
 
 const (
-	setTransactions     = "transactions"
-	setBumps            = "bumps"
-	setStumps           = "stumps"
-	setSubmissions      = "submissions"
-	setProcessedBlocks  = "processed_blocks"
-	setLeases           = "leases"
-	setDatahubEndpoints = "datahub_endpoints"
+	setTransactions     = "arcade_transactions"
+	setBumps            = "arcade_bumps"
+	setStumps           = "arcade_stumps"
+	setSubmissions      = "arcade_submissions"
+	setProcessedBlocks  = "arcade_processed_blocks"
+	setLeases           = "arcade_leases"
+	setDatahubEndpoints = "arcade_datahub_endpoints"
 )
 
 // Ensure Store implements the store interfaces.
@@ -105,13 +105,13 @@ func (s *Store) EnsureIndexes() error {
 		set, bin, name string
 		indexType      aero.IndexType
 	}{
-		{setStumps, "block_hash", "idx_stumps_block_hash", aero.STRING},
-		{setTransactions, "block_hash", "idx_tx_block_hash", aero.STRING},
-		{setSubmissions, "txid", "idx_sub_txid", aero.STRING},
-		{setSubmissions, "callback_token", "idx_sub_callback_token", aero.STRING},
-		{setProcessedBlocks, "block_height", "idx_pb_block_height", aero.NUMERIC},
-		{setTransactions, "status", "idx_tx_status", aero.STRING},
-		{setDatahubEndpoints, "last_seen", "idx_dh_last_seen", aero.NUMERIC},
+		{setStumps, "block_hash", "arcade_idx_stumps_block_hash", aero.STRING},
+		{setTransactions, "block_hash", "arcade_idx_tx_block_hash", aero.STRING},
+		{setSubmissions, "txid", "arcade_idx_sub_txid", aero.STRING},
+		{setSubmissions, "callback_token", "arcade_idx_sub_callback_token", aero.STRING},
+		{setProcessedBlocks, "block_height", "arcade_idx_pb_block_height", aero.NUMERIC},
+		{setTransactions, "status", "arcade_idx_tx_status", aero.STRING},
+		{setDatahubEndpoints, "last_seen", "arcade_idx_dh_last_seen", aero.NUMERIC},
 	}
 	// CreateIndex returns an IndexTask that must be polled — the server call
 	// is asynchronous and the index won't be queryable on every node until
@@ -462,7 +462,7 @@ func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []
 	return nil
 }
 
-// GetReadyRetries uses the existing idx_tx_status index to find PENDING_RETRY
+// GetReadyRetries uses the existing arcade_idx_tx_status index to find PENDING_RETRY
 // rows and filters by next_retry_at in code. At expected cardinality
 // (thousands, not millions) this is cheap.
 func (s *Store) GetReadyRetries(ctx context.Context, now time.Time, limit int) ([]*store.PendingRetry, error) {
