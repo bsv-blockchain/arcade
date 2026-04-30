@@ -190,7 +190,7 @@ func multiSubtreeTestSetup(numSubtrees, subtreeSize int) (allLeaves [][]chainhas
 	}
 
 	blockRoot = computeMerkleRootFromLeaves(subtreeHashes)
-	return
+	return allLeaves, subtreeHashes, blockRoot
 }
 
 // setupCoinbaseBlock creates a block with a coinbase placeholder at subtree 0, offset 0.
