@@ -205,6 +205,38 @@ func (c *Client) consume(ctx context.Context, msgs <-chan teranodep2p.NodeStatus
 func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatusMessage) {
 	metrics.P2PNodeStatusMessagesTotal.Inc()
 
+	if ce := c.logger.Check(zap.DebugLevel, "received node_status"); ce != nil {
+		fields := []zap.Field{
+			zap.String("peer_id", msg.PeerID),
+			zap.String("client_name", msg.ClientName),
+			zap.String("type", msg.Type),
+			zap.String("base_url", msg.BaseURL),
+			zap.String("propagation_url", msg.PropagationURL),
+			zap.String("version", msg.Version),
+			zap.String("commit_hash", msg.CommitHash),
+			zap.String("best_block_hash", msg.BestBlockHash),
+			zap.Uint32("best_height", msg.BestHeight),
+			zap.Uint64("tx_count", msg.TxCount),
+			zap.Uint32("subtree_count", msg.SubtreeCount),
+			zap.String("fsm_state", msg.FSMState),
+			zap.Int64("start_time", msg.StartTime),
+			zap.Float64("uptime_seconds", msg.Uptime),
+			zap.String("miner_name", msg.MinerName),
+			zap.String("listen_mode", msg.ListenMode),
+			zap.String("chain_work", msg.ChainWork),
+			zap.String("sync_peer_id", msg.SyncPeerID),
+			zap.Uint32("sync_peer_height", msg.SyncPeerHeight),
+			zap.String("sync_peer_block_hash", msg.SyncPeerBlockHash),
+			zap.Int64("sync_connected_at", msg.SyncConnectedAt),
+			zap.Int("connected_peers_count", msg.ConnectedPeersCount),
+			zap.String("storage", msg.Storage),
+		}
+		if msg.MinMiningTxFee != nil {
+			fields = append(fields, zap.Float64("min_mining_tx_fee", *msg.MinMiningTxFee))
+		}
+		ce.Write(fields...)
+	}
+
 	raw := pickDatahubURL(msg)
 	if raw == "" {
 		metrics.P2PEndpointDiscoveryTotal.WithLabelValues("no_url").Inc()
