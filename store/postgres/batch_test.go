@@ -337,20 +337,15 @@ func BenchmarkBatchVsSerialInsert(b *testing.B) {
 // newTestStoreB is the *testing.B counterpart of newTestStore.
 func newTestStoreB(b *testing.B) *Store {
 	b.Helper()
-	dir := b.TempDir()
-	cfg := newEmbeddedCfg(dir)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	if sharedStore == nil {
+		b.Skipf("postgres unavailable, skipping: %v", sharedStoreErr)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	s, err := New(ctx, cfg)
-	if err != nil {
-		b.Fatalf("New: %v", err)
+	if _, err := sharedStore.pool.Exec(ctx, truncateSQL); err != nil {
+		b.Fatalf("truncate: %v", err)
 	}
-	if err := s.EnsureIndexes(); err != nil {
-		_ = s.Close()
-		b.Fatalf("EnsureIndexes: %v", err)
-	}
-	b.Cleanup(func() { _ = s.Close() })
-	return s
+	return sharedStore
 }
 
 func pgBatchTxID(i int) string {

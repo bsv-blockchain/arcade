@@ -50,20 +50,36 @@ type chaintracksRoutes struct {
 // sseWriter serializes writes to a single http.ResponseWriter. Gin does not
 // promise concurrent-safe writes, and our broadcaster + keepalive goroutines
 // both write to the same writer — a mutex keeps framing intact.
+//
+// closed is set when the owning handler returns. The broadcaster may have
+// already snapshotted this writer before the handler removed itself from the
+// client map, so close() must serialize against any in-flight write to keep
+// the broadcaster from touching the response after the HTTP server starts
+// finalizing it.
 type sseWriter struct {
-	mu sync.Mutex
-	w  http.ResponseWriter
-	f  http.Flusher
+	mu     sync.Mutex
+	w      http.ResponseWriter
+	f      http.Flusher
+	closed bool
 }
 
 func (s *sseWriter) write(payload string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return http.ErrBodyNotAllowed
+	}
 	if _, err := fmt.Fprint(s.w, payload); err != nil {
 		return err
 	}
 	s.f.Flush()
 	return nil
+}
+
+func (s *sseWriter) close() {
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
 }
 
 // newChaintracksRoutes subscribes to tip and reorg channels and starts
@@ -455,6 +471,7 @@ func (r *chaintracksRoutes) handleTipStream(c *gin.Context) {
 		r.tipMu.Lock()
 		delete(r.tipClients, id)
 		r.tipMu.Unlock()
+		writer.close()
 	}()
 
 	ctx := c.Request.Context()
@@ -493,6 +510,7 @@ func (r *chaintracksRoutes) handleReorgStream(c *gin.Context) {
 		r.reorgMu.Lock()
 		delete(r.reorgClients, id)
 		r.reorgMu.Unlock()
+		writer.close()
 	}()
 
 	r.runKeepalive(c.Request.Context(), writer)

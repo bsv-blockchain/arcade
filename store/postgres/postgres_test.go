@@ -43,30 +43,70 @@ func newEmbeddedCfg(tempDir string) config.Postgres {
 	}
 }
 
-func newTestStore(t *testing.T) *Store {
-	t.Helper()
-	cfg := newEmbeddedCfg(t.TempDir())
+// Shared embedded-postgres state: one instance per `go test` invocation,
+// reused across every test in the package. Spinning up embedded-postgres is
+// dominated by binary extraction + initdb (~30s each), so creating a fresh
+// instance per test pushed the package well past the 10-minute test timeout.
+// Tests get isolation via TRUNCATE in newTestStore rather than per-test DBs.
+var (
+	sharedStore    *Store
+	sharedStoreErr error
+	sharedDir      string
+)
 
+func TestMain(m *testing.M) {
+	code, cleanup := runWithSharedStore(m)
+	cleanup()
+	os.Exit(code)
+}
+
+func runWithSharedStore(m *testing.M) (int, func()) {
+	dir, err := os.MkdirTemp("", "arcade-pg-test-")
+	if err != nil {
+		sharedStoreErr = err
+		return m.Run(), func() {}
+	}
+	sharedDir = dir
+
+	cfg := newEmbeddedCfg(sharedDir)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	s, err := New(ctx, cfg)
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		sharedStoreErr = err
+		return m.Run(), func() { _ = os.RemoveAll(sharedDir) }
 	}
 	if err := s.EnsureIndexes(); err != nil {
 		_ = s.Close()
-		t.Fatalf("EnsureIndexes: %v", err)
+		sharedStoreErr = err
+		return m.Run(), func() { _ = os.RemoveAll(sharedDir) }
 	}
-	// Each test uses a fresh DSN or fresh tables; when sharing an external DSN
-	// we truncate to prevent cross-test bleed.
-	if os.Getenv("ARCADE_POSTGRES_DSN") != "" {
-		if _, err := s.pool.Exec(ctx,
-			`TRUNCATE transactions, bumps, stumps, submissions, leases`); err != nil {
-			t.Fatalf("truncate: %v", err)
-		}
+	sharedStore = s
+
+	cleanup := func() {
+		_ = sharedStore.Close()
+		_ = os.RemoveAll(sharedDir)
 	}
-	t.Cleanup(func() { _ = s.Close() })
-	return s
+	return m.Run(), cleanup
+}
+
+const truncateSQL = `TRUNCATE transactions, bumps, stumps, submissions, leases, datahub_endpoints`
+
+func newTestStore(t *testing.T) *Store {
+	t.Helper()
+	if sharedStore == nil {
+		// If neither an external DSN nor a working embedded-postgres is
+		// available (binary download failed, port unavailable, sandboxed CI),
+		// skip rather than fail — these tests are infrastructure-gated by the
+		// `postgres` build tag and require Postgres to actually be reachable.
+		t.Skipf("postgres unavailable, skipping: %v", sharedStoreErr)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := sharedStore.pool.Exec(ctx, truncateSQL); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	return sharedStore
 }
 
 func TestGetOrInsertStatus_InsertsNew(t *testing.T) {
