@@ -786,20 +786,21 @@ func (s *Store) UpsertDatahubEndpoint(ctx context.Context, ep store.DatahubEndpo
 		return fmt.Errorf("upsert datahub endpoint: empty url")
 	}
 	const q = `
-INSERT INTO datahub_endpoints (url, source, last_seen)
-VALUES ($1, $2, $3)
+INSERT INTO datahub_endpoints (url, network, source, last_seen)
+VALUES ($1, $2, $3, $4)
 ON CONFLICT (url) DO UPDATE SET
+    network = EXCLUDED.network,
     source = EXCLUDED.source,
     last_seen = EXCLUDED.last_seen`
-	if _, err := s.pool.Exec(ctx, q, ep.URL, ep.Source, ep.LastSeen); err != nil {
+	if _, err := s.pool.Exec(ctx, q, ep.URL, ep.Network, ep.Source, ep.LastSeen); err != nil {
 		return fmt.Errorf("upsert datahub endpoint %s: %w", ep.URL, err)
 	}
 	return nil
 }
 
-func (s *Store) ListDatahubEndpoints(ctx context.Context) ([]store.DatahubEndpoint, error) {
-	const q = `SELECT url, source, last_seen FROM datahub_endpoints`
-	rows, err := s.pool.Query(ctx, q)
+func (s *Store) ListDatahubEndpoints(ctx context.Context, network string) ([]store.DatahubEndpoint, error) {
+	const q = `SELECT url, network, source, last_seen FROM datahub_endpoints WHERE network = $1`
+	rows, err := s.pool.Query(ctx, q, network)
 	if err != nil {
 		return nil, fmt.Errorf("list datahub endpoints: %w", err)
 	}
@@ -807,7 +808,7 @@ func (s *Store) ListDatahubEndpoints(ctx context.Context) ([]store.DatahubEndpoi
 	var out []store.DatahubEndpoint
 	for rows.Next() {
 		var ep store.DatahubEndpoint
-		if err := rows.Scan(&ep.URL, &ep.Source, &ep.LastSeen); err != nil {
+		if err := rows.Scan(&ep.URL, &ep.Network, &ep.Source, &ep.LastSeen); err != nil {
 			return nil, fmt.Errorf("scan datahub endpoint: %w", err)
 		}
 		out = append(out, ep)

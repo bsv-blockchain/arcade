@@ -974,15 +974,18 @@ func (s *Store) UpsertDatahubEndpoint(ctx context.Context, ep store.DatahubEndpo
 	}
 	bins := aero.BinMap{
 		"url":       ep.URL,
+		"network":   ep.Network,
 		"source":    ep.Source,
 		"last_seen": ep.LastSeen.UnixMilli(),
 	}
 	return s.client.Put(s.writePolicy(ctx), key, bins)
 }
 
-// ListDatahubEndpoints scans every row in the registry. Cardinality is
-// expected in the dozens to low hundreds — no pagination needed.
-func (s *Store) ListDatahubEndpoints(ctx context.Context) ([]store.DatahubEndpoint, error) {
+// ListDatahubEndpoints scans every row in the registry, filtering to entries
+// scoped to the given network. Cardinality is expected in the dozens to low
+// hundreds — no pagination needed. Records written before the network bin
+// existed return an empty Network and are filtered out.
+func (s *Store) ListDatahubEndpoints(ctx context.Context, network string) ([]store.DatahubEndpoint, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -1014,13 +1017,14 @@ loop:
 				break loop
 			}
 			ep := store.DatahubEndpoint{
-				URL:    getString(rec.Record, "url"),
-				Source: getString(rec.Record, "source"),
+				URL:     getString(rec.Record, "url"),
+				Network: getString(rec.Record, "network"),
+				Source:  getString(rec.Record, "source"),
 			}
 			if ms := getInt64(rec.Record, "last_seen"); ms > 0 {
 				ep.LastSeen = time.UnixMilli(ms)
 			}
-			if ep.URL != "" {
+			if ep.URL != "" && ep.Network == network {
 				out = append(out, ep)
 			}
 		}

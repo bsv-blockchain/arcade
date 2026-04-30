@@ -30,8 +30,15 @@ const DatahubEndpointSourceDiscovered = "discovered"
 // DatahubEndpoint is a registered datahub URL persisted to the shared store
 // so propagation and bump-builder pods running as separate microservices
 // converge on the same union of (configured + p2p-discovered) URLs.
+//
+// Network scopes the entry to a Bitcoin network (mainnet/testnet/teratestnet/
+// regtest). It exists so a store reused across network changes — or shared
+// between pods on the same persistence backend — never serves a peer from one
+// network to a pod configured for another. Legacy rows written before this
+// field existed have an empty Network and are filtered out by every read.
 type DatahubEndpoint struct {
 	URL      string
+	Network  string
 	Source   string // DatahubEndpointSourceConfigured or DatahubEndpointSourceDiscovered
 	LastSeen time.Time
 }
@@ -145,10 +152,13 @@ type Store interface {
 	// statically configured URLs so all pods see the same registry.
 	UpsertDatahubEndpoint(ctx context.Context, ep DatahubEndpoint) error
 
-	// ListDatahubEndpoints returns every registered datahub endpoint. Each
-	// pod's teranode.Client polls this on a refresh interval and merges new
-	// URLs into its in-memory list.
-	ListDatahubEndpoints(ctx context.Context) ([]DatahubEndpoint, error)
+	// ListDatahubEndpoints returns every registered datahub endpoint scoped
+	// to the given network. Each pod's teranode.Client polls this on a refresh
+	// interval and merges new URLs into its in-memory list. Entries written
+	// before the schema gained a network column have an empty Network and are
+	// excluded — they will be re-registered with the correct network the next
+	// time their peer announces.
+	ListDatahubEndpoints(ctx context.Context, network string) ([]DatahubEndpoint, error)
 
 	// Close closes the database connection
 	Close() error

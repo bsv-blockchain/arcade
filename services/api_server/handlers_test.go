@@ -142,7 +142,7 @@ func (m *mockStore) UpsertDatahubEndpoint(context.Context, store.DatahubEndpoint
 	return nil
 }
 
-func (m *mockStore) ListDatahubEndpoints(context.Context) ([]store.DatahubEndpoint, error) {
+func (m *mockStore) ListDatahubEndpoints(context.Context, string) ([]store.DatahubEndpoint, error) {
 	return nil, nil
 }
 func (m *mockStore) Close() error { return nil }

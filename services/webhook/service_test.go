@@ -119,7 +119,7 @@ func (s *fakeStore) UpsertDatahubEndpoint(context.Context, store.DatahubEndpoint
 	return nil
 }
 
-func (s *fakeStore) ListDatahubEndpoints(context.Context) ([]store.DatahubEndpoint, error) {
+func (s *fakeStore) ListDatahubEndpoints(context.Context, string) ([]store.DatahubEndpoint, error) {
 	return nil, nil
 }
 func (s *fakeStore) Close() error { return nil }

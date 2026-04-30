@@ -63,7 +63,14 @@ CREATE TABLE IF NOT EXISTS leases (
 
 CREATE TABLE IF NOT EXISTS datahub_endpoints (
     url        TEXT PRIMARY KEY,
+    network    TEXT NOT NULL DEFAULT '',
     source     TEXT NOT NULL,
     last_seen  TIMESTAMPTZ NOT NULL
 );
+-- Idempotent column add for tables created before the network scoping was
+-- introduced. Existing rows keep the empty default, which excludes them from
+-- every ListDatahubEndpoints query — they re-register the next time the peer
+-- announces, with the correct network attached.
+ALTER TABLE datahub_endpoints ADD COLUMN IF NOT EXISTS network TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_dh_last_seen ON datahub_endpoints(last_seen);
+CREATE INDEX IF NOT EXISTS idx_dh_network   ON datahub_endpoints(network);

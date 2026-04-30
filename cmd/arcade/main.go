@@ -96,7 +96,7 @@ func run(cmd *cobra.Command, _ []string) error {
 		ProbeTimeout:        time.Duration(cfg.Propagation.EndpointHealth.ProbeTimeoutMs) * time.Millisecond,
 		MinHealthyEndpoints: cfg.Propagation.EndpointHealth.MinHealthyEndpoints,
 		RefreshInterval:     time.Duration(cfg.Propagation.EndpointHealth.RefreshIntervalMs) * time.Millisecond,
-		Source:              endpointSource{st: st},
+		Source:              endpointSource{st: st, network: cfg.Network},
 		Logger:              logger,
 	})
 	defer teranodeClient.Close()
@@ -111,6 +111,7 @@ func run(cmd *cobra.Command, _ []string) error {
 		for _, url := range cfg.DatahubURLs {
 			if err := st.UpsertDatahubEndpoint(seedCtx, store.DatahubEndpoint{
 				URL:      url,
+				Network:  cfg.Network,
 				Source:   store.DatahubEndpointSourceConfigured,
 				LastSeen: time.Now(),
 			}); err != nil {
@@ -245,12 +246,17 @@ func buildServices(
 // endpointSource adapts store.Store to teranode.EndpointSource by extracting
 // just the URL list. Defining the adapter here (rather than in teranode) keeps
 // the teranode package free of a direct store dependency.
+//
+// network scopes the listing to the configured Bitcoin network so a store
+// shared across pods (or reused after a network change) never replays peers
+// from a different network.
 type endpointSource struct {
-	st store.Store
+	st      store.Store
+	network string
 }
 
 func (a endpointSource) ListEndpointURLs(ctx context.Context) ([]string, error) {
-	eps, err := a.st.ListDatahubEndpoints(ctx)
+	eps, err := a.st.ListDatahubEndpoints(ctx, a.network)
 	if err != nil {
 		return nil, err
 	}

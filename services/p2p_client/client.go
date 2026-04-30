@@ -283,6 +283,7 @@ func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatu
 		upsertCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		err := c.store.UpsertDatahubEndpoint(upsertCtx, store.DatahubEndpoint{
 			URL:      normalized,
+			Network:  c.cfg.Network,
 			Source:   store.DatahubEndpointSourceDiscovered,
 			LastSeen: time.Now(),
 		})

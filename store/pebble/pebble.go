@@ -165,6 +165,7 @@ type storedBump struct {
 
 type storedDatahubEndpoint struct {
 	URL            string `json:"url"`
+	Network        string `json:"network"`
 	Source         string `json:"source"`
 	LastSeenUnixNs int64  `json:"last_seen"`
 }
@@ -1096,8 +1097,9 @@ func (s *Store) UpsertDatahubEndpoint(ctx context.Context, ep store.DatahubEndpo
 		return fmt.Errorf("upsert datahub endpoint: empty url")
 	}
 	stored := storedDatahubEndpoint{
-		URL:    ep.URL,
-		Source: ep.Source,
+		URL:     ep.URL,
+		Network: ep.Network,
+		Source:  ep.Source,
 	}
 	if !ep.LastSeen.IsZero() {
 		stored.LastSeenUnixNs = ep.LastSeen.UnixNano()
@@ -1109,7 +1111,7 @@ func (s *Store) UpsertDatahubEndpoint(ctx context.Context, ep store.DatahubEndpo
 	return s.db.Set(datahubEndpointKey(ep.URL), payload, s.writeOpts)
 }
 
-func (s *Store) ListDatahubEndpoints(ctx context.Context) ([]store.DatahubEndpoint, error) {
+func (s *Store) ListDatahubEndpoints(ctx context.Context, network string) ([]store.DatahubEndpoint, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -1132,9 +1134,13 @@ func (s *Store) ListDatahubEndpoints(ctx context.Context) ([]store.DatahubEndpoi
 		if err := json.Unmarshal(iter.Value(), &row); err != nil {
 			continue
 		}
+		if row.Network != network {
+			continue
+		}
 		ep := store.DatahubEndpoint{
-			URL:    row.URL,
-			Source: row.Source,
+			URL:     row.URL,
+			Network: row.Network,
+			Source:  row.Source,
 		}
 		if row.LastSeenUnixNs != 0 {
 			ep.LastSeen = time.Unix(0, row.LastSeenUnixNs)

@@ -385,8 +385,8 @@ func TestDatahubEndpoints_UpsertAndList(t *testing.T) {
 	now := time.Date(2026, 4, 24, 12, 0, 0, 0, time.UTC)
 
 	in := []store.DatahubEndpoint{
-		{URL: "https://a.example", Source: store.DatahubEndpointSourceConfigured, LastSeen: now},
-		{URL: "https://b.example", Source: store.DatahubEndpointSourceDiscovered, LastSeen: now.Add(time.Minute)},
+		{URL: "https://a.example", Network: "mainnet", Source: store.DatahubEndpointSourceConfigured, LastSeen: now},
+		{URL: "https://b.example", Network: "mainnet", Source: store.DatahubEndpointSourceDiscovered, LastSeen: now.Add(time.Minute)},
 	}
 	for _, ep := range in {
 		if err := s.UpsertDatahubEndpoint(ctx, ep); err != nil {
@@ -394,7 +394,7 @@ func TestDatahubEndpoints_UpsertAndList(t *testing.T) {
 		}
 	}
 
-	out, err := s.ListDatahubEndpoints(ctx)
+	out, err := s.ListDatahubEndpoints(ctx, "mainnet")
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -410,12 +410,58 @@ func TestDatahubEndpoints_UpsertAndList(t *testing.T) {
 		if !ok {
 			t.Fatalf("missing endpoint %s", want.URL)
 		}
+		if gotEp.Network != want.Network {
+			t.Errorf("%s network: got %q want %q", want.URL, gotEp.Network, want.Network)
+		}
 		if gotEp.Source != want.Source {
 			t.Errorf("%s source: got %q want %q", want.URL, gotEp.Source, want.Source)
 		}
 		if !gotEp.LastSeen.Equal(want.LastSeen) {
 			t.Errorf("%s last_seen: got %v want %v", want.URL, gotEp.LastSeen, want.LastSeen)
 		}
+	}
+}
+
+// TestDatahubEndpoints_NetworkScoped is the regression for the bug where a
+// regtest pod served mainnet URLs persisted from a prior run.
+func TestDatahubEndpoints_NetworkScoped(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
+
+	rows := []store.DatahubEndpoint{
+		{URL: "https://main-a.example", Network: "mainnet", Source: store.DatahubEndpointSourceDiscovered, LastSeen: now},
+		{URL: "https://main-b.example", Network: "mainnet", Source: store.DatahubEndpointSourceDiscovered, LastSeen: now},
+		{URL: "https://regtest-a.example", Network: "regtest", Source: store.DatahubEndpointSourceConfigured, LastSeen: now},
+	}
+	for _, ep := range rows {
+		if err := s.UpsertDatahubEndpoint(ctx, ep); err != nil {
+			t.Fatalf("upsert %s: %v", ep.URL, err)
+		}
+	}
+
+	regtest, err := s.ListDatahubEndpoints(ctx, "regtest")
+	if err != nil {
+		t.Fatalf("list regtest: %v", err)
+	}
+	if len(regtest) != 1 || regtest[0].URL != "https://regtest-a.example" {
+		t.Fatalf("regtest list: got %+v", regtest)
+	}
+
+	mainnet, err := s.ListDatahubEndpoints(ctx, "mainnet")
+	if err != nil {
+		t.Fatalf("list mainnet: %v", err)
+	}
+	if len(mainnet) != 2 {
+		t.Fatalf("mainnet list: got %d entries, want 2: %+v", len(mainnet), mainnet)
+	}
+
+	empty, err := s.ListDatahubEndpoints(ctx, "")
+	if err != nil {
+		t.Fatalf("list empty: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("empty network filter must not match scoped rows: %+v", empty)
 	}
 }
 
@@ -426,17 +472,17 @@ func TestDatahubEndpoints_UpsertOverwrites(t *testing.T) {
 	t2 := t1.Add(time.Hour)
 
 	if err := s.UpsertDatahubEndpoint(ctx, store.DatahubEndpoint{
-		URL: "https://a.example", Source: store.DatahubEndpointSourceConfigured, LastSeen: t1,
+		URL: "https://a.example", Network: "mainnet", Source: store.DatahubEndpointSourceConfigured, LastSeen: t1,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.UpsertDatahubEndpoint(ctx, store.DatahubEndpoint{
-		URL: "https://a.example", Source: store.DatahubEndpointSourceDiscovered, LastSeen: t2,
+		URL: "https://a.example", Network: "mainnet", Source: store.DatahubEndpointSourceDiscovered, LastSeen: t2,
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	out, err := s.ListDatahubEndpoints(ctx)
+	out, err := s.ListDatahubEndpoints(ctx, "mainnet")
 	if err != nil {
 		t.Fatal(err)
 	}
