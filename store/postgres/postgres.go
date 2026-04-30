@@ -187,6 +187,9 @@ func (s *Store) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.T
 
 	// Normalise inputs the same way GetOrInsertStatus does — empty Status
 	// becomes RECEIVED, missing timestamps default to now, CreatedAt is set.
+	// Defaults are computed into local variables, never written back to the
+	// caller's struct: callers (e.g. tx_validator) may share the same input
+	// slice across goroutines, and mutating shared pointers would race.
 	// Postgres rejects multi-row INSERT…ON CONFLICT DO UPDATE when the same
 	// key appears twice in VALUES (SQLSTATE 21000), so dedupe by txid here
 	// and stitch results back to every duplicate position after the round
@@ -196,19 +199,20 @@ func (s *Store) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.T
 	uniqueIdx := make([]int, 0, len(statuses))
 	args := make([]any, 0, len(statuses)*columnsPerInsertRow)
 	for i, st := range statuses {
-		if st.Timestamp.IsZero() {
-			st.Timestamp = now
-		}
-		if st.Status == "" {
-			st.Status = models.StatusReceived
-		}
-		st.CreatedAt = now
-
 		if _, seen := firstPos[st.TxID]; seen {
 			continue
 		}
 		firstPos[st.TxID] = i
 		uniqueIdx = append(uniqueIdx, i)
+
+		ts := st.Timestamp
+		if ts.IsZero() {
+			ts = now
+		}
+		statusVal := st.Status
+		if statusVal == "" {
+			statusVal = models.StatusReceived
+		}
 
 		var competing any
 		if len(st.CompetingTxs) > 0 {
@@ -223,11 +227,11 @@ func (s *Store) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.T
 			nextRetry = st.NextRetryAt
 		}
 		args = append(args,
-			st.TxID, string(st.Status), st.StatusCode,
+			st.TxID, string(statusVal), st.StatusCode,
 			st.BlockHash, int64(st.BlockHeight), /* #nosec G115 */
 			[]byte(st.MerklePath), st.ExtraInfo, competing,
 			[]byte(st.RawTx), st.RetryCount,
-			nextRetry, st.Timestamp, st.CreatedAt,
+			nextRetry, ts, now,
 		)
 	}
 
@@ -289,6 +293,13 @@ RETURNING txid, status, status_code, block_hash, block_height, merkle_path,
 		if i != firstPos[st.TxID] && res.Inserted {
 			first := statuses[firstPos[st.TxID]]
 			cp := *first
+			if cp.Status == "" {
+				cp.Status = models.StatusReceived
+			}
+			if cp.Timestamp.IsZero() {
+				cp.Timestamp = now
+			}
+			cp.CreatedAt = now
 			res = store.BatchInsertResult{Inserted: false, Existing: &cp}
 		}
 		out[i] = res
