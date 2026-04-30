@@ -11,8 +11,10 @@
 mode: all
 log_level: info
 
-# Bitcoin network: mainnet | testnet | teratestnet. Drives both the p2p
-# discovery topic and the embedded chaintracks bootstrap peers.
+# Bitcoin network: mainnet | testnet | teratestnet | regtest. Drives both the
+# p2p discovery topic and the embedded chaintracks bootstrap peers. Regtest
+# requires operator-supplied p2p.bootstrap_peers when datahub_discovery is on
+# and auto-disables chaintracks_server.
 network: teratestnet
 
 # All on-disk state goes under this root (Pebble DB, chaintracks headers,

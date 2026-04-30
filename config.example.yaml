@@ -12,6 +12,9 @@ log_level: info
 #   mainnet      — production Bitcoin SV
 #   testnet      — public testnet
 #   teratestnet  — teranode scaling testnet
+#   regtest      — local/private network; requires operator-supplied
+#                  p2p.bootstrap_peers when datahub_discovery is on, and
+#                  auto-disables chaintracks_server (no regtest genesis header).
 # Both the libp2p datahub discovery client and the embedded chaintracks
 # instance derive their pubsub topic and bootstrap peers from this value.
 network: mainnet

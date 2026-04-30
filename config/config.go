@@ -35,6 +35,7 @@ const (
 	NetworkMainnet     = "mainnet"
 	NetworkTestnet     = "testnet"
 	NetworkTeratestnet = "teratestnet"
+	NetworkRegtest     = "regtest"
 )
 
 // knownNetworks gates validate() and ResolveP2PNetwork.
@@ -42,6 +43,7 @@ var knownNetworks = map[string]struct{}{
 	NetworkMainnet:     {},
 	NetworkTestnet:     {},
 	NetworkTeratestnet: {},
+	NetworkRegtest:     {},
 }
 
 // ResolveP2PNetwork maps a canonical arcade network name to the values that
@@ -56,12 +58,18 @@ var knownNetworks = map[string]struct{}{
 // name is wrong. We sidestep it by handing the library the canonical topic
 // network ("mainnet"/"testnet"/"teratestnet") and injecting the bootstrap peer
 // list ourselves — so topic and peers always agree.
+//
+// Regtest deliberately returns a nil bootstrap list: there is no canonical
+// regtest DNS, so operators must supply p2p.bootstrap_peers themselves.
+// validate() enforces this when datahub_discovery is enabled.
 func ResolveP2PNetwork(network string) (topicNetwork string, bootstrapPeers []string) {
 	switch network {
 	case NetworkTestnet:
 		return NetworkTestnet, []string{"/dnsaddr/testnet.bootstrap.teranode.bsvb.tech"}
 	case NetworkTeratestnet:
 		return NetworkTeratestnet, []string{"/dnsaddr/teratestnet.bootstrap.teranode.bsvb.tech"}
+	case NetworkRegtest:
+		return NetworkRegtest, nil
 	case NetworkMainnet, "":
 		fallthrough
 	default:
@@ -73,6 +81,10 @@ func ResolveP2PNetwork(network string) (topicNetwork string, bootstrapPeers []st
 // go-chaintracks accepts at config.P2P.Network. Its chainmanager.getGenesisHeader
 // only knows "main"/"test"/"teratest"/"teratestnet", so we translate at the
 // boundary instead of leaking upstream naming into the arcade config surface.
+//
+// Regtest is intentionally absent: chaintracks has no regtest genesis header,
+// so validate() force-disables chaintracks_server when network=regtest and this
+// function is never reached with that value.
 func ResolveChaintracksNetwork(network string) string {
 	switch network {
 	case NetworkTestnet:
@@ -479,8 +491,17 @@ func validate(cfg *Config) error {
 		cfg.Network = NetworkMainnet
 	}
 	if _, ok := knownNetworks[cfg.Network]; !ok {
-		return fmt.Errorf("invalid network %q (expected %s, %s, or %s)",
-			cfg.Network, NetworkMainnet, NetworkTestnet, NetworkTeratestnet)
+		return fmt.Errorf("invalid network %q (expected %s, %s, %s, or %s)",
+			cfg.Network, NetworkMainnet, NetworkTestnet, NetworkTeratestnet, NetworkRegtest)
+	}
+	if cfg.Network == NetworkRegtest {
+		// chaintracks has no regtest genesis header — initializing it would
+		// crash with ErrUnknownNetwork. Force-disable so operators only need to
+		// set network: regtest without also remembering chaintracks_server.
+		cfg.ChaintracksServer.Enabled = false
+		if cfg.P2P.DatahubDiscovery && len(cfg.P2P.BootstrapPeers) == 0 {
+			return fmt.Errorf("p2p.bootstrap_peers is required when network=regtest and p2p.datahub_discovery=true")
+		}
 	}
 	validModes := map[string]bool{
 		"all": true, "api-server": true,
