@@ -55,19 +55,34 @@ func (p *fakePublisher) Close() error { return nil }
 
 // sseStoreStub extends mockStore with submission/status fixtures so we can
 // drive token filtering and Last-Event-ID catchup paths.
+//
+// The fixtures are mutated from test goroutines while the SSE handler reads
+// them from its own goroutine (via httptest.Server), so accesses are guarded
+// by a mutex to keep `go test -race` clean.
 type sseStoreStub struct {
 	mockStore
 
+	mu          sync.RWMutex
 	subsByToken map[string][]*models.Submission
 	statusByTx  map[string]*models.TransactionStatus
 }
 
 func (s *sseStoreStub) GetSubmissionsByToken(_ context.Context, token string) ([]*models.Submission, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.subsByToken[token], nil
 }
 
 func (s *sseStoreStub) GetStatus(_ context.Context, txid string) (*models.TransactionStatus, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.statusByTx[txid], nil
+}
+
+func (s *sseStoreStub) setStatus(txid string, status *models.TransactionStatus) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.statusByTx[txid] = status
 }
 
 // setupSSEServer wires up an api_server.Server backed by a fakePublisher and

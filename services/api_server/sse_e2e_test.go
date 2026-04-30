@@ -76,7 +76,7 @@ func newE2EHarness(t *testing.T) *e2eHarness {
 // Tests use this to simulate a real status update.
 func (h *e2eHarness) publishAndPersist(t *testing.T, status *models.TransactionStatus) {
 	t.Helper()
-	h.store.statusByTx[status.TxID] = status
+	h.store.setStatus(status.TxID, status)
 	if err := h.publisher.Publish(t.Context(), status); err != nil {
 		t.Fatalf("publish: %v", err)
 	}

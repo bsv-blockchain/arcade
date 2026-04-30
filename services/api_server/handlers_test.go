@@ -77,12 +77,14 @@ func (m *mockStore) GetBUMP(context.Context, string) (uint64, []byte, error)  { 
 func (m *mockStore) SetMinedByTxIDs(context.Context, string, []string) ([]*models.TransactionStatus, error) {
 	return nil, nil
 }
+
 func (m *mockStore) InsertSubmission(_ context.Context, sub *models.Submission) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.insertedSubmissions = append(m.insertedSubmissions, sub)
 	return nil
 }
+
 func (m *mockStore) GetSubmissionsByTxID(context.Context, string) ([]*models.Submission, error) {
 	return nil, nil
 }
