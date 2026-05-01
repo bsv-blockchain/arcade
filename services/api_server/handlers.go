@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"html/template"
 	"io"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"github.com/bsv-blockchain/arcade/callbackurl"
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/teranode"
 )
 
@@ -265,6 +267,11 @@ func (s *Server) handleCallback(c *gin.Context) {
 	}
 }
 
+// handleSeenOnNetwork applies a SEEN_ON_NETWORK callback from merkle-service
+// to every txid in the message. Unknown txids (i.e. callbacks for txs we
+// never recorded) are dropped with a Warn — never created as phantom rows.
+// See F-033 / issue #91; the store layer enforces this by returning
+// store.ErrNotFound from UpdateStatus when the row is absent.
 func (s *Server) handleSeenOnNetwork(c *gin.Context, msg models.CallbackMessage, logger *zap.Logger) {
 	txids := msg.ResolveSeenTxIDs()
 	if len(txids) == 0 {
@@ -280,6 +287,11 @@ func (s *Server) handleSeenOnNetwork(c *gin.Context, msg models.CallbackMessage,
 			Timestamp: now,
 		}
 		if err := s.store.UpdateStatus(ctx, status); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				logger.Warn("dropping seen_on_network for unknown txid",
+					zap.String("txid", txid))
+				continue
+			}
 			logger.Warn("failed to update seen_on_network", zap.String("txid", txid), zap.Error(err))
 			continue
 		}
@@ -290,6 +302,10 @@ func (s *Server) handleSeenOnNetwork(c *gin.Context, msg models.CallbackMessage,
 	}
 }
 
+// handleSeenMultipleNodes applies a SEEN_ON_MULTIPLE_NODES callback. Same
+// unknown-txid handling as handleSeenOnNetwork — the store rejects updates
+// to absent rows (F-033 / #91) and we log + continue rather than creating
+// phantom rows.
 func (s *Server) handleSeenMultipleNodes(c *gin.Context, msg models.CallbackMessage, logger *zap.Logger) {
 	txids := msg.ResolveSeenTxIDs()
 	if len(txids) == 0 {
@@ -305,6 +321,11 @@ func (s *Server) handleSeenMultipleNodes(c *gin.Context, msg models.CallbackMess
 			Timestamp: now,
 		}
 		if err := s.store.UpdateStatus(ctx, status); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				logger.Warn("dropping seen_multiple_nodes for unknown txid",
+					zap.String("txid", txid))
+				continue
+			}
 			logger.Warn("failed to update seen_multiple_nodes", zap.String("txid", txid), zap.Error(err))
 			continue
 		}
