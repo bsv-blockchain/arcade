@@ -321,6 +321,16 @@ var KafkaProduceErrors = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "Kafka producer error count, by topic.",
 }, []string{"topic"})
 
+// KafkaDLQPublishFailures counts DLQ publish failures by original topic. A
+// non-zero rate means the DLQ topic is rejecting publishes — investigate Kafka
+// availability. The consumer leaves the offset uncommitted on these failures,
+// so they correlate with rising consumer lag on the primary topic until
+// publishing recovers.
+var KafkaDLQPublishFailures = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_kafka_dlq_publish_failures_total",
+	Help: "Kafka DLQ publish failure count, by original topic.",
+}, []string{"topic"})
+
 // ---------------------------------------------------------------------------
 // p2p_client
 // ---------------------------------------------------------------------------
