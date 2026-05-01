@@ -244,6 +244,21 @@ var APIRequestBytes = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Buckets: bytesBuckets,
 }, []string{"route"})
 
+// APISSEDroppedTotal counts SSE fan-out events that were dropped without
+// being delivered to a client. Reasons:
+//   - "slow_client": the client's send buffer was full (the consumer goroutine
+//     wasn't draining it fast enough).
+//   - "client_gone": the client was unregistering concurrently and its context
+//     had already been canceled by the time fan-out reached it.
+//
+// A non-zero "client_gone" rate is normal under churn; a sustained
+// "slow_client" rate indicates a consumer that can't keep up with the publish
+// rate and may need a larger buffer or a backpressure strategy.
+var APISSEDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_api_sse_dropped_total",
+	Help: "SSE fan-out events dropped without delivery, by reason.",
+}, []string{"reason"}) // slow_client, client_gone
+
 // ---------------------------------------------------------------------------
 // teranode (HTTP client)
 // ---------------------------------------------------------------------------
