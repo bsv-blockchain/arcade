@@ -230,7 +230,7 @@ func buildServices(
 	// deployment ships callbacks without extra config) but can be split into
 	// its own pod by setting mode=webhook.
 	if shouldRun("api-server") || shouldRun("webhook") {
-		svcs = append(svcs, webhook.New(cfg.Webhook, logger, publisher, st))
+		svcs = append(svcs, webhook.New(cfg.Webhook, cfg.Callback, logger, publisher, st))
 	}
 	// p2p_client is its own service; it's needed both by mode=propagation
 	// (where it feeds the local teranode.Client directly) and by mode=p2p-client
