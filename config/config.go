@@ -509,9 +509,13 @@ func validate(cfg *Config) error {
 	default:
 		return fmt.Errorf("unknown store.backend %q (expected aerospike, pebble, or postgres)", cfg.Store.Backend)
 	}
-	if cfg.MerkleService.URL == "" {
-		return fmt.Errorf("merkle_service.url is required")
-	}
+	// merkle_service.url is intentionally optional: an empty value means the
+	// Merkle integration is disabled. The runtime treats URL-presence as the
+	// toggle — cmd/arcade/main.go only constructs a merkleservice.Client when
+	// the URL is set, and propagation.Propagator nil-guards every dereference
+	// of the client. The documented standalone and zero-dependency profiles
+	// (config.example.standalone.yaml) ship with merkle_service.url: "" for
+	// exactly this reason. See issue #59 / finding F-001.
 	if cfg.Network == "" {
 		cfg.Network = NetworkMainnet
 	}

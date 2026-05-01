@@ -18,19 +18,28 @@ func baseValidConfig() *Config {
 	return cfg
 }
 
-// merkle_service.url is mandatory: the merkle service is always enabled, and
-// startup with an unconfigured URL would silently produce a nil client and
-// fail later in obscure ways. Catching it at config load surfaces the misconfig
-// immediately.
-func TestValidate_RequiresMerkleServiceURL(t *testing.T) {
+// merkle_service.url is optional: URL-presence is the runtime toggle for the
+// Merkle integration. cmd/arcade/main.go only constructs a merkleservice.Client
+// when the URL is set, and propagation nil-guards every dereference. The
+// documented standalone profile ships with merkle_service.url: "" — validation
+// must accept that, otherwise the standalone binary refuses to start (issue #59
+// / finding F-001).
+func TestValidate_AllowsEmptyMerkleServiceURL(t *testing.T) {
 	cfg := baseValidConfig()
 	cfg.MerkleService.URL = ""
-	err := validate(cfg)
-	if err == nil {
-		t.Fatal("expected error when merkle_service.url is unset")
+	if err := validate(cfg); err != nil {
+		t.Fatalf("empty merkle_service.url should be accepted, got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "merkle_service.url") {
-		t.Errorf("error should mention merkle_service.url, got: %v", err)
+}
+
+// A populated merkle_service.url is the production path and must continue to
+// validate cleanly so the "set the URL to enable Merkle" toggle stays symmetric
+// with the empty-URL case above.
+func TestValidate_AcceptsPopulatedMerkleServiceURL(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.MerkleService.URL = "http://merkle.local"
+	if err := validate(cfg); err != nil {
+		t.Fatalf("populated merkle_service.url should be accepted, got: %v", err)
 	}
 }
 
