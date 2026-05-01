@@ -384,6 +384,15 @@ WHERE t.txid = v.txid AND t.status <> ALL(v.disallowed_prev)`
 	return nil
 }
 
+// UpdateStatus updates an existing transaction. If no row exists for
+// status.TxID the call returns store.ErrNotFound without writing — callers
+// must use GetOrInsertStatus to create new rows. This guard closes F-033 /
+// issue #91: previously a callback referencing a never-submitted txid would
+// create a phantom row with no submission/validation history, turning the
+// callback endpoint into a write-anywhere primitive. Postgres' UPDATE …
+// WHERE txid=$1 already no-ops on missing rows; we now distinguish the
+// "row absent" case from "row present but lattice rejected" by checking
+// existence in a separate query when the UPDATE affects zero rows.
 func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStatus) error {
 	// Mirror Aerospike's BinMap semantics: empty fields are ignored, so the
 	// caller can issue partial updates without clobbering unrelated columns.
@@ -427,14 +436,45 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 	// overwrite a terminal status (MINED/IMMUTABLE/REJECTED/DOUBLE_SPEND_ATTEMPTED)
 	// with a later, lower-priority update such as a stray SEEN_ON_NETWORK
 	// callback. See models.Status.DisallowedPreviousStatuses and #61 / F-003.
+	hasLatticeGuard := false
 	if disallowed := disallowedPrevAsStrings(status.Status); len(disallowed) > 0 {
 		q += fmt.Sprintf(" AND status <> ALL($%d::text[])", idx)
 		args = append(args, disallowed)
+		hasLatticeGuard = true
 	}
 
-	_, err := s.pool.Exec(ctx, q, args...)
+	tag, err := s.pool.Exec(ctx, q, args...)
 	if err != nil {
 		return fmt.Errorf("update tx %s: %w", status.TxID, err)
+	}
+	if tag.RowsAffected() > 0 {
+		return nil
+	}
+	// Zero rows: when no lattice guard was applied, the only way to reach
+	// here is "txid not in the table" — return ErrNotFound. With a lattice
+	// guard, zero rows could also mean "row present but transition refused";
+	// disambiguate with a cheap existence probe so legitimate lattice no-ops
+	// don't surface as ErrNotFound.
+	if !hasLatticeGuard {
+		return store.ErrNotFound
+	}
+	return s.probeMissingTxID(ctx, status.TxID)
+}
+
+// probeMissingTxID returns store.ErrNotFound if no row exists for txid, nil
+// otherwise. Used by UpdateStatus to distinguish "row absent" from "row
+// present but lattice rejected" when an UPDATE … WHERE … AND status<>ALL(…)
+// affects zero rows.
+func (s *Store) probeMissingTxID(ctx context.Context, txid string) error {
+	var exists bool
+	if err := s.pool.QueryRow(ctx,
+		"SELECT EXISTS(SELECT 1 FROM transactions WHERE txid = $1)",
+		txid,
+	).Scan(&exists); err != nil {
+		return fmt.Errorf("update tx %s: existence probe: %w", txid, err)
+	}
+	if !exists {
+		return store.ErrNotFound
 	}
 	return nil
 }

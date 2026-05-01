@@ -553,6 +553,66 @@ func TestUpdateStatus_TerminalNotOverwritten(t *testing.T) {
 	}
 }
 
+// TestUpdateStatus_UnknownTxidReturnsErrNotFound is the regression for F-033
+// (#91): UpdateStatus on a txid that has no existing row must return
+// store.ErrNotFound and must NOT create a phantom row. Previously the UPDATE
+// no-opped silently and callers (notably the merkle-service callback handler)
+// could not distinguish "row missing" from "row updated".
+func TestUpdateStatus_UnknownTxidReturnsErrNotFound(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	txid := "ghost-tx"
+
+	err := s.UpdateStatus(ctx, &models.TransactionStatus{
+		TxID:      txid,
+		Status:    models.StatusSeenOnNetwork,
+		Timestamp: time.Now(),
+	})
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected store.ErrNotFound for unknown txid, got %v", err)
+	}
+
+	// And critically: no phantom row was created.
+	got, gerr := s.GetStatus(ctx, txid)
+	if gerr != nil {
+		t.Fatalf("GetStatus after rejected update: %v", gerr)
+	}
+	if got != nil {
+		t.Fatalf("expected nil status for ghost txid, got %+v", got)
+	}
+}
+
+// TestUpdateStatus_ExistingTxidStillWorks is the F-033 happy-path regression:
+// the unknown-txid guard must not break updates against rows that were
+// legitimately inserted via GetOrInsertStatus.
+func TestUpdateStatus_ExistingTxidStillWorks(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	txid := "real-tx"
+
+	if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+		TxID: txid, Status: models.StatusReceived,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := s.UpdateStatus(ctx, &models.TransactionStatus{
+		TxID:      txid,
+		Status:    models.StatusSeenOnNetwork,
+		Timestamp: time.Now(),
+	}); err != nil {
+		t.Fatalf("UpdateStatus on existing row: %v", err)
+	}
+
+	got, err := s.GetStatus(ctx, txid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Status != models.StatusSeenOnNetwork {
+		t.Fatalf("expected SEEN_ON_NETWORK, got %+v", got)
+	}
+}
+
 // TestBatchUpdateStatus_TerminalNotOverwritten covers the same F-003
 // regression for the batched code path.
 func TestBatchUpdateStatus_TerminalNotOverwritten(t *testing.T) {
