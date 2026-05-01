@@ -1,7 +1,12 @@
 package validator
 
 import (
+	"errors"
 	"testing"
+
+	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/bsv-blockchain/go-sdk/script"
+	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 
 	arcerrors "github.com/bsv-blockchain/arcade/errors"
 )
@@ -101,5 +106,174 @@ func TestWrapPolicyError_UnlockingScripts(t *testing.T) {
 	}
 	if arcErr.StatusCode != arcerrors.StatusUnlockingScripts {
 		t.Errorf("expected StatusUnlockingScripts (461), got %d", arcErr.StatusCode)
+	}
+}
+
+// nonDataLockingScript returns a minimal non-data locking script suitable for
+// exercising the output validation paths. A single OP_TRUE (0x51) is treated
+// as a non-data, non-empty locking script by the SDK's IsData heuristic.
+func nonDataLockingScript() *script.Script {
+	s := script.Script([]byte{0x51})
+	return &s
+}
+
+// nonZeroSourceTXID returns a pointer to a non-zero chainhash so an input is
+// not treated as a coinbase input by checkInputs.
+func nonZeroSourceTXID() *chainhash.Hash {
+	h := chainhash.Hash{}
+	h[0] = 0x01
+	return &h
+}
+
+// TestCheckOutputs_OverflowGuarded crafts a transaction with two non-data
+// outputs each at maxSatoshis. Each value individually passes the
+// "output.Satoshis > maxSatoshis" check, and their sum exceeds maxSatoshis;
+// the per-iteration guard must reject this before the unbounded total can
+// be relied upon.
+func TestCheckOutputs_OverflowGuarded(t *testing.T) {
+	v := NewValidator(nil, nil)
+
+	tx := &sdkTx.Transaction{
+		Outputs: []*sdkTx.TransactionOutput{
+			{Satoshis: maxSatoshis, LockingScript: nonDataLockingScript()},
+			{Satoshis: maxSatoshis, LockingScript: nonDataLockingScript()},
+		},
+	}
+
+	err := v.checkOutputs(tx)
+	if err == nil {
+		t.Fatal("expected error for total satoshis above maxSatoshis, got nil")
+	}
+	if !errors.Is(err, ErrTxOutputTotalSatoshisTooHigh) {
+		t.Errorf("expected ErrTxOutputTotalSatoshisTooHigh, got %v", err)
+	}
+	if !errors.Is(err, ErrTxOutputInvalid) {
+		t.Errorf("expected ErrTxOutputInvalid wrap, got %v", err)
+	}
+}
+
+// TestCheckOutputs_ManySmallOutputsCannotOverflow exercises the per-iteration
+// guard by accumulating many outputs whose total exceeds maxSatoshis. This is
+// the regression case for F-004: prior to the fix a sequence of values that
+// summed past 2^64 could wrap and slip past the post-loop check.
+func TestCheckOutputs_ManySmallOutputsCannotOverflow(t *testing.T) {
+	v := NewValidator(nil, nil)
+
+	half := uint64(maxSatoshis / 2)
+	tx := &sdkTx.Transaction{
+		Outputs: []*sdkTx.TransactionOutput{
+			{Satoshis: half, LockingScript: nonDataLockingScript()},
+			{Satoshis: half, LockingScript: nonDataLockingScript()},
+			{Satoshis: half, LockingScript: nonDataLockingScript()},
+		},
+	}
+
+	err := v.checkOutputs(tx)
+	if err == nil {
+		t.Fatal("expected error for cumulative output satoshis above maxSatoshis, got nil")
+	}
+	if !errors.Is(err, ErrTxOutputTotalSatoshisTooHigh) {
+		t.Errorf("expected ErrTxOutputTotalSatoshisTooHigh, got %v", err)
+	}
+}
+
+// TestCheckOutputs_ValidPasses confirms a legitimate transaction is still
+// accepted by checkOutputs after the overflow guard is added.
+func TestCheckOutputs_ValidPasses(t *testing.T) {
+	v := NewValidator(nil, nil)
+
+	tx := &sdkTx.Transaction{
+		Outputs: []*sdkTx.TransactionOutput{
+			{Satoshis: 1_000, LockingScript: nonDataLockingScript()},
+			{Satoshis: 2_000, LockingScript: nonDataLockingScript()},
+		},
+	}
+
+	if err := v.checkOutputs(tx); err != nil {
+		t.Fatalf("expected no error for valid outputs, got %v", err)
+	}
+}
+
+// TestCheckInputs_OverflowGuarded crafts a transaction whose input
+// SourceTxSatoshis values are each <= maxSatoshis but whose cumulative sum
+// exceeds maxSatoshis. Without the per-iteration guard a uint64 wrap could
+// allow the post-loop check to pass.
+func TestCheckInputs_OverflowGuarded(t *testing.T) {
+	v := NewValidator(nil, nil)
+
+	makeInput := func(sats uint64) *sdkTx.TransactionInput {
+		in := &sdkTx.TransactionInput{SourceTXID: nonZeroSourceTXID()}
+		in.SetSourceTxOutput(&sdkTx.TransactionOutput{Satoshis: sats, LockingScript: nonDataLockingScript()})
+		return in
+	}
+
+	tx := &sdkTx.Transaction{
+		Inputs: []*sdkTx.TransactionInput{
+			makeInput(maxSatoshis),
+			makeInput(maxSatoshis),
+		},
+	}
+
+	err := v.checkInputs(tx)
+	if err == nil {
+		t.Fatal("expected error for total input satoshis above maxSatoshis, got nil")
+	}
+	if !errors.Is(err, ErrTxInputTotalSatoshisTooHigh) {
+		t.Errorf("expected ErrTxInputTotalSatoshisTooHigh, got %v", err)
+	}
+	if !errors.Is(err, ErrTxInputInvalid) {
+		t.Errorf("expected ErrTxInputInvalid wrap, got %v", err)
+	}
+}
+
+// TestCheckInputs_ManySmallInputsCannotOverflow exercises the per-iteration
+// guard via accumulation across multiple inputs.
+func TestCheckInputs_ManySmallInputsCannotOverflow(t *testing.T) {
+	v := NewValidator(nil, nil)
+
+	half := uint64(maxSatoshis / 2)
+	makeInput := func(sats uint64) *sdkTx.TransactionInput {
+		in := &sdkTx.TransactionInput{SourceTXID: nonZeroSourceTXID()}
+		in.SetSourceTxOutput(&sdkTx.TransactionOutput{Satoshis: sats, LockingScript: nonDataLockingScript()})
+		return in
+	}
+
+	tx := &sdkTx.Transaction{
+		Inputs: []*sdkTx.TransactionInput{
+			makeInput(half),
+			makeInput(half),
+			makeInput(half),
+		},
+	}
+
+	err := v.checkInputs(tx)
+	if err == nil {
+		t.Fatal("expected error for cumulative input satoshis above maxSatoshis, got nil")
+	}
+	if !errors.Is(err, ErrTxInputTotalSatoshisTooHigh) {
+		t.Errorf("expected ErrTxInputTotalSatoshisTooHigh, got %v", err)
+	}
+}
+
+// TestCheckInputs_ValidPasses confirms a legitimate transaction is still
+// accepted by checkInputs after the overflow guard is added.
+func TestCheckInputs_ValidPasses(t *testing.T) {
+	v := NewValidator(nil, nil)
+
+	makeInput := func(sats uint64) *sdkTx.TransactionInput {
+		in := &sdkTx.TransactionInput{SourceTXID: nonZeroSourceTXID()}
+		in.SetSourceTxOutput(&sdkTx.TransactionOutput{Satoshis: sats, LockingScript: nonDataLockingScript()})
+		return in
+	}
+
+	tx := &sdkTx.Transaction{
+		Inputs: []*sdkTx.TransactionInput{
+			makeInput(1_000),
+			makeInput(2_000),
+		},
+	}
+
+	if err := v.checkInputs(tx); err != nil {
+		t.Fatalf("expected no error for valid inputs, got %v", err)
 	}
 }

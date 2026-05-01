@@ -214,6 +214,13 @@ func (v *Validator) checkOutputs(tx *sdkTx.Transaction) error {
 		case isData && output.Satoshis != 0:
 			return errors.Join(ErrTxOutputInvalid, ErrTxOutputNonZeroOpReturn)
 		}
+		// Overflow-safe accumulation: both total and output.Satoshis are
+		// individually <= maxSatoshis here, so maxSatoshis - output.Satoshis
+		// cannot underflow and the comparison catches any wrap before it
+		// happens.
+		if total > maxSatoshis-output.Satoshis {
+			return errors.Join(ErrTxOutputInvalid, ErrTxOutputTotalSatoshisTooHigh)
+		}
 		total += output.Satoshis
 	}
 	if total > maxSatoshis {
@@ -236,6 +243,13 @@ func (v *Validator) checkInputs(tx *sdkTx.Transaction) error {
 
 		if inputSatoshis > maxSatoshis {
 			return errors.Join(ErrTxInputInvalid, ErrTxInputSatoshisTooHigh)
+		}
+		// Overflow-safe accumulation: both total and inputSatoshis are
+		// individually <= maxSatoshis here, so maxSatoshis - inputSatoshis
+		// cannot underflow and the comparison catches any wrap before it
+		// happens.
+		if total > maxSatoshis-inputSatoshis {
+			return errors.Join(ErrTxInputInvalid, ErrTxInputTotalSatoshisTooHigh)
 		}
 		total += inputSatoshis
 	}
