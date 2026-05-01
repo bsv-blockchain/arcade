@@ -21,7 +21,12 @@ import (
 //     carry sensible values. Partition is always 0.
 //   - MarkMessage is a no-op; at-most-once on crash is acceptable for a
 //     single-binary deployment.
-//   - Close closes all subscriber channels. Further Send calls return an error.
+//   - Close signals every subscriber's done channel and prevents further
+//     publishes. The mailbox channels themselves are deliberately NOT closed
+//     so a publisher that snapshotted a mailbox under the lock and released
+//     it before sending can't panic with "send on closed channel" when Close
+//     runs concurrently. Mirrors the SSE fan-out fix from #78 (F-020); see
+//     F-012 for the kafka memory-broker variant.
 type memoryBroker struct {
 	mu      sync.Mutex
 	closed  bool
@@ -33,8 +38,16 @@ type memoryBroker struct {
 // memoryMailbox is a per-(group, topic) delivery queue. Subscriptions joined
 // to the same group share it so either concurrent consumer wins the next
 // message (standard consumer-group semantics).
+//
+// done is closed when the mailbox is being torn down (broker Close, or its
+// last subscription unwinding). Publishers select on it so a concurrent
+// teardown turns a would-be send-on-closed-channel into a clean drop. The
+// mailbox channel itself is intentionally never closed — the forward
+// goroutine exits via done instead, and the unreferenced channel is left to
+// the GC. See F-012.
 type memoryMailbox struct {
 	ch       chan *Message
+	done     chan struct{}
 	refCount int
 }
 
@@ -87,13 +100,19 @@ func (b *memoryBroker) publish(ctx context.Context, topic, key string, value []b
 	}
 	offset := atomic.AddInt64(offsetPtr, 1) - 1
 
-	// Collect the mailboxes that currently care about this topic. Snapshot
+	// Snapshot the mailboxes that currently care about this topic. Snapshot
 	// under the lock, then release before sending so a blocked receiver
-	// doesn't stall other publishers.
-	var targets []chan *Message
+	// doesn't stall other publishers. Each mailbox's done channel rides
+	// along so a concurrent Close that tears down the mailbox between the
+	// snapshot and the send is observed as a drop rather than a panic.
+	type target struct {
+		ch   chan *Message
+		done chan struct{}
+	}
+	var targets []target
 	for _, topics := range b.groups {
 		if mb, ok := topics[topic]; ok {
-			targets = append(targets, mb.ch)
+			targets = append(targets, target{ch: mb.ch, done: mb.done})
 		}
 	}
 	b.mu.Unlock()
@@ -107,17 +126,33 @@ func (b *memoryBroker) publish(ctx context.Context, topic, key string, value []b
 		Timestamp: time.Now(),
 	}
 
-	for _, ch := range targets {
+	for _, t := range targets {
+		// Quick out for already-torn-down mailboxes: avoids the channel
+		// dance for subscribers we know are gone. The send-site re-checks
+		// done so the race between this peek and the select is safe.
+		select {
+		case <-t.done:
+			continue
+		default:
+		}
 		if async {
+			// Async semantics: drop on full buffer or torn-down mailbox.
 			select {
-			case ch <- msg:
+			case t.ch <- msg:
+			case <-t.done:
+				// Subscriber went away — drop silently.
 			default:
-				// drop silently — async semantics
+				// Buffer full — drop silently (async semantics).
 			}
 			continue
 		}
 		select {
-		case ch <- msg:
+		case t.ch <- msg:
+		case <-t.done:
+			// Subscriber went away mid-publish — drop and move on. The
+			// caller asked for "synchronous" but the destination is
+			// gone; treating this as a successful no-op matches the
+			// async drop and avoids a misleading error to the producer.
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -145,11 +180,14 @@ func (b *memoryBroker) Subscribe(groupID string, topics []string) (Subscription,
 	for _, t := range topics {
 		mb, ok := topicMailboxes[t]
 		if !ok {
-			mb = &memoryMailbox{ch: make(chan *Message, b.buffer)}
+			mb = &memoryMailbox{
+				ch:   make(chan *Message, b.buffer),
+				done: make(chan struct{}),
+			}
 			topicMailboxes[t] = mb
 		}
 		mb.refCount++
-		go forward(mb.ch, merged)
+		go forward(mb.ch, merged, mb.done)
 	}
 
 	return &memorySubscription{
@@ -161,10 +199,27 @@ func (b *memoryBroker) Subscribe(groupID string, topics []string) (Subscription,
 }
 
 // forward pipes messages from a per-topic mailbox into the merged per-
-// subscription channel until the mailbox is closed.
-func forward(in <-chan *Message, out chan<- *Message) {
-	for msg := range in {
-		out <- msg
+// subscription channel until the mailbox is torn down. The mailbox channel
+// is never closed (see F-012), so we exit via done instead of relying on
+// channel-close detection. Any messages still buffered in the mailbox at
+// teardown are abandoned; publishers may have already raced past Close and
+// landed values that no consumer will see — this matches the at-most-once
+// semantics documented on the broker.
+func forward(in <-chan *Message, out chan<- *Message, done <-chan struct{}) {
+	for {
+		select {
+		case <-done:
+			return
+		case msg, ok := <-in:
+			if !ok {
+				return
+			}
+			select {
+			case out <- msg:
+			case <-done:
+				return
+			}
+		}
 	}
 }
 
@@ -181,9 +236,15 @@ func (b *memoryBroker) Close() error {
 		return nil
 	}
 	b.closed = true
+	// Signal every mailbox via its done channel. We deliberately do NOT
+	// close mb.ch: a publisher may have snapshotted the channel under the
+	// lock and released the lock before sending (see publish), so closing
+	// it here would race that send and panic. Closing done is enough —
+	// publishers select on it to drop, and forward goroutines select on it
+	// to exit. The unreferenced channel is reclaimed by the GC. (F-012)
 	for _, topics := range b.groups {
 		for _, mb := range topics {
-			close(mb.ch)
+			close(mb.done)
 		}
 	}
 	b.groups = nil
@@ -213,8 +274,9 @@ func (s *memorySubscription) Close() error {
 		return nil
 	}
 	// We don't close s.out here — the broker owns the underlying mailboxes
-	// and will close them on broker Close(). Closing out would risk a send
-	// on a closed channel from a still-running publisher.
+	// and their done channels, and will signal them on broker Close().
+	// Closing out would risk a send on a closed channel from the still-
+	// running forward goroutines.
 	return nil
 }
 

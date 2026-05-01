@@ -172,3 +172,176 @@ func TestMemoryBroker_ConsumerGroupDrainThenFlush(t *testing.T) {
 		t.Errorf("expected drain-then-flush to batch, but flush fired %d times (>=1 per msg)", flushes.Load())
 	}
 }
+
+// TestMemoryBroker_CloseRacePublish stresses the F-012 fix: many publishers
+// hammer a topic while Close runs concurrently. Before the fix, Publish
+// snapshotted the mailbox channels under the lock and then sent without it,
+// so a Close that ran in between would close mb.ch and the next send would
+// panic with "send on closed channel". After the fix, Close signals each
+// mailbox's done channel (without closing mb.ch) and Publish selects on
+// done so the send turns into a clean drop.
+//
+// The test also catches sender-side goroutine leaks: every spawned publisher
+// must return within the test's deadline.
+func TestMemoryBroker_CloseRacePublish(t *testing.T) {
+	for iter := 0; iter < 25; iter++ {
+		b := NewMemoryBroker(8)
+
+		// Spin up a fleet of subscribers across multiple groups so Publish
+		// has many mailboxes to fan out to.
+		const numGroups = 8
+		subs := make([]Subscription, 0, numGroups)
+		for g := 0; g < numGroups; g++ {
+			s, err := b.Subscribe(fmt.Sprintf("g-%d", g), []string{"race"})
+			if err != nil {
+				t.Fatalf("subscribe: %v", err)
+			}
+			subs = append(subs, s)
+		}
+
+		// Drain in the background so most sends succeed; the test isn't
+		// about correctness of delivery, only about not panicking.
+		drainCtx, drainCancel := context.WithCancel(context.Background())
+		var drainWG sync.WaitGroup
+		for _, s := range subs {
+			drainWG.Add(1)
+			go func(s Subscription) {
+				defer drainWG.Done()
+				_ = s.Consume(drainCtx, func(claim Claim) error {
+					for {
+						select {
+						case <-claim.Messages():
+						case <-claim.Context().Done():
+							return nil
+						}
+					}
+				})
+			}(s)
+		}
+
+		// Publishers race against Close. We catch any panic from a
+		// publisher goroutine via a deferred recover and surface it as a
+		// test failure.
+		const numPublishers = 32
+		var pubWG sync.WaitGroup
+		panicCh := make(chan any, numPublishers)
+		ctx := context.Background()
+		for p := 0; p < numPublishers; p++ {
+			pubWG.Add(1)
+			go func() {
+				defer pubWG.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						panicCh <- r
+					}
+				}()
+				for i := 0; i < 50; i++ {
+					_ = b.Send(ctx, "race", "k", []byte("v"))
+					_ = b.SendAsync(ctx, "race", "k", []byte("v"))
+				}
+			}()
+		}
+
+		// Close concurrently with the publisher fleet. A short jitter
+		// makes the Close land somewhere inside the publish loops most
+		// iterations.
+		time.Sleep(time.Duration(iter%5) * 100 * time.Microsecond)
+		if err := b.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+
+		pubWG.Wait()
+		drainCancel()
+		drainWG.Wait()
+		close(panicCh)
+
+		for r := range panicCh {
+			t.Fatalf("publisher panicked: %v", r)
+		}
+	}
+}
+
+// TestMemoryBroker_CloseAfterAllowsNewSendsToFail confirms that once Close
+// has run, subsequent publishes return a clear error rather than panicking
+// or hanging. Mirrors the "broker closed" guard at the top of publish.
+func TestMemoryBroker_CloseAfterAllowsNewSendsToFail(t *testing.T) {
+	b := NewMemoryBroker(4)
+	if err := b.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	if err := b.Send(context.Background(), "t", "k", []byte("v")); err == nil {
+		t.Errorf("expected error sending to closed broker, got nil")
+	}
+	if err := b.SendAsync(context.Background(), "t", "k", []byte("v")); err == nil {
+		t.Errorf("expected error SendAsync-ing to closed broker, got nil")
+	}
+	if err := b.SendBatch(context.Background(), "t", []KeyValue{{Key: "k", Value: "v"}}); err == nil {
+		t.Errorf("expected error batch-sending to closed broker, got nil")
+	}
+	if _, err := b.Subscribe("g", []string{"t"}); err == nil {
+		t.Errorf("expected error subscribing to closed broker, got nil")
+	}
+
+	// Idempotent close: second close is a no-op, not a panic.
+	if err := b.Close(); err != nil {
+		t.Errorf("second close: %v", err)
+	}
+}
+
+// TestMemoryBroker_SlowSubscriberDoesNotBlockClose verifies that a stuck
+// subscriber (full mailbox, nobody draining) doesn't wedge Close or the
+// concurrent publisher. After the fix, the publisher's select observes
+// done firing and drops the message instead of waiting forever on a buffer
+// that will never drain.
+func TestMemoryBroker_SlowSubscriberDoesNotBlockClose(t *testing.T) {
+	b := NewMemoryBroker(2) // tiny buffer so we can fill it fast
+
+	sub, err := b.Subscribe("slow", []string{"t"})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	// Intentionally never call sub.Consume — the merged channel never
+	// drains, so after a couple of forwarded messages, mb.ch backs up.
+	_ = sub
+
+	// Pre-fill the buffer so the next send would block without the fix.
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	for i := 0; i < 10; i++ {
+		_ = b.SendAsync(ctx, "t", "", []byte("v"))
+	}
+
+	// Kick a synchronous publisher that would otherwise block on the
+	// full buffer. Close should unblock it via mb.done.
+	pubDone := make(chan error, 1)
+	go func() {
+		pubDone <- b.Send(context.Background(), "t", "", []byte("v"))
+	}()
+
+	// Brief pause so the publisher reaches its select before Close runs.
+	time.Sleep(20 * time.Millisecond)
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- b.Close() }()
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close blocked behind a slow subscriber")
+	}
+
+	select {
+	case err := <-pubDone:
+		// Publisher should have observed mb.done firing and returned
+		// nil (drop), not panicked or hung.
+		if err != nil {
+			t.Fatalf("publisher returned error after Close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("publisher blocked behind a slow subscriber even after Close")
+	}
+}
