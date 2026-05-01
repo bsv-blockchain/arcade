@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/events"
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
 )
@@ -22,10 +23,25 @@ import (
 // `ch` and writes frames to the wire; the manager pushes onto `ch` from its
 // fan-out goroutine. token narrows the stream to txids associated with that
 // callback token; empty means unfiltered.
+//
+// ctx is derived from the manager's parent context so we can broadcast
+// "client is gone" to fan-out without racing the consumer-side close. The
+// consumer (handleEventsSSE) calls cancel() via unregister on disconnect,
+// which causes any concurrent fan-out send to fall through the ctx.Done()
+// arm of its select rather than blocking or panicking. The channel is
+// intentionally NOT closed: senders always race the close otherwise (F-020).
+// The buffered channel is left to the GC once no goroutine references it.
 type sseClient struct {
 	id    int64
 	token string
 	ch    chan *models.TransactionStatus
+	// ctx and cancel intentionally live on the struct: this is the
+	// per-client cancel signal that fan-out selects on to avoid sending
+	// onto a no-longer-drained channel (F-020). The standard "don't
+	// store contexts" guidance doesn't apply to long-lived cancellation
+	// handles owned by a registry entry.
+	ctx    context.Context    //nolint:containedctx // see comment above
+	cancel context.CancelFunc //nolint:containedctx // paired with ctx above
 }
 
 // sseManager owns the per-pod registry of SSE clients listening on /events.
@@ -42,6 +58,11 @@ type sseManager struct {
 	publisher events.Publisher
 	store     store.Store
 	logger    *zap.Logger
+
+	// parentCtx is the long-lived context that owns the manager goroutine.
+	// Per-client contexts are derived from it so canceling the manager
+	// also cancels every registered client's fan-out path.
+	parentCtx context.Context //nolint:containedctx // long-lived registry root
 
 	nextClientID atomic.Int64
 
@@ -61,6 +82,7 @@ func newSSEManager(ctx context.Context, publisher events.Publisher, st store.Sto
 		publisher: publisher,
 		store:     st,
 		logger:    logger.Named("sse"),
+		parentCtx: ctx,
 		clients:   make(map[int64]*sseClient),
 	}
 	ch, err := publisher.Subscribe(ctx)
@@ -95,6 +117,14 @@ func (m *sseManager) run(ctx context.Context, in <-chan *models.TransactionStatu
 // submission registered under that token (mirrors the old arcade's
 // txBelongsToToken behavior). Sends are non-blocking — slow consumers drop
 // the event and recover via Last-Event-ID catchup on reconnect.
+//
+// Concurrency contract (F-020): we snapshot the client list under RLock and
+// release the lock before sending. A client may unregister between the
+// snapshot and the send. Each client owns a context that unregister cancels;
+// the send selects on ctx.Done() so a canceled-and-gone client takes the
+// drop arm instead of blocking or panicking. The send channel is never
+// closed by the manager — closing would race this exact send. Slow clients
+// fall through `default` and increment the dropped-by-reason counter.
 func (m *sseManager) fanOut(ctx context.Context, status *models.TransactionStatus) {
 	m.mu.RLock()
 	clients := make([]*sseClient, 0, len(m.clients))
@@ -104,12 +134,27 @@ func (m *sseManager) fanOut(ctx context.Context, status *models.TransactionStatu
 	m.mu.RUnlock()
 
 	for _, c := range clients {
+		// Quick out for already-gone clients: avoids the token lookup work
+		// for connections we know are unwinding. The send-site re-checks
+		// ctx.Done() to handle the race where cancel happens between here
+		// and the channel select.
+		if c.ctx.Err() != nil {
+			metrics.APISSEDroppedTotal.WithLabelValues("client_gone").Inc()
+			continue
+		}
 		if c.token != "" && !m.txBelongsToToken(ctx, status.TxID, c.token) {
 			continue
 		}
 		select {
 		case c.ch <- status:
+		case <-c.ctx.Done():
+			// Client unregistered concurrently. Drop without sending —
+			// the channel may already be unreferenced by the consumer.
+			metrics.APISSEDroppedTotal.WithLabelValues("client_gone").Inc()
 		default:
+			// Buffer is full: consumer is slow. Drop and let
+			// Last-Event-ID catchup recover on reconnect.
+			metrics.APISSEDroppedTotal.WithLabelValues("slow_client").Inc()
 			m.logger.Warn("dropping update for slow SSE client",
 				zap.Int64("client_id", c.id),
 				zap.String("txid", status.TxID),
@@ -141,29 +186,48 @@ func (m *sseManager) txBelongsToToken(ctx context.Context, txid, token string) b
 	return false
 }
 
-// register adds a client to the registry and returns its assigned id.
+// register adds a client to the registry.
 func (m *sseManager) register(c *sseClient) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.clients[c.id] = c
 }
 
-// unregister removes a client and closes its channel.
+// unregister removes a client and signals any in-flight fan-out send to drop
+// rather than push onto the channel. We deliberately do NOT close c.ch:
+// closing would race with concurrent fanOut sends (F-020). The consumer
+// goroutine in handleEventsSSE selects on its request ctx (which is what
+// drives the unregister) so it exits without needing a channel-close signal;
+// the unreferenced channel is reclaimed by the GC.
 func (m *sseManager) unregister(id int64) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if c, ok := m.clients[id]; ok {
+	c, ok := m.clients[id]
+	if ok {
 		delete(m.clients, id)
-		close(c.ch)
+	}
+	m.mu.Unlock()
+	if ok {
+		c.cancel()
 	}
 }
 
-// newClient assembles a client with a fresh id and buffered channel.
+// newClient assembles a client with a fresh id, buffered channel, and a
+// per-client cancel handle. The client context is derived from the
+// manager's parent ctx so a manager shutdown propagates to every client.
 func (m *sseManager) newClient(token string) *sseClient {
+	parent := m.parentCtx
+	if parent == nil {
+		parent = context.Background()
+	}
+	// The cancel func is stored on sseClient and invoked by unregister;
+	// the linter can't trace that flow, so silence the warning explicitly.
+	ctx, cancel := context.WithCancel(parent) //nolint:gosec // cancel called by sseManager.unregister
 	return &sseClient{
-		id:    m.nextClientID.Add(1),
-		token: token,
-		ch:    make(chan *models.TransactionStatus, 64),
+		id:     m.nextClientID.Add(1),
+		token:  token,
+		ch:     make(chan *models.TransactionStatus, 64),
+		ctx:    ctx,
+		cancel: cancel,
 	}
 }
 
@@ -220,13 +284,18 @@ func (s *Server) handleEventsSSE(c *gin.Context) {
 	keepalive := time.NewTicker(15 * time.Second)
 	defer keepalive.Stop()
 
+	// The channel is intentionally never closed by the manager (see F-020),
+	// so the loop exits via the request ctx — that's what triggers the
+	// deferred unregister, which cancels the client context. Reads from a
+	// non-closed, no-longer-written channel just block until ctx.Done()
+	// wins the select.
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case status, ok := <-client.ch:
-			if !ok {
-				return
+		case status := <-client.ch:
+			if status == nil {
+				continue
 			}
 			if err := writeSSEStatus(writer, status); err != nil {
 				return

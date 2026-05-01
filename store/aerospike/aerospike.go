@@ -11,6 +11,7 @@ import (
 	"time"
 
 	aero "github.com/aerospike/aerospike-client-go/v7"
+	"github.com/aerospike/aerospike-client-go/v7/types"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 
@@ -21,6 +22,26 @@ import (
 
 func isKeyNotFound(err error) bool {
 	return errors.Is(err, aero.ErrKeyNotFound)
+}
+
+// isGenerationErr is true when an Aerospike write fails because the record was
+// modified between our read and our CAS write (EXPECT_GEN_EQUAL mismatch).
+func isGenerationErr(err error) bool {
+	var aerr aero.Error
+	if errors.As(err, &aerr) {
+		return aerr.Matches(types.GENERATION_ERROR)
+	}
+	return false
+}
+
+// isKeyExistsErr is true when an Aerospike CREATE_ONLY write fails because
+// another writer raced us in and the record now exists.
+func isKeyExistsErr(err error) bool {
+	var aerr aero.Error
+	if errors.As(err, &aerr) {
+		return aerr.Matches(types.KEY_EXISTS_ERROR)
+	}
+	return false
 }
 
 const (
@@ -350,7 +371,44 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 		bins["merkle_path"] = []byte(status.MerklePath)
 	}
 
-	return s.client.Put(s.writePolicy(ctx), key, bins)
+	// Enforce the status lattice: refuse to overwrite a terminal status with a
+	// later, lower-priority update (e.g. a stray SEEN_ON_NETWORK callback after
+	// MINED). Read-then-CAS-write using the record's generation guarantees the
+	// pre-write check and the write are atomic with respect to other writers.
+	// See models.Status.CanTransitionFrom and #61 / F-003.
+	if status.Status == "" {
+		return s.client.Put(s.writePolicy(ctx), key, bins)
+	}
+	for {
+		rec, gerr := s.client.Get(s.readPolicy(ctx), key, "status")
+		if gerr != nil && !isKeyNotFound(gerr) {
+			return fmt.Errorf("read status for lattice check %s: %w", status.TxID, gerr)
+		}
+		policy := s.writePolicy(ctx)
+		if rec != nil {
+			existing := models.Status(getString(rec, "status"))
+			if !status.Status.CanTransitionFrom(existing) {
+				return nil
+			}
+			policy.GenerationPolicy = aero.EXPECT_GEN_EQUAL
+			policy.Generation = rec.Generation
+		} else {
+			// No existing row: only create if the row is genuinely absent. If
+			// another writer races us in, retry the read-modify-write so the
+			// lattice check covers the new state too.
+			policy.RecordExistsAction = aero.CREATE_ONLY
+		}
+		if err := s.client.Put(policy, key, bins); err != nil {
+			// Generation mismatch / create-only conflict means another writer
+			// landed between our read and our put. Re-read and re-evaluate the
+			// lattice rather than silently clobbering their write.
+			if isGenerationErr(err) || isKeyExistsErr(err) {
+				continue
+			}
+			return fmt.Errorf("update tx %s: %w", status.TxID, err)
+		}
+		return nil
+	}
 }
 
 func (s *Store) GetStatus(ctx context.Context, txid string) (*models.TransactionStatus, error) {

@@ -84,21 +84,124 @@ const (
 	StatusImmutable = Status("IMMUTABLE")
 )
 
-// DisallowedPreviousStatuses returns statuses that CANNOT transition to this status
-// Used in UPDATE queries to prevent invalid status transitions
+// terminalStatuses lists statuses that represent a final outcome for a
+// transaction. A row already in one of these states must never be overwritten
+// by a lower-priority update (e.g. a late SEEN_ON_NETWORK callback arriving
+// after MINED). The only allowed transition out of a terminal status is the
+// MINED → IMMUTABLE promotion handled explicitly by CanTransitionFrom.
+var terminalStatuses = map[Status]struct{}{
+	StatusRejected:             {},
+	StatusDoubleSpendAttempted: {},
+	StatusMined:                {},
+	StatusImmutable:            {},
+}
+
+// IsTerminal reports whether this status is a final outcome that should not be
+// overwritten by later, lower-priority updates.
+func (s Status) IsTerminal() bool {
+	_, ok := terminalStatuses[s]
+	return ok
+}
+
+// DisallowedPreviousStatuses returns statuses that CANNOT transition to this status.
+// Used by stores' UpdateStatus implementations (and CanTransitionFrom) to prevent
+// invalid status transitions — most importantly, to prevent terminal statuses
+// (MINED, IMMUTABLE, REJECTED, DOUBLE_SPEND_ATTEMPTED) from being silently
+// overwritten by a later, lower-priority update such as SEEN_ON_NETWORK.
 func (s Status) DisallowedPreviousStatuses() []Status {
 	switch s {
 	case StatusUnknown, StatusReceived:
-		return []Status{}
+		// Going back to UNKNOWN/RECEIVED is never valid once the tx has any
+		// further status — only an initial insert should set these.
+		return []Status{
+			StatusSentToNetwork, StatusAcceptedByNetwork,
+			StatusSeenOnNetwork, StatusSeenMultipleNodes,
+			StatusPendingRetry, StatusStumpProcessing,
+			StatusRejected, StatusDoubleSpendAttempted,
+			StatusMined, StatusImmutable,
+		}
 	case StatusSentToNetwork:
-		return []Status{StatusSentToNetwork, StatusAcceptedByNetwork, StatusSeenOnNetwork, StatusSeenMultipleNodes, StatusRejected, StatusPendingRetry, StatusDoubleSpendAttempted, StatusMined}
+		// PENDING_RETRY → SENT_TO_NETWORK is the reaper republishing a retry-
+		// queued tx, so it must be allowed; everything to the right of
+		// SENT_TO_NETWORK in the forward order is a regression.
+		return []Status{
+			StatusSentToNetwork, StatusAcceptedByNetwork,
+			StatusSeenOnNetwork, StatusSeenMultipleNodes,
+			StatusRejected, StatusDoubleSpendAttempted,
+			StatusMined, StatusImmutable,
+		}
 	case StatusAcceptedByNetwork:
-		return []Status{StatusAcceptedByNetwork, StatusSeenOnNetwork, StatusSeenMultipleNodes, StatusRejected, StatusDoubleSpendAttempted, StatusMined}
-	case StatusSeenOnNetwork, StatusSeenMultipleNodes, StatusRejected, StatusDoubleSpendAttempted, StatusMined, StatusImmutable, StatusPendingRetry, StatusStumpProcessing:
+		return []Status{
+			StatusAcceptedByNetwork,
+			StatusSeenOnNetwork, StatusSeenMultipleNodes,
+			StatusRejected, StatusDoubleSpendAttempted,
+			StatusMined, StatusImmutable,
+		}
+	case StatusSeenOnNetwork:
+		// SEEN_ON_NETWORK is a forward step from earlier states only — once a
+		// tx has progressed to SEEN_MULTIPLE_NODES, a terminal state, or is in
+		// the retry side-branch it must not regress to SEEN_ON_NETWORK.
+		return []Status{
+			StatusSeenOnNetwork, StatusSeenMultipleNodes,
+			StatusPendingRetry,
+			StatusRejected, StatusDoubleSpendAttempted,
+			StatusMined, StatusImmutable,
+		}
+	case StatusSeenMultipleNodes:
+		return []Status{
+			StatusSeenMultipleNodes,
+			StatusPendingRetry,
+			StatusRejected, StatusDoubleSpendAttempted,
+			StatusMined, StatusImmutable,
+		}
+	case StatusPendingRetry:
+		// PENDING_RETRY is only valid for txs that are still in flight — never
+		// from a terminal state, and never from an already-confirmed state.
+		return []Status{
+			StatusSeenOnNetwork, StatusSeenMultipleNodes,
+			StatusRejected, StatusDoubleSpendAttempted,
+			StatusMined, StatusImmutable,
+		}
+	case StatusStumpProcessing:
+		// STUMP_PROCESSING relates to mined-block bump building. It is only
+		// meaningful for in-flight txs; once a tx is terminal it must not be
+		// pushed back into STUMP_PROCESSING.
+		return []Status{
+			StatusRejected, StatusDoubleSpendAttempted,
+			StatusMined, StatusImmutable,
+		}
+	case StatusRejected, StatusDoubleSpendAttempted:
+		// Rejection paths can override any non-terminal in-flight state, but
+		// must not be able to clobber an already-confirmed (MINED/IMMUTABLE)
+		// transaction.
+		return []Status{StatusMined, StatusImmutable}
+	case StatusMined:
+		// MINED can be set from any in-flight state, but a transient miner-
+		// reorg-style regression must not pull a tx out of IMMUTABLE.
+		return []Status{StatusImmutable}
+	case StatusImmutable:
+		// IMMUTABLE is the highest-priority sink — reachable from anything.
 		return []Status{}
 	default:
 		return []Status{}
 	}
+}
+
+// CanTransitionFrom reports whether moving from prev → s is allowed by the
+// status lattice. An empty prev (i.e. no existing row) is always allowed —
+// the very first write for a txid bypasses the lattice. Re-asserting the same
+// status (prev == s) is also allowed: it is an idempotent no-op for callers
+// that may receive duplicate callbacks.
+func (s Status) CanTransitionFrom(prev Status) bool {
+	if prev == "" || prev == s {
+		return true
+	}
+	for _, banned := range s.DisallowedPreviousStatuses() {
+		if banned == prev {
+			return false
+		}
+	}
+	return true
 }
 
 // Submission represents a client's submission and subscription preferences

@@ -6,6 +6,7 @@ import (
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/script"
+	"github.com/bsv-blockchain/go-sdk/script/interpreter"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 
 	arcerrors "github.com/bsv-blockchain/arcade/errors"
@@ -252,6 +253,106 @@ func TestCheckInputs_ManySmallInputsCannotOverflow(t *testing.T) {
 	}
 	if !errors.Is(err, ErrTxInputTotalSatoshisTooHigh) {
 		t.Errorf("expected ErrTxInputTotalSatoshisTooHigh, got %v", err)
+	}
+}
+
+// parseScript is a small test helper that runs the SDK's default opcode
+// parser over the supplied raw script bytes. The parser itself is exercised
+// by the SDK's own tests, so any error here indicates a bug in the test
+// fixture rather than the code under test.
+func parseScript(t *testing.T, raw []byte) interpreter.ParsedScript {
+	t.Helper()
+	parser := interpreter.DefaultOpcodeParser{}
+	s := script.Script(raw)
+	parsed, err := parser.Parse(&s)
+	if err != nil {
+		t.Fatalf("parse script %x: %v", raw, err)
+	}
+	return parsed
+}
+
+// TestCountSigOps_EmptyScript ensures an empty script yields zero sigops.
+func TestCountSigOps_EmptyScript(t *testing.T) {
+	parsed := parseScript(t, []byte{})
+	if got := countSigOps(parsed); got != 0 {
+		t.Errorf("empty script: expected 0 sigops, got %d", got)
+	}
+}
+
+// TestCountSigOps_CheckSig regresses the original behavior: a single
+// OP_CHECKSIG and a single OP_CHECKSIGVERIFY each count as one sigop.
+func TestCountSigOps_CheckSig(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  []byte
+		want int64
+	}{
+		{"OP_CHECKSIG", []byte{script.OpCHECKSIG}, 1},
+		{"OP_CHECKSIGVERIFY", []byte{script.OpCHECKSIGVERIFY}, 1},
+		{"two OP_CHECKSIG", []byte{script.OpCHECKSIG, script.OpCHECKSIG}, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			parsed := parseScript(t, tc.raw)
+			if got := countSigOps(parsed); got != tc.want {
+				t.Errorf("countSigOps(%s) = %d, want %d", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCountSigOps_CheckMultisigWithSmallInt verifies that an OP_CHECKMULTISIG
+// preceded by OP_3 contributes 3 sigops, matching the canonical
+// "n-of-m signed by n keys" multisig accounting.
+func TestCountSigOps_CheckMultisigWithSmallInt(t *testing.T) {
+	parsed := parseScript(t, []byte{script.Op3, script.OpCHECKMULTISIG})
+	if got := countSigOps(parsed); got != 3 {
+		t.Errorf("OP_3 OP_CHECKMULTISIG: expected 3 sigops, got %d", got)
+	}
+}
+
+// TestCountSigOps_CheckMultisigDefaults verifies that an OP_CHECKMULTISIG
+// with no preceding small-int contributes the standard upper bound of 20
+// sigops (MaxPubKeysPerMultiSigBeforeGenesis).
+func TestCountSigOps_CheckMultisigDefaults(t *testing.T) {
+	parsed := parseScript(t, []byte{script.OpCHECKMULTISIG})
+	if got := countSigOps(parsed); got != 20 {
+		t.Errorf("bare OP_CHECKMULTISIG: expected 20 sigops, got %d", got)
+	}
+}
+
+// TestCountSigOps_CheckMultisigVerifyImmediatelyPrecedingSmallInt ensures we
+// look at the immediately-preceding opcode (OP_15), not some earlier one
+// (OP_3), when assigning sigop weight to OP_CHECKMULTISIGVERIFY.
+func TestCountSigOps_CheckMultisigVerifyImmediatelyPrecedingSmallInt(t *testing.T) {
+	parsed := parseScript(t, []byte{
+		script.Op3, script.OpDROP,
+		script.Op15, script.OpCHECKMULTISIGVERIFY,
+	})
+	if got := countSigOps(parsed); got != 15 {
+		t.Errorf("OP_3 OP_DROP OP_15 OP_CHECKMULTISIGVERIFY: expected 15 sigops, got %d", got)
+	}
+}
+
+// TestCountSigOps_MixedCheckSigAndMultisig combines OP_CHECKSIG and a
+// small-int weighted OP_CHECKMULTISIG to confirm the sigops are summed.
+func TestCountSigOps_MixedCheckSigAndMultisig(t *testing.T) {
+	parsed := parseScript(t, []byte{
+		script.OpCHECKSIG,
+		script.Op2, script.OpCHECKMULTISIG,
+	})
+	if got := countSigOps(parsed); got != 3 {
+		t.Errorf("OP_CHECKSIG OP_2 OP_CHECKMULTISIG: expected 3 sigops, got %d", got)
+	}
+}
+
+// TestCountSigOps_OpZeroIsNotSmallInt confirms OP_0 does not satisfy the
+// small-int branch (it is 0x00, not 0x51..0x60), and so an
+// OP_CHECKMULTISIG preceded by OP_0 falls back to the default 20.
+func TestCountSigOps_OpZeroIsNotSmallInt(t *testing.T) {
+	parsed := parseScript(t, []byte{script.Op0, script.OpCHECKMULTISIG})
+	if got := countSigOps(parsed); got != 20 {
+		t.Errorf("OP_0 OP_CHECKMULTISIG: expected 20 sigops (no small-int), got %d", got)
 	}
 }
 

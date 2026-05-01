@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/bsv-blockchain/go-sdk/script"
 	"github.com/bsv-blockchain/go-sdk/script/interpreter"
 	"github.com/bsv-blockchain/go-sdk/spv"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
@@ -285,14 +286,47 @@ func (v *Validator) sigOpsCheck(tx *sdkTx.Transaction) error {
 	return nil
 }
 
+// countSigOps counts the signature operations contained in a parsed script.
+//
+// The accounting follows the standard Bitcoin policy used by node
+// implementations:
+//
+//   - OP_CHECKSIG and OP_CHECKSIGVERIFY each contribute 1 sigop.
+//   - OP_CHECKMULTISIG and OP_CHECKMULTISIGVERIFY contribute the value of
+//     the immediately-preceding small-int opcode (OP_1..OP_16), or
+//     MaxPubKeysPerMultiSigBeforeGenesis (20) if no small-int precedes.
+//
+// This is the cheap, static count used to enforce the policy budget
+// (MaxTxSigopsCountsPolicy). It does not recurse into P2SH redeem scripts;
+// BSV has disabled P2SH at the consensus level so that case is intentionally
+// out of scope here.
 func countSigOps(lockingScript interpreter.ParsedScript) int64 {
 	numSigOps := int64(0)
-	for _, op := range lockingScript {
-		if op.Value() == 0xac || op.Value() == 0xad { // OP_CHECKSIG, OP_CHECKSIGVERIFY
+	for i, op := range lockingScript {
+		switch op.Value() {
+		case script.OpCHECKSIG, script.OpCHECKSIGVERIFY:
 			numSigOps++
+		case script.OpCHECKMULTISIG, script.OpCHECKMULTISIGVERIFY:
+			numSigOps += multisigSigOpCount(lockingScript, i)
 		}
 	}
 	return numSigOps
+}
+
+// multisigSigOpCount returns the sigop weight of an OP_CHECKMULTISIG[VERIFY]
+// at index i in script. If the immediately-preceding opcode is OP_1..OP_16,
+// the weight is that small int (1..16); otherwise the weight defaults to
+// MaxPubKeysPerMultiSigBeforeGenesis (20), the standard upper bound applied
+// by Bitcoin-family nodes when the explicit pubkey count is not statically
+// visible.
+func multisigSigOpCount(s interpreter.ParsedScript, i int) int64 {
+	if i > 0 {
+		prev := s[i-1].Value()
+		if prev >= script.Op1 && prev <= script.Op16 {
+			return int64(prev-script.Op1) + 1
+		}
+	}
+	return int64(interpreter.MaxPubKeysPerMultiSigBeforeGenesis)
 }
 
 func (v *Validator) pushDataCheck(tx *sdkTx.Transaction) error {
