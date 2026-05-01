@@ -472,6 +472,41 @@ loop:
 	return results, nil
 }
 
+// IterateStatusesSince streams scan results to fn one record at a time. The
+// Aerospike client already produces records over a channel — we just hand
+// them off without buffering, so peak memory is O(1) plus whatever fn keeps.
+func (s *Store) IterateStatusesSince(ctx context.Context, _ time.Time, fn func(*models.TransactionStatus) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	stmt := aero.NewStatement(s.namespace, setTransactions)
+	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
+	if rs != nil {
+		defer func() { _ = rs.Close() }()
+	}
+	if err != nil {
+		return fmt.Errorf("query statuses: %w", err)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case rec, ok := <-rs.Results():
+			if !ok {
+				return nil
+			}
+			if rec.Err != nil {
+				return rec.Err
+			}
+			txid := getString(rec.Record, "txid")
+			if err := fn(recordToStatus(rec.Record, txid)); err != nil {
+				return err
+			}
+		}
+	}
+}
+
 func (s *Store) SetStatusByBlockHash(ctx context.Context, blockHash string, newStatus models.Status) ([]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
