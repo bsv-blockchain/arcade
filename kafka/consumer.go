@@ -133,7 +133,21 @@ func (c *ConsumerGroup) processOne(claim Claim, msg *Message) {
 	metrics.KafkaMessagesTotal.WithLabelValues(msg.Topic, "consume").Inc()
 	metrics.KafkaMessageBytes.WithLabelValues(msg.Topic, "consume").Observe(float64(len(msg.Value)))
 	if err := c.processWithRetry(claim.Context(), msg); err != nil {
-		c.sendToDLQ(msg, err)
+		// If DLQ publish also fails (e.g. transient outage on the DLQ
+		// topic) we deliberately do NOT mark the offset. Leaving it
+		// uncommitted causes Kafka to redeliver on the next session,
+		// which is preferable to silent message loss. The next
+		// rebalance / pod restart will retry from the same offset.
+		if dlqErr := c.sendToDLQ(msg, err); dlqErr != nil {
+			metrics.KafkaDLQPublishFailures.WithLabelValues(msg.Topic).Inc()
+			c.logger.Error("DLQ publish failed; leaving offset uncommitted for redelivery",
+				zap.String("topic", msg.Topic),
+				zap.Int32("partition", msg.Partition),
+				zap.Int64("offset", msg.Offset),
+				zap.Error(dlqErr),
+			)
+			return
+		}
 	}
 	claim.MarkMessage(msg)
 }
@@ -177,13 +191,21 @@ func (c *ConsumerGroup) processWithRetry(ctx context.Context, msg *Message) erro
 // sendToDLQ publishes the failed message envelope to <topic>.dlq via the
 // Broker. Routing through Broker (not the sync Sarama producer) keeps DLQ
 // working in standalone mode where there's no Sarama at all.
-func (c *ConsumerGroup) sendToDLQ(msg *Message, processErr error) {
+//
+// Returns an error when the DLQ publish itself failed so the caller can
+// decide whether the original Kafka offset is safe to commit. If no
+// producer is configured (DLQ disabled by deployment choice), this
+// returns nil — the caller treats the failed message as best-effort
+// dropped, which preserves the historical behavior for that mode.
+// Marshal failures also return nil because retrying will not help and
+// dropping is the only sane outcome.
+func (c *ConsumerGroup) sendToDLQ(msg *Message, processErr error) error {
 	if c.producer == nil {
 		c.logger.Error("no producer configured for DLQ — dropping failed message",
 			zap.String("topic", msg.Topic),
 			zap.Int64("offset", msg.Offset),
 		)
-		return
+		return nil
 	}
 	dlqTopic := DLQTopic(msg.Topic)
 	dlqMsg := map[string]any{
@@ -197,14 +219,14 @@ func (c *ConsumerGroup) sendToDLQ(msg *Message, processErr error) {
 	data, err := json.Marshal(dlqMsg)
 	if err != nil {
 		c.logger.Error("failed to marshal DLQ message", zap.Error(err))
-		return
+		return nil
 	}
 	if err := c.producer.SendRaw(dlqTopic, string(msg.Key), data); err != nil {
 		c.logger.Error("failed to send to DLQ",
 			zap.String("dlq_topic", dlqTopic),
 			zap.Error(err),
 		)
-		return
+		return fmt.Errorf("publishing to DLQ %q: %w", dlqTopic, err)
 	}
 	metrics.KafkaMessagesTotal.WithLabelValues(msg.Topic, "dlq").Inc()
 	c.logger.Info("message sent to DLQ",
@@ -213,4 +235,5 @@ func (c *ConsumerGroup) sendToDLQ(msg *Message, processErr error) {
 		zap.Int32("partition", msg.Partition),
 		zap.Int64("offset", msg.Offset),
 	)
+	return nil
 }
