@@ -1650,8 +1650,8 @@ func TestBuildCompoundBUMP_NoSubtree0Stump_NonPow2(t *testing.T) {
 	// The compound must validate against the true block merkle root —
 	// i.e. the same root Teranode would have written into the block header,
 	// computed from the corrected subtree-0 root (with real coinbase txid).
-	if err := ValidateCompoundRoot(compound, &trueBlockRoot); err != nil {
-		t.Fatalf("compound BUMP did not validate against true block merkle root: %v", err)
+	if vErr := ValidateCompoundRoot(compound, &trueBlockRoot); vErr != nil {
+		t.Fatalf("compound BUMP did not validate against true block merkle root: %v", vErr)
 	}
 
 	// Spot-check: extract the path for the tracked tx and confirm it climbs

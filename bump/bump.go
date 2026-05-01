@@ -396,6 +396,34 @@ func ValidateCompoundRoot(compound *transaction.MerklePath, expected *chainhash.
 	return nil
 }
 
+// correctedSubtree0Root returns the corrected root for subtree 0 derived from the
+// real coinbase txid. Prefers the subtree-0 STUMP when present; otherwise falls
+// back to deriving the root from the coinbase BUMP using the height of any
+// available STUMP. Returns nil if no correction is possible.
+func correctedSubtree0Root(stumps []*models.Stump, coinbaseTxID *chainhash.Hash, coinbaseBUMP []byte) *chainhash.Hash {
+	for _, stump := range stumps {
+		if stump.SubtreeIndex != 0 {
+			continue
+		}
+		if root, err := computeCorrectedSubtreeRoot(stump.StumpData, coinbaseTxID); err == nil {
+			return root
+		}
+		return nil
+	}
+	// No subtree-0 STUMP delivered (merkle-service didn't track any txid in
+	// subtree 0). Derive the corrected root directly from the coinbase BUMP.
+	// Any STUMP carries a parsable BRC-74 path so internalHeight is the same
+	// across all stumps for the block.
+	if len(stumps) == 0 {
+		return nil
+	}
+	mp, err := transaction.NewMerklePathFromBinary(stumps[0].StumpData)
+	if err != nil || len(mp.Path) == 0 {
+		return nil
+	}
+	return subtree0RootFromCoinbaseBUMP(coinbaseBUMP, len(mp.Path))
+}
+
 // BuildCompoundBUMP merges multiple per-subtree BUMPs into a single compound MerklePath
 // containing all tracked transactions at level 0. The tracker is used to discover
 // which level-0 hashes are tracked transactions.
@@ -412,30 +440,8 @@ func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, c
 	// correction every block-level merkle path that climbs through the L20
 	// offset 0 sibling (which is most of them) produces a wrong root.
 	if coinbaseTxID != nil && len(subtreeHashes) > 0 {
-		corrected := false
-		for _, stump := range stumps {
-			if stump.SubtreeIndex == 0 {
-				if correctedRoot, err := computeCorrectedSubtreeRoot(stump.StumpData, coinbaseTxID); err == nil {
-					subtreeHashes[0] = *correctedRoot
-					corrected = true
-				}
-				break
-			}
-		}
-		// If no subtree-0 STUMP was delivered (merkle-service didn't track
-		// any txid in subtree 0), derive the corrected root directly from
-		// the coinbase BUMP. Any STUMP carries a parsable BRC-74 path so
-		// internalHeight is the same across all stumps for the block.
-		if !corrected && len(stumps) > 0 {
-			internalHeight := 0
-			if mp, err := transaction.NewMerklePathFromBinary(stumps[0].StumpData); err == nil {
-				internalHeight = len(mp.Path)
-			}
-			if internalHeight > 0 {
-				if root := subtree0RootFromCoinbaseBUMP(coinbaseBUMP, internalHeight); root != nil {
-					subtreeHashes[0] = *root
-				}
-			}
+		if root := correctedSubtree0Root(stumps, coinbaseTxID, coinbaseBUMP); root != nil {
+			subtreeHashes[0] = *root
 		}
 	}
 
