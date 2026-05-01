@@ -161,7 +161,13 @@ func TestDeliverSuccess(t *testing.T) {
 			}},
 		},
 	}
-	svc := New(config.WebhookConfig{HTTPTimeoutMs: 1000, MaxRetries: 3, InitialBackoffMs: 1}, zap.NewNop(), recordingPub{}, st)
+	svc := New(
+		config.WebhookConfig{HTTPTimeoutMs: 1000, MaxRetries: 3, InitialBackoffMs: 1},
+		// httptest.Server listens on 127.0.0.1 — opt into private dials so
+		// the SSRF guard doesn't block the test client.
+		config.CallbackConfig{AllowPrivateIPs: true},
+		zap.NewNop(), recordingPub{}, st,
+	)
 
 	svc.handleUpdate(t.Context(), &models.TransactionStatus{
 		TxID:      "txA",
@@ -207,7 +213,11 @@ func TestSkipIntermediateWhenNotFullUpdates(t *testing.T) {
 			}},
 		},
 	}
-	svc := New(config.WebhookConfig{HTTPTimeoutMs: 1000}, zap.NewNop(), recordingPub{}, st)
+	svc := New(
+		config.WebhookConfig{HTTPTimeoutMs: 1000},
+		config.CallbackConfig{AllowPrivateIPs: true},
+		zap.NewNop(), recordingPub{}, st,
+	)
 
 	svc.handleUpdate(t.Context(), &models.TransactionStatus{
 		TxID:      "txA",
@@ -233,7 +243,11 @@ func TestRetryOnFailure(t *testing.T) {
 			"txA": {{SubmissionID: "sub-1", TxID: "txA", CallbackURL: srv.URL}},
 		},
 	}
-	svc := New(config.WebhookConfig{HTTPTimeoutMs: 1000, MaxRetries: 5, InitialBackoffMs: 50, MaxBackoffMs: 1000}, zap.NewNop(), recordingPub{}, st)
+	svc := New(
+		config.WebhookConfig{HTTPTimeoutMs: 1000, MaxRetries: 5, InitialBackoffMs: 50, MaxBackoffMs: 1000},
+		config.CallbackConfig{AllowPrivateIPs: true},
+		zap.NewNop(), recordingPub{}, st,
+	)
 
 	before := time.Now()
 	svc.handleUpdate(t.Context(), &models.TransactionStatus{
@@ -274,7 +288,11 @@ func TestDedupOnRepeatedStatus(t *testing.T) {
 			}},
 		},
 	}
-	svc := New(config.WebhookConfig{HTTPTimeoutMs: 1000, MaxRetries: 3}, zap.NewNop(), recordingPub{}, st)
+	svc := New(
+		config.WebhookConfig{HTTPTimeoutMs: 1000, MaxRetries: 3},
+		config.CallbackConfig{AllowPrivateIPs: true},
+		zap.NewNop(), recordingPub{}, st,
+	)
 
 	svc.handleUpdate(t.Context(), &models.TransactionStatus{
 		TxID:      "txA",
@@ -284,5 +302,55 @@ func TestDedupOnRepeatedStatus(t *testing.T) {
 
 	if hits.Load() != 0 {
 		t.Errorf("expected 0 hits (deduped), got %d", hits.Load())
+	}
+}
+
+// TestSSRFGuardBlocksLoopbackDial confirms the dial-time SSRF guard:
+// with AllowPrivateIPs=false (the default), a delivery whose target is
+// 127.0.0.1 — i.e. an httptest.Server — is refused at dial time, the
+// callback never reaches the server, and the failure is recorded as a
+// retryable delivery (RetryCount bumped).
+//
+// This is the second layer of defense: registration-time validation
+// catches IP-literal callback URLs, and this dial-time check catches
+// the DNS-rebinding case where a hostname resolved to a private IP.
+func TestSSRFGuardBlocksLoopbackDial(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	st := &fakeStore{
+		subs: map[string][]*models.Submission{
+			"txA": {{
+				SubmissionID: "sub-1",
+				TxID:         "txA",
+				CallbackURL:  srv.URL, // 127.0.0.1:<port>
+			}},
+		},
+	}
+	svc := New(
+		config.WebhookConfig{HTTPTimeoutMs: 1000, MaxRetries: 3, InitialBackoffMs: 1, MaxBackoffMs: 100},
+		// Default-safe: SSRF guard ON.
+		config.CallbackConfig{AllowPrivateIPs: false},
+		zap.NewNop(), recordingPub{}, st,
+	)
+
+	svc.handleUpdate(t.Context(), &models.TransactionStatus{
+		TxID:      "txA",
+		Status:    models.StatusMined,
+		Timestamp: time.Now(),
+	})
+
+	if hits.Load() != 0 {
+		t.Errorf("expected 0 hits (dial refused), got %d", hits.Load())
+	}
+	if len(st.deliveries) != 1 {
+		t.Fatalf("expected 1 delivery record (retry scheduled), got %d", len(st.deliveries))
+	}
+	if st.deliveries[0].RetryCount != 1 {
+		t.Errorf("RetryCount = %d, want 1", st.deliveries[0].RetryCount)
 	}
 }
