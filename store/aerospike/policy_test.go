@@ -95,8 +95,8 @@ func TestPolicyBuilders(t *testing.T) {
 		if p.TotalTimeout != s.opTimeout {
 			t.Fatalf("want %v, got %v", s.opTimeout, p.TotalTimeout)
 		}
-		if p.MaxRetries != 1 {
-			t.Fatalf("want MaxRetries=1, got %d", p.MaxRetries)
+		if p.MaxRetries != 0 {
+			t.Fatalf("want MaxRetries=0 (in-client batch retries amplify pool pressure when one node is slow), got %d", p.MaxRetries)
 		}
 	})
 }

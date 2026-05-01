@@ -1609,3 +1609,76 @@ func TestComputeCorrectedSubtreeRoot_ReturnsRealRoot(t *testing.T) {
 		})
 	}
 }
+
+// TestBuildCompoundBUMP_NoSubtree0Stump_NonPow2 reproduces the production
+// failure where merkle-service tracks no txid in subtree 0 (so no STUMP for
+// subtree 0 is delivered), and the block has a non-power-of-2 subtree count.
+//
+// In this scenario the existing subtree-0 correction loop in BuildCompoundBUMP
+// never fires (it only ran when a subtree-0 STUMP existed), and the
+// uncorrected DataHub subtreeHashes[0] (computed against the coinbase
+// placeholder) was used for every block-level path that climbed through
+// L20 offset 0. Every block then failed compound BUMP validation with
+// "computed root != block header merkle root".
+func TestBuildCompoundBUMP_NoSubtree0Stump_NonPow2(t *testing.T) {
+	// 10 subtrees (non-power-of-2), 4 leaves each. Tracked txid is in subtree 7
+	// — the failing real-world block that surfaced this bug had the same
+	// shape (10 subtrees, only subtree 7 had a tracked txid).
+	const numSubtrees = 10
+	const subtreeSize = 4
+	const trackedSubtree = 7
+	const trackedOffset = 1
+
+	allLeaves, trueAllLeaves, subtreeHashes, coinbaseTxID, trueBlockRoot := setupCoinbaseBlock(numSubtrees, subtreeSize)
+
+	// Build a STUMP only for subtree 7 — NOT for subtree 0. This is the
+	// regression case: the bump-builder must still derive the corrected
+	// subtree-0 root from the coinbase BUMP alone.
+	stump7 := buildFullSTUMP(allLeaves[trackedSubtree], trackedOffset, 1234567)
+
+	stumps := []*models.Stump{
+		{BlockHash: "blkNonPow2", SubtreeIndex: trackedSubtree, StumpData: stump7},
+	}
+
+	cbBUMP := buildCoinbaseBUMP(allLeaves[0], coinbaseTxID, 1234567)
+
+	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, cbBUMP)
+	if err != nil {
+		t.Fatalf("BuildCompoundBUMP failed: %v", err)
+	}
+
+	// The compound must validate against the true block merkle root —
+	// i.e. the same root Teranode would have written into the block header,
+	// computed from the corrected subtree-0 root (with real coinbase txid).
+	if err := ValidateCompoundRoot(compound, &trueBlockRoot); err != nil {
+		t.Fatalf("compound BUMP did not validate against true block merkle root: %v", err)
+	}
+
+	// Spot-check: extract the path for the tracked tx and confirm it climbs
+	// to the block root cleanly.
+	parsed, err := transaction.NewMerklePathFromBinary(compound.Bytes())
+	if err != nil {
+		t.Fatalf("re-parsing compound BUMP failed: %v", err)
+	}
+	txHash := trueAllLeaves[trackedSubtree][trackedOffset]
+	var txOffset uint64
+	found := false
+	for _, leaf := range parsed.Path[0] {
+		if leaf.Hash != nil && *leaf.Hash == txHash {
+			txOffset = leaf.Offset
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("tracked tx not present at level 0 of compound BUMP")
+	}
+	minimal := ExtractMinimalPath(parsed, txOffset)
+	gotRoot, err := minimal.ComputeRoot(&txHash)
+	if err != nil {
+		t.Fatalf("ComputeRoot on minimal path failed: %v", err)
+	}
+	if *gotRoot != trueBlockRoot {
+		t.Fatalf("minimal-path root mismatch: got %s, want %s", gotRoot, trueBlockRoot)
+	}
+}

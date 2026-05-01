@@ -231,6 +231,65 @@ func computeCorrectedSubtreeRoot(stumpData []byte, coinbaseTxID *chainhash.Hash)
 	return stumpPath.ComputeRoot(coinbaseTxID)
 }
 
+// subtree0RootFromCoinbaseBUMP derives the real subtree-0 root by walking the
+// coinbase BUMP (which is a full block-level path for the coinbase tx) from
+// level 0 up through the subtree-internal levels.
+//
+// Why this is needed: DataHub's subtreeHashes[0] is computed against the
+// coinbase *placeholder* (zero hash) at offset 0, not the real coinbase txid.
+// computeCorrectedSubtreeRoot only fires when we happen to have a STUMP for
+// subtree 0 — but if merkle-service didn't track any txid in subtree 0, no
+// STUMP for subtree 0 is delivered, and subtreeHashes[0] stays silently
+// wrong. Every other subtree's BUMP path that touches subtreeHashes[0]
+// (which is most of them — all paths under L23 offset 0 do) then produces a
+// wrong block merkle root.
+//
+// The coinbase BUMP carries everything we need: the coinbase txid sits at
+// (level 0, offset 0) and the BUMP encodes its full path to the block root.
+// The first internalHeight levels of that path constitute subtree 0 — so
+// folding coinbase txid up internalHeight levels yields the corrected
+// subtree-0 root.
+//
+// Returns nil if the BUMP is malformed or doesn't have enough levels.
+func subtree0RootFromCoinbaseBUMP(coinbaseBUMP []byte, internalHeight int) *chainhash.Hash {
+	if len(coinbaseBUMP) == 0 || internalHeight <= 0 {
+		return nil
+	}
+	cbPath, err := transaction.NewMerklePathFromBinary(coinbaseBUMP)
+	if err != nil || len(cbPath.Path) < internalHeight {
+		return nil
+	}
+
+	var coinbase *chainhash.Hash
+	for _, leaf := range cbPath.Path[0] {
+		if leaf.Offset == 0 && leaf.Hash != nil {
+			coinbase = leaf.Hash
+			break
+		}
+	}
+	if coinbase == nil {
+		return nil
+	}
+
+	working := coinbase
+	for level := 0; level < internalHeight; level++ {
+		// Walking up from offset 0 at level 0 keeps the working position at
+		// offset 0 at every level, so the sibling is always at offset 1.
+		sibling := findLeafByOffset(cbPath, level, 1)
+		if sibling == nil {
+			return nil
+		}
+		if isDuplicate(sibling) {
+			working = transaction.MerkleTreeParent(working, working)
+		} else if sibling.Hash != nil {
+			working = transaction.MerkleTreeParent(working, sibling.Hash)
+		} else {
+			return nil
+		}
+	}
+	return working
+}
+
 // ExtractMinimalPath extracts the minimal set of nodes needed to verify a single
 // transaction at the given offset from a full merkle path.
 func ExtractMinimalPath(fullPath *transaction.MerklePath, txOffset uint64) *transaction.MerklePath {
@@ -348,14 +407,34 @@ func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, c
 	coinbaseTxID := extractCoinbaseTxID(coinbaseBUMP)
 
 	// Correct subtreeHashes[0] if coinbase is available.
-	// The original subtreeHashes[0] may be computed from the placeholder, not the real coinbase.
+	// The DataHub-supplied subtreeHashes[0] is computed against the coinbase
+	// PLACEHOLDER (zero hash), not the real coinbase txid — so without
+	// correction every block-level merkle path that climbs through the L20
+	// offset 0 sibling (which is most of them) produces a wrong root.
 	if coinbaseTxID != nil && len(subtreeHashes) > 0 {
+		corrected := false
 		for _, stump := range stumps {
 			if stump.SubtreeIndex == 0 {
 				if correctedRoot, err := computeCorrectedSubtreeRoot(stump.StumpData, coinbaseTxID); err == nil {
 					subtreeHashes[0] = *correctedRoot
+					corrected = true
 				}
 				break
+			}
+		}
+		// If no subtree-0 STUMP was delivered (merkle-service didn't track
+		// any txid in subtree 0), derive the corrected root directly from
+		// the coinbase BUMP. Any STUMP carries a parsable BRC-74 path so
+		// internalHeight is the same across all stumps for the block.
+		if !corrected && len(stumps) > 0 {
+			internalHeight := 0
+			if mp, err := transaction.NewMerklePathFromBinary(stumps[0].StumpData); err == nil {
+				internalHeight = len(mp.Path)
+			}
+			if internalHeight > 0 {
+				if root := subtree0RootFromCoinbaseBUMP(coinbaseBUMP, internalHeight); root != nil {
+					subtreeHashes[0] = *root
+				}
 			}
 		}
 	}
