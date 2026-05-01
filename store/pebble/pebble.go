@@ -345,6 +345,16 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 		return err
 	}
 
+	// Enforce the status lattice: a later, lower-priority update (e.g. a stray
+	// SEEN_ON_NETWORK callback arriving after a tx has already been MINED) must
+	// not overwrite a terminal status. See models.Status.CanTransitionFrom and
+	// issue #61 / F-003.
+	if existing != nil && status.Status != "" {
+		if !status.Status.CanTransitionFrom(models.Status(existing.Status)) {
+			return nil
+		}
+	}
+
 	merged := mergeStatus(existing, status)
 	payload, err := json.Marshal(merged)
 	if err != nil {

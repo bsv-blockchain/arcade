@@ -138,6 +138,98 @@ func TestUpdateStatus_ClearsOldStatusIndex(t *testing.T) {
 	_ = v
 }
 
+// TestUpdateStatus_TerminalNotOverwritten is the regression for F-003 (#61):
+// once a tx is in a terminal status (MINED, IMMUTABLE, REJECTED,
+// DOUBLE_SPEND_ATTEMPTED), a later lower-priority UpdateStatus call (e.g. a
+// stray SEEN_ON_NETWORK callback) must be a silent no-op rather than a clobber.
+func TestUpdateStatus_TerminalNotOverwritten(t *testing.T) {
+	terminals := []models.Status{
+		models.StatusMined,
+		models.StatusImmutable,
+		models.StatusRejected,
+		models.StatusDoubleSpendAttempted,
+	}
+	regressions := []models.Status{
+		models.StatusSeenOnNetwork,
+		models.StatusSeenMultipleNodes,
+		models.StatusSentToNetwork,
+		models.StatusPendingRetry,
+	}
+	for _, terminal := range terminals {
+		for _, regression := range regressions {
+			name := string(terminal) + "_then_" + string(regression)
+			t.Run(name, func(t *testing.T) {
+				s := newTestStore(t)
+				ctx := context.Background()
+				txid := "tx-" + name
+
+				// Seed a row in the terminal state.
+				if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+					TxID: txid, Status: models.StatusReceived,
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if err := s.UpdateStatus(ctx, &models.TransactionStatus{
+					TxID: txid, Status: terminal, Timestamp: time.Now(),
+				}); err != nil {
+					t.Fatalf("seed terminal: %v", err)
+				}
+
+				// A late lower-priority callback must not regress the row.
+				if err := s.UpdateStatus(ctx, &models.TransactionStatus{
+					TxID: txid, Status: regression, Timestamp: time.Now(),
+				}); err != nil {
+					t.Fatalf("regression update: %v", err)
+				}
+
+				got, err := s.GetStatus(ctx, txid)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got.Status != terminal {
+					t.Fatalf("terminal status %s was overwritten by %s (got %s)",
+						terminal, regression, got.Status)
+				}
+			})
+		}
+	}
+}
+
+// TestUpdateStatus_ForwardTransitionsStillWork sanity-checks that the lattice
+// guard does not break legitimate forward transitions.
+func TestUpdateStatus_ForwardTransitionsStillWork(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	txid := "tx-forward"
+
+	if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+		TxID: txid, Status: models.StatusReceived,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, st := range []models.Status{
+		models.StatusSentToNetwork,
+		models.StatusAcceptedByNetwork,
+		models.StatusSeenOnNetwork,
+		models.StatusSeenMultipleNodes,
+		models.StatusMined,
+		models.StatusImmutable,
+	} {
+		if err := s.UpdateStatus(ctx, &models.TransactionStatus{
+			TxID: txid, Status: st, Timestamp: time.Now(),
+		}); err != nil {
+			t.Fatalf("forward transition to %s: %v", st, err)
+		}
+		got, err := s.GetStatus(ctx, txid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Status != st {
+			t.Fatalf("forward transition lost: expected %s, got %s", st, got.Status)
+		}
+	}
+}
+
 func TestPendingRetryLifecycle(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
