@@ -80,6 +80,24 @@ func New(cfg config.Aero) (*Store, error) {
 	}
 	policy.IdleTimeout = time.Duration(idleSec) * time.Second
 
+	// Aggressive node-level circuit breaker. In a multi-tenant Aerospike
+	// cluster a single slow node — squeezed by another namespace's traffic
+	// — will otherwise drain the per-node pool because every retry just
+	// piles another timeout on the unhealthy peer. The default
+	// MaxErrorRate=100 is too lenient; we trip the breaker much sooner so
+	// the client returns MAX_ERROR_RATE for affected partitions instead of
+	// holding pool slots open while waiting for timeouts.
+	if cfg.MaxErrorRate > 0 {
+		policy.MaxErrorRate = cfg.MaxErrorRate
+	} else {
+		policy.MaxErrorRate = 5
+	}
+	if cfg.ErrorRateWindow > 0 {
+		policy.ErrorRateWindow = cfg.ErrorRateWindow
+	} else {
+		policy.ErrorRateWindow = 1
+	}
+
 	client, err := aero.NewClientWithPolicyAndHost(policy, hosts...)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to aerospike: %w", err)
@@ -211,12 +229,14 @@ func (s *Store) writePolicy(ctx context.Context) *aero.WritePolicy {
 }
 
 // batchPolicy builds a BatchPolicy for multi-record operations. Retries are
-// kept low because batch failures amplify connection pressure.
+// disabled at the client layer because batch failures amplify connection
+// pressure (every retry re-fans-out across every node, including the sick
+// one), and Kafka-driven application retries handle real recovery.
 func (s *Store) batchPolicy(ctx context.Context) *aero.BatchPolicy {
 	p := aero.NewBatchPolicy()
 	p.TotalTimeout = remaining(ctx, s.opTimeout)
 	p.SocketTimeout = s.socketTimeout
-	p.MaxRetries = 1
+	p.MaxRetries = 0
 	return p
 }
 

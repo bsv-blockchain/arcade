@@ -182,6 +182,15 @@ type Aero struct {
 	// proto-fd-idle-ms=0. Set a few seconds below the server value when
 	// nonzero. Default 55.
 	IdleTimeoutSec int `mapstructure:"idle_timeout_sec"`
+	// MaxErrorRate is the threshold for the per-node circuit breaker — once
+	// a node returns this many errors within an ErrorRateWindow tend cycles,
+	// requests fast-fail with MAX_ERROR_RATE instead of timing out and
+	// holding pool slots. Default 5; the Aerospike default of 100 is too
+	// lenient for a multi-tenant cluster.
+	MaxErrorRate int `mapstructure:"max_error_rate"`
+	// ErrorRateWindow is the number of cluster-tend iterations the breaker
+	// observes before resetting. Default 1 (~1 second).
+	ErrorRateWindow int `mapstructure:"error_rate_window"`
 }
 
 // Postgres configures the Postgres-backed store. Embedded=true spins up
