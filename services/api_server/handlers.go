@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"github.com/bsv-blockchain/arcade/callbackurl"
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/teranode"
@@ -37,6 +38,33 @@ func extractSubmitOptions(c *gin.Context) submitOptions {
 		CallbackToken:     c.GetHeader("X-CallbackToken"),
 		FullStatusUpdates: c.GetHeader("X-FullStatusUpdates") == "true",
 	}
+}
+
+// validateCallbackURL applies the SSRF guard to the X-CallbackUrl header
+// before the request is allowed to register a subscription. Empty URLs
+// pass through — token-only subscriptions don't trigger an outbound dial,
+// so there's no SSRF surface to protect. The shared callbackurl predicate
+// is the same one the webhook delivery client uses at dial time, so a host
+// that survives this check still gets re-validated at connection time
+// (catches DNS rebinding).
+//
+// Returns a 400 to the client on failure and reports false; callers should
+// abort processing in that case. The unsafe URL is logged at debug (not
+// the value itself, just the host) so operators can correlate refusals
+// without leaking attacker-controlled strings into structured logs.
+func (s *Server) validateCallbackURL(c *gin.Context, url string) bool {
+	if url == "" {
+		return true
+	}
+	if err := callbackurl.ValidateURL(url, s.cfg.Callback.AllowPrivateIPs); err != nil {
+		s.logger.Warn("rejecting submit due to unsafe callback url",
+			zap.String("client_ip", c.ClientIP()),
+			zap.Error(err),
+		)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid callback url: " + err.Error()})
+		return false
+	}
+	return true
 }
 
 // hasSubscription reports whether the request asked for callback / SSE
@@ -360,6 +388,15 @@ const (
 // handleSubmitTransaction accepts transactions for validation and propagation.
 // Supports application/octet-stream, text/plain (hex), and JSON.
 func (s *Server) handleSubmitTransaction(c *gin.Context) {
+	// SSRF guard: reject before reading the body so a hostile client can't
+	// exhaust ingress bandwidth alongside a banned callback host. The same
+	// predicate runs again at dial time on the webhook delivery client to
+	// catch DNS rebinding.
+	opts := extractSubmitOptions(c)
+	if !s.validateCallbackURL(c, opts.CallbackURL) {
+		return
+	}
+
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxSingleTxBytes)
 
 	var rawTx []byte
@@ -435,7 +472,7 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// txid or callbackToken. A late InsertSubmission would race with the
 	// validator and risk silently dropping the first few status events for
 	// fast-path transactions.
-	s.recordSubmission(c.Request.Context(), txid, extractSubmitOptions(c))
+	s.recordSubmission(c.Request.Context(), txid, opts)
 
 	msg := map[string]interface{}{
 		"action": "submit",
@@ -454,6 +491,13 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	if !strings.Contains(c.ContentType(), "octet-stream") {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Content-Type must be application/octet-stream"})
+		return
+	}
+
+	// SSRF guard: reject early so a hostile client posting a 256 MiB batch
+	// with a banned callback host doesn't get to consume any ingress.
+	opts := extractSubmitOptions(c)
+	if !s.validateCallbackURL(c, opts.CallbackURL) {
 		return
 	}
 
@@ -508,8 +552,8 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 
 	// Record one submission per parsed txid before the batch publish so the
 	// downstream services can resolve callback preferences as soon as
-	// status updates start flowing back.
-	opts := extractSubmitOptions(c)
+	// status updates start flowing back. opts was extracted (and the URL
+	// validated) at the top of the handler.
 	if opts.hasSubscription() {
 		ctx := c.Request.Context()
 		for _, m := range msgs {
