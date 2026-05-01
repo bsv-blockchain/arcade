@@ -24,6 +24,9 @@ import (
 //
 // Returns the minimal merkle path for the tracked transaction (with global offsets) and the global tx offset.
 func AssembleBUMP(stumpData []byte, subtreeIndex int, subtreeHashes []chainhash.Hash, coinbaseBUMP []byte) (*transaction.MerklePath, uint64, error) {
+	if err := validateSubtreeIndex(subtreeIndex, len(subtreeHashes)); err != nil {
+		return nil, 0, err
+	}
 	fullPath, txOffset, err := assembleFullPath(stumpData, subtreeIndex, subtreeHashes, coinbaseBUMP)
 	if err != nil {
 		return nil, 0, err
@@ -32,10 +35,25 @@ func AssembleBUMP(stumpData []byte, subtreeIndex int, subtreeHashes []chainhash.
 	return minimalPath, txOffset, nil
 }
 
+// validateSubtreeIndex rejects subtreeIndex values that are negative or that fall
+// outside the range of subtree hashes the block actually has. Without this guard
+// a negative index wraps when converted to uint64 and corrupts every offset in
+// the assembled BUMP, while an out-of-range positive index produces a path for a
+// subtree that isn't present in the block.
+func validateSubtreeIndex(subtreeIndex, numSubtrees int) error {
+	if subtreeIndex < 0 || subtreeIndex >= numSubtrees {
+		return fmt.Errorf("invalid subtree index %d for block with %d subtrees", subtreeIndex, numSubtrees)
+	}
+	return nil
+}
+
 // assembleFullPath constructs a full BUMP from a STUMP, retaining ALL level-0 hashes
 // and intermediate nodes. This is used by BuildCompoundBUMP to preserve data for all
 // tracked transactions, not just one.
 func assembleFullPath(stumpData []byte, subtreeIndex int, subtreeHashes []chainhash.Hash, coinbaseBUMP []byte) (*transaction.MerklePath, uint64, error) {
+	if err := validateSubtreeIndex(subtreeIndex, len(subtreeHashes)); err != nil {
+		return nil, 0, err
+	}
 	stumpPath, err := transaction.NewMerklePathFromBinary(stumpData)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to parse STUMP: %w", err)
