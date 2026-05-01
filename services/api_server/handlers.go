@@ -3,6 +3,7 @@ package api_server
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"html/template"
 	"io"
@@ -225,14 +226,27 @@ func (s *Server) handleReady(c *gin.Context) {
 
 // handleCallback processes inbound callbacks from Merkle Service.
 // Uses CallbackMessage format with Type field.
+//
+// Bearer-token authentication is mandatory. config.validate refuses to start
+// the binary when MerkleService is configured without a CallbackToken (finding
+// F-018 / issue #76), so reaching this handler with an empty configured token
+// means a misconfigured deployment outside the supported envelope. We still
+// fail closed here as a defense-in-depth measure: an empty/missing bearer or
+// any mismatch is rejected with 401 before any callback processing runs.
 func (s *Server) handleCallback(c *gin.Context) {
-	// Bearer token validation
-	if s.cfg.CallbackToken != "" {
-		auth := c.GetHeader("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") || auth[len("Bearer "):] != s.cfg.CallbackToken {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
-			return
-		}
+	// Bearer token validation — always enforced, never skipped on empty
+	// configured token. subtle.ConstantTimeCompare removes the timing side
+	// channel that a plain == on the secret would expose.
+	auth := c.GetHeader("Authorization")
+	const bearerPrefix = "Bearer "
+	configured := []byte(s.cfg.CallbackToken)
+	var presented []byte
+	if strings.HasPrefix(auth, bearerPrefix) {
+		presented = []byte(auth[len(bearerPrefix):])
+	}
+	if len(configured) == 0 || subtle.ConstantTimeCompare(configured, presented) != 1 {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
 	}
 
 	var msg models.CallbackMessage

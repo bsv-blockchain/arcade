@@ -552,6 +552,16 @@ func validate(cfg *Config) error {
 	// of the client. The documented standalone and zero-dependency profiles
 	// (config.example.standalone.yaml) ship with merkle_service.url: "" for
 	// exactly this reason. See issue #59 / finding F-001.
+	//
+	// When the Merkle integration IS enabled (URL set), callback_token is
+	// mandatory. The /api/v1/merkle-service/callback endpoint accepts forged
+	// status updates for any txid in the system if it runs without bearer-token
+	// auth, so we fail-closed here at config load rather than silently exposing
+	// the unauthenticated receiver. See issue #76 / finding F-018.
+	if cfg.MerkleService.URL != "" && cfg.CallbackToken == "" {
+		return fmt.Errorf("callback_token is required when merkle_service.url is set " +
+			"(unauthenticated /api/v1/merkle-service/callback would accept forged callbacks; see issue #76)")
+	}
 	if cfg.Network == "" {
 		cfg.Network = NetworkMainnet
 	}

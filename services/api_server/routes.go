@@ -55,7 +55,7 @@ var routeDocs = []RouteDoc{
 		Method:         "POST",
 		Path:           "/api/v1/merkle-service/callback",
 		Description:    "Receive callbacks from Merkle Service",
-		RequestFormat:  "JSON CallbackMessage with type field. Optional Bearer token auth.",
+		RequestFormat:  "JSON CallbackMessage with type field. Bearer token auth required (Authorization: Bearer <callback_token>).",
 		ResponseFormat: "200 OK",
 	},
 	{
