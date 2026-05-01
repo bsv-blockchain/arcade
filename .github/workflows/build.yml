@@ -41,7 +41,7 @@ jobs:
     steps:
       # Step 1: checkout code
       - name: Checkout code
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       # Step 2: Set up QEMU for multi-architecture builds
       - name: Set up QEMU
@@ -53,7 +53,7 @@ jobs:
 
       # Step 4: login to GCHR
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -61,7 +61,7 @@ jobs:
 
       # Step 5: Build and push the Docker image
       - name: Build and push Docker image
-        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
           context: . # Build context (root directory, adjust if Dockerfile is elsewhere)
           file: ./Dockerfile # Path to Dockerfile
