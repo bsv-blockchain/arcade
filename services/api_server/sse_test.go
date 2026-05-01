@@ -9,15 +9,18 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 )
 
@@ -275,6 +278,188 @@ func TestSSENoPublisher(t *testing.T) {
 
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("expected 503, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestSSEFanOutConcurrentUnregister stresses the F-020 fix: many clients
+// register, then half are unregistered concurrently with a fan-out push. The
+// previous implementation closed c.ch on unregister, which races a fan-out
+// send and panics with "send on closed channel". With the fix, fan-out
+// selects on the per-client ctx and bails cleanly when a client is gone, so
+// no panic ever occurs even under aggressive interleaving.
+func TestSSEFanOutConcurrentUnregister(t *testing.T) {
+	st := &sseStoreStub{
+		subsByToken: map[string][]*models.Submission{},
+		statusByTx:  map[string]*models.TransactionStatus{},
+	}
+	_, _, _, cancel := setupSSEServer(t, st)
+	defer cancel()
+
+	// Build a manager directly (bypass HTTP) so we can drive register /
+	// unregister / fanOut on the same struct the production path uses.
+	ctx, mgrCancel := context.WithCancel(t.Context())
+	defer mgrCancel()
+	mgr, err := newSSEManager(ctx, &fakePublisher{}, st, zap.NewNop())
+	if err != nil {
+		t.Fatalf("newSSEManager: %v", err)
+	}
+
+	const N = 200
+	clients := make([]*sseClient, N)
+	for i := 0; i < N; i++ {
+		c := mgr.newClient("") // empty token → no store filter
+		mgr.register(c)
+		clients[i] = c
+	}
+
+	startGoroutines := runtime.NumGoroutine()
+
+	status := &models.TransactionStatus{
+		TxID:      "race-tx",
+		Status:    models.StatusMined,
+		Timestamp: time.Unix(0, 1700000000000000000).UTC(),
+	}
+
+	// Race: half the clients unregister while a stream of fan-outs happens.
+	// Repeat enough times to exercise the interleaving.
+	const iterations = 50
+	for it := 0; it < iterations; it++ {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < N; i += 2 {
+				mgr.unregister(clients[i].id)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			// fanOut must not panic even though half the clients are
+			// being unregistered (and previously had their ch closed)
+			// concurrently.
+			mgr.fanOut(ctx, status)
+		}()
+		wg.Wait()
+
+		// Re-register fresh clients in those slots so the next iteration
+		// has another batch to race.
+		for i := 0; i < N; i += 2 {
+			c := mgr.newClient("")
+			mgr.register(c)
+			clients[i] = c
+		}
+	}
+
+	// Drain remaining: cancel ctx → manager goroutine exits, all client
+	// ctxs cancel via parent. Allow scheduler a beat to clean up.
+	mgrCancel()
+	cancel()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if runtime.NumGoroutine() <= startGoroutines+2 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// Best-effort goroutine-leak check: we don't pin an exact count
+	// (httptest / runtime can spawn helpers) but we tolerate a small
+	// fudge. The real assertion is "no panic" above.
+	t.Logf("goroutines start=%d end=%d (fudge tolerated)", startGoroutines, runtime.NumGoroutine())
+}
+
+// TestSSEFanOutSlowClientDrops verifies that a client whose buffer is full
+// causes fan-out to take the drop arm rather than block. The slow_client
+// counter must increment by exactly the number of drops, and the fan-out
+// must complete promptly even though the slow client never drains.
+func TestSSEFanOutSlowClientDrops(t *testing.T) {
+	st := &sseStoreStub{
+		subsByToken: map[string][]*models.Submission{},
+		statusByTx:  map[string]*models.TransactionStatus{},
+	}
+	_, _, _, cancel := setupSSEServer(t, st)
+	defer cancel()
+
+	ctx, mgrCancel := context.WithCancel(t.Context())
+	defer mgrCancel()
+	mgr, err := newSSEManager(ctx, &fakePublisher{}, st, zap.NewNop())
+	if err != nil {
+		t.Fatalf("newSSEManager: %v", err)
+	}
+
+	slow := mgr.newClient("")
+	mgr.register(slow)
+	defer mgr.unregister(slow.id)
+
+	// Fill the slow client's buffer to capacity so subsequent fan-outs
+	// must take the default-drop arm.
+	for i := 0; i < cap(slow.ch); i++ {
+		slow.ch <- &models.TransactionStatus{TxID: "filler", Timestamp: time.Now()}
+	}
+
+	before := testutil.ToFloat64(metrics.APISSEDroppedTotal.WithLabelValues("slow_client"))
+
+	const drops = 5
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < drops; i++ {
+			mgr.fanOut(ctx, &models.TransactionStatus{
+				TxID:      "drop",
+				Status:    models.StatusMined,
+				Timestamp: time.Now(),
+			})
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("fanOut blocked on slow client (should have dropped)")
+	}
+
+	after := testutil.ToFloat64(metrics.APISSEDroppedTotal.WithLabelValues("slow_client"))
+	if got := after - before; got != drops {
+		t.Errorf("slow_client drops = %v, want %d", got, drops)
+	}
+}
+
+// TestSSEFanOutClientGoneDrops ensures a client whose ctx has been canceled
+// (i.e. unregister already ran) falls through the ctx.Done() arm of the
+// fan-out select rather than panicking on a closed channel. We invoke
+// fanOut directly so the race is deterministic.
+func TestSSEFanOutClientGoneDrops(t *testing.T) {
+	st := &sseStoreStub{
+		subsByToken: map[string][]*models.Submission{},
+		statusByTx:  map[string]*models.TransactionStatus{},
+	}
+	_, _, _, cancel := setupSSEServer(t, st)
+	defer cancel()
+
+	ctx, mgrCancel := context.WithCancel(t.Context())
+	defer mgrCancel()
+	mgr, err := newSSEManager(ctx, &fakePublisher{}, st, zap.NewNop())
+	if err != nil {
+		t.Fatalf("newSSEManager: %v", err)
+	}
+
+	gone := mgr.newClient("")
+	mgr.register(gone)
+	// Cancel WITHOUT removing from the map so fanOut still sees this
+	// client in its snapshot — exactly the race the bug describes.
+	gone.cancel()
+
+	before := testutil.ToFloat64(metrics.APISSEDroppedTotal.WithLabelValues("client_gone"))
+
+	// Must not panic.
+	mgr.fanOut(ctx, &models.TransactionStatus{
+		TxID:      "gone",
+		Status:    models.StatusMined,
+		Timestamp: time.Now(),
+	})
+
+	after := testutil.ToFloat64(metrics.APISSEDroppedTotal.WithLabelValues("client_gone"))
+	if got := after - before; got < 1 {
+		t.Errorf("client_gone drops = %v, want >= 1", got)
 	}
 }
 
