@@ -142,13 +142,25 @@ var PropagationInlineRetryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "Inline retry attempts on broadcastSingleToEndpoints.",
 }, []string{"outcome"}) // recovered, exhausted
 
-// PropagationMerkleRegisterDuration measures the merkle-service batch
+// PropagationMerkleRegisterDuration measures the merkle-service per-message
 // registration round-trip. Slow merkle calls are a common bottleneck.
 var PropagationMerkleRegisterDuration = promauto.NewHistogram(prometheus.HistogramOpts{
 	Name:    "arcade_propagation_merkle_register_duration_seconds",
-	Help:    "Duration of merkle-service RegisterBatch calls.",
+	Help:    "Duration of merkle-service Register calls.",
 	Buckets: latencyBuckets,
 })
+
+// PropagationMerkleRegisterFailures counts per-message merkle-service
+// registration failures by reason. Sustained values indicate the merkle
+// service is unhealthy — without this metric a registration outage was
+// previously masked by silent broadcast continuation. Reasons map to the
+// failure mode observed by handleMessage; today only "register_error" is
+// emitted, but the label is kept open so future error-class splits (e.g.
+// "timeout", "5xx", "auth") can be added without renaming the metric.
+var PropagationMerkleRegisterFailures = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_propagation_merkle_register_failures_total",
+	Help: "Per-message merkle-service Register failures, by reason.",
+}, []string{"reason"})
 
 // PropagationReaperLease is 1 when this pod holds the reaper lease, 0 otherwise.
 // In K8s, sum across pods should always equal 1 (or 0 during failover).
@@ -307,6 +319,16 @@ var KafkaMessageBytes = promauto.NewHistogramVec(prometheus.HistogramOpts{
 var KafkaProduceErrors = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_kafka_produce_errors_total",
 	Help: "Kafka producer error count, by topic.",
+}, []string{"topic"})
+
+// KafkaDLQPublishFailures counts DLQ publish failures by original topic. A
+// non-zero rate means the DLQ topic is rejecting publishes — investigate Kafka
+// availability. The consumer leaves the offset uncommitted on these failures,
+// so they correlate with rising consumer lag on the primary topic until
+// publishing recovers.
+var KafkaDLQPublishFailures = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_kafka_dlq_publish_failures_total",
+	Help: "Kafka DLQ publish failure count, by original topic.",
 }, []string{"topic"})
 
 // ---------------------------------------------------------------------------

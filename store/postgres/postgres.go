@@ -498,6 +498,37 @@ ORDER BY timestamp_at DESC`
 	return results, rows.Err()
 }
 
+// IterateStatusesSince streams the same query as GetStatusesSince through fn
+// without buffering the full result set. pgx's rows.Next() pulls rows from the
+// server one at a time, so memory stays O(row) regardless of history depth.
+func (s *Store) IterateStatusesSince(ctx context.Context, since time.Time, fn func(*models.TransactionStatus) error) error {
+	const q = `
+SELECT txid, status, status_code, block_hash, block_height, merkle_path,
+       extra_info, competing_txs, raw_tx, retry_count, next_retry_at,
+       timestamp_at, created_at
+FROM transactions WHERE timestamp_at >= $1
+ORDER BY timestamp_at DESC`
+	rows, err := s.pool.Query(ctx, q, since)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		st, err := scanStatus(rows)
+		if err != nil {
+			return err
+		}
+		if err := fn(st); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
 // SetStatusByBlockHash rewrites every row in the block. Block fields are
 // cleared on SEEN_ON_NETWORK transitions (reorg path) and kept otherwise —
 // matches the Aerospike / Pebble contract.
