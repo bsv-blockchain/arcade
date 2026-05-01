@@ -63,6 +63,35 @@ func (b *Builder) publishStatus(ctx context.Context, status *models.TransactionS
 	}
 }
 
+// markMinedAndPublish moves the txids to MINED and fans the resulting status
+// updates out to the events Publisher. blockHeight is required so each
+// published status carries the block-height anchor that downstream SSE /
+// webhook / BUMP-dedup consumers depend on (issue #87 / F-029). If a backend
+// regresses and returns a status with BlockHeight == 0, the publish path
+// repairs it from the compound BUMP's height before fanning out so a
+// half-applied revert can never reintroduce the original bug.
+func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, blockHash string, blockHeight uint64, txids []string) {
+	mined, err := b.store.SetMinedByTxIDs(ctx, blockHash, blockHeight, txids)
+	if err != nil {
+		logger.Error("failed to set mined status", zap.Error(err))
+		return
+	}
+	logger.Info("set transactions to MINED",
+		zap.Int("count", len(mined)),
+		zap.Uint64("block_height", blockHeight),
+	)
+	// SetMinedByTxIDs returns full status objects only for the rows it
+	// actually updated — silently skipping txids without an existing record.
+	// Publish the rich rows directly so SSE clients receive blockHash /
+	// blockHeight / merklePath in their status updates.
+	for _, st := range mined {
+		if st.BlockHeight == 0 {
+			st.BlockHeight = blockHeight
+		}
+		b.publishStatus(ctx, st)
+	}
+}
+
 func (b *Builder) Name() string { return "bump-builder" }
 
 func (b *Builder) Start(ctx context.Context) error {
@@ -208,24 +237,13 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 		return fmt.Errorf("storing BUMP: %w", err)
 	}
 
-	// 6. Set tracked transactions to MINED
+	// 6. Set tracked transactions to MINED.
+	// blockHeight is threaded through here (and asserted on the returned
+	// statuses below) because downstream SSE/webhook consumers and the
+	// dedup path in BUMP-build rely on the height to anchor each MINED
+	// status to a specific block — a zero/missing height triggered F-029.
 	if len(txids) > 0 {
-		mined, err := b.store.SetMinedByTxIDs(ctx, blockHash, txids)
-		if err != nil {
-			logger.Error("failed to set mined status", zap.Error(err))
-		} else {
-			logger.Info("set transactions to MINED",
-				zap.Int("count", len(mined)),
-			)
-			// SetMinedByTxIDs returns full status objects only for the rows
-			// it actually updated — silently skipping txids without an
-			// existing record. Publish the rich rows directly so SSE
-			// clients receive blockHash / blockHeight / merklePath in their
-			// status updates.
-			for _, st := range mined {
-				b.publishStatus(ctx, st)
-			}
-		}
+		b.markMinedAndPublish(ctx, logger, blockHash, blockHeight, txids)
 	}
 
 	// 7. Prune STUMPs

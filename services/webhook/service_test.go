@@ -94,7 +94,7 @@ func (s *fakeStore) SetStatusByBlockHash(context.Context, string, models.Status)
 }
 func (s *fakeStore) InsertBUMP(context.Context, string, uint64, []byte) error { return nil }
 func (s *fakeStore) GetBUMP(context.Context, string) (uint64, []byte, error)  { return 0, nil, nil }
-func (s *fakeStore) SetMinedByTxIDs(context.Context, string, []string) ([]*models.TransactionStatus, error) {
+func (s *fakeStore) SetMinedByTxIDs(context.Context, string, uint64, []string) ([]*models.TransactionStatus, error) {
 	return nil, nil
 }
 func (s *fakeStore) InsertSubmission(context.Context, *models.Submission) error { return nil }

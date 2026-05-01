@@ -103,11 +103,17 @@ type Store interface {
 	// GetBUMP retrieves the compound BUMP for a block.
 	GetBUMP(ctx context.Context, blockHash string) (blockHeight uint64, bumpData []byte, err error)
 
-	// SetMinedByTxIDs marks transactions as mined for a given block hash and tx list.
+	// SetMinedByTxIDs marks transactions as mined for a given block (hash + height)
+	// and tx list. blockHeight is required: downstream consumers (SSE, webhooks,
+	// BUMP-build dedup) rely on the height to anchor each MINED status to a
+	// specific block, and a zero/missing height has historically caused dropped
+	// updates and BUMP-build re-work (see issue #87 / F-029). Implementations
+	// must persist both blockHash and blockHeight on each updated row, and the
+	// returned TransactionStatus values MUST carry BlockHeight populated.
 	// Implementations must only update records that already exist in the store;
 	// txids with no existing record should be silently skipped (not created).
 	// Returns full status objects only for the transactions that were actually updated.
-	SetMinedByTxIDs(ctx context.Context, blockHash string, txids []string) ([]*models.TransactionStatus, error)
+	SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeight uint64, txids []string) ([]*models.TransactionStatus, error)
 
 	// InsertSubmission creates a new submission record
 	InsertSubmission(ctx context.Context, sub *models.Submission) error
