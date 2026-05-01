@@ -17,18 +17,49 @@ import (
 
 var httpClient = &http.Client{Timeout: 5 * time.Minute}
 
+// DefaultMaxBlockBytes caps a single /block/<hash> binary response from a
+// DataHub endpoint. The endpoint serves block metadata: 80-byte header,
+// transaction-count varints, the 32-byte subtree-hash list, the coinbase
+// transaction, and the coinbase BUMP. Even on a Teranode network with
+// millions of subtrees per block this stays well under a hundred MiB; 1 GiB
+// is two-plus orders of magnitude of headroom while still bounding memory
+// against a hostile or malfunctioning DataHub. See finding F-007.
+const DefaultMaxBlockBytes int64 = 1 * 1024 * 1024 * 1024 // 1 GiB
+
+// maxErrorBodyBytes caps how much of a non-200 response body we read into the
+// returned error string. The HTTP status itself carries the diagnostic
+// signal — body is just for human debugging — so a small cap is fine and
+// stops a hostile server from inflating arcade's log lines.
+const maxErrorBodyBytes int64 = 512
+
 // FetchBlockDataForBUMP fetches subtree hashes, coinbase BUMP, and the block's
 // header merkle root from the binary block endpoint, trying all DataHub URLs.
 // Each attempt emits a Debug-level log line so operators can see which URLs
 // were tried, the HTTP status, elapsed time, and per-URL error. logger may be
 // nil — in that case the per-attempt logs are silently dropped.
 //
+// Response bodies are read through an io.LimitReader and Content-Length is
+// inspected before reading, so a hostile or malfunctioning DataHub cannot
+// exhaust process memory by returning an unbounded body. The cap is the
+// package-level default (DefaultMaxBlockBytes); use FetchBlockDataForBUMPWithCap
+// to override from configuration.
+//
 // Binary format: header (80) | txCount (varint) | sizeBytes (varint) |
 // subtreeCount (varint) | subtreeHashes (N×32) | coinbaseTx (variable) |
 // blockHeight (varint) | coinbaseBUMPLen (varint) | coinbaseBUMP (variable)
 func FetchBlockDataForBUMP(ctx context.Context, datahubURLs []string, blockHash string, logger *zap.Logger) (subtreeHashes []chainhash.Hash, coinbaseBUMP []byte, headerMerkleRoot *chainhash.Hash, err error) {
+	return FetchBlockDataForBUMPWithCap(ctx, datahubURLs, blockHash, DefaultMaxBlockBytes, logger)
+}
+
+// FetchBlockDataForBUMPWithCap is the cap-aware variant of FetchBlockDataForBUMP.
+// maxBlockBytes <= 0 selects DefaultMaxBlockBytes — passing zero/negative does
+// not silently disable the protection.
+func FetchBlockDataForBUMPWithCap(ctx context.Context, datahubURLs []string, blockHash string, maxBlockBytes int64, logger *zap.Logger) (subtreeHashes []chainhash.Hash, coinbaseBUMP []byte, headerMerkleRoot *chainhash.Hash, err error) {
 	if logger == nil {
 		logger = zap.NewNop()
+	}
+	if maxBlockBytes <= 0 {
+		maxBlockBytes = DefaultMaxBlockBytes
 	}
 	if len(datahubURLs) == 0 {
 		return nil, nil, nil, fmt.Errorf("no DataHub URLs configured (static + discovered list is empty) for block %s", blockHash)
@@ -36,12 +67,13 @@ func FetchBlockDataForBUMP(ctx context.Context, datahubURLs []string, blockHash 
 	var urlErrors []string
 	for i, dataHubURL := range datahubURLs {
 		start := time.Now()
-		hashes, cbBUMP, root, status, fetchErr := fetchBlockBinary(ctx, dataHubURL, blockHash)
+		hashes, cbBUMP, root, status, fetchErr := fetchBlockBinary(ctx, dataHubURL, blockHash, maxBlockBytes)
 		logger.Debug("datahub fetch attempt",
 			zap.Int("idx", i),
 			zap.String("url", dataHubURL),
 			zap.Int("status", status),
 			zap.Duration("elapsed", time.Since(start)),
+			zap.Int64("max_block_bytes", maxBlockBytes),
 			zap.Error(fetchErr),
 		)
 		if fetchErr == nil {
@@ -56,7 +88,13 @@ func FetchBlockDataForBUMP(ctx context.Context, datahubURLs []string, blockHash 
 // subtree hashes, coinbase BUMP, and the header merkle root from the response.
 // Returns the HTTP status code (0 on transport error before a response was
 // received) so the caller can include it in its per-attempt log line.
-func fetchBlockBinary(ctx context.Context, baseURL, blockHash string) ([]chainhash.Hash, []byte, *chainhash.Hash, int, error) {
+//
+// maxBlockBytes bounds the response body size: Content-Length is rejected
+// before reading when advertised oversize, and the body itself is read
+// through an io.LimitReader of maxBlockBytes+1 so we can distinguish
+// "exactly at cap" (allowed) from "exceeded cap" (rejected) without ever
+// buffering more than the cap.
+func fetchBlockBinary(ctx context.Context, baseURL, blockHash string, maxBlockBytes int64) ([]chainhash.Hash, []byte, *chainhash.Hash, int, error) {
 	url := fmt.Sprintf("%s/block/%s", baseURL, blockHash)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -70,14 +108,27 @@ func fetchBlockBinary(ctx context.Context, baseURL, blockHash string) ([]chainha
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 		return nil, nil, nil, resp.StatusCode, fmt.Errorf("GET %s: status %d (body: %s)", url, resp.StatusCode, string(body))
 	}
 
-	// Read entire response into memory so we can use NewTransactionFromStream
-	data, err := io.ReadAll(resp.Body)
+	// Reject advertised oversize responses without reading any of the body.
+	// resp.ContentLength is -1 when the server omits the header or uses
+	// chunked encoding; in that case we fall through to the LimitReader
+	// check below, which still bounds memory.
+	if resp.ContentLength >= 0 && resp.ContentLength > maxBlockBytes {
+		return nil, nil, nil, resp.StatusCode, fmt.Errorf("GET %s: Content-Length %d exceeds cap of %d bytes", url, resp.ContentLength, maxBlockBytes)
+	}
+
+	// Read entire response into memory so we can use NewTransactionFromStream.
+	// Read maxBlockBytes+1 so a body that lands exactly at the cap is
+	// accepted but anything larger is detected and rejected.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBlockBytes+1))
 	if err != nil {
 		return nil, nil, nil, resp.StatusCode, fmt.Errorf("failed to read response body: %w", err)
+	}
+	if int64(len(data)) > maxBlockBytes {
+		return nil, nil, nil, resp.StatusCode, fmt.Errorf("GET %s: response body exceeds %d bytes", url, maxBlockBytes)
 	}
 
 	hashes, cb, root, parseErr := parseBlockBinary(data)

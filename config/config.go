@@ -311,6 +311,15 @@ type EndpointHealthConfig struct {
 // giving merkle-service retries time to land for any STUMPs that initially got a 5xx.
 type BumpBuilderConfig struct {
 	GraceWindowMs int `mapstructure:"grace_window_ms"`
+	// DataHubMaxBlockBytes caps a single /block/<hash> response body fetched
+	// from a DataHub endpoint, in bytes. The DataHub serves block metadata
+	// (header + subtree-hash list + coinbase tx + coinbase BUMP), so the
+	// default of 1 GiB is two-plus orders of magnitude over a realistic
+	// Teranode payload while still bounding memory against a hostile or
+	// malfunctioning endpoint. A value <= 0 selects bump.DefaultMaxBlockBytes.
+	// Mitigates F-007 (DataHub block fetch reads unbounded response bodies
+	// into memory).
+	DataHubMaxBlockBytes int64 `mapstructure:"datahub_max_block_bytes"`
 }
 
 // WebhookConfig tunes the HTTP webhook delivery service. The service
@@ -502,6 +511,11 @@ func setDefaults() {
 	var ct chaintracksconfig.Config
 	ct.SetDefaults(viper.GetViper(), "chaintracks")
 	viper.SetDefault("bump_builder.grace_window_ms", 30000)
+	// 1 GiB — DataHub /block/<hash> responses contain block metadata
+	// (header + subtree hashes + coinbase tx + coinbase BUMP). 1 GiB is
+	// two-plus orders of magnitude of headroom over a realistic payload
+	// while still bounding memory against a hostile DataHub. See F-007.
+	viper.SetDefault("bump_builder.datahub_max_block_bytes", int64(1*1024*1024*1024))
 }
 
 func validate(cfg *Config) error {

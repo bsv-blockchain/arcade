@@ -99,6 +99,8 @@ chaintracks_server:
 
 bump_builder:
   grace_window_ms: 30000
+  # Cap on DataHub /block/<hash> response bodies (bytes). Default 1 GiB.
+  # Mitigates F-007. datahub_max_block_bytes: 1073741824
 
 # propagation:
 #   # Per-endpoint circuit-breaker for datahub URLs. Bad peers are sidelined
