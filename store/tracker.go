@@ -13,6 +13,14 @@ import (
 const (
 	// ConfirmationsRequired is the number of blocks after mining before removing from tracker
 	ConfirmationsRequired = 100
+
+	// loadFromStoreBatchSize is the number of statuses LoadFromStore processes
+	// per batch before handing the kept rows to the tracker. Streaming through
+	// the store one row at a time is enough to bound peak memory; batching
+	// just amortizes the lock acquisition. 10k keeps the lock-held window
+	// short while still covering hundreds of thousands of rows in a handful
+	// of acquisitions.
+	loadFromStoreBatchSize = 10000
 )
 
 // TrackedTx holds the status for a tracked transaction
@@ -36,37 +44,81 @@ func NewTxTracker() *TxTracker {
 	}
 }
 
-// LoadFromStore populates the tracker from the store.
-// Loads all transactions that aren't deeply confirmed (mined for 100+ blocks).
+// statusIterator narrows the Store surface LoadFromStore actually needs so
+// tests can supply a fake without standing up every Store method. Any
+// implementation of Store satisfies this implicitly.
+type statusIterator interface {
+	IterateStatusesSince(ctx context.Context, since time.Time, fn func(*models.TransactionStatus) error) error
+}
+
+// LoadFromStore populates the tracker from the store, streaming rows in
+// fixed-size batches and dropping deeply-confirmed transactions before they
+// reach the tracker map. Peak memory is bounded by loadFromStoreBatchSize
+// rather than the full history depth, which matters at startup on systems
+// with months of accumulated transactions.
 func (t *TxTracker) LoadFromStore(ctx context.Context, store Store, currentHeight uint64) (int, error) {
-	statuses, err := store.GetStatusesSince(ctx, time.Time{})
-	if err != nil {
-		return 0, err
+	return t.loadFromStore(ctx, store, currentHeight, loadFromStoreBatchSize)
+}
+
+// loadFromStore is the batchSize-parameterized form of LoadFromStore so tests
+// can drive the batching boundary without inflating fixture sizes.
+func (t *TxTracker) loadFromStore(ctx context.Context, store statusIterator, currentHeight uint64, batchSize int) (int, error) {
+	if batchSize <= 0 {
+		batchSize = loadFromStoreBatchSize
 	}
 
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
+	type kept struct {
+		hash chainhash.Hash
+		tx   TrackedTx
+	}
+	batch := make([]kept, 0, batchSize)
 	count := 0
-	for _, status := range statuses {
-		// Skip transactions that are deeply confirmed
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		t.mu.Lock()
+		for _, k := range batch {
+			t.txids[k.hash] = k.tx
+		}
+		t.mu.Unlock()
+		count += len(batch)
+		batch = batch[:0]
+	}
+
+	err := store.IterateStatusesSince(ctx, time.Time{}, func(status *models.TransactionStatus) error {
+		// Skip transactions that are deeply confirmed — these would only be
+		// pruned moments later, so never let them touch the tracker map.
 		if status.Status == models.StatusMined && status.BlockHeight > 0 {
 			if currentHeight >= status.BlockHeight+ConfirmationsRequired {
-				continue
+				return nil
 			}
 		}
 
 		hash, err := chainhash.NewHashFromHex(status.TxID)
 		if err != nil {
-			continue
+			return nil //nolint:nilerr // malformed txid: skip the row, keep loading.
 		}
-		t.txids[*hash] = TrackedTx{
-			Status:      status.Status,
-			MinedHeight: status.BlockHeight,
+		batch = append(batch, kept{
+			hash: *hash,
+			tx: TrackedTx{
+				Status:      status.Status,
+				MinedHeight: status.BlockHeight,
+			},
+		})
+		if len(batch) >= batchSize {
+			flush()
 		}
-		count++
+		return nil
+	})
+	if err != nil {
+		// Surface the error but keep whatever we already merged so the
+		// tracker isn't left empty on a transient store hiccup mid-scan.
+		flush()
+		return count, err
 	}
-
+	flush()
 	return count, nil
 }
 

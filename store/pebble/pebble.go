@@ -489,6 +489,44 @@ func (s *Store) GetStatusesSince(ctx context.Context, since time.Time) ([]*model
 	return results, nil
 }
 
+// IterateStatusesSince walks the same updated-at index as GetStatusesSince but
+// hands each row to fn directly instead of accumulating a slice. The Pebble
+// iterator already streams keys lazily, so peak memory is bounded by whatever
+// fn retains rather than the full history depth.
+func (s *Store) IterateStatusesSince(ctx context.Context, since time.Time, fn func(*models.TransactionStatus) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	prefix := idxTxUpdatedPrefix()
+	iter, err := s.db.NewIter(&pebbledb.IterOptions{
+		LowerBound: prefix,
+		UpperBound: endOfPrefix(prefix),
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = iter.Close() }()
+
+	sinceNs := since.UnixNano()
+	for iter.First(); iter.Valid(); iter.Next() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		txid := lastSegment(iter.Key())
+		st, err := s.readStatus(txid)
+		if err != nil || st == nil {
+			continue
+		}
+		if !since.IsZero() && st.Timestamp.UnixNano() < sinceNs {
+			continue
+		}
+		if err := fn(st); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // SetStatusByBlockHash walks idx:tx:block:<blockHash>:* and rewrites each
 // referenced row with the new status. For SEEN_ON_NETWORK transitions block
 // fields are cleared (matches Aerospike contract); for IMMUTABLE they're kept.

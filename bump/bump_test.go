@@ -1682,3 +1682,136 @@ func TestBuildCompoundBUMP_NoSubtree0Stump_NonPow2(t *testing.T) {
 		t.Fatalf("minimal-path root mismatch: got %s, want %s", gotRoot, trueBlockRoot)
 	}
 }
+
+// --- Subtree Index Validation Tests (F-006) ---
+
+// TestAssembleBUMP_RejectsNegativeSubtreeIndex covers the F-006 case where a
+// negative subtreeIndex would wrap when converted to uint64 and corrupt every
+// shifted offset in the assembled BUMP.
+func TestAssembleBUMP_RejectsNegativeSubtreeIndex(t *testing.T) {
+	allLeaves, subtreeHashes, _ := multiSubtreeTestSetup(4, 4)
+	stump := buildSTUMP(allLeaves[0], 0, 900100)
+
+	_, _, err := AssembleBUMP(stump, -1, subtreeHashes, nil)
+	if err == nil {
+		t.Fatal("expected error for negative subtreeIndex, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid subtree index") {
+		t.Fatalf("expected 'invalid subtree index' error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "-1") {
+		t.Fatalf("expected error to mention the offending index -1, got: %v", err)
+	}
+}
+
+// TestAssembleBUMP_RejectsSubtreeIndexEqualToLen rejects an index equal to the
+// number of subtrees — the first out-of-range positive value.
+func TestAssembleBUMP_RejectsSubtreeIndexEqualToLen(t *testing.T) {
+	allLeaves, subtreeHashes, _ := multiSubtreeTestSetup(4, 4)
+	stump := buildSTUMP(allLeaves[0], 0, 900101)
+
+	_, _, err := AssembleBUMP(stump, len(subtreeHashes), subtreeHashes, nil)
+	if err == nil {
+		t.Fatal("expected error for subtreeIndex == len(subtreeHashes), got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid subtree index") {
+		t.Fatalf("expected 'invalid subtree index' error, got: %v", err)
+	}
+}
+
+// TestAssembleBUMP_RejectsSubtreeIndexBeyondLen rejects an index that is
+// strictly greater than len(subtreeHashes).
+func TestAssembleBUMP_RejectsSubtreeIndexBeyondLen(t *testing.T) {
+	allLeaves, subtreeHashes, _ := multiSubtreeTestSetup(4, 4)
+	stump := buildSTUMP(allLeaves[0], 0, 900102)
+
+	_, _, err := AssembleBUMP(stump, len(subtreeHashes)+1, subtreeHashes, nil)
+	if err == nil {
+		t.Fatal("expected error for subtreeIndex > len(subtreeHashes), got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid subtree index") {
+		t.Fatalf("expected 'invalid subtree index' error, got: %v", err)
+	}
+}
+
+// TestAssembleBUMP_AcceptsZeroSubtreeIndex is a regression test that
+// subtreeIndex=0 with valid inputs continues to succeed after the validation
+// guard is added.
+func TestAssembleBUMP_AcceptsZeroSubtreeIndex(t *testing.T) {
+	allLeaves, subtreeHashes, blockRoot := multiSubtreeTestSetup(4, 4)
+	txOffset := uint64(2)
+	stump := buildSTUMP(allLeaves[0], txOffset, 900103)
+
+	result, _, err := AssembleBUMP(stump, 0, subtreeHashes, nil)
+	if err != nil {
+		t.Fatalf("AssembleBUMP failed for valid subtreeIndex=0: %v", err)
+	}
+	root, err := result.ComputeRoot(&allLeaves[0][txOffset])
+	if err != nil {
+		t.Fatalf("ComputeRoot failed: %v", err)
+	}
+	if *root != blockRoot {
+		t.Fatalf("root mismatch: got %s, want %s", root, blockRoot)
+	}
+}
+
+// TestAssembleBUMP_AcceptsLastSubtreeIndex covers the upper boundary
+// subtreeIndex == len(subtreeHashes)-1.
+func TestAssembleBUMP_AcceptsLastSubtreeIndex(t *testing.T) {
+	allLeaves, subtreeHashes, blockRoot := multiSubtreeTestSetup(4, 4)
+	last := len(subtreeHashes) - 1
+	txOffset := uint64(1)
+	stump := buildSTUMP(allLeaves[last], txOffset, 900104)
+
+	result, _, err := AssembleBUMP(stump, last, subtreeHashes, nil)
+	if err != nil {
+		t.Fatalf("AssembleBUMP failed for valid last subtreeIndex=%d: %v", last, err)
+	}
+	root, err := result.ComputeRoot(&allLeaves[last][txOffset])
+	if err != nil {
+		t.Fatalf("ComputeRoot failed: %v", err)
+	}
+	if *root != blockRoot {
+		t.Fatalf("root mismatch: got %s, want %s", root, blockRoot)
+	}
+}
+
+// TestAssembleBUMP_SingleSubtree_RejectsOutOfRangeSubtreeIndex confirms the
+// single-subtree early-return path also enforces the bound. Previously a
+// caller passing subtreeIndex=1 with one subtree would have silently produced
+// a path under the placeholder coinbase branch (subtreeIndex==0 check would
+// skip) — now it errors at the boundary.
+func TestAssembleBUMP_SingleSubtree_RejectsOutOfRangeSubtreeIndex(t *testing.T) {
+	leaves := generateTxHashes(4)
+	subtreeHashes := []chainhash.Hash{computeMerkleRootFromLeaves(leaves)}
+	stump := buildSTUMP(leaves, 0, 900105)
+
+	_, _, err := AssembleBUMP(stump, 1, subtreeHashes, nil)
+	if err == nil {
+		t.Fatal("expected error for subtreeIndex=1 with single-subtree block, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid subtree index") {
+		t.Fatalf("expected 'invalid subtree index' error, got: %v", err)
+	}
+}
+
+// TestAssembleBUMP_SingleSubtree_Unaffected confirms the single-subtree
+// happy-path still works (subtreeIndex=0 with one subtree).
+func TestAssembleBUMP_SingleSubtree_Unaffected(t *testing.T) {
+	leaves := generateTxHashes(4)
+	expectedRoot := computeMerkleRootFromLeaves(leaves)
+	subtreeHashes := []chainhash.Hash{expectedRoot}
+	stump := buildSTUMP(leaves, 2, 900106)
+
+	result, _, err := AssembleBUMP(stump, 0, subtreeHashes, nil)
+	if err != nil {
+		t.Fatalf("AssembleBUMP failed for single-subtree happy path: %v", err)
+	}
+	root, err := result.ComputeRoot(&leaves[2])
+	if err != nil {
+		t.Fatalf("ComputeRoot failed: %v", err)
+	}
+	if *root != expectedRoot {
+		t.Fatalf("root mismatch: got %s, want %s", root, expectedRoot)
+	}
+}

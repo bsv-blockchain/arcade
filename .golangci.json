@@ -164,6 +164,12 @@
                 },
                 {
                     "linters": [
+                        "containedctx"
+                    ],
+                    "path": "kafka/consumer_test\\.go"
+                },
+                {
+                    "linters": [
                         "bodyclose"
                     ],
                     "path": "teranode/client\\.go"
