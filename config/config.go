@@ -177,6 +177,11 @@ type Aero struct {
 	QueryTimeoutMs  int      `mapstructure:"query_timeout_ms"`
 	OpTimeoutMs     int      `mapstructure:"op_timeout_ms"`
 	SocketTimeoutMs int      `mapstructure:"socket_timeout_ms"`
+	// IdleTimeoutSec sets ClientPolicy.IdleTimeout — client-side reap of idle
+	// pooled connections. Required when the Aerospike server runs with
+	// proto-fd-idle-ms=0. Set a few seconds below the server value when
+	// nonzero. Default 55.
+	IdleTimeoutSec int `mapstructure:"idle_timeout_sec"`
 }
 
 // Postgres configures the Postgres-backed store. Embedded=true spins up
@@ -486,6 +491,9 @@ func validate(cfg *Config) error {
 		}
 	default:
 		return fmt.Errorf("unknown store.backend %q (expected aerospike, pebble, or postgres)", cfg.Store.Backend)
+	}
+	if cfg.MerkleService.URL == "" {
+		return fmt.Errorf("merkle_service.url is required")
 	}
 	if cfg.Network == "" {
 		cfg.Network = NetworkMainnet

@@ -14,7 +14,24 @@ func baseValidConfig() *Config {
 	cfg.Store.Backend = "pebble"
 	cfg.Store.Pebble.Path = "/tmp/arcade-test"
 	cfg.Network = NetworkMainnet
+	cfg.MerkleService.URL = "http://merkle.local"
 	return cfg
+}
+
+// merkle_service.url is mandatory: the merkle service is always enabled, and
+// startup with an unconfigured URL would silently produce a nil client and
+// fail later in obscure ways. Catching it at config load surfaces the misconfig
+// immediately.
+func TestValidate_RequiresMerkleServiceURL(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.MerkleService.URL = ""
+	err := validate(cfg)
+	if err == nil {
+		t.Fatal("expected error when merkle_service.url is unset")
+	}
+	if !strings.Contains(err.Error(), "merkle_service.url") {
+		t.Errorf("error should mention merkle_service.url, got: %v", err)
+	}
 }
 
 // Each canonical network name must validate cleanly. The empty string is also

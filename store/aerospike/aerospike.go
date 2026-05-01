@@ -68,6 +68,17 @@ func New(cfg config.Aero) (*Store, error) {
 
 	policy := aero.NewClientPolicy()
 	policy.ConnectionQueueSize = cfg.PoolSize
+	// IdleTimeout reaps idle pooled connections client-side. Required when the
+	// Aerospike server runs with proto-fd-idle-ms=0 (no server-side idle
+	// reap) — without this, connections pile up forever and starve the pool
+	// (we observed 35k zombie conns on a single node before adding this).
+	// Should be set a few seconds below the server's proto-fd-idle-ms when
+	// nonzero. cfg.IdleTimeoutSec=0 falls back to the safe default.
+	idleSec := cfg.IdleTimeoutSec
+	if idleSec <= 0 {
+		idleSec = 55
+	}
+	policy.IdleTimeout = time.Duration(idleSec) * time.Second
 
 	client, err := aero.NewClientWithPolicyAndHost(policy, hosts...)
 	if err != nil {
