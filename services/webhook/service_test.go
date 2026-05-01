@@ -85,6 +85,10 @@ func (s *fakeStore) GetStatusesSince(context.Context, time.Time) ([]*models.Tran
 	return nil, nil
 }
 
+func (s *fakeStore) IterateStatusesSince(context.Context, time.Time, func(*models.TransactionStatus) error) error {
+	return nil
+}
+
 func (s *fakeStore) SetStatusByBlockHash(context.Context, string, models.Status) ([]string, error) {
 	return nil, nil
 }

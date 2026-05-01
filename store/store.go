@@ -84,6 +84,14 @@ type Store interface {
 	// GetStatusesSince retrieves all transactions updated since a given timestamp
 	GetStatusesSince(ctx context.Context, since time.Time) ([]*models.TransactionStatus, error)
 
+	// IterateStatusesSince streams every transaction updated since the given
+	// timestamp through fn, one row at a time. Implementations must avoid
+	// materializing the full result set in memory — this is the bounded-memory
+	// path used by TxTracker.LoadFromStore at startup, where months of history
+	// would otherwise pin a large slice during pruning. fn returning a non-nil
+	// error stops iteration and surfaces that error to the caller.
+	IterateStatusesSince(ctx context.Context, since time.Time, fn func(*models.TransactionStatus) error) error
+
 	// SetStatusByBlockHash updates all transactions with the given block hash to a new status.
 	// Returns the txids that were updated. For unmined statuses (SEEN_ON_NETWORK),
 	// block fields are cleared. For IMMUTABLE, block fields are preserved.
