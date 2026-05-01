@@ -20,6 +20,12 @@ log_level: info
 network: mainnet
 
 # callback_url: "https://example.com/callback"
+# Bearer token the Merkle Service must present in the Authorization header on
+# every POST /api/v1/merkle-service/callback. REQUIRED when merkle_service.url
+# is set: arcade refuses to start otherwise, since an unset token would let any
+# unauthenticated caller submit forged status updates for any txid. Generate a
+# high-entropy random value (e.g. `openssl rand -hex 32`) and configure the
+# matching token on the Merkle Service. See issue #76 / finding F-018.
 # callback_token: "your-callback-token"
 
 api:
@@ -73,6 +79,10 @@ teranode:
   auth_token: ""
 
 merkle_service:
+  # Merkle Service base URL. Leaving this empty disables the Merkle integration
+  # (standalone profiles). When set, the top-level `callback_token` becomes
+  # REQUIRED — arcade fails to start otherwise so that the inbound callback
+  # endpoint never runs unauthenticated. See issue #76 / finding F-018.
   url: ""
   auth_token: ""
 

@@ -7,6 +7,10 @@ import (
 
 // baseValidConfig returns a Config populated with the minimum fields other
 // validate() branches require so each test can focus on the network branch.
+//
+// Sets a non-empty CallbackToken because validate() now refuses to start
+// when MerkleService.URL is set without a bearer token (issue #76 / F-018).
+// Tests that need to exercise that branch override CallbackToken explicitly.
 func baseValidConfig() *Config {
 	cfg := &Config{}
 	cfg.Mode = "all"
@@ -15,6 +19,7 @@ func baseValidConfig() *Config {
 	cfg.Store.Pebble.Path = "/tmp/arcade-test"
 	cfg.Network = NetworkMainnet
 	cfg.MerkleService.URL = "http://merkle.local"
+	cfg.CallbackToken = "test-callback-token"
 	return cfg
 }
 
@@ -40,6 +45,37 @@ func TestValidate_AcceptsPopulatedMerkleServiceURL(t *testing.T) {
 	cfg.MerkleService.URL = "http://merkle.local"
 	if err := validate(cfg); err != nil {
 		t.Fatalf("populated merkle_service.url should be accepted, got: %v", err)
+	}
+}
+
+// Issue #76 / finding F-018: when the Merkle integration is wired up, the
+// inbound /api/v1/merkle-service/callback endpoint MUST be authenticated. We
+// fail fast at config load when MerkleService.URL is set without a
+// callback_token rather than silently exposing an unauthenticated receiver
+// that any unauthenticated caller could use to submit forged status updates.
+func TestValidate_RequiresCallbackTokenWhenMerkleEnabled(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.MerkleService.URL = "http://merkle.local"
+	cfg.CallbackToken = ""
+	err := validate(cfg)
+	if err == nil {
+		t.Fatal("expected error when merkle_service.url is set without callback_token")
+	}
+	if !strings.Contains(err.Error(), "callback_token") {
+		t.Errorf("error should mention callback_token, got: %v", err)
+	}
+}
+
+// Standalone profiles ship with merkle_service.url: "" and frequently leave
+// callback_token empty too — there is no Merkle Service issuing callbacks, so
+// no token is required. The validation must pass cleanly so the standalone
+// binary keeps booting (issue #59 fix from #104 must continue to hold).
+func TestValidate_AllowsEmptyCallbackTokenInStandaloneMode(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.MerkleService.URL = ""
+	cfg.CallbackToken = ""
+	if err := validate(cfg); err != nil {
+		t.Fatalf("standalone (no merkle, no callback_token) should validate, got: %v", err)
 	}
 }
 

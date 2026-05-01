@@ -161,11 +161,17 @@ func mustMarshalJSON(t *testing.T, v any) []byte {
 	return b
 }
 
+// testCallbackToken is the bearer secret every callback test installs into the
+// Server.cfg so handleCallback's mandatory auth check passes. Real deployments
+// supply a high-entropy value via config.callback_token; tests just need a
+// stable non-empty string.
+const testCallbackToken = "test-callback-token"
+
 func setupServerWithStore(broker *kafka.RecordingBroker, ms *mockStore) (*Server, *gin.Engine) {
 	gin.SetMode(gin.TestMode)
 	producer := kafka.NewProducer(broker)
 	srv := &Server{
-		cfg:      &config.Config{},
+		cfg:      &config.Config{CallbackToken: testCallbackToken},
 		logger:   zap.NewNop(),
 		producer: producer,
 		store:    ms,
@@ -179,13 +185,24 @@ func setupServer(broker *kafka.RecordingBroker) (*Server, *gin.Engine) {
 	gin.SetMode(gin.TestMode)
 	producer := kafka.NewProducer(broker)
 	srv := &Server{
-		cfg:      &config.Config{},
+		cfg:      &config.Config{CallbackToken: testCallbackToken},
 		logger:   zap.NewNop(),
 		producer: producer,
 	}
 	router := gin.New()
 	srv.registerRoutes(router)
 	return srv, router
+}
+
+// authedCallbackRequest builds a callback POST with the canonical bearer
+// header so the mandatory auth check inside handleCallback accepts it. Tests
+// that exercise the auth check itself construct their own requests instead.
+func authedCallbackRequest(t *testing.T, body []byte) *http.Request {
+	t.Helper()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testCallbackToken)
+	return req
 }
 
 // totalMessages returns the combined count of single-message Sends and
@@ -315,8 +332,7 @@ func TestHandleCallback_SeenMultipleNodes_UpdatesStatus(t *testing.T) {
 	}
 	body := mustMarshalJSON(t, payload)
 
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
+	req := authedCallbackRequest(t, body)
 	w := httptest.NewRecorder()
 
 	router.ServeHTTP(w, req)
@@ -356,8 +372,7 @@ func TestHandleCallback_Stump_StorageError_Returns500(t *testing.T) {
 	}
 	body := mustMarshalJSON(t, payload)
 
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
+	req := authedCallbackRequest(t, body)
 	w := httptest.NewRecorder()
 
 	router.ServeHTTP(w, req)
@@ -380,8 +395,7 @@ func TestHandleCallback_SeenMultipleNodes_EmptyTxIDs(t *testing.T) {
 	}
 	body := mustMarshalJSON(t, payload)
 
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
+	req := authedCallbackRequest(t, body)
 	w := httptest.NewRecorder()
 
 	router.ServeHTTP(w, req)
@@ -459,8 +473,7 @@ func TestHandleCallback_FullBlockFlow_20Subtrees(t *testing.T) {
 				errCh <- fmt.Errorf("marshal subtree %d: %w", i, err)
 				return
 			}
-			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
-			req.Header.Set("Content-Type", "application/json")
+			req := authedCallbackRequest(t, body)
 			// Match merkle-service's delivery headers exactly.
 			req.Header.Set("X-Idempotency-Key", fmt.Sprintf("%s:%d:STUMP", blockHash, i))
 			w := httptest.NewRecorder()
@@ -523,8 +536,7 @@ func TestHandleCallback_FullBlockFlow_20Subtrees(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal BLOCK_PROCESSED: %v", err)
 	}
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
+	req := authedCallbackRequest(t, body)
 	req.Header.Set("X-Idempotency-Key", blockHash+":BLOCK_PROCESSED")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
@@ -573,8 +585,7 @@ func TestHandleCallback_FullBlockFlow_20Subtrees(t *testing.T) {
 		Stump:        stumpPayloads[0],
 	}
 	retryBody := mustMarshalJSON(t, retryPayload)
-	retryReq := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(retryBody))
-	retryReq.Header.Set("Content-Type", "application/json")
+	retryReq := authedCallbackRequest(t, retryBody)
 	retryW := httptest.NewRecorder()
 	router.ServeHTTP(retryW, retryReq)
 	if retryW.Code != http.StatusOK {
@@ -658,8 +669,7 @@ func TestHandleCallback_FullBlockFlow_PartialStumpFailure(t *testing.T) {
 				Stump:        stumpPayloads[i],
 			}
 			body := mustMarshalJSON(t, payload)
-			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
-			req.Header.Set("Content-Type", "application/json")
+			req := authedCallbackRequest(t, body)
 			w := httptest.NewRecorder()
 			router.ServeHTTP(w, req)
 			resCh <- result{idx: i, status: w.Code}
@@ -707,8 +717,7 @@ func TestHandleCallback_FullBlockFlow_PartialStumpFailure(t *testing.T) {
 		BlockHash: blockHash,
 	}
 	body := mustMarshalJSON(t, blockMsg)
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
+	req := authedCallbackRequest(t, body)
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -861,5 +870,119 @@ func TestHandleSubmitTransactions_TxID_IsCanonical(t *testing.T) {
 	want := []string{canonA, canonB}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("submissions: want %v, got %v", want, got)
+	}
+}
+
+// TestHandleCallback_RejectsUnauthenticated locks down the F-018 fix: the
+// /api/v1/merkle-service/callback receiver MUST refuse any request missing
+// or presenting the wrong bearer token, and MUST refuse all requests when
+// the configured token is empty (fail-closed). Pre-fix, the handler skipped
+// the entire bearer check when CallbackToken == "", letting any unauthenticated
+// caller submit forged Merkle status updates.
+//
+// This test exercises the runtime check directly. The "config rejects empty
+// token when Merkle is enabled" half of the fix is covered in
+// config/config_test.go (TestValidate_RequiresCallbackTokenWhenMerkleEnabled).
+func TestHandleCallback_RejectsUnauthenticated(t *testing.T) {
+	payload := mustMarshalJSON(t, models.CallbackMessage{
+		Type:  models.CallbackSeenMultipleNodes,
+		TxIDs: []string{"tx1"},
+	})
+
+	cases := []struct {
+		name    string
+		token   string // configured CallbackToken on the Server.
+		header  string // Authorization header sent on the request, "" = none.
+		wantOK  bool
+		wantErr int
+	}{
+		{
+			name:    "no auth header is rejected",
+			token:   testCallbackToken,
+			header:  "",
+			wantOK:  false,
+			wantErr: http.StatusUnauthorized,
+		},
+		{
+			name:    "wrong bearer is rejected",
+			token:   testCallbackToken,
+			header:  "Bearer not-the-real-token",
+			wantOK:  false,
+			wantErr: http.StatusUnauthorized,
+		},
+		{
+			name:    "non-bearer scheme is rejected",
+			token:   testCallbackToken,
+			header:  "Basic " + testCallbackToken,
+			wantOK:  false,
+			wantErr: http.StatusUnauthorized,
+		},
+		{
+			// Defense-in-depth. Config validation now refuses to start with an
+			// empty CallbackToken when Merkle is enabled, but if a misconfigured
+			// process somehow reaches the handler with cfg.CallbackToken == ""
+			// every request — including one presenting an empty bearer — must
+			// still be refused.
+			name:    "empty configured token rejects all callers",
+			token:   "",
+			header:  "Bearer ",
+			wantOK:  false,
+			wantErr: http.StatusUnauthorized,
+		},
+		{
+			// Same scenario as above with no auth header — must also be 401.
+			name:    "empty configured token rejects unauthenticated caller",
+			token:   "",
+			header:  "",
+			wantOK:  false,
+			wantErr: http.StatusUnauthorized,
+		},
+		{
+			name:   "correct bearer is accepted",
+			token:  testCallbackToken,
+			header: "Bearer " + testCallbackToken,
+			wantOK: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ms := &mockStore{}
+			gin.SetMode(gin.TestMode)
+			producer := kafka.NewProducer(&kafka.RecordingBroker{})
+			srv := &Server{
+				cfg:      &config.Config{CallbackToken: tc.token},
+				logger:   zap.NewNop(),
+				producer: producer,
+				store:    ms,
+			}
+			router := gin.New()
+			srv.registerRoutes(router)
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(payload))
+			req.Header.Set("Content-Type", "application/json")
+			if tc.header != "" {
+				req.Header.Set("Authorization", tc.header)
+			}
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+
+			if tc.wantOK {
+				if w.Code != http.StatusOK {
+					t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+				}
+				if len(ms.updateStatusCalls) != 1 {
+					t.Errorf("expected store update on accepted callback, got %d", len(ms.updateStatusCalls))
+				}
+				return
+			}
+			if w.Code != tc.wantErr {
+				t.Fatalf("expected %d, got %d: %s", tc.wantErr, w.Code, w.Body.String())
+			}
+			// Rejected requests must not reach the dispatch path.
+			if len(ms.updateStatusCalls) != 0 {
+				t.Errorf("rejected callback must not write to the store, got %d UpdateStatus calls", len(ms.updateStatusCalls))
+			}
+		})
 	}
 }
