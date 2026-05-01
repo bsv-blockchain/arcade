@@ -187,11 +187,22 @@ func (p *Propagator) Stop() error {
 	return nil
 }
 
-// handleMessage accumulates a single propagation message into the pending batch.
-// The consumer's drain-then-flush pattern calls flushBatch after all immediately
-// available messages have been processed, so the batch size naturally matches
-// what the client submitted — no configured threshold needed.
-func (p *Propagator) handleMessage(_ context.Context, msg *kafka.Message) error {
+// handleMessage registers a single propagation message with the merkle
+// service and, on success, accumulates it into the pending batch for the
+// next flush. The consumer's drain-then-flush pattern calls flushBatch after
+// all immediately available messages have been processed, so the batch size
+// for the broadcast step naturally matches what the client submitted — no
+// configured threshold needed.
+//
+// Registration is performed synchronously, per message, BEFORE the message
+// is added to the pending batch. This is the durable-registration invariant
+// from F-024: if the merkle service refuses (network blip, 5xx, timeout),
+// handleMessage returns an error so the Kafka consumer's processWithRetry
+// loop retries, and on exhaustion routes the message to DLQ — preserving
+// the registration promise instead of silently broadcasting a tx whose
+// callbacks will never fire. A failed message is never appended to
+// pendingMsgs, so it cannot be broadcast or status-updated downstream.
+func (p *Propagator) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	var propMsg propagationMsg
 	if err := json.Unmarshal(msg.Value, &propMsg); err != nil {
 		return fmt.Errorf("unmarshaling propagation message: %w", err)
@@ -199,6 +210,21 @@ func (p *Propagator) handleMessage(_ context.Context, msg *kafka.Message) error 
 
 	if len(propMsg.RawTx) == 0 {
 		return fmt.Errorf("propagation message has empty raw_tx")
+	}
+
+	if p.merkleClient != nil && p.cfg.CallbackURL != "" {
+		mStart := time.Now()
+		if err := p.merkleClient.Register(ctx, propMsg.TXID, p.cfg.CallbackURL); err != nil {
+			metrics.PropagationMerkleRegisterDuration.Observe(time.Since(mStart).Seconds())
+			metrics.PropagationMerkleRegisterFailures.WithLabelValues("register_error").Inc()
+			// Surface the failure so the consumer's retry+DLQ machinery
+			// preserves the message instead of silently dropping it after
+			// continuing to broadcast. The tx is NOT added to pendingMsgs,
+			// so no downstream side-effects (broadcast, status update,
+			// PENDING_RETRY) occur for it.
+			return fmt.Errorf("merkle-service registration failed for %s: %w", propMsg.TXID, err)
+		}
+		metrics.PropagationMerkleRegisterDuration.Observe(time.Since(mStart).Seconds())
 	}
 
 	p.mu.Lock()
@@ -240,9 +266,15 @@ type txResult struct {
 }
 
 // processBatch handles a batch of propagation messages:
-// 1. Register all txids with merkle service concurrently
-// 2. Broadcast all raw txs to teranode endpoints, chunked to teranodeBatchCap
-// 3. Update status for each transaction
+//  1. Broadcast all raw txs to teranode endpoints, chunked to teranodeBatchCap.
+//  2. Update status for each transaction.
+//
+// Merkle-service registration is no longer performed here — that step has
+// moved into handleMessage so a registration failure surfaces as a per-
+// message handler error (the Kafka consumer retries; on exhaustion the
+// message is routed to DLQ). By the time processBatch sees a message it has
+// already been registered successfully, so the broadcast pipeline never
+// races ahead of an unregistered tx (F-024).
 func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) error {
 	// Log batch summary for traceability
 	txidSample := make([]string, 0, 5)
@@ -259,25 +291,7 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) e
 
 	metrics.PropagationBatchSize.Observe(float64(len(batch)))
 
-	// Step 1: Register all txids with merkle service (mandatory)
-	if p.merkleClient != nil && p.cfg.CallbackURL != "" {
-		regs := make([]merkleservice.Registration, len(batch))
-		for i, msg := range batch {
-			regs[i] = merkleservice.Registration{
-				TxID:        msg.TXID,
-				CallbackURL: p.cfg.CallbackURL,
-			}
-		}
-		mStart := time.Now()
-		if err := p.merkleClient.RegisterBatch(ctx, regs, p.merkleConcurrency); err != nil {
-			metrics.PropagationMerkleRegisterDuration.Observe(time.Since(mStart).Seconds())
-			return fmt.Errorf("merkle-service batch registration failed: %w", err)
-		}
-		metrics.PropagationMerkleRegisterDuration.Observe(time.Since(mStart).Seconds())
-		p.logger.Debug("batch registered with merkle-service", zap.Int("count", len(batch)))
-	}
-
-	// Step 2: Broadcast in chunks bounded by teranodeBatchCap so a single
+	// Step 1: Broadcast in chunks bounded by teranodeBatchCap so a single
 	// oversized Kafka flush doesn't blow past Teranode's /txs size limit.
 	rawTxs := make([][]byte, len(batch))
 	for i, msg := range batch {
@@ -285,7 +299,7 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) e
 	}
 	results := p.broadcastInChunks(ctx, batch, rawTxs)
 
-	// Step 3: Update status for each transaction, with retry classification
+	// Step 2: Update status for each transaction, with retry classification
 	seenEndpoints := make(map[string]struct{})
 	var successEndpoints []string
 	var accepted, rejected, retryable, noVerdict int
