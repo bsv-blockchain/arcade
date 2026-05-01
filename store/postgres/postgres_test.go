@@ -496,3 +496,114 @@ func TestDatahubEndpoints_UpsertOverwrites(t *testing.T) {
 		t.Errorf("last_seen not overwritten: got %v want %v", out[0].LastSeen, t2)
 	}
 }
+
+// TestUpdateStatus_TerminalNotOverwritten is the regression for F-003 (#61):
+// once a tx is in a terminal status (MINED, IMMUTABLE, REJECTED,
+// DOUBLE_SPEND_ATTEMPTED), a later lower-priority UpdateStatus call (e.g. a
+// stray SEEN_ON_NETWORK callback) must be a silent no-op rather than a clobber.
+func TestUpdateStatus_TerminalNotOverwritten(t *testing.T) {
+	terminals := []models.Status{
+		models.StatusMined,
+		models.StatusImmutable,
+		models.StatusRejected,
+		models.StatusDoubleSpendAttempted,
+	}
+	regressions := []models.Status{
+		models.StatusSeenOnNetwork,
+		models.StatusSeenMultipleNodes,
+		models.StatusSentToNetwork,
+		models.StatusPendingRetry,
+	}
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	for _, terminal := range terminals {
+		for _, regression := range regressions {
+			name := string(terminal) + "_then_" + string(regression)
+			t.Run(name, func(t *testing.T) {
+				txid := "tx-" + name
+
+				if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+					TxID: txid, Status: models.StatusReceived,
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if err := s.UpdateStatus(ctx, &models.TransactionStatus{
+					TxID: txid, Status: terminal, Timestamp: time.Now(),
+				}); err != nil {
+					t.Fatalf("seed terminal: %v", err)
+				}
+
+				if err := s.UpdateStatus(ctx, &models.TransactionStatus{
+					TxID: txid, Status: regression, Timestamp: time.Now(),
+				}); err != nil {
+					t.Fatalf("regression update: %v", err)
+				}
+
+				got, err := s.GetStatus(ctx, txid)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got.Status != terminal {
+					t.Fatalf("terminal status %s overwritten by %s (got %s)",
+						terminal, regression, got.Status)
+				}
+			})
+		}
+	}
+}
+
+// TestBatchUpdateStatus_TerminalNotOverwritten covers the same F-003
+// regression for the batched code path.
+func TestBatchUpdateStatus_TerminalNotOverwritten(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	type row struct {
+		txid     string
+		seedTerm models.Status
+		regress  models.Status
+	}
+	rows := []row{
+		{"tx-mined", models.StatusMined, models.StatusSeenOnNetwork},
+		{"tx-immutable", models.StatusImmutable, models.StatusSeenOnNetwork},
+		{"tx-rejected", models.StatusRejected, models.StatusSeenMultipleNodes},
+		{"tx-dsa", models.StatusDoubleSpendAttempted, models.StatusPendingRetry},
+	}
+
+	// Seed each row in its terminal status.
+	for _, r := range rows {
+		if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+			TxID: r.txid, Status: models.StatusReceived,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.UpdateStatus(ctx, &models.TransactionStatus{
+			TxID: r.txid, Status: r.seedTerm, Timestamp: time.Now(),
+		}); err != nil {
+			t.Fatalf("seed %s: %v", r.txid, err)
+		}
+	}
+
+	// One batched lower-priority update for the whole set.
+	updates := make([]*models.TransactionStatus, len(rows))
+	for i, r := range rows {
+		updates[i] = &models.TransactionStatus{
+			TxID: r.txid, Status: r.regress, Timestamp: time.Now(),
+		}
+	}
+	if err := s.BatchUpdateStatus(ctx, updates); err != nil {
+		t.Fatalf("BatchUpdateStatus: %v", err)
+	}
+
+	for _, r := range rows {
+		got, err := s.GetStatus(ctx, r.txid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Status != r.seedTerm {
+			t.Errorf("%s: terminal %s overwritten by batch %s (got %s)",
+				r.txid, r.seedTerm, r.regress, got.Status)
+		}
+	}
+}
