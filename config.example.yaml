@@ -126,6 +126,14 @@ bump_builder:
   # Grace window after BLOCK_PROCESSED before reading STUMPs, to allow for
   # late merkle-service retries of any STUMPs that initially got a 5xx.
   grace_window_ms: 30000
+  # Maximum response body size, in bytes, accepted from a DataHub
+  # /block/<hash> endpoint. The endpoint serves block metadata (header +
+  # subtree-hash list + coinbase tx + coinbase BUMP), so the default
+  # 1 GiB leaves two-plus orders of magnitude of headroom over realistic
+  # Teranode payloads while bounding memory against a hostile or
+  # malfunctioning endpoint. Set <= 0 to use the built-in default.
+  # Mitigates F-007.
+  # datahub_max_block_bytes: 1073741824
 
 # Shared on-disk root for arcade state. Chaintracks headers default to
 # <storage_path>/chaintracks/.

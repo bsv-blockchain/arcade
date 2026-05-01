@@ -161,7 +161,7 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	}
 	logger.Debug("fetching block data from datahub", zap.Strings("datahub_urls", endpoints))
 	fetchStart := time.Now()
-	subtreeHashes, coinbaseBUMP, headerMerkleRoot, err := bump.FetchBlockDataForBUMP(ctx, endpoints, blockHash, logger)
+	subtreeHashes, coinbaseBUMP, headerMerkleRoot, err := bump.FetchBlockDataForBUMPWithCap(ctx, endpoints, blockHash, b.cfg.BumpBuilder.DataHubMaxBlockBytes, logger)
 	metrics.BumpBuilderDatahubFetchDuration.Observe(time.Since(fetchStart).Seconds())
 	if err != nil {
 		outcome = "fetch_failed"
