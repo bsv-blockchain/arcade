@@ -4,23 +4,49 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/IBM/sarama"
+	"go.uber.org/zap"
+
+	"github.com/bsv-blockchain/arcade/metrics"
 )
 
 // saramaBroker is the production Broker backed by IBM Sarama. It owns both a
 // sync and async producer so Send/SendAsync/SendBatch can pick the appropriate
 // one without the caller caring.
+//
+// The async producer is configured with Return.Successes=true and
+// Return.Errors=true. Sarama routes every produced message's outcome onto
+// those channels, and if no goroutine drains them they fill up and the
+// producer blocks indefinitely on Input(). To keep SendAsync non-blocking,
+// the broker spawns two drain goroutines for the producer's lifetime: one
+// discards successes (the SendAsync caller already counted the produce in
+// the Producer wrapper) and one logs/counts errors via metrics.
+// Close() waits for both drainers to exit after closing the underlying
+// async producer, which closes both channels in turn.
 type saramaBroker struct {
 	syncProducer  sarama.SyncProducer
 	asyncProducer sarama.AsyncProducer
 	brokers       []string
 	consumerGroup string
+
+	logger     *zap.Logger
+	drainersWG sync.WaitGroup
 }
 
 // NewSaramaBroker constructs a Sarama-backed Broker with sensible defaults
-// (WaitForAll on sync, WaitForLocal on async, 5 retries).
+// (WaitForAll on sync, WaitForLocal on async, 5 retries). Errors from the
+// async producer are logged via the package-global zap logger; callers that
+// want a custom logger should use NewSaramaBrokerWithLogger.
 func NewSaramaBroker(brokers []string, consumerGroup string) (Broker, error) {
+	return NewSaramaBrokerWithLogger(brokers, consumerGroup, nil)
+}
+
+// NewSaramaBrokerWithLogger is like NewSaramaBroker but lets callers inject a
+// zap logger for async-producer error logging. A nil logger falls back to
+// zap.NewNop() so the broker is always safe to construct.
+func NewSaramaBrokerWithLogger(brokers []string, consumerGroup string, logger *zap.Logger) (Broker, error) {
 	syncCfg := sarama.NewConfig()
 	syncCfg.Producer.RequiredAcks = sarama.WaitForAll
 	syncCfg.Producer.Retry.Max = 5
@@ -44,12 +70,69 @@ func NewSaramaBroker(brokers []string, consumerGroup string) (Broker, error) {
 		return nil, fmt.Errorf("creating async producer: %w", err)
 	}
 
-	return &saramaBroker{
-		syncProducer:  syncProducer,
-		asyncProducer: asyncProducer,
+	return newSaramaBrokerFromProducers(syncProducer, asyncProducer, brokers, consumerGroup, logger), nil
+}
+
+// newSaramaBrokerFromProducers wires the broker around already-constructed
+// sync and async producers. Extracted so tests can substitute Sarama mocks
+// without standing up a real Kafka cluster. It also starts the async-producer
+// drainer goroutines, which is the only place those should be spawned —
+// duplicating that elsewhere would race for ownership of Successes/Errors.
+func newSaramaBrokerFromProducers(
+	sync sarama.SyncProducer,
+	async sarama.AsyncProducer,
+	brokers []string,
+	consumerGroup string,
+	logger *zap.Logger,
+) *saramaBroker {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	b := &saramaBroker{
+		syncProducer:  sync,
+		asyncProducer: async,
 		brokers:       brokers,
 		consumerGroup: consumerGroup,
-	}, nil
+		logger:        logger,
+	}
+	b.startAsyncDrainers()
+	return b
+}
+
+// startAsyncDrainers spawns the two goroutines that consume the async
+// producer's Successes and Errors channels for the producer's lifetime.
+// They return when the underlying channels close, which Sarama does as
+// part of asyncProducer.Close(). Close() then waits on drainersWG so the
+// broker does not return from Close until both goroutines have exited —
+// otherwise a test or a process restart could observe partial shutdown.
+func (b *saramaBroker) startAsyncDrainers() {
+	b.drainersWG.Add(2)
+	go func() {
+		defer b.drainersWG.Done()
+		// Successes are already accounted for by Producer.SendAsync at
+		// enqueue time, so we just discard them here. Draining is the
+		// whole point — a full Successes channel blocks Input().
+		successes := b.asyncProducer.Successes()
+		for {
+			if _, ok := <-successes; !ok {
+				return
+			}
+		}
+	}()
+	go func() {
+		defer b.drainersWG.Done()
+		for produceErr := range b.asyncProducer.Errors() {
+			topic := ""
+			if produceErr.Msg != nil {
+				topic = produceErr.Msg.Topic
+			}
+			metrics.KafkaProduceErrors.WithLabelValues(topic).Inc()
+			b.logger.Error("async kafka produce failed",
+				zap.String("topic", topic),
+				zap.Error(produceErr.Err),
+			)
+		}
+	}()
 }
 
 func (b *saramaBroker) Send(_ context.Context, topic, key string, value []byte) error {
@@ -137,9 +220,13 @@ func (b *saramaBroker) Close() error {
 	if err := b.syncProducer.Close(); err != nil {
 		errs = append(errs, err)
 	}
+	// Closing the async producer closes its Successes/Errors channels once
+	// in-flight messages have been flushed, which is what unblocks the
+	// drain goroutines below.
 	if err := b.asyncProducer.Close(); err != nil {
 		errs = append(errs, err)
 	}
+	b.drainersWG.Wait()
 	if len(errs) > 0 {
 		return fmt.Errorf("closing producers: %v", errs)
 	}
