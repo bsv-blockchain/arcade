@@ -191,6 +191,14 @@ type Aero struct {
 	// ErrorRateWindow is the number of cluster-tend iterations the breaker
 	// observes before resetting. Default 1 (~1 second).
 	ErrorRateWindow int `mapstructure:"error_rate_window"`
+	// BumpChunkSizeBytes is the target chunk size used by InsertBUMP when
+	// splitting a compound BUMP across multiple Aerospike records. A single
+	// Aerospike record cannot exceed the namespace's write-block-size (default
+	// 1 MiB, hard ceiling 8 MiB), so very large BUMPs from scaling networks
+	// must be chunked. Default 768 KiB stays safely under the 1 MiB default
+	// write-block-size; operators who raise write-block-size to 8 MiB can
+	// raise this to ~6 MiB to reduce chunk fan-out for huge BUMPs.
+	BumpChunkSizeBytes int `mapstructure:"bump_chunk_size_bytes"`
 }
 
 // Postgres configures the Postgres-backed store. Embedded=true spins up

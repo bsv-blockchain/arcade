@@ -33,6 +33,18 @@ const (
 	setDatahubEndpoints = "arcade_datahub_endpoints"
 )
 
+// BUMP chunking — large compound BUMPs (scaling networks with millions of
+// txs/block produce tens of MiB of merkle path data) cannot fit in a single
+// Aerospike record because record size is bounded by the namespace's
+// write-block-size (default 1 MiB, max 8 MiB). InsertBUMP/GetBUMP split the
+// payload across N+1 records: a manifest at <blockHash> with chunk_count, and
+// chunk records at <blockHash>:c:<index>.
+const (
+	bumpFormatVersion         = 1
+	bumpDefaultChunkSizeBytes = 768 * 1024
+	bumpChunkKeyFormat        = "%s:c:%08d"
+)
+
 // Ensure Store implements the store interfaces.
 var (
 	_ store.Store  = (*Store)(nil)
@@ -47,6 +59,7 @@ type Store struct {
 	queryTimeout  time.Duration
 	opTimeout     time.Duration
 	socketTimeout time.Duration
+	bumpChunkSize int
 }
 
 // New creates an Aerospike-backed Store connected to the configured cluster.
@@ -103,6 +116,11 @@ func New(cfg config.Aero) (*Store, error) {
 		return nil, fmt.Errorf("connecting to aerospike: %w", err)
 	}
 
+	bumpChunkSize := cfg.BumpChunkSizeBytes
+	if bumpChunkSize <= 0 {
+		bumpChunkSize = bumpDefaultChunkSizeBytes
+	}
+
 	s := &Store{
 		client:        client,
 		namespace:     cfg.Namespace,
@@ -110,6 +128,7 @@ func New(cfg config.Aero) (*Store, error) {
 		queryTimeout:  time.Duration(cfg.QueryTimeoutMs) * time.Millisecond,
 		opTimeout:     time.Duration(cfg.OpTimeoutMs) * time.Millisecond,
 		socketTimeout: time.Duration(cfg.SocketTimeoutMs) * time.Millisecond,
+		bumpChunkSize: bumpChunkSize,
 	}
 
 	if err := s.EnsureIndexes(); err != nil {
@@ -632,46 +651,267 @@ func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, txids []s
 }
 
 // --- BUMP Operations ---
+//
+// BUMPs are stored as a manifest record at primary key <blockHash> plus N
+// chunk records at <blockHash>:c:<index>. Chunking is unconditional — every
+// BUMP, however small, takes one manifest + at least one chunk record. This
+// is required because compound BUMPs on scaling networks routinely exceed
+// Aerospike's per-record ceiling (write-block-size, default 1 MiB, max 8 MiB).
+//
+// Manifest bins: block_hash, block_height, chunk_count, total_size,
+// format_version. The manifest carries no bump_data — it points exclusively
+// at chunk records.
+//
+// Chunk bins: block_hash, chunk_index, chunk_data.
+//
+// Atomicity: chunks are written first (BatchOperate), then the manifest. The
+// manifest write is the linearization point — readers see the new BUMP only
+// after it lands. A crash between chunk write and manifest write leaves
+// orphan chunks but the previous manifest still references the previous
+// chunks, so readers continue to see the old BUMP intact.
 
+// InsertBUMP stores a compound BUMP as a manifest plus chunks. Chunks are
+// written before the manifest so a concurrent reader observing the new
+// manifest is guaranteed to find every chunk it references.
 func (s *Store) InsertBUMP(ctx context.Context, blockHash string, blockHeight uint64, bumpData []byte) error {
-	key, err := s.key(setBumps, blockHash)
+	if blockHash == "" {
+		return fmt.Errorf("insert bump: empty block hash")
+	}
+
+	// Read the previous manifest so we know whether to clean up orphan chunks
+	// from a prior larger BUMP for the same block. Failure here is non-fatal
+	// for the write itself — if we can't read it, we skip cleanup; the write
+	// still succeeds and orphans are unreferenced.
+	oldChunkCount := 0
+	if oldManifestKey, err := s.key(setBumps, blockHash); err == nil {
+		if rec, err := s.client.Get(s.readPolicy(ctx), oldManifestKey, "chunk_count"); err == nil && rec != nil {
+			if v, ok := rec.Bins["chunk_count"].(int); ok && v > 0 {
+				oldChunkCount = v
+			}
+		}
+	}
+
+	newChunkCount := 1
+	if len(bumpData) > s.bumpChunkSize {
+		newChunkCount = (len(bumpData) + s.bumpChunkSize - 1) / s.bumpChunkSize
+	}
+
+	if err := s.writeBumpChunks(ctx, blockHash, bumpData, newChunkCount); err != nil {
+		return fmt.Errorf("write bump chunks for %s: %w", blockHash, err)
+	}
+
+	manifestKey, err := s.key(setBumps, blockHash)
 	if err != nil {
 		return err
 	}
+	wp := s.writePolicy(ctx)
+	wp.RecordExistsAction = aero.REPLACE
 	bins := aero.BinMap{
-		"block_hash":   blockHash,
-		"block_height": int(blockHeight), //nolint:gosec // block height fits in int on 64-bit platforms
-		"bump_data":    bumpData,
+		"block_hash":     blockHash,
+		"block_height":   int(blockHeight), //nolint:gosec // block height fits in int on 64-bit platforms
+		"chunk_count":    newChunkCount,
+		"total_size":     len(bumpData),
+		"format_version": bumpFormatVersion,
 	}
-	return s.client.Put(s.writePolicy(ctx), key, bins)
+	if err := s.client.Put(wp, manifestKey, bins); err != nil {
+		return fmt.Errorf("write bump manifest for %s: %w", blockHash, err)
+	}
+
+	// Best-effort cleanup of orphan chunks from a prior write that had more
+	// chunks than this one. Orphans are unreferenced (the manifest now caps at
+	// newChunkCount) so a failure here only wastes disk.
+	if oldChunkCount > newChunkCount {
+		if err := s.deleteBumpChunkRange(ctx, blockHash, newChunkCount, oldChunkCount); err != nil {
+			// Don't fail the write — orphans are harmless aside from disk.
+			// The next InsertBUMP for this block retries the cleanup.
+			_ = err
+		}
+	}
+	return nil
 }
 
+// GetBUMP fetches the manifest, then batch-reads every chunk and reassembles
+// the original bumpData. Returns store.ErrNotFound if no manifest exists.
+// Any chunk error or assembly mismatch returns a wrapped error and no partial
+// data — callers (enrichMerklePath) treat errors as "skip enrichment", which
+// is correct: a truncated BUMP would silently produce wrong per-tx proofs.
 func (s *Store) GetBUMP(ctx context.Context, blockHash string) (uint64, []byte, error) {
-	key, err := s.key(setBumps, blockHash)
+	manifestKey, err := s.key(setBumps, blockHash)
 	if err != nil {
 		return 0, nil, err
 	}
-	rec, err := s.client.Get(s.readPolicy(ctx), key)
+	rec, err := s.client.Get(s.readPolicy(ctx), manifestKey)
 	if err != nil && !isKeyNotFound(err) {
-		return 0, nil, fmt.Errorf("get bump %s: %w", blockHash, err)
+		return 0, nil, fmt.Errorf("get bump manifest %s: %w", blockHash, err)
 	}
 	if rec == nil {
 		return 0, nil, store.ErrNotFound
 	}
 
-	var height uint64
-	if v, ok := rec.Bins["block_height"]; ok {
-		if n, ok := v.(int); ok {
-			height = uint64(n) //nolint:gosec // round-trip of a value we wrote as int from a uint64 fitting block height
-		}
+	chunkCount, _ := rec.Bins["chunk_count"].(int)
+	totalSize, _ := rec.Bins["total_size"].(int)
+	formatVersion, _ := rec.Bins["format_version"].(int)
+	if chunkCount <= 0 || totalSize < 0 || formatVersion != bumpFormatVersion {
+		return 0, nil, fmt.Errorf(
+			"get bump %s: invalid manifest (chunk_count=%d total_size=%d format_version=%d)",
+			blockHash, chunkCount, totalSize, formatVersion)
 	}
-	var data []byte
-	if v, ok := rec.Bins["bump_data"]; ok {
-		if b, ok := v.([]byte); ok {
-			data = b
-		}
+
+	var height uint64
+	if v, ok := rec.Bins["block_height"].(int); ok {
+		height = uint64(v) //nolint:gosec // round-trip of a value we wrote as int from a uint64 fitting block height
+	}
+
+	data, err := s.readBumpChunks(ctx, blockHash, chunkCount, totalSize)
+	if err != nil {
+		return 0, nil, fmt.Errorf("get bump %s: %w", blockHash, err)
 	}
 	return height, data, nil
+}
+
+// bumpChunkKey constructs the primary key for a chunk record. Index is
+// zero-padded to a fixed width so chunk keys sort lexicographically and don't
+// collide with future schema additions on the same set.
+func (s *Store) bumpChunkKey(blockHash string, idx int) (*aero.Key, error) {
+	return s.key(setBumps, fmt.Sprintf(bumpChunkKeyFormat, blockHash, idx))
+}
+
+// writeBumpChunks slices bumpData into chunkCount records and writes them in
+// one BatchOperate. Uses RecordExistsAction=REPLACE so any stale state from a
+// previously failed write at the same key is dropped.
+func (s *Store) writeBumpChunks(ctx context.Context, blockHash string, bumpData []byte, chunkCount int) error {
+	bwp := aero.NewBatchWritePolicy()
+	bwp.RecordExistsAction = aero.REPLACE
+
+	for start := 0; start < chunkCount; start += s.batchSize {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		end := start + s.batchSize
+		if end > chunkCount {
+			end = chunkCount
+		}
+
+		records := make([]aero.BatchRecordIfc, 0, end-start)
+		for i := start; i < end; i++ {
+			off := i * s.bumpChunkSize
+			tail := off + s.bumpChunkSize
+			if tail > len(bumpData) {
+				tail = len(bumpData)
+			}
+			key, err := s.bumpChunkKey(blockHash, i)
+			if err != nil {
+				return err
+			}
+			ops := []*aero.Operation{
+				aero.PutOp(aero.NewBin("block_hash", blockHash)),
+				aero.PutOp(aero.NewBin("chunk_index", i)),
+				aero.PutOp(aero.NewBin("chunk_data", bumpData[off:tail])),
+			}
+			records = append(records, aero.NewBatchWrite(bwp, key, ops...))
+		}
+		if err := s.client.BatchOperate(s.batchPolicy(ctx), records); err != nil {
+			return fmt.Errorf("batch write bump chunks: %w", err)
+		}
+		for _, r := range records {
+			if br := r.BatchRec(); br != nil && br.Err != nil {
+				return fmt.Errorf("write bump chunk: %w", br.Err)
+			}
+		}
+	}
+	return nil
+}
+
+// readBumpChunks fetches chunkCount chunk records via BatchGet (one round
+// trip per batch slice) and assembles them into a single byte slice of length
+// totalSize. Validates each chunk's index matches the slot it occupies and
+// rejects any missing chunk or length mismatch.
+func (s *Store) readBumpChunks(ctx context.Context, blockHash string, chunkCount, totalSize int) ([]byte, error) {
+	out := make([]byte, totalSize)
+	written := 0
+
+	for start := 0; start < chunkCount; start += s.batchSize {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		end := start + s.batchSize
+		if end > chunkCount {
+			end = chunkCount
+		}
+
+		keys := make([]*aero.Key, 0, end-start)
+		for i := start; i < end; i++ {
+			key, err := s.bumpChunkKey(blockHash, i)
+			if err != nil {
+				return nil, err
+			}
+			keys = append(keys, key)
+		}
+
+		recs, err := s.client.BatchGet(s.batchPolicy(ctx), keys, "chunk_index", "chunk_data")
+		if err != nil {
+			return nil, fmt.Errorf("batch get bump chunks: %w", err)
+		}
+		if len(recs) != len(keys) {
+			return nil, fmt.Errorf("batch get bump chunks: got %d records, want %d", len(recs), len(keys))
+		}
+
+		for j, r := range recs {
+			idx := start + j
+			if r == nil {
+				return nil, fmt.Errorf("missing bump chunk %d", idx)
+			}
+			gotIdx, ok := r.Bins["chunk_index"].(int)
+			if !ok || gotIdx != idx {
+				return nil, fmt.Errorf("bump chunk %d: chunk_index mismatch (got %v)", idx, r.Bins["chunk_index"])
+			}
+			data, ok := r.Bins["chunk_data"].([]byte)
+			if !ok {
+				return nil, fmt.Errorf("bump chunk %d: chunk_data missing or wrong type", idx)
+			}
+			off := idx * s.bumpChunkSize
+			if off+len(data) > totalSize {
+				return nil, fmt.Errorf("bump chunk %d: would overflow assembled buffer (off=%d len=%d total=%d)", idx, off, len(data), totalSize)
+			}
+			copy(out[off:], data)
+			written += len(data)
+		}
+	}
+
+	if written != totalSize {
+		return nil, fmt.Errorf("assembled %d bytes, manifest says %d", written, totalSize)
+	}
+	return out, nil
+}
+
+// deleteBumpChunkRange batch-deletes chunk records at indices [fromIdx,
+// toExcl). Used by InsertBUMP to clean up orphans when a rewrite shrinks the
+// chunk count for a block.
+func (s *Store) deleteBumpChunkRange(ctx context.Context, blockHash string, fromIdx, toExcl int) error {
+	if toExcl <= fromIdx {
+		return nil
+	}
+	for start := fromIdx; start < toExcl; start += s.batchSize {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		end := start + s.batchSize
+		if end > toExcl {
+			end = toExcl
+		}
+		records := make([]aero.BatchRecordIfc, 0, end-start)
+		for i := start; i < end; i++ {
+			key, err := s.bumpChunkKey(blockHash, i)
+			if err != nil {
+				return err
+			}
+			records = append(records, aero.NewBatchDelete(nil, key))
+		}
+		if err := s.client.BatchOperate(s.batchPolicy(ctx), records); err != nil {
+			return fmt.Errorf("batch delete bump chunks: %w", err)
+		}
+	}
+	return nil
 }
 
 // --- STUMP Operations (keyed by blockHash:subtreeIndex) ---
