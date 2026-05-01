@@ -38,6 +38,10 @@ type mockStore struct {
 	stumps              map[string]*models.Stump
 	insertStumpErr      error
 	insertedSubmissions []*models.Submission
+	// updateStatusErr, if non-nil, is returned from UpdateStatus and the call
+	// is NOT recorded — this models the F-033 (#91) "no phantom row" guard
+	// where a backend that rejects the call must not have written anything.
+	updateStatusErr error
 	// insertStumpFn, if set, runs before the default record step and may
 	// return an error to simulate per-key failures (Aerospike RECORD_TOO_BIG,
 	// DEVICE_OVERLOAD, HOT_KEY, etc.). Returning non-nil skips the record.
@@ -45,6 +49,9 @@ type mockStore struct {
 }
 
 func (m *mockStore) UpdateStatus(_ context.Context, status *models.TransactionStatus) error {
+	if m.updateStatusErr != nil {
+		return m.updateStatusErr
+	}
 	m.updateStatusCalls = append(m.updateStatusCalls, status)
 	return nil
 }
@@ -358,6 +365,57 @@ func TestHandleCallback_SeenMultipleNodes_UpdatesStatus(t *testing.T) {
 	}
 	if ms.updateStatusCalls[1].TxID != "tx2" {
 		t.Errorf("expected second txid=tx2, got %s", ms.updateStatusCalls[1].TxID)
+	}
+}
+
+// TestHandleCallback_UnknownTxid_NoPhantomRow is the regression for F-033
+// (#91). When merkle-service POSTs a SEEN_ON_NETWORK / SEEN_MULTIPLE_NODES
+// callback for a txid we never recorded, the store layer rejects the update
+// with store.ErrNotFound and the handler must:
+//
+//   - log a Warn (operators want to see attempts to update unknown txids)
+//   - skip publishStatus / txTracker updates (no observers should learn
+//     about a tx that doesn't exist in our records)
+//   - still return 200 OK so merkle-service stops retrying — the txid is
+//     definitively unknown, not transiently unavailable.
+//
+// The contract here is intentionally NOT 404: merkle-service treats 4xx as a
+// permanent reject already, but a callback can carry a batch of txids and a
+// single unknown one shouldn't fail the whole batch.
+func TestHandleCallback_UnknownTxid_NoPhantomRow(t *testing.T) {
+	cases := []models.CallbackType{
+		models.CallbackSeenOnNetwork,
+		models.CallbackSeenMultipleNodes,
+	}
+	for _, cbType := range cases {
+		t.Run(string(cbType), func(t *testing.T) {
+			ms := &mockStore{updateStatusErr: store.ErrNotFound}
+			_, router := setupServerWithStore(&kafka.RecordingBroker{}, ms)
+
+			payload := models.CallbackMessage{
+				Type:  cbType,
+				TxIDs: []string{"unknown-tx-1", "unknown-tx-2"},
+			}
+			body := mustMarshalJSON(t, payload)
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+
+			router.ServeHTTP(w, req)
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("expected 200 (callbacks for unknown txids are silently dropped), got %d: %s",
+					w.Code, w.Body.String())
+			}
+			// The store rejected the call — mockStore must not have recorded
+			// any UpdateStatus payload (otherwise the production backend would
+			// have written a phantom row).
+			if len(ms.updateStatusCalls) != 0 {
+				t.Fatalf("expected 0 recorded UpdateStatus calls when store returns ErrNotFound, got %d",
+					len(ms.updateStatusCalls))
+			}
+		})
 	}
 }
 

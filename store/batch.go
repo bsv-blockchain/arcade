@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"github.com/bsv-blockchain/arcade/models"
@@ -75,6 +76,10 @@ func BatchGetOrInsertStatusParallel(ctx context.Context, s SingleStore, statuses
 
 // BatchUpdateStatusParallel runs UpdateStatus concurrently for each row,
 // bounded by defaultBatchConcurrency. Returns the first error encountered.
+// Per-row ErrNotFound is treated as a silent no-op so the batch contract
+// matches Postgres' WHERE-clause semantics: unknown txids are skipped, not
+// turned into a fatal batch error. (UpdateStatus itself still surfaces
+// ErrNotFound to single-row callers — see store.Store.UpdateStatus.)
 func BatchUpdateStatusParallel(ctx context.Context, s SingleStore, statuses []*models.TransactionStatus) error {
 	if len(statuses) == 0 {
 		return nil
@@ -100,7 +105,7 @@ func BatchUpdateStatusParallel(ctx context.Context, s SingleStore, statuses []*m
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			if err := s.UpdateStatus(ctx, st); err != nil {
+			if err := s.UpdateStatus(ctx, st); err != nil && !errors.Is(err, ErrNotFound) {
 				mu.Lock()
 				if firstErr == nil {
 					firstErr = err

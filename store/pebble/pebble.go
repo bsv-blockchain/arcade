@@ -313,8 +313,6 @@ func (s *Store) removeStatusIndexes(b *pebbledb.Batch, st storedStatus) {
 	}
 }
 
-// UpdateStatus replaces the status row for status.TxID. It's a full rewrite:
-// any existing secondary index entries for the previous version are deleted
 // BatchGetOrInsertStatus runs GetOrInsertStatus concurrently for each row.
 // Pebble is single-process and operations are already memory-fast; the
 // parallel-loop fallback is the simplest correct path here.
@@ -327,8 +325,18 @@ func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.Transa
 	return store.BatchUpdateStatusParallel(ctx, s, statuses)
 }
 
+// UpdateStatus replaces the status row for status.TxID. It's a full rewrite:
+// any existing secondary index entries for the previous version are deleted
 // and the new set is written in the same batch, so an intermediate query
 // never sees a stale index pointing at a row with a different status.
+//
+// UpdateStatus is for *existing* rows only. If no row exists for the given
+// txid the call returns store.ErrNotFound without writing anything — callers
+// (notably the merkle-service callback receiver) must use GetOrInsertStatus
+// to create new rows. This guard closes F-033 / issue #91: previously a
+// callback referencing a never-submitted txid would create a phantom row
+// with no submission/validation history, turning the callback endpoint into
+// a write-anywhere primitive.
 func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStatus) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -344,12 +352,16 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 	if err != nil {
 		return err
 	}
+	if existing == nil {
+		// Don't create phantom rows. See F-033 / issue #91.
+		return store.ErrNotFound
+	}
 
 	// Enforce the status lattice: a later, lower-priority update (e.g. a stray
 	// SEEN_ON_NETWORK callback arriving after a tx has already been MINED) must
 	// not overwrite a terminal status. See models.Status.CanTransitionFrom and
 	// issue #61 / F-003.
-	if existing != nil && status.Status != "" {
+	if status.Status != "" {
 		if !status.Status.CanTransitionFrom(models.Status(existing.Status)) {
 			return nil
 		}
@@ -363,9 +375,7 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 
 	b := s.db.NewBatch()
 	defer func() { _ = b.Close() }()
-	if existing != nil {
-		s.removeStatusIndexes(b, *existing)
-	}
+	s.removeStatusIndexes(b, *existing)
 	if err := b.Set(txKey(status.TxID), payload, nil); err != nil {
 		return err
 	}
