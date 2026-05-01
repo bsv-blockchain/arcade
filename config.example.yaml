@@ -97,6 +97,16 @@ p2p:
 health:
   port: 8081
 
+# SSRF guard for client-supplied callback URLs. The api-server rejects
+# X-CallbackUrl values whose host is loopback / link-local / RFC1918 /
+# cloud-metadata, and the webhook delivery client refuses to dial those
+# IPs at connection time (catches DNS rebinding). Set
+# allow_private_ips: true if your deployment intentionally posts
+# callbacks to internal services (testing, k8s service DNS, intranet
+# webhooks). See finding F-017 / issue #75.
+# callback:
+#   allow_private_ips: false
+
 # propagation:
 #   # Per-endpoint circuit-breaker for the datahub URL list. Endpoints that
 #   # accumulate `failure_threshold` consecutive failures are marked unhealthy

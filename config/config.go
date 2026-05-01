@@ -121,6 +121,7 @@ type Config struct {
 	TxValidator   TxValidatorConfig   `mapstructure:"tx_validator"`
 	BumpBuilder   BumpBuilderConfig   `mapstructure:"bump_builder"`
 	Webhook       WebhookConfig       `mapstructure:"webhook"`
+	Callback      CallbackConfig      `mapstructure:"callback"`
 	// ChaintracksServer gates whether the embedded go-chaintracks HTTP API
 	// runs alongside api-server. Default is on so the refactor is a drop-in
 	// replacement for the original single-binary arcade.
@@ -344,6 +345,21 @@ type WebhookConfig struct {
 	HTTPTimeoutMs int `mapstructure:"http_timeout_ms"`
 }
 
+// CallbackConfig governs the SSRF guard that protects api-server's
+// X-CallbackUrl registration and the webhook delivery client's outbound
+// dials. Both layers share the same knob so an operator who opts in
+// for internal-network callbacks doesn't have to remember to flip a
+// matching flag elsewhere. See finding F-017 / issue #75.
+type CallbackConfig struct {
+	// AllowPrivateIPs, when true, disables the SSRF guard. Default false:
+	// X-CallbackUrl values whose host parses as a loopback / link-local /
+	// metadata / RFC1918 IP are rejected at submit time, and the webhook
+	// delivery http.Client refuses to dial those IPs at connect time.
+	// Operators running purely against internal services (testing rigs,
+	// k8s service DNS, intranet webhooks) can set this true.
+	AllowPrivateIPs bool `mapstructure:"allow_private_ips"`
+}
+
 // TxValidatorConfig tunes the parallel batch validation pipeline. Parallelism
 // caps how many transactions are parsed and validated concurrently inside a
 // single flush window — bounded so a huge in-flight batch can't open more
@@ -481,6 +497,12 @@ func setDefaults() {
 	viper.SetDefault("webhook.initial_backoff_ms", 5000)
 	viper.SetDefault("webhook.max_backoff_ms", 300000)
 	viper.SetDefault("webhook.http_timeout_ms", 10000)
+
+	// Callback SSRF guard defaults to enabled (allow_private_ips=false). See
+	// finding F-017 / issue #75 — accepting any X-CallbackUrl turned arcade
+	// into a blind SSRF primitive against internal services and cloud
+	// metadata endpoints.
+	viper.SetDefault("callback.allow_private_ips", false)
 
 	viper.SetDefault("storage_path", "~/.arcade")
 	viper.SetDefault("chaintracks_server.enabled", true)

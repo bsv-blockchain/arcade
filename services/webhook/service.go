@@ -12,12 +12,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"sync"
 	"time"
 
 	"go.uber.org/zap"
 
+	"github.com/bsv-blockchain/arcade/callbackurl"
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/events"
 	"github.com/bsv-blockchain/arcade/models"
@@ -41,7 +43,13 @@ type Service struct {
 // New constructs a Service. publisher must be non-nil; store provides
 // submission lookup and retry persistence. The HTTP client is constructed
 // here so each Service has its own pool — keeps tests hermetic.
-func New(cfg config.WebhookConfig, logger *zap.Logger, publisher events.Publisher, st store.Store) *Service {
+//
+// callbackCfg threads the SSRF guard through to the dialer: when
+// AllowPrivateIPs is false (the default), the underlying transport
+// refuses to connect to loopback / link-local / RFC1918 / metadata IPs
+// even if a host previously survived registration-time validation
+// (catches DNS rebinding). See finding F-017 / issue #75.
+func New(cfg config.WebhookConfig, callbackCfg config.CallbackConfig, logger *zap.Logger, publisher events.Publisher, st store.Store) *Service {
 	timeout := time.Duration(cfg.HTTPTimeoutMs) * time.Millisecond
 	if timeout <= 0 {
 		timeout = 10 * time.Second
@@ -51,7 +59,32 @@ func New(cfg config.WebhookConfig, logger *zap.Logger, publisher events.Publishe
 		logger:    logger.Named("webhook"),
 		publisher: publisher,
 		store:     st,
-		client:    &http.Client{Timeout: timeout},
+		client:    newCallbackClient(timeout, callbackCfg.AllowPrivateIPs),
+	}
+}
+
+// newCallbackClient builds an http.Client whose dialer enforces the SSRF
+// guard. The Dialer.Control hook fires after DNS resolution but before
+// connect(), so a hostname that resolves to a banned IP fails fast with
+// an error from the callbackurl package — the request never leaves the
+// machine. Pulled out of New so tests can construct an equivalent client
+// without instantiating the whole Service.
+func newCallbackClient(timeout time.Duration, allowPrivate bool) *http.Client {
+	dialer := &net.Dialer{
+		Timeout:   timeout,
+		KeepAlive: 30 * time.Second,
+		Control:   callbackurl.DialControl(allowPrivate),
+	}
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			DialContext:           dialer.DialContext,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: timeout,
+			ExpectContinueTimeout: 1 * time.Second,
+			ForceAttemptHTTP2:     true,
+			IdleConnTimeout:       90 * time.Second,
+		},
 	}
 }
 
