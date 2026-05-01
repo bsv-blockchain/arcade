@@ -14,7 +14,7 @@
 # Security Hardened Defaults:
 #   • Weekly cadence (Monday 09:00 America/New_York) – align with CVE dump cycle.
 #   • Direct dependencies only – prevents unsolicited transitive churn.
-#   • PRs labeled, assigned, and target the protected "master" branch.
+#   • PRs labeled, assigned, and target the protected "main" branch.
 #   • PR titles prefixed with chore(scope): – conventional commits.
 #   • Force‑push and delete‑branch disabled via branch‑protection rules.
 #   • PR limit = 10 to avoid queue flooding.
@@ -29,7 +29,7 @@ updates:
   # ──────────────────────────────────────────────────────────────
   - package-ecosystem: "gomod"
     directory: "/"
-    target-branch: "master"
+    target-branch: "main"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -58,7 +58,7 @@ updates:
   # ──────────────────────────────────────────────────────────────
   - package-ecosystem: "github-actions"
     directory: "/"
-    target-branch: "master"
+    target-branch: "main"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -81,7 +81,7 @@ updates:
   # ──────────────────────────────────────────────────────────────
   - package-ecosystem: "devcontainers"
     directory: "/"
-    target-branch: "master"
+    target-branch: "main"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -104,7 +104,7 @@ updates:
   # ──────────────────────────────────────────────────────────────
   - package-ecosystem: "docker"
     directory: "/"
-    target-branch: "master"
+    target-branch: "main"
     schedule:
       interval: "weekly"
       day: "monday"
