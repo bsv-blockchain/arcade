@@ -69,6 +69,10 @@ func (m *mockStore) GetStatusesSince(context.Context, time.Time) ([]*models.Tran
 	return nil, nil
 }
 
+func (m *mockStore) IterateStatusesSince(context.Context, time.Time, func(*models.TransactionStatus) error) error {
+	return nil
+}
+
 func (m *mockStore) SetStatusByBlockHash(context.Context, string, models.Status) ([]string, error) {
 	return nil, nil
 }
