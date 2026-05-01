@@ -195,6 +195,73 @@ func TestUpdateStatus_TerminalNotOverwritten(t *testing.T) {
 	}
 }
 
+// TestUpdateStatus_UnknownTxidReturnsErrNotFound is the regression for F-033
+// (#91): UpdateStatus on a txid that has no existing row must return
+// store.ErrNotFound and must NOT create a phantom record. Previously,
+// callbacks pointing at unknown txids could synthesize bogus rows in the
+// store, turning the callback endpoint into a write-anywhere primitive.
+func TestUpdateStatus_UnknownTxidReturnsErrNotFound(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	txid := "ghost-tx"
+
+	err := s.UpdateStatus(ctx, &models.TransactionStatus{
+		TxID:      txid,
+		Status:    models.StatusSeenOnNetwork,
+		Timestamp: time.Now(),
+	})
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected store.ErrNotFound for unknown txid, got %v", err)
+	}
+
+	// And critically: no phantom row was created.
+	got, gerr := s.GetStatus(ctx, txid)
+	if gerr != nil {
+		t.Fatalf("GetStatus after rejected update: %v", gerr)
+	}
+	if got != nil {
+		t.Fatalf("expected nil status for ghost txid, got %+v", got)
+	}
+
+	// The status index must also be empty — i.e. no idx:tx:status:SEEN_ON_NETWORK:ghost-tx.
+	v, closer, gErr := s.db.Get(idxTxStatusKey(string(models.StatusSeenOnNetwork), txid))
+	if gErr == nil {
+		_ = closer.Close()
+		t.Fatalf("phantom secondary index entry was written for ghost txid: %x", v)
+	}
+}
+
+// TestUpdateStatus_ExistingTxidStillWorks is the regression for the happy
+// path: the F-033 guard must not break legitimate updates against rows that
+// were created via GetOrInsertStatus.
+func TestUpdateStatus_ExistingTxidStillWorks(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	txid := "real-tx"
+
+	if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+		TxID: txid, Status: models.StatusReceived,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := s.UpdateStatus(ctx, &models.TransactionStatus{
+		TxID:      txid,
+		Status:    models.StatusSeenOnNetwork,
+		Timestamp: time.Now(),
+	}); err != nil {
+		t.Fatalf("UpdateStatus on existing row: %v", err)
+	}
+
+	got, err := s.GetStatus(ctx, txid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Status != models.StatusSeenOnNetwork {
+		t.Fatalf("expected SEEN_ON_NETWORK, got %+v", got)
+	}
+}
+
 // TestUpdateStatus_ForwardTransitionsStillWork sanity-checks that the lattice
 // guard does not break legitimate forward transitions.
 func TestUpdateStatus_ForwardTransitionsStillWork(t *testing.T) {

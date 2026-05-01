@@ -68,14 +68,20 @@ type Store interface {
 	// Pebble) fall back to a bounded-concurrency loop over GetOrInsertStatus.
 	BatchGetOrInsertStatus(ctx context.Context, statuses []*models.TransactionStatus) ([]BatchInsertResult, error)
 
-	// UpdateStatus updates an existing transaction status (used for P2P, blocks, etc.)
+	// UpdateStatus updates an existing transaction status (used for P2P, blocks, etc.).
+	// If no row exists for status.TxID the call returns ErrNotFound without
+	// writing — callers must use GetOrInsertStatus to create new rows. This
+	// guards the callback receiver path from creating phantom rows on behalf
+	// of unknown txids (F-033 / issue #91).
 	UpdateStatus(ctx context.Context, status *models.TransactionStatus) error
 
 	// BatchUpdateStatus is the multi-row form of UpdateStatus. Same partial-
 	// update semantics as UpdateStatus — empty fields are ignored, non-empty
-	// fields overwrite. Returns the first error encountered if any. Postgres
-	// implements this in a single round-trip via UPDATE ... FROM (VALUES …);
-	// other backends fall back to a bounded-concurrency loop.
+	// fields overwrite. Rows whose txid is unknown are silently skipped (the
+	// per-row ErrNotFound contract from UpdateStatus is collapsed to a no-op
+	// here — callers wanting per-row diagnostics use UpdateStatus directly).
+	// Postgres implements this in a single round-trip via UPDATE ... FROM
+	// (VALUES …); other backends fall back to a bounded-concurrency loop.
 	BatchUpdateStatus(ctx context.Context, statuses []*models.TransactionStatus) error
 
 	// GetStatus retrieves the status for a transaction

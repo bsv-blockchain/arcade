@@ -34,16 +34,6 @@ func isGenerationErr(err error) bool {
 	return false
 }
 
-// isKeyExistsErr is true when an Aerospike CREATE_ONLY write fails because
-// another writer raced us in and the record now exists.
-func isKeyExistsErr(err error) bool {
-	var aerr aero.Error
-	if errors.As(err, &aerr) {
-		return aerr.Matches(types.KEY_EXISTS_ERROR)
-	}
-	return false
-}
-
 const (
 	setTransactions     = "arcade_transactions"
 	setBumps            = "arcade_bumps"
@@ -348,6 +338,12 @@ func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.Transa
 	return store.BatchUpdateStatusParallel(ctx, s, statuses)
 }
 
+// UpdateStatus updates an existing transaction record. If no record exists for
+// status.TxID the call returns store.ErrNotFound without writing — callers
+// must use GetOrInsertStatus to create new rows. This guard closes F-033 /
+// issue #91: previously a callback referencing a never-submitted txid would
+// create a phantom row with no submission/validation history, turning the
+// callback endpoint into a write-anywhere primitive.
 func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStatus) error {
 	key, err := s.key(setTransactions, status.TxID)
 	if err != nil {
@@ -376,34 +372,39 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 	// MINED). Read-then-CAS-write using the record's generation guarantees the
 	// pre-write check and the write are atomic with respect to other writers.
 	// See models.Status.CanTransitionFrom and #61 / F-003.
-	if status.Status == "" {
-		return s.client.Put(s.writePolicy(ctx), key, bins)
-	}
+	//
+	// Also: never create a record from UpdateStatus (F-033 / #91) — if the
+	// record is genuinely absent we return ErrNotFound. UPDATE_ONLY on the
+	// write enforces this even if a racing writer deleted the row between
+	// our read and our put.
 	for {
 		rec, gerr := s.client.Get(s.readPolicy(ctx), key, "status")
 		if gerr != nil && !isKeyNotFound(gerr) {
 			return fmt.Errorf("read status for lattice check %s: %w", status.TxID, gerr)
 		}
-		policy := s.writePolicy(ctx)
-		if rec != nil {
+		if rec == nil {
+			return store.ErrNotFound
+		}
+		if status.Status != "" {
 			existing := models.Status(getString(rec, "status"))
 			if !status.Status.CanTransitionFrom(existing) {
 				return nil
 			}
-			policy.GenerationPolicy = aero.EXPECT_GEN_EQUAL
-			policy.Generation = rec.Generation
-		} else {
-			// No existing row: only create if the row is genuinely absent. If
-			// another writer races us in, retry the read-modify-write so the
-			// lattice check covers the new state too.
-			policy.RecordExistsAction = aero.CREATE_ONLY
 		}
+		policy := s.writePolicy(ctx)
+		policy.GenerationPolicy = aero.EXPECT_GEN_EQUAL
+		policy.Generation = rec.Generation
+		policy.RecordExistsAction = aero.UPDATE_ONLY
 		if err := s.client.Put(policy, key, bins); err != nil {
-			// Generation mismatch / create-only conflict means another writer
-			// landed between our read and our put. Re-read and re-evaluate the
-			// lattice rather than silently clobbering their write.
-			if isGenerationErr(err) || isKeyExistsErr(err) {
+			// Generation mismatch means another writer landed between our read
+			// and our put. Re-read and re-evaluate the lattice rather than
+			// silently clobbering their write.
+			if isGenerationErr(err) {
 				continue
+			}
+			// UPDATE_ONLY on a record that was deleted between our read and put.
+			if isKeyNotFound(err) {
+				return store.ErrNotFound
 			}
 			return fmt.Errorf("update tx %s: %w", status.TxID, err)
 		}
