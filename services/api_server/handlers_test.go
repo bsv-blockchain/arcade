@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -988,5 +989,161 @@ func TestHandleCallback_RejectsUnauthenticated(t *testing.T) {
 				t.Errorf("rejected callback must not write to the store, got %d UpdateStatus calls", len(ms.updateStatusCalls))
 			}
 		})
+	}
+}
+
+// setupServerWithCallbackLimit returns a Server / router pair with the
+// callback body cap explicitly configured. Used by the F-019 body-cap tests
+// so they can run against a small, predictable limit instead of the 16 MiB
+// production default.
+func setupServerWithCallbackLimit(broker *kafka.RecordingBroker, ms *mockStore, maxBytes int64) (*Server, *gin.Engine) {
+	gin.SetMode(gin.TestMode)
+	producer := kafka.NewProducer(broker)
+	srv := &Server{
+		cfg: &config.Config{
+			CallbackToken: testCallbackToken,
+			Callback:      config.CallbackConfig{MaxBodyBytes: maxBytes},
+		},
+		logger:   zap.NewNop(),
+		producer: producer,
+		store:    ms,
+	}
+	router := gin.New()
+	srv.registerRoutes(router)
+	return srv, router
+}
+
+// TestHandleCallback_BodySizeLimit_UnderLimitSucceeds verifies that a
+// callback whose serialized JSON sits comfortably under the configured cap
+// is processed normally — guarding against an overly aggressive limit
+// rejecting legitimate STUMP deliveries. Locks down half of the F-019 fix.
+func TestHandleCallback_BodySizeLimit_UnderLimitSucceeds(t *testing.T) {
+	const limit = 64 * 1024 // 64 KiB
+	ms := &mockStore{}
+	_, router := setupServerWithCallbackLimit(&kafka.RecordingBroker{}, ms, limit)
+
+	// Build a STUMP payload sized so that the resulting JSON body — which
+	// hex-encodes the bytes via models.HexBytes — is just under the cap. Hex
+	// roughly doubles the byte count, so half the limit (less envelope
+	// overhead) leaves headroom for the JSON wrapper.
+	stumpBytes := make([]byte, limit/2-1024)
+	for i := range stumpBytes {
+		stumpBytes[i] = byte(i & 0xFF)
+	}
+	payload := models.CallbackMessage{
+		Type:      models.CallbackStump,
+		BlockHash: "0000000000000000000000000000000000000000000000000000000000000001",
+		Stump:     stumpBytes,
+	}
+	body := mustMarshalJSON(t, payload)
+	if int64(len(body)) >= limit {
+		t.Fatalf("test setup: body %d bytes is not under limit %d", len(body), limit)
+	}
+
+	req := authedCallbackRequest(t, body)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	ms.mu.Lock()
+	stored := len(ms.stumps)
+	ms.mu.Unlock()
+	if stored != 1 {
+		t.Errorf("expected 1 stump stored on under-limit body, got %d", stored)
+	}
+}
+
+// TestHandleCallback_BodySizeLimit_OverLimitReturns413 verifies the F-019
+// fix: an oversize callback POST is rejected with 413 Payload Too Large
+// (not 400) before any decoding allocates the full body. Locks down the
+// other half of the fix.
+func TestHandleCallback_BodySizeLimit_OverLimitReturns413(t *testing.T) {
+	const limit = 64 * 1024 // 64 KiB
+	ms := &mockStore{}
+	_, router := setupServerWithCallbackLimit(&kafka.RecordingBroker{}, ms, limit)
+
+	// Construct a body whose raw byte length exceeds the cap. We embed it in
+	// a CallbackSeenOnNetwork payload (oversize TxIDs list) so the structure
+	// is still valid JSON — what we're testing is the size check, not parse
+	// behavior on garbage input.
+	huge := strings.Repeat("a", int(limit)+1024)
+	body := mustMarshalJSON(t, models.CallbackMessage{
+		Type:  models.CallbackSeenOnNetwork,
+		TxIDs: []string{huge},
+	})
+	if int64(len(body)) <= limit {
+		t.Fatalf("test setup: body %d bytes is not over limit %d", len(body), limit)
+	}
+
+	req := authedCallbackRequest(t, body)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Oversize bodies must short-circuit before the dispatch path runs.
+	if len(ms.updateStatusCalls) != 0 {
+		t.Errorf("oversize callback must not write to the store, got %d UpdateStatus calls", len(ms.updateStatusCalls))
+	}
+}
+
+// TestHandleCallback_BodySizeLimit_HugeStumpRejected covers the original
+// F-019 scenario directly: a STUMP callback whose embedded payload is much
+// larger than the configured cap returns 413 instead of allocating the
+// entire body into memory.
+func TestHandleCallback_BodySizeLimit_HugeStumpRejected(t *testing.T) {
+	const limit = 32 * 1024 // 32 KiB
+	ms := &mockStore{}
+	_, router := setupServerWithCallbackLimit(&kafka.RecordingBroker{}, ms, limit)
+
+	// 4 MiB STUMP — vastly larger than the cap, mimicking the unbounded
+	// payload that motivated F-019.
+	stumpBytes := make([]byte, 4*1024*1024)
+	for i := range stumpBytes {
+		stumpBytes[i] = byte(i & 0xFF)
+	}
+	body := mustMarshalJSON(t, models.CallbackMessage{
+		Type:      models.CallbackStump,
+		BlockHash: "0000000000000000000000000000000000000000000000000000000000000002",
+		Stump:     stumpBytes,
+	})
+
+	req := authedCallbackRequest(t, body)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d: %s", w.Code, w.Body.String())
+	}
+	ms.mu.Lock()
+	stored := len(ms.stumps)
+	ms.mu.Unlock()
+	if stored != 0 {
+		t.Errorf("oversize STUMP must not be persisted, got %d stored", stored)
+	}
+}
+
+// TestHandleCallback_BodySizeLimit_DefaultsToConfigConstant confirms that
+// leaving Callback.MaxBodyBytes unset (or zero/negative) falls back to the
+// package default, so a misconfiguration can never disable the cap entirely.
+func TestHandleCallback_BodySizeLimit_DefaultsToConfigConstant(t *testing.T) {
+	srv := &Server{cfg: &config.Config{}}
+	if got := srv.callbackMaxBodyBytes(); got != config.DefaultCallbackMaxBodyBytes {
+		t.Errorf("zero value: got %d, want %d", got, config.DefaultCallbackMaxBodyBytes)
+	}
+
+	srv.cfg.Callback.MaxBodyBytes = -1
+	if got := srv.callbackMaxBodyBytes(); got != config.DefaultCallbackMaxBodyBytes {
+		t.Errorf("negative value: got %d, want %d", got, config.DefaultCallbackMaxBodyBytes)
+	}
+
+	srv.cfg.Callback.MaxBodyBytes = 1 << 10
+	if got := srv.callbackMaxBodyBytes(); got != 1<<10 {
+		t.Errorf("explicit value: got %d, want %d", got, 1<<10)
 	}
 }
