@@ -316,7 +316,7 @@ func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.Transa
 		return nil
 	}
 
-	const colsPerRow = 6 // txid, status, block_hash, block_height, extra_info, timestamp_at + merkle_path
+	const colsPerRow = 7 // txid, status, block_hash, block_height, extra_info, merkle_path, timestamp_at, disallowed_prev
 
 	args := make([]any, 0, len(statuses)*(colsPerRow+1))
 	now := time.Now()
@@ -329,6 +329,14 @@ func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.Transa
 		if len(st.MerklePath) > 0 {
 			mp = []byte(st.MerklePath)
 		}
+		// disallowed previous statuses for this row's lattice guard. A nil/
+		// empty slice means "no constraint" — the AND clause uses ALL() so an
+		// empty array is satisfied trivially (status <> ALL('{}'::text[]) is
+		// true for every row).
+		disallowed := disallowedPrevAsStrings(st.Status)
+		if disallowed == nil {
+			disallowed = []string{}
+		}
 		args = append(args,
 			st.TxID,
 			string(st.Status),
@@ -337,6 +345,7 @@ func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.Transa
 			st.ExtraInfo,
 			mp,
 			ts,
+			disallowed,
 		)
 	}
 
@@ -346,14 +355,18 @@ func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.Transa
 			values.WriteString(", ")
 		}
 		base := i * (colsPerRow + 1)
-		// Cast text/bytea/bigint/timestamptz so Postgres can pick the right
-		// types for the VALUES alias columns.
+		// Cast text/bytea/bigint/timestamptz/text[] so Postgres can pick the
+		// right types for the VALUES alias columns.
 		fmt.Fprintf(&values,
-			"($%d::text,$%d::text,$%d::text,$%d::bigint,$%d::text,$%d::bytea,$%d::timestamptz)",
-			base+1, base+2, base+3, base+4, base+5, base+6, base+7,
+			"($%d::text,$%d::text,$%d::text,$%d::bigint,$%d::text,$%d::bytea,$%d::timestamptz,$%d::text[])",
+			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8,
 		)
 	}
 
+	// Lattice guard (status <> ALL(v.disallowed_prev)) is applied in the
+	// WHERE clause: rows whose existing status appears in the per-row disallowed
+	// list are silently skipped. See models.Status.DisallowedPreviousStatuses
+	// and #61 / F-003.
 	q := `
 UPDATE transactions t SET
     status       = v.status,
@@ -362,8 +375,8 @@ UPDATE transactions t SET
     extra_info   = COALESCE(NULLIF(v.extra_info, ''),     t.extra_info),
     merkle_path  = COALESCE(v.merkle_path,                t.merkle_path),
     timestamp_at = v.timestamp_at
-FROM (VALUES ` + values.String() + `) AS v(txid, status, block_hash, block_height, extra_info, merkle_path, timestamp_at)
-WHERE t.txid = v.txid`
+FROM (VALUES ` + values.String() + `) AS v(txid, status, block_hash, block_height, extra_info, merkle_path, timestamp_at, disallowed_prev)
+WHERE t.txid = v.txid AND t.status <> ALL(v.disallowed_prev)`
 
 	if _, err := s.pool.Exec(ctx, q, args...); err != nil {
 		return fmt.Errorf("batch update: %w", err)
@@ -398,6 +411,7 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 	if len(status.MerklePath) > 0 {
 		sets = append(sets, fmt.Sprintf("merkle_path = $%d", idx))
 		args = append(args, []byte(status.MerklePath))
+		idx++
 	}
 
 	q := "UPDATE transactions SET "
@@ -409,11 +423,37 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 	}
 	q += " WHERE txid = $1"
 
+	// Enforce the status lattice atomically inside the same UPDATE: refuse to
+	// overwrite a terminal status (MINED/IMMUTABLE/REJECTED/DOUBLE_SPEND_ATTEMPTED)
+	// with a later, lower-priority update such as a stray SEEN_ON_NETWORK
+	// callback. See models.Status.DisallowedPreviousStatuses and #61 / F-003.
+	if disallowed := disallowedPrevAsStrings(status.Status); len(disallowed) > 0 {
+		q += fmt.Sprintf(" AND status <> ALL($%d::text[])", idx)
+		args = append(args, disallowed)
+	}
+
 	_, err := s.pool.Exec(ctx, q, args...)
 	if err != nil {
 		return fmt.Errorf("update tx %s: %w", status.TxID, err)
 	}
 	return nil
+}
+
+// disallowedPrevAsStrings is a small adapter so UpdateStatus / BatchUpdateStatus
+// can drop the lattice into a parameterised text[] clause.
+func disallowedPrevAsStrings(s models.Status) []string {
+	if s == "" {
+		return nil
+	}
+	prev := s.DisallowedPreviousStatuses()
+	if len(prev) == 0 {
+		return nil
+	}
+	out := make([]string, len(prev))
+	for i, p := range prev {
+		out[i] = string(p)
+	}
+	return out
 }
 
 func (s *Store) GetStatus(ctx context.Context, txid string) (*models.TransactionStatus, error) {
