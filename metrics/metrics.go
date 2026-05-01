@@ -142,13 +142,25 @@ var PropagationInlineRetryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "Inline retry attempts on broadcastSingleToEndpoints.",
 }, []string{"outcome"}) // recovered, exhausted
 
-// PropagationMerkleRegisterDuration measures the merkle-service batch
+// PropagationMerkleRegisterDuration measures the merkle-service per-message
 // registration round-trip. Slow merkle calls are a common bottleneck.
 var PropagationMerkleRegisterDuration = promauto.NewHistogram(prometheus.HistogramOpts{
 	Name:    "arcade_propagation_merkle_register_duration_seconds",
-	Help:    "Duration of merkle-service RegisterBatch calls.",
+	Help:    "Duration of merkle-service Register calls.",
 	Buckets: latencyBuckets,
 })
+
+// PropagationMerkleRegisterFailures counts per-message merkle-service
+// registration failures by reason. Sustained values indicate the merkle
+// service is unhealthy — without this metric a registration outage was
+// previously masked by silent broadcast continuation. Reasons map to the
+// failure mode observed by handleMessage; today only "register_error" is
+// emitted, but the label is kept open so future error-class splits (e.g.
+// "timeout", "5xx", "auth") can be added without renaming the metric.
+var PropagationMerkleRegisterFailures = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_propagation_merkle_register_failures_total",
+	Help: "Per-message merkle-service Register failures, by reason.",
+}, []string{"reason"})
 
 // PropagationReaperLease is 1 when this pod holds the reaper lease, 0 otherwise.
 // In K8s, sum across pods should always equal 1 (or 0 during failover).

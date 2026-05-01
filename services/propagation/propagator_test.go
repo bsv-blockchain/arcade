@@ -362,8 +362,8 @@ func TestHandleMessage_MerkleFailure_NoBroadcast(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if !strings.Contains(err.Error(), "merkle-service batch registration failed") {
-		t.Errorf("expected error to contain 'merkle-service batch registration failed', got: %v", err)
+	if !strings.Contains(err.Error(), "merkle-service registration failed") {
+		t.Errorf("expected error to contain 'merkle-service registration failed', got: %v", err)
 	}
 
 	if log.count("broadcast") != 0 {
@@ -596,7 +596,10 @@ func TestProcessBatch_ChunksOversizedBatch(t *testing.T) {
 	}
 }
 
-// Test 8: Merkle failure aborts entire batch — no broadcast
+// Test 8: Merkle failure aborts the affected message at handleMessage time
+// — no batching, no broadcast, no status update. F-024: registration is the
+// per-message gate, so the Kafka consumer's processWithRetry/DLQ machinery
+// preserves the message instead of silently broadcasting an unregistered tx.
 func TestProcessBatch_MerkleFailure_AbortsBatch(t *testing.T) {
 	var broadcastCount atomic.Int32
 	merkleSrv := newMerkleServer(&eventLog{}, http.StatusInternalServerError)
@@ -612,12 +615,18 @@ func TestProcessBatch_MerkleFailure_AbortsBatch(t *testing.T) {
 	p := newPropagator(merkleSrv.URL, teranodeSrv.URL, ms)
 
 	for i := 0; i < 5; i++ {
-		_ = p.handleMessage(context.Background(), consumerMsg(makePropMsg(fmt.Sprintf("tx%d", i))))
+		err := p.handleMessage(context.Background(), consumerMsg(makePropMsg(fmt.Sprintf("tx%d", i))))
+		if err == nil {
+			t.Fatalf("tx%d: expected handleMessage to return an error when merkle registration fails", i)
+		}
+		if !strings.Contains(err.Error(), "merkle-service registration failed") {
+			t.Fatalf("tx%d: expected merkle error, got: %v", i, err)
+		}
 	}
 
-	err := p.flushBatch(context.Background())
-	if err == nil {
-		t.Fatal("expected error from merkle failure")
+	// flushBatch on an empty pending list is a no-op; broadcast must not run.
+	if err := p.flushBatch(context.Background()); err != nil {
+		t.Fatalf("flushBatch on empty pending list should be a no-op, got: %v", err)
 	}
 
 	if broadcastCount.Load() != 0 {
@@ -625,6 +634,122 @@ func TestProcessBatch_MerkleFailure_AbortsBatch(t *testing.T) {
 	}
 	if ms.updateCount() != 0 {
 		t.Errorf("expected 0 UpdateStatus calls, got %d", ms.updateCount())
+	}
+}
+
+// F-024 regression: when registration fails for one message inside a batch,
+// only that message is rejected (its handleMessage returns an error). The
+// already-registered messages remain in the pending batch and are broadcast
+// + status-updated normally on flush. The failed tx is NEVER added to
+// pendingMsgs, so it is never broadcast, never status-updated, never put on
+// PENDING_RETRY — it relies entirely on the consumer's processWithRetry/DLQ
+// machinery to preserve the message until the operator can recover.
+func TestHandleMessage_PartialMerkleFailure_OnlyFailedMessageIsAborted(t *testing.T) {
+	// Merkle server returns 500 for txid "tx-bad", 200 for everything else.
+	var registerLog eventLog
+	merkleSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			TxID string `json:"txid"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		registerLog.add("register:" + req.TxID)
+		if req.TxID == "tx-bad" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer merkleSrv.Close()
+
+	var broadcastBodies []string
+	var bodyMu sync.Mutex
+	teranodeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bodyMu.Lock()
+		defer bodyMu.Unlock()
+		broadcastBodies = append(broadcastBodies, r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer teranodeSrv.Close()
+
+	ms := newMockStore()
+	p := newPropagator(merkleSrv.URL, teranodeSrv.URL, ms)
+
+	// Three messages: two succeed, one (tx-bad) fails registration.
+	goodA := makePropMsg("tx-good-a")
+	bad := makePropMsg("tx-bad")
+	goodB := makePropMsg("tx-good-b")
+
+	if err := p.handleMessage(context.Background(), consumerMsg(goodA)); err != nil {
+		t.Fatalf("tx-good-a: expected nil, got %v", err)
+	}
+	if err := p.handleMessage(context.Background(), consumerMsg(bad)); err == nil {
+		t.Fatalf("tx-bad: expected handleMessage error, got nil")
+	}
+	if err := p.handleMessage(context.Background(), consumerMsg(goodB)); err != nil {
+		t.Fatalf("tx-good-b: expected nil, got %v", err)
+	}
+
+	if err := p.flushBatch(context.Background()); err != nil {
+		t.Fatalf("flushBatch returned: %v", err)
+	}
+
+	// All three were attempted at the merkle layer; the failed one was the
+	// "bad" txid only.
+	if got := registerLog.count("register:"); got != 3 {
+		t.Errorf("expected 3 merkle register attempts, got %d", got)
+	}
+
+	// Only the two surviving txids made it into the broadcast batch — that
+	// is, exactly two good ones broadcast. /txs is used because batch>1.
+	bodyMu.Lock()
+	defer bodyMu.Unlock()
+	if len(broadcastBodies) != 1 {
+		t.Errorf("expected 1 broadcast call (the /txs batch of the 2 good txs), got %d: %v", len(broadcastBodies), broadcastBodies)
+	}
+	if len(broadcastBodies) > 0 && broadcastBodies[0] != "/txs" {
+		t.Errorf("expected /txs batch endpoint, got %s", broadcastBodies[0])
+	}
+
+	// Two status updates: one per surviving tx. tx-bad has no row written.
+	if ms.updateCount() != 2 {
+		t.Errorf("expected 2 status updates (only the 2 good txs), got %d", ms.updateCount())
+	}
+	if ms.lastUpdateForTxid("tx-bad") != nil {
+		t.Errorf("tx-bad must not have a status row — registration was rejected and the message is the consumer's responsibility to redeliver/DLQ")
+	}
+	if u := ms.lastUpdateForTxid("tx-good-a"); u == nil || u.Status != models.StatusAcceptedByNetwork {
+		t.Errorf("tx-good-a: expected ACCEPTED_BY_NETWORK status update, got %+v", u)
+	}
+	if u := ms.lastUpdateForTxid("tx-good-b"); u == nil || u.Status != models.StatusAcceptedByNetwork {
+		t.Errorf("tx-good-b: expected ACCEPTED_BY_NETWORK status update, got %+v", u)
+	}
+}
+
+// F-024 invariant: a registration failure must NOT cause any side-effects
+// downstream (broadcast, status, PENDING_RETRY) for the failed message —
+// it's entirely the consumer's job to preserve and recover it via DLQ.
+func TestHandleMessage_MerkleFailure_NoPendingRetryRow(t *testing.T) {
+	merkleSrv := newMerkleServer(&eventLog{}, http.StatusInternalServerError)
+	defer merkleSrv.Close()
+
+	teranodeSrv := newTeranodeServer(&eventLog{}, http.StatusOK)
+	defer teranodeSrv.Close()
+
+	ms := newMockStore()
+	p := newPropagator(merkleSrv.URL, teranodeSrv.URL, ms)
+
+	if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg("tx-reg-fail"))); err == nil {
+		t.Fatal("expected merkle registration error from handleMessage")
+	}
+
+	// No PENDING_RETRY row — the durable retry track is for broadcast
+	// retryability, not registration. Registration retries belong to the
+	// Kafka consumer (processWithRetry → DLQ on exhaustion).
+	if ms.pendingRetryCount() != 0 {
+		t.Errorf("expected no pending retry rows, got %d", ms.pendingRetryCount())
+	}
+	if ms.updateCount() != 0 {
+		t.Errorf("expected no status updates, got %d", ms.updateCount())
 	}
 }
 
