@@ -358,7 +358,24 @@ type CallbackConfig struct {
 	// Operators running purely against internal services (testing rigs,
 	// k8s service DNS, intranet webhooks) can set this true.
 	AllowPrivateIPs bool `mapstructure:"allow_private_ips"`
+	// MaxBodyBytes caps the size of an inbound POST
+	// /api/v1/merkle-service/callback body, in bytes. The callback receives
+	// JSON with embedded STUMP payloads (subtree merkle paths) that can be
+	// genuinely large for busy subtrees, but unbounded reads let a malicious
+	// or malfunctioning peer exhaust memory. Default 16 MiB is well over a
+	// realistic STUMP delivery (~hundreds of KiB even for the largest
+	// subtrees observed in production) while still bounding worst-case
+	// memory use per request. A value <= 0 selects DefaultCallbackMaxBodyBytes.
+	// Mitigates F-019 (callback JSON bodies and STUMP payloads are unbounded).
+	MaxBodyBytes int64 `mapstructure:"max_body_bytes"`
 }
+
+// DefaultCallbackMaxBodyBytes is the fallback value for
+// CallbackConfig.MaxBodyBytes when an operator leaves it unset (or sets a
+// non-positive value). 16 MiB is generous enough for the largest realistic
+// STUMP payload while still bounding memory against a hostile peer; see
+// F-019 for the threat model.
+const DefaultCallbackMaxBodyBytes int64 = 16 << 20
 
 // TxValidatorConfig tunes the parallel batch validation pipeline. Parallelism
 // caps how many transactions are parsed and validated concurrently inside a
@@ -503,6 +520,9 @@ func setDefaults() {
 	// into a blind SSRF primitive against internal services and cloud
 	// metadata endpoints.
 	viper.SetDefault("callback.allow_private_ips", false)
+	// Inbound callback body cap. 16 MiB headroom over realistic STUMP payloads
+	// while bounding memory against a hostile or malfunctioning peer (F-019).
+	viper.SetDefault("callback.max_body_bytes", DefaultCallbackMaxBodyBytes)
 
 	viper.SetDefault("storage_path", "~/.arcade")
 	viper.SetDefault("chaintracks_server.enabled", true)
