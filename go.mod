@@ -5,10 +5,10 @@ go 1.26.0
 require (
 	github.com/IBM/sarama v1.48.0
 	github.com/aerospike/aerospike-client-go/v7 v7.10.2
-	github.com/bsv-blockchain/go-chaintracks v1.2.5
-	github.com/bsv-blockchain/go-p2p-message-bus v0.1.17
+	github.com/bsv-blockchain/go-chaintracks v1.2.6
+	github.com/bsv-blockchain/go-p2p-message-bus v0.1.18
 	github.com/bsv-blockchain/go-sdk v1.2.23
-	github.com/bsv-blockchain/go-teranode-p2p-client v0.2.4
+	github.com/bsv-blockchain/go-teranode-p2p-client v0.2.5
 	github.com/bsv-blockchain/teranode v0.15.0-beta-3
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/fergusstrange/embedded-postgres v1.34.0
@@ -32,7 +32,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.17 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.16 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.23 // indirect
-	github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager v0.1.19 // indirect
+	github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager v0.1.20 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.23 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.23 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/v4a v1.4.24 // indirect
@@ -49,13 +49,13 @@ require (
 	github.com/benbjohnson/clock v1.3.5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bsv-blockchain/go-batcher v1.2.11 // indirect
-	github.com/bsv-blockchain/go-bt/v2 v2.6.2 // indirect
-	github.com/bsv-blockchain/go-chaincfg v1.5.6 // indirect
-	github.com/bsv-blockchain/go-lockfree-queue v1.1.2 // indirect
-	github.com/bsv-blockchain/go-safe-conversion v1.1.2 // indirect
-	github.com/bsv-blockchain/go-subtree v1.3.0 // indirect
-	github.com/bsv-blockchain/go-tx-map v1.3.4 // indirect
-	github.com/bsv-blockchain/go-wire v1.2.2 // indirect
+	github.com/bsv-blockchain/go-bt/v2 v2.6.3 // indirect
+	github.com/bsv-blockchain/go-chaincfg v1.5.7 // indirect
+	github.com/bsv-blockchain/go-lockfree-queue v1.1.3 // indirect
+	github.com/bsv-blockchain/go-safe-conversion v1.1.3 // indirect
+	github.com/bsv-blockchain/go-subtree v1.3.1 // indirect
+	github.com/bsv-blockchain/go-tx-map v1.3.5 // indirect
+	github.com/bsv-blockchain/go-wire v1.2.3 // indirect
 	github.com/bytedance/gopkg v0.1.4 // indirect
 	github.com/bytedance/sonic v1.15.1 // indirect
 	github.com/bytedance/sonic/loader v0.5.1 // indirect
@@ -143,13 +143,13 @@ require (
 	github.com/jellydator/ttlcache/v3 v3.4.0 // indirect
 	github.com/joho/godotenv v1.6.0-pre.2 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
-	github.com/klauspost/compress v1.18.5 // indirect
+	github.com/klauspost/compress v1.18.6 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/koron/go-ssdp v0.1.0 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
-	github.com/labstack/echo/v4 v4.15.1 // indirect
+	github.com/labstack/echo/v4 v4.15.2 // indirect
 	github.com/labstack/gommon v0.5.0 // indirect
 	github.com/leodido/go-urn v1.4.0 // indirect
 	github.com/lib/pq v1.12.3 // indirect
@@ -194,7 +194,7 @@ require (
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/ordishs/gocore v1.0.81 // indirect
 	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58 // indirect
-	github.com/pelletier/go-toml/v2 v2.3.0 // indirect
+	github.com/pelletier/go-toml/v2 v2.3.1 // indirect
 	github.com/pierrec/lz4/v4 v4.1.26 // indirect
 	github.com/pion/datachannel v1.6.0 // indirect
 	github.com/pion/dtls/v3 v3.1.2 // indirect
@@ -204,7 +204,7 @@ require (
 	github.com/pion/mdns/v2 v2.1.0 // indirect
 	github.com/pion/randutil v0.1.0 // indirect
 	github.com/pion/rtcp v1.2.16 // indirect
-	github.com/pion/rtp v1.10.1 // indirect
+	github.com/pion/rtp v1.10.2 // indirect
 	github.com/pion/sctp v1.9.5 // indirect
 	github.com/pion/sdp/v3 v3.0.18 // indirect
 	github.com/pion/srtp/v3 v3.0.10 // indirect
@@ -288,7 +288,7 @@ require (
 	k8s.io/apimachinery v0.36.0 // indirect
 	k8s.io/client-go v0.36.0 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect
-	k8s.io/kube-openapi v0.0.0-20260427204847-8949caaa1199 // indirect
+	k8s.io/kube-openapi v0.0.0-20260502001324-b7f5293f4787 // indirect
 	k8s.io/utils v0.0.0-20260319190234-28399d86e0b5 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 	modernc.org/libc v1.72.1 // indirect
