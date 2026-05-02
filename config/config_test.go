@@ -213,3 +213,15 @@ func TestResolveChaintracksNetwork(t *testing.T) {
 		})
 	}
 }
+
+// TestDefaultCallbackMaxBodyBytes pins the default body cap for the inbound
+// callback receiver. Set to 16 MiB — comfortably over a realistic STUMP
+// delivery while bounding worst-case memory if a peer is malicious or
+// malfunctioning. Mitigates F-019 / issue #77; bumping this value should be
+// a deliberate, reviewed change.
+func TestDefaultCallbackMaxBodyBytes(t *testing.T) {
+	const want int64 = 16 * 1024 * 1024
+	if DefaultCallbackMaxBodyBytes != want {
+		t.Errorf("DefaultCallbackMaxBodyBytes = %d, want %d", DefaultCallbackMaxBodyBytes, want)
+	}
+}

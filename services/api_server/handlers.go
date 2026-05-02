@@ -17,6 +17,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/callbackurl"
+	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
@@ -226,6 +227,17 @@ func (s *Server) handleReady(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ready"})
 }
 
+// callbackMaxBodyBytes returns the configured upper bound on the request
+// body for POST /api/v1/merkle-service/callback, falling back to the
+// package default when the operator leaves the knob unset or sets a
+// non-positive value. Centralized so the handler and tests stay in sync.
+func (s *Server) callbackMaxBodyBytes() int64 {
+	if n := s.cfg.Callback.MaxBodyBytes; n > 0 {
+		return n
+	}
+	return config.DefaultCallbackMaxBodyBytes
+}
+
 // handleCallback processes inbound callbacks from Merkle Service.
 // Uses CallbackMessage format with Type field.
 //
@@ -235,6 +247,12 @@ func (s *Server) handleReady(c *gin.Context) {
 // means a misconfigured deployment outside the supported envelope. We still
 // fail closed here as a defense-in-depth measure: an empty/missing bearer or
 // any mismatch is rejected with 401 before any callback processing runs.
+//
+// The request body is wrapped in http.MaxBytesReader before JSON-binding so
+// a malicious or malfunctioning peer can't exhaust memory by streaming an
+// unbounded JSON body (notably the embedded STUMP blob). Oversize bodies
+// produce a 413 Payload Too Large; the cap is configurable via
+// Callback.MaxBodyBytes (default 16 MiB). See F-019 / issue #77.
 func (s *Server) handleCallback(c *gin.Context) {
 	// Bearer token validation — always enforced, never skipped on empty
 	// configured token. subtle.ConstantTimeCompare removes the timing side
@@ -251,8 +269,20 @@ func (s *Server) handleCallback(c *gin.Context) {
 		return
 	}
 
+	// Cap the inbound body BEFORE JSON-binding. http.MaxBytesReader returns a
+	// *http.MaxBytesError once the limit is exceeded, which we map to 413.
+	// Other decode errors (malformed JSON, type mismatches) keep their
+	// existing 400 mapping — the contract for legitimate malformed input
+	// hasn't changed.
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, s.callbackMaxBodyBytes())
+
 	var msg models.CallbackMessage
 	if err := c.ShouldBindJSON(&msg); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body too large"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}

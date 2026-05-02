@@ -114,8 +114,16 @@ health:
 # allow_private_ips: true if your deployment intentionally posts
 # callbacks to internal services (testing, k8s service DNS, intranet
 # webhooks). See finding F-017 / issue #75.
+#
+# max_body_bytes caps the size of an inbound POST
+# /api/v1/merkle-service/callback request body (JSON, with embedded STUMP
+# payload). Default 16 MiB is generous over a realistic STUMP delivery
+# while bounding worst-case memory if a peer is malicious or malfunctioning.
+# Oversize requests are rejected with 413 Payload Too Large. See finding
+# F-019 / issue #77.
 # callback:
 #   allow_private_ips: false
+#   max_body_bytes: 16777216    # 16 MiB
 
 # propagation:
 #   # Per-endpoint circuit-breaker for the datahub URL list. Endpoints that
