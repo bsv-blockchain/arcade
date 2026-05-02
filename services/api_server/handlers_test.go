@@ -398,8 +398,7 @@ func TestHandleCallback_UnknownTxid_NoPhantomRow(t *testing.T) {
 			}
 			body := mustMarshalJSON(t, payload)
 
-			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
-			req.Header.Set("Content-Type", "application/json")
+			req := authedCallbackRequest(t, body)
 			w := httptest.NewRecorder()
 
 			router.ServeHTTP(w, req)
