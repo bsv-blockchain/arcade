@@ -687,19 +687,22 @@ WHERE txid=$1`
 }
 
 // SetMinedByTxIDs updates only rows that already exist. UPDATE ... WHERE txid
-// = ANY($2) is a single round-trip for the batch, and RETURNING lets us emit
-// one status object per affected row without a second read.
-func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, txids []string) ([]*models.TransactionStatus, error) {
+// = ANY($5) is a single round-trip for the batch, and RETURNING lets us emit
+// one status object per affected row without a second read. blockHeight is
+// persisted alongside blockHash and echoed back on each returned status so
+// downstream SSE/webhook consumers always see the height that anchors the
+// MINED transition (issue #87 / F-029).
+func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeight uint64, txids []string) ([]*models.TransactionStatus, error) {
 	if len(txids) == 0 {
 		return nil, nil
 	}
 	now := time.Now()
 	const q = `
 UPDATE transactions
-SET status=$1, block_hash=$2, timestamp_at=$3
-WHERE txid = ANY($4)
+SET status=$1, block_hash=$2, block_height=$3, timestamp_at=$4
+WHERE txid = ANY($5)
 RETURNING txid`
-	rows, err := s.pool.Query(ctx, q, string(models.StatusMined), blockHash, now, txids)
+	rows, err := s.pool.Query(ctx, q, string(models.StatusMined), blockHash, int64(blockHeight), now, txids) //nolint:gosec // block height fits in int64
 	if err != nil {
 		return nil, fmt.Errorf("set mined: %w", err)
 	}
@@ -711,10 +714,11 @@ RETURNING txid`
 			return out, err
 		}
 		out = append(out, &models.TransactionStatus{
-			TxID:      txid,
-			Status:    models.StatusMined,
-			BlockHash: blockHash,
-			Timestamp: now,
+			TxID:        txid,
+			Status:      models.StatusMined,
+			BlockHash:   blockHash,
+			BlockHeight: blockHeight,
+			Timestamp:   now,
 		})
 	}
 	return out, rows.Err()

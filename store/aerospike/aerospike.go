@@ -694,7 +694,11 @@ func (s *Store) ClearRetryState(ctx context.Context, txid string, finalStatus mo
 	return nil
 }
 
-func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, txids []string) ([]*models.TransactionStatus, error) {
+// SetMinedByTxIDs writes a MINED status batch keyed by blockHash + blockHeight.
+// blockHeight is persisted as the block_height bin and echoed back on each
+// returned TransactionStatus so SSE/webhook consumers always see the height
+// alongside the hash (issue #87 / F-029).
+func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeight uint64, txids []string) ([]*models.TransactionStatus, error) {
 	now := time.Now()
 	var statuses []*models.TransactionStatus
 
@@ -720,6 +724,7 @@ func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, txids []s
 			ops := []*aero.Operation{
 				aero.PutOp(aero.NewBin("status", string(models.StatusMined))),
 				aero.PutOp(aero.NewBin("block_hash", blockHash)),
+				aero.PutOp(aero.NewBin("block_height", int(blockHeight))), //nolint:gosec // block height fits in int on 64-bit platforms
 				aero.PutOp(aero.NewBin("timestamp", now.UnixMilli())),
 			}
 			records[j] = aero.NewBatchWrite(bwp, key, ops...)
@@ -732,10 +737,11 @@ func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, txids []s
 		for j, txid := range batch {
 			if records[j] != nil && records[j].BatchRec().Err == nil {
 				statuses = append(statuses, &models.TransactionStatus{
-					TxID:      txid,
-					Status:    models.StatusMined,
-					BlockHash: blockHash,
-					Timestamp: now,
+					TxID:        txid,
+					Status:      models.StatusMined,
+					BlockHash:   blockHash,
+					BlockHeight: blockHeight,
+					Timestamp:   now,
 				})
 			}
 		}

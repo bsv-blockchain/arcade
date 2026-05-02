@@ -788,8 +788,10 @@ func (s *Store) ClearRetryState(ctx context.Context, txid string, finalStatus mo
 }
 
 // SetMinedByTxIDs updates only rows that already exist — matching the
-// Aerospike contract where absent txids are silently skipped.
-func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, txids []string) ([]*models.TransactionStatus, error) {
+// Aerospike contract where absent txids are silently skipped. blockHeight is
+// persisted on each row and echoed back on the returned status so SSE/webhook
+// consumers see the same height that anchors the BUMP (issue #87 / F-029).
+func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeight uint64, txids []string) ([]*models.TransactionStatus, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -815,6 +817,7 @@ func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, txids []s
 		updated := *existing
 		updated.Status = string(models.StatusMined)
 		updated.BlockHash = blockHash
+		updated.BlockHeight = blockHeight
 		updated.TimestampUnixNs = now.UnixNano()
 
 		payload, err := json.Marshal(updated)
@@ -839,10 +842,11 @@ func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, txids []s
 		}
 
 		out = append(out, &models.TransactionStatus{
-			TxID:      txid,
-			Status:    models.StatusMined,
-			BlockHash: blockHash,
-			Timestamp: now,
+			TxID:        txid,
+			Status:      models.StatusMined,
+			BlockHash:   blockHash,
+			BlockHeight: blockHeight,
+			Timestamp:   now,
 		})
 	}
 	return out, nil

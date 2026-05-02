@@ -86,7 +86,7 @@ func (m *mockStore) SetStatusByBlockHash(context.Context, string, models.Status)
 }
 func (m *mockStore) InsertBUMP(context.Context, string, uint64, []byte) error { return nil }
 func (m *mockStore) GetBUMP(context.Context, string) (uint64, []byte, error)  { return 0, nil, nil }
-func (m *mockStore) SetMinedByTxIDs(context.Context, string, []string) ([]*models.TransactionStatus, error) {
+func (m *mockStore) SetMinedByTxIDs(context.Context, string, uint64, []string) ([]*models.TransactionStatus, error) {
 	return nil, nil
 }
 
