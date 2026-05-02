@@ -36,17 +36,6 @@ Our technical standards are organized into focused, portable documents in the `.
 
 <br><br>
 
-## ✅ Task Completion Requirements
-
-Before declaring any task complete, you **must** verify that the following commands pass with no errors:
-
-* `magex lint` — all configured linters (golangci-lint, go vet) must pass
-* `magex test` — the full test suite must pass
-
-If either command fails, fix the underlying issue and re-run until both pass. Do not report a task as done while lint or test failures remain.
-
-<br><br>
-
 ## 📁 Directory Structure
 
 | Directory                   | Description                                             |
