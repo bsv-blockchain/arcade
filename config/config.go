@@ -603,6 +603,7 @@ func validate(cfg *Config) error {
 		"bump-builder": true,
 		"tx-validator": true, "propagation": true,
 		"p2p-client": true,
+		"webhook":     true,
 	}
 	if !validModes[cfg.Mode] {
 		return fmt.Errorf("invalid mode %q", cfg.Mode)
