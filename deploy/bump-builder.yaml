@@ -22,7 +22,7 @@ spec:
     spec:
       containers:
         - name: arcade
-          image: ghcr.io/galt-tr/arcade-refactor:latest
+          image: ghcr.io/bsv-blockchain/arcade:latest
           args: ["--mode", "bump-builder"]
           ports:
             - containerPort: 8081
