@@ -1,7 +1,9 @@
 package bump
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -237,5 +239,137 @@ func TestFetchBlockDataForBUMP_ZeroCapUsesDefault(t *testing.T) {
 		zap.NewNop(),
 	); err != nil {
 		t.Fatalf("negative cap should select the default and succeed, got: %v", err)
+	}
+}
+
+// --- Untrusted-varint allocation tests (F-008) ---------------------------
+
+// blockBytesWithSubtreeCountVarint builds a binary block payload with the
+// supplied subtreeCount written verbatim as a 9-byte 0xFF varint. The body
+// itself is short, so a parser that allocates based on the varint will trip
+// long before it tries to fill the buffer.
+func blockBytesWithSubtreeCountVarint(t *testing.T, subtreeCount uint64) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	buf.Write(make([]byte, 80)) // header (zeroed; merkle-root only needs 32 bytes)
+	buf.WriteByte(0x00)         // txCount = 0
+	buf.WriteByte(0x00)         // sizeBytes = 0
+	// subtreeCount as 0xFF + uint64 LE — the largest VarInt encoding form,
+	// so we can dial in any uint64 value the test wants.
+	buf.WriteByte(0xff)
+	var le [8]byte
+	binary.LittleEndian.PutUint64(le[:], subtreeCount)
+	buf.Write(le[:])
+	return buf.Bytes()
+}
+
+// TestFetchBlockDataForBUMP_RejectsHugeSubtreeCount verifies that a varint
+// claiming far more subtrees than maxSubtreeCount is rejected without
+// attempting a giant preallocation. We run the test through the public
+// fetcher to also exercise the body-cap and HTTP plumbing.
+func TestFetchBlockDataForBUMP_RejectsHugeSubtreeCount(t *testing.T) {
+	body := blockBytesWithSubtreeCountVarint(t, 1<<60) // ~1.15 quintillion
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+
+	_, _, _, err := FetchBlockDataForBUMP(
+		context.Background(),
+		[]string{srv.URL},
+		"deadbeef",
+		zap.NewNop(),
+	)
+	if err == nil {
+		t.Fatal("expected error for oversized subtree count varint")
+	}
+	if !strings.Contains(err.Error(), "subtree count") {
+		t.Errorf("expected error mentioning subtree count, got: %v", err)
+	}
+}
+
+// TestParseBlockBinary_RejectsSubtreeCountAboveBodyCapacity verifies that a
+// subtreeCount which is below maxSubtreeCount but still cannot fit in the
+// remaining body bytes is rejected before the make() call. This catches
+// "plausible-but-impossible" counts that would otherwise allocate hundreds
+// of MiB for a body only kilobytes long.
+func TestParseBlockBinary_RejectsSubtreeCountAboveBodyCapacity(t *testing.T) {
+	// 1,000,000 < maxSubtreeCount (10,000,000) so the absolute cap passes,
+	// but the body has zero bytes after the varint, so the body-capacity
+	// check must reject.
+	body := blockBytesWithSubtreeCountVarint(t, 1_000_000)
+	_, _, _, err := parseBlockBinary(body)
+	if err == nil {
+		t.Fatal("expected error for subtree count exceeding body capacity")
+	}
+	if !strings.Contains(err.Error(), "remaining body capacity") {
+		t.Errorf("expected body-capacity error, got: %v", err)
+	}
+}
+
+// TestParseBlockBinary_AcceptsZeroSubtreeCount keeps the boundary case
+// covered: an empty subtree list must continue to parse successfully and
+// return zero hashes.
+func TestParseBlockBinary_AcceptsZeroSubtreeCount(t *testing.T) {
+	body := minimalValidBlockBytes(t)
+	hashes, _, root, err := parseBlockBinary(body)
+	if err != nil {
+		t.Fatalf("expected success for zero subtree count, got: %v", err)
+	}
+	if len(hashes) != 0 {
+		t.Errorf("expected 0 hashes, got %d", len(hashes))
+	}
+	if root == nil {
+		t.Errorf("expected non-nil header merkle root")
+	}
+}
+
+// TestParseBlockBinary_RejectsCoinbaseBUMPLengthAboveBodyCapacity covers the
+// sibling unbounded allocation: cbBUMPLen is a varint and was previously
+// fed straight into make([]byte, ...). We construct a payload with a valid
+// header + zero subtree hashes + minimal coinbase tx, then a bogus 2^60
+// cbBUMPLen, and confirm the parser short-circuits to "no coinbase BUMP"
+// instead of allocating an exabyte of memory.
+func TestParseBlockBinary_RejectsCoinbaseBUMPLengthAboveBodyCapacity(t *testing.T) {
+	var buf bytes.Buffer
+	buf.Write(make([]byte, 80)) // header
+	buf.WriteByte(0x00)         // txCount = 0
+	buf.WriteByte(0x00)         // sizeBytes = 0
+	buf.WriteByte(0x00)         // subtreeCount = 0
+	// Minimal-ish coinbase tx: version (4) | inCount=1 | prev hash (32) |
+	// prev index (4) | scriptLen=0 | sequence (4) | outCount=0 | locktime (4).
+	// The bsv-sdk tx parser is happy with this skeleton even though it would
+	// be rejected by consensus — we only need txBytesUsed to advance.
+	tx := make([]byte, 0, 64)
+	tx = append(tx, 0x01, 0x00, 0x00, 0x00) // version
+	tx = append(tx, 0x01)                   // inCount = 1
+	tx = append(tx, make([]byte, 32)...)    // prev hash
+	tx = append(tx, 0xff, 0xff, 0xff, 0xff) // prev index
+	tx = append(tx, 0x00)                   // scriptLen = 0
+	tx = append(tx, 0xff, 0xff, 0xff, 0xff) // sequence
+	tx = append(tx, 0x00)                   // outCount = 0
+	tx = append(tx, 0x00, 0x00, 0x00, 0x00) // locktime
+	buf.Write(tx)
+	buf.WriteByte(0x00) // blockHeight varint = 0
+	// cbBUMPLen as a 0xFF varint with a wildly oversized value.
+	buf.WriteByte(0xff)
+	var le [8]byte
+	binary.LittleEndian.PutUint64(le[:], 1<<60)
+	buf.Write(le[:])
+
+	hashes, cb, root, err := parseBlockBinary(buf.Bytes())
+	if err != nil {
+		t.Fatalf("parser should not error on bogus cbBUMPLen, got: %v", err)
+	}
+	if cb != nil {
+		t.Errorf("expected nil coinbase BUMP for oversize cbBUMPLen, got %d bytes", len(cb))
+	}
+	if len(hashes) != 0 {
+		t.Errorf("expected 0 hashes, got %d", len(hashes))
+	}
+	if root == nil {
+		t.Errorf("expected non-nil header merkle root")
 	}
 }
