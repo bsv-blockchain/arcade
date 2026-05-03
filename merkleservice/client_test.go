@@ -26,7 +26,7 @@ func TestRegister(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL, "mytoken", 0)
-	err := client.Register(context.Background(), "abc123", "http://callback/url")
+	err := client.Register(context.Background(), "abc123", "http://callback/url", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -44,6 +44,62 @@ func TestRegister(t *testing.T) {
 	}
 }
 
+// TestRegister_ForwardsCallbackToken pins the F-018 fix on the outbound
+// /watch path: when arcade is configured with a callback token, that token
+// must round-trip through the watch payload so merkle-service can stamp
+// Authorization on callbacks. The inbound receiver requires it; without
+// forwarding the loop 401s.
+func TestRegister_ForwardsCallbackToken(t *testing.T) {
+	var rawBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rawBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "auth-token", 0)
+	if err := client.Register(context.Background(), "abc123", "http://callback/url", "my-token"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Field present and exact match on the wire.
+	if !strings.Contains(string(rawBody), `"callbackToken":"my-token"`) {
+		t.Errorf("expected body to contain callbackToken=my-token, got %s", string(rawBody))
+	}
+
+	// And it round-trips cleanly through json.Unmarshal too.
+	var parsed map[string]string
+	if err := json.Unmarshal(rawBody, &parsed); err != nil {
+		t.Fatalf("body is not valid JSON: %v", err)
+	}
+	if parsed["callbackToken"] != "my-token" {
+		t.Errorf("expected callbackToken=my-token, got %q", parsed["callbackToken"])
+	}
+}
+
+// TestRegister_OmitsEmptyCallbackToken pins the back-compat half: pre-fix
+// callers (and arcade builds without a configured token) must produce a wire
+// payload with NO callbackToken key, so merkle-service builds that don't yet
+// know the field aren't impacted. The omitempty tag is what enforces this and
+// the test exists specifically to fail loudly if someone removes it.
+func TestRegister_OmitsEmptyCallbackToken(t *testing.T) {
+	var rawBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rawBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", 0)
+	if err := client.Register(context.Background(), "abc123", "http://callback/url", ""); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if strings.Contains(string(rawBody), "callbackToken") {
+		t.Errorf("expected body to omit callbackToken when empty, got %s", string(rawBody))
+	}
+}
+
 func TestRegister_Error(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -51,7 +107,7 @@ func TestRegister_Error(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL, "", 0)
-	err := client.Register(context.Background(), "abc123", "http://callback")
+	err := client.Register(context.Background(), "abc123", "http://callback", "")
 	if err == nil {
 		t.Error("expected error for 500 response")
 	}

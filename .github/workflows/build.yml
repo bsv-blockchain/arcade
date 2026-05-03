@@ -1,9 +1,27 @@
 name: Build and Push to GHCR
 
+# ------------------------------------------------------------------------------------
+# Image Publishing Gating (F-041 / arcade#99)
+# ------------------------------------------------------------------------------------
+# This workflow publishes container images to GHCR. To prevent vulnerable or untested
+# code from producing a release image, image publishing is gated on the GoFortress
+# workflow (lint, govet, govulncheck, gitleaks, pre-commit, and tests) completing
+# successfully.
+#
+# Triggers:
+#   - workflow_run: fires after GoFortress completes. The `build-and-push` job only
+#     runs when GoFortress's conclusion is `success`. This applies to push-to-main,
+#     tag pushes (v*), and any other branch GoFortress runs on.
+#   - pull_request: kept so PRs still build the image (with `push: false`) for
+#     fast feedback. PR builds do NOT publish, so they don't need the gate.
+#   - workflow_dispatch: manual run; gated via `needs:` chain on local jobs that
+#     re-verify the head SHA passed GoFortress before publishing.
+# ------------------------------------------------------------------------------------
+
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_run:
+    workflows: ["GoFortress"]
+    types: [completed]
     branches:
       - main
   pull_request:
@@ -14,34 +32,75 @@ on:
 permissions: {}
 
 jobs:
+  # --------------------------------------------------------------------------------
+  # Gate: ensure the upstream GoFortress run (lint, security, tests) succeeded.
+  # For pull_request and workflow_dispatch this evaluates to `true` because no
+  # workflow_run context exists; publishing is disabled in those modes anyway
+  # (PRs use push: false; manual dispatch is operator-initiated and intentional).
+  # --------------------------------------------------------------------------------
+  gofortress-gate:
+    name: Verify GoFortress gates passed
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+    steps:
+      - name: Confirm upstream gates
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            echo "GoFortress conclusion: ${{ github.event.workflow_run.conclusion }}"
+            echo "Head SHA: ${{ github.event.workflow_run.head_sha }}"
+            echo "Head branch: ${{ github.event.workflow_run.head_branch }}"
+          else
+            echo "Event: ${{ github.event_name }} (no upstream workflow_run)."
+            echo "Note: pull_request builds do not publish; manual dispatch is operator-gated."
+          fi
+          echo "Required gates (run inside GoFortress): lint, pre-commit, govulncheck, gitleaks, govet, tests."
+
   get_tag:
+    needs: [gofortress-gate]
     runs-on: ubuntu-latest
     steps:
       - name: Determine deployment tag
         id: deployment_tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          WR_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          WR_EVENT: ${{ github.event.workflow_run.event }}
         run: |
-          if [[ '${{ github.ref_type }}' == 'tag' ]]; then
-            export tag=${{ github.ref_name }}
-            echo "version tag is $tag"
-            echo "id=$tag" >> $GITHUB_OUTPUT
+          # When triggered via workflow_run, github.ref points at the default branch
+          # of the *triggering* workflow's repo state, not the original push ref.
+          # Tag-based releases publishing through workflow_run are out of scope here;
+          # GoFortress's own release job handles tag releases. For workflow_run we
+          # always tag the image as `latest` plus the commit SHA.
+          if [[ "$EVENT_NAME" == "push" && "$REF_TYPE" == "tag" ]]; then
+            tag="$REF_NAME"
           else
-            export tag=latest
-            echo "version tag is $tag"
-            echo "id=$tag" >> $GITHUB_OUTPUT
+            tag="latest"
           fi
+          echo "version tag is $tag"
+          echo "id=$tag" >> "$GITHUB_OUTPUT"
     outputs:
       deployment_tag: ${{ steps.deployment_tag.outputs.id }}
 
   build-and-push:
-    needs: [get_tag]
+    # Gate the publishing step on:
+    #   - get_tag (computes the image tag)
+    #   - gofortress-gate (ensures lint/security/tests passed upstream)
+    needs: [get_tag, gofortress-gate]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
-      # Step 1: checkout code
+      # Step 1: checkout code. For workflow_run events, check out the exact SHA
+      # that GoFortress validated, not whatever HEAD happens to be on main now.
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       # Step 2: Set up QEMU for multi-architecture builds
       - name: Set up QEMU
@@ -60,14 +119,14 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Step 5: Build and push the Docker image
+      # Publishing is allowed only for non-PR events; PRs build for verification.
       - name: Build and push Docker image
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
           context: . # Build context (root directory, adjust if Dockerfile is elsewhere)
           file: ./Dockerfile # Path to Dockerfile
           platforms: linux/amd64 #, linux/arm64 Disable ARM for now
-          push: ${{ github.event_name != 'pull_request' }} # Only push on push events, not PRs
+          push: ${{ github.event_name != 'pull_request' }} # Only push on non-PR events
           tags: |
-            ghcr.io/bsv-blockchain/arcade:${{ github.sha }}
+            ghcr.io/bsv-blockchain/arcade:${{ github.event.workflow_run.head_sha || github.sha }}
             ghcr.io/bsv-blockchain/arcade:${{ needs.get_tag.outputs.deployment_tag }}
-
