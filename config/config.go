@@ -578,6 +578,13 @@ func validate(cfg *Config) error {
 	// status updates for any txid in the system if it runs without bearer-token
 	// auth, so we fail-closed here at config load rather than silently exposing
 	// the unauthenticated receiver. See issue #76 / finding F-018.
+	//
+	// This same check now also gates the OUTBOUND /watch token forwarding:
+	// merkleservice.Client.Register/RegisterBatch propagate cfg.CallbackToken
+	// to merkle-service so it can attach `Authorization: Bearer <token>` on
+	// callbacks. Without a configured token there's nothing to forward AND the
+	// inbound receiver would 401 anyway — the same fail-closed posture covers
+	// both ends, so a duplicate "outbound token required" check is unnecessary.
 	if cfg.MerkleService.URL != "" && cfg.CallbackToken == "" {
 		return fmt.Errorf("callback_token is required when merkle_service.url is set " +
 			"(unauthenticated /api/v1/merkle-service/callback would accept forged callbacks; see issue #76)")

@@ -214,7 +214,7 @@ func (p *Propagator) handleMessage(ctx context.Context, msg *kafka.Message) erro
 
 	if p.merkleClient != nil && p.cfg.CallbackURL != "" {
 		mStart := time.Now()
-		if err := p.merkleClient.Register(ctx, propMsg.TXID, p.cfg.CallbackURL); err != nil {
+		if err := p.merkleClient.Register(ctx, propMsg.TXID, p.cfg.CallbackURL, p.cfg.CallbackToken); err != nil {
 			metrics.PropagationMerkleRegisterDuration.Observe(time.Since(mStart).Seconds())
 			metrics.PropagationMerkleRegisterFailures.WithLabelValues("register_error").Inc()
 			// Surface the failure so the consumer's retry+DLQ machinery

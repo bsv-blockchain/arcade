@@ -305,6 +305,46 @@ func handleAndFlush(t *testing.T, p *Propagator, payload []byte) error {
 	return p.flushBatch(context.Background())
 }
 
+// TestHandleMessage_ForwardsCallbackToken pins the propagator → merkle-service
+// half of the F-018 callback-auth loop: the token configured at the arcade
+// side (cfg.CallbackToken) must reach merkle-service via the /watch payload,
+// so merkle-service can attach it as Authorization on outbound delivery. If
+// this test fails, callbacks will 401 even if the inbound receiver and
+// merkle-service forwarder are both correct.
+func TestHandleMessage_ForwardsCallbackToken(t *testing.T) {
+	var gotToken string
+	merkleSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			TxID          string `json:"txid"`
+			CallbackToken string `json:"callbackToken"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		gotToken = req.CallbackToken
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer merkleSrv.Close()
+
+	teranodeSrv := newTeranodeServer(&eventLog{}, http.StatusOK)
+	defer teranodeSrv.Close()
+
+	cfg := &config.Config{
+		CallbackURL:   "http://localhost:8080/callback",
+		CallbackToken: "secret-arcade-token",
+	}
+	cfg.Propagation.MerkleConcurrency = 10
+	mc := merkleservice.NewClient(merkleSrv.URL, "", 5*time.Second)
+	tc := teranode.NewClient([]string{teranodeSrv.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
+	p := New(cfg, zap.NewNop(), nil, nil, newMockStore(), nil, tc, mc)
+
+	if err := handleAndFlush(t, p, makePropMsg("abc123")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if gotToken != "secret-arcade-token" {
+		t.Errorf("expected merkle-service to receive callbackToken=secret-arcade-token, got %q", gotToken)
+	}
+}
+
 // Test 1: Registration happens before broadcast on success (single message)
 func TestHandleMessage_RegistrationBeforeBroadcast(t *testing.T) {
 	log := &eventLog{}
