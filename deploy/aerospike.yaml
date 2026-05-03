@@ -34,7 +34,11 @@ data:
     namespace arcade {
       replication-factor 1
       memory-size 1G
-      storage-engine memory
+      storage-engine device {
+        file /opt/aerospike/data/arcade.dat
+        filesize 8G
+        data-in-memory false
+      }
     }
 ---
 apiVersion: apps/v1
@@ -92,10 +96,20 @@ spec:
               mountPath: /opt/aerospike/etc/aerospike.conf
               subPath: aerospike.conf
               readOnly: true
+            - name: aerospike-data
+              mountPath: /opt/aerospike/data
       volumes:
         - name: config
           configMap:
             name: aerospike-config
+  volumeClaimTemplates:
+    - metadata:
+        name: aerospike-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
 ---
 apiVersion: v1
 kind: Service
