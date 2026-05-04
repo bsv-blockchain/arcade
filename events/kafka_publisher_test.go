@@ -15,7 +15,7 @@ func TestKafkaPublisherRoundtrip(t *testing.T) {
 	broker := kafka.NewMemoryBroker(64)
 	defer func() { _ = broker.Close() }()
 
-	pub := NewKafkaPublisher(kafka.NewProducer(broker), zap.NewNop())
+	pub := NewKafkaPublisher(kafka.NewProducer(broker), zap.NewNop(), 0)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -64,7 +64,7 @@ func TestKafkaPublisherFanOut(t *testing.T) {
 	broker := kafka.NewMemoryBroker(64)
 	defer func() { _ = broker.Close() }()
 
-	pub := NewKafkaPublisher(kafka.NewProducer(broker), zap.NewNop())
+	pub := NewKafkaPublisher(kafka.NewProducer(broker), zap.NewNop(), 0)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -39,7 +39,7 @@ func newE2EHarness(t *testing.T) *e2eHarness {
 	gin.SetMode(gin.TestMode)
 
 	broker := kafka.NewMemoryBroker(64)
-	publisher := events.NewKafkaPublisher(kafka.NewProducer(broker), zap.NewNop())
+	publisher := events.NewKafkaPublisher(kafka.NewProducer(broker), zap.NewNop(), 0)
 	st := &sseStoreStub{
 		subsByToken: map[string][]*models.Submission{},
 		statusByTx:  map[string]*models.TransactionStatus{},

@@ -138,7 +138,7 @@ func run(cmd *cobra.Command, _ []string) error {
 	// the webhook delivery service consume from that topic, so the
 	// transaction-status fan-out works whether the deployment is monolithic
 	// (mode=all) or split across pods.
-	publisher := events.NewKafkaPublisher(producer, logger)
+	publisher := events.NewKafkaPublisher(producer, logger, cfg.Events.SubscriberBuffer)
 	defer func() { _ = publisher.Close() }()
 
 	svcs := buildServices(cfg, logger, producer, publisher, st, leaser, txTracker, teranodeClient, merkleClient, txVal)

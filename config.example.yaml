@@ -125,6 +125,17 @@ health:
 #   allow_private_ips: false
 #   max_body_bytes: 16777216    # 16 MiB
 
+# events tunes the in-process status-update fan-out. subscriber_buffer is
+# the channel capacity each Subscribe call mints (one per consumer — SSE
+# manager and webhook delivery). When a consumer can't drain fast enough
+# the publisher logs "subscriber channel full, dropping update" and drops.
+# Default 4096 absorbs typical bursts; raise up to ~65536 if you see drops.
+# Going beyond ~65536 just delays the drop rather than addressing the
+# slow-consumer root cause. Memory cost is roughly
+# subscribers × subscriber_buffer × ~500 bytes per slot.
+# events:
+#   subscriber_buffer: 4096
+
 # propagation:
 #   # Per-endpoint circuit-breaker for the datahub URL list. Endpoints that
 #   # accumulate `failure_threshold` consecutive failures are marked unhealthy

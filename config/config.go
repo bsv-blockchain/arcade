@@ -122,6 +122,7 @@ type Config struct {
 	BumpBuilder   BumpBuilderConfig   `mapstructure:"bump_builder"`
 	Webhook       WebhookConfig       `mapstructure:"webhook"`
 	Callback      CallbackConfig      `mapstructure:"callback"`
+	Events        EventsConfig        `mapstructure:"events"`
 	// ChaintracksServer gates whether the embedded go-chaintracks HTTP API
 	// runs alongside api-server. Default is on so the refactor is a drop-in
 	// replacement for the original single-binary arcade.
@@ -377,6 +378,24 @@ type CallbackConfig struct {
 // F-019 for the threat model.
 const DefaultCallbackMaxBodyBytes int64 = 16 << 20
 
+// EventsConfig tunes the in-process events.Publisher. SubscriberBuffer is
+// the channel capacity each Subscribe call mints — when a downstream
+// consumer (SSE manager, webhook delivery) can't drain fast enough the
+// publisher logs "subscriber channel full, dropping update" and drops.
+// Raising the buffer absorbs larger bursts without dropping; the practical
+// ceiling is ~65536 (beyond that you're masking a slow consumer rather
+// than absorbing a spike). Each Subscribe gets its own buffer, so total
+// memory scales with subscribers × SubscriberBuffer × sizeof(*TransactionStatus).
+type EventsConfig struct {
+	SubscriberBuffer int `mapstructure:"subscriber_buffer"`
+}
+
+// DefaultEventsSubscriberBuffer is the fallback channel capacity for each
+// events.Publisher.Subscribe channel when SubscriberBuffer is unset or
+// non-positive. 4096 is 16× the original 256 — enough headroom for typical
+// status-update bursts without committing significant memory upfront.
+const DefaultEventsSubscriberBuffer = 4096
+
 // TxValidatorConfig tunes the parallel batch validation pipeline. Parallelism
 // caps how many transactions are parsed and validated concurrently inside a
 // single flush window — bounded so a huge in-flight batch can't open more
@@ -523,6 +542,12 @@ func setDefaults() {
 	// Inbound callback body cap. 16 MiB headroom over realistic STUMP payloads
 	// while bounding memory against a hostile or malfunctioning peer (F-019).
 	viper.SetDefault("callback.max_body_bytes", DefaultCallbackMaxBodyBytes)
+
+	// Per-subscription channel capacity for events.Publisher. 4096 is 16× the
+	// original 256 — enough to absorb status-update bursts without committing
+	// significant memory upfront. Operators seeing "subscriber channel full,
+	// dropping update" warnings can raise this up to ~65536.
+	viper.SetDefault("events.subscriber_buffer", DefaultEventsSubscriberBuffer)
 
 	viper.SetDefault("storage_path", "~/.arcade")
 	viper.SetDefault("chaintracks_server.enabled", true)

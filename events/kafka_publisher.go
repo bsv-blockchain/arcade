@@ -21,9 +21,14 @@ import (
 // the same partition in real Kafka). Subscribe spins up a dedicated
 // consumer group with a random ID — every caller gets every message,
 // regardless of how many other subscribers are running.
+// DefaultSubscriberBuffer is the fallback channel capacity used when
+// NewKafkaPublisher is called with a non-positive subscriberBuffer.
+const DefaultSubscriberBuffer = 4096
+
 type KafkaPublisher struct {
-	producer *kafka.Producer
-	logger   *zap.Logger
+	producer         *kafka.Producer
+	logger           *zap.Logger
+	subscriberBuffer int
 
 	mu     sync.Mutex
 	closed bool
@@ -32,11 +37,16 @@ type KafkaPublisher struct {
 
 // NewKafkaPublisher wraps a kafka.Producer. The producer's underlying broker
 // is also used for Subscribe, so a single Publisher serves both publishing
-// and subscribing.
-func NewKafkaPublisher(producer *kafka.Producer, logger *zap.Logger) *KafkaPublisher {
+// and subscribing. subscriberBuffer is the channel capacity minted for each
+// Subscribe call — values <= 0 fall back to DefaultSubscriberBuffer.
+func NewKafkaPublisher(producer *kafka.Producer, logger *zap.Logger, subscriberBuffer int) *KafkaPublisher {
+	if subscriberBuffer <= 0 {
+		subscriberBuffer = DefaultSubscriberBuffer
+	}
 	return &KafkaPublisher{
-		producer: producer,
-		logger:   logger.Named("events.kafka"),
+		producer:         producer,
+		logger:           logger.Named("events.kafka"),
+		subscriberBuffer: subscriberBuffer,
 	}
 }
 
@@ -75,7 +85,7 @@ func (p *KafkaPublisher) Subscribe(ctx context.Context) (<-chan *models.Transact
 		return nil, fmt.Errorf("generating group id: %w", err)
 	}
 
-	out := make(chan *models.TransactionStatus, 256)
+	out := make(chan *models.TransactionStatus, p.subscriberBuffer)
 
 	cg, err := kafka.NewConsumerGroup(kafka.ConsumerConfig{
 		Broker:  p.producer.Broker(),
