@@ -22,9 +22,22 @@ import (
 	"github.com/bsv-blockchain/arcade/callbackurl"
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/events"
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
 )
+
+// defaultMaxConcurrentDeliveries is the fallback pool size when
+// WebhookConfig.MaxConcurrentDeliveries is unset or non-positive.
+const defaultMaxConcurrentDeliveries = 32
+
+// workQueueDepth is the bounded capacity of the channel that hands
+// statuses from the upstream-channel reader to the delivery workers.
+// Sized larger than MaxConcurrentDeliveries so a brief HTTP stall
+// doesn't immediately back-pressure the reader. Drops past this depth
+// land in the WebhookPoolSaturatedTotal counter — the signal that the
+// pool needs to grow.
+const workQueueDepth = 1024
 
 // Service is the entry point for webhook delivery. Wire it up in main.go for
 // every process that should ship callbacks (typically the api-server, but
@@ -103,14 +116,42 @@ func (s *Service) Start(ctx context.Context) error {
 	s.running = true
 	s.mu.Unlock()
 
-	ch, err := s.publisher.Subscribe(ctx)
+	ch, err := s.publisher.Subscribe(ctx, "webhook")
 	if err != nil {
 		return fmt.Errorf("subscribing to events publisher: %w", err)
 	}
+
+	workers := s.cfg.MaxConcurrentDeliveries
+	if workers <= 0 {
+		workers = defaultMaxConcurrentDeliveries
+	}
+
 	s.logger.Info("webhook service started",
 		zap.Int("max_retries", s.cfg.MaxRetries),
 		zap.Int("http_timeout_ms", s.cfg.HTTPTimeoutMs),
+		zap.Int("max_concurrent_deliveries", workers),
 	)
+
+	// Bounded delivery worker pool. handleUpdate does a synchronous
+	// store.GetSubmissionsByTxID plus up to N synchronous HTTP POSTs;
+	// running it on the channel-reader goroutine would let a single slow
+	// callback stall the entire upstream subscription and trigger drops
+	// at the publisher (arcade_events_subscriber_dropped_total).
+	work := make(chan *models.TransactionStatus, workQueueDepth)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for status := range work {
+				s.handleUpdate(ctx, status)
+			}
+		}()
+	}
+	defer func() {
+		close(work)
+		wg.Wait()
+	}()
 
 	for {
 		select {
@@ -123,7 +164,22 @@ func (s *Service) Start(ctx context.Context) error {
 			if status == nil {
 				continue
 			}
-			s.handleUpdate(ctx, status)
+			select {
+			case work <- status:
+			default:
+				// Pool saturated — every worker is blocked on a slow
+				// callback and the work queue is full. Drop with metric;
+				// the lost update is recoverable via the durable Kafka
+				// offset on reconnect, and we'd rather drop here than
+				// back-pressure the upstream subscriber channel (which
+				// would multiply the impact across this and other
+				// subscribers in the same publisher).
+				metrics.WebhookPoolSaturatedTotal.Inc()
+				s.logger.Warn("webhook delivery pool saturated, dropping status",
+					zap.String("txid", status.TxID),
+					zap.String("status", string(status.Status)),
+				)
+			}
 		}
 	}
 }

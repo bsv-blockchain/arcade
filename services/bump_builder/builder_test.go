@@ -784,7 +784,7 @@ func (p *recordingPublisher) Publish(_ context.Context, status *models.Transacti
 	return nil
 }
 
-func (p *recordingPublisher) Subscribe(context.Context) (<-chan *models.TransactionStatus, error) {
+func (p *recordingPublisher) Subscribe(context.Context, string) (<-chan *models.TransactionStatus, error) {
 	return nil, errors.New("recordingPublisher: Subscribe not used in tests")
 }
 

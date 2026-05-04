@@ -7,12 +7,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 )
+
+// dropLogInterval is the minimum time between "subscriber channel full"
+// warn logs per (publisher, caller). The drop count is still tracked
+// precisely via the Prometheus counter — this interval just throttles the
+// log line so a sustained burst doesn't spam the operator with millions of
+// identical warns.
+const dropLogInterval = 5 * time.Second
 
 // KafkaPublisher fans transaction status updates through a Kafka topic so
 // services running in different processes share a view of every status
@@ -72,7 +82,11 @@ func (p *KafkaPublisher) Publish(ctx context.Context, status *models.Transaction
 // The unique groupID guarantees this subscriber sees every message — useful
 // when multiple subscribers (SSE manager + webhook service) coexist in the
 // same process or across pods.
-func (p *KafkaPublisher) Subscribe(ctx context.Context) (<-chan *models.TransactionStatus, error) {
+//
+// caller is a low-cardinality identifier (e.g. "sse", "webhook") used as a
+// Prometheus label on EventsSubscriberDroppedTotal so an operator can tell
+// which subscriber is dropping when the channel fills.
+func (p *KafkaPublisher) Subscribe(ctx context.Context, caller string) (<-chan *models.TransactionStatus, error) {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
@@ -80,12 +94,22 @@ func (p *KafkaPublisher) Subscribe(ctx context.Context) (<-chan *models.Transact
 	}
 	p.mu.Unlock()
 
+	if caller == "" {
+		caller = "unknown"
+	}
+
 	groupID, err := uniqueGroupID()
 	if err != nil {
 		return nil, fmt.Errorf("generating group id: %w", err)
 	}
 
 	out := make(chan *models.TransactionStatus, p.subscriberBuffer)
+
+	// Pre-resolve the counter so the hot path is a single atomic increment.
+	dropCounter := metrics.EventsSubscriberDroppedTotal.WithLabelValues(caller)
+	// Last-warn timestamp (unix nanos) for log throttling. Atomic so the
+	// kafka handler goroutine can update it without a mutex.
+	var lastWarnUnixNano atomic.Int64
 
 	cg, err := kafka.NewConsumerGroup(kafka.ConsumerConfig{
 		Broker:  p.producer.Broker(),
@@ -105,10 +129,20 @@ func (p *KafkaPublisher) Subscribe(ctx context.Context) (<-chan *models.Transact
 				// Slow consumer — drop rather than block the broker. Matches the
 				// old arcade's non-blocking fan-out semantics; SSE clients
 				// recover via Last-Event-ID catchup on reconnect.
-				p.logger.Warn("subscriber channel full, dropping update",
-					zap.String("txid", status.TxID),
-					zap.String("status", string(status.Status)),
-				)
+				dropCounter.Inc()
+				// Throttle the warn log: every drop bumps the counter (so
+				// Prometheus has the precise rate), but we only emit a log
+				// line once per dropLogInterval to avoid drowning the
+				// operator under sustained pressure.
+				now := time.Now().UnixNano()
+				prev := lastWarnUnixNano.Load()
+				if now-prev >= int64(dropLogInterval) && lastWarnUnixNano.CompareAndSwap(prev, now) {
+					p.logger.Warn("subscriber channel full, dropping update",
+						zap.String("caller", caller),
+						zap.String("txid", status.TxID),
+						zap.String("status", string(status.Status)),
+					)
+				}
 			}
 			return nil
 		},

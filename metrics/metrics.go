@@ -271,6 +271,32 @@ var APISSEDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "SSE fan-out events dropped without delivery, by reason.",
 }, []string{"reason"}) // slow_client, client_gone
 
+// EventsSubscriberDroppedTotal counts events.Publisher.Subscribe channel
+// drops, labeled by which caller's channel filled. The publisher emits a
+// drop when the per-subscriber buffer is at capacity and the kafka handler
+// goroutine can't enqueue the next message without blocking. A sustained
+// non-zero rate on a particular caller (e.g. "webhook") points to that
+// subscriber's downstream draining slower than the producer rate — typical
+// causes are synchronous I/O in the channel reader or a CPU-pressured pod.
+var EventsSubscriberDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_events_subscriber_dropped_total",
+	Help: "events.Publisher subscriber-channel drops, labeled by caller (e.g. sse, webhook).",
+}, []string{"caller"})
+
+// WebhookPoolSaturatedTotal counts status updates that the webhook
+// service dropped because its bounded delivery worker pool was full when
+// the channel reader tried to enqueue them. A non-zero rate means
+// MaxConcurrentDeliveries is too low for the current rate of slow
+// callbacks: workers are blocked on http.Client.Do and incoming statuses
+// pile up faster than the work channel can hold them. Distinguishes
+// pool-pressure drops from upstream subscriber-channel drops
+// (arcade_events_subscriber_dropped_total{caller="webhook"}) so the two
+// failure modes can be tuned independently.
+var WebhookPoolSaturatedTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "arcade_webhook_pool_saturated_total",
+	Help: "Status updates dropped by the webhook service because its delivery worker pool was full.",
+})
+
 // ---------------------------------------------------------------------------
 // teranode (HTTP client)
 // ---------------------------------------------------------------------------

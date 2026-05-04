@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -133,10 +134,23 @@ func (s *fakeStore) Close() error { return nil }
 type recordingPub struct{}
 
 func (recordingPub) Publish(context.Context, *models.TransactionStatus) error { return nil }
-func (recordingPub) Subscribe(context.Context) (<-chan *models.TransactionStatus, error) {
+func (recordingPub) Subscribe(context.Context, string) (<-chan *models.TransactionStatus, error) {
 	return nil, errors.New("not used in tests")
 }
 func (recordingPub) Close() error { return nil }
+
+// scriptedPub serves a caller-supplied channel from Subscribe so tests can
+// drive Service.Start with synthetic status updates and observe how the
+// channel reader / worker pool route them downstream.
+type scriptedPub struct {
+	ch chan *models.TransactionStatus
+}
+
+func (p *scriptedPub) Publish(context.Context, *models.TransactionStatus) error { return nil }
+func (p *scriptedPub) Subscribe(context.Context, string) (<-chan *models.TransactionStatus, error) {
+	return p.ch, nil
+}
+func (p *scriptedPub) Close() error { return nil }
 
 // TestDeliverSuccess covers the happy path: matching submission, terminal
 // status, callback URL gets POSTed with the bearer token, store records
@@ -356,5 +370,123 @@ func TestSSRFGuardBlocksLoopbackDial(t *testing.T) {
 	}
 	if st.deliveries[0].RetryCount != 1 {
 		t.Errorf("RetryCount = %d, want 1", st.deliveries[0].RetryCount)
+	}
+}
+
+// TestStartDecouplesSlowDelivery is the regression test for the worker-pool
+// fix. The previous implementation called handleUpdate (synchronous DB
+// lookup + synchronous HTTP POST) on the channel-reader goroutine, so a
+// single slow callback target stalled draining of the upstream
+// events.Publisher subscriber channel and triggered drops there. The fix
+// hands each status to a bounded worker pool; the reader stays drainable
+// while workers are blocked on slow targets.
+//
+// The test stalls one delivery (server never responds, only ctx-cancel
+// unblocks it) and asserts that subsequent statuses still reach
+// handleUpdate via other workers — i.e. the reader didn't block on the
+// stalled delivery.
+func TestStartDecouplesSlowDelivery(t *testing.T) {
+	stallStarted := make(chan struct{}, 1)
+	releaseStall := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Notify on first hit, then block until releaseStall fires or the
+		// request context cancels (which will happen at test cleanup).
+		select {
+		case stallStarted <- struct{}{}:
+		default:
+		}
+		select {
+		case <-releaseStall:
+			w.WriteHeader(http.StatusOK)
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	defer close(releaseStall)
+
+	var fastHits atomic.Int32
+	fastSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fastHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer fastSrv.Close()
+
+	// One stalled submission plus several distinct fast submissions: each
+	// fast tx has its own LastDeliveredStatus so shouldDeliver doesn't
+	// dedup them away after the first success.
+	st := &fakeStore{
+		subs: map[string][]*models.Submission{
+			"txStall": {{SubmissionID: "stall", TxID: "txStall", CallbackURL: srv.URL}},
+			"txFast0": {{SubmissionID: "fast0", TxID: "txFast0", CallbackURL: fastSrv.URL}},
+			"txFast1": {{SubmissionID: "fast1", TxID: "txFast1", CallbackURL: fastSrv.URL}},
+			"txFast2": {{SubmissionID: "fast2", TxID: "txFast2", CallbackURL: fastSrv.URL}},
+			"txFast3": {{SubmissionID: "fast3", TxID: "txFast3", CallbackURL: fastSrv.URL}},
+		},
+	}
+
+	pub := &scriptedPub{ch: make(chan *models.TransactionStatus, 16)}
+
+	// Pool of 2 workers: enough to keep one stalled delivery from blocking
+	// every worker, while still small enough to make the test fast.
+	svc := New(
+		config.WebhookConfig{
+			HTTPTimeoutMs:           60_000, // long, so the stall actually stalls
+			MaxRetries:              3,
+			InitialBackoffMs:        1,
+			MaxBackoffMs:            10,
+			MaxConcurrentDeliveries: 2,
+		},
+		config.CallbackConfig{AllowPrivateIPs: true}, // server is on 127.0.0.1
+		zap.NewNop(), pub, st,
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	startErr := make(chan error, 1)
+	go func() { startErr <- svc.Start(ctx) }()
+
+	// First, send the stall-bound status. Wait until the stalled HTTP
+	// handler has actually been entered — this proves a worker has picked
+	// up the status and is blocked.
+	pub.ch <- &models.TransactionStatus{TxID: "txStall", Status: models.StatusMined, Timestamp: time.Now()}
+	select {
+	case <-stallStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stalled HTTP server was never hit; worker pool didn't pick up the status")
+	}
+
+	// With one worker stalled, send several fast-bound statuses. If the
+	// channel reader were still synchronous (pre-fix), the second worker
+	// would also be busy serving handleUpdate and the reader would
+	// eventually block on the stalled HTTP call. With the worker-pool
+	// decoupling, the reader stays free and the second worker handles
+	// these promptly.
+	for i := 0; i < 4; i++ {
+		pub.ch <- &models.TransactionStatus{
+			TxID:      fmt.Sprintf("txFast%d", i),
+			Status:    models.StatusMined,
+			Timestamp: time.Now(),
+		}
+	}
+
+	// All four fast deliveries should land within a generous timeout.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if fastHits.Load() >= 4 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := fastHits.Load(); got < 4 {
+		t.Fatalf("fast deliveries got through: %d, want 4 — channel reader appears to be blocked by stalled delivery", got)
+	}
+
+	// Cleanly stop the service.
+	cancel()
+	select {
+	case <-startErr:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Start did not return after ctx cancel")
 	}
 }

@@ -19,8 +19,13 @@ import (
 // Publish must be safe for concurrent use across goroutines. Subscribe
 // returns a channel the caller drains until ctx is canceled; on cancellation,
 // the channel is closed and any backend resources released.
+//
+// The caller string identifies the subscriber for observability — drop and
+// pressure metrics are labeled with it so an operator can tell which
+// subscriber (e.g. "sse", "webhook") is failing to keep up. Use a
+// low-cardinality, stable identifier; treat it as a Prometheus label.
 type Publisher interface {
 	Publish(ctx context.Context, status *models.TransactionStatus) error
-	Subscribe(ctx context.Context) (<-chan *models.TransactionStatus, error)
+	Subscribe(ctx context.Context, caller string) (<-chan *models.TransactionStatus, error)
 	Close() error
 }

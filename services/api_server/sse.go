@@ -85,7 +85,7 @@ func newSSEManager(ctx context.Context, publisher events.Publisher, st store.Sto
 		parentCtx: ctx,
 		clients:   make(map[int64]*sseClient),
 	}
-	ch, err := publisher.Subscribe(ctx)
+	ch, err := publisher.Subscribe(ctx, "sse")
 	if err != nil {
 		return nil, fmt.Errorf("subscribing to events publisher: %w", err)
 	}

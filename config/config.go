@@ -344,6 +344,18 @@ type WebhookConfig struct {
 	// HTTPTimeoutMs caps how long a single POST attempt may run. Default
 	// 10s — webhook receivers should ack fast or risk being timed out.
 	HTTPTimeoutMs int `mapstructure:"http_timeout_ms"`
+	// MaxConcurrentDeliveries bounds the worker pool that fans status
+	// updates out to callback URLs. The service's channel reader hands
+	// each status to the pool and immediately returns to draining the
+	// upstream events.Publisher channel — without this decoupling, a
+	// single slow callback target (synchronous http.Client.Do up to
+	// HTTPTimeoutMs) would block the channel reader and cause the
+	// publisher to drop subsequent events as the in-memory buffer
+	// filled. Default 32: comfortably above expected concurrent slow
+	// callbacks while staying well under the per-pod TCP/connection
+	// budget. Increase only if pool saturation
+	// (arcade_webhook_pool_saturated_total) shows non-trivial drop rate.
+	MaxConcurrentDeliveries int `mapstructure:"max_concurrent_deliveries"`
 }
 
 // CallbackConfig governs the SSRF guard that protects api-server's
@@ -533,6 +545,7 @@ func setDefaults() {
 	viper.SetDefault("webhook.initial_backoff_ms", 5000)
 	viper.SetDefault("webhook.max_backoff_ms", 300000)
 	viper.SetDefault("webhook.http_timeout_ms", 10000)
+	viper.SetDefault("webhook.max_concurrent_deliveries", 32)
 
 	// Callback SSRF guard defaults to enabled (allow_private_ips=false). See
 	// finding F-017 / issue #75 — accepting any X-CallbackUrl turned arcade

@@ -46,7 +46,7 @@ func (p *fakePublisher) Publish(_ context.Context, status *models.TransactionSta
 	return nil
 }
 
-func (p *fakePublisher) Subscribe(_ context.Context) (<-chan *models.TransactionStatus, error) {
+func (p *fakePublisher) Subscribe(_ context.Context, _ string) (<-chan *models.TransactionStatus, error) {
 	ch := make(chan *models.TransactionStatus, 64)
 	p.mu.Lock()
 	p.subscribers = append(p.subscribers, ch)
