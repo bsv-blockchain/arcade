@@ -9,7 +9,7 @@ require (
 	github.com/bsv-blockchain/go-p2p-message-bus v0.1.18
 	github.com/bsv-blockchain/go-sdk v1.2.23
 	github.com/bsv-blockchain/go-teranode-p2p-client v0.2.5
-	github.com/bsv-blockchain/teranode v0.15.0-beta-3
+	github.com/bsv-blockchain/teranode v0.15.0-beta-5
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/fergusstrange/embedded-postgres v1.34.0
 	github.com/gin-gonic/gin v1.12.0
@@ -48,7 +48,7 @@ require (
 	github.com/aws/smithy-go v1.25.1 // indirect
 	github.com/benbjohnson/clock v1.3.5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
-	github.com/bsv-blockchain/go-batcher v1.2.11 // indirect
+	github.com/bsv-blockchain/go-batcher/v2 v2.0.0 // indirect
 	github.com/bsv-blockchain/go-bt/v2 v2.6.3 // indirect
 	github.com/bsv-blockchain/go-chaincfg v1.5.7 // indirect
 	github.com/bsv-blockchain/go-lockfree-queue v1.1.3 // indirect
