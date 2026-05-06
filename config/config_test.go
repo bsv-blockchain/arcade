@@ -214,6 +214,39 @@ func TestResolveChaintracksNetwork(t *testing.T) {
 	}
 }
 
+// Issue #60 / finding F-002: cmd/arcade/main.go's buildServices wires up the
+// webhook delivery service when mode=="webhook" (so operators can split it out
+// into its own pod), but the validate() validModes map was missing "webhook"
+// and rejected the documented configuration with "invalid mode". Each mode the
+// runtime understands must validate cleanly.
+func TestValidate_AcceptsAllRuntimeModes(t *testing.T) {
+	for _, mode := range []string{
+		"all", "api-server", "bump-builder", "tx-validator",
+		"propagation", "p2p-client", "webhook",
+	} {
+		cfg := baseValidConfig()
+		cfg.Mode = mode
+		if err := validate(cfg); err != nil {
+			t.Errorf("mode=%q should be accepted, got: %v", mode, err)
+		}
+	}
+}
+
+// Anything outside the known mode set must still be rejected so typos like
+// "webhooks" or "api_server" fail fast at config load instead of silently
+// producing a binary that runs zero services.
+func TestValidate_RejectsUnknownMode(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.Mode = "webhooks" // common typo of the now-valid "webhook"
+	err := validate(cfg)
+	if err == nil {
+		t.Fatal("expected error for unknown mode")
+	}
+	if !strings.Contains(err.Error(), "invalid mode") {
+		t.Errorf("error should mention invalid mode, got: %v", err)
+	}
+}
+
 // TestDefaultCallbackMaxBodyBytes pins the default body cap for the inbound
 // callback receiver. Set to 16 MiB — comfortably over a realistic STUMP
 // delivery while bounding worst-case memory if a peer is malicious or
