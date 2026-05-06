@@ -413,8 +413,19 @@ const DefaultEventsSubscriberBuffer = 4096
 // single flush window — bounded so a huge in-flight batch can't open more
 // goroutines than the host has cores. Zero or negative falls back to
 // runtime.NumCPU at construction time.
+//
+// SkipFeeValidation / SkipScriptValidation default to false (i.e. fees AND
+// scripts are checked). They exist as escape hatches for environments that
+// can't currently fulfil the underlying validator's prerequisites — for
+// example, deployments without a wired-up chaintracker should set
+// skip_script_validation=true rather than letting the SDK silently fall back
+// to WhatsOnChain. Operators flipping these to true accept that fee/script
+// rules will not be enforced for submitted transactions; they MUST NOT be
+// flipped on in production without a compensating control.
 type TxValidatorConfig struct {
-	Parallelism int `mapstructure:"parallelism"`
+	Parallelism          int  `mapstructure:"parallelism"`
+	SkipFeeValidation    bool `mapstructure:"skip_fee_validation"`
+	SkipScriptValidation bool `mapstructure:"skip_script_validation"`
 }
 
 func BindFlags(cmd *cobra.Command) {

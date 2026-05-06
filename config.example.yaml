@@ -160,6 +160,15 @@ tx_validator:
 # window. Validation is CPU-bound and stateless, so the sweet spot is around
 # NumCPU. Set 0 to take runtime.NumCPU() at startup.
 # parallelism: 0
+#
+# skip_fee_validation / skip_script_validation default to false. Leave them
+# false in production — the validator will then enforce the policy minimum
+# fee and run full script verification (via spv.Verify) for every submitted
+# transaction. Set either true ONLY in tests or in environments where the
+# underlying preconditions can't be satisfied (e.g. no chaintracker is wired
+# up yet); flipping them on is equivalent to "trust whatever the client sent".
+# skip_fee_validation: false
+# skip_script_validation: false
 
 bump_builder:
   # Grace window after BLOCK_PROCESSED before reading STUMPs, to allow for
