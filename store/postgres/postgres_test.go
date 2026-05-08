@@ -14,6 +14,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"testing"
@@ -90,7 +91,7 @@ func runWithSharedStore(m *testing.M) (int, func()) {
 	return m.Run(), cleanup
 }
 
-const truncateSQL = `TRUNCATE transactions, bumps, stumps, submissions, leases, datahub_endpoints`
+const truncateSQL = `TRUNCATE transactions, bumps, stumps, submissions, leases, datahub_endpoints, block_processing`
 
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
@@ -666,4 +667,193 @@ func TestBatchUpdateStatus_TerminalNotOverwritten(t *testing.T) {
 				r.txid, r.seedTerm, r.regress, got.Status)
 		}
 	}
+}
+
+// --- Block processing status ---
+
+func TestBlockProcessing_Upsert_Header_Then_Processed(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	hash := "aa11"
+	t0 := time.Unix(1700000000, 0).UTC()
+	t1 := t0.Add(2 * time.Second)
+	t2 := t0.Add(4 * time.Second)
+
+	if err := s.UpsertBlockHeaderSeen(ctx, hash, 100, t0); err != nil {
+		t.Fatalf("seen: %v", err)
+	}
+	if err := s.MarkBlockProcessed(ctx, hash, 100, t1); err != nil {
+		t.Fatalf("processed: %v", err)
+	}
+	if err := s.MarkBlockBUMPBuilt(ctx, hash, 100, t2); err != nil {
+		t.Fatalf("bump: %v", err)
+	}
+	got, err := s.GetBlockProcessingStatus(ctx, hash)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.BlockHeight != 100 || !got.HeaderSeenAt.Equal(t0) {
+		t.Errorf("got height=%d seen=%v want 100/%v", got.BlockHeight, got.HeaderSeenAt, t0)
+	}
+	if got.ProcessedAt == nil || !got.ProcessedAt.Equal(t1) {
+		t.Errorf("processed=%v want %v", got.ProcessedAt, t1)
+	}
+	if got.BUMPBuiltAt == nil || !got.BUMPBuiltAt.Equal(t2) {
+		t.Errorf("bumpBuilt=%v want %v", got.BUMPBuiltAt, t2)
+	}
+	if got.Status != models.BlockStatusActive {
+		t.Errorf("status=%q want active", got.Status)
+	}
+}
+
+func TestBlockProcessing_OutOfOrder_Processed_Then_Header(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	hash := "bb22"
+	tProc := time.Unix(1700000010, 0).UTC()
+	tSeen := tProc.Add(time.Second)
+
+	if err := s.MarkBlockProcessed(ctx, hash, 0, tProc); err != nil {
+		t.Fatalf("processed: %v", err)
+	}
+	got, _ := s.GetBlockProcessingStatus(ctx, hash)
+	if !got.HeaderSeenAt.Equal(tProc) {
+		t.Errorf("synthesized seen=%v want %v", got.HeaderSeenAt, tProc)
+	}
+
+	if err := s.UpsertBlockHeaderSeen(ctx, hash, 200, tSeen); err != nil {
+		t.Fatalf("seen: %v", err)
+	}
+	got, _ = s.GetBlockProcessingStatus(ctx, hash)
+	if got.BlockHeight != 200 {
+		t.Errorf("height=%d want 200", got.BlockHeight)
+	}
+	if got.ProcessedAt == nil || !got.ProcessedAt.Equal(tProc) {
+		t.Errorf("processed clobbered: got %v want %v", got.ProcessedAt, tProc)
+	}
+	if !got.HeaderSeenAt.Equal(tProc) {
+		t.Errorf("HeaderSeenAt should preserve %v, got %v", tProc, got.HeaderSeenAt)
+	}
+}
+
+func TestBlockProcessing_HeaderReArrival_Idempotent(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	hash := "cc33"
+	t0 := time.Unix(1700000020, 0).UTC()
+
+	if err := s.UpsertBlockHeaderSeen(ctx, hash, 300, t0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkBlockProcessed(ctx, hash, 300, t0.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertBlockHeaderSeen(ctx, hash, 300, t0.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.GetBlockProcessingStatus(ctx, hash)
+	if !got.HeaderSeenAt.Equal(t0) {
+		t.Errorf("HeaderSeenAt should preserve %v, got %v", t0, got.HeaderSeenAt)
+	}
+	if got.ProcessedAt == nil {
+		t.Error("ProcessedAt cleared on header re-arrival")
+	}
+}
+
+func TestBlockProcessing_MarkOrphaned_AndResurrection(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	hash := "dd44"
+	t0 := time.Unix(1700000030, 0).UTC()
+
+	if err := s.UpsertBlockHeaderSeen(ctx, hash, 400, t0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkBlocksOrphaned(ctx, []string{hash}, t0.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.GetBlockProcessingStatus(ctx, hash)
+	if got.Status != models.BlockStatusOrphaned || got.OrphanedAt == nil {
+		t.Errorf("after orphan: status=%q orphanedAt=%v", got.Status, got.OrphanedAt)
+	}
+
+	if err := s.UpsertBlockHeaderSeen(ctx, hash, 400, t0.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.GetBlockProcessingStatus(ctx, hash)
+	if got.Status != models.BlockStatusActive || got.OrphanedAt != nil {
+		t.Errorf("after resurrect: status=%q orphanedAt=%v", got.Status, got.OrphanedAt)
+	}
+}
+
+func TestBlockProcessing_NotFound(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.GetBlockProcessingStatus(context.Background(), "missing"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("err=%v want ErrNotFound", err)
+	}
+}
+
+func TestBlockProcessing_List_DescendingHeight_Pagination(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	t0 := time.Unix(1700000100, 0).UTC()
+	for i := uint64(1); i <= 75; i++ {
+		hash := fmt.Sprintf("h%04d", i)
+		if err := s.UpsertBlockHeaderSeen(ctx, hash, i, t0); err != nil {
+			t.Fatalf("seed %d: %v", i, err)
+		}
+	}
+
+	var seen []uint64
+	cursor := uint64(0)
+	for {
+		page, err := s.ListBlockProcessingStatus(ctx, cursor, 20)
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		for _, bp := range page {
+			seen = append(seen, bp.BlockHeight)
+		}
+		cursor = page[len(page)-1].BlockHeight
+		if len(page) < 20 {
+			break
+		}
+	}
+	if len(seen) != 75 {
+		t.Fatalf("walked %d want 75", len(seen))
+	}
+	for i := 1; i < len(seen); i++ {
+		if seen[i-1] <= seen[i] {
+			t.Fatalf("not descending at i=%d: %d <= %d", i, seen[i-1], seen[i])
+		}
+	}
+}
+
+func TestBlockProcessing_List_BeforeHeight_Excludes(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	t0 := time.Unix(1700000200, 0).UTC()
+	for _, h := range []uint64{10, 20, 30, 40, 50} {
+		if err := s.UpsertBlockHeaderSeen(ctx, fmt.Sprintf("h%d", h), h, t0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, err := s.ListBlockProcessingStatus(ctx, 30, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 2 || page[0].BlockHeight != 20 || page[1].BlockHeight != 10 {
+		t.Errorf("got %d rows, heights=%v", len(page), heightsOf(page))
+	}
+}
+
+func heightsOf(rows []*models.BlockProcessingStatus) []uint64 {
+	out := make([]uint64, len(rows))
+	for i, r := range rows {
+		out[i] = r.BlockHeight
+	}
+	return out
 }

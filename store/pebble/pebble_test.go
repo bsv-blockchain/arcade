@@ -3,6 +3,7 @@ package pebble
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -602,5 +603,222 @@ func TestDatahubEndpoints_RejectsEmptyURL(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for empty URL")
+	}
+}
+
+// --- Block processing status ---
+
+func TestBlockProcessing_Upsert_Header_Then_Processed(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	hash := "aa11"
+	t0 := time.Unix(1700000000, 0).UTC()
+	t1 := t0.Add(2 * time.Second)
+	t2 := t0.Add(4 * time.Second)
+
+	if err := s.UpsertBlockHeaderSeen(ctx, hash, 100, t0); err != nil {
+		t.Fatalf("header seen: %v", err)
+	}
+	if err := s.MarkBlockProcessed(ctx, hash, 100, t1); err != nil {
+		t.Fatalf("processed: %v", err)
+	}
+	if err := s.MarkBlockBUMPBuilt(ctx, hash, 100, t2); err != nil {
+		t.Fatalf("bump built: %v", err)
+	}
+
+	got, err := s.GetBlockProcessingStatus(ctx, hash)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.BlockHeight != 100 {
+		t.Errorf("BlockHeight=%d, want 100", got.BlockHeight)
+	}
+	if !got.HeaderSeenAt.Equal(t0) {
+		t.Errorf("HeaderSeenAt=%v, want %v", got.HeaderSeenAt, t0)
+	}
+	if got.ProcessedAt == nil || !got.ProcessedAt.Equal(t1) {
+		t.Errorf("ProcessedAt=%v, want %v", got.ProcessedAt, t1)
+	}
+	if got.BUMPBuiltAt == nil || !got.BUMPBuiltAt.Equal(t2) {
+		t.Errorf("BUMPBuiltAt=%v, want %v", got.BUMPBuiltAt, t2)
+	}
+	if got.Status != models.BlockStatusActive {
+		t.Errorf("Status=%q, want active", got.Status)
+	}
+}
+
+func TestBlockProcessing_OutOfOrder_Processed_Then_Header(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	hash := "bb22"
+	tProc := time.Unix(1700000010, 0).UTC()
+	tSeen := tProc.Add(time.Second)
+
+	// BLOCK_PROCESSED arrives first with height=0 (callback has no height).
+	if err := s.MarkBlockProcessed(ctx, hash, 0, tProc); err != nil {
+		t.Fatalf("processed: %v", err)
+	}
+	got, _ := s.GetBlockProcessingStatus(ctx, hash)
+	if !got.HeaderSeenAt.Equal(tProc) {
+		t.Errorf("synthesized HeaderSeenAt=%v, want %v", got.HeaderSeenAt, tProc)
+	}
+	if got.BlockHeight != 0 {
+		t.Errorf("BlockHeight before header=%d, want 0", got.BlockHeight)
+	}
+
+	// Header lands later with the real height.
+	if err := s.UpsertBlockHeaderSeen(ctx, hash, 200, tSeen); err != nil {
+		t.Fatalf("header seen: %v", err)
+	}
+	got, _ = s.GetBlockProcessingStatus(ctx, hash)
+	if got.BlockHeight != 200 {
+		t.Errorf("BlockHeight after header=%d, want 200 (chaintracks authoritative)", got.BlockHeight)
+	}
+	// Original processed_at must be preserved.
+	if got.ProcessedAt == nil || !got.ProcessedAt.Equal(tProc) {
+		t.Errorf("ProcessedAt clobbered: got %v, want %v", got.ProcessedAt, tProc)
+	}
+	// Original synthesized header_seen_at must be preserved (not bumped to tSeen).
+	if !got.HeaderSeenAt.Equal(tProc) {
+		t.Errorf("HeaderSeenAt should be preserved at %v, got %v", tProc, got.HeaderSeenAt)
+	}
+}
+
+func TestBlockProcessing_HeaderReArrival_Idempotent(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	hash := "cc33"
+	t0 := time.Unix(1700000020, 0).UTC()
+
+	if err := s.UpsertBlockHeaderSeen(ctx, hash, 300, t0); err != nil {
+		t.Fatalf("first seen: %v", err)
+	}
+	if err := s.MarkBlockProcessed(ctx, hash, 300, t0.Add(time.Second)); err != nil {
+		t.Fatalf("processed: %v", err)
+	}
+	// Re-arrive with a later timestamp.
+	if err := s.UpsertBlockHeaderSeen(ctx, hash, 300, t0.Add(time.Hour)); err != nil {
+		t.Fatalf("second seen: %v", err)
+	}
+	got, _ := s.GetBlockProcessingStatus(ctx, hash)
+	if !got.HeaderSeenAt.Equal(t0) {
+		t.Errorf("HeaderSeenAt should be preserved at %v, got %v", t0, got.HeaderSeenAt)
+	}
+	if got.ProcessedAt == nil {
+		t.Error("ProcessedAt cleared on header re-arrival")
+	}
+}
+
+func TestBlockProcessing_MarkOrphaned_AndResurrection(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	hash := "dd44"
+	t0 := time.Unix(1700000030, 0).UTC()
+
+	if err := s.UpsertBlockHeaderSeen(ctx, hash, 400, t0); err != nil {
+		t.Fatalf("seen: %v", err)
+	}
+	if err := s.MarkBlocksOrphaned(ctx, []string{hash}, t0.Add(time.Minute)); err != nil {
+		t.Fatalf("orphan: %v", err)
+	}
+	got, _ := s.GetBlockProcessingStatus(ctx, hash)
+	if got.Status != models.BlockStatusOrphaned {
+		t.Errorf("Status=%q, want orphaned", got.Status)
+	}
+	if got.OrphanedAt == nil {
+		t.Error("OrphanedAt should be set")
+	}
+
+	// Resurrection: header re-arrives.
+	if err := s.UpsertBlockHeaderSeen(ctx, hash, 400, t0.Add(time.Hour)); err != nil {
+		t.Fatalf("resurrect: %v", err)
+	}
+	got, _ = s.GetBlockProcessingStatus(ctx, hash)
+	if got.Status != models.BlockStatusActive {
+		t.Errorf("Status after resurrection=%q, want active", got.Status)
+	}
+	if got.OrphanedAt != nil {
+		t.Errorf("OrphanedAt should be cleared, got %v", got.OrphanedAt)
+	}
+}
+
+func TestBlockProcessing_MarkOrphaned_MissingRow_NoOp(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if err := s.MarkBlocksOrphaned(ctx, []string{"never-seen"}, time.Now()); err != nil {
+		t.Fatalf("orphan missing: %v", err)
+	}
+}
+
+func TestBlockProcessing_NotFound(t *testing.T) {
+	s := newTestStore(t)
+	_, err := s.GetBlockProcessingStatus(context.Background(), "missing")
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("err=%v, want ErrNotFound", err)
+	}
+}
+
+func TestBlockProcessing_List_DescendingHeight_Pagination(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	t0 := time.Unix(1700000100, 0).UTC()
+	for i := uint64(1); i <= 75; i++ {
+		hash := fmt.Sprintf("h%04d", i)
+		if err := s.UpsertBlockHeaderSeen(ctx, hash, i, t0); err != nil {
+			t.Fatalf("seed %d: %v", i, err)
+		}
+	}
+
+	// Walk via cursor pages of 20.
+	var seen []uint64
+	cursor := uint64(0)
+	for {
+		page, err := s.ListBlockProcessingStatus(ctx, cursor, 20)
+		if err != nil {
+			t.Fatalf("list cursor=%d: %v", cursor, err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		for _, bp := range page {
+			seen = append(seen, bp.BlockHeight)
+		}
+		// Next page starts strictly before the lowest height we just saw.
+		cursor = page[len(page)-1].BlockHeight
+		if len(page) < 20 {
+			break
+		}
+	}
+	if len(seen) != 75 {
+		t.Fatalf("walked %d rows, want 75", len(seen))
+	}
+	for i := 1; i < len(seen); i++ {
+		if seen[i-1] <= seen[i] {
+			t.Fatalf("not strictly descending at i=%d: %d <= %d", i, seen[i-1], seen[i])
+		}
+	}
+	if seen[0] != 75 || seen[len(seen)-1] != 1 {
+		t.Errorf("unexpected endpoints first=%d last=%d", seen[0], seen[len(seen)-1])
+	}
+}
+
+func TestBlockProcessing_List_BeforeHeight_ExcludesEqualAndAbove(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	t0 := time.Unix(1700000200, 0).UTC()
+	for _, h := range []uint64{10, 20, 30, 40, 50} {
+		if err := s.UpsertBlockHeaderSeen(ctx, fmt.Sprintf("h%d", h), h, t0); err != nil {
+			t.Fatalf("seed %d: %v", h, err)
+		}
+	}
+	page, err := s.ListBlockProcessingStatus(ctx, 30, 100)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(page) != 2 {
+		t.Fatalf("got %d rows, want 2 (heights 10, 20)", len(page))
+	}
+	if page[0].BlockHeight != 20 || page[1].BlockHeight != 10 {
+		t.Errorf("got heights %d,%d want 20,10", page[0].BlockHeight, page[1].BlockHeight)
 	}
 }

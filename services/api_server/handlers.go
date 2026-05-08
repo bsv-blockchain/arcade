@@ -410,6 +410,14 @@ func (s *Server) handleBlockProcessed(c *gin.Context, msg models.CallbackMessage
 		c.JSON(http.StatusBadRequest, gin.H{"error": "blockHash is required"})
 		return
 	}
+	// Record the milestone for observability before enqueueing — this is
+	// load-bearing only for the /api/v1/blocks/processing-status surface,
+	// not for BUMP construction. The callback message currently carries no
+	// block height, so 0 is passed; UpsertBlockHeaderSeen on the chaintracks
+	// path is authoritative for height and will overwrite a 0 placeholder.
+	if err := s.store.MarkBlockProcessed(c.Request.Context(), msg.BlockHash, 0, time.Now()); err != nil {
+		logger.Warn("failed to record block_processed status", zap.Error(err))
+	}
 	if err := s.producer.Send(kafka.TopicBlockProcessed, msg.BlockHash, msg); err != nil {
 		logger.Error("failed to publish block_processed", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to enqueue"})

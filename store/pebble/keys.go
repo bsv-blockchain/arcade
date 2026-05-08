@@ -21,13 +21,15 @@ const (
 	prefixLease   = "lease:"
 	prefixDatahub = "dh:"
 
-	prefixIdxTxStatus     = "idx:tx:status:"
-	prefixIdxTxBlock      = "idx:tx:block:"
-	prefixIdxTxRetryReady = "idx:tx:retry_ready:"
-	prefixIdxTxUpdated    = "idx:tx:updated:"
-	prefixIdxSubTxID      = "idx:sub:txid:"
-	prefixIdxSubToken     = "idx:sub:token:" //nolint:gosec // index-prefix string, not a credential
-	prefixIdxStumpBlock   = "idx:stump:block:"
+	prefixIdxTxStatus        = "idx:tx:status:"
+	prefixIdxTxBlock         = "idx:tx:block:"
+	prefixIdxTxRetryReady    = "idx:tx:retry_ready:"
+	prefixIdxTxUpdated       = "idx:tx:updated:"
+	prefixIdxSubTxID         = "idx:sub:txid:"
+	prefixIdxSubToken        = "idx:sub:token:" //nolint:gosec // index-prefix string, not a credential
+	prefixIdxStumpBlock      = "idx:stump:block:"
+	prefixBlockProc          = "blkproc:"
+	prefixIdxBlockProcHeight = "idx:blkproc:height:"
 )
 
 func txKey(txid string) []byte             { return []byte(prefixTx + txid) }
@@ -99,6 +101,19 @@ func idxSubTokenPrefix(token string) []byte {
 func idxStumpBlockKey(blockHash string, subtreeIndex int) []byte {
 	return []byte(fmt.Sprintf("%s%s:%010d", prefixIdxStumpBlock, blockHash, subtreeIndex))
 }
+
+// blockProcKey is the primary record key for a block-processing row.
+func blockProcKey(blockHash string) []byte { return []byte(prefixBlockProc + blockHash) }
+
+// idxBlockProcHeightKey encodes block_height as the bitwise-inverted uint64
+// rendered as 16 hex digits so a forward iterator over the index prefix
+// returns rows in descending-height order. Same trick the retry index uses
+// for time-ordered scans, but inverted because we want newest-first.
+func idxBlockProcHeightKey(blockHeight uint64, blockHash string) []byte {
+	return []byte(fmt.Sprintf("%s%016x:%s", prefixIdxBlockProcHeight, ^blockHeight, blockHash))
+}
+
+func idxBlockProcHeightPrefix() []byte { return []byte(prefixIdxBlockProcHeight) }
 
 // idEndOfPrefix returns the upper bound of a prefix range for use with
 // pebble.IterOptions.UpperBound. The returned slice is the shortest bytes

@@ -39,7 +39,7 @@ const (
 	setBumps            = "arcade_bumps"
 	setStumps           = "arcade_stumps"
 	setSubmissions      = "arcade_submissions"
-	setProcessedBlocks  = "arcade_processed_blocks"
+	setBlockProcessing  = "arcade_block_processing"
 	setLeases           = "arcade_leases"
 	setDatahubEndpoints = "arcade_datahub_endpoints"
 )
@@ -168,7 +168,8 @@ func (s *Store) EnsureIndexes() error {
 		{setTransactions, "block_hash", "arcade_idx_tx_block_hash", aero.STRING},
 		{setSubmissions, "txid", "arcade_idx_sub_txid", aero.STRING},
 		{setSubmissions, "callback_token", "arcade_idx_sub_callback_token", aero.STRING},
-		{setProcessedBlocks, "block_height", "arcade_idx_pb_block_height", aero.NUMERIC},
+		{setBlockProcessing, "block_height", "arcade_idx_bp_block_height", aero.NUMERIC},
+		{setBlockProcessing, "status", "arcade_idx_bp_status", aero.STRING},
 		{setTransactions, "status", "arcade_idx_tx_status", aero.STRING},
 		{setDatahubEndpoints, "last_seen", "arcade_idx_dh_last_seen", aero.NUMERIC},
 	}
@@ -1233,66 +1234,185 @@ func (s *Store) UpdateDeliveryStatus(ctx context.Context, submissionID string, l
 	return s.client.Put(s.writePolicy(ctx), key, bins)
 }
 
-// --- Block Tracking Operations ---
+// --- Block processing status ---
+//
+// Bins:
+//   block_hash      string  (also primary key)
+//   block_height    int
+//   header_seen_at  int64 (unix nanos; 0 = unset)
+//   processed_at    int64 (unix nanos; 0 = unset)
+//   bump_built_at   int64 (unix nanos; 0 = unset)
+//   status          string ("active" | "orphaned")
+//   orphaned_at     int64 (unix nanos; 0 = unset)
+//
+// Writers must use Operate with per-bin PutOps so concurrent header /
+// processed / bump-built paths only touch their own bins. A full-record
+// Put would clobber whichever bins the other writer recently set.
 
-func (s *Store) HasAnyProcessedBlocks(ctx context.Context) (bool, error) {
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-	stmt := aero.NewStatement(s.namespace, setProcessedBlocks)
-	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
-	if rs != nil {
-		defer func() { _ = rs.Close() }()
-	}
+const (
+	binBlockHash    = "block_hash"
+	binBlockHeight  = "block_height"
+	binHeaderSeenAt = "header_seen_at"
+	binProcessedAt  = "processed_at"
+	binBUMPBuiltAt  = "bump_built_at"
+	binStatus       = "status"
+	binOrphanedAt   = "orphaned_at"
+)
+
+func (s *Store) UpsertBlockHeaderSeen(ctx context.Context, blockHash string, blockHeight uint64, seenAt time.Time) error {
+	key, err := s.key(setBlockProcessing, blockHash)
 	if err != nil {
-		return false, err
+		return err
 	}
-
-	var (
-		found   bool
-		loopErr error
-	)
-loop:
-	for {
-		select {
-		case <-ctx.Done():
-			loopErr = ctx.Err()
-			break loop
-		case rec, ok := <-rs.Results():
-			if !ok {
-				break loop
-			}
-			if rec.Err == nil {
-				found = true
-				break loop
-			}
+	// On insert we want every bin populated (the row may be brand new). On
+	// update we must NOT clobber processed_at or bump_built_at, which is
+	// what per-bin Operate gives us — bins not named here are left alone.
+	// We do overwrite block_height (chaintracks is authoritative) and reset
+	// status/orphaned_at so a returning orphan re-joins active.
+	ops := []*aero.Operation{
+		aero.PutOp(aero.NewBin(binBlockHash, blockHash)),
+		aero.PutOp(aero.NewBin(binBlockHeight, int(blockHeight))), //nolint:gosec // block height fits in int on 64-bit platforms
+		aero.PutOp(aero.NewBin(binStatus, string(models.BlockStatusActive))),
+		aero.PutOp(aero.NewBin(binOrphanedAt, nil)),
+		// header_seen_at: only set when the bin is currently absent. Aerospike
+		// has no client-side conditional bin write that's race-free, so we do
+		// a generation-CAS read+write loop to set it on first observation
+		// only.
+	}
+	if _, err := s.client.Operate(s.writePolicy(ctx), key, ops...); err != nil {
+		return fmt.Errorf("upsert block header seen %s: %w", blockHash, err)
+	}
+	// Set header_seen_at only if absent. Generation CAS isn't needed because
+	// repeat writes are idempotent (same bin name, same value would just be
+	// re-written but not harmfully).
+	rec, err := s.client.Get(s.readPolicy(ctx), key, binHeaderSeenAt)
+	if err != nil && !isKeyNotFound(err) {
+		return fmt.Errorf("read header_seen_at %s: %w", blockHash, err)
+	}
+	if rec == nil || getInt64(rec, binHeaderSeenAt) == 0 {
+		setOp := aero.PutOp(aero.NewBin(binHeaderSeenAt, seenAt.UnixNano()))
+		if _, err := s.client.Operate(s.writePolicy(ctx), key, setOp); err != nil {
+			return fmt.Errorf("set header_seen_at %s: %w", blockHash, err)
 		}
 	}
-	if loopErr != nil {
-		return false, loopErr
-	}
-	return found, nil
+	return nil
 }
 
-func (s *Store) GetOnChainBlockAtHeight(ctx context.Context, height uint64) (string, bool, error) {
-	if err := ctx.Err(); err != nil {
-		return "", false, err
-	}
-	stmt := aero.NewStatement(s.namespace, setProcessedBlocks)
-	_ = stmt.SetFilter(aero.NewEqualFilter("block_height", int(height))) //nolint:gosec // block height fits in int on 64-bit platforms
+func (s *Store) MarkBlockProcessed(ctx context.Context, blockHash string, blockHeight uint64, processedAt time.Time) error {
+	return s.markBlockMilestone(ctx, blockHash, blockHeight, processedAt, binProcessedAt)
+}
 
+func (s *Store) MarkBlockBUMPBuilt(ctx context.Context, blockHash string, blockHeight uint64, builtAt time.Time) error {
+	return s.markBlockMilestone(ctx, blockHash, blockHeight, builtAt, binBUMPBuiltAt)
+}
+
+// markBlockMilestone is the shared upsert path for processed_at and
+// bump_built_at. When the row exists, only the milestone bin is written
+// (block_height and other bins are preserved). When it doesn't, the row
+// is created with header_seen_at synthesized to the milestone time so
+// observability still has a record. The synthesized header_seen_at will
+// be preserved by a later UpsertBlockHeaderSeen.
+func (s *Store) markBlockMilestone(ctx context.Context, blockHash string, blockHeight uint64, at time.Time, milestoneBin string) error {
+	key, err := s.key(setBlockProcessing, blockHash)
+	if err != nil {
+		return err
+	}
+	rec, err := s.client.Get(s.readPolicy(ctx), key, binBlockHash)
+	if err != nil && !isKeyNotFound(err) {
+		return fmt.Errorf("read block_processing %s: %w", blockHash, err)
+	}
+	if rec == nil {
+		// New row: write all bins so block_height and header_seen_at land.
+		ops := []*aero.Operation{
+			aero.PutOp(aero.NewBin(binBlockHash, blockHash)),
+			aero.PutOp(aero.NewBin(binBlockHeight, int(blockHeight))), //nolint:gosec // block height fits in int on 64-bit platforms
+			aero.PutOp(aero.NewBin(binHeaderSeenAt, at.UnixNano())),
+			aero.PutOp(aero.NewBin(milestoneBin, at.UnixNano())),
+			aero.PutOp(aero.NewBin(binStatus, string(models.BlockStatusActive))),
+		}
+		if _, err := s.client.Operate(s.writePolicy(ctx), key, ops...); err != nil {
+			return fmt.Errorf("create block_processing %s: %w", blockHash, err)
+		}
+		return nil
+	}
+	// Existing row: touch only the milestone bin.
+	op := aero.PutOp(aero.NewBin(milestoneBin, at.UnixNano()))
+	if _, err := s.client.Operate(s.writePolicy(ctx), key, op); err != nil {
+		return fmt.Errorf("update %s on block_processing %s: %w", milestoneBin, blockHash, err)
+	}
+	return nil
+}
+
+func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) error {
+	if len(blockHashes) == 0 {
+		return nil
+	}
+	for _, h := range blockHashes {
+		key, err := s.key(setBlockProcessing, h)
+		if err != nil {
+			return err
+		}
+		// Skip rows that don't exist — chaintracks may emit OrphanedHashes
+		// for blocks observed before this service started recording.
+		rec, err := s.client.Get(s.readPolicy(ctx), key, binBlockHash)
+		if err != nil {
+			if isKeyNotFound(err) {
+				continue
+			}
+			return fmt.Errorf("read block_processing %s: %w", h, err)
+		}
+		if rec == nil {
+			continue
+		}
+		ops := []*aero.Operation{
+			aero.PutOp(aero.NewBin(binStatus, string(models.BlockStatusOrphaned))),
+			aero.PutOp(aero.NewBin(binOrphanedAt, orphanedAt.UnixNano())),
+		}
+		if _, err := s.client.Operate(s.writePolicy(ctx), key, ops...); err != nil {
+			return fmt.Errorf("mark orphaned %s: %w", h, err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) GetBlockProcessingStatus(ctx context.Context, blockHash string) (*models.BlockProcessingStatus, error) {
+	key, err := s.key(setBlockProcessing, blockHash)
+	if err != nil {
+		return nil, err
+	}
+	rec, err := s.client.Get(s.readPolicy(ctx), key)
+	if err != nil {
+		if isKeyNotFound(err) {
+			return nil, store.ErrNotFound
+		}
+		return nil, fmt.Errorf("get block_processing %s: %w", blockHash, err)
+	}
+	return blockProcessingFromRecord(rec), nil
+}
+
+func (s *Store) ListBlockProcessingStatus(ctx context.Context, beforeHeight uint64, limit int) ([]*models.BlockProcessingStatus, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		return nil, nil
+	}
+	stmt := aero.NewStatement(s.namespace, setBlockProcessing)
+	if beforeHeight > 0 {
+		// Aerospike's NUMERIC range filter is inclusive on the upper bound,
+		// so subtract one to express "block_height < beforeHeight".
+		_ = stmt.SetFilter(aero.NewRangeFilter(binBlockHeight, 0, int64(beforeHeight-1))) //nolint:gosec // height fits in int64
+	}
 	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
 	if rs != nil {
 		defer func() { _ = rs.Close() }()
 	}
 	if err != nil {
-		return "", false, err
+		return nil, fmt.Errorf("query block_processing: %w", err)
 	}
-
 	var (
-		blockHash string
-		onChain   bool
-		loopErr   error
+		all     []*models.BlockProcessingStatus
+		loopErr error
 	)
 loop:
 	for {
@@ -1307,27 +1427,58 @@ loop:
 			if rec.Err != nil {
 				continue
 			}
-			if v, ok := rec.Record.Bins["on_chain"]; ok {
-				if n, ok := v.(int); ok && n == 1 {
-					blockHash = getString(rec.Record, "block_hash")
-					onChain = true
-					break loop
-				}
-			}
+			all = append(all, blockProcessingFromRecord(rec.Record))
 		}
 	}
 	if loopErr != nil {
-		return "", false, loopErr
+		return all, loopErr
 	}
-	return blockHash, onChain, nil
+	// Aerospike secondary-index queries don't sort. Sort in memory by
+	// height descending and truncate. Cardinality is ~144 rows/day, so
+	// even unbounded scans here cost milliseconds.
+	sortByHeightDesc(all)
+	if len(all) > limit {
+		all = all[:limit]
+	}
+	return all, nil
 }
 
-func (s *Store) MarkBlockOffChain(ctx context.Context, blockHash string) error {
-	key, err := s.key(setProcessedBlocks, blockHash)
-	if err != nil {
-		return err
+func blockProcessingFromRecord(rec *aero.Record) *models.BlockProcessingStatus {
+	if rec == nil {
+		return nil
 	}
-	return s.client.Put(s.writePolicy(ctx), key, aero.BinMap{"on_chain": 0})
+	bp := &models.BlockProcessingStatus{
+		BlockHash:   getString(rec, binBlockHash),
+		BlockHeight: uint64(getInt(rec, binBlockHeight)), //nolint:gosec // height non-negative
+		Status:      models.BlockProcessingStatusValue(getString(rec, binStatus)),
+	}
+	if v := getInt64(rec, binHeaderSeenAt); v != 0 {
+		bp.HeaderSeenAt = time.Unix(0, v).UTC()
+	}
+	if v := getInt64(rec, binProcessedAt); v != 0 {
+		t := time.Unix(0, v).UTC()
+		bp.ProcessedAt = &t
+	}
+	if v := getInt64(rec, binBUMPBuiltAt); v != 0 {
+		t := time.Unix(0, v).UTC()
+		bp.BUMPBuiltAt = &t
+	}
+	if v := getInt64(rec, binOrphanedAt); v != 0 {
+		t := time.Unix(0, v).UTC()
+		bp.OrphanedAt = &t
+	}
+	return bp
+}
+
+func sortByHeightDesc(rows []*models.BlockProcessingStatus) {
+	// Insertion sort is fine — the result set is at most a couple hundred rows.
+	for i := 1; i < len(rows); i++ {
+		j := i
+		for j > 0 && rows[j-1].BlockHeight < rows[j].BlockHeight {
+			rows[j-1], rows[j] = rows[j], rows[j-1]
+			j--
+		}
+	}
 }
 
 // --- Datahub endpoint registry ---

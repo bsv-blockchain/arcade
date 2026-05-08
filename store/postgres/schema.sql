@@ -41,6 +41,22 @@ CREATE TABLE IF NOT EXISTS stumps (
 );
 CREATE INDEX IF NOT EXISTS idx_stump_block_hash ON stumps(block_hash);
 
+-- Per-block processing status. One row per block hash; tracks the milestones
+-- (header observed, BLOCK_PROCESSED received, compound BUMP built) and reorg
+-- state. Writers use partial UPDATEs (only their own column on conflict) so
+-- concurrent paths converge correctly.
+CREATE TABLE IF NOT EXISTS block_processing (
+    block_hash     TEXT PRIMARY KEY,
+    block_height   BIGINT NOT NULL,
+    header_seen_at TIMESTAMPTZ NOT NULL,
+    processed_at   TIMESTAMPTZ,
+    bump_built_at  TIMESTAMPTZ,
+    status         TEXT NOT NULL DEFAULT 'active',
+    orphaned_at    TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_bp_block_height  ON block_processing(block_height DESC);
+CREATE INDEX IF NOT EXISTS idx_bp_status_height ON block_processing(status, block_height DESC);
+
 CREATE TABLE IF NOT EXISTS submissions (
     submission_id         TEXT PRIMARY KEY,
     txid                  TEXT NOT NULL,

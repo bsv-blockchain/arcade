@@ -157,6 +157,29 @@ func (m *mockStore) UpsertDatahubEndpoint(context.Context, store.DatahubEndpoint
 func (m *mockStore) ListDatahubEndpoints(context.Context, string) ([]store.DatahubEndpoint, error) {
 	return nil, nil
 }
+
+func (m *mockStore) UpsertBlockHeaderSeen(context.Context, string, uint64, time.Time) error {
+	return nil
+}
+
+func (m *mockStore) MarkBlockProcessed(context.Context, string, uint64, time.Time) error {
+	return nil
+}
+
+func (m *mockStore) MarkBlockBUMPBuilt(context.Context, string, uint64, time.Time) error {
+	return nil
+}
+
+func (m *mockStore) MarkBlocksOrphaned(context.Context, []string, time.Time) error { return nil }
+
+func (m *mockStore) GetBlockProcessingStatus(context.Context, string) (*models.BlockProcessingStatus, error) {
+	return nil, store.ErrNotFound
+}
+
+func (m *mockStore) ListBlockProcessingStatus(context.Context, uint64, int) ([]*models.BlockProcessingStatus, error) {
+	return nil, nil
+}
+
 func (m *mockStore) Close() error { return nil }
 
 func makeMinimalTx() []byte {

@@ -127,6 +127,26 @@ func (s *fakeStore) UpsertDatahubEndpoint(context.Context, store.DatahubEndpoint
 func (s *fakeStore) ListDatahubEndpoints(context.Context, string) ([]store.DatahubEndpoint, error) {
 	return nil, nil
 }
+
+func (s *fakeStore) UpsertBlockHeaderSeen(context.Context, string, uint64, time.Time) error {
+	return nil
+}
+func (s *fakeStore) MarkBlockProcessed(context.Context, string, uint64, time.Time) error {
+	return nil
+}
+func (s *fakeStore) MarkBlockBUMPBuilt(context.Context, string, uint64, time.Time) error {
+	return nil
+}
+func (s *fakeStore) MarkBlocksOrphaned(context.Context, []string, time.Time) error { return nil }
+
+//nolint:nilnil // unused stub.
+func (s *fakeStore) GetBlockProcessingStatus(context.Context, string) (*models.BlockProcessingStatus, error) {
+	return nil, nil
+}
+
+func (s *fakeStore) ListBlockProcessingStatus(context.Context, uint64, int) ([]*models.BlockProcessingStatus, error) {
+	return nil, nil
+}
 func (s *fakeStore) Close() error { return nil }
 
 // recordingPub captures published statuses but doesn't actually subscribe —

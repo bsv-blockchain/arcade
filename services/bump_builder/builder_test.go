@@ -35,16 +35,23 @@ const testBlockHash = "aabbccdd0000000000000000000000000000000000000000000000000
 type mockStore struct {
 	store.Store // embed — panics on unimplemented methods
 
-	mu              sync.Mutex
-	stumps          map[string][]*models.Stump // blockHash → stumps
-	bumps           map[string][]byte          // blockHash → bumpData
-	minedCalls      []minedCall
-	deletedBlocks   []string
-	getStumpsErr    error
-	insertBUMPErr   error
-	insertStumpErr  error
-	setMinedErr     error
-	deleteStumpsErr error
+	mu               sync.Mutex
+	stumps           map[string][]*models.Stump // blockHash → stumps
+	bumps            map[string][]byte          // blockHash → bumpData
+	minedCalls       []minedCall
+	deletedBlocks    []string
+	bumpBuiltCalls   []bumpBuiltCall
+	getStumpsErr     error
+	insertBUMPErr    error
+	insertStumpErr   error
+	setMinedErr      error
+	deleteStumpsErr  error
+	markBumpBuiltErr error
+}
+
+type bumpBuiltCall struct {
+	blockHash   string
+	blockHeight uint64
 }
 
 type minedCall struct {
@@ -119,6 +126,19 @@ func (m *mockStore) DeleteStumpsByBlockHash(_ context.Context, blockHash string)
 	}
 	m.deletedBlocks = append(m.deletedBlocks, blockHash)
 	delete(m.stumps, blockHash)
+	return nil
+}
+
+// MarkBlockBUMPBuilt records the call so tests can assert observability
+// reaches the store after a successful BUMP build. markBumpBuiltErr lets a
+// test inject a failure to verify the builder logs and continues.
+func (m *mockStore) MarkBlockBUMPBuilt(_ context.Context, blockHash string, blockHeight uint64, _ time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.markBumpBuiltErr != nil {
+		return m.markBumpBuiltErr
+	}
+	m.bumpBuiltCalls = append(m.bumpBuiltCalls, bumpBuiltCall{blockHash: blockHash, blockHeight: blockHeight})
 	return nil
 }
 
@@ -471,6 +491,40 @@ func TestBuilder_HandleMessage_HappyPath_SingleSubtree(t *testing.T) {
 	// Verify STUMPs were pruned
 	if len(ms.deletedBlocks) != 1 || ms.deletedBlocks[0] != blockHash {
 		t.Errorf("expected STUMPs for %s to be deleted, got: %v", blockHash, ms.deletedBlocks)
+	}
+
+	// Verify the block-processing observability row was updated.
+	if len(ms.bumpBuiltCalls) != 1 || ms.bumpBuiltCalls[0].blockHash != blockHash {
+		t.Errorf("expected MarkBlockBUMPBuilt(%s), got %+v", blockHash, ms.bumpBuiltCalls)
+	}
+}
+
+func TestBuilder_HandleMessage_BumpBuiltStoreError_StillSucceeds(t *testing.T) {
+	ms := newMockStore()
+	ms.markBumpBuiltErr = errors.New("store down")
+	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
+	txidHex := "1111111111111111111111111111111111111111111111111111111111111111"
+
+	stumpData := makeMinimalSTUMP(txidHex)
+	ms.addStump(blockHash, 0, stumpData)
+
+	subtreeHash := mustHash(t, txidHex)
+	root := expectedCompoundRoot(t,
+		[]*models.Stump{{BlockHash: blockHash, SubtreeIndex: 0, StumpData: stumpData}},
+		[]chainhash.Hash{subtreeHash}, nil)
+	datahub := newDatahubServer(root, []chainhash.Hash{subtreeHash})
+	defer datahub.Close()
+
+	b := newTestBuilder(ms, datahub.URL)
+
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash)); err != nil {
+		t.Fatalf("MarkBlockBUMPBuilt error must not fail handler, got: %v", err)
+	}
+
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if _, ok := ms.bumps[blockHash]; !ok {
+		t.Error("BUMP should still be stored despite the observability write failure")
 	}
 }
 

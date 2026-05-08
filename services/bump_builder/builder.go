@@ -237,6 +237,12 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 		return fmt.Errorf("storing BUMP: %w", err)
 	}
 
+	// Observability-only: record bump_built_at on the block-processing row.
+	// Failure here must not block the MINED status updates downstream.
+	if err := b.store.MarkBlockBUMPBuilt(ctx, blockHash, blockHeight, time.Now()); err != nil {
+		logger.Warn("failed to record bump_built status", zap.Error(err))
+	}
+
 	// 6. Set tracked transactions to MINED.
 	// blockHeight is threaded through here (and asserted on the returned
 	// statuses below) because downstream SSE/webhook consumers and the

@@ -931,6 +931,269 @@ func (s *Store) GetStumpsByBlockHash(ctx context.Context, blockHash string) ([]*
 	return stumps, nil
 }
 
+// --- Block processing status ---
+
+// storedBlockProcessing is the persistence shape. Times are stored as unix
+// nanoseconds (0 == "not yet") to match the conventions used by storedStatus
+// and to avoid JSON timezone drift.
+type storedBlockProcessing struct {
+	BlockHash         string `json:"block_hash"`
+	BlockHeight       uint64 `json:"block_height"`
+	HeaderSeenUnixNs  int64  `json:"header_seen_at,omitempty"`
+	ProcessedUnixNs   int64  `json:"processed_at,omitempty"`
+	BUMPBuiltUnixNs   int64  `json:"bump_built_at,omitempty"`
+	Status            string `json:"status"`
+	OrphanedAtUnixNs  int64  `json:"orphaned_at,omitempty"`
+}
+
+func (b storedBlockProcessing) toModel() *models.BlockProcessingStatus {
+	out := &models.BlockProcessingStatus{
+		BlockHash:   b.BlockHash,
+		BlockHeight: b.BlockHeight,
+		Status:      models.BlockProcessingStatusValue(b.Status),
+	}
+	if b.HeaderSeenUnixNs != 0 {
+		out.HeaderSeenAt = time.Unix(0, b.HeaderSeenUnixNs).UTC()
+	}
+	if b.ProcessedUnixNs != 0 {
+		t := time.Unix(0, b.ProcessedUnixNs).UTC()
+		out.ProcessedAt = &t
+	}
+	if b.BUMPBuiltUnixNs != 0 {
+		t := time.Unix(0, b.BUMPBuiltUnixNs).UTC()
+		out.BUMPBuiltAt = &t
+	}
+	if b.OrphanedAtUnixNs != 0 {
+		t := time.Unix(0, b.OrphanedAtUnixNs).UTC()
+		out.OrphanedAt = &t
+	}
+	return out
+}
+
+// readBlockProc returns the stored row for blockHash, or nil if absent.
+func (s *Store) readBlockProc(blockHash string) (*storedBlockProcessing, error) {
+	v, closer, err := s.db.Get(blockProcKey(blockHash))
+	if errors.Is(err, pebbledb.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get block_processing %s: %w", blockHash, err)
+	}
+	defer func() { _ = closer.Close() }()
+	var b storedBlockProcessing
+	if err := json.Unmarshal(v, &b); err != nil {
+		return nil, fmt.Errorf("unmarshal block_processing %s: %w", blockHash, err)
+	}
+	return &b, nil
+}
+
+// writeBlockProc persists the row plus the descending-height index entry.
+// The caller is expected to hold the per-block shard lock so the index does
+// not pick up stale entries from a concurrent height change.
+func (s *Store) writeBlockProc(prev *storedBlockProcessing, current *storedBlockProcessing) error {
+	payload, err := json.Marshal(current)
+	if err != nil {
+		return err
+	}
+	batch := s.db.NewBatch()
+	defer func() { _ = batch.Close() }()
+
+	// If the height changed, the old index entry is now wrong — delete it.
+	// In practice this only happens when a row created via MarkBlockProcessed
+	// with height=0 is later corrected by UpsertBlockHeaderSeen.
+	if prev != nil && prev.BlockHeight != current.BlockHeight {
+		if err := batch.Delete(idxBlockProcHeightKey(prev.BlockHeight, prev.BlockHash), nil); err != nil {
+			return err
+		}
+	}
+	if err := batch.Set(blockProcKey(current.BlockHash), payload, nil); err != nil {
+		return err
+	}
+	if err := batch.Set(idxBlockProcHeightKey(current.BlockHeight, current.BlockHash), nil, nil); err != nil {
+		return err
+	}
+	return batch.Commit(s.writeOpts)
+}
+
+func (s *Store) UpsertBlockHeaderSeen(ctx context.Context, blockHash string, blockHeight uint64, seenAt time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	mu := s.shardFor(blockHash)
+	mu.Lock()
+	defer mu.Unlock()
+
+	prev, err := s.readBlockProc(blockHash)
+	if err != nil {
+		return err
+	}
+	cur := storedBlockProcessing{
+		BlockHash:   blockHash,
+		BlockHeight: blockHeight,
+		Status:      string(models.BlockStatusActive),
+	}
+	if prev != nil {
+		// Preserve milestone timestamps; chaintracks owns block_height and
+		// status, which we forcibly reset to active so a returning orphan
+		// re-joins the main chain.
+		cur.HeaderSeenUnixNs = prev.HeaderSeenUnixNs
+		cur.ProcessedUnixNs = prev.ProcessedUnixNs
+		cur.BUMPBuiltUnixNs = prev.BUMPBuiltUnixNs
+	}
+	if cur.HeaderSeenUnixNs == 0 {
+		cur.HeaderSeenUnixNs = seenAt.UnixNano()
+	}
+	return s.writeBlockProc(prev, &cur)
+}
+
+func (s *Store) MarkBlockProcessed(ctx context.Context, blockHash string, blockHeight uint64, processedAt time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	mu := s.shardFor(blockHash)
+	mu.Lock()
+	defer mu.Unlock()
+
+	prev, err := s.readBlockProc(blockHash)
+	if err != nil {
+		return err
+	}
+	cur := storedBlockProcessing{
+		BlockHash:        blockHash,
+		BlockHeight:      blockHeight,
+		ProcessedUnixNs:  processedAt.UnixNano(),
+		Status:           string(models.BlockStatusActive),
+	}
+	if prev != nil {
+		// Preserve everything except processed_at.
+		cur.BlockHeight = prev.BlockHeight
+		cur.HeaderSeenUnixNs = prev.HeaderSeenUnixNs
+		cur.BUMPBuiltUnixNs = prev.BUMPBuiltUnixNs
+		cur.Status = prev.Status
+		cur.OrphanedAtUnixNs = prev.OrphanedAtUnixNs
+	} else {
+		// Row didn't exist — synthesize header_seen_at = processedAt for
+		// observability. The next UpsertBlockHeaderSeen will preserve it.
+		cur.HeaderSeenUnixNs = processedAt.UnixNano()
+	}
+	return s.writeBlockProc(prev, &cur)
+}
+
+func (s *Store) MarkBlockBUMPBuilt(ctx context.Context, blockHash string, blockHeight uint64, builtAt time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	mu := s.shardFor(blockHash)
+	mu.Lock()
+	defer mu.Unlock()
+
+	prev, err := s.readBlockProc(blockHash)
+	if err != nil {
+		return err
+	}
+	cur := storedBlockProcessing{
+		BlockHash:       blockHash,
+		BlockHeight:     blockHeight,
+		BUMPBuiltUnixNs: builtAt.UnixNano(),
+		Status:          string(models.BlockStatusActive),
+	}
+	if prev != nil {
+		cur.BlockHeight = prev.BlockHeight
+		cur.HeaderSeenUnixNs = prev.HeaderSeenUnixNs
+		cur.ProcessedUnixNs = prev.ProcessedUnixNs
+		cur.Status = prev.Status
+		cur.OrphanedAtUnixNs = prev.OrphanedAtUnixNs
+	} else {
+		cur.HeaderSeenUnixNs = builtAt.UnixNano()
+	}
+	return s.writeBlockProc(prev, &cur)
+}
+
+func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	for _, h := range blockHashes {
+		mu := s.shardFor(h)
+		mu.Lock()
+		prev, err := s.readBlockProc(h)
+		if err != nil {
+			mu.Unlock()
+			return err
+		}
+		if prev == nil {
+			mu.Unlock()
+			continue
+		}
+		cur := *prev
+		cur.Status = string(models.BlockStatusOrphaned)
+		cur.OrphanedAtUnixNs = orphanedAt.UnixNano()
+		if err := s.writeBlockProc(prev, &cur); err != nil {
+			mu.Unlock()
+			return err
+		}
+		mu.Unlock()
+	}
+	return nil
+}
+
+func (s *Store) GetBlockProcessingStatus(ctx context.Context, blockHash string) (*models.BlockProcessingStatus, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	stored, err := s.readBlockProc(blockHash)
+	if err != nil {
+		return nil, err
+	}
+	if stored == nil {
+		return nil, store.ErrNotFound
+	}
+	return stored.toModel(), nil
+}
+
+func (s *Store) ListBlockProcessingStatus(ctx context.Context, beforeHeight uint64, limit int) ([]*models.BlockProcessingStatus, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		return nil, nil
+	}
+	prefix := idxBlockProcHeightPrefix()
+	// Inverted-height encoding means descending height = ascending bytes.
+	// To filter "block_height < beforeHeight" we lower-bound the iterator at
+	// the inverted (beforeHeight-1) so heights >= beforeHeight are skipped.
+	lower := prefix
+	if beforeHeight > 0 {
+		lower = []byte(fmt.Sprintf("%s%016x:", prefixIdxBlockProcHeight, ^(beforeHeight-1)))
+	}
+	iter, err := s.db.NewIter(&pebbledb.IterOptions{
+		LowerBound: lower,
+		UpperBound: endOfPrefix(prefix),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = iter.Close() }()
+
+	out := make([]*models.BlockProcessingStatus, 0, limit)
+	for iter.First(); iter.Valid() && len(out) < limit; iter.Next() {
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
+		blockHash := lastSegment(iter.Key())
+		stored, err := s.readBlockProc(blockHash)
+		if err != nil {
+			return out, err
+		}
+		if stored == nil {
+			// Stale index entry — skip rather than fail the whole list.
+			continue
+		}
+		out = append(out, stored.toModel())
+	}
+	return out, nil
+}
+
 func (s *Store) DeleteStumpsByBlockHash(ctx context.Context, blockHash string) error {
 	if err := ctx.Err(); err != nil {
 		return err

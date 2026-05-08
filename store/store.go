@@ -109,6 +109,49 @@ type Store interface {
 	// GetBUMP retrieves the compound BUMP for a block.
 	GetBUMP(ctx context.Context, blockHash string) (blockHeight uint64, bumpData []byte, err error)
 
+	// --- Block processing status ---
+	//
+	// These methods track which blocks have reached each milestone in the
+	// (header observed → BLOCK_PROCESSED → compound BUMP built) pipeline. The
+	// table is observability-first: writers must not fail their primary work
+	// because of a status-tracking error.
+
+	// UpsertBlockHeaderSeen records that chaintracks observed a tip header.
+	// On insert, status='active' and header_seen_at=seenAt. On conflict,
+	// implementations MUST overwrite block_height (chaintracks is the
+	// authoritative source) and reset status='active' / orphaned_at=NULL,
+	// but MUST preserve the existing header_seen_at, processed_at, and
+	// bump_built_at so a re-arrival or reorg-resurrection does not erase
+	// earlier milestones.
+	UpsertBlockHeaderSeen(ctx context.Context, blockHash string, blockHeight uint64, seenAt time.Time) error
+
+	// MarkBlockProcessed records that the merkle service delivered
+	// BLOCK_PROCESSED for this block. Upsert: when no row exists (callback
+	// arrived before chaintracks emitted the header), insert with
+	// header_seen_at = processedAt. On conflict, only processed_at is
+	// updated — block_height and other milestones are left alone.
+	MarkBlockProcessed(ctx context.Context, blockHash string, blockHeight uint64, processedAt time.Time) error
+
+	// MarkBlockBUMPBuilt records that the compound BUMP was successfully
+	// stored for this block. Same upsert-on-missing semantics as
+	// MarkBlockProcessed.
+	MarkBlockBUMPBuilt(ctx context.Context, blockHash string, blockHeight uint64, builtAt time.Time) error
+
+	// MarkBlocksOrphaned transitions every named block to status='orphaned'
+	// and stamps orphaned_at. Hashes that have no row are silently skipped
+	// (chaintracks may emit OrphanedHashes for blocks observed before the
+	// service started recording).
+	MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) error
+
+	// GetBlockProcessingStatus returns the row keyed by blockHash. Returns
+	// ErrNotFound if no row exists.
+	GetBlockProcessingStatus(ctx context.Context, blockHash string) (*models.BlockProcessingStatus, error)
+
+	// ListBlockProcessingStatus returns up to limit rows ordered by
+	// block_height DESC. When beforeHeight > 0, restricts to rows with
+	// block_height < beforeHeight (the keyset cursor). limit must be > 0.
+	ListBlockProcessingStatus(ctx context.Context, beforeHeight uint64, limit int) ([]*models.BlockProcessingStatus, error)
+
 	// SetMinedByTxIDs marks transactions as mined for a given block (hash + height)
 	// and tx list. blockHeight is required: downstream consumers (SSE, webhooks,
 	// BUMP-build dedup) rely on the height to anchor each MINED status to a

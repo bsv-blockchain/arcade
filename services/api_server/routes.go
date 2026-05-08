@@ -65,6 +65,20 @@ var routeDocs = []RouteDoc{
 		RequestFormat:  "Optional query: callbackToken. Optional header: Last-Event-ID.",
 		ResponseFormat: "text/event-stream — frames: id, event: status, data: {txid, txStatus, timestamp}",
 	},
+	{
+		Method:         "GET",
+		Path:           "/api/v1/blocks/processing-status",
+		Description:    "List block processing milestones (header seen, BLOCK_PROCESSED received, compound BUMP built) in descending-height order. Pages via ?limit (default 50, max 200) and ?before-height (cursor = lowest height from previous page).",
+		RequestFormat:  "Optional query: limit, before-height",
+		ResponseFormat: `{"blocks": [{"blockHash", "blockHeight", "headerSeenAt", "processedAt", "bumpBuiltAt", "status", "orphanedAt", "hasBlockProcessed", "hasCompoundBUMP"}], "nextCursor"}`,
+	},
+	{
+		Method:         "GET",
+		Path:           "/api/v1/blocks/processing-status/:blockHash",
+		Description:    "Get block processing milestones for a single block by hash.",
+		RequestFormat:  "Path param: blockHash",
+		ResponseFormat: `{"blockHash", "blockHeight", "headerSeenAt", "processedAt", "bumpBuiltAt", "status", "orphanedAt", "hasBlockProcessed", "hasCompoundBUMP"}`,
+	},
 }
 
 func (s *Server) registerRoutes(r *gin.Engine) {
@@ -78,6 +92,8 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	r.POST("/api/v1/merkle-service/callback", s.handleCallback)
+	r.GET("/api/v1/blocks/processing-status", s.handleListBlockProcessingStatus)
+	r.GET("/api/v1/blocks/processing-status/:blockHash", s.handleGetBlockProcessingStatus)
 	r.GET("/tx/:txid", s.handleGetTransaction)
 	r.POST("/tx", s.handleSubmitTransaction)
 	r.POST("/txs", s.handleSubmitTransactions)

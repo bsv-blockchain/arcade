@@ -30,9 +30,10 @@ type Server struct {
 	txTracker   *store.TxTracker
 	teranode    *teranode.Client // used by /health for datahub URL inventory; nil in tests
 	server      *http.Server
-	chaintracks chaintracks.Chaintracks // nil when disabled
-	ctRoutes    *chaintracksRoutes      // nil when disabled
-	sse         *sseManager             // nil when no publisher is configured
+	chaintracks  chaintracks.Chaintracks // nil when disabled
+	ctRoutes     *chaintracksRoutes      // nil when disabled
+	blockTracker *blockStatusTracker     // nil when chaintracks is disabled
+	sse          *sseManager             // nil when no publisher is configured
 }
 
 func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publisher events.Publisher, st store.Store, tracker *store.TxTracker, tc *teranode.Client) *Server {
@@ -54,6 +55,17 @@ func (s *Server) Start(ctx context.Context) error {
 	// can mount its handlers only when a live instance is present.
 	if err := s.initChaintracks(ctx); err != nil {
 		return fmt.Errorf("initializing chaintracks: %w", err)
+	}
+
+	// Wire the block-processing tracker after chaintracks so the subscription
+	// goroutines can attach to its tip + reorg channels. With chaintracks
+	// disabled, header tracking is also disabled (block_processed and
+	// bump_built_at are still recorded by the api/handlers and bump-builder
+	// paths respectively, just without a header row preceding them).
+	if s.chaintracks != nil {
+		s.blockTracker = newBlockStatusTracker(ctx, s.chaintracks, s.store, s.logger)
+	} else {
+		s.logger.Debug("block-status header tracking disabled (chaintracks not initialized)")
 	}
 
 	// Boot the SSE fan-out manager BEFORE registering routes so /events has

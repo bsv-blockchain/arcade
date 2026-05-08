@@ -785,6 +785,134 @@ func (s *Store) DeleteStumpsByBlockHash(ctx context.Context, blockHash string) e
 	return err
 }
 
+// --- Block processing status ---
+
+func (s *Store) UpsertBlockHeaderSeen(ctx context.Context, blockHash string, blockHeight uint64, seenAt time.Time) error {
+	// On conflict the existing milestone timestamps and header_seen_at must
+	// be preserved. block_height is overwritten because chaintracks is the
+	// authoritative source — earlier rows might have been created by
+	// MarkBlockProcessed with height=0.
+	const q = `
+INSERT INTO block_processing (block_hash, block_height, header_seen_at, status)
+VALUES ($1, $2, $3, 'active')
+ON CONFLICT (block_hash) DO UPDATE SET
+    block_height = EXCLUDED.block_height,
+    status       = 'active',
+    orphaned_at  = NULL`
+	_, err := s.pool.Exec(ctx, q, blockHash, int64(blockHeight), seenAt) //nolint:gosec // block height fits in int64
+	if err != nil {
+		return fmt.Errorf("upsert block header seen %s: %w", blockHash, err)
+	}
+	return nil
+}
+
+func (s *Store) MarkBlockProcessed(ctx context.Context, blockHash string, blockHeight uint64, processedAt time.Time) error {
+	const q = `
+INSERT INTO block_processing (block_hash, block_height, header_seen_at, processed_at, status)
+VALUES ($1, $2, $3, $3, 'active')
+ON CONFLICT (block_hash) DO UPDATE SET
+    processed_at = EXCLUDED.processed_at`
+	_, err := s.pool.Exec(ctx, q, blockHash, int64(blockHeight), processedAt) //nolint:gosec // block height fits in int64
+	if err != nil {
+		return fmt.Errorf("mark block processed %s: %w", blockHash, err)
+	}
+	return nil
+}
+
+func (s *Store) MarkBlockBUMPBuilt(ctx context.Context, blockHash string, blockHeight uint64, builtAt time.Time) error {
+	const q = `
+INSERT INTO block_processing (block_hash, block_height, header_seen_at, bump_built_at, status)
+VALUES ($1, $2, $3, $3, 'active')
+ON CONFLICT (block_hash) DO UPDATE SET
+    bump_built_at = EXCLUDED.bump_built_at`
+	_, err := s.pool.Exec(ctx, q, blockHash, int64(blockHeight), builtAt) //nolint:gosec // block height fits in int64
+	if err != nil {
+		return fmt.Errorf("mark block bump built %s: %w", blockHash, err)
+	}
+	return nil
+}
+
+func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) error {
+	if len(blockHashes) == 0 {
+		return nil
+	}
+	const q = `
+UPDATE block_processing
+SET status = 'orphaned', orphaned_at = $2
+WHERE block_hash = ANY($1)`
+	_, err := s.pool.Exec(ctx, q, blockHashes, orphanedAt)
+	if err != nil {
+		return fmt.Errorf("mark blocks orphaned: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetBlockProcessingStatus(ctx context.Context, blockHash string) (*models.BlockProcessingStatus, error) {
+	const q = `
+SELECT block_hash, block_height, header_seen_at, processed_at, bump_built_at, status, orphaned_at
+FROM block_processing
+WHERE block_hash = $1`
+	row := s.pool.QueryRow(ctx, q, blockHash)
+	bp, err := scanBlockProcessing(row.Scan)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get block processing %s: %w", blockHash, err)
+	}
+	return bp, nil
+}
+
+func (s *Store) ListBlockProcessingStatus(ctx context.Context, beforeHeight uint64, limit int) ([]*models.BlockProcessingStatus, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	const q = `
+SELECT block_hash, block_height, header_seen_at, processed_at, bump_built_at, status, orphaned_at
+FROM block_processing
+WHERE ($1 = 0 OR block_height < $1)
+ORDER BY block_height DESC
+LIMIT $2`
+	rows, err := s.pool.Query(ctx, q, int64(beforeHeight), limit) //nolint:gosec // block height fits in int64
+	if err != nil {
+		return nil, fmt.Errorf("list block processing: %w", err)
+	}
+	defer rows.Close()
+	var out []*models.BlockProcessingStatus
+	for rows.Next() {
+		bp, err := scanBlockProcessing(rows.Scan)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, bp)
+	}
+	return out, rows.Err()
+}
+
+// scanBlockProcessing decodes one block_processing row. The scan callback
+// shape lets us share this between QueryRow.Scan and Rows.Scan.
+func scanBlockProcessing(scan func(...any) error) (*models.BlockProcessingStatus, error) {
+	var (
+		bp          models.BlockProcessingStatus
+		height      int64
+		processed   *time.Time
+		bumpBuilt   *time.Time
+		statusVal   string
+		orphanedAt  *time.Time
+		seenAt      time.Time
+	)
+	if err := scan(&bp.BlockHash, &height, &seenAt, &processed, &bumpBuilt, &statusVal, &orphanedAt); err != nil {
+		return nil, err
+	}
+	bp.BlockHeight = uint64(height) //nolint:gosec // height non-negative in storage
+	bp.HeaderSeenAt = seenAt
+	bp.ProcessedAt = processed
+	bp.BUMPBuiltAt = bumpBuilt
+	bp.Status = models.BlockProcessingStatusValue(statusVal)
+	bp.OrphanedAt = orphanedAt
+	return &bp, nil
+}
+
 // --- Submissions ---
 
 func (s *Store) InsertSubmission(ctx context.Context, sub *models.Submission) error {
