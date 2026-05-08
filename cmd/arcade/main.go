@@ -7,27 +7,14 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
+	"github.com/bsv-blockchain/arcade/app"
 	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/events"
-	"github.com/bsv-blockchain/arcade/kafka"
-	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/services"
-	"github.com/bsv-blockchain/arcade/services/api_server"
-	"github.com/bsv-blockchain/arcade/services/bump_builder"
-	"github.com/bsv-blockchain/arcade/services/p2p_client"
-	"github.com/bsv-blockchain/arcade/services/propagation"
-	"github.com/bsv-blockchain/arcade/services/tx_validator"
-	"github.com/bsv-blockchain/arcade/services/webhook"
-	"github.com/bsv-blockchain/arcade/store"
-	storefactory "github.com/bsv-blockchain/arcade/store/factory"
-	"github.com/bsv-blockchain/arcade/teranode"
-	"github.com/bsv-blockchain/arcade/validator"
 )
 
 func main() {
@@ -54,102 +41,16 @@ func run(cmd *cobra.Command, _ []string) error {
 	logger := newLogger(cfg.LogLevel)
 	defer func() { _ = logger.Sync() }()
 
-	logger.Info("starting arcade",
-		zap.String("mode", cfg.Mode),
-		zap.String("kafka_backend", cfg.Kafka.Backend),
-		zap.String("store_backend", cfg.Store.Backend),
-	)
-
-	broker, err := kafka.NewBroker(cfg.Kafka)
-	if err != nil {
-		return fmt.Errorf("creating kafka broker: %w", err)
-	}
-	producer := kafka.NewProducer(broker)
-	defer func() { _ = producer.Close() }()
-
-	// Validate that the hot-path topics have enough partitions for the
-	// deployment. min_partitions is operator-supplied — leave unset (0/1) in
-	// standalone or single-replica deployments; set to the expected replica
-	// count in K8s. Fails fast on misconfigured horizontally-scaled topics so
-	// the error surfaces before live traffic arrives.
-	if cfg.Kafka.MinPartitions > 1 {
-		if pErr := kafka.CheckPartitions(broker, []string{kafka.TopicTransaction, kafka.TopicPropagation}, cfg.Kafka.MinPartitions, logger); pErr != nil {
-			return fmt.Errorf("kafka partition check: %w", pErr)
-		}
-	}
-
-	st, leaser, err := storefactory.New(cfg)
-	if err != nil {
-		return fmt.Errorf("creating store: %w", err)
-	}
-	defer func() { _ = st.Close() }()
-	if err := st.EnsureIndexes(); err != nil {
-		return fmt.Errorf("ensuring store indexes: %w", err)
-	}
-
-	// Create shared components
-	txTracker := store.NewTxTracker()
-
-	teranodeClient := teranode.NewClient(cfg.DatahubURLs, cfg.Teranode.AuthToken, teranode.HealthConfig{
-		FailureThreshold:    cfg.Propagation.EndpointHealth.FailureThreshold,
-		ProbeInterval:       time.Duration(cfg.Propagation.EndpointHealth.ProbeIntervalMs) * time.Millisecond,
-		ProbeTimeout:        time.Duration(cfg.Propagation.EndpointHealth.ProbeTimeoutMs) * time.Millisecond,
-		MinHealthyEndpoints: cfg.Propagation.EndpointHealth.MinHealthyEndpoints,
-		RefreshInterval:     time.Duration(cfg.Propagation.EndpointHealth.RefreshIntervalMs) * time.Millisecond,
-		Source:              endpointSource{st: st, network: cfg.Network},
-		Logger:              logger,
-	})
-	defer teranodeClient.Close()
-
-	// Seed the registry with statically configured URLs so a freshly started
-	// pod (especially mode=p2p-client which has no static list of its own to
-	// broadcast against) always sees them via the same discovery path. The
-	// upsert is idempotent and refreshes LastSeen on every restart, so this
-	// also works as a heartbeat for the operator-defined seed list.
-	if len(cfg.DatahubURLs) > 0 {
-		seedCtx, seedCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		for _, url := range cfg.DatahubURLs {
-			if err := st.UpsertDatahubEndpoint(seedCtx, store.DatahubEndpoint{
-				URL:      url,
-				Network:  cfg.Network,
-				Source:   store.DatahubEndpointSourceConfigured,
-				LastSeen: time.Now(),
-			}); err != nil {
-				logger.Warn("failed to seed configured datahub url",
-					zap.String("url", url),
-					zap.Error(err),
-				)
-			}
-		}
-		seedCancel()
-	}
-
-	var merkleClient *merkleservice.Client
-	if cfg.MerkleService.URL != "" {
-		merkleClient = merkleservice.NewClient(cfg.MerkleService.URL, cfg.MerkleService.AuthToken, 0)
-		merkleClient.SetLogger(logger.Named("merkle-client"))
-	}
-
-	txVal := validator.NewValidator(nil, nil) // Default policy, no chain tracker yet
-
-	// One process-wide events.Publisher routes status updates from every
-	// service that mutates state (validator, propagation, bump-builder,
-	// api-server) onto a shared Kafka topic. The api-server SSE handler and
-	// the webhook delivery service consume from that topic, so the
-	// transaction-status fan-out works whether the deployment is monolithic
-	// (mode=all) or split across pods.
-	publisher := events.NewKafkaPublisher(producer, logger, cfg.Events.SubscriberBuffer)
-	defer func() { _ = publisher.Close() }()
-
-	svcs := buildServices(cfg, logger, producer, publisher, st, leaser, txTracker, teranodeClient, merkleClient, txVal)
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Tie the teranode client's background probe to the service lifecycle so
-	// unhealthy endpoints are re-probed for recovery and the goroutine exits
-	// cleanly on shutdown.
-	teranodeClient.Start(ctx)
+	deps, cleanup, err := app.Bootstrap(ctx, cfg, logger)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	svcs := app.BuildServices(deps)
 
 	// Start health server for non-API modes (api-server serves /health on its own port)
 	if cfg.Mode != "api-server" {
@@ -194,77 +95,6 @@ func run(cmd *cobra.Command, _ []string) error {
 	wg.Wait()
 	logger.Info("arcade stopped")
 	return nil
-}
-
-func buildServices(
-	cfg *config.Config,
-	logger *zap.Logger,
-	producer *kafka.Producer,
-	publisher events.Publisher,
-	st store.Store,
-	leaser store.Leaser,
-	txTracker *store.TxTracker,
-	teranodeClient *teranode.Client,
-	merkleClient *merkleservice.Client,
-	txVal *validator.Validator,
-) []services.Service {
-	var svcs []services.Service
-
-	shouldRun := func(name string) bool {
-		return cfg.Mode == "all" || cfg.Mode == name
-	}
-
-	if shouldRun("api-server") {
-		svcs = append(svcs, api_server.New(cfg, logger, producer, publisher, st, txTracker, teranodeClient))
-	}
-	if shouldRun("bump-builder") {
-		svcs = append(svcs, bump_builder.New(cfg, logger, producer, publisher, st, teranodeClient))
-	}
-	if shouldRun("tx-validator") {
-		svcs = append(svcs, tx_validator.New(cfg, logger, producer, publisher, st, txTracker, txVal))
-	}
-	if shouldRun("propagation") {
-		svcs = append(svcs, propagation.New(cfg, logger, producer, publisher, st, leaser, teranodeClient, merkleClient))
-	}
-	// Webhook delivery runs alongside api-server by default (so a single-binary
-	// deployment ships callbacks without extra config) but can be split into
-	// its own pod by setting mode=webhook.
-	if shouldRun("api-server") || shouldRun("webhook") {
-		svcs = append(svcs, webhook.New(cfg.Webhook, cfg.Callback, logger, publisher, st))
-	}
-	// p2p_client is its own service; it's needed both by mode=propagation
-	// (where it feeds the local teranode.Client directly) and by mode=p2p-client
-	// (its own pod in the K8s topology, where it publishes discoveries to the
-	// shared store for other pods to pick up via refresh).
-	if shouldRun("propagation") || shouldRun("p2p-client") {
-		svcs = append(svcs, p2p_client.New(cfg, logger, producer, teranodeClient, st))
-	}
-
-	return svcs
-}
-
-// endpointSource adapts store.Store to teranode.EndpointSource by extracting
-// just the URL list. Defining the adapter here (rather than in teranode) keeps
-// the teranode package free of a direct store dependency.
-//
-// network scopes the listing to the configured Bitcoin network so a store
-// shared across pods (or reused after a network change) never replays peers
-// from a different network.
-type endpointSource struct {
-	st      store.Store
-	network string
-}
-
-func (a endpointSource) ListEndpointURLs(ctx context.Context) ([]string, error) {
-	eps, err := a.st.ListDatahubEndpoints(ctx, a.network)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]string, 0, len(eps))
-	for _, ep := range eps {
-		out = append(out, ep.URL)
-	}
-	return out, nil
 }
 
 func newLogger(level string) *zap.Logger {
