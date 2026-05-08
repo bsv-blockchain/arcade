@@ -1,0 +1,55 @@
+name: e2e-smoke
+
+# ------------------------------------------------------------------------------------
+#  arcade ↔ merkle-service end-to-end smoke
+# ------------------------------------------------------------------------------------
+# Boots Postgres, Redpanda, and ghcr.io/bsv-blockchain/merkle-service:latest via
+# testcontainers-go alongside an in-process arcade instance, then drives a
+# representative tx-flow scenario through both services.
+#
+# Required PR gate: every PR must show a green run before merging. The job
+# pre-pulls the merkle-service image so cold-start latency doesn't surface as
+# flaky timeouts on the wait strategies in tests/e2e/harness.
+# ------------------------------------------------------------------------------------
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-smoke-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Pre-pulling pins image-fetch time outside the test's wait strategies so
+      # the harness's own timeouts only have to cover container startup, not
+      # registry pulls. ghcr.io is unauthenticated for public images.
+      - name: Pre-pull merkle-service image
+        run: docker pull ghcr.io/bsv-blockchain/merkle-service:latest
+
+      - name: Run e2e smoke tests
+        env:
+          # testcontainers-go honors DOCKER_HOST when set; on the GitHub
+          # ubuntu runner the docker socket lives at the default path so we
+          # leave it unset.
+          TESTCONTAINERS_RYUK_DISABLED: "true"
+        run: go test -tags=e2e -timeout=20m -v ./tests/e2e/...
