@@ -5,12 +5,38 @@ package harness
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/model"
 )
+
+// nonDataScript returns a single-byte OP_TRUE locking script. arcade's
+// validator considers this non-data (so checkOutputs accepts it) and
+// it's accepted by checkInputs as a non-coinbase witness.
+func nonDataScript() *bscript.Script {
+	s := bscript.Script([]byte{0x51})
+	return &s
+}
+
+// emptyScript is the unlocking-script placeholder for inputs whose real
+// unlocking-script content doesn't matter (scripts are skipped at
+// validation time in arcade).
+func emptyScript() *bscript.Script {
+	s := bscript.Script(nil)
+	return &s
+}
+
+// toChainHashBT widens a 32-byte slice into a chainhash.Hash. Used for
+// PreviousTxIDAdd which expects the bytes in network byte order.
+func toChainHashBT(b []byte) *chainhash.Hash {
+	var h chainhash.Hash
+	copy(h[:], b)
+	return &h
+}
 
 // We use go-bt/v2 types throughout this file because teranode's
 // model.Block API requires *bt.Tx and bt/chainhash.Hash. arcade itself
@@ -24,11 +50,61 @@ import (
 //
 // startNonce lets callers stitch multiple batches into one stream where
 // each tx in the entire stream has a distinct LockTime.
+//
+// These txs DO NOT pass arcade's structural validator (no inputs, no
+// outputs, under-minimum size). For broadcasting through arcade's
+// POST /tx, use BuildValidatableTxs.
 func BuildTxs(n int, startNonce uint32) []*bt.Tx {
 	out := make([]*bt.Tx, n)
 	for i := 0; i < n; i++ {
 		tx := bt.NewTx()
 		tx.LockTime = startNonce + uint32(i) //nolint:gosec // bounded by caller
+		out[i] = tx
+	}
+	return out
+}
+
+// BuildValidatableTxs returns n synthetic transactions that pass
+// arcade's structural validator (the only validator step left after
+// scripts and fees are skipped). Each tx has:
+//
+//   - One input pointing at a non-zero source txid + non-data locking
+//     script + finite satoshis (so checkInputs accepts it as not-coinbase).
+//   - One output with non-data locking script + 1 satoshi (passes
+//     checkOutputs).
+//   - LockTime = startNonce + i, ensuring each tx hashes differently.
+//
+// Scripts are intentionally minimal (OP_TRUE, single byte 0x51) — that
+// satisfies arcade's IsData heuristic without dragging in real
+// signing. The result serializes to ~62 bytes, just over the
+// minTxSizeBytes=61 floor.
+func BuildValidatableTxs(n int, startNonce uint32) []*bt.Tx {
+	out := make([]*bt.Tx, n)
+	// Reused across all txs so we don't re-allocate the same constant
+	// shapes. Each tx's LockTime varies so the txid stays unique.
+	prevTxIDHex := "0101010101010101010101010101010101010101010101010101010101010101"
+	prevTxIDBytes, _ := hex.DecodeString(prevTxIDHex)
+	for i := 0; i < n; i++ {
+		tx := bt.NewTx()
+		tx.LockTime = startNonce + uint32(i) //nolint:gosec // bounded by caller
+		// Input: previous-output-script and previous-output-satoshis are
+		// what bt persists into UTXO data, used by validators that walk
+		// inputs. Empty unlocking script is fine since scripts are
+		// skipped at validation time.
+		input := &bt.Input{
+			SequenceNumber: 0xffffffff,
+		}
+		_ = input.PreviousTxIDAdd(toChainHashBT(prevTxIDBytes))
+		input.PreviousTxOutIndex = 0
+		input.PreviousTxScript = nonDataScript()
+		input.PreviousTxSatoshis = 1000
+		input.UnlockingScript = emptyScript()
+		tx.Inputs = append(tx.Inputs, input)
+		// Output: 1 satoshi to a non-data script (single OP_TRUE).
+		tx.AddOutput(&bt.Output{
+			Satoshis:      1,
+			LockingScript: nonDataScript(),
+		})
 		out[i] = tx
 	}
 	return out
