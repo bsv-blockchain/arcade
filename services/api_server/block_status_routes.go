@@ -2,6 +2,7 @@ package api_server
 
 import (
 	"errors"
+	"math"
 	"net/http"
 	"strconv"
 
@@ -79,6 +80,10 @@ func (s *Server) handleListBlockProcessingStatus(c *gin.Context) {
 		n, err := strconv.ParseUint(v, 10, 64)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "before-height must be a non-negative integer"})
+			return
+		}
+		if n > math.MaxInt64 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "before-height is too large"})
 			return
 		}
 		beforeHeight = n
