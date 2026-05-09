@@ -162,7 +162,7 @@ func recoverSubtreeBoundaries(txidsInternal []chainhash.Hash, subtreeHashesHex [
 // buildMultiSubtreeBinaries handles subtreeCount > 1. Per-subtree
 // binaries are concatenated 32-byte hashes; subtree[0] uses the
 // coinbase placeholder at index 0.
-func buildMultiSubtreeBinaries(txids []string, subtreeHashesHex []string) (map[string][]byte, error) {
+func buildMultiSubtreeBinaries(txids, subtreeHashesHex []string) (map[string][]byte, error) {
 	internal := parseHashes(txids)
 	bounds, err := recoverSubtreeBoundaries(internal, subtreeHashesHex)
 	if err != nil {

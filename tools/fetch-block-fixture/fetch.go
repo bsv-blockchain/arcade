@@ -245,7 +245,7 @@ func parseTeranodeBlock(data []byte) (*teranodeBlock, error) {
 // For multi-subtree blocks WoC doesn't expose subtree boundaries — we
 // recover them by computing the merkle root over progressively-larger
 // candidate batches and matching against parsed.subtreeHashes.
-func buildSubtreeBinaries(txids []string, subtreeHashesHex []string) (map[string][]byte, error) {
+func buildSubtreeBinaries(txids, subtreeHashesHex []string) (map[string][]byte, error) {
 	if len(subtreeHashesHex) == 0 {
 		return nil, fmt.Errorf("block has no subtrees")
 	}
