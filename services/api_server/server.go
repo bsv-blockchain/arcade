@@ -22,14 +22,14 @@ import (
 )
 
 type Server struct {
-	cfg         *config.Config
-	logger      *zap.Logger
-	producer    *kafka.Producer
-	publisher   events.Publisher // nil-safe; used to fan status updates out to SSE / webhooks
-	store       store.Store
-	txTracker   *store.TxTracker
-	teranode    *teranode.Client // used by /health for datahub URL inventory; nil in tests
-	server      *http.Server
+	cfg          *config.Config
+	logger       *zap.Logger
+	producer     *kafka.Producer
+	publisher    events.Publisher // nil-safe; used to fan status updates out to SSE / webhooks
+	store        store.Store
+	txTracker    *store.TxTracker
+	teranode     *teranode.Client // used by /health for datahub URL inventory; nil in tests
+	server       *http.Server
 	chaintracks  chaintracks.Chaintracks // nil when disabled
 	ctRoutes     *chaintracksRoutes      // nil when disabled
 	blockTracker *blockStatusTracker     // nil when chaintracks is disabled

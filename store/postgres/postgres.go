@@ -893,13 +893,13 @@ LIMIT $2`
 // shape lets us share this between QueryRow.Scan and Rows.Scan.
 func scanBlockProcessing(scan func(...any) error) (*models.BlockProcessingStatus, error) {
 	var (
-		bp          models.BlockProcessingStatus
-		height      int64
-		processed   *time.Time
-		bumpBuilt   *time.Time
-		statusVal   string
-		orphanedAt  *time.Time
-		seenAt      time.Time
+		bp         models.BlockProcessingStatus
+		height     int64
+		processed  *time.Time
+		bumpBuilt  *time.Time
+		statusVal  string
+		orphanedAt *time.Time
+		seenAt     time.Time
 	)
 	if err := scan(&bp.BlockHash, &height, &seenAt, &processed, &bumpBuilt, &statusVal, &orphanedAt); err != nil {
 		return nil, err

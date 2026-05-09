@@ -131,9 +131,11 @@ func (s *fakeStore) ListDatahubEndpoints(context.Context, string) ([]store.Datah
 func (s *fakeStore) UpsertBlockHeaderSeen(context.Context, string, uint64, time.Time) error {
 	return nil
 }
+
 func (s *fakeStore) MarkBlockProcessed(context.Context, string, uint64, time.Time) error {
 	return nil
 }
+
 func (s *fakeStore) MarkBlockBUMPBuilt(context.Context, string, uint64, time.Time) error {
 	return nil
 }

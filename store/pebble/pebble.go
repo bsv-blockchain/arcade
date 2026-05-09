@@ -937,13 +937,13 @@ func (s *Store) GetStumpsByBlockHash(ctx context.Context, blockHash string) ([]*
 // nanoseconds (0 == "not yet") to match the conventions used by storedStatus
 // and to avoid JSON timezone drift.
 type storedBlockProcessing struct {
-	BlockHash         string `json:"block_hash"`
-	BlockHeight       uint64 `json:"block_height"`
-	HeaderSeenUnixNs  int64  `json:"header_seen_at,omitempty"`
-	ProcessedUnixNs   int64  `json:"processed_at,omitempty"`
-	BUMPBuiltUnixNs   int64  `json:"bump_built_at,omitempty"`
-	Status            string `json:"status"`
-	OrphanedAtUnixNs  int64  `json:"orphaned_at,omitempty"`
+	BlockHash        string `json:"block_hash"`
+	BlockHeight      uint64 `json:"block_height"`
+	HeaderSeenUnixNs int64  `json:"header_seen_at,omitempty"`
+	ProcessedUnixNs  int64  `json:"processed_at,omitempty"`
+	BUMPBuiltUnixNs  int64  `json:"bump_built_at,omitempty"`
+	Status           string `json:"status"`
+	OrphanedAtUnixNs int64  `json:"orphaned_at,omitempty"`
 }
 
 func (b storedBlockProcessing) toModel() *models.BlockProcessingStatus {
@@ -1059,10 +1059,10 @@ func (s *Store) MarkBlockProcessed(ctx context.Context, blockHash string, blockH
 		return err
 	}
 	cur := storedBlockProcessing{
-		BlockHash:        blockHash,
-		BlockHeight:      blockHeight,
-		ProcessedUnixNs:  processedAt.UnixNano(),
-		Status:           string(models.BlockStatusActive),
+		BlockHash:       blockHash,
+		BlockHeight:     blockHeight,
+		ProcessedUnixNs: processedAt.UnixNano(),
+		Status:          string(models.BlockStatusActive),
 	}
 	if prev != nil {
 		// Preserve everything except processed_at.
@@ -1164,7 +1164,7 @@ func (s *Store) ListBlockProcessingStatus(ctx context.Context, beforeHeight uint
 	// the inverted (beforeHeight-1) so heights >= beforeHeight are skipped.
 	lower := prefix
 	if beforeHeight > 0 {
-		lower = []byte(fmt.Sprintf("%s%016x:", prefixIdxBlockProcHeight, ^(beforeHeight-1)))
+		lower = []byte(fmt.Sprintf("%s%016x:", prefixIdxBlockProcHeight, ^(beforeHeight - 1)))
 	}
 	iter, err := s.db.NewIter(&pebbledb.IterOptions{
 		LowerBound: lower,

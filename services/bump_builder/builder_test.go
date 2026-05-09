@@ -30,6 +30,11 @@ import (
 // regression tests for issue #87 push the literal count past the threshold.
 const testBlockHash = "aabbccdd00000000000000000000000000000000000000000000000000000000"
 
+// testTxidHex is the canonical synthetic txid hash used across the
+// happy-path / multi-subtree / mark-bump-built tests. Same goconst-
+// satisfaction motivation as testBlockHash above.
+const testTxidHex = "1111111111111111111111111111111111111111111111111111111111111111"
+
 // --- Mock Store ---
 
 type mockStore struct {
@@ -412,7 +417,7 @@ func TestBuilder_HandleMessage_GetStumpsError_Propagated(t *testing.T) {
 func TestBuilder_HandleMessage_DatahubFailure_ReturnsError(t *testing.T) {
 	ms := newMockStore()
 	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
-	stumpData := makeMinimalSTUMP("1111111111111111111111111111111111111111111111111111111111111111")
+	stumpData := makeMinimalSTUMP(testTxidHex)
 	ms.addStump(blockHash, 0, stumpData)
 
 	datahub := newFailingDatahubServer()
@@ -434,7 +439,7 @@ func TestBuilder_HandleMessage_InsertBUMPError_ReturnsError(t *testing.T) {
 	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
 
 	// Need a valid STUMP that produces a valid BUMP. Use a single-subtree scenario.
-	txidHex := "1111111111111111111111111111111111111111111111111111111111111111"
+	txidHex := testTxidHex
 	stumpData := makeMinimalSTUMP(txidHex)
 	ms.addStump(blockHash, 0, stumpData)
 	ms.insertBUMPErr = errors.New("SERVER_MEM_ERROR")
@@ -462,7 +467,7 @@ func TestBuilder_HandleMessage_InsertBUMPError_ReturnsError(t *testing.T) {
 func TestBuilder_HandleMessage_HappyPath_SingleSubtree(t *testing.T) {
 	ms := newMockStore()
 	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
-	txidHex := "1111111111111111111111111111111111111111111111111111111111111111"
+	txidHex := testTxidHex
 
 	stumpData := makeMinimalSTUMP(txidHex)
 	ms.addStump(blockHash, 0, stumpData)
@@ -503,7 +508,7 @@ func TestBuilder_HandleMessage_BumpBuiltStoreError_StillSucceeds(t *testing.T) {
 	ms := newMockStore()
 	ms.markBumpBuiltErr = errors.New("store down")
 	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
-	txidHex := "1111111111111111111111111111111111111111111111111111111111111111"
+	txidHex := testTxidHex
 
 	stumpData := makeMinimalSTUMP(txidHex)
 	ms.addStump(blockHash, 0, stumpData)
@@ -531,7 +536,7 @@ func TestBuilder_HandleMessage_BumpBuiltStoreError_StillSucceeds(t *testing.T) {
 func TestBuilder_HandleMessage_HappyPath_WithTracker(t *testing.T) {
 	ms := newMockStore()
 	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
-	txidHex := "1111111111111111111111111111111111111111111111111111111111111111"
+	txidHex := testTxidHex
 
 	stumpData := makeMinimalSTUMP(txidHex)
 	ms.addStump(blockHash, 0, stumpData)
@@ -597,7 +602,7 @@ func TestBuilder_HandleMessage_InvalidJSON_ReturnsError(t *testing.T) {
 func TestBuilder_LateSTUMP_ArrivesDuringGraceWindow(t *testing.T) {
 	ms := newMockStore()
 	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
-	txidHex := "1111111111111111111111111111111111111111111111111111111111111111"
+	txidHex := testTxidHex
 
 	// Compute what the late-arriving STUMP will produce so the datahub header
 	// merkle root set up ahead of time matches the compound the builder builds
@@ -641,7 +646,7 @@ func TestBuilder_LateSTUMP_ArrivesDuringGraceWindow(t *testing.T) {
 func TestBuilder_E2E_InsertStump_GetStumps_BuildBUMP(t *testing.T) {
 	ms := newMockStore()
 	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
-	txid1 := "1111111111111111111111111111111111111111111111111111111111111111"
+	txid1 := testTxidHex
 	txid2 := "3333333333333333333333333333333333333333333333333333333333333333"
 	sib1 := "5555555555555555555555555555555555555555555555555555555555555555"
 	sib2 := "7777777777777777777777777777777777777777777777777777777777777777"
@@ -713,7 +718,7 @@ func TestBuilder_E2E_BUMPExtractionWithRealisticSTUMP(t *testing.T) {
 	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
 
 	// Build a realistic STUMP with 2 leaves using go-sdk types
-	txHash1Bytes, _ := hex.DecodeString("1111111111111111111111111111111111111111111111111111111111111111")
+	txHash1Bytes, _ := hex.DecodeString(testTxidHex)
 	txHash2Bytes, _ := hex.DecodeString("2222222222222222222222222222222222222222222222222222222222222222")
 	h1, _ := chainhash.NewHash(txHash1Bytes)
 	h2, _ := chainhash.NewHash(txHash2Bytes)
@@ -768,7 +773,7 @@ func TestBuilder_E2E_BUMPExtractionWithRealisticSTUMP(t *testing.T) {
 func TestBuilder_HandleMessage_RootMismatch_SkipsPersistence(t *testing.T) {
 	ms := newMockStore()
 	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
-	txidHex := "1111111111111111111111111111111111111111111111111111111111111111"
+	txidHex := testTxidHex
 
 	stumpData := makeMinimalSTUMP(txidHex)
 	ms.addStump(blockHash, 0, stumpData)
@@ -878,7 +883,7 @@ func TestBuilder_HandleMessage_PublishesMinedStatusWithBlockHeight(t *testing.T)
 	pub := &recordingPublisher{}
 
 	blockHash := testBlockHash
-	txidHex := "1111111111111111111111111111111111111111111111111111111111111111"
+	txidHex := testTxidHex
 
 	stumpData := makeMinimalSTUMPAtHeight(t, txidHex, wantHeight)
 	ms.addStump(blockHash, 0, stumpData)
@@ -942,7 +947,7 @@ func TestBuilder_HandleMessage_PublishedHeightIsNeverZero(t *testing.T) {
 	pub := &recordingPublisher{}
 
 	blockHash := testBlockHash
-	txidHex := "1111111111111111111111111111111111111111111111111111111111111111"
+	txidHex := testTxidHex
 
 	// Use the existing 0x01 minimal STUMP — it encodes blockHeight=1, which is
 	// non-zero, so any code path that zero-values the height will be caught.
@@ -985,7 +990,7 @@ func TestBuilder_HandleMessage_DefensivelyRestoresHeightIfStoreDropsIt(t *testin
 	pub := &recordingPublisher{}
 
 	blockHash := testBlockHash
-	txidHex := "1111111111111111111111111111111111111111111111111111111111111111"
+	txidHex := testTxidHex
 
 	stumpData := makeMinimalSTUMP(txidHex)
 	ms.addStump(blockHash, 0, stumpData)

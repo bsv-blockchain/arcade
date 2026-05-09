@@ -23,14 +23,14 @@ import (
 type blockProcStore struct {
 	mockStore
 
-	mu              sync.Mutex
-	rows            map[string]*models.BlockProcessingStatus
-	processedCalls  []string
-	bumpBuiltCalls  []string
-	headerCalls     []string
-	orphanedCalls   [][]string
-	listErr         error
-	getErr          error
+	mu               sync.Mutex
+	rows             map[string]*models.BlockProcessingStatus
+	processedCalls   []string
+	bumpBuiltCalls   []string
+	headerCalls      []string
+	orphanedCalls    [][]string
+	listErr          error
+	getErr           error
 	markProcessedErr error
 }
 
@@ -281,7 +281,6 @@ func TestHandleGetBlockProcessingStatus_NotFound(t *testing.T) {
 
 func TestHandleBlockProcessed_RecordsStatusBeforeKafka(t *testing.T) {
 	bs := newBlockProcStore()
-	broker := &kafka.RecordingBroker{}
 	srv, router := setupServerWithStoreAndBlockProc(t, bs)
 	_ = srv
 
@@ -297,10 +296,6 @@ func TestHandleBlockProcessed_RecordsStatusBeforeKafka(t *testing.T) {
 	}
 	if len(bs.processedCalls) != 1 || bs.processedCalls[0] != "blk-1" {
 		t.Errorf("processedCalls=%v want [blk-1]", bs.processedCalls)
-	}
-	if totalMessages(broker) != 0 {
-		// We didn't pass our broker into the handler — just sanity check the
-		// store-side recording above.
 	}
 }
 

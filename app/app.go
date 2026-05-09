@@ -53,7 +53,8 @@ type Deps struct {
 // reverse order. teranodeClient.Start is wired to ctx, so its background
 // probes terminate when ctx is canceled.
 func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*Deps, func(), error) {
-	logger.Info("starting arcade",
+	logger.Info(
+		"starting arcade",
 		zap.String("mode", cfg.Mode),
 		zap.String("kafka_backend", cfg.Kafka.Backend),
 		zap.String("store_backend", cfg.Store.Backend),
@@ -72,7 +73,7 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		}
 	}
 
-	st, leaser, err := storefactory.New(cfg)
+	st, leaser, err := storefactory.New(cfg) //nolint:contextcheck // factory signature predates ctx; the Postgres backend honors ctx via its own internal pool dial, others (Pebble, Aerospike) connect synchronously
 	if err != nil {
 		_ = producer.Close()
 		return nil, nil, fmt.Errorf("creating store: %w", err)
@@ -108,7 +109,8 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 				Source:   store.DatahubEndpointSourceConfigured,
 				LastSeen: time.Now(),
 			}); err != nil {
-				logger.Warn("failed to seed configured datahub url",
+				logger.Warn(
+					"failed to seed configured datahub url",
 					zap.String("url", url),
 					zap.Error(err),
 				)
