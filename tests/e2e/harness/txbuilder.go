@@ -160,7 +160,7 @@ func SubtreeRoot(txids []chainhash.Hash) chainhash.Hash {
 // MerkleRootFromCoinbaseAndSubtree computes the block-header merkle root
 // for a block laid out as one subtree. Layout: leaf 0 is the coinbase
 // txid, leaf 1 is the subtree root. SHA-256d concatenated.
-func MerkleRootFromCoinbaseAndSubtree(coinbase chainhash.Hash, subtreeRoot chainhash.Hash) chainhash.Hash {
+func MerkleRootFromCoinbaseAndSubtree(coinbase, subtreeRoot chainhash.Hash) chainhash.Hash {
 	return sha256d(coinbase[:], subtreeRoot[:])
 }
 

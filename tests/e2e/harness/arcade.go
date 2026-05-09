@@ -25,9 +25,9 @@ type ArcadeRuntime struct {
 	Cfg     *config.Config
 	Deps    *app.Deps
 	Logger  *zap.Logger
-	Port    int            // host port the api-server is bound to
-	BaseURL string         // http://127.0.0.1:<Port>; reachable from the test process
-	HostURL string         // http://host.docker.internal:<Port>; reachable from inside merkle-service container
+	Port    int    // host port the api-server is bound to
+	BaseURL string // http://127.0.0.1:<Port>; reachable from the test process
+	HostURL string // http://host.docker.internal:<Port>; reachable from inside merkle-service container
 	wg      sync.WaitGroup
 	cancel  context.CancelFunc
 	cleanup func()

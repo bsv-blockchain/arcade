@@ -38,9 +38,9 @@ func TestDatahub_StageAndServe(t *testing.T) {
 
 	prev := chainhash.Hash{}
 	blockBin, blockHash, err := BuildBlockBinary(
-		prev, merkleRoot, /*height=*/ 1, /*ts=*/ 0, /*bits=*/ nil, /*nonce=*/ 0,
+		prev, merkleRoot /*height=*/, 1 /*ts=*/, 0 /*bits=*/, nil /*nonce=*/, 0,
 		[]chainhash.Hash{subtreeRoot}, coinbase, nil,
-		/*txCount=*/ uint64(len(txs)+1), /*sizeBytes=*/ 1,
+		/*txCount=*/ uint64(len(txs)+1) /*sizeBytes=*/, 1,
 	)
 	if err != nil {
 		t.Fatalf("build block: %v", err)

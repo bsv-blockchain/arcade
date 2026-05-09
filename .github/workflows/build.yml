@@ -58,8 +58,7 @@ jobs:
     name: Verify GoFortress gates passed
     runs-on: ubuntu-latest
     if: >-
-      github.event_name != 'workflow_run' ||
-      (github.event.workflow_run.conclusion == 'success' &&
+      github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push')
     steps:
       - name: Confirm upstream gates

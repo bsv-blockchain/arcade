@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/moby/moby/api/types/container"
+	dockerclient "github.com/moby/moby/client"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/modules/redpanda"
@@ -57,6 +58,18 @@ type Containers struct {
 	// gossiping to merkle-service via libp2p — though that path uses
 	// multiaddrs, not HTTP).
 	MerkleInternalURL string
+
+	// GatewayIP is the bridge-network gateway IP from a container's
+	// perspective — i.e., the address that routes back to the host the
+	// test process is running on. Used by LibP2PHost to advertise an
+	// announce multiaddr containers can actually dial.
+	//
+	// On Docker, host.docker.internal:host-gateway resolves to this
+	// gateway IP and works either way. On rootless podman + slirp4netns
+	// the host-gateway IP is a synthetic link-local address that isn't
+	// routable from the container, so we have to thread the real
+	// gateway through explicitly.
+	GatewayIP string
 }
 
 // MerkleStartOptions tells StartContainers how to wire merkle-service to
@@ -79,15 +92,61 @@ type MerkleStartOptions struct {
 }
 
 // StartContainers brings up Postgres, Redpanda, and merkle-service on a
-// shared user-defined bridge network. Caller is responsible for calling
+// fresh user-defined bridge network. Caller is responsible for calling
 // Close on the returned Containers (or wiring it to t.Cleanup).
 //
-// Wait strategies are conservative: Postgres waits for the listening
-// log message, Redpanda for its broker port, merkle-service for an
-// HTTP 200 OR 503 on /health. 503 (degraded) is acceptable because
+// Most callers should prefer harness.New(), which sequences network
+// creation, gateway discovery, and libp2p-host construction in the
+// right order — StartContainers is the lower-level entry for tests
+// that want to manage those pieces themselves.
+//
+// Wait strategies: Postgres uses the module's BasicWaitStrategies (log
+// "ready to accept connections" twice + 5432/tcp listening), Redpanda
+// uses the module default (port mappings), merkle-service waits for
+// HTTP 200 OR 503 on /health. 503 (degraded) is accepted because
 // merkle-service reports degraded until it has at least one libp2p
-// peer — which the harness only provides after this function returns.
+// peer — which only happens after this function returns.
 func StartContainers(ctx context.Context, t *testing.T, opts MerkleStartOptions) (*Containers, error) {
+	t.Helper()
+
+	nw, gateway, err := newNetworkWithGateway(ctx)
+	if err != nil {
+		return nil, err
+	}
+	c, err := startContainersOnNetwork(ctx, t, opts, nw, gateway)
+	if err != nil {
+		// network ownership transfers to startContainersOnNetwork's
+		// cleanup path on error; we don't double-remove.
+		return nil, err
+	}
+	return c, nil
+}
+
+// newNetworkWithGateway creates the e2e bridge network and inspects it
+// to find the gateway IP a container would route through to reach the
+// host. Used by harness.New() to thread the gateway into the libp2p
+// host before any container starts up.
+func newNetworkWithGateway(ctx context.Context) (*testcontainers.DockerNetwork, string, error) {
+	nw, err := network.New(ctx,
+		network.WithDriver("bridge"),
+		network.WithLabels(map[string]string{"arcade-e2e": "true"}),
+	)
+	if err != nil {
+		return nil, "", fmt.Errorf("create network: %w", err)
+	}
+	gateway, err := networkGatewayIP(ctx, nw)
+	if err != nil {
+		// Best-effort: a missing gateway is logged by the caller and
+		// the libp2p host falls back to host.docker.internal.
+		gateway = ""
+	}
+	return nw, gateway, nil
+}
+
+// startContainersOnNetwork runs the per-container start sequence
+// against an already-created network. Owns Containers ownership for
+// teardown when one of the inner Run calls fails part-way through.
+func startContainersOnNetwork(ctx context.Context, t *testing.T, opts MerkleStartOptions, nw *testcontainers.DockerNetwork, gateway string) (*Containers, error) {
 	t.Helper()
 
 	if opts.Image == "" {
@@ -97,22 +156,24 @@ func StartContainers(ctx context.Context, t *testing.T, opts MerkleStartOptions)
 		opts.P2PNetwork = "regtest"
 	}
 
-	nw, err := network.New(ctx,
-		network.WithDriver("bridge"),
-		network.WithLabels(map[string]string{"arcade-e2e": "true"}),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("create network: %w", err)
-	}
-
-	out := &Containers{Network: nw}
+	out := &Containers{Network: nw, GatewayIP: gateway}
 
 	// Postgres ----------------------------------------------------------
+	// BasicWaitStrategies() composes the log-and-port wait the postgres
+	// module ships (log "ready to accept connections" twice + 5432/tcp
+	// listening) on top of the default wait — without it, postgres.Run
+	// returns before the server is actually accepting connections from
+	// peer containers on the user-defined network. CI runners hit this
+	// race because the log line fires before the inter-container TCP
+	// listener is up; merkle-service then tries to dial Postgres and
+	// fails with `connection refused` (issue surfaced in CI run
+	// 25600805894).
 	pg, err := postgres.Run(ctx,
 		"postgres:17-alpine",
 		postgres.WithDatabase(postgresDB),
 		postgres.WithUsername(postgresUser),
 		postgres.WithPassword(postgresPass),
+		postgres.BasicWaitStrategies(),
 		network.WithNetwork([]string{netAliasPostgres}, nw),
 	)
 	if err != nil {
@@ -226,6 +287,29 @@ func StartContainers(ctx context.Context, t *testing.T, opts MerkleStartOptions)
 	out.MerkleInternalURL = fmt.Sprintf("http://%s:8080", netAliasMerkle)
 
 	return out, nil
+}
+
+// networkGatewayIP inspects the docker/podman network to find the
+// gateway IP from a container's perspective — i.e., the address that
+// routes back to the host the test process is running on. Returns an
+// empty string + error when the network has no IPv4 IPAM entry (very
+// unusual; bridge networks always have one in practice).
+func networkGatewayIP(ctx context.Context, nw *testcontainers.DockerNetwork) (string, error) {
+	cli, err := testcontainers.NewDockerClientWithOpts(ctx)
+	if err != nil {
+		return "", fmt.Errorf("docker client: %w", err)
+	}
+	defer func() { _ = cli.Close() }()
+	res, err := cli.NetworkInspect(ctx, nw.ID, dockerclient.NetworkInspectOptions{})
+	if err != nil {
+		return "", fmt.Errorf("inspect network: %w", err)
+	}
+	for _, cfg := range res.Network.IPAM.Config {
+		if cfg.Gateway.IsValid() && cfg.Gateway.Is4() {
+			return cfg.Gateway.String(), nil
+		}
+	}
+	return "", fmt.Errorf("no IPv4 gateway on network %s", nw.Name)
 }
 
 // PostgresDSNInternal returns the DSN merkle-service uses to reach

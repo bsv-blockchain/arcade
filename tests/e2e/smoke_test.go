@@ -40,23 +40,17 @@ import (
 func TestSmoke_TxRegistersWithMerkleService(t *testing.T) {
 	skipIfNoDocker(t)
 
-	libp2pHost, err := harness.NewLibP2PHost(t, "regtest", 0)
-	if err != nil {
-		t.Fatalf("libp2p host: %v", err)
-	}
-	t.Cleanup(func() { _ = libp2pHost.Close() })
-
 	datahub, err := harness.NewDatahub(t)
 	if err != nil {
 		t.Fatalf("datahub: %v", err)
 	}
 
-	h := harness.New(t, harness.WithBootstrapPeers(libp2pHost.BootstrapMultiaddr()))
+	h := harness.New(t)
 
 	rt := harness.StartArcade(t, harness.ArcadeOptions{
 		MerkleServiceURL: h.Containers.MerkleHostURL,
 		DatahubURL:       datahub.HostURL(),
-		LibP2PBootstrap:  libp2pHost.BootstrapMultiaddr(),
+		LibP2PBootstrap:  h.LibP2P.BootstrapMultiaddr(),
 		MerkleAuthToken:  "e2e-watch-token",
 		CallbackToken:    "e2e-callback-token",
 	})

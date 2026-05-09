@@ -20,23 +20,17 @@ import (
 func TestArcadeRuntime_BootsAndServesHealth(t *testing.T) {
 	skipIfNoDocker(t)
 
-	libp2pHost, err := NewLibP2PHost(t, "regtest", 0)
-	if err != nil {
-		t.Fatalf("libp2p host: %v", err)
-	}
-	t.Cleanup(func() { _ = libp2pHost.Close() })
-
 	datahub, err := NewDatahub(t)
 	if err != nil {
 		t.Fatalf("datahub: %v", err)
 	}
 
-	containers := New(t, WithBootstrapPeers(libp2pHost.BootstrapMultiaddr()))
+	h := New(t)
 
 	rt := StartArcade(t, ArcadeOptions{
-		MerkleServiceURL: containers.Containers.MerkleHostURL,
+		MerkleServiceURL: h.Containers.MerkleHostURL,
 		DatahubURL:       datahub.HostURL(),
-		LibP2PBootstrap:  libp2pHost.BootstrapMultiaddr(),
+		LibP2PBootstrap:  h.LibP2P.BootstrapMultiaddr(),
 		MerkleAuthToken:  "e2e-watch-token",
 		CallbackToken:    "e2e-callback-token",
 	})

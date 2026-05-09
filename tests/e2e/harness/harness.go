@@ -18,18 +18,28 @@ import (
 type Harness struct {
 	Containers *Containers
 
-	// Future fields — wired in subsequent steps:
-	//   LibP2P  *LibP2PHost
-	//   Datahub *Datahub
-	//   Arcade  *ArcadeRuntime
+	// LibP2P is the in-process libp2p peer that merkle-service treats as
+	// its sole bootstrap peer. Auto-built by New() using the docker
+	// network's gateway IP so containers can dial back to the harness on
+	// runtimes where host.docker.internal isn't routable (rootless
+	// podman). Tests that want full control of the libp2p host instead
+	// (e.g. to drive failure-injection scenarios) build it themselves
+	// via NewLibP2PHostWith and use the lower-level pieces.
+	LibP2P *LibP2PHost
 }
 
-// New brings up the full harness. Currently this is just the container
-// layer (Postgres + Redpanda + merkle-service); the libp2p host, datahub
-// fake, and in-process arcade are added in subsequent steps so each can
-// be exercised in isolation while it's being built.
+// New brings up the full harness in the right order to dodge the
+// host-from-container chicken-and-egg:
 //
-// Failure during start triggers a synchronous Close on whatever was
+//  1. Create the docker bridge network.
+//  2. Inspect the network to discover the host-from-container gateway IP.
+//  3. Build the in-process libp2p host announcing on that gateway IP
+//     (so the merkle-service container can dial it back regardless of
+//     whether host.docker.internal is routable on this runtime).
+//  4. Bring up Postgres + Redpanda + merkle-service on the network with
+//     the libp2p host's multiaddr threaded in as P2P_BOOTSTRAP_PEERS.
+//
+// Failure at any step triggers a synchronous Close on whatever was
 // already running. On success, Close runs via t.Cleanup.
 func New(t *testing.T, opts ...Option) *Harness {
 	t.Helper()
@@ -41,12 +51,43 @@ func New(t *testing.T, opts ...Option) *Harness {
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.startupTimeout)
 	defer cancel()
 
-	containers, err := StartContainers(ctx, t, cfg.merkleStart)
+	// Step 1+2: network and gateway discovery, before anything else
+	// needs them.
+	nw, gateway, err := newNetworkWithGateway(ctx)
+	if err != nil {
+		t.Fatalf("create network: %v", err)
+	}
+	t.Cleanup(func() {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer closeCancel()
+		_ = nw.Remove(closeCtx)
+	})
+
+	// Step 3: libp2p host with the gateway IP baked into its announce
+	// multiaddr. Skipped when the caller explicitly passed a bootstrap
+	// peer string — that mode is for tests that want to wire their own
+	// libp2p configuration.
+	var libp2p *LibP2PHost
+	if cfg.merkleStart.BootstrapPeers == "" {
+		libp2p, err = NewLibP2PHostWith(t, LibP2PHostOptions{
+			Network:      cfg.merkleStart.P2PNetwork,
+			AnnounceHost: gateway,
+		})
+		if err != nil {
+			t.Fatalf("build libp2p host: %v", err)
+		}
+		t.Cleanup(func() { _ = libp2p.Close() })
+		cfg.merkleStart.BootstrapPeers = libp2p.BootstrapMultiaddr()
+	}
+
+	// Step 4: Postgres + Redpanda + merkle-service on the prepared
+	// network.
+	containers, err := startContainersOnNetwork(ctx, t, cfg.merkleStart, nw, gateway)
 	if err != nil {
 		t.Fatalf("start containers: %v", err)
 	}
 
-	h := &Harness{Containers: containers}
+	h := &Harness{Containers: containers, LibP2P: libp2p}
 	t.Cleanup(func() {
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer closeCancel()

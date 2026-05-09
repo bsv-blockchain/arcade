@@ -33,12 +33,15 @@ func TestLibP2PHost_StartsAndExposesMultiaddr(t *testing.T) {
 }
 
 // TestLibP2PHost_MerkleServicePeersWithHost is the joint test for the
-// container layer + libp2p host. We bring up the libp2p host, feed its
-// bootstrap multiaddr to merkle-service via P2P_BOOTSTRAP_PEERS, and
-// assert merkle-service logs a `[CONNECTED] Topic peer <harness-peer-id>`
-// line within a generous timeout. This proves
+// container layer + libp2p host. harness.New() auto-builds the libp2p
+// host using the docker-network gateway IP it discovers (so containers
+// can dial back regardless of whether host.docker.internal is routable
+// on the runtime), feeds the resulting multiaddr to merkle-service via
+// P2P_BOOTSTRAP_PEERS, and we assert merkle-service logs a
+// `[CONNECTED] Topic peer <harness-peer-id>` line within a generous
+// timeout. This proves
 //
-//   - merkle-service can reach the harness via host.docker.internal
+//   - merkle-service can reach the harness via the bridge gateway IP
 //   - both sides agree on the regtest topic namespace
 //   - gossipsub mesh formation succeeded.
 //
@@ -50,13 +53,7 @@ func TestLibP2PHost_StartsAndExposesMultiaddr(t *testing.T) {
 func TestLibP2PHost_MerkleServicePeersWithHost(t *testing.T) {
 	skipIfNoDocker(t)
 
-	host, err := NewLibP2PHost(t, "regtest", 0)
-	if err != nil {
-		t.Fatalf("new libp2p host: %v", err)
-	}
-	t.Cleanup(func() { _ = host.Close() })
-
-	h := New(t, WithBootstrapPeers(host.BootstrapMultiaddr()))
+	h := New(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -65,9 +62,9 @@ func TestLibP2PHost_MerkleServicePeersWithHost(t *testing.T) {
 	// completes a libp2p connection on a topic the peer is also subscribed
 	// to. Matching the peer ID anchors the assertion to OUR harness host
 	// rather than any incidental peer.
-	signal := "[CONNECTED] Topic peer " + host.PeerID()
+	signal := "[CONNECTED] Topic peer " + h.LibP2P.PeerID()
 	if err := h.Containers.WaitForMerkleLogLine(ctx, signal, 90*time.Second); err != nil {
 		t.Fatalf("merkle-service did not log peering with harness: %v", err)
 	}
-	t.Logf("merkle-service peered with harness on topic mesh (peer ID %s)", host.PeerID())
+	t.Logf("merkle-service peered with harness on topic mesh (peer ID %s)", h.LibP2P.PeerID())
 }

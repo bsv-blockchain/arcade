@@ -990,7 +990,7 @@ func (s *Store) readBlockProc(blockHash string) (*storedBlockProcessing, error) 
 // writeBlockProc persists the row plus the descending-height index entry.
 // The caller is expected to hold the per-block shard lock so the index does
 // not pick up stale entries from a concurrent height change.
-func (s *Store) writeBlockProc(prev *storedBlockProcessing, current *storedBlockProcessing) error {
+func (s *Store) writeBlockProc(prev, current *storedBlockProcessing) error {
 	payload, err := json.Marshal(current)
 	if err != nil {
 		return err
