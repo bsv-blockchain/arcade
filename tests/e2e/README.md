@@ -47,21 +47,27 @@ export DOCKER_HOST=unix:///run/user/$(id -u)/podman/podman.sock
 go test -tags=e2e -timeout=15m ./tests/e2e/...
 ```
 
-The harness uses `host.docker.internal` to let containers reach the in-
-process arcade callback URL and in-process datahub. Recent Docker
-engines and Docker Desktop honor `--add-host=host.docker.internal:host-
-gateway`. Rootless podman exposes the host on the same DNS name when
-the container has been allow-listed for slirp4netns host loopback —
-testcontainers-go's `WithExtraHosts` handles the wiring.
+The harness reaches the host from inside containers two ways:
 
-If you see `connection refused` from the merkle-service container when
-it tries to call back to arcade, check:
+1. **Docker bridge gateway IP** — auto-discovered by `harness.New()`
+   via `network.NetworkInspect`. Used as the announce address for the
+   in-process libp2p host so merkle-service can dial back. Works on
+   Docker engines (the gateway IP routes to the host).
+2. **`host.docker.internal`** — fallback when no gateway is available.
+   Honored by Docker via `--add-host=host.docker.internal:host-gateway`.
 
-1. Container has `host.docker.internal` resolved (`docker exec <id>
-   getent hosts host.docker.internal`).
-2. `arcade.cfg.CallbackURL` uses `host.docker.internal:<port>` (the
-   harness sets this automatically — only relevant if you've forked
-   the boot path).
+**Known limitation on rootless podman + pasta networking:** if pasta
+is started with `--no-map-gw` (the default for security), the host is
+not reachable from inside containers via either the gateway IP or
+`host.docker.internal`. Tests that require merkle-service to dial
+back into the harness (`TestLibP2PHost_MerkleServicePeersWithHost`,
+`TestSmoke_TxRegistersWithMerkleService`) will time out under this
+configuration. CI runners use Docker so this doesn't affect the
+required PR gate.
+
+To verify your setup: `podman run --rm alpine sh -c 'nc -zv -w2
+host.docker.internal 22 || echo NOT REACHABLE'`. If the host is
+reachable, the full e2e suite works locally.
 
 ## Disabling Ryuk (the testcontainers reaper)
 
