@@ -5,14 +5,18 @@ package harness
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-sdk/chainhash"
+	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 )
 
 // BroadcastTx submits a single transaction to arcade via POST /tx.
@@ -84,6 +88,140 @@ func GetTxStatus(ctx context.Context, rt *ArcadeRuntime, txid string) (txStatusR
 		return txStatusResponse{}, false, fmt.Errorf("decode tx status: %w", err)
 	}
 	return out, true, nil
+}
+
+// BroadcastRawTxs submits each (txid, rawTxBytes) pair via POST /tx
+// and returns the txids in stable order. Pacing matches the e2e
+// smoke test pattern — one POST per tx, no batching, since per-tx
+// status assertions are easier to read than batch acknowledgements.
+//
+// txids in the returned slice are sorted so callers can pass them to
+// WaitForMined without worrying about map iteration order.
+func BroadcastRawTxs(ctx context.Context, t *testing.T, rt *ArcadeRuntime, rawTxs map[string][]byte) ([]string, error) {
+	t.Helper()
+	got := make([]string, 0, len(rawTxs))
+	for id, raw := range rawTxs {
+		tx, err := bt.NewTxFromBytes(raw)
+		if err != nil {
+			return nil, fmt.Errorf("parse raw tx %s: %w", id, err)
+		}
+		assigned, err := BroadcastTx(ctx, t, rt, tx)
+		if err != nil {
+			return nil, fmt.Errorf("broadcast %s: %w", id, err)
+		}
+		if assigned != id {
+			// arcade's POST /tx returns the canonical txid arcade
+			// derived from the parsed bytes; if it disagrees with
+			// our fixture's recorded txid, something is wrong with
+			// the raw-tx fetch (or the tx version differs from
+			// what WoC normalized).
+			return nil, fmt.Errorf("txid mismatch for %s: arcade reports %s", id, assigned)
+		}
+		got = append(got, id)
+	}
+	sort.Strings(got)
+	return got, nil
+}
+
+// WaitForMerkleRegistration polls merkle-service's GET /api/lookup/<txid>
+// until the registered callback URL list is non-empty or the timeout
+// elapses. Hoisted from smoke_test.go so real-block scenarios can
+// reuse it.
+func WaitForMerkleRegistration(ctx context.Context, merkleHostURL, txid string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	url := fmt.Sprintf("%s/api/lookup/%s", merkleHostURL, txid)
+	for {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			body, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				var lookup struct {
+					CallbackUrls []string `json:"callbackUrls"`
+				}
+				if jErr := json.Unmarshal(body, &lookup); jErr == nil && len(lookup.CallbackUrls) > 0 {
+					return nil
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out polling %s", url)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+// AssertMerklePathsMatchHeaderRoot fetches each tx's status from arcade,
+// parses its merklePath, and asserts ComputeRoot reproduces the header
+// merkle root recorded in the fixture. Catches "MINED happened but the
+// path is wrong" silently — a confused-deputy bug between merkle-service
+// and arcade's compound BUMP build that WaitForMined alone wouldn't
+// catch.
+//
+// expectedHeaderRoot is the display-order hex string from
+// fixture.MerkleRoot.
+func AssertMerklePathsMatchHeaderRoot(t *testing.T, rt *ArcadeRuntime, expectedHeaderRoot string, txids []string) {
+	t.Helper()
+	wantBytes, err := hex.DecodeString(expectedHeaderRoot)
+	if err != nil {
+		t.Fatalf("decode expected merkle root %s: %v", expectedHeaderRoot, err)
+	}
+	if len(wantBytes) != chainhash.HashSize {
+		t.Fatalf("expected 32-byte merkle root, got %d", len(wantBytes))
+	}
+	// Reverse to internal byte order for comparison against
+	// MerklePath.ComputeRoot's output.
+	wantInternal := make([]byte, chainhash.HashSize)
+	for i := range wantBytes {
+		wantInternal[i] = wantBytes[chainhash.HashSize-1-i]
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	for _, id := range txids {
+		st, ok, err := GetTxStatus(ctx, rt, id)
+		if err != nil {
+			t.Errorf("status %s: %v", id, err)
+			continue
+		}
+		if !ok {
+			t.Errorf("status %s: not found", id)
+			continue
+		}
+		if st.MerklePath == "" {
+			t.Errorf("status %s: empty merklePath", id)
+			continue
+		}
+		mpBytes, err := hex.DecodeString(st.MerklePath)
+		if err != nil {
+			t.Errorf("decode merklePath for %s: %v", id, err)
+			continue
+		}
+		mp, err := sdkTx.NewMerklePathFromBinary(mpBytes)
+		if err != nil {
+			t.Errorf("parse merklePath for %s: %v", id, err)
+			continue
+		}
+		txidHash, err := chainhash.NewHashFromHex(id)
+		if err != nil {
+			t.Errorf("parse txid %s: %v", id, err)
+			continue
+		}
+		root, err := mp.ComputeRoot(txidHash)
+		if err != nil {
+			t.Errorf("ComputeRoot for %s: %v", id, err)
+			continue
+		}
+		if !bytes.Equal(root[:], wantInternal) {
+			t.Errorf("merkle root mismatch for %s: got %x want %x", id, root[:], wantInternal)
+		}
+	}
 }
 
 // WaitForMined polls /tx/:txid for every txid in the slice until each

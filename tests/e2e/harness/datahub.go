@@ -36,11 +36,37 @@ type Datahub struct {
 	subtrees map[string][]byte
 }
 
-// NewDatahub spins up a fresh datahub HTTP server. The server's URL,
-// reachable from inside containers via host.docker.internal, is
-// available via HostURL(). Tests register staged binaries via Stage*.
+// DatahubOptions tunes the announce hostname/IP the datahub publishes
+// in its HostURL(). Zero-value falls back to host.docker.internal,
+// preserving legacy behavior. For runtimes where host.docker.internal
+// isn't routable (rootless podman with pasta's --no-map-gw), pass the
+// docker-network gateway IP from Containers.GatewayIP — same recipe
+// the libp2p host uses.
+type DatahubOptions struct {
+	// AnnounceHost overrides the hostname/IP in the URL the datahub
+	// reports via HostURL(). Defaults to "host.docker.internal".
+	AnnounceHost string
+}
+
+// NewDatahub spins up a fresh datahub HTTP server announcing on
+// host.docker.internal. Equivalent to NewDatahubWith(t,
+// DatahubOptions{}). Kept for callers that don't need to override the
+// announce host.
 func NewDatahub(t *testing.T) (*Datahub, error) {
+	return NewDatahubWith(t, DatahubOptions{})
+}
+
+// NewDatahubWith is the option-bag variant of NewDatahub. Use this
+// when host.docker.internal isn't routable from your container
+// runtime (in particular rootless podman) and pass the docker-network
+// gateway IP from Containers.GatewayIP via opts.AnnounceHost.
+func NewDatahubWith(t *testing.T, opts DatahubOptions) (*Datahub, error) {
 	t.Helper()
+
+	announceHost := opts.AnnounceHost
+	if announceHost == "" {
+		announceHost = "host.docker.internal"
+	}
 
 	d := &Datahub{
 		blocks:   make(map[string][]byte),
@@ -62,7 +88,7 @@ func NewDatahub(t *testing.T) (*Datahub, error) {
 
 	d.server = srv
 	d.port = listener.Addr().(*net.TCPAddr).Port
-	d.hostURL = fmt.Sprintf("http://host.docker.internal:%d", d.port)
+	d.hostURL = fmt.Sprintf("http://%s:%d", announceHost, d.port)
 
 	t.Cleanup(d.Close)
 	return d, nil
@@ -95,6 +121,18 @@ func (d *Datahub) StageSubtree(hash chainhash.Hash, payload []byte) {
 	d.subtrees[hash.String()] = append([]byte(nil), payload...)
 }
 
+// StageFixture stages every binary a RealBlockFixture carries: the
+// block.bin under /block/<hash> and each subtree under /subtree/<hash>.
+// One call per fixture is enough to make merkle-service's block-fetch
+// pipeline succeed when it consumes the published BlockMessage /
+// SubtreeMessage announcements.
+func (d *Datahub) StageFixture(fix *RealBlockFixture) {
+	d.StageBlock(fix.BlockHash, fix.BlockBin)
+	for _, st := range fix.Subtrees {
+		d.StageSubtree(st.Hash, st.Bin)
+	}
+}
+
 // Close stops the server. Idempotent.
 func (d *Datahub) Close() {
 	if d == nil || d.server == nil {
@@ -105,7 +143,7 @@ func (d *Datahub) Close() {
 
 func (d *Datahub) handle(w http.ResponseWriter, r *http.Request) {
 	switch {
-	case strings.HasPrefix(r.URL.Path, "/block/"):
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/block/"):
 		hash := strings.TrimPrefix(r.URL.Path, "/block/")
 		d.mu.RLock()
 		payload, ok := d.blocks[hash]
@@ -116,7 +154,7 @@ func (d *Datahub) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "application/octet-stream")
 		_, _ = w.Write(payload)
-	case strings.HasPrefix(r.URL.Path, "/subtree/"):
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/subtree/"):
 		hash := strings.TrimPrefix(r.URL.Path, "/subtree/")
 		d.mu.RLock()
 		payload, ok := d.subtrees[hash]
@@ -127,6 +165,15 @@ func (d *Datahub) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "application/octet-stream")
 		_, _ = w.Write(payload)
+	case r.Method == http.MethodPost && (r.URL.Path == "/tx" || r.URL.Path == "/txs"):
+		// Arcade's propagation service POSTs validated raw txs here
+		// expecting a real teranode would accept them into mempool.
+		// For e2e tests we just acknowledge — the mempool side-effect
+		// isn't observable, and rejecting (404) cascades into arcade
+		// marking the txs themselves REJECTED, blocking the
+		// merkle-proof-return-path scenarios. Returning 200 with no
+		// body satisfies arcade's teranode.Client.Submit*.
+		w.WriteHeader(http.StatusOK)
 	default:
 		http.NotFound(w, r)
 	}

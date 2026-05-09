@@ -98,6 +98,23 @@ func New(t *testing.T, opts ...Option) *Harness {
 	return h
 }
 
+// NewDatahub spins up an in-process datahub HTTP server announcing on
+// the docker-network gateway IP discovered when the harness's network
+// was created. The returned datahub is reachable from the merkle-service
+// container regardless of whether host.docker.internal is routable on
+// the runtime — same fix as the libp2p host.
+//
+// Lifetime is tied to t via t.Cleanup. Tests call this from within a
+// scenario after harness.New(t) has run.
+func (h *Harness) NewDatahub(t *testing.T) *Datahub {
+	t.Helper()
+	d, err := NewDatahubWith(t, DatahubOptions{AnnounceHost: h.Containers.GatewayIP})
+	if err != nil {
+		t.Fatalf("new datahub: %v", err)
+	}
+	return d
+}
+
 // Option mutates harness configuration before startup.
 type Option func(*harnessOptions)
 

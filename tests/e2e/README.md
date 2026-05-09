@@ -86,18 +86,66 @@ disabling Ryuk only matters if a test process is `kill -9`'d.
 ## Adding a new scenario
 
 1. Write a `_test.go` under `tests/e2e/` with the `e2e` build tag.
-2. Build a harness:
+2. Build a harness — `harness.New(t)` wires the bridge network,
+   discovers the gateway IP, and auto-builds the libp2p host so
+   merkle-service can dial back regardless of runtime:
    ```go
-   libp2pHost, _ := harness.NewLibP2PHost(t, "regtest", 0)
-   datahub, _   := harness.NewDatahub(t)
-   h := harness.New(t, harness.WithBootstrapPeers(libp2pHost.BootstrapMultiaddr()))
-   rt := harness.StartArcade(t, harness.ArcadeOptions{...})
+   h := harness.New(t)              // containers + libp2p host
+   datahub := h.NewDatahub(t)       // gateway-IP-aware datahub
+   rt := harness.StartArcade(t, harness.ArcadeOptions{
+       MerkleServiceURL: h.Containers.MerkleHostURL,
+       DatahubURL:       datahub.LocalURL(),  // arcade reaches via loopback
+       LibP2PBootstrap:  h.LibP2P.BootstrapMultiaddr(),
+       MerkleAuthToken:  "...",
+       CallbackToken:    "...",
+   })
    ```
 3. Drive the scenario via the helpers in `harness/poll.go`
-   (`BroadcastTx`, `GetTxStatus`, `WaitForMined`) and the libp2p
-   publish methods (`PublishBlock`, `PublishSubtree`).
+   (`BroadcastTx`, `BroadcastRawTxs`, `GetTxStatus`, `WaitForMined`,
+   `WaitForMerkleRegistration`, `AssertMerklePathsMatchHeaderRoot`)
+   and the libp2p publish methods (`PublishBlock`,
+   `PublishSubtree`).
 4. Use `harness.Containers.WaitForMerkleLogLine` if you need a
    merkle-service-side signal that isn't surfaced via HTTP.
+
+## Real-block fixtures
+
+Some scenarios use real BSV mainnet block data to dodge the
+synthetic-merkle-tree-consistency problem (issue #135). Fixtures live
+under `tests/e2e/fixtures/blocks/<block-hash>/`:
+
+```
+block.bin                  # bytes the harness datahub serves at /block/<hash>
+subtrees/<hash>.bin        # concat 32-byte tx hashes per subtree
+txs/<txid>.bin             # raw tx body for each picked watch target
+meta.json                  # height, merkleRoot, picked txids, provenance
+```
+
+Generate or refresh a fixture with the bundled tool:
+
+```sh
+go run ./tools/fetch-block-fixture \
+    --block <block-hash> \
+    --out tests/e2e/fixtures/blocks/<block-hash>
+```
+
+The tool fetches the block binary from a teranode datahub
+(default `bsva-ovh-teranode-eu-1.bsvb.tech:8000/api/v1`), reconstructs
+the subtree binaries from WhatsOnChain's txid list, picks 10 random
+non-coinbase txids, and downloads their raw bytes. The merkle math
+self-check fails loudly if the txid list and the block header
+disagree.
+
+The shipped fixture for
+`000000000000000001bc8a601dd5f0659d36a9b077808850375dfa2d9f009396`
+(height 948351, 1 subtree, 1911 txs) drives
+`TestSmoke_RealBlockMined_SingleSubtree`. **Multi-subtree blocks
+are deferred** — current mainnet load fits in one subtree per block,
+so a multi-subtree scenario needs teratestnet or scaling-net fixtures
+(follow-up; would also need teratestnet datahub access). When that
+lands, drop a fixture under
+`tests/e2e/fixtures/blocks/<teratestnet-hash>` and add a
+`TestSmoke_RealBlockMined_MultiSubtree` variant.
 
 ## CI
 
