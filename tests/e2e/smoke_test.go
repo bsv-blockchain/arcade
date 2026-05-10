@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/testcontainers/testcontainers-go"
+
 	"github.com/bsv-blockchain/arcade/tests/e2e/harness"
 )
 
@@ -103,17 +105,17 @@ func waitForMerkleRegistration(ctx context.Context, merkleURL, txid string, time
 }
 
 // skipIfNoDocker mirrors the harness package helper so smoke tests
-// don't need access to its private function. Lightweight enough to
-// duplicate.
+// don't need access to its private function.
 func skipIfNoDocker(t *testing.T) {
 	t.Helper()
-	// We rely on harness.New / harness.StartContainers to skip on
-	// failure if needed — the wiring above panics quickly with a
-	// readable error if no runtime is available, but for cleanliness
-	// we replicate the t.Skip path on the most common failure mode.
-	if _, err := http.Get("http://127.0.0.1:1"); err == nil {
-		// unreachable — placeholder to keep this function compileable
-		// even when the body shrinks during refactors
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	provider, err := testcontainers.NewDockerProvider()
+	if err != nil {
+		t.Skipf("no container runtime reachable (NewDockerProvider): %v", err)
 	}
-	_ = t
+	defer func() { _ = provider.Close() }()
+	if err := provider.Health(ctx); err != nil {
+		t.Skipf("container runtime not healthy: %v", err)
+	}
 }
