@@ -73,7 +73,7 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		}
 	}
 
-	st, leaser, err := storefactory.New(cfg) //nolint:contextcheck // factory signature predates ctx; the Postgres backend honors ctx via its own internal pool dial, others (Pebble, Aerospike) connect synchronously
+	st, leaser, err := storefactory.New(ctx, cfg)
 	if err != nil {
 		_ = producer.Close()
 		return nil, nil, fmt.Errorf("creating store: %w", err)
