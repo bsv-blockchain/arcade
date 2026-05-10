@@ -219,9 +219,8 @@ func (m *sseManager) newClient(token string) *sseClient {
 	if parent == nil {
 		parent = context.Background()
 	}
-	// The cancel func is stored on sseClient and invoked by unregister;
-	// the linter can't trace that flow, so silence the warning explicitly.
-	ctx, cancel := context.WithCancel(parent) //nolint:gosec // cancel called by sseManager.unregister
+	// cancel is stored on sseClient and invoked by sseManager.unregister.
+	ctx, cancel := context.WithCancel(parent)
 	return &sseClient{
 		id:     m.nextClientID.Add(1),
 		token:  token,
@@ -237,13 +236,13 @@ func (m *sseManager) newClient(token string) *sseClient {
 // after the supplied nanosecond timestamp (matches the old arcade exactly).
 func (s *Server) handleEventsSSE(c *gin.Context) {
 	if s.sse == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "events stream not enabled"})
+		c.JSON(http.StatusServiceUnavailable, gin.H{jsonKeyError: "events stream not enabled"})
 		return
 	}
 
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "streaming unsupported"})
+		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "streaming unsupported"})
 		return
 	}
 

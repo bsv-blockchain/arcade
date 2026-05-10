@@ -258,7 +258,7 @@ func (r *chaintracksRoutes) handleGetHeaderByHashDispatch(c *gin.Context) {
 func (r *chaintracksRoutes) handleGetNetwork(c *gin.Context) {
 	network, err := r.cm.GetNetwork(c.Request.Context())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"network": network})
@@ -273,7 +273,7 @@ func (r *chaintracksRoutes) handleGetTip(c *gin.Context) {
 	c.Header("Cache-Control", "no-cache")
 	tip := r.cm.GetTip(c.Request.Context())
 	if tip == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Chain tip not found"})
+		c.JSON(http.StatusNotFound, gin.H{jsonKeyError: "Chain tip not found"})
 		return
 	}
 	c.Header("X-Block-Height", strconv.FormatUint(uint64(tip.Height), 10))
@@ -284,7 +284,7 @@ func (r *chaintracksRoutes) handleGetHeaderByHeight(c *gin.Context) {
 	heightStr := strings.TrimSuffix(c.Param("height"), ".bin")
 	height, err := strconv.ParseUint(heightStr, 10, 32)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid height parameter"})
+		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "Invalid height parameter"})
 		return
 	}
 
@@ -293,7 +293,7 @@ func (r *chaintracksRoutes) handleGetHeaderByHeight(c *gin.Context) {
 
 	header, err := r.cm.GetHeaderByHeight(ctx, uint32(height))
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Header not found"})
+		c.JSON(http.StatusNotFound, gin.H{jsonKeyError: "Header not found"})
 		return
 	}
 	c.JSON(http.StatusOK, header)
@@ -303,14 +303,14 @@ func (r *chaintracksRoutes) handleGetHeaderByHash(c *gin.Context) {
 	hashStr := strings.TrimSuffix(c.Param("hash"), ".bin")
 	hash, err := chainhash.NewHashFromHex(hashStr)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid hash parameter"})
+		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "Invalid hash parameter"})
 		return
 	}
 
 	ctx := c.Request.Context()
 	header, err := r.cm.GetHeaderByHash(ctx, hash)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Header not found"})
+		c.JSON(http.StatusNotFound, gin.H{jsonKeyError: "Header not found"})
 		return
 	}
 	r.setHeightCache(ctx, c, header.Height)
@@ -321,17 +321,17 @@ func (r *chaintracksRoutes) handleGetHeaders(c *gin.Context) {
 	heightStr := c.Query("height")
 	countStr := c.Query("count")
 	if heightStr == "" || countStr == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing height or count parameter"})
+		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "Missing height or count parameter"})
 		return
 	}
 	height, err := strconv.ParseUint(heightStr, 10, 32)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid height parameter"})
+		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "Invalid height parameter"})
 		return
 	}
 	count, err := strconv.ParseUint(countStr, 10, 32)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid count parameter"})
+		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "Invalid count parameter"})
 		return
 	}
 
@@ -355,7 +355,7 @@ func (r *chaintracksRoutes) handleGetTipBinary(c *gin.Context) {
 	c.Header("Cache-Control", "no-cache")
 	tip := r.cm.GetTip(c.Request.Context())
 	if tip == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Chain tip not found"})
+		c.JSON(http.StatusNotFound, gin.H{jsonKeyError: "Chain tip not found"})
 		return
 	}
 	c.Header("X-Block-Height", strconv.FormatUint(uint64(tip.Height), 10))
@@ -366,7 +366,7 @@ func (r *chaintracksRoutes) handleGetHeaderByHeightBinary(c *gin.Context) {
 	heightStr := strings.TrimSuffix(c.Param("height"), ".bin")
 	height, err := strconv.ParseUint(heightStr, 10, 32)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid height parameter"})
+		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "Invalid height parameter"})
 		return
 	}
 
@@ -375,7 +375,7 @@ func (r *chaintracksRoutes) handleGetHeaderByHeightBinary(c *gin.Context) {
 
 	header, err := r.cm.GetHeaderByHeight(ctx, uint32(height))
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Header not found"})
+		c.JSON(http.StatusNotFound, gin.H{jsonKeyError: "Header not found"})
 		return
 	}
 	c.Header("X-Block-Height", strconv.FormatUint(uint64(header.Height), 10))
@@ -386,13 +386,13 @@ func (r *chaintracksRoutes) handleGetHeaderByHashBinary(c *gin.Context) {
 	hashStr := strings.TrimSuffix(c.Param("hash"), ".bin")
 	hash, err := chainhash.NewHashFromHex(hashStr)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid hash parameter"})
+		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "Invalid hash parameter"})
 		return
 	}
 	ctx := c.Request.Context()
 	header, err := r.cm.GetHeaderByHash(ctx, hash)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Header not found"})
+		c.JSON(http.StatusNotFound, gin.H{jsonKeyError: "Header not found"})
 		return
 	}
 	r.setHeightCache(ctx, c, header.Height)
@@ -404,17 +404,17 @@ func (r *chaintracksRoutes) handleGetHeadersBinary(c *gin.Context) {
 	heightStr := c.Query("height")
 	countStr := c.Query("count")
 	if heightStr == "" || countStr == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing height or count parameter"})
+		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "Missing height or count parameter"})
 		return
 	}
 	height, err := strconv.ParseUint(heightStr, 10, 32)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid height parameter"})
+		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "Invalid height parameter"})
 		return
 	}
 	count, err := strconv.ParseUint(countStr, 10, 32)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid count parameter"})
+		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "Invalid count parameter"})
 		return
 	}
 
@@ -453,7 +453,7 @@ func (r *chaintracksRoutes) setHeightCache(ctx context.Context, c *gin.Context, 
 func (r *chaintracksRoutes) handleTipStream(c *gin.Context) {
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "streaming unsupported"})
+		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "streaming unsupported"})
 		return
 	}
 	c.Header("Content-Type", "text/event-stream")
@@ -492,7 +492,7 @@ func (r *chaintracksRoutes) handleTipStream(c *gin.Context) {
 func (r *chaintracksRoutes) handleReorgStream(c *gin.Context) {
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "streaming unsupported"})
+		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "streaming unsupported"})
 		return
 	}
 	c.Header("Content-Type", "text/event-stream")
@@ -548,7 +548,7 @@ func legacySuccess(value interface{}) legacyResponse {
 }
 
 func legacyError(code, description string) legacyResponse {
-	return legacyResponse{Status: "error", Code: code, Description: description}
+	return legacyResponse{Status: jsonKeyError, Code: code, Description: description}
 }
 
 func (r *chaintracksRoutes) handleLegacyGetChain(c *gin.Context) {

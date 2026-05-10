@@ -66,7 +66,7 @@ func (s *Server) handleListBlockProcessingStatus(c *gin.Context) {
 	if v := c.Query("limit"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n <= 0 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "limit must be a positive integer"})
+			c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "limit must be a positive integer"})
 			return
 		}
 		limit = n
@@ -79,11 +79,11 @@ func (s *Server) handleListBlockProcessingStatus(c *gin.Context) {
 	if v := c.Query("before-height"); v != "" {
 		n, err := strconv.ParseUint(v, 10, 64)
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "before-height must be a non-negative integer"})
+			c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "before-height must be a non-negative integer"})
 			return
 		}
 		if n > math.MaxInt64 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "before-height is too large"})
+			c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "before-height is too large"})
 			return
 		}
 		beforeHeight = n
@@ -93,7 +93,7 @@ func (s *Server) handleListBlockProcessingStatus(c *gin.Context) {
 	rows, err := s.store.ListBlockProcessingStatus(c.Request.Context(), beforeHeight, limit+1)
 	if err != nil {
 		s.logger.Error("list block_processing", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list block processing status"})
+		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to list block processing status"})
 		return
 	}
 
@@ -114,17 +114,17 @@ func (s *Server) handleListBlockProcessingStatus(c *gin.Context) {
 func (s *Server) handleGetBlockProcessingStatus(c *gin.Context) {
 	hash := c.Param("blockHash")
 	if hash == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "blockHash is required"})
+		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "blockHash is required"})
 		return
 	}
 	bp, err := s.store.GetBlockProcessingStatus(c.Request.Context(), hash)
 	if errors.Is(err, store.ErrNotFound) {
-		c.JSON(http.StatusNotFound, gin.H{"error": "block processing status not found"})
+		c.JSON(http.StatusNotFound, gin.H{jsonKeyError: "block processing status not found"})
 		return
 	}
 	if err != nil {
 		s.logger.Error("get block_processing", zap.String("block_hash", hash), zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch block processing status"})
+		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to fetch block processing status"})
 		return
 	}
 	c.JSON(http.StatusOK, toBlockProcessingResponse(bp))

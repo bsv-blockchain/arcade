@@ -24,6 +24,8 @@ import (
 	"github.com/bsv-blockchain/arcade/teranode"
 )
 
+const jsonKeyError = "error"
+
 // submitOptions captures the callback subscription preferences a client
 // expressed via the X-CallbackUrl / X-CallbackToken / X-FullStatusUpdates
 // request headers. Empty when the client did not subscribe.
@@ -65,7 +67,7 @@ func (s *Server) validateCallbackURL(c *gin.Context, url string) bool {
 			zap.String("client_ip", c.ClientIP()),
 			zap.Error(err),
 		)
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid callback url: " + err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "invalid callback url: " + err.Error()})
 		return false
 	}
 	return true
@@ -265,7 +267,7 @@ func (s *Server) handleCallback(c *gin.Context) {
 		presented = []byte(auth[len(bearerPrefix):])
 	}
 	if len(configured) == 0 || subtle.ConstantTimeCompare(configured, presented) != 1 {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		c.JSON(http.StatusUnauthorized, gin.H{jsonKeyError: "unauthorized"})
 		return
 	}
 
@@ -280,10 +282,10 @@ func (s *Server) handleCallback(c *gin.Context) {
 	if err := c.ShouldBindJSON(&msg); err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
-			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body too large"})
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{jsonKeyError: "request body too large"})
 			return
 		}
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "invalid request body"})
 		return
 	}
 
@@ -383,7 +385,7 @@ func (s *Server) handleSeenMultipleNodes(c *gin.Context, msg models.CallbackMess
 func (s *Server) handleStump(c *gin.Context, msg models.CallbackMessage, logger *zap.Logger) {
 	if msg.BlockHash == "" || len(msg.Stump) == 0 {
 		logger.Warn("incomplete STUMP callback")
-		c.JSON(http.StatusBadRequest, gin.H{"error": "blockHash and stump are required"})
+		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "blockHash and stump are required"})
 		return
 	}
 
@@ -398,7 +400,7 @@ func (s *Server) handleStump(c *gin.Context, msg models.CallbackMessage, logger 
 	}
 	if err := s.store.InsertStump(c.Request.Context(), stump); err != nil {
 		logger.Error("failed to store STUMP", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store stump"})
+		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to store stump"})
 		return
 	}
 
@@ -407,7 +409,7 @@ func (s *Server) handleStump(c *gin.Context, msg models.CallbackMessage, logger 
 
 func (s *Server) handleBlockProcessed(c *gin.Context, msg models.CallbackMessage, logger *zap.Logger) {
 	if msg.BlockHash == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "blockHash is required"})
+		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "blockHash is required"})
 		return
 	}
 	// Record the milestone for observability before enqueueing — this is
@@ -420,7 +422,7 @@ func (s *Server) handleBlockProcessed(c *gin.Context, msg models.CallbackMessage
 	}
 	if err := s.producer.Send(kafka.TopicBlockProcessed, msg.BlockHash, msg); err != nil {
 		logger.Error("failed to publish block_processed", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to enqueue"})
+		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to enqueue"})
 		return
 	}
 	c.Status(http.StatusOK)
@@ -430,19 +432,19 @@ func (s *Server) handleBlockProcessed(c *gin.Context, msg models.CallbackMessage
 func (s *Server) handleGetTransaction(c *gin.Context) {
 	txid := c.Param("txid")
 	if txid == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "txid is required"})
+		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "txid is required"})
 		return
 	}
 
 	status, err := s.store.GetStatus(c.Request.Context(), txid)
 	if err != nil {
 		s.logger.Error("failed to get status", zap.String("txid", txid), zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "internal error"})
 		return
 	}
 
 	if status == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "transaction not found"})
+		c.JSON(http.StatusNotFound, gin.H{jsonKeyError: "transaction not found"})
 		return
 	}
 
@@ -479,19 +481,19 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	case strings.Contains(contentType, "octet-stream"):
 		body, err := io.ReadAll(c.Request.Body)
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+			c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "failed to read body"})
 			return
 		}
 		rawTx = body
 	case strings.Contains(contentType, "text/plain"):
 		body, err := io.ReadAll(c.Request.Body)
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+			c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "failed to read body"})
 			return
 		}
 		decoded, err := hex.DecodeString(strings.TrimSpace(string(body)))
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid hex"})
+			c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "invalid hex"})
 			return
 		}
 		rawTx = decoded
@@ -501,19 +503,19 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 			RawTx string `json:"rawTx"`
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
+			c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "invalid request"})
 			return
 		}
 		decoded, err := hex.DecodeString(req.RawTx)
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid hex in rawTx"})
+			c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "invalid hex in rawTx"})
 			return
 		}
 		rawTx = decoded
 	}
 
 	if len(rawTx) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "empty transaction"})
+		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "empty transaction"})
 		return
 	}
 
@@ -525,7 +527,7 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// (keyed by submissions.txid) silently fail to match.
 	parsedTx, _, err := sdkTx.NewTransactionFromStream(rawTx)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to parse transaction"})
+		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "failed to parse transaction"})
 		return
 	}
 
@@ -553,7 +555,7 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	}
 	if err := s.producer.Send(kafka.TopicTransaction, txid, msg); err != nil {
 		s.logger.Error("failed to publish transaction", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to submit"})
+		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to submit"})
 		return
 	}
 
@@ -563,7 +565,7 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 // handleSubmitTransactions accepts a batch of concatenated raw transactions.
 func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	if !strings.Contains(c.ContentType(), "octet-stream") {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Content-Type must be application/octet-stream"})
+		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "Content-Type must be application/octet-stream"})
 		return
 	}
 
@@ -578,11 +580,11 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "failed to read body"})
 		return
 	}
 	if len(body) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "empty body"})
+		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "empty body"})
 		return
 	}
 
@@ -600,7 +602,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				zap.Int("parsed", len(msgs)),
 				zap.Error(parseErr),
 			)
-			c.JSON(http.StatusBadRequest, gin.H{"error": "failed to parse transaction", "parsed": len(msgs)})
+			c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "failed to parse transaction", "parsed": len(msgs)})
 			return
 		}
 		if bytesUsed == 0 {
@@ -619,7 +621,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	}
 
 	if len(msgs) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "no transactions parsed"})
+		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "no transactions parsed"})
 		return
 	}
 
@@ -637,7 +639,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	// Phase 2: Batch publish all parsed transactions in one call
 	if err := s.producer.SendBatch(kafka.TopicTransaction, msgs); err != nil {
 		s.logger.Error("failed to publish transaction batch", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to submit"})
+		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to submit"})
 		return
 	}
 
