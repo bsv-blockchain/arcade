@@ -10,6 +10,10 @@
 # merkle service, datahub, webhook delivery) and TLS handshakes fail without
 # the system CA bundle.
 
+# Intentionally not pinned to @sha256: — alpine:3.23 is a multi-arch manifest
+# list consumed by the matrix amd64/arm64 build in .github/workflows/build.yml,
+# and dependabot's docker ecosystem (.github/dependabot.yml) already tracks
+# upstream changes. See Scorecard alert #58 (dismissed: "won't fix").
 FROM alpine:3.23
 
 RUN apk --no-cache add ca-certificates

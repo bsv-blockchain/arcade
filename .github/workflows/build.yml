@@ -124,12 +124,44 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
+      # Step 0: For workflow_run triggers, prove the head_sha is on main or a
+      # v* tag before we use it. This narrows the trust boundary and avoids
+      # Scorecard's dangerous-workflow pattern of feeding workflow_run.head_sha
+      # straight into actions/checkout.
+      - name: Resolve and verify build SHA
+        id: resolve_sha
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          WR_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          WR_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          FALLBACK_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" != "workflow_run" ]]; then
+            echo "sha=${FALLBACK_SHA}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # workflow_run path: assert head_sha is reachable from main, or is
+          # the tip of a v* tag. Reject anything else.
+          if [[ "$WR_HEAD_BRANCH" == "main" ]]; then
+            status=$(gh api "repos/${GITHUB_REPOSITORY}/compare/main...${WR_HEAD_SHA}" --jq '.status')
+            [[ "$status" == "identical" || "$status" == "behind" ]] || { echo "head_sha not on main: $status"; exit 1; }
+          elif [[ "$WR_HEAD_BRANCH" =~ ^v[0-9] ]]; then
+            tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/${WR_HEAD_BRANCH}" --jq '.object.sha')
+            [[ "$tag_sha" == "$WR_HEAD_SHA" ]] || { echo "tag $WR_HEAD_BRANCH does not point at $WR_HEAD_SHA"; exit 1; }
+          else
+            echo "Refusing untrusted head_branch: $WR_HEAD_BRANCH"
+            exit 1
+          fi
+          echo "sha=${WR_HEAD_SHA}" >> "$GITHUB_OUTPUT"
+
       # Step 1: checkout code. For workflow_run events, check out the exact SHA
       # that GoFortress validated, not whatever HEAD happens to be on main now.
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ steps.resolve_sha.outputs.sha }}
 
       # Step 2: install Go and warm the module / build cache for this runner.
       - name: Set up Go
@@ -218,6 +250,35 @@ jobs:
       contents: read
       packages: write
     steps:
+      # Step 0: Same trust-boundary check as build-and-push. Verify that the
+      # workflow_run.head_sha is reachable from main or is the tip of a v* tag
+      # before using it as an image tag.
+      - name: Resolve and verify build SHA
+        id: resolve_sha
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          WR_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          WR_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          FALLBACK_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" != "workflow_run" ]]; then
+            echo "sha=${FALLBACK_SHA}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "$WR_HEAD_BRANCH" == "main" ]]; then
+            status=$(gh api "repos/${GITHUB_REPOSITORY}/compare/main...${WR_HEAD_SHA}" --jq '.status')
+            [[ "$status" == "identical" || "$status" == "behind" ]] || { echo "head_sha not on main: $status"; exit 1; }
+          elif [[ "$WR_HEAD_BRANCH" =~ ^v[0-9] ]]; then
+            tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/${WR_HEAD_BRANCH}" --jq '.object.sha')
+            [[ "$tag_sha" == "$WR_HEAD_SHA" ]] || { echo "tag $WR_HEAD_BRANCH does not point at $WR_HEAD_SHA"; exit 1; }
+          else
+            echo "Refusing untrusted head_branch: $WR_HEAD_BRANCH"
+            exit 1
+          fi
+          echo "sha=${WR_HEAD_SHA}" >> "$GITHUB_OUTPUT"
+
       - name: Download digest artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
@@ -239,7 +300,7 @@ jobs:
         working-directory: ${{ runner.temp }}/digests
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          SHA_TAG: ${{ github.event.workflow_run.head_sha || github.sha }}
+          SHA_TAG: ${{ steps.resolve_sha.outputs.sha }}
           DEPLOYMENT_TAG: ${{ needs.get_tag.outputs.deployment_tag }}
         run: |
           docker buildx imagetools create \
@@ -250,5 +311,5 @@ jobs:
       - name: Inspect resulting manifest
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          SHA_TAG: ${{ github.event.workflow_run.head_sha || github.sha }}
+          SHA_TAG: ${{ steps.resolve_sha.outputs.sha }}
         run: docker buildx imagetools inspect "${IMAGE}:${SHA_TAG}"
