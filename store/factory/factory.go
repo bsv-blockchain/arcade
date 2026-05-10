@@ -19,7 +19,7 @@ import (
 // Both return values point to the same underlying backend — every supported
 // backend implements both interfaces — so callers can pass the returned
 // Leaser into services.propagation without a second factory.
-func New(cfg *config.Config) (store.Store, store.Leaser, error) {
+func New(ctx context.Context, cfg *config.Config) (store.Store, store.Leaser, error) {
 	switch cfg.Store.Backend {
 	case "", "aerospike":
 		s, err := aerospike.New(cfg.Store.Aerospike)
@@ -37,9 +37,9 @@ func New(cfg *config.Config) (store.Store, store.Leaser, error) {
 		// Embedded Postgres extraction on first run can take tens of seconds;
 		// give the connect phase a generous ceiling so the CLI fails fast on
 		// real misconfigs rather than hanging forever.
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		pgCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer cancel()
-		s, err := postgres.New(ctx, cfg.Store.Postgres)
+		s, err := postgres.New(pgCtx, cfg.Store.Postgres)
 		if err != nil {
 			return nil, nil, err
 		}
