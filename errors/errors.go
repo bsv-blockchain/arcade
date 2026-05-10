@@ -121,8 +121,6 @@ func GetArcError(err error) *ArcError {
 }
 
 // NewErrorFields creates ErrorFields for the given status code.
-//
-//nolint:gocyclo // status code validation requires many cases
 func NewErrorFields(status StatusCode, extraInfo string) *ErrorFields {
 	fields := &ErrorFields{
 		Status: int(status),
