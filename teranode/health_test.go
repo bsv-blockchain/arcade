@@ -12,19 +12,19 @@ import (
 )
 
 func TestRecordFailure_TripsAfterThreshold(t *testing.T) {
-	c := NewClient([]string{"https://a.example", "https://b.example"}, "", HealthConfig{FailureThreshold: 3})
+	c := NewClient([]string{testEndpointA, testEndpointB}, "", HealthConfig{FailureThreshold: 3})
 
 	// Two sub-threshold failures keep the endpoint healthy.
-	c.RecordFailure("https://a.example")
-	c.RecordFailure("https://a.example")
+	c.RecordFailure(testEndpointA)
+	c.RecordFailure(testEndpointA)
 	if healthy := c.GetHealthyEndpoints(); len(healthy) != 2 {
 		t.Fatalf("expected both endpoints healthy after 2 failures, got %v", healthy)
 	}
 
 	// Third failure trips.
-	c.RecordFailure("https://a.example")
+	c.RecordFailure(testEndpointA)
 	healthy := c.GetHealthyEndpoints()
-	if !reflect.DeepEqual(healthy, []string{"https://b.example"}) {
+	if !reflect.DeepEqual(healthy, []string{testEndpointB}) {
 		t.Fatalf("expected only b after trip, got %v", healthy)
 	}
 	// GetEndpoints still returns everything.
@@ -34,38 +34,38 @@ func TestRecordFailure_TripsAfterThreshold(t *testing.T) {
 }
 
 func TestRecordSuccess_ResetsCounter(t *testing.T) {
-	c := NewClient([]string{"https://a.example"}, "", HealthConfig{FailureThreshold: 3})
+	c := NewClient([]string{testEndpointA}, "", HealthConfig{FailureThreshold: 3})
 
-	c.RecordFailure("https://a.example")
-	c.RecordFailure("https://a.example")
-	c.RecordSuccess("https://a.example")
+	c.RecordFailure(testEndpointA)
+	c.RecordFailure(testEndpointA)
+	c.RecordSuccess(testEndpointA)
 	// After reset, three more failures should be required to trip.
-	c.RecordFailure("https://a.example")
-	c.RecordFailure("https://a.example")
+	c.RecordFailure(testEndpointA)
+	c.RecordFailure(testEndpointA)
 	if len(c.GetHealthyEndpoints()) != 1 {
 		t.Fatalf("endpoint should still be healthy after reset + 2 failures")
 	}
-	c.RecordFailure("https://a.example")
+	c.RecordFailure(testEndpointA)
 	if len(c.GetHealthyEndpoints()) != 0 {
 		t.Fatalf("endpoint should trip after 3 post-reset failures")
 	}
 }
 
 func TestRecordSuccess_RecoversUnhealthy(t *testing.T) {
-	c := NewClient([]string{"https://a.example"}, "", HealthConfig{FailureThreshold: 2})
-	c.RecordFailure("https://a.example")
-	c.RecordFailure("https://a.example")
+	c := NewClient([]string{testEndpointA}, "", HealthConfig{FailureThreshold: 2})
+	c.RecordFailure(testEndpointA)
+	c.RecordFailure(testEndpointA)
 	if len(c.GetHealthyEndpoints()) != 0 {
 		t.Fatal("expected endpoint to be unhealthy")
 	}
-	c.RecordSuccess("https://a.example")
+	c.RecordSuccess(testEndpointA)
 	if len(c.GetHealthyEndpoints()) != 1 {
 		t.Fatal("expected endpoint to recover to healthy")
 	}
 }
 
 func TestRecordFailure_UnknownURL_NoOp(t *testing.T) {
-	c := NewClient([]string{"https://a.example"}, "", HealthConfig{FailureThreshold: 1})
+	c := NewClient([]string{testEndpointA}, "", HealthConfig{FailureThreshold: 1})
 	// Repeatedly call RecordFailure for an unknown URL — should not create a
 	// health entry or affect the registered endpoint.
 	for i := 0; i < 10; i++ {
@@ -80,21 +80,21 @@ func TestRecordFailure_UnknownURL_NoOp(t *testing.T) {
 }
 
 func TestGetHealthyEndpoints_SnapshotIndependence(t *testing.T) {
-	c := NewClient([]string{"https://a.example", "https://b.example"}, "", HealthConfig{FailureThreshold: 1})
+	c := NewClient([]string{testEndpointA, testEndpointB}, "", HealthConfig{FailureThreshold: 1})
 	snap := c.GetHealthyEndpoints()
-	c.RecordFailure("https://a.example") // trips a
+	c.RecordFailure(testEndpointA) // trips a
 	if len(snap) != 2 {
 		t.Fatalf("previously-returned snapshot was mutated: %v", snap)
 	}
 }
 
 func TestGetHealthyEndpoints_PreservesOrder(t *testing.T) {
-	c := NewClient([]string{"https://a.example", "https://b.example", "https://c.example"}, "", HealthConfig{FailureThreshold: 2})
+	c := NewClient([]string{testEndpointA, testEndpointB, "https://c.example"}, "", HealthConfig{FailureThreshold: 2})
 	// Trip b, leaving a and c healthy.
-	c.RecordFailure("https://b.example")
-	c.RecordFailure("https://b.example")
+	c.RecordFailure(testEndpointB)
+	c.RecordFailure(testEndpointB)
 	got := c.GetHealthyEndpoints()
-	want := []string{"https://a.example", "https://c.example"}
+	want := []string{testEndpointA, "https://c.example"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("expected %v, got %v", want, got)
 	}
@@ -109,14 +109,14 @@ func TestAddEndpoints_SeedsHealthyState(t *testing.T) {
 }
 
 func TestAddEndpoints_Rediscover_PreservesHealthState(t *testing.T) {
-	c := NewClient([]string{"https://a.example"}, "", HealthConfig{FailureThreshold: 2})
-	c.RecordFailure("https://a.example")
-	c.RecordFailure("https://a.example") // trip
+	c := NewClient([]string{testEndpointA}, "", HealthConfig{FailureThreshold: 2})
+	c.RecordFailure(testEndpointA)
+	c.RecordFailure(testEndpointA) // trip
 	if len(c.GetHealthyEndpoints()) != 0 {
 		t.Fatal("expected endpoint to be unhealthy")
 	}
 	// Re-announcement is deduplicated — must NOT reset health state.
-	added := c.AddEndpoints([]string{"https://a.example"})
+	added := c.AddEndpoints([]string{testEndpointA})
 	if added != 0 {
 		t.Fatalf("expected 0 new endpoints, got %d", added)
 	}
@@ -127,7 +127,7 @@ func TestAddEndpoints_Rediscover_PreservesHealthState(t *testing.T) {
 
 // Concurrent RecordSuccess / RecordFailure + readers — -race must stay silent.
 func TestHealthTracker_Concurrent(_ *testing.T) {
-	c := NewClient([]string{"https://a.example", "https://b.example"}, "", HealthConfig{FailureThreshold: 1000})
+	c := NewClient([]string{testEndpointA, testEndpointB}, "", HealthConfig{FailureThreshold: 1000})
 
 	const workers = 8
 	const perWorker = 200
@@ -137,13 +137,13 @@ func TestHealthTracker_Concurrent(_ *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < perWorker; j++ {
-				c.RecordFailure("https://a.example")
+				c.RecordFailure(testEndpointA)
 			}
 		}()
 		go func() {
 			defer wg.Done()
 			for j := 0; j < perWorker; j++ {
-				c.RecordSuccess("https://a.example")
+				c.RecordSuccess(testEndpointA)
 			}
 		}()
 		go func() {
@@ -226,17 +226,17 @@ func TestProbe_4xxTreatedAsReachable(t *testing.T) {
 }
 
 func TestGetEndpointStatuses_SourceAndHealth(t *testing.T) {
-	c := NewClient([]string{"https://a.example", "https://b.example"}, "", HealthConfig{FailureThreshold: 2})
+	c := NewClient([]string{testEndpointA, testEndpointB}, "", HealthConfig{FailureThreshold: 2})
 	c.AddEndpoints([]string{"https://c.example"})
 
 	// Trip b to unhealthy.
-	c.RecordFailure("https://b.example")
-	c.RecordFailure("https://b.example")
+	c.RecordFailure(testEndpointB)
+	c.RecordFailure(testEndpointB)
 
 	got := c.GetEndpointStatuses()
 	want := []EndpointStatus{
-		{URL: "https://a.example", Source: "configured", Healthy: true},
-		{URL: "https://b.example", Source: "configured", Healthy: false},
+		{URL: testEndpointA, Source: "configured", Healthy: true},
+		{URL: testEndpointB, Source: "configured", Healthy: false},
 		{URL: "https://c.example", Source: "discovered", Healthy: true},
 	}
 	if !reflect.DeepEqual(got, want) {

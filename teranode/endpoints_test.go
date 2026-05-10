@@ -5,6 +5,11 @@ import (
 	"testing"
 )
 
+const (
+	testEndpointA = "https://a.example"
+	testEndpointB = "https://b.example"
+)
+
 func TestClient_AddEndpoints_Dedup(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -16,27 +21,27 @@ func TestClient_AddEndpoints_Dedup(t *testing.T) {
 	}{
 		{
 			name:       "novel url is added",
-			seed:       []string{"https://a.example"},
-			add:        []string{"https://b.example"},
+			seed:       []string{testEndpointA},
+			add:        []string{testEndpointB},
 			wantAdded:  1,
 			wantTotal:  2,
-			wantInList: []string{"https://a.example", "https://b.example"},
+			wantInList: []string{testEndpointA, testEndpointB},
 		},
 		{
 			name:       "exact duplicate ignored",
-			seed:       []string{"https://a.example"},
-			add:        []string{"https://a.example"},
+			seed:       []string{testEndpointA},
+			add:        []string{testEndpointA},
 			wantAdded:  0,
 			wantTotal:  1,
-			wantInList: []string{"https://a.example"},
+			wantInList: []string{testEndpointA},
 		},
 		{
 			name:       "trailing slash variant deduplicated",
-			seed:       []string{"https://a.example"},
+			seed:       []string{testEndpointA},
 			add:        []string{"https://a.example/"},
 			wantAdded:  0,
 			wantTotal:  1,
-			wantInList: []string{"https://a.example"},
+			wantInList: []string{testEndpointA},
 		},
 		{
 			name:       "statically configured url later announced by peer is skipped",
@@ -48,19 +53,19 @@ func TestClient_AddEndpoints_Dedup(t *testing.T) {
 		},
 		{
 			name:       "two adds, one duplicate one novel",
-			seed:       []string{"https://a.example"},
-			add:        []string{"https://a.example", "https://c.example"},
+			seed:       []string{testEndpointA},
+			add:        []string{testEndpointA, "https://c.example"},
 			wantAdded:  1,
 			wantTotal:  2,
-			wantInList: []string{"https://a.example", "https://c.example"},
+			wantInList: []string{testEndpointA, "https://c.example"},
 		},
 		{
 			name:       "empty string is ignored",
-			seed:       []string{"https://a.example"},
+			seed:       []string{testEndpointA},
 			add:        []string{""},
 			wantAdded:  0,
 			wantTotal:  1,
-			wantInList: []string{"https://a.example"},
+			wantInList: []string{testEndpointA},
 		},
 	}
 	for _, tc := range cases {
@@ -93,7 +98,7 @@ func TestClient_AddEndpoints_Dedup(t *testing.T) {
 func TestClient_SeedDedup(t *testing.T) {
 	// Static config can itself contain duplicates; NewClient should dedupe on
 	// the way in so AddEndpoints's first call doesn't see phantoms.
-	c := NewClient([]string{"https://a.example", "https://a.example/", "https://b.example"}, "", HealthConfig{})
+	c := NewClient([]string{testEndpointA, "https://a.example/", testEndpointB}, "", HealthConfig{})
 	eps := c.GetEndpoints()
 	if len(eps) != 2 {
 		t.Fatalf("seed dedup failed: got %v", eps)
@@ -101,9 +106,9 @@ func TestClient_SeedDedup(t *testing.T) {
 }
 
 func TestClient_GetEndpoints_SnapshotIndependence(t *testing.T) {
-	c := NewClient([]string{"https://a.example"}, "", HealthConfig{})
+	c := NewClient([]string{testEndpointA}, "", HealthConfig{})
 	snap := c.GetEndpoints()
-	c.AddEndpoints([]string{"https://b.example"})
+	c.AddEndpoints([]string{testEndpointB})
 	if len(snap) != 1 {
 		t.Fatalf("snapshot was mutated by subsequent AddEndpoints: %v", snap)
 	}

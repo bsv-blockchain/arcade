@@ -30,7 +30,7 @@ func (f *fakeSource) ListEndpointURLs(_ context.Context) ([]string, error) {
 
 func TestStart_SyncFirstRefreshSeedsEndpoints(t *testing.T) {
 	src := &fakeSource{}
-	src.urls.Store([]string{"https://a.example", "https://b.example"})
+	src.urls.Store([]string{testEndpointA, testEndpointB})
 
 	c := NewClient(nil, "", HealthConfig{
 		Source:          src,
@@ -56,7 +56,7 @@ func TestStart_SyncFirstRefreshSeedsEndpoints(t *testing.T) {
 
 func TestRefreshLoop_AddsLaterDiscoveries(t *testing.T) {
 	src := &fakeSource{}
-	src.urls.Store([]string{"https://a.example"})
+	src.urls.Store([]string{testEndpointA})
 
 	c := NewClient(nil, "", HealthConfig{
 		Source:          src,
@@ -74,7 +74,7 @@ func TestRefreshLoop_AddsLaterDiscoveries(t *testing.T) {
 	}
 
 	// Mutate the source — the refresh loop should pick up the new URL.
-	src.urls.Store([]string{"https://a.example", "https://b.example"})
+	src.urls.Store([]string{testEndpointA, testEndpointB})
 
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
@@ -118,7 +118,7 @@ func TestRefreshLoop_SourceErrorDoesNotPanic(t *testing.T) {
 }
 
 func TestRefreshLoop_NoSourceMeansNoLoop(t *testing.T) {
-	c := NewClient([]string{"https://a.example"}, "", HealthConfig{
+	c := NewClient([]string{testEndpointA}, "", HealthConfig{
 		RefreshInterval: time.Millisecond,
 		Logger:          zap.NewNop(),
 	})
