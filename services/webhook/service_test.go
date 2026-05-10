@@ -20,6 +20,8 @@ import (
 	"github.com/bsv-blockchain/arcade/store"
 )
 
+const txA = "txA"
+
 // fakeStore implements just enough of store.Store for these tests.
 type fakeStore struct {
 	mu   sync.Mutex
@@ -193,9 +195,9 @@ func TestDeliverSuccess(t *testing.T) {
 
 	st := &fakeStore{
 		subs: map[string][]*models.Submission{
-			"txA": {{
+			txA: {{
 				SubmissionID:  "sub-1",
-				TxID:          "txA",
+				TxID:          txA,
 				CallbackURL:   srv.URL,
 				CallbackToken: "tok-A",
 			}},
@@ -210,7 +212,7 @@ func TestDeliverSuccess(t *testing.T) {
 	)
 
 	svc.handleUpdate(t.Context(), &models.TransactionStatus{
-		TxID:      "txA",
+		TxID:      txA,
 		Status:    models.StatusMined,
 		Timestamp: time.Now(),
 	})
@@ -225,7 +227,7 @@ func TestDeliverSuccess(t *testing.T) {
 	if err := json.Unmarshal(receivedBody, &payload); err != nil {
 		t.Fatalf("decoding callback body: %v", err)
 	}
-	if payload["txid"] != "txA" || payload["txStatus"] != string(models.StatusMined) {
+	if payload["txid"] != txA || payload["txStatus"] != string(models.StatusMined) {
 		t.Errorf("unexpected payload: %+v", payload)
 	}
 	if len(st.deliveries) != 1 || st.deliveries[0].LastStatus != models.StatusMined {
@@ -245,9 +247,9 @@ func TestSkipIntermediateWhenNotFullUpdates(t *testing.T) {
 
 	st := &fakeStore{
 		subs: map[string][]*models.Submission{
-			"txA": {{
+			txA: {{
 				SubmissionID:      "sub-1",
-				TxID:              "txA",
+				TxID:              txA,
 				CallbackURL:       srv.URL,
 				FullStatusUpdates: false,
 			}},
@@ -260,7 +262,7 @@ func TestSkipIntermediateWhenNotFullUpdates(t *testing.T) {
 	)
 
 	svc.handleUpdate(t.Context(), &models.TransactionStatus{
-		TxID:      "txA",
+		TxID:      txA,
 		Status:    models.StatusSeenOnNetwork,
 		Timestamp: time.Now(),
 	})
@@ -280,7 +282,7 @@ func TestRetryOnFailure(t *testing.T) {
 
 	st := &fakeStore{
 		subs: map[string][]*models.Submission{
-			"txA": {{SubmissionID: "sub-1", TxID: "txA", CallbackURL: srv.URL}},
+			txA: {{SubmissionID: "sub-1", TxID: txA, CallbackURL: srv.URL}},
 		},
 	}
 	svc := New(
@@ -291,7 +293,7 @@ func TestRetryOnFailure(t *testing.T) {
 
 	before := time.Now()
 	svc.handleUpdate(t.Context(), &models.TransactionStatus{
-		TxID:      "txA",
+		TxID:      txA,
 		Status:    models.StatusMined,
 		Timestamp: time.Now(),
 	})
@@ -320,9 +322,9 @@ func TestDedupOnRepeatedStatus(t *testing.T) {
 
 	st := &fakeStore{
 		subs: map[string][]*models.Submission{
-			"txA": {{
+			txA: {{
 				SubmissionID:        "sub-1",
-				TxID:                "txA",
+				TxID:                txA,
 				CallbackURL:         srv.URL,
 				LastDeliveredStatus: models.StatusMined,
 			}},
@@ -335,7 +337,7 @@ func TestDedupOnRepeatedStatus(t *testing.T) {
 	)
 
 	svc.handleUpdate(t.Context(), &models.TransactionStatus{
-		TxID:      "txA",
+		TxID:      txA,
 		Status:    models.StatusMined, // same as LastDeliveredStatus
 		Timestamp: time.Now(),
 	})
@@ -364,9 +366,9 @@ func TestSSRFGuardBlocksLoopbackDial(t *testing.T) {
 
 	st := &fakeStore{
 		subs: map[string][]*models.Submission{
-			"txA": {{
+			txA: {{
 				SubmissionID: "sub-1",
-				TxID:         "txA",
+				TxID:         txA,
 				CallbackURL:  srv.URL, // 127.0.0.1:<port>
 			}},
 		},
@@ -379,7 +381,7 @@ func TestSSRFGuardBlocksLoopbackDial(t *testing.T) {
 	)
 
 	svc.handleUpdate(t.Context(), &models.TransactionStatus{
-		TxID:      "txA",
+		TxID:      txA,
 		Status:    models.StatusMined,
 		Timestamp: time.Now(),
 	})
