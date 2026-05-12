@@ -137,8 +137,8 @@ github.com/bsv-blockchain/go-tx-map v1.3.5 h1:KPCwGfJHJY2+s1tBGevSu2sfAo6RQ4IgsH
 github.com/bsv-blockchain/go-tx-map v1.3.5/go.mod h1:QJo02rdqFTHaimSTCgl6mLMLwIDtykwWTC1lt7nrhY8=
 github.com/bsv-blockchain/go-wire v1.2.3 h1:dqnpNFgqw8ZQAlzNCe3qjv39SrYYDMsWXhVneaR2a7E=
 github.com/bsv-blockchain/go-wire v1.2.3/go.mod h1:zAe6A4L5cOvzb3g8t1rWtJOb0GwXgG2pcB9VpM7otEw=
-github.com/bsv-blockchain/teranode v0.15.0-beta-5 h1:suGLKsRad8TM4ZXgcU+FNhFqhPpf1Mzh+VASyEgR6o8=
-github.com/bsv-blockchain/teranode v0.15.0-beta-5/go.mod h1:l6Sk6+HiNJ4lo9j5NzqClL6bjSHtmHHbYsR0Go2xy30=
+github.com/bsv-blockchain/teranode v0.15.0-beta-9 h1:GpQ9V2OSJxhOLzJLGQnx7harSK/Y8S890qDFDq2Z/nw=
+github.com/bsv-blockchain/teranode v0.15.0-beta-9/go.mod h1:l6Sk6+HiNJ4lo9j5NzqClL6bjSHtmHHbYsR0Go2xy30=
 github.com/bsv-blockchain/testcontainers-aerospike-go v0.3.6 h1:4MFYwG7ChdiqYehgwfVjIfGauGIyvE9yOpGNBwoHzA0=
 github.com/bsv-blockchain/testcontainers-aerospike-go v0.3.6/go.mod h1:IbTVPaMuPWGtXTjZVtEQszh3oCo98OrBOmmGs9zP9us=
 github.com/bytedance/gopkg v0.1.4 h1:oZnQwnX82KAIWb7033bEwtxvTqXcYMxDBaQxo5JJHWM=

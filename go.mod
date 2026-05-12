@@ -10,7 +10,7 @@ require (
 	github.com/bsv-blockchain/go-p2p-message-bus v0.1.18
 	github.com/bsv-blockchain/go-sdk v1.2.23
 	github.com/bsv-blockchain/go-teranode-p2p-client v0.2.5
-	github.com/bsv-blockchain/teranode v0.15.0-beta-5
+	github.com/bsv-blockchain/teranode v0.15.0-beta-9
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/fergusstrange/embedded-postgres v1.34.0
 	github.com/gin-gonic/gin v1.12.0
