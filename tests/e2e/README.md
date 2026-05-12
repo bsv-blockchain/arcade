@@ -151,6 +151,27 @@ lands, drop a fixture under
 `tests/e2e/fixtures/blocks/<teratestnet-hash>` and add a
 `TestSmoke_RealBlockMined_MultiSubtree` variant.
 
+## Block-processing watchdog
+
+`services/watchdog/watchdog.go` is a standalone arcade service
+(`mode=watchdog`) that periodically queries `block_processing` for
+rows whose chaintracks header arrived but whose BLOCK_PROCESSED
+callback never landed, then calls merkle-service `POST /reprocess` to
+recover. The smoke tests don't have their own scenario for this —
+`TestSmoke_RealBlockMined_ViaReprocess` exercises the underlying
+`/reprocess` machinery, and the watchdog's per-tick behavior is
+covered by `services/watchdog/watchdog_test.go`.
+
+## Microservice topology vs. e2e harness
+
+In production, arcade runs each mode (api-server, sse, chaintracks,
+watchdog, bump-builder, propagation, tx-validator, p2p-client) as a
+separate pod — see `deploy/*.yaml`. The e2e harness here boots
+`mode=all`, which launches every service as an in-process goroutine
+sharing a single Kafka broker and store. The harness exercises the
+same code paths the per-pod deployments do; only the supervisor
+boundary differs.
+
 ## CI
 
 `.github/workflows/e2e-smoke.yml` runs the full suite on every PR and

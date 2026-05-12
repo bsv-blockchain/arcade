@@ -1,6 +1,10 @@
 # BUMP Builder Deployment
 #
 # Consumes merkle proof events, builds BUMP proofs for mined transactions.
+#
+# As of the microservice decomposition, this pod NO LONGER runs the
+# block-processing watchdog — that responsibility moved to its own
+# pod. See deploy/watchdog.yaml.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

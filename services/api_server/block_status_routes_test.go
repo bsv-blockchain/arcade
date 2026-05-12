@@ -150,6 +150,12 @@ func (s *blockProcStore) ListBlockProcessingStatus(_ context.Context, beforeHeig
 	return rows, nil
 }
 
+func (s *blockProcStore) GetActiveTipBlockHeight(context.Context) (uint64, error) { return 0, nil }
+
+func (s *blockProcStore) ListStaleBlockProcessingStatus(context.Context, time.Time, uint64, int) ([]*models.BlockProcessingStatus, error) {
+	return nil, nil
+}
+
 // --- handler tests ---
 
 func TestHandleListBlockProcessingStatus_Pagination(t *testing.T) {

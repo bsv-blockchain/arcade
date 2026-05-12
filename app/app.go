@@ -22,9 +22,12 @@ import (
 	"github.com/bsv-blockchain/arcade/services"
 	"github.com/bsv-blockchain/arcade/services/api_server"
 	"github.com/bsv-blockchain/arcade/services/bump_builder"
+	"github.com/bsv-blockchain/arcade/services/chaintracks_server"
 	"github.com/bsv-blockchain/arcade/services/p2p_client"
 	"github.com/bsv-blockchain/arcade/services/propagation"
+	"github.com/bsv-blockchain/arcade/services/sse"
 	"github.com/bsv-blockchain/arcade/services/tx_validator"
+	"github.com/bsv-blockchain/arcade/services/watchdog"
 	"github.com/bsv-blockchain/arcade/services/webhook"
 	"github.com/bsv-blockchain/arcade/store"
 	storefactory "github.com/bsv-blockchain/arcade/store/factory"
@@ -170,6 +173,27 @@ func BuildServices(d *Deps) []services.Service {
 	}
 	if shouldRun("bump-builder") {
 		svcs = append(svcs, bump_builder.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.TeranodeClient))
+	}
+	if shouldRun("watchdog") && cfg.Watchdog.Enabled {
+		if wd := watchdog.NewService(cfg, d.Logger, d.Store, d.Leaser, d.MerkleClient); wd != nil {
+			svcs = append(svcs, wd)
+		} else {
+			d.Logger.Info("watchdog skipped: merkle_service.url or leaser not configured")
+		}
+	}
+	if shouldRun("sse") {
+		if ssvc := sse.New(cfg, d.Logger, d.Publisher, d.Store); ssvc != nil {
+			svcs = append(svcs, ssvc)
+		} else {
+			d.Logger.Info("sse skipped: sse.enabled=false or publisher not configured")
+		}
+	}
+	if shouldRun("chaintracks") {
+		if ct := chaintracks_server.New(cfg, d.Logger, d.Store); ct != nil {
+			svcs = append(svcs, ct)
+		} else {
+			d.Logger.Info("chaintracks skipped: chaintracks_server.enabled=false (regtest force-disables this)")
+		}
 	}
 	if shouldRun("tx-validator") {
 		svcs = append(svcs, tx_validator.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.TxTracker, d.Validator))

@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"sort"
 	"sync"
 	"time"
 
@@ -1149,6 +1150,103 @@ func (s *Store) GetBlockProcessingStatus(ctx context.Context, blockHash string) 
 		return nil, store.ErrNotFound
 	}
 	return stored.toModel(), nil
+}
+
+// GetActiveTipBlockHeight scans the descending-height index (newest first
+// thanks to the inverted uint64 encoding) and returns the first active row's
+// height. Pebble has no native MAX so this is the closest equivalent — and
+// is still O(active-orphan prefix) at worst, which in practice means the
+// first key the iterator sees (orphans are vanishingly rare at the tip).
+func (s *Store) GetActiveTipBlockHeight(ctx context.Context) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	prefix := idxBlockProcHeightPrefix()
+	iter, err := s.db.NewIter(&pebbledb.IterOptions{
+		LowerBound: prefix,
+		UpperBound: endOfPrefix(prefix),
+	})
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = iter.Close() }()
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		stored, err := s.readBlockProc(lastSegment(iter.Key()))
+		if err != nil {
+			return 0, err
+		}
+		if stored == nil || stored.Status != string(models.BlockStatusActive) {
+			continue
+		}
+		return stored.BlockHeight, nil
+	}
+	return 0, nil
+}
+
+// ListStaleBlockProcessingStatus iterates every block_processing row and
+// filters in-memory. Cardinality is ~144 rows/day and the watchdog tick
+// happens on the order of 30 s, so a full scan is comfortably under the
+// budget even at multi-week retention.
+func (s *Store) ListStaleBlockProcessingStatus(ctx context.Context, olderThan time.Time, minHeight uint64, limit int) ([]*models.BlockProcessingStatus, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		return nil, nil
+	}
+	threshold := olderThan.UnixNano()
+	prefix := idxBlockProcHeightPrefix()
+	iter, err := s.db.NewIter(&pebbledb.IterOptions{
+		LowerBound: prefix,
+		UpperBound: endOfPrefix(prefix),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = iter.Close() }()
+
+	var candidates []*storedBlockProcessing
+	for iter.First(); iter.Valid(); iter.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		stored, err := s.readBlockProc(lastSegment(iter.Key()))
+		if err != nil {
+			return nil, err
+		}
+		if stored == nil {
+			continue
+		}
+		if stored.Status != string(models.BlockStatusActive) {
+			continue
+		}
+		if stored.ProcessedUnixNs != 0 {
+			continue
+		}
+		if stored.HeaderSeenUnixNs == 0 || stored.HeaderSeenUnixNs >= threshold {
+			continue
+		}
+		if stored.BlockHeight < minHeight {
+			continue
+		}
+		candidates = append(candidates, stored)
+	}
+	// Oldest header_seen_at first — fair retry order.
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].HeaderSeenUnixNs < candidates[j].HeaderSeenUnixNs
+	})
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	out := make([]*models.BlockProcessingStatus, len(candidates))
+	for i, c := range candidates {
+		out[i] = c.toModel()
+	}
+	return out, nil
 }
 
 func (s *Store) ListBlockProcessingStatus(ctx context.Context, beforeHeight uint64, limit int) ([]*models.BlockProcessingStatus, error) {

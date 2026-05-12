@@ -1,8 +1,6 @@
 package api_server
 
 import (
-	"net/http"
-
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -60,13 +58,6 @@ var routeDocs = []RouteDoc{
 	},
 	{
 		Method:         "GET",
-		Path:           "/events",
-		Description:    "Stream transaction status updates as Server-Sent Events. Optional ?callbackToken filters to txids registered under that token. Last-Event-ID header (nanosecond timestamp) replays missed events.",
-		RequestFormat:  "Optional query: callbackToken. Optional header: Last-Event-ID.",
-		ResponseFormat: "text/event-stream — frames: id, event: status, data: {txid, txStatus, timestamp}",
-	},
-	{
-		Method:         "GET",
 		Path:           "/api/v1/blocks/processing-status",
 		Description:    "List block processing milestones (header seen, BLOCK_PROCESSED received, compound BUMP built) in descending-height order. Pages via ?limit (default 50, max 200) and ?before-height (cursor = lowest height from previous page).",
 		RequestFormat:  "Optional query: limit, before-height",
@@ -97,60 +88,4 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 	r.GET("/tx/:txid", s.handleGetTransaction)
 	r.POST("/tx", s.handleSubmitTransaction)
 	r.POST("/txs", s.handleSubmitTransactions)
-	r.GET("/events", s.handleEventsSSE)
-
-	s.registerChaintracksRoutes(r)
-}
-
-// registerChaintracksRoutes mounts the embedded go-chaintracks HTTP API under
-// /chaintracks/v1 and /chaintracks/v2, plus a static-file handler for bulk
-// header downloads at /chaintracks/<file>. Routes are only mounted when
-// chaintracks was initialized (ChaintracksServer.Enabled=true).
-//
-// The static handler is registered LAST so the v1/v2 API prefixes win Gin's
-// radix-tree lookup. Static serving is done via a catch-all under
-// /chaintracks-files/ that we redirect-forward to http.ServeFile so Range
-// requests work for the large header files.
-func (s *Server) registerChaintracksRoutes(r *gin.Engine) {
-	if s.ctRoutes == nil {
-		return
-	}
-	v2 := r.Group("/chaintracks/v2")
-	s.ctRoutes.Register(v2)
-	v1 := r.Group("/chaintracks/v1")
-	s.ctRoutes.RegisterLegacy(v1)
-
-	// Static file serving for bulk header downloads. Uses http.ServeFile
-	// (via Gin's File) which supports Range requests out of the box.
-	storagePath := s.cfg.Chaintracks.StoragePath
-	r.GET("/chaintracks/:file", func(c *gin.Context) {
-		file := c.Param("file")
-		// Guard against path traversal: reject names containing '/' or '..'.
-		if file == "" || file == "v1" || file == "v2" || containsUnsafePathChars(file) {
-			c.Status(http.StatusNotFound)
-			return
-		}
-		c.File(storagePath + "/" + file)
-	})
-}
-
-// containsUnsafePathChars rejects filenames that could escape the storage
-// directory. Header files are flat names like `mainNet_0.headers`, so any
-// slash or dot-dot is unsafe.
-func containsUnsafePathChars(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] == '/' || s[i] == '\\' {
-			return true
-		}
-	}
-	// Reject parent-dir traversal.
-	if s == ".." || len(s) >= 3 && s[:3] == "../" {
-		return true
-	}
-	for i := 0; i+1 < len(s); i++ {
-		if s[i] == '.' && s[i+1] == '.' {
-			return true
-		}
-	}
-	return false
 }

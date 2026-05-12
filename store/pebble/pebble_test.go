@@ -822,3 +822,97 @@ func TestBlockProcessing_List_BeforeHeight_ExcludesEqualAndAbove(t *testing.T) {
 		t.Errorf("got heights %d,%d want 20,10", page[0].BlockHeight, page[1].BlockHeight)
 	}
 }
+
+func TestBlockProcessing_GetActiveTipBlockHeight(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	if h, err := s.GetActiveTipBlockHeight(ctx); err != nil || h != 0 {
+		t.Fatalf("empty: got h=%d err=%v want 0/nil", h, err)
+	}
+
+	t0 := time.Unix(1700003000, 0).UTC()
+	for _, h := range []uint64{100, 200, 150} {
+		if err := s.UpsertBlockHeaderSeen(ctx, fmt.Sprintf("h%d", h), h, t0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.GetActiveTipBlockHeight(ctx)
+	if err != nil || got != 200 {
+		t.Errorf("tip=%d err=%v want 200/nil", got, err)
+	}
+
+	// Orphaning the highest row drops the tip to the next active row.
+	if oErr := s.MarkBlocksOrphaned(ctx, []string{"h200"}, t0); oErr != nil {
+		t.Fatal(oErr)
+	}
+	got, err = s.GetActiveTipBlockHeight(ctx)
+	if err != nil || got != 150 {
+		t.Errorf("after orphan tip=%d err=%v want 150/nil", got, err)
+	}
+}
+
+func TestBlockProcessing_ListStale_FiltersAndOrders(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	baseSeen := time.Unix(1700004000, 0).UTC()
+	threshold := baseSeen.Add(5 * time.Minute)
+
+	if err := s.UpsertBlockHeaderSeen(ctx, "recent", 500, threshold.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertBlockHeaderSeen(ctx, "processed", 400, baseSeen); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkBlockProcessed(ctx, "processed", 400, baseSeen.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertBlockHeaderSeen(ctx, "orphaned", 410, baseSeen); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkBlocksOrphaned(ctx, []string{"orphaned"}, baseSeen.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertBlockHeaderSeen(ctx, "old", 100, baseSeen.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertBlockHeaderSeen(ctx, "stale-a", 450, baseSeen); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertBlockHeaderSeen(ctx, "stale-b", 460, baseSeen.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.ListStaleBlockProcessingStatus(ctx, threshold, 200, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0].BlockHash != "stale-a" || rows[1].BlockHash != "stale-b" {
+		t.Errorf("got %v want [stale-a stale-b]", hashesOf(rows))
+	}
+
+	rows, err = s.ListStaleBlockProcessingStatus(ctx, threshold, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("rows=%d want 3 (%v)", len(rows), hashesOf(rows))
+	}
+
+	rows, err = s.ListStaleBlockProcessingStatus(ctx, threshold, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].BlockHash != "stale-a" {
+		t.Errorf("limit truncation: %v", hashesOf(rows))
+	}
+}
+
+func hashesOf(rows []*models.BlockProcessingStatus) []string {
+	out := make([]string, len(rows))
+	for i, r := range rows {
+		out[i] = r.BlockHash
+	}
+	return out
+}

@@ -857,3 +857,117 @@ func heightsOf(rows []*models.BlockProcessingStatus) []uint64 {
 	}
 	return out
 }
+
+func TestBlockProcessing_GetActiveTipBlockHeight(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	if h, err := s.GetActiveTipBlockHeight(ctx); err != nil || h != 0 {
+		t.Fatalf("empty: got h=%d err=%v want 0/nil", h, err)
+	}
+
+	t0 := time.Unix(1700001000, 0).UTC()
+	for _, h := range []uint64{100, 200, 150} {
+		if err := s.UpsertBlockHeaderSeen(ctx, fmt.Sprintf("h%d", h), h, t0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.GetActiveTipBlockHeight(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 200 {
+		t.Errorf("tip=%d want 200", got)
+	}
+
+	// Orphaning the highest row must drop the tip back to the next active row.
+	if err := s.MarkBlocksOrphaned(ctx, []string{"h200"}, t0); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.GetActiveTipBlockHeight(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 150 {
+		t.Errorf("tip after orphan=%d want 150", got)
+	}
+}
+
+func TestBlockProcessing_ListStale_FiltersAndOrders(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	baseSeen := time.Unix(1700002000, 0).UTC()
+	threshold := baseSeen.Add(5 * time.Minute) // anything < threshold is stale
+
+	// recent: should not surface (seen >= threshold)
+	if err := s.UpsertBlockHeaderSeen(ctx, "recent", 500, threshold.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	// processed: should not surface (processed_at set)
+	if err := s.UpsertBlockHeaderSeen(ctx, "processed", 400, baseSeen); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkBlockProcessed(ctx, "processed", 400, baseSeen.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	// orphaned: should not surface (status='orphaned')
+	if err := s.UpsertBlockHeaderSeen(ctx, "orphaned", 410, baseSeen); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkBlocksOrphaned(ctx, []string{"orphaned"}, baseSeen.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	// too-low height: surfaces only when minHeight allows
+	if err := s.UpsertBlockHeaderSeen(ctx, "old", 100, baseSeen.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	// stale: should surface
+	if err := s.UpsertBlockHeaderSeen(ctx, "stale-a", 450, baseSeen); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertBlockHeaderSeen(ctx, "stale-b", 460, baseSeen.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.ListStaleBlockProcessingStatus(ctx, threshold, 200, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows=%d want 2 (%v)", len(rows), hashesOf(rows))
+	}
+	// header_seen_at ASC → stale-a (baseSeen) before stale-b (+2m)
+	if rows[0].BlockHash != "stale-a" || rows[1].BlockHash != "stale-b" {
+		t.Errorf("order wrong: %v", hashesOf(rows))
+	}
+
+	// minHeight=0 lets the lower-height row in too.
+	rows, err = s.ListStaleBlockProcessingStatus(ctx, threshold, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("rows=%d want 3 (%v)", len(rows), hashesOf(rows))
+	}
+
+	// Limit truncation: oldest first.
+	rows, err = s.ListStaleBlockProcessingStatus(ctx, threshold, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].BlockHash != "stale-a" {
+		t.Errorf("limit truncation: %v", hashesOf(rows))
+	}
+}
+
+func hashesOf(rows []*models.BlockProcessingStatus) []string {
+	out := make([]string, len(rows))
+	for i, r := range rows {
+		out[i] = r.BlockHash
+	}
+	return out
+}

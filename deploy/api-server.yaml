@@ -1,7 +1,11 @@
 # API Server Deployment + Service
 #
-# Handles HTTP transaction submissions and status queries.
-# Only service that needs inbound traffic (port 8080).
+# Handles HTTP transaction submissions and status queries on port 8080.
+#
+# As of the microservice decomposition, this pod NO LONGER serves:
+#   - /events (SSE)                → see deploy/sse.yaml (port 8082)
+#   - /chaintracks/v1, /chaintracks/v2 → see deploy/chaintracks.yaml (port 8083)
+# Update any external clients / Ingress routing to target those services.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

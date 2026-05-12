@@ -151,6 +151,10 @@ func (s *fakeStore) GetBlockProcessingStatus(context.Context, string) (*models.B
 func (s *fakeStore) ListBlockProcessingStatus(context.Context, uint64, int) ([]*models.BlockProcessingStatus, error) {
 	return nil, nil
 }
+func (s *fakeStore) GetActiveTipBlockHeight(context.Context) (uint64, error) { return 0, nil }
+func (s *fakeStore) ListStaleBlockProcessingStatus(context.Context, time.Time, uint64, int) ([]*models.BlockProcessingStatus, error) {
+	return nil, nil
+}
 func (s *fakeStore) Close() error { return nil }
 
 // recordingPub captures published statuses but doesn't actually subscribe —

@@ -231,6 +231,37 @@ var BumpBuilderGraceWaitTotal = promauto.NewCounter(prometheus.CounterOpts{
 })
 
 // ---------------------------------------------------------------------------
+// watchdog (standalone service — block-processing recovery)
+// ---------------------------------------------------------------------------
+
+// WatchdogTickTotal tracks watchdog tick outcomes.
+var WatchdogTickTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_watchdog_tick_total",
+	Help: "Watchdog tick outcomes.",
+}, []string{"outcome"}) // ran, skipped_no_leader, lease_error
+
+// WatchdogStaleCount is the number of stale block_processing rows the last
+// tick observed (post-recency-window filter, pre-backoff filter).
+var WatchdogStaleCount = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "arcade_watchdog_stale_count",
+	Help: "Stale block_processing rows observed by the last watchdog tick.",
+})
+
+// WatchdogReprocessTotal counts /reprocess outcomes by reason.
+var WatchdogReprocessTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_watchdog_reprocess_total",
+	Help: "Watchdog /reprocess call outcomes.",
+}, []string{"outcome"}) // success, err_4xx, err_5xx, err_network
+
+// WatchdogBackoffDepth is the size of the in-memory attempts map.
+// Sustained growth implies blocks are persistently failing to recover —
+// inspect logs for the 4xx/5xx outcome breakdown.
+var WatchdogBackoffDepth = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "arcade_watchdog_backoff_depth",
+	Help: "Number of blocks currently held in the watchdog's in-memory backoff map.",
+})
+
+// ---------------------------------------------------------------------------
 // api_server
 // ---------------------------------------------------------------------------
 

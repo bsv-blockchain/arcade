@@ -181,47 +181,21 @@ func (s *Server) handleDocs(c *gin.Context) {
 	}
 }
 
-// chaintracksHealth is the chaintracks sub-block of the /health response.
-// Enabled is a straight read of cfg.ChaintracksServer.Enabled; the rest are
-// populated only when a live chaintracks instance is attached.
-type chaintracksHealth struct {
-	Enabled   bool   `json:"enabled"`
-	Network   string `json:"network,omitempty"`
-	TipHeight uint32 `json:"tip_height,omitempty"`
-	TipHash   string `json:"tip_hash,omitempty"`
-	HasTip    bool   `json:"has_tip"`
-}
-
 // healthResponse is the schema of GET /health. The top-level "status":"ok"
 // preserves backwards compatibility with existing health checkers that
-// only grep the response for liveness; chaintracks and datahub_urls are
-// additive diagnostic fields.
+// only grep the response for liveness. Chaintracks moved out of api-server
+// in the microservice decomposition — its health is now reported by the
+// standalone chaintracks pod's /health endpoint.
 type healthResponse struct {
 	Status      string                    `json:"status"`
-	Chaintracks chaintracksHealth         `json:"chaintracks"`
 	DatahubURLs []teranode.EndpointStatus `json:"datahub_urls"`
 }
 
 func (s *Server) handleHealth(c *gin.Context) {
 	resp := healthResponse{Status: "ok", DatahubURLs: []teranode.EndpointStatus{}}
-
-	if s.chaintracks != nil {
-		ctx := c.Request.Context()
-		resp.Chaintracks.Enabled = true
-		if net, err := s.chaintracks.GetNetwork(ctx); err == nil {
-			resp.Chaintracks.Network = net
-		}
-		resp.Chaintracks.TipHeight = s.chaintracks.GetHeight(ctx)
-		if tip := s.chaintracks.GetTip(ctx); tip != nil {
-			resp.Chaintracks.HasTip = true
-			resp.Chaintracks.TipHash = tip.Hash.String()
-		}
-	}
-
 	if s.teranode != nil {
 		resp.DatahubURLs = s.teranode.GetEndpointStatuses()
 	}
-
 	c.JSON(http.StatusOK, resp)
 }
 

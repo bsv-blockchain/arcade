@@ -13,17 +13,12 @@ import (
 	"github.com/bsv-blockchain/arcade/teranode"
 )
 
-// healthResp mirrors the server's healthResponse shape but uses
-// generic Go types so test code does not depend on unexported fields.
+// healthResp mirrors the server's healthResponse shape but uses generic
+// Go types so test code does not depend on unexported fields.
+// Chaintracks moved out of api-server in the microservice decomposition,
+// so the response no longer includes a chaintracks block.
 type healthResp struct {
-	Status      string `json:"status"`
-	Chaintracks struct {
-		Enabled   bool   `json:"enabled"`
-		Network   string `json:"network"`
-		TipHeight uint32 `json:"tip_height"`
-		TipHash   string `json:"tip_hash"`
-		HasTip    bool   `json:"has_tip"`
-	} `json:"chaintracks"`
+	Status      string                    `json:"status"`
 	DatahubURLs []teranode.EndpointStatus `json:"datahub_urls"`
 }
 
@@ -48,11 +43,6 @@ func doHealth(t *testing.T, srv *Server) (int, healthResp, []byte) {
 }
 
 func TestHandleHealth_StructuredResponse(t *testing.T) {
-	fake := newFakeChaintracks()
-	fake.network = "main"
-	fake.height = 42
-	fake.tip = fixtureTip()
-
 	tc := teranode.NewClient(
 		[]string{"https://a.example", "https://b.example"},
 		"",
@@ -63,10 +53,9 @@ func TestHandleHealth_StructuredResponse(t *testing.T) {
 	tc.RecordFailure("https://b.example") // trip
 
 	srv := &Server{
-		cfg:         &config.Config{ChaintracksServer: config.ChaintracksServerConfig{Enabled: true}},
-		logger:      zap.NewNop(),
-		chaintracks: fake,
-		teranode:    tc,
+		cfg:      &config.Config{},
+		logger:   zap.NewNop(),
+		teranode: tc,
 	}
 
 	code, resp, body := doHealth(t, srv)
@@ -75,21 +64,6 @@ func TestHandleHealth_StructuredResponse(t *testing.T) {
 	}
 	if resp.Status != "ok" {
 		t.Fatalf("expected status=ok, got %q", resp.Status)
-	}
-	if !resp.Chaintracks.Enabled {
-		t.Errorf("expected chaintracks.enabled=true")
-	}
-	if resp.Chaintracks.Network != "main" {
-		t.Errorf("expected network=main, got %q", resp.Chaintracks.Network)
-	}
-	if resp.Chaintracks.TipHeight != 42 {
-		t.Errorf("expected tip_height=42, got %d", resp.Chaintracks.TipHeight)
-	}
-	if !resp.Chaintracks.HasTip {
-		t.Errorf("expected has_tip=true")
-	}
-	if resp.Chaintracks.TipHash != fixtureTip().Hash.String() {
-		t.Errorf("expected tip_hash=%s, got %s", fixtureTip().Hash.String(), resp.Chaintracks.TipHash)
 	}
 
 	want := []teranode.EndpointStatus{
@@ -104,31 +78,6 @@ func TestHandleHealth_StructuredResponse(t *testing.T) {
 		if resp.DatahubURLs[i] != w {
 			t.Errorf("datahub_urls[%d] = %+v, want %+v", i, resp.DatahubURLs[i], w)
 		}
-	}
-}
-
-func TestHandleHealth_ChaintracksDisabled(t *testing.T) {
-	tc := teranode.NewClient([]string{"https://a.example"}, "", teranode.HealthConfig{})
-
-	srv := &Server{
-		cfg:      &config.Config{},
-		logger:   zap.NewNop(),
-		teranode: tc,
-		// chaintracks left nil — as when ChaintracksServer.Enabled=false
-	}
-
-	code, resp, _ := doHealth(t, srv)
-	if code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", code)
-	}
-	if resp.Chaintracks.Enabled {
-		t.Errorf("expected chaintracks.enabled=false when chaintracks is nil")
-	}
-	if resp.Chaintracks.HasTip {
-		t.Errorf("expected has_tip=false")
-	}
-	if len(resp.DatahubURLs) != 1 || resp.DatahubURLs[0].URL != "https://a.example" {
-		t.Errorf("expected one datahub URL, got %+v", resp.DatahubURLs)
 	}
 }
 

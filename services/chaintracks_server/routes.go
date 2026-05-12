@@ -1,4 +1,4 @@
-package api_server
+package chaintracks_server
 
 // Gin adapter for go-chaintracks HTTP routes.
 //
@@ -27,12 +27,12 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// chaintracksRoutes wraps a chaintracks.Chaintracks instance with HTTP
+// Routes wraps a chaintracks.Chaintracks instance with HTTP
 // plumbing: one broadcaster goroutine per SSE stream, fanning updates out to
 // all connected clients. The broadcaster lifetimes are tied to the ctx passed
-// to newChaintracksRoutes (which is the api-server's ctx), so a service
+// to NewRoutes (which is the api-server's ctx), so a service
 // shutdown cleanly tears down subscriptions.
-type chaintracksRoutes struct {
+type Routes struct {
 	cm chaintracks.Chaintracks
 
 	// SSE fan-out registries. clientID is a monotonic counter assigned on
@@ -82,10 +82,10 @@ func (s *sseWriter) close() {
 	s.mu.Unlock()
 }
 
-// newChaintracksRoutes subscribes to tip and reorg channels and starts
+// NewRoutes subscribes to tip and reorg channels and starts
 // broadcaster goroutines. Both exit when ctx is canceled.
-func newChaintracksRoutes(ctx context.Context, cm chaintracks.Chaintracks) *chaintracksRoutes {
-	r := &chaintracksRoutes{
+func NewRoutes(ctx context.Context, cm chaintracks.Chaintracks) *Routes {
+	r := &Routes{
 		cm:           cm,
 		tipClients:   make(map[int64]*sseWriter),
 		reorgClients: make(map[int64]*sseWriter),
@@ -100,7 +100,7 @@ func newChaintracksRoutes(ctx context.Context, cm chaintracks.Chaintracks) *chai
 	return r
 }
 
-func (r *chaintracksRoutes) runBroadcaster(ctx context.Context, ch <-chan *chaintracks.BlockHeader, fan func(*chaintracks.BlockHeader)) {
+func (r *Routes) runBroadcaster(ctx context.Context, ch <-chan *chaintracks.BlockHeader, fan func(*chaintracks.BlockHeader)) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -116,7 +116,7 @@ func (r *chaintracksRoutes) runBroadcaster(ctx context.Context, ch <-chan *chain
 	}
 }
 
-func (r *chaintracksRoutes) runReorgBroadcaster(ctx context.Context, ch <-chan *chaintracks.ReorgEvent) {
+func (r *Routes) runReorgBroadcaster(ctx context.Context, ch <-chan *chaintracks.ReorgEvent) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -132,7 +132,7 @@ func (r *chaintracksRoutes) runReorgBroadcaster(ctx context.Context, ch <-chan *
 	}
 }
 
-func (r *chaintracksRoutes) broadcastTip(tip *chaintracks.BlockHeader) {
+func (r *Routes) broadcastTip(tip *chaintracks.BlockHeader) {
 	data, err := json.Marshal(tip)
 	if err != nil {
 		return
@@ -163,7 +163,7 @@ func (r *chaintracksRoutes) broadcastTip(tip *chaintracks.BlockHeader) {
 	}
 }
 
-func (r *chaintracksRoutes) broadcastReorg(ev *chaintracks.ReorgEvent) {
+func (r *Routes) broadcastReorg(ev *chaintracks.ReorgEvent) {
 	data, err := json.Marshal(ev)
 	if err != nil {
 		return
@@ -204,7 +204,7 @@ func (r *chaintracksRoutes) broadcastReorg(ev *chaintracks.ReorgEvent) {
 // allow literal suffixes on named params (`:height.bin` would conflict with
 // `:height`). Upstream Fiber doesn't have this restriction, but the dispatch
 // difference is invisible to clients.
-func (r *chaintracksRoutes) Register(router *gin.RouterGroup) {
+func (r *Routes) Register(router *gin.RouterGroup) {
 	r.registerCommon(router)
 	router.GET("/tip/stream", r.handleTipStream)
 	router.GET("/reorg/stream", r.handleReorgStream)
@@ -213,7 +213,7 @@ func (r *chaintracksRoutes) Register(router *gin.RouterGroup) {
 // RegisterLegacy mounts the v1 RPC-style routes matching the original
 // chaintracks-server API PLUS the JSON/binary surface (so clients targeting
 // the shorter v1 prefix get the whole API, matching upstream behavior).
-func (r *chaintracksRoutes) RegisterLegacy(router *gin.RouterGroup) {
+func (r *Routes) RegisterLegacy(router *gin.RouterGroup) {
 	router.GET("/getChain", r.handleLegacyGetChain)
 	router.GET("/getPresentHeight", r.handleLegacyGetPresentHeight)
 	router.GET("/findChainTipHashHex", r.handleLegacyFindChainTipHashHex)
@@ -225,7 +225,7 @@ func (r *chaintracksRoutes) RegisterLegacy(router *gin.RouterGroup) {
 }
 
 // registerCommon wires the JSON + binary surface shared by v1 and v2.
-func (r *chaintracksRoutes) registerCommon(router *gin.RouterGroup) {
+func (r *Routes) registerCommon(router *gin.RouterGroup) {
 	router.GET("/network", r.handleGetNetwork)
 	router.GET("/height", r.handleGetHeight)
 	router.GET("/tip", r.handleGetTip)
@@ -237,7 +237,7 @@ func (r *chaintracksRoutes) registerCommon(router *gin.RouterGroup) {
 	router.GET("/header/hash/:hash", r.handleGetHeaderByHashDispatch)
 }
 
-func (r *chaintracksRoutes) handleGetHeaderByHeightDispatch(c *gin.Context) {
+func (r *Routes) handleGetHeaderByHeightDispatch(c *gin.Context) {
 	if strings.HasSuffix(c.Param("height"), ".bin") {
 		r.handleGetHeaderByHeightBinary(c)
 		return
@@ -245,7 +245,7 @@ func (r *chaintracksRoutes) handleGetHeaderByHeightDispatch(c *gin.Context) {
 	r.handleGetHeaderByHeight(c)
 }
 
-func (r *chaintracksRoutes) handleGetHeaderByHashDispatch(c *gin.Context) {
+func (r *Routes) handleGetHeaderByHashDispatch(c *gin.Context) {
 	if strings.HasSuffix(c.Param("hash"), ".bin") {
 		r.handleGetHeaderByHashBinary(c)
 		return
@@ -255,7 +255,7 @@ func (r *chaintracksRoutes) handleGetHeaderByHashDispatch(c *gin.Context) {
 
 // --- JSON handlers ---
 
-func (r *chaintracksRoutes) handleGetNetwork(c *gin.Context) {
+func (r *Routes) handleGetNetwork(c *gin.Context) {
 	network, err := r.cm.GetNetwork(c.Request.Context())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: err.Error()})
@@ -264,12 +264,12 @@ func (r *chaintracksRoutes) handleGetNetwork(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"network": network})
 }
 
-func (r *chaintracksRoutes) handleGetHeight(c *gin.Context) {
+func (r *Routes) handleGetHeight(c *gin.Context) {
 	c.Header("Cache-Control", "public, max-age=60")
 	c.JSON(http.StatusOK, gin.H{"height": r.cm.GetHeight(c.Request.Context())})
 }
 
-func (r *chaintracksRoutes) handleGetTip(c *gin.Context) {
+func (r *Routes) handleGetTip(c *gin.Context) {
 	c.Header("Cache-Control", "no-cache")
 	tip := r.cm.GetTip(c.Request.Context())
 	if tip == nil {
@@ -280,7 +280,7 @@ func (r *chaintracksRoutes) handleGetTip(c *gin.Context) {
 	c.JSON(http.StatusOK, tip)
 }
 
-func (r *chaintracksRoutes) handleGetHeaderByHeight(c *gin.Context) {
+func (r *Routes) handleGetHeaderByHeight(c *gin.Context) {
 	heightStr := strings.TrimSuffix(c.Param("height"), ".bin")
 	height, err := strconv.ParseUint(heightStr, 10, 32)
 	if err != nil {
@@ -299,7 +299,7 @@ func (r *chaintracksRoutes) handleGetHeaderByHeight(c *gin.Context) {
 	c.JSON(http.StatusOK, header)
 }
 
-func (r *chaintracksRoutes) handleGetHeaderByHash(c *gin.Context) {
+func (r *Routes) handleGetHeaderByHash(c *gin.Context) {
 	hashStr := strings.TrimSuffix(c.Param("hash"), ".bin")
 	hash, err := chainhash.NewHashFromHex(hashStr)
 	if err != nil {
@@ -317,7 +317,7 @@ func (r *chaintracksRoutes) handleGetHeaderByHash(c *gin.Context) {
 	c.JSON(http.StatusOK, header)
 }
 
-func (r *chaintracksRoutes) handleGetHeaders(c *gin.Context) {
+func (r *Routes) handleGetHeaders(c *gin.Context) {
 	heightStr := c.Query("height")
 	countStr := c.Query("count")
 	if heightStr == "" || countStr == "" {
@@ -351,7 +351,7 @@ func (r *chaintracksRoutes) handleGetHeaders(c *gin.Context) {
 
 // --- Binary handlers ---
 
-func (r *chaintracksRoutes) handleGetTipBinary(c *gin.Context) {
+func (r *Routes) handleGetTipBinary(c *gin.Context) {
 	c.Header("Cache-Control", "no-cache")
 	tip := r.cm.GetTip(c.Request.Context())
 	if tip == nil {
@@ -362,7 +362,7 @@ func (r *chaintracksRoutes) handleGetTipBinary(c *gin.Context) {
 	c.Data(http.StatusOK, "application/octet-stream", tip.Bytes())
 }
 
-func (r *chaintracksRoutes) handleGetHeaderByHeightBinary(c *gin.Context) {
+func (r *Routes) handleGetHeaderByHeightBinary(c *gin.Context) {
 	heightStr := strings.TrimSuffix(c.Param("height"), ".bin")
 	height, err := strconv.ParseUint(heightStr, 10, 32)
 	if err != nil {
@@ -382,7 +382,7 @@ func (r *chaintracksRoutes) handleGetHeaderByHeightBinary(c *gin.Context) {
 	c.Data(http.StatusOK, "application/octet-stream", header.Bytes())
 }
 
-func (r *chaintracksRoutes) handleGetHeaderByHashBinary(c *gin.Context) {
+func (r *Routes) handleGetHeaderByHashBinary(c *gin.Context) {
 	hashStr := strings.TrimSuffix(c.Param("hash"), ".bin")
 	hash, err := chainhash.NewHashFromHex(hashStr)
 	if err != nil {
@@ -400,7 +400,7 @@ func (r *chaintracksRoutes) handleGetHeaderByHashBinary(c *gin.Context) {
 	c.Data(http.StatusOK, "application/octet-stream", header.Bytes())
 }
 
-func (r *chaintracksRoutes) handleGetHeadersBinary(c *gin.Context) {
+func (r *Routes) handleGetHeadersBinary(c *gin.Context) {
 	heightStr := c.Query("height")
 	countStr := c.Query("count")
 	if heightStr == "" || countStr == "" {
@@ -439,7 +439,7 @@ func (r *chaintracksRoutes) handleGetHeadersBinary(c *gin.Context) {
 // setHeightCache marks heights older than ~100 blocks as immutable for an hour
 // so CDNs can cache them; recent heights are marked no-cache because they may
 // still reorg. Matches the upstream Fiber handler behavior.
-func (r *chaintracksRoutes) setHeightCache(ctx context.Context, c *gin.Context, height uint32) {
+func (r *Routes) setHeightCache(ctx context.Context, c *gin.Context, height uint32) {
 	tip := r.cm.GetHeight(ctx)
 	if tip > 100 && height < tip-100 {
 		c.Header("Cache-Control", "public, max-age=3600")
@@ -450,7 +450,7 @@ func (r *chaintracksRoutes) setHeightCache(ctx context.Context, c *gin.Context, 
 
 // --- SSE handlers ---
 
-func (r *chaintracksRoutes) handleTipStream(c *gin.Context) {
+func (r *Routes) handleTipStream(c *gin.Context) {
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
 		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "streaming unsupported"})
@@ -489,7 +489,7 @@ func (r *chaintracksRoutes) handleTipStream(c *gin.Context) {
 	r.runKeepalive(ctx, writer)
 }
 
-func (r *chaintracksRoutes) handleReorgStream(c *gin.Context) {
+func (r *Routes) handleReorgStream(c *gin.Context) {
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
 		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "streaming unsupported"})
@@ -519,7 +519,7 @@ func (r *chaintracksRoutes) handleReorgStream(c *gin.Context) {
 // runKeepalive blocks on ctx.Done() and periodically sends SSE comments so
 // intermediaries don't time the connection out. Exits as soon as the client
 // disconnects (ctx.Done closes) or a keepalive write fails.
-func (r *chaintracksRoutes) runKeepalive(ctx context.Context, writer *sseWriter) {
+func (r *Routes) runKeepalive(ctx context.Context, writer *sseWriter) {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -551,7 +551,7 @@ func legacyError(code, description string) legacyResponse {
 	return legacyResponse{Status: jsonKeyError, Code: code, Description: description}
 }
 
-func (r *chaintracksRoutes) handleLegacyGetChain(c *gin.Context) {
+func (r *Routes) handleLegacyGetChain(c *gin.Context) {
 	network, err := r.cm.GetNetwork(c.Request.Context())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, legacyError("ERR_INTERNAL", err.Error()))
@@ -560,12 +560,12 @@ func (r *chaintracksRoutes) handleLegacyGetChain(c *gin.Context) {
 	c.JSON(http.StatusOK, legacySuccess(network))
 }
 
-func (r *chaintracksRoutes) handleLegacyGetPresentHeight(c *gin.Context) {
+func (r *Routes) handleLegacyGetPresentHeight(c *gin.Context) {
 	c.Header("Cache-Control", "no-cache")
 	c.JSON(http.StatusOK, legacySuccess(r.cm.GetHeight(c.Request.Context())))
 }
 
-func (r *chaintracksRoutes) handleLegacyFindChainTipHashHex(c *gin.Context) {
+func (r *Routes) handleLegacyFindChainTipHashHex(c *gin.Context) {
 	c.Header("Cache-Control", "no-cache")
 	tip := r.cm.GetTip(c.Request.Context())
 	if tip == nil {
@@ -575,7 +575,7 @@ func (r *chaintracksRoutes) handleLegacyFindChainTipHashHex(c *gin.Context) {
 	c.JSON(http.StatusOK, legacySuccess(tip.Hash.String()))
 }
 
-func (r *chaintracksRoutes) handleLegacyFindChainTipHeaderHex(c *gin.Context) {
+func (r *Routes) handleLegacyFindChainTipHeaderHex(c *gin.Context) {
 	c.Header("Cache-Control", "no-cache")
 	tip := r.cm.GetTip(c.Request.Context())
 	if tip == nil {
@@ -585,7 +585,7 @@ func (r *chaintracksRoutes) handleLegacyFindChainTipHeaderHex(c *gin.Context) {
 	c.JSON(http.StatusOK, legacySuccess(tip))
 }
 
-func (r *chaintracksRoutes) handleLegacyFindHeaderHexForHeight(c *gin.Context) {
+func (r *Routes) handleLegacyFindHeaderHexForHeight(c *gin.Context) {
 	heightStr := c.Query("height")
 	if heightStr == "" {
 		c.JSON(http.StatusBadRequest, legacyError("ERR_INVALID_PARAMS", "Missing height parameter"))
@@ -607,7 +607,7 @@ func (r *chaintracksRoutes) handleLegacyFindHeaderHexForHeight(c *gin.Context) {
 	c.JSON(http.StatusOK, legacySuccess(header))
 }
 
-func (r *chaintracksRoutes) handleLegacyFindHeaderHexForBlockHash(c *gin.Context) {
+func (r *Routes) handleLegacyFindHeaderHexForBlockHash(c *gin.Context) {
 	hashStr := c.Query("hash")
 	if hashStr == "" {
 		c.JSON(http.StatusBadRequest, legacyError("ERR_INVALID_PARAMS", "Missing hash parameter"))
@@ -628,7 +628,7 @@ func (r *chaintracksRoutes) handleLegacyFindHeaderHexForBlockHash(c *gin.Context
 	c.JSON(http.StatusOK, legacySuccess(header))
 }
 
-func (r *chaintracksRoutes) handleLegacyGetHeaders(c *gin.Context) {
+func (r *Routes) handleLegacyGetHeaders(c *gin.Context) {
 	heightStr := c.Query("height")
 	countStr := c.Query("count")
 	if heightStr == "" || countStr == "" {

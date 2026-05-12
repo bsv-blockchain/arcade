@@ -1,4 +1,4 @@
-package api_server
+package sse
 
 import (
 	"fmt"
@@ -17,11 +17,11 @@ import (
 	"github.com/bsv-blockchain/arcade/models"
 )
 
-// e2eHarness wires the SSE handler against the real KafkaPublisher backed by
-// the in-memory Kafka broker. Unlike fakePublisher, this exercises the same
-// publish→Kafka→subscribe→fanOut path that runs in production, so the e2e
-// tests catch regressions in Subscribe-group plumbing or message ordering
-// that a fake would miss.
+// e2eHarness wires the SSE handler against the real KafkaPublisher
+// backed by the in-memory Kafka broker. Unlike fakePublisher this
+// exercises the same publish→Kafka→subscribe→fanOut path that runs in
+// production — catches regressions in Subscribe-group plumbing or
+// message ordering that a fake would miss.
 type e2eHarness struct {
 	broker    kafka.Broker
 	publisher *events.KafkaPublisher
@@ -45,22 +45,22 @@ func newE2EHarness(t *testing.T) *e2eHarness {
 		statusByTx:  map[string]*models.TransactionStatus{},
 	}
 
-	srv := &Server{
-		cfg:       &config.Config{},
+	svc := &Service{
+		cfg:       &config.Config{SSE: config.SSEConfig{Enabled: true}},
 		logger:    zap.NewNop(),
 		store:     st,
 		publisher: publisher,
 	}
 
-	mgr, err := newSSEManager(t.Context(), publisher, st, zap.NewNop())
+	mgr, err := newManager(t.Context(), publisher, st, zap.NewNop())
 	if err != nil {
 		_ = broker.Close()
-		t.Fatalf("newSSEManager: %v", err)
+		t.Fatalf("newManager: %v", err)
 	}
-	srv.sse = mgr
+	svc.manager = mgr
 
 	router := gin.New()
-	srv.registerRoutes(router)
+	router.GET("/events", svc.handleEvents)
 	httpSrv := httptest.NewServer(router)
 
 	return &e2eHarness{
@@ -71,9 +71,9 @@ func newE2EHarness(t *testing.T) *e2eHarness {
 	}
 }
 
-// publishAndPersist mirrors what tx_validator does in production: it writes
-// the status row to the store first, then publishes onto the events stream.
-// Tests use this to simulate a real status update.
+// publishAndPersist mirrors what tx_validator does in production: it
+// writes the status row to the store first, then publishes onto the
+// events stream.
 func (h *e2eHarness) publishAndPersist(t *testing.T, status *models.TransactionStatus) {
 	t.Helper()
 	h.store.setStatus(status.TxID, status)
@@ -82,14 +82,10 @@ func (h *e2eHarness) publishAndPersist(t *testing.T, status *models.TransactionS
 	}
 }
 
-// waitForSubscriberReady gives the KafkaPublisher's consumer goroutine a beat
-// to wire up its claim before the test publishes. Without this the first
-// publish can land on the topic before the sseManager's Subscribe has fully
-// joined the group, and the message would be lost to the manager.
+// waitForSubscriberReady gives the KafkaPublisher's consumer goroutine
+// a beat to wire up its claim before the test publishes.
 func waitForSubscriberReady() { time.Sleep(100 * time.Millisecond) }
 
-// TestSSE_E2E_LiveDelivery — connect first, then publish. Baseline check
-// that the live fan-out path works end-to-end through real Kafka transport.
 func TestSSE_E2E_LiveDelivery(t *testing.T) {
 	h := newE2EHarness(t)
 	defer h.Close()
@@ -107,8 +103,6 @@ func TestSSE_E2E_LiveDelivery(t *testing.T) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Give the SSE handler time to register its client (replay runs first
-	// but emits nothing because statusByTx is empty for this txid).
 	time.Sleep(100 * time.Millisecond)
 
 	h.publishAndPersist(t, &models.TransactionStatus{
@@ -127,10 +121,6 @@ func TestSSE_E2E_LiveDelivery(t *testing.T) {
 	}
 }
 
-// TestSSE_E2E_RaceCatchup — publish first, then connect. This is the bug the
-// fix targets: a client that connects after arcade has already published its
-// initial event must still see the current status via the initial-state
-// replay (no Last-Event-ID required).
 func TestSSE_E2E_RaceCatchup(t *testing.T) {
 	h := newE2EHarness(t)
 	defer h.Close()
@@ -140,22 +130,15 @@ func TestSSE_E2E_RaceCatchup(t *testing.T) {
 	const token = "tok-race"
 	h.store.subsByToken[token] = []*models.Submission{{TxID: txid, CallbackToken: token}}
 
-	// Publish RECEIVED BEFORE the client connects. The sseManager will fan
-	// it out to zero clients (none registered yet), and the live feed for
-	// this connection will never see it. The fix relies on the initial
-	// replay reading the persisted status at connect time.
 	h.publishAndPersist(t, &models.TransactionStatus{
 		TxID:      txid,
 		Status:    models.StatusReceived,
 		Timestamp: time.Now().UTC(),
 	})
-	// Let the publish drain through the sseManager's subscription so we
-	// know we're testing the catchup path, not the live path.
 	time.Sleep(100 * time.Millisecond)
 
 	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet,
 		h.httpSrv.URL+"/events?callbackToken="+token, nil)
-	// Crucially: NO Last-Event-ID header.
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("GET /events: %v", err)
@@ -172,9 +155,6 @@ func TestSSE_E2E_RaceCatchup(t *testing.T) {
 	}
 }
 
-// TestSSE_E2E_ReconnectWithLastEventID — pin the reconnect contract. After a
-// disconnect, replaying with Last-Event-ID must skip statuses already seen
-// and only emit later ones.
 func TestSSE_E2E_ReconnectWithLastEventID(t *testing.T) {
 	h := newE2EHarness(t)
 	defer h.Close()
@@ -184,8 +164,6 @@ func TestSSE_E2E_ReconnectWithLastEventID(t *testing.T) {
 	const token = "tok-reconnect"
 	h.store.subsByToken[token] = []*models.Submission{{TxID: txid, CallbackToken: token}}
 
-	// Persist the initial RECEIVED status. The first connection's replay
-	// will surface it.
 	receivedAt := time.Now().UTC().Truncate(time.Microsecond)
 	h.publishAndPersist(t, &models.TransactionStatus{
 		TxID:      txid,
@@ -193,7 +171,6 @@ func TestSSE_E2E_ReconnectWithLastEventID(t *testing.T) {
 		Timestamp: receivedAt,
 	})
 
-	// First connect — read the RECEIVED frame, capture its id.
 	req1, _ := http.NewRequestWithContext(t.Context(), http.MethodGet,
 		h.httpSrv.URL+"/events?callbackToken="+token, nil)
 	resp1, err := http.DefaultClient.Do(req1)
@@ -209,10 +186,6 @@ func TestSSE_E2E_ReconnectWithLastEventID(t *testing.T) {
 		t.Fatalf("first frame should be RECEIVED, got %q", frame1)
 	}
 
-	// Now overwrite the persisted status to SEEN_ON_NETWORK with a strictly
-	// later timestamp. Reconnect with Last-Event-ID set to the first frame's
-	// id (== receivedAt nanos): replay must skip RECEIVED and emit only
-	// SEEN_ON_NETWORK.
 	seenAt := receivedAt.Add(time.Second)
 	h.store.statusByTx[txid] = &models.TransactionStatus{
 		TxID:      txid,

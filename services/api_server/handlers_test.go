@@ -180,6 +180,12 @@ func (m *mockStore) ListBlockProcessingStatus(context.Context, uint64, int) ([]*
 	return nil, nil
 }
 
+func (m *mockStore) GetActiveTipBlockHeight(context.Context) (uint64, error) { return 0, nil }
+
+func (m *mockStore) ListStaleBlockProcessingStatus(context.Context, time.Time, uint64, int) ([]*models.BlockProcessingStatus, error) {
+	return nil, nil
+}
+
 func (m *mockStore) Close() error { return nil }
 
 func makeMinimalTx() []byte {

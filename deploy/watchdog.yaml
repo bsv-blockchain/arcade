@@ -1,47 +1,36 @@
-# All-in-One Deployment
+# Watchdog Deployment
 #
-# Runs all services in a single pod. Useful for development and testing.
-# In mode=all every service is launched as a goroutine in one process
-# and each binds its own port:
-#   - 8080: api-server
-#   - 8081: health probe (shared)
-#   - 8082: sse
-#   - 8083: chaintracks
+# Block-processing recovery service. Periodically scans block_processing
+# for rows whose chaintracks header arrived but whose BLOCK_PROCESSED
+# callback never landed; calls merkle-service POST /reprocess to recover.
+# Coordination via the `block-processing-watchdog` store lease, so
+# replicas>1 elect a single ticker and pile-on doesn't burn merkle-service.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: arcade-all
+  name: arcade-watchdog
   namespace: arcade
   labels:
-    app.kubernetes.io/name: all
+    app.kubernetes.io/name: watchdog
     app.kubernetes.io/part-of: arcade
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: all
+      app.kubernetes.io/name: watchdog
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: all
+        app.kubernetes.io/name: watchdog
         app.kubernetes.io/part-of: arcade
     spec:
       containers:
         - name: arcade
           image: ghcr.io/bsv-blockchain/arcade:latest
-          args: ["--mode", "all"]
+          args: ["--mode", "watchdog"]
           ports:
-            - containerPort: 8080
-              name: http
-              protocol: TCP
             - containerPort: 8081
               name: health
-              protocol: TCP
-            - containerPort: 8082
-              name: sse
-              protocol: TCP
-            - containerPort: 8083
-              name: chaintracks
               protocol: TCP
           env:
             - name: ARCADE_KAFKA_BROKERS
@@ -64,8 +53,8 @@ spec:
             periodSeconds: 30
           resources:
             requests:
-              cpu: 250m
-              memory: 256Mi
+              cpu: 50m
+              memory: 64Mi
             limits:
-              cpu: "1"
-              memory: 512Mi
+              cpu: 200m
+              memory: 128Mi

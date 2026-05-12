@@ -1,4 +1,4 @@
-package api_server
+package chaintracks_server
 
 import (
 	"context"
@@ -15,8 +15,9 @@ import (
 )
 
 // fakeChaintracks implements the chaintracks.Chaintracks interface with
-// canned responses and a tip channel the test drives directly. Just enough to
-// exercise the Gin adapter — we don't pretend to run a real P2P subscription.
+// canned responses and a tip channel the test drives directly. Just
+// enough to exercise the Gin adapter — we don't pretend to run a real
+// P2P subscription.
 type fakeChaintracks struct {
 	network string
 	height  uint32
@@ -70,7 +71,6 @@ func (f *fakeChaintracks) SubscribeReorg(context.Context) <-chan *chaintracks.Re
 }
 func (f *fakeChaintracks) UnsubscribeReorg(<-chan *chaintracks.ReorgEvent) {}
 
-// fixtureTip returns a deterministic BlockHeader so tests can assert exact bytes.
 func fixtureTip() *chaintracks.BlockHeader {
 	var prev, merkle chainhash.Hash
 	for i := range prev {
@@ -92,41 +92,22 @@ func fixtureTip() *chaintracks.BlockHeader {
 	}
 }
 
-func setupChaintracksRouter(t *testing.T, ct chaintracks.Chaintracks) (*gin.Engine, *chaintracksRoutes) {
+func setupChaintracksRouter(t *testing.T, ct chaintracks.Chaintracks) (*gin.Engine, *Routes) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	routes := newChaintracksRoutes(ctx, ct)
+	routes := NewRoutes(ctx, ct)
 	routes.Register(r.Group("/chaintracks/v2"))
 	routes.RegisterLegacy(r.Group("/chaintracks/v1"))
 	return r, routes
 }
 
-// When chaintracks is disabled (no routes mounted), requests to the namespace
-// must 404 rather than leak to an unrelated handler.
-func TestServer_ChaintracksDisabled_Returns404ForChaintracksRoutes(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	r := gin.New()
-	// No chaintracks routes registered. Simulate a bare router with the same
-	// non-chaintracks routes the server would normally have.
-	r.GET("/health", func(c *gin.Context) { c.Status(http.StatusOK) })
-
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/chaintracks/v1/height", nil)
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-	if w.Code != http.StatusNotFound {
-		t.Fatalf("expected 404 when chaintracks routes not mounted, got %d", w.Code)
-	}
-}
-
-// Enabled path: /network and /height return canned JSON from the fake.
-func TestServer_ChaintracksEnabled_MountsRoutes(t *testing.T) {
+func TestChaintracksRoutes_MountsRoutes(t *testing.T) {
 	f := newFakeChaintracks()
 	r, _ := setupChaintracksRouter(t, f)
 
-	// /network
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/chaintracks/v2/network", nil)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -143,7 +124,6 @@ func TestServer_ChaintracksEnabled_MountsRoutes(t *testing.T) {
 		t.Errorf("network=%q, want mainnet", netResp.Network)
 	}
 
-	// /height
 	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/chaintracks/v2/height", nil)
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -161,7 +141,6 @@ func TestServer_ChaintracksEnabled_MountsRoutes(t *testing.T) {
 	}
 }
 
-// Binary endpoint must return exactly 80 bytes and set X-Block-Height.
 func TestChaintracksRoutes_BinaryHeader_Returns80Bytes(t *testing.T) {
 	f := newFakeChaintracks()
 	tip := fixtureTip()
@@ -186,18 +165,15 @@ func TestChaintracksRoutes_BinaryHeader_Returns80Bytes(t *testing.T) {
 	}
 }
 
-// Tip SSE stream must forward new tips and exit on client disconnect.
 func TestChaintracksRoutes_TipStream_ForwardsUpdates(t *testing.T) {
 	f := newFakeChaintracks()
 	f.tip = fixtureTip()
 
-	// Use a real httptest.Server here so we get a real http.Flusher and can
-	// close the client connection to drive disconnect.
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	routes := newChaintracksRoutes(ctx, f)
+	routes := NewRoutes(ctx, f)
 	routes.Register(r.Group("/chaintracks/v2"))
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)
@@ -215,9 +191,6 @@ func TestChaintracksRoutes_TipStream_ForwardsUpdates(t *testing.T) {
 		t.Fatalf("stream status=%d, want 200", resp.StatusCode)
 	}
 
-	// First frame is the initial tip. Rely on the http client's overall
-	// timeout to bound this read; in the happy path the broadcaster writes
-	// the initial tip before we get here.
 	buf := make([]byte, 512)
 	n, err := resp.Body.Read(buf)
 	if err != nil && n == 0 {
@@ -227,19 +200,15 @@ func TestChaintracksRoutes_TipStream_ForwardsUpdates(t *testing.T) {
 		t.Errorf("expected SSE 'data: ' prefix, got %q", string(buf[:min(n, 32)]))
 	}
 
-	// Push another tip, expect to receive it within a short window.
 	nextTip := fixtureTip()
 	nextTip.Height = 101
 	f.tipCh <- nextTip
 
-	// Small wait to let broadcaster fan it out.
 	time.Sleep(100 * time.Millisecond)
 	n2, _ := resp.Body.Read(buf)
 	if n2 == 0 {
 		t.Fatal("no second tip frame received")
 	}
 
-	// Disconnect; goroutine in the handler should exit (verified implicitly by
-	// the test not leaking — go test -race would catch leaks).
 	reqCancel()
 }

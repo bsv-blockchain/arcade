@@ -889,6 +889,50 @@ LIMIT $2`
 	return out, rows.Err()
 }
 
+func (s *Store) GetActiveTipBlockHeight(ctx context.Context) (uint64, error) {
+	const q = `
+SELECT COALESCE(MAX(block_height), 0)
+FROM block_processing
+WHERE status = 'active'`
+	var height int64
+	if err := s.pool.QueryRow(ctx, q).Scan(&height); err != nil {
+		return 0, fmt.Errorf("get active tip height: %w", err)
+	}
+	if height < 0 {
+		return 0, nil
+	}
+	return uint64(height), nil
+}
+
+func (s *Store) ListStaleBlockProcessingStatus(ctx context.Context, olderThan time.Time, minHeight uint64, limit int) ([]*models.BlockProcessingStatus, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	const q = `
+SELECT block_hash, block_height, header_seen_at, processed_at, bump_built_at, status, orphaned_at
+FROM block_processing
+WHERE processed_at IS NULL
+  AND status = 'active'
+  AND header_seen_at < $1
+  AND block_height >= $2
+ORDER BY header_seen_at ASC
+LIMIT $3`
+	rows, err := s.pool.Query(ctx, q, olderThan, int64(minHeight), limit) //nolint:gosec // height fits in int64
+	if err != nil {
+		return nil, fmt.Errorf("list stale block processing: %w", err)
+	}
+	defer rows.Close()
+	var out []*models.BlockProcessingStatus
+	for rows.Next() {
+		bp, err := scanBlockProcessing(rows.Scan)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, bp)
+	}
+	return out, rows.Err()
+}
+
 // scanBlockProcessing decodes one block_processing row. The scan callback
 // shape lets us share this between QueryRow.Scan and Rows.Scan.
 func scanBlockProcessing(scan func(...any) error) (*models.BlockProcessingStatus, error) {

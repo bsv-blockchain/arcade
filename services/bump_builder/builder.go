@@ -37,7 +37,18 @@ type Builder struct {
 // connection. publisher fans MINED status updates out to subscribers.
 // teranodeClient supplies the live datahub URL list (static + p2p-discovered,
 // refreshed from the shared store) used for block fetches.
-func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publisher events.Publisher, st store.Store, teranodeClient *teranode.Client) *Builder {
+//
+// The block-processing watchdog lives in services/watchdog and runs as a
+// separate arcade service (mode=watchdog) — bump-builder is no longer
+// responsible for stale-block recovery.
+func New(
+	cfg *config.Config,
+	logger *zap.Logger,
+	producer *kafka.Producer,
+	publisher events.Publisher,
+	st store.Store,
+	teranodeClient *teranode.Client,
+) *Builder {
 	return &Builder{
 		cfg:       cfg,
 		logger:    logger.Named("bump-builder"),

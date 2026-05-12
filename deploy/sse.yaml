@@ -1,47 +1,43 @@
-# All-in-One Deployment
+# SSE Server Deployment + Service
 #
-# Runs all services in a single pod. Useful for development and testing.
-# In mode=all every service is launched as a goroutine in one process
-# and each binds its own port:
-#   - 8080: api-server
-#   - 8081: health probe (shared)
-#   - 8082: sse
-#   - 8083: chaintracks
+# Serves Server-Sent Events to clients subscribed to transaction status
+# updates. Extracted from api-server so slow SSE consumers can't
+# backpressure /submit handling.
+#
+# Subscribes to the shared Kafka topic for status updates and reads
+# submission metadata + per-tx status from the shared store for
+# Last-Event-ID catchup. The pod is horizontally scalable — each replica
+# binds its own Kafka consumer group so every replica receives every
+# event independently.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: arcade-all
+  name: arcade-sse
   namespace: arcade
   labels:
-    app.kubernetes.io/name: all
+    app.kubernetes.io/name: sse
     app.kubernetes.io/part-of: arcade
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: all
+      app.kubernetes.io/name: sse
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: all
+        app.kubernetes.io/name: sse
         app.kubernetes.io/part-of: arcade
     spec:
       containers:
         - name: arcade
           image: ghcr.io/bsv-blockchain/arcade:latest
-          args: ["--mode", "all"]
+          args: ["--mode", "sse"]
           ports:
-            - containerPort: 8080
+            - containerPort: 8082
               name: http
               protocol: TCP
             - containerPort: 8081
               name: health
-              protocol: TCP
-            - containerPort: 8082
-              name: sse
-              protocol: TCP
-            - containerPort: 8083
-              name: chaintracks
               protocol: TCP
           env:
             - name: ARCADE_KAFKA_BROKERS
@@ -64,8 +60,26 @@ spec:
             periodSeconds: 30
           resources:
             requests:
-              cpu: 250m
-              memory: 256Mi
+              cpu: 100m
+              memory: 128Mi
             limits:
-              cpu: "1"
-              memory: 512Mi
+              cpu: 500m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: arcade-sse
+  namespace: arcade
+  labels:
+    app.kubernetes.io/name: sse
+    app.kubernetes.io/part-of: arcade
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: sse
+  ports:
+    - port: 8082
+      targetPort: http
+      protocol: TCP
+      name: http

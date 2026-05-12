@@ -3,12 +3,14 @@ package merkleservice
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestRegister(t *testing.T) {
@@ -199,5 +201,117 @@ func TestRegisterBatch_EmptyReturnsNil(t *testing.T) {
 	err := client.RegisterBatch(context.Background(), nil, 5)
 	if err != nil {
 		t.Fatalf("expected no error for empty batch, got: %v", err)
+	}
+}
+
+func TestReprocess_AcceptedReturnsNil(t *testing.T) {
+	var gotPath, gotAuth string
+	var gotBody map[string]string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "mytoken", 0)
+	err := client.Reprocess(context.Background(), "blockhash123", "http://callback/url", "cbtoken")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotPath != "/reprocess" {
+		t.Errorf("expected /reprocess, got %s", gotPath)
+	}
+	if gotAuth != "Bearer mytoken" {
+		t.Errorf("expected Bearer mytoken, got %s", gotAuth)
+	}
+	if gotBody["blockHash"] != "blockhash123" {
+		t.Errorf("blockHash=%q want blockhash123", gotBody["blockHash"])
+	}
+	if gotBody["callbackUrl"] != "http://callback/url" {
+		t.Errorf("callbackUrl=%q", gotBody["callbackUrl"])
+	}
+	if gotBody["callbackToken"] != "cbtoken" {
+		t.Errorf("callbackToken=%q", gotBody["callbackToken"])
+	}
+}
+
+func TestReprocess_OmitsEmptyCallbackToken(t *testing.T) {
+	var rawBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rawBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", 0)
+	if err := client.Reprocess(context.Background(), "blockhash123", "http://cb", ""); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(string(rawBody), "callbackToken") {
+		t.Errorf("expected body to omit callbackToken when empty, got %s", string(rawBody))
+	}
+}
+
+func TestReprocess_4xxReturnsTypedFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte("block not found"))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", 0)
+	err := client.Reprocess(context.Background(), "blockhash123", "http://cb", "")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	var fail *ReprocessError
+	if !errors.As(err, &fail) {
+		t.Fatalf("expected *ReprocessError, got %T: %v", err, err)
+	}
+	if fail.StatusCode != http.StatusNotFound {
+		t.Errorf("StatusCode=%d want 404", fail.StatusCode)
+	}
+	if !strings.Contains(fail.Body, "block not found") {
+		t.Errorf("Body=%q missing server message", fail.Body)
+	}
+}
+
+func TestReprocess_5xxReturnsTypedFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", 0)
+	err := client.Reprocess(context.Background(), "blockhash123", "http://cb", "")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	var fail *ReprocessError
+	if !errors.As(err, &fail) {
+		t.Fatalf("expected *ReprocessError, got %T: %v", err, err)
+	}
+	if fail.StatusCode != http.StatusBadGateway {
+		t.Errorf("StatusCode=%d want 502", fail.StatusCode)
+	}
+}
+
+func TestReprocess_ContextCanceled(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", 100*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := client.Reprocess(ctx, "blockhash", "http://cb", "")
+	if err == nil {
+		t.Fatal("expected error from canceled context")
 	}
 }

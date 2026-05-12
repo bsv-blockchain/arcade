@@ -152,6 +152,20 @@ type Store interface {
 	// block_height < beforeHeight (the keyset cursor). limit must be > 0.
 	ListBlockProcessingStatus(ctx context.Context, beforeHeight uint64, limit int) ([]*models.BlockProcessingStatus, error)
 
+	// GetActiveTipBlockHeight returns the highest block_height across rows
+	// with status='active'. Returns 0 when the table is empty (or every row
+	// is orphaned). The bump-builder watchdog uses this to compute a
+	// recency window — only blocks within N of the active tip are eligible
+	// for /reprocess, so a long arcade outage that floods the table with
+	// historical headers doesn't trigger thousands of reprocess calls.
+	GetActiveTipBlockHeight(ctx context.Context) (uint64, error)
+
+	// ListStaleBlockProcessingStatus returns up to limit rows where
+	// processed_at IS NULL, status='active', header_seen_at < olderThan,
+	// and block_height >= minHeight. Ordered by header_seen_at ASC so the
+	// watchdog retries the oldest gap first. limit must be > 0.
+	ListStaleBlockProcessingStatus(ctx context.Context, olderThan time.Time, minHeight uint64, limit int) ([]*models.BlockProcessingStatus, error)
+
 	// SetMinedByTxIDs marks transactions as mined for a given block (hash + height)
 	// and tx list. blockHeight is required: downstream consumers (SSE, webhooks,
 	// BUMP-build dedup) rely on the height to anchor each MINED status to a

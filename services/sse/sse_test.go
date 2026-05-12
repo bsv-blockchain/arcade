@@ -1,4 +1,4 @@
-package api_server
+package sse
 
 import (
 	"bufio"
@@ -22,6 +22,7 @@ import (
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/store"
 )
 
 // fakePublisher is a test-only events.Publisher. It captures published
@@ -56,14 +57,11 @@ func (p *fakePublisher) Subscribe(_ context.Context, _ string) (<-chan *models.T
 
 func (p *fakePublisher) Close() error { return nil }
 
-// sseStoreStub extends mockStore with submission/status fixtures so we can
-// drive token filtering and Last-Event-ID catchup paths.
-//
-// The fixtures are mutated from test goroutines while the SSE handler reads
-// them from its own goroutine (via httptest.Server), so accesses are guarded
-// by a mutex to keep `go test -race` clean.
+// sseStoreStub is a minimum-surface fake. The SSE service only touches
+// GetSubmissionsByToken and GetStatus on the Store; embed the interface
+// so every other method panics if accidentally called.
 type sseStoreStub struct {
-	mockStore
+	store.Store
 
 	mu          sync.RWMutex
 	subsByToken map[string][]*models.Submission
@@ -88,41 +86,39 @@ func (s *sseStoreStub) setStatus(txid string, status *models.TransactionStatus) 
 	s.statusByTx[txid] = status
 }
 
-// setupSSEServer wires up an api_server.Server backed by a fakePublisher and
-// the supplied store stub. The returned cancel must be deferred to release
-// the manager goroutine.
-func setupSSEServer(t *testing.T, st *sseStoreStub) (*Server, *gin.Engine, *fakePublisher, context.CancelFunc) {
+// setupSSEService wires a Service backed by a fakePublisher and the
+// supplied store stub. Returns the service, a gin router with /events
+// registered, the publisher, and a cancel that releases the manager
+// goroutine.
+func setupSSEService(t *testing.T, st *sseStoreStub) (*Service, *gin.Engine, *fakePublisher, context.CancelFunc) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	pub := &fakePublisher{}
-	srv := &Server{
-		cfg:       &config.Config{},
+	svc := &Service{
+		cfg:       &config.Config{SSE: config.SSEConfig{Enabled: true}},
 		logger:    zap.NewNop(),
 		store:     st,
 		publisher: pub,
 	}
 	ctx, cancel := context.WithCancel(t.Context())
-	mgr, err := newSSEManager(ctx, pub, st, zap.NewNop())
+	mgr, err := newManager(ctx, pub, st, zap.NewNop())
 	if err != nil {
 		cancel()
-		t.Fatalf("newSSEManager: %v", err)
+		t.Fatalf("newManager: %v", err)
 	}
-	srv.sse = mgr
+	svc.manager = mgr
 	router := gin.New()
-	srv.registerRoutes(router)
-	return srv, router, pub, cancel
+	router.GET("/events", svc.handleEvents)
+	return svc, router, pub, cancel
 }
 
-// TestSSEFrameFormat verifies the wire format byte-for-byte against what the
-// old arcade emits. Field order, separators, and trailing blank line all
-// matter — clients parse SSE strictly per the spec.
 func TestSSEFrameFormat(t *testing.T) {
 	st := &sseStoreStub{
 		subsByToken: map[string][]*models.Submission{
 			"tok-A": {{TxID: "abc", CallbackToken: "tok-A"}},
 		},
 	}
-	_, router, pub, cancel := setupSSEServer(t, st)
+	_, router, pub, cancel := setupSSEService(t, st)
 	defer cancel()
 
 	srv := httptest.NewServer(router)
@@ -139,9 +135,6 @@ func TestSSEFrameFormat(t *testing.T) {
 		t.Errorf("Content-Type = %q, want text/event-stream", got)
 	}
 
-	// Drive one event into the publisher; the manager will fan it to the
-	// connected client. Tiny sleep gives the handler goroutine time to
-	// register before the publish lands.
 	go func() {
 		time.Sleep(50 * time.Millisecond)
 		_ = pub.Publish(t.Context(), &models.TransactionStatus{
@@ -174,15 +167,13 @@ func TestSSEFrameFormat(t *testing.T) {
 	}
 }
 
-// TestSSETokenFilter verifies that an event whose txid does not belong to
-// the connecting client's callback token is suppressed.
 func TestSSETokenFilter(t *testing.T) {
 	st := &sseStoreStub{
 		subsByToken: map[string][]*models.Submission{
 			"tok-A": {{TxID: "match", CallbackToken: "tok-A"}},
 		},
 	}
-	_, router, pub, cancel := setupSSEServer(t, st)
+	_, router, pub, cancel := setupSSEService(t, st)
 	defer cancel()
 
 	srv := httptest.NewServer(router)
@@ -197,9 +188,7 @@ func TestSSETokenFilter(t *testing.T) {
 
 	go func() {
 		time.Sleep(50 * time.Millisecond)
-		// First update is for a tx the token doesn't own — should be dropped.
 		_ = pub.Publish(t.Context(), &models.TransactionStatus{TxID: "other", Status: models.StatusMined, Timestamp: time.Now()})
-		// Second update should be delivered.
 		_ = pub.Publish(t.Context(), &models.TransactionStatus{TxID: "match", Status: models.StatusMined, Timestamp: time.Now()})
 	}()
 
@@ -212,9 +201,6 @@ func TestSSETokenFilter(t *testing.T) {
 	}
 }
 
-// TestSSECatchup replays a Last-Event-ID-driven catchup pass. The handler
-// must emit any frame whose timestamp is after the supplied ns and skip the
-// older one.
 func TestSSECatchup(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	older := now.Add(-time.Hour)
@@ -232,7 +218,7 @@ func TestSSECatchup(t *testing.T) {
 			"new": {TxID: "new", Status: models.StatusMined, Timestamp: newer},
 		},
 	}
-	_, router, _, cancel := setupSSEServer(t, st)
+	_, router, _, cancel := setupSSEService(t, st)
 	defer cancel()
 
 	srv := httptest.NewServer(router)
@@ -259,18 +245,16 @@ func TestSSECatchup(t *testing.T) {
 	}
 }
 
-// TestSSENoPublisher verifies that the endpoint returns 503 when no
-// Publisher is wired up — the degraded-deployment path.
 func TestSSENoPublisher(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	srv := &Server{
-		cfg:    &config.Config{},
+	svc := &Service{
+		cfg:    &config.Config{SSE: config.SSEConfig{Enabled: true}},
 		logger: zap.NewNop(),
 		store:  &sseStoreStub{},
-		// publisher and sse intentionally nil
+		// publisher and manager intentionally nil
 	}
 	router := gin.New()
-	srv.registerRoutes(router)
+	router.GET("/events", svc.handleEvents)
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/events", nil)
 	w := httptest.NewRecorder()
@@ -281,34 +265,26 @@ func TestSSENoPublisher(t *testing.T) {
 	}
 }
 
-// TestSSEFanOutConcurrentUnregister stresses the F-020 fix: many clients
-// register, then half are unregistered concurrently with a fan-out push. The
-// previous implementation closed c.ch on unregister, which races a fan-out
-// send and panics with "send on closed channel". With the fix, fan-out
-// selects on the per-client ctx and bails cleanly when a client is gone, so
-// no panic ever occurs even under aggressive interleaving.
 func TestSSEFanOutConcurrentUnregister(t *testing.T) {
 	st := &sseStoreStub{
 		subsByToken: map[string][]*models.Submission{},
 		statusByTx:  map[string]*models.TransactionStatus{},
 	}
-	_, _, _, cancel := setupSSEServer(t, st)
+	_, _, _, cancel := setupSSEService(t, st)
 	defer cancel()
 
-	// Build a manager directly (bypass HTTP) so we can drive register /
-	// unregister / fanOut on the same struct the production path uses.
 	ctx, mgrCancel := context.WithCancel(t.Context())
 	defer mgrCancel()
-	mgr, err := newSSEManager(ctx, &fakePublisher{}, st, zap.NewNop())
+	mgr, err := newManager(ctx, &fakePublisher{}, st, zap.NewNop())
 	if err != nil {
-		t.Fatalf("newSSEManager: %v", err)
+		t.Fatalf("newManager: %v", err)
 	}
 
 	const N = 200
-	clients := make([]*sseClient, N)
+	clients := make([]*Client, N)
 	for i := 0; i < N; i++ {
-		c := mgr.newClient("") // empty token → no store filter
-		mgr.register(c)
+		c := mgr.NewClient("")
+		mgr.Register(c)
 		clients[i] = c
 	}
 
@@ -320,8 +296,6 @@ func TestSSEFanOutConcurrentUnregister(t *testing.T) {
 		Timestamp: time.Unix(0, 1700000000000000000).UTC(),
 	}
 
-	// Race: half the clients unregister while a stream of fan-outs happens.
-	// Repeat enough times to exercise the interleaving.
 	const iterations = 50
 	for it := 0; it < iterations; it++ {
 		var wg sync.WaitGroup
@@ -329,29 +303,22 @@ func TestSSEFanOutConcurrentUnregister(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < N; i += 2 {
-				mgr.unregister(clients[i].id)
+				mgr.Unregister(clients[i].ID)
 			}
 		}()
 		go func() {
 			defer wg.Done()
-			// fanOut must not panic even though half the clients are
-			// being unregistered (and previously had their ch closed)
-			// concurrently.
 			mgr.fanOut(ctx, status)
 		}()
 		wg.Wait()
 
-		// Re-register fresh clients in those slots so the next iteration
-		// has another batch to race.
 		for i := 0; i < N; i += 2 {
-			c := mgr.newClient("")
-			mgr.register(c)
+			c := mgr.NewClient("")
+			mgr.Register(c)
 			clients[i] = c
 		}
 	}
 
-	// Drain remaining: cancel ctx → manager goroutine exits, all client
-	// ctxs cancel via parent. Allow scheduler a beat to clean up.
 	mgrCancel()
 	cancel()
 	deadline := time.Now().Add(2 * time.Second)
@@ -361,39 +328,30 @@ func TestSSEFanOutConcurrentUnregister(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	// Best-effort goroutine-leak check: we don't pin an exact count
-	// (httptest / runtime can spawn helpers) but we tolerate a small
-	// fudge. The real assertion is "no panic" above.
 	t.Logf("goroutines start=%d end=%d (fudge tolerated)", startGoroutines, runtime.NumGoroutine())
 }
 
-// TestSSEFanOutSlowClientDrops verifies that a client whose buffer is full
-// causes fan-out to take the drop arm rather than block. The slow_client
-// counter must increment by exactly the number of drops, and the fan-out
-// must complete promptly even though the slow client never drains.
 func TestSSEFanOutSlowClientDrops(t *testing.T) {
 	st := &sseStoreStub{
 		subsByToken: map[string][]*models.Submission{},
 		statusByTx:  map[string]*models.TransactionStatus{},
 	}
-	_, _, _, cancel := setupSSEServer(t, st)
+	_, _, _, cancel := setupSSEService(t, st)
 	defer cancel()
 
 	ctx, mgrCancel := context.WithCancel(t.Context())
 	defer mgrCancel()
-	mgr, err := newSSEManager(ctx, &fakePublisher{}, st, zap.NewNop())
+	mgr, err := newManager(ctx, &fakePublisher{}, st, zap.NewNop())
 	if err != nil {
-		t.Fatalf("newSSEManager: %v", err)
+		t.Fatalf("newManager: %v", err)
 	}
 
-	slow := mgr.newClient("")
-	mgr.register(slow)
-	defer mgr.unregister(slow.id)
+	slow := mgr.NewClient("")
+	mgr.Register(slow)
+	defer mgr.Unregister(slow.ID)
 
-	// Fill the slow client's buffer to capacity so subsequent fan-outs
-	// must take the default-drop arm.
-	for i := 0; i < cap(slow.ch); i++ {
-		slow.ch <- &models.TransactionStatus{TxID: "filler", Timestamp: time.Now()}
+	for i := 0; i < cap(slow.Ch); i++ {
+		slow.Ch <- &models.TransactionStatus{TxID: "filler", Timestamp: time.Now()}
 	}
 
 	before := testutil.ToFloat64(metrics.APISSEDroppedTotal.WithLabelValues("slow_client"))
@@ -423,34 +381,27 @@ func TestSSEFanOutSlowClientDrops(t *testing.T) {
 	}
 }
 
-// TestSSEFanOutClientGoneDrops ensures a client whose ctx has been canceled
-// (i.e. unregister already ran) falls through the ctx.Done() arm of the
-// fan-out select rather than panicking on a closed channel. We invoke
-// fanOut directly so the race is deterministic.
 func TestSSEFanOutClientGoneDrops(t *testing.T) {
 	st := &sseStoreStub{
 		subsByToken: map[string][]*models.Submission{},
 		statusByTx:  map[string]*models.TransactionStatus{},
 	}
-	_, _, _, cancel := setupSSEServer(t, st)
+	_, _, _, cancel := setupSSEService(t, st)
 	defer cancel()
 
 	ctx, mgrCancel := context.WithCancel(t.Context())
 	defer mgrCancel()
-	mgr, err := newSSEManager(ctx, &fakePublisher{}, st, zap.NewNop())
+	mgr, err := newManager(ctx, &fakePublisher{}, st, zap.NewNop())
 	if err != nil {
-		t.Fatalf("newSSEManager: %v", err)
+		t.Fatalf("newManager: %v", err)
 	}
 
-	gone := mgr.newClient("")
-	mgr.register(gone)
-	// Cancel WITHOUT removing from the map so fanOut still sees this
-	// client in its snapshot — exactly the race the bug describes.
-	gone.cancel()
+	gone := mgr.NewClient("")
+	mgr.Register(gone)
+	gone.Cancel()
 
 	before := testutil.ToFloat64(metrics.APISSEDroppedTotal.WithLabelValues("client_gone"))
 
-	// Must not panic.
 	mgr.fanOut(ctx, &models.TransactionStatus{
 		TxID:      "gone",
 		Status:    models.StatusMined,
@@ -463,9 +414,6 @@ func TestSSEFanOutClientGoneDrops(t *testing.T) {
 	}
 }
 
-// readNextSSEFrame reads bytes from r until two consecutive newlines mark
-// the end of an SSE frame, or until timeout. Returns the frame text
-// including the terminating "\n\n".
 func readNextSSEFrame(r io.Reader, timeout time.Duration) (string, error) {
 	type result struct {
 		s   string
@@ -482,8 +430,6 @@ func readNextSSEFrame(r io.Reader, timeout time.Duration) (string, error) {
 				return
 			}
 			buf.Write(line)
-			// SSE comments start with ":" — skip them so keepalives don't
-			// satisfy the test prematurely.
 			if len(line) > 0 && line[0] == ':' {
 				buf.Reset()
 				continue

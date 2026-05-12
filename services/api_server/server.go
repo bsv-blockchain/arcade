@@ -5,11 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
-	"path"
 	"time"
 
-	"github.com/bsv-blockchain/go-chaintracks/chaintracks"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
@@ -22,18 +19,14 @@ import (
 )
 
 type Server struct {
-	cfg          *config.Config
-	logger       *zap.Logger
-	producer     *kafka.Producer
-	publisher    events.Publisher // nil-safe; used to fan status updates out to SSE / webhooks
-	store        store.Store
-	txTracker    *store.TxTracker
-	teranode     *teranode.Client // used by /health for datahub URL inventory; nil in tests
-	server       *http.Server
-	chaintracks  chaintracks.Chaintracks // nil when disabled
-	ctRoutes     *chaintracksRoutes      // nil when disabled
-	blockTracker *blockStatusTracker     // nil when chaintracks is disabled
-	sse          *sseManager             // nil when no publisher is configured
+	cfg       *config.Config
+	logger    *zap.Logger
+	producer  *kafka.Producer
+	publisher events.Publisher // nil-safe; status updates flow to SSE via Kafka — the api-server itself publishes but does not subscribe
+	store     store.Store
+	txTracker *store.TxTracker
+	teranode  *teranode.Client // used by /health for datahub URL inventory; nil in tests
+	server    *http.Server
 }
 
 func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publisher events.Publisher, st store.Store, tracker *store.TxTracker, tc *teranode.Client) *Server {
@@ -51,32 +44,6 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 func (s *Server) Name() string { return "api-server" }
 
 func (s *Server) Start(ctx context.Context) error {
-	// Bring up chaintracks BEFORE the router is assembled so registerRoutes
-	// can mount its handlers only when a live instance is present.
-	if err := s.initChaintracks(ctx); err != nil {
-		return fmt.Errorf("initializing chaintracks: %w", err)
-	}
-
-	// Wire the block-processing tracker after chaintracks so the subscription
-	// goroutines can attach to its tip + reorg channels. With chaintracks
-	// disabled, header tracking is also disabled (block_processed and
-	// bump_built_at are still recorded by the api/handlers and bump-builder
-	// paths respectively, just without a header row preceding them).
-	if s.chaintracks != nil {
-		s.blockTracker = newBlockStatusTracker(ctx, s.chaintracks, s.store, s.logger)
-	} else {
-		s.logger.Debug("block-status header tracking disabled (chaintracks not initialized)")
-	}
-
-	// Boot the SSE fan-out manager BEFORE registering routes so /events has
-	// a live subscription to attach clients to. nil when no Publisher was
-	// supplied — the handler returns 503 in that case.
-	sse, err := newSSEManager(ctx, s.publisher, s.store, s.logger)
-	if err != nil {
-		return fmt.Errorf("initializing SSE manager: %w", err)
-	}
-	s.sse = sse
-
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
 	router.Use(gin.CustomRecovery(s.recoverPanic))
@@ -101,65 +68,6 @@ func (s *Server) Start(ctx context.Context) error {
 	if err := s.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("server error: %w", err)
 	}
-	return nil
-}
-
-// initChaintracks spins up the embedded go-chaintracks instance when
-// ChaintracksServer.Enabled is true. Shutdown is driven by ctx — when the
-// api-server's context is canceled, chaintracks's P2P subscription and SSE
-// broadcasters unwind themselves.
-//
-// Initialization failures are returned as errors so main.go can surface them
-// as a fatal startup error rather than silently disabling the feature.
-func (s *Server) initChaintracks(ctx context.Context) error {
-	if !s.cfg.ChaintracksServer.Enabled {
-		s.logger.Debug("chaintracks disabled")
-		return nil
-	}
-
-	// Default chaintracks storage to <storage_path>/chaintracks/ so operators
-	// only need to set a single storage root in the common case. Tilde expansion
-	// happens in config.Load, so root is already a real filesystem path here.
-	if s.cfg.Chaintracks.StoragePath == "" {
-		root := s.cfg.StoragePath
-		if root == "" {
-			root = "."
-		}
-		if err := os.MkdirAll(root, 0o750); err != nil {
-			return fmt.Errorf("creating storage directory %s: %w", root, err)
-		}
-		s.cfg.Chaintracks.StoragePath = path.Join(root, "chaintracks")
-	}
-
-	// Thread the top-level network into chaintracks' embedded p2p config.
-	// Without this, go-chaintracks.Config.Initialize sees an empty Network and
-	// silently falls back to "main" — so a testnet/teratestnet arcade would
-	// still bootstrap its block headers from mainnet. Bootstrap peers are
-	// injected from the same resolver the discovery service uses, so chaintracks
-	// and the datahub client always agree on which network they joined.
-	//
-	// Chaintracks needs the upstream-strict spelling ("main"/"test"/"teratestnet")
-	// because its chainmanager.getGenesisHeader switch is exact-match; the
-	// p2p-client tolerates either form via its own alias map, so the discovery
-	// service still gets the canonical "mainnet"/"testnet"/"teratestnet" topic.
-	_, defaultBootstrap := config.ResolveP2PNetwork(s.cfg.Network)
-	s.cfg.Chaintracks.P2P.Network = config.ResolveChaintracksNetwork(s.cfg.Network)
-	if len(s.cfg.Chaintracks.P2P.MsgBus.BootstrapPeers) == 0 {
-		s.cfg.Chaintracks.P2P.MsgBus.BootstrapPeers = defaultBootstrap
-	}
-
-	ct, err := s.cfg.Chaintracks.Initialize(ctx, "arcade", nil)
-	if err != nil {
-		return fmt.Errorf("chaintracks init: %w", err)
-	}
-	s.chaintracks = ct
-	s.ctRoutes = newChaintracksRoutes(ctx, ct)
-
-	network, _ := ct.GetNetwork(ctx)
-	s.logger.Info("Chaintracks HTTP API enabled",
-		zap.String("storage_path", s.cfg.Chaintracks.StoragePath),
-		zap.String("network", network),
-	)
 	return nil
 }
 

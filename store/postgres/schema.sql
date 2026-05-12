@@ -56,6 +56,13 @@ CREATE TABLE IF NOT EXISTS block_processing (
 );
 CREATE INDEX IF NOT EXISTS idx_bp_block_height  ON block_processing(block_height DESC);
 CREATE INDEX IF NOT EXISTS idx_bp_status_height ON block_processing(status, block_height DESC);
+-- Partial index for the bump-builder watchdog's stale-row scan. Only rows
+-- that have observed a header but not yet seen BLOCK_PROCESSED are eligible
+-- candidates, so the predicate keeps the index size proportional to the
+-- backlog rather than the full block history.
+CREATE INDEX IF NOT EXISTS idx_bp_stale_seen
+    ON block_processing(header_seen_at)
+    WHERE processed_at IS NULL AND status = 'active';
 
 CREATE TABLE IF NOT EXISTS submissions (
     submission_id         TEXT PRIMARY KEY,
