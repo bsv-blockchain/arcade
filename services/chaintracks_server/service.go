@@ -19,6 +19,8 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/bsv-blockchain/go-chaintracks/chaintracks"
@@ -172,7 +174,16 @@ func (s *Service) registerRoutes(r *gin.Engine) {
 			c.Status(http.StatusNotFound)
 			return
 		}
-		c.File(storagePath + "/" + file)
+
+		basePath := filepath.Clean(storagePath)
+		resolvedPath := filepath.Clean(filepath.Join(basePath, file))
+		baseWithSep := basePath + string(os.PathSeparator)
+		if resolvedPath != basePath && !strings.HasPrefix(resolvedPath, baseWithSep) {
+			c.Status(http.StatusNotFound)
+			return
+		}
+
+		c.File(resolvedPath)
 	})
 }
 
