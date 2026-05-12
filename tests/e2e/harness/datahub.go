@@ -61,6 +61,17 @@ func NewDatahub(t *testing.T) (*Datahub, error) {
 // runtime (in particular rootless podman) and pass the docker-network
 // gateway IP from Containers.GatewayIP via opts.AnnounceHost.
 func NewDatahubWith(t *testing.T, opts DatahubOptions) (*Datahub, error) {
+	return NewDatahubOnPort(t, opts, 0)
+}
+
+// NewDatahubOnPort spins up the datahub bound to a specific TCP port.
+// Pass port=0 to let the OS pick — equivalent to NewDatahubWith. Use
+// a pre-picked port (via pickFreeTCPPort) when the caller needs the
+// datahub URL constructible BEFORE the listener actually binds —
+// e.g., harness.WithReprocessReady() builds the URL and stuffs it into
+// merkle-service's DATAHUB_FALLBACK_URLS env var at container creation
+// time, then opens the listener after the container is up.
+func NewDatahubOnPort(t *testing.T, opts DatahubOptions, port int) (*Datahub, error) {
 	t.Helper()
 
 	announceHost := opts.AnnounceHost
@@ -74,12 +85,12 @@ func NewDatahubWith(t *testing.T, opts DatahubOptions) (*Datahub, error) {
 	}
 
 	// Bind on 0.0.0.0 so the merkle-service container can reach us via
-	// host.docker.internal:<port>. httptest.NewUnstartedServer binds on
-	// 127.0.0.1 by default which is unreachable from a container even
-	// with host-gateway, so we replace its listener with a 0.0.0.0 one.
-	listener, err := net.Listen("tcp", "0.0.0.0:0")
+	// host.docker.internal / gateway-IP:<port>. httptest.NewUnstartedServer
+	// binds on 127.0.0.1 by default which is unreachable from a container
+	// even with host-gateway, so we replace its listener with a 0.0.0.0 one.
+	listener, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
 	if err != nil {
-		return nil, fmt.Errorf("listen 0.0.0.0:0: %w", err)
+		return nil, fmt.Errorf("listen 0.0.0.0:%d: %w", port, err)
 	}
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(d.handle))
 	_ = srv.Listener.Close()

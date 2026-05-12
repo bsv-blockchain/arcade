@@ -123,6 +123,51 @@ func BroadcastRawTxs(ctx context.Context, t *testing.T, rt *ArcadeRuntime, rawTx
 	return got, nil
 }
 
+// ReprocessResponse is the 202-Accepted body merkle-service returns
+// from POST /reprocess. DataHubURL echoes the candidate URL the
+// endpoint resolved to (i.e., which fallback / registered datahub
+// served the block on the probe).
+type ReprocessResponse struct {
+	Status     string `json:"status"`
+	BlockHash  string `json:"blockHash"`
+	DataHubURL string `json:"dataHubUrl"`
+}
+
+// TriggerReprocess POSTs to merkle-service's /reprocess endpoint
+// with the supplied block hash + arcade callback URL + token. It
+// expects HTTP 202 and returns the parsed response so callers can
+// assert which datahub URL got picked up. Any non-202 surfaces as
+// an error with the body included for diagnosis.
+func TriggerReprocess(ctx context.Context, merkleHostURL, blockHash, callbackURL, callbackToken string) (*ReprocessResponse, error) {
+	body, err := json.Marshal(map[string]string{
+		"blockHash":     blockHash,
+		"callbackUrl":   callbackURL,
+		"callbackToken": callbackToken,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal reprocess body: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, merkleHostURL+"/reprocess", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("build reprocess request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("post reprocess: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusAccepted {
+		return nil, fmt.Errorf("POST /reprocess: status %d body=%s", resp.StatusCode, respBody)
+	}
+	var out ReprocessResponse
+	if err := json.Unmarshal(respBody, &out); err != nil {
+		return nil, fmt.Errorf("decode reprocess response: %w (body=%s)", err, respBody)
+	}
+	return &out, nil
+}
+
 // WaitForMerkleRegistration polls merkle-service's GET /api/lookup/<txid>
 // until the registered callback URL list is non-empty or the timeout
 // elapses. Hoisted from smoke_test.go so real-block scenarios can

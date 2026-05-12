@@ -4,6 +4,7 @@ package harness
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -26,6 +27,17 @@ type Harness struct {
 	// (e.g. to drive failure-injection scenarios) build it themselves
 	// via NewLibP2PHostWith and use the lower-level pieces.
 	LibP2P *LibP2PHost
+
+	// Datahub is non-nil only when New() was called with
+	// WithReprocessReady(). Pre-allocated on the network gateway IP
+	// BEFORE merkle-service starts and threaded into the container's
+	// DATAHUB_FALLBACK_URLS so /reprocess can find blocks staged here
+	// without needing a prior live block-fetch.
+	//
+	// For other scenarios (round-trip, single-tx registration, etc.)
+	// tests build their own datahub via h.NewDatahub(t) after
+	// New() returns.
+	Datahub *Datahub
 }
 
 // New brings up the full harness in the right order to dodge the
@@ -80,6 +92,24 @@ func New(t *testing.T, opts ...Option) *Harness {
 		cfg.merkleStart.BootstrapPeers = libp2p.BootstrapMultiaddr()
 	}
 
+	// Step 3a (optional): pre-allocate a Datahub port + URL so we can
+	// thread the URL into DATAHUB_FALLBACK_URLS BEFORE merkle-service
+	// starts. Required for /reprocess scenarios because that endpoint
+	// looks up datahubs in the operator-configured fallbacks (or the
+	// internal registry); it doesn't take a URL in the request body.
+	// The actual listener binds in step 5 after containers are up.
+	var datahubPort int
+	if cfg.reprocessReady {
+		datahubPort, err = pickFreeTCPPort()
+		if err != nil {
+			t.Fatalf("pre-pick datahub port: %v", err)
+		}
+		if cfg.merkleStart.ExtraEnv == nil {
+			cfg.merkleStart.ExtraEnv = make(map[string]string)
+		}
+		cfg.merkleStart.ExtraEnv["DATAHUB_FALLBACK_URLS"] = fmt.Sprintf("http://%s:%d", gateway, datahubPort)
+	}
+
 	// Step 4: Postgres + Redpanda + merkle-service on the prepared
 	// network.
 	containers, err := startContainersOnNetwork(ctx, t, cfg.merkleStart, nw, gateway)
@@ -87,7 +117,20 @@ func New(t *testing.T, opts ...Option) *Harness {
 		t.Fatalf("start containers: %v", err)
 	}
 
-	h := &Harness{Containers: containers, LibP2P: libp2p}
+	// Step 5 (optional): bind the pre-registered Datahub on the port
+	// we reserved in step 3a. Has to happen AFTER container start so
+	// t.Cleanup ordering matches teardown expectations (datahub closes
+	// before containers, so a final container request doesn't hit a
+	// dead listener).
+	var datahub *Datahub
+	if cfg.reprocessReady {
+		datahub, err = NewDatahubOnPort(t, DatahubOptions{AnnounceHost: gateway}, datahubPort)
+		if err != nil {
+			t.Fatalf("bind pre-registered datahub: %v", err)
+		}
+	}
+
+	h := &Harness{Containers: containers, LibP2P: libp2p, Datahub: datahub}
 	t.Cleanup(func() {
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer closeCancel()
@@ -121,6 +164,12 @@ type Option func(*harnessOptions)
 type harnessOptions struct {
 	startupTimeout time.Duration
 	merkleStart    MerkleStartOptions
+	// reprocessReady opts into the pre-registered datahub path: the
+	// harness reserves a port + advertises a datahub URL via merkle-
+	// service's DATAHUB_FALLBACK_URLS env var, then binds the
+	// listener after containers start. h.Datahub is non-nil only
+	// when this option was set.
+	reprocessReady bool
 }
 
 func defaultOptions() harnessOptions {
@@ -148,6 +197,28 @@ func WithMerkleImage(image string) Option {
 // report degraded health, which the wait strategy tolerates).
 func WithBootstrapPeers(peers string) Option {
 	return func(o *harnessOptions) { o.merkleStart.BootstrapPeers = peers }
+}
+
+// WithReprocessReady tells the harness to pre-allocate a Datahub
+// bound to the docker-network gateway IP BEFORE merkle-service
+// starts, and thread its URL into the container's
+// DATAHUB_FALLBACK_URLS env var so merkle-service's /reprocess
+// endpoint can find blocks staged on the harness datahub without
+// needing a prior live block-fetch to populate the internal datahub
+// registry.
+//
+// The pre-allocated datahub is exposed as h.Datahub. Tests stage
+// fixtures via h.Datahub.StageFixture(fix) and then trigger
+// /reprocess via harness.TriggerReprocess(...).
+//
+// Without this option, tests build their own datahub via
+// h.NewDatahub(t). That works for the round-trip scenarios where
+// the libp2p BlockMessage carries the DataHubURL inline (so
+// merkle-service learns about the URL on first fetch), but it
+// doesn't work for /reprocess because the endpoint doesn't accept
+// a DataHubURL in the request body.
+func WithReprocessReady() Option {
+	return func(o *harnessOptions) { o.reprocessReady = true }
 }
 
 // WithExtraMerkleEnv merges extra env vars into the merkle-service

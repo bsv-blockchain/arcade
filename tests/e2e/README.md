@@ -60,10 +60,14 @@ The harness reaches the host from inside containers two ways:
 is started with `--no-map-gw` (the default for security), the host is
 not reachable from inside containers via either the gateway IP or
 `host.docker.internal`. Tests that require merkle-service to dial
-back into the harness (`TestLibP2PHost_MerkleServicePeersWithHost`,
-`TestSmoke_TxRegistersWithMerkleService`) will time out under this
-configuration. CI runners use Docker so this doesn't affect the
-required PR gate.
+back into the harness — `TestLibP2PHost_MerkleServicePeersWithHost`,
+`TestSmoke_TxRegistersWithMerkleService`,
+`TestSmoke_RealBlockMined_SingleSubtree`, and
+`TestSmoke_RealBlockMined_ViaReprocess` (the last one fails its
+`/reprocess` call with `no DataHub could serve the requested block`
+because merkle-service can't reach the harness datahub at the
+gateway IP) — will time out under this configuration. CI runners
+use Docker so this doesn't affect the required PR gate.
 
 To verify your setup: `podman run --rm alpine sh -c 'nc -zv -w2
 host.docker.internal 22 || echo NOT REACHABLE'`. If the host is
