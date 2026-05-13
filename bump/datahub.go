@@ -32,6 +32,17 @@ const DefaultMaxBlockBytes int64 = 1 * 1024 * 1024 * 1024 // 1 GiB
 // stops a hostile server from inflating arcade's log lines.
 const maxErrorBodyBytes int64 = 512
 
+// maxSubtreeCount caps the number of subtree hashes parseBlockBinary will
+// preallocate before reading them from the response. PR#107 / F-007 caps the
+// total response body at DefaultMaxBlockBytes (1 GiB), and each subtree hash
+// is exactly 32 bytes on the wire, so the absolute upper bound implied by the
+// body cap is DefaultMaxBlockBytes/32 ≈ 33.5 million entries. We pick a
+// round, well-under-the-ceiling cap of 10 million, which is comfortably above
+// any plausible Teranode block (millions of subtrees) while preventing a
+// hostile DataHub from pushing a varint of, say, 2^60 and forcing a
+// multi-petabyte preallocation. See finding F-008.
+const maxSubtreeCount uint64 = 10_000_000
+
 // FetchBlockDataForBUMP fetches subtree hashes, coinbase BUMP, and the block's
 // header merkle root from the binary block endpoint, trying all DataHub URLs.
 // Each attempt emits a Debug-level log line so operators can see which URLs
@@ -172,6 +183,19 @@ func parseBlockBinary(data []byte) ([]chainhash.Hash, []byte, *chainhash.Hash, e
 		return nil, nil, nil, fmt.Errorf("failed to read subtree count: %w", rErr)
 	}
 
+	// Reject implausible subtree counts before allocating. A hostile or
+	// buggy DataHub could otherwise send a 9-byte varint encoding ~2^64-1
+	// and force a multi-petabyte preallocation. A count that cannot
+	// physically fit in the remaining body (32 bytes per hash) is also
+	// rejected so we never allocate space we are guaranteed never to fill.
+	// See finding F-008.
+	if uint64(subtreeCount) > maxSubtreeCount {
+		return nil, nil, nil, fmt.Errorf("subtree count %d exceeds maximum of %d", uint64(subtreeCount), maxSubtreeCount)
+	}
+	if uint64(subtreeCount) > uint64(r.Len()/32) {
+		return nil, nil, nil, fmt.Errorf("subtree count %d exceeds remaining body capacity (%d bytes for %d-byte hashes)", uint64(subtreeCount), r.Len(), 32)
+	}
+
 	// Read subtree hashes (32 bytes each)
 	hashes := make([]chainhash.Hash, 0, uint64(subtreeCount))
 	hashBuf := make([]byte, 32)
@@ -209,6 +233,18 @@ func parseBlockBinary(data []byte) ([]chainhash.Hash, []byte, *chainhash.Hash, e
 	}
 
 	if uint64(cbBUMPLen) == 0 {
+		return hashes, nil, headerMerkleRoot, nil
+	}
+
+	// Reject coinbase BUMP lengths that cannot physically fit in the
+	// remaining response body before allocating. The body itself was
+	// already capped by FetchBlockDataForBUMPWithCap, but the in-band
+	// varint is still untrusted, so a 2^64-sized cbBUMPLen would force an
+	// enormous preallocation here without this check. We treat oversize
+	// lengths as "no coinbase BUMP available" — matching the existing
+	// best-effort posture of the coinbase-tail parsing below the subtree
+	// hashes. See finding F-008.
+	if uint64(cbBUMPLen) > uint64(r.Len()) {
 		return hashes, nil, headerMerkleRoot, nil
 	}
 
