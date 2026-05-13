@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	chaintrackslib "github.com/bsv-blockchain/go-chaintracks/chaintracks"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 	"go.uber.org/zap"
@@ -22,6 +24,17 @@ import (
 	"github.com/bsv-blockchain/arcade/teranode"
 )
 
+// ChainHeaderReader is the narrow contract bump-builder needs from a chain-
+// tracker: synchronous lookup of the canonical block header for a given hash.
+// Implemented in production by go-chaintracks; mocked in tests.
+//
+// Returning (nil, nil) is permitted for "header not yet known" so bump-builder
+// can fall back to the existing post-build merkle-root validation instead of
+// failing the build outright on a transient chaintracks race.
+type ChainHeaderReader interface {
+	GetHeaderByHash(ctx context.Context, hash *chainhash.Hash) (*chaintrackslib.BlockHeader, error)
+}
+
 type Builder struct {
 	cfg       *config.Config
 	logger    *zap.Logger
@@ -30,13 +43,29 @@ type Builder struct {
 	publisher events.Publisher // nil-safe; broadcasts MINED status to SSE / webhooks
 	consumer  *kafka.ConsumerGroup
 	teranode  *teranode.Client
+	// txTracker is nil-safe: when unset, the post-build SetMined path runs with
+	// the unfiltered level-0 hash list (legacy behavior). When set, level-0
+	// hashes are pre-filtered to those the local tracker knows about, shrinking
+	// the SetMinedByTxIDs payload from O(all leaves in block) to O(tracked
+	// txids in block).
+	txTracker *store.TxTracker
+	// chainHeader, when non-nil, supplies the canonical merkle root for a
+	// block hash so the datahub-fetched response can be cross-checked at
+	// fetch time. Lets us reject a pruned/lying peer's response before
+	// BuildCompoundBUMP wastes a round of failed AssembleBUMP calls. nil is
+	// the legacy / regtest path — the post-build ValidateCompoundRoot at
+	// builder.go (below) is still the final safety net.
+	chainHeader ChainHeaderReader
 }
 
 // New constructs a Builder. producer is the shared process-wide producer —
 // the builder reuses it (for DLQ routing) rather than creating a duplicate
 // connection. publisher fans MINED status updates out to subscribers.
 // teranodeClient supplies the live datahub URL list (static + p2p-discovered,
-// refreshed from the shared store) used for block fetches.
+// refreshed from the shared store) used for block fetches. txTracker, when
+// non-nil, gates the post-build SetMined call to txids the local tracker
+// knows about — a no-op for correctness (the SQL UPDATE filters by row
+// existence anyway) but a meaningful payload-size cut for large blocks.
 //
 // The block-processing watchdog lives in services/watchdog and runs as a
 // separate arcade service (mode=watchdog) — bump-builder is no longer
@@ -48,14 +77,84 @@ func New(
 	publisher events.Publisher,
 	st store.Store,
 	teranodeClient *teranode.Client,
+	txTracker *store.TxTracker,
+	chainHeader ChainHeaderReader,
 ) *Builder {
 	return &Builder{
-		cfg:       cfg,
-		logger:    logger.Named("bump-builder"),
-		store:     st,
-		producer:  producer,
-		publisher: publisher,
-		teranode:  teranodeClient,
+		cfg:         cfg,
+		logger:      logger.Named("bump-builder"),
+		store:       st,
+		producer:    producer,
+		publisher:   publisher,
+		teranode:    teranodeClient,
+		txTracker:   txTracker,
+		chainHeader: chainHeader,
+	}
+}
+
+// combineValidators chains two validators: both must accept for the response
+// to be accepted. nil inputs are no-ops, so callers can compose conditionally
+// without nil guards at each call site.
+func combineValidators(a, b bump.BlockDataValidator) bump.BlockDataValidator {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	return func(hashes []chainhash.Hash, root *chainhash.Hash) error {
+		if err := a(hashes, root); err != nil {
+			return err
+		}
+		return b(hashes, root)
+	}
+}
+
+// chainHeaderRootValidator returns a validator that compares the datahub's
+// header merkle root against the canonical merkle root from chaintracks. A
+// mismatch means the datahub returned a block representation that doesn't
+// belong to the canonical chain (pruned peer, stale cache, malicious peer),
+// so the fetch loop should fall through to the next URL.
+//
+// Soft-fails to "no validation" when chaintracks doesn't know the header
+// yet — this is a real race in mode=all where chaintracks's P2P subscription
+// is independent of the BLOCK_PROCESSED message that drives bump-builder.
+// The post-build ValidateCompoundRoot at builder.go still runs and catches
+// any compound that doesn't reconcile.
+func (b *Builder) chainHeaderRootValidator(ctx context.Context, blockHash string, logger *zap.Logger) bump.BlockDataValidator {
+	if b.chainHeader == nil {
+		return nil
+	}
+	hashObj, err := chainhash.NewHashFromHex(blockHash)
+	if err != nil {
+		logger.Warn("skipping canonical-root validation: invalid block hash", zap.Error(err))
+		return nil
+	}
+	return func(_ []chainhash.Hash, fetchedRoot *chainhash.Hash) error {
+		header, lookupErr := b.chainHeader.GetHeaderByHash(ctx, hashObj)
+		if lookupErr != nil || header == nil {
+			// Soft-fail: log and accept the response. Post-build
+			// ValidateCompoundRoot is still the final guard.
+			if lookupErr != nil && !errors.Is(lookupErr, context.Canceled) {
+				logger.Debug("chaintracks header lookup failed; skipping canonical-root validation",
+					zap.String("block_hash", blockHash),
+					zap.Error(lookupErr),
+				)
+			}
+			return nil
+		}
+		if fetchedRoot == nil || !header.MerkleRoot.IsEqual(fetchedRoot) {
+			canonical := "<nil>"
+			if header != nil {
+				canonical = header.MerkleRoot.String()
+			}
+			fetched := "<nil>"
+			if fetchedRoot != nil {
+				fetched = fetchedRoot.String()
+			}
+			return fmt.Errorf("merkle_root mismatch: canonical %s, datahub %s", canonical, fetched)
+		}
+		return nil
 	}
 }
 
@@ -123,7 +222,99 @@ func (b *Builder) Start(ctx context.Context) error {
 	b.logger.Info("bump builder started",
 		zap.Int("grace_window_ms", b.cfg.BumpBuilder.GraceWindowMs),
 	)
+
+	// One-shot startup janitor: drop orphan STUMPs left behind by blocks
+	// whose BUMP build already succeeded (bump_built_at IS NOT NULL). The
+	// happy-path DeleteStumpsByBlockHash at the end of handleMessage is
+	// best-effort — any transient store error there leaves orphans that
+	// never get cleaned up by the normal flow.
+	go b.pruneOrphanStumps(ctx)
+
 	return consumer.Run(ctx)
+}
+
+// pruneOrphanStumps walks the most recent block_processing rows and deletes
+// STUMP rows for any block that already has bump_built_at set. Bounded by
+// the watchdog's recency window so a long-running deployment doesn't
+// repeatedly scan ancient history. Runs once at startup and exits.
+//
+// This catches the "happy-path delete failed transiently" orphan case. The
+// "perma-failure" case (BUMP build never validates, stumps stuck forever
+// after Kafka DLQ) needs a different cleanup path keyed on block age rather
+// than bump_built_at — tracked separately; the metric
+// arcade_bump_builder_empty_stump_blocks_total will surface accumulation if
+// it becomes a real issue.
+func (b *Builder) pruneOrphanStumps(ctx context.Context) {
+	// Use the watchdog's RecencyDepth as the scan horizon — anything older
+	// than (tip - RecencyDepth) is outside arcade's recovery window anyway.
+	// Default to 144 (~24h at 10min blocks) when watchdog is disabled.
+	depth := uint64(b.cfg.Watchdog.RecencyDepth)
+	if depth == 0 {
+		depth = 144
+	}
+
+	tip, err := b.store.GetActiveTipBlockHeight(ctx)
+	if err != nil {
+		b.logger.Warn("orphan-stump prune: failed to read tip", zap.Error(err))
+		return
+	}
+	if tip == 0 {
+		return // empty store / fresh deployment — nothing to prune
+	}
+
+	const pageSize = 200
+	var (
+		cursor  = tip + 1 // exclusive upper bound; first page starts strictly below tip+1
+		scanned int
+		pruned  int
+	)
+	for {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		rows, err := b.store.ListBlockProcessingStatus(ctx, cursor, pageSize)
+		if err != nil {
+			b.logger.Warn("orphan-stump prune: list failed",
+				zap.Uint64("cursor", cursor),
+				zap.Error(err),
+			)
+			return
+		}
+		if len(rows) == 0 {
+			break
+		}
+		for _, r := range rows {
+			scanned++
+			if r.BUMPBuiltAt == nil {
+				continue
+			}
+			// Idempotent: no-op when there are no stumps for the block.
+			if err := b.store.DeleteStumpsByBlockHash(ctx, r.BlockHash); err != nil {
+				b.logger.Warn("orphan-stump prune: delete failed",
+					zap.String("block_hash", r.BlockHash),
+					zap.Error(err),
+				)
+				continue
+			}
+			pruned++
+		}
+		// Stop when we've stepped outside the recency window.
+		oldest := rows[len(rows)-1]
+		if tip > depth && oldest.BlockHeight <= tip-depth {
+			break
+		}
+		// Advance the keyset cursor strictly below the oldest row we saw.
+		if oldest.BlockHeight == 0 {
+			break
+		}
+		cursor = oldest.BlockHeight
+	}
+	b.logger.Info("orphan-stump prune complete",
+		zap.Uint64("tip", tip),
+		zap.Uint64("recency_depth", depth),
+		zap.Int("scanned", scanned),
+		zap.Int("pruned", pruned),
+	)
 }
 
 func (b *Builder) Stop() error {
@@ -158,6 +349,41 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 
 	logger := b.logger.With(zap.String("block_hash", blockHash))
 
+	// Short-circuit: if a compound BUMP already exists for this block, this is
+	// a redelivery (typically from a /reprocess re-firing BLOCK_PROCESSED).
+	// Skip the datahub fetch + recompute entirely; re-run SetMinedByTxIDs with
+	// the level-0 hashes from the stored BUMP so any tracked tx that was
+	// registered AFTER the original build still gets marked MINED. The UPDATE
+	// is idempotent at the store layer, so this is safe to repeat per delivery.
+	if existingHeight, bumpBytes, err := b.store.GetBUMP(ctx, blockHash); err == nil && len(bumpBytes) > 0 {
+		txids, parseErr := levelZeroTxidsFromBUMP(bumpBytes)
+		if parseErr != nil {
+			// Stored BUMP failed to decode — fall through to the normal
+			// rebuild path so an upstream corruption doesn't pin a block
+			// in a broken state forever.
+			logger.Warn("stored BUMP failed to parse on redelivery — rebuilding", zap.Error(parseErr))
+		} else {
+			metrics.BumpBuilderShortCircuitTotal.Inc()
+			outcome = "short_circuited"
+			tracked := b.filterTrackedTxids(txids)
+			logger.Info("BUMP already built — skipping datahub fetch on redelivery",
+				zap.Int("level0_count", len(txids)),
+				zap.Int("tracked_count", len(tracked)),
+				zap.Uint64("block_height", existingHeight),
+			)
+			if len(tracked) > 0 {
+				b.markMinedAndPublish(ctx, logger, blockHash, existingHeight, tracked)
+			}
+			// STUMP rows for this block should already have been pruned at
+			// the end of the original build; ensure stragglers are cleared
+			// in case a STUMP arrived after pruning ran.
+			if err := b.store.DeleteStumpsByBlockHash(ctx, blockHash); err != nil {
+				logger.Warn("failed to clean up STUMPs on short-circuit", zap.Error(err))
+			}
+			return nil
+		}
+	}
+
 	// Grace window: merkle-service's stumpGate only waits for the first HTTP attempt
 	// of each STUMP before releasing BLOCK_PROCESSED. STUMPs that got a 5xx on the
 	// first attempt retry asynchronously and may land after BLOCK_PROCESSED.
@@ -182,7 +408,14 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	metrics.BumpBuilderStumpCount.Observe(float64(len(stumps)))
 	if len(stumps) == 0 {
 		outcome = "no_stumps"
-		logger.Info("no STUMPs found — block has no tracked transactions, skipping BUMP construction")
+		metrics.BumpBuilderEmptyStumpBlocksTotal.Inc()
+		// Warn — not Info — because the legitimate case (block contains no
+		// tracked txs) is indistinguishable from the silent-drop case
+		// (STUMP callbacks were dedup'd / DLQ'd / lost upstream). Operators
+		// need to see this rate in logs; a sustained stream while watched
+		// txs are in flight is the signal that merkle-service callbacks
+		// aren't landing.
+		logger.Warn("BLOCK_PROCESSED arrived with zero STUMPs for this block — either no tracked txs in this block, or upstream STUMP callbacks were dropped (check merkle-service callback delivery)")
 		return nil
 	}
 
@@ -199,9 +432,27 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	if len(endpoints) == 0 {
 		endpoints = b.teranode.GetEndpoints()
 	}
-	logger.Debug("fetching block data from datahub", zap.Strings("datahub_urls", endpoints))
+	// Build a response validator from the STUMPs we already have. A datahub
+	// claiming fewer subtrees than max(stump.SubtreeIndex)+1 is provably
+	// wrong — without this guard, a pruned/lying peer's "200 OK" with a
+	// truncated subtree list poisons every retry until the message DLQs.
+	minSubtrees := 0
+	for _, s := range stumps {
+		if s.SubtreeIndex+1 > minSubtrees {
+			minSubtrees = s.SubtreeIndex + 1
+		}
+	}
+	validator := bump.SubtreeCountValidator(minSubtrees)
+	if b.chainHeader != nil {
+		validator = combineValidators(validator, b.chainHeaderRootValidator(ctx, blockHash, logger))
+	}
+
+	logger.Debug("fetching block data from datahub",
+		zap.Strings("datahub_urls", endpoints),
+		zap.Int("min_subtrees", minSubtrees),
+	)
 	fetchStart := time.Now()
-	subtreeHashes, coinbaseBUMP, headerMerkleRoot, err := bump.FetchBlockDataForBUMPWithCap(ctx, endpoints, blockHash, b.cfg.BumpBuilder.DataHubMaxBlockBytes, logger)
+	subtreeHashes, coinbaseBUMP, headerMerkleRoot, err := bump.FetchBlockDataForBUMPWithOptions(ctx, endpoints, blockHash, b.cfg.BumpBuilder.DataHubMaxBlockBytes, validator, logger)
 	metrics.BumpBuilderDatahubFetchDuration.Observe(time.Since(fetchStart).Seconds())
 	if err != nil {
 		outcome = "fetch_failed"
@@ -259,8 +510,16 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	// statuses below) because downstream SSE/webhook consumers and the
 	// dedup path in BUMP-build rely on the height to anchor each MINED
 	// status to a specific block — a zero/missing height triggered F-029.
-	if len(txids) > 0 {
-		b.markMinedAndPublish(ctx, logger, blockHash, blockHeight, txids)
+	//
+	// BuildCompoundBUMP returns every level-0 hash in the compound (the
+	// caller's job is to filter). Pre-filter against TxTracker so the
+	// SetMinedByTxIDs UPDATE only carries txids the local store could
+	// possibly have. For mainnet blocks with thousands of leaves this
+	// drops payload size by ~99% even though the store-level WHERE clause
+	// would have filtered out the misses anyway.
+	tracked := b.filterTrackedTxids(txids)
+	if len(tracked) > 0 {
+		b.markMinedAndPublish(ctx, logger, blockHash, blockHeight, tracked)
 	}
 
 	// 7. Prune STUMPs
@@ -269,10 +528,46 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	}
 
 	logger.Info("BUMP built successfully",
-		zap.Int("tracked_txids", len(txids)),
+		zap.Int("tracked_txids", len(tracked)),
+		zap.Int("level0_count", len(txids)),
 		zap.Int("stumps_pruned", len(stumps)),
 	)
 	return nil
+}
+
+// filterTrackedTxids narrows a level-0 hash list to those the local
+// TxTracker knows about. If the builder was constructed without a tracker
+// (legacy wiring / tests), every txid is passed through unchanged.
+func (b *Builder) filterTrackedTxids(txids []string) []string {
+	if b.txTracker == nil || len(txids) == 0 {
+		return txids
+	}
+	tracked, unknown := b.txTracker.FilterTrackedTxids(txids)
+	if unknown > 0 {
+		metrics.BumpBuilderUntrackedTxidsTotal.Add(float64(unknown))
+	}
+	return tracked
+}
+
+// levelZeroTxidsFromBUMP parses a stored compound BUMP and returns every
+// level-0 hash as a lowercase hex string. Used by the short-circuit path
+// to recover the candidate txid list without re-running BuildCompoundBUMP.
+func levelZeroTxidsFromBUMP(bumpData []byte) ([]string, error) {
+	mp, err := transaction.NewMerklePathFromBinary(bumpData)
+	if err != nil {
+		return nil, fmt.Errorf("parsing stored BUMP: %w", err)
+	}
+	if len(mp.Path) == 0 {
+		return nil, nil
+	}
+	out := make([]string, 0, len(mp.Path[0]))
+	for _, elem := range mp.Path[0] {
+		if elem.Hash == nil {
+			continue
+		}
+		out = append(out, elem.Hash.String())
+	}
+	return out, nil
 }
 
 // --- Debug helpers ---

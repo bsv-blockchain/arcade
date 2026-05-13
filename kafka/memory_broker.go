@@ -27,13 +27,30 @@ import (
 //     it before sending can't panic with "send on closed channel" when Close
 //     runs concurrently. Mirrors the SSE fan-out fix from #78 (F-020); see
 //     F-012 for the kafka memory-broker variant.
+//   - Send() has a bounded wait via sendTimeout: when the destination mailbox
+//     is full the producer gets ErrBrokerBackpressure rather than hanging.
+//     Callers translate this into HTTP 503 / DLQ as appropriate. Default 2s.
 type memoryBroker struct {
-	mu      sync.Mutex
-	closed  bool
-	groups  map[string]map[string]*memoryMailbox // [groupID][topic] = mailbox
-	offsets map[string]*int64                    // per-topic monotonic offsets
-	buffer  int
+	mu          sync.Mutex
+	closed      bool
+	groups      map[string]map[string]*memoryMailbox // [groupID][topic] = mailbox
+	offsets     map[string]*int64                    // per-topic monotonic offsets
+	buffer      int
+	sendTimeout time.Duration
 }
+
+// ErrBrokerBackpressure is returned by Send when a subscriber's mailbox is
+// full for longer than the broker's sendTimeout. The producer should treat
+// it as transient: shed load to the client (e.g. HTTP 503) and let the
+// caller retry rather than hanging the calling goroutine.
+var ErrBrokerBackpressure = errors.New("broker mailbox full (backpressure)")
+
+// defaultSendTimeout is the upper bound on how long Send blocks waiting for
+// a slot in a full mailbox before returning ErrBrokerBackpressure. 2s is
+// long enough to ride out brief flush gaps in a healthy consumer, short
+// enough that an HTTP handler still completes within a typical client
+// deadline.
+const defaultSendTimeout = 2 * time.Second
 
 // memoryMailbox is a per-(group, topic) delivery queue. Subscriptions joined
 // to the same group share it so either concurrent consumer wins the next
@@ -53,14 +70,26 @@ type memoryMailbox struct {
 
 // NewMemoryBroker constructs an in-process broker. buffer is the per-mailbox
 // channel capacity — larger values smooth out bursts at the cost of memory.
+// sendTimeout, when > 0, bounds how long Send blocks on a full mailbox before
+// returning ErrBrokerBackpressure; zero falls back to defaultSendTimeout.
 func NewMemoryBroker(buffer int) Broker {
+	return NewMemoryBrokerWithTimeout(buffer, 0)
+}
+
+// NewMemoryBrokerWithTimeout exposes the sendTimeout knob for tests and
+// callers that want to deliberately tighten or loosen backpressure handling.
+func NewMemoryBrokerWithTimeout(buffer int, sendTimeout time.Duration) Broker {
 	if buffer <= 0 {
 		buffer = 10000
 	}
+	if sendTimeout <= 0 {
+		sendTimeout = defaultSendTimeout
+	}
 	return &memoryBroker{
-		groups:  make(map[string]map[string]*memoryMailbox),
-		offsets: make(map[string]*int64),
-		buffer:  buffer,
+		groups:      make(map[string]map[string]*memoryMailbox),
+		offsets:     make(map[string]*int64),
+		buffer:      buffer,
+		sendTimeout: sendTimeout,
 	}
 }
 
@@ -146,15 +175,25 @@ func (b *memoryBroker) publish(ctx context.Context, topic, key string, value []b
 			}
 			continue
 		}
+		// Sync semantics: bounded wait. If the mailbox is still full when
+		// sendTimeout elapses we surface ErrBrokerBackpressure so the caller
+		// (HTTP handler, validator publish, propagator publish) can shed load
+		// rather than pin a goroutine on a slow consumer.
+		timer := time.NewTimer(b.sendTimeout)
 		select {
 		case t.ch <- msg:
+			timer.Stop()
 		case <-t.done:
 			// Subscriber went away mid-publish — drop and move on. The
 			// caller asked for "synchronous" but the destination is
 			// gone; treating this as a successful no-op matches the
 			// async drop and avoids a misleading error to the producer.
+			timer.Stop()
 		case <-ctx.Done():
+			timer.Stop()
 			return ctx.Err()
+		case <-timer.C:
+			return ErrBrokerBackpressure
 		}
 	}
 	return nil

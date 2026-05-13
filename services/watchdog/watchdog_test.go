@@ -200,7 +200,11 @@ func newTestWatchdog(t *testing.T, st *watchdogStore, leaser *watchdogLeaser, mc
 		MaxBackoff:      30 * time.Minute,
 		TerminalBackoff: 4 * time.Hour,
 	}
-	return New(st, leaser, mc, "http://arcade/callback", "tok", cfg, zap.NewNop())
+	w := New(st, leaser, mc, "http://arcade/callback", "tok", cfg, zap.NewNop())
+	// Tests assert on exact backoff values; pin jitter to identity so the
+	// production ±20% spread doesn't bleed into per-test equality checks.
+	w.jitter = identityJitter
+	return w
 }
 
 func TestWatchdog_TriggersReprocessForStaleRow(t *testing.T) {
@@ -392,6 +396,39 @@ func TestWatchdog_DoesNotRetryProcessedRows(t *testing.T) {
 	w.tick(context.Background())
 	if srv.callCount() != 1 {
 		t.Fatalf("after processed_at set, watchdog still fired /reprocess (calls=%d)", srv.callCount())
+	}
+}
+
+func TestProportionalJitter_StaysWithinSpread(t *testing.T) {
+	const trials = 1000
+	base := time.Minute
+	spread := time.Duration(float64(base) * backoffJitterFraction)
+	min := base - spread
+	max := base + spread
+
+	var sumDelta int64
+	for i := 0; i < trials; i++ {
+		got := proportionalJitter(base)
+		if got < min || got > max {
+			t.Fatalf("trial %d: got=%v out of bounds [%v..%v]", i, got, min, max)
+		}
+		sumDelta += int64(got) - int64(base)
+	}
+
+	// Mean of a uniform distribution centered on 0 with N samples should
+	// hug 0; allow ±5% of the spread as a loose sanity check that the
+	// jitter is genuinely centered and not biased high/low.
+	meanDelta := time.Duration(sumDelta / trials)
+	if meanDelta > spread/20 || meanDelta < -spread/20 {
+		t.Errorf("mean jitter=%v leans too far from 0 (spread=%v)", meanDelta, spread)
+	}
+}
+
+func TestProportionalJitter_ZeroPassesThrough(t *testing.T) {
+	for _, d := range []time.Duration{0, -time.Second} {
+		if got := proportionalJitter(d); got != d {
+			t.Errorf("proportionalJitter(%v)=%v want %v", d, got, d)
+		}
 	}
 }
 

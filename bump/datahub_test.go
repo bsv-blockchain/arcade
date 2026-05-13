@@ -95,6 +95,113 @@ func minimalValidBlockBytes(t *testing.T) []byte {
 	return out
 }
 
+// blockWithSubtrees builds a minimal-but-valid binary block body with
+// `count` subtree hashes (filled with 0xAA…). Used by the multi-URL
+// validator tests to simulate a pruned peer (count=1) vs a healthy peer
+// (count=N). Caller-chosen merkleRoot lets tests assert mismatches.
+func blockWithSubtrees(t *testing.T, count int, merkleRoot [32]byte) []byte {
+	t.Helper()
+	out := make([]byte, 0, 80+3+count*32)
+	// header: 80 bytes; merkle root lives at [36..68).
+	header := make([]byte, 80)
+	copy(header[36:68], merkleRoot[:])
+	out = append(out, header...)
+	// varints: txCount=0, sizeBytes=0, subtreeCount=count (single byte if <0xfd)
+	out = append(out, 0x00, 0x00)
+	if count >= 0xfd {
+		t.Fatalf("test helper only supports count<0xfd, got %d", count)
+	}
+	out = append(out, byte(count))
+	for i := 0; i < count; i++ {
+		hash := make([]byte, 32)
+		for j := range hash {
+			hash[j] = byte(0xA0 | (i & 0x0F))
+		}
+		out = append(out, hash...)
+	}
+	return out
+}
+
+// TestFetchBlockDataForBUMP_SubtreeCountValidator_FallsThrough exercises
+// Fix 1: a pruned peer returning fewer subtrees than the caller demands
+// must be skipped, and the next healthy peer's response must be returned.
+// Without this guard, the first 200 response — even if it's wrong — was
+// accepted, poisoning every subsequent BUMP assembly attempt.
+func TestFetchBlockDataForBUMP_SubtreeCountValidator_FallsThrough(t *testing.T) {
+	prunedBody := blockWithSubtrees(t, 1, [32]byte{0xCA, 0xFE})
+	healthyBody := blockWithSubtrees(t, 16, [32]byte{0xBE, 0xEF})
+
+	pruned := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(prunedBody)
+	}))
+	t.Cleanup(pruned.Close)
+
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(healthyBody)
+	}))
+	t.Cleanup(healthy.Close)
+
+	validator := SubtreeCountValidator(16)
+	hashes, _, root, err := FetchBlockDataForBUMPWithOptions(
+		context.Background(),
+		[]string{pruned.URL, healthy.URL},
+		"deadbeef",
+		1<<20,
+		validator,
+		zap.NewNop(),
+	)
+	if err != nil {
+		t.Fatalf("expected to fall through to healthy peer, got error: %v", err)
+	}
+	if len(hashes) != 16 {
+		t.Errorf("expected 16 subtree hashes from healthy peer, got %d", len(hashes))
+	}
+	if root == nil || root[0] != 0xBE {
+		t.Errorf("expected merkle root from healthy peer (BEEF prefix), got %v", root)
+	}
+}
+
+// TestFetchBlockDataForBUMP_SubtreeCountValidator_AllFail confirms the
+// loop surfaces the validator's rejection in the aggregated error when
+// every URL fails the check — no silent success.
+func TestFetchBlockDataForBUMP_SubtreeCountValidator_AllFail(t *testing.T) {
+	body := blockWithSubtrees(t, 1, [32]byte{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+
+	_, _, _, err := FetchBlockDataForBUMPWithOptions(
+		context.Background(),
+		[]string{srv.URL},
+		"deadbeef",
+		1<<20,
+		SubtreeCountValidator(5),
+		zap.NewNop(),
+	)
+	if err == nil {
+		t.Fatal("expected error when validator rejects every URL")
+	}
+	if !strings.Contains(err.Error(), "validator rejected") {
+		t.Errorf("expected error to mention validator rejection, got: %v", err)
+	}
+}
+
+// TestSubtreeCountValidator_DisabledAtZero documents the contract: zero
+// minSubtrees returns a nil validator so the legacy "first 200 wins"
+// behavior is preserved for callers that haven't yet collected STUMPs.
+func TestSubtreeCountValidator_DisabledAtZero(t *testing.T) {
+	if v := SubtreeCountValidator(0); v != nil {
+		t.Errorf("expected nil validator for minSubtrees=0, got non-nil")
+	}
+	if v := SubtreeCountValidator(-3); v != nil {
+		t.Errorf("expected nil validator for negative minSubtrees, got non-nil")
+	}
+}
+
 // padToSize right-pads payload with zero bytes so the response body is
 // exactly size bytes long.
 func padToSize(payload []byte, size int) []byte {

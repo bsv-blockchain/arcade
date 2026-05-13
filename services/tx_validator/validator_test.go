@@ -146,6 +146,34 @@ func newTestValidatorWithValidator(broker *kafka.RecordingBroker, ms *mockStore,
 	return v
 }
 
+// flushAndWaitPublish runs flushValidations and then drains the decoupled
+// publishCh into the broker so test assertions on broker.BatchCalls /
+// MessageCount see the publish before they're evaluated. Tests don't spin
+// up Start()/runPublisher, so this stand-in performs the same SendBatch the
+// publisher goroutine would.
+func flushAndWaitPublish(t *testing.T, v *Validator) error {
+	t.Helper()
+	if err := v.flushValidations(context.Background()); err != nil {
+		return err
+	}
+	// Drain any payloads the flush handed to publishCh. Non-blocking — the
+	// flush only enqueues at most one batch, and an empty channel just means
+	// there was nothing accepted to publish.
+	for {
+		select {
+		case batch := <-v.publishCh:
+			if err := v.producer.SendBatch(kafka.TopicPropagation, batch); err != nil {
+				v.mu.Lock()
+				v.publishCarry = append(batch, v.publishCarry...)
+				v.mu.Unlock()
+				return err
+			}
+		default:
+			return nil
+		}
+	}
+}
+
 // TestValidator_HappyPath_TwoBatchesOf100 is the user-facing scenario from
 // the design proposal: two quick bursts of 100 txs each. The validator must
 // queue every message in handleMessage without doing any work, then process
@@ -175,7 +203,7 @@ func TestValidator_HappyPath_TwoBatchesOf100(t *testing.T) {
 		t.Errorf("expected 0 store inserts before flush, got %d", got)
 	}
 
-	if err := v.flushValidations(context.Background()); err != nil {
+	if err := flushAndWaitPublish(t, v); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
 
@@ -204,7 +232,7 @@ func TestValidator_EmptyFlushIsNoOp(t *testing.T) {
 	ms := newMockStore()
 	v := newTestValidator(broker, ms)
 
-	if err := v.flushValidations(context.Background()); err != nil {
+	if err := flushAndWaitPublish(t, v); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
 	if broker.BatchCalls != 0 {
@@ -226,7 +254,7 @@ func TestValidator_SingleTxFlows(t *testing.T) {
 	if err := v.handleMessage(context.Background(), makeKafkaMsg(makeTxMsg(txHex))); err != nil {
 		t.Fatalf("handleMessage: %v", err)
 	}
-	if err := v.flushValidations(context.Background()); err != nil {
+	if err := flushAndWaitPublish(t, v); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
 	if broker.BatchCalls != 1 {
@@ -255,7 +283,7 @@ func TestValidator_ParseFailures_DontBreakBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := v.flushValidations(context.Background()); err != nil {
+	if err := flushAndWaitPublish(t, v); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
 
@@ -282,7 +310,7 @@ func TestValidator_Duplicates_SkipValidationAndPublish(t *testing.T) {
 	if err := v.handleMessage(context.Background(), makeKafkaMsg(makeTxMsgFromBytes(rawTx))); err != nil {
 		t.Fatalf("handleMessage: %v", err)
 	}
-	if err := v.flushValidations(context.Background()); err != nil {
+	if err := flushAndWaitPublish(t, v); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
 
@@ -312,7 +340,7 @@ func TestValidator_RejectedTxs_PersistedNotPublished(t *testing.T) {
 		}
 	}
 
-	if err := v.flushValidations(context.Background()); err != nil {
+	if err := flushAndWaitPublish(t, v); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
 
@@ -352,7 +380,7 @@ func TestValidator_DedupStoreError_DropsOneKeepsBatch(t *testing.T) {
 		}
 	}
 
-	if err := v.flushValidations(context.Background()); err != nil {
+	if err := flushAndWaitPublish(t, v); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
 
@@ -375,7 +403,7 @@ func TestValidator_PublishFailure_RetriesOnNextFlush(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	err := v.flushValidations(context.Background())
+	err := flushAndWaitPublish(t, v)
 	if err == nil {
 		t.Fatal("expected publish error to surface from flush")
 	}
@@ -399,7 +427,7 @@ func TestValidator_PublishFailure_RetriesOnNextFlush(t *testing.T) {
 	broker.BatchCalls = 0
 	broker.Unlock()
 
-	if err := v.flushValidations(context.Background()); err != nil {
+	if err := flushAndWaitPublish(t, v); err != nil {
 		t.Fatalf("retry flush: %v", err)
 	}
 	if got := broker.MessageCount(); got != 5 {
@@ -436,7 +464,7 @@ func TestValidator_ConcurrentFlush_NoDoublePublish(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_ = v.flushValidations(context.Background())
+			_ = flushAndWaitPublish(t, v)
 		}()
 	}
 	wg.Wait()
@@ -485,5 +513,68 @@ func TestValidator_StartLogsParallelism(t *testing.T) {
 	v := New(cfg, logger, kafka.NewProducer(broker), nil, ms, store.NewTxTracker(), nil)
 	if v.parallelism != 16 {
 		t.Errorf("expected parallelism=16 from config, got %d", v.parallelism)
+	}
+}
+
+// TestValidator_DecoupledPublish_DoesNotDeadlockOnBackpressure simulates the
+// downstream broker returning ErrBrokerBackpressure and verifies the
+// validator's flushValidations:
+//  1. Does not block waiting for the publish to succeed.
+//  2. Retains the failed batch in publishCarry so no validated tx is lost.
+//  3. Recovers on the next flush once the broker heals.
+//
+// This is the regression guard for the P1a decoupling: if flush ever starts
+// blocking on the publish round-trip, the consumer drain stalls and the
+// observed "kafka messages stop being consumed" symptom returns.
+func TestValidator_DecoupledPublish_DoesNotDeadlockOnBackpressure(t *testing.T) {
+	broker := &kafka.RecordingBroker{
+		BatchErr: kafka.ErrBrokerBackpressure,
+	}
+	ms := newMockStore()
+	v := newTestValidator(broker, ms)
+
+	for i := 0; i < 10; i++ {
+		if err := v.handleMessage(context.Background(), makeKafkaMsg(makeTxMsgFromBytes(uniqueRawTx(uint32(i))))); err != nil {
+			t.Fatalf("handleMessage[%d]: %v", i, err)
+		}
+	}
+
+	// The flush itself must return quickly even though every publish attempt
+	// returns ErrBrokerBackpressure — the sync-fallback path inside
+	// flushValidations preserves the batch in publishCarry and returns the
+	// error rather than hanging.
+	done := make(chan error, 1)
+	go func() { done <- flushAndWaitPublish(t, v) }()
+	select {
+	case <-done:
+		// success — flush completed (with or without error, both acceptable).
+	case <-time.After(5 * time.Second):
+		t.Fatal("flushValidations blocked under broker backpressure — decoupling regressed")
+	}
+
+	v.mu.Lock()
+	carrySize := len(v.publishCarry)
+	v.mu.Unlock()
+	if carrySize != 10 {
+		t.Errorf("expected 10 messages retained in publishCarry, got %d", carrySize)
+	}
+
+	// Heal the broker and re-flush. The carried batch must land in a SendBatch
+	// call on the recovered broker, and publishCarry must clear.
+	broker.Lock()
+	broker.BatchErr = nil
+	broker.Unlock()
+
+	if err := flushAndWaitPublish(t, v); err != nil {
+		t.Fatalf("retry flush: %v", err)
+	}
+	if got := broker.MessageCount(); got != 10 {
+		t.Errorf("expected 10 published messages after recovery, got %d", got)
+	}
+	v.mu.Lock()
+	carrySize = len(v.publishCarry)
+	v.mu.Unlock()
+	if carrySize != 0 {
+		t.Errorf("expected publishCarry to clear after recovery, got %d", carrySize)
 	}
 }

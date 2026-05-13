@@ -2,6 +2,7 @@ package kafka
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -343,5 +344,46 @@ func TestMemoryBroker_SlowSubscriberDoesNotBlockClose(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("publisher blocked behind a slow subscriber even after Close")
+	}
+}
+
+// TestMemoryBroker_SendTimeoutBackpressure verifies that Send returns
+// ErrBrokerBackpressure (rather than blocking indefinitely) when the
+// destination mailbox is full and the sendTimeout elapses. Models the
+// scenario where a downstream consumer is stalled and a producer must not
+// pin its goroutine on the channel send.
+func TestMemoryBroker_SendTimeoutBackpressure(t *testing.T) {
+	const buffer = 1
+	b := NewMemoryBrokerWithTimeout(buffer, 50*time.Millisecond)
+	defer func() { _ = b.Close() }()
+
+	// Subscribe without consuming. The subscription's forward goroutine
+	// drains the per-(group, topic) mailbox into a merged channel of equal
+	// capacity, so the total slack between the producer's Send and a stuck
+	// consumer is 2 * buffer + 1 (one in-flight in forward).
+	sub, err := b.Subscribe("group-stall", []string{"topic-stall"})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	defer func() { _ = sub.Close() }()
+
+	ctx := context.Background()
+	// Fill every slot the consumer pipeline can absorb without an active
+	// receiver. After this loop the next Send must time out.
+	for i := 0; i < 2*buffer+1; i++ {
+		if err := b.Send(ctx, "topic-stall", "k", []byte("pad")); err != nil {
+			t.Fatalf("pad send %d: %v", i, err)
+		}
+	}
+
+	start := time.Now()
+	err = b.Send(ctx, "topic-stall", "k", []byte("overflow"))
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, ErrBrokerBackpressure) {
+		t.Fatalf("expected ErrBrokerBackpressure, got %v", err)
+	}
+	if elapsed < 40*time.Millisecond || elapsed > 500*time.Millisecond {
+		t.Errorf("expected ~50ms backpressure wait, got %v", elapsed)
 	}
 }

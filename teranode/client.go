@@ -24,6 +24,15 @@ const (
 	defaultFailureThreshold = 3
 	defaultProbeInterval    = 30 * time.Second
 	defaultProbeTimeout     = 2 * time.Second
+
+	// defaultBroadcastFailureThreshold is how many consecutive non-2xx
+	// broadcast responses sideline an endpoint via the slow track. Set
+	// higher than defaultFailureThreshold because non-2xx can legitimately
+	// represent peer-side per-tx decisions ("already seen") that aren't
+	// the endpoint's fault. Persistent 4xx/5xx across many broadcasts is
+	// the actual signal — that means the endpoint isn't useful to us even
+	// though it's reachable.
+	defaultBroadcastFailureThreshold = 10
 )
 
 var errUnexpectedStatusCode = errors.New("unexpected status code")
@@ -48,11 +57,28 @@ const (
 // endpointHealth tracks the running health of a single endpoint URL. It is
 // guarded by the enclosing Client's RWMutex — the struct itself is not
 // independently thread-safe.
+//
+// Two parallel failure counters drive the same `state` field:
+//
+//   - consecutiveFailures: fast track for reachability failures (no HTTP
+//     response received — DNS, transport, timeout). Trips at
+//     failureThreshold (default 3).
+//   - consecutiveBroadcastFailures: slow track for non-2xx responses. Trips
+//     at broadcastFailureThreshold (default 10). Catches the case where an
+//     endpoint is responding but consistently rejecting our payload —
+//     ngrok-proxied datahubs serving 404 "endpoint offline" responses, or
+//     peers whose validation rules disagree with ours, are alive but
+//     useless to us. Without this, every broadcast wasted a worker slot on
+//     them.
+//
+// Either counter tripping marks the endpoint unhealthy; a single 2xx
+// response resets both.
 type endpointHealth struct {
-	consecutiveFailures int
-	lastFailure         time.Time
-	state               healthState
-	source              healthSource
+	consecutiveFailures          int
+	consecutiveBroadcastFailures int
+	lastFailure                  time.Time
+	state                        healthState
+	source                       healthSource
 }
 
 // EndpointStatus is a diagnostic snapshot of one endpoint's registration
@@ -75,13 +101,19 @@ type EndpointStatus struct {
 // URLs that the p2p-client pod discovered. Leave Source nil in monolith mode
 // or in tests that don't care about discovery.
 type HealthConfig struct {
-	FailureThreshold    int
-	ProbeInterval       time.Duration
-	ProbeTimeout        time.Duration
-	MinHealthyEndpoints int
-	RefreshInterval     time.Duration
-	Source              EndpointSource
-	Logger              *zap.Logger
+	FailureThreshold int
+	// BroadcastFailureThreshold is the slow-track circuit breaker — how
+	// many consecutive non-2xx broadcast responses sideline an endpoint.
+	// Zero falls back to defaultBroadcastFailureThreshold. Independent of
+	// FailureThreshold so a peer that always responds (with the wrong
+	// answer) is still excluded after enough useless attempts.
+	BroadcastFailureThreshold int
+	ProbeInterval             time.Duration
+	ProbeTimeout              time.Duration
+	MinHealthyEndpoints       int
+	RefreshInterval           time.Duration
+	Source                    EndpointSource
+	Logger                    *zap.Logger
 }
 
 // EndpointSource produces a set of datahub URLs. The expected implementation
@@ -112,14 +144,15 @@ type Client struct {
 	authToken  string
 	httpClient *http.Client
 
-	failureThreshold    int
-	probeInterval       time.Duration
-	probeTimeout        time.Duration
-	minHealthyEndpoints int
-	refreshInterval     time.Duration
-	source              EndpointSource
-	logger              *zap.Logger
-	belowThreshold      bool
+	failureThreshold          int
+	broadcastFailureThreshold int
+	probeInterval             time.Duration
+	probeTimeout              time.Duration
+	minHealthyEndpoints       int
+	refreshInterval           time.Duration
+	source                    EndpointSource
+	logger                    *zap.Logger
+	belowThreshold            bool
 
 	startOnce   sync.Once
 	probeCancel context.CancelFunc
@@ -141,6 +174,9 @@ func normalizeURL(u string) string {
 func NewClient(endpoints []string, authToken string, hc HealthConfig) *Client {
 	if hc.FailureThreshold <= 0 {
 		hc.FailureThreshold = defaultFailureThreshold
+	}
+	if hc.BroadcastFailureThreshold <= 0 {
+		hc.BroadcastFailureThreshold = defaultBroadcastFailureThreshold
 	}
 	if hc.ProbeInterval <= 0 {
 		hc.ProbeInterval = defaultProbeInterval
@@ -165,13 +201,14 @@ func NewClient(endpoints []string, authToken string, hc HealthConfig) *Client {
 			Timeout:   defaultTimeout,
 			Transport: newBroadcastTransport(),
 		},
-		failureThreshold:    hc.FailureThreshold,
-		probeInterval:       hc.ProbeInterval,
-		probeTimeout:        hc.ProbeTimeout,
-		minHealthyEndpoints: hc.MinHealthyEndpoints,
-		refreshInterval:     hc.RefreshInterval,
-		source:              hc.Source,
-		logger:              hc.Logger.Named("teranode-client"),
+		failureThreshold:          hc.FailureThreshold,
+		broadcastFailureThreshold: hc.BroadcastFailureThreshold,
+		probeInterval:             hc.ProbeInterval,
+		probeTimeout:              hc.ProbeTimeout,
+		minHealthyEndpoints:       hc.MinHealthyEndpoints,
+		refreshInterval:           hc.RefreshInterval,
+		source:                    hc.Source,
+		logger:                    hc.Logger.Named("teranode-client"),
 	}
 	for _, ep := range endpoints {
 		n := normalizeURL(ep)
@@ -320,7 +357,8 @@ func (c *Client) AddEndpoints(urls []string) int {
 	return added
 }
 
-// RecordSuccess resets an endpoint's failure counter to zero and, if the
+// RecordSuccess resets both failure counters to zero (a successful 2xx
+// response is the canonical signal of full endpoint health) and, if the
 // endpoint was previously unhealthy, transitions it back to healthy.
 // Unknown URLs are silently ignored so callers don't need to pre-check.
 func (c *Client) RecordSuccess(url string) {
@@ -333,6 +371,7 @@ func (c *Client) RecordSuccess(url string) {
 	}
 	transitioned := h.state == stateUnhealthy
 	h.consecutiveFailures = 0
+	h.consecutiveBroadcastFailures = 0
 	h.state = stateHealthy
 	source := h.source
 	c.recomputeBelowThresholdLocked()
@@ -347,9 +386,10 @@ func (c *Client) RecordSuccess(url string) {
 	}
 }
 
-// RecordFailure increments the consecutive-failure counter for an endpoint
+// RecordFailure increments the reachability-failure counter for an endpoint
 // and transitions it to unhealthy once the counter reaches failureThreshold.
-// Unknown URLs are silently ignored.
+// Unknown URLs are silently ignored. Use for transport-level failures (no
+// HTTP response received: DNS, transport, timeout).
 func (c *Client) RecordFailure(url string) {
 	n := normalizeURL(url)
 	c.mu.Lock()
@@ -375,6 +415,50 @@ func (c *Client) RecordFailure(url string) {
 			zap.Int("consecutive_failures", h.consecutiveFailures),
 			zap.String("from", "healthy"),
 			zap.String("to", "unhealthy"),
+			zap.String("reason", "reachability"),
+		)
+	}
+}
+
+// RecordBroadcastFailure is the slow-track circuit breaker: invoked when an
+// endpoint returned an HTTP response but a non-2xx status. Increments
+// consecutiveBroadcastFailures; sidelines the endpoint when the counter
+// reaches broadcastFailureThreshold. Catches the case where an endpoint is
+// reachable but consistently useless for broadcasts (ngrok proxy returning
+// 404 "offline" for a dead upstream, or a peer whose validation rules
+// disagree with ours for every batch).
+//
+// Sidelining via this path is recovered the same way as RecordFailure: a
+// single RecordSuccess (any 2xx response) resets both counters and brings
+// the endpoint back. The recovery probe still runs against unhealthy
+// endpoints on its normal cadence.
+func (c *Client) RecordBroadcastFailure(url string) {
+	n := normalizeURL(url)
+	c.mu.Lock()
+	h, ok := c.health[n]
+	if !ok {
+		c.mu.Unlock()
+		return
+	}
+	h.consecutiveBroadcastFailures++
+	h.lastFailure = time.Now()
+	transitioned := false
+	if h.state == stateHealthy && h.consecutiveBroadcastFailures >= c.broadcastFailureThreshold {
+		h.state = stateUnhealthy
+		transitioned = true
+	}
+	source := h.source
+	consecutive := h.consecutiveBroadcastFailures
+	c.recomputeBelowThresholdLocked()
+	c.mu.Unlock()
+	if transitioned {
+		metrics.TeranodeEndpointHealth.WithLabelValues(n, sourceLabel(source)).Set(0)
+		c.logger.Warn("endpoint unhealthy",
+			zap.String("endpoint", n),
+			zap.Int("consecutive_broadcast_failures", consecutive),
+			zap.String("from", "healthy"),
+			zap.String("to", "unhealthy"),
+			zap.String("reason", "persistent_non_2xx"),
 		)
 	}
 }

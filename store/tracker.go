@@ -281,6 +281,38 @@ func (t *TxTracker) FilterTrackedHashes(hashes []chainhash.Hash) []chainhash.Has
 	return matched
 }
 
+// FilterTrackedTxids is the hex-string form of FilterTrackedHashes. Returns
+// the subset of txids the tracker knows about (preserving input order) plus
+// the count of unknown txids — callers use the count to surface "STUMP
+// contained N leaves not watched by this arcade" without re-scanning.
+//
+// Malformed hex inputs are counted as unknown rather than rejected; the
+// caller is the BUMP builder, which receives txids derived from on-disk
+// stump bytes already validated upstream, so a parse failure here is
+// programmer error worth a metric tick but not a hard stop.
+func (t *TxTracker) FilterTrackedTxids(txids []string) (tracked []string, unknown int) {
+	if len(txids) == 0 {
+		return nil, 0
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	tracked = make([]string, 0, len(txids))
+	for _, s := range txids {
+		hash, err := chainhash.NewHashFromHex(s)
+		if err != nil {
+			unknown++
+			continue
+		}
+		if _, ok := t.txids[*hash]; ok {
+			tracked = append(tracked, s)
+		} else {
+			unknown++
+		}
+	}
+	return tracked, unknown
+}
+
 // Count returns the number of tracked txids
 func (t *TxTracker) Count() int {
 	t.mu.RLock()

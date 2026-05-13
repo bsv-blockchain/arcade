@@ -2,9 +2,11 @@ package propagation
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -100,11 +102,19 @@ func TestBroadcast_RecordsEndpointOutcomes(t *testing.T) {
 	}
 }
 
-// TestPeerReturning500_StaysHealthy verifies that an application-level
-// rejection (peer returns HTTP 500 on every submission) does NOT trip the
-// circuit-breaker. The peer is reachable — it's just telling us the tx is
-// bad. Tripping on legitimate 500s would sideline a healthy peer.
-func TestPeerReturning500_StaysHealthy(t *testing.T) {
+// TestPeerReturning500_NotSidelinedWhenUnanimous documents the resilience
+// tunable from the 02:07 EDT incident: when EVERY responding peer returns
+// non-2xx for the same tx, that's a network-consensus signal (the tx is
+// bad — typically a double-spend or invalid sig), not a peer-health signal.
+// Penalising the peers in that case progressively sidelines the entire
+// fleet until "no healthy teranode endpoints" and ~1.6M txs sit in
+// RECEIVED. With network-aware breaker logic, peers stay healthy when
+// they agree, so the tx flows through to UpdateStatus(REJECTED) and the
+// fleet remains usable for whatever the generator broadcasts next.
+//
+// Single-peer setup represents the limiting case (one peer = the whole
+// network); the all-agreement rule still applies.
+func TestPeerReturning500_NotSidelinedWhenUnanimous(t *testing.T) {
 	alwaysFiveHundred := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "missing inputs for tx", http.StatusInternalServerError)
 	}))
@@ -113,20 +123,70 @@ func TestPeerReturning500_StaysHealthy(t *testing.T) {
 	ms := newMockStore()
 	cfg := &config.Config{}
 	cfg.Propagation.MerkleConcurrency = 10
-	// Low failure threshold so the test would fail fast if any 500 were
-	// miscounted as a transport failure.
-	tc := teranode.NewClient([]string{alwaysFiveHundred.URL}, "", teranode.HealthConfig{FailureThreshold: 2})
+	tc := teranode.NewClient([]string{alwaysFiveHundred.URL}, "", teranode.HealthConfig{
+		FailureThreshold:          2,
+		BroadcastFailureThreshold: 5, // intentionally low — sub-threshold drives most peer-health tests
+	})
+	prevDelay := inlineRetryDelay
+	inlineRetryDelay = 0
+	defer func() { inlineRetryDelay = prevDelay }()
 	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, nil)
 
-	// Ten broadcasts, all hitting a 500-returning peer.
-	for i := 0; i < 10; i++ {
-		if err := handleAndFlush(t, p, makePropMsg("tx-"+string(rune('a'+i)))); err != nil {
+	// Many broadcasts, all unanimous 500. With the old per-result penalty
+	// the peer would be sidelined long before this — the new logic keeps
+	// it healthy because nobody else disagreed.
+	for i := 0; i < 20; i++ {
+		if err := handleAndFlush(t, p, makePropMsg(fmt.Sprintf("tx-%02d", i))); err != nil {
 			t.Fatalf("flush error: %v", err)
 		}
 	}
-
 	if len(tc.GetHealthyEndpoints()) != 1 {
-		t.Fatalf("peer returning 500 was wrongly tripped: healthy=%v", tc.GetHealthyEndpoints())
+		t.Fatalf("unanimous-reject peer must stay healthy under network-aware breaker; healthy=%v", tc.GetHealthyEndpoints())
+	}
+}
+
+// TestPeerReturning500_SidelinedWhenOthersAccept covers the complementary
+// case: when one peer rejects but a sibling accepts, the rejecting peer
+// IS the outlier and slow-track sidelining must still fire. This is the
+// per-peer health signal the breaker was designed to catch.
+func TestPeerReturning500_SidelinedWhenOthersAccept(t *testing.T) {
+	// Bad peer responds instantly with 500. Good peer responds after a
+	// short delay so the loop deterministically records the bad peer's
+	// non-2xx outcome before the good peer's 200 cancels siblings.
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "missing inputs for tx", http.StatusInternalServerError)
+	}))
+	defer bad.Close()
+
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(20 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer good.Close()
+
+	ms := newMockStore()
+	cfg := &config.Config{}
+	cfg.Propagation.MerkleConcurrency = 10
+	tc := teranode.NewClient([]string{bad.URL, good.URL}, "", teranode.HealthConfig{
+		FailureThreshold:          2,
+		BroadcastFailureThreshold: 5,
+	})
+	prevDelay := inlineRetryDelay
+	inlineRetryDelay = 0
+	defer func() { inlineRetryDelay = prevDelay }()
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, nil)
+
+	// Drive the bad peer past its slow threshold. Each broadcast produces a
+	// 200 from `good` AND a 500 from `bad` — not unanimous → bad gets
+	// penalised, good gets credit.
+	for i := 0; i < 10; i++ {
+		if err := handleAndFlush(t, p, makePropMsg(fmt.Sprintf("tx-%02d", i))); err != nil {
+			t.Fatalf("flush error: %v", err)
+		}
+	}
+	healthy := tc.GetHealthyEndpoints()
+	if len(healthy) != 1 || !strings.HasPrefix(healthy[0], good.URL) {
+		t.Fatalf("expected only the 200-returning peer to remain healthy; healthy=%v", healthy)
 	}
 }
 

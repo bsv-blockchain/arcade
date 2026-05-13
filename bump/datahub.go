@@ -32,6 +32,19 @@ const DefaultMaxBlockBytes int64 = 1 * 1024 * 1024 * 1024 // 1 GiB
 // stops a hostile server from inflating arcade's log lines.
 const maxErrorBodyBytes int64 = 512
 
+// BlockDataValidator is an optional response-acceptance predicate run after a
+// successful datahub fetch. Returning a non-nil error causes the fetch loop
+// to discard that peer's response (logging the reason into urlErrors) and try
+// the next URL — turning the otherwise-greedy "first 200 wins" into a
+// "first 200 that passes validation wins" policy.
+//
+// Validators are stateless and pure functions of the response; they receive
+// what was parsed from one peer and decide whether it's plausible. Callers
+// use this to reject obviously-truncated responses (a pruned peer returning
+// fewer subtrees than the STUMPs reference) and to cross-check the header
+// merkle root against an out-of-band canonical value (chaintracks).
+type BlockDataValidator func(subtreeHashes []chainhash.Hash, headerMerkleRoot *chainhash.Hash) error
+
 // FetchBlockDataForBUMP fetches subtree hashes, coinbase BUMP, and the block's
 // header merkle root from the binary block endpoint, trying all DataHub URLs.
 // Each attempt emits a Debug-level log line so operators can see which URLs
@@ -48,13 +61,27 @@ const maxErrorBodyBytes int64 = 512
 // subtreeCount (varint) | subtreeHashes (N×32) | coinbaseTx (variable) |
 // blockHeight (varint) | coinbaseBUMPLen (varint) | coinbaseBUMP (variable)
 func FetchBlockDataForBUMP(ctx context.Context, datahubURLs []string, blockHash string, logger *zap.Logger) (subtreeHashes []chainhash.Hash, coinbaseBUMP []byte, headerMerkleRoot *chainhash.Hash, err error) {
-	return FetchBlockDataForBUMPWithCap(ctx, datahubURLs, blockHash, DefaultMaxBlockBytes, logger)
+	return FetchBlockDataForBUMPWithOptions(ctx, datahubURLs, blockHash, DefaultMaxBlockBytes, nil, logger)
 }
 
 // FetchBlockDataForBUMPWithCap is the cap-aware variant of FetchBlockDataForBUMP.
 // maxBlockBytes <= 0 selects DefaultMaxBlockBytes — passing zero/negative does
 // not silently disable the protection.
+//
+// Retained for backwards compatibility with callers that don't need to plug
+// in a content validator. Equivalent to FetchBlockDataForBUMPWithOptions with
+// validator=nil.
 func FetchBlockDataForBUMPWithCap(ctx context.Context, datahubURLs []string, blockHash string, maxBlockBytes int64, logger *zap.Logger) (subtreeHashes []chainhash.Hash, coinbaseBUMP []byte, headerMerkleRoot *chainhash.Hash, err error) {
+	return FetchBlockDataForBUMPWithOptions(ctx, datahubURLs, blockHash, maxBlockBytes, nil, logger)
+}
+
+// FetchBlockDataForBUMPWithOptions adds an optional BlockDataValidator that
+// runs after each successful HTTP+parse. A non-nil error from the validator
+// is treated the same as a transport error: log it, append to urlErrors, and
+// try the next URL. This turns the loop into "first 200-that-passes-validation
+// wins" — defending against datahubs that return self-consistent-but-wrong
+// block representations (pruned peers, stale caches).
+func FetchBlockDataForBUMPWithOptions(ctx context.Context, datahubURLs []string, blockHash string, maxBlockBytes int64, validator BlockDataValidator, logger *zap.Logger) (subtreeHashes []chainhash.Hash, coinbaseBUMP []byte, headerMerkleRoot *chainhash.Hash, err error) {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
@@ -76,12 +103,46 @@ func FetchBlockDataForBUMPWithCap(ctx context.Context, datahubURLs []string, blo
 			zap.Int64("max_block_bytes", maxBlockBytes),
 			zap.Error(fetchErr),
 		)
-		if fetchErr == nil {
-			return hashes, cbBUMP, root, nil
+		if fetchErr != nil {
+			urlErrors = append(urlErrors, fmt.Sprintf("url[%d] %q: %v", i, dataHubURL, fetchErr))
+			continue
 		}
-		urlErrors = append(urlErrors, fmt.Sprintf("url[%d] %q: %v", i, dataHubURL, fetchErr))
+		if validator != nil {
+			if vErr := validator(hashes, root); vErr != nil {
+				logger.Warn("datahub response rejected by validator",
+					zap.Int("idx", i),
+					zap.String("url", dataHubURL),
+					zap.Int("subtree_count", len(hashes)),
+					zap.Error(vErr),
+				)
+				urlErrors = append(urlErrors, fmt.Sprintf("url[%d] %q: validator rejected: %v", i, dataHubURL, vErr))
+				continue
+			}
+		}
+		return hashes, cbBUMP, root, nil
 	}
 	return nil, nil, nil, fmt.Errorf("all DataHub URLs failed for block %s:\n  %s", blockHash, strings.Join(urlErrors, "\n  "))
+}
+
+// SubtreeCountValidator returns a BlockDataValidator that rejects responses
+// with fewer than minSubtrees subtree hashes. Pass max(stump.SubtreeIndex)+1
+// when STUMPs are already in hand — a peer whose response can't index every
+// STUMP we've collected is provably wrong, no expensive cryptographic check
+// required.
+//
+// minSubtrees <= 0 returns nil — no validation, which preserves the old
+// "first 200 wins" behavior for callers that haven't yet collected STUMPs.
+func SubtreeCountValidator(minSubtrees int) BlockDataValidator {
+	if minSubtrees <= 0 {
+		return nil
+	}
+	return func(subtreeHashes []chainhash.Hash, _ *chainhash.Hash) error {
+		if len(subtreeHashes) < minSubtrees {
+			return fmt.Errorf("subtree_count %d < required %d (STUMPs reference subtree indexes up to %d)",
+				len(subtreeHashes), minSubtrees, minSubtrees-1)
+		}
+		return nil
+	}
 }
 
 // fetchBlockBinary fetches a block from the binary endpoint and parses

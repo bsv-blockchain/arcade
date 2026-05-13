@@ -112,6 +112,29 @@ var PropagationBatchSize = promauto.NewHistogram(prometheus.HistogramOpts{
 	Buckets: sizeBuckets,
 })
 
+// PropagationBroadcastConsensus counts broadcasts by network-level outcome.
+// "unanimous_reject" means every endpoint that responded returned non-2xx —
+// the network agrees the tx is bad, so the slow-track breaker is NOT
+// charged against the responding peers (they're behaving correctly). This
+// metric is the diagnostic for the resilience tunable: if it's growing
+// quickly, the tx generator is producing rejectable txs (double-spends,
+// invalid signatures, insufficient fees, …) — not a peer-health problem.
+var PropagationBroadcastConsensus = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_propagation_broadcast_consensus_total",
+	Help: "Per-broadcast consensus outcome across all responding endpoints.",
+}, []string{"verdict"}) // accepted, unanimous_reject, mixed, unreachable
+
+// PropagationPendingDepth gauges how many propagationMsgs are buffered in
+// the propagator's accumulator slice between flushes. Sustained growth
+// indicates downstream (teranode broadcast or merkle-service register) is
+// not keeping up with ingest — combined with the publish-carry gauge on the
+// validator side, this is the canonical "kafka consumer falling behind"
+// signal.
+var PropagationPendingDepth = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "arcade_propagation_pending_depth",
+	Help: "Number of propagation messages buffered awaiting flush.",
+})
+
 // PropagationBroadcastDuration measures end-to-end wall time of broadcasting
 // a single chunk to all healthy endpoints (the inner /tx or /txs path).
 var PropagationBroadcastDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
@@ -230,6 +253,36 @@ var BumpBuilderGraceWaitTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "BLOCK_PROCESSED handlers that waited the grace window before reading STUMPs.",
 })
 
+// BumpBuilderEmptyStumpBlocksTotal counts BLOCK_PROCESSED messages that
+// arrived with zero stored STUMPs for the block. The "expected" case is a
+// block with no tracked transactions, but a sustained non-zero rate while
+// arcade has watched txs is a strong signal that STUMP callbacks are being
+// lost upstream (merkle-service callback_dedup suppression, delivery DLQ,
+// callback URL outage). Surfaces silent drops that would otherwise only show
+// up as "tx stuck in SEEN_MULTIPLE_NODES" days later.
+var BumpBuilderEmptyStumpBlocksTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "arcade_bump_builder_empty_stump_blocks_total",
+	Help: "BLOCK_PROCESSED messages handled with zero STUMPs in the store for the block.",
+})
+
+// BumpBuilderShortCircuitTotal counts BLOCK_PROCESSED messages handled by the
+// short-circuit path — the BUMP already exists in the store and this is a
+// redelivery (typically from /reprocess re-emitting BLOCK_PROCESSED). Tracks
+// how much work the short-circuit saves vs. re-fetching datahub.
+var BumpBuilderShortCircuitTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "arcade_bump_builder_short_circuit_total",
+	Help: "BLOCK_PROCESSED messages skipped because a compound BUMP already exists for the block.",
+})
+
+// BumpBuilderUntrackedTxidsTotal counts level-0 hashes pulled out of STUMPs
+// that the local TxTracker did not recognize. A non-zero rate is expected
+// (every block has subtree leaves that aren't watched by this arcade) but the
+// metric helps gauge how much UPDATE pressure the pre-filter step is saving.
+var BumpBuilderUntrackedTxidsTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "arcade_bump_builder_untracked_txids_total",
+	Help: "Level-0 STUMP hashes filtered out before SetMinedByTxIDs because the local TxTracker doesn't know them.",
+})
+
 // ---------------------------------------------------------------------------
 // watchdog (standalone service — block-processing recovery)
 // ---------------------------------------------------------------------------
@@ -273,6 +326,16 @@ var APIRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Help:    "API request latency by route + method + status class.",
 	Buckets: latencyBuckets,
 }, []string{"route", "method", "status_class"}) // status_class = 2xx, 3xx, 4xx, 5xx
+
+// APISubmissionRecorderDropTotal counts submission rows dropped by the async
+// recorder pool because its bounded queue was full. Non-zero is acceptable
+// (recordSubmission is best-effort) but sustained drops mean the recorder
+// pool is undersized relative to the inbound submit rate — raise worker
+// count or queue depth in server.go.
+var APISubmissionRecorderDropTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "arcade_api_submission_recorder_drop_total",
+	Help: "Submission rows dropped because the async recorder queue was full.",
+})
 
 // APIRequestsInFlight tracks how many requests are currently being handled.
 var APIRequestsInFlight = promauto.NewGauge(prometheus.GaugeOpts{
@@ -371,6 +434,15 @@ var KafkaMessageBytes = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Help:    "Kafka message size in bytes, by topic and op.",
 	Buckets: bytesBuckets,
 }, []string{"topic", "op"})
+
+// KafkaBackpressureTotal counts Send() calls that returned
+// ErrBrokerBackpressure. A sustained non-zero rate means a consumer is too
+// slow to keep up with the producer at the broker's configured buffer/timeout
+// — investigate the corresponding consumer's pending-depth gauge.
+var KafkaBackpressureTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_kafka_backpressure_total",
+	Help: "Producer Send calls that returned ErrBrokerBackpressure, by topic.",
+}, []string{"topic"})
 
 // KafkaProduceErrors counts producer failures by topic.
 var KafkaProduceErrors = promauto.NewCounterVec(prometheus.CounterOpts{

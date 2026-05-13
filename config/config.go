@@ -171,16 +171,28 @@ type Kafka struct {
 	// fails fast when the cluster can't actually fan out across pods. Leave
 	// at 0 or 1 in standalone/single-replica deployments.
 	MinPartitions int `mapstructure:"min_partitions"`
+	// SendTimeoutMs bounds how long the in-process memory broker waits for a
+	// slot in a full mailbox before returning ErrBrokerBackpressure to the
+	// producer. Only consulted by the memory backend; sarama has its own
+	// producer-side timeouts. Default 2000ms — long enough to absorb brief
+	// flush gaps, short enough that HTTP handlers don't hang.
+	SendTimeoutMs int `mapstructure:"send_timeout_ms"`
 }
 
 // Store picks the persistence backend. Backend dispatches construction in
 // storefactory.New; sub-blocks are read only when their backend is selected
 // so operators don't need to fill in unused sections.
 type Store struct {
-	Backend   string   `mapstructure:"backend"` // "aerospike" (default), "pebble", or "postgres"
-	Aerospike Aero     `mapstructure:"aerospike"`
-	Pebble    Pebble   `mapstructure:"pebble"`
-	Postgres  Postgres `mapstructure:"postgres"`
+	Backend string `mapstructure:"backend"` // "aerospike" (default), "pebble", or "postgres"
+	// BatchConcurrency tunes the parallel-loop helpers (BatchGetOrInsertStatus,
+	// BatchUpdateStatus) used by backends without a native batch path
+	// (Aerospike, Pebble). Default 0 → runtime.NumCPU(). Raise to match
+	// validator parallelism when DB writes are the bottleneck; lower to
+	// reduce DB pool pressure under contention.
+	BatchConcurrency int      `mapstructure:"batch_concurrency"`
+	Aerospike        Aero     `mapstructure:"aerospike"`
+	Pebble           Pebble   `mapstructure:"pebble"`
+	Postgres         Postgres `mapstructure:"postgres"`
 }
 
 type Aero struct {
@@ -296,6 +308,31 @@ type PropagationConfig struct {
 	// into chunks keeps the batch endpoint in play even under Kafka backlog.
 	TeranodeMaxBatchSize int                  `mapstructure:"teranode_max_batch_size"`
 	EndpointHealth       EndpointHealthConfig `mapstructure:"endpoint_health"`
+	// RegisterReplayOnStart re-registers every non-terminal tx in the store
+	// with merkle-service /watch at startup. This compensates for the lack
+	// of durability of /watch entries on the merkle-service side: when
+	// merkle-service loses its postgres state (data wipe, migration,
+	// recreation), arcade's previously-submitted txs are no longer being
+	// watched and no STUMP callbacks will ever fire for them. Without
+	// replay, the only recovery path is resubmitting every in-flight tx
+	// manually.
+	//
+	// Defaults to true. Set to false if you operate against a guaranteed-
+	// durable merkle-service deployment, or if the cost of one POST /watch
+	// per in-flight tx at boot is unacceptable for your fleet size.
+	RegisterReplayOnStart *bool `mapstructure:"register_replay_on_start"`
+	// RegisterReplayLookbackHours bounds how far back IterateStatusesSince
+	// scans when replaying. Older txs are very likely terminal already
+	// (MINED/IMMUTABLE) and skipping them avoids walking months of history
+	// on every boot. Defaults to 168 (7 days).
+	RegisterReplayLookbackHours int `mapstructure:"register_replay_lookback_hours"`
+	// MaxPending caps the in-memory pending-batch slice the propagation
+	// consumer accumulates between flushes. Once full, new messages are
+	// returned as errors from handleMessage so the Kafka consumer's
+	// retry+DLQ machinery sheds load instead of growing the slice to OOM.
+	// Defaults to 50000 — large enough to absorb a multi-minute downstream
+	// stall at 50 TPS without dropping, small enough to bound memory.
+	MaxPending int `mapstructure:"max_pending"`
 }
 
 // EndpointHealthConfig tunes the per-endpoint circuit-breaker in teranode.Client.
@@ -312,11 +349,16 @@ type PropagationConfig struct {
 // reduce store load. Zero or negative values fall back to the documented
 // defaults at client construction time.
 type EndpointHealthConfig struct {
-	FailureThreshold    int `mapstructure:"failure_threshold"`
-	ProbeIntervalMs     int `mapstructure:"probe_interval_ms"`
-	ProbeTimeoutMs      int `mapstructure:"probe_timeout_ms"`
-	MinHealthyEndpoints int `mapstructure:"min_healthy_endpoints"`
-	RefreshIntervalMs   int `mapstructure:"refresh_interval_ms"`
+	FailureThreshold int `mapstructure:"failure_threshold"`
+	// BroadcastFailureThreshold is the slow-track breaker: how many
+	// consecutive non-2xx broadcast responses sideline an endpoint. Zero
+	// falls back to the teranode-client default (10). Set lower for
+	// stricter pruning, higher to tolerate flappy peers.
+	BroadcastFailureThreshold int `mapstructure:"broadcast_failure_threshold"`
+	ProbeIntervalMs           int `mapstructure:"probe_interval_ms"`
+	ProbeTimeoutMs            int `mapstructure:"probe_timeout_ms"`
+	MinHealthyEndpoints       int `mapstructure:"min_healthy_endpoints"`
+	RefreshIntervalMs         int `mapstructure:"refresh_interval_ms"`
 }
 
 // BumpBuilderConfig controls the BUMP construction workflow. GraceWindowMs is the
@@ -493,6 +535,12 @@ const DefaultEventsSubscriberBuffer = 4096
 // runtime.NumCPU at construction time.
 type TxValidatorConfig struct {
 	Parallelism int `mapstructure:"parallelism"`
+	// MaxPending caps the in-memory pending-validation slice the validator
+	// consumer accumulates between flushes. Once full, new messages are
+	// returned as errors from handleMessage so the Kafka consumer's
+	// retry+DLQ path sheds load instead of growing the slice to OOM.
+	// Defaults to 50000.
+	MaxPending int `mapstructure:"max_pending"`
 }
 
 func BindFlags(cmd *cobra.Command) {
@@ -574,6 +622,7 @@ func setDefaults() {
 	viper.SetDefault("kafka.consumer_group", "arcade")
 	viper.SetDefault("kafka.max_retries", 5)
 	viper.SetDefault("kafka.buffer_size", 10000)
+	viper.SetDefault("kafka.send_timeout_ms", 2000)
 	viper.SetDefault("store.backend", "aerospike")
 	viper.SetDefault("store.aerospike.hosts", []string{"localhost:3000"})
 	viper.SetDefault("store.aerospike.namespace", "arcade")
@@ -605,10 +654,18 @@ func setDefaults() {
 	viper.SetDefault("propagation.lease_ttl_ms", 0)
 	viper.SetDefault("propagation.teranode_max_batch_size", 100)
 	viper.SetDefault("propagation.endpoint_health.failure_threshold", 3)
+	viper.SetDefault("propagation.endpoint_health.broadcast_failure_threshold", 10)
 	viper.SetDefault("propagation.endpoint_health.probe_interval_ms", 30000)
 	viper.SetDefault("propagation.endpoint_health.probe_timeout_ms", 2000)
 	viper.SetDefault("propagation.endpoint_health.min_healthy_endpoints", 0)
 	viper.SetDefault("propagation.endpoint_health.refresh_interval_ms", 30000)
+	// Replay arcade's in-flight tx set to merkle-service /watch at startup.
+	// Defaults to true: /watch is idempotent on merkle-service so the cost
+	// of replaying covers the (real, observed) case where merkle-service
+	// drops its registration state and arcade silently stops receiving
+	// callbacks for everything in-flight.
+	viper.SetDefault("propagation.register_replay_on_start", true)
+	viper.SetDefault("propagation.register_replay_lookback_hours", 168)
 
 	viper.SetDefault("network", NetworkMainnet)
 

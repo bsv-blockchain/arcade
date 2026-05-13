@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -207,4 +208,45 @@ func (c *Client) RegisterBatch(ctx context.Context, registrations []Registration
 	}
 
 	return g.Wait()
+}
+
+// RegisterBatchWithResults registers each transaction in parallel and returns
+// a per-index error slice (nil = success). Unlike RegisterBatch this does NOT
+// fail-fast: every registration runs to completion (or hits its own context
+// timeout) so callers can partition the batch into "registered" vs "failed"
+// without losing successes when one element errors.
+//
+// Used by the propagation flush to preserve F-024 ("registration is durable
+// BEFORE broadcast") at batch granularity: the propagator skips broadcast for
+// any tx whose entry is non-nil and routes it through handleRetryableFailure.
+//
+// Output length always equals len(registrations); errors[i] corresponds to
+// registrations[i] in input order.
+func (c *Client) RegisterBatchWithResults(ctx context.Context, registrations []Registration, maxConcurrency int) []error {
+	if len(registrations) == 0 {
+		return nil
+	}
+	if maxConcurrency <= 0 {
+		maxConcurrency = 10
+	}
+
+	errs := make([]error, len(registrations))
+	sem := make(chan struct{}, maxConcurrency)
+	var wg sync.WaitGroup
+	for i, reg := range registrations {
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			errs[i] = ctx.Err()
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			errs[i] = c.Register(ctx, reg.TxID, reg.CallbackURL, reg.CallbackToken)
+		}()
+	}
+	wg.Wait()
+	return errs
 }

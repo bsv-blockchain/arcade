@@ -2,6 +2,7 @@ package kafka
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/bsv-blockchain/arcade/config"
 )
@@ -24,7 +25,7 @@ func NewBroker(cfg config.Kafka) (Broker, error) {
 		}
 		return NewSaramaBroker(cfg.Brokers, cfg.ConsumerGroup)
 	case "memory":
-		return NewMemoryBroker(cfg.BufferSize), nil
+		return NewMemoryBrokerWithTimeout(cfg.BufferSize, time.Duration(cfg.SendTimeoutMs)*time.Millisecond), nil
 	default:
 		return nil, fmt.Errorf("unknown kafka backend %q", backend)
 	}

@@ -66,6 +66,8 @@ type mockStore struct {
 	retryCounts    map[string]int
 	pendingRetries map[string]*store.PendingRetry
 	cleared        []clearedCall
+	// replayRows drives IterateStatusesSince for merkle-replay tests.
+	replayRows []*models.TransactionStatus
 }
 
 type clearedCall struct {
@@ -143,6 +145,18 @@ func (m *mockStore) ClearRetryState(_ context.Context, txid string, finalStatus 
 		ExtraInfo: extraInfo,
 		Timestamp: time.Now(),
 	})
+	return nil
+}
+
+func (m *mockStore) IterateStatusesSince(_ context.Context, _ time.Time, fn func(*models.TransactionStatus) error) error {
+	m.mu.Lock()
+	rows := append([]*models.TransactionStatus(nil), m.replayRows...)
+	m.mu.Unlock()
+	for _, r := range rows {
+		if err := fn(r); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -385,7 +399,11 @@ func TestHandleMessage_RegistrationBeforeBroadcast(t *testing.T) {
 	}
 }
 
-// Test 2: Merkle failure returns error and prevents broadcast
+// Test 2: Merkle failure routes the tx to durable PENDING_RETRY and prevents
+// broadcast. The reaper picks the row up on its next tick (which will re-call
+// registerBatch and re-broadcast); registration failures no longer abort the
+// Kafka consumer's claim — that path is reserved for catastrophic decoding
+// failures, not transient merkle-service unavailability.
 func TestHandleMessage_MerkleFailure_NoBroadcast(t *testing.T) {
 	log := &eventLog{}
 	ms := newMockStore()
@@ -398,23 +416,27 @@ func TestHandleMessage_MerkleFailure_NoBroadcast(t *testing.T) {
 
 	p := newPropagator(merkleSrv.URL, teranodeSrv.URL, ms)
 
-	err := handleAndFlush(t, p, makePropMsg("abc123"))
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	if !strings.Contains(err.Error(), "merkle-service registration failed") {
-		t.Errorf("expected error to contain 'merkle-service registration failed', got: %v", err)
+	// handleMessage + flushBatch must both succeed: the failed registration is
+	// handled internally by routing the tx to handleRetryableFailure.
+	if err := handleAndFlush(t, p, makePropMsg("abc123")); err != nil {
+		t.Fatalf("expected nil, got: %v", err)
 	}
 
 	if log.count("broadcast") != 0 {
-		t.Error("teranode should not have received any requests")
+		t.Error("teranode should not have received any requests when register fails")
 	}
-	if ms.updateCount() != 0 {
-		t.Error("store should not have received any UpdateStatus calls")
+	// The PENDING_RETRY transition is the durable record of the failure;
+	// no ACCEPTED/REJECTED status update should have been written.
+	if ms.pendingRetryCount() != 1 {
+		t.Errorf("expected 1 PENDING_RETRY row, got %d", ms.pendingRetryCount())
+	}
+	if u := ms.lastUpdateForTxid("abc123"); u == nil || u.Status != models.StatusPendingRetry {
+		t.Errorf("expected PENDING_RETRY status update, got %+v", u)
 	}
 }
 
-// Test 3: Merkle timeout returns error and prevents broadcast
+// Test 3: Merkle timeout sends the tx to durable PENDING_RETRY instead of
+// aborting the consumer claim. The reaper retries after backoff.
 func TestHandleMessage_MerkleTimeout_NoBroadcast(t *testing.T) {
 	log := &eventLog{}
 	ms := newMockStore()
@@ -435,13 +457,15 @@ func TestHandleMessage_MerkleTimeout_NoBroadcast(t *testing.T) {
 	tc := teranode.NewClient([]string{teranodeSrv.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
 	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, mc)
 
-	err := handleAndFlush(t, p, makePropMsg("abc123"))
-	if err == nil {
-		t.Fatal("expected error, got nil")
+	if err := handleAndFlush(t, p, makePropMsg("abc123")); err != nil {
+		t.Fatalf("expected nil, got: %v", err)
 	}
 
 	if log.count("broadcast") != 0 {
-		t.Error("teranode should not have received any requests")
+		t.Error("teranode should not have received any requests when register times out")
+	}
+	if ms.pendingRetryCount() != 1 {
+		t.Errorf("expected 1 PENDING_RETRY row after register timeout, got %d", ms.pendingRetryCount())
 	}
 
 	close(done)
@@ -552,6 +576,80 @@ func TestHandleMessage_NoCallbackURL_SkipsRegistration(t *testing.T) {
 	}
 }
 
+// TestRunMerkleReplay_RegistersOnlyNonTerminal verifies the startup replay
+// path: every in-flight tx in the store gets POSTed to merkle-service
+// /watch, but rows already MINED/IMMUTABLE/REJECTED/DOUBLE_SPEND are
+// skipped because re-registering terminal txs is wasted work.
+func TestRunMerkleReplay_RegistersOnlyNonTerminal(t *testing.T) {
+	log := &eventLog{}
+	ms := newMockStore()
+	ms.replayRows = []*models.TransactionStatus{
+		{TxID: "tx-recvd", Status: models.StatusReceived},
+		{TxID: "tx-seen", Status: models.StatusSeenOnNetwork},
+		{TxID: "tx-multi", Status: models.StatusSeenMultipleNodes},
+		{TxID: "tx-retry", Status: models.StatusPendingRetry},
+		{TxID: "tx-mined", Status: models.StatusMined},      // terminal, skip
+		{TxID: "tx-immut", Status: models.StatusImmutable},  // terminal, skip
+		{TxID: "tx-rejct", Status: models.StatusRejected},   // terminal, skip
+		{TxID: "tx-dspnd", Status: models.StatusDoubleSpendAttempted}, // terminal, skip
+		{TxID: "", Status: models.StatusReceived},           // empty txid, skip
+	}
+
+	merkleSrv := newMerkleServer(log, http.StatusOK)
+	defer merkleSrv.Close()
+
+	cfg := &config.Config{CallbackURL: "http://arcade/cb", CallbackToken: "tok"}
+	cfg.Propagation.MerkleConcurrency = 4
+	cfg.Propagation.RegisterReplayLookbackHours = 24
+	enabled := true
+	cfg.Propagation.RegisterReplayOnStart = &enabled
+
+	mc := merkleservice.NewClient(merkleSrv.URL, "auth", 5*time.Second)
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, nil, mc)
+
+	p.runMerkleReplay(context.Background())
+
+	got := log.count("register:")
+	if got != 4 {
+		t.Errorf("registered=%d want 4 (the four non-terminal rows)", got)
+	}
+	// Spot-check that terminal txids aren't in the event log.
+	for _, ev := range log.all() {
+		for _, skip := range []string{"tx-mined", "tx-immut", "tx-rejct", "tx-dspnd"} {
+			if strings.Contains(ev, skip) {
+				t.Errorf("event %q should have been filtered (terminal status)", ev)
+			}
+		}
+	}
+}
+
+// TestRunMerkleReplay_DisabledByConfig confirms that operators can opt out
+// of replay (e.g. a deployment that uses an alternative resync path) and
+// the replay function exits without calling merkle-service.
+func TestRunMerkleReplay_DisabledByConfig(t *testing.T) {
+	log := &eventLog{}
+	ms := newMockStore()
+	ms.replayRows = []*models.TransactionStatus{
+		{TxID: "tx-recvd", Status: models.StatusReceived},
+	}
+
+	merkleSrv := newMerkleServer(log, http.StatusOK)
+	defer merkleSrv.Close()
+
+	cfg := &config.Config{CallbackURL: "http://arcade/cb", CallbackToken: "tok"}
+	disabled := false
+	cfg.Propagation.RegisterReplayOnStart = &disabled
+
+	mc := merkleservice.NewClient(merkleSrv.URL, "auth", 5*time.Second)
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, nil, mc)
+
+	p.runMerkleReplay(context.Background())
+
+	if log.count("register:") != 0 {
+		t.Errorf("registered=%d want 0 (replay disabled)", log.count("register:"))
+	}
+}
+
 // Test 7: Batch of 100 — all registered then broadcast in single call
 func TestProcessBatch_100Transactions(t *testing.T) {
 	var registerCount atomic.Int32
@@ -636,10 +734,10 @@ func TestProcessBatch_ChunksOversizedBatch(t *testing.T) {
 	}
 }
 
-// Test 8: Merkle failure aborts the affected message at handleMessage time
-// — no batching, no broadcast, no status update. F-024: registration is the
-// per-message gate, so the Kafka consumer's processWithRetry/DLQ machinery
-// preserves the message instead of silently broadcasting an unregistered tx.
+// Test 8: When every tx in a batch fails registration, none is broadcast and
+// each one is routed to durable PENDING_RETRY. F-024 invariant: a broadcast is
+// only attempted on the registered subset; failed-register txs return to the
+// reaper-owned retry path.
 func TestProcessBatch_MerkleFailure_AbortsBatch(t *testing.T) {
 	var broadcastCount atomic.Int32
 	merkleSrv := newMerkleServer(&eventLog{}, http.StatusInternalServerError)
@@ -655,35 +753,26 @@ func TestProcessBatch_MerkleFailure_AbortsBatch(t *testing.T) {
 	p := newPropagator(merkleSrv.URL, teranodeSrv.URL, ms)
 
 	for i := 0; i < 5; i++ {
-		err := p.handleMessage(context.Background(), consumerMsg(makePropMsg(fmt.Sprintf("tx%d", i))))
-		if err == nil {
-			t.Fatalf("tx%d: expected handleMessage to return an error when merkle registration fails", i)
-		}
-		if !strings.Contains(err.Error(), "merkle-service registration failed") {
-			t.Fatalf("tx%d: expected merkle error, got: %v", i, err)
+		if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg(fmt.Sprintf("tx%d", i)))); err != nil {
+			t.Fatalf("tx%d: expected handleMessage to succeed (failure deferred to flush), got: %v", i, err)
 		}
 	}
-
-	// flushBatch on an empty pending list is a no-op; broadcast must not run.
 	if err := p.flushBatch(context.Background()); err != nil {
-		t.Fatalf("flushBatch on empty pending list should be a no-op, got: %v", err)
+		t.Fatalf("flushBatch returned: %v", err)
 	}
 
 	if broadcastCount.Load() != 0 {
 		t.Errorf("expected 0 broadcast calls, got %d", broadcastCount.Load())
 	}
-	if ms.updateCount() != 0 {
-		t.Errorf("expected 0 UpdateStatus calls, got %d", ms.updateCount())
+	if ms.pendingRetryCount() != 5 {
+		t.Errorf("expected 5 PENDING_RETRY rows (all txs durably enqueued for reaper), got %d", ms.pendingRetryCount())
 	}
 }
 
 // F-024 regression: when registration fails for one message inside a batch,
-// only that message is rejected (its handleMessage returns an error). The
-// already-registered messages remain in the pending batch and are broadcast
-// + status-updated normally on flush. The failed tx is NEVER added to
-// pendingMsgs, so it is never broadcast, never status-updated, never put on
-// PENDING_RETRY — it relies entirely on the consumer's processWithRetry/DLQ
-// machinery to preserve the message until the operator can recover.
+// the already-registered messages are broadcast and the failed one is routed
+// to durable PENDING_RETRY. The reaper handles re-registration + rebroadcast.
+// No tx is ever broadcast without a successful register first.
 func TestHandleMessage_PartialMerkleFailure_OnlyFailedMessageIsAborted(t *testing.T) {
 	// Merkle server returns 500 for txid "tx-bad", 200 for everything else.
 	var registerLog eventLog
@@ -714,7 +803,8 @@ func TestHandleMessage_PartialMerkleFailure_OnlyFailedMessageIsAborted(t *testin
 	ms := newMockStore()
 	p := newPropagator(merkleSrv.URL, teranodeSrv.URL, ms)
 
-	// Three messages: two succeed, one (tx-bad) fails registration.
+	// Three messages: two succeed, one (tx-bad) fails registration. All
+	// queue successfully — failure is deferred to flush time.
 	goodA := makePropMsg("tx-good-a")
 	bad := makePropMsg("tx-bad")
 	goodB := makePropMsg("tx-good-b")
@@ -722,8 +812,8 @@ func TestHandleMessage_PartialMerkleFailure_OnlyFailedMessageIsAborted(t *testin
 	if err := p.handleMessage(context.Background(), consumerMsg(goodA)); err != nil {
 		t.Fatalf("tx-good-a: expected nil, got %v", err)
 	}
-	if err := p.handleMessage(context.Background(), consumerMsg(bad)); err == nil {
-		t.Fatalf("tx-bad: expected handleMessage error, got nil")
+	if err := p.handleMessage(context.Background(), consumerMsg(bad)); err != nil {
+		t.Fatalf("tx-bad: handleMessage must succeed (failure deferred), got %v", err)
 	}
 	if err := p.handleMessage(context.Background(), consumerMsg(goodB)); err != nil {
 		t.Fatalf("tx-good-b: expected nil, got %v", err)
@@ -750,12 +840,11 @@ func TestHandleMessage_PartialMerkleFailure_OnlyFailedMessageIsAborted(t *testin
 		t.Errorf("expected /txs batch endpoint, got %s", broadcastBodies[0])
 	}
 
-	// Two status updates: one per surviving tx. tx-bad has no row written.
-	if ms.updateCount() != 2 {
-		t.Errorf("expected 2 status updates (only the 2 good txs), got %d", ms.updateCount())
+	if ms.pendingRetryCount() != 1 {
+		t.Errorf("expected 1 PENDING_RETRY row for tx-bad, got %d", ms.pendingRetryCount())
 	}
-	if ms.lastUpdateForTxid("tx-bad") != nil {
-		t.Errorf("tx-bad must not have a status row — registration was rejected and the message is the consumer's responsibility to redeliver/DLQ")
+	if u := ms.lastUpdateForTxid("tx-bad"); u == nil || u.Status != models.StatusPendingRetry {
+		t.Errorf("tx-bad: expected PENDING_RETRY status update, got %+v", u)
 	}
 	if u := ms.lastUpdateForTxid("tx-good-a"); u == nil || u.Status != models.StatusAcceptedByNetwork {
 		t.Errorf("tx-good-a: expected ACCEPTED_BY_NETWORK status update, got %+v", u)
@@ -765,10 +854,12 @@ func TestHandleMessage_PartialMerkleFailure_OnlyFailedMessageIsAborted(t *testin
 	}
 }
 
-// F-024 invariant: a registration failure must NOT cause any side-effects
-// downstream (broadcast, status, PENDING_RETRY) for the failed message —
-// it's entirely the consumer's job to preserve and recover it via DLQ.
-func TestHandleMessage_MerkleFailure_NoPendingRetryRow(t *testing.T) {
+// F-024 durability: a registration failure creates a PENDING_RETRY row so
+// the reaper picks the tx back up on its cadence — registration retries are
+// no longer the Kafka consumer's responsibility (which used to be coupled to
+// the per-message DLQ path). The reaper re-runs registerBatch before
+// rebroadcasting, so every broadcast is still preceded by a fresh register.
+func TestHandleMessage_MerkleFailure_PendingRetryRow(t *testing.T) {
 	merkleSrv := newMerkleServer(&eventLog{}, http.StatusInternalServerError)
 	defer merkleSrv.Close()
 
@@ -778,18 +869,15 @@ func TestHandleMessage_MerkleFailure_NoPendingRetryRow(t *testing.T) {
 	ms := newMockStore()
 	p := newPropagator(merkleSrv.URL, teranodeSrv.URL, ms)
 
-	if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg("tx-reg-fail"))); err == nil {
-		t.Fatal("expected merkle registration error from handleMessage")
+	if err := handleAndFlush(t, p, makePropMsg("tx-reg-fail")); err != nil {
+		t.Fatalf("expected handleAndFlush to succeed (failure routed to PENDING_RETRY), got: %v", err)
 	}
 
-	// No PENDING_RETRY row — the durable retry track is for broadcast
-	// retryability, not registration. Registration retries belong to the
-	// Kafka consumer (processWithRetry → DLQ on exhaustion).
-	if ms.pendingRetryCount() != 0 {
-		t.Errorf("expected no pending retry rows, got %d", ms.pendingRetryCount())
+	if ms.pendingRetryCount() != 1 {
+		t.Errorf("expected 1 PENDING_RETRY row, got %d", ms.pendingRetryCount())
 	}
-	if ms.updateCount() != 0 {
-		t.Errorf("expected no status updates, got %d", ms.updateCount())
+	if u := ms.lastUpdateForTxid("tx-reg-fail"); u == nil || u.Status != models.StatusPendingRetry {
+		t.Errorf("expected PENDING_RETRY status update, got %+v", u)
 	}
 }
 
@@ -918,6 +1006,34 @@ func TestSingleTransaction_Status202_NoStatusUpdate(t *testing.T) {
 
 	if ms.updateCount() != 0 {
 		t.Errorf("expected 0 UpdateStatus calls for 202 response, got %d", ms.updateCount())
+	}
+	if ms.pendingRetryCount() != 0 {
+		t.Errorf("202 ack must NOT route to PENDING_RETRY (tx is in flight); got %d", ms.pendingRetryCount())
+	}
+}
+
+// TestNoVerdict_NoHealthyEndpoints_RoutesToRetry is the regression guard
+// for the 02:07 EDT incident: when zero healthy endpoints exist at fan-out
+// time, broadcastSingleOnce returns Status=nil and Acknowledged=false.
+// Old behavior left the tx stuck in RECEIVED forever (~1.6M txs during the
+// incident). New behavior routes it to PENDING_RETRY so the reaper can
+// re-try later or terminally reject after retry exhaustion.
+func TestNoVerdict_NoHealthyEndpoints_RoutesToRetry(t *testing.T) {
+	ms := newMockStore()
+
+	// teranode client with no endpoints → GetHealthyEndpoints returns empty
+	// → broadcastSingleOnce returns broadcastResult{} → no_verdict.
+	cfg := &config.Config{}
+	cfg.Propagation.MerkleConcurrency = 10
+	tc := teranode.NewClient(nil, "", teranode.HealthConfig{})
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, nil)
+
+	if err := handleAndFlush(t, p, makePropMsg("tx-stuck")); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if ms.pendingRetryCount() != 1 {
+		t.Fatalf("no_verdict tx must be queued for retry when no peer was reachable; pending=%d", ms.pendingRetryCount())
 	}
 }
 

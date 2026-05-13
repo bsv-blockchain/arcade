@@ -8,10 +8,13 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	chaintrackslib "github.com/bsv-blockchain/go-chaintracks/chaintracks"
+	"github.com/bsv-blockchain/go-sdk/block"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/bsv-blockchain/go-sdk/util"
@@ -43,6 +46,7 @@ type mockStore struct {
 	mu               sync.Mutex
 	stumps           map[string][]*models.Stump // blockHash → stumps
 	bumps            map[string][]byte          // blockHash → bumpData
+	bumpHeights      map[string]uint64          // blockHash → blockHeight
 	minedCalls       []minedCall
 	deletedBlocks    []string
 	bumpBuiltCalls   []bumpBuiltCall
@@ -52,6 +56,12 @@ type mockStore struct {
 	setMinedErr      error
 	deleteStumpsErr  error
 	markBumpBuiltErr error
+
+	// Janitor fixtures: tipHeight feeds GetActiveTipBlockHeight; blockProc
+	// feeds ListBlockProcessingStatus. Both default empty so existing tests
+	// (which never set them) see the "fresh deployment" early-exit path.
+	tipHeight uint64
+	blockProc []*models.BlockProcessingStatus
 }
 
 type bumpBuiltCall struct {
@@ -67,9 +77,65 @@ type minedCall struct {
 
 func newMockStore() *mockStore {
 	return &mockStore{
-		stumps: make(map[string][]*models.Stump),
-		bumps:  make(map[string][]byte),
+		stumps:      make(map[string][]*models.Stump),
+		bumps:       make(map[string][]byte),
+		bumpHeights: make(map[string]uint64),
 	}
+}
+
+// GetBUMP returns a stored compound BUMP if InsertBUMP previously wrote one
+// for this block, or ErrNotFound otherwise. The short-circuit path in
+// handleMessage calls this before any other work, so the default empty-map
+// behavior keeps the existing tests on the rebuild path.
+func (m *mockStore) GetBUMP(_ context.Context, blockHash string) (uint64, []byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	data, ok := m.bumps[blockHash]
+	if !ok {
+		return 0, nil, store.ErrNotFound
+	}
+	return m.bumpHeights[blockHash], data, nil
+}
+
+// GetActiveTipBlockHeight feeds the orphan-stump janitor's startup scan.
+// Tests that exercise the janitor set tipHeight directly; everything else
+// gets 0 (signals "empty store", janitor exits early).
+func (m *mockStore) GetActiveTipBlockHeight(_ context.Context) (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.tipHeight, nil
+}
+
+// ListBlockProcessingStatus returns rows from blockProc ordered by
+// block_height DESC, with a "block_height < beforeHeight" cursor. Matches
+// the production keyset paging contract used by the orphan-stump janitor.
+func (m *mockStore) ListBlockProcessingStatus(_ context.Context, beforeHeight uint64, limit int) ([]*models.BlockProcessingStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if limit <= 0 {
+		return nil, nil
+	}
+	out := make([]*models.BlockProcessingStatus, 0, limit)
+	// Iterate a sorted copy so test order is deterministic.
+	rows := append([]*models.BlockProcessingStatus(nil), m.blockProc...)
+	// Sort by height descending.
+	for i := 0; i < len(rows); i++ {
+		for j := i + 1; j < len(rows); j++ {
+			if rows[j].BlockHeight > rows[i].BlockHeight {
+				rows[i], rows[j] = rows[j], rows[i]
+			}
+		}
+	}
+	for _, r := range rows {
+		if beforeHeight > 0 && r.BlockHeight >= beforeHeight {
+			continue
+		}
+		out = append(out, r)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
 }
 
 func (m *mockStore) EnsureIndexes() error { return nil }
@@ -462,6 +528,112 @@ func TestBuilder_HandleMessage_InsertBUMPError_ReturnsError(t *testing.T) {
 	if !containsStr(err.Error(), "storing BUMP") {
 		t.Errorf("expected 'storing BUMP' error, got: %v", err)
 	}
+}
+
+// TestBuilder_HandleMessage_ShortCircuit_BUMPAlreadyExists checks the
+// short-circuit path: when a compound BUMP is already stored for the block,
+// handleMessage must not re-fetch from datahub or rebuild. It should re-run
+// SetMinedByTxIDs with the level-0 hashes from the stored BUMP so any
+// tracked tx registered AFTER the original build gets marked MINED on
+// redelivery, then ack and return.
+func TestBuilder_HandleMessage_ShortCircuit_BUMPAlreadyExists(t *testing.T) {
+	ms := newMockStore()
+	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
+
+	// Construct a valid stored BUMP for the block by running BuildCompoundBUMP
+	// on a minimal STUMP. We stash the BUMP directly in the mock and then
+	// invoke handleMessage — there are NO STUMP rows, NO datahub server, and
+	// the test still must succeed via the short-circuit path.
+	stumpData := makeMinimalSTUMP(testTxidHex)
+	subtreeHash := mustHash(t, testTxidHex)
+	compound, _, err := bump.BuildCompoundBUMP(
+		[]*models.Stump{{BlockHash: blockHash, SubtreeIndex: 0, StumpData: stumpData}},
+		[]chainhash.Hash{subtreeHash}, nil)
+	if err != nil {
+		t.Fatalf("BuildCompoundBUMP: %v", err)
+	}
+	ms.bumps[blockHash] = compound.Bytes()
+	ms.bumpHeights[blockHash] = uint64(compound.BlockHeight)
+
+	// No datahub server wired — if the short-circuit fails, the test fails
+	// with a connection error or panic, surfacing the regression.
+	b := &Builder{
+		cfg:    &config.Config{},
+		logger: zap.NewNop().Named("bump-builder"),
+		store:  ms,
+		// teranode left nil so the rebuild path would crash on use,
+		// proving the short-circuit must run.
+	}
+
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash)); err != nil {
+		t.Fatalf("short-circuit handleMessage returned error: %v", err)
+	}
+
+	// SetMinedByTxIDs should have been called once with the level-0 hash list
+	// from the stored BUMP.
+	if len(ms.minedCalls) != 1 {
+		t.Fatalf("expected 1 SetMinedByTxIDs call, got %d", len(ms.minedCalls))
+	}
+	got := ms.minedCalls[0]
+	if got.blockHash != blockHash {
+		t.Errorf("mined blockHash=%q want %q", got.blockHash, blockHash)
+	}
+	if len(got.txids) != 1 || got.txids[0] != testTxidHex {
+		t.Errorf("mined txids=%v want [%q]", got.txids, testTxidHex)
+	}
+}
+
+// TestBuilder_PruneOrphanStumps_DeletesAfterSuccess verifies the startup
+// janitor: STUMPs left behind for blocks whose BUMP already built (i.e.
+// BUMPBuiltAt is set) get cleaned up on boot. Blocks still in flight
+// (BUMPBuiltAt == nil) keep their STUMPs.
+func TestBuilder_PruneOrphanStumps_DeletesAfterSuccess(t *testing.T) {
+	ms := newMockStore()
+	ms.tipHeight = 1000
+	built := time.Now()
+	ms.blockProc = []*models.BlockProcessingStatus{
+		{BlockHash: "done-1", BlockHeight: 999, BUMPBuiltAt: &built}, // BUMP built — prune
+		{BlockHash: "done-2", BlockHeight: 998, BUMPBuiltAt: &built}, // BUMP built — prune
+		{BlockHash: "in-flight", BlockHeight: 997, BUMPBuiltAt: nil}, // still pending — keep
+	}
+	// Seed stumps for all three so we can verify the in-flight one survives.
+	ms.addStump("done-1", 0, []byte("orphan-1"))
+	ms.addStump("done-2", 0, []byte("orphan-2"))
+	ms.addStump("in-flight", 0, []byte("pending"))
+
+	b := &Builder{
+		cfg:    &config.Config{},
+		logger: zap.NewNop().Named("bump-builder"),
+		store:  ms,
+	}
+	// Set recency depth manually since cfg is bare in this test.
+	b.cfg.Watchdog.RecencyDepth = 144
+
+	b.pruneOrphanStumps(context.Background())
+
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if _, exists := ms.stumps["done-1"]; exists && len(ms.stumps["done-1"]) > 0 {
+		t.Errorf("done-1 STUMPs should have been pruned, still have %d", len(ms.stumps["done-1"]))
+	}
+	if _, exists := ms.stumps["done-2"]; exists && len(ms.stumps["done-2"]) > 0 {
+		t.Errorf("done-2 STUMPs should have been pruned, still have %d", len(ms.stumps["done-2"]))
+	}
+	if len(ms.stumps["in-flight"]) != 1 {
+		t.Errorf("in-flight STUMPs should have been preserved, got %d", len(ms.stumps["in-flight"]))
+	}
+}
+
+// TestBuilder_PruneOrphanStumps_EmptyStore exits early when there's no tip.
+func TestBuilder_PruneOrphanStumps_EmptyStore(t *testing.T) {
+	ms := newMockStore() // tipHeight = 0
+	b := &Builder{
+		cfg:    &config.Config{},
+		logger: zap.NewNop().Named("bump-builder"),
+		store:  ms,
+	}
+	// Should not panic, should not call anything that would.
+	b.pruneOrphanStumps(context.Background())
 }
 
 func TestBuilder_HandleMessage_HappyPath_SingleSubtree(t *testing.T) {
@@ -1036,4 +1208,177 @@ func (h *heightDroppingMockStore) SetMinedByTxIDs(ctx context.Context, blockHash
 		s.BlockHeight = 0
 	}
 	return statuses, err
+}
+
+// stubChaintracks is a minimal ChainHeaderReader for tests. nil header
+// returns simulate "chaintracks doesn't know this block yet" (soft fail).
+// Non-nil headers simulate the canonical chain.
+type stubChaintracks struct {
+	headers map[string]*chaintrackslib.BlockHeader
+	err     error
+}
+
+func (s *stubChaintracks) GetHeaderByHash(_ context.Context, h *chainhash.Hash) (*chaintrackslib.BlockHeader, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.headers[h.String()], nil
+}
+
+// TestBuilder_HandleMessage_PrunedPeerFallthrough simulates the production
+// failure mode for block 18603: the first datahub returns 200 with
+// subtree_count=1 while the block actually has more subtrees. Fix 1 must
+// reject that response and fall through to a healthy peer, so the BUMP
+// builds successfully instead of looping the consumer retry.
+func TestBuilder_HandleMessage_PrunedPeerFallthrough(t *testing.T) {
+	ms := newMockStore()
+	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
+	txidHex := testTxidHex
+
+	stumpData := makeMinimalSTUMP(txidHex)
+	ms.addStump(blockHash, 0, stumpData)
+
+	subtreeHash := mustHash(t, txidHex)
+	root := expectedCompoundRoot(t,
+		[]*models.Stump{{BlockHash: blockHash, SubtreeIndex: 0, StumpData: stumpData}},
+		[]chainhash.Hash{subtreeHash}, nil)
+
+	// Pruned peer: returns 200 with a *different* subtree list of length 0.
+	// Since min_subtrees is computed from STUMP indexes (max 0 → min=1) and
+	// the pruned response has 0 subtrees, the validator rejects it.
+	pruned := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		var buf bytes.Buffer
+		buf.Write(buildBlockHeader(make([]byte, 32)))
+		buf.WriteByte(0x01) // txCount
+		buf.WriteByte(0x00) // sizeBytes
+		buf.WriteByte(0x00) // subtreeCount=0
+		coinbaseTx := transaction.NewTransaction()
+		buf.Write(coinbaseTx.Bytes())
+		buf.WriteByte(0x01) // blockHeight
+		buf.WriteByte(0x00) // coinbaseBUMPLen
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write(buf.Bytes())
+	}))
+	defer pruned.Close()
+
+	healthy := newDatahubServer(root, []chainhash.Hash{subtreeHash})
+	defer healthy.Close()
+
+	cfg := &config.Config{DatahubURLs: []string{pruned.URL, healthy.URL}}
+	tc := teranode.NewClient([]string{pruned.URL, healthy.URL}, "", teranode.HealthConfig{})
+	b := &Builder{
+		cfg:      cfg,
+		logger:   zap.NewNop().Named("bump-builder"),
+		store:    ms,
+		teranode: tc,
+	}
+
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash)); err != nil {
+		t.Fatalf("expected fall-through to healthy peer, got: %v", err)
+	}
+
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if _, ok := ms.bumps[blockHash]; !ok {
+		t.Error("expected BUMP to be stored after fall-through to healthy peer")
+	}
+}
+
+// TestBuilder_HandleMessage_ChaintracksRootMismatch exercises Fix 2: a
+// datahub returns a self-consistent block whose header merkle root does
+// not match chaintracks's canonical merkle root for the same hash. The
+// validator must reject the response and the build must fail (no healthy
+// peer to fall through to in this test setup).
+func TestBuilder_HandleMessage_ChaintracksRootMismatch(t *testing.T) {
+	ms := newMockStore()
+	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
+	txidHex := testTxidHex
+
+	stumpData := makeMinimalSTUMP(txidHex)
+	ms.addStump(blockHash, 0, stumpData)
+
+	subtreeHash := mustHash(t, txidHex)
+	datahubRoot := expectedCompoundRoot(t,
+		[]*models.Stump{{BlockHash: blockHash, SubtreeIndex: 0, StumpData: stumpData}},
+		[]chainhash.Hash{subtreeHash}, nil)
+
+	datahub := newDatahubServer(datahubRoot, []chainhash.Hash{subtreeHash})
+	defer datahub.Close()
+
+	// Canonical merkle root differs from what the datahub serves.
+	canonicalRoot := chainhash.Hash{}
+	for i := range canonicalRoot {
+		canonicalRoot[i] = 0xFF
+	}
+	hashObj, _ := chainhash.NewHashFromHex(blockHash)
+	canonicalHeader := &chaintrackslib.BlockHeader{Header: &block.Header{MerkleRoot: canonicalRoot}}
+	stub := &stubChaintracks{headers: map[string]*chaintrackslib.BlockHeader{
+		hashObj.String(): canonicalHeader,
+	}}
+
+	cfg := &config.Config{DatahubURLs: []string{datahub.URL}}
+	tc := teranode.NewClient([]string{datahub.URL}, "", teranode.HealthConfig{})
+	b := &Builder{
+		cfg:         cfg,
+		logger:      zap.NewNop().Named("bump-builder"),
+		store:       ms,
+		teranode:    tc,
+		chainHeader: stub,
+	}
+
+	err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash))
+	if err == nil {
+		t.Fatal("expected error when datahub root disagrees with chaintracks")
+	}
+	if !strings.Contains(err.Error(), "merkle_root mismatch") && !strings.Contains(err.Error(), "validator rejected") {
+		t.Errorf("expected error mentioning merkle_root mismatch, got: %v", err)
+	}
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if _, ok := ms.bumps[blockHash]; ok {
+		t.Error("BUMP must NOT be stored when datahub disagrees with chaintracks")
+	}
+}
+
+// TestBuilder_HandleMessage_ChaintracksUnknownHeader_SoftFails verifies the
+// fall-back path: chaintracks doesn't know the block (returns nil header
+// with no error). The validator must NOT reject the response — the
+// post-build ValidateCompoundRoot is still the final safety net.
+func TestBuilder_HandleMessage_ChaintracksUnknownHeader_SoftFails(t *testing.T) {
+	ms := newMockStore()
+	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
+	txidHex := testTxidHex
+
+	stumpData := makeMinimalSTUMP(txidHex)
+	ms.addStump(blockHash, 0, stumpData)
+
+	subtreeHash := mustHash(t, txidHex)
+	root := expectedCompoundRoot(t,
+		[]*models.Stump{{BlockHash: blockHash, SubtreeIndex: 0, StumpData: stumpData}},
+		[]chainhash.Hash{subtreeHash}, nil)
+
+	datahub := newDatahubServer(root, []chainhash.Hash{subtreeHash})
+	defer datahub.Close()
+
+	// Empty header map → GetHeaderByHash returns (nil, nil), the soft-fail path.
+	stub := &stubChaintracks{headers: map[string]*chaintrackslib.BlockHeader{}}
+
+	cfg := &config.Config{DatahubURLs: []string{datahub.URL}}
+	tc := teranode.NewClient([]string{datahub.URL}, "", teranode.HealthConfig{})
+	b := &Builder{
+		cfg:         cfg,
+		logger:      zap.NewNop().Named("bump-builder"),
+		store:       ms,
+		teranode:    tc,
+		chainHeader: stub,
+	}
+
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash)); err != nil {
+		t.Fatalf("expected soft-fail to accept response, got: %v", err)
+	}
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if _, ok := ms.bumps[blockHash]; !ok {
+		t.Error("BUMP should still be stored when chaintracks doesn't know the header (soft-fail)")
+	}
 }

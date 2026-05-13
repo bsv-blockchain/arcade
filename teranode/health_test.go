@@ -51,6 +51,95 @@ func TestRecordSuccess_ResetsCounter(t *testing.T) {
 	}
 }
 
+// TestRecordBroadcastFailure_TripsAfterThreshold covers the slow-track
+// breaker: persistent non-2xx broadcast responses sideline an endpoint even
+// though it is still responding (reachability counter never advances).
+// Without this, ngrok-proxied datahubs serving "endpoint offline" 404s and
+// peers with permanently disagreeing validation rules kept being included
+// in every broadcast, wasting worker-pool slots.
+func TestRecordBroadcastFailure_TripsAfterThreshold(t *testing.T) {
+	c := NewClient([]string{testEndpointA, testEndpointB}, "", HealthConfig{
+		FailureThreshold:          3,
+		BroadcastFailureThreshold: 5,
+	})
+
+	// Sub-threshold broadcast failures keep the endpoint healthy.
+	for i := 0; i < 4; i++ {
+		c.RecordBroadcastFailure(testEndpointA)
+	}
+	if healthy := c.GetHealthyEndpoints(); len(healthy) != 2 {
+		t.Fatalf("expected both endpoints healthy after 4 broadcast failures, got %v", healthy)
+	}
+
+	// Fifth broadcast failure trips the slow-track breaker.
+	c.RecordBroadcastFailure(testEndpointA)
+	healthy := c.GetHealthyEndpoints()
+	if !reflect.DeepEqual(healthy, []string{testEndpointB}) {
+		t.Fatalf("expected only b after broadcast-trip, got %v", healthy)
+	}
+}
+
+// TestRecordBroadcastFailure_IndependentFromReachability proves the two
+// counters are independent: an endpoint with 2 reachability failures and 4
+// broadcast failures is still healthy (neither threshold reached), even
+// though their sum exceeds either threshold.
+func TestRecordBroadcastFailure_IndependentFromReachability(t *testing.T) {
+	c := NewClient([]string{testEndpointA}, "", HealthConfig{
+		FailureThreshold:          3,
+		BroadcastFailureThreshold: 5,
+	})
+
+	c.RecordFailure(testEndpointA)
+	c.RecordFailure(testEndpointA)
+	c.RecordBroadcastFailure(testEndpointA)
+	c.RecordBroadcastFailure(testEndpointA)
+	c.RecordBroadcastFailure(testEndpointA)
+	c.RecordBroadcastFailure(testEndpointA)
+	if len(c.GetHealthyEndpoints()) != 1 {
+		t.Fatalf("endpoint should still be healthy (neither counter tripped)")
+	}
+	// One more of either kind trips. Take the reachability path.
+	c.RecordFailure(testEndpointA)
+	if len(c.GetHealthyEndpoints()) != 0 {
+		t.Fatalf("endpoint should trip on the 3rd reachability failure")
+	}
+}
+
+// TestRecordSuccess_ResetsBothCounters confirms a 2xx response is the
+// single recovery signal: it clears the reachability counter AND the
+// broadcast counter, regardless of which one is closer to tripping. Without
+// this, a flapping endpoint with intermittent successes would accumulate
+// broadcast failures forever and eventually trip even though it's mostly
+// working.
+func TestRecordSuccess_ResetsBothCounters(t *testing.T) {
+	c := NewClient([]string{testEndpointA}, "", HealthConfig{
+		FailureThreshold:          3,
+		BroadcastFailureThreshold: 5,
+	})
+
+	// Accumulate 2 reachability failures + 4 broadcast failures.
+	c.RecordFailure(testEndpointA)
+	c.RecordFailure(testEndpointA)
+	for i := 0; i < 4; i++ {
+		c.RecordBroadcastFailure(testEndpointA)
+	}
+
+	// One success wipes both slates.
+	c.RecordSuccess(testEndpointA)
+
+	// Now we should need full thresholds again on either track.
+	for i := 0; i < 4; i++ {
+		c.RecordBroadcastFailure(testEndpointA)
+	}
+	if len(c.GetHealthyEndpoints()) != 1 {
+		t.Fatalf("broadcast counter did not reset after success")
+	}
+	c.RecordBroadcastFailure(testEndpointA)
+	if len(c.GetHealthyEndpoints()) != 0 {
+		t.Fatalf("expected broadcast trip on 5th post-reset failure")
+	}
+}
+
 func TestRecordSuccess_RecoversUnhealthy(t *testing.T) {
 	c := NewClient([]string{testEndpointA}, "", HealthConfig{FailureThreshold: 2})
 	c.RecordFailure(testEndpointA)

@@ -3,7 +3,9 @@ package store
 import (
 	"context"
 	"errors"
+	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"github.com/bsv-blockchain/arcade/models"
 )
@@ -11,7 +13,27 @@ import (
 // defaultBatchConcurrency caps how many parallel single-record store calls
 // the helpers issue. Set to keep DB pool pressure modest on backends that
 // don't have a native batch implementation.
-const defaultBatchConcurrency = 16
+//
+// Exposed via SetBatchConcurrency so process bootstrap can align it with
+// validator parallelism (which defaults to runtime.NumCPU). Stored as int32
+// atomically so concurrent batch calls observe the latest value without a
+// lock on every read.
+var batchConcurrency int32 = int32(runtime.NumCPU())
+
+// SetBatchConcurrency overrides the parallel-loop helper concurrency at
+// process start. Zero or negative values restore the runtime.NumCPU default.
+// Safe to call at most once during bootstrap; concurrent batch calls observe
+// the new value on their next iteration.
+func SetBatchConcurrency(n int) {
+	if n <= 0 {
+		n = runtime.NumCPU()
+	}
+	atomic.StoreInt32(&batchConcurrency, int32(n))
+}
+
+func currentBatchConcurrency() int {
+	return int(atomic.LoadInt32(&batchConcurrency))
+}
 
 // SingleStore is the narrow contract the parallel-loop helpers need: the
 // single-record GetOrInsertStatus / UpdateStatus methods. Every Store
@@ -34,7 +56,7 @@ func BatchGetOrInsertStatusParallel(ctx context.Context, s SingleStore, statuses
 	}
 
 	results := make([]BatchInsertResult, len(statuses))
-	sem := make(chan struct{}, defaultBatchConcurrency)
+	sem := make(chan struct{}, currentBatchConcurrency())
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var firstErr error
@@ -85,7 +107,7 @@ func BatchUpdateStatusParallel(ctx context.Context, s SingleStore, statuses []*m
 		return nil
 	}
 
-	sem := make(chan struct{}, defaultBatchConcurrency)
+	sem := make(chan struct{}, currentBatchConcurrency())
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var firstErr error

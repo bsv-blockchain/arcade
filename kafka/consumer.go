@@ -16,15 +16,16 @@ import (
 // handler and an optional batch-flush hook. The underlying Broker supplies
 // the transport (Sarama or in-memory).
 type ConsumerGroup struct {
-	broker     Broker
-	sub        Subscription
-	topics     []string
-	handler    MessageHandler
-	flushFunc  FlushFunc
-	producer   *Producer
-	maxRetries int
-	logger     *zap.Logger
-	ready      chan struct{}
+	broker        Broker
+	sub           Subscription
+	topics        []string
+	handler       MessageHandler
+	flushFunc     FlushFunc
+	producer      *Producer
+	maxRetries    int
+	flushInterval time.Duration
+	logger        *zap.Logger
+	ready         chan struct{}
 }
 
 // FlushFunc is called after a drain of immediately-ready messages. The
@@ -41,7 +42,13 @@ type ConsumerConfig struct {
 	FlushFunc  FlushFunc // called when claim channel drains or ends
 	Producer   *Producer // used for DLQ routing
 	MaxRetries int
-	Logger     *zap.Logger
+	// FlushInterval, when > 0, fires the flush hook periodically even if the
+	// drain loop hasn't observed a channel-empty moment. Bounds end-to-end
+	// latency on bursty traffic where new messages keep arriving inside the
+	// drain inner loop (which would otherwise indefinitely defer the flush).
+	// Default 50ms via NewConsumerGroup; zero disables the ticker.
+	FlushInterval time.Duration
+	Logger        *zap.Logger
 }
 
 func NewConsumerGroup(cfg ConsumerConfig) (*ConsumerGroup, error) {
@@ -58,16 +65,27 @@ func NewConsumerGroup(cfg ConsumerConfig) (*ConsumerGroup, error) {
 		maxRetries = 5
 	}
 
+	flushInterval := cfg.FlushInterval
+	if flushInterval < 0 {
+		flushInterval = 0
+	}
+	if flushInterval == 0 {
+		// Default 50ms: short enough to bound tail latency under sustained
+		// traffic, long enough not to add measurable overhead on idle.
+		flushInterval = 50 * time.Millisecond
+	}
+
 	return &ConsumerGroup{
-		broker:     cfg.Broker,
-		sub:        sub,
-		topics:     cfg.Topics,
-		handler:    cfg.Handler,
-		flushFunc:  cfg.FlushFunc,
-		producer:   cfg.Producer,
-		maxRetries: maxRetries,
-		logger:     cfg.Logger,
-		ready:      make(chan struct{}),
+		broker:        cfg.Broker,
+		sub:           sub,
+		topics:        cfg.Topics,
+		handler:       cfg.Handler,
+		flushFunc:     cfg.FlushFunc,
+		producer:      cfg.Producer,
+		maxRetries:    maxRetries,
+		flushInterval: flushInterval,
+		logger:        cfg.Logger,
+		ready:         make(chan struct{}),
 	}, nil
 }
 
@@ -95,9 +113,18 @@ func (c *ConsumerGroup) Close() error {
 // context is passed into the flush hook so downstream work (broadcasts, store
 // writes) unwinds when the claim is revoked instead of running on
 // context.Background.
+//
+// A flushInterval ticker fires the flush hook even when the inner drain loop
+// keeps observing new messages — sustained traffic would otherwise defer the
+// flush indefinitely and grow the in-memory pending slice. Bounds end-to-end
+// latency without sacrificing the drain-then-flush batching efficiency.
 func (c *ConsumerGroup) handleClaim(claim Claim) error {
 	ctx := claim.Context()
 	defer c.flush(ctx)
+
+	ticker := time.NewTicker(c.flushInterval)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case msg, ok := <-claim.Messages():
@@ -121,6 +148,12 @@ func (c *ConsumerGroup) handleClaim(claim Claim) error {
 				}
 			}
 		drainDone:
+			c.flush(ctx)
+
+		case <-ticker.C:
+			// Periodic flush kicks pending work loose even if the drain
+			// inner loop is hot. Cheap when there's nothing to flush — the
+			// service's FlushFunc no-ops on empty pending state.
 			c.flush(ctx)
 
 		case <-ctx.Done():

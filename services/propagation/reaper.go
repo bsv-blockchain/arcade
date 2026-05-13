@@ -72,6 +72,12 @@ func (p *Propagator) tryReap(ctx context.Context) {
 // has elapsed, broadcasts them in teranodeBatchCap-sized chunks, and resolves
 // each row based on the outcome. Batch-all-rejected falls back to per-tx
 // within the failing chunk only.
+//
+// Re-registers each row with merkle-service before broadcast (F-024): the
+// PENDING_RETRY row may have originated from a registration failure on the
+// flush path, or from a merkle-service state wipe — either way the upstream
+// /watch entry may not exist, so the reaper must re-establish it before any
+// broadcast attempt.
 func (p *Propagator) reapOnce(ctx context.Context) {
 	ready, err := p.store.GetReadyRetries(ctx, time.Now(), p.reaperBatchSize)
 	if err != nil {
@@ -85,19 +91,37 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 
 	p.logger.Info("reaper: rebroadcasting pending retries", zap.Int("count", len(ready)))
 
-	rawTxs := make([][]byte, len(ready))
-	batch := make([]propagationMsg, len(ready))
+	// Build the batch slice up-front; registerBatch partitions it into the
+	// register-success subset. Anything left in `ready` whose index isn't in
+	// the surviving set has already been routed through handleRetryableFailure
+	// (which bumps retry_count and may terminally reject if exhausted) — no
+	// further work needed here.
+	preReg := make([]propagationMsg, len(ready))
+	readyByTxID := make(map[string]*store.PendingRetry, len(ready))
 	for i, r := range ready {
-		rawTxs[i] = r.RawTx
-		batch[i] = propagationMsg{TXID: r.TxID, RawTx: r.RawTx}
+		preReg[i] = propagationMsg{TXID: r.TxID, RawTx: r.RawTx}
+		readyByTxID[r.TxID] = r
+	}
+	registered := p.registerBatch(ctx, preReg)
+	if len(registered) == 0 {
+		return
+	}
+
+	rawTxs := make([][]byte, len(registered))
+	for i, m := range registered {
+		rawTxs[i] = m.RawTx
 	}
 
 	// Reuse the same chunk-and-fallback path as processBatch — the retry
 	// flow doesn't need its own broadcast machinery, just a different
 	// outcome resolver.
-	results := p.broadcastInChunks(ctx, batch, rawTxs)
-	for i, r := range ready {
-		p.resolveRetryOutcome(ctx, r, retryResult{status: results[i].status, errMsg: results[i].errMsg})
+	results := p.broadcastInChunks(ctx, registered, rawTxs)
+	for i, m := range registered {
+		entry := readyByTxID[m.TXID]
+		if entry == nil {
+			continue
+		}
+		p.resolveRetryOutcome(ctx, entry, retryResult{status: results[i].status, errMsg: results[i].errMsg})
 	}
 }
 

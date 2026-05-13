@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -13,31 +14,66 @@ import (
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/events"
 	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/metrics"
+	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/teranode"
 )
 
+const (
+	// submissionRecorderBuffer caps the in-memory queue depth feeding the
+	// async InsertSubmission workers. 4096 absorbs ~80s of 50 TPS without
+	// dropping; sustained backpressure triggers drop+metric (best-effort
+	// contract preserved).
+	submissionRecorderBuffer = 4096
+	// submissionRecorderWorkers is the worker count draining submissionCh.
+	// 8 is comfortably above expected DB write concurrency on Pebble; the
+	// real limiter is the store.BatchConcurrency knob.
+	submissionRecorderWorkers = 8
+)
+
 type Server struct {
-	cfg       *config.Config
-	logger    *zap.Logger
-	producer  *kafka.Producer
-	publisher events.Publisher // nil-safe; status updates flow to SSE via Kafka — the api-server itself publishes but does not subscribe
-	store     store.Store
-	txTracker *store.TxTracker
-	teranode  *teranode.Client // used by /health for datahub URL inventory; nil in tests
-	server    *http.Server
+	cfg          *config.Config
+	logger       *zap.Logger
+	producer     *kafka.Producer
+	publisher    events.Publisher // nil-safe; status updates flow to SSE via Kafka — the api-server itself publishes but does not subscribe
+	store        store.Store
+	txTracker    *store.TxTracker
+	teranode     *teranode.Client      // used by /health for datahub URL inventory; nil in tests
+	merkleClient *merkleservice.Client // nil when merkle_service.url is unset; gates POST /api/v1/blocks/:blockHash/reprocess
+	server       *http.Server
+
+	// submissionCh decouples the InsertSubmission Pebble write from the HTTP
+	// handler tail latency. recordSubmission enqueues onto it via a non-
+	// blocking select; a worker pool drains and writes asynchronously. Drop on
+	// full is acceptable because the underlying call is already best-effort
+	// (errors are logged, not surfaced to the client).
+	submissionCh   chan submissionRecord
+	submissionStop chan struct{}
 }
 
-func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publisher events.Publisher, st store.Store, tracker *store.TxTracker, tc *teranode.Client) *Server {
+// submissionRecord is the in-memory payload the async recorder consumes.
+// Kept tiny — just enough to call store.InsertSubmission with the original
+// values. The original request context is intentionally NOT propagated;
+// recordSubmission is best-effort and shouldn't be cancelled when the HTTP
+// handler returns.
+type submissionRecord struct {
+	sub *models.Submission
+}
+
+func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publisher events.Publisher, st store.Store, tracker *store.TxTracker, tc *teranode.Client, mc *merkleservice.Client) *Server {
 	return &Server{
-		cfg:       cfg,
-		logger:    logger.Named("api-server"),
-		producer:  producer,
-		publisher: publisher,
-		store:     st,
-		txTracker: tracker,
-		teranode:  tc,
+		cfg:            cfg,
+		logger:         logger.Named("api-server"),
+		producer:       producer,
+		publisher:      publisher,
+		store:          st,
+		txTracker:      tracker,
+		teranode:       tc,
+		merkleClient:   mc,
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
 	}
 }
 
@@ -51,6 +87,14 @@ func (s *Server) Start(ctx context.Context) error {
 
 	s.registerRoutes(router)
 
+	// Spin up the submission recorder pool. Workers exit on submissionStop
+	// (Stop()) which is signaled before the HTTP server is closed.
+	var recorderWG sync.WaitGroup
+	for i := 0; i < submissionRecorderWorkers; i++ {
+		recorderWG.Add(1)
+		go s.runSubmissionRecorder(&recorderWG)
+	}
+
 	addr := fmt.Sprintf("%s:%d", s.cfg.APIServer.Host, s.cfg.APIServer.Port)
 	s.server = &http.Server{
 		Addr:              addr,
@@ -63,12 +107,39 @@ func (s *Server) Start(ctx context.Context) error {
 	go func() {
 		<-ctx.Done()
 		_ = s.Stop()
+		recorderWG.Wait()
 	}()
 
 	if err := s.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("server error: %w", err)
 	}
 	return nil
+}
+
+// runSubmissionRecorder drains submissionCh into store.InsertSubmission. Each
+// worker reuses a short-lived background context so a recorder write outlives
+// the HTTP request that triggered it (handler returns before the row lands —
+// that's the whole point of the decoupling).
+func (s *Server) runSubmissionRecorder(wg *sync.WaitGroup) {
+	defer wg.Done()
+	for {
+		select {
+		case <-s.submissionStop:
+			return
+		case rec, ok := <-s.submissionCh:
+			if !ok {
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := s.store.InsertSubmission(ctx, rec.sub); err != nil {
+				s.logger.Warn("failed to insert submission (async)",
+					zap.String("txid", rec.sub.TxID),
+					zap.Error(err),
+				)
+			}
+			cancel()
+		}
+	}
 }
 
 func (s *Server) requestLogger() gin.HandlerFunc {
@@ -134,6 +205,14 @@ func (s *Server) recoverPanic(c *gin.Context, recovered any) {
 }
 
 func (s *Server) Stop() error {
+	// Signal recorder workers to exit. Safe to call multiple times via the
+	// guard pattern below; Stop() is invoked by the Start ctx-watcher and may
+	// race with an explicit caller.
+	select {
+	case <-s.submissionStop:
+	default:
+		close(s.submissionStop)
+	}
 	if s.server != nil {
 		s.logger.Info("shutting down API server")
 		return s.server.Close()

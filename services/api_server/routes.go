@@ -70,6 +70,13 @@ var routeDocs = []RouteDoc{
 		RequestFormat:  "Path param: blockHash",
 		ResponseFormat: `{"blockHash", "blockHeight", "headerSeenAt", "processedAt", "bumpBuiltAt", "status", "orphanedAt", "hasBlockProcessed", "hasCompoundBUMP"}`,
 	},
+	{
+		Method:         "POST",
+		Path:           "/api/v1/blocks/:blockHash/reprocess",
+		Description:    "Ask merkle-service to re-emit STUMP + BLOCK_PROCESSED callbacks for the given block hash. Returns 503 if merkle-service is not configured for this deployment.",
+		RequestFormat:  "Path param: blockHash. No body.",
+		ResponseFormat: `{"status": "accepted", "blockHash"} (202 Accepted)`,
+	},
 }
 
 func (s *Server) registerRoutes(r *gin.Engine) {
@@ -85,6 +92,7 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 	r.POST("/api/v1/merkle-service/callback", s.handleCallback)
 	r.GET("/api/v1/blocks/processing-status", s.handleListBlockProcessingStatus)
 	r.GET("/api/v1/blocks/processing-status/:blockHash", s.handleGetBlockProcessingStatus)
+	r.POST("/api/v1/blocks/:blockHash/reprocess", s.handleReprocessBlock)
 	r.GET("/tx/:txid", s.handleGetTransaction)
 	r.POST("/tx", s.handleSubmitTransaction)
 	r.POST("/txs", s.handleSubmitTransactions)

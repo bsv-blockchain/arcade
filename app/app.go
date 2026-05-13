@@ -11,8 +11,12 @@ package app
 import (
 	"context"
 	"fmt"
+	"os"
+	"path"
 	"time"
 
+	chaintrackslib "github.com/bsv-blockchain/go-chaintracks/chaintracks"
+	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/config"
@@ -49,6 +53,11 @@ type Deps struct {
 	TeranodeClient *teranode.Client
 	MerkleClient   *merkleservice.Client // nil when MerkleService.URL is unset
 	Validator      *validator.Validator
+	// Chaintracks is the shared in-process header tracker. nil when
+	// chaintracks_server is disabled (regtest, or explicit opt-out) — services
+	// that consume it (chaintracks_server, bump-builder canonical-root
+	// validation) must nil-guard.
+	Chaintracks chaintrackslib.Chaintracks
 }
 
 // Bootstrap creates every shared dependency the services rely on, in the
@@ -87,16 +96,22 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		return nil, nil, fmt.Errorf("ensuring store indexes: %w", err)
 	}
 
+	// Align store batch-helper concurrency with config. Zero falls back to
+	// runtime.NumCPU which matches validator parallelism — keeps DB write
+	// fanout from being the bottleneck.
+	store.SetBatchConcurrency(cfg.Store.BatchConcurrency)
+
 	txTracker := store.NewTxTracker()
 
 	teranodeClient := teranode.NewClient(cfg.DatahubURLs, cfg.Teranode.AuthToken, teranode.HealthConfig{
-		FailureThreshold:    cfg.Propagation.EndpointHealth.FailureThreshold,
-		ProbeInterval:       time.Duration(cfg.Propagation.EndpointHealth.ProbeIntervalMs) * time.Millisecond,
-		ProbeTimeout:        time.Duration(cfg.Propagation.EndpointHealth.ProbeTimeoutMs) * time.Millisecond,
-		MinHealthyEndpoints: cfg.Propagation.EndpointHealth.MinHealthyEndpoints,
-		RefreshInterval:     time.Duration(cfg.Propagation.EndpointHealth.RefreshIntervalMs) * time.Millisecond,
-		Source:              endpointSource{st: st, network: cfg.Network},
-		Logger:              logger,
+		FailureThreshold:          cfg.Propagation.EndpointHealth.FailureThreshold,
+		BroadcastFailureThreshold: cfg.Propagation.EndpointHealth.BroadcastFailureThreshold,
+		ProbeInterval:             time.Duration(cfg.Propagation.EndpointHealth.ProbeIntervalMs) * time.Millisecond,
+		ProbeTimeout:              time.Duration(cfg.Propagation.EndpointHealth.ProbeTimeoutMs) * time.Millisecond,
+		MinHealthyEndpoints:       cfg.Propagation.EndpointHealth.MinHealthyEndpoints,
+		RefreshInterval:           time.Duration(cfg.Propagation.EndpointHealth.RefreshIntervalMs) * time.Millisecond,
+		Source:                    endpointSource{st: st, network: cfg.Network},
+		Logger:                    logger,
 	})
 
 	// Seed the registry with statically configured URLs so a freshly started
@@ -134,6 +149,18 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 
 	teranodeClient.Start(ctx)
 
+	// Construct chaintracks once at process startup so every consumer
+	// (chaintracks_server, bump-builder canonical-root validation, watchdog
+	// future use) shares one P2P subscription and header cache. Skipped when
+	// chaintracks_server is disabled — that flag is already the operator's
+	// process-wide "no chaintracks" switch (regtest force-disables it).
+	chainTracks, err := initChaintracks(ctx, cfg, logger)
+	if err != nil {
+		_ = st.Close()
+		_ = producer.Close()
+		return nil, nil, fmt.Errorf("chaintracks init: %w", err)
+	}
+
 	deps := &Deps{
 		Cfg:            cfg,
 		Logger:         logger,
@@ -146,6 +173,7 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		TeranodeClient: teranodeClient,
 		MerkleClient:   merkleClient,
 		Validator:      txVal,
+		Chaintracks:    chainTracks,
 	}
 
 	cleanup := func() {
@@ -155,6 +183,55 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		_ = producer.Close()
 	}
 	return deps, cleanup, nil
+}
+
+// initChaintracks brings up the embedded go-chaintracks instance shared
+// across the process. Returns (nil, nil) when chaintracks_server is disabled
+// — the wired-in consumers nil-guard and fall back to legacy behavior.
+//
+// The construction logic mirrors what previously lived in
+// chaintracks_server.Service.initChaintracks. Moving it here lets bump-
+// builder use the same instance without depending on a service's
+// initialization timing or a duplicate P2P subscription.
+func initChaintracks(ctx context.Context, cfg *config.Config, logger *zap.Logger) (chaintrackslib.Chaintracks, error) {
+	if !cfg.ChaintracksServer.Enabled {
+		return nil, nil
+	}
+
+	// Default chaintracks storage to <storage_path>/chaintracks/ so
+	// operators only need to set a single storage root. Tilde expansion
+	// happens in config.Load.
+	if cfg.Chaintracks.StoragePath == "" {
+		root := cfg.StoragePath
+		if root == "" {
+			root = "."
+		}
+		if err := os.MkdirAll(root, 0o750); err != nil {
+			return nil, fmt.Errorf("creating storage directory %s: %w", root, err)
+		}
+		cfg.Chaintracks.StoragePath = path.Join(root, "chaintracks")
+	}
+
+	// Thread the top-level network into chaintracks' embedded p2p config.
+	// Without this go-chaintracks falls back to "main" silently. Chaintracks
+	// needs the upstream-strict spelling ("main"/"test"/"teratestnet").
+	_, defaultBootstrap := config.ResolveP2PNetwork(cfg.Network)
+	cfg.Chaintracks.P2P.Network = config.ResolveChaintracksNetwork(cfg.Network)
+	if len(cfg.Chaintracks.P2P.MsgBus.BootstrapPeers) == 0 {
+		cfg.Chaintracks.P2P.MsgBus.BootstrapPeers = defaultBootstrap
+	}
+
+	ct, err := cfg.Chaintracks.Initialize(ctx, "arcade", nil)
+	if err != nil {
+		return nil, fmt.Errorf("chaintracks initialize: %w", err)
+	}
+
+	network, _ := ct.GetNetwork(ctx)
+	logger.Info("chaintracks initialized",
+		zap.String("storage_path", cfg.Chaintracks.StoragePath),
+		zap.String("network", network),
+	)
+	return ct, nil
 }
 
 // BuildServices returns the services that should run for the configured mode.
@@ -169,10 +246,16 @@ func BuildServices(d *Deps) []services.Service {
 	}
 
 	if shouldRun("api-server") {
-		svcs = append(svcs, api_server.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.TxTracker, d.TeranodeClient))
+		svcs = append(svcs, api_server.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.TxTracker, d.TeranodeClient, d.MerkleClient))
 	}
 	if shouldRun("bump-builder") {
-		svcs = append(svcs, bump_builder.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.TeranodeClient))
+		// chainHeader is nil when chaintracks is disabled — bump-builder
+		// nil-guards and falls back to subtree-count-only validation.
+		var chainHeader bump_builder.ChainHeaderReader
+		if d.Chaintracks != nil {
+			chainHeader = chaintracksHeaderReader{ct: d.Chaintracks}
+		}
+		svcs = append(svcs, bump_builder.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.TeranodeClient, d.TxTracker, chainHeader))
 	}
 	if shouldRun("watchdog") && cfg.Watchdog.Enabled {
 		if wd := watchdog.NewService(cfg, d.Logger, d.Store, d.Leaser, d.MerkleClient); wd != nil {
@@ -189,7 +272,7 @@ func BuildServices(d *Deps) []services.Service {
 		}
 	}
 	if shouldRun("chaintracks") {
-		if ct := chaintracks_server.New(cfg, d.Logger, d.Store); ct != nil {
+		if ct := chaintracks_server.New(cfg, d.Logger, d.Store, d.Chaintracks); ct != nil {
 			svcs = append(svcs, ct)
 		} else {
 			d.Logger.Info("chaintracks skipped: chaintracks_server.enabled=false (regtest force-disables this)")
@@ -209,6 +292,19 @@ func BuildServices(d *Deps) []services.Service {
 	}
 
 	return svcs
+}
+
+// chaintracksHeaderReader adapts go-chaintracks's Chaintracks interface to
+// the narrower ChainHeaderReader contract bump-builder needs. The library
+// already exposes GetHeaderByHash with the same signature, so this is a
+// trivial passthrough; the wrapper exists only to keep arcade packages from
+// importing chaintracks types into their public APIs.
+type chaintracksHeaderReader struct {
+	ct chaintrackslib.Chaintracks
+}
+
+func (a chaintracksHeaderReader) GetHeaderByHash(ctx context.Context, hash *chainhash.Hash) (*chaintrackslib.BlockHeader, error) {
+	return a.ct.GetHeaderByHash(ctx, hash)
 }
 
 // endpointSource adapts store.Store to teranode.EndpointSource by extracting

@@ -74,6 +74,7 @@ type Validator struct {
 	consumer    *kafka.ConsumerGroup
 
 	parallelism int
+	maxPending  int
 
 	mu sync.Mutex
 	// pending holds raw tx bytes that haven't yet been through the validation
@@ -83,12 +84,26 @@ type Validator struct {
 	// but whose Kafka publish failed. The next flush prepends these to its
 	// publish payload so we don't lose work across a transient publish error.
 	publishCarry []kafka.KeyValue
+
+	// publishCh decouples Kafka publish from the consumer's drain cycle. The
+	// validator's flush hands the accepted batch to a dedicated publisher
+	// goroutine via this buffered channel and immediately returns to draining
+	// the next batch. The publisher does the synchronous SendBatch and, on
+	// ErrBrokerBackpressure, stuffs the messages into publishCarry so the
+	// next flush retries them. Sized at ~4× parallelism so a brief broker
+	// stall doesn't immediately stall the validator drain.
+	publishCh   chan []kafka.KeyValue
+	publishDone chan struct{}
 }
 
 func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publisher events.Publisher, st store.Store, tracker *store.TxTracker, v *validator.Validator) *Validator {
 	parallelism := cfg.TxValidator.Parallelism
 	if parallelism <= 0 {
 		parallelism = runtime.NumCPU()
+	}
+	maxPending := cfg.TxValidator.MaxPending
+	if maxPending <= 0 {
+		maxPending = 50000
 	}
 	return &Validator{
 		cfg:         cfg,
@@ -99,6 +114,9 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 		txTracker:   tracker,
 		txValidator: v,
 		parallelism: parallelism,
+		maxPending:  maxPending,
+		publishCh:   make(chan []kafka.KeyValue, parallelism*4),
+		publishDone: make(chan struct{}),
 	}
 }
 
@@ -135,6 +153,11 @@ func (v *Validator) Start(ctx context.Context) error {
 	}
 	v.consumer = consumer
 
+	// Spin up the decoupled publisher goroutine. flushValidations hands
+	// accepted batches to it via publishCh and returns to the drain loop
+	// without waiting for SendBatch.
+	go v.runPublisher(ctx)
+
 	v.logger.Info("tx validator started", zap.Int("parallelism", v.parallelism))
 	return consumer.Run(ctx)
 }
@@ -142,9 +165,63 @@ func (v *Validator) Start(ctx context.Context) error {
 func (v *Validator) Stop() error {
 	v.logger.Info("stopping tx validator")
 	if v.consumer != nil {
-		return v.consumer.Close()
+		err := v.consumer.Close()
+		// Signal the publisher to drain and exit. publishDone is closed
+		// inside runPublisher when ctx-cancel observed; close publishCh
+		// here so runPublisher exits even if it was started without a
+		// cancelable ctx (tests).
+		close(v.publishCh)
+		<-v.publishDone
+		return err
 	}
 	return nil
+}
+
+// runPublisher consumes batches from publishCh and forwards them to Kafka.
+// On broker backpressure it stashes the batch into publishCarry so the next
+// flush can re-prepend it — preserving the validator's at-least-once
+// publish guarantee without blocking the consumer drain loop.
+func (v *Validator) runPublisher(ctx context.Context) {
+	defer close(v.publishDone)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case batch, ok := <-v.publishCh:
+			if !ok {
+				return
+			}
+			if len(batch) == 0 {
+				continue
+			}
+			if err := v.producer.SendBatch(kafka.TopicPropagation, batch); err != nil {
+				v.mu.Lock()
+				// Prepend so the older messages stay in front. Cap retained
+				// carry depth — beyond a point we'd rather drop the oldest
+				// than OOM. The carry survives multiple flushes already; this
+				// just prevents pathological retention.
+				v.publishCarry = append(batch, v.publishCarry...)
+				if v.maxPending > 0 && len(v.publishCarry) > v.maxPending {
+					excess := len(v.publishCarry) - v.maxPending
+					v.publishCarry = v.publishCarry[excess:]
+					v.logger.Warn("publish carry exceeded max_pending; dropped oldest",
+						zap.Int("dropped", excess),
+						zap.Int("retained", len(v.publishCarry)),
+					)
+				}
+				carryDepth := len(v.publishCarry)
+				v.mu.Unlock()
+				metrics.TxValidatorPublishCarryDepth.Set(float64(carryDepth))
+				v.logger.Warn("propagation publish failed; retained in carry",
+					zap.Int("batch", len(batch)),
+					zap.Int("carry_depth", carryDepth),
+					zap.Error(err),
+				)
+				continue
+			}
+			metrics.TxValidatorPublishCarryDepth.Set(0)
+		}
+	}
 }
 
 type txMessage struct {
@@ -171,6 +248,14 @@ func (v *Validator) handleMessage(_ context.Context, msg *kafka.Message) error {
 	}
 
 	v.mu.Lock()
+	if v.maxPending > 0 && len(v.pending) >= v.maxPending {
+		depth := len(v.pending)
+		v.mu.Unlock()
+		metrics.TxValidatorPendingDepth.Set(float64(depth))
+		// Surface back to the consumer's retry+DLQ so memory stays bounded
+		// when validation can't keep up.
+		return fmt.Errorf("tx validator pending queue full (depth=%d, max=%d)", depth, v.maxPending)
+	}
 	v.pending = append(v.pending, pendingTx{rawTx: txMsg.RawTx})
 	depth := len(v.pending)
 	v.mu.Unlock()
@@ -261,21 +346,29 @@ func (v *Validator) flushValidations(ctx context.Context) error {
 	v.publishCarry = nil
 	v.mu.Unlock()
 
-	// Phase 5: single Kafka publish for the accepted set + any carry.
+	// Phase 5: hand the publish payload off to the decoupled publisher
+	// goroutine. The drain-then-flush loop returns immediately to the next
+	// drain instead of waiting on broker round-trips; backpressure handling
+	// happens inside runPublisher (carry retain on error).
+	//
+	// On a saturated publishCh (publisher hasn't kept up either) we fall
+	// back to the inline SendBatch path with the same carry semantics —
+	// trading a brief drain stall for not silently dropping messages.
 	if len(publishMsgs) > 0 {
-		if err := v.producer.SendBatch(kafka.TopicPropagation, publishMsgs); err != nil { //nolint:contextcheck // Producer.SendBatch wraps context internally; a refactor to plumb ctx is out of scope here
-			// Carry these messages to the next flush. Validation, dedup, and
-			// reject persistence are already done in the store; we only need
-			// the Kafka publish to succeed eventually.
-			v.mu.Lock()
-			v.publishCarry = append(publishMsgs, v.publishCarry...)
-			carryDepth := len(v.publishCarry)
-			v.mu.Unlock()
-			metrics.TxValidatorPublishCarryDepth.Set(float64(carryDepth))
-			metrics.TxValidatorFlushDuration.WithLabelValues("publish_failed").Observe(time.Since(start).Seconds())
-			return fmt.Errorf("batch publishing to propagation: %w", err)
+		select {
+		case v.publishCh <- publishMsgs:
+		default:
+			if err := v.producer.SendBatch(kafka.TopicPropagation, publishMsgs); err != nil { //nolint:contextcheck // Producer.SendBatch wraps context internally
+				v.mu.Lock()
+				v.publishCarry = append(publishMsgs, v.publishCarry...)
+				carryDepth := len(v.publishCarry)
+				v.mu.Unlock()
+				metrics.TxValidatorPublishCarryDepth.Set(float64(carryDepth))
+				metrics.TxValidatorFlushDuration.WithLabelValues("publish_failed").Observe(time.Since(start).Seconds())
+				return fmt.Errorf("batch publishing to propagation (publishCh full, sync fallback): %w", err)
+			}
+			metrics.TxValidatorPublishCarryDepth.Set(0)
 		}
-		metrics.TxValidatorPublishCarryDepth.Set(0)
 	}
 
 	parseFails := 0

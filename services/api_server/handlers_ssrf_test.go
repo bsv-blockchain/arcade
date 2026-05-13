@@ -23,10 +23,12 @@ func setupServerWithCallbackCfg(broker *kafka.RecordingBroker, ms *mockStore, cb
 	gin.SetMode(gin.TestMode)
 	producer := kafka.NewProducer(broker)
 	srv := &Server{
-		cfg:      &config.Config{Callback: cb},
-		logger:   zap.NewNop(),
-		producer: producer,
-		store:    ms,
+		cfg:            &config.Config{Callback: cb},
+		logger:         zap.NewNop(),
+		producer:       producer,
+		store:          ms,
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
 	}
 	router := gin.New()
 	srv.registerRoutes(router)
@@ -106,13 +108,14 @@ func TestSubmitTransaction_AcceptsPublicCallbackURL(t *testing.T) {
 
 	broker := &kafka.RecordingBroker{}
 	ms := &mockStore{}
-	_, router := setupServerWithCallbackCfg(broker, ms, config.CallbackConfig{AllowPrivateIPs: false})
+	srv, router := setupServerWithCallbackCfg(broker, ms, config.CallbackConfig{AllowPrivateIPs: false})
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/tx", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-CallbackUrl", "https://example.com/foo")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
+	drainSubmissions(t, srv)
 
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202; body=%s", w.Code, w.Body.String())
@@ -138,13 +141,14 @@ func TestSubmitTransaction_AllowPrivateIPs_OptIn(t *testing.T) {
 
 	broker := &kafka.RecordingBroker{}
 	ms := &mockStore{}
-	_, router := setupServerWithCallbackCfg(broker, ms, config.CallbackConfig{AllowPrivateIPs: true})
+	srv, router := setupServerWithCallbackCfg(broker, ms, config.CallbackConfig{AllowPrivateIPs: true})
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/tx", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-CallbackUrl", "http://127.0.0.1:9000/cb")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
+	drainSubmissions(t, srv)
 
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202; body=%s", w.Code, w.Body.String())
@@ -203,13 +207,14 @@ func TestSubmitTransaction_TokenOnlySubscriptionStillAllowed(t *testing.T) {
 
 	broker := &kafka.RecordingBroker{}
 	ms := &mockStore{}
-	_, router := setupServerWithCallbackCfg(broker, ms, config.CallbackConfig{AllowPrivateIPs: false})
+	srv, router := setupServerWithCallbackCfg(broker, ms, config.CallbackConfig{AllowPrivateIPs: false})
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/tx", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-CallbackToken", "tok-1") // no X-CallbackUrl
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
+	drainSubmissions(t, srv)
 
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202; body=%s", w.Code, w.Body.String())

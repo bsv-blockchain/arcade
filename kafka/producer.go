@@ -3,6 +3,7 @@ package kafka
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/bsv-blockchain/arcade/metrics"
@@ -30,7 +31,11 @@ func (p *Producer) Send(topic, key string, value any) error {
 		return fmt.Errorf("marshaling message: %w", err)
 	}
 	if err := p.broker.Send(context.Background(), topic, key, data); err != nil {
-		metrics.KafkaProduceErrors.WithLabelValues(topic).Inc()
+		if errors.Is(err, ErrBrokerBackpressure) {
+			metrics.KafkaBackpressureTotal.WithLabelValues(topic).Inc()
+		} else {
+			metrics.KafkaProduceErrors.WithLabelValues(topic).Inc()
+		}
 		return err
 	}
 	metrics.KafkaMessagesTotal.WithLabelValues(topic, "produce").Inc()
@@ -57,7 +62,11 @@ func (p *Producer) SendAsync(topic, key string, value any) error {
 // is JSON-marshaled before the batch is forwarded to the broker.
 func (p *Producer) SendBatch(topic string, msgs []KeyValue) error {
 	if err := p.broker.SendBatch(context.Background(), topic, msgs); err != nil {
-		metrics.KafkaProduceErrors.WithLabelValues(topic).Inc()
+		if errors.Is(err, ErrBrokerBackpressure) {
+			metrics.KafkaBackpressureTotal.WithLabelValues(topic).Inc()
+		} else {
+			metrics.KafkaProduceErrors.WithLabelValues(topic).Inc()
+		}
 		return err
 	}
 	metrics.KafkaMessagesTotal.WithLabelValues(topic, "produce").Add(float64(len(msgs)))
@@ -68,7 +77,11 @@ func (p *Producer) SendBatch(topic string, msgs []KeyValue) error {
 // don't double-encode.
 func (p *Producer) SendRaw(topic, key string, value []byte) error {
 	if err := p.broker.Send(context.Background(), topic, key, value); err != nil {
-		metrics.KafkaProduceErrors.WithLabelValues(topic).Inc()
+		if errors.Is(err, ErrBrokerBackpressure) {
+			metrics.KafkaBackpressureTotal.WithLabelValues(topic).Inc()
+		} else {
+			metrics.KafkaProduceErrors.WithLabelValues(topic).Inc()
+		}
 		return err
 	}
 	metrics.KafkaMessagesTotal.WithLabelValues(topic, "produce").Inc()

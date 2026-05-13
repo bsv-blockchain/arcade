@@ -19,6 +19,7 @@ import (
 	"github.com/bsv-blockchain/arcade/callbackurl"
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/teranode"
@@ -81,10 +82,12 @@ func (o submitOptions) hasSubscription() bool {
 	return o.CallbackURL != "" || o.CallbackToken != ""
 }
 
-// recordSubmission persists a callback registration for txid. Best-effort:
-// failures are logged and don't fail the submit, since the tx itself is
-// already on Kafka and clients can re-submit if needed.
-func (s *Server) recordSubmission(ctx context.Context, txid string, opts submitOptions) {
+// recordSubmission queues a callback registration for txid onto the async
+// recorder. Best-effort: a full queue drops with a warn+metric — the contract
+// matches the prior synchronous version (InsertSubmission failures were
+// already logged and non-fatal). Moving the Pebble write off the HTTP
+// handler removes a per-request DB write from POST tail latency.
+func (s *Server) recordSubmission(_ context.Context, txid string, opts submitOptions) {
 	if !opts.hasSubscription() {
 		return
 	}
@@ -101,10 +104,12 @@ func (s *Server) recordSubmission(ctx context.Context, txid string, opts submitO
 		FullStatusUpdates: opts.FullStatusUpdates,
 		CreatedAt:         time.Now(),
 	}
-	if err := s.store.InsertSubmission(ctx, sub); err != nil {
-		s.logger.Warn("failed to insert submission",
+	select {
+	case s.submissionCh <- submissionRecord{sub: sub}:
+	default:
+		metrics.APISubmissionRecorderDropTotal.Inc()
+		s.logger.Warn("submission recorder queue full; dropping (best-effort)",
 			zap.String("txid", txid),
-			zap.Error(err),
 		)
 	}
 }
@@ -528,6 +533,14 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		"raw_tx": rawTx,
 	}
 	if err := s.producer.Send(kafka.TopicTransaction, txid, msg); err != nil {
+		if errors.Is(err, kafka.ErrBrokerBackpressure) {
+			// Backpressure → shed load to the client. The tx was never queued,
+			// so a retry is safe and is the contract the 503 expresses.
+			s.logger.Warn("submit rejected: kafka backpressure", zap.String("txid", txid))
+			c.Header("Retry-After", "1")
+			c.JSON(http.StatusServiceUnavailable, gin.H{jsonKeyError: "service overloaded, retry shortly"})
+			return
+		}
 		s.logger.Error("failed to publish transaction", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to submit"})
 		return
@@ -612,6 +625,12 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 
 	// Phase 2: Batch publish all parsed transactions in one call
 	if err := s.producer.SendBatch(kafka.TopicTransaction, msgs); err != nil {
+		if errors.Is(err, kafka.ErrBrokerBackpressure) {
+			s.logger.Warn("batch submit rejected: kafka backpressure", zap.Int("count", len(msgs)))
+			c.Header("Retry-After", "1")
+			c.JSON(http.StatusServiceUnavailable, gin.H{jsonKeyError: "service overloaded, retry shortly"})
+			return
+		}
 		s.logger.Error("failed to publish transaction batch", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to submit"})
 		return

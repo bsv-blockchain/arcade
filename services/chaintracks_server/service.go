@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -47,31 +46,40 @@ type Service struct {
 }
 
 // New constructs the Service. Returns nil when chaintracks_server is
-// disabled — callers treat nil as "don't run chaintracks in this
-// deployment". The regtest network has no genesis header in go-chaintracks
-// so the runtime force-disables this service when network=regtest
-// (config validate already does that).
-func New(cfg *config.Config, logger *zap.Logger, st store.Store) *Service {
-	if !cfg.ChaintracksServer.Enabled {
+// disabled or the shared chaintracks instance is unavailable. Callers treat
+// nil as "don't run chaintracks in this deployment". The regtest network
+// has no genesis header in go-chaintracks so the runtime force-disables
+// this service when network=regtest (config validate already does that).
+//
+// The chaintracks instance is constructed once in app.Bootstrap and passed
+// in here so bump-builder can share the same P2P subscription and header
+// cache via the Deps struct.
+func New(cfg *config.Config, logger *zap.Logger, st store.Store, ct chaintracks.Chaintracks) *Service {
+	if !cfg.ChaintracksServer.Enabled || ct == nil {
 		return nil
 	}
 	return &Service{
 		cfg:    cfg,
 		logger: logger.Named("chaintracks"),
 		store:  st,
+		ct:     ct,
 	}
 }
 
 // Name implements services.Service.
 func (s *Service) Name() string { return "chaintracks" }
 
-// Start initializes chaintracks, brings up the block-status bridge,
-// and runs the HTTP server. Blocks until ctx is canceled or
-// ListenAndServe returns a non-graceful error.
+// Start brings up the block-status bridge and runs the HTTP server. The
+// embedded chaintracks instance is built in app.Bootstrap and injected via
+// New; this service no longer owns its construction. Blocks until ctx is
+// canceled or ListenAndServe returns a non-graceful error.
 func (s *Service) Start(ctx context.Context) error {
-	if err := s.initChaintracks(ctx); err != nil {
-		return fmt.Errorf("initializing chaintracks: %w", err)
-	}
+	s.routes = NewRoutes(ctx, s.ct)
+	network, _ := s.ct.GetNetwork(ctx)
+	s.logger.Info("Chaintracks HTTP API enabled",
+		zap.String("storage_path", s.cfg.Chaintracks.StoragePath),
+		zap.String("network", network),
+	)
 
 	// Bridge chaintracks tip + reorg → block_processing store. Downstream
 	// services (watchdog, api-server) read from the shared table, so this
@@ -112,48 +120,6 @@ func (s *Service) Stop() error {
 	return nil
 }
 
-// initChaintracks spins up the embedded go-chaintracks instance. Moved
-// verbatim from services/api_server/server.go — the only behavioral
-// change is which process this code runs in.
-func (s *Service) initChaintracks(ctx context.Context) error {
-	// Default chaintracks storage to <storage_path>/chaintracks/ so
-	// operators only need to set a single storage root. Tilde expansion
-	// happens in config.Load.
-	if s.cfg.Chaintracks.StoragePath == "" {
-		root := s.cfg.StoragePath
-		if root == "" {
-			root = "."
-		}
-		if err := os.MkdirAll(root, 0o750); err != nil {
-			return fmt.Errorf("creating storage directory %s: %w", root, err)
-		}
-		s.cfg.Chaintracks.StoragePath = path.Join(root, "chaintracks")
-	}
-
-	// Thread the top-level network into chaintracks' embedded p2p
-	// config. Without this go-chaintracks falls back to "main" silently.
-	// Chaintracks needs the upstream-strict spelling
-	// ("main"/"test"/"teratestnet").
-	_, defaultBootstrap := config.ResolveP2PNetwork(s.cfg.Network)
-	s.cfg.Chaintracks.P2P.Network = config.ResolveChaintracksNetwork(s.cfg.Network)
-	if len(s.cfg.Chaintracks.P2P.MsgBus.BootstrapPeers) == 0 {
-		s.cfg.Chaintracks.P2P.MsgBus.BootstrapPeers = defaultBootstrap
-	}
-
-	ct, err := s.cfg.Chaintracks.Initialize(ctx, "arcade", nil)
-	if err != nil {
-		return fmt.Errorf("chaintracks init: %w", err)
-	}
-	s.ct = ct
-	s.routes = NewRoutes(ctx, ct)
-
-	network, _ := ct.GetNetwork(ctx)
-	s.logger.Info("Chaintracks HTTP API enabled",
-		zap.String("storage_path", s.cfg.Chaintracks.StoragePath),
-		zap.String("network", network),
-	)
-	return nil
-}
 
 // registerRoutes mounts /chaintracks/v1 + /chaintracks/v2 plus the bulk
 // header-file handler. Health probes also live here so K8s liveness

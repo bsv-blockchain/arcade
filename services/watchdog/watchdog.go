@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"math"
+	mrand "math/rand"
 	"os"
 	"sync"
 	"time"
@@ -34,6 +35,13 @@ import (
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
 )
+
+// backoffJitterFraction is the maximum proportional deviation from the
+// nominal backoff delay applied on each scheduled retry. ±20% gives enough
+// spread to break fleet-wide synchrony at restart (the documented thundering-
+// herd risk when many replicas hit InitialBackoff at the same instant)
+// without meaningfully changing per-block recovery latency.
+const backoffJitterFraction = 0.20
 
 // LeaseName is the cluster-wide coordination key. One watchdog instance
 // holds the lease at a time so only one fleet member fires /reprocess
@@ -92,6 +100,11 @@ type Watchdog struct {
 
 	// now is overridable for tests. Production uses time.Now.
 	now func() time.Time
+	// jitter is overridable for tests so deterministic assertions on
+	// nextEligibleAt don't depend on the RNG. Production uses
+	// proportionalJitter; tests can set it to identityJitter for exact
+	// equality checks against InitialBackoff / TerminalBackoff.
+	jitter func(time.Duration) time.Duration
 
 	mu       sync.Mutex
 	attempts map[string]*attemptState
@@ -118,9 +131,35 @@ func New(
 		logger:       logger.Named("watchdog"),
 		holderID:     newHolderID(),
 		now:          time.Now,
+		jitter:       proportionalJitter,
 		attempts:     make(map[string]*attemptState),
 	}
 }
+
+// proportionalJitter returns d perturbed by a uniform random fraction in
+// [-backoffJitterFraction, +backoffJitterFraction]. Zero/negative input is
+// passed through unchanged so callers with a "no delay" intent stay exact.
+// Uses math/rand (not crypto/rand) because the application is non-security:
+// any source of independence between replicas suffices.
+func proportionalJitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	spread := int64(float64(d) * backoffJitterFraction)
+	if spread <= 0 {
+		return d
+	}
+	delta := mrand.Int63n(2*spread+1) - spread
+	out := int64(d) + delta
+	if out <= 0 {
+		return d
+	}
+	return time.Duration(out)
+}
+
+// identityJitter is a no-op jitter for tests that assert on exact nominal
+// backoff values. Wired by the watchdog test helper.
+func identityJitter(d time.Duration) time.Duration { return d }
 
 // newHolderID matches the propagation reaper's holder format:
 // "<hostname>-<8-hex-chars>". The random suffix prevents a restarted pod
@@ -323,7 +362,7 @@ func (w *Watchdog) recordFailure(hash string, now time.Time, delay time.Duration
 	}
 	st.lastTriedAt = now
 	st.failures++
-	st.nextEligibleAt = now.Add(delay)
+	st.nextEligibleAt = now.Add(w.jitter(delay))
 	metrics.WatchdogBackoffDepth.Set(float64(len(w.attempts)))
 }
 
@@ -338,7 +377,7 @@ func (w *Watchdog) recordTransientFailure(hash string, now time.Time) {
 	st.lastTriedAt = now
 	st.failures++
 	delay := transientBackoff(w.cfg.InitialBackoff, w.cfg.MaxBackoff, st.failures)
-	st.nextEligibleAt = now.Add(delay)
+	st.nextEligibleAt = now.Add(w.jitter(delay))
 	metrics.WatchdogBackoffDepth.Set(float64(len(w.attempts)))
 }
 
