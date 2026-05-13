@@ -24,7 +24,8 @@ func CheckPartitions(broker Broker, topics []string, minPartitions int, logger *
 	for _, topic := range topics {
 		count, err := broker.PartitionCount(topic)
 		if errors.Is(err, ErrTopicNotFound) {
-			logger.Warn("topic not found on broker — will be auto-created on first publish; ensure partition count matches deployment size",
+			logger.Warn(
+				"topic not found on broker — will be auto-created on first publish; ensure partition count matches deployment size",
 				zap.String("topic", topic),
 				zap.Int("min_partitions", minPartitions),
 			)
@@ -36,7 +37,8 @@ func CheckPartitions(broker Broker, topics []string, minPartitions int, logger *
 		if count < minPartitions {
 			return fmt.Errorf("topic %s has %d partitions, need at least %d for horizontal scaling", topic, count, minPartitions)
 		}
-		logger.Info("topic partition count ok",
+		logger.Info(
+			"topic partition count ok",
 			zap.String("topic", topic),
 			zap.Int("partitions", count),
 		)

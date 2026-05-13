@@ -222,7 +222,8 @@ func (p *Propagator) publishStatus(ctx context.Context, status *models.Transacti
 		return
 	}
 	if err := p.publisher.Publish(ctx, status); err != nil {
-		p.logger.Warn("failed to publish status update",
+		p.logger.Warn(
+			"failed to publish status update",
 			zap.String("txid", status.TxID),
 			zap.String("status", string(status.Status)),
 			zap.Error(err),
@@ -268,7 +269,8 @@ func (p *Propagator) Start(ctx context.Context) error {
 	// silently disables STUMP callbacks for every previously-submitted tx.
 	go p.runMerkleReplay(ctx)
 
-	p.logger.Info("propagation service started",
+	p.logger.Info(
+		"propagation service started",
 		zap.Duration("reaper_interval", p.reaperInterval),
 		zap.Int("reaper_batch_size", p.reaperBatchSize),
 		zap.Int("broadcast_workers", broadcastWorkers),
@@ -395,7 +397,8 @@ func (p *Propagator) registerBatch(ctx context.Context, batch []propagationMsg) 
 		p.handleRetryableFailure(ctx, batch[i].TXID, batch[i].RawTx)
 	}
 	if failedCount > 0 {
-		p.logger.Warn("merkle-service registration partial failure",
+		p.logger.Warn(
+			"merkle-service registration partial failure",
 			zap.Int("batch_size", len(batch)),
 			zap.Int("failed", failedCount),
 			zap.Int("registered", len(registered)),
@@ -445,7 +448,8 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) e
 		}
 		txidSample = append(txidSample, msg.TXID)
 	}
-	p.logger.Info("processing batch",
+	p.logger.Info(
+		"processing batch",
 		zap.Int("count", len(batch)),
 		zap.Strings("txids_sample", txidSample),
 	)
@@ -504,7 +508,8 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) e
 			// without affecting the accepted/rejected counters.
 		}
 		if err := p.store.UpdateStatus(ctx, res.status); err != nil {
-			p.logger.Error("failed to update status",
+			p.logger.Error(
+				"failed to update status",
 				zap.String("txid", batch[i].TXID),
 				zap.Error(err),
 			)
@@ -517,7 +522,8 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) e
 	metrics.PropagationOutcomeTotal.WithLabelValues("retryable").Add(float64(retryable))
 	metrics.PropagationOutcomeTotal.WithLabelValues("no_verdict").Add(float64(noVerdict))
 
-	p.logger.Info("batch propagated",
+	p.logger.Info(
+		"batch propagated",
 		zap.Int("count", len(batch)),
 		zap.Strings("success_endpoints", successEndpoints),
 	)
@@ -648,7 +654,8 @@ func (p *Propagator) broadcastChunk(ctx context.Context, chunk []propagationMsg,
 		}()
 	}
 	wg.Wait()
-	p.logger.Info("per-tx fallback complete",
+	p.logger.Info(
+		"per-tx fallback complete",
 		zap.Int("chunk_size", len(chunk)),
 		zap.Int("accepted", accepted),
 		zap.Int("rejected", rejected),
@@ -980,7 +987,8 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 		}
 		outcomes = append(outcomes, endpointOutcome{endpoint: result.endpoint, statusCode: result.statusCode})
 		if result.err != nil {
-			p.logger.Warn("batch broadcast endpoint failed",
+			p.logger.Warn(
+				"batch broadcast endpoint failed",
 				zap.String("endpoint", result.endpoint),
 				zap.Int("batch_size", len(batch)),
 				zap.Int("status_code", result.statusCode),
@@ -988,7 +996,8 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 			)
 			continue
 		}
-		p.logger.Debug("batch broadcast endpoint succeeded",
+		p.logger.Debug(
+			"batch broadcast endpoint succeeded",
 			zap.String("endpoint", result.endpoint),
 			zap.Int("batch_size", len(batch)),
 		)
@@ -1002,7 +1011,8 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 	}
 	recordBroadcastOutcomes(p.teranodeClient, outcomes)
 
-	p.logger.Debug("batch broadcast complete",
+	p.logger.Debug(
+		"batch broadcast complete",
 		zap.Int("batch_size", len(batch)),
 		zap.Bool("any_success", anySuccess),
 		zap.Int("endpoint_count", len(endpoints)),
@@ -1050,7 +1060,8 @@ func (p *Propagator) handleRetryableFailure(ctx context.Context, txid string, ra
 		return
 	}
 
-	p.logger.Debug("transaction queued for retry",
+	p.logger.Debug(
+		"transaction queued for retry",
 		zap.String("txid", txid),
 		zap.Int("attempt", retryCount),
 		zap.Time("next_retry_at", nextRetryAt),

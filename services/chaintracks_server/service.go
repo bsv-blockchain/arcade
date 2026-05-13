@@ -76,7 +76,8 @@ func (s *Service) Name() string { return "chaintracks" }
 func (s *Service) Start(ctx context.Context) error {
 	s.routes = NewRoutes(ctx, s.ct)
 	network, _ := s.ct.GetNetwork(ctx)
-	s.logger.Info("Chaintracks HTTP API enabled",
+	s.logger.Info(
+		"Chaintracks HTTP API enabled",
 		zap.String("storage_path", s.cfg.Chaintracks.StoragePath),
 		zap.String("network", network),
 	)

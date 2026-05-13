@@ -77,6 +77,29 @@ func (p *KafkaPublisher) Publish(ctx context.Context, status *models.Transaction
 	return p.producer.Send(kafka.TopicStatusUpdate, status.TxID, status) //nolint:contextcheck // kafka.Producer.Send doesn't take a context; ctx already checked above
 }
 
+// PublishBulk sends one event carrying TxIDs[]. The kafka key is the
+// BlockHash (so bulk events for the same block land on the same partition
+// in real Kafka); fall back to a synthesized key if BlockHash is empty.
+// See the Publisher.PublishBulk contract for rationale.
+func (p *KafkaPublisher) PublishBulk(ctx context.Context, template *models.TransactionStatus) error {
+	if template == nil {
+		return fmt.Errorf("nil template")
+	}
+	if len(template.TxIDs) == 0 {
+		return fmt.Errorf("PublishBulk requires non-empty TxIDs")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	key := template.BlockHash
+	if key == "" {
+		// Synthesize a stable key from the first txid so partitioning is
+		// deterministic even before block context is known.
+		key = "bulk-" + template.TxIDs[0]
+	}
+	return p.producer.Send(kafka.TopicStatusUpdate, key, template) //nolint:contextcheck // kafka.Producer.Send doesn't take a context; ctx already checked above
+}
+
 // Subscribe joins a fresh consumer group on TopicStatusUpdate and returns a
 // channel that yields decoded TransactionStatus values until ctx is canceled.
 // The unique groupID guarantees this subscriber sees every message — useful
@@ -137,7 +160,8 @@ func (p *KafkaPublisher) Subscribe(ctx context.Context, caller string) (<-chan *
 				now := time.Now().UnixNano()
 				prev := lastWarnUnixNano.Load()
 				if now-prev >= int64(dropLogInterval) && lastWarnUnixNano.CompareAndSwap(prev, now) {
-					p.logger.Warn("subscriber channel full, dropping update",
+					p.logger.Warn(
+						"subscriber channel full, dropping update",
 						zap.String("caller", caller),
 						zap.String("txid", status.TxID),
 						zap.String("status", string(status.Status)),

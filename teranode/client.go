@@ -313,7 +313,8 @@ func (c *Client) refreshOnce(ctx context.Context) {
 		return
 	}
 	if added := c.AddEndpoints(urls); added > 0 {
-		c.logger.Info("endpoint refresh added urls",
+		c.logger.Info(
+			"endpoint refresh added urls",
 			zap.Int("added", added),
 			zap.Int("total", len(c.GetEndpoints())),
 		)
@@ -378,7 +379,8 @@ func (c *Client) RecordSuccess(url string) {
 	c.mu.Unlock()
 	if transitioned {
 		metrics.TeranodeEndpointHealth.WithLabelValues(n, sourceLabel(source)).Set(1)
-		c.logger.Info("endpoint healthy",
+		c.logger.Info(
+			"endpoint healthy",
 			zap.String("endpoint", n),
 			zap.String("from", "unhealthy"),
 			zap.String("to", "healthy"),
@@ -410,7 +412,8 @@ func (c *Client) RecordFailure(url string) {
 	c.mu.Unlock()
 	if transitioned {
 		metrics.TeranodeEndpointHealth.WithLabelValues(n, sourceLabel(source)).Set(0)
-		c.logger.Warn("endpoint unhealthy",
+		c.logger.Warn(
+			"endpoint unhealthy",
 			zap.String("endpoint", n),
 			zap.Int("consecutive_failures", h.consecutiveFailures),
 			zap.String("from", "healthy"),
@@ -453,7 +456,8 @@ func (c *Client) RecordBroadcastFailure(url string) {
 	c.mu.Unlock()
 	if transitioned {
 		metrics.TeranodeEndpointHealth.WithLabelValues(n, sourceLabel(source)).Set(0)
-		c.logger.Warn("endpoint unhealthy",
+		c.logger.Warn(
+			"endpoint unhealthy",
 			zap.String("endpoint", n),
 			zap.Int("consecutive_broadcast_failures", consecutive),
 			zap.String("from", "healthy"),
@@ -542,7 +546,8 @@ func (c *Client) recomputeBelowThresholdLocked() {
 	below := healthyCount < c.minHealthyEndpoints
 	if below && !c.belowThreshold {
 		c.belowThreshold = true
-		c.logger.Warn("healthy endpoint count below minimum",
+		c.logger.Warn(
+			"healthy endpoint count below minimum",
 			zap.Int("healthy", healthyCount),
 			zap.Int("min_healthy_endpoints", c.minHealthyEndpoints),
 		)

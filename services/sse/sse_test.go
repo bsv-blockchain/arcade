@@ -47,6 +47,10 @@ func (p *fakePublisher) Publish(_ context.Context, status *models.TransactionSta
 	return nil
 }
 
+func (p *fakePublisher) PublishBulk(ctx context.Context, template *models.TransactionStatus) error {
+	return p.Publish(ctx, template)
+}
+
 func (p *fakePublisher) Subscribe(_ context.Context, _ string) (<-chan *models.TransactionStatus, error) {
 	ch := make(chan *models.TransactionStatus, 64)
 	p.mu.Lock()

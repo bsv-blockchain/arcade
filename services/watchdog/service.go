@@ -52,7 +52,8 @@ func (s *Service) Name() string { return "watchdog" }
 // and /reprocess failures are all per-tick conditions that the run loop
 // recovers from on the next tick.
 func (s *Service) Start(ctx context.Context) error {
-	s.logger.Info("starting watchdog service",
+	s.logger.Info(
+		"starting watchdog service",
 		zap.Duration("interval", s.wd.cfg.Interval),
 		zap.Duration("stale_threshold", s.wd.cfg.StaleThreshold),
 		zap.Uint64("recency_depth", s.wd.cfg.RecencyDepth),

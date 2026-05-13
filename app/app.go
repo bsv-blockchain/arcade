@@ -227,7 +227,8 @@ func initChaintracks(ctx context.Context, cfg *config.Config, logger *zap.Logger
 	}
 
 	network, _ := ct.GetNetwork(ctx)
-	logger.Info("chaintracks initialized",
+	logger.Info(
+		"chaintracks initialized",
 		zap.String("storage_path", cfg.Chaintracks.StoragePath),
 		zap.String("network", network),
 	)

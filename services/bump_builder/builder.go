@@ -136,7 +136,8 @@ func (b *Builder) chainHeaderRootValidator(ctx context.Context, blockHash string
 			// Soft-fail: log and accept the response. Post-build
 			// ValidateCompoundRoot is still the final guard.
 			if lookupErr != nil && !errors.Is(lookupErr, context.Canceled) {
-				logger.Debug("chaintracks header lookup failed; skipping canonical-root validation",
+				logger.Debug(
+					"chaintracks header lookup failed; skipping canonical-root validation",
 					zap.String("block_hash", blockHash),
 					zap.Error(lookupErr),
 				)
@@ -158,21 +159,6 @@ func (b *Builder) chainHeaderRootValidator(ctx context.Context, blockHash string
 	}
 }
 
-// publishStatus fans a status update to the events Publisher. Non-fatal —
-// SSE catchup and the durable store row recover any drops.
-func (b *Builder) publishStatus(ctx context.Context, status *models.TransactionStatus) {
-	if b.publisher == nil || status == nil {
-		return
-	}
-	if err := b.publisher.Publish(ctx, status); err != nil {
-		b.logger.Warn("failed to publish status update",
-			zap.String("txid", status.TxID),
-			zap.String("status", string(status.Status)),
-			zap.Error(err),
-		)
-	}
-}
-
 // markMinedAndPublish moves the txids to MINED and fans the resulting status
 // updates out to the events Publisher. blockHeight is required so each
 // published status carries the block-height anchor that downstream SSE /
@@ -186,19 +172,41 @@ func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, b
 		logger.Error("failed to set mined status", zap.Error(err))
 		return
 	}
-	logger.Info("set transactions to MINED",
+	logger.Info(
+		"set transactions to MINED",
 		zap.Int("count", len(mined)),
 		zap.Uint64("block_height", blockHeight),
 	)
-	// SetMinedByTxIDs returns full status objects only for the rows it
-	// actually updated — silently skipping txids without an existing record.
-	// Publish the rich rows directly so SSE clients receive blockHash /
-	// blockHeight / merklePath in their status updates.
+	metrics.BumpBuilderTxidsMinedTotal.Add(float64(len(mined)))
+	if len(mined) == 0 {
+		return
+	}
+	// Coalesce the N-per-block MINED fan-out into ONE bulk event. Without
+	// this, a single BUMP build for a 14k-tx block produced 14k individual
+	// publish calls, which overran the webhook service's 1024-cap work
+	// queue and triggered ~185k drops/block. Subscribers (SSE, webhook)
+	// unfan from the bulk template in their own handlers — they own the
+	// per-tx delivery cost, but they don't pay the channel-saturation cost.
+	publishTxIDs := make([]string, 0, len(mined))
 	for _, st := range mined {
-		if st.BlockHeight == 0 {
-			st.BlockHeight = blockHeight
+		publishTxIDs = append(publishTxIDs, st.TxID)
+	}
+	template := &models.TransactionStatus{
+		Status:      models.StatusMined,
+		BlockHash:   blockHash,
+		BlockHeight: blockHeight,
+		Timestamp:   time.Now(),
+		TxIDs:       publishTxIDs,
+	}
+	if b.publisher != nil {
+		if pubErr := b.publisher.PublishBulk(ctx, template); pubErr != nil {
+			logger.Warn(
+				"failed to publish bulk MINED",
+				zap.String("block_hash", blockHash),
+				zap.Int("txid_count", len(publishTxIDs)),
+				zap.Error(pubErr),
+			)
 		}
-		b.publishStatus(ctx, st)
 	}
 }
 
@@ -219,7 +227,8 @@ func (b *Builder) Start(ctx context.Context) error {
 	}
 	b.consumer = consumer
 
-	b.logger.Info("bump builder started",
+	b.logger.Info(
+		"bump builder started",
 		zap.Int("grace_window_ms", b.cfg.BumpBuilder.GraceWindowMs),
 	)
 
@@ -275,7 +284,8 @@ func (b *Builder) pruneOrphanStumps(ctx context.Context) {
 		}
 		rows, err := b.store.ListBlockProcessingStatus(ctx, cursor, pageSize)
 		if err != nil {
-			b.logger.Warn("orphan-stump prune: list failed",
+			b.logger.Warn(
+				"orphan-stump prune: list failed",
 				zap.Uint64("cursor", cursor),
 				zap.Error(err),
 			)
@@ -291,7 +301,8 @@ func (b *Builder) pruneOrphanStumps(ctx context.Context) {
 			}
 			// Idempotent: no-op when there are no stumps for the block.
 			if err := b.store.DeleteStumpsByBlockHash(ctx, r.BlockHash); err != nil {
-				b.logger.Warn("orphan-stump prune: delete failed",
+				b.logger.Warn(
+					"orphan-stump prune: delete failed",
 					zap.String("block_hash", r.BlockHash),
 					zap.Error(err),
 				)
@@ -310,7 +321,8 @@ func (b *Builder) pruneOrphanStumps(ctx context.Context) {
 		}
 		cursor = oldest.BlockHeight
 	}
-	b.logger.Info("orphan-stump prune complete",
+	b.logger.Info(
+		"orphan-stump prune complete",
 		zap.Uint64("tip", tip),
 		zap.Uint64("recency_depth", depth),
 		zap.Int("scanned", scanned),
@@ -421,7 +433,8 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 		validator = combineValidators(validator, b.chainHeaderRootValidator(ctx, blockHash, logger))
 	}
 
-	logger.Debug("fetching block data from datahub",
+	logger.Debug(
+		"fetching block data from datahub",
 		zap.Strings("datahub_urls", endpoints),
 		zap.Int("min_subtrees", minSubtrees),
 	)
@@ -432,7 +445,8 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 		outcome = "fetch_failed"
 		return fmt.Errorf("fetching block data: %w", err)
 	}
-	logger.Debug("datahub fetch succeeded",
+	logger.Debug(
+		"datahub fetch succeeded",
 		zap.Int("subtree_count", len(subtreeHashes)),
 		zap.Bool("has_coinbase_bump", coinbaseBUMP != nil),
 		zap.Bool("has_header_merkle_root", headerMerkleRoot != nil),
@@ -501,7 +515,8 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 		logger.Warn("failed to clean up STUMPs", zap.Error(err))
 	}
 
-	logger.Info("BUMP built successfully",
+	logger.Info(
+		"BUMP built successfully",
 		zap.Int("tracked_txids", len(tracked)),
 		zap.Int("level0_count", len(txids)),
 		zap.Int("stumps_pruned", len(stumps)),
@@ -547,7 +562,8 @@ func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, block
 	}
 	metrics.BumpBuilderShortCircuitTotal.Inc()
 	tracked := b.filterTrackedTxids(txids)
-	logger.Info("BUMP already built — skipping datahub fetch on redelivery",
+	logger.Info(
+		"BUMP already built — skipping datahub fetch on redelivery",
 		zap.Int("level0_count", len(txids)),
 		zap.Int("tracked_count", len(tracked)),
 		zap.Uint64("block_height", existingHeight),
@@ -614,7 +630,8 @@ func logStumpInputs(logger *zap.Logger, stumps []*models.Stump) {
 		for i, h := range leaves {
 			leafHex[i] = h.String()
 		}
-		logger.Debug("stump input",
+		logger.Debug(
+			"stump input",
 			zap.Int("subtree_index", s.SubtreeIndex),
 			zap.Int("stump_bytes", len(s.StumpData)),
 			zap.String("stump_hex", hex.EncodeToString(s.StumpData)),
@@ -634,7 +651,8 @@ func logBlockInputs(logger *zap.Logger, subtreeHashes []chainhash.Hash, coinbase
 	for i, h := range subtreeHashes {
 		subtreeHex[i] = h.String()
 	}
-	logger.Debug("block inputs",
+	logger.Debug(
+		"block inputs",
 		zap.Int("subtree_count", len(subtreeHashes)),
 		zap.Strings("subtree_hashes", subtreeHex),
 	)
@@ -649,7 +667,8 @@ func logBlockInputs(logger *zap.Logger, subtreeHashes []chainhash.Hash, coinbase
 				}
 			}
 		}
-		logger.Debug("coinbase bump",
+		logger.Debug(
+			"coinbase bump",
 			zap.Int("bytes", len(coinbaseBUMP)),
 			zap.String("hex", hex.EncodeToString(coinbaseBUMP)),
 			zap.String("coinbase_txid", cbTxID),
@@ -667,20 +686,23 @@ func logPerStumpAssembly(logger *zap.Logger, stumps []*models.Stump, subtreeHash
 	for _, s := range stumps {
 		full, _, err := bump.AssembleBUMP(s.StumpData, s.SubtreeIndex, subtreeHashes, coinbaseBUMP)
 		if err != nil {
-			logger.Debug("per-stump assembly failed",
+			logger.Debug(
+				"per-stump assembly failed",
 				zap.Int("subtree_index", s.SubtreeIndex),
 				zap.Error(err),
 			)
 			continue
 		}
-		logger.Debug("per-stump assembly",
+		logger.Debug(
+			"per-stump assembly",
 			zap.Int("subtree_index", s.SubtreeIndex),
 			zap.Uint32("block_height", full.BlockHeight),
 			zap.Int("levels", len(full.Path)),
 			zap.String("full_bump_hex", hex.EncodeToString(full.Bytes())),
 		)
 		for level, elems := range full.Path {
-			logger.Debug("per-stump level",
+			logger.Debug(
+				"per-stump level",
 				zap.Int("subtree_index", s.SubtreeIndex),
 				zap.Int("level", level),
 				zap.String("elements", formatPathElements(elems)),
@@ -695,7 +717,8 @@ func logCompoundBUMP(logger *zap.Logger, compound *transaction.MerklePath, bumpB
 	if !logger.Core().Enabled(zap.DebugLevel) {
 		return
 	}
-	logger.Debug("compound bump",
+	logger.Debug(
+		"compound bump",
 		zap.Uint32("block_height", compound.BlockHeight),
 		zap.Int("levels", len(compound.Path)),
 		zap.Int("bytes", len(bumpBytes)),
@@ -704,7 +727,8 @@ func logCompoundBUMP(logger *zap.Logger, compound *transaction.MerklePath, bumpB
 		zap.Strings("txids", txids),
 	)
 	for level, elems := range compound.Path {
-		logger.Debug("compound bump level",
+		logger.Debug(
+			"compound bump level",
 			zap.Int("level", level),
 			zap.Int("element_count", len(elems)),
 			zap.String("elements", formatPathElements(elems)),
@@ -749,7 +773,8 @@ func dumpBUMPFailureInputs(
 		headerRootHex = headerMerkleRoot.String()
 	}
 
-	logger.Error("compound BUMP validation failed — refusing to persist",
+	logger.Error(
+		"compound BUMP validation failed — refusing to persist",
 		zap.Error(validationErr),
 		zap.String("header_merkle_root", headerRootHex),
 		zap.Int("stump_count", len(stumps)),

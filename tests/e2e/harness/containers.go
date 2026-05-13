@@ -127,7 +127,8 @@ func StartContainers(ctx context.Context, t *testing.T, opts MerkleStartOptions)
 // host. Used by harness.New() to thread the gateway into the libp2p
 // host before any container starts up.
 func newNetworkWithGateway(ctx context.Context) (*testcontainers.DockerNetwork, string, error) {
-	nw, err := network.New(ctx,
+	nw, err := network.New(
+		ctx,
 		network.WithDriver("bridge"),
 		network.WithLabels(map[string]string{"arcade-e2e": "true"}),
 	)
@@ -168,7 +169,8 @@ func startContainersOnNetwork(ctx context.Context, t *testing.T, opts MerkleStar
 	// listener is up; merkle-service then tries to dial Postgres and
 	// fails with `connection refused` (issue surfaced in CI run
 	// 25600805894).
-	pg, err := postgres.Run(ctx,
+	pg, err := postgres.Run(
+		ctx,
 		"postgres:17-alpine",
 		postgres.WithDatabase(postgresDB),
 		postgres.WithUsername(postgresUser),
@@ -187,7 +189,8 @@ func startContainersOnNetwork(ctx context.Context, t *testing.T, opts MerkleStar
 	// the network at the alias:port we name here. The default listener
 	// remains the host-mapped one, used by the Container.KafkaSeedBroker
 	// helper for host-side test debug.
-	rp, err := redpanda.Run(ctx,
+	rp, err := redpanda.Run(
+		ctx,
 		"docker.redpanda.com/redpandadata/redpanda:v25.2.4",
 		redpanda.WithAutoCreateTopics(),
 		redpanda.WithListener(fmt.Sprintf("%s:%d", netAliasRedpanda, inNetworkKafkaPort)),
@@ -240,7 +243,8 @@ func startContainersOnNetwork(ctx context.Context, t *testing.T, opts MerkleStar
 		env[k] = v
 	}
 
-	merkleC, err := testcontainers.Run(ctx, opts.Image,
+	merkleC, err := testcontainers.Run(
+		ctx, opts.Image,
 		testcontainers.WithEnv(env),
 		// host-gateway lets the container reach the host (and our in-process
 		// arcade callback receiver + datahub) at host.docker.internal.

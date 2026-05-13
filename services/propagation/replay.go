@@ -58,7 +58,8 @@ func (p *Propagator) runMerkleReplay(ctx context.Context) {
 	const batchSize = 1000
 
 	start := time.Now()
-	p.logger.Info("merkle-service replay starting",
+	p.logger.Info(
+		"merkle-service replay starting",
 		zap.Time("since", since),
 		zap.Int("concurrency", concurrency),
 	)
@@ -72,7 +73,8 @@ func (p *Propagator) runMerkleReplay(ctx context.Context) {
 		}
 		if err := p.merkleClient.RegisterBatch(ctx, batch, concurrency); err != nil {
 			failures += len(batch)
-			p.logger.Warn("merkle-service replay batch failed",
+			p.logger.Warn(
+				"merkle-service replay batch failed",
 				zap.Int("batch_size", len(batch)),
 				zap.Error(err),
 			)
@@ -112,13 +114,15 @@ func (p *Propagator) runMerkleReplay(ctx context.Context) {
 	flush()
 
 	if err != nil && !errors.Is(err, ctx.Err()) {
-		p.logger.Warn("merkle-service replay scan ended with error",
+		p.logger.Warn(
+			"merkle-service replay scan ended with error",
 			zap.Error(err),
 			zap.Int("scanned", scanned),
 			zap.Int("queued", queued),
 		)
 	}
-	p.logger.Info("merkle-service replay complete",
+	p.logger.Info(
+		"merkle-service replay complete",
 		zap.Duration("elapsed", time.Since(start)),
 		zap.Int("scanned", scanned),
 		zap.Int("queued", queued),

@@ -64,7 +64,8 @@ func (s *Server) validateCallbackURL(c *gin.Context, url string) bool {
 		return true
 	}
 	if err := callbackurl.ValidateURL(url, s.cfg.Callback.AllowPrivateIPs); err != nil {
-		s.logger.Warn("rejecting submit due to unsafe callback url",
+		s.logger.Warn(
+			"rejecting submit due to unsafe callback url",
 			zap.String("client_ip", c.ClientIP()),
 			zap.Error(err),
 		)
@@ -108,7 +109,8 @@ func (s *Server) recordSubmission(_ context.Context, txid string, opts submitOpt
 	case s.submissionCh <- submissionRecord{sub: sub}:
 	default:
 		metrics.APISubmissionRecorderDropTotal.Inc()
-		s.logger.Warn("submission recorder queue full; dropping (best-effort)",
+		s.logger.Warn(
+			"submission recorder queue full; dropping (best-effort)",
 			zap.String("txid", txid),
 		)
 	}
@@ -133,7 +135,8 @@ func (s *Server) publishStatus(ctx context.Context, status *models.TransactionSt
 		return
 	}
 	if err := s.publisher.Publish(ctx, status); err != nil {
-		s.logger.Warn("failed to publish status update",
+		s.logger.Warn(
+			"failed to publish status update",
 			zap.String("txid", status.TxID),
 			zap.String("status", string(status.Status)),
 			zap.Error(err),
@@ -584,7 +587,8 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	for offset < len(body) {
 		parsedTx, bytesUsed, parseErr := sdkTx.NewTransactionFromStream(body[offset:])
 		if parseErr != nil {
-			s.logger.Error("failed to parse transaction in batch",
+			s.logger.Error(
+				"failed to parse transaction in batch",
 				zap.Int("offset", offset),
 				zap.Int("parsed", len(msgs)),
 				zap.Error(parseErr),

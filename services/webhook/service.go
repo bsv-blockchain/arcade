@@ -126,7 +126,8 @@ func (s *Service) Start(ctx context.Context) error {
 		workers = defaultMaxConcurrentDeliveries
 	}
 
-	s.logger.Info("webhook service started",
+	s.logger.Info(
+		"webhook service started",
 		zap.Int("max_retries", s.cfg.MaxRetries),
 		zap.Int("http_timeout_ms", s.cfg.HTTPTimeoutMs),
 		zap.Int("max_concurrent_deliveries", workers),
@@ -175,7 +176,8 @@ func (s *Service) Start(ctx context.Context) error {
 				// would multiply the impact across this and other
 				// subscribers in the same publisher).
 				metrics.WebhookPoolSaturatedTotal.Inc()
-				s.logger.Warn("webhook delivery pool saturated, dropping status",
+				s.logger.Warn(
+					"webhook delivery pool saturated, dropping status",
 					zap.String("txid", status.TxID),
 					zap.String("status", string(status.Status)),
 				)
@@ -193,12 +195,33 @@ func (s *Service) Stop() error {
 	return nil
 }
 
-// handleUpdate dispatches a single status update to every submission
-// registered for that txid.
+// handleUpdate dispatches a status update to every submission registered
+// for the affected txid(s). For bulk events (status.TxIDs non-empty) it
+// iterates the txids and dispatches each, so ONE queue entry covers an
+// entire block's MINED fan-out without holding 14k slots in the work
+// channel. The expensive bit — N store.GetSubmissionsByTxID calls — runs
+// inside the worker, never blocking the channel reader.
 func (s *Service) handleUpdate(ctx context.Context, status *models.TransactionStatus) {
+	if len(status.TxIDs) == 0 {
+		s.dispatchOne(ctx, status)
+		return
+	}
+	for _, txid := range status.TxIDs {
+		perTx := *status
+		perTx.TxID = txid
+		perTx.TxIDs = nil
+		s.dispatchOne(ctx, &perTx)
+	}
+}
+
+// dispatchOne handles a single-tx status update: look up registered
+// submissions and deliver to those whose CallbackURL is set and whose
+// shouldDeliver gating matches.
+func (s *Service) dispatchOne(ctx context.Context, status *models.TransactionStatus) {
 	subs, err := s.store.GetSubmissionsByTxID(ctx, status.TxID)
 	if err != nil {
-		s.logger.Warn("submission lookup failed",
+		s.logger.Warn(
+			"submission lookup failed",
 			zap.String("txid", status.TxID),
 			zap.Error(err),
 		)

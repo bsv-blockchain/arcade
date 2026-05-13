@@ -49,14 +49,15 @@ func startEmbedded(cfg config.Postgres) (dsn string, stop func() error, err erro
 		db = "arcade"
 	}
 
-	ep := embedded.NewDatabase(embedded.DefaultConfig().
-		Username(user).
-		Password(pass).
-		Database(db).
-		Port(port).
-		DataPath(cfg.EmbeddedDataDir).
-		RuntimePath(cfg.EmbeddedCacheDir).
-		BinariesPath(cfg.EmbeddedCacheDir),
+	ep := embedded.NewDatabase(
+		embedded.DefaultConfig().
+			Username(user).
+			Password(pass).
+			Database(db).
+			Port(port).
+			DataPath(cfg.EmbeddedDataDir).
+			RuntimePath(cfg.EmbeddedCacheDir).
+			BinariesPath(cfg.EmbeddedCacheDir),
 	)
 	if err := ep.Start(); err != nil {
 		return "", nil, fmt.Errorf("start embedded postgres on port %d: %w", port, err)

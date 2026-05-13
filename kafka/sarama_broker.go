@@ -127,7 +127,8 @@ func (b *saramaBroker) startAsyncDrainers() {
 				topic = produceErr.Msg.Topic
 			}
 			metrics.KafkaProduceErrors.WithLabelValues(topic).Inc()
-			b.logger.Error("async kafka produce failed",
+			b.logger.Error(
+				"async kafka produce failed",
 				zap.String("topic", topic),
 				zap.Error(produceErr.Err),
 			)

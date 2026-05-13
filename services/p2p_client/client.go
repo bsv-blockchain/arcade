@@ -96,7 +96,8 @@ func (c *Client) Name() string { return "p2p-client" }
 
 func (c *Client) Start(ctx context.Context) error {
 	if !c.cfg.P2P.DatahubDiscovery {
-		c.logger.Info("p2p discovery disabled",
+		c.logger.Info(
+			"p2p discovery disabled",
 			zap.Bool("datahub_discovery", false),
 		)
 		// Block until parent shutdown so the service stays in the service
@@ -145,7 +146,8 @@ func (c *Client) Start(ctx context.Context) error {
 
 	msgs := b.SubscribeNodeStatus(ctx)
 
-	c.logger.Info("p2p discovery enabled",
+	c.logger.Info(
+		"p2p discovery enabled",
 		zap.String("network", c.cfg.Network),
 		zap.String("topic_network", p2pCfg.Network),
 		zap.String("peer_id", b.GetID()),
@@ -240,7 +242,8 @@ func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatu
 	raw := pickDatahubURL(msg)
 	if raw == "" {
 		metrics.P2PEndpointDiscoveryTotal.WithLabelValues("no_url").Inc()
-		c.logger.Debug("node_status has no datahub url",
+		c.logger.Debug(
+			"node_status has no datahub url",
 			zap.String("peer_id", msg.PeerID),
 		)
 		return
@@ -249,7 +252,8 @@ func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatu
 	normalized, err := validateURL(raw, c.cfg.P2P.AllowPrivateURLs)
 	if err != nil {
 		metrics.P2PEndpointDiscoveryTotal.WithLabelValues("invalid").Inc()
-		c.logger.Warn("rejected discovered datahub url",
+		c.logger.Warn(
+			"rejected discovered datahub url",
 			zap.String("peer_id", msg.PeerID),
 			zap.String("url", raw),
 			zap.Error(err),
@@ -265,11 +269,13 @@ func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatu
 	}
 	if added == 1 {
 		eps := c.teranode.GetEndpoints()
-		c.logger.Info("registered peer datahub url",
+		c.logger.Info(
+			"registered peer datahub url",
 			zap.String("peer_id", msg.PeerID),
 			zap.String("url", normalized),
 		)
-		c.logger.Debug("endpoint count changed",
+		c.logger.Debug(
+			"endpoint count changed",
 			zap.Int("total_endpoints", len(eps)),
 		)
 	}
@@ -289,7 +295,8 @@ func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatu
 		})
 		cancel()
 		if err != nil {
-			c.logger.Warn("failed to persist discovered datahub url",
+			c.logger.Warn(
+				"failed to persist discovered datahub url",
 				zap.String("url", normalized),
 				zap.Error(err),
 			)

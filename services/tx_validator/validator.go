@@ -127,7 +127,8 @@ func (v *Validator) publishStatus(ctx context.Context, status *models.Transactio
 		return
 	}
 	if err := v.publisher.Publish(ctx, status); err != nil {
-		v.logger.Warn("failed to publish status update",
+		v.logger.Warn(
+			"failed to publish status update",
 			zap.String("txid", status.TxID),
 			zap.String("status", string(status.Status)),
 			zap.Error(err),
@@ -204,7 +205,8 @@ func (v *Validator) runPublisher(ctx context.Context) {
 				if v.maxPending > 0 && len(v.publishCarry) > v.maxPending {
 					excess := len(v.publishCarry) - v.maxPending
 					v.publishCarry = v.publishCarry[excess:]
-					v.logger.Warn("publish carry exceeded max_pending; dropped oldest",
+					v.logger.Warn(
+						"publish carry exceeded max_pending; dropped oldest",
 						zap.Int("dropped", excess),
 						zap.Int("retained", len(v.publishCarry)),
 					)
@@ -212,7 +214,8 @@ func (v *Validator) runPublisher(ctx context.Context) {
 				carryDepth := len(v.publishCarry)
 				v.mu.Unlock()
 				metrics.TxValidatorPublishCarryDepth.Set(float64(carryDepth))
-				v.logger.Warn("propagation publish failed; retained in carry",
+				v.logger.Warn(
+					"propagation publish failed; retained in carry",
 					zap.Int("batch", len(batch)),
 					zap.Int("carry_depth", carryDepth),
 					zap.Error(err),
@@ -382,7 +385,8 @@ func (v *Validator) flushValidations(ctx context.Context) error {
 	metrics.TxValidatorOutcomeTotal.WithLabelValues("duplicate").Add(float64(len(dups)))
 	metrics.TxValidatorOutcomeTotal.WithLabelValues("parse_fail").Add(float64(parseFails))
 	metrics.TxValidatorFlushDuration.WithLabelValues("success").Observe(time.Since(start).Seconds())
-	v.logger.Info("validation flush complete",
+	v.logger.Info(
+		"validation flush complete",
 		zap.Int("count", len(batch)),
 		zap.Int("parsed", len(parsed)-parseFails),
 		zap.Int("parse_fails", parseFails),
@@ -572,7 +576,8 @@ func (v *Validator) phaseValidate(ctx context.Context, live []*validatedTx) {
 			if err := v.txValidator.ValidateTransaction(gctx, vt.parsed, true, true); err != nil {
 				vt.rejected = true
 				vt.rejectReason = err.Error()
-				v.logger.Info("transaction validation failed",
+				v.logger.Info(
+					"transaction validation failed",
 					zap.String("txid", vt.txid),
 					zap.Error(err),
 				)
@@ -604,7 +609,8 @@ func (v *Validator) phasePersistRejects(ctx context.Context, rejects []*validate
 		}
 	}
 	if err := v.store.BatchUpdateStatus(ctx, updates); err != nil {
-		v.logger.Error("failed to persist rejected statuses",
+		v.logger.Error(
+			"failed to persist rejected statuses",
 			zap.Int("count", len(rejects)),
 			zap.Error(err),
 		)

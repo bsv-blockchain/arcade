@@ -62,7 +62,8 @@ func (s *Server) handleReprocessBlock(c *gin.Context) {
 
 	var fail *merkleservice.ReprocessError
 	if errors.As(err, &fail) {
-		s.logger.Warn("reprocess rejected by merkle-service",
+		s.logger.Warn(
+			"reprocess rejected by merkle-service",
 			zap.String("block_hash", hash),
 			zap.Int("upstream_status", fail.StatusCode),
 			zap.String("upstream_body", fail.Body),
@@ -81,7 +82,8 @@ func (s *Server) handleReprocessBlock(c *gin.Context) {
 		return
 	}
 
-	s.logger.Error("reprocess transport failure",
+	s.logger.Error(
+		"reprocess transport failure",
 		zap.String("block_hash", hash),
 		zap.Error(err),
 	)

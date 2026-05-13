@@ -26,6 +26,13 @@ import (
 // low-cardinality, stable identifier; treat it as a Prometheus label.
 type Publisher interface {
 	Publish(ctx context.Context, status *models.TransactionStatus) error
+	// PublishBulk fans a single template status across many txids. The
+	// publisher sends ONE event over the wire (TxIDs populated, TxID
+	// empty); subscribers unfan in their own handler. Used by bump-builder
+	// to coalesce per-block MINED bursts (N=14k+) into one event so the
+	// webhook service's bounded work queue can't saturate on BUMP fan-out.
+	// template.TxID is ignored; template.TxIDs must be non-empty.
+	PublishBulk(ctx context.Context, template *models.TransactionStatus) error
 	Subscribe(ctx context.Context, caller string) (<-chan *models.TransactionStatus, error)
 	Close() error
 }

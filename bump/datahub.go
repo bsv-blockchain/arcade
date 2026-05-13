@@ -95,7 +95,8 @@ func FetchBlockDataForBUMPWithOptions(ctx context.Context, datahubURLs []string,
 	for i, dataHubURL := range datahubURLs {
 		start := time.Now()
 		hashes, cbBUMP, root, status, fetchErr := fetchBlockBinary(ctx, dataHubURL, blockHash, maxBlockBytes)
-		logger.Debug("datahub fetch attempt",
+		logger.Debug(
+			"datahub fetch attempt",
 			zap.Int("idx", i),
 			zap.String("url", dataHubURL),
 			zap.Int("status", status),
@@ -109,7 +110,8 @@ func FetchBlockDataForBUMPWithOptions(ctx context.Context, datahubURLs []string,
 		}
 		if validator != nil {
 			if vErr := validator(hashes, root); vErr != nil {
-				logger.Warn("datahub response rejected by validator",
+				logger.Warn(
+					"datahub response rejected by validator",
 					zap.Int("idx", i),
 					zap.String("url", dataHubURL),
 					zap.Int("subtree_count", len(hashes)),

@@ -346,7 +346,8 @@ func makeMinimalSTUMP(txidHex string) []byte {
 	}
 
 	buf := make([]byte, 0, 5+len(txidBytes))
-	buf = append(buf,
+	buf = append(
+		buf,
 		0x01, // blockHeight = 1
 		0x01, // treeHeight = 1 (one level)
 		0x01, // nLeaves at level 0 = 1
@@ -416,7 +417,8 @@ func makeTwoLeafSTUMP(txidHex, siblingHex string) []byte {
 	}
 
 	buf := make([]byte, 0, 5+len(txidBytes)+2+len(sibBytes))
-	buf = append(buf,
+	buf = append(
+		buf,
 		0x01, // blockHeight = 1
 		0x01, // treeHeight = 1
 		0x02, // nLeaves at level 0 = 2
@@ -424,7 +426,8 @@ func makeTwoLeafSTUMP(txidHex, siblingHex string) []byte {
 		0x02, // flags: txid
 	)
 	buf = append(buf, txidBytes...)
-	buf = append(buf,
+	buf = append(
+		buf,
 		0x01, // offset 1
 		0x00, // flags: data
 	)
@@ -548,7 +551,8 @@ func TestBuilder_HandleMessage_ShortCircuit_BUMPAlreadyExists(t *testing.T) {
 	subtreeHash := mustHash(t, testTxidHex)
 	compound, _, err := bump.BuildCompoundBUMP(
 		[]*models.Stump{{BlockHash: blockHash, SubtreeIndex: 0, StumpData: stumpData}},
-		[]chainhash.Hash{subtreeHash}, nil)
+		[]chainhash.Hash{subtreeHash}, nil,
+	)
 	if err != nil {
 		t.Fatalf("BuildCompoundBUMP: %v", err)
 	}
@@ -1015,6 +1019,21 @@ func (p *recordingPublisher) Publish(_ context.Context, status *models.Transacti
 	return nil
 }
 
+// PublishBulk fans the template into one published entry per TxID so tests
+// that drive the bump-builder MINED path can assert per-tx behavior with
+// the existing snapshot() helper, unchanged.
+func (p *recordingPublisher) PublishBulk(_ context.Context, template *models.TransactionStatus) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, txid := range template.TxIDs {
+		cp := *template
+		cp.TxID = txid
+		cp.TxIDs = nil
+		p.published = append(p.published, &cp)
+	}
+	return nil
+}
+
 func (p *recordingPublisher) Subscribe(context.Context, string) (<-chan *models.TransactionStatus, error) {
 	return nil, errors.New("recordingPublisher: Subscribe not used in tests")
 }
@@ -1041,6 +1060,60 @@ func makeMinimalSTUMPAtHeight(t *testing.T, txidHex string, blockHeight uint32) 
 		{{Offset: 0, Hash: &txHash, Txid: &isTxid}},
 	})
 	return mp.Bytes()
+}
+
+// TestBuilder_MarkMinedAndPublish_UsesBulkEvent covers the coalesced fan-out:
+// markMinedAndPublish must call publisher.PublishBulk exactly once for the
+// whole block (instead of one Publish per tx), and the bulk event must
+// carry every mined txid in TxIDs[]. Without this, a 14k-tx block produced
+// 14k publish events and overran the webhook service's 1024-cap work queue
+// (~185k drops observed in production).
+func TestBuilder_MarkMinedAndPublish_UsesBulkEvent(t *testing.T) {
+	ms := newMockStore()
+	pub := &recordingPublisher{}
+
+	blockHash := testBlockHash
+	const blockHeight uint64 = 18700
+
+	// Three mined txids — enough to prove the bulk packing, small enough to
+	// keep the test trivial. The mock store accepts any txids; the actual
+	// MINED transition cascade is exercised by other tests.
+	txids := []string{
+		"1111111111111111111111111111111111111111111111111111111111111111",
+		"2222222222222222222222222222222222222222222222222222222222222222",
+		"3333333333333333333333333333333333333333333333333333333333333333",
+	}
+
+	b := newTestBuilder(ms, "http://unused.example/api/v1")
+	b.publisher = pub
+
+	b.markMinedAndPublish(context.Background(), zap.NewNop(), blockHash, blockHeight, txids)
+
+	// recordingPublisher.PublishBulk unfans into one entry per TxID for
+	// assertion convenience, so snapshot() shows N entries — but the
+	// publisher saw exactly one PublishBulk call. Each entry must carry the
+	// shared template fields and TxIDs must be cleared on the unfanned copy.
+	emitted := pub.snapshot()
+	if len(emitted) != len(txids) {
+		t.Fatalf("expected %d unfanned entries from one bulk event, got %d", len(txids), len(emitted))
+	}
+	for i, st := range emitted {
+		if st.TxID != txids[i] {
+			t.Errorf("entry[%d].TxID = %q, want %q", i, st.TxID, txids[i])
+		}
+		if st.Status != models.StatusMined {
+			t.Errorf("entry[%d].Status = %q, want MINED", i, st.Status)
+		}
+		if st.BlockHash != blockHash {
+			t.Errorf("entry[%d].BlockHash = %q, want %q", i, st.BlockHash, blockHash)
+		}
+		if st.BlockHeight != blockHeight {
+			t.Errorf("entry[%d].BlockHeight = %d, want %d", i, st.BlockHeight, blockHeight)
+		}
+		if len(st.TxIDs) != 0 {
+			t.Errorf("entry[%d] still carries TxIDs after unfan: %v", i, st.TxIDs)
+		}
+	}
 }
 
 // TestBuilder_HandleMessage_PublishesMinedStatusWithBlockHeight is the

@@ -161,7 +161,8 @@ func (s *fakeStore) Close() error { return nil }
 // the webhook tests drive handleUpdate directly.
 type recordingPub struct{}
 
-func (recordingPub) Publish(context.Context, *models.TransactionStatus) error { return nil }
+func (recordingPub) Publish(context.Context, *models.TransactionStatus) error     { return nil }
+func (recordingPub) PublishBulk(context.Context, *models.TransactionStatus) error { return nil }
 func (recordingPub) Subscribe(context.Context, string) (<-chan *models.TransactionStatus, error) {
 	return nil, errors.New("not used in tests")
 }
@@ -174,7 +175,8 @@ type scriptedPub struct {
 	ch chan *models.TransactionStatus
 }
 
-func (p *scriptedPub) Publish(context.Context, *models.TransactionStatus) error { return nil }
+func (p *scriptedPub) Publish(context.Context, *models.TransactionStatus) error     { return nil }
+func (p *scriptedPub) PublishBulk(context.Context, *models.TransactionStatus) error { return nil }
 func (p *scriptedPub) Subscribe(context.Context, string) (<-chan *models.TransactionStatus, error) {
 	return p.ch, nil
 }

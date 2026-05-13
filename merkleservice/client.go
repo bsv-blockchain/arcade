@@ -96,7 +96,8 @@ func (c *Client) Register(ctx context.Context, txid, callbackURL, callbackToken 
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		err := fmt.Errorf("POST %s: merkle service returned status %d (body: %s)", url, resp.StatusCode, string(body))
 		if c.logger != nil {
-			c.logger.Debug("merkle service registration failed",
+			c.logger.Debug(
+				"merkle service registration failed",
 				zap.String("url", url),
 				zap.String("txid", txid),
 				zap.Int("status_code", resp.StatusCode),
@@ -166,7 +167,8 @@ func (c *Client) Reprocess(ctx context.Context, blockHash, callbackURL, callback
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		fail := &ReprocessError{StatusCode: resp.StatusCode, Body: string(respBody)}
 		if c.logger != nil {
-			c.logger.Debug("merkle service /reprocess failed",
+			c.logger.Debug(
+				"merkle service /reprocess failed",
 				zap.String("url", url),
 				zap.String("block_hash", blockHash),
 				zap.Int("status_code", resp.StatusCode),

@@ -173,7 +173,8 @@ func (c *ConsumerGroup) processOne(claim Claim, msg *Message) {
 		// rebalance / pod restart will retry from the same offset.
 		if dlqErr := c.sendToDLQ(msg, err); dlqErr != nil {
 			metrics.KafkaDLQPublishFailures.WithLabelValues(msg.Topic).Inc()
-			c.logger.Error("DLQ publish failed; leaving offset uncommitted for redelivery",
+			c.logger.Error(
+				"DLQ publish failed; leaving offset uncommitted for redelivery",
 				zap.String("topic", msg.Topic),
 				zap.Int32("partition", msg.Partition),
 				zap.Int64("offset", msg.Offset),
@@ -207,7 +208,8 @@ func (c *ConsumerGroup) processWithRetry(ctx context.Context, msg *Message) erro
 		}
 		if err := c.handler(ctx, msg); err != nil {
 			lastErr = err
-			c.logger.Warn("message processing failed, retrying",
+			c.logger.Warn(
+				"message processing failed, retrying",
 				zap.String("topic", msg.Topic),
 				zap.Int32("partition", msg.Partition),
 				zap.Int64("offset", msg.Offset),
@@ -234,7 +236,8 @@ func (c *ConsumerGroup) processWithRetry(ctx context.Context, msg *Message) erro
 // dropping is the only sane outcome.
 func (c *ConsumerGroup) sendToDLQ(msg *Message, processErr error) error {
 	if c.producer == nil {
-		c.logger.Error("no producer configured for DLQ — dropping failed message",
+		c.logger.Error(
+			"no producer configured for DLQ — dropping failed message",
 			zap.String("topic", msg.Topic),
 			zap.Int64("offset", msg.Offset),
 		)
@@ -255,14 +258,16 @@ func (c *ConsumerGroup) sendToDLQ(msg *Message, processErr error) error {
 		return nil
 	}
 	if err := c.producer.SendRaw(dlqTopic, string(msg.Key), data); err != nil {
-		c.logger.Error("failed to send to DLQ",
+		c.logger.Error(
+			"failed to send to DLQ",
 			zap.String("dlq_topic", dlqTopic),
 			zap.Error(err),
 		)
 		return fmt.Errorf("publishing to DLQ %q: %w", dlqTopic, err)
 	}
 	metrics.KafkaMessagesTotal.WithLabelValues(msg.Topic, "dlq").Inc()
-	c.logger.Info("message sent to DLQ",
+	c.logger.Info(
+		"message sent to DLQ",
 		zap.String("dlq_topic", dlqTopic),
 		zap.String("original_topic", msg.Topic),
 		zap.Int32("partition", msg.Partition),

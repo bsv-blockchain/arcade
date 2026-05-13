@@ -94,6 +94,12 @@ func newManager(ctx context.Context, publisher events.Publisher, st store.Store,
 
 // run drains the upstream subscription and fans every update out to
 // clients. Exits when ctx is canceled or the upstream channel closes.
+//
+// Bulk events (status.TxIDs non-empty) are unfanned here: SSE clients
+// expect a stream of per-tx events, so each entry in TxIDs is turned into
+// its own TransactionStatus before fan-out. The bump-builder coalesces
+// per-block MINED bursts into one bulk event so the webhook service's
+// bounded work queue can't saturate — the unfan cost lives downstream.
 func (m *Manager) run(ctx context.Context, in <-chan *models.TransactionStatus) {
 	for {
 		select {
@@ -106,7 +112,16 @@ func (m *Manager) run(ctx context.Context, in <-chan *models.TransactionStatus) 
 			if status == nil {
 				continue
 			}
-			m.fanOut(ctx, status)
+			if len(status.TxIDs) == 0 {
+				m.fanOut(ctx, status)
+				continue
+			}
+			for _, txid := range status.TxIDs {
+				perTx := *status
+				perTx.TxID = txid
+				perTx.TxIDs = nil
+				m.fanOut(ctx, &perTx)
+			}
 		}
 	}
 }
@@ -146,7 +161,8 @@ func (m *Manager) fanOut(ctx context.Context, status *models.TransactionStatus) 
 			metrics.APISSEDroppedTotal.WithLabelValues("client_gone").Inc()
 		default:
 			metrics.APISSEDroppedTotal.WithLabelValues("slow_client").Inc()
-			m.logger.Warn("dropping update for slow SSE client",
+			m.logger.Warn(
+				"dropping update for slow SSE client",
 				zap.Int64("client_id", c.ID),
 				zap.String("txid", status.TxID),
 			)
@@ -163,7 +179,8 @@ func (m *Manager) txBelongsToToken(ctx context.Context, txid, token string) bool
 	}
 	subs, err := m.store.GetSubmissionsByToken(ctx, token)
 	if err != nil {
-		m.logger.Warn("submission lookup failed",
+		m.logger.Warn(
+			"submission lookup failed",
 			zap.String("token", token),
 			zap.Error(err),
 		)

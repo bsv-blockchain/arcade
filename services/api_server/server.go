@@ -140,7 +140,8 @@ func (s *Server) runSubmissionRecorder(parentCtx context.Context, wg *sync.WaitG
 			}
 			ctx, cancel := context.WithTimeout(parentCtx, 5*time.Second)
 			if err := s.store.InsertSubmission(ctx, rec.sub); err != nil {
-				s.logger.Warn("failed to insert submission (async)",
+				s.logger.Warn(
+					"failed to insert submission (async)",
 					zap.String("txid", rec.sub.TxID),
 					zap.Error(err),
 				)
@@ -202,7 +203,8 @@ func (s *Server) requestLogger() gin.HandlerFunc {
 // requestLogger middleware still runs after this and emits the request line
 // at Error level for the recovered 500.
 func (s *Server) recoverPanic(c *gin.Context, recovered any) {
-	s.logger.Error("panic in handler",
+	s.logger.Error(
+		"panic in handler",
 		zap.Any("panic", recovered),
 		zap.String("method", c.Request.Method),
 		zap.String("path", c.Request.URL.Path),

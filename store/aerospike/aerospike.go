@@ -855,7 +855,8 @@ func (s *Store) GetBUMP(ctx context.Context, blockHash string) (uint64, []byte, 
 	if chunkCount <= 0 || totalSize < 0 || formatVersion != bumpFormatVersion {
 		return 0, nil, fmt.Errorf(
 			"get bump %s: invalid manifest (chunk_count=%d total_size=%d format_version=%d)",
-			blockHash, chunkCount, totalSize, formatVersion)
+			blockHash, chunkCount, totalSize, formatVersion,
+		)
 	}
 
 	var height uint64

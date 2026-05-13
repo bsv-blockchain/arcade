@@ -39,10 +39,20 @@ func (h *HexBytes) UnmarshalJSON(data []byte) error {
 // RawTx and NextRetryAt are set only while the tx is in PENDING_RETRY and
 // cleared on any terminal transition; they drive the durable retry reaper.
 type TransactionStatus struct {
-	TxID         string    `json:"txid"`
-	Status       Status    `json:"txStatus"`
-	StatusCode   int       `json:"status,omitempty"`
-	Timestamp    time.Time `json:"timestamp"`
+	TxID       string    `json:"txid"`
+	Status     Status    `json:"txStatus"`
+	StatusCode int       `json:"status,omitempty"`
+	Timestamp  time.Time `json:"timestamp"`
+	// TxIDs, when populated, marks this as a bulk-transition event: every
+	// txid in the slice carries the same Status/BlockHash/BlockHeight. Used
+	// by bump-builder's MINED fan-out to publish ONE Kafka event per block
+	// instead of N events per block, which previously saturated the webhook
+	// service's bounded work queue (~185k drops/block on testnet bursts).
+	// Subscribers detect bulk via len(TxIDs) > 0 and unfan in their own
+	// handler. omitempty so the HTTP API surface (single-tx status reads)
+	// is unaffected — TxIDs is never set on rows read from the store, only
+	// on transient events on the publisher channel.
+	TxIDs        []string  `json:"txids,omitempty"`
 	BlockHash    string    `json:"blockHash,omitempty"`
 	BlockHeight  uint64    `json:"blockHeight,omitempty"`
 	MerklePath   HexBytes  `json:"merklePath,omitempty"`
