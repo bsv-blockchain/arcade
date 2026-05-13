@@ -404,6 +404,14 @@ func (p *Propagator) registerBatch(ctx context.Context, batch []propagationMsg) 
 			zap.Int("registered", len(registered)),
 		)
 	}
+	switch {
+	case failedCount == 0:
+		metrics.PropagationMerkleRegisterBatchOutcomeTotal.WithLabelValues("fully_ok").Inc()
+	case len(registered) == 0:
+		metrics.PropagationMerkleRegisterBatchOutcomeTotal.WithLabelValues("all_failed").Inc()
+	default:
+		metrics.PropagationMerkleRegisterBatchOutcomeTotal.WithLabelValues("partial").Inc()
+	}
 	return registered
 }
 

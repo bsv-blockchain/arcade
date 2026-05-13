@@ -204,6 +204,186 @@ func TestRegisterBatch_EmptyReturnsNil(t *testing.T) {
 	}
 }
 
+func TestRegisterBatchWithResults_AllSucceed(t *testing.T) {
+	var count atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		count.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", 0)
+	regs := make([]Registration, 10)
+	for i := range regs {
+		regs[i] = Registration{TxID: "tx" + string(rune('0'+i)), CallbackURL: "http://cb"}
+	}
+
+	errs := client.RegisterBatchWithResults(context.Background(), regs, 5)
+	if len(errs) != len(regs) {
+		t.Fatalf("expected len(errs)=%d, got %d", len(regs), len(errs))
+	}
+	for i, e := range errs {
+		if e != nil {
+			t.Errorf("errs[%d]=%v want nil", i, e)
+		}
+	}
+	if count.Load() != 10 {
+		t.Errorf("expected 10 requests, got %d", count.Load())
+	}
+}
+
+// TestRegisterBatchWithResults_PartialFailure pins the key contract difference
+// versus RegisterBatch: this variant does NOT fail-fast — successes survive a
+// sibling's failure so the propagator can partition the batch and broadcast
+// the successes while routing failures to PENDING_RETRY.
+func TestRegisterBatchWithResults_PartialFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), "fail") {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", 0)
+	regs := []Registration{
+		{TxID: "ok-1", CallbackURL: "http://cb"},
+		{TxID: "fail-1", CallbackURL: "http://cb"},
+		{TxID: "ok-2", CallbackURL: "http://cb"},
+		{TxID: "fail-2", CallbackURL: "http://cb"},
+		{TxID: "ok-3", CallbackURL: "http://cb"},
+	}
+
+	errs := client.RegisterBatchWithResults(context.Background(), regs, 3)
+	if len(errs) != len(regs) {
+		t.Fatalf("expected len(errs)=%d, got %d", len(regs), len(errs))
+	}
+	wantNil := []int{0, 2, 4}
+	wantErr := []int{1, 3}
+	for _, i := range wantNil {
+		if errs[i] != nil {
+			t.Errorf("errs[%d]=%v want nil (tx %s)", i, errs[i], regs[i].TxID)
+		}
+	}
+	for _, i := range wantErr {
+		if errs[i] == nil {
+			t.Errorf("errs[%d]=nil want non-nil (tx %s)", i, regs[i].TxID)
+		}
+	}
+}
+
+func TestRegisterBatchWithResults_AllFail(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", 0)
+	regs := make([]Registration, 4)
+	for i := range regs {
+		regs[i] = Registration{TxID: "tx", CallbackURL: "http://cb"}
+	}
+
+	errs := client.RegisterBatchWithResults(context.Background(), regs, 2)
+	if len(errs) != len(regs) {
+		t.Fatalf("expected len(errs)=%d, got %d", len(regs), len(errs))
+	}
+	for i, e := range errs {
+		if e == nil {
+			t.Errorf("errs[%d]=nil want non-nil", i)
+		}
+	}
+}
+
+// TestRegisterBatchWithResults_ContextCanceled verifies that a cancellation
+// mid-batch still produces a per-index error slice the caller can partition —
+// the propagator relies on len(errs)==len(regs) to align failures with
+// pendingMsgs entries when routing to PENDING_RETRY.
+func TestRegisterBatchWithResults_ContextCanceled(t *testing.T) {
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	defer close(release)
+
+	client := NewClient(server.URL, "", 0)
+	regs := make([]Registration, 8)
+	for i := range regs {
+		regs[i] = Registration{TxID: "tx", CallbackURL: "http://cb"}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	errs := client.RegisterBatchWithResults(ctx, regs, 2)
+	if len(errs) != len(regs) {
+		t.Fatalf("expected len(errs)=%d, got %d", len(regs), len(errs))
+	}
+	var sawErr bool
+	for _, e := range errs {
+		if e != nil {
+			sawErr = true
+			break
+		}
+	}
+	if !sawErr {
+		t.Errorf("expected at least one non-nil error after context cancel, got all nil")
+	}
+}
+
+func TestRegisterBatchWithResults_EmptyReturnsNil(t *testing.T) {
+	client := NewClient("http://unused", "", 0)
+	errs := client.RegisterBatchWithResults(context.Background(), nil, 5)
+	if errs != nil {
+		t.Errorf("expected nil for empty batch, got %v", errs)
+	}
+}
+
+// TestRegisterBatchWithResults_ConcurrencyBounded covers the semaphore code
+// path at client.go:236-251, which is structurally different from
+// RegisterBatch's errgroup.SetLimit path and warrants its own assertion.
+func TestRegisterBatchWithResults_ConcurrencyBounded(t *testing.T) {
+	var concurrent atomic.Int32
+	var maxConcurrent atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		cur := concurrent.Add(1)
+		for {
+			old := maxConcurrent.Load()
+			if cur <= old || maxConcurrent.CompareAndSwap(old, cur) {
+				break
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+		concurrent.Add(-1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", 0)
+	regs := make([]Registration, 30)
+	for i := range regs {
+		regs[i] = Registration{TxID: "tx", CallbackURL: "http://cb"}
+	}
+
+	errs := client.RegisterBatchWithResults(context.Background(), regs, 3)
+	for i, e := range errs {
+		if e != nil {
+			t.Errorf("errs[%d]=%v want nil", i, e)
+		}
+	}
+	if maxConcurrent.Load() > 3 {
+		t.Errorf("expected max concurrency <= 3, got %d", maxConcurrent.Load())
+	}
+}
+
 func TestReprocess_AcceptedReturnsNil(t *testing.T) {
 	var gotPath, gotAuth string
 	var gotBody map[string]string

@@ -13,11 +13,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/merkleservice"
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/teranode"
@@ -851,6 +853,126 @@ func TestHandleMessage_PartialMerkleFailure_OnlyFailedMessageIsAborted(t *testin
 	}
 	if u := ms.lastUpdateForTxid("tx-good-b"); u == nil || u.Status != models.StatusAcceptedByNetwork {
 		t.Errorf("tx-good-b: expected ACCEPTED_BY_NETWORK status update, got %+v", u)
+	}
+}
+
+// batchOutcomeSnapshot captures the three label counters atomically. Counters
+// are process-global so we assert deltas rather than absolute values — other
+// tests in this package legitimately increment them too.
+func batchOutcomeSnapshot() (fullyOK, partial, allFailed float64) {
+	return testutil.ToFloat64(metrics.PropagationMerkleRegisterBatchOutcomeTotal.WithLabelValues("fully_ok")),
+		testutil.ToFloat64(metrics.PropagationMerkleRegisterBatchOutcomeTotal.WithLabelValues("partial")),
+		testutil.ToFloat64(metrics.PropagationMerkleRegisterBatchOutcomeTotal.WithLabelValues("all_failed"))
+}
+
+// TestRegisterBatch_Metric_FullyOK verifies the fully_ok label increments
+// exactly once per flushBatch when every tx registers cleanly.
+func TestRegisterBatch_Metric_FullyOK(t *testing.T) {
+	merkleSrv := newMerkleServer(&eventLog{}, http.StatusOK)
+	defer merkleSrv.Close()
+	teranodeSrv := newTeranodeServer(&eventLog{}, http.StatusOK)
+	defer teranodeSrv.Close()
+
+	p := newPropagator(merkleSrv.URL, teranodeSrv.URL, newMockStore())
+
+	okBefore, partialBefore, failBefore := batchOutcomeSnapshot()
+
+	for i := 0; i < 3; i++ {
+		if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg(fmt.Sprintf("tx%d", i)))); err != nil {
+			t.Fatalf("handleMessage: %v", err)
+		}
+	}
+	if err := p.flushBatch(context.Background()); err != nil {
+		t.Fatalf("flushBatch: %v", err)
+	}
+
+	okAfter, partialAfter, failAfter := batchOutcomeSnapshot()
+	if delta := okAfter - okBefore; delta != 1 {
+		t.Errorf("fully_ok delta=%v want 1", delta)
+	}
+	if delta := partialAfter - partialBefore; delta != 0 {
+		t.Errorf("partial delta=%v want 0", delta)
+	}
+	if delta := failAfter - failBefore; delta != 0 {
+		t.Errorf("all_failed delta=%v want 0", delta)
+	}
+}
+
+// TestRegisterBatch_Metric_Partial verifies the partial label increments
+// when some txs register and some fail — the canonical "dashboard should
+// see this" signal that per-tx failure counters alone obscure.
+func TestRegisterBatch_Metric_Partial(t *testing.T) {
+	merkleSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			TxID string `json:"txid"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if strings.HasPrefix(req.TxID, "bad") {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer merkleSrv.Close()
+	teranodeSrv := newTeranodeServer(&eventLog{}, http.StatusOK)
+	defer teranodeSrv.Close()
+
+	p := newPropagator(merkleSrv.URL, teranodeSrv.URL, newMockStore())
+
+	okBefore, partialBefore, failBefore := batchOutcomeSnapshot()
+
+	for _, txid := range []string{"good-a", "bad-1", "good-b"} {
+		if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg(txid))); err != nil {
+			t.Fatalf("handleMessage %s: %v", txid, err)
+		}
+	}
+	if err := p.flushBatch(context.Background()); err != nil {
+		t.Fatalf("flushBatch: %v", err)
+	}
+
+	okAfter, partialAfter, failAfter := batchOutcomeSnapshot()
+	if delta := partialAfter - partialBefore; delta != 1 {
+		t.Errorf("partial delta=%v want 1", delta)
+	}
+	if delta := okAfter - okBefore; delta != 0 {
+		t.Errorf("fully_ok delta=%v want 0", delta)
+	}
+	if delta := failAfter - failBefore; delta != 0 {
+		t.Errorf("all_failed delta=%v want 0", delta)
+	}
+}
+
+// TestRegisterBatch_Metric_AllFailed verifies the all_failed label increments
+// when every tx in the batch fails registration — the strongest signal of a
+// merkle-service outage.
+func TestRegisterBatch_Metric_AllFailed(t *testing.T) {
+	merkleSrv := newMerkleServer(&eventLog{}, http.StatusInternalServerError)
+	defer merkleSrv.Close()
+	teranodeSrv := newTeranodeServer(&eventLog{}, http.StatusOK)
+	defer teranodeSrv.Close()
+
+	p := newPropagator(merkleSrv.URL, teranodeSrv.URL, newMockStore())
+
+	okBefore, partialBefore, failBefore := batchOutcomeSnapshot()
+
+	for i := 0; i < 2; i++ {
+		if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg(fmt.Sprintf("tx%d", i)))); err != nil {
+			t.Fatalf("handleMessage: %v", err)
+		}
+	}
+	if err := p.flushBatch(context.Background()); err != nil {
+		t.Fatalf("flushBatch: %v", err)
+	}
+
+	okAfter, partialAfter, failAfter := batchOutcomeSnapshot()
+	if delta := failAfter - failBefore; delta != 1 {
+		t.Errorf("all_failed delta=%v want 1", delta)
+	}
+	if delta := okAfter - okBefore; delta != 0 {
+		t.Errorf("fully_ok delta=%v want 0", delta)
+	}
+	if delta := partialAfter - partialBefore; delta != 0 {
+		t.Errorf("partial delta=%v want 0", delta)
 	}
 }
 

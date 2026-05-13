@@ -165,25 +165,38 @@ var PropagationInlineRetryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "Inline retry attempts on broadcastSingleToEndpoints.",
 }, []string{"outcome"}) // recovered, exhausted
 
-// PropagationMerkleRegisterDuration measures the merkle-service per-message
-// registration round-trip. Slow merkle calls are a common bottleneck.
+// PropagationMerkleRegisterDuration measures the merkle-service registration
+// wall time for one flushBatch — a single bounded-concurrency fan-out over
+// every tx in the batch, observed once per batch. Slow merkle calls are a
+// common bottleneck; under burst ingest this histogram is the canonical
+// p50/p99 signal.
 var PropagationMerkleRegisterDuration = promauto.NewHistogram(prometheus.HistogramOpts{
 	Name:    "arcade_propagation_merkle_register_duration_seconds",
-	Help:    "Duration of merkle-service Register calls.",
+	Help:    "Wall time of one batched merkle-service registration fan-out.",
 	Buckets: latencyBuckets,
 })
 
-// PropagationMerkleRegisterFailures counts per-message merkle-service
-// registration failures by reason. Sustained values indicate the merkle
-// service is unhealthy — without this metric a registration outage was
-// previously masked by silent broadcast continuation. Reasons map to the
-// failure mode observed by handleMessage; today only "register_error" is
-// emitted, but the label is kept open so future error-class splits (e.g.
-// "timeout", "5xx", "auth") can be added without renaming the metric.
+// PropagationMerkleRegisterFailures counts per-tx merkle-service registration
+// failures by reason. Sustained values indicate the merkle service is
+// unhealthy — without this metric a registration outage was previously
+// masked by silent broadcast continuation. The label is kept open so future
+// error-class splits (e.g. "timeout", "5xx", "auth") can be added without
+// renaming the metric.
 var PropagationMerkleRegisterFailures = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_propagation_merkle_register_failures_total",
-	Help: "Per-message merkle-service Register failures, by reason.",
+	Help: "Per-tx merkle-service Register failures, by reason.",
 }, []string{"reason"})
+
+// PropagationMerkleRegisterBatchOutcomeTotal counts each flushBatch's merkle
+// registration result. "fully_ok" = every tx registered, "partial" = some
+// succeeded and some routed to PENDING_RETRY, "all_failed" = nothing
+// broadcast this flush. Lets dashboards distinguish a one-off RTT blip
+// (single "partial" tick) from a sustained outage (rising "all_failed"
+// rate) — a signal the per-tx failure counter alone obscures.
+var PropagationMerkleRegisterBatchOutcomeTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_propagation_merkle_register_batch_outcome_total",
+	Help: "Per-batch merkle-service registration outcome.",
+}, []string{"outcome"}) // fully_ok, partial, all_failed
 
 // PropagationReaperLease is 1 when this pod holds the reaper lease, 0 otherwise.
 // In K8s, sum across pods should always equal 1 (or 0 during failover).
