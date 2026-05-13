@@ -41,6 +41,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
+// labelOutcome is the conventional label name for counters that partition
+// their measurements by a coarse success/failure-class enum. Centralized so
+// every metric uses the same label key (and goconst stays quiet).
+const labelOutcome = "outcome"
+
 // Standard latency buckets for histograms measuring durations from very
 // short (DB lookup, validate) up to long (reaper tick, bump build).
 var latencyBuckets = []float64{
@@ -83,7 +88,7 @@ var TxValidatorFlushDuration = promauto.NewHistogramVec(prometheus.HistogramOpts
 	Name:    "arcade_tx_validator_flush_duration_seconds",
 	Help:    "Wall time of one tx_validator flush window, by outcome.",
 	Buckets: latencyBuckets,
-}, []string{"outcome"}) // success, publish_failed
+}, []string{labelOutcome}) // success, publish_failed
 
 // TxValidatorFlushSize captures how many txs each flush processed. Tracking the
 // distribution surfaces whether parallelism is being applied at all (a stuck
@@ -98,7 +103,7 @@ var TxValidatorFlushSize = promauto.NewHistogram(prometheus.HistogramOpts{
 var TxValidatorOutcomeTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_tx_validator_outcome_total",
 	Help: "Per-tx validation outcome counts.",
-}, []string{"outcome"}) // accepted, rejected, duplicate, parse_fail, store_error
+}, []string{labelOutcome}) // accepted, rejected, duplicate, parse_fail, store_error
 
 // ---------------------------------------------------------------------------
 // propagation
@@ -147,7 +152,7 @@ var PropagationBroadcastDuration = promauto.NewHistogramVec(prometheus.Histogram
 var PropagationOutcomeTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_propagation_outcome_total",
 	Help: "Per-tx propagation outcome counts.",
-}, []string{"outcome"}) // accepted, rejected, retryable, no_verdict
+}, []string{labelOutcome}) // accepted, rejected, retryable, no_verdict
 
 // PropagationChunkTotal counts how many chunk broadcasts were issued. Combined
 // with PropagationBatchSize this surfaces whether teranode_max_batch_size is
@@ -163,7 +168,7 @@ var PropagationChunkTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 var PropagationInlineRetryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_propagation_inline_retry_total",
 	Help: "Inline retry attempts on broadcastSingleToEndpoints.",
-}, []string{"outcome"}) // recovered, exhausted
+}, []string{labelOutcome}) // recovered, exhausted
 
 // PropagationMerkleRegisterDuration measures the merkle-service registration
 // wall time for one flushBatch — a single bounded-concurrency fan-out over
@@ -196,7 +201,7 @@ var PropagationMerkleRegisterFailures = promauto.NewCounterVec(prometheus.Counte
 var PropagationMerkleRegisterBatchOutcomeTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_propagation_merkle_register_batch_outcome_total",
 	Help: "Per-batch merkle-service registration outcome.",
-}, []string{"outcome"}) // fully_ok, partial, all_failed
+}, []string{labelOutcome}) // fully_ok, partial, all_failed
 
 // PropagationReaperLease is 1 when this pod holds the reaper lease, 0 otherwise.
 // In K8s, sum across pods should always equal 1 (or 0 during failover).
@@ -209,7 +214,7 @@ var PropagationReaperLease = promauto.NewGauge(prometheus.GaugeOpts{
 var PropagationReaperTickTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_propagation_reaper_tick_total",
 	Help: "Reaper tick outcomes.",
-}, []string{"outcome"}) // ran, skipped_no_leader, lease_error
+}, []string{labelOutcome}) // ran, skipped_no_leader, lease_error
 
 // PropagationReaperReadyDepth is the count of PENDING_RETRY rows that the last
 // reaper tick observed as ready. Sustained high values indicate a struggling
@@ -229,7 +234,7 @@ var BumpBuilderBuildDuration = promauto.NewHistogramVec(prometheus.HistogramOpts
 	Name:    "arcade_bump_builder_build_duration_seconds",
 	Help:    "Time to build and persist one compound BUMP, by outcome.",
 	Buckets: latencyBuckets,
-}, []string{"outcome"}) // success, no_stumps, fetch_failed, validation_failed, store_failed
+}, []string{labelOutcome}) // success, no_stumps, fetch_failed, validation_failed, store_failed
 
 // BumpBuilderBlocksProcessedTotal counts BLOCK_PROCESSED messages handled.
 var BumpBuilderBlocksProcessedTotal = promauto.NewCounter(prometheus.CounterOpts{
@@ -304,7 +309,7 @@ var BumpBuilderUntrackedTxidsTotal = promauto.NewCounter(prometheus.CounterOpts{
 var WatchdogTickTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_watchdog_tick_total",
 	Help: "Watchdog tick outcomes.",
-}, []string{"outcome"}) // ran, skipped_no_leader, lease_error
+}, []string{labelOutcome}) // ran, skipped_no_leader, lease_error
 
 // WatchdogStaleCount is the number of stale block_processing rows the last
 // tick observed (post-recency-window filter, pre-backoff filter).
@@ -317,7 +322,7 @@ var WatchdogStaleCount = promauto.NewGauge(prometheus.GaugeOpts{
 var WatchdogReprocessTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_watchdog_reprocess_total",
 	Help: "Watchdog /reprocess call outcomes.",
-}, []string{"outcome"}) // success, err_4xx, err_5xx, err_network
+}, []string{labelOutcome}) // success, err_4xx, err_5xx, err_network
 
 // WatchdogBackoffDepth is the size of the in-memory attempts map.
 // Sustained growth implies blocks are persistently failing to recover —
@@ -488,7 +493,7 @@ var P2PNodeStatusMessagesTotal = promauto.NewCounter(prometheus.CounterOpts{
 var P2PEndpointDiscoveryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_p2p_endpoint_discovery_total",
 	Help: "Datahub URL discovery outcomes from peer announcements.",
-}, []string{"outcome"}) // registered, duplicate, invalid, no_url
+}, []string{labelOutcome}) // registered, duplicate, invalid, no_url
 
 // ObserveStatusClass returns the bucket label ("2xx", "3xx", "4xx", "5xx",
 // "transport_error") for a given HTTP status code. Used by HTTP-latency

@@ -13,6 +13,10 @@ import (
 	"time"
 )
 
+// testCallbackURL is a sentinel callback URL used across registration tests.
+// Centralized so goconst stays quiet — the URL itself is never dialed.
+const testCallbackURL = "http://cb"
+
 func TestRegister(t *testing.T) {
 	var gotBody map[string]string
 	var gotAuth string
@@ -126,7 +130,7 @@ func TestRegisterBatch_AllSucceed(t *testing.T) {
 	client := NewClient(server.URL, "", 0)
 	regs := make([]Registration, 10)
 	for i := range regs {
-		regs[i] = Registration{TxID: "tx" + string(rune('0'+i)), CallbackURL: "http://cb"}
+		regs[i] = Registration{TxID: "tx" + string(rune('0'+i)), CallbackURL: testCallbackURL}
 	}
 
 	err := client.RegisterBatch(context.Background(), regs, 5)
@@ -153,7 +157,7 @@ func TestRegisterBatch_FailFast(t *testing.T) {
 
 	client := NewClient(server.URL, "", 0)
 	regs := []Registration{
-		{TxID: "fail-tx", CallbackURL: "http://cb"},
+		{TxID: "fail-tx", CallbackURL: testCallbackURL},
 	}
 
 	err := client.RegisterBatch(context.Background(), regs, 1)
@@ -184,7 +188,7 @@ func TestRegisterBatch_ConcurrencyBounded(t *testing.T) {
 	client := NewClient(server.URL, "", 0)
 	regs := make([]Registration, 50)
 	for i := range regs {
-		regs[i] = Registration{TxID: "tx", CallbackURL: "http://cb"}
+		regs[i] = Registration{TxID: "tx", CallbackURL: testCallbackURL}
 	}
 
 	err := client.RegisterBatch(context.Background(), regs, 3)
@@ -215,7 +219,7 @@ func TestRegisterBatchWithResults_AllSucceed(t *testing.T) {
 	client := NewClient(server.URL, "", 0)
 	regs := make([]Registration, 10)
 	for i := range regs {
-		regs[i] = Registration{TxID: "tx" + string(rune('0'+i)), CallbackURL: "http://cb"}
+		regs[i] = Registration{TxID: "tx" + string(rune('0'+i)), CallbackURL: testCallbackURL}
 	}
 
 	errs := client.RegisterBatchWithResults(context.Background(), regs, 5)
@@ -249,11 +253,11 @@ func TestRegisterBatchWithResults_PartialFailure(t *testing.T) {
 
 	client := NewClient(server.URL, "", 0)
 	regs := []Registration{
-		{TxID: "ok-1", CallbackURL: "http://cb"},
-		{TxID: "fail-1", CallbackURL: "http://cb"},
-		{TxID: "ok-2", CallbackURL: "http://cb"},
-		{TxID: "fail-2", CallbackURL: "http://cb"},
-		{TxID: "ok-3", CallbackURL: "http://cb"},
+		{TxID: "ok-1", CallbackURL: testCallbackURL},
+		{TxID: "fail-1", CallbackURL: testCallbackURL},
+		{TxID: "ok-2", CallbackURL: testCallbackURL},
+		{TxID: "fail-2", CallbackURL: testCallbackURL},
+		{TxID: "ok-3", CallbackURL: testCallbackURL},
 	}
 
 	errs := client.RegisterBatchWithResults(context.Background(), regs, 3)
@@ -283,7 +287,7 @@ func TestRegisterBatchWithResults_AllFail(t *testing.T) {
 	client := NewClient(server.URL, "", 0)
 	regs := make([]Registration, 4)
 	for i := range regs {
-		regs[i] = Registration{TxID: "tx", CallbackURL: "http://cb"}
+		regs[i] = Registration{TxID: "tx", CallbackURL: testCallbackURL}
 	}
 
 	errs := client.RegisterBatchWithResults(context.Background(), regs, 2)
@@ -316,7 +320,7 @@ func TestRegisterBatchWithResults_ContextCanceled(t *testing.T) {
 	client := NewClient(server.URL, "", 0)
 	regs := make([]Registration, 8)
 	for i := range regs {
-		regs[i] = Registration{TxID: "tx", CallbackURL: "http://cb"}
+		regs[i] = Registration{TxID: "tx", CallbackURL: testCallbackURL}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -370,7 +374,7 @@ func TestRegisterBatchWithResults_ConcurrencyBounded(t *testing.T) {
 	client := NewClient(server.URL, "", 0)
 	regs := make([]Registration, 30)
 	for i := range regs {
-		regs[i] = Registration{TxID: "tx", CallbackURL: "http://cb"}
+		regs[i] = Registration{TxID: "tx", CallbackURL: testCallbackURL}
 	}
 
 	errs := client.RegisterBatchWithResults(context.Background(), regs, 3)
@@ -428,7 +432,7 @@ func TestReprocess_OmitsEmptyCallbackToken(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL, "", 0)
-	if err := client.Reprocess(context.Background(), "blockhash123", "http://cb", ""); err != nil {
+	if err := client.Reprocess(context.Background(), "blockhash123", testCallbackURL, ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if strings.Contains(string(rawBody), "callbackToken") {
@@ -444,7 +448,7 @@ func TestReprocess_4xxReturnsTypedFailure(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL, "", 0)
-	err := client.Reprocess(context.Background(), "blockhash123", "http://cb", "")
+	err := client.Reprocess(context.Background(), "blockhash123", testCallbackURL, "")
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -467,7 +471,7 @@ func TestReprocess_5xxReturnsTypedFailure(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL, "", 0)
-	err := client.Reprocess(context.Background(), "blockhash123", "http://cb", "")
+	err := client.Reprocess(context.Background(), "blockhash123", testCallbackURL, "")
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -490,7 +494,7 @@ func TestReprocess_ContextCanceled(t *testing.T) {
 	client := NewClient(server.URL, "", 100*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := client.Reprocess(ctx, "blockhash", "http://cb", "")
+	err := client.Reprocess(ctx, "blockhash", testCallbackURL, "")
 	if err == nil {
 		t.Fatal("expected error from canceled context")
 	}
