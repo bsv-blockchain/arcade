@@ -70,7 +70,7 @@ func newReprocessHarness(t *testing.T, status int, respBody string) *reprocessHa
 func TestReprocessBlock_AcceptedForwardsCallbackConfig(t *testing.T) {
 	h := newReprocessHarness(t, http.StatusAccepted, "")
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/blocks/000000004ec7cc6848c07caa63dcdd0dbcd3c354eee8e99e998149ad13b530da/reprocess", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/blocks/000000004ec7cc6848c07caa63dcdd0dbcd3c354eee8e99e998149ad13b530da/reprocess", nil)
 	w := httptest.NewRecorder()
 	h.router.ServeHTTP(w, req)
 
@@ -109,7 +109,7 @@ func TestReprocessBlock_AcceptedForwardsCallbackConfig(t *testing.T) {
 func TestReprocessBlock_UpstreamNotFoundReturns422(t *testing.T) {
 	h := newReprocessHarness(t, http.StatusNotFound, "block not on consensus chain")
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/blocks/000000004ec7cc6848c07caa63dcdd0dbcd3c354eee8e99e998149ad13b530da/reprocess", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/blocks/000000004ec7cc6848c07caa63dcdd0dbcd3c354eee8e99e998149ad13b530da/reprocess", nil)
 	w := httptest.NewRecorder()
 	h.router.ServeHTTP(w, req)
 
@@ -124,7 +124,7 @@ func TestReprocessBlock_UpstreamNotFoundReturns422(t *testing.T) {
 func TestReprocessBlock_Upstream5xxReturns502(t *testing.T) {
 	h := newReprocessHarness(t, http.StatusInternalServerError, "boom")
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/blocks/000000004ec7cc6848c07caa63dcdd0dbcd3c354eee8e99e998149ad13b530da/reprocess", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/blocks/000000004ec7cc6848c07caa63dcdd0dbcd3c354eee8e99e998149ad13b530da/reprocess", nil)
 	w := httptest.NewRecorder()
 	h.router.ServeHTTP(w, req)
 
@@ -140,11 +140,11 @@ func TestReprocessBlock_InvalidBlockHashReturns400(t *testing.T) {
 	cases := []string{
 		"deadbeef",
 		"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
-		"000000004ec7cc6848c07caa63dcdd0dbcd3c354eee8e99e998149ad13b530d",  // 63
+		"000000004ec7cc6848c07caa63dcdd0dbcd3c354eee8e99e998149ad13b530d",   // 63
 		"000000004ec7cc6848c07caa63dcdd0dbcd3c354eee8e99e998149ad13b530daa", // 65
 	}
 	for _, hash := range cases {
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/blocks/"+hash+"/reprocess", nil)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/blocks/"+hash+"/reprocess", nil)
 		w := httptest.NewRecorder()
 		h.router.ServeHTTP(w, req)
 		if w.Code != http.StatusBadRequest {
@@ -170,7 +170,7 @@ func TestReprocessBlock_MerkleClientUnconfiguredReturns503(t *testing.T) {
 	router := gin.New()
 	srv.registerRoutes(router)
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/blocks/000000004ec7cc6848c07caa63dcdd0dbcd3c354eee8e99e998149ad13b530da/reprocess", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/blocks/000000004ec7cc6848c07caa63dcdd0dbcd3c354eee8e99e998149ad13b530da/reprocess", nil)
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 

@@ -2,6 +2,7 @@ package propagation
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"go.uber.org/zap"
@@ -110,7 +111,7 @@ func (p *Propagator) runMerkleReplay(ctx context.Context) {
 	})
 	flush()
 
-	if err != nil && err != ctx.Err() {
+	if err != nil && !errors.Is(err, ctx.Err()) {
 		p.logger.Warn("merkle-service replay scan ended with error",
 			zap.Error(err),
 			zap.Int("scanned", scanned),

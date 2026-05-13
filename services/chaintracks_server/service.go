@@ -120,7 +120,6 @@ func (s *Service) Stop() error {
 	return nil
 }
 
-
 // registerRoutes mounts /chaintracks/v1 + /chaintracks/v2 plus the bulk
 // header-file handler. Health probes also live here so K8s liveness
 // checks the same listener.

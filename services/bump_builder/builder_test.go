@@ -482,7 +482,7 @@ func TestBuilder_HandleMessage_GetStumpsError_Propagated(t *testing.T) {
 
 func TestBuilder_HandleMessage_DatahubFailure_ReturnsError(t *testing.T) {
 	ms := newMockStore()
-	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
+	blockHash := testBlockHash
 	stumpData := makeMinimalSTUMP(testTxidHex)
 	ms.addStump(blockHash, 0, stumpData)
 
@@ -502,7 +502,7 @@ func TestBuilder_HandleMessage_DatahubFailure_ReturnsError(t *testing.T) {
 
 func TestBuilder_HandleMessage_InsertBUMPError_ReturnsError(t *testing.T) {
 	ms := newMockStore()
-	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
+	blockHash := testBlockHash
 
 	// Need a valid STUMP that produces a valid BUMP. Use a single-subtree scenario.
 	txidHex := testTxidHex
@@ -538,7 +538,7 @@ func TestBuilder_HandleMessage_InsertBUMPError_ReturnsError(t *testing.T) {
 // redelivery, then ack and return.
 func TestBuilder_HandleMessage_ShortCircuit_BUMPAlreadyExists(t *testing.T) {
 	ms := newMockStore()
-	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
+	blockHash := testBlockHash
 
 	// Construct a valid stored BUMP for the block by running BuildCompoundBUMP
 	// on a minimal STUMP. We stash the BUMP directly in the mock and then
@@ -625,7 +625,7 @@ func TestBuilder_PruneOrphanStumps_DeletesAfterSuccess(t *testing.T) {
 }
 
 // TestBuilder_PruneOrphanStumps_EmptyStore exits early when there's no tip.
-func TestBuilder_PruneOrphanStumps_EmptyStore(t *testing.T) {
+func TestBuilder_PruneOrphanStumps_EmptyStore(_ *testing.T) {
 	ms := newMockStore() // tipHeight = 0
 	b := &Builder{
 		cfg:    &config.Config{},
@@ -638,7 +638,7 @@ func TestBuilder_PruneOrphanStumps_EmptyStore(t *testing.T) {
 
 func TestBuilder_HandleMessage_HappyPath_SingleSubtree(t *testing.T) {
 	ms := newMockStore()
-	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
+	blockHash := testBlockHash
 	txidHex := testTxidHex
 
 	stumpData := makeMinimalSTUMP(txidHex)
@@ -679,7 +679,7 @@ func TestBuilder_HandleMessage_HappyPath_SingleSubtree(t *testing.T) {
 func TestBuilder_HandleMessage_BumpBuiltStoreError_StillSucceeds(t *testing.T) {
 	ms := newMockStore()
 	ms.markBumpBuiltErr = errors.New("store down")
-	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
+	blockHash := testBlockHash
 	txidHex := testTxidHex
 
 	stumpData := makeMinimalSTUMP(txidHex)
@@ -707,7 +707,7 @@ func TestBuilder_HandleMessage_BumpBuiltStoreError_StillSucceeds(t *testing.T) {
 
 func TestBuilder_HandleMessage_HappyPath_WithTracker(t *testing.T) {
 	ms := newMockStore()
-	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
+	blockHash := testBlockHash
 	txidHex := testTxidHex
 
 	stumpData := makeMinimalSTUMP(txidHex)
@@ -773,7 +773,7 @@ func TestBuilder_HandleMessage_InvalidJSON_ReturnsError(t *testing.T) {
 // the grace window, then find the STUMP and build the BUMP successfully.
 func TestBuilder_LateSTUMP_ArrivesDuringGraceWindow(t *testing.T) {
 	ms := newMockStore()
-	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
+	blockHash := testBlockHash
 	txidHex := testTxidHex
 
 	// Compute what the late-arriving STUMP will produce so the datahub header
@@ -817,7 +817,7 @@ func TestBuilder_LateSTUMP_ArrivesDuringGraceWindow(t *testing.T) {
 // which is the geometric invariant BuildCompoundBUMP's shift math assumes.
 func TestBuilder_E2E_InsertStump_GetStumps_BuildBUMP(t *testing.T) {
 	ms := newMockStore()
-	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
+	blockHash := testBlockHash
 	txid1 := testTxidHex
 	txid2 := "3333333333333333333333333333333333333333333333333333333333333333"
 	sib1 := "5555555555555555555555555555555555555555555555555555555555555555"
@@ -887,7 +887,7 @@ func TestBuilder_E2E_BUMPExtractionWithRealisticSTUMP(t *testing.T) {
 	// The bump/bump_test.go suite covers ExtractMinimalPathForTx exhaustively;
 	// this test verifies the builder stores data that extraction can consume.
 	ms := newMockStore()
-	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
+	blockHash := testBlockHash
 
 	// Build a realistic STUMP with 2 leaves using go-sdk types
 	txHash1Bytes, _ := hex.DecodeString(testTxidHex)
@@ -944,7 +944,7 @@ func TestBuilder_E2E_BUMPExtractionWithRealisticSTUMP(t *testing.T) {
 // fix) can rebuild from the same inputs.
 func TestBuilder_HandleMessage_RootMismatch_SkipsPersistence(t *testing.T) {
 	ms := newMockStore()
-	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
+	blockHash := testBlockHash
 	txidHex := testTxidHex
 
 	stumpData := makeMinimalSTUMP(txidHex)
@@ -1232,7 +1232,7 @@ func (s *stubChaintracks) GetHeaderByHash(_ context.Context, h *chainhash.Hash) 
 // builds successfully instead of looping the consumer retry.
 func TestBuilder_HandleMessage_PrunedPeerFallthrough(t *testing.T) {
 	ms := newMockStore()
-	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
+	blockHash := testBlockHash
 	txidHex := testTxidHex
 
 	stumpData := makeMinimalSTUMP(txidHex)
@@ -1291,7 +1291,7 @@ func TestBuilder_HandleMessage_PrunedPeerFallthrough(t *testing.T) {
 // peer to fall through to in this test setup).
 func TestBuilder_HandleMessage_ChaintracksRootMismatch(t *testing.T) {
 	ms := newMockStore()
-	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
+	blockHash := testBlockHash
 	txidHex := testTxidHex
 
 	stumpData := makeMinimalSTUMP(txidHex)
@@ -1346,7 +1346,7 @@ func TestBuilder_HandleMessage_ChaintracksRootMismatch(t *testing.T) {
 // post-build ValidateCompoundRoot is still the final safety net.
 func TestBuilder_HandleMessage_ChaintracksUnknownHeader_SoftFails(t *testing.T) {
 	ms := newMockStore()
-	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
+	blockHash := testBlockHash
 	txidHex := testTxidHex
 
 	stumpData := makeMinimalSTUMP(txidHex)

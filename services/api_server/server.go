@@ -56,7 +56,7 @@ type Server struct {
 // submissionRecord is the in-memory payload the async recorder consumes.
 // Kept tiny — just enough to call store.InsertSubmission with the original
 // values. The original request context is intentionally NOT propagated;
-// recordSubmission is best-effort and shouldn't be cancelled when the HTTP
+// recordSubmission is best-effort and shouldn't be canceled when the HTTP
 // handler returns.
 type submissionRecord struct {
 	sub *models.Submission
@@ -88,11 +88,15 @@ func (s *Server) Start(ctx context.Context) error {
 	s.registerRoutes(router)
 
 	// Spin up the submission recorder pool. Workers exit on submissionStop
-	// (Stop()) which is signaled before the HTTP server is closed.
+	// (Stop()) which is signaled before the HTTP server is closed. The
+	// recorder is intentionally NOT bound to the request context — it's a
+	// fire-and-forget best-effort DB write that must outlive the HTTP
+	// handler that triggered it, so gosec G118 ("use request-scoped ctx")
+	// does not apply here.
 	var recorderWG sync.WaitGroup
 	for i := 0; i < submissionRecorderWorkers; i++ {
 		recorderWG.Add(1)
-		go s.runSubmissionRecorder(&recorderWG)
+		go s.runSubmissionRecorder(ctx, &recorderWG)
 	}
 
 	addr := fmt.Sprintf("%s:%d", s.cfg.APIServer.Host, s.cfg.APIServer.Port)
@@ -116,21 +120,25 @@ func (s *Server) Start(ctx context.Context) error {
 	return nil
 }
 
-// runSubmissionRecorder drains submissionCh into store.InsertSubmission. Each
-// worker reuses a short-lived background context so a recorder write outlives
-// the HTTP request that triggered it (handler returns before the row lands —
-// that's the whole point of the decoupling).
-func (s *Server) runSubmissionRecorder(wg *sync.WaitGroup) {
+// runSubmissionRecorder drains submissionCh into store.InsertSubmission.
+// parentCtx is the process/server lifetime context so a service shutdown
+// also unwinds in-flight DB writes; per-call writes derive a short timeout
+// child so a recorder write outlives the HTTP request that triggered it
+// (handler returns before the row lands — that's the whole point of the
+// decoupling).
+func (s *Server) runSubmissionRecorder(parentCtx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for {
 		select {
 		case <-s.submissionStop:
 			return
+		case <-parentCtx.Done():
+			return
 		case rec, ok := <-s.submissionCh:
 			if !ok {
 				return
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(parentCtx, 5*time.Second)
 			if err := s.store.InsertSubmission(ctx, rec.sub); err != nil {
 				s.logger.Warn("failed to insert submission (async)",
 					zap.String("txid", rec.sub.TxID),

@@ -371,8 +371,8 @@ func TestMemoryBroker_SendTimeoutBackpressure(t *testing.T) {
 	// Fill every slot the consumer pipeline can absorb without an active
 	// receiver. After this loop the next Send must time out.
 	for i := 0; i < 2*buffer+1; i++ {
-		if err := b.Send(ctx, "topic-stall", "k", []byte("pad")); err != nil {
-			t.Fatalf("pad send %d: %v", i, err)
+		if sendErr := b.Send(ctx, "topic-stall", "k", []byte("pad")); sendErr != nil {
+			t.Fatalf("pad send %d: %v", i, sendErr)
 		}
 	}
 

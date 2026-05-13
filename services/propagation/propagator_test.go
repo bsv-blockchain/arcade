@@ -588,11 +588,11 @@ func TestRunMerkleReplay_RegistersOnlyNonTerminal(t *testing.T) {
 		{TxID: "tx-seen", Status: models.StatusSeenOnNetwork},
 		{TxID: "tx-multi", Status: models.StatusSeenMultipleNodes},
 		{TxID: "tx-retry", Status: models.StatusPendingRetry},
-		{TxID: "tx-mined", Status: models.StatusMined},      // terminal, skip
-		{TxID: "tx-immut", Status: models.StatusImmutable},  // terminal, skip
-		{TxID: "tx-rejct", Status: models.StatusRejected},   // terminal, skip
+		{TxID: "tx-mined", Status: models.StatusMined},                // terminal, skip
+		{TxID: "tx-immut", Status: models.StatusImmutable},            // terminal, skip
+		{TxID: "tx-rejct", Status: models.StatusRejected},             // terminal, skip
 		{TxID: "tx-dspnd", Status: models.StatusDoubleSpendAttempted}, // terminal, skip
-		{TxID: "", Status: models.StatusReceived},           // empty txid, skip
+		{TxID: "", Status: models.StatusReceived},                     // empty txid, skip
 	}
 
 	merkleSrv := newMerkleServer(log, http.StatusOK)

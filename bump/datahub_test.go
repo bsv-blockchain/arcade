@@ -108,14 +108,14 @@ func blockWithSubtrees(t *testing.T, count int, merkleRoot [32]byte) []byte {
 	out = append(out, header...)
 	// varints: txCount=0, sizeBytes=0, subtreeCount=count (single byte if <0xfd)
 	out = append(out, 0x00, 0x00)
-	if count >= 0xfd {
-		t.Fatalf("test helper only supports count<0xfd, got %d", count)
+	if count < 0 || count >= 0xfd {
+		t.Fatalf("test helper only supports 0<=count<0xfd, got %d", count)
 	}
-	out = append(out, byte(count))
+	out = append(out, byte(count)) //nolint:gosec // bounds-checked above
 	for i := 0; i < count; i++ {
 		hash := make([]byte, 32)
 		for j := range hash {
-			hash[j] = byte(0xA0 | (i & 0x0F))
+			hash[j] = byte(0xA0 | (i & 0x0F)) //nolint:gosec // i&0x0F is in [0,15]
 		}
 		out = append(out, hash...)
 	}

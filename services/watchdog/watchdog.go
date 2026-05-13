@@ -149,7 +149,9 @@ func proportionalJitter(d time.Duration) time.Duration {
 	if spread <= 0 {
 		return d
 	}
-	delta := mrand.Int63n(2*spread+1) - spread
+	// math/rand is fine here — this is jitter for backoff, not crypto.
+	// gosec G404 is suppressed accordingly.
+	delta := mrand.Int63n(2*spread+1) - spread //nolint:gosec // jitter, not security-relevant
 	out := int64(d) + delta
 	if out <= 0 {
 		return d

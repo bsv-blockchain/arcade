@@ -77,8 +77,13 @@ type Propagator struct {
 // One job represents one HTTP call to one endpoint; the caller bundles a
 // per-call result channel so it can collect outcomes from multiple endpoints
 // in parallel without each worker carrying that bookkeeping.
+//
+// The ctx field is intentionally part of the value — the job travels through
+// a channel so the cancellation token has to ride with it. The standard
+// "context as first arg" pattern doesn't apply to message-passing handoffs;
+// containedctx is suppressed deliberately at the type declaration.
 type broadcastJob struct {
-	ctx      context.Context
+	ctx      context.Context //nolint:containedctx // travels with the work item through broadcastJobs channel
 	endpoint string
 	// Exactly one of rawTx (single /tx) or rawTxs (batch /txs) is set.
 	rawTx    []byte
@@ -834,7 +839,7 @@ type endpointOutcome struct {
 //     accepted — they're the outliers), each 2xx peer is credited.
 //   - Zero 2xx but every responder returned non-2xx: unanimous network
 //     reject. The peers are doing their job (responding) and they all agree
-//     the tx is bad — penalising them would punish the messenger. Treat as
+//     the tx is bad — penalizing them would punish the messenger. Treat as
 //     RecordSuccess for the responding peers. Transport errors still get
 //     RecordFailure (they didn't respond at all).
 //

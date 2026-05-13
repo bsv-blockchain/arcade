@@ -248,10 +248,11 @@ func (b *Builder) pruneOrphanStumps(ctx context.Context) {
 	// Use the watchdog's RecencyDepth as the scan horizon — anything older
 	// than (tip - RecencyDepth) is outside arcade's recovery window anyway.
 	// Default to 144 (~24h at 10min blocks) when watchdog is disabled.
-	depth := uint64(b.cfg.Watchdog.RecencyDepth)
-	if depth == 0 {
-		depth = 144
+	rd := b.cfg.Watchdog.RecencyDepth
+	if rd <= 0 {
+		rd = 144
 	}
+	depth := uint64(rd)
 
 	tip, err := b.store.GetActiveTipBlockHeight(ctx)
 	if err != nil {
@@ -349,39 +350,12 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 
 	logger := b.logger.With(zap.String("block_hash", blockHash))
 
-	// Short-circuit: if a compound BUMP already exists for this block, this is
-	// a redelivery (typically from a /reprocess re-firing BLOCK_PROCESSED).
-	// Skip the datahub fetch + recompute entirely; re-run SetMinedByTxIDs with
-	// the level-0 hashes from the stored BUMP so any tracked tx that was
-	// registered AFTER the original build still gets marked MINED. The UPDATE
-	// is idempotent at the store layer, so this is safe to repeat per delivery.
-	if existingHeight, bumpBytes, err := b.store.GetBUMP(ctx, blockHash); err == nil && len(bumpBytes) > 0 {
-		txids, parseErr := levelZeroTxidsFromBUMP(bumpBytes)
-		if parseErr != nil {
-			// Stored BUMP failed to decode — fall through to the normal
-			// rebuild path so an upstream corruption doesn't pin a block
-			// in a broken state forever.
-			logger.Warn("stored BUMP failed to parse on redelivery — rebuilding", zap.Error(parseErr))
-		} else {
-			metrics.BumpBuilderShortCircuitTotal.Inc()
-			outcome = "short_circuited"
-			tracked := b.filterTrackedTxids(txids)
-			logger.Info("BUMP already built — skipping datahub fetch on redelivery",
-				zap.Int("level0_count", len(txids)),
-				zap.Int("tracked_count", len(tracked)),
-				zap.Uint64("block_height", existingHeight),
-			)
-			if len(tracked) > 0 {
-				b.markMinedAndPublish(ctx, logger, blockHash, existingHeight, tracked)
-			}
-			// STUMP rows for this block should already have been pruned at
-			// the end of the original build; ensure stragglers are cleared
-			// in case a STUMP arrived after pruning ran.
-			if err := b.store.DeleteStumpsByBlockHash(ctx, blockHash); err != nil {
-				logger.Warn("failed to clean up STUMPs on short-circuit", zap.Error(err))
-			}
-			return nil
-		}
+	// Short-circuit: if a compound BUMP already exists for this block, skip
+	// the datahub fetch + recompute path entirely. See tryShortCircuit for
+	// the full contract.
+	if b.tryShortCircuit(ctx, logger, blockHash) {
+		outcome = "short_circuited"
+		return nil
 	}
 
 	// Grace window: merkle-service's stumpGate only waits for the first HTTP attempt
@@ -538,6 +512,58 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 // filterTrackedTxids narrows a level-0 hash list to those the local
 // TxTracker knows about. If the builder was constructed without a tracker
 // (legacy wiring / tests), every txid is passed through unchanged.
+// tryShortCircuit attempts the BUMP-already-exists redelivery path. Returns
+// true when the short-circuit handled the message and the caller should
+// treat it as done. Returns false when no usable BUMP exists and the caller
+// should fall through to the normal rebuild.
+//
+// Errors at the store-read step (not-found, etc.) are intentionally
+// swallowed — they're indistinguishable from "no BUMP" and we want the
+// rebuild path to handle both. A parseErr on a corrupt stored BUMP is
+// logged so operators can see the divergence; the rebuild still proceeds.
+//
+// Extracted from processBlockProcessed to reduce nesting depth (nestif).
+// The short-circuit is exercised on /reprocess redeliveries of
+// BLOCK_PROCESSED — typical case is the watchdog re-firing after a missed
+// callback. The SetMinedByTxIDs UPDATE is idempotent so repeated calls are
+// safe; the value is letting a tx registered after the original build still
+// get marked MINED on the redelivery.
+func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, blockHash string) bool {
+	existingHeight, bumpBytes, getErr := b.store.GetBUMP(ctx, blockHash)
+	if getErr != nil {
+		// not-found / transient store error — fall through to rebuild
+		return false
+	}
+	if len(bumpBytes) == 0 {
+		return false
+	}
+	txids, parseErr := levelZeroTxidsFromBUMP(bumpBytes)
+	if parseErr != nil {
+		// Stored BUMP failed to decode — fall through to the normal rebuild
+		// path so an upstream corruption doesn't pin a block in a broken
+		// state forever.
+		logger.Warn("stored BUMP failed to parse on redelivery — rebuilding", zap.Error(parseErr))
+		return false
+	}
+	metrics.BumpBuilderShortCircuitTotal.Inc()
+	tracked := b.filterTrackedTxids(txids)
+	logger.Info("BUMP already built — skipping datahub fetch on redelivery",
+		zap.Int("level0_count", len(txids)),
+		zap.Int("tracked_count", len(tracked)),
+		zap.Uint64("block_height", existingHeight),
+	)
+	if len(tracked) > 0 {
+		b.markMinedAndPublish(ctx, logger, blockHash, existingHeight, tracked)
+	}
+	// STUMP rows for this block should already have been pruned at the end
+	// of the original build; ensure stragglers are cleared in case a STUMP
+	// arrived after pruning ran.
+	if delErr := b.store.DeleteStumpsByBlockHash(ctx, blockHash); delErr != nil {
+		logger.Warn("failed to clean up STUMPs on short-circuit", zap.Error(delErr))
+	}
+	return true
+}
+
 func (b *Builder) filterTrackedTxids(txids []string) []string {
 	if b.txTracker == nil || len(txids) == 0 {
 		return txids

@@ -403,14 +403,14 @@ func TestProportionalJitter_StaysWithinSpread(t *testing.T) {
 	const trials = 1000
 	base := time.Minute
 	spread := time.Duration(float64(base) * backoffJitterFraction)
-	min := base - spread
-	max := base + spread
+	lo := base - spread
+	hi := base + spread
 
 	var sumDelta int64
 	for i := 0; i < trials; i++ {
 		got := proportionalJitter(base)
-		if got < min || got > max {
-			t.Fatalf("trial %d: got=%v out of bounds [%v..%v]", i, got, min, max)
+		if got < lo || got > hi {
+			t.Fatalf("trial %d: got=%v out of bounds [%v..%v]", i, got, lo, hi)
 		}
 		sumDelta += int64(got) - int64(base)
 	}

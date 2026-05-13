@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"math"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -23,10 +24,15 @@ var batchConcurrency int32 = int32(runtime.NumCPU())
 // SetBatchConcurrency overrides the parallel-loop helper concurrency at
 // process start. Zero or negative values restore the runtime.NumCPU default.
 // Safe to call at most once during bootstrap; concurrent batch calls observe
-// the new value on their next iteration.
+// the new value on their next iteration. Values above math.MaxInt32 clamp
+// to math.MaxInt32 — far above any realistic DB pool size, but the bound
+// satisfies gosec G115 without a per-call check on the read side.
 func SetBatchConcurrency(n int) {
 	if n <= 0 {
 		n = runtime.NumCPU()
+	}
+	if n > math.MaxInt32 {
+		n = math.MaxInt32
 	}
 	atomic.StoreInt32(&batchConcurrency, int32(n))
 }

@@ -106,7 +106,7 @@ func TestBroadcast_RecordsEndpointOutcomes(t *testing.T) {
 // tunable from the 02:07 EDT incident: when EVERY responding peer returns
 // non-2xx for the same tx, that's a network-consensus signal (the tx is
 // bad — typically a double-spend or invalid sig), not a peer-health signal.
-// Penalising the peers in that case progressively sidelines the entire
+// Penalizing the peers in that case progressively sidelines the entire
 // fleet until "no healthy teranode endpoints" and ~1.6M txs sit in
 // RECEIVED. With network-aware breaker logic, peers stay healthy when
 // they agree, so the tx flows through to UpdateStatus(REJECTED) and the
@@ -178,7 +178,7 @@ func TestPeerReturning500_SidelinedWhenOthersAccept(t *testing.T) {
 
 	// Drive the bad peer past its slow threshold. Each broadcast produces a
 	// 200 from `good` AND a 500 from `bad` — not unanimous → bad gets
-	// penalised, good gets credit.
+	// penalized, good gets credit.
 	for i := 0; i < 10; i++ {
 		if err := handleAndFlush(t, p, makePropMsg(fmt.Sprintf("tx-%02d", i))); err != nil {
 			t.Fatalf("flush error: %v", err)

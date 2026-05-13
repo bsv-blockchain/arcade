@@ -90,10 +90,10 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		_ = producer.Close()
 		return nil, nil, fmt.Errorf("creating store: %w", err)
 	}
-	if err := st.EnsureIndexes(); err != nil {
+	if idxErr := st.EnsureIndexes(); idxErr != nil {
 		_ = st.Close()
 		_ = producer.Close()
-		return nil, nil, fmt.Errorf("ensuring store indexes: %w", err)
+		return nil, nil, fmt.Errorf("ensuring store indexes: %w", idxErr)
 	}
 
 	// Align store batch-helper concurrency with config. Zero falls back to
@@ -121,16 +121,16 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 	if len(cfg.DatahubURLs) > 0 {
 		seedCtx, seedCancel := context.WithTimeout(ctx, 5*time.Second)
 		for _, url := range cfg.DatahubURLs {
-			if err := st.UpsertDatahubEndpoint(seedCtx, store.DatahubEndpoint{
+			if seedErr := st.UpsertDatahubEndpoint(seedCtx, store.DatahubEndpoint{
 				URL:      url,
 				Network:  cfg.Network,
 				Source:   store.DatahubEndpointSourceConfigured,
 				LastSeen: time.Now(),
-			}); err != nil {
+			}); seedErr != nil {
 				logger.Warn(
 					"failed to seed configured datahub url",
 					zap.String("url", url),
-					zap.Error(err),
+					zap.Error(seedErr),
 				)
 			}
 		}
@@ -154,11 +154,15 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 	// future use) shares one P2P subscription and header cache. Skipped when
 	// chaintracks_server is disabled — that flag is already the operator's
 	// process-wide "no chaintracks" switch (regtest force-disables it).
-	chainTracks, err := initChaintracks(ctx, cfg, logger)
-	if err != nil {
-		_ = st.Close()
-		_ = producer.Close()
-		return nil, nil, fmt.Errorf("chaintracks init: %w", err)
+	var chainTracks chaintrackslib.Chaintracks
+	if cfg.ChaintracksServer.Enabled {
+		ct, ctErr := initChaintracks(ctx, cfg, logger)
+		if ctErr != nil {
+			_ = st.Close()
+			_ = producer.Close()
+			return nil, nil, fmt.Errorf("chaintracks init: %w", ctErr)
+		}
+		chainTracks = ct
 	}
 
 	deps := &Deps{
@@ -186,18 +190,14 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 }
 
 // initChaintracks brings up the embedded go-chaintracks instance shared
-// across the process. Returns (nil, nil) when chaintracks_server is disabled
-// — the wired-in consumers nil-guard and fall back to legacy behavior.
+// across the process. Caller gates the enabled-ness check; this function
+// always tries to construct and returns an error on failure.
 //
 // The construction logic mirrors what previously lived in
 // chaintracks_server.Service.initChaintracks. Moving it here lets bump-
 // builder use the same instance without depending on a service's
 // initialization timing or a duplicate P2P subscription.
 func initChaintracks(ctx context.Context, cfg *config.Config, logger *zap.Logger) (chaintrackslib.Chaintracks, error) {
-	if !cfg.ChaintracksServer.Enabled {
-		return nil, nil
-	}
-
 	// Default chaintracks storage to <storage_path>/chaintracks/ so
 	// operators only need to set a single storage root. Tilde expansion
 	// happens in config.Load.

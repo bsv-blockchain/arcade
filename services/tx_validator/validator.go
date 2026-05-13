@@ -194,7 +194,7 @@ func (v *Validator) runPublisher(ctx context.Context) {
 			if len(batch) == 0 {
 				continue
 			}
-			if err := v.producer.SendBatch(kafka.TopicPropagation, batch); err != nil {
+			if err := v.producer.SendBatch(kafka.TopicPropagation, batch); err != nil { //nolint:contextcheck // Producer.SendBatch is a kafka-package convenience wrapper that owns its own ctx; the publisher goroutine's parent ctx is honored via the publishCh close signal
 				v.mu.Lock()
 				// Prepend so the older messages stay in front. Cap retained
 				// carry depth — beyond a point we'd rather drop the oldest
