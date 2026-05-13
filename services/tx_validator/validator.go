@@ -74,6 +74,14 @@ type Validator struct {
 	consumer    *kafka.ConsumerGroup
 
 	parallelism int
+	// skipFees / skipScripts mirror cfg.TxValidator.{SkipFeeValidation,
+	// SkipScriptValidation} and are forwarded to validator.ValidateTransaction
+	// at flush time. Defaults are false on both — i.e. validation is on.
+	// Finding F-022 / issue #80: these used to be hard-coded true (skip both)
+	// which silently disabled fee and script enforcement for every submitted
+	// transaction.
+	skipFees    bool
+	skipScripts bool
 
 	mu sync.Mutex
 	// pending holds raw tx bytes that haven't yet been through the validation
@@ -99,6 +107,8 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 		txTracker:   tracker,
 		txValidator: v,
 		parallelism: parallelism,
+		skipFees:    cfg.TxValidator.SkipFeeValidation,
+		skipScripts: cfg.TxValidator.SkipScriptValidation,
 	}
 }
 
@@ -467,6 +477,12 @@ func (v *Validator) phaseDedup(ctx context.Context, parsed []parseResult) (live,
 // validator.ValidateTransaction reads only immutable struct fields so
 // fan-out is safe. Mutates entries in-place: rejected=true and rejectReason
 // for failures, untouched for accepts.
+//
+// The skipFees / skipScripts arguments forwarded to the underlying validator
+// are the per-service config knobs (cfg.TxValidator.SkipFeeValidation /
+// SkipScriptValidation), default false. The previous implementation hard-
+// coded both to true, which meant fees AND scripts were silently skipped on
+// every submission — the bug fixed in #80 (F-022).
 func (v *Validator) phaseValidate(ctx context.Context, live []*validatedTx) {
 	if v.txValidator == nil {
 		// Tests sometimes pass a nil validator; treat all as accepts.
@@ -476,7 +492,7 @@ func (v *Validator) phaseValidate(ctx context.Context, live []*validatedTx) {
 	g.SetLimit(v.parallelism)
 	for _, vt := range live {
 		g.Go(func() error {
-			if err := v.txValidator.ValidateTransaction(gctx, vt.parsed, true, true); err != nil {
+			if err := v.txValidator.ValidateTransaction(gctx, vt.parsed, v.skipFees, v.skipScripts); err != nil {
 				vt.rejected = true
 				vt.rejectReason = err.Error()
 				v.logger.Info("transaction validation failed",

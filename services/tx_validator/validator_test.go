@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/bsv-blockchain/go-sdk/script"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
@@ -136,8 +138,14 @@ func newTestValidator(broker *kafka.RecordingBroker, ms *mockStore) *Validator {
 }
 
 func newTestValidatorWithValidator(broker *kafka.RecordingBroker, ms *mockStore, txValidator *validator.Validator) *Validator {
+	return newTestValidatorWithConfig(broker, ms, txValidator, &config.Config{})
+}
+
+// newTestValidatorWithConfig wires the validator with a caller-supplied
+// config so tests can flip TxValidator.SkipFeeValidation /
+// SkipScriptValidation and assert the new plumbing.
+func newTestValidatorWithConfig(broker *kafka.RecordingBroker, ms *mockStore, txValidator *validator.Validator, cfg *config.Config) *Validator {
 	producer := kafka.NewProducer(broker)
-	cfg := &config.Config{}
 	tracker := store.NewTxTracker()
 	v := New(cfg, zap.NewNop(), producer, nil, ms, tracker, txValidator)
 	// Pin parallelism for deterministic tests so we don't accidentally serialize
@@ -485,5 +493,156 @@ func TestValidator_StartLogsParallelism(t *testing.T) {
 	v := New(cfg, logger, kafka.NewProducer(broker), nil, ms, store.NewTxTracker(), nil)
 	if v.parallelism != 16 {
 		t.Errorf("expected parallelism=16 from config, got %d", v.parallelism)
+	}
+}
+
+// makeFeeFailingTxBytes returns a freshly minted transaction that passes
+// validator.ValidatePolicy (one push-only input with a populated source
+// output, one non-data output, size > minTxSizeBytes) but has totalIn ==
+// totalOut, i.e. a fee of zero. The default min-fee-per-KB policy is 100
+// sat/kB, so spv.Verify fee enforcement must reject it whenever
+// skipFees=false. Per validator.ValidateTransaction's contract, a tx that
+// has a non-nil chaintracker but zero fee will trip fee validation before
+// any script work touches the wire — which is what we want for unit tests
+// (no network).
+func makeFeeFailingTxBytes(t *testing.T) []byte {
+	t.Helper()
+	tx := sdkTx.NewTransaction()
+	// Vary the lock_time so the txid is unique across calls — keeps
+	// dedup happy when this helper is reused inside a single batch.
+	tx.LockTime = 0xdeadbeef
+
+	srcID := chainhash.Hash{}
+	srcID[0] = 0x42
+
+	// Single input. UnlockingScript is a single OP_TRUE (0x51) so it
+	// satisfies pushDataCheck (push-only and non-empty) without dragging
+	// real signatures into the test fixture. The source output is set
+	// inline so TotalInputSatoshis returns successfully — required for
+	// spv.Verify's fee math to even run.
+	unlocking := script.Script([]byte{0x51})
+	in := &sdkTx.TransactionInput{
+		SourceTXID:      &srcID,
+		UnlockingScript: &unlocking,
+	}
+	in.SetSourceTxOutput(&sdkTx.TransactionOutput{
+		Satoshis:      1_000,
+		LockingScript: opTrueScript(),
+	})
+	tx.AddInput(in)
+
+	// Single output equal to input → zero fee → fee validation rejects.
+	tx.AddOutput(&sdkTx.TransactionOutput{
+		Satoshis:      1_000,
+		LockingScript: opTrueScript(),
+	})
+
+	// Pad with an extra OP_RETURN data output so the serialized tx is
+	// comfortably above the 61-byte minimum policy size.
+	dataScript := script.Script(append([]byte{0x6a, 0x20}, make([]byte, 0x20)...))
+	tx.AddOutput(&sdkTx.TransactionOutput{
+		Satoshis:      0,
+		LockingScript: &dataScript,
+	})
+
+	return tx.Bytes()
+}
+
+// opTrueScript returns a *script.Script containing a single OP_TRUE byte.
+// Treated as non-data and non-empty by the SDK heuristics, so it clears
+// validator.checkOutputs without producing a dust output.
+func opTrueScript() *script.Script {
+	s := script.Script([]byte{0x51})
+	return &s
+}
+
+// TestValidator_DefaultsRejectFeeFailures is the regression guard for
+// finding F-022 / issue #80. The previous implementation hard-coded
+// (skipFees=true, skipScripts=true) at the call site, so a tx with a zero
+// fee was accepted even though the underlying validator was perfectly
+// capable of catching it. With the fix the defaults thread through as
+// (false, false) and the same tx gets rejected.
+func TestValidator_DefaultsRejectFeeFailures(t *testing.T) {
+	broker := &kafka.RecordingBroker{}
+	ms := newMockStore()
+
+	realValidator := validator.NewValidator(nil, nil)
+	v := newTestValidatorWithValidator(broker, ms, realValidator)
+	if v.skipFees || v.skipScripts {
+		t.Fatalf("default config must keep fee/script validation on; got skipFees=%v skipScripts=%v",
+			v.skipFees, v.skipScripts)
+	}
+
+	if err := v.handleMessage(context.Background(), makeKafkaMsg(makeTxMsgFromBytes(makeFeeFailingTxBytes(t)))); err != nil {
+		t.Fatalf("handleMessage: %v", err)
+	}
+	if err := v.flushValidations(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	updates := ms.snapshotUpdates()
+	if len(updates) != 1 {
+		t.Fatalf("expected exactly 1 reject update from a zero-fee tx, got %d", len(updates))
+	}
+	if updates[0].Status != models.StatusRejected {
+		t.Errorf("expected REJECTED, got %q", updates[0].Status)
+	}
+	if updates[0].ExtraInfo == "" {
+		t.Errorf("reject reason should not be empty")
+	}
+	if broker.BatchCalls != 0 {
+		t.Errorf("rejected tx must not reach the propagation topic; got %d batch calls",
+			broker.BatchCalls)
+	}
+}
+
+// TestValidator_SkipFlagsBypassFeeFailures pins the new config knobs:
+// flipping skip_fee_validation=true makes the same zero-fee tx pass. The
+// test exists so a future refactor can't silently drop the flags; if this
+// test starts failing the flags have stopped being plumbed through.
+func TestValidator_SkipFlagsBypassFeeFailures(t *testing.T) {
+	broker := &kafka.RecordingBroker{}
+	ms := newMockStore()
+
+	cfg := &config.Config{}
+	cfg.TxValidator.SkipFeeValidation = true
+	cfg.TxValidator.SkipScriptValidation = true
+
+	realValidator := validator.NewValidator(nil, nil)
+	v := newTestValidatorWithConfig(broker, ms, realValidator, cfg)
+	if !v.skipFees || !v.skipScripts {
+		t.Fatalf("config skip flags must reach the validator; got skipFees=%v skipScripts=%v",
+			v.skipFees, v.skipScripts)
+	}
+
+	if err := v.handleMessage(context.Background(), makeKafkaMsg(makeTxMsgFromBytes(makeFeeFailingTxBytes(t)))); err != nil {
+		t.Fatalf("handleMessage: %v", err)
+	}
+	if err := v.flushValidations(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	if got := ms.updateCallCount.Load(); got != 0 {
+		t.Errorf("expected 0 reject updates with skip flags on, got %d", got)
+	}
+	if broker.BatchCalls != 1 || broker.MessageCount() != 1 {
+		t.Errorf("expected the tx to publish when skip flags are on; got batchCalls=%d messages=%d",
+			broker.BatchCalls, broker.MessageCount())
+	}
+}
+
+// TestValidator_DefaultSkipFlagsAreFalse is a tiny but high-value
+// invariant test. If somebody flips the defaults in TxValidatorConfig the
+// fee/script validators silently turn off again — this test fails loudly
+// the moment that happens.
+func TestValidator_DefaultSkipFlagsAreFalse(t *testing.T) {
+	cfg := &config.Config{}
+	v := New(cfg, zap.NewNop(), kafka.NewProducer(&kafka.RecordingBroker{}), nil,
+		newMockStore(), store.NewTxTracker(), nil)
+	if v.skipFees {
+		t.Error("default cfg must keep fee validation on (skipFees=false)")
+	}
+	if v.skipScripts {
+		t.Error("default cfg must keep script validation on (skipScripts=false)")
 	}
 }
