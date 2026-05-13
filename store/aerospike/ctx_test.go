@@ -151,3 +151,73 @@ func TestUpdateStatus_ExistingTxidStillWorks(t *testing.T) {
 		t.Fatalf("expected SEEN_ON_NETWORK, got %+v", got)
 	}
 }
+
+// TestMarkMerkleRegisteredByTxIDs_UpdatesExistingRows pins the issue #145
+// fix: every successful merkle-service register must stamp the row so the
+// next startup replay can skip it.
+func TestMarkMerkleRegisteredByTxIDs_UpdatesExistingRows(t *testing.T) {
+	s := integrationStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stamp := time.Now().Format("150405.000000000")
+	txids := []string{"mr-1-" + stamp, "mr-2-" + stamp, "mr-3-" + stamp}
+	for _, txid := range txids {
+		if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+			TxID: txid, Status: models.StatusReceived,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", txid, err)
+		}
+	}
+
+	ts := time.Now().Add(-5 * time.Minute).Truncate(time.Millisecond)
+	if err := s.MarkMerkleRegisteredByTxIDs(ctx, txids, ts); err != nil {
+		t.Fatalf("MarkMerkleRegisteredByTxIDs: %v", err)
+	}
+
+	for _, txid := range txids {
+		got, err := s.GetStatus(ctx, txid)
+		if err != nil {
+			t.Fatalf("GetStatus %s: %v", txid, err)
+		}
+		if got == nil {
+			t.Fatalf("%s: missing after mark", txid)
+		}
+		if !got.MerkleRegisteredAt.Equal(ts) {
+			t.Errorf("%s: MerkleRegisteredAt=%v want %v", txid, got.MerkleRegisteredAt, ts)
+		}
+	}
+}
+
+// TestMarkMerkleRegisteredByTxIDs_SkipsUnknownTxIDs verifies the
+// UPDATE_ONLY contract: passing a txid with no existing row is a silent
+// no-op rather than creating a phantom row (matching SetMinedByTxIDs).
+func TestMarkMerkleRegisteredByTxIDs_SkipsUnknownTxIDs(t *testing.T) {
+	s := integrationStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stamp := time.Now().Format("150405.000000000")
+	known := "mr-known-" + stamp
+	ghosts := []string{"mr-ghost-a-" + stamp, "mr-ghost-b-" + stamp}
+
+	if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+		TxID: known, Status: models.StatusReceived,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	all := append([]string{known}, ghosts...)
+	if err := s.MarkMerkleRegisteredByTxIDs(ctx, all, time.Now()); err != nil {
+		t.Fatalf("mark: %v", err)
+	}
+
+	if got, _ := s.GetStatus(ctx, known); got == nil || got.MerkleRegisteredAt.IsZero() {
+		t.Errorf("known: MerkleRegisteredAt should be set, got %+v", got)
+	}
+	for _, txid := range ghosts {
+		if got, _ := s.GetStatus(ctx, txid); got != nil {
+			t.Errorf("%s: unknown txid should not have created a row", txid)
+		}
+	}
+}

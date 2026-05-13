@@ -2,20 +2,26 @@
 -- Store.EnsureIndexes() via pgx.Exec; safe to run repeatedly.
 
 CREATE TABLE IF NOT EXISTS transactions (
-    txid            TEXT PRIMARY KEY,
-    status          TEXT NOT NULL,
-    status_code     INT,
-    block_hash      TEXT,
-    block_height    BIGINT,
-    merkle_path     BYTEA,
-    extra_info      TEXT,
-    competing_txs   JSONB,
-    raw_tx          BYTEA,
-    retry_count     INT NOT NULL DEFAULT 0,
-    next_retry_at   TIMESTAMPTZ,
-    timestamp_at    TIMESTAMPTZ NOT NULL,
-    created_at      TIMESTAMPTZ NOT NULL
+    txid                 TEXT PRIMARY KEY,
+    status               TEXT NOT NULL,
+    status_code          INT,
+    block_hash           TEXT,
+    block_height         BIGINT,
+    merkle_path          BYTEA,
+    extra_info           TEXT,
+    competing_txs        JSONB,
+    raw_tx               BYTEA,
+    retry_count          INT NOT NULL DEFAULT 0,
+    next_retry_at        TIMESTAMPTZ,
+    timestamp_at         TIMESTAMPTZ NOT NULL,
+    created_at           TIMESTAMPTZ NOT NULL,
+    merkle_registered_at TIMESTAMPTZ
 );
+
+-- Idempotent column add for stores created before merkle_registered_at was
+-- introduced. Existing rows keep NULL until the next successful /watch call
+-- repopulates the marker — see issue #145.
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS merkle_registered_at TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS idx_tx_status        ON transactions(status);
 CREATE INDEX IF NOT EXISTS idx_tx_block_hash    ON transactions(block_hash);

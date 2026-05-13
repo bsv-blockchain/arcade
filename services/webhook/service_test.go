@@ -100,6 +100,10 @@ func (s *fakeStore) GetBUMP(context.Context, string) (uint64, []byte, error)  { 
 func (s *fakeStore) SetMinedByTxIDs(context.Context, string, uint64, []string) ([]*models.TransactionStatus, error) {
 	return nil, nil
 }
+
+func (s *fakeStore) MarkMerkleRegisteredByTxIDs(context.Context, []string, time.Time) error {
+	return nil
+}
 func (s *fakeStore) InsertSubmission(context.Context, *models.Submission) error { return nil }
 func (s *fakeStore) GetSubmissionsByToken(context.Context, string) ([]*models.Submission, error) {
 	return nil, nil

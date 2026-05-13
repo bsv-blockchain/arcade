@@ -1,0 +1,51 @@
+# ------------------------------------------------------------------------------
+#  Add Issues to Project Workflow
+#
+#  Purpose: Automatically add every newly opened issue in this repository to the
+#           bsv-blockchain organization project board so triage and planning stay
+#           in sync without manual intervention.
+#
+#  Triggers: Runs whenever an issue is opened in this repository.
+#
+#  Maintainer: @mrz1836
+# ------------------------------------------------------------------------------
+
+name: add-issues-to-project
+
+# --------------------------------------------------------------------
+# Trigger Configuration
+# --------------------------------------------------------------------
+on:
+  issues:
+    types:
+      - opened
+
+# --------------------------------------------------------------------
+# Permissions
+# --------------------------------------------------------------------
+permissions: read-all
+
+# --------------------------------------------------------------------
+# Concurrency Control
+# --------------------------------------------------------------------
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  add-to-project:
+    name: Add issue to bsv-blockchain project #18
+    runs-on: ubuntu-latest
+    permissions:
+      # The org-level project token is supplied via ADD_TO_PROJECT_PAT; no
+      # repository-scoped write permissions are required here.
+      contents: read
+    steps:
+      # --------------------------------------------------------------------
+      # Add the newly opened issue to the configured organization project
+      # --------------------------------------------------------------------
+      - name: Add issue to project
+        uses: actions/add-to-project@5afcf98fcd03f1c2f92c3c83f58ae24323cc57fd # v2.0.0
+        with:
+          project-url: https://github.com/orgs/bsv-blockchain/projects/18
+          github-token: ${{ secrets.ADD_TO_PROJECT_PAT }}

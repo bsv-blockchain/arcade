@@ -414,6 +414,96 @@ func TestSetStatusByBlockHash_UpdatesAllInBlock(t *testing.T) {
 	}
 }
 
+func TestMarkMerkleRegisteredByTxIDs_UpdatesExistingRows(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	txids := []string{"mr-1", "mr-2", "mr-3"}
+	for _, txid := range txids {
+		if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+			TxID: txid, Status: models.StatusReceived, Timestamp: time.Now(),
+		}); err != nil {
+			t.Fatalf("seed %s: %v", txid, err)
+		}
+	}
+
+	ts := time.Now().Add(-5 * time.Minute)
+	if err := s.MarkMerkleRegisteredByTxIDs(ctx, txids, ts); err != nil {
+		t.Fatalf("mark: %v", err)
+	}
+
+	for _, txid := range txids {
+		got, err := s.GetStatus(ctx, txid)
+		if err != nil {
+			t.Fatalf("GetStatus %s: %v", txid, err)
+		}
+		if got == nil {
+			t.Fatalf("%s: missing after mark", txid)
+		}
+		if !got.MerkleRegisteredAt.Equal(ts) {
+			t.Errorf("%s: MerkleRegisteredAt=%v want %v", txid, got.MerkleRegisteredAt, ts)
+		}
+	}
+}
+
+func TestMarkMerkleRegisteredByTxIDs_SkipsUnknownTxIDs(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+		TxID: "known", Status: models.StatusReceived, Timestamp: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.MarkMerkleRegisteredByTxIDs(ctx, []string{"known", "ghost-a", "ghost-b"}, time.Now()); err != nil {
+		t.Fatalf("mark: %v", err)
+	}
+
+	got, _ := s.GetStatus(ctx, "known")
+	if got == nil || got.MerkleRegisteredAt.IsZero() {
+		t.Errorf("known: MerkleRegisteredAt should be set, got %+v", got)
+	}
+	for _, txid := range []string{"ghost-a", "ghost-b"} {
+		got, _ := s.GetStatus(ctx, txid)
+		if got != nil {
+			t.Errorf("%s: unknown txid should not have created a row", txid)
+		}
+	}
+}
+
+func TestMarkMerkleRegisteredByTxIDs_RoundTripsThroughIterate(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+		TxID: "iter-1", Status: models.StatusReceived, Timestamp: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ts := time.Now()
+	if err := s.MarkMerkleRegisteredByTxIDs(ctx, []string{"iter-1"}, ts); err != nil {
+		t.Fatal(err)
+	}
+
+	var seen *models.TransactionStatus
+	if err := s.IterateStatusesSince(ctx, time.Now().Add(-time.Hour), func(st *models.TransactionStatus) error {
+		if st.TxID == "iter-1" {
+			seen = st
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if seen == nil {
+		t.Fatalf("iter-1 not seen")
+	}
+	if !seen.MerkleRegisteredAt.Equal(ts) {
+		t.Errorf("MerkleRegisteredAt=%v want %v", seen.MerkleRegisteredAt, ts)
+	}
+}
+
 func TestSubmissions_InsertAndQueryByTxID(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

@@ -323,9 +323,28 @@ type PropagationConfig struct {
 	RegisterReplayOnStart *bool `mapstructure:"register_replay_on_start"`
 	// RegisterReplayLookbackHours bounds how far back IterateStatusesSince
 	// scans when replaying. Older txs are very likely terminal already
-	// (MINED/IMMUTABLE) and skipping them avoids walking months of history
-	// on every boot. Defaults to 168 (7 days).
+	// (MINED/IMMUTABLE), and a non-terminal tx older than this window has
+	// almost certainly stalled — re-registering it on every boot won't
+	// unstick it. Defaults to 24 (one day), tightened from the original
+	// 7 days after issue #145.
 	RegisterReplayLookbackHours int `mapstructure:"register_replay_lookback_hours"`
+	// MerkleReplaySkipRecentMinutes lets the startup replay skip txs whose
+	// MerkleRegisteredAt is within this window. /watch is INSERT ... ON
+	// CONFLICT DO NOTHING on the merkle-service side and does not refresh
+	// expires_at, so re-registering a tx merkle-service already knows about
+	// is wasted work. Default 30 (matches merkle-service postMineTTLSec).
+	// Set to 0 to disable the skip and re-register every non-terminal tx —
+	// useful for forcing a full re-sync after a known merkle-service wipe.
+	// Issue #145.
+	MerkleReplaySkipRecentMinutes int `mapstructure:"merkle_replay_skip_recent_minutes"`
+	// MerkleReplayRPS caps the average requests-per-second the startup
+	// replay issues against merkle-service. Implemented as an inter-batch
+	// sleep proportional to batch size, so the actual rate hovers around
+	// the configured RPS rather than burst-then-stall. 0 disables
+	// throttling. Default 50 — a 24h replay over a 1.85M-row store would
+	// otherwise pin merkle-service at its postgres write ceiling for hours.
+	// Issue #145.
+	MerkleReplayRPS int `mapstructure:"merkle_replay_rps"`
 	// MaxPending caps the in-memory pending-batch slice the propagation
 	// consumer accumulates between flushes. Once full, new messages are
 	// returned as errors from handleMessage so the Kafka consumer's
@@ -665,7 +684,9 @@ func setDefaults() {
 	// drops its registration state and arcade silently stops receiving
 	// callbacks for everything in-flight.
 	viper.SetDefault("propagation.register_replay_on_start", true)
-	viper.SetDefault("propagation.register_replay_lookback_hours", 168)
+	viper.SetDefault("propagation.register_replay_lookback_hours", 24)
+	viper.SetDefault("propagation.merkle_replay_skip_recent_minutes", 30)
+	viper.SetDefault("propagation.merkle_replay_rps", 50)
 
 	viper.SetDefault("network", NetworkMainnet)
 
