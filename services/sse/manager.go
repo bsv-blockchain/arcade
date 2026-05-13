@@ -229,7 +229,7 @@ func (m *Manager) NewClient(token string) *Client {
 	}
 	// cancel is stored on Client and invoked by Manager.Unregister — its
 	// lifetime is the client connection, not this function.
-	ctx, cancel := context.WithCancel(parent) //nolint:gosec // see comment above
+	ctx, cancel := context.WithCancel(parent)
 	return &Client{
 		ID:     m.nextClientID.Add(1),
 		Token:  token,
