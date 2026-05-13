@@ -90,6 +90,10 @@ func (m *mockStore) SetMinedByTxIDs(context.Context, string, uint64, []string) (
 	return nil, nil
 }
 
+func (m *mockStore) MarkMerkleRegisteredByTxIDs(context.Context, []string, time.Time) error {
+	return nil
+}
+
 func (m *mockStore) InsertSubmission(_ context.Context, sub *models.Submission) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -383,10 +383,12 @@ func (p *Propagator) registerBatch(ctx context.Context, batch []propagationMsg) 
 	metrics.PropagationMerkleRegisterDuration.Observe(time.Since(start).Seconds())
 
 	registered = make([]propagationMsg, 0, len(batch))
+	successTxIDs := make([]string, 0, len(batch))
 	var failedCount int
 	for i, err := range errs {
 		if err == nil {
 			registered = append(registered, batch[i])
+			successTxIDs = append(successTxIDs, batch[i].TXID)
 			continue
 		}
 		failedCount++
@@ -411,6 +413,22 @@ func (p *Propagator) registerBatch(ctx context.Context, batch []propagationMsg) 
 		metrics.PropagationMerkleRegisterBatchOutcomeTotal.WithLabelValues("all_failed").Inc()
 	default:
 		metrics.PropagationMerkleRegisterBatchOutcomeTotal.WithLabelValues("partial").Inc()
+	}
+	// Stamp merkle_registered_at on every tx we successfully registered. The
+	// startup replay loop reads this and skips rows registered within
+	// MerkleReplaySkipRecentMinutes — without it, every restart re-walks the
+	// whole watchlist regardless of whether merkle-service already has it
+	// (issue #145). A failure here must not block broadcast: the mark is a
+	// hint, not part of the F-024 invariant. Worst case a missed mark causes
+	// one redundant /watch on the next replay.
+	if len(successTxIDs) > 0 {
+		if err := p.store.MarkMerkleRegisteredByTxIDs(ctx, successTxIDs, time.Now()); err != nil {
+			p.logger.Warn(
+				"mark merkle-registered failed",
+				zap.Int("count", len(successTxIDs)),
+				zap.Error(err),
+			)
+		}
 	}
 	return registered
 }

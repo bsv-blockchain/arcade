@@ -367,6 +367,9 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 	if len(status.MerklePath) > 0 {
 		bins["merkle_path"] = []byte(status.MerklePath)
 	}
+	if !status.MerkleRegisteredAt.IsZero() {
+		bins["merkle_registered_at"] = status.MerkleRegisteredAt.UnixMilli()
+	}
 
 	// Enforce the status lattice: refuse to overwrite a terminal status with a
 	// later, lower-priority update (e.g. a stray SEEN_ON_NETWORK callback after
@@ -749,6 +752,45 @@ func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeig
 	}
 
 	return statuses, nil
+}
+
+// MarkMerkleRegisteredByTxIDs writes merkle_registered_at = ts.UnixMilli() on
+// every existing transaction record in the txid list. Unknown txids are
+// silently skipped via UPDATE_ONLY (matching SetMinedByTxIDs). Used by the
+// startup replay loop to skip rows registered recently (issue #145).
+func (s *Store) MarkMerkleRegisteredByTxIDs(ctx context.Context, txids []string, ts time.Time) error {
+	if len(txids) == 0 {
+		return nil
+	}
+	bwp := aero.NewBatchWritePolicy()
+	bwp.RecordExistsAction = aero.UPDATE_ONLY
+
+	for i := 0; i < len(txids); i += s.batchSize {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		end := i + s.batchSize
+		if end > len(txids) {
+			end = len(txids)
+		}
+		batch := txids[i:end]
+
+		records := make([]aero.BatchRecordIfc, len(batch))
+		for j, txid := range batch {
+			key, err := s.key(setTransactions, txid)
+			if err != nil {
+				continue
+			}
+			records[j] = aero.NewBatchWrite(bwp, key,
+				aero.PutOp(aero.NewBin("merkle_registered_at", ts.UnixMilli())),
+			)
+		}
+
+		if err := s.client.BatchOperate(s.batchPolicy(ctx), records); err != nil {
+			return fmt.Errorf("batch mark merkle registered: %w", err)
+		}
+	}
+	return nil
 }
 
 // --- BUMP Operations ---
@@ -1716,6 +1758,11 @@ func recordToStatus(rec *aero.Record, txid string) *models.TransactionStatus {
 	if v, ok := rec.Bins["created_at"]; ok {
 		if ms, ok := v.(int); ok {
 			status.CreatedAt = time.UnixMilli(int64(ms))
+		}
+	}
+	if v, ok := rec.Bins["merkle_registered_at"]; ok {
+		if ms, ok := v.(int); ok {
+			status.MerkleRegisteredAt = time.UnixMilli(int64(ms))
 		}
 	}
 	return status

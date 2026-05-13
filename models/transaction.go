@@ -62,6 +62,12 @@ type TransactionStatus struct {
 	RetryCount   int       `json:"retryCount,omitempty"`
 	NextRetryAt  time.Time `json:"nextRetryAt,omitempty"`
 	CreatedAt    time.Time `json:"-"`
+	// MerkleRegisteredAt is the wall-clock time of the most recent
+	// successful merkle-service /watch registration for this txid. Zero
+	// value means "never registered" (or registered before this field was
+	// added). The startup replay loop reads this to skip rows registered
+	// within MerkleReplaySkipRecentMinutes — see issue #145.
+	MerkleRegisteredAt time.Time `json:"merkleRegisteredAt,omitempty"`
 }
 
 // Status represents the various states a transaction can be in

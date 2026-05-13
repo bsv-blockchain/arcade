@@ -12,10 +12,22 @@ import (
 )
 
 // defaultReplayLookback is the IterateStatusesSince window used when the
-// operator hasn't pinned register_replay_lookback_hours. 7 days covers the
-// typical confirmation horizon (deep reorgs + watchdog recency_depth) while
-// keeping startup work bounded for accounts with months of history.
-const defaultReplayLookback = 7 * 24 * time.Hour
+// operator hasn't pinned register_replay_lookback_hours. 24h covers the
+// confirmation horizon and watchdog recency window while keeping startup
+// work bounded — a non-terminal tx older than this is almost certainly
+// stuck, and re-registering it on every restart won't unstick it (issue
+// #145, was 7 days).
+const defaultReplayLookback = 24 * time.Hour
+
+// defaultReplaySkipRecent is the merkle_registered_at recency window used
+// when MerkleReplaySkipRecentMinutes isn't set. Matches merkle-service's
+// postMineTTLSec (1800s = 30min): if we registered within this window,
+// merkle-service almost certainly still has the row.
+const defaultReplaySkipRecent = 30 * time.Minute
+
+// defaultReplayRPS caps the average requests-per-second the replay loop
+// issues against merkle-service when MerkleReplayRPS isn't set.
+const defaultReplayRPS = 50
 
 // runMerkleReplay re-registers every non-terminal tx in the store with
 // merkle-service /watch. Runs once on startup and exits.
@@ -51,6 +63,23 @@ func (p *Propagator) runMerkleReplay(ctx context.Context) {
 	if concurrency <= 0 {
 		concurrency = 10
 	}
+	// skipRecent: rows registered within this window are skipped. 0 disables
+	// the skip — useful for forcing a full re-sync after a known
+	// merkle-service wipe (issue #145).
+	var skipRecent time.Duration
+	switch m := p.cfg.Propagation.MerkleReplaySkipRecentMinutes; {
+	case m < 0:
+		skipRecent = defaultReplaySkipRecent
+	case m == 0:
+		skipRecent = 0
+	default:
+		skipRecent = time.Duration(m) * time.Minute
+	}
+	// rps: average rate cap on RegisterBatch calls. 0 disables throttling.
+	rps := p.cfg.Propagation.MerkleReplayRPS
+	if rps < 0 {
+		rps = defaultReplayRPS
+	}
 	// batchSize bounds the in-memory accumulator before each RegisterBatch
 	// round. Small enough that a stalled merkle-service doesn't pin tens of
 	// MB of strings while we wait; large enough that the per-batch fixed
@@ -62,20 +91,54 @@ func (p *Propagator) runMerkleReplay(ctx context.Context) {
 		"merkle-service replay starting",
 		zap.Time("since", since),
 		zap.Int("concurrency", concurrency),
+		zap.Duration("skip_recent", skipRecent),
+		zap.Int("rps", rps),
 	)
 
-	var scanned, queued, failures int
+	var scanned, queued, failures, skippedRecent int
+	var throttled time.Duration
 	batch := make([]merkleservice.Registration, 0, batchSize)
+	now := time.Now()
 
 	flush := func() {
 		if len(batch) == 0 {
 			return
+		}
+		// Average-rate throttle: sleep proportional to batch size so the
+		// long-run RPS converges on the configured cap. Simpler than a
+		// token bucket and good enough for boot-time catch-up.
+		if rps > 0 {
+			delay := time.Duration(float64(len(batch))/float64(rps)) * time.Second
+			if delay > 0 {
+				throttled += delay
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(delay):
+				}
+			}
 		}
 		if err := p.merkleClient.RegisterBatch(ctx, batch, concurrency); err != nil {
 			failures += len(batch)
 			p.logger.Warn(
 				"merkle-service replay batch failed",
 				zap.Int("batch_size", len(batch)),
+				zap.Error(err),
+			)
+			batch = batch[:0]
+			return
+		}
+		// On success, stamp merkle_registered_at so future replays can skip
+		// these rows. RegisterBatch is fail-fast, so reaching here means
+		// every entry succeeded — mark them all in one round-trip.
+		txids := make([]string, len(batch))
+		for i := range batch {
+			txids[i] = batch[i].TxID
+		}
+		if err := p.store.MarkMerkleRegisteredByTxIDs(ctx, txids, time.Now()); err != nil {
+			p.logger.Warn(
+				"merkle-service replay mark failed",
+				zap.Int("count", len(txids)),
 				zap.Error(err),
 			)
 		}
@@ -91,6 +154,13 @@ func (p *Propagator) runMerkleReplay(ctx context.Context) {
 			return nil
 		}
 		if status.TxID == "" {
+			return nil
+		}
+		// Skip rows we registered recently — merkle-service almost certainly
+		// still has them, and POST /watch doesn't refresh expires_at anyway
+		// (issue #145). skipRecent == 0 disables.
+		if skipRecent > 0 && !status.MerkleRegisteredAt.IsZero() && now.Sub(status.MerkleRegisteredAt) < skipRecent {
+			skippedRecent++
 			return nil
 		}
 		batch = append(batch, merkleservice.Registration{
@@ -126,6 +196,8 @@ func (p *Propagator) runMerkleReplay(ctx context.Context) {
 		zap.Duration("elapsed", time.Since(start)),
 		zap.Int("scanned", scanned),
 		zap.Int("queued", queued),
+		zap.Int("skipped_recent", skippedRecent),
 		zap.Int("failures", failures),
+		zap.Duration("throttled", throttled),
 	)
 }

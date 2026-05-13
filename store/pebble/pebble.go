@@ -57,19 +57,20 @@ type Store struct {
 // unix-nanoseconds to dodge JSON time-zone drift and to keep retry index
 // keys byte-for-byte consistent.
 type storedStatus struct {
-	TxID            string   `json:"txid"`
-	Status          string   `json:"status"`
-	StatusCode      int      `json:"status_code,omitempty"`
-	BlockHash       string   `json:"block_hash,omitempty"`
-	BlockHeight     uint64   `json:"block_height,omitempty"`
-	MerklePath      []byte   `json:"merkle_path,omitempty"`
-	ExtraInfo       string   `json:"extra_info,omitempty"`
-	CompetingTxs    []string `json:"competing_txs,omitempty"`
-	RawTx           []byte   `json:"raw_tx,omitempty"`
-	RetryCount      int      `json:"retry_count,omitempty"`
-	TimestampUnixNs int64    `json:"ts"`
-	CreatedUnixNs   int64    `json:"created_at,omitempty"`
-	NextRetryUnixNs int64    `json:"next_retry_at,omitempty"`
+	TxID                   string   `json:"txid"`
+	Status                 string   `json:"status"`
+	StatusCode             int      `json:"status_code,omitempty"`
+	BlockHash              string   `json:"block_hash,omitempty"`
+	BlockHeight            uint64   `json:"block_height,omitempty"`
+	MerklePath             []byte   `json:"merkle_path,omitempty"`
+	ExtraInfo              string   `json:"extra_info,omitempty"`
+	CompetingTxs           []string `json:"competing_txs,omitempty"`
+	RawTx                  []byte   `json:"raw_tx,omitempty"`
+	RetryCount             int      `json:"retry_count,omitempty"`
+	TimestampUnixNs        int64    `json:"ts"`
+	CreatedUnixNs          int64    `json:"created_at,omitempty"`
+	NextRetryUnixNs        int64    `json:"next_retry_at,omitempty"`
+	MerkleRegisteredUnixNs int64    `json:"merkle_registered_at,omitempty"`
 }
 
 func (s storedStatus) toModel() *models.TransactionStatus {
@@ -93,6 +94,9 @@ func (s storedStatus) toModel() *models.TransactionStatus {
 	}
 	if s.NextRetryUnixNs != 0 {
 		out.NextRetryAt = time.Unix(0, s.NextRetryUnixNs)
+	}
+	if s.MerkleRegisteredUnixNs != 0 {
+		out.MerkleRegisteredAt = time.Unix(0, s.MerkleRegisteredUnixNs)
 	}
 	return out
 }
@@ -118,6 +122,9 @@ func fromModel(m *models.TransactionStatus) storedStatus {
 	}
 	if !m.NextRetryAt.IsZero() {
 		out.NextRetryUnixNs = m.NextRetryAt.UnixNano()
+	}
+	if !m.MerkleRegisteredAt.IsZero() {
+		out.MerkleRegisteredUnixNs = m.MerkleRegisteredAt.UnixNano()
 	}
 	return out
 }
@@ -428,6 +435,9 @@ func mergeStatus(existing *storedStatus, update *models.TransactionStatus) store
 	}
 	if !update.NextRetryAt.IsZero() {
 		out.NextRetryUnixNs = update.NextRetryAt.UnixNano()
+	}
+	if !update.MerkleRegisteredAt.IsZero() {
+		out.MerkleRegisteredUnixNs = update.MerkleRegisteredAt.UnixNano()
 	}
 	return out
 }
@@ -851,6 +861,51 @@ func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeig
 		})
 	}
 	return out, nil
+}
+
+// MarkMerkleRegisteredByTxIDs stamps merkle_registered_at on every existing row
+// in the txid list. Unknown txids are silently no-ops (matching SetMinedByTxIDs).
+// Per-shard locking matches the rest of the status writers; an UpdateStatus
+// racing with this write may see either ordering but never lose other fields
+// since mergeStatus only ever overwrites populated fields. Issue #145.
+func (s *Store) MarkMerkleRegisteredByTxIDs(ctx context.Context, txids []string, ts time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	tsNs := ts.UnixNano()
+	for _, txid := range txids {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		mu := s.shardFor(txid)
+		mu.Lock()
+
+		existing, err := s.readStoredStatus(txid)
+		if err != nil {
+			mu.Unlock()
+			return err
+		}
+		if existing == nil {
+			mu.Unlock()
+			continue
+		}
+
+		updated := *existing
+		updated.MerkleRegisteredUnixNs = tsNs
+
+		payload, err := json.Marshal(updated)
+		if err != nil {
+			mu.Unlock()
+			return err
+		}
+		// No index churn: merkle_registered_at isn't indexed.
+		err = s.db.Set(txKey(txid), payload, s.writeOpts)
+		mu.Unlock()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // --- BUMP / STUMP ---

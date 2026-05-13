@@ -70,6 +70,13 @@ type mockStore struct {
 	cleared        []clearedCall
 	// replayRows drives IterateStatusesSince for merkle-replay tests.
 	replayRows []*models.TransactionStatus
+	// merkleMarks records every MarkMerkleRegisteredByTxIDs call as one
+	// slice per call. Lets tests assert how many flushes happened and
+	// which txids landed in each.
+	merkleMarks [][]string
+	// markErr forces MarkMerkleRegisteredByTxIDs to return this error.
+	// Used by tests that verify a mark failure doesn't block broadcast.
+	markErr error
 }
 
 type clearedCall struct {
@@ -136,6 +143,53 @@ func (m *mockStore) GetReadyRetries(_ context.Context, now time.Time, limit int)
 	return out, nil
 }
 
+func (m *mockStore) MarkMerkleRegisteredByTxIDs(_ context.Context, txids []string, ts time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.markErr != nil {
+		return m.markErr
+	}
+	cp := append([]string(nil), txids...)
+	m.merkleMarks = append(m.merkleMarks, cp)
+	// Also stamp the replayRows so successive IterateStatusesSince calls
+	// observe the marker — lets replay tests verify the round-trip.
+	marked := make(map[string]struct{}, len(txids))
+	for _, t := range txids {
+		marked[t] = struct{}{}
+	}
+	for _, r := range m.replayRows {
+		if _, ok := marked[r.TxID]; ok {
+			r.MerkleRegisteredAt = ts
+		}
+	}
+	return nil
+}
+
+func (m *mockStore) markCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.merkleMarks)
+}
+
+func (m *mockStore) lastMark() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.merkleMarks) == 0 {
+		return nil
+	}
+	return m.merkleMarks[len(m.merkleMarks)-1]
+}
+
+func (m *mockStore) allMarks() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []string
+	for _, batch := range m.merkleMarks {
+		out = append(out, batch...)
+	}
+	return out
+}
+
 func (m *mockStore) ClearRetryState(_ context.Context, txid string, finalStatus models.Status, extraInfo string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -150,11 +204,17 @@ func (m *mockStore) ClearRetryState(_ context.Context, txid string, finalStatus 
 	return nil
 }
 
-func (m *mockStore) IterateStatusesSince(_ context.Context, _ time.Time, fn func(*models.TransactionStatus) error) error {
+func (m *mockStore) IterateStatusesSince(_ context.Context, since time.Time, fn func(*models.TransactionStatus) error) error {
 	m.mu.Lock()
 	rows := append([]*models.TransactionStatus(nil), m.replayRows...)
 	m.mu.Unlock()
 	for _, r := range rows {
+		// Honor the lookback filter so replay tests can pin behavior that
+		// depends on it. Rows with a zero Timestamp are always returned —
+		// matches existing tests that don't bother setting one.
+		if !r.Timestamp.IsZero() && r.Timestamp.Before(since) {
+			continue
+		}
 		if err := fn(r); err != nil {
 			return err
 		}
@@ -652,6 +712,185 @@ func TestRunMerkleReplay_DisabledByConfig(t *testing.T) {
 	}
 }
 
+// replayPropagator builds a Propagator wired to the supplied merkle server,
+// with all the knobs replay tests care about pre-populated. Keeps the
+// per-test setup boilerplate small.
+func replayPropagator(t *testing.T, ms *mockStore, merkleURL string, configure func(*config.Config)) *Propagator {
+	t.Helper()
+	cfg := &config.Config{CallbackURL: "http://arcade/cb", CallbackToken: "tok"}
+	cfg.Propagation.MerkleConcurrency = 4
+	cfg.Propagation.RegisterReplayLookbackHours = 24
+	enabled := true
+	cfg.Propagation.RegisterReplayOnStart = &enabled
+	if configure != nil {
+		configure(cfg)
+	}
+	mc := merkleservice.NewClient(merkleURL, "auth", 5*time.Second)
+	return New(cfg, zap.NewNop(), nil, nil, ms, nil, nil, mc)
+}
+
+// TestRunMerkleReplay_SkipsRecentlyRegistered pins the issue #145 fix:
+// rows whose MerkleRegisteredAt is within MerkleReplaySkipRecentMinutes
+// don't need re-registration (merkle-service still has them, and POST
+// /watch wouldn't refresh expires_at anyway).
+func TestRunMerkleReplay_SkipsRecentlyRegistered(t *testing.T) {
+	log := &eventLog{}
+	ms := newMockStore()
+	now := time.Now()
+	ms.replayRows = []*models.TransactionStatus{
+		{TxID: "tx-stale-1", Status: models.StatusReceived, MerkleRegisteredAt: now.Add(-2 * time.Hour)},
+		{TxID: "tx-recent-1", Status: models.StatusReceived, MerkleRegisteredAt: now.Add(-5 * time.Minute)},
+		{TxID: "tx-stale-2", Status: models.StatusSeenOnNetwork, MerkleRegisteredAt: now.Add(-2 * time.Hour)},
+		{TxID: "tx-recent-2", Status: models.StatusSeenOnNetwork, MerkleRegisteredAt: now.Add(-5 * time.Minute)},
+	}
+
+	merkleSrv := newMerkleServer(log, http.StatusOK)
+	defer merkleSrv.Close()
+
+	p := replayPropagator(t, ms, merkleSrv.URL, func(cfg *config.Config) {
+		cfg.Propagation.MerkleReplaySkipRecentMinutes = 30
+	})
+	p.runMerkleReplay(context.Background())
+
+	if got := log.count("register:"); got != 2 {
+		t.Errorf("registered=%d want 2 (only stale rows)", got)
+	}
+	for _, skip := range []string{"tx-recent-1", "tx-recent-2"} {
+		for _, ev := range log.all() {
+			if strings.Contains(ev, skip) {
+				t.Errorf("event %q should have been skipped (recently registered)", ev)
+			}
+		}
+	}
+}
+
+// TestRunMerkleReplay_SkipDisabled verifies that
+// MerkleReplaySkipRecentMinutes=0 forces a full re-register regardless
+// of recency — the escape hatch operators need after a known
+// merkle-service wipe.
+func TestRunMerkleReplay_SkipDisabled(t *testing.T) {
+	log := &eventLog{}
+	ms := newMockStore()
+	now := time.Now()
+	ms.replayRows = []*models.TransactionStatus{
+		{TxID: "tx-1", Status: models.StatusReceived, MerkleRegisteredAt: now.Add(-1 * time.Minute)},
+		{TxID: "tx-2", Status: models.StatusReceived, MerkleRegisteredAt: now.Add(-30 * time.Second)},
+	}
+
+	merkleSrv := newMerkleServer(log, http.StatusOK)
+	defer merkleSrv.Close()
+
+	p := replayPropagator(t, ms, merkleSrv.URL, func(cfg *config.Config) {
+		cfg.Propagation.MerkleReplaySkipRecentMinutes = 0
+	})
+	p.runMerkleReplay(context.Background())
+
+	if got := log.count("register:"); got != 2 {
+		t.Errorf("registered=%d want 2 (skip disabled — every row re-registers)", got)
+	}
+}
+
+// TestRunMerkleReplay_LookbackDefault24h pins the lookback default
+// change. Rows older than 24h are filtered out by IterateStatusesSince;
+// only the recent rows make it into the replay scan.
+func TestRunMerkleReplay_LookbackDefault24h(t *testing.T) {
+	log := &eventLog{}
+	ms := newMockStore()
+	now := time.Now()
+	ms.replayRows = []*models.TransactionStatus{
+		{TxID: "tx-recent", Status: models.StatusReceived, Timestamp: now.Add(-12 * time.Hour)},
+		{TxID: "tx-old", Status: models.StatusReceived, Timestamp: now.Add(-5 * 24 * time.Hour)},
+	}
+
+	merkleSrv := newMerkleServer(log, http.StatusOK)
+	defer merkleSrv.Close()
+
+	p := replayPropagator(t, ms, merkleSrv.URL, func(cfg *config.Config) {
+		cfg.Propagation.RegisterReplayLookbackHours = 0 // fall back to defaultReplayLookback (24h)
+		cfg.Propagation.MerkleReplaySkipRecentMinutes = 0
+	})
+	p.runMerkleReplay(context.Background())
+
+	if got := log.count("register:"); got != 1 {
+		t.Errorf("registered=%d want 1 (only the 12h-old row is in lookback)", got)
+	}
+	for _, ev := range log.all() {
+		if strings.Contains(ev, "tx-old") {
+			t.Errorf("event %q: tx-old is 5 days old, must be excluded by 24h default lookback", ev)
+		}
+	}
+}
+
+// TestRunMerkleReplay_RateLimit verifies the throttle: with RPS=10 and
+// batch size 1000, a 30-row replay falls into one batch and pays
+// ~3s of inter-batch sleep before flushing. (The first flush is also
+// throttled in the current implementation since we sleep before each
+// non-empty flush.) Wall-time floor with generous CI-slack.
+func TestRunMerkleReplay_RateLimit(t *testing.T) {
+	log := &eventLog{}
+	ms := newMockStore()
+	rows := make([]*models.TransactionStatus, 30)
+	for i := range rows {
+		rows[i] = &models.TransactionStatus{TxID: fmt.Sprintf("tx-%d", i), Status: models.StatusReceived}
+	}
+	ms.replayRows = rows
+
+	merkleSrv := newMerkleServer(log, http.StatusOK)
+	defer merkleSrv.Close()
+
+	p := replayPropagator(t, ms, merkleSrv.URL, func(cfg *config.Config) {
+		cfg.Propagation.MerkleReplayRPS = 10
+		cfg.Propagation.MerkleReplaySkipRecentMinutes = 0
+	})
+
+	start := time.Now()
+	p.runMerkleReplay(context.Background())
+	elapsed := time.Since(start)
+
+	if got := log.count("register:"); got != 30 {
+		t.Errorf("registered=%d want 30", got)
+	}
+	// 30 rows / 10 rps = 3s nominal. Accept ≥ 2.5s to absorb scheduling jitter.
+	if elapsed < 2500*time.Millisecond {
+		t.Errorf("elapsed=%v want ≥ 2.5s with RPS=10 over 30 rows", elapsed)
+	}
+}
+
+// TestRunMerkleReplay_MarksSuccessfulFlush pins the round-trip:
+// replay's successful flush() must stamp merkle_registered_at on the
+// rows it sent, so the NEXT replay skips them.
+func TestRunMerkleReplay_MarksSuccessfulFlush(t *testing.T) {
+	log := &eventLog{}
+	ms := newMockStore()
+	ms.replayRows = []*models.TransactionStatus{
+		{TxID: "tx-1", Status: models.StatusReceived},
+		{TxID: "tx-2", Status: models.StatusReceived},
+		{TxID: "tx-3", Status: models.StatusReceived},
+	}
+
+	merkleSrv := newMerkleServer(log, http.StatusOK)
+	defer merkleSrv.Close()
+
+	p := replayPropagator(t, ms, merkleSrv.URL, func(cfg *config.Config) {
+		cfg.Propagation.MerkleReplaySkipRecentMinutes = 0 // not relevant here, just keep behavior explicit
+		cfg.Propagation.MerkleReplayRPS = 0               // no throttle so the test stays fast
+	})
+	p.runMerkleReplay(context.Background())
+
+	if ms.markCount() != 1 {
+		t.Errorf("expected 1 mark batch (one successful flush), got %d", ms.markCount())
+	}
+	got := map[string]bool{}
+	for _, txid := range ms.lastMark() {
+		got[txid] = true
+	}
+	for _, want := range []string{"tx-1", "tx-2", "tx-3"} {
+		if !got[want] {
+			t.Errorf("expected %s in last mark, got %v", want, ms.lastMark())
+		}
+	}
+}
+
 // Test 7: Batch of 100 — all registered then broadcast in single call
 func TestProcessBatch_100Transactions(t *testing.T) {
 	var registerCount atomic.Int32
@@ -973,6 +1212,83 @@ func TestRegisterBatch_Metric_AllFailed(t *testing.T) {
 	}
 	if delta := partialAfter - partialBefore; delta != 0 {
 		t.Errorf("partial delta=%v want 0", delta)
+	}
+}
+
+// TestRegisterBatch_MarksSuccessesOnly is the issue #145 hook: every txid
+// that successfully /watch-registers must get a merkle_registered_at stamp
+// on its row so the next startup replay can skip it. Failed txids must NOT
+// be marked — their row is PENDING_RETRY and the reaper will re-register.
+func TestRegisterBatch_MarksSuccessesOnly(t *testing.T) {
+	merkleSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			TxID string `json:"txid"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.TxID == "tx-bad" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer merkleSrv.Close()
+	teranodeSrv := newTeranodeServer(&eventLog{}, http.StatusOK)
+	defer teranodeSrv.Close()
+
+	ms := newMockStore()
+	p := newPropagator(merkleSrv.URL, teranodeSrv.URL, ms)
+
+	for _, txid := range []string{"tx-good-a", "tx-bad", "tx-good-b"} {
+		if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg(txid))); err != nil {
+			t.Fatalf("handleMessage %s: %v", txid, err)
+		}
+	}
+	if err := p.flushBatch(context.Background()); err != nil {
+		t.Fatalf("flushBatch: %v", err)
+	}
+
+	marks := ms.allMarks()
+	if len(marks) != 2 {
+		t.Fatalf("expected 2 marks (only good txs), got %d: %v", len(marks), marks)
+	}
+	got := map[string]bool{}
+	for _, m := range marks {
+		got[m] = true
+	}
+	if !got["tx-good-a"] || !got["tx-good-b"] {
+		t.Errorf("expected tx-good-a and tx-good-b marked, got %v", got)
+	}
+	if got["tx-bad"] {
+		t.Errorf("tx-bad must NOT be marked — it failed registration")
+	}
+}
+
+// TestRegisterBatch_MarkStoreFailure_DoesNotBlockBroadcast pins the
+// "best-effort" contract on the mark hook: the marker is a replay-skip
+// hint, not part of F-024. If MarkMerkleRegisteredByTxIDs returns an
+// error, broadcast must still happen — worst case the next replay
+// re-registers one extra time.
+func TestRegisterBatch_MarkStoreFailure_DoesNotBlockBroadcast(t *testing.T) {
+	merkleSrv := newMerkleServer(&eventLog{}, http.StatusOK)
+	defer merkleSrv.Close()
+
+	broadcastLog := &eventLog{}
+	teranodeSrv := newTeranodeServer(broadcastLog, http.StatusOK)
+	defer teranodeSrv.Close()
+
+	ms := newMockStore()
+	ms.markErr = errors.New("store down")
+	p := newPropagator(merkleSrv.URL, teranodeSrv.URL, ms)
+
+	if err := handleAndFlush(t, p, makePropMsg("tx-1")); err != nil {
+		t.Fatalf("handleAndFlush: %v", err)
+	}
+
+	if broadcastLog.count("broadcast") != 1 {
+		t.Errorf("broadcast should still fire on mark failure, got %d", broadcastLog.count("broadcast"))
+	}
+	if u := ms.lastUpdateForTxid("tx-1"); u == nil || u.Status != models.StatusAcceptedByNetwork {
+		t.Errorf("tx-1: expected ACCEPTED_BY_NETWORK, got %+v", u)
 	}
 }
 

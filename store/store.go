@@ -221,6 +221,13 @@ type Store interface {
 	// row stops showing up in ready-retry queries.
 	ClearRetryState(ctx context.Context, txid string, finalStatus models.Status, extraInfo string) error
 
+	// MarkMerkleRegisteredByTxIDs records that the given txids have been
+	// successfully registered with merkle-service at ts. Unknown txids are
+	// silently skipped (matching SetMinedByTxIDs semantics). Used by the
+	// startup replay loop to skip rows it already registered recently — see
+	// issue #145.
+	MarkMerkleRegisteredByTxIDs(ctx context.Context, txids []string, ts time.Time) error
+
 	// EnsureIndexes creates any required secondary indexes for query operations.
 	EnsureIndexes() error
 
