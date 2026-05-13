@@ -136,7 +136,7 @@ func (s *Service) registerRoutes(r *gin.Engine) {
 	storagePath := s.cfg.Chaintracks.StoragePath
 	r.GET("/chaintracks/:file", func(c *gin.Context) {
 		file := c.Param("file")
-		if file == "" || file == "v1" || file == "v2" || containsUnsafePathChars(file) {
+		if file == "" || file == "v1" || file == "v2" || !isSafeHeaderFileName(file) {
 			c.Status(http.StatusNotFound)
 			return
 		}
@@ -157,22 +157,27 @@ func (s *Service) handleHealth(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
-// containsUnsafePathChars rejects filenames that could escape the
-// storage directory. Header files are flat names like
-// `mainNet_0.headers`, so any slash or dot-dot is unsafe.
-func containsUnsafePathChars(s string) bool {
+// isSafeHeaderFileName allowlists expected header file names.
+// Header files are single path components (for example `mainNet_0.headers`),
+// so separators, traversal tokens, and unexpected characters are rejected.
+func isSafeHeaderFileName(s string) bool {
+	if s == "" {
+		return false
+	}
+	if strings.Contains(s, "/") || strings.Contains(s, "\\") || strings.Contains(s, "..") {
+		return false
+	}
+
 	for i := 0; i < len(s); i++ {
-		if s[i] == '/' || s[i] == '\\' {
-			return true
+		ch := s[i]
+		isLower := ch >= 'a' && ch <= 'z'
+		isUpper := ch >= 'A' && ch <= 'Z'
+		isDigit := ch >= '0' && ch <= '9'
+		if isLower || isUpper || isDigit || ch == '.' || ch == '_' || ch == '-' {
+			continue
 		}
+		return false
 	}
-	if s == ".." || len(s) >= 3 && s[:3] == "../" {
-		return true
-	}
-	for i := 0; i+1 < len(s); i++ {
-		if s[i] == '.' && s[i+1] == '.' {
-			return true
-		}
-	}
-	return false
+
+	return true
 }
