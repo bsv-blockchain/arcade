@@ -10,7 +10,6 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/teranode"
@@ -45,18 +44,6 @@ type dispatcherBroadcaster struct {
 	flips          chan<- statusFlip
 	logger         *zap.Logger
 	submitTimeout  time.Duration
-
-	// Merkle-service integration. When merkleClient is non-nil and
-	// callbackURL is set, every tx in a batch is registered with
-	// merkle-service before broadcast. Preserves the F-024 invariant
-	// (every tx that hits Teranode has a /watch entry so MINED /
-	// SEEN_ON_NETWORK callbacks can fire). Per-tx registration
-	// failures route to a retryable statusFlip (statusCode=0); the
-	// dispatcher's retry queue re-dispatches them on backoff.
-	merkleClient        *merkleservice.Client
-	merkleConcurrency   int
-	merkleCallbackURL   string
-	merkleCallbackToken string
 }
 
 // dispatcherBroadcasterConfig collects construction parameters.
@@ -67,15 +54,6 @@ type dispatcherBroadcasterConfig struct {
 	Flips          chan<- statusFlip
 	Logger         *zap.Logger
 	SubmitTimeout  time.Duration // 0 → default 15s, matches existing propagator
-
-	// Merkle-service deps. All optional — when MerkleClient is nil OR
-	// MerkleCallbackURL is empty, registration is skipped entirely
-	// and broadcast proceeds without a /watch entry. Same behavior
-	// as the legacy propagator's registerBatch in that mode.
-	MerkleClient        *merkleservice.Client
-	MerkleConcurrency   int // 0 → default 10, matches legacy default
-	MerkleCallbackURL   string
-	MerkleCallbackToken string
 }
 
 func newDispatcherBroadcaster(cfg dispatcherBroadcasterConfig) (*dispatcherBroadcaster, error) {
@@ -99,21 +77,13 @@ func newDispatcherBroadcaster(cfg dispatcherBroadcasterConfig) (*dispatcherBroad
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
-	merkleConcurrency := cfg.MerkleConcurrency
-	if merkleConcurrency <= 0 {
-		merkleConcurrency = 10
-	}
 	return &dispatcherBroadcaster{
-		teranodeClient:      cfg.TeranodeClient,
-		store:               cfg.Store,
-		incoming:            cfg.Incoming,
-		flips:               cfg.Flips,
-		logger:              logger,
-		submitTimeout:       timeout,
-		merkleClient:        cfg.MerkleClient,
-		merkleConcurrency:   merkleConcurrency,
-		merkleCallbackURL:   cfg.MerkleCallbackURL,
-		merkleCallbackToken: cfg.MerkleCallbackToken,
+		teranodeClient: cfg.TeranodeClient,
+		store:          cfg.Store,
+		incoming:       cfg.Incoming,
+		flips:          cfg.Flips,
+		logger:         logger,
+		submitTimeout:  timeout,
 	}, nil
 }
 
@@ -147,16 +117,6 @@ func (b *dispatcherBroadcaster) Run(ctx context.Context) {
 // without the fallback we couldn't tell which tx in a batch was bad.
 // A single-tx batch goes directly to /tx.
 func (b *dispatcherBroadcaster) processBatch(ctx context.Context, batch []*inFlightEntry) {
-	if len(batch) == 0 {
-		return
-	}
-
-	// Register every tx with merkle-service before broadcast. Failed
-	// registrations route to retryable statusFlips and are dropped
-	// from the batch — the dispatcher's retry queue will pick them up
-	// on backoff. This preserves the F-024 invariant: no tx hits
-	// Teranode without a /watch entry.
-	batch = b.registerOrRetry(ctx, batch)
 	if len(batch) == 0 {
 		return
 	}
@@ -195,56 +155,6 @@ func (b *dispatcherBroadcaster) processBatch(ctx context.Context, batch []*inFli
 		)
 		b.fallbackPerTx(ctx, batch)
 	}
-}
-
-// registerOrRetry submits every tx in the batch to merkle-service for
-// /watch registration. Returns the subset that registered
-// successfully. Per-tx failures emit a retryable statusFlip
-// (statusCode=0) so the dispatcher's retry queue re-dispatches them on
-// backoff. When the merkle integration is disabled (nil client or no
-// callback URL), the input batch is returned unchanged — matches the
-// legacy propagator's registerBatch behavior.
-func (b *dispatcherBroadcaster) registerOrRetry(ctx context.Context, batch []*inFlightEntry) []*inFlightEntry {
-	if b.merkleClient == nil || b.merkleCallbackURL == "" {
-		return batch
-	}
-
-	regs := make([]merkleservice.Registration, len(batch))
-	for i, entry := range batch {
-		regs[i] = merkleservice.Registration{
-			TxID:          entry.txid,
-			CallbackURL:   b.merkleCallbackURL,
-			CallbackToken: b.merkleCallbackToken,
-		}
-	}
-
-	errs := b.merkleClient.RegisterBatchWithResults(ctx, regs, b.merkleConcurrency)
-	registered := make([]*inFlightEntry, 0, len(batch))
-	for i, err := range errs {
-		if err == nil {
-			registered = append(registered, batch[i])
-			continue
-		}
-		b.logger.Warn(
-			"dispatcherBroadcaster: merkle register failed, scheduling retry",
-			zap.String("txid", batch[i].txid),
-			zap.Error(err),
-		)
-		// statusCode=0 is the retryable signal for the dispatcher. Do
-		// NOT write a REJECTED row to the store — the tx is in flight,
-		// just needs another registration attempt.
-		select {
-		case b.flips <- statusFlip{
-			txid:       batch[i].txid,
-			status:     models.StatusRejected,
-			errorMsg:   "merkle register failed: " + err.Error(),
-			statusCode: 0,
-		}:
-		case <-ctx.Done():
-			return nil
-		}
-	}
-	return registered
 }
 
 // broadcastSingle handles a single-tx batch by calling /tx directly
