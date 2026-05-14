@@ -140,6 +140,16 @@ var PropagationPendingDepth = promauto.NewGauge(prometheus.GaugeOpts{
 	Help: "Number of propagation messages buffered awaiting flush.",
 })
 
+// PropagationInflightBatches gauges how many flushBatch goroutines are
+// currently running their register+broadcast pipeline. Capped at
+// PropagationConfig.MaxConcurrentBatches; sustained saturation means the
+// pipeline cannot keep up with the kafka drain rate and pendingMsgs will
+// grow until backpressure forces the consumer to block.
+var PropagationInflightBatches = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "arcade_propagation_inflight_batches",
+	Help: "Number of propagation batches currently mid-pipeline.",
+})
+
 // PropagationBroadcastDuration measures end-to-end wall time of broadcasting
 // a single chunk to all healthy endpoints (the inner /tx or /txs path).
 var PropagationBroadcastDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
@@ -494,6 +504,101 @@ var P2PEndpointDiscoveryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_p2p_endpoint_discovery_total",
 	Help: "Datahub URL discovery outcomes from peer announcements.",
 }, []string{labelOutcome}) // registered, duplicate, invalid, no_url
+
+// ---------------------------------------------------------------------------
+// callback path — inbound merkle-service callbacks
+// ---------------------------------------------------------------------------
+
+// statusTransitionAgeBuckets covers RECEIVED→SEEN_ON_NETWORK style
+// transitions. Wider than latencyBuckets because the tail can stretch into
+// the multi-second range under merkle-service congestion (the slow case is
+// the one we care most about catching with a histogram).
+var statusTransitionAgeBuckets = []float64{
+	0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
+	1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+}
+
+// StatusTransitionAge measures the wall-clock age of the previous status
+// row at the moment a new transition is applied. Wired into the SEEN_ON_NETWORK
+// callback handler so {from="RECEIVED",to="SEEN_ON_NETWORK"} surfaces the
+// time between arcade receiving a tx and the merkle-service callback
+// landing in arcade's store + publish pipeline. Naturally extensible to
+// other transitions (RECEIVED→REJECTED, SEEN_ON_NETWORK→MINED, ...) without
+// new metric definitions.
+var StatusTransitionAge = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Name:    "arcade_status_transition_age_seconds",
+	Help:    "Wall-clock age of the previous status row at the moment a new transition is applied.",
+	Buckets: statusTransitionAgeBuckets,
+}, []string{"from", "to"})
+
+// CallbackHandlerDuration measures end-to-end handler latency for one
+// inbound /api/v1/merkle-service/callback request, partitioned by the
+// callback type so a slow STUMP path doesn't get conflated with a slow
+// SEEN_ON_NETWORK path. result ∈ {success, partial, error}.
+var CallbackHandlerDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Name:    "arcade_callback_handler_duration_seconds",
+	Help:    "End-to-end duration of one inbound merkle-service callback handler, by type.",
+	Buckets: latencyBuckets,
+}, []string{"type", "result"})
+
+// CallbackBatchSize records len(TxIDs) per inbound callback so we can see
+// how aggressively the upstream is batching. Informs whether bulk-publish
+// optimizations are paying off.
+var CallbackBatchSize = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Name:    "arcade_callback_batch_size",
+	Help:    "Number of txids in one inbound merkle-service callback, by type.",
+	Buckets: sizeBuckets,
+}, []string{"type"})
+
+// CallbackUnknownTxIDTotal counts txids referenced by a callback that
+// arcade's store has no record of. Already logged at WARN; the counter
+// makes the rate scrapable so an operator can spot upstream drift.
+var CallbackUnknownTxIDTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_callback_unknown_txid_total",
+	Help: "Inbound callbacks that named a txid arcade's store doesn't know.",
+}, []string{"type"})
+
+// CallbackStaleTotal counts txids in inbound callbacks whose store row is
+// already past the target status (lattice short-circuited the update). The
+// underlying signal also lives in store_updatestatus_duration_seconds_count
+// with outcome=skipped_lattice, but that histogram bakes in the duration
+// label set; a dedicated counter is cheaper to alert on and makes
+// "merkle-service is sending us stale callbacks" a first-class number.
+// prev_status carries the lattice-blocked previous state (e.g. MINED) so
+// operators can tell apart "callback for already-mined tx" from "duplicate
+// SEEN_ON_NETWORK".
+var CallbackStaleTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_callback_stale_total",
+	Help: "Inbound callbacks whose target status was already eclipsed by the stored row's status.",
+}, []string{"type", "prev_status"})
+
+// ---------------------------------------------------------------------------
+// store hot-path — per-call latency
+// ---------------------------------------------------------------------------
+
+// StoreUpdateStatusDuration decomposes the per-call UpdateStatus latency so
+// we can tell whether a long callback handler is paying disk-write cost or
+// publish cost. from_status/to_status label cardinality is bounded by the
+// status lattice (~10 values each) so the matrix stays small.
+var StoreUpdateStatusDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Name:    "arcade_store_updatestatus_duration_seconds",
+	Help:    "Duration of one store.UpdateStatus call, by from/to status and outcome.",
+	Buckets: latencyBuckets,
+}, []string{"from_status", "to_status", labelOutcome}) // outcome: applied, skipped_lattice, not_found, error
+
+// ---------------------------------------------------------------------------
+// events publisher — Kafka send latency
+// ---------------------------------------------------------------------------
+
+// EventsPublishDuration measures the latency of one Publisher.Publish or
+// PublishBulk call. Currently the path is dark — when the in-memory broker
+// applies backpressure (a stalled consumer makes Send take 2s), nothing
+// surfaces in metrics. kind ∈ {single, bulk}.
+var EventsPublishDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Name:    "arcade_events_publish_duration_seconds",
+	Help:    "Duration of one Publisher.Publish/PublishBulk call.",
+	Buckets: latencyBuckets,
+}, []string{"kind", labelOutcome}) // outcome: success, error
 
 // ObserveStatusClass returns the bucket label ("2xx", "3xx", "4xx", "5xx",
 // "transport_error") for a given HTTP status code. Used by HTTP-latency

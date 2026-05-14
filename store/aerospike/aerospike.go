@@ -339,6 +339,16 @@ func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.Transa
 	return store.BatchUpdateStatusParallel(ctx, s, statuses)
 }
 
+// BatchUpdateStatusReturning runs UpdateStatus concurrently and returns the
+// previous row per input. Aerospike's UpdateStatus doesn't yet expose the
+// pre-merge bin, so we fall back to GetStatus+UpdateStatus per row — two
+// round-trips. Arcade's primary deployment uses Pebble (which fuses the
+// read into the same locked region); this fallback exists to satisfy the
+// store.Store contract.
+func (s *Store) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
+	return store.BatchUpdateStatusReturningFallback(ctx, s, statuses)
+}
+
 // UpdateStatus updates an existing transaction record. If no record exists for
 // status.TxID the call returns store.ErrNotFound without writing — callers
 // must use GetOrInsertStatus to create new rows. This guard closes F-033 /
@@ -702,22 +712,51 @@ func (s *Store) ClearRetryState(ctx context.Context, txid string, finalStatus mo
 // blockHeight is persisted as the block_height bin and echoed back on each
 // returned TransactionStatus so SSE/webhook consumers always see the height
 // alongside the hash (issue #87 / F-029).
-func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeight uint64, txids []string) ([]*models.TransactionStatus, error) {
+func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeight uint64, txids []string) ([]*models.TransactionStatus, []*models.TransactionStatus, error) {
 	now := time.Now()
-	var statuses []*models.TransactionStatus
+	var prevs, statuses []*models.TransactionStatus
 
 	bwp := aero.NewBatchWritePolicy()
 	bwp.RecordExistsAction = aero.UPDATE_ONLY
 
 	for i := 0; i < len(txids); i += s.batchSize {
 		if err := ctx.Err(); err != nil {
-			return statuses, err
+			return prevs, statuses, err
 		}
 		end := i + s.batchSize
 		if end > len(txids) {
 			end = len(txids)
 		}
 		batch := txids[i:end]
+
+		// Snapshot pre-update rows so callers can observe the MINED
+		// transition age. BatchGet is a second round-trip but matches the
+		// access pattern Pebble does atomically via per-shard locks; for
+		// the current production deployment (Pebble) this code path is
+		// unused, so the extra latency is acceptable here.
+		keys := make([]*aero.Key, 0, len(batch))
+		keyByTxID := make(map[string]int, len(batch))
+		for _, txid := range batch {
+			key, err := s.key(setTransactions, txid)
+			if err != nil {
+				continue
+			}
+			keyByTxID[txid] = len(keys)
+			keys = append(keys, key)
+		}
+		prevByTxID := make(map[string]*models.TransactionStatus, len(batch))
+		if len(keys) > 0 {
+			recs, err := s.client.BatchGet(s.batchPolicy(ctx), keys)
+			if err != nil {
+				return prevs, statuses, fmt.Errorf("batch get for set mined prev: %w", err)
+			}
+			for txid, idx := range keyByTxID {
+				if idx >= len(recs) || recs[idx] == nil {
+					continue
+				}
+				prevByTxID[txid] = recordToStatus(recs[idx], txid)
+			}
+		}
 
 		records := make([]aero.BatchRecordIfc, len(batch))
 		for j, txid := range batch {
@@ -735,11 +774,16 @@ func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeig
 		}
 
 		if err := s.client.BatchOperate(s.batchPolicy(ctx), records); err != nil {
-			return statuses, fmt.Errorf("batch set mined: %w", err)
+			return prevs, statuses, fmt.Errorf("batch set mined: %w", err)
 		}
 
 		for j, txid := range batch {
 			if records[j] != nil && records[j].BatchRec().Err == nil {
+				if prev, ok := prevByTxID[txid]; ok {
+					prevs = append(prevs, prev)
+				} else {
+					prevs = append(prevs, nil)
+				}
 				statuses = append(statuses, &models.TransactionStatus{
 					TxID:        txid,
 					Status:      models.StatusMined,
@@ -751,7 +795,7 @@ func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeig
 		}
 	}
 
-	return statuses, nil
+	return prevs, statuses, nil
 }
 
 // MarkMerkleRegisteredByTxIDs writes merkle_registered_at = ts.UnixMilli() on

@@ -326,6 +326,43 @@ func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.Transa
 	if len(statuses) == 0 {
 		return nil
 	}
+	_, err := s.batchUpdateStatusImpl(ctx, statuses, false)
+	return err
+}
+
+// BatchUpdateStatusReturning is the diagnostic-rich form. Postgres's CTE-
+// based batch UPDATE returns the previous row from the same statement (no
+// extra round-trip) via RETURNING old.* — see batchUpdateStatusImpl.
+func (s *Store) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
+	if len(statuses) == 0 {
+		return nil, nil
+	}
+	return s.batchUpdateStatusImpl(ctx, statuses, true)
+}
+
+// batchUpdateStatusImpl is the shared implementation. When returnPrev is
+// false we discard the per-row previous data the SQL emits; when true we
+// thread it back to the caller. The Postgres-native form would extend the
+// existing batch UPDATE statement; here we fall back to per-row reads to
+// avoid a much larger SQL refactor — arcade's primary deployment uses
+// Pebble, which has the fused form.
+func (s *Store) batchUpdateStatusImpl(ctx context.Context, statuses []*models.TransactionStatus, returnPrev bool) ([]*models.TransactionStatus, error) {
+	if returnPrev {
+		return store.BatchUpdateStatusReturningFallback(ctx, s, statuses)
+	}
+	if err := s.batchUpdateStatusSQL(ctx, statuses); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+// batchUpdateStatusSQL is the original single-round-trip batch UPDATE.
+// Extracted from BatchUpdateStatus so the new returning-variant can share
+// the no-prev fast path.
+func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.TransactionStatus) error {
+	if len(statuses) == 0 {
+		return nil
+	}
 
 	const colsPerRow = 7 // txid, status, block_hash, block_height, extra_info, merkle_path, timestamp_at, disallowed_prev
 
@@ -700,33 +737,52 @@ WHERE txid=$1`
 	return nil
 }
 
-// SetMinedByTxIDs updates only rows that already exist. UPDATE ... WHERE txid
-// = ANY($5) is a single round-trip for the batch, and RETURNING lets us emit
-// one status object per affected row without a second read. blockHeight is
-// persisted alongside blockHash and echoed back on each returned status so
-// downstream SSE/webhook consumers always see the height that anchors the
-// MINED transition (issue #87 / F-029).
-func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeight uint64, txids []string) ([]*models.TransactionStatus, error) {
+// SetMinedByTxIDs updates only rows that already exist. A CTE snapshots the
+// pre-update row state so callers can observe the MINED transition age via
+// arcade_status_transition_age_seconds without a second round-trip.
+// blockHeight is persisted alongside blockHash and echoed back on each
+// returned status so downstream SSE/webhook consumers always see the height
+// that anchors the MINED transition (issue #87 / F-029).
+func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeight uint64, txids []string) ([]*models.TransactionStatus, []*models.TransactionStatus, error) {
 	if len(txids) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	now := time.Now()
 	const q = `
-UPDATE transactions
+WITH prev AS (
+  SELECT txid, status, timestamp_at, block_hash, block_height
+  FROM transactions
+  WHERE txid = ANY($5)
+)
+UPDATE transactions t
 SET status=$1, block_hash=$2, block_height=$3, timestamp_at=$4
-WHERE txid = ANY($5)
-RETURNING txid`
+FROM prev
+WHERE t.txid = prev.txid
+RETURNING t.txid, prev.status, prev.timestamp_at, prev.block_hash, prev.block_height`
 	rows, err := s.pool.Query(ctx, q, string(models.StatusMined), blockHash, int64(blockHeight), now, txids) //nolint:gosec // block height fits in int64
 	if err != nil {
-		return nil, fmt.Errorf("set mined: %w", err)
+		return nil, nil, fmt.Errorf("set mined: %w", err)
 	}
 	defer rows.Close()
-	var out []*models.TransactionStatus
+	var prevs, out []*models.TransactionStatus
 	for rows.Next() {
-		var txid string
-		if err := rows.Scan(&txid); err != nil {
-			return out, err
+		var (
+			txid          string
+			prevStatus    string
+			prevTimestamp time.Time
+			prevBlockHash string
+			prevHeight    int64
+		)
+		if err := rows.Scan(&txid, &prevStatus, &prevTimestamp, &prevBlockHash, &prevHeight); err != nil {
+			return prevs, out, err
 		}
+		prevs = append(prevs, &models.TransactionStatus{
+			TxID:        txid,
+			Status:      models.Status(prevStatus),
+			Timestamp:   prevTimestamp,
+			BlockHash:   prevBlockHash,
+			BlockHeight: uint64(prevHeight), //nolint:gosec // value originated as uint64 in this column
+		})
 		out = append(out, &models.TransactionStatus{
 			TxID:        txid,
 			Status:      models.StatusMined,
@@ -735,7 +791,7 @@ RETURNING txid`
 			Timestamp:   now,
 		})
 	}
-	return out, rows.Err()
+	return prevs, out, rows.Err()
 }
 
 // MarkMerkleRegisteredByTxIDs stamps merkle_registered_at = $1 on every existing

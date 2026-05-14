@@ -75,6 +75,10 @@ func (m *mockStore) BatchUpdateStatus(ctx context.Context, statuses []*models.Tr
 	return store.BatchUpdateStatusParallel(ctx, m, statuses)
 }
 
+func (m *mockStore) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
+	return store.BatchUpdateStatusReturningFallback(ctx, m, statuses)
+}
+
 func (m *mockStore) UpdateStatus(_ context.Context, status *models.TransactionStatus) error {
 	m.updateCallCount.Add(1)
 	m.mu.Lock()

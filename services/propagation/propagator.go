@@ -71,6 +71,21 @@ type Propagator struct {
 	broadcastJobs    chan broadcastJob
 	broadcastWG      sync.WaitGroup
 	broadcastRunning atomic.Bool // true while Start() workers are running
+
+	// processBatchSem caps how many flushed batches run their register+
+	// broadcast pipeline concurrently. With cap=1 (the historical default
+	// before pipelining), batch N+1 cannot start its merkle /watch until
+	// batch N's broadcast completes — at sustained 100 TPS that costs
+	// ~half-a-pipeline-cycle of queue wait per tx. Cap>1 lets register and
+	// broadcast overlap across adjacent batches. flushBatch acquires a
+	// slot before spawning the processBatch goroutine, providing natural
+	// backpressure to the kafka consumer.
+	processBatchSem chan struct{}
+	// inflightBatches counts processBatch goroutines that are still
+	// running. Stop() blocks on this before tearing down the broadcast
+	// worker pool so an in-flight batch doesn't lose its broadcast
+	// results to a closed jobs channel.
+	inflightBatches sync.WaitGroup
 }
 
 // broadcastJob is the unit of work the persistent broadcast pool consumes.
@@ -149,6 +164,10 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 	if maxPending <= 0 {
 		maxPending = 50000
 	}
+	maxConcurrentBatches := cfg.Propagation.MaxConcurrentBatches
+	if maxConcurrentBatches <= 0 {
+		maxConcurrentBatches = 4
+	}
 	return &Propagator{
 		cfg:               cfg,
 		logger:            logger.Named("propagation"),
@@ -168,6 +187,7 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 		holderID:          newHolderID(),
 		leaseTTL:          leaseTTL,
 		broadcastJobs:     make(chan broadcastJob, broadcastJobBuffer),
+		processBatchSem:   make(chan struct{}, maxConcurrentBatches),
 	}
 }
 
@@ -214,18 +234,87 @@ func newHolderID() string {
 
 func (p *Propagator) Name() string { return "propagation" }
 
-// publishStatus fans a post-broadcast status update onto the events
-// Publisher. Non-fatal: the durable store row is already written, and SSE
-// catchup recovers any dropped events.
-func (p *Propagator) publishStatus(ctx context.Context, status *models.TransactionStatus) {
-	if p.publisher == nil || status == nil {
+// applyTerminalStatuses persists the per-tx terminal statuses produced by
+// processBatch in one BatchUpdateStatusReturning call, observes the
+// RECEIVED→{ACCEPTED_BY_NETWORK,REJECTED} transition age, and emits one
+// PublishBulk per terminal status. Lattice no-ops (prev.Status == st.Status)
+// and unknown txids (prev == nil — row reaped between RECEIVED and
+// broadcast) are excluded from the bulk publish to avoid phantom events.
+// Split out of processBatch so the surrounding flush loop stays under
+// nesting-complexity limits.
+func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses []*models.TransactionStatus, accepted, rejected int) {
+	if len(terminalStatuses) == 0 {
 		return
 	}
-	if err := p.publisher.Publish(ctx, status); err != nil {
+	prevs, err := p.store.BatchUpdateStatusReturning(ctx, terminalStatuses)
+	if err != nil {
+		p.logger.Error(
+			"batch update propagation status failed",
+			zap.Int("batch_size", len(terminalStatuses)),
+			zap.Error(err),
+		)
+		// Continue: per-row entries may still be valid; bulk-publish
+		// those whose prev row is populated below.
+	}
+
+	acceptedTxIDs := make([]string, 0, accepted)
+	rejectedTxIDs := make([]string, 0, rejected)
+	now := time.Now()
+	for i, st := range terminalStatuses {
+		var prev *models.TransactionStatus
+		if i < len(prevs) {
+			prev = prevs[i]
+		}
+		// Unknown txid (row was reaped between RECEIVED and broadcast)
+		// or per-row store error. Skip publish to avoid phantom events.
+		if prev == nil {
+			continue
+		}
+		if !prev.Timestamp.IsZero() {
+			metrics.StatusTransitionAge.
+				WithLabelValues(string(prev.Status), string(st.Status)).
+				Observe(time.Since(prev.Timestamp).Seconds())
+		}
+		// Lattice no-op — no transition to fan out.
+		if prev.Status == st.Status {
+			continue
+		}
+		switch st.Status {
+		case models.StatusAcceptedByNetwork:
+			acceptedTxIDs = append(acceptedTxIDs, st.TxID)
+		case models.StatusRejected:
+			rejectedTxIDs = append(rejectedTxIDs, st.TxID)
+		default:
+			// processBatch only routes ACCEPTED_BY_NETWORK and REJECTED
+			// terminal statuses into this slice; other statuses are
+			// either retryable (re-queued) or no_verdict (no store
+			// update). A defensive default keeps the switch exhaustive.
+		}
+	}
+
+	p.publishBulkStatus(ctx, models.StatusAcceptedByNetwork, acceptedTxIDs, now)
+	p.publishBulkStatus(ctx, models.StatusRejected, rejectedTxIDs, now)
+}
+
+// publishBulkStatus fans a post-broadcast batch status update onto the
+// events Publisher as a single bulk event. txids is the list of
+// transactions that just transitioned to the same terminal status.
+// Non-fatal: the durable store rows are already written, and SSE catchup
+// recovers any dropped events.
+func (p *Propagator) publishBulkStatus(ctx context.Context, status models.Status, txids []string, ts time.Time) {
+	if p.publisher == nil || len(txids) == 0 {
+		return
+	}
+	template := &models.TransactionStatus{
+		Status:    status,
+		Timestamp: ts,
+		TxIDs:     txids,
+	}
+	if err := p.publisher.PublishBulk(ctx, template); err != nil {
 		p.logger.Warn(
-			"failed to publish status update",
-			zap.String("txid", status.TxID),
-			zap.String("status", string(status.Status)),
+			"failed to publish bulk propagation status",
+			zap.String("status", string(status)),
+			zap.Int("count", len(txids)),
 			zap.Error(err),
 		)
 	}
@@ -278,12 +367,25 @@ func (p *Propagator) Start(ctx context.Context) error {
 	return consumer.Run(ctx)
 }
 
+// WaitForBatches blocks until every processBatch goroutine spawned by
+// flushBatch has finished. Used by tests to assert post-flush invariants
+// against the in-memory mockStore, and reused by Stop() to drain in-flight
+// pipelines before tearing down the broadcast worker pool.
+func (p *Propagator) WaitForBatches() {
+	p.inflightBatches.Wait()
+}
+
 func (p *Propagator) Stop() error {
 	p.logger.Info("stopping propagation service")
 	var consumerErr error
 	if p.consumer != nil {
 		consumerErr = p.consumer.Close()
 	}
+	// Wait for in-flight processBatch goroutines to finish before tearing
+	// down the broadcast worker pool. Otherwise an in-flight batch would
+	// push jobs into a channel we're about to close, deadlocking the
+	// broadcast collect loop on a resultCh that never receives.
+	p.inflightBatches.Wait()
 	// Closing broadcastJobs lets every worker drain its current iteration
 	// and exit. Flip broadcastRunning first so any in-flight submit fan-out
 	// falls back to the goroutine path rather than pushing into a channel
@@ -336,14 +438,31 @@ func (p *Propagator) handleMessage(_ context.Context, msg *kafka.Message) error 
 	return nil
 }
 
-// flushBatch processes all accumulated messages as a batch. Retry work
-// belongs to the reaper goroutine — it is no longer coupled to the consumer's
-// drain-flush cycle, so live ingest doesn't have to wait on rebroadcasts.
+// flushBatch hands the drained pending slice off to a processBatch goroutine
+// and returns. Concurrency is bounded by processBatchSem: while batch N runs
+// its register+broadcast pipeline (~4s at 100 TPS), the kafka consumer can
+// drain batch N+1 and begin its own pipeline in parallel up to the configured
+// cap (MaxConcurrentBatches, default 4). Sustained-100-TPS RECEIVED→
+// ACCEPTED_BY_NETWORK latency benefits roughly by half-a-pipeline-cycle per
+// tx because pendingMsgs no longer sits idle waiting for the prior batch's
+// broadcast to finish.
+//
+// Acquiring the semaphore inside flushBatch (rather than firing the goroutine
+// unconditionally) provides natural backpressure: when MaxConcurrentBatches
+// pipelines are already in flight, the kafka consumer's flush call blocks
+// here until a slot frees. This bounds peak in-memory pendingMsgs depth and
+// gives the kafka claim a clean cancellation point.
 //
 // The context comes from the current Kafka claim — it is canceled when the
 // claim ends (shutdown or rebalance). Downstream HTTP broadcasts and store
 // writes observe that cancellation and unwind cleanly, so a revoked partition
 // doesn't keep doing work on behalf of a partition it no longer owns.
+//
+// F-024 ("register before broadcast") is preserved per-batch: each goroutine
+// drives one batch through registerBatch and broadcastInChunks sequentially.
+// Across batches, status writes pass through the lattice so a slower batch's
+// ACCEPTED_BY_NETWORK can't regress a tx that a faster sibling already moved
+// to SEEN_ON_NETWORK.
 func (p *Propagator) flushBatch(ctx context.Context) error {
 	p.mu.Lock()
 	batch := p.pendingMsgs
@@ -354,7 +473,23 @@ func (p *Propagator) flushBatch(ctx context.Context) error {
 	if len(batch) == 0 {
 		return nil
 	}
-	return p.processBatch(ctx, batch)
+
+	select {
+	case p.processBatchSem <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	p.inflightBatches.Add(1)
+	metrics.PropagationInflightBatches.Set(float64(len(p.processBatchSem)))
+	go func() {
+		defer func() {
+			<-p.processBatchSem
+			p.inflightBatches.Done()
+			metrics.PropagationInflightBatches.Set(float64(len(p.processBatchSem)))
+		}()
+		p.processBatch(ctx, batch)
+	}()
+	return nil
 }
 
 // registerBatch invokes merkle-service /watch for every tx in the batch and
@@ -457,13 +592,18 @@ type txResult struct {
 //  2. Broadcast registered txs to teranode endpoints, chunked to
 //     teranodeBatchCap.
 //  3. Update status for each transaction.
-func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) error {
+//
+// All failure paths are absorbed internally: per-tx failures route to
+// PENDING_RETRY or get logged-and-skipped, and a batch-wide store error is
+// logged on the goroutine spawned by flushBatch. There is no caller that
+// reacts to an aggregate error here, so the function returns void.
+func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) {
 	// Step 1: register all txs with merkle-service in parallel. Drops any tx
 	// whose registration failed — that tx is already queued for durable retry
 	// via handleRetryableFailure inside registerBatch.
 	batch = p.registerBatch(ctx, batch)
 	if len(batch) == 0 {
-		return nil
+		return
 	}
 
 	// Log batch summary for traceability
@@ -490,10 +630,15 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) e
 	}
 	results := p.broadcastInChunks(ctx, batch, rawTxs)
 
-	// Step 2: Update status for each transaction, with retry classification
+	// Step 2: Classify per-tx outcomes and bundle terminal-status updates
+	// into one BatchUpdateStatusReturning + one PublishBulk per terminal
+	// status. This drops the propagator's per-tx Kafka send count from N
+	// to ≤2 per flush (one event for accepted, one for rejected), mirroring
+	// the callback-handler optimization already shipped for SEEN_ON_NETWORK.
 	seenEndpoints := make(map[string]struct{})
 	var successEndpoints []string
 	var accepted, rejected, retryable, noVerdict int
+	terminalStatuses := make([]*models.TransactionStatus, 0, len(results))
 	for i, res := range results {
 		if res.successEndpoint != "" {
 			if _, ok := seenEndpoints[res.successEndpoint]; !ok {
@@ -533,16 +678,10 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) e
 			// Other statuses (Mined, SeenOnNetwork, etc.) flow through
 			// without affecting the accepted/rejected counters.
 		}
-		if err := p.store.UpdateStatus(ctx, res.status); err != nil {
-			p.logger.Error(
-				"failed to update status",
-				zap.String("txid", batch[i].TXID),
-				zap.Error(err),
-			)
-			continue
-		}
-		p.publishStatus(ctx, res.status)
+		terminalStatuses = append(terminalStatuses, res.status)
 	}
+
+	p.applyTerminalStatuses(ctx, terminalStatuses, accepted, rejected)
 	metrics.PropagationOutcomeTotal.WithLabelValues("accepted").Add(float64(accepted))
 	metrics.PropagationOutcomeTotal.WithLabelValues("rejected").Add(float64(rejected))
 	metrics.PropagationOutcomeTotal.WithLabelValues("retryable").Add(float64(retryable))
@@ -553,7 +692,6 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) e
 		zap.Int("count", len(batch)),
 		zap.Strings("success_endpoints", successEndpoints),
 	)
-	return nil
 }
 
 // maxParallelChunks caps how many chunk broadcasts run concurrently. Each

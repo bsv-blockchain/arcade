@@ -17,6 +17,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/events"
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/metrics"
@@ -24,6 +25,56 @@ import (
 	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/teranode"
 )
+
+// recordingPublisher captures Publish and PublishBulk calls so tests can
+// assert that a batch flush emits one bulk event per terminal status rather
+// than N per-tx events.
+type recordingPublisher struct {
+	mu           sync.Mutex
+	publishCalls []*models.TransactionStatus
+	bulkCalls    []*models.TransactionStatus
+}
+
+func (p *recordingPublisher) Publish(_ context.Context, status *models.TransactionStatus) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.publishCalls = append(p.publishCalls, status)
+	return nil
+}
+
+func (p *recordingPublisher) PublishBulk(_ context.Context, template *models.TransactionStatus) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.bulkCalls = append(p.bulkCalls, template)
+	return nil
+}
+
+func (p *recordingPublisher) Subscribe(_ context.Context, _ string) (<-chan *models.TransactionStatus, error) {
+	// Tests in this file never exercise Subscribe; a closed empty channel
+	// satisfies the contract (Subscribers see no events, ctx cancellation
+	// terminates them) without forcing every test to plumb a real one.
+	ch := make(chan *models.TransactionStatus)
+	close(ch)
+	return ch, nil
+}
+
+func (p *recordingPublisher) Close() error { return nil }
+
+func (p *recordingPublisher) publishCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.publishCalls)
+}
+
+func (p *recordingPublisher) bulkSnapshot() []*models.TransactionStatus {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]*models.TransactionStatus, len(p.bulkCalls))
+	copy(out, p.bulkCalls)
+	return out
+}
+
+var _ events.Publisher = (*recordingPublisher)(nil)
 
 // eventLog is a thread-safe ordered list of string events for verifying call ordering.
 type eventLog struct {
@@ -99,6 +150,29 @@ func (m *mockStore) UpdateStatus(_ context.Context, status *models.TransactionSt
 	defer m.mu.Unlock()
 	m.updates = append(m.updates, status)
 	return nil
+}
+
+// BatchUpdateStatusReturning mirrors UpdateStatus into m.updates for each row
+// so existing tests that count `updateCount()` continue to observe the same
+// invariant they did before propagator.processBatch switched to the batched
+// store API. Every row returns a synthetic previous-status with a RECEIVED
+// status and a recent timestamp so the propagator's transition-age metric
+// observation and lattice no-op detection both behave naturally: prev.Status
+// (RECEIVED) ≠ new.Status (ACCEPTED_BY_NETWORK or REJECTED), so every row is
+// emitted as a transition.
+func (m *mockStore) BatchUpdateStatusReturning(_ context.Context, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	prevs := make([]*models.TransactionStatus, len(statuses))
+	for i, s := range statuses {
+		m.updates = append(m.updates, s)
+		prevs[i] = &models.TransactionStatus{
+			TxID:      s.TxID,
+			Status:    models.StatusReceived,
+			Timestamp: time.Now(),
+		}
+	}
+	return prevs, nil
 }
 
 func (m *mockStore) BumpRetryCount(_ context.Context, txid string) (int, error) {
@@ -378,7 +452,23 @@ func handleAndFlush(t *testing.T, p *Propagator, payload []byte) error {
 	if err := p.handleMessage(context.Background(), consumerMsg(payload)); err != nil {
 		return err
 	}
-	return p.flushBatch(context.Background())
+	if err := flushSync(t, p); err != nil {
+		return err
+	}
+	p.WaitForBatches()
+	return nil
+}
+
+// flushSync drains pendingMsgs and synchronously waits for the resulting
+// processBatch goroutine to finish. Mirrors the pre-pipelining semantics
+// that existing tests rely on (assert state right after flushBatch returns).
+func flushSync(t *testing.T, p *Propagator) error {
+	t.Helper()
+	if err := p.flushBatch(context.Background()); err != nil {
+		return err
+	}
+	p.WaitForBatches()
+	return nil
 }
 
 // TestHandleMessage_ForwardsCallbackToken pins the propagator → merkle-service
@@ -557,7 +647,7 @@ func TestHandleMessage_BatchAllRegistered(t *testing.T) {
 	}
 
 	// Flush the batch
-	if err := p.flushBatch(context.Background()); err != nil {
+	if err := flushSync(t, p); err != nil {
 		t.Fatalf("flush error: %v", err)
 	}
 
@@ -920,7 +1010,7 @@ func TestProcessBatch_100Transactions(t *testing.T) {
 	}
 
 	// Flush
-	if err := p.flushBatch(context.Background()); err != nil {
+	if err := flushSync(t, p); err != nil {
 		t.Fatalf("flush error: %v", err)
 	}
 
@@ -932,6 +1022,59 @@ func TestProcessBatch_100Transactions(t *testing.T) {
 	}
 	if ms.updateCount() != 100 {
 		t.Errorf("expected 100 UpdateStatus calls, got %d", ms.updateCount())
+	}
+}
+
+// TestProcessBatch_BulkPublish_OneEventPerStatus pins the optimization that
+// drops the propagator's per-tx Publish count from N to ≤2 per flush. For a
+// 50-tx batch that all teranode accepts, exactly one PublishBulk event
+// (Status=ACCEPTED_BY_NETWORK, TxIDs=[50]) should be emitted and zero per-tx
+// Publish calls. Mirrors the SEEN_ON_NETWORK callback-handler regression
+// (TestHandleSeenOnNetwork_BulkPath_OnePublishPerCallback) on the
+// propagation side.
+func TestProcessBatch_BulkPublish_OneEventPerStatus(t *testing.T) {
+	merkleSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer merkleSrv.Close()
+
+	teranodeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer teranodeSrv.Close()
+
+	ms := newMockStore()
+	cfg := &config.Config{CallbackURL: "http://localhost:8080/callback"}
+	cfg.Propagation.MerkleConcurrency = 10
+
+	mc := merkleservice.NewClient(merkleSrv.URL, "", 5*time.Second)
+	tc := teranode.NewClient([]string{teranodeSrv.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
+
+	pub := &recordingPublisher{}
+	p := New(cfg, zap.NewNop(), nil, pub, ms, nil, tc, mc)
+
+	const batchSize = 50
+	for i := 0; i < batchSize; i++ {
+		if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg(fmt.Sprintf("tx%03d", i)))); err != nil {
+			t.Fatalf("handleMessage %d: %v", i, err)
+		}
+	}
+	if err := flushSync(t, p); err != nil {
+		t.Fatalf("flushBatch: %v", err)
+	}
+
+	if pub.publishCount() != 0 {
+		t.Errorf("expected 0 per-tx Publish calls, got %d", pub.publishCount())
+	}
+	bulks := pub.bulkSnapshot()
+	if len(bulks) != 1 {
+		t.Fatalf("expected exactly 1 PublishBulk call, got %d", len(bulks))
+	}
+	if bulks[0].Status != models.StatusAcceptedByNetwork {
+		t.Errorf("expected bulk Status=ACCEPTED_BY_NETWORK, got %q", bulks[0].Status)
+	}
+	if got := len(bulks[0].TxIDs); got != batchSize {
+		t.Errorf("expected bulk to carry %d txids, got %d", batchSize, got)
 	}
 }
 
@@ -963,7 +1106,7 @@ func TestProcessBatch_ChunksOversizedBatch(t *testing.T) {
 	for i := 0; i < 25; i++ {
 		_ = p.handleMessage(context.Background(), consumerMsg(makePropMsg(fmt.Sprintf("tx%03d", i))))
 	}
-	if err := p.flushBatch(context.Background()); err != nil {
+	if err := flushSync(t, p); err != nil {
 		t.Fatalf("flush error: %v", err)
 	}
 
@@ -998,7 +1141,7 @@ func TestProcessBatch_MerkleFailure_AbortsBatch(t *testing.T) {
 			t.Fatalf("tx%d: expected handleMessage to succeed (failure deferred to flush), got: %v", i, err)
 		}
 	}
-	if err := p.flushBatch(context.Background()); err != nil {
+	if err := flushSync(t, p); err != nil {
 		t.Fatalf("flushBatch returned: %v", err)
 	}
 
@@ -1060,7 +1203,7 @@ func TestHandleMessage_PartialMerkleFailure_OnlyFailedMessageIsAborted(t *testin
 		t.Fatalf("tx-good-b: expected nil, got %v", err)
 	}
 
-	if err := p.flushBatch(context.Background()); err != nil {
+	if err := flushSync(t, p); err != nil {
 		t.Fatalf("flushBatch returned: %v", err)
 	}
 
@@ -1121,7 +1264,7 @@ func TestRegisterBatch_Metric_FullyOK(t *testing.T) {
 			t.Fatalf("handleMessage: %v", err)
 		}
 	}
-	if err := p.flushBatch(context.Background()); err != nil {
+	if err := flushSync(t, p); err != nil {
 		t.Fatalf("flushBatch: %v", err)
 	}
 
@@ -1165,7 +1308,7 @@ func TestRegisterBatch_Metric_Partial(t *testing.T) {
 			t.Fatalf("handleMessage %s: %v", txid, err)
 		}
 	}
-	if err := p.flushBatch(context.Background()); err != nil {
+	if err := flushSync(t, p); err != nil {
 		t.Fatalf("flushBatch: %v", err)
 	}
 
@@ -1199,7 +1342,7 @@ func TestRegisterBatch_Metric_AllFailed(t *testing.T) {
 			t.Fatalf("handleMessage: %v", err)
 		}
 	}
-	if err := p.flushBatch(context.Background()); err != nil {
+	if err := flushSync(t, p); err != nil {
 		t.Fatalf("flushBatch: %v", err)
 	}
 
@@ -1243,7 +1386,7 @@ func TestRegisterBatch_MarksSuccessesOnly(t *testing.T) {
 			t.Fatalf("handleMessage %s: %v", txid, err)
 		}
 	}
-	if err := p.flushBatch(context.Background()); err != nil {
+	if err := flushSync(t, p); err != nil {
 		t.Fatalf("flushBatch: %v", err)
 	}
 
@@ -1337,7 +1480,7 @@ func TestProcessBatch_NilMerkleClient_SkipsRegistration(t *testing.T) {
 		_ = p.handleMessage(context.Background(), consumerMsg(makePropMsg(fmt.Sprintf("tx%d", i))))
 	}
 
-	if err := p.flushBatch(context.Background()); err != nil {
+	if err := flushSync(t, p); err != nil {
 		t.Fatalf("flush error: %v", err)
 	}
 
@@ -1386,7 +1529,7 @@ func TestBatchTransactions_UsesTxsEndpoint(t *testing.T) {
 		_ = p.handleMessage(context.Background(), consumerMsg(makePropMsg(fmt.Sprintf("tx%d", i))))
 	}
 
-	if err := p.flushBatch(context.Background()); err != nil {
+	if err := flushSync(t, p); err != nil {
 		t.Fatalf("flush error: %v", err)
 	}
 
@@ -1501,7 +1644,7 @@ func TestBatchTransactions_AnySuccess_AcceptedByNetwork(t *testing.T) {
 		_ = p.handleMessage(context.Background(), consumerMsg(makePropMsg(fmt.Sprintf("tx%d", i))))
 	}
 
-	if err := p.flushBatch(context.Background()); err != nil {
+	if err := flushSync(t, p); err != nil {
 		t.Fatalf("flush error: %v", err)
 	}
 
@@ -1532,7 +1675,7 @@ func TestBatchTransactions_AllFail_Rejected(t *testing.T) {
 		_ = p.handleMessage(context.Background(), consumerMsg(makePropMsg(fmt.Sprintf("tx%d", i))))
 	}
 
-	if err := p.flushBatch(context.Background()); err != nil {
+	if err := flushSync(t, p); err != nil {
 		t.Fatalf("flush error: %v", err)
 	}
 

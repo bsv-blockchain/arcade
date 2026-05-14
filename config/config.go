@@ -352,6 +352,18 @@ type PropagationConfig struct {
 	// Defaults to 50000 — large enough to absorb a multi-minute downstream
 	// stall at 50 TPS without dropping, small enough to bound memory.
 	MaxPending int `mapstructure:"max_pending"`
+	// MaxConcurrentBatches caps how many flushed batches run their
+	// register+broadcast pipeline concurrently. With concurrency=1 (the
+	// historical default), batch N+1 cannot begin merkle /watch until
+	// batch N's broadcast completes — meaning sustained-100-TPS traffic
+	// pays ~half-a-pipeline-cycle of queue wait per tx on top of the
+	// pipeline work itself. Bumping to ≥2 lets the register and broadcast
+	// stages overlap across adjacent batches. F-024 is preserved per-batch
+	// (each goroutine registers before it broadcasts) and per-row lattice
+	// guards prevent out-of-order status transitions from regressing state.
+	// Defaults to 4 — enough to fully overlap pipeline stages at typical
+	// pipeline times without flooding merkle-service or teranode.
+	MaxConcurrentBatches int `mapstructure:"max_concurrent_batches"`
 }
 
 // EndpointHealthConfig tunes the per-endpoint circuit-breaker in teranode.Client.
@@ -672,6 +684,7 @@ func setDefaults() {
 	// automatically moves the lease TTL unless the operator opts into a fixed value.
 	viper.SetDefault("propagation.lease_ttl_ms", 0)
 	viper.SetDefault("propagation.teranode_max_batch_size", 100)
+	viper.SetDefault("propagation.max_concurrent_batches", 4)
 	viper.SetDefault("propagation.endpoint_health.failure_threshold", 3)
 	viper.SetDefault("propagation.endpoint_health.broadcast_failure_threshold", 10)
 	viper.SetDefault("propagation.endpoint_health.probe_interval_ms", 30000)

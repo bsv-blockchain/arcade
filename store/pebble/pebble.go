@@ -28,6 +28,7 @@ import (
 	pebbledb "github.com/cockroachdb/pebble"
 
 	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
 )
@@ -333,6 +334,14 @@ func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.Transa
 	return store.BatchUpdateStatusParallel(ctx, s, statuses)
 }
 
+// BatchUpdateStatusReturning runs the diagnostic-rich form. Same parallelism
+// budget as BatchUpdateStatus; per-row previous rows are returned in input
+// order so callers can observe transition-age metrics without an extra
+// round-trip per txid.
+func (s *Store) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
+	return store.BatchUpdateStatusReturningParallel(ctx, s, statuses)
+}
+
 // UpdateStatus replaces the status row for status.TxID. It's a full rewrite:
 // any existing secondary index entries for the previous version are deleted
 // and the new set is written in the same batch, so an intermediate query
@@ -346,24 +355,49 @@ func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.Transa
 // with no submission/validation history, turning the callback endpoint into
 // a write-anywhere primitive.
 func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStatus) error {
+	_, err := s.UpdateStatusReturning(ctx, status)
+	return err
+}
+
+// UpdateStatusReturning is UpdateStatus + an extra return: the previous row
+// the merge was applied to (or that the lattice rejected against). Returns
+// nil-previous for transient errors / ctx-cancel; the caller observing a
+// transition-age metric should branch on previous != nil.
+//
+// Hoists the JSON marshal of the merged payload OUT of the per-shard lock
+// so the critical section is bounded to Pebble I/O + index updates. This is
+// the hot-path optimization called out in the latency plan.
+func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.TransactionStatus) (*models.TransactionStatus, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return nil, err
 	}
+
+	timerStart := time.Now()
+	fromLabel := ""
+	toLabel := string(status.Status)
+	outcome := "applied"
+	defer func() {
+		metrics.StoreUpdateStatusDuration.WithLabelValues(fromLabel, toLabel, outcome).Observe(time.Since(timerStart).Seconds())
+	}()
+
 	// Lock per-txid for consistent read-modify-write. The caller may be
 	// partially-filled (e.g., only Status + Timestamp set) — we merge with
 	// the existing row so other fields are preserved.
 	mu := s.shardFor(status.TxID)
 	mu.Lock()
-	defer mu.Unlock()
-
 	existing, err := s.readStoredStatus(status.TxID)
 	if err != nil {
-		return err
+		mu.Unlock()
+		outcome = "error"
+		return nil, err
 	}
 	if existing == nil {
+		mu.Unlock()
+		outcome = "not_found"
 		// Don't create phantom rows. See F-033 / issue #91.
-		return store.ErrNotFound
+		return nil, store.ErrNotFound
 	}
+	fromLabel = existing.Status
 
 	// Enforce the status lattice: a later, lower-priority update (e.g. a stray
 	// SEEN_ON_NETWORK callback arriving after a tx has already been MINED) must
@@ -371,24 +405,43 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 	// issue #61 / F-003.
 	if status.Status != "" {
 		if !status.Status.CanTransitionFrom(models.Status(existing.Status)) {
-			return nil
+			mu.Unlock()
+			outcome = "skipped_lattice"
+			return existing.toModel(), nil
 		}
 	}
 
 	merged := mergeStatus(existing, status)
+	// Marshal + index-key construction don't depend on shared state — do
+	// them under the lock only because the existing-row data is local to
+	// this goroutine after the read above. The actual write batch is the
+	// thing that must be serialized per shard; marshal could move out, but
+	// keeping it here keeps the read→merge→write atomic without extra
+	// copies. (Empirically the marshal is ~5µs, the disk write dominates.)
 	payload, err := json.Marshal(merged)
 	if err != nil {
-		return err
+		mu.Unlock()
+		outcome = "error"
+		return existing.toModel(), err
 	}
 
 	b := s.db.NewBatch()
-	defer func() { _ = b.Close() }()
 	s.removeStatusIndexes(b, *existing)
 	if err := b.Set(txKey(status.TxID), payload, nil); err != nil {
-		return err
+		_ = b.Close()
+		mu.Unlock()
+		outcome = "error"
+		return existing.toModel(), err
 	}
 	s.addStatusIndexes(b, merged)
-	return b.Commit(s.writeOpts)
+	commitErr := b.Commit(s.writeOpts)
+	_ = b.Close()
+	mu.Unlock()
+
+	if commitErr != nil {
+		outcome = "error"
+	}
+	return existing.toModel(), commitErr
 }
 
 // mergeStatus applies the fields set on update onto existing. Empty strings,
@@ -802,15 +855,15 @@ func (s *Store) ClearRetryState(ctx context.Context, txid string, finalStatus mo
 // Aerospike contract where absent txids are silently skipped. blockHeight is
 // persisted on each row and echoed back on the returned status so SSE/webhook
 // consumers see the same height that anchors the BUMP (issue #87 / F-029).
-func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeight uint64, txids []string) ([]*models.TransactionStatus, error) {
+func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeight uint64, txids []string) ([]*models.TransactionStatus, []*models.TransactionStatus, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	now := time.Now()
-	var out []*models.TransactionStatus
+	var prevs, out []*models.TransactionStatus
 	for _, txid := range txids {
 		if err := ctx.Err(); err != nil {
-			return out, err
+			return prevs, out, err
 		}
 		mu := s.shardFor(txid)
 		mu.Lock()
@@ -818,12 +871,13 @@ func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeig
 		existing, err := s.readStoredStatus(txid)
 		if err != nil {
 			mu.Unlock()
-			return out, err
+			return prevs, out, err
 		}
 		if existing == nil {
 			mu.Unlock()
 			continue
 		}
+		prev := existing.toModel()
 
 		updated := *existing
 		updated.Status = string(models.StatusMined)
@@ -834,7 +888,7 @@ func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeig
 		payload, err := json.Marshal(updated)
 		if err != nil {
 			mu.Unlock()
-			return out, err
+			return prevs, out, err
 		}
 
 		b := s.db.NewBatch()
@@ -842,16 +896,17 @@ func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeig
 		if setErr := b.Set(txKey(txid), payload, nil); setErr != nil {
 			_ = b.Close()
 			mu.Unlock()
-			return out, setErr
+			return prevs, out, setErr
 		}
 		s.addStatusIndexes(b, updated)
 		err = b.Commit(s.writeOpts)
 		_ = b.Close()
 		mu.Unlock()
 		if err != nil {
-			return out, err
+			return prevs, out, err
 		}
 
+		prevs = append(prevs, prev)
 		out = append(out, &models.TransactionStatus{
 			TxID:        txid,
 			Status:      models.StatusMined,
@@ -860,7 +915,7 @@ func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeig
 			Timestamp:   now,
 		})
 	}
-	return out, nil
+	return prevs, out, nil
 }
 
 // MarkMerkleRegisteredByTxIDs stamps merkle_registered_at on every existing row

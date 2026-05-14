@@ -47,6 +47,14 @@ type mockStore struct {
 	// return an error to simulate per-key failures (Aerospike RECORD_TOO_BIG,
 	// DEVICE_OVERLOAD, HOT_KEY, etc.). Returning non-nil skips the record.
 	insertStumpFn func(stump *models.Stump) error
+	// batchUpdateReturningCalls captures the slices passed to
+	// BatchUpdateStatusReturning so tests can assert the batch+bulk callback
+	// refactor calls the store exactly once per inbound callback.
+	batchUpdateReturningCalls [][]*models.TransactionStatus
+	batchUpdateReturningErr   error
+	// batchUpdatePrevFunc lets a test inject previous-row data per-txid for
+	// transition-age assertions. Returning nil mirrors the not-found path.
+	batchUpdatePrevFunc func(txid string) *models.TransactionStatus
 }
 
 func (m *mockStore) UpdateStatus(_ context.Context, status *models.TransactionStatus) error {
@@ -69,6 +77,49 @@ func (m *mockStore) BatchUpdateStatus(context.Context, []*models.TransactionStat
 	return nil
 }
 
+// BatchUpdateStatusReturning records calls and returns the previous statuses
+// per input. Default prev for each known txid is a {Status: RECEIVED}
+// snapshot — this both satisfies the handler's nil-prev = unknown-txid
+// branch (so the batch path treats every txid as known by default) and
+// keeps existing assertions on updateStatusCalls working unchanged
+// (each input status is appended to updateStatusCalls as if the legacy
+// per-row path had run). Tests that need a different prev shape override
+// via batchUpdatePrevFunc.
+func (m *mockStore) BatchUpdateStatusReturning(_ context.Context, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.batchUpdateReturningCalls = append(m.batchUpdateReturningCalls, append([]*models.TransactionStatus(nil), statuses...))
+	if m.batchUpdateReturningErr != nil {
+		return nil, m.batchUpdateReturningErr
+	}
+	out := make([]*models.TransactionStatus, len(statuses))
+	// updateStatusErr == ErrNotFound models the production "unknown txid"
+	// guard (F-033 / #91): the legacy backend silently skipped the write
+	// AND did not record the call. The batch path mirrors that — nil prev
+	// for every input, and no append to updateStatusCalls.
+	if errors.Is(m.updateStatusErr, store.ErrNotFound) {
+		return out, nil
+	}
+	for i, st := range statuses {
+		// Mirror the legacy contract: record the update as if UpdateStatus
+		// had been called per-row, so existing assertions on
+		// updateStatusCalls keep working without rewriting every test.
+		m.updateStatusCalls = append(m.updateStatusCalls, st)
+		if m.batchUpdatePrevFunc != nil {
+			out[i] = m.batchUpdatePrevFunc(st.TxID)
+		} else {
+			// Default prev: RECEIVED with a fresh timestamp so the
+			// handler's transition-age observation has a non-zero value.
+			out[i] = &models.TransactionStatus{
+				TxID:      st.TxID,
+				Status:    models.StatusReceived,
+				Timestamp: time.Now(),
+			}
+		}
+	}
+	return out, nil
+}
+
 func (m *mockStore) GetStatus(context.Context, string) (*models.TransactionStatus, error) {
 	return nil, nil
 }
@@ -86,8 +137,8 @@ func (m *mockStore) SetStatusByBlockHash(context.Context, string, models.Status)
 }
 func (m *mockStore) InsertBUMP(context.Context, string, uint64, []byte) error { return nil }
 func (m *mockStore) GetBUMP(context.Context, string) (uint64, []byte, error)  { return 0, nil, nil }
-func (m *mockStore) SetMinedByTxIDs(context.Context, string, uint64, []string) ([]*models.TransactionStatus, error) {
-	return nil, nil
+func (m *mockStore) SetMinedByTxIDs(context.Context, string, uint64, []string) ([]*models.TransactionStatus, []*models.TransactionStatus, error) {
+	return nil, nil, nil
 }
 
 func (m *mockStore) MarkMerkleRegisteredByTxIDs(context.Context, []string, time.Time) error {
@@ -385,6 +436,102 @@ func TestHandleSubmitTransactions_KafkaFailure_Returns500(t *testing.T) {
 
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// recordingCallbackPub captures publishes from the seen-callback path so
+// tests can assert: (a) exactly one PublishBulk call per inbound callback,
+// (b) zero per-tx Publish calls, (c) the bulk template carries every
+// successful txid. Coarse but enough for the regression we care about —
+// the perf-critical fan-out path lives in the subscriber side which has
+// its own coverage.
+type recordingCallbackPub struct {
+	mu            sync.Mutex
+	publishes     []*models.TransactionStatus
+	bulkPublishes []*models.TransactionStatus
+}
+
+func (p *recordingCallbackPub) Publish(_ context.Context, status *models.TransactionStatus) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	cp := *status
+	p.publishes = append(p.publishes, &cp)
+	return nil
+}
+
+func (p *recordingCallbackPub) PublishBulk(_ context.Context, template *models.TransactionStatus) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	cp := *template
+	cp.TxIDs = append([]string(nil), template.TxIDs...)
+	p.bulkPublishes = append(p.bulkPublishes, &cp)
+	return nil
+}
+
+func (p *recordingCallbackPub) Subscribe(context.Context, string) (<-chan *models.TransactionStatus, error) {
+	return nil, errors.New("not used")
+}
+
+func (p *recordingCallbackPub) Close() error { return nil }
+
+// TestHandleSeenOnNetwork_BulkPath_OnePublishPerCallback is the regression
+// guard for the perf optimization in plan "RECEIVED → SEEN_ON_NETWORK
+// Latency": one inbound callback with N txids must produce exactly ONE
+// PublishBulk event and ZERO per-tx Publish calls. The old code did N
+// synchronous Kafka sends per callback; under 100 TPS with batches of 50
+// that was ~50× the per-callback fan-out work.
+func TestHandleSeenOnNetwork_BulkPath_OnePublishPerCallback(t *testing.T) {
+	ms := &mockStore{}
+	pub := &recordingCallbackPub{}
+	gin.SetMode(gin.TestMode)
+	srv := &Server{
+		cfg:            &config.Config{CallbackToken: testCallbackToken},
+		logger:         zap.NewNop(),
+		producer:       kafka.NewProducer(&kafka.RecordingBroker{}),
+		store:          ms,
+		publisher:      pub,
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
+	}
+	router := gin.New()
+	srv.registerRoutes(router)
+
+	const n = 50
+	txids := make([]string, n)
+	for i := range txids {
+		txids[i] = fmt.Sprintf("tx-%02d", i)
+	}
+	payload := models.CallbackMessage{Type: models.CallbackSeenOnNetwork, TxIDs: txids}
+	req := authedCallbackRequest(t, mustMarshalJSON(t, payload))
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+
+	pub.mu.Lock()
+	defer pub.mu.Unlock()
+	if len(pub.publishes) != 0 {
+		t.Errorf("expected ZERO per-tx Publish calls, got %d", len(pub.publishes))
+	}
+	if len(pub.bulkPublishes) != 1 {
+		t.Fatalf("expected exactly 1 PublishBulk call, got %d", len(pub.bulkPublishes))
+	}
+	bulk := pub.bulkPublishes[0]
+	if bulk.Status != models.StatusSeenOnNetwork {
+		t.Errorf("bulk template status = %q, want SEEN_ON_NETWORK", bulk.Status)
+	}
+	if len(bulk.TxIDs) != n {
+		t.Errorf("bulk template TxIDs length = %d, want %d", len(bulk.TxIDs), n)
+	}
+	// The store also saw exactly one BatchUpdateStatusReturning call covering
+	// every txid in input order.
+	if got := len(ms.batchUpdateReturningCalls); got != 1 {
+		t.Fatalf("expected 1 BatchUpdateStatusReturning call, got %d", got)
+	}
+	if got := len(ms.batchUpdateReturningCalls[0]); got != n {
+		t.Errorf("expected batch of %d statuses, got %d", n, got)
 	}
 }
 

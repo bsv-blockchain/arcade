@@ -79,6 +79,10 @@ func (s *fakeStore) BatchUpdateStatus(context.Context, []*models.TransactionStat
 	return nil
 }
 
+func (s *fakeStore) BatchUpdateStatusReturning(context.Context, []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
+	return nil, nil
+}
+
 //nolint:nilnil // unused stub; safe to return the zero pair.
 func (s *fakeStore) GetStatus(context.Context, string) (*models.TransactionStatus, error) {
 	return nil, nil
@@ -97,8 +101,8 @@ func (s *fakeStore) SetStatusByBlockHash(context.Context, string, models.Status)
 }
 func (s *fakeStore) InsertBUMP(context.Context, string, uint64, []byte) error { return nil }
 func (s *fakeStore) GetBUMP(context.Context, string) (uint64, []byte, error)  { return 0, nil, nil }
-func (s *fakeStore) SetMinedByTxIDs(context.Context, string, uint64, []string) ([]*models.TransactionStatus, error) {
-	return nil, nil
+func (s *fakeStore) SetMinedByTxIDs(context.Context, string, uint64, []string) ([]*models.TransactionStatus, []*models.TransactionStatus, error) {
+	return nil, nil, nil
 }
 
 func (s *fakeStore) MarkMerkleRegisteredByTxIDs(context.Context, []string, time.Time) error {

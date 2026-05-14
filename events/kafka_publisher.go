@@ -74,7 +74,14 @@ func (p *KafkaPublisher) Publish(ctx context.Context, status *models.Transaction
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return p.producer.Send(kafka.TopicStatusUpdate, status.TxID, status) //nolint:contextcheck // kafka.Producer.Send doesn't take a context; ctx already checked above
+	start := time.Now()
+	err := p.producer.Send(kafka.TopicStatusUpdate, status.TxID, status) //nolint:contextcheck // kafka.Producer.Send doesn't take a context; ctx already checked above
+	outcome := "success"
+	if err != nil {
+		outcome = "error"
+	}
+	metrics.EventsPublishDuration.WithLabelValues("single", outcome).Observe(time.Since(start).Seconds())
+	return err
 }
 
 // PublishBulk sends one event carrying TxIDs[]. The kafka key is the
@@ -97,7 +104,14 @@ func (p *KafkaPublisher) PublishBulk(ctx context.Context, template *models.Trans
 		// deterministic even before block context is known.
 		key = "bulk-" + template.TxIDs[0]
 	}
-	return p.producer.Send(kafka.TopicStatusUpdate, key, template) //nolint:contextcheck // kafka.Producer.Send doesn't take a context; ctx already checked above
+	start := time.Now()
+	err := p.producer.Send(kafka.TopicStatusUpdate, key, template) //nolint:contextcheck // kafka.Producer.Send doesn't take a context; ctx already checked above
+	outcome := "success"
+	if err != nil {
+		outcome = "error"
+	}
+	metrics.EventsPublishDuration.WithLabelValues("bulk", outcome).Observe(time.Since(start).Seconds())
+	return err
 }
 
 // Subscribe joins a fresh consumer group on TopicStatusUpdate and returns a

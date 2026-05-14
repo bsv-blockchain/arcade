@@ -21,7 +21,6 @@ import (
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/teranode"
 )
 
@@ -124,24 +123,6 @@ func newSubmissionID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b[:]), nil
-}
-
-// publishStatus fans a status update out via the configured Publisher. The
-// Publisher is nil in unit tests and degraded deployments; in those cases
-// the status mutation is still durable in the store and SSE catchup will
-// recover it on reconnect, so this helper is intentionally non-fatal.
-func (s *Server) publishStatus(ctx context.Context, status *models.TransactionStatus) {
-	if s.publisher == nil || status == nil {
-		return
-	}
-	if err := s.publisher.Publish(ctx, status); err != nil {
-		s.logger.Warn(
-			"failed to publish status update",
-			zap.String("txid", status.TxID),
-			zap.String("status", string(status.Status)),
-			zap.Error(err),
-		)
-	}
 }
 
 const docsTemplate = `<!DOCTYPE html>
@@ -300,34 +281,16 @@ func (s *Server) handleCallback(c *gin.Context) {
 // never recorded) are dropped with a Warn — never created as phantom rows.
 // See F-033 / issue #91; the store layer enforces this by returning
 // store.ErrNotFound from UpdateStatus when the row is absent.
+//
+// Batch path: one BatchUpdateStatusReturning call (parallel per-shard
+// writes, with previous rows returned for transition-age observation) plus
+// one PublishBulk event covering every successful txid. The previous
+// per-tx loop did N synchronous store calls and N kafka.Send calls; under
+// 100 TPS with merkle-service batching ~50 txids per callback that was
+// ~50× the work per callback. See plan: RECEIVED → SEEN_ON_NETWORK
+// Latency.
 func (s *Server) handleSeenOnNetwork(c *gin.Context, msg models.CallbackMessage, logger *zap.Logger) {
-	txids := msg.ResolveSeenTxIDs()
-	if len(txids) == 0 {
-		return
-	}
-
-	ctx := c.Request.Context()
-	now := time.Now()
-	for _, txid := range txids {
-		status := &models.TransactionStatus{
-			TxID:      txid,
-			Status:    models.StatusSeenOnNetwork,
-			Timestamp: now,
-		}
-		if err := s.store.UpdateStatus(ctx, status); err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				logger.Warn("dropping seen_on_network for unknown txid",
-					zap.String("txid", txid))
-				continue
-			}
-			logger.Warn("failed to update seen_on_network", zap.String("txid", txid), zap.Error(err))
-			continue
-		}
-		if s.txTracker != nil {
-			s.txTracker.UpdateStatus(txid, models.StatusSeenOnNetwork)
-		}
-		s.publishStatus(ctx, status)
-	}
+	s.applySeenCallback(c, msg, logger, models.StatusSeenOnNetwork, "SEEN_ON_NETWORK")
 }
 
 // handleSeenMultipleNodes applies a SEEN_ON_MULTIPLE_NODES callback. Same
@@ -335,32 +298,100 @@ func (s *Server) handleSeenOnNetwork(c *gin.Context, msg models.CallbackMessage,
 // to absent rows (F-033 / #91) and we log + continue rather than creating
 // phantom rows.
 func (s *Server) handleSeenMultipleNodes(c *gin.Context, msg models.CallbackMessage, logger *zap.Logger) {
+	s.applySeenCallback(c, msg, logger, models.StatusSeenMultipleNodes, "SEEN_MULTIPLE_NODES")
+}
+
+// applySeenCallback is the shared body of the two "seen" callback paths.
+// targetStatus is the status to transition each known txid to;
+// metricLabel is the type label used on the callback metrics.
+func (s *Server) applySeenCallback(c *gin.Context, msg models.CallbackMessage, logger *zap.Logger, targetStatus models.Status, metricLabel string) {
+	start := time.Now()
+	outcome := "success"
+	defer func() {
+		metrics.CallbackHandlerDuration.WithLabelValues(metricLabel, outcome).Observe(time.Since(start).Seconds())
+	}()
+
 	txids := msg.ResolveSeenTxIDs()
+	metrics.CallbackBatchSize.WithLabelValues(metricLabel).Observe(float64(len(txids)))
 	if len(txids) == 0 {
 		return
 	}
 
 	ctx := c.Request.Context()
 	now := time.Now()
-	for _, txid := range txids {
-		status := &models.TransactionStatus{
+	statuses := make([]*models.TransactionStatus, len(txids))
+	for i, txid := range txids {
+		statuses[i] = &models.TransactionStatus{
 			TxID:      txid,
-			Status:    models.StatusSeenMultipleNodes,
+			Status:    targetStatus,
 			Timestamp: now,
 		}
-		if err := s.store.UpdateStatus(ctx, status); err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				logger.Warn("dropping seen_multiple_nodes for unknown txid",
-					zap.String("txid", txid))
-				continue
-			}
-			logger.Warn("failed to update seen_multiple_nodes", zap.String("txid", txid), zap.Error(err))
+	}
+
+	prevs, err := s.store.BatchUpdateStatusReturning(ctx, statuses)
+	if err != nil {
+		outcome = "error"
+		logger.Warn("batch update seen status failed",
+			zap.String("type", metricLabel),
+			zap.Int("batch_size", len(txids)),
+			zap.Error(err),
+		)
+		// Continue: per-row errors are nil-prev in the slice; we still want
+		// to publish successful transitions if any.
+	}
+
+	successful := make([]string, 0, len(txids))
+	for i, prev := range prevs {
+		if prev == nil {
+			outcome = "partial"
+			metrics.CallbackUnknownTxIDTotal.WithLabelValues(metricLabel).Inc()
+			logger.Warn("dropping callback for unknown txid",
+				zap.String("type", metricLabel),
+				zap.String("txid", txids[i]))
 			continue
 		}
-		if s.txTracker != nil {
-			s.txTracker.UpdateStatus(txid, models.StatusSeenMultipleNodes)
+		// Observe transition age — the headline metric the user asked for.
+		// Use the previous row's Timestamp (last-update wall-clock) as the
+		// anchor; for the RECEIVED→SEEN_ON_NETWORK case it equals the
+		// time the validator marked the tx RECEIVED, which is exactly
+		// the latency we want to optimize against.
+		if !prev.Timestamp.IsZero() {
+			metrics.StatusTransitionAge.
+				WithLabelValues(string(prev.Status), string(targetStatus)).
+				Observe(time.Since(prev.Timestamp).Seconds())
 		}
-		s.publishStatus(ctx, status)
+		// Status lattice skipped the update — no transition to fan out.
+		// Record the stale-callback signal so an operator can alert on
+		// upstream rate without parsing the store_updatestatus histogram.
+		// Two stale sub-cases: prev == target (duplicate callback) and
+		// target not reachable from prev (e.g. MINED → SEEN_ON_NETWORK).
+		if prev.Status == targetStatus || !targetStatus.CanTransitionFrom(prev.Status) {
+			metrics.CallbackStaleTotal.WithLabelValues(metricLabel, string(prev.Status)).Inc()
+			continue
+		}
+		successful = append(successful, txids[i])
+		if s.txTracker != nil {
+			s.txTracker.UpdateStatus(txids[i], targetStatus)
+		}
+	}
+
+	// Single PublishBulk for the whole batch — drops the per-txid Kafka send
+	// down to one event regardless of N. Subscribers (SSE, webhook) unfan in
+	// their own handler, where they pay the per-tx cost without saturating
+	// the bounded work queue.
+	if len(successful) > 0 && s.publisher != nil {
+		template := &models.TransactionStatus{
+			Status:    targetStatus,
+			Timestamp: now,
+			TxIDs:     successful,
+		}
+		if pubErr := s.publisher.PublishBulk(ctx, template); pubErr != nil {
+			logger.Warn("failed to publish bulk seen-status",
+				zap.String("type", metricLabel),
+				zap.Int("count", len(successful)),
+				zap.Error(pubErr),
+			)
+		}
 	}
 }
 

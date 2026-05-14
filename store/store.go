@@ -84,6 +84,20 @@ type Store interface {
 	// (VALUES …); other backends fall back to a bounded-concurrency loop.
 	BatchUpdateStatus(ctx context.Context, statuses []*models.TransactionStatus) error
 
+	// BatchUpdateStatusReturning is the diagnostic-rich form of BatchUpdateStatus.
+	// Returns a slice the same length as `statuses` where result[i] is the
+	// previous row that was merged with (i.e. the row as it existed before
+	// the update), or nil for unknown txids and per-row errors. Used by the
+	// inbound callback handlers to observe transition-age metrics
+	// (RECEIVED→SEEN_ON_NETWORK) without an extra round-trip.
+	//
+	// Backends are expected to short-circuit when the requested transition
+	// is blocked by the status lattice (CanTransitionFrom) — the returned
+	// `previous[i]` is still the row that existed at lookup time, but the
+	// update is a no-op. Callers can detect "no transition applied" by
+	// comparing previous[i].Status to the requested status[i].Status.
+	BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error)
+
 	// GetStatus retrieves the status for a transaction
 	GetStatus(ctx context.Context, txid string) (*models.TransactionStatus, error)
 
@@ -172,11 +186,18 @@ type Store interface {
 	// specific block, and a zero/missing height has historically caused dropped
 	// updates and BUMP-build re-work (see issue #87 / F-029). Implementations
 	// must persist both blockHash and blockHeight on each updated row, and the
-	// returned TransactionStatus values MUST carry BlockHeight populated.
+	// returned `mined` TransactionStatus values MUST carry BlockHeight populated.
 	// Implementations must only update records that already exist in the store;
 	// txids with no existing record should be silently skipped (not created).
-	// Returns full status objects only for the transactions that were actually updated.
-	SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeight uint64, txids []string) ([]*models.TransactionStatus, error)
+	//
+	// Returns two parallel slices of equal length: `prevs[i]` is the row as it
+	// existed immediately before the MINED write, and `mined[i]` is the row as
+	// it exists after. Only txids that were actually updated appear in either
+	// slice — unknown-txid skips produce no entry on either side. The prevs
+	// slice exists so callers can observe the
+	// arcade_status_transition_age_seconds{from=*,to=MINED} metric without an
+	// extra round-trip.
+	SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeight uint64, txids []string) (prevs []*models.TransactionStatus, mined []*models.TransactionStatus, err error)
 
 	// InsertSubmission creates a new submission record
 	InsertSubmission(ctx context.Context, sub *models.Submission) error

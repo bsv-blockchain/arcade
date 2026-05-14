@@ -167,7 +167,7 @@ func (b *Builder) chainHeaderRootValidator(ctx context.Context, blockHash string
 // repairs it from the compound BUMP's height before fanning out so a
 // half-applied revert can never reintroduce the original bug.
 func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, blockHash string, blockHeight uint64, txids []string) {
-	mined, err := b.store.SetMinedByTxIDs(ctx, blockHash, blockHeight, txids)
+	prevs, mined, err := b.store.SetMinedByTxIDs(ctx, blockHash, blockHeight, txids)
 	if err != nil {
 		logger.Error("failed to set mined status", zap.Error(err))
 		return
@@ -178,6 +178,18 @@ func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, b
 		zap.Uint64("block_height", blockHeight),
 	)
 	metrics.BumpBuilderTxidsMinedTotal.Add(float64(len(mined)))
+	// Observe the per-tx age of the previous status row so an operator can see
+	// how long each tx sat at SEEN_ON_NETWORK / SEEN_MULTIPLE_NODES before the
+	// block landed. Pairs with arcade_bump_builder_build_duration_seconds for
+	// the block-level latency (BLOCK_PROCESSED → BUMP-persisted).
+	for i, prev := range prevs {
+		if prev == nil || prev.Timestamp.IsZero() || i >= len(mined) {
+			continue
+		}
+		metrics.StatusTransitionAge.
+			WithLabelValues(string(prev.Status), string(models.StatusMined)).
+			Observe(time.Since(prev.Timestamp).Seconds())
+	}
 	if len(mined) == 0 {
 		return
 	}

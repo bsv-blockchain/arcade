@@ -169,15 +169,20 @@ func (m *mockStore) InsertBUMP(_ context.Context, blockHash string, _ uint64, bu
 	return nil
 }
 
-func (m *mockStore) SetMinedByTxIDs(_ context.Context, blockHash string, blockHeight uint64, txids []string) ([]*models.TransactionStatus, error) {
+func (m *mockStore) SetMinedByTxIDs(_ context.Context, blockHash string, blockHeight uint64, txids []string) ([]*models.TransactionStatus, []*models.TransactionStatus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.setMinedErr != nil {
-		return nil, m.setMinedErr
+		return nil, nil, m.setMinedErr
 	}
 	m.minedCalls = append(m.minedCalls, minedCall{blockHash, blockHeight, txids})
-	var statuses []*models.TransactionStatus
+	var prevs, statuses []*models.TransactionStatus
 	for _, txid := range txids {
+		prevs = append(prevs, &models.TransactionStatus{
+			TxID:      txid,
+			Status:    models.StatusSeenOnNetwork,
+			Timestamp: time.Now(),
+		})
 		statuses = append(statuses, &models.TransactionStatus{
 			TxID:        txid,
 			Status:      models.StatusMined,
@@ -186,7 +191,7 @@ func (m *mockStore) SetMinedByTxIDs(_ context.Context, blockHash string, blockHe
 			Timestamp:   time.Now(),
 		})
 	}
-	return statuses, nil
+	return prevs, statuses, nil
 }
 
 func (m *mockStore) DeleteStumpsByBlockHash(_ context.Context, blockHash string) error {
@@ -1275,12 +1280,12 @@ type heightDroppingMockStore struct {
 	*mockStore
 }
 
-func (h *heightDroppingMockStore) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeight uint64, txids []string) ([]*models.TransactionStatus, error) {
-	statuses, err := h.mockStore.SetMinedByTxIDs(ctx, blockHash, blockHeight, txids)
+func (h *heightDroppingMockStore) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeight uint64, txids []string) ([]*models.TransactionStatus, []*models.TransactionStatus, error) {
+	prevs, statuses, err := h.mockStore.SetMinedByTxIDs(ctx, blockHash, blockHeight, txids)
 	for _, s := range statuses {
 		s.BlockHeight = 0
 	}
-	return statuses, err
+	return prevs, statuses, err
 }
 
 // stubChaintracks is a minimal ChainHeaderReader for tests. nil header
