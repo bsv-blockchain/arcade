@@ -147,12 +147,16 @@ func NewPipeline(
 	}
 
 	bcast, err := newDispatcherBroadcaster(dispatcherBroadcasterConfig{
-		TeranodeClient: tc,
-		Store:          st,
-		Incoming:       outgoing,
-		Flips:          flips,
-		Logger:         logger.Named("broadcaster"),
-		SubmitTimeout:  15 * time.Second,
+		TeranodeClient:      tc,
+		Store:               st,
+		Incoming:            outgoing,
+		Flips:               flips,
+		Logger:              logger.Named("broadcaster"),
+		SubmitTimeout:       15 * time.Second,
+		MerkleClient:        mc,
+		MerkleConcurrency:   cfg.Propagation.MerkleConcurrency,
+		MerkleCallbackURL:   cfg.CallbackURL,
+		MerkleCallbackToken: cfg.CallbackToken,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("propagation.NewPipeline: broadcaster: %w", err)

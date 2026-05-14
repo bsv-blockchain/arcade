@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -11,6 +12,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/teranode"
 )
@@ -297,5 +299,99 @@ func TestDispatcherBroadcaster_NoHealthyEndpoints(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("no flip received")
+	}
+}
+
+// TestDispatcherBroadcaster_MerkleRegisterFailure_RetryFlip verifies
+// that a merkle-service registration failure produces a retryable
+// statusFlip (statusCode=0) and does NOT broadcast the failing tx to
+// Teranode. The successful tx in the same batch still broadcasts.
+func TestDispatcherBroadcaster_MerkleRegisterFailure_RetryFlip(t *testing.T) {
+	// Teranode emulator — count how many times it was hit so we can
+	// confirm the failed-registration tx never reached it.
+	var teranodeHits int32
+	teranodeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&teranodeHits, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(teranodeSrv.Close)
+	tc := teranode.NewClient([]string{teranodeSrv.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
+
+	// Merkle-service emulator — returns 500 for txid containing "fail",
+	// 200 otherwise. The /watch endpoint receives a JSON payload with
+	// the txid inside.
+	merkleSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := make([]byte, 256)
+		n, _ := r.Body.Read(body)
+		if strings.Contains(string(body[:n]), "fail") {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(merkleSrv.Close)
+	mc := merkleservice.NewClient(merkleSrv.URL, "", 2*time.Second)
+
+	store := newBroadcastTestStore()
+	outBatch := make(chan []*inFlightEntry, 1)
+	flips := make(chan statusFlip, 4)
+
+	b, err := newDispatcherBroadcaster(dispatcherBroadcasterConfig{
+		TeranodeClient:    tc,
+		Store:             store,
+		Incoming:          outBatch,
+		Flips:             flips,
+		Logger:            zap.NewNop(),
+		SubmitTimeout:     time.Second,
+		MerkleClient:      mc,
+		MerkleConcurrency: 4,
+		MerkleCallbackURL: "http://test/callback",
+	})
+	if err != nil {
+		t.Fatalf("newDispatcherBroadcaster: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go b.Run(ctx)
+
+	outBatch <- []*inFlightEntry{
+		{txid: "okTx", rawTx: []byte{0xaa}},
+		{txid: "failTx", rawTx: []byte{0xbb}},
+	}
+
+	// Two flips expected: ACCEPTED for okTx (broadcast), retryable
+	// REJECTED for failTx (merkle register failed). Order is not
+	// guaranteed.
+	flipsByTxID := map[string]statusFlip{}
+	for i := 0; i < 2; i++ {
+		select {
+		case f := <-flips:
+			flipsByTxID[f.txid] = f
+		case <-time.After(3 * time.Second):
+			t.Fatalf("only saw %d/2 flips: %+v", len(flipsByTxID), flipsByTxID)
+		}
+	}
+
+	okFlip, ok := flipsByTxID["okTx"]
+	if !ok || okFlip.status != models.StatusAcceptedByNetwork {
+		t.Errorf("okTx flip: want ACCEPTED, got %+v", okFlip)
+	}
+
+	failFlip, ok := flipsByTxID["failTx"]
+	if !ok || failFlip.status != models.StatusRejected {
+		t.Errorf("failTx flip: want REJECTED, got %+v", failFlip)
+	}
+	if failFlip.statusCode != 0 {
+		t.Errorf("failTx statusCode: want 0 (retryable), got %d", failFlip.statusCode)
+	}
+	if !strings.Contains(failFlip.errorMsg, "merkle register failed") {
+		t.Errorf("failTx errorMsg should mention merkle register failure, got %q", failFlip.errorMsg)
+	}
+
+	// Only the successful tx should have been broadcast — /tx (single)
+	// because after registration filtering the batch is size 1.
+	if got := atomic.LoadInt32(&teranodeHits); got != 1 {
+		t.Errorf("expected exactly 1 Teranode submission (okTx only), got %d", got)
 	}
 }
