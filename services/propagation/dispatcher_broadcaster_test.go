@@ -77,7 +77,7 @@ func TestDispatcherBroadcaster_BatchAccepted(t *testing.T) {
 
 	store := newBroadcastTestStore()
 	outBatch := make(chan []*inFlightEntry, 1)
-	flips := make(chan *models.TransactionStatus, 4)
+	flips := make(chan statusFlip, 4)
 
 	b, err := newDispatcherBroadcaster(dispatcherBroadcasterConfig{
 		TeranodeClient: tc,
@@ -104,7 +104,7 @@ func TestDispatcherBroadcaster_BatchAccepted(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		select {
 		case f := <-flips:
-			seen[f.TxID] = f.Status
+			seen[f.txid] = f.status
 		case <-time.After(2 * time.Second):
 			t.Fatalf("only saw %d/2 flips: %+v", len(seen), seen)
 		}
@@ -155,7 +155,7 @@ func TestDispatcherBroadcaster_BatchRejected_FallsBackPerTx(t *testing.T) {
 
 	store := newBroadcastTestStore()
 	outBatch := make(chan []*inFlightEntry, 1)
-	flips := make(chan *models.TransactionStatus, 4)
+	flips := make(chan statusFlip, 4)
 
 	b, err := newDispatcherBroadcaster(dispatcherBroadcasterConfig{
 		TeranodeClient: tc,
@@ -182,10 +182,10 @@ func TestDispatcherBroadcaster_BatchRejected_FallsBackPerTx(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		select {
 		case f := <-flips:
-			if f.Status != models.StatusRejected {
-				t.Errorf("expected REJECTED for %s, got %s", f.TxID, f.Status)
+			if f.status != models.StatusRejected {
+				t.Errorf("expected REJECTED for %s, got %s", f.txid, f.status)
 			}
-			rejectedTxs[f.TxID] = f.StatusCode
+			rejectedTxs[f.txid] = f.statusCode
 		case <-time.After(2 * time.Second):
 			t.Fatalf("only saw %d/2 flips", len(rejectedTxs))
 		}
@@ -223,7 +223,7 @@ func TestDispatcherBroadcaster_SingleTx(t *testing.T) {
 
 	store := newBroadcastTestStore()
 	outBatch := make(chan []*inFlightEntry, 1)
-	flips := make(chan *models.TransactionStatus, 1)
+	flips := make(chan statusFlip, 1)
 
 	b, err := newDispatcherBroadcaster(dispatcherBroadcasterConfig{
 		TeranodeClient: tc,
@@ -245,7 +245,7 @@ func TestDispatcherBroadcaster_SingleTx(t *testing.T) {
 
 	select {
 	case f := <-flips:
-		if f.TxID != "soloTx" || f.Status != models.StatusAcceptedByNetwork {
+		if f.txid != "soloTx" || f.status != models.StatusAcceptedByNetwork {
 			t.Errorf("expected soloTx ACCEPTED, got %+v", f)
 		}
 	case <-time.After(2 * time.Second):
@@ -269,7 +269,7 @@ func TestDispatcherBroadcaster_NoHealthyEndpoints(t *testing.T) {
 
 	store := newBroadcastTestStore()
 	outBatch := make(chan []*inFlightEntry, 1)
-	flips := make(chan *models.TransactionStatus, 1)
+	flips := make(chan statusFlip, 1)
 
 	b, err := newDispatcherBroadcaster(dispatcherBroadcasterConfig{
 		TeranodeClient: tc,
@@ -291,11 +291,11 @@ func TestDispatcherBroadcaster_NoHealthyEndpoints(t *testing.T) {
 
 	select {
 	case f := <-flips:
-		if f.Status != models.StatusRejected {
-			t.Errorf("expected REJECTED, got %s", f.Status)
+		if f.status != models.StatusRejected {
+			t.Errorf("expected REJECTED, got %s", f.status)
 		}
-		if f.StatusCode != 0 {
-			t.Errorf("expected statusCode=0 (retryable signal), got %d", f.StatusCode)
+		if f.statusCode != 0 {
+			t.Errorf("expected statusCode=0 (retryable signal), got %d", f.statusCode)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("no flip received")
@@ -334,7 +334,7 @@ func TestDispatcherBroadcaster_MerkleRegisterFailure_RetryFlip(t *testing.T) {
 
 	store := newBroadcastTestStore()
 	outBatch := make(chan []*inFlightEntry, 1)
-	flips := make(chan *models.TransactionStatus, 4)
+	flips := make(chan statusFlip, 4)
 
 	b, err := newDispatcherBroadcaster(dispatcherBroadcasterConfig{
 		TeranodeClient:    tc,
@@ -363,30 +363,30 @@ func TestDispatcherBroadcaster_MerkleRegisterFailure_RetryFlip(t *testing.T) {
 	// Two flips expected: ACCEPTED for okTx (broadcast), retryable
 	// REJECTED for failTx (merkle register failed). Order is not
 	// guaranteed.
-	flipsByTxID := map[string]*models.TransactionStatus{}
+	flipsByTxID := map[string]statusFlip{}
 	for i := 0; i < 2; i++ {
 		select {
 		case f := <-flips:
-			flipsByTxID[f.TxID] = f
+			flipsByTxID[f.txid] = f
 		case <-time.After(3 * time.Second):
 			t.Fatalf("only saw %d/2 flips: %+v", len(flipsByTxID), flipsByTxID)
 		}
 	}
 
 	okFlip, ok := flipsByTxID["okTx"]
-	if !ok || okFlip.Status != models.StatusAcceptedByNetwork {
+	if !ok || okFlip.status != models.StatusAcceptedByNetwork {
 		t.Errorf("okTx flip: want ACCEPTED, got %+v", okFlip)
 	}
 
 	failFlip, ok := flipsByTxID["failTx"]
-	if !ok || failFlip.Status != models.StatusRejected {
+	if !ok || failFlip.status != models.StatusRejected {
 		t.Errorf("failTx flip: want REJECTED, got %+v", failFlip)
 	}
-	if failFlip.StatusCode != 0 {
-		t.Errorf("failTx statusCode: want 0 (retryable), got %d", failFlip.StatusCode)
+	if failFlip.statusCode != 0 {
+		t.Errorf("failTx statusCode: want 0 (retryable), got %d", failFlip.statusCode)
 	}
-	if !strings.Contains(failFlip.ExtraInfo, "merkle register failed") {
-		t.Errorf("failTx errorMsg should mention merkle register failure, got %q", failFlip.ExtraInfo)
+	if !strings.Contains(failFlip.errorMsg, "merkle register failed") {
+		t.Errorf("failTx errorMsg should mention merkle register failure, got %q", failFlip.errorMsg)
 	}
 
 	// Only the successful tx should have been broadcast — /tx (single)

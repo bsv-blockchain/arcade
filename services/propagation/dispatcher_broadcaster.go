@@ -42,7 +42,7 @@ type dispatcherBroadcaster struct {
 	teranodeClient *teranode.Client
 	store          store.Store
 	incoming       <-chan []*inFlightEntry
-	flips          chan<- *models.TransactionStatus
+	flips          chan<- statusFlip
 	logger         *zap.Logger
 	submitTimeout  time.Duration
 
@@ -64,7 +64,7 @@ type dispatcherBroadcasterConfig struct {
 	TeranodeClient *teranode.Client
 	Store          store.Store
 	Incoming       <-chan []*inFlightEntry
-	Flips          chan<- *models.TransactionStatus
+	Flips          chan<- statusFlip
 	Logger         *zap.Logger
 	SubmitTimeout  time.Duration // 0 → default 15s, matches existing propagator
 
@@ -234,11 +234,11 @@ func (b *dispatcherBroadcaster) registerOrRetry(ctx context.Context, batch []*in
 		// NOT write a REJECTED row to the store — the tx is in flight,
 		// just needs another registration attempt.
 		select {
-		case b.flips <- &models.TransactionStatus{
-			TxID:       batch[i].txid,
-			Status:     models.StatusRejected,
-			ExtraInfo:  "merkle register failed: " + err.Error(),
-			StatusCode: 0,
+		case b.flips <- statusFlip{
+			txid:       batch[i].txid,
+			status:     models.StatusRejected,
+			errorMsg:   "merkle register failed: " + err.Error(),
+			statusCode: 0,
 		}:
 		case <-ctx.Done():
 			return nil
@@ -392,12 +392,12 @@ func (b *dispatcherBroadcaster) submitSingleToHealthy(parentCtx context.Context,
 // is gone from the dispatcher's view but still RECEIVED in the store —
 // the Kafka replay re-creates it and the broadcast retries).
 func (b *dispatcherBroadcaster) emitOutcome(ctx context.Context, entry *inFlightEntry, status models.Status, errMsg string, statusCode int) {
+	now := time.Now()
 	row := &models.TransactionStatus{
-		TxID:       entry.txid,
-		Status:     status,
-		StatusCode: statusCode,
-		ExtraInfo:  errMsg,
-		Timestamp:  time.Now(),
+		TxID:      entry.txid,
+		Status:    status,
+		Timestamp: now,
+		ExtraInfo: errMsg,
 	}
 	if err := b.store.BatchUpdateStatus(ctx, []*models.TransactionStatus{row}); err != nil {
 		b.logger.Warn(
@@ -408,8 +408,14 @@ func (b *dispatcherBroadcaster) emitOutcome(ctx context.Context, entry *inFlight
 		)
 	}
 
+	flip := statusFlip{
+		txid:       entry.txid,
+		status:     status,
+		errorMsg:   errMsg,
+		statusCode: statusCode,
+	}
 	select {
-	case b.flips <- row:
+	case b.flips <- flip:
 	case <-ctx.Done():
 	}
 }

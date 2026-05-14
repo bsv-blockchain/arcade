@@ -9,6 +9,24 @@ import (
 	"github.com/bsv-blockchain/arcade/models"
 )
 
+// dispatcherMsg is the propagation topic payload in the dep-aware design.
+// Extends propagationMsg with the parent txids extracted at intake. The
+// field is optional on the JSON side so consumers that haven't been
+// updated can ignore it, but the dispatcher requires it to make
+// dep-aware decisions — messages arriving without InputTXIDs are treated
+// as having no in-flight parents and broadcast immediately.
+type dispatcherMsg struct {
+	TXID       string   `json:"txid"`
+	RawTx      []byte   `json:"raw_tx"`
+	InputTXIDs []string `json:"input_txids,omitempty"`
+
+	// KafkaOffset is set by the consumer that produces these messages
+	// before sending into the dispatcher. The dispatcher uses it to track
+	// the lowest-unfinished commit point. Not serialized to/from JSON;
+	// internal-only.
+	KafkaOffset int64 `json:"-"`
+}
+
 // inFlightEntry is the dispatcher's per-tx record. Owned exclusively by
 // the dispatcher goroutine — no locks because no other goroutine touches
 // it. The struct holds everything the dispatcher needs to make decisions
@@ -21,6 +39,19 @@ type inFlightEntry struct {
 	kafkaOffset   int64
 	receivedAt    time.Time
 	retryAttempts int
+}
+
+// statusFlip is the dispatcher's notification that a tx has reached a new
+// status. Produced by broadcast workers (after a /tx or /txs round-trip)
+// and by the merkle-service callback handler (when SEEN_ON_NETWORK /
+// MINED / etc. arrive out-of-band). The dispatcher uses these to release
+// waiters (on ACCEPTED_BY_NETWORK), cascade rejections (on REJECTED), or
+// requeue with backoff (on retryable failures).
+type statusFlip struct {
+	txid       string
+	status     models.Status
+	errorMsg   string
+	statusCode int
 }
 
 // offsetTracker exposes the dispatcher's Kafka-offset bookkeeping behind
@@ -62,9 +93,9 @@ type offsetTracker interface {
 // string keys are not the bottleneck.
 type Dispatcher struct {
 	// Channels — interface boundaries.
-	incomingMsgs  <-chan propagationMsg
+	incomingMsgs  <-chan dispatcherMsg
 	outgoingBatch chan<- []*inFlightEntry
-	statusFlips   <-chan *models.TransactionStatus
+	statusFlips   <-chan statusFlip
 
 	// Dep index state. Only mutated by the goroutine running Run.
 	inFlight       map[string]*inFlightEntry
@@ -103,9 +134,9 @@ type Dispatcher struct {
 // started yet.
 func NewDispatcher(
 	logger *zap.Logger,
-	incomingMsgs <-chan propagationMsg,
+	incomingMsgs <-chan dispatcherMsg,
 	outgoingBatch chan<- []*inFlightEntry,
-	statusFlips <-chan *models.TransactionStatus,
+	statusFlips <-chan statusFlip,
 	offsets offsetTracker,
 	maxInFlight, batchMaxSize, retryMaxAttempts, retryBackoffMs int,
 	batchFlushTimeout time.Duration,
@@ -227,7 +258,7 @@ func (d *Dispatcher) nextWakeUp() time.Time {
 // happen on Kafka replay after restart, and the dispatcher's existing
 // entry already reflects whatever decisions were made. We still record
 // the offset so commit-tracking advances.
-func (d *Dispatcher) handleIncoming(msg propagationMsg) {
+func (d *Dispatcher) handleIncoming(msg dispatcherMsg) {
 	d.offsetTracker.Add(msg.KafkaOffset)
 
 	if _, exists := d.inFlight[msg.TXID]; exists {
@@ -295,36 +326,34 @@ func (d *Dispatcher) handleIncoming(msg propagationMsg) {
 // can legitimately happen for txs the dispatcher previously terminalized
 // or for status flips from the merkle-service callback path firing on
 // txs not in our current in-flight window.
-func (d *Dispatcher) handleStatusFlip(flip *models.TransactionStatus) {
-	if flip == nil {
-		return
-	}
-	entry, ok := d.inFlight[flip.TxID]
+func (d *Dispatcher) handleStatusFlip(flip statusFlip) {
+	entry, ok := d.inFlight[flip.txid]
 	if !ok {
 		return
 	}
 
-	switch flip.Status {
+	switch flip.status {
 	case models.StatusAcceptedByNetwork:
 		d.terminalize(entry)
-		d.releaseWaiters(flip.TxID)
+		d.releaseWaiters(flip.txid)
 
 	case models.StatusRejected:
 		// Differentiate retryable from terminal by HTTP status code.
 		// 422 (ErrTxMissingParent) and connection-level failures
 		// (statusCode == 0, captured separately upstream) are
-		// retryable; everything else is terminal.
-		if isRetryableStatusCode(flip.StatusCode) && entry.retryAttempts < d.retryMaxAttempts {
+		// retryable; everything else is terminal. Per the plan,
+		// IsRetryableError's text matching is replaced by this.
+		if isRetryableStatusCode(flip.statusCode) && entry.retryAttempts < d.retryMaxAttempts {
 			entry.retryAttempts++
-			d.retryQueue[flip.TxID] = computeRetryDeadline(d.retryBackoffMs, entry.retryAttempts)
+			d.retryQueue[flip.txid] = computeRetryDeadline(d.retryBackoffMs, entry.retryAttempts)
 			return
 		}
-		reason := flip.ExtraInfo
-		if isRetryableStatusCode(flip.StatusCode) {
-			reason = "broadcast retries exhausted"
+		if isRetryableStatusCode(flip.statusCode) {
+			// Retries exhausted — terminalize with explicit reason.
+			flip.errorMsg = "broadcast retries exhausted"
 		}
 		d.terminalize(entry)
-		d.cascadeReject(flip.TxID, reason)
+		d.cascadeReject(flip.txid, flip.errorMsg)
 
 	default:
 		// Intermediate statuses don't change dep-index decisions.

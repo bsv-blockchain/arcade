@@ -9,7 +9,6 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/kafka"
-	"github.com/bsv-blockchain/arcade/models"
 )
 
 // staticOffsetReader returns whatever the test sets, ignoring any heap
@@ -51,8 +50,8 @@ func TestDispatcherConsumer_DeferredCommit(t *testing.T) {
 	t.Cleanup(func() { _ = broker.Close() })
 
 	const topic = "test-propagation-defer"
-	in := make(chan propagationMsg, 8)
-	flips := make(chan *models.TransactionStatus)
+	in := make(chan dispatcherMsg, 8)
+	flips := make(chan statusFlip)
 	out := make(chan []*inFlightEntry, 4)
 
 	// Real dispatcher so the Dispatcher reference can be wired, but we
@@ -93,7 +92,7 @@ func TestDispatcherConsumer_DeferredCommit(t *testing.T) {
 	// Publish 3 messages.
 	producer := kafka.NewProducer(broker)
 	for i := 0; i < 3; i++ {
-		envelope := propagationMsg{TXID: txidForIndex(i), RawTx: []byte{byte(i)}}
+		envelope := dispatcherMsg{TXID: txidForIndex(i), RawTx: []byte{byte(i)}}
 		if err := producer.Send(topic, envelope.TXID, envelope); err != nil {
 			t.Fatalf("producer.Send: %v", err)
 		}

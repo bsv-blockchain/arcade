@@ -37,15 +37,6 @@ type propagationMsg struct {
 	// []byte as base64 — still smaller than hex (4/3 expansion vs 2x) and
 	// avoids the per-hop hex encode/decode the pipeline used to do.
 	RawTx []byte `json:"raw_tx"`
-	// InputTXIDs is populated by the dep-aware intake handler so the
-	// dispatcher can decide eligibility without re-parsing the raw tx.
-	// Optional — empty/absent on legacy producers, treated as "no
-	// in-flight parents".
-	InputTXIDs []string `json:"input_txids,omitempty"`
-	// KafkaOffset is the consumer-side offset. The dispatcher consumer
-	// populates it before handing the message off so offset commit can
-	// be deferred until the tx terminalizes. Not serialized.
-	KafkaOffset int64 `json:"-"`
 }
 
 type Propagator struct {

@@ -53,16 +53,16 @@ func drainBatches(t *testing.T, out <-chan []*inFlightEntry, expected int, timeo
 // a tx with no in-flight parents flushes to the broadcast workers
 // without delay.
 func TestDispatcher_NoParents_AdmitsImmediately(t *testing.T) {
-	in := make(chan propagationMsg, 1)
+	in := make(chan dispatcherMsg, 1)
 	out := make(chan []*inFlightEntry, 1)
-	flips := make(chan *models.TransactionStatus)
+	flips := make(chan statusFlip)
 
 	d := NewDispatcher(nil, in, out, flips, newOffsetTracker(),
 		100, 1 /*batchMaxSize=1 → flush every tx*/, 3, 100, 50*time.Millisecond)
 	cancel := runDispatcherForTest(t, d)
 	defer cancel()
 
-	in <- propagationMsg{TXID: "tx1", RawTx: []byte{0x01}, KafkaOffset: 1}
+	in <- dispatcherMsg{TXID: "tx1", RawTx: []byte{0x01}, KafkaOffset: 1}
 
 	got := drainBatches(t, out, 1, 500*time.Millisecond)
 	if len(got) != 1 || got[0].txid != "tx1" {
@@ -74,9 +74,9 @@ func TestDispatcher_NoParents_AdmitsImmediately(t *testing.T) {
 // parent is currently in flight is held as a waiter and does NOT appear
 // in the outgoing batch until the parent terminalizes.
 func TestDispatcher_ParentInFlight_HoldsChild(t *testing.T) {
-	in := make(chan propagationMsg, 2)
+	in := make(chan dispatcherMsg, 2)
 	out := make(chan []*inFlightEntry, 2)
-	flips := make(chan *models.TransactionStatus, 1)
+	flips := make(chan statusFlip, 1)
 
 	d := NewDispatcher(nil, in, out, flips, newOffsetTracker(),
 		100, 1, 3, 100, 50*time.Millisecond)
@@ -84,7 +84,7 @@ func TestDispatcher_ParentInFlight_HoldsChild(t *testing.T) {
 	defer cancel()
 
 	// Parent first — flushes immediately because no parents.
-	in <- propagationMsg{TXID: "parent", RawTx: []byte{0xaa}, KafkaOffset: 1}
+	in <- dispatcherMsg{TXID: "parent", RawTx: []byte{0xaa}, KafkaOffset: 1}
 	got := drainBatches(t, out, 1, 500*time.Millisecond)
 	if len(got) != 1 || got[0].txid != "parent" {
 		t.Fatalf("expected parent in batch, got %+v", got)
@@ -92,7 +92,7 @@ func TestDispatcher_ParentInFlight_HoldsChild(t *testing.T) {
 
 	// Child arrives. Parent is still in flight (no ACCEPTED yet), so
 	// child must be held as a waiter, not admitted.
-	in <- propagationMsg{
+	in <- dispatcherMsg{
 		TXID:        "child",
 		RawTx:       []byte{0xbb},
 		InputTXIDs:  []string{"parent"},
@@ -108,7 +108,7 @@ func TestDispatcher_ParentInFlight_HoldsChild(t *testing.T) {
 	}
 
 	// Now flip parent to ACCEPTED_BY_NETWORK; child should be released.
-	flips <- &models.TransactionStatus{TxID: "parent", Status: models.StatusAcceptedByNetwork}
+	flips <- statusFlip{txid: "parent", status: models.StatusAcceptedByNetwork}
 
 	got = drainBatches(t, out, 1, 500*time.Millisecond)
 	if len(got) != 1 || got[0].txid != "child" {
@@ -121,9 +121,9 @@ func TestDispatcher_ParentInFlight_HoldsChild(t *testing.T) {
 // terminally rejected without ever being broadcast, and the rejected
 // sink is invoked with a parent-rejected reason.
 func TestDispatcher_ParentRejected_CascadesChildren(t *testing.T) {
-	in := make(chan propagationMsg, 3)
+	in := make(chan dispatcherMsg, 3)
 	out := make(chan []*inFlightEntry, 3)
-	flips := make(chan *models.TransactionStatus, 2)
+	flips := make(chan statusFlip, 2)
 
 	d := NewDispatcher(nil, in, out, flips, newOffsetTracker(),
 		100, 1, 3, 100, 50*time.Millisecond)
@@ -141,13 +141,13 @@ func TestDispatcher_ParentRejected_CascadesChildren(t *testing.T) {
 	cancel := runDispatcherForTest(t, d)
 	defer cancel()
 
-	in <- propagationMsg{TXID: "parent", RawTx: []byte{0xaa}, KafkaOffset: 1}
+	in <- dispatcherMsg{TXID: "parent", RawTx: []byte{0xaa}, KafkaOffset: 1}
 	drainBatches(t, out, 1, 500*time.Millisecond) // consume parent's batch
 
-	in <- propagationMsg{
+	in <- dispatcherMsg{
 		TXID: "child", RawTx: []byte{0xbb}, InputTXIDs: []string{"parent"}, KafkaOffset: 2,
 	}
-	in <- propagationMsg{
+	in <- dispatcherMsg{
 		TXID: "grandchild", RawTx: []byte{0xcc}, InputTXIDs: []string{"child"}, KafkaOffset: 3,
 	}
 
@@ -155,7 +155,7 @@ func TestDispatcher_ParentRejected_CascadesChildren(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// 400 maps to terminal REJECTED per isRetryableStatusCode.
-	flips <- &models.TransactionStatus{TxID: "parent", Status: models.StatusRejected, StatusCode: 400, ExtraInfo: "bad parent"}
+	flips <- statusFlip{txid: "parent", status: models.StatusRejected, statusCode: 400, errorMsg: "bad parent"}
 
 	// Wait for the cascade to complete.
 	deadline := time.Now().Add(500 * time.Millisecond)
@@ -197,26 +197,26 @@ func TestDispatcher_ParentRejected_CascadesChildren(t *testing.T) {
 // multi-parent case: a child with two in-flight parents stays held
 // until BOTH have terminalized, not just one.
 func TestDispatcher_MultipleParents_HoldsUntilAllAccepted(t *testing.T) {
-	in := make(chan propagationMsg, 3)
+	in := make(chan dispatcherMsg, 3)
 	out := make(chan []*inFlightEntry, 3)
-	flips := make(chan *models.TransactionStatus, 2)
+	flips := make(chan statusFlip, 2)
 
 	d := NewDispatcher(nil, in, out, flips, newOffsetTracker(),
 		100, 1, 3, 100, 50*time.Millisecond)
 	cancel := runDispatcherForTest(t, d)
 	defer cancel()
 
-	in <- propagationMsg{TXID: "p1", RawTx: []byte{0xa1}, KafkaOffset: 1}
-	in <- propagationMsg{TXID: "p2", RawTx: []byte{0xa2}, KafkaOffset: 2}
+	in <- dispatcherMsg{TXID: "p1", RawTx: []byte{0xa1}, KafkaOffset: 1}
+	in <- dispatcherMsg{TXID: "p2", RawTx: []byte{0xa2}, KafkaOffset: 2}
 	drainBatches(t, out, 2, 500*time.Millisecond) // consume parents
 
-	in <- propagationMsg{
+	in <- dispatcherMsg{
 		TXID: "child", RawTx: []byte{0xcc}, InputTXIDs: []string{"p1", "p2"}, KafkaOffset: 3,
 	}
 	time.Sleep(50 * time.Millisecond)
 
 	// First parent ACCEPTED — child should still be held (p2 unmet).
-	flips <- &models.TransactionStatus{TxID: "p1", Status: models.StatusAcceptedByNetwork}
+	flips <- statusFlip{txid: "p1", status: models.StatusAcceptedByNetwork}
 	select {
 	case batch := <-out:
 		t.Fatalf("child released after only one parent ACCEPTED: %+v", batch)
@@ -224,7 +224,7 @@ func TestDispatcher_MultipleParents_HoldsUntilAllAccepted(t *testing.T) {
 	}
 
 	// Second parent ACCEPTED — child should now be released.
-	flips <- &models.TransactionStatus{TxID: "p2", Status: models.StatusAcceptedByNetwork}
+	flips <- statusFlip{txid: "p2", status: models.StatusAcceptedByNetwork}
 	got := drainBatches(t, out, 1, 500*time.Millisecond)
 	if len(got) != 1 || got[0].txid != "child" {
 		t.Fatalf("expected child released after both parents ACCEPTED, got %+v", got)
@@ -235,9 +235,9 @@ func TestDispatcher_MultipleParents_HoldsUntilAllAccepted(t *testing.T) {
 // status (422 ErrTxMissingParent) puts the tx back in the queue with a
 // short backoff and re-admits it to a batch when the backoff elapses.
 func TestDispatcher_RetryableFailure_Requeues(t *testing.T) {
-	in := make(chan propagationMsg, 1)
+	in := make(chan dispatcherMsg, 1)
 	out := make(chan []*inFlightEntry, 2)
-	flips := make(chan *models.TransactionStatus, 1)
+	flips := make(chan statusFlip, 1)
 
 	// retryBackoffMs=10 so the test doesn't have to wait long.
 	d := NewDispatcher(nil, in, out, flips, newOffsetTracker(),
@@ -245,14 +245,14 @@ func TestDispatcher_RetryableFailure_Requeues(t *testing.T) {
 	cancel := runDispatcherForTest(t, d)
 	defer cancel()
 
-	in <- propagationMsg{TXID: "tx1", RawTx: []byte{0x01}, KafkaOffset: 1}
+	in <- dispatcherMsg{TXID: "tx1", RawTx: []byte{0x01}, KafkaOffset: 1}
 	got := drainBatches(t, out, 1, 500*time.Millisecond)
 	if len(got) != 1 || got[0].txid != "tx1" {
 		t.Fatalf("expected initial broadcast of tx1, got %+v", got)
 	}
 
 	// 422 → retryable.
-	flips <- &models.TransactionStatus{TxID: "tx1", Status: models.StatusRejected, StatusCode: 422}
+	flips <- statusFlip{txid: "tx1", status: models.StatusRejected, statusCode: 422}
 
 	// Retry should fire after the backoff elapses.
 	got = drainBatches(t, out, 1, 500*time.Millisecond)
@@ -268,9 +268,9 @@ func TestDispatcher_RetryableFailure_Requeues(t *testing.T) {
 // retryMaxAttempts is exceeded, the tx is terminally rejected rather
 // than re-queued indefinitely.
 func TestDispatcher_RetryExhausted_Terminates(t *testing.T) {
-	in := make(chan propagationMsg, 1)
+	in := make(chan dispatcherMsg, 1)
 	out := make(chan []*inFlightEntry, 5)
-	flips := make(chan *models.TransactionStatus, 5)
+	flips := make(chan statusFlip, 5)
 
 	// retryMaxAttempts=2 + small backoff.
 	d := NewDispatcher(nil, in, out, flips, newOffsetTracker(),
@@ -289,7 +289,7 @@ func TestDispatcher_RetryExhausted_Terminates(t *testing.T) {
 	cancel := runDispatcherForTest(t, d)
 	defer cancel()
 
-	in <- propagationMsg{TXID: "tx1", RawTx: []byte{0x01}, KafkaOffset: 1}
+	in <- dispatcherMsg{TXID: "tx1", RawTx: []byte{0x01}, KafkaOffset: 1}
 
 	// Flip 422 repeatedly until exhaustion. We drain each retry's batch
 	// before flipping again so the dispatcher actually picks up the
@@ -299,7 +299,7 @@ func TestDispatcher_RetryExhausted_Terminates(t *testing.T) {
 		if len(got) != 1 {
 			t.Fatalf("attempt %d: expected one batch entry, got %+v", attempt, got)
 		}
-		flips <- &models.TransactionStatus{TxID: "tx1", Status: models.StatusRejected, StatusCode: 422}
+		flips <- statusFlip{txid: "tx1", status: models.StatusRejected, statusCode: 422}
 	}
 
 	// Allow the terminal rejection to land.
@@ -325,7 +325,7 @@ func TestDispatcher_RetryExhausted_Terminates(t *testing.T) {
 	// and should treat this flip as unknown — meaning no further batch
 	// is admitted and no retry is scheduled. We wait past one full
 	// backoff window to be sure.
-	flips <- &models.TransactionStatus{TxID: "tx1", Status: models.StatusRejected, StatusCode: 422}
+	flips <- statusFlip{txid: "tx1", status: models.StatusRejected, statusCode: 422}
 	select {
 	case batch := <-out:
 		t.Fatalf("expected no further broadcast after exhaustion, got %+v", batch)
@@ -337,9 +337,9 @@ func TestDispatcher_RetryExhausted_Terminates(t *testing.T) {
 // pending batch is flushed when the flush-timeout elapses, even if the
 // batch size threshold hasn't been reached.
 func TestDispatcher_BatchFlushDeadline_FiresOnTimeout(t *testing.T) {
-	in := make(chan propagationMsg, 3)
+	in := make(chan dispatcherMsg, 3)
 	out := make(chan []*inFlightEntry, 1)
-	flips := make(chan *models.TransactionStatus)
+	flips := make(chan statusFlip)
 
 	// batchMaxSize=100 → never flushes by size; batchFlushTimeout=20ms
 	// → flushes by deadline.
@@ -348,8 +348,8 @@ func TestDispatcher_BatchFlushDeadline_FiresOnTimeout(t *testing.T) {
 	cancel := runDispatcherForTest(t, d)
 	defer cancel()
 
-	in <- propagationMsg{TXID: "tx1", RawTx: []byte{0x01}, KafkaOffset: 1}
-	in <- propagationMsg{TXID: "tx2", RawTx: []byte{0x02}, KafkaOffset: 2}
+	in <- dispatcherMsg{TXID: "tx1", RawTx: []byte{0x01}, KafkaOffset: 1}
+	in <- dispatcherMsg{TXID: "tx2", RawTx: []byte{0x02}, KafkaOffset: 2}
 
 	got := drainBatches(t, out, 2, 500*time.Millisecond)
 	if len(got) != 2 {
