@@ -283,7 +283,11 @@ func BuildServices(d *Deps) []services.Service {
 		svcs = append(svcs, tx_validator.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.TxTracker, d.Validator))
 	}
 	if shouldRun("propagation") {
-		svcs = append(svcs, propagation.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.Leaser, d.TeranodeClient, d.MerkleClient))
+		pipeline, err := propagation.NewPipeline(cfg, d.Logger, d.Producer, d.Store, d.TeranodeClient, d.MerkleClient)
+		if err != nil {
+			d.Logger.Fatal("failed to build propagation pipeline", zap.Error(err))
+		}
+		svcs = append(svcs, pipeline)
 	}
 	if shouldRun("api-server") || shouldRun("webhook") {
 		svcs = append(svcs, webhook.New(cfg.Webhook, cfg.Callback, d.Logger, d.Publisher, d.Store))
