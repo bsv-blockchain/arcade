@@ -46,9 +46,9 @@ type Pipeline struct {
 	// Buffered to absorb short bursts; sizes match the typical batch
 	// shape so a producer-side spike doesn't stall a consumer-side
 	// drain.
-	incomingMsgs  chan dispatcherMsg
+	incomingMsgs  chan propagationMsg
 	outgoingBatch chan []*inFlightEntry
-	statusFlips   chan statusFlip
+	statusFlips   chan *models.TransactionStatus
 
 	// Components.
 	dispatcher  *Dispatcher
@@ -111,9 +111,9 @@ func NewPipeline(
 	// Channel buffers — sized so transient producer/consumer rate
 	// differences don't immediately block the chain. The dispatcher's
 	// max_in_flight is the real backpressure surface.
-	incoming := make(chan dispatcherMsg, batchMax)
+	incoming := make(chan propagationMsg, batchMax)
 	outgoing := make(chan []*inFlightEntry, 4)
-	flips := make(chan statusFlip, batchMax)
+	flips := make(chan *models.TransactionStatus, batchMax)
 
 	offsets := newOffsetTracker()
 
@@ -171,11 +171,10 @@ func NewPipeline(
 	// per-flip handler logic.
 	disp.SetRejectedSink(func(txid, reason string) {
 		select {
-		case flips <- statusFlip{
-			txid:       txid,
-			status:     statusRejectedForCascade(),
-			errorMsg:   reason,
-			statusCode: 0,
+		case flips <- &models.TransactionStatus{
+			TxID:      txid,
+			Status:    models.StatusRejected,
+			ExtraInfo: reason,
 		}:
 		default:
 			// flips is full — the dispatcher will eventually drain it
@@ -249,13 +248,3 @@ func (p *Pipeline) Stop() error {
 	p.wg.Wait()
 	return nil
 }
-
-// statusRejectedForCascade returns the models.StatusRejected constant.
-// Pulled into a tiny helper because the dispatcher_broadcaster.go file
-// references models.Status for the flip's Status field — keeping the
-// pipeline file free of the models import unless needed lets it stay
-// focused on wiring.
-//
-// (Indirection is throwaway — once the cascade path moves to its own
-// dedicated handler outside the broadcaster, this helper goes away.)
-func statusRejectedForCascade() models.Status { return models.StatusRejected }

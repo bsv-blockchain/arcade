@@ -627,16 +627,12 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// path can find it for any status events fired on the txid.
 	s.recordSubmission(c.Request.Context(), txid, opts)
 
-	// Extract input txids so the dispatcher can register dep-relationships
-	// without re-parsing the raw bytes downstream.
-	inputTXIDs := extractInputTXIDs(parsedTx)
-
-	envelope := map[string]interface{}{
+	msg := map[string]interface{}{
 		"txid":        txid,
 		"raw_tx":      rawTx,
-		"input_txids": inputTXIDs,
+		"input_txids": extractInputTXIDs(parsedTx),
 	}
-	if err := s.producer.Send(kafka.TopicDispatch, txid, envelope); err != nil {
+	if err := s.producer.Send(kafka.TopicDispatch, txid, msg); err != nil {
 		if errors.Is(err, kafka.ErrBrokerBackpressure) {
 			s.logger.Warn("submit rejected: kafka backpressure", zap.String("txid", txid))
 			c.Header("Retry-After", "1")

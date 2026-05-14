@@ -43,7 +43,7 @@ type dispatcherConsumer struct {
 	dispatcher    *Dispatcher
 	offsets       offsetTrackerReader
 	commitTicker  time.Duration
-	incomingMsgs  chan<- dispatcherMsg
+	incomingMsgs  chan<- propagationMsg
 	logger        *zap.Logger
 	pending       map[int64]*kafka.Message // offset → message awaiting MarkMessage
 	pendingMu     sync.Mutex
@@ -69,7 +69,7 @@ type dispatcherConsumerConfig struct {
 	Topic        string
 	Dispatcher   *Dispatcher
 	Offsets      offsetTrackerReader
-	IncomingMsgs chan<- dispatcherMsg
+	IncomingMsgs chan<- propagationMsg
 	CommitTicker time.Duration // 0 → default 200ms
 	Logger       *zap.Logger
 }
@@ -189,7 +189,7 @@ func (c *dispatcherConsumer) runReadLoop(ctx context.Context, claim kafka.Claim)
 // blocked by a malformed payload. A DLQ pathway can be added later if
 // silent skip turns out to be insufficient.
 func (c *dispatcherConsumer) handleMessage(ctx context.Context, msg *kafka.Message) {
-	var envelope dispatcherMsg
+	var envelope propagationMsg
 	if err := json.Unmarshal(msg.Value, &envelope); err != nil {
 		c.logger.Warn(
 			"dispatcherConsumer: decode failed, skipping",

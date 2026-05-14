@@ -101,7 +101,7 @@ func TestPipeline_EndToEnd_AcceptedBatch(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	for _, txid := range []string{"tx1", "tx2"} {
-		envelope := dispatcherMsg{TXID: txid, RawTx: []byte{0xaa}, InputTXIDs: nil}
+		envelope := propagationMsg{TXID: txid, RawTx: []byte{0xaa}, InputTXIDs: nil}
 		if err := producer.Send(kafka.TopicDispatch, txid, envelope); err != nil {
 			t.Fatalf("producer.Send: %v", err)
 		}
@@ -189,8 +189,8 @@ func TestPipeline_DepAware_ChildHeldUntilParentAccepted(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Publish parent then child.
-	parentMsg := dispatcherMsg{TXID: "parentTx", RawTx: []byte{0xa1}}
-	childMsg := dispatcherMsg{TXID: "childTx", RawTx: []byte{0xc1}, InputTXIDs: []string{"parentTx"}}
+	parentMsg := propagationMsg{TXID: "parentTx", RawTx: []byte{0xa1}}
+	childMsg := propagationMsg{TXID: "childTx", RawTx: []byte{0xc1}, InputTXIDs: []string{"parentTx"}}
 	if err := producer.Send(kafka.TopicDispatch, parentMsg.TXID, parentMsg); err != nil {
 		t.Fatalf("send parent: %v", err)
 	}
