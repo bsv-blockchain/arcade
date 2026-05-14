@@ -9,27 +9,6 @@ import (
 	"github.com/bsv-blockchain/arcade/models"
 )
 
-// propagationMsg is the propagation-topic payload. JSON-encoded onto
-// kafka.TopicDispatch by intake and decoded by dispatcherConsumer.
-//
-// InputTXIDs and KafkaOffset support the dep-aware pipeline: the
-// dispatcher uses InputTXIDs to decide eligibility without re-parsing
-// the raw tx, and KafkaOffset is populated by the consumer (not via
-// JSON) so offset commit can be deferred until the tx terminalizes.
-type propagationMsg struct {
-	TXID string `json:"txid"`
-	// RawTx is the serialized transaction as raw bytes. encoding/json
-	// encodes []byte as base64.
-	RawTx []byte `json:"raw_tx"`
-	// InputTXIDs is populated by intake so the dispatcher can decide
-	// eligibility without re-parsing. Empty/absent is treated as "no
-	// in-flight parents".
-	InputTXIDs []string `json:"input_txids,omitempty"`
-	// KafkaOffset is set by the consumer before handing the message to
-	// the dispatcher. Not serialized.
-	KafkaOffset int64 `json:"-"`
-}
-
 // inFlightEntry is the dispatcher's per-tx record. Owned exclusively by
 // the dispatcher goroutine — no locks because no other goroutine touches
 // it. The struct holds everything the dispatcher needs to make decisions
