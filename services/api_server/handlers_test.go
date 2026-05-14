@@ -18,10 +18,12 @@ import (
 	"github.com/bsv-blockchain/go-sdk/script"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
 )
@@ -532,6 +534,105 @@ func TestHandleSeenOnNetwork_BulkPath_OnePublishPerCallback(t *testing.T) {
 	}
 	if got := len(ms.batchUpdateReturningCalls[0]); got != n {
 		t.Errorf("expected batch of %d statuses, got %d", n, got)
+	}
+}
+
+// TestApplySeenCallback_TrackerPrefilter_SkipsStaleTxids pins the optimization
+// where the callback handler consults the in-memory TxTracker before hitting
+// the store. At sustained 100 TPS ~91% of SEEN_ON_NETWORK callback txids end
+// up lattice-skipped at the Pebble layer (merkle-service re-fires after the
+// tx already moved past SEEN_ON_NETWORK). Filtering those out before the
+// BatchUpdateStatusReturning call removes ~1100 wasted Pebble reads/sec from
+// the hot path. Tracker is always ≤ store, so the prefilter cannot drop a
+// transition that the store would have applied.
+func TestApplySeenCallback_TrackerPrefilter_SkipsStaleTxids(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ms := &mockStore{}
+	pub := &recordingCallbackPub{}
+	tracker := store.NewTxTracker()
+
+	const (
+		nStale   = 50 // tracker says SEEN_MULTIPLE_NODES — SEEN_ON_NETWORK callback is a no-op
+		nFresh   = 10 // tracker says ACCEPTED_BY_NETWORK — callback should apply
+		nUnknown = 5  // not in tracker — must pass through to the store (authoritative)
+	)
+	// Tracker stores txids as chainhash.Hash, so each test id needs to be a
+	// valid 64-char hex string — otherwise Add silently no-ops and the
+	// prefilter sees an empty tracker.
+	mkTxID := func(prefix byte, i int) string {
+		return fmt.Sprintf("%02x%062x", prefix, i)
+	}
+	stale := make([]string, nStale)
+	for i := range stale {
+		stale[i] = mkTxID(0x01, i)
+		tracker.Add(stale[i], models.StatusSeenMultipleNodes)
+	}
+	fresh := make([]string, nFresh)
+	for i := range fresh {
+		fresh[i] = mkTxID(0x02, i)
+		tracker.Add(fresh[i], models.StatusAcceptedByNetwork)
+	}
+	unknown := make([]string, nUnknown)
+	for i := range unknown {
+		unknown[i] = mkTxID(0x03, i)
+	}
+	allTxIDs := append(append(append([]string(nil), stale...), fresh...), unknown...)
+
+	// Inject a prev row for every kept txid so the post-batch loop fires
+	// the publish path for the 10 fresh txids; default (RECEIVED) is fine.
+	ms.batchUpdatePrevFunc = func(txid string) *models.TransactionStatus {
+		return &models.TransactionStatus{
+			TxID:      txid,
+			Status:    models.StatusAcceptedByNetwork,
+			Timestamp: time.Now().Add(-1 * time.Second),
+		}
+	}
+
+	srv := &Server{
+		cfg:            &config.Config{CallbackToken: testCallbackToken},
+		logger:         zap.NewNop(),
+		producer:       kafka.NewProducer(&kafka.RecordingBroker{}),
+		store:          ms,
+		publisher:      pub,
+		txTracker:      tracker,
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
+	}
+	router := gin.New()
+	srv.registerRoutes(router)
+
+	stalePrev := testutil.ToFloat64(metrics.CallbackStaleTotal.WithLabelValues("SEEN_ON_NETWORK", string(models.StatusSeenMultipleNodes)))
+
+	payload := models.CallbackMessage{Type: models.CallbackSeenOnNetwork, TxIDs: allTxIDs}
+	req := authedCallbackRequest(t, mustMarshalJSON(t, payload))
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+
+	if got := len(ms.batchUpdateReturningCalls); got != 1 {
+		t.Fatalf("expected 1 BatchUpdateStatusReturning call, got %d", got)
+	}
+	if got, want := len(ms.batchUpdateReturningCalls[0]), nFresh+nUnknown; got != want {
+		t.Errorf("expected store to receive %d statuses (fresh+unknown), got %d — prefilter not active", want, got)
+	}
+
+	// Confirm the stale-callback counter advanced by exactly nStale for the
+	// SEEN_MULTIPLE_NODES prev_status label.
+	staleNow := testutil.ToFloat64(metrics.CallbackStaleTotal.WithLabelValues("SEEN_ON_NETWORK", string(models.StatusSeenMultipleNodes)))
+	if got, want := staleNow-stalePrev, float64(nStale); got != want {
+		t.Errorf("CallbackStaleTotal{prev=SEEN_MULTIPLE_NODES} delta = %v, want %v", got, want)
+	}
+
+	pub.mu.Lock()
+	defer pub.mu.Unlock()
+	if len(pub.bulkPublishes) != 1 {
+		t.Fatalf("expected 1 PublishBulk, got %d", len(pub.bulkPublishes))
+	}
+	if got, want := len(pub.bulkPublishes[0].TxIDs), nFresh+nUnknown; got != want {
+		t.Errorf("bulk publish carried %d txids, want %d", got, want)
 	}
 }
 

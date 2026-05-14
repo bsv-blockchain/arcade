@@ -319,13 +319,36 @@ func (s *Server) applySeenCallback(c *gin.Context, msg models.CallbackMessage, l
 
 	ctx := c.Request.Context()
 	now := time.Now()
-	statuses := make([]*models.TransactionStatus, len(txids))
-	for i, txid := range txids {
-		statuses[i] = &models.TransactionStatus{
+
+	// Tracker prefilter: drop txids whose in-memory tracked status already
+	// eclipses targetStatus. At 100 TPS sustained ~91% of SEEN_ON_NETWORK
+	// callback txids end up lattice-skipped at the store (merkle-service
+	// re-fires after the tx is already past SEEN_ON_NETWORK). The tracker
+	// is updated under the same RWMutex the rest of arcade uses and is
+	// always ≤ the store's status, so a prefilter hit is provably safe —
+	// the store-side lattice remains authoritative for anything the
+	// tracker doesn't know about. keptTxIDs maps the post-filter index
+	// back to the original txid so per-row metric labels stay accurate.
+	statuses := make([]*models.TransactionStatus, 0, len(txids))
+	keptTxIDs := make([]string, 0, len(txids))
+	for _, txid := range txids {
+		if s.txTracker != nil {
+			if prevStatus, ok := s.txTracker.GetStatus(txid); ok {
+				if prevStatus == targetStatus || !targetStatus.CanTransitionFrom(prevStatus) {
+					metrics.CallbackStaleTotal.WithLabelValues(metricLabel, string(prevStatus)).Inc()
+					continue
+				}
+			}
+		}
+		statuses = append(statuses, &models.TransactionStatus{
 			TxID:      txid,
 			Status:    targetStatus,
 			Timestamp: now,
-		}
+		})
+		keptTxIDs = append(keptTxIDs, txid)
+	}
+	if len(statuses) == 0 {
+		return
 	}
 
 	prevs, err := s.store.BatchUpdateStatusReturning(ctx, statuses)
@@ -340,14 +363,14 @@ func (s *Server) applySeenCallback(c *gin.Context, msg models.CallbackMessage, l
 		// to publish successful transitions if any.
 	}
 
-	successful := make([]string, 0, len(txids))
+	successful := make([]string, 0, len(statuses))
 	for i, prev := range prevs {
 		if prev == nil {
 			outcome = "partial"
 			metrics.CallbackUnknownTxIDTotal.WithLabelValues(metricLabel).Inc()
 			logger.Warn("dropping callback for unknown txid",
 				zap.String("type", metricLabel),
-				zap.String("txid", txids[i]))
+				zap.String("txid", keptTxIDs[i]))
 			continue
 		}
 		// Observe transition age — the headline metric the user asked for.
@@ -369,9 +392,9 @@ func (s *Server) applySeenCallback(c *gin.Context, msg models.CallbackMessage, l
 			metrics.CallbackStaleTotal.WithLabelValues(metricLabel, string(prev.Status)).Inc()
 			continue
 		}
-		successful = append(successful, txids[i])
+		successful = append(successful, keptTxIDs[i])
 		if s.txTracker != nil {
-			s.txTracker.UpdateStatus(txids[i], targetStatus)
+			s.txTracker.UpdateStatus(keptTxIDs[i], targetStatus)
 		}
 	}
 

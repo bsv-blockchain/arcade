@@ -1078,6 +1078,81 @@ func TestProcessBatch_BulkPublish_OneEventPerStatus(t *testing.T) {
 	}
 }
 
+// TestBroadcastInChunks_ParallelismHonorsConfig pins the optimization where
+// p.maxParallelChunks (from cfg.Propagation.MaxParallelChunks, default 4)
+// lets a single batch's chunks broadcast concurrently rather than serially.
+// With teranode_max_batch_size=25 a 100-tx batch produces 4 chunks; this
+// test asserts they actually run in parallel — the dominant component of
+// RECEIVED→ACCEPTED_BY_NETWORK latency at 100 TPS is the per-chunk wall
+// time, so serializing them would erase the gain from smaller chunks.
+func TestBroadcastInChunks_ParallelismHonorsConfig(t *testing.T) {
+	merkleSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer merkleSrv.Close()
+
+	// teranode mock: each /txs call increments an inflight gauge, sleeps
+	// long enough that all parallel chunks overlap, then decrements.
+	// maxInflight captures the peak observed concurrency.
+	const sleep = 200 * time.Millisecond
+	var inflight atomic.Int32
+	var maxInflight atomic.Int32
+	teranodeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		cur := inflight.Add(1)
+		for {
+			peak := maxInflight.Load()
+			if cur <= peak || maxInflight.CompareAndSwap(peak, cur) {
+				break
+			}
+		}
+		time.Sleep(sleep)
+		inflight.Add(-1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer teranodeSrv.Close()
+
+	ms := newMockStore()
+	cfg := &config.Config{CallbackURL: "http://localhost:8080/callback"}
+	cfg.Propagation.MerkleConcurrency = 10
+	cfg.Propagation.TeranodeMaxBatchSize = 25
+	cfg.Propagation.MaxParallelChunks = 4
+	cfg.Propagation.BroadcastWorkers = 256
+
+	mc := merkleservice.NewClient(merkleSrv.URL, "", 5*time.Second)
+	tc := teranode.NewClient([]string{teranodeSrv.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
+
+	pub := &recordingPublisher{}
+	p := New(cfg, zap.NewNop(), nil, pub, ms, nil, tc, mc)
+	if p.maxParallelChunks != 4 {
+		t.Fatalf("propagator picked up maxParallelChunks=%d, want 4", p.maxParallelChunks)
+	}
+	if p.broadcastWorkers != 256 {
+		t.Fatalf("propagator picked up broadcastWorkers=%d, want 256", p.broadcastWorkers)
+	}
+
+	const batchSize = 100 // 4 chunks of 25 each
+	for i := 0; i < batchSize; i++ {
+		if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg(fmt.Sprintf("tx%03d", i)))); err != nil {
+			t.Fatalf("handleMessage %d: %v", i, err)
+		}
+	}
+	start := time.Now()
+	if err := flushSync(t, p); err != nil {
+		t.Fatalf("flushBatch: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	if got, want := int(maxInflight.Load()), 4; got != want {
+		t.Errorf("max concurrent chunks at teranode = %d, want %d (chunks serialized — parallelism gain lost)", got, want)
+	}
+	// Serial would be 4×200ms = 800ms; parallel should be ≈ 200ms. Pick a
+	// loose upper bound to avoid flakes on slow CI: anything < 500ms proves
+	// at least 2 chunks overlapped.
+	if elapsed >= 500*time.Millisecond {
+		t.Errorf("broadcast took %v with maxParallelChunks=4; expected <500ms (chunks not running in parallel)", elapsed)
+	}
+}
+
 // Oversized batches are chunked to teranode_max_batch_size so a 1.5k Kafka
 // flush can't trigger "too many transactions" → per-tx storm on Teranode.
 func TestProcessBatch_ChunksOversizedBatch(t *testing.T) {

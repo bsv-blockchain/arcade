@@ -364,6 +364,21 @@ type PropagationConfig struct {
 	// Defaults to 4 — enough to fully overlap pipeline stages at typical
 	// pipeline times without flooding merkle-service or teranode.
 	MaxConcurrentBatches int `mapstructure:"max_concurrent_batches"`
+	// BroadcastWorkers sizes the persistent goroutine pool that runs every
+	// per-endpoint SubmitTransaction(s) HTTP call. Peak in-flight jobs is
+	// MaxConcurrentBatches × MaxParallelChunks × len(healthy endpoints).
+	// Under-sized workers serialize the pool and eat the parallelism gain
+	// from smaller chunks — at 8 concurrent batches × 4 chunks × 8 endpoints
+	// peak load = 256 jobs, the default. Lower it on small fleets to bound
+	// goroutine count.
+	BroadcastWorkers int `mapstructure:"broadcast_workers"`
+	// MaxParallelChunks caps how many chunk broadcasts within a single
+	// flushBatch can run concurrently. Each chunk already fans out across
+	// every healthy endpoint, so effective in-flight is MaxParallelChunks ×
+	// len(endpoints) per batch. Bigger values let a single oversized flush
+	// spread chunk work across the broadcast pool instead of serializing.
+	// Default 4.
+	MaxParallelChunks int `mapstructure:"max_parallel_chunks"`
 }
 
 // EndpointHealthConfig tunes the per-endpoint circuit-breaker in teranode.Client.
@@ -685,6 +700,8 @@ func setDefaults() {
 	viper.SetDefault("propagation.lease_ttl_ms", 0)
 	viper.SetDefault("propagation.teranode_max_batch_size", 100)
 	viper.SetDefault("propagation.max_concurrent_batches", 4)
+	viper.SetDefault("propagation.broadcast_workers", 256)
+	viper.SetDefault("propagation.max_parallel_chunks", 4)
 	viper.SetDefault("propagation.endpoint_health.failure_threshold", 3)
 	viper.SetDefault("propagation.endpoint_health.broadcast_failure_threshold", 10)
 	viper.SetDefault("propagation.endpoint_health.probe_interval_ms", 30000)

@@ -59,6 +59,8 @@ type Propagator struct {
 	reaperInterval    time.Duration
 	reaperBatchSize   int
 	teranodeBatchCap  int
+	broadcastWorkers  int
+	maxParallelChunks int
 	holderID          string
 	leaseTTL          time.Duration
 
@@ -112,17 +114,22 @@ type broadcastJobResult struct {
 	err        error
 }
 
-// broadcastWorkers caps the total in-flight HTTP submit goroutines across
-// every chunk and every endpoint. Sized to comfortably saturate the typical
-// 6-10 datahub endpoint fleet while bounding peak goroutine count under
-// load. Each worker call is bounded by the per-job context (15s) so a stuck
-// endpoint can't permanently consume a slot.
-const broadcastWorkers = 64
-
 // broadcastJobBuffer sizes the job channel between broadcast helpers and the
 // worker pool. Generous enough that flush-time fan-out doesn't block in
 // steady state; bounded so a stalled pool can't grow unboundedly.
 const broadcastJobBuffer = 1024
+
+// defaultBroadcastWorkers is the fallback when cfg.Propagation.BroadcastWorkers
+// is non-positive. Sized to cover the peak concurrent-job estimate at the
+// other shipped defaults (8 concurrent batches × 4 parallel chunks ×
+// ~8 healthy datahub endpoints = 256).
+const defaultBroadcastWorkers = 256
+
+// defaultMaxParallelChunks caps the per-batch chunk fan-out when
+// cfg.Propagation.MaxParallelChunks is non-positive. Each chunk already fans
+// out to every healthy endpoint, so the effective concurrency is
+// defaultMaxParallelChunks × len(endpoints).
+const defaultMaxParallelChunks = 4
 
 // New constructs a Propagator. leaser may be nil, in which case the reaper
 // runs unguarded — appropriate for tests and single-process deployments that
@@ -168,6 +175,14 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 	if maxConcurrentBatches <= 0 {
 		maxConcurrentBatches = 4
 	}
+	broadcastWorkers := cfg.Propagation.BroadcastWorkers
+	if broadcastWorkers <= 0 {
+		broadcastWorkers = defaultBroadcastWorkers
+	}
+	maxParallelChunks := cfg.Propagation.MaxParallelChunks
+	if maxParallelChunks <= 0 {
+		maxParallelChunks = defaultMaxParallelChunks
+	}
 	return &Propagator{
 		cfg:               cfg,
 		logger:            logger.Named("propagation"),
@@ -184,6 +199,8 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 		reaperInterval:    reaperInterval,
 		reaperBatchSize:   reaperBatch,
 		teranodeBatchCap:  teranodeBatchCap,
+		broadcastWorkers:  broadcastWorkers,
+		maxParallelChunks: maxParallelChunks,
 		holderID:          newHolderID(),
 		leaseTTL:          leaseTTL,
 		broadcastJobs:     make(chan broadcastJob, broadcastJobBuffer),
@@ -342,7 +359,7 @@ func (p *Propagator) Start(ctx context.Context) error {
 	// so callers don't push into an undrained channel before workers start
 	// or after they exit (Stop, or never started in tests).
 	p.broadcastRunning.Store(true)
-	for i := 0; i < broadcastWorkers; i++ {
+	for i := 0; i < p.broadcastWorkers; i++ {
 		p.broadcastWG.Add(1)
 		go p.runBroadcastWorker()
 	}
@@ -362,7 +379,8 @@ func (p *Propagator) Start(ctx context.Context) error {
 		"propagation service started",
 		zap.Duration("reaper_interval", p.reaperInterval),
 		zap.Int("reaper_batch_size", p.reaperBatchSize),
-		zap.Int("broadcast_workers", broadcastWorkers),
+		zap.Int("broadcast_workers", p.broadcastWorkers),
+		zap.Int("max_parallel_chunks", p.maxParallelChunks),
 	)
 	return consumer.Run(ctx)
 }
@@ -694,11 +712,9 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) {
 	)
 }
 
-// maxParallelChunks caps how many chunk broadcasts run concurrently. Each
-// chunk already fans out to every healthy endpoint, so the real concurrency is
-// maxParallelChunks × len(endpoints). Keep this modest so a huge flush doesn't
-// open thousands of sockets at once.
-const maxParallelChunks = 4
+// Per-batch chunk parallelism is now config-driven via
+// cfg.Propagation.MaxParallelChunks (see Propagator.maxParallelChunks);
+// defaults to defaultMaxParallelChunks.
 
 // fallbackParallelism caps concurrent per-tx broadcasts when an all-rejected
 // chunk falls back to per-tx classification. Each single-tx broadcast already
@@ -710,8 +726,8 @@ const fallbackParallelism = 8
 // broadcastInChunks splits a batch into teranodeBatchCap-sized chunks and
 // broadcasts each via /txs, falling back to per-tx /tx within a chunk only
 // when that chunk's batch broadcast is all-rejected. Chunks run in parallel
-// bounded by maxParallelChunks so a large flush doesn't serialize behind one
-// slow endpoint. Returns per-tx results in the same order as the input.
+// bounded by p.maxParallelChunks so a large flush doesn't serialize behind
+// one slow endpoint. Returns per-tx results in the same order as the input.
 func (p *Propagator) broadcastInChunks(ctx context.Context, batch []propagationMsg, rawTxs [][]byte) []txResult {
 	results := make([]txResult, len(batch))
 	chunkSize := p.teranodeBatchCap
@@ -739,7 +755,7 @@ func (p *Propagator) broadcastInChunks(ctx context.Context, batch []propagationM
 		return results
 	}
 
-	sem := make(chan struct{}, maxParallelChunks)
+	sem := make(chan struct{}, p.maxParallelChunks)
 	var wg sync.WaitGroup
 	for _, c := range chunks {
 		wg.Add(1)
