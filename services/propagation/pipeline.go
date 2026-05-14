@@ -16,7 +16,7 @@ import (
 	"github.com/bsv-blockchain/arcade/teranode"
 )
 
-// Propagator is the dep-aware propagation service. It wires together
+// Pipeline is the dep-aware propagation service. It wires together
 // three goroutines that cooperate via channels:
 //
 //   - dispatcherConsumer: reads Kafka messages off TopicDispatch,
@@ -34,7 +34,7 @@ import (
 // Lifecycle matches services.Service: Start blocks on the consumer's
 // Run for the dispatcher's lifetime; Stop cancels the internal
 // context and waits for every goroutine to exit cleanly.
-type Propagator struct {
+type Pipeline struct {
 	cfg            *config.Config
 	logger         *zap.Logger
 	producer       *kafka.Producer
@@ -60,7 +60,7 @@ type Propagator struct {
 	cancelFunc context.CancelFunc
 }
 
-// New constructs a Propagator with all components wired but not
+// NewPipeline constructs a Pipeline with all components wired but not
 // started. Defaults applied where config is zero:
 //
 //   - max_in_flight       = 100000 (caps dep-index memory)
@@ -69,28 +69,28 @@ type Propagator struct {
 //   - retry_max_attempts  = 5, matches existing reaper budget
 //   - retry_backoff_ms    = 500, matches existing reaper base
 //   - commit_ticker       = 200ms
-func New(
+func NewPipeline(
 	cfg *config.Config,
 	logger *zap.Logger,
 	producer *kafka.Producer,
 	st store.Store,
 	tc *teranode.Client,
 	mc *merkleservice.Client,
-) (*Propagator, error) {
+) (*Pipeline, error) {
 	if cfg == nil {
-		return nil, fmt.Errorf("propagation.New: cfg required")
+		return nil, fmt.Errorf("propagation.NewPipeline: cfg required")
 	}
 	if logger == nil {
 		logger = zap.NewNop()
 	}
 	if producer == nil {
-		return nil, fmt.Errorf("propagation.New: producer required")
+		return nil, fmt.Errorf("propagation.NewPipeline: producer required")
 	}
 	if st == nil {
-		return nil, fmt.Errorf("propagation.New: store required")
+		return nil, fmt.Errorf("propagation.NewPipeline: store required")
 	}
 	if tc == nil {
-		return nil, fmt.Errorf("propagation.New: teranodeClient required")
+		return nil, fmt.Errorf("propagation.NewPipeline: teranodeClient required")
 	}
 
 	logger = logger.Named("propagation")
@@ -143,7 +143,7 @@ func New(
 		Logger:       logger.Named("consumer"),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("propagation.New: consumer: %w", err)
+		return nil, fmt.Errorf("propagation.NewPipeline: consumer: %w", err)
 	}
 
 	bcast, err := newDispatcherBroadcaster(dispatcherBroadcasterConfig{
@@ -159,7 +159,7 @@ func New(
 		MerkleCallbackToken: cfg.CallbackToken,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("propagation.New: broadcaster: %w", err)
+		return nil, fmt.Errorf("propagation.NewPipeline: broadcaster: %w", err)
 	}
 
 	// Wire the dispatcher's rejected-sink to the broadcaster's store
@@ -187,7 +187,7 @@ func New(
 		}
 	})
 
-	return &Propagator{
+	return &Pipeline{
 		cfg:            cfg,
 		logger:         logger,
 		producer:       producer,
@@ -205,14 +205,14 @@ func New(
 
 // Name implements services.Service. Matches the legacy Propagator's
 // name so log/metric labels are consistent during rollout.
-func (p *Propagator) Name() string { return "propagation" }
+func (p *Pipeline) Name() string { return "propagation" }
 
 // Start launches the broadcaster and dispatcher goroutines, then runs
 // the consumer in the calling goroutine (blocking until ctx is
 // canceled or the subscription closes). Returns the consumer's exit
 // error, if any. The internal cancel function is captured so Stop can
 // terminate the background goroutines independently.
-func (p *Propagator) Start(ctx context.Context) error {
+func (p *Pipeline) Start(ctx context.Context) error {
 	innerCtx, cancel := context.WithCancel(ctx)
 	p.cancelFunc = cancel
 
@@ -226,7 +226,7 @@ func (p *Propagator) Start(ctx context.Context) error {
 		p.dispatcher.Run(innerCtx)
 	}()
 
-	p.logger.Info("propagation started",
+	p.logger.Info("propagation pipeline started",
 		zap.String("topic", kafka.TopicDispatch),
 		zap.String("group_id", p.cfg.Kafka.ConsumerGroup+"-dispatcher"),
 	)
@@ -240,7 +240,7 @@ func (p *Propagator) Start(ctx context.Context) error {
 // both to exit before returning. The consumer is expected to exit on
 // its own when ctx is canceled — Stop doesn't wait on it explicitly
 // because Start's caller blocks on Run() return.
-func (p *Propagator) Stop() error {
+func (p *Pipeline) Stop() error {
 	p.logger.Info("stopping propagation pipeline")
 	if p.cancelFunc != nil {
 		p.cancelFunc()

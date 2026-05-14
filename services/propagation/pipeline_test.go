@@ -18,22 +18,22 @@ import (
 	"github.com/bsv-blockchain/arcade/teranode"
 )
 
-// propagatorTestStore is the smallest Store impl that satisfies the
+// pipelineTestStore is the smallest Store impl that satisfies the
 // pipeline's needs: capture writes from the broadcaster's terminal
 // status path. Other methods inherit from the package's mockStore so
 // the full Store interface is implemented.
-type propagatorTestStore struct {
+type pipelineTestStore struct {
 	*mockStore
 
 	mu      sync.Mutex
 	updates []*models.TransactionStatus
 }
 
-func newPropagatorTestStore() *propagatorTestStore {
-	return &propagatorTestStore{mockStore: newMockStore()}
+func newPipelineTestStore() *pipelineTestStore {
+	return &pipelineTestStore{mockStore: newMockStore()}
 }
 
-func (s *propagatorTestStore) BatchUpdateStatus(_ context.Context, statuses []*models.TransactionStatus) error {
+func (s *pipelineTestStore) BatchUpdateStatus(_ context.Context, statuses []*models.TransactionStatus) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, st := range statuses {
@@ -43,7 +43,7 @@ func (s *propagatorTestStore) BatchUpdateStatus(_ context.Context, statuses []*m
 	return nil
 }
 
-func (s *propagatorTestStore) byTxID() map[string]models.Status {
+func (s *pipelineTestStore) byTxID() map[string]models.Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make(map[string]models.Status, len(s.updates))
@@ -53,13 +53,13 @@ func (s *propagatorTestStore) byTxID() map[string]models.Status {
 	return out
 }
 
-// TestPropagator_EndToEnd_AcceptedBatch starts the full propagator against
+// TestPipeline_EndToEnd_AcceptedBatch starts the full pipeline against
 // an in-memory broker and an HTTP server that mimics Teranode's
 // happy-path /txs response. A producer publishes two txs to
 // TopicDispatch; both should land in the broadcaster's batch, hit
 // Teranode's /txs once, and produce ACCEPTED_BY_NETWORK status rows
 // in the store.
-func TestPropagator_EndToEnd_AcceptedBatch(t *testing.T) {
+func TestPipeline_EndToEnd_AcceptedBatch(t *testing.T) {
 	var txsHits int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/txs" {
@@ -72,7 +72,7 @@ func TestPropagator_EndToEnd_AcceptedBatch(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	tc := teranode.NewClient([]string{srv.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
-	store := newPropagatorTestStore()
+	store := newPipelineTestStore()
 	broker := kafka.NewMemoryBroker(0)
 	t.Cleanup(func() { _ = broker.Close() })
 	producer := kafka.NewProducer(broker)
@@ -83,9 +83,9 @@ func TestPropagator_EndToEnd_AcceptedBatch(t *testing.T) {
 	cfg.Propagation.RetryMaxAttempts = 3
 	cfg.Propagation.RetryBackoffMs = 50
 
-	p, err := New(cfg, zap.NewNop(), producer, store, tc, nil)
+	p, err := NewPipeline(cfg, zap.NewNop(), producer, store, tc, nil)
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatalf("NewPipeline: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -124,12 +124,12 @@ func TestPropagator_EndToEnd_AcceptedBatch(t *testing.T) {
 	}
 }
 
-// TestPropagator_DepAware_ChildHeldUntilParentAccepted is the actual
+// TestPipeline_DepAware_ChildHeldUntilParentAccepted is the actual
 // integration verification: when parent and child arrive on the
 // dispatch topic, the child must NOT be broadcast until the parent's
 // broadcast has succeeded. Without dep awareness the child could race
 // the parent on a concurrent /txs to Teranode.
-func TestPropagator_DepAware_ChildHeldUntilParentAccepted(t *testing.T) {
+func TestPipeline_DepAware_ChildHeldUntilParentAccepted(t *testing.T) {
 	// Teranode emulator: slow parent, fast child. The point of the
 	// test is to ensure the child doesn't even ATTEMPT a broadcast
 	// until the parent's broadcast has completed. We track the order
@@ -158,7 +158,7 @@ func TestPropagator_DepAware_ChildHeldUntilParentAccepted(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	tc := teranode.NewClient([]string{srv.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
-	store := newPropagatorTestStore()
+	store := newPipelineTestStore()
 	broker := kafka.NewMemoryBroker(0)
 	t.Cleanup(func() { _ = broker.Close() })
 	producer := kafka.NewProducer(broker)
@@ -172,9 +172,9 @@ func TestPropagator_DepAware_ChildHeldUntilParentAccepted(t *testing.T) {
 	cfg.Propagation.RetryMaxAttempts = 3
 	cfg.Propagation.RetryBackoffMs = 50
 
-	p, err := New(cfg, zap.NewNop(), producer, store, tc, nil)
+	p, err := NewPipeline(cfg, zap.NewNop(), producer, store, tc, nil)
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatalf("NewPipeline: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

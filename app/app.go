@@ -279,7 +279,7 @@ func BuildServices(d *Deps) []services.Service {
 		}
 	}
 	if shouldRun("propagation") {
-		pipeline, err := propagation.New(cfg, d.Logger, d.Producer, d.Store, d.TeranodeClient, d.MerkleClient)
+		pipeline, err := propagation.NewPipeline(cfg, d.Logger, d.Producer, d.Store, d.TeranodeClient, d.MerkleClient)
 		if err != nil {
 			d.Logger.Fatal("failed to build propagation pipeline", zap.Error(err))
 		}
