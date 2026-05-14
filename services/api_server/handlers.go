@@ -567,77 +567,32 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		return
 	}
 
+	// Publish to transaction topic for validation. Keying by txid pins the tx
+	// to one Kafka partition, so any re-submission (retry, user double-post)
+	// lands on the same consumer — a future idempotency check can then see the
+	// duplicate instead of having it fan out across replicas.
+	//
+	// Raw tx bytes travel as []byte in the JSON payload (encoded as base64 by
+	// encoding/json) so the validator and propagator never hex-decode the body
+	// and re-encode it downstream.
 	txid := parsedTx.TxID().String()
 
-	// Run synchronous policy validation. Matches the existing tx_validator
-	// service's behavior (skipFees=true, skipScripts=true) — fee and script
-	// checks remain Teranode's job. Validation failure becomes a 400 with a
-	// REJECTED row written to the store so future status queries find this
-	// txid. Nil validator (some test setups) skips validation.
-	if s.validator != nil {
-		if err := s.validator.ValidateTransaction(c.Request.Context(), parsedTx, true, true); err != nil {
-			reason := err.Error()
-			s.persistRejectedAtIntake(c.Request.Context(), txid, reason)
-			c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "transaction failed validation", "reason": reason})
-			return
-		}
-	}
-
-	// Dedup CAS via GetOrInsertStatus. Two submitters racing on the same
-	// txid both attempt the insert; the loser sees `inserted=false` and
-	// returns 202 idempotently without re-publishing to Kafka. Nil store
-	// skips dedup (test setups); the dispatcher's own in-flight check
-	// would catch dupes within the same flush window, but persisted dedup
-	// is what protects across pod restarts and intake replicas.
-	if s.store != nil {
-		row := &models.TransactionStatus{
-			TxID:      txid,
-			Status:    models.StatusReceived,
-			Timestamp: time.Now(),
-		}
-		existing, inserted, err := s.store.GetOrInsertStatus(c.Request.Context(), row)
-		switch {
-		case err != nil:
-			s.logger.Error("dedup CAS failed", zap.String("txid", txid), zap.Error(err))
-			// Best-effort: continue with publish. The dispatcher will pick
-			// up duplicates via its in-flight set if they slip past.
-		case !inserted && existing != nil:
-			// Already submitted. Record the new callback subscription on the
-			// existing row so the caller still gets notifications, then
-			// return idempotently with the row's current status.
-			s.recordSubmission(c.Request.Context(), txid, opts)
-			c.JSON(http.StatusAccepted, gin.H{
-				"status": "already submitted",
-				"txid":   txid,
-				"state":  string(existing.Status),
-			})
-			return
-		case !inserted && existing == nil:
-			// Pathological: store says "not inserted" but returns no
-			// existing row. Treat as a transient signal — log and
-			// proceed to publish so the request isn't silently dropped.
-			s.logger.Warn(
-				"dedup CAS returned not-inserted with nil existing; proceeding to publish",
-				zap.String("txid", txid),
-			)
-		}
-	}
-
-	// Record the callback subscription BEFORE publishing so the validator
-	// path can find it for any status events fired on the txid.
+	// Record the subscription BEFORE publishing to Kafka so the validator's
+	// RECEIVED status (and any subsequent updates) can find a matching
+	// submission row when the webhook service / SSE catchup queries by
+	// txid or callbackToken. A late InsertSubmission would race with the
+	// validator and risk silently dropping the first few status events for
+	// fast-path transactions.
 	s.recordSubmission(c.Request.Context(), txid, opts)
 
-	// Extract input txids so the dispatcher can register dep-relationships
-	// without re-parsing the raw bytes downstream.
-	inputTXIDs := extractInputTXIDs(parsedTx)
-
-	envelope := map[string]interface{}{
-		"txid":        txid,
-		"raw_tx":      rawTx,
-		"input_txids": inputTXIDs,
+	msg := map[string]interface{}{
+		"action": "submit",
+		"raw_tx": rawTx,
 	}
-	if err := s.producer.Send(kafka.TopicDispatch, txid, envelope); err != nil {
+	if err := s.producer.Send(kafka.TopicTransaction, txid, msg); err != nil {
 		if errors.Is(err, kafka.ErrBrokerBackpressure) {
+			// Backpressure → shed load to the client. The tx was never queued,
+			// so a retry is safe and is the contract the 503 expresses.
 			s.logger.Warn("submit rejected: kafka backpressure", zap.String("txid", txid))
 			c.Header("Retry-After", "1")
 			c.JSON(http.StatusServiceUnavailable, gin.H{jsonKeyError: "service overloaded, retry shortly"})
@@ -649,48 +604,6 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusAccepted, gin.H{"status": "submitted"})
-}
-
-// persistRejectedAtIntake writes a terminal REJECTED row for a tx that
-// failed validation at the intake handler. Best-effort — a write
-// failure is logged but doesn't change the client response (the 400
-// has already told them the tx was rejected). When the store is nil
-// (test setups), this is a no-op.
-func (s *Server) persistRejectedAtIntake(ctx context.Context, txid, reason string) {
-	if s.store == nil {
-		return
-	}
-	row := &models.TransactionStatus{
-		TxID:      txid,
-		Status:    models.StatusRejected,
-		ExtraInfo: reason,
-		Timestamp: time.Now(),
-	}
-	if _, _, err := s.store.GetOrInsertStatus(ctx, row); err != nil {
-		s.logger.Warn(
-			"intake rejection persist failed",
-			zap.String("txid", txid),
-			zap.Error(err),
-		)
-	}
-}
-
-// extractInputTXIDs returns the txids of every parent referenced by a
-// transaction's inputs. Coinbase transactions return an empty slice
-// (no parents). Duplicates are preserved — the dispatcher dedups
-// internally via its in-flight set lookup.
-func extractInputTXIDs(tx *sdkTx.Transaction) []string {
-	if tx == nil || len(tx.Inputs) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(tx.Inputs))
-	for _, in := range tx.Inputs {
-		if in == nil || in.SourceTXID == nil {
-			continue
-		}
-		out = append(out, in.SourceTXID.String())
-	}
-	return out
 }
 
 // handleSubmitTransactions accepts a batch of concatenated raw transactions.

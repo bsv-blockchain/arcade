@@ -247,7 +247,7 @@ func BuildServices(d *Deps) []services.Service {
 	}
 
 	if shouldRun("api-server") {
-		svcs = append(svcs, api_server.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.TxTracker, d.TeranodeClient, d.MerkleClient, d.Validator))
+		svcs = append(svcs, api_server.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.TxTracker, d.TeranodeClient, d.MerkleClient))
 	}
 	if shouldRun("bump-builder") {
 		// chainHeader is nil when chaintracks is disabled — bump-builder
