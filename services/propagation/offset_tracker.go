@@ -1,9 +1,6 @@
 package propagation
 
-import (
-	"container/heap"
-	"sync"
-)
+import "container/heap"
 
 // minHeapOffsetTracker is a min-heap of in-flight Kafka offsets backed
 // by a "done" set for lazy deletion. Add is O(log n); Done is O(1);
@@ -15,13 +12,7 @@ import (
 // arbitrary entry from a heap. Done flags simply mark offsets as
 // terminalized; the heap's top is purged of done entries the next time
 // the caller asks for the lowest unfinished or Empty status.
-//
-// All operations are guarded by a single mutex. The dispatcher goroutine
-// drives Add/Done; the Kafka consumer's commit goroutine drives
-// LowestUnfinished/Empty. Uncontested lock cost is ~10-20ns per call —
-// negligible against per-message JSON decode (~5-10μs).
 type minHeapOffsetTracker struct {
-	mu   sync.Mutex
 	heap *offsetMinHeap
 	done map[int64]struct{}
 }
@@ -34,21 +25,15 @@ func newOffsetTracker() *minHeapOffsetTracker {
 }
 
 func (t *minHeapOffsetTracker) Add(offset int64) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
 	heap.Push(t.heap, offset)
 }
 
 func (t *minHeapOffsetTracker) Done(offset int64) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
 	t.done[offset] = struct{}{}
 }
 
 func (t *minHeapOffsetTracker) LowestUnfinished() (int64, bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.cleanTopLocked()
+	t.cleanTop()
 	if t.heap.Len() == 0 {
 		return 0, false
 	}
@@ -56,16 +41,14 @@ func (t *minHeapOffsetTracker) LowestUnfinished() (int64, bool) {
 }
 
 func (t *minHeapOffsetTracker) Empty() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.cleanTopLocked()
+	t.cleanTop()
 	return t.heap.Len() == 0
 }
 
-// cleanTopLocked pops done entries from the heap's top until either the
-// heap is empty or its top is an unfinished offset. Caller must hold
-// t.mu.
-func (t *minHeapOffsetTracker) cleanTopLocked() {
+// cleanTop pops done entries from the heap's top until either the heap
+// is empty or its top is an unfinished offset. Called by every query
+// method so the heap top is always accurate after the call returns.
+func (t *minHeapOffsetTracker) cleanTop() {
 	for t.heap.Len() > 0 {
 		top := (*t.heap)[0]
 		if _, isDone := t.done[top]; !isDone {
