@@ -57,6 +57,10 @@ type mockStore struct {
 	// batchUpdatePrevFunc lets a test inject previous-row data per-txid for
 	// transition-age assertions. Returning nil mirrors the not-found path.
 	batchUpdatePrevFunc func(txid string) *models.TransactionStatus
+	// getOrInsertStatusFn lets a test override GetOrInsertStatus when
+	// exercising the intake handler's dedup path. Default behavior
+	// (function unset) is to return the input as the inserted row.
+	getOrInsertStatusFn func(*models.TransactionStatus) (*models.TransactionStatus, bool, error)
 }
 
 func (m *mockStore) UpdateStatus(_ context.Context, status *models.TransactionStatus) error {
@@ -67,8 +71,13 @@ func (m *mockStore) UpdateStatus(_ context.Context, status *models.TransactionSt
 	return nil
 }
 
-func (m *mockStore) GetOrInsertStatus(context.Context, *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
-	return nil, false, nil
+func (m *mockStore) GetOrInsertStatus(_ context.Context, status *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+	// Default: treat every call as a fresh insert. Tests that need
+	// duplicate-detection behavior override via getOrInsertStatusFn.
+	if m.getOrInsertStatusFn != nil {
+		return m.getOrInsertStatusFn(status)
+	}
+	return status, true, nil
 }
 
 func (m *mockStore) BatchGetOrInsertStatus(context.Context, []*models.TransactionStatus) ([]store.BatchInsertResult, error) {

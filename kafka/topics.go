@@ -7,6 +7,11 @@ const (
 	TopicBlockProcessed = "arcade.block_processed"
 	TopicTransaction    = "arcade.transaction"
 	TopicPropagation    = "arcade.propagation"
+	// TopicDispatch carries the dep-aware dispatcher pipeline's messages
+	// (txid + raw_tx + input_txids). A fresh topic for the new design —
+	// the legacy TopicPropagation still exists during cutover but is
+	// drained and ignored by the new code path.
+	TopicDispatch = "arcade.dispatch"
 	// TopicStatusUpdate carries transaction status mutations from every
 	// service that writes to the store (validator, propagation, bump-builder,
 	// api-server). It exists so the api-server SSE handler and webhook
@@ -18,6 +23,7 @@ const (
 	TopicBlockProcessedDLQ = "arcade.block_processed.dlq"
 	TopicTransactionDLQ    = "arcade.transaction.dlq"
 	TopicPropagationDLQ    = "arcade.propagation.dlq"
+	TopicDispatchDLQ       = "arcade.dispatch.dlq"
 	TopicStatusUpdateDLQ   = "arcade.tx_status.dlq"
 )
 
