@@ -30,6 +30,7 @@ import (
 	"github.com/bsv-blockchain/arcade/services/p2p_client"
 	"github.com/bsv-blockchain/arcade/services/propagation"
 	"github.com/bsv-blockchain/arcade/services/sse"
+	"github.com/bsv-blockchain/arcade/services/tx_validator"
 	"github.com/bsv-blockchain/arcade/services/watchdog"
 	"github.com/bsv-blockchain/arcade/services/webhook"
 	"github.com/bsv-blockchain/arcade/store"
@@ -277,6 +278,9 @@ func BuildServices(d *Deps) []services.Service {
 		} else {
 			d.Logger.Info("chaintracks skipped: chaintracks_server.enabled=false (regtest force-disables this)")
 		}
+	}
+	if shouldRun("tx-validator") {
+		svcs = append(svcs, tx_validator.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.TxTracker, d.Validator))
 	}
 	if shouldRun("propagation") {
 		pipeline, err := propagation.NewPipeline(cfg, d.Logger, d.Producer, d.Store, d.TeranodeClient, d.MerkleClient)
