@@ -860,11 +860,11 @@ func validate(cfg *Config) error {
 	validModes := map[string]bool{
 		"all": true, "api-server": true,
 		"bump-builder": true,
-		"tx-validator": true, "propagation": true,
-		"p2p-client":  true,
-		"chaintracks": true,
-		"sse":         true,
-		"watchdog":    true,
+		"propagation":  true,
+		"p2p-client":   true,
+		"chaintracks":  true,
+		"sse":          true,
+		"watchdog":     true,
 	}
 	if !validModes[cfg.Mode] {
 		return fmt.Errorf("invalid mode %q", cfg.Mode)
