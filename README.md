@@ -43,7 +43,7 @@
     </td>
     <td align="left">
        <a href="https://github.com/bsv-blockchain/arcade/graphs/contributors"><img src="https://img.shields.io/github/contributors/bsv-blockchain/arcade?style=flat-square&color=orange" alt="Contributors"></a>
-       <a href="https://github.com/sponsors/bsv-blockchain"><img src="https://img.shields.io/badge/sponsor-BSV-181717.svg?logo=github&style=flat-square" alt="Sponsor"></a>
+       <a href="https://deepwiki.com/bsv-blockchain/arcade"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
     </td>
   </tr>
 </table>
