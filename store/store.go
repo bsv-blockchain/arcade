@@ -197,7 +197,7 @@ type Store interface {
 	// slice exists so callers can observe the
 	// arcade_status_transition_age_seconds{from=*,to=MINED} metric without an
 	// extra round-trip.
-	SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeight uint64, txids []string) (prevs []*models.TransactionStatus, mined []*models.TransactionStatus, err error)
+	SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeight uint64, txids []string) (prevs, mined []*models.TransactionStatus, err error)
 
 	// InsertSubmission creates a new submission record
 	InsertSubmission(ctx context.Context, sub *models.Submission) error
