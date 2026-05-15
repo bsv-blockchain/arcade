@@ -19,6 +19,7 @@ import (
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/teranode"
+	"github.com/bsv-blockchain/arcade/validator"
 )
 
 const (
@@ -42,7 +43,12 @@ type Server struct {
 	txTracker    *store.TxTracker
 	teranode     *teranode.Client      // used by /health for datahub URL inventory; nil in tests
 	merkleClient *merkleservice.Client // nil when merkle_service.url is unset; gates POST /api/v1/blocks/:blockHash/reprocess
-	server       *http.Server
+	// validator runs synchronous policy validation in the submit handler.
+	// Nil-safe: tests that use struct-literal construction may leave it
+	// unset, in which case the handler skips validation. Production
+	// wiring through New requires it.
+	validator *validator.Validator
+	server    *http.Server
 
 	// submissionCh decouples the InsertSubmission Pebble write from the HTTP
 	// handler tail latency. recordSubmission enqueues onto it via a non-
@@ -62,7 +68,7 @@ type submissionRecord struct {
 	sub *models.Submission
 }
 
-func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publisher events.Publisher, st store.Store, tracker *store.TxTracker, tc *teranode.Client, mc *merkleservice.Client) *Server {
+func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publisher events.Publisher, st store.Store, tracker *store.TxTracker, tc *teranode.Client, mc *merkleservice.Client, val *validator.Validator) *Server {
 	return &Server{
 		cfg:            cfg,
 		logger:         logger.Named("api-server"),
@@ -72,6 +78,7 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 		txTracker:      tracker,
 		teranode:       tc,
 		merkleClient:   mc,
+		validator:      val,
 		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
 		submissionStop: make(chan struct{}),
 	}

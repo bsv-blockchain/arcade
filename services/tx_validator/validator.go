@@ -339,8 +339,9 @@ func (v *Validator) flushValidations(ctx context.Context) error {
 		freshMsgs = append(freshMsgs, kafka.KeyValue{
 			Key: vt.txid,
 			Value: map[string]interface{}{
-				"txid":   vt.txid,
-				"raw_tx": vt.rawTx,
+				"txid":        vt.txid,
+				"raw_tx":      vt.rawTx,
+				"input_txids": CollectInputTXIDs(vt.parsed),
 			},
 		})
 	}
@@ -637,6 +638,25 @@ func collectRejects(live []*validatedTx) []*validatedTx {
 		if vt.rejected {
 			out = append(out, vt)
 		}
+	}
+	return out
+}
+
+// CollectInputTXIDs returns the parent txids referenced by every input
+// of tx. Empty for coinbase (no inputs). Exported so the api-server
+// intake handler can reuse this exact extraction when populating the
+// dep-aware propagation envelope's input_txids field — keeps the wire
+// format identical regardless of which code path produced the message.
+func CollectInputTXIDs(tx *sdkTx.Transaction) []string {
+	if tx == nil || len(tx.Inputs) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(tx.Inputs))
+	for _, in := range tx.Inputs {
+		if in == nil || in.SourceTXID == nil {
+			continue
+		}
+		out = append(out, in.SourceTXID.String())
 	}
 	return out
 }

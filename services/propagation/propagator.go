@@ -37,6 +37,12 @@ type propagationMsg struct {
 	// []byte as base64 — still smaller than hex (4/3 expansion vs 2x) and
 	// avoids the per-hop hex encode/decode the pipeline used to do.
 	RawTx []byte `json:"raw_tx"`
+	// InputTXIDs lists the txids this tx spends from. Populated by the
+	// upstream producer (tx_validator) so the propagator can decide
+	// eligibility without re-parsing the raw bytes. Empty/absent is
+	// treated as "no in-flight parents" — older producers that haven't
+	// been updated continue to work, just without dep-aware ordering.
+	InputTXIDs []string `json:"input_txids,omitempty"`
 }
 
 type Propagator struct {
@@ -50,9 +56,20 @@ type Propagator struct {
 	merkleClient   *merkleservice.Client
 	consumer       *kafka.ConsumerGroup
 
-	mu                sync.Mutex
-	pendingMsgs       []propagationMsg
-	maxPending        int
+	mu          sync.Mutex
+	pendingMsgs []propagationMsg
+	maxPending  int
+	// In-flight dep index. inFlight is the set of txids the propagator
+	// has accepted but not yet terminalized; waiters maps a parent txid
+	// to the children currently waiting on it; pendingParents is the
+	// reverse, mapping each held child to its outstanding parent set.
+	// All three are guarded by mu — same mutex that protects
+	// pendingMsgs since dep decisions happen during handleMessage and
+	// applyTerminalStatuses, both of which already hold or take mu.
+	inFlight          map[string]struct{}
+	waiters           map[string]map[string]struct{} // parent → set of children
+	pendingParents    map[string]map[string]struct{} // child → set of parents
+	heldMsgs          map[string]propagationMsg      // txid → the held child's raw message
 	merkleConcurrency int
 	retryMaxAttempts  int
 	retryBackoffMs    int
@@ -205,6 +222,10 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 		leaseTTL:          leaseTTL,
 		broadcastJobs:     make(chan broadcastJob, broadcastJobBuffer),
 		processBatchSem:   make(chan struct{}, maxConcurrentBatches),
+		inFlight:          make(map[string]struct{}),
+		waiters:           make(map[string]map[string]struct{}),
+		pendingParents:    make(map[string]map[string]struct{}),
+		heldMsgs:          make(map[string]propagationMsg),
 	}
 }
 
@@ -311,6 +332,134 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 
 	p.publishBulkStatus(ctx, models.StatusAcceptedByNetwork, acceptedTxIDs, now)
 	p.publishBulkStatus(ctx, models.StatusRejected, rejectedTxIDs, now)
+
+	// Dep-aware bookkeeping: terminalize each txid (drop from inFlight)
+	// and release/cascade its waiters. Released waiters re-enter
+	// pendingMsgs so the next flushBatch picks them up; cascaded
+	// children skip Teranode entirely and are written as REJECTED here.
+	p.handleTerminalForDeps(ctx, acceptedTxIDs, rejectedTxIDs, now)
+}
+
+// handleTerminalForDeps walks the just-terminalized txids and updates
+// the dep index. ACCEPTED parents release any waiters whose parent set
+// becomes empty (pushed back into pendingMsgs). REJECTED parents
+// cascade-reject every waiter recursively. All terminalized txids are
+// removed from inFlight.
+//
+// Cascade-rejected children get a REJECTED row written to the store
+// here (one bulk call per cascade depth) so downstream consumers see
+// the terminal state. They never hit Teranode — their parent was
+// rejected, so they're structurally invalid.
+func (p *Propagator) handleTerminalForDeps(ctx context.Context, acceptedTxIDs, rejectedTxIDs []string, now time.Time) {
+	if len(acceptedTxIDs) == 0 && len(rejectedTxIDs) == 0 {
+		return
+	}
+
+	p.mu.Lock()
+	for _, txid := range acceptedTxIDs {
+		delete(p.inFlight, txid)
+	}
+	released := p.releaseWaitersLocked(acceptedTxIDs)
+	cascaded := p.cascadeRejectLocked(rejectedTxIDs)
+	for _, txid := range rejectedTxIDs {
+		delete(p.inFlight, txid)
+	}
+	if len(released) > 0 {
+		p.pendingMsgs = append(p.pendingMsgs, released...)
+		// Add released waiters to inFlight so subsequent children see
+		// them as parents to wait on (same as the normal admit path).
+		for _, m := range released {
+			p.inFlight[m.TXID] = struct{}{}
+		}
+	}
+	p.mu.Unlock()
+
+	if len(cascaded) > 0 {
+		p.persistCascadeRejections(ctx, cascaded, now)
+	}
+}
+
+// releaseWaitersLocked returns the held messages whose entire parent
+// set is now satisfied by the given accepted txids. Caller must hold
+// p.mu. Each released child is removed from heldMsgs and
+// pendingParents; the parent → waiter edges are removed from waiters.
+func (p *Propagator) releaseWaitersLocked(acceptedTxIDs []string) []propagationMsg {
+	var released []propagationMsg
+	for _, parent := range acceptedTxIDs {
+		children, ok := p.waiters[parent]
+		if !ok {
+			continue
+		}
+		delete(p.waiters, parent)
+		for child := range children {
+			parents := p.pendingParents[child]
+			delete(parents, parent)
+			if len(parents) > 0 {
+				continue
+			}
+			delete(p.pendingParents, child)
+			if msg, ok := p.heldMsgs[child]; ok {
+				delete(p.heldMsgs, child)
+				released = append(released, msg)
+			}
+		}
+	}
+	return released
+}
+
+// cascadeRejectLocked walks the dep graph from each rejected parent
+// and returns the txids of every descendant that has to be terminally
+// rejected as a result. Caller must hold p.mu. Drops the cascaded
+// entries from heldMsgs, pendingParents, and waiters; cascaded children
+// are NOT added to pendingMsgs since they never broadcast.
+func (p *Propagator) cascadeRejectLocked(rejectedTxIDs []string) []string {
+	if len(rejectedTxIDs) == 0 {
+		return nil
+	}
+	var cascaded []string
+	queue := append([]string(nil), rejectedTxIDs...)
+	for len(queue) > 0 {
+		parent := queue[0]
+		queue = queue[1:]
+		children, ok := p.waiters[parent]
+		if !ok {
+			continue
+		}
+		delete(p.waiters, parent)
+		for child := range children {
+			delete(p.pendingParents, child)
+			delete(p.heldMsgs, child)
+			delete(p.inFlight, child)
+			cascaded = append(cascaded, child)
+			queue = append(queue, child) // recurse into the child's own waiters
+		}
+	}
+	return cascaded
+}
+
+// persistCascadeRejections writes terminal REJECTED rows for txs the
+// dep cascade rejected without ever broadcasting them, then emits one
+// bulk publish so SSE/webhook subscribers learn about the outcome.
+// Best-effort: a store write failure is logged but doesn't undo the
+// in-memory cascade state.
+func (p *Propagator) persistCascadeRejections(ctx context.Context, txids []string, now time.Time) {
+	statuses := make([]*models.TransactionStatus, len(txids))
+	for i, txid := range txids {
+		statuses[i] = &models.TransactionStatus{
+			TxID:      txid,
+			Status:    models.StatusRejected,
+			Timestamp: now,
+			ExtraInfo: "parent rejected",
+		}
+	}
+	if err := p.store.BatchUpdateStatus(ctx, statuses); err != nil {
+		p.logger.Warn(
+			"cascade rejection write failed",
+			zap.Int("count", len(txids)),
+			zap.Error(err),
+		)
+	}
+	p.publishBulkStatus(ctx, models.StatusRejected, txids, now)
 }
 
 // publishBulkStatus fans a post-broadcast batch status update onto the
@@ -448,12 +597,66 @@ func (p *Propagator) handleMessage(_ context.Context, msg *kafka.Message) error 
 		// shedding into DLQ is preferable to ballooning memory until OOM.
 		return fmt.Errorf("propagation pending queue full (depth=%d, max=%d)", depth, p.maxPending)
 	}
+
+	// Dep-aware admission: if any of this tx's input txids are currently
+	// in flight, register the tx as a waiter and DO NOT add it to
+	// pendingMsgs. It enters the batch only after every in-flight parent
+	// terminalizes (ACCEPTED → released, REJECTED → cascade-rejected).
+	// Parents that are not in flight (mined long ago, never seen by
+	// Arcade, etc.) are out of scope — Teranode resolves them.
+	if p.holdAsWaiterLocked(propMsg) {
+		p.mu.Unlock()
+		return nil
+	}
+
+	// Track this txid as in-flight so any child arriving later sees it
+	// as a parent to wait on.
+	p.inFlight[propMsg.TXID] = struct{}{}
 	p.pendingMsgs = append(p.pendingMsgs, propMsg)
 	depth := len(p.pendingMsgs)
 	p.mu.Unlock()
 	metrics.PropagationPendingDepth.Set(float64(depth))
 
 	return nil
+}
+
+// holdAsWaiterLocked checks whether any of msg.InputTXIDs is currently
+// in-flight and, if so, registers msg as a waiter on each such parent.
+// Returns true when at least one parent was in flight (meaning msg was
+// held, not admitted). Caller must hold p.mu. msg.TXID itself is NOT
+// added to p.inFlight here — that happens only when the tx is admitted
+// to pendingMsgs.
+func (p *Propagator) holdAsWaiterLocked(msg propagationMsg) bool {
+	var pending map[string]struct{}
+	for _, parent := range msg.InputTXIDs {
+		if parent == "" || parent == msg.TXID {
+			continue
+		}
+		if _, inFlight := p.inFlight[parent]; !inFlight {
+			continue
+		}
+		if pending == nil {
+			pending = make(map[string]struct{})
+		}
+		pending[parent] = struct{}{}
+	}
+	if len(pending) == 0 {
+		return false
+	}
+	p.pendingParents[msg.TXID] = pending
+	for parent := range pending {
+		set, ok := p.waiters[parent]
+		if !ok {
+			set = make(map[string]struct{})
+			p.waiters[parent] = set
+		}
+		set[msg.TXID] = struct{}{}
+	}
+	// Hold the message itself so it can re-enter pendingMsgs once all
+	// parents terminalize. Stored alongside the dep maps to keep the
+	// release path O(1) per child.
+	p.heldMsgs[msg.TXID] = msg
+	return true
 }
 
 // flushBatch hands the drained pending slice off to a processBatch goroutine

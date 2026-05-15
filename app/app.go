@@ -247,7 +247,7 @@ func BuildServices(d *Deps) []services.Service {
 	}
 
 	if shouldRun("api-server") {
-		svcs = append(svcs, api_server.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.TxTracker, d.TeranodeClient, d.MerkleClient))
+		svcs = append(svcs, api_server.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.TxTracker, d.TeranodeClient, d.MerkleClient, d.Validator))
 	}
 	if shouldRun("bump-builder") {
 		// chainHeader is nil when chaintracks is disabled — bump-builder
@@ -279,9 +279,12 @@ func BuildServices(d *Deps) []services.Service {
 			d.Logger.Info("chaintracks skipped: chaintracks_server.enabled=false (regtest force-disables this)")
 		}
 	}
-	if shouldRun("tx-validator") {
-		svcs = append(svcs, tx_validator.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.TxTracker, d.Validator))
-	}
+	// tx-validator no longer registered: intake handler now performs
+	// parse + policy validation + dedup synchronously and publishes
+	// directly to the propagation topic with input_txids populated.
+	// The package and its queue-processing scaffolding stay in the
+	// source tree for future reuse.
+	_ = tx_validator.New
 	if shouldRun("propagation") {
 		svcs = append(svcs, propagation.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.Leaser, d.TeranodeClient, d.MerkleClient))
 	}

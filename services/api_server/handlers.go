@@ -21,6 +21,7 @@ import (
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/services/tx_validator"
 	"github.com/bsv-blockchain/arcade/teranode"
 )
 
@@ -577,19 +578,58 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// and re-encode it downstream.
 	txid := parsedTx.TxID().String()
 
-	// Record the subscription BEFORE publishing to Kafka so the validator's
-	// RECEIVED status (and any subsequent updates) can find a matching
-	// submission row when the webhook service / SSE catchup queries by
-	// txid or callbackToken. A late InsertSubmission would race with the
-	// validator and risk silently dropping the first few status events for
-	// fast-path transactions.
+	// Synchronous policy validation. Matches the legacy tx_validator
+	// service's behavior (skipFees=true, skipScripts=true) — fee and
+	// script checks remain Teranode's job. Validation failure writes a
+	// terminal REJECTED row to the store and returns 400 to the client
+	// so the failure is durable AND immediate.
+	if s.validator != nil {
+		if err := s.validator.ValidateTransaction(c.Request.Context(), parsedTx, true, true); err != nil {
+			s.persistRejectedAtIntake(c.Request.Context(), txid, err.Error())
+			c.JSON(http.StatusBadRequest, gin.H{
+				jsonKeyError: "transaction failed validation",
+				"reason":     err.Error(),
+			})
+			return
+		}
+	}
+
+	// Dedup CAS via GetOrInsertStatus. Two submitters racing on the
+	// same txid both attempt the insert; the loser sees inserted=false
+	// and returns 202 idempotently without re-publishing.
+	if s.store != nil {
+		row := &models.TransactionStatus{
+			TxID:      txid,
+			Status:    models.StatusReceived,
+			Timestamp: time.Now(),
+		}
+		existing, inserted, dedupErr := s.store.GetOrInsertStatus(c.Request.Context(), row)
+		switch {
+		case dedupErr != nil:
+			s.logger.Error("dedup CAS failed", zap.String("txid", txid), zap.Error(dedupErr))
+			// Best-effort: continue with publish. The propagator's
+			// in-flight set catches duplicates that slip past.
+		case !inserted && existing != nil:
+			s.recordSubmission(c.Request.Context(), txid, opts)
+			c.JSON(http.StatusAccepted, gin.H{
+				"status": "already submitted",
+				"txid":   txid,
+				"state":  string(existing.Status),
+			})
+			return
+		}
+	}
+
+	// Record the callback subscription BEFORE publishing to Kafka so
+	// any status events fired on this txid can find a matching row.
 	s.recordSubmission(c.Request.Context(), txid, opts)
 
 	msg := map[string]interface{}{
-		"action": "submit",
-		"raw_tx": rawTx,
+		"txid":        txid,
+		"raw_tx":      rawTx,
+		"input_txids": tx_validator.CollectInputTXIDs(parsedTx),
 	}
-	if err := s.producer.Send(kafka.TopicTransaction, txid, msg); err != nil {
+	if err := s.producer.Send(kafka.TopicPropagation, txid, msg); err != nil {
 		if errors.Is(err, kafka.ErrBrokerBackpressure) {
 			// Backpressure → shed load to the client. The tx was never queued,
 			// so a retry is safe and is the contract the 503 expresses.
@@ -604,6 +644,30 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusAccepted, gin.H{"status": "submitted"})
+}
+
+// persistRejectedAtIntake writes a terminal REJECTED row for a tx that
+// failed validation at the intake handler. Best-effort: a write
+// failure is logged but doesn't change the client response (the 400
+// has already told them the tx was rejected). When the store is nil
+// (test setups using struct-literal construction), this is a no-op.
+func (s *Server) persistRejectedAtIntake(ctx context.Context, txid, reason string) {
+	if s.store == nil {
+		return
+	}
+	row := &models.TransactionStatus{
+		TxID:      txid,
+		Status:    models.StatusRejected,
+		ExtraInfo: reason,
+		Timestamp: time.Now(),
+	}
+	if _, _, err := s.store.GetOrInsertStatus(ctx, row); err != nil {
+		s.logger.Warn(
+			"intake rejection persist failed",
+			zap.String("txid", txid),
+			zap.Error(err),
+		)
+	}
 }
 
 // handleSubmitTransactions accepts a batch of concatenated raw transactions.
