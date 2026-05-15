@@ -14,9 +14,7 @@ import (
 )
 
 // makePropMsgWithParents builds a propagationMsg envelope with explicit
-// InputTXIDs. The legacy makePropMsg helper builds one without
-// InputTXIDs for the original tests; this variant is used by the
-// dep-aware tests below.
+// InputTXIDs.
 func makePropMsgWithParents(txid string, parents []string) []byte {
 	msg := propagationMsg{
 		TXID:       txid,
@@ -30,9 +28,9 @@ func makePropMsgWithParents(txid string, parents []string) []byte {
 	return b
 }
 
-// newPropagatorForDepTest constructs a Propagator wired with a
-// minimal mock store, kicks off its dispatcher goroutine via New, and
-// returns a cleanup that cancels the dispatcher when the test ends.
+// newPropagatorForDepTest constructs a Propagator with a minimal mock
+// store. Its dispatcher goroutine starts inside New; the returned
+// cleanup cancels it when the test ends.
 func newPropagatorForDepTest(t *testing.T, ms *mockStore) (*Propagator, func()) {
 	t.Helper()
 	cfg := &config.Config{}
@@ -45,9 +43,10 @@ func newPropagatorForDepTest(t *testing.T, ms *mockStore) (*Propagator, func()) 
 	}
 }
 
-// drainSet snapshots the dispatcher's pendingMsgs as a set of txids,
-// CLEARING the dispatcher's state in the process. Tests that drain
-// must then re-think downstream assertions accordingly.
+// drainSet snapshots the dispatcher's pendingMsgs as a set of txids
+// AND clears the dispatcher's pending state (moving the txids from
+// "queued for next batch" to "broadcasting"). Tests calling this
+// must then re-think subsequent admission decisions accordingly.
 func drainSet(p *Propagator) map[string]bool {
 	batch := p.drainPending()
 	out := make(map[string]bool, len(batch))
@@ -57,11 +56,11 @@ func drainSet(p *Propagator) map[string]bool {
 	return out
 }
 
-// TestHandleMessage_HoldsChildWhenParentInFlight verifies the
-// dep-aware admission path: a tx whose declared input is currently in
-// flight does NOT enter the pending broadcast batch; only the parent
-// is observable on drain.
-func TestHandleMessage_HoldsChildWhenParentInFlight(t *testing.T) {
+// TestHandleMessage_SameBatchAdmission verifies the dep-aware
+// optimization: a parent and its child both arrive before the next
+// flush. Both end up in the same broadcast batch — Teranode handles
+// the dependency ordering inside its /txs POST.
+func TestHandleMessage_SameBatchAdmission(t *testing.T) {
 	ms := newMockStore()
 	p, cancel := newPropagatorForDepTest(t, ms)
 	defer cancel()
@@ -77,14 +76,43 @@ func TestHandleMessage_HoldsChildWhenParentInFlight(t *testing.T) {
 	if !pending["parent"] {
 		t.Errorf("parent should be in pending batch, got %v", pending)
 	}
-	if pending["child"] {
-		t.Errorf("child should be HELD as waiter, not in pending batch; got %v", pending)
+	if !pending["child"] {
+		t.Errorf("child SHOULD be in pending batch (parent in same batch, Teranode handles order); got %v", pending)
 	}
 }
 
-// TestApplyTerminalStatuses_ReleasesWaitersOnAccepted verifies that
-// when a parent terminalizes ACCEPTED, the child waiter is released
-// back into the pending batch.
+// TestHandleMessage_HoldsChildWhenParentInDifferentBatch verifies the
+// "different in-flight batch → hold" rule. A child arriving after its
+// parent has already been drained (and is now broadcasting) must be
+// held; Teranode can't coordinate across separate batches.
+func TestHandleMessage_HoldsChildWhenParentInDifferentBatch(t *testing.T) {
+	ms := newMockStore()
+	p, cancel := newPropagatorForDepTest(t, ms)
+	defer cancel()
+
+	if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg("parent"))); err != nil {
+		t.Fatalf("parent admit: %v", err)
+	}
+	// Drain — parent moves from inPending to inFlight-but-not-inPending
+	// (broadcasting from this point until terminal).
+	if got := drainSet(p); !got["parent"] {
+		t.Fatalf("parent should drain, got %v", got)
+	}
+
+	// Now child arrives. Parent is in inFlight but not in inPending →
+	// child must hold.
+	if err := p.handleMessage(context.Background(), consumerMsg(makePropMsgWithParents("child", []string{"parent"}))); err != nil {
+		t.Fatalf("child admit: %v", err)
+	}
+
+	if got := drainSet(p); got["child"] {
+		t.Errorf("child should be held (parent in different batch), not in pending; got %v", got)
+	}
+}
+
+// TestApplyTerminalStatuses_ReleasesWaitersOnAccepted verifies the
+// release path: child held on a broadcasting parent gets released to
+// the pending batch when the parent terminalizes ACCEPTED.
 func TestApplyTerminalStatuses_ReleasesWaitersOnAccepted(t *testing.T) {
 	ms := newMockStore()
 	p, cancel := newPropagatorForDepTest(t, ms)
@@ -93,26 +121,29 @@ func TestApplyTerminalStatuses_ReleasesWaitersOnAccepted(t *testing.T) {
 	if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg("parent"))); err != nil {
 		t.Fatalf("parent admit: %v", err)
 	}
+	_ = drainSet(p) // parent now broadcasting
+
 	if err := p.handleMessage(context.Background(), consumerMsg(makePropMsgWithParents("child", []string{"parent"}))); err != nil {
 		t.Fatalf("child admit: %v", err)
 	}
-	// Drain the parent (simulating flushBatch consuming it) so the
-	// subsequent drain only shows what gets ADDED after ACCEPTED.
-	_ = drainSet(p)
+	// Confirm child is held, not in pending.
+	if got := drainSet(p); got["child"] {
+		t.Fatalf("child should be held before parent ACCEPTED; got %v", got)
+	}
 
 	p.applyTerminalStatuses(context.Background(), []*models.TransactionStatus{
 		{TxID: "parent", Status: models.StatusAcceptedByNetwork, Timestamp: time.Now()},
 	}, 1, 0)
 
-	pending := drainSet(p)
-	if !pending["child"] {
-		t.Errorf("child should be released into pending batch after parent ACCEPTED; got %v", pending)
+	if got := drainSet(p); !got["child"] {
+		t.Errorf("child should be released into pending batch after parent ACCEPTED; got %v", got)
 	}
 }
 
-// TestApplyTerminalStatuses_CascadesRejectedChildren verifies the
-// recursive cascade: parent REJECTED → child + grandchild get REJECTED
-// rows written and never enter the broadcast batch.
+// TestApplyTerminalStatuses_CascadesRejectedChildren verifies that
+// when a broadcasting parent terminalizes REJECTED, every held
+// descendant gets a terminal REJECTED row written and is removed
+// from in-flight state without ever broadcasting.
 func TestApplyTerminalStatuses_CascadesRejectedChildren(t *testing.T) {
 	ms := newMockStore()
 	p, cancel := newPropagatorForDepTest(t, ms)
@@ -121,28 +152,26 @@ func TestApplyTerminalStatuses_CascadesRejectedChildren(t *testing.T) {
 	if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg("parent"))); err != nil {
 		t.Fatalf("parent admit: %v", err)
 	}
+	_ = drainSet(p) // parent broadcasting; subsequent children of it must hold
+
 	if err := p.handleMessage(context.Background(), consumerMsg(makePropMsgWithParents("child", []string{"parent"}))); err != nil {
 		t.Fatalf("child admit: %v", err)
 	}
 	if err := p.handleMessage(context.Background(), consumerMsg(makePropMsgWithParents("grandchild", []string{"child"}))); err != nil {
 		t.Fatalf("grandchild admit: %v", err)
 	}
-	_ = drainSet(p) // discard parent (only thing in pending batch — children are held)
+	if got := drainSet(p); len(got) != 0 {
+		t.Fatalf("child and grandchild should both be held; got %v", got)
+	}
 
 	p.applyTerminalStatuses(context.Background(), []*models.TransactionStatus{
 		{TxID: "parent", Status: models.StatusRejected, Timestamp: time.Now(), ExtraInfo: "bad parent"},
 	}, 0, 1)
 
-	// Cascaded descendants do NOT re-enter pending batch.
-	pending := drainSet(p)
-	if pending["child"] || pending["grandchild"] {
-		t.Errorf("cascaded descendants should NOT enter pending batch; got %v", pending)
+	if got := drainSet(p); got["child"] || got["grandchild"] {
+		t.Errorf("cascaded descendants should NOT enter pending batch; got %v", got)
 	}
 
-	// Cascaded descendants DO get terminal REJECTED rows written. The
-	// reason is always "parent rejected" — the descendants didn't
-	// fail for any reason of their own. The parent's actual cause
-	// stays on the parent's row.
 	ms.mu.Lock()
 	rejected := map[string]string{}
 	for _, st := range ms.updates {
@@ -161,9 +190,48 @@ func TestApplyTerminalStatuses_CascadesRejectedChildren(t *testing.T) {
 	}
 }
 
-// TestHandleMessage_NoParents_AdmitsNormally sanity-checks the legacy
-// admission path: a tx with no InputTXIDs lands in the pending batch
-// as before.
+// TestCascadeRelease_DeepChain verifies that a release at the top of
+// a held chain propagates downward in a single terminal event. After
+// grandparent ACCEPTED, both parent (held on grandparent) and child
+// (held on parent) re-enter the pending batch together — they'll
+// broadcast in the same /txs POST on the next flush.
+func TestCascadeRelease_DeepChain(t *testing.T) {
+	ms := newMockStore()
+	p, cancel := newPropagatorForDepTest(t, ms)
+	defer cancel()
+
+	if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg("grandparent"))); err != nil {
+		t.Fatalf("grandparent admit: %v", err)
+	}
+	_ = drainSet(p) // grandparent broadcasting
+
+	if err := p.handleMessage(context.Background(), consumerMsg(makePropMsgWithParents("parent", []string{"grandparent"}))); err != nil {
+		t.Fatalf("parent admit: %v", err)
+	}
+	// parent is held (grandparent in different batch). child of parent
+	// must also hold (parent is in inFlight but not in inPending).
+	if err := p.handleMessage(context.Background(), consumerMsg(makePropMsgWithParents("child", []string{"parent"}))); err != nil {
+		t.Fatalf("child admit: %v", err)
+	}
+	if got := drainSet(p); len(got) != 0 {
+		t.Fatalf("parent and child should both be held; got %v", got)
+	}
+
+	p.applyTerminalStatuses(context.Background(), []*models.TransactionStatus{
+		{TxID: "grandparent", Status: models.StatusAcceptedByNetwork, Timestamp: time.Now()},
+	}, 1, 0)
+
+	got := drainSet(p)
+	if !got["parent"] {
+		t.Errorf("parent should release after grandparent ACCEPTED; got %v", got)
+	}
+	if !got["child"] {
+		t.Errorf("child should cascade-release after parent enters inPending; got %v", got)
+	}
+}
+
+// TestHandleMessage_NoParents_AdmitsNormally is the trivial path: a
+// tx with no InputTXIDs lands in the pending batch.
 func TestHandleMessage_NoParents_AdmitsNormally(t *testing.T) {
 	ms := newMockStore()
 	p, cancel := newPropagatorForDepTest(t, ms)
@@ -173,15 +241,15 @@ func TestHandleMessage_NoParents_AdmitsNormally(t *testing.T) {
 		t.Fatalf("admit: %v", err)
 	}
 
-	pending := drainSet(p)
-	if !pending["lone"] {
-		t.Errorf("lone tx should be in pending batch; got %v", pending)
+	if got := drainSet(p); !got["lone"] {
+		t.Errorf("lone tx should be in pending batch; got %v", got)
 	}
 }
 
 // TestHandleMessage_ParentNotInFlight_AdmitsChildDirectly verifies
-// that a child's InputTXIDs referencing a tx NOT currently in flight
-// is admitted directly — only in-flight overlap creates a wait.
+// that a child whose declared parent isn't tracked by Arcade at all
+// (mined long ago, never seen, whatever) is admitted normally — only
+// IN-FLIGHT parents block.
 func TestHandleMessage_ParentNotInFlight_AdmitsChildDirectly(t *testing.T) {
 	ms := newMockStore()
 	p, cancel := newPropagatorForDepTest(t, ms)
@@ -191,39 +259,28 @@ func TestHandleMessage_ParentNotInFlight_AdmitsChildDirectly(t *testing.T) {
 		t.Fatalf("admit: %v", err)
 	}
 
-	pending := drainSet(p)
-	if !pending["child"] {
-		t.Errorf("child should be admitted directly when parent is not in flight; got %v", pending)
+	if got := drainSet(p); !got["child"] {
+		t.Errorf("child should be admitted directly when parent is not in flight; got %v", got)
 	}
 }
 
 // TestHandleMessage_MaxPendingFull_BlocksUntilDrained verifies the
-// pending-cap backpressure mechanism: when pendingMsgs is at its
-// configured maximum, handleMessage BLOCKS rather than returning an
-// error. As soon as a drain or terminal event shrinks pending under
-// the cap, the blocked handleMessage unblocks and the tx is admitted.
-//
-// This is the "natural backpressure" pattern: blocking the consumer
-// goroutine pauses Kafka pulls, which lets the partition grow on the
-// broker side without losing messages through a DLQ or retry-exhaust
-// path.
+// pending-cap backpressure: handleMessage BLOCKS when pending is at
+// its configured cap, then unblocks after a drain frees capacity.
+// No DLQ, no error to the consumer wrapper — just natural
+// backpressure flowing back to the broker.
 func TestHandleMessage_MaxPendingFull_BlocksUntilDrained(t *testing.T) {
 	ms := newMockStore()
 	cfg := &config.Config{}
-	cfg.Propagation.MaxPending = 1 // saturate after a single admit
+	cfg.Propagation.MaxPending = 1
 	tc := teranode.NewClient(nil, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
 	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, nil)
 	defer p.dispatcherCancel()
 
-	// First admit lands immediately.
 	if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg("tx1"))); err != nil {
 		t.Fatalf("first admit: %v", err)
 	}
 
-	// Second admit should block — pending is now at cap. Run it in a
-	// goroutine and verify it hasn't returned within a generous
-	// timeout. If it returns prematurely, that's a regression to the
-	// old error-return-on-full behavior.
 	tx2Done := make(chan error, 1)
 	go func() {
 		tx2Done <- p.handleMessage(context.Background(), consumerMsg(makePropMsg("tx2")))
@@ -236,14 +293,12 @@ func TestHandleMessage_MaxPendingFull_BlocksUntilDrained(t *testing.T) {
 		// expected: still blocked
 	}
 
-	// Drain pending. tx1 leaves, capacity opens up, tx2's blocked
-	// admit should unblock and complete.
 	pending := drainSet(p)
 	if !pending["tx1"] {
 		t.Errorf("tx1 should be in pending batch; got %v", pending)
 	}
 	if pending["tx2"] {
-		t.Errorf("tx2 should not have been in the drained batch yet — it was still blocked; got %v", pending)
+		t.Errorf("tx2 should not have been in the drained batch yet; got %v", pending)
 	}
 
 	select {
@@ -255,8 +310,7 @@ func TestHandleMessage_MaxPendingFull_BlocksUntilDrained(t *testing.T) {
 		t.Fatal("tx2 admit didn't unblock after pending drain")
 	}
 
-	pending = drainSet(p)
-	if !pending["tx2"] {
-		t.Errorf("tx2 should be in pending batch after unblocking; got %v", pending)
+	if got := drainSet(p); !got["tx2"] {
+		t.Errorf("tx2 should be in pending batch after unblocking; got %v", got)
 	}
 }

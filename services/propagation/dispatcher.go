@@ -7,40 +7,33 @@ import (
 )
 
 // The dispatcher is a single-goroutine engine that owns ALL dep-aware
-// state: the in-flight set, waiters map, pendingParents map, held
-// messages, AND the pending-broadcast slice. Every read and write to
-// that state happens on this one goroutine — no locks anywhere.
+// state: inFlight, inPending, waiters, heldMsgs, and pendingMsgs.
+// Every read and write to that state happens on this one goroutine —
+// no locks anywhere.
 //
 // External components communicate via three channels:
 //
-//   - admitCh: handleMessage sends a propagationMsg here and waits
-//     for a synchronous reply describing what happened (admitted to
-//     pending batch, held as a waiter on in-flight parents, or
-//     rejected because pendingMsgs is at its max-pending cap).
+//   - admitCh: handleMessage sends a propagationMsg here and waits for
+//     a synchronous reply describing what happened (admitted to the
+//     pending batch, or held as a waiter on in-flight parents).
 //
-//   - terminalCh: applyTerminalStatuses sends a terminalEvent here
-//     per terminalized txid and waits for a terminalResult that
-//     names the cascaded descendants the caller has to write
-//     REJECTED rows for. Released waiters are re-entered into
-//     pendingMsgs by the dispatcher itself — the caller never
-//     touches that slice.
+//   - terminalCh: applyTerminalStatuses sends a terminalEvent here per
+//     terminalized txid and waits for a terminalResult naming the
+//     cascaded descendants the caller has to write REJECTED rows for.
+//     Released waiters are re-entered into pendingMsgs by the
+//     dispatcher itself — the caller never touches that slice.
 //
 //   - drainCh: flushBatch sends a drainRequest here to pull the
-//     current pendingMsgs as a batch; the dispatcher replies with
-//     the slice and clears its local state.
+//     current pendingMsgs as a batch; the dispatcher hands over the
+//     slice and clears its local state.
 //
-// Since all dep-aware state plus pendingMsgs lives behind the select
-// loop, there is no shared state and no mutex anywhere in the
-// propagation pipeline's dep-aware path.
+// Backpressure: when pendingMsgs is at maxPending the dispatcher
+// excludes admitCh from its select, so handleMessage's send blocks
+// and the Kafka consumer goroutine pauses pulling — backpressure
+// flows back to the broker naturally, no DLQ.
 
 // admitResult tells handleMessage what the dispatcher did with the
-// admitted tx. Exactly one of admitted / held is true. There is no
-// "full" state — when the pending-broadcast slice is at maxPending,
-// the dispatcher simply stops reading from admitCh until pending
-// drains. handleMessage's send to admitCh blocks; the Kafka consumer
-// goroutine is therefore blocked too, which pauses Kafka pulls and
-// lets backpressure flow back to the broker naturally. No DLQ
-// pathway, no error to the client.
+// admitted tx. Exactly one of admitted / held is true.
 type admitResult struct {
 	admitted bool // true: tx was added to pendingMsgs, broadcast pending
 	held     bool // true: registered as a waiter on in-flight parents
@@ -54,8 +47,7 @@ type admitRequest struct {
 }
 
 // terminalEvent is the protocol between applyTerminalStatuses and the
-// dispatcher goroutine. status is the just-applied terminal status of
-// txid.
+// dispatcher goroutine.
 type terminalEvent struct {
 	txid   string
 	status models.Status
@@ -63,31 +55,23 @@ type terminalEvent struct {
 }
 
 // terminalResult names cascaded descendants the caller has to write
-// terminal REJECTED rows for. Released waiters (those whose final
-// parent just terminalized ACCEPTED) are NOT returned — the
-// dispatcher re-enters them into pendingMsgs directly, so the
-// next flushBatch picks them up without any caller action.
-//
-// Cascaded descendants don't carry the parent's rejection reason
-// down — the parent's actual cause is the parent's concern, not the
-// child's. From the child's perspective the only useful "why" is
-// "parent rejected"; the caller writes that as the ExtraInfo when
-// persisting the row.
+// terminal REJECTED rows for. Released waiters (those whose blocking
+// parents have all cleared) are NOT returned — the dispatcher
+// re-enters them into pendingMsgs directly, so the next flushBatch
+// picks them up without any caller action.
 type terminalResult struct {
 	cascaded []string
 }
 
 // drainRequest is the protocol between flushBatch and the dispatcher.
-// The dispatcher replies with the current pendingMsgs (as a slice the
-// caller owns) and clears its own slice.
+// The dispatcher replies with the current pendingMsgs and clears its
+// local pendingMsgs + inPending state.
 type drainRequest struct {
 	reply chan []propagationMsg
 }
 
 // dispatcherConfig is the small subset of Propagator config the
-// dispatcher needs at runtime. Captured into local variables when
-// runDispatcher starts so the goroutine doesn't have to reach back
-// into the Propagator's shared struct fields after that point.
+// dispatcher needs at runtime.
 type dispatcherConfig struct {
 	maxPending int
 }
@@ -99,44 +83,48 @@ type dispatcherConfig struct {
 // body — nothing leaks out, so nothing else can mutate it without
 // going through the channels.
 func (p *Propagator) runDispatcher(ctx context.Context, cfg dispatcherConfig) {
-	// inFlight is the set of txids the dispatcher knows about and has
-	// not yet seen a terminal status for. A tx is in inFlight whether
-	// it's pending broadcast OR held as a waiter — both states count
-	// as "Arcade is aware of this tx, work is pending." Descendants
-	// check inFlight to decide whether to wait.
+	// inFlight is the set of txids the dispatcher is aware of and has
+	// not yet seen a terminal status for. Anything in pendingMsgs,
+	// already broadcasting, or held as a waiter is in this set.
+	// Descendants check inFlight to decide whether they need to wait.
 	inFlight := make(map[string]struct{})
 
+	// inPending is the subset of inFlight currently in pendingMsgs —
+	// i.e., the txids that will go in the NEXT broadcast batch.
+	// Children whose only in-flight parents are also in inPending can
+	// join the same batch (Teranode handles intra-batch ordering).
+	// Children with a parent that's in inFlight but NOT in inPending
+	// must hold — the parent is in a different in-flight batch and
+	// Teranode can't coordinate across batches.
+	inPending := make(map[string]struct{})
+
 	// waiters maps a parent txid to the set of children currently
-	// waiting on it. Populated by admit (when a child has in-flight
-	// parents) and drained by terminal (ACCEPTED releases, REJECTED
-	// cascade-rejects).
+	// waiting on it. Populated by admit (when a child has an
+	// inFlight-but-not-inPending parent) and drained by terminal
+	// (ACCEPTED releases the parent's waiters, REJECTED cascade-
+	// rejects them).
 	waiters := make(map[string]map[string]struct{})
 
-	// pendingParents is the inverse of waiters: child txid → set of
-	// parents the child is still waiting on. Used so a child with
-	// multiple parents only releases when the LAST parent terminalizes.
-	pendingParents := make(map[string]map[string]struct{})
-
 	// heldMsgs stores the held child's raw message so release can
-	// re-enter it into pendingMsgs without going back to Kafka.
+	// re-enter it into pendingMsgs without going back to Kafka. We
+	// don't keep a separate "pending parent count" — at release time
+	// we recompute it by walking heldMsgs[child].InputTXIDs against
+	// inFlight/inPending. One less map to maintain.
 	heldMsgs := make(map[string]propagationMsg)
 
-	// pendingMsgs is the broadcast-ready queue. flushBatch drains it
-	// via a drainCh request; admit appends to it; release (from
-	// terminal events) also appends to it. All three on this one
+	// pendingMsgs is the broadcast-ready queue. drainCh pulls from
+	// here; admit and release append to here. All on this one
 	// goroutine — no locks.
 	var pendingMsgs []propagationMsg
 
 	for {
 		// Nil-channel trick: when pendingMsgs is at the configured cap,
 		// exclude admitCh from the select so handleMessage's send
-		// blocks. The Kafka consumer goroutine sits inside handleMessage
-		// → no more pulls from claim.Messages() → Kafka's offset
-		// doesn't advance → broker holds the messages on its side.
-		// Terminal and drain events keep firing in the meantime; the
-		// instant they shrink pendingMsgs back under the cap, admitCh
-		// is included again and the blocked send unblocks. No DLQ, no
-		// dropped messages, just natural backpressure to the broker.
+		// blocks. Kafka consumer goroutine sits blocked → no more
+		// pulls → broker holds messages. Terminal and drain events
+		// keep firing; the instant they shrink pendingMsgs back under
+		// the cap, admitCh is back in the select and the blocked
+		// send unblocks.
 		var admitChIfRoom <-chan admitRequest
 		if cfg.maxPending <= 0 || len(pendingMsgs) < cfg.maxPending {
 			admitChIfRoom = p.admitCh
@@ -147,61 +135,84 @@ func (p *Propagator) runDispatcher(ctx context.Context, cfg dispatcherConfig) {
 			return
 
 		case req := <-admitChIfRoom:
-			res := handleAdmit(req.msg, inFlight, waiters, pendingParents, heldMsgs, &pendingMsgs)
+			res := handleAdmit(req.msg, inFlight, inPending, waiters, heldMsgs, &pendingMsgs)
 			req.reply <- res
 
 		case ev := <-p.terminalCh:
-			result := handleTerminal(ev, inFlight, waiters, pendingParents, heldMsgs, &pendingMsgs)
+			result := handleTerminal(ev, inFlight, inPending, waiters, heldMsgs, &pendingMsgs)
 			ev.reply <- result
 
 		case req := <-p.drainCh:
 			batch := pendingMsgs
 			pendingMsgs = nil
+			// Drain semantics: every txid currently in inPending is
+			// moving from "queued for next batch" to "in-flight on
+			// the broadcast pipeline." inPending clears; the txids
+			// stay in inFlight (still tracked, still blocking
+			// descendants from joining a future batch they can't
+			// reach) until they terminalize.
+			for txid := range inPending {
+				delete(inPending, txid)
+			}
 			req.reply <- batch
 		}
 	}
 }
 
-// handleAdmit decides what to do with a new tx:
-//   - If any input txid is in inFlight, register the tx as a waiter
-//     on each such parent and return held (no append to pendingMsgs).
-//   - Otherwise add to inFlight, append to pendingMsgs, return
-//     admitted.
+// handleAdmit decides what to do with a new tx based on whether its
+// inputs are currently in flight, and if so, whether they're in the
+// same pending batch:
+//
+//   - Parent in inPending → fine, will go in the same batch
+//     (Teranode handles intra-batch ordering internally).
+//   - Parent in inFlight but NOT in inPending → parent is in a
+//     different in-flight batch or is itself held; we must hold this
+//     child until the parent is reachable.
+//   - Parent not in inFlight → already mined, never seen by Arcade,
+//     or otherwise out of scope. Doesn't block this admit.
+//
+// If ANY input requires holding, the whole tx is held as a waiter on
+// every such blocking parent. Otherwise the tx is admitted to both
+// inFlight and inPending and appended to pendingMsgs.
 //
 // The maxPending cap is enforced upstream by the select loop's
-// nil-channel pattern (we don't read from admitCh when pending is
-// full), so this function never sees a full-queue admit and doesn't
-// need to handle it.
+// nil-channel pattern; handleAdmit never sees a full-queue admit.
 func handleAdmit(
 	msg propagationMsg,
 	inFlight map[string]struct{},
+	inPending map[string]struct{},
 	waiters map[string]map[string]struct{},
-	pendingParents map[string]map[string]struct{},
 	heldMsgs map[string]propagationMsg,
 	pendingMsgs *[]propagationMsg,
 ) admitResult {
-	// Identify in-flight parents.
-	var pending map[string]struct{}
+	// Identify blocking parents — in flight but not in this batch.
+	var blocking map[string]struct{}
 	for _, parent := range msg.InputTXIDs {
 		if parent == "" || parent == msg.TXID {
 			continue
 		}
-		if _, ok := inFlight[parent]; !ok {
+		if _, inFlt := inFlight[parent]; !inFlt {
 			continue
 		}
-		if pending == nil {
-			pending = make(map[string]struct{})
+		if _, inPnd := inPending[parent]; inPnd {
+			// Parent is queued for the same batch — fine, Teranode
+			// handles ordering inside the /txs POST.
+			continue
 		}
-		pending[parent] = struct{}{}
+		// Parent is in a different in-flight batch or is itself
+		// held — block this child on it.
+		if blocking == nil {
+			blocking = make(map[string]struct{})
+		}
+		blocking[parent] = struct{}{}
 	}
 
-	if len(pending) > 0 {
-		// Hold as a waiter. Held txs DO go into inFlight so
-		// descendants can register on them; they DON'T count against
-		// maxPending since they aren't on the broadcast path.
+	if len(blocking) > 0 {
+		// Hold as a waiter. Held txs DO go into inFlight (so
+		// descendants can register on them) but NOT into inPending
+		// (they're not on the broadcast path yet).
 		inFlight[msg.TXID] = struct{}{}
-		pendingParents[msg.TXID] = pending
-		for parent := range pending {
+		for parent := range blocking {
 			set, ok := waiters[parent]
 			if !ok {
 				set = make(map[string]struct{})
@@ -213,76 +224,115 @@ func handleAdmit(
 		return admitResult{held: true}
 	}
 
+	// Eligible for broadcast. Add to both inFlight and inPending so
+	// subsequent children of this tx can co-batch with it.
 	inFlight[msg.TXID] = struct{}{}
+	inPending[msg.TXID] = struct{}{}
 	*pendingMsgs = append(*pendingMsgs, msg)
 	return admitResult{admitted: true}
 }
 
 // handleTerminal processes a terminal status flip for txid. ACCEPTED
-// releases waiters whose parent set becomes empty as a result;
-// REJECTED recursively cascades rejection through every descendant.
-// In both cases txid is removed from inFlight. Released waiters get
-// appended directly to pendingMsgs by the dispatcher (no caller
-// action needed); cascaded descendants are returned via the result
-// so the caller can write REJECTED rows for them.
+// releases waiters whose blocking-parent set becomes empty (including
+// recursive cascade — a released waiter's own waiters re-check and
+// may release, since the just-released tx is now in inPending and
+// no longer blocking). REJECTED recursively cascade-rejects every
+// descendant.
 func handleTerminal(
 	ev terminalEvent,
 	inFlight map[string]struct{},
+	inPending map[string]struct{},
 	waiters map[string]map[string]struct{},
-	pendingParents map[string]map[string]struct{},
 	heldMsgs map[string]propagationMsg,
 	pendingMsgs *[]propagationMsg,
 ) terminalResult {
 	delete(inFlight, ev.txid)
+	delete(inPending, ev.txid)
 
 	switch ev.status {
 	case models.StatusAcceptedByNetwork:
-		released := releaseWaiters(ev.txid, waiters, pendingParents, heldMsgs)
-		*pendingMsgs = append(*pendingMsgs, released...)
+		releaseWaiters(ev.txid, inFlight, inPending, waiters, heldMsgs, pendingMsgs)
 		return terminalResult{}
 
 	case models.StatusRejected:
 		return terminalResult{
-			cascaded: cascadeReject(ev.txid, inFlight, waiters, pendingParents, heldMsgs),
+			cascaded: cascadeReject(ev.txid, inFlight, waiters, heldMsgs),
 		}
 
 	default:
-		// Intermediate statuses (SEEN_ON_NETWORK, etc.) aren't part
-		// of the terminal contract; the caller shouldn't be sending
-		// them here. No state change, empty result.
+		// Intermediate statuses don't change dispatcher state.
 		return terminalResult{}
 	}
 }
 
-// releaseWaiters scans the waiters of parentTxID, decrementing each
-// child's pendingParents set. Children whose set becomes empty are
-// returned as released msgs (caller appends to pendingMsgs).
+// releaseWaiters processes a parent that just left inFlight or moved
+// into inPending. Walks waiters[parent], evaluating each child via
+// canRelease — children whose remaining blockers are all gone (or in
+// inPending) move to pendingMsgs + inPending themselves, and the
+// process recurses on their waiters. This propagates a release
+// through a held chain in one call, so a chain whose root just
+// terminalized ACCEPTED all queues into the next batch together.
 func releaseWaiters(
 	parentTxID string,
+	inFlight map[string]struct{},
+	inPending map[string]struct{},
 	waiters map[string]map[string]struct{},
-	pendingParents map[string]map[string]struct{},
 	heldMsgs map[string]propagationMsg,
-) []propagationMsg {
-	children, ok := waiters[parentTxID]
-	if !ok {
-		return nil
-	}
-	delete(waiters, parentTxID)
-
-	var released []propagationMsg
-	for child := range children {
-		parents := pendingParents[child]
-		delete(parents, parentTxID)
-		if len(parents) > 0 {
+	pendingMsgs *[]propagationMsg,
+) {
+	queue := []string{parentTxID}
+	for len(queue) > 0 {
+		p := queue[0]
+		queue = queue[1:]
+		children, ok := waiters[p]
+		if !ok {
 			continue
 		}
-		delete(pendingParents, child)
-		if msg, ok := heldMsgs[child]; ok {
+		delete(waiters, p)
+		for child := range children {
+			msg, ready := canRelease(child, inFlight, inPending, heldMsgs)
+			if !ready {
+				continue
+			}
+			cleanupWaiterEntries(child, p, waiters, heldMsgs)
 			delete(heldMsgs, child)
-			released = append(released, msg)
+			inPending[child] = struct{}{}
+			*pendingMsgs = append(*pendingMsgs, msg)
+			// The just-released child is now in inPending; its own
+			// waiters may release as a result. Cascade.
+			queue = append(queue, child)
 		}
 	}
-	return released
+}
+
+// canRelease asks: are all of child's blocking parents resolved?
+// A parent is "blocking" if it's in inFlight but not in inPending
+// (i.e., in a different in-flight batch or held). Recomputes the
+// answer from heldMsgs[child].InputTXIDs at call time — we don't
+// maintain a per-child pending-parent count.
+func canRelease(
+	child string,
+	inFlight map[string]struct{},
+	inPending map[string]struct{},
+	heldMsgs map[string]propagationMsg,
+) (propagationMsg, bool) {
+	msg, ok := heldMsgs[child]
+	if !ok {
+		return propagationMsg{}, false
+	}
+	for _, parent := range msg.InputTXIDs {
+		if parent == "" || parent == child {
+			continue
+		}
+		if _, inFlt := inFlight[parent]; !inFlt {
+			continue
+		}
+		if _, inPnd := inPending[parent]; inPnd {
+			continue
+		}
+		return propagationMsg{}, false
+	}
+	return msg, true
 }
 
 // cascadeReject walks the dep graph from rejectedTxID forward and
@@ -294,7 +344,6 @@ func cascadeReject(
 	rejectedTxID string,
 	inFlight map[string]struct{},
 	waiters map[string]map[string]struct{},
-	pendingParents map[string]map[string]struct{},
 	heldMsgs map[string]propagationMsg,
 ) []string {
 	var cascaded []string
@@ -308,7 +357,7 @@ func cascadeReject(
 		}
 		delete(waiters, parent)
 		for child := range children {
-			delete(pendingParents, child)
+			cleanupWaiterEntries(child, parent, waiters, heldMsgs)
 			delete(heldMsgs, child)
 			delete(inFlight, child)
 			cascaded = append(cascaded, child)
@@ -316,6 +365,36 @@ func cascadeReject(
 		}
 	}
 	return cascaded
+}
+
+// cleanupWaiterEntries removes child from every OTHER parent's
+// waiters set, where "other" means parents in heldMsgs[child].InputTXIDs
+// other than skipParent (the one being processed by the calling
+// release / cascade walk). Prevents dangling waiter entries that
+// would otherwise show up when those other parents terminalize
+// later.
+func cleanupWaiterEntries(
+	child, skipParent string,
+	waiters map[string]map[string]struct{},
+	heldMsgs map[string]propagationMsg,
+) {
+	msg, ok := heldMsgs[child]
+	if !ok {
+		return
+	}
+	for _, otherParent := range msg.InputTXIDs {
+		if otherParent == "" || otherParent == child || otherParent == skipParent {
+			continue
+		}
+		set, ok := waiters[otherParent]
+		if !ok {
+			continue
+		}
+		delete(set, child)
+		if len(set) == 0 {
+			delete(waiters, otherParent)
+		}
+	}
 }
 
 // dispatcherChannelBuffer sizes the dispatcher's input channels. The
@@ -326,8 +405,8 @@ func cascadeReject(
 // workers.
 const dispatcherChannelBuffer = 256
 
-// admitToDispatcher is the consumer-side helper. Sends the tx,
-// waits for the dispatcher's verdict, returns it.
+// admitToDispatcher is the consumer-side helper. Sends the tx, waits
+// for the dispatcher's verdict, returns it.
 func (p *Propagator) admitToDispatcher(msg propagationMsg) admitResult {
 	reply := make(chan admitResult, 1)
 	p.admitCh <- admitRequest{msg: msg, reply: reply}
@@ -344,9 +423,9 @@ func (p *Propagator) notifyTerminalToDispatcher(txid string, status models.Statu
 }
 
 // drainPending asks the dispatcher for the current pendingMsgs as a
-// batch. The dispatcher clears its slice and hands the snapshot to
-// the caller; the caller owns it fully and processBatch can mutate
-// it as needed.
+// batch. The dispatcher clears its slice and inPending set and hands
+// the snapshot to the caller; the caller owns it fully and
+// processBatch can mutate it as needed.
 func (p *Propagator) drainPending() []propagationMsg {
 	reply := make(chan []propagationMsg, 1)
 	p.drainCh <- drainRequest{reply: reply}
