@@ -671,6 +671,12 @@ func (s *Server) persistRejectedAtIntake(ctx context.Context, txid, reason strin
 }
 
 // handleSubmitTransactions accepts a batch of concatenated raw transactions.
+// Mirrors handleSubmitTransaction's intake pipeline (parse → validate →
+// dedup CAS → publish to TopicPropagation) for each tx in the batch. The
+// publish is a single SendBatch so all txs in one HTTP request hit the
+// in-memory broker as one fan-out, preserving in-batch order. Each tx
+// carries its input_txids so the propagation dispatcher can co-batch
+// parents and children submitted together.
 func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	if !strings.Contains(c.ContentType(), "octet-stream") {
 		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "Content-Type must be application/octet-stream"})
@@ -696,67 +702,130 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 		return
 	}
 
-	// Phase 1: Parse all transactions upfront. We use the parsed tx's
-	// canonical TxID() for the Kafka key (and submissions row) so it matches
-	// what the validator emits later — hashing the wire bytes directly would
-	// be wrong for Extended Format submissions.
-	var msgs []kafka.KeyValue
+	// Phase 1: parse the whole stream. Use the canonical TxID() (not a
+	// hash of the wire bytes) so Extended Format submissions key the
+	// same as the canonical txid the propagator broadcasts.
+	type parsedItem struct {
+		tx   *sdkTx.Transaction
+		raw  []byte
+		txid string
+	}
+	var parsed []parsedItem
 	offset := 0
 	for offset < len(body) {
-		parsedTx, bytesUsed, parseErr := sdkTx.NewTransactionFromStream(body[offset:])
+		tx, bytesUsed, parseErr := sdkTx.NewTransactionFromStream(body[offset:])
 		if parseErr != nil {
 			s.logger.Error(
 				"failed to parse transaction in batch",
 				zap.Int("offset", offset),
-				zap.Int("parsed", len(msgs)),
+				zap.Int("parsed", len(parsed)),
 				zap.Error(parseErr),
 			)
-			c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "failed to parse transaction", "parsed": len(msgs)})
+			c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "failed to parse transaction", "parsed": len(parsed)})
 			return
 		}
 		if bytesUsed == 0 {
 			break
 		}
-
-		rawTxBytes := body[offset : offset+bytesUsed]
-		msgs = append(msgs, kafka.KeyValue{
-			Key: parsedTx.TxID().String(),
-			Value: map[string]interface{}{
-				"action": "submit",
-				"raw_tx": rawTxBytes,
-			},
+		parsed = append(parsed, parsedItem{
+			tx:   tx,
+			raw:  body[offset : offset+bytesUsed],
+			txid: tx.TxID().String(),
 		})
 		offset += bytesUsed
 	}
-
-	if len(msgs) == 0 {
+	if len(parsed) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "no transactions parsed"})
 		return
 	}
 
-	// Record one submission per parsed txid before the batch publish so the
-	// downstream services can resolve callback preferences as soon as
-	// status updates start flowing back. opts was extracted (and the URL
-	// validated) at the top of the handler.
-	if opts.hasSubscription() {
+	// Phase 2: synchronous policy validation per tx. Any failure aborts
+	// the whole batch with 400 — matches the single-tx contract. The
+	// failed tx gets a durable REJECTED row before the response so
+	// SSE/webhook subscribers can resolve the outcome.
+	if s.validator != nil {
 		ctx := c.Request.Context()
-		for _, m := range msgs {
-			s.recordSubmission(ctx, m.Key, opts)
+		for _, p := range parsed {
+			if vErr := s.validator.ValidateTransaction(ctx, p.tx, true, true); vErr != nil {
+				s.persistRejectedAtIntake(ctx, p.txid, vErr.Error())
+				c.JSON(http.StatusBadRequest, gin.H{
+					jsonKeyError: "transaction failed validation",
+					"txid":       p.txid,
+					"reason":     vErr.Error(),
+				})
+				return
+			}
 		}
 	}
 
-	// Phase 2: Batch publish all parsed transactions in one call
-	if err := s.producer.SendBatch(kafka.TopicTransaction, msgs); err != nil {
-		if errors.Is(err, kafka.ErrBrokerBackpressure) {
-			s.logger.Warn("batch submit rejected: kafka backpressure", zap.Int("count", len(msgs)))
-			c.Header("Retry-After", "1")
-			c.JSON(http.StatusServiceUnavailable, gin.H{jsonKeyError: "service overloaded, retry shortly"})
+	// Phase 3: dedup CAS per tx. Duplicates are skipped from the
+	// publish but counted in the response so the caller can reconcile.
+	// A dedup error logs but doesn't drop the tx — matches single-tx
+	// best-effort behavior.
+	toPublish := make([]parsedItem, 0, len(parsed))
+	duplicates := 0
+	if s.store != nil {
+		ctx := c.Request.Context()
+		for _, p := range parsed {
+			row := &models.TransactionStatus{
+				TxID:      p.txid,
+				Status:    models.StatusReceived,
+				Timestamp: time.Now(),
+			}
+			existing, inserted, dedupErr := s.store.GetOrInsertStatus(ctx, row)
+			switch {
+			case dedupErr != nil:
+				s.logger.Error("dedup CAS failed", zap.String("txid", p.txid), zap.Error(dedupErr))
+				toPublish = append(toPublish, p)
+			case !inserted && existing != nil:
+				duplicates++
+				s.recordSubmission(ctx, p.txid, opts)
+			default:
+				toPublish = append(toPublish, p)
+			}
+		}
+	} else {
+		toPublish = parsed
+	}
+
+	// Record subscriptions BEFORE publishing so any status events that
+	// fire on these txids find a matching row.
+	ctx := c.Request.Context()
+	for _, p := range toPublish {
+		s.recordSubmission(ctx, p.txid, opts)
+	}
+
+	// Phase 4: build propagation envelopes and publish as one batch.
+	// input_txids lets the dispatcher co-batch parents and children
+	// submitted together (Teranode handles intra-batch ordering).
+	if len(toPublish) > 0 {
+		msgs := make([]kafka.KeyValue, 0, len(toPublish))
+		for _, p := range toPublish {
+			msgs = append(msgs, kafka.KeyValue{
+				Key: p.txid,
+				Value: map[string]interface{}{
+					"txid":        p.txid,
+					"raw_tx":      p.raw,
+					"input_txids": tx_validator.CollectInputTXIDs(p.tx),
+				},
+			})
+		}
+		if err := s.producer.SendBatch(kafka.TopicPropagation, msgs); err != nil {
+			if errors.Is(err, kafka.ErrBrokerBackpressure) {
+				s.logger.Warn("batch submit rejected: kafka backpressure", zap.Int("count", len(msgs)))
+				c.Header("Retry-After", "1")
+				c.JSON(http.StatusServiceUnavailable, gin.H{jsonKeyError: "service overloaded, retry shortly"})
+				return
+			}
+			s.logger.Error("failed to publish transaction batch", zap.Error(err))
+			c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to submit"})
 			return
 		}
-		s.logger.Error("failed to publish transaction batch", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to submit"})
-		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"submitted": len(msgs)})
+	c.JSON(http.StatusAccepted, gin.H{
+		"submitted":  len(toPublish),
+		"duplicates": duplicates,
+		"total":      len(parsed),
+	})
 }

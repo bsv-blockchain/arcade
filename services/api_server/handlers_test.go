@@ -352,8 +352,8 @@ func TestHandleSubmitTransactions_BatchPublish(t *testing.T) {
 
 	router.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
 	}
 
 	var resp map[string]interface{}
@@ -406,8 +406,8 @@ func TestHandleSubmitTransactions_100Txs_SingleBatchCall(t *testing.T) {
 
 	router.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
 	}
 
 	var resp map[string]interface{}
@@ -1215,7 +1215,7 @@ func TestHandleSubmitTransactions_TxID_IsCanonical(t *testing.T) {
 	router.ServeHTTP(w, req)
 	drainSubmissions(t, srv)
 
-	if w.Code != http.StatusOK {
+	if w.Code != http.StatusAccepted {
 		t.Fatalf("status %d: %s", w.Code, w.Body.String())
 	}
 
