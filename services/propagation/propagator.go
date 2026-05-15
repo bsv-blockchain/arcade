@@ -52,16 +52,16 @@ type Propagator struct {
 	consumer       *kafka.ConsumerGroup
 
 	maxPending int
-	// admitCh, terminalCh, drainCh, requeueCh, and watermarkCh are the
-	// dispatcher goroutine's input channels. The dispatcher owns ALL
-	// dep-aware state — inFlight, waiters, heldMsgs, pendingMsgs, and
-	// the offsetTracker — inside its goroutine. No shared maps, no
-	// shared slice, no mutex. See dispatcher.go for the protocol.
+	// admitCh, terminalCh, drainCh, and requeueCh feed runDispatcher's
+	// single state-owning loop. The loop selects on these channels (and,
+	// in production, claim.Messages()) and runs ALL dep-aware state
+	// mutations — inFlight, waiters, heldMsgs, pendingMsgs, the
+	// offsetTracker, and the pendingMarks map — inside the goroutine
+	// that owns the loop. No locks, no atomics. See dispatcher.go.
 	admitCh           chan admitRequest
 	terminalCh        chan terminalEvent
 	drainCh           chan drainRequest
 	requeueCh         chan requeueRequest
-	watermarkCh       chan watermarkRequest
 	dispatcherCancel  context.CancelFunc
 	merkleConcurrency int
 	reaperInterval    time.Duration
@@ -249,16 +249,20 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 		terminalCh:        make(chan terminalEvent, dispatcherChannelBuffer),
 		drainCh:           make(chan drainRequest),
 		requeueCh:         make(chan requeueRequest, dispatcherChannelBuffer),
-		watermarkCh:       make(chan watermarkRequest),
 	}
-	// Start the dispatcher goroutine here (not in Start) so existing
-	// tests that construct via New and call handleMessage directly —
-	// without invoking Start — still have a running dispatcher. Stop
-	// cancels the context; tests that bypass Stop just leak the
-	// goroutine for the test process lifetime, which is fine.
+	// Start a dispatcher goroutine with a nil claim so tests that
+	// construct via New and drive via admitCh / drainCh have a running
+	// state machine without needing to invoke Start. In production
+	// Start replaces this with the same loop running inside the kafka
+	// ClaimHandler — see Start. The two paths can't both be live at
+	// once: Start cancels this context before subscribing.
 	dispatcherCtx, dispatcherCancel := context.WithCancel(context.Background())
 	p.dispatcherCancel = dispatcherCancel
-	go p.runDispatcher(dispatcherCtx, dispatcherConfig{maxPending: maxPending})
+	go func() {
+		if err := p.runDispatcher(dispatcherCtx, nil, dispatcherConfig{maxPending: maxPending}); err != nil {
+			p.logger.Error("test-mode dispatcher exited with error", zap.Error(err))
+		}
+	}()
 	return p
 }
 
@@ -443,16 +447,23 @@ func (p *Propagator) publishBulkStatus(ctx context.Context, status models.Status
 }
 
 func (p *Propagator) Start(ctx context.Context) error {
+	// Stop the test-mode dispatcher goroutine started in New(); the
+	// production lifecycle runs the same loop inside the kafka
+	// ClaimHandler so dep state + offset marking stay on a single
+	// goroutine.
+	if p.dispatcherCancel != nil {
+		p.dispatcherCancel()
+		p.dispatcherCancel = nil
+	}
+
 	consumer, err := kafka.NewConsumerGroup(kafka.ConsumerConfig{
-		Broker:         p.producer.Broker(),
-		GroupID:        p.cfg.Kafka.ConsumerGroup + "-propagation",
-		Topics:         []string{kafka.TopicPropagation},
-		Handler:        p.handleMessage,
-		FlushFunc:      p.flushBatch,
-		Producer:       p.producer,
-		MaxRetries:     p.cfg.Kafka.MaxRetries,
-		Logger:         p.logger,
-		DeferredCommit: true,
+		Broker:       p.producer.Broker(),
+		GroupID:      p.cfg.Kafka.ConsumerGroup + "-propagation",
+		Topics:       []string{kafka.TopicPropagation},
+		Producer:     p.producer,
+		MaxRetries:   p.cfg.Kafka.MaxRetries,
+		Logger:       p.logger,
+		ClaimHandler: p.handleClaim(ctx),
 	})
 	if err != nil {
 		return fmt.Errorf("creating consumer group: %w", err)
@@ -470,21 +481,6 @@ func (p *Propagator) Start(ctx context.Context) error {
 		go p.runBroadcastWorker()
 	}
 
-	// Independent flush ticker. The Kafka consumer wrapper has its own
-	// flush hook, but it shares a goroutine with the consumer's drain
-	// loop — if handleMessage blocks on the dispatcher's admitCh
-	// (when pending is at cap), the wrapper can't call flushBatch
-	// itself. This goroutine runs on its own clock so the
-	// pause-Kafka-consumption backpressure pattern resolves within
-	// one tick.
-	go p.runFlushTicker(ctx)
-
-	// Watermark ticker — reads the dispatcher's lowest in-flight Kafka
-	// offset and tells the consumer to mark every pending message at
-	// or below (lowestUnfinished - 1). When nothing is in flight the
-	// tracker reports !ok and we leave the watermark alone.
-	go p.runWatermarkTicker(ctx)
-
 	// Replay in-flight registrations to merkle-service. One-shot; exits on
 	// its own. Compensates for /watch state loss on the merkle-service side
 	// (recreated namespace, data wipe, schema migration) which otherwise
@@ -501,66 +497,34 @@ func (p *Propagator) Start(ctx context.Context) error {
 	return consumer.Run(ctx)
 }
 
+// handleClaim returns the kafka.ClaimHandler that owns each per-partition
+// session. The dispatcher loop runs in the goroutine Sarama hands us via
+// claim, so dep state, Kafka offset tracking, and claim.MarkMessage all
+// happen on the same goroutine.
+func (p *Propagator) handleClaim(ctx context.Context) kafka.ClaimHandler {
+	cfg := dispatcherConfig{maxPending: p.maxPending}
+	return func(claim kafka.Claim) error {
+		// Use the claim's context as a child of the service context so
+		// shutdown OR a rebalance both unblock the loop.
+		claimCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		go func() {
+			select {
+			case <-claim.Context().Done():
+				cancel()
+			case <-claimCtx.Done():
+			}
+		}()
+		return p.runDispatcher(claimCtx, claim, cfg)
+	}
+}
+
 // WaitForBatches blocks until every processBatch goroutine spawned by
 // flushBatch has finished. Used by tests to assert post-flush invariants
 // against the in-memory mockStore, and reused by Stop() to drain in-flight
 // pipelines before tearing down the broadcast worker pool.
 func (p *Propagator) WaitForBatches() {
 	p.inflightBatches.Wait()
-}
-
-// runFlushTicker periodically calls flushBatch on its own goroutine,
-// independent of the Kafka consumer wrapper. The wrapper has a flush
-// hook of its own but shares the consumer goroutine; if handleMessage
-// blocks on the dispatcher's admitCh (pending at cap), the wrapper
-// can't trigger its own flush. This goroutine guarantees flushes keep
-// happening regardless of the consumer's state, so the "pause Kafka
-// consumption when pending is full" backpressure pattern resolves
-// itself within one tick.
-func (p *Propagator) runFlushTicker(ctx context.Context) {
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			_ = p.flushBatch(ctx)
-		}
-	}
-}
-
-// runWatermarkTicker reads the dispatcher's lowest in-flight Kafka
-// offset every watermarkInterval and pushes a commit watermark to the
-// consumer. The watermark is set to (lowestUnfinished - 1), meaning
-// "the consumer may commit every offset strictly less than the lowest
-// in-flight one." When the tracker reports no in-flight work, the
-// previous watermark is left unchanged (the consumer holds whatever
-// it had last; any messages it processed since become eligible to
-// mark on the next non-empty tick).
-//
-// Single goroutine — runs for the lifetime of the propagator. The
-// channel round-trip into the dispatcher is the only synchronization
-// with the dispatcher's state.
-func (p *Propagator) runWatermarkTicker(ctx context.Context) {
-	const watermarkInterval = 200 * time.Millisecond
-	ticker := time.NewTicker(watermarkInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if p.consumer == nil {
-				continue
-			}
-			off, ok := p.lowestUnfinishedOffset()
-			if !ok {
-				continue
-			}
-			p.consumer.SetCommitWatermark(off - 1)
-		}
-	}
 }
 
 func (p *Propagator) Stop() error {

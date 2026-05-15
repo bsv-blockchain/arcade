@@ -2,7 +2,13 @@ package propagation
 
 import (
 	"context"
+	"encoding/json"
+	"time"
 
+	"go.uber.org/zap"
+
+	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 )
 
@@ -74,21 +80,6 @@ type drainRequest struct {
 	reply chan []propagationMsg
 }
 
-// watermarkRequest asks the dispatcher for the lowest in-flight Kafka
-// offset on the offsetTracker. Used by the propagator's watermark
-// ticker; the consumer's commit position must not advance past this
-// value. ok is false when nothing is in-flight (or nothing has ever
-// been admitted), in which case the ticker leaves the consumer
-// watermark unchanged.
-type watermarkRequest struct {
-	reply chan watermarkReply
-}
-
-type watermarkReply struct {
-	offset int64
-	ok     bool
-}
-
 // requeueRequest re-injects a slice of propagation messages into the
 // dispatcher after an infra-failed broadcast. The dispatcher re-runs
 // admission logic on each message — txs whose parents have terminalized
@@ -106,64 +97,92 @@ type dispatcherConfig struct {
 	maxPending int
 }
 
-// runDispatcher is the dispatcher goroutine's main loop. Started by
-// New (so existing tests that don't call Start still have a running
-// dispatcher) and runs for the lifetime of the propagation service.
-// All dep-index + pendingMsgs state declared inside the function
-// body — nothing leaks out, so nothing else can mutate it without
-// going through the channels.
-func (p *Propagator) runDispatcher(ctx context.Context, cfg dispatcherConfig) {
-	// inFlight maps txid → Kafka offset for every tx the dispatcher
-	// is aware of and has not yet seen a terminal status for. Stores
-	// the offset so terminal/cascade paths can mark the offsetTracker
-	// without needing a separate txid→offset map.
-	// A child of any in-flight parent gets held — Teranode processes
-	// bulk submissions in parallel, so parent and child must be in
-	// SEPARATE batches with the parent terminalized before the child
-	// is admitted.
+// runDispatcher is the single state-owning loop. ALL dep-aware state
+// (inFlight, waiters, heldMsgs, pendingMsgs, the offsetTracker, and the
+// per-offset *kafka.Message references used for marking) lives in this
+// function's local variables. Nothing else touches any of it — every
+// mutation arrives via the channels read in the select.
+//
+// Two modes:
+//
+//   - Production: invoked as the kafka.ClaimHandler with a non-nil claim.
+//     The loop runs on Sarama's per-claim goroutine; claim.Messages() is
+//     the message source and claim.MarkMessage is called inline when an
+//     offset terminalizes. Returns when the claim ends.
+//   - Test: invoked with a nil claim from a goroutine started by tests.
+//     admitCh is the message source; no MarkMessage calls.
+//
+// One goroutine, no locks, no atomics.
+func (p *Propagator) runDispatcher(ctx context.Context, claim kafka.Claim, cfg dispatcherConfig) error {
 	inFlight := make(map[string]int64)
-
-	// waiters maps a parent txid to the set of children currently
-	// waiting on it. Populated by admit (when a child has any
-	// in-flight parent) and drained by terminal events:
-	// ACCEPTED releases direct waiters whose other parents have also
-	// cleared; REJECTED cascade-rejects every descendant in the
-	// subtree.
 	waiters := make(map[string]map[string]struct{})
-
-	// heldMsgs stores the held child's raw message so release can
-	// re-enter it into pendingMsgs without going back to Kafka. We
-	// don't keep a separate "pending parent count" — at release time
-	// we recompute it by walking heldMsgs[child].InputTXIDs against
-	// inFlight.
 	heldMsgs := make(map[string]propagationMsg)
-
-	// pendingMsgs is the broadcast-ready queue. drainCh pulls from
-	// here; admit and release append to here. All on this one
-	// goroutine — no locks.
 	var pendingMsgs []propagationMsg
-
-	// tracker holds the in-flight Kafka offsets. Add on admit, Done
-	// on terminal/cascade. The watermark ticker reads
-	// LowestUnfinished via watermarkCh.
 	tracker := newOffsetTracker()
+	// pendingMarks is the per-offset Kafka-message reference we hand back
+	// to claim.MarkMessage when its offset terminalizes. Only populated
+	// when claim != nil; in test mode admitRequests carry no Kafka
+	// message and pendingMarks stays empty.
+	pendingMarks := make(map[int64]*kafka.Message)
+
+	var claimMsgCh <-chan *kafka.Message
+	if claim != nil {
+		claimMsgCh = claim.Messages()
+	}
+
+	// In production the ticker drives periodic flushes (50ms). In test
+	// mode (nil claim) tests drive flushes explicitly via flushBatch /
+	// drainCh, so a live ticker would race with the explicit drain.
+	// flushTickC is nil in test mode, which (per the nil-channel-in-
+	// select trick) means the ticker case never fires.
+	var flushTickC <-chan time.Time
+	if claim != nil {
+		t := time.NewTicker(50 * time.Millisecond)
+		defer t.Stop()
+		flushTickC = t.C
+	}
 
 	for {
-		// Nil-channel trick: when pendingMsgs is at the configured cap,
-		// exclude admitCh from the select so handleMessage's send
-		// blocks. Kafka consumer goroutine sits blocked → no more
-		// pulls → broker holds messages. Terminal and drain events
-		// keep firing; the instant they shrink pendingMsgs back under
-		// the cap, admitCh is back in the select and the blocked
-		// send unblocks.
+		// Backpressure: nil-channel trick excludes incoming-message
+		// sources from the select when pendingMsgs is at cap. Both
+		// claim.Messages() and admitCh participate, so the same cap
+		// applies in either mode.
 		var admitChIfRoom <-chan admitRequest
+		var claimChIfRoom <-chan *kafka.Message
 		if cfg.maxPending <= 0 || len(pendingMsgs) < cfg.maxPending {
 			admitChIfRoom = p.admitCh
+			claimChIfRoom = claimMsgCh
 		}
 
 		select {
 		case <-ctx.Done():
-			return
+			return nil
+
+		case msg, ok := <-claimChIfRoom:
+			if !ok {
+				// Claim channel closed → claim ended; exit cleanly so
+				// Sarama can move on.
+				return nil
+			}
+			var propMsg propagationMsg
+			if err := json.Unmarshal(msg.Value, &propMsg); err != nil {
+				p.logger.Warn(
+					"decoding propagation message",
+					zap.Int64("offset", msg.Offset),
+					zap.Error(err),
+				)
+				// Mark malformed messages so the consumer doesn't
+				// redeliver them forever. Drop on the floor.
+				claim.MarkMessage(msg)
+				continue
+			}
+			if len(propMsg.RawTx) == 0 {
+				p.logger.Warn("propagation message has empty raw_tx", zap.Int64("offset", msg.Offset))
+				claim.MarkMessage(msg)
+				continue
+			}
+			handleAdmit(propMsg, msg.Offset, inFlight, waiters, heldMsgs, &pendingMsgs, tracker)
+			pendingMarks[msg.Offset] = msg
 
 		case req := <-admitChIfRoom:
 			res := handleAdmit(req.msg, req.offset, inFlight, waiters, heldMsgs, &pendingMsgs, tracker)
@@ -172,11 +191,7 @@ func (p *Propagator) runDispatcher(ctx context.Context, cfg dispatcherConfig) {
 		case ev := <-p.terminalCh:
 			result := handleTerminal(ev, inFlight, waiters, heldMsgs, &pendingMsgs, tracker)
 			ev.reply <- result
-
-		case req := <-p.drainCh:
-			batch := pendingMsgs
-			pendingMsgs = nil
-			req.reply <- batch
+			advanceMarks(claim, tracker, pendingMarks)
 
 		case req := <-p.requeueCh:
 			// Requeue path: an infra-failed broadcast wants these
@@ -186,16 +201,61 @@ func (p *Propagator) runDispatcher(ctx context.Context, cfg dispatcherConfig) {
 			// didn't terminalize). Re-run admission so a tx whose
 			// parents are no longer in-flight goes to pendingMsgs,
 			// while one whose parents are still in-flight goes
-			// (back) to heldMsgs. inFlight already contains the txid,
-			// so handleRequeue skips the offsetTracker.Add.
+			// (back) to heldMsgs.
 			for _, msg := range req.msgs {
 				handleRequeue(msg, inFlight, waiters, heldMsgs, &pendingMsgs)
 			}
 
-		case req := <-p.watermarkCh:
-			off, ok := tracker.LowestUnfinished()
-			req.reply <- watermarkReply{offset: off, ok: ok}
+		case req := <-p.drainCh:
+			batch := pendingMsgs
+			pendingMsgs = nil
+			req.reply <- batch
+
+		case <-flushTickC:
+			if len(pendingMsgs) == 0 {
+				continue
+			}
+			// Non-blocking semaphore acquire: if all processBatch
+			// slots are busy, leave pendingMsgs alone and try next
+			// tick. The reads from claim/admit pause naturally
+			// because the cap path keeps appending; backpressure
+			// flows the right direction.
+			select {
+			case p.processBatchSem <- struct{}{}:
+			default:
+				continue
+			}
+			batch := pendingMsgs
+			pendingMsgs = nil
+			p.inflightBatches.Add(1)
+			metrics.PropagationInflightBatches.Set(float64(len(p.processBatchSem)))
+			go func() {
+				defer func() {
+					<-p.processBatchSem
+					p.inflightBatches.Done()
+					metrics.PropagationInflightBatches.Set(float64(len(p.processBatchSem)))
+				}()
+				p.processBatch(ctx, batch)
+			}()
 		}
+	}
+}
+
+// advanceMarks walks pendingMarks and calls claim.MarkMessage on every
+// offset that is strictly below the dispatcher's current lowest in-flight
+// offset. Idempotent and cheap when nothing has advanced. No-op when
+// claim is nil (test mode).
+func advanceMarks(claim kafka.Claim, tracker *offsetTracker, pendingMarks map[int64]*kafka.Message) {
+	if claim == nil {
+		return
+	}
+	lowest, hasUnfinished := tracker.LowestUnfinished()
+	for offset, msg := range pendingMarks {
+		if hasUnfinished && offset >= lowest {
+			continue
+		}
+		claim.MarkMessage(msg)
+		delete(pendingMarks, offset)
 	}
 }
 
@@ -535,15 +595,4 @@ func (p *Propagator) requeueToDispatcher(msgs []propagationMsg) {
 		return
 	}
 	p.requeueCh <- requeueRequest{msgs: msgs}
-}
-
-// lowestUnfinishedOffset asks the dispatcher for the smallest in-flight
-// Kafka offset on the offsetTracker, or (0, false) when nothing is in
-// flight. Used by the watermark ticker to drive the Kafka consumer's
-// SetCommitWatermark.
-func (p *Propagator) lowestUnfinishedOffset() (int64, bool) {
-	reply := make(chan watermarkReply, 1)
-	p.watermarkCh <- watermarkRequest{reply: reply}
-	r := <-reply
-	return r.offset, r.ok
 }
