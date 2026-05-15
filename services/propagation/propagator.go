@@ -652,10 +652,10 @@ func (p *Propagator) registerBatch(ctx context.Context, batch []propagationMsg) 
 		}
 		failedCount++
 		metrics.PropagationMerkleRegisterFailures.WithLabelValues("register_error").Inc()
-		// Mirror the prior per-message contract: a failed register must not
-		// broadcast and must not be lost. Route to durable PENDING_RETRY so
-		// the reaper re-attempts registration+broadcast on its own cadence.
-		p.handleRetryableFailure(ctx, batch[i].TXID, batch[i].RawTx)
+		// Dep-aware design: failed registration is terminal REJECTED
+		// (no PENDING_RETRY queue, no reaper). The tx doesn't broadcast
+		// and the wallet sees a REJECTED status with the reason.
+		p.writeTerminalRejected(ctx, batch[i].TXID, "merkle-service registration failed: "+err.Error())
 	}
 	if failedCount > 0 {
 		p.logger.Warn(
@@ -777,21 +777,21 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) {
 			//     202 — accepted, will report back). Tx is in flight — don't
 			//     queue a retry, the merkle-service callback / next broadcast
 			//     will move it forward.
-			//   - !acknowledged: no peer was reachable at all (every endpoint
-			//     sidelined, or every responder canceled-by-broadcast). The
-			//     tx is stuck in RECEIVED unless we route to PENDING_RETRY so
-			//     the reaper picks it up on its next tick. This is the fix
-			//     for the 02:07 EDT incident where ~1.6M txs sat in RECEIVED
-			//     forever while the breaker had sidelined every endpoint.
+			//   - !acknowledged: no peer was reachable at all (every
+			//     endpoint sidelined, or every responder canceled-by-
+			//     broadcast). In the dep-aware design, no retry queue:
+			//     this is terminal REJECTED. Wallet can resubmit.
 			if !res.acknowledged {
-				p.handleRetryableFailure(ctx, batch[i].TXID, res.rawTx)
+				p.writeTerminalRejected(ctx, batch[i].TXID, "broadcast not acknowledged by any endpoint")
 			}
 			continue
 		}
 		if res.status.Status == models.StatusRejected && IsRetryableError(res.errMsg) {
+			// Dep-aware design: no PENDING_RETRY queue. The previously-
+			// retryable cases (missing-inputs, mempool-conflict) are
+			// terminal here. Falls through to the normal REJECTED
+			// counter and applyTerminalStatuses store write.
 			retryable++
-			p.handleRetryableFailure(ctx, batch[i].TXID, res.rawTx)
-			continue
 		}
 		switch res.status.Status {
 		case models.StatusAcceptedByNetwork:
@@ -1321,11 +1321,47 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 	return statuses, successEndpoint
 }
 
-// handleRetryableFailure marks a tx for durable retry. The two-call pattern
-// (BumpRetryCount then SetPendingRetryFields) lets us compute the real
-// exponential backoff from the post-increment count without double-
-// incrementing. If retry_count exceeds retryMaxAttempts, the tx is rejected
-// immediately and its retry bins are cleared.
+// writeTerminalRejected writes a one-shot terminal REJECTED status for
+// txid with the given reason. Used when a broadcast outcome can't be
+// retried under the dep-aware design's "no retry queue" rule —
+// merkle-service registration failure, no broadcast acknowledgement,
+// etc. Notifies the dispatcher so its in-flight set is cleaned up and
+// any held descendants are cascade-rejected.
+//
+// Best-effort: a store write failure is logged but doesn't undo the
+// dispatcher's in-memory cleanup. Kafka replay on restart would re-
+// process the tx if the store row is missing.
+func (p *Propagator) writeTerminalRejected(ctx context.Context, txid, reason string) {
+	now := time.Now()
+	row := &models.TransactionStatus{
+		TxID:      txid,
+		Status:    models.StatusRejected,
+		Timestamp: now,
+		ExtraInfo: reason,
+	}
+	if _, err := p.store.BatchUpdateStatusReturning(ctx, []*models.TransactionStatus{row}); err != nil {
+		p.logger.Warn(
+			"terminal rejection write failed",
+			zap.String("txid", txid),
+			zap.String("reason", reason),
+			zap.Error(err),
+		)
+	}
+	// Notify the dispatcher so in-flight is cleaned up and any held
+	// descendants cascade-reject. cascaded list (if any) gets its
+	// own row writes via persistCascadeRejections.
+	result := p.notifyTerminalToDispatcher(txid, models.StatusRejected)
+	if len(result.cascaded) > 0 {
+		p.persistCascadeRejections(ctx, result.cascaded, now)
+	}
+	p.publishBulkStatus(ctx, models.StatusRejected, []string{txid}, now)
+}
+
+// handleRetryableFailure is preserved from the legacy reaper-flow
+// tooling. The dep-aware design doesn't call it (failures are
+// terminal REJECTED via writeTerminalRejected). Still referenced
+// from the reaper, which keeps it from being flagged unused; the
+// reaper itself is preserved-but-not-started.
 func (p *Propagator) handleRetryableFailure(ctx context.Context, txid string, rawTx []byte) {
 	retryCount, err := p.store.BumpRetryCount(ctx, txid)
 	if err != nil {

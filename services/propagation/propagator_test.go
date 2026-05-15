@@ -296,16 +296,6 @@ func (m *mockStore) IterateStatusesSince(_ context.Context, since time.Time, fn 
 	return nil
 }
 
-// forceReady makes every pending retry eligible for the next reaper tick.
-func (m *mockStore) forceReady() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	past := time.Now().Add(-time.Second)
-	for _, pr := range m.pendingRetries {
-		pr.NextRetryAt = past
-	}
-}
-
 func (m *mockStore) pendingRetryCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -577,13 +567,13 @@ func TestHandleMessage_MerkleFailure_NoBroadcast(t *testing.T) {
 	if log.count("broadcast") != 0 {
 		t.Error("teranode should not have received any requests when register fails")
 	}
-	// The PENDING_RETRY transition is the durable record of the failure;
-	// no ACCEPTED/REJECTED status update should have been written.
-	if ms.pendingRetryCount() != 1 {
-		t.Errorf("expected 1 PENDING_RETRY row, got %d", ms.pendingRetryCount())
+	// Dep-aware design: a merkle-service registration failure is
+	// terminal REJECTED, not PENDING_RETRY.
+	if ms.pendingRetryCount() != 0 {
+		t.Errorf("expected 0 PENDING_RETRY rows in the dep-aware design, got %d", ms.pendingRetryCount())
 	}
-	if u := ms.lastUpdateForTxid("abc123"); u == nil || u.Status != models.StatusPendingRetry {
-		t.Errorf("expected PENDING_RETRY status update, got %+v", u)
+	if u := ms.lastUpdateForTxid("abc123"); u == nil || u.Status != models.StatusRejected {
+		t.Errorf("expected REJECTED status update, got %+v", u)
 	}
 }
 
@@ -616,8 +606,9 @@ func TestHandleMessage_MerkleTimeout_NoBroadcast(t *testing.T) {
 	if log.count("broadcast") != 0 {
 		t.Error("teranode should not have received any requests when register times out")
 	}
-	if ms.pendingRetryCount() != 1 {
-		t.Errorf("expected 1 PENDING_RETRY row after register timeout, got %d", ms.pendingRetryCount())
+	u := ms.lastUpdateForTxid("abc123")
+	if u == nil || u.Status != models.StatusRejected {
+		t.Errorf("expected REJECTED status update after register timeout, got %+v", u)
 	}
 
 	close(done)
@@ -1223,8 +1214,18 @@ func TestProcessBatch_MerkleFailure_AbortsBatch(t *testing.T) {
 	if broadcastCount.Load() != 0 {
 		t.Errorf("expected 0 broadcast calls, got %d", broadcastCount.Load())
 	}
-	if ms.pendingRetryCount() != 5 {
-		t.Errorf("expected 5 PENDING_RETRY rows (all txs durably enqueued for reaper), got %d", ms.pendingRetryCount())
+	if ms.pendingRetryCount() != 0 {
+		t.Errorf("expected 0 PENDING_RETRY rows in the dep-aware design, got %d", ms.pendingRetryCount())
+	}
+	// All 5 txs should have been terminally rejected.
+	rejected := 0
+	for _, u := range ms.updates {
+		if u.Status == models.StatusRejected {
+			rejected++
+		}
+	}
+	if rejected != 5 {
+		t.Errorf("expected 5 REJECTED status writes, got %d", rejected)
 	}
 }
 
@@ -1299,11 +1300,11 @@ func TestHandleMessage_PartialMerkleFailure_OnlyFailedMessageIsAborted(t *testin
 		t.Errorf("expected /txs batch endpoint, got %s", broadcastBodies[0])
 	}
 
-	if ms.pendingRetryCount() != 1 {
-		t.Errorf("expected 1 PENDING_RETRY row for tx-bad, got %d", ms.pendingRetryCount())
+	if ms.pendingRetryCount() != 0 {
+		t.Errorf("expected 0 PENDING_RETRY rows in the dep-aware design, got %d", ms.pendingRetryCount())
 	}
-	if u := ms.lastUpdateForTxid("tx-bad"); u == nil || u.Status != models.StatusPendingRetry {
-		t.Errorf("tx-bad: expected PENDING_RETRY status update, got %+v", u)
+	if u := ms.lastUpdateForTxid("tx-bad"); u == nil || u.Status != models.StatusRejected {
+		t.Errorf("tx-bad: expected REJECTED status update, got %+v", u)
 	}
 	if u := ms.lastUpdateForTxid("tx-good-a"); u == nil || u.Status != models.StatusAcceptedByNetwork {
 		t.Errorf("tx-good-a: expected ACCEPTED_BY_NETWORK status update, got %+v", u)
@@ -1510,12 +1511,11 @@ func TestRegisterBatch_MarkStoreFailure_DoesNotBlockBroadcast(t *testing.T) {
 	}
 }
 
-// F-024 durability: a registration failure creates a PENDING_RETRY row so
-// the reaper picks the tx back up on its cadence — registration retries are
-// no longer the Kafka consumer's responsibility (which used to be coupled to
-// the per-message DLQ path). The reaper re-runs registerBatch before
-// rebroadcasting, so every broadcast is still preceded by a fresh register.
-func TestHandleMessage_MerkleFailure_PendingRetryRow(t *testing.T) {
+// In the dep-aware design there's no PENDING_RETRY queue and no
+// reaper: a merkle-service registration failure is terminal REJECTED.
+// The wallet sees a REJECTED row with the merkle-service error in
+// ExtraInfo and can resubmit if it chooses.
+func TestHandleMessage_MerkleFailure_WritesTerminalRejected(t *testing.T) {
 	merkleSrv := newMerkleServer(&eventLog{}, http.StatusInternalServerError)
 	defer merkleSrv.Close()
 
@@ -1526,14 +1526,18 @@ func TestHandleMessage_MerkleFailure_PendingRetryRow(t *testing.T) {
 	p := newPropagator(merkleSrv.URL, teranodeSrv.URL, ms)
 
 	if err := handleAndFlush(t, p, makePropMsg("tx-reg-fail")); err != nil {
-		t.Fatalf("expected handleAndFlush to succeed (failure routed to PENDING_RETRY), got: %v", err)
+		t.Fatalf("handleAndFlush: %v", err)
 	}
 
-	if ms.pendingRetryCount() != 1 {
-		t.Errorf("expected 1 PENDING_RETRY row, got %d", ms.pendingRetryCount())
+	if ms.pendingRetryCount() != 0 {
+		t.Errorf("expected 0 PENDING_RETRY rows in the dep-aware design, got %d", ms.pendingRetryCount())
 	}
-	if u := ms.lastUpdateForTxid("tx-reg-fail"); u == nil || u.Status != models.StatusPendingRetry {
-		t.Errorf("expected PENDING_RETRY status update, got %+v", u)
+	u := ms.lastUpdateForTxid("tx-reg-fail")
+	if u == nil || u.Status != models.StatusRejected {
+		t.Errorf("expected REJECTED status update, got %+v", u)
+	}
+	if u != nil && !strings.Contains(u.ExtraInfo, "merkle-service registration failed") {
+		t.Errorf("ExtraInfo should mention merkle-service failure, got %q", u.ExtraInfo)
 	}
 }
 
@@ -1668,13 +1672,11 @@ func TestSingleTransaction_Status202_NoStatusUpdate(t *testing.T) {
 	}
 }
 
-// TestNoVerdict_NoHealthyEndpoints_RoutesToRetry is the regression guard
-// for the 02:07 EDT incident: when zero healthy endpoints exist at fan-out
-// time, broadcastSingleOnce returns Status=nil and Acknowledged=false.
-// Old behavior left the tx stuck in RECEIVED forever (~1.6M txs during the
-// incident). New behavior routes it to PENDING_RETRY so the reaper can
-// re-try later or terminally reject after retry exhaustion.
-func TestNoVerdict_NoHealthyEndpoints_RoutesToRetry(t *testing.T) {
+// TestNoVerdict_NoHealthyEndpoints_TerminalRejected is the regression
+// guard for the "tx stuck in RECEIVED" scenario. In the dep-aware
+// design, no retry queue: when no peer is reachable, the tx writes a
+// terminal REJECTED row and the wallet can resubmit.
+func TestNoVerdict_NoHealthyEndpoints_TerminalRejected(t *testing.T) {
 	ms := newMockStore()
 
 	// teranode client with no endpoints → GetHealthyEndpoints returns empty
@@ -1688,8 +1690,12 @@ func TestNoVerdict_NoHealthyEndpoints_RoutesToRetry(t *testing.T) {
 		t.Fatalf("expected no error, got: %v", err)
 	}
 
-	if ms.pendingRetryCount() != 1 {
-		t.Fatalf("no_verdict tx must be queued for retry when no peer was reachable; pending=%d", ms.pendingRetryCount())
+	if ms.pendingRetryCount() != 0 {
+		t.Errorf("expected 0 PENDING_RETRY rows in the dep-aware design, got %d", ms.pendingRetryCount())
+	}
+	u := ms.lastUpdateForTxid("tx-stuck")
+	if u == nil || u.Status != models.StatusRejected {
+		t.Errorf("expected terminal REJECTED, got %+v", u)
 	}
 }
 
@@ -1776,103 +1782,12 @@ func newTeranodeServerWithError(errMsg string) *httptest.Server {
 	}))
 }
 
-// newTeranodeServerToggle fails N times with errMsg, then succeeds
-func newTeranodeServerToggle(failCount *atomic.Int32, maxFails int32, errMsg string) *httptest.Server {
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		n := failCount.Add(1)
-		if n <= maxFails {
-			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte(errMsg))
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-}
-
-// Retryable-error first broadcast writes a durable PENDING_RETRY row via the
-// new store API (BumpRetryCount + SetPendingRetryFields); reaper picks it up
-// and, on a successful rebroadcast, clears the retry state to ACCEPTED_BY_NETWORK.
-func TestRetry_MissingInputs_ThenReaperSuccess(t *testing.T) {
-	ms := newMockStore()
-	failCount := &atomic.Int32{}
-
-	// Fail enough times to exhaust the inline retry (1 + inlineRetryAttempts),
-	// so the tx lands in PENDING_RETRY; the reaper's rebroadcast then succeeds.
-	teranodeSrv := newTeranodeServerToggle(failCount, int32(1+inlineRetryAttempts), "missing inputs for tx")
-	defer teranodeSrv.Close()
-
-	// Speed up the inline retry delays for the test.
-	origDelay := inlineRetryDelay
-	inlineRetryDelay = 0
-	defer func() { inlineRetryDelay = origDelay }()
-
-	p := newPropagator("", teranodeSrv.URL, ms)
-
-	if err := handleAndFlush(t, p, makePropMsg("tx-retry")); err != nil {
-		t.Fatalf("flush error: %v", err)
-	}
-
-	if ms.pendingRetryCount() != 1 {
-		t.Fatalf("expected 1 durable pending retry row, got %d", ms.pendingRetryCount())
-	}
-	if ms.retryCounts["tx-retry"] != 1 {
-		t.Fatalf("expected retry_count=1 after first failure, got %d", ms.retryCounts["tx-retry"])
-	}
-
-	// Simulate enough time having elapsed for the reaper to consider the row ready.
-	ms.forceReady()
-	p.reapOnce(context.Background())
-
-	if ms.pendingRetryCount() != 0 {
-		t.Fatalf("expected pending retry row cleared after reaper success, got %d", ms.pendingRetryCount())
-	}
-	// Last transition should be ACCEPTED_BY_NETWORK (via ClearRetryState).
-	lastUpdate := ms.lastUpdateForTxid("tx-retry")
-	if lastUpdate == nil || lastUpdate.Status != models.StatusAcceptedByNetwork {
-		t.Fatalf("expected ACCEPTED_BY_NETWORK after reaper, got %+v", lastUpdate)
-	}
-}
-
-// Retryable error repeated until retry_count exceeds the configured max →
-// ClearRetryState(REJECTED, "broadcast retries exhausted"). Covers the
-// "don't loop forever" invariant that replaced the old retry-buffer-full path.
-func TestRetry_Exhausted_ClearsToRejected(t *testing.T) {
-	ms := newMockStore()
-
-	teranodeSrv := newTeranodeServerWithError("missing inputs for tx")
-	defer teranodeSrv.Close()
-
-	cfg := &config.Config{}
-	cfg.Propagation.MerkleConcurrency = 10
-	cfg.Propagation.RetryMaxAttempts = 2
-	cfg.Propagation.RetryBackoffMs = 1
-	tc := teranode.NewClient([]string{teranodeSrv.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
-	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, nil)
-
-	// Initial broadcast → PENDING_RETRY at retry_count=1.
-	if err := handleAndFlush(t, p, makePropMsg("tx-exhaust")); err != nil {
-		t.Fatalf("flush error: %v", err)
-	}
-
-	// Reaper fires; Teranode still failing → handleRetryableFailure bumps to 2.
-	ms.forceReady()
-	p.reapOnce(context.Background())
-
-	// One more reaper tick → retry_count becomes 3, exceeds max=2, REJECT.
-	ms.forceReady()
-	p.reapOnce(context.Background())
-
-	if ms.pendingRetryCount() != 0 {
-		t.Fatalf("expected no pending retries after exhaustion, got %d", ms.pendingRetryCount())
-	}
-	lastUpdate := ms.lastUpdateForTxid("tx-exhaust")
-	if lastUpdate == nil || lastUpdate.Status != models.StatusRejected {
-		t.Fatalf("expected REJECTED, got %+v", lastUpdate)
-	}
-	if !strings.Contains(lastUpdate.ExtraInfo, "broadcast retries exhausted") {
-		t.Fatalf("expected 'broadcast retries exhausted' in ExtraInfo, got %q", lastUpdate.ExtraInfo)
-	}
-}
+// Reaper-based retry tests previously covered the legacy
+// PENDING_RETRY → reaper rebroadcast flow. That flow is disabled in
+// the dep-aware design (failures are terminal REJECTED, no queue, no
+// reaper). The reaper code itself is preserved in-tree as inert
+// tooling; if it's ever re-enabled, the tests can be restored from
+// git history.
 
 // Non-retryable error on the first broadcast → immediate REJECTED via the
 // existing processBatch path (no PENDING_RETRY row is ever written).
