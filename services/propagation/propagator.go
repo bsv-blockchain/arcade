@@ -365,12 +365,10 @@ func (p *Propagator) handleTerminalForDeps(ctx context.Context, acceptedTxIDs, r
 		delete(p.inFlight, txid)
 	}
 	if len(released) > 0 {
+		// Released waiters were already in inFlight (added at admission
+		// time) — they just need to re-enter pendingMsgs so the next
+		// flushBatch picks them up.
 		p.pendingMsgs = append(p.pendingMsgs, released...)
-		// Add released waiters to inFlight so subsequent children see
-		// them as parents to wait on (same as the normal admit path).
-		for _, m := range released {
-			p.inFlight[m.TXID] = struct{}{}
-		}
 	}
 	p.mu.Unlock()
 
@@ -452,7 +450,12 @@ func (p *Propagator) persistCascadeRejections(ctx context.Context, txids []strin
 			ExtraInfo: "parent rejected",
 		}
 	}
-	if err := p.store.BatchUpdateStatus(ctx, statuses); err != nil {
+	// Uses BatchUpdateStatusReturning to match the existing
+	// applyTerminalStatuses path's store contract (returns previous
+	// rows; we discard them since cascaded children don't have a
+	// transition-age metric or per-row publish — the bulk publish
+	// below covers all of them in one event).
+	if _, err := p.store.BatchUpdateStatusReturning(ctx, statuses); err != nil {
 		p.logger.Warn(
 			"cascade rejection write failed",
 			zap.Int("count", len(txids)),
@@ -598,6 +601,11 @@ func (p *Propagator) handleMessage(_ context.Context, msg *kafka.Message) error 
 		return fmt.Errorf("propagation pending queue full (depth=%d, max=%d)", depth, p.maxPending)
 	}
 
+	// Track this txid as in-flight first so descendants arriving later
+	// see it as a parent regardless of whether it's admitted or held.
+	// Removed from inFlight only when the tx terminalizes.
+	p.inFlight[propMsg.TXID] = struct{}{}
+
 	// Dep-aware admission: if any of this tx's input txids are currently
 	// in flight, register the tx as a waiter and DO NOT add it to
 	// pendingMsgs. It enters the batch only after every in-flight parent
@@ -609,9 +617,6 @@ func (p *Propagator) handleMessage(_ context.Context, msg *kafka.Message) error 
 		return nil
 	}
 
-	// Track this txid as in-flight so any child arriving later sees it
-	// as a parent to wait on.
-	p.inFlight[propMsg.TXID] = struct{}{}
 	p.pendingMsgs = append(p.pendingMsgs, propMsg)
 	depth := len(p.pendingMsgs)
 	p.mu.Unlock()
