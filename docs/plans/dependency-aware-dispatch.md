@@ -1,6 +1,6 @@
 # Dependency-Aware Dispatch
 
-Plan to add parent-child dependency awareness to Arcade's broadcast pipeline so that transactions in the queue with parent-child relationships are sequenced correctly when sent to Teranode. The redesign also simplifies the pipeline: validation moves to intake, the `tx_validator` service is removed, PENDING_RETRY status and the reaper are removed, and retry state lives in the dispatcher's memory backed by Kafka replay for durability.
+Plan to add parent-child dependency awareness to Arcade's broadcast pipeline so that transactions in the queue with parent-child relationships are sequenced correctly when sent to Teranode. The redesign also simplifies the pipeline: validation moves to intake, the `tx_validator` service is removed, PENDING_RETRY status and the reaper are removed, and the dispatcher holds Kafka offsets in flight until each tx terminalizes so a crash replays everything that wasn't done.
 
 ## Problem
 
@@ -42,28 +42,28 @@ The dispatcher is a single goroutine reading from a single-partition Kafka topic
 
 - `inFlight` — set of txids currently being processed
 - `waiters` — map from parent txid to list of child txids waiting on it
-- `pendingParents` — map from child txid to set of parent txids it's still waiting on
-- `retryQueue` — map from txid to next-retry-time for txs awaiting backoff
-- `offsetHeap` — min-heap of Kafka offsets for in-flight txs
+- `heldMsgs` — map from child txid to the pending propagation message held until its parent terminalizes
+- `pendingMsgs` — the broadcast-ready slice that the next flush drains
+- `offsetTracker` — min-heap of Kafka offsets for in-flight txs (with lazy deletion)
 
 For each incoming message:
 1. Look up each `input_txid` in `inFlight`
-2. If any parent is in-flight, register the child as a waiter on each unmet parent and hold
-3. Otherwise add the child to the current pending batch
+2. If any parent is in-flight, register the child as a waiter on each unmet parent and hold in `heldMsgs`
+3. Otherwise add to `pendingMsgs` and record the offset on the tracker
 
-On terminal status flips (received via the dispatcher's input channel from broadcast workers and the merkle-service callback handler):
-- `ACCEPTED_BY_NETWORK`: pop the txid's waiters; for each waiter, decrement `pendingParents`. If empty, release the waiter to the pending batch.
-- `REJECTED`: pop the txid's waiters; mark each waiter REJECTED with a parent-rejected reason; recurse using each waiter as a new parent for further cascade.
+On terminal status events (sent via channel from broadcast workers and the merkle-service callback handler):
+- `ACCEPTED_BY_NETWORK`: pop the txid from `inFlight`, mark its offset `Done` on the tracker, release any waiters that no longer have an in-flight parent.
+- `REJECTED`: pop the txid from `inFlight`, mark its offset `Done`, walk waiters/`heldMsgs` for the cascade subtree, write terminal REJECTED rows for every cascaded descendant, mark their offsets `Done` too.
 
-On retryable failures (genuine transient infra errors, network failures, or `ErrTxMissingParent` from Teranode):
-- Add the txid to `retryQueue` with `nextRetryAt = now + backoff`
-- A timer goroutine in the dispatcher wakes when the soonest retry is due and re-dispatches the tx to broadcast workers
+Infra failures (Teranode 500, no-peer-reachable, merkle-service /watch failure) are NOT terminal status events — the broadcast worker retries inline (see "Retry handling"). The offset stays alive on the tracker for the entire retry loop, so the Kafka commit watermark cannot advance past a stuck tx.
 
 ### Batching
 
-Batching remains. The dispatcher accumulates eligible transactions into a pending batch and flushes when batch size reaches `teranodeBatchCap` or a short timer expires. Within a flushed batch, parent and child can coexist — Teranode serializes their processing internally. The dispatcher only holds back children whose parents are in a different in-flight batch.
+Batching remains. The dispatcher accumulates eligible transactions into `pendingMsgs` and flushes when batch size reaches `teranodeBatchCap` or a short timer expires.
 
-Broadcast workers consume flushed batches and post to Teranode in parallel. The existing per-tx fallback (when a `/txs` batch returns all-rejected, fall back to per-tx `/tx` calls) is preserved — it's how the dispatcher gets per-tx status outcomes that a batch response can't provide.
+Children of in-flight parents are never co-batched with their parent — held in `heldMsgs` until the parent terminalizes (Teranode is moving to parallel-process `/txs` per [bsv-blockchain/teranode#879](https://github.com/bsv-blockchain/teranode/pull/879), so an in-batch parent-child pair is no longer safe).
+
+Broadcast workers consume flushed batches and post to Teranode in parallel via `/txs`. The per-tx `/tx` fallback is removed — with [bsv-blockchain/teranode#879](https://github.com/bsv-blockchain/teranode/pull/879) and [bsv-blockchain/teranode#881](https://github.com/bsv-blockchain/teranode/pull/881), the `/txs` response itself carries per-slot status (`"OK"` or `"<TERANODE_CODE> (<num>)"` in submission order) and arcade parses those lines for per-tx classification directly.
 
 ### Single partition
 
@@ -73,38 +73,61 @@ Throughput is bounded by what a single goroutine can do for dispatch decisions. 
 
 ### Offset commit policy
 
-The dispatcher tracks Kafka offsets for in-flight transactions in a min-heap. When a transaction reaches terminal status, its offset is popped. The Kafka commit offset is the current minimum, meaning we never advance past unfinished work. Commits are batched every few hundred milliseconds rather than per-message to keep API overhead bounded.
+The dispatcher tracks Kafka offsets for in-flight transactions in an `offsetTracker` (min-heap with lazy deletion). On admission, the offset is added. On terminal status (accepted, real rejection, or cascade rejection), it's marked done.
 
-On restart, replay starts from the last committed offset and the dep index rebuilds as messages flow through the dispatcher again — same code path as live operation. The retry queue rebuilds the same way: a tx in the in-flight set that hasn't terminalized will re-enter via replay.
+`kafka/consumer.go` is modified to stop marking each message immediately after the handler returns. Instead a separate goroutine in the propagator ticks every 200ms, asks the dispatcher for the current `LowestUnfinished`, and tells the consumer to mark every pending message at or below that offset. The Kafka commit position therefore never advances past unfinished work; held children, in-flight broadcasts, and retrying-forever txs all pin the watermark to their offset.
+
+On restart, replay starts from the last committed offset and the dep index rebuilds as messages flow through the dispatcher again — same code path as live operation. A tx that was held or in-flight when the process crashed re-enters the same flow on consume.
 
 ### Retry handling
 
-PENDING_RETRY status and the reaper go away. Retries live in the dispatcher's memory:
+PENDING_RETRY status and the reaper go away. Infrastructure failures retry forever; the mechanism differs by failure mode because merkle-service is binary while Teranode is per-tx.
 
-- Retryable broadcast failure → add to `retryQueue` with backoff
-- Timer wakes when next retry is due → re-dispatch to broadcast workers
-- Each retry bumps an attempt counter; once it exceeds the max, the tx flips to terminal REJECTED with reason "broadcast retries exhausted"
+**Merkle-service `/watch` failure — inline retry, whole batch.** `registerBatch` sleeps with capped-exponential backoff and retries the whole batch. The merkle-service `/watch` payload's only per-tx variation is the txid string — a failure is always all-or-nothing, so splitting buys nothing. The `processBatch` goroutine holds a `processBatchSem` slot during the retry loop, which is the natural backpressure we want: once all slots are held, the consumer stops pulling new work.
 
-Durability comes from Kafka replay: a tx in retry has not committed its offset, so a restart re-processes it. Worst case, retry state (attempt count, next-retry-time) resets to zero on restart, which means a tx might get more retry attempts than intended after a crash. Acceptable trade-off for losing the entire PENDING_RETRY apparatus.
+Backoff: **100ms → 500ms → 2s → 5s → 10s, then 10s steady, retrying forever**.
+
+**Teranode `/txs` per-slot infra failures — requeue individually, short flat wait.** With #879 + #881, the `/txs` response delivers per-slot Teranode codes. `broadcastInChunks` walks the per-slot lines and partitions them:
+
+- `"OK"` → terminalize as `ACCEPTED_BY_NETWORK`.
+- Terminal Teranode code (`TX_INVALID (31)`, `TX_CONFLICTING (36)`, `UTXO_FROZEN (72)`, etc.) → terminalize as `REJECTED`, cascade as before.
+- Infra-classified code (e.g. `PROCESSING (4)`) → infra slot.
+
+For infra slots, the processBatch goroutine waits a short flat period (a few seconds), then sends a requeue event to the dispatcher with the original propagation messages. The dispatcher re-runs admission on each — if the tx's parents are still in-flight, it goes back to `heldMsgs`; otherwise it goes back to `pendingMsgs`. The offset stays pinned the whole time (the slot never terminalized, so the tracker never marked it `Done`).
+
+A batch-level HTTP 500 with no parseable body is treated as every-slot-infra: every tx in the batch is requeued.
+
+**No healthy endpoints / no peer reachable** — same as Teranode infra: requeue every tx in the batch.
+
+No attempt counter, no exhaustion, no terminal REJECTED for infra failures. If merkle-service or Teranode is genuinely down, arcade is correctly stuck — broadcasting without `/watch` registration breaks F-024, and there is no useful work the propagator can do until upstream recovers. Each retry attempt is logged so an operator monitoring the service sees the upstream is unhealthy.
+
+The Kafka offset tracker keeps the watermark pinned to the earliest stuck tx so a restart replays everything that wasn't terminalized.
+
+Real per-tx rejections from Teranode are terminal — the tx is genuinely invalid and retrying won't change that. `ErrTxExists` (returned as 200 OK by Teranode) is success. Cascade-rejection of children of a real-rejected parent continues as before.
+
+API resubmission of a tx whose row already exists falls through the intake's dedup CAS and returns the current status (no special handling for retry-stuck txs).
 
 ### Mining and merkle-service callbacks
 
 The merkle-service callback path is unchanged. `SEEN_ON_NETWORK`, `SEEN_MULTIPLE_NODES`, `STUMP`, and `BLOCK_PROCESSED` continue to land at the existing HTTP callback endpoint and write directly to the status store. The callback handler additionally pushes status flips onto the dispatcher's input channel so the dep index can release or cascade waiters as appropriate.
 
-### Retry classification
+### Result classification
 
-Arcade's retry classification is driven by Teranode's HTTP status code, not by string-matching the error body:
+With #879 + #881, Teranode `/txs` returns one of:
 
-- 422 (Unprocessable Entity, emitted for `ErrTxMissingParent`) → retryable, add to retry queue
-- 500 → terminal REJECTED (real infra failure that's not recoverable per-tx)
-- 400 / 403 / 409 → terminal REJECTED
-- 200 → ACCEPTED_BY_NETWORK (includes the duplicate-submit / `ErrTxExists` case, which Teranode returns as 200 since the tx is already in its UTXO store)
-- 202 → in-flight, awaiting merkle-service callback
-- No response at all (network error, timeout) → retryable, add to retry queue
+- HTTP 200 + body `"OK"` → every tx in the batch was accepted. Every slot is `ACCEPTED_BY_NETWORK`.
+- HTTP 500 + body containing per-slot lines → at least one tx had an error. Each line is either `"OK"` (slot succeeded) or `"<NAME> (<num>)"` (slot failed with that Teranode error code).
+- HTTP 500 + no body (or unparseable body) → batch-level server failure. Retry forever, infra failure.
 
-Mempool-conflict is terminal REJECTED — wallets resolve it, not Arcade.
+Per-slot Teranode codes are bucketed:
 
-The status-code audit on the Teranode side (bsv-blockchain/teranode#870) landed the 422 mapping for `ErrTxMissingParent` and the 200 mapping for `ErrTxExists`. The existing string-match in [`IsRetryableError`](../../services/propagation/retryable.go) is removed in favor of a `statusCode`-driven switch in the same call site.
+- `ACCEPTED_BY_NETWORK` — slot returned `"OK"` (including `ErrTxExists`/`TX_EXISTS (33)`, which Teranode treats as success).
+- **Terminal REJECTED** — `TX_INVALID (31)`, `TX_INVALID_DOUBLE_SPEND (32)`, `TX_CONFLICTING (36)`, `TX_LOCKED (37)`, `TX_LOCK_TIME (35)`, `TX_POLICY (39)`, `TX_COINBASE_IMMATURE (38)`, `TX_MISSING_PARENT (34)`, `UTXO_FROZEN (72)`, `UTXO_SPENT (70)`, `UTXO_NON_FINAL (71)`, `UTXO_INVALID_SIZE (...)`, `INVALID_ARGUMENT (1)`. These are real per-tx rejections; cascade walks waiters.
+- **Infra retry** — batch-level 500 with no per-slot info, network/timeout, or any per-slot line that classifies as infra (e.g. `PROCESSING (4)` from the default branch).
+
+`TX_MISSING_PARENT (34)` is terminal in this design — dep-aware dispatch already gated children on in-flight parents, so a missing-parent rejection from Teranode means a parent that arcade doesn't know about. Wallets resolve it.
+
+Single-tx `/tx` returns the same Teranode code in the response body when there's an error, with the HTTP status mirroring the classification (400/403/409/422/500). Arcade keeps the per-tx `/tx` path for non-batch use cases but the `/txs` failure path no longer falls back to it.
 
 ## Message format
 
@@ -134,12 +157,23 @@ Single coordinated deploy. The new code does not coexist with the old: there's n
 
 Single binary deploy with the new code. The new code:
 
-- Creates and uses a new propagation topic (name TBD, e.g. `TopicPropagationV2`) with one partition
+- Uses a single-partition propagation topic
 - Performs all intake work synchronously, including validation
-- Runs the new dispatcher in place of the old propagator's parallel consumer pool
-- Maintains retry queue in memory; no reaper, no PENDING_RETRY
+- Runs the dispatcher inside the propagator (single state-owning goroutine, channel-fed) in place of the old parallel consumer pool
+- Defers Kafka offset commits to a watermark driven by the dispatcher's `offsetTracker`
+- Retries infrastructure failures inline, forever, with bounded backoff; no reaper, no PENDING_RETRY
+- Parses Teranode `/txs` per-slot response for per-tx classification (no per-tx `/tx` fallback)
 
-The old `TopicTransaction` and original `TopicPropagation` topics can be deleted after deploy.
+The old `TopicTransaction` and any prior PENDING_RETRY rows can be cleaned up after deploy.
+
+### Dependencies
+
+This plan depends on two upstream Teranode PRs:
+
+- [bsv-blockchain/teranode#879](https://github.com/bsv-blockchain/teranode/pull/879) — `/txs` processes the batch concurrently with per-submission slots.
+- [bsv-blockchain/teranode#881](https://github.com/bsv-blockchain/teranode/pull/881) — `/txs` response body emits per-slot lines in submission order so arcade can attribute results to specific txids. Also unifies the single-tx and batch error format on Teranode error codes (`"NAME (num)"`).
+
+The arcade-side parsing in `teranode/client.go` is written against the post-#881 format. If #881 isn't merged at deploy time, the parsing falls back to treating the batch result as binary (any 500 → retry), which is degraded but not broken.
 
 ## Install base note
 
