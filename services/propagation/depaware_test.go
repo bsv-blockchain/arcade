@@ -60,7 +60,7 @@ func drainSet(p *Propagator) map[string]bool {
 // optimization: a parent and its child both arrive before the next
 // flush. Both end up in the same broadcast batch — Teranode handles
 // the dependency ordering inside its /txs POST.
-func TestHandleMessage_SameBatchAdmission(t *testing.T) {
+func TestHandleMessage_HoldsChildWhenParentInFlight(t *testing.T) {
 	ms := newMockStore()
 	p, cancel := newPropagatorForDepTest(t, ms)
 	defer cancel()
@@ -76,8 +76,8 @@ func TestHandleMessage_SameBatchAdmission(t *testing.T) {
 	if !pending["parent"] {
 		t.Errorf("parent should be in pending batch, got %v", pending)
 	}
-	if !pending["child"] {
-		t.Errorf("child SHOULD be in pending batch (parent in same batch, Teranode handles order); got %v", pending)
+	if pending["child"] {
+		t.Errorf("child should be HELD while parent is in-flight (Teranode parallel processing forbids same-batch parent+child); got %v", pending)
 	}
 }
 
@@ -190,12 +190,12 @@ func TestApplyTerminalStatuses_CascadesRejectedChildren(t *testing.T) {
 	}
 }
 
-// TestCascadeRelease_DeepChain verifies that a release at the top of
-// a held chain propagates downward in a single terminal event. After
-// grandparent ACCEPTED, both parent (held on grandparent) and child
-// (held on parent) re-enter the pending batch together — they'll
-// broadcast in the same /txs POST on the next flush.
-func TestCascadeRelease_DeepChain(t *testing.T) {
+// TestSequentialReleaseDeepChain verifies that a held chain releases
+// one link at a time. Under Teranode's parallel bulk processing,
+// parent and child can't share a batch — so when grandparent
+// ACCEPTED, only parent (one level down) releases. Child stays held
+// on parent until parent ACCEPTED in its own batch.
+func TestSequentialReleaseDeepChain(t *testing.T) {
 	ms := newMockStore()
 	p, cancel := newPropagatorForDepTest(t, ms)
 	defer cancel()
@@ -208,8 +208,6 @@ func TestCascadeRelease_DeepChain(t *testing.T) {
 	if err := p.handleMessage(context.Background(), consumerMsg(makePropMsgWithParents("parent", []string{"grandparent"}))); err != nil {
 		t.Fatalf("parent admit: %v", err)
 	}
-	// parent is held (grandparent in different batch). child of parent
-	// must also hold (parent is in inFlight but not in inPending).
 	if err := p.handleMessage(context.Background(), consumerMsg(makePropMsgWithParents("child", []string{"parent"}))); err != nil {
 		t.Fatalf("child admit: %v", err)
 	}
@@ -217,6 +215,8 @@ func TestCascadeRelease_DeepChain(t *testing.T) {
 		t.Fatalf("parent and child should both be held; got %v", got)
 	}
 
+	// grandparent ACCEPTED — releases parent only. Child still held
+	// because parent is still in-flight (just queued for broadcast).
 	p.applyTerminalStatuses(context.Background(), []*models.TransactionStatus{
 		{TxID: "grandparent", Status: models.StatusAcceptedByNetwork, Timestamp: time.Now()},
 	}, 1, 0)
@@ -225,8 +225,18 @@ func TestCascadeRelease_DeepChain(t *testing.T) {
 	if !got["parent"] {
 		t.Errorf("parent should release after grandparent ACCEPTED; got %v", got)
 	}
+	if got["child"] {
+		t.Errorf("child should NOT release yet — parent still in-flight; got %v", got)
+	}
+
+	// parent ACCEPTED in its own batch — now child can release.
+	p.applyTerminalStatuses(context.Background(), []*models.TransactionStatus{
+		{TxID: "parent", Status: models.StatusAcceptedByNetwork, Timestamp: time.Now()},
+	}, 1, 0)
+
+	got = drainSet(p)
 	if !got["child"] {
-		t.Errorf("child should cascade-release after parent enters inPending; got %v", got)
+		t.Errorf("child should release after parent ACCEPTED; got %v", got)
 	}
 }
 

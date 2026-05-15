@@ -674,9 +674,9 @@ func (s *Server) persistRejectedAtIntake(ctx context.Context, txid, reason strin
 // Mirrors handleSubmitTransaction's intake pipeline (parse → validate →
 // dedup CAS → publish to TopicPropagation) for each tx in the batch. The
 // publish is a single SendBatch so all txs in one HTTP request hit the
-// in-memory broker as one fan-out, preserving in-batch order. Each tx
-// carries its input_txids so the propagation dispatcher can co-batch
-// parents and children submitted together.
+// in-memory broker as one fan-out. Each tx carries its input_txids so
+// the propagation dispatcher can detect parent-child relationships and
+// hold children until their parents have terminalized.
 func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	if !strings.Contains(c.ContentType(), "octet-stream") {
 		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "Content-Type must be application/octet-stream"})
@@ -796,8 +796,8 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	}
 
 	// Phase 4: build propagation envelopes and publish as one batch.
-	// input_txids lets the dispatcher co-batch parents and children
-	// submitted together (Teranode handles intra-batch ordering).
+	// input_txids drives the dispatcher's dep-aware admission — children
+	// of any in-flight parent are held until the parent terminalizes.
 	if len(toPublish) > 0 {
 		msgs := make([]kafka.KeyValue, 0, len(toPublish))
 		for _, p := range toPublish {
