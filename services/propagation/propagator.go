@@ -439,6 +439,15 @@ func (p *Propagator) Start(ctx context.Context) error {
 		go p.runBroadcastWorker()
 	}
 
+	// Independent flush ticker. The Kafka consumer wrapper has its own
+	// flush hook, but it shares a goroutine with the consumer's drain
+	// loop — if handleMessage blocks on the dispatcher's admitCh
+	// (when pending is at cap), the wrapper can't call flushBatch
+	// itself. This goroutine runs on its own clock so the
+	// pause-Kafka-consumption backpressure pattern resolves within
+	// one tick.
+	go p.runFlushTicker(ctx)
+
 	// Kick off the durable-retry reaper alongside the Kafka consumer. It owns
 	// all rebroadcast work for PENDING_RETRY rows, decoupled from the incoming
 	// message flush cycle so a retry storm can't starve live traffic.
@@ -466,6 +475,27 @@ func (p *Propagator) Start(ctx context.Context) error {
 // pipelines before tearing down the broadcast worker pool.
 func (p *Propagator) WaitForBatches() {
 	p.inflightBatches.Wait()
+}
+
+// runFlushTicker periodically calls flushBatch on its own goroutine,
+// independent of the Kafka consumer wrapper. The wrapper has a flush
+// hook of its own but shares the consumer goroutine; if handleMessage
+// blocks on the dispatcher's admitCh (pending at cap), the wrapper
+// can't trigger its own flush. This goroutine guarantees flushes keep
+// happening regardless of the consumer's state, so the "pause Kafka
+// consumption when pending is full" backpressure pattern resolves
+// itself within one tick.
+func (p *Propagator) runFlushTicker(ctx context.Context) {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_ = p.flushBatch(ctx)
+		}
+	}
 }
 
 func (p *Propagator) Stop() error {
