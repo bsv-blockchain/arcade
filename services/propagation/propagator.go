@@ -448,10 +448,12 @@ func (p *Propagator) Start(ctx context.Context) error {
 	// one tick.
 	go p.runFlushTicker(ctx)
 
-	// Kick off the durable-retry reaper alongside the Kafka consumer. It owns
-	// all rebroadcast work for PENDING_RETRY rows, decoupled from the incoming
-	// message flush cycle so a retry storm can't starve live traffic.
-	go p.runReaper(ctx)
+	// Reaper goroutine intentionally NOT started. In the dep-aware
+	// design we don't queue PENDING_RETRY rows — failed broadcasts
+	// terminate as REJECTED. The reaper code stays in the source
+	// tree as preserved tooling but doesn't run. The reference
+	// below keeps the linter from flagging runReaper as unused.
+	_ = p.runReaper
 
 	// Replay in-flight registrations to merkle-service. One-shot; exits on
 	// its own. Compensates for /watch state loss on the merkle-service side
