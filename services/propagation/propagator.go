@@ -182,11 +182,7 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 	}
 	maxPending := cfg.Propagation.MaxPending
 	if maxPending <= 0 {
-		// 1M entries at ~500 bytes per propagationMsg ≈ 500 MB for the
-		// pending slice alone, well within the 8-16 GB envelope we
-		// target for dep-aware deployments. Operator config override
-		// available via propagation.max_pending.
-		maxPending = 1_000_000
+		maxPending = 50000
 	}
 	maxConcurrentBatches := cfg.Propagation.MaxConcurrentBatches
 	if maxConcurrentBatches <= 0 {
