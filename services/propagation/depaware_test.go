@@ -139,8 +139,10 @@ func TestApplyTerminalStatuses_CascadesRejectedChildren(t *testing.T) {
 		t.Errorf("cascaded descendants should NOT enter pending batch; got %v", pending)
 	}
 
-	// Cascaded descendants DO get terminal REJECTED rows written with
-	// the original ancestor's rejection reason threaded through.
+	// Cascaded descendants DO get terminal REJECTED rows written. The
+	// reason is always "parent rejected" — the descendants didn't
+	// fail for any reason of their own. The parent's actual cause
+	// stays on the parent's row.
 	ms.mu.Lock()
 	rejected := map[string]string{}
 	for _, st := range ms.updates {
@@ -152,11 +154,10 @@ func TestApplyTerminalStatuses_CascadesRejectedChildren(t *testing.T) {
 	if len(rejected) != 2 {
 		t.Errorf("expected 2 cascade-rejection rows (child + grandchild), got %d: %v", len(rejected), rejected)
 	}
-	if rejected["child"] != "bad parent" {
-		t.Errorf("child rejection reason should be threaded from parent (\"bad parent\"), got %q", rejected["child"])
-	}
-	if rejected["grandchild"] != "bad parent" {
-		t.Errorf("grandchild rejection reason should be threaded from parent (\"bad parent\"), got %q", rejected["grandchild"])
+	for txid, reason := range rejected {
+		if reason != "parent rejected" {
+			t.Errorf("%s ExtraInfo should be \"parent rejected\", got %q", txid, reason)
+		}
 	}
 }
 

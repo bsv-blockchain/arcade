@@ -50,13 +50,10 @@ type admitRequest struct {
 
 // terminalEvent is the protocol between applyTerminalStatuses and the
 // dispatcher goroutine. status is the just-applied terminal status of
-// txid; reason carries the rejection reason for the REJECTED case so
-// cascaded descendants can attribute their own rejection back to the
-// original cause.
+// txid.
 type terminalEvent struct {
 	txid   string
 	status models.Status
-	reason string
 	reply  chan terminalResult
 }
 
@@ -65,16 +62,14 @@ type terminalEvent struct {
 // parent just terminalized ACCEPTED) are NOT returned — the
 // dispatcher re-enters them into pendingMsgs directly, so the
 // next flushBatch picks them up without any caller action.
+//
+// Cascaded descendants don't carry the parent's rejection reason
+// down — the parent's actual cause is the parent's concern, not the
+// child's. From the child's perspective the only useful "why" is
+// "parent rejected"; the caller writes that as the ExtraInfo when
+// persisting the row.
 type terminalResult struct {
-	cascaded []cascadedRejection
-}
-
-// cascadedRejection pairs a cascaded txid with the reason from the
-// ancestor that originally caused the rejection. The caller writes
-// these as REJECTED rows with ExtraInfo populated.
-type cascadedRejection struct {
-	txid   string
-	reason string
+	cascaded []string
 }
 
 // drainRequest is the protocol between flushBatch and the dispatcher.
@@ -240,7 +235,7 @@ func handleTerminal(
 
 	case models.StatusRejected:
 		return terminalResult{
-			cascaded: cascadeReject(ev.txid, ev.reason, inFlight, waiters, pendingParents, heldMsgs),
+			cascaded: cascadeReject(ev.txid, inFlight, waiters, pendingParents, heldMsgs),
 		}
 
 	default:
@@ -284,19 +279,17 @@ func releaseWaiters(
 
 // cascadeReject walks the dep graph from rejectedTxID forward and
 // returns every descendant that should be terminally rejected. The
-// reason carried in from the originally-rejected ancestor is propagated
-// to every cascaded descendant so the eventual REJECTED row's
-// ExtraInfo records the actual cause, not a generic "parent rejected"
-// string.
+// caller writes a REJECTED row for each, with "parent rejected" as
+// the ExtraInfo — the descendants didn't fail for any reason of
+// their own, only because an ancestor did.
 func cascadeReject(
 	rejectedTxID string,
-	reason string,
 	inFlight map[string]struct{},
 	waiters map[string]map[string]struct{},
 	pendingParents map[string]map[string]struct{},
 	heldMsgs map[string]propagationMsg,
-) []cascadedRejection {
-	var cascaded []cascadedRejection
+) []string {
+	var cascaded []string
 	queue := []string{rejectedTxID}
 	for len(queue) > 0 {
 		parent := queue[0]
@@ -310,7 +303,7 @@ func cascadeReject(
 			delete(pendingParents, child)
 			delete(heldMsgs, child)
 			delete(inFlight, child)
-			cascaded = append(cascaded, cascadedRejection{txid: child, reason: reason})
+			cascaded = append(cascaded, child)
 			queue = append(queue, child)
 		}
 	}
@@ -336,9 +329,9 @@ func (p *Propagator) admitToDispatcher(msg propagationMsg) admitResult {
 // notifyTerminalToDispatcher is the post-broadcast helper. Tells the
 // dispatcher the txid reached terminal status, returns the cascaded
 // descendants (caller writes REJECTED rows for them).
-func (p *Propagator) notifyTerminalToDispatcher(txid string, status models.Status, reason string) terminalResult {
+func (p *Propagator) notifyTerminalToDispatcher(txid string, status models.Status) terminalResult {
 	reply := make(chan terminalResult, 1)
-	p.terminalCh <- terminalEvent{txid: txid, status: status, reason: reason, reply: reply}
+	p.terminalCh <- terminalEvent{txid: txid, status: status, reply: reply}
 	return <-reply
 }
 

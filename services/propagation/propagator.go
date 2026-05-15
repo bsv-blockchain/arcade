@@ -305,7 +305,6 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 
 	acceptedTxIDs := make([]string, 0, accepted)
 	rejectedTxIDs := make([]string, 0, rejected)
-	rejectedReasons := make(map[string]string, rejected)
 	now := time.Now()
 	for i, st := range terminalStatuses {
 		var prev *models.TransactionStatus
@@ -331,7 +330,6 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 			acceptedTxIDs = append(acceptedTxIDs, st.TxID)
 		case models.StatusRejected:
 			rejectedTxIDs = append(rejectedTxIDs, st.TxID)
-			rejectedReasons[st.TxID] = st.ExtraInfo
 		default:
 			// processBatch only routes ACCEPTED_BY_NETWORK and REJECTED
 			// terminal statuses into this slice; other statuses are
@@ -347,14 +345,15 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 	// releases waiters via the dispatcher itself (no caller action
 	// needed — released msgs are appended directly to the
 	// dispatcher's pendingMsgs). REJECTED returns cascaded
-	// descendants we write REJECTED rows for, with the same
-	// rejection reason threaded through.
-	var allCascaded []cascadedRejection
+	// descendants we write REJECTED rows for; the cascade reason is
+	// always "parent rejected" regardless of the parent's actual
+	// cause — see persistCascadeRejections.
+	var allCascaded []string
 	for _, txid := range acceptedTxIDs {
-		p.notifyTerminalToDispatcher(txid, models.StatusAcceptedByNetwork, "")
+		p.notifyTerminalToDispatcher(txid, models.StatusAcceptedByNetwork)
 	}
 	for _, txid := range rejectedTxIDs {
-		r := p.notifyTerminalToDispatcher(txid, models.StatusRejected, rejectedReasons[txid])
+		r := p.notifyTerminalToDispatcher(txid, models.StatusRejected)
 		allCascaded = append(allCascaded, r.cascaded...)
 	}
 	if len(allCascaded) > 0 {
@@ -368,26 +367,25 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 // Best-effort: a store write failure is logged but doesn't undo the
 // in-memory cascade state (the dispatcher has already terminalized
 // them; we'd be reconciling at restart via Kafka replay anyway).
-func (p *Propagator) persistCascadeRejections(ctx context.Context, rejections []cascadedRejection, now time.Time) {
-	statuses := make([]*models.TransactionStatus, len(rejections))
-	txids := make([]string, len(rejections))
-	for i, r := range rejections {
-		reason := r.reason
-		if reason == "" {
-			reason = "parent rejected"
-		}
+func (p *Propagator) persistCascadeRejections(ctx context.Context, txids []string, now time.Time) {
+	statuses := make([]*models.TransactionStatus, len(txids))
+	for i, txid := range txids {
 		statuses[i] = &models.TransactionStatus{
-			TxID:      r.txid,
+			TxID:      txid,
 			Status:    models.StatusRejected,
 			Timestamp: now,
-			ExtraInfo: reason,
+			// "parent rejected" is the only structural reason that
+			// applies to a cascaded child — it didn't fail for any
+			// reason of its own. The parent's actual cause lives on
+			// the parent's row; downstream consumers can correlate
+			// via the dep graph if they care.
+			ExtraInfo: "parent rejected",
 		}
-		txids[i] = r.txid
 	}
 	if _, err := p.store.BatchUpdateStatusReturning(ctx, statuses); err != nil {
 		p.logger.Warn(
 			"cascade rejection write failed",
-			zap.Int("count", len(rejections)),
+			zap.Int("count", len(txids)),
 			zap.Error(err),
 		)
 	}
