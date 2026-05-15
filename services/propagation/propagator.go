@@ -56,15 +56,15 @@ type Propagator struct {
 	merkleClient   *merkleservice.Client
 	consumer       *kafka.ConsumerGroup
 
-	mu          sync.Mutex
-	pendingMsgs []propagationMsg
-	maxPending  int
-	// admitCh and terminalCh are the dispatcher goroutine's input
-	// channels. The dispatcher owns all dep-index state (inFlight,
-	// waiters, pendingParents, heldMsgs) inside its goroutine — no
-	// shared maps, no locks. See dispatcher.go for the protocol.
+	maxPending int
+	// admitCh, terminalCh, and drainCh are the dispatcher goroutine's
+	// input channels. The dispatcher owns ALL dep-aware state —
+	// inFlight, waiters, pendingParents, heldMsgs, AND pendingMsgs —
+	// inside its goroutine. No shared maps, no shared slice, no
+	// mutex. See dispatcher.go for the protocol.
 	admitCh           chan admitRequest
 	terminalCh        chan terminalEvent
+	drainCh           chan drainRequest
 	dispatcherCancel  context.CancelFunc
 	merkleConcurrency int
 	retryMaxAttempts  int
@@ -182,7 +182,11 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 	}
 	maxPending := cfg.Propagation.MaxPending
 	if maxPending <= 0 {
-		maxPending = 50000
+		// 1M entries at ~500 bytes per propagationMsg ≈ 500 MB for the
+		// pending slice alone, well within the 8-16 GB envelope we
+		// target for dep-aware deployments. Operator config override
+		// available via propagation.max_pending.
+		maxPending = 1_000_000
 	}
 	maxConcurrentBatches := cfg.Propagation.MaxConcurrentBatches
 	if maxConcurrentBatches <= 0 {
@@ -220,15 +224,16 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 		processBatchSem:   make(chan struct{}, maxConcurrentBatches),
 		admitCh:           make(chan admitRequest, dispatcherChannelBuffer),
 		terminalCh:        make(chan terminalEvent, dispatcherChannelBuffer),
+		drainCh:           make(chan drainRequest),
 	}
-	// Start the dispatcher goroutine here (not in Start) so the
-	// existing tests — which construct via New and call handleMessage
-	// directly without invoking Start — also get a running dispatcher.
-	// Stop cancels the context; tests that bypass Stop just leak the
+	// Start the dispatcher goroutine here (not in Start) so existing
+	// tests that construct via New and call handleMessage directly —
+	// without invoking Start — still have a running dispatcher. Stop
+	// cancels the context; tests that bypass Stop just leak the
 	// goroutine for the test process lifetime, which is fine.
 	dispatcherCtx, dispatcherCancel := context.WithCancel(context.Background())
 	p.dispatcherCancel = dispatcherCancel
-	go p.runDispatcher(dispatcherCtx)
+	go p.runDispatcher(dispatcherCtx, dispatcherConfig{maxPending: maxPending})
 	return p
 }
 
@@ -300,6 +305,7 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 
 	acceptedTxIDs := make([]string, 0, accepted)
 	rejectedTxIDs := make([]string, 0, rejected)
+	rejectedReasons := make(map[string]string, rejected)
 	now := time.Now()
 	for i, st := range terminalStatuses {
 		var prev *models.TransactionStatus
@@ -325,6 +331,7 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 			acceptedTxIDs = append(acceptedTxIDs, st.TxID)
 		case models.StatusRejected:
 			rejectedTxIDs = append(rejectedTxIDs, st.TxID)
+			rejectedReasons[st.TxID] = st.ExtraInfo
 		default:
 			// processBatch only routes ACCEPTED_BY_NETWORK and REJECTED
 			// terminal statuses into this slice; other statuses are
@@ -337,26 +344,18 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 	p.publishBulkStatus(ctx, models.StatusRejected, rejectedTxIDs, now)
 
 	// Notify the dispatcher of every terminal status flip. ACCEPTED
-	// releases waiters whose parent set is now empty (we re-enter them
-	// into pendingMsgs so the next flushBatch picks them up). REJECTED
-	// recursively cascades through descendants — we write a terminal
-	// REJECTED row and emit a bulk publish for the cascaded set.
-	var allReleased []propagationMsg
-	var allCascaded []string
+	// releases waiters via the dispatcher itself (no caller action
+	// needed — released msgs are appended directly to the
+	// dispatcher's pendingMsgs). REJECTED returns cascaded
+	// descendants we write REJECTED rows for, with the same
+	// rejection reason threaded through.
+	var allCascaded []cascadedRejection
 	for _, txid := range acceptedTxIDs {
-		r := p.notifyTerminalToDispatcher(txid, models.StatusAcceptedByNetwork, "")
-		allReleased = append(allReleased, r.released...)
-		allCascaded = append(allCascaded, r.cascaded...)
+		p.notifyTerminalToDispatcher(txid, models.StatusAcceptedByNetwork, "")
 	}
 	for _, txid := range rejectedTxIDs {
-		r := p.notifyTerminalToDispatcher(txid, models.StatusRejected, "")
-		allReleased = append(allReleased, r.released...)
+		r := p.notifyTerminalToDispatcher(txid, models.StatusRejected, rejectedReasons[txid])
 		allCascaded = append(allCascaded, r.cascaded...)
-	}
-	if len(allReleased) > 0 {
-		p.mu.Lock()
-		p.pendingMsgs = append(p.pendingMsgs, allReleased...)
-		p.mu.Unlock()
 	}
 	if len(allCascaded) > 0 {
 		p.persistCascadeRejections(ctx, allCascaded, now)
@@ -369,20 +368,26 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 // Best-effort: a store write failure is logged but doesn't undo the
 // in-memory cascade state (the dispatcher has already terminalized
 // them; we'd be reconciling at restart via Kafka replay anyway).
-func (p *Propagator) persistCascadeRejections(ctx context.Context, txids []string, now time.Time) {
-	statuses := make([]*models.TransactionStatus, len(txids))
-	for i, txid := range txids {
+func (p *Propagator) persistCascadeRejections(ctx context.Context, rejections []cascadedRejection, now time.Time) {
+	statuses := make([]*models.TransactionStatus, len(rejections))
+	txids := make([]string, len(rejections))
+	for i, r := range rejections {
+		reason := r.reason
+		if reason == "" {
+			reason = "parent rejected"
+		}
 		statuses[i] = &models.TransactionStatus{
-			TxID:      txid,
+			TxID:      r.txid,
 			Status:    models.StatusRejected,
 			Timestamp: now,
-			ExtraInfo: "parent rejected",
+			ExtraInfo: reason,
 		}
+		txids[i] = r.txid
 	}
 	if _, err := p.store.BatchUpdateStatusReturning(ctx, statuses); err != nil {
 		p.logger.Warn(
 			"cascade rejection write failed",
-			zap.Int("count", len(txids)),
+			zap.Int("count", len(rejections)),
 			zap.Error(err),
 		)
 	}
@@ -519,29 +524,15 @@ func (p *Propagator) handleMessage(_ context.Context, msg *kafka.Message) error 
 		return fmt.Errorf("propagation message has empty raw_tx")
 	}
 
-	// Ask the dispatcher whether this tx is eligible to broadcast or
-	// must be held as a waiter. The reply is synchronous — single
-	// goroutine-round-trip per message — so backpressure on the
-	// dispatcher (e.g., a deep cascade walk) naturally propagates back
-	// to the Kafka consumer.
-	if !p.admitToDispatcher(propMsg) {
-		// Held as a waiter; dispatcher owns the bookkeeping. Nothing
-		// for the consumer goroutine to do here.
-		return nil
+	// All admission logic — parent dep check, maxPending cap,
+	// pendingMsgs append — happens on the dispatcher goroutine.
+	// Synchronous reply tells us whether to surface backpressure to
+	// the Kafka consumer (full=true) or just acknowledge (admitted
+	// or held).
+	res := p.admitToDispatcher(propMsg)
+	if res.full {
+		return fmt.Errorf("propagation pending queue full (max=%d)", p.maxPending)
 	}
-
-	p.mu.Lock()
-	if p.maxPending > 0 && len(p.pendingMsgs) >= p.maxPending {
-		depth := len(p.pendingMsgs)
-		p.mu.Unlock()
-		metrics.PropagationPendingDepth.Set(float64(depth))
-		return fmt.Errorf("propagation pending queue full (depth=%d, max=%d)", depth, p.maxPending)
-	}
-	p.pendingMsgs = append(p.pendingMsgs, propMsg)
-	depth := len(p.pendingMsgs)
-	p.mu.Unlock()
-	metrics.PropagationPendingDepth.Set(float64(depth))
-
 	return nil
 }
 
@@ -571,10 +562,10 @@ func (p *Propagator) handleMessage(_ context.Context, msg *kafka.Message) error 
 // ACCEPTED_BY_NETWORK can't regress a tx that a faster sibling already moved
 // to SEEN_ON_NETWORK.
 func (p *Propagator) flushBatch(ctx context.Context) error {
-	p.mu.Lock()
-	batch := p.pendingMsgs
-	p.pendingMsgs = nil
-	p.mu.Unlock()
+	// Drain pendingMsgs from the dispatcher goroutine via the
+	// drainCh request/reply. The dispatcher owns the slice; we
+	// receive a snapshot and own it from here on.
+	batch := p.drainPending()
 	metrics.PropagationPendingDepth.Set(0)
 
 	if len(batch) == 0 {

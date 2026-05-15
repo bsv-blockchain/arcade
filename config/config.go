@@ -346,11 +346,12 @@ type PropagationConfig struct {
 	// Issue #145.
 	MerkleReplayRPS int `mapstructure:"merkle_replay_rps"`
 	// MaxPending caps the in-memory pending-batch slice the propagation
-	// consumer accumulates between flushes. Once full, new messages are
-	// returned as errors from handleMessage so the Kafka consumer's
+	// dispatcher accumulates between flushes. Once full, new messages
+	// are returned as errors from handleMessage so the Kafka consumer's
 	// retry+DLQ machinery sheds load instead of growing the slice to OOM.
-	// Defaults to 50000 — large enough to absorb a multi-minute downstream
-	// stall at 50 TPS without dropping, small enough to bound memory.
+	// Defaults to 1,000,000 — at ~500 bytes per propagationMsg ≈ 500 MB
+	// for the slice itself, comfortably within the 8-16 GB memory
+	// envelope targeted for dep-aware deployments.
 	MaxPending int `mapstructure:"max_pending"`
 	// MaxConcurrentBatches caps how many flushed batches run their
 	// register+broadcast pipeline concurrently. With concurrency=1 (the
