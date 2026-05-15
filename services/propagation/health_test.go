@@ -127,9 +127,6 @@ func TestPeerReturning500_NotSidelinedWhenUnanimous(t *testing.T) {
 		FailureThreshold:          2,
 		BroadcastFailureThreshold: 5, // intentionally low — sub-threshold drives most peer-health tests
 	})
-	prevDelay := inlineRetryDelay
-	inlineRetryDelay = 0
-	defer func() { inlineRetryDelay = prevDelay }()
 	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, nil)
 
 	// Many broadcasts, all unanimous 500. With the old per-result penalty
@@ -171,9 +168,6 @@ func TestPeerReturning500_SidelinedWhenOthersAccept(t *testing.T) {
 		FailureThreshold:          2,
 		BroadcastFailureThreshold: 5,
 	})
-	prevDelay := inlineRetryDelay
-	inlineRetryDelay = 0
-	defer func() { inlineRetryDelay = prevDelay }()
 	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, nil)
 
 	// Drive the bad peer past its slow threshold. Each broadcast produces a

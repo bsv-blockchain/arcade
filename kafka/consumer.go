@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -15,17 +16,31 @@ import (
 // drain-then-flush + retry + DLQ logic so services only supply a per-message
 // handler and an optional batch-flush hook. The underlying Broker supplies
 // the transport (Sarama or in-memory).
+//
+// When DeferredCommit is set on the ConsumerConfig, processOne no longer
+// calls claim.MarkMessage inline after the handler returns. Instead each
+// processed message is kept in pendingMarks (per-partition) until the
+// service calls SetCommitWatermark with a watermark offset; the next
+// flush boundary then walks pendingMarks and calls MarkMessage for every
+// message at or below that watermark. This lets the service hold
+// in-flight work without giving Kafka permission to advance past it.
 type ConsumerGroup struct {
-	broker        Broker
-	sub           Subscription
-	topics        []string
-	handler       MessageHandler
-	flushFunc     FlushFunc
-	producer      *Producer
-	maxRetries    int
-	flushInterval time.Duration
-	logger        *zap.Logger
-	ready         chan struct{}
+	broker         Broker
+	sub            Subscription
+	topics         []string
+	handler        MessageHandler
+	flushFunc      FlushFunc
+	producer       *Producer
+	maxRetries     int
+	flushInterval  time.Duration
+	logger         *zap.Logger
+	ready          chan struct{}
+	deferredCommit bool
+	// watermark is read by every active claim's drain loop on each flush
+	// boundary; SetCommitWatermark stores a new value from another
+	// goroutine. atomic so the cross-goroutine read is race-free without
+	// dragging a mutex into the hot path.
+	watermark atomic.Int64
 }
 
 // FlushFunc is called after a drain of immediately-ready messages. The
@@ -49,6 +64,14 @@ type ConsumerConfig struct {
 	// Default 50ms via NewConsumerGroup; zero disables the ticker.
 	FlushInterval time.Duration
 	Logger        *zap.Logger
+	// DeferredCommit changes the commit semantics: when true, processOne
+	// does NOT mark messages after the handler returns. Instead the
+	// service is expected to call SetCommitWatermark periodically with
+	// the lowest in-flight offset minus one; on each flush boundary the
+	// consumer marks every pending message at or below that watermark.
+	// Used by the dep-aware propagator so Kafka offsets stay in flight
+	// until a tx terminalizes.
+	DeferredCommit bool
 }
 
 func NewConsumerGroup(cfg ConsumerConfig) (*ConsumerGroup, error) {
@@ -75,18 +98,36 @@ func NewConsumerGroup(cfg ConsumerConfig) (*ConsumerGroup, error) {
 		flushInterval = 50 * time.Millisecond
 	}
 
-	return &ConsumerGroup{
-		broker:        cfg.Broker,
-		sub:           sub,
-		topics:        cfg.Topics,
-		handler:       cfg.Handler,
-		flushFunc:     cfg.FlushFunc,
-		producer:      cfg.Producer,
-		maxRetries:    maxRetries,
-		flushInterval: flushInterval,
-		logger:        cfg.Logger,
-		ready:         make(chan struct{}),
-	}, nil
+	cg := &ConsumerGroup{
+		broker:         cfg.Broker,
+		sub:            sub,
+		topics:         cfg.Topics,
+		handler:        cfg.Handler,
+		flushFunc:      cfg.FlushFunc,
+		producer:       cfg.Producer,
+		maxRetries:     maxRetries,
+		flushInterval:  flushInterval,
+		logger:         cfg.Logger,
+		ready:          make(chan struct{}),
+		deferredCommit: cfg.DeferredCommit,
+	}
+	// Watermark sentinel: -1 means "no watermark received yet, mark
+	// nothing." Offsets are non-negative, so this is unambiguously below
+	// the lowest real offset. Stored atomically because SetCommitWatermark
+	// can be called from a different goroutine than the drain loop that
+	// reads it.
+	cg.watermark.Store(-1)
+	return cg, nil
+}
+
+// SetCommitWatermark stores the offset below or equal to which the
+// consumer is permitted to mark messages as processed. Called by the
+// service (typically from a periodic ticker that reads the dispatcher's
+// lowest in-flight offset). Only meaningful when DeferredCommit is true.
+//
+// Safe to call from any goroutine.
+func (c *ConsumerGroup) SetCommitWatermark(offset int64) {
+	c.watermark.Store(offset)
 }
 
 // Run drives the subscription. Blocks until ctx is canceled or the broker
@@ -118,8 +159,15 @@ func (c *ConsumerGroup) Close() error {
 // keeps observing new messages — sustained traffic would otherwise defer the
 // flush indefinitely and grow the in-memory pending slice. Bounds end-to-end
 // latency without sacrificing the drain-then-flush batching efficiency.
+//
+// In deferredCommit mode, pendingMarks accumulates every consumed message
+// keyed by offset; markUpToWatermark is called at each flush boundary to
+// mark every pending message whose offset is at or below the watermark
+// the service has published. pendingMarks is owned exclusively by this
+// goroutine — no locking required.
 func (c *ConsumerGroup) handleClaim(claim Claim) error {
 	ctx := claim.Context()
+	pendingMarks := map[int64]*Message{}
 	defer c.flush(ctx)
 
 	ticker := time.NewTicker(c.flushInterval)
@@ -131,7 +179,7 @@ func (c *ConsumerGroup) handleClaim(claim Claim) error {
 			if !ok {
 				return nil
 			}
-			c.processOne(claim, msg)
+			c.processOne(claim, msg, pendingMarks)
 
 			// Drain all immediately-ready messages before flushing. Messages
 			// that arrived as a batch publish naturally cluster here, so batch
@@ -142,19 +190,21 @@ func (c *ConsumerGroup) handleClaim(claim Claim) error {
 					if !ok {
 						return nil
 					}
-					c.processOne(claim, msg)
+					c.processOne(claim, msg, pendingMarks)
 				default:
 					goto drainDone
 				}
 			}
 		drainDone:
 			c.flush(ctx)
+			c.markUpToWatermark(claim, pendingMarks)
 
 		case <-ticker.C:
 			// Periodic flush kicks pending work loose even if the drain
 			// inner loop is hot. Cheap when there's nothing to flush — the
 			// service's FlushFunc no-ops on empty pending state.
 			c.flush(ctx)
+			c.markUpToWatermark(claim, pendingMarks)
 
 		case <-ctx.Done():
 			return nil
@@ -162,7 +212,35 @@ func (c *ConsumerGroup) handleClaim(claim Claim) error {
 	}
 }
 
-func (c *ConsumerGroup) processOne(claim Claim, msg *Message) {
+// markUpToWatermark walks pendingMarks and marks every message whose
+// offset is at or below the service-published watermark. No-op when
+// DeferredCommit is false (pendingMarks stays empty in that mode) or when
+// no watermark has been published yet (sentinel -1).
+//
+// Called from handleClaim's goroutine; pendingMarks access is unsynchronized.
+func (c *ConsumerGroup) markUpToWatermark(claim Claim, pendingMarks map[int64]*Message) {
+	if !c.deferredCommit {
+		return
+	}
+	wm := c.watermark.Load()
+	if wm < 0 {
+		return
+	}
+	for offset, msg := range pendingMarks {
+		if offset <= wm {
+			claim.MarkMessage(msg)
+			delete(pendingMarks, offset)
+		}
+	}
+}
+
+// processOne runs the configured handler against a single message, then
+// either marks the offset inline (default) or registers the message in
+// pendingMarks for later watermark-driven marking (deferredCommit mode).
+//
+// On DLQ-publish failure the offset is left unmarked so Kafka redelivers
+// on the next session — preferable to silent message loss.
+func (c *ConsumerGroup) processOne(claim Claim, msg *Message, pendingMarks map[int64]*Message) {
 	metrics.KafkaMessagesTotal.WithLabelValues(msg.Topic, "consume").Inc()
 	metrics.KafkaMessageBytes.WithLabelValues(msg.Topic, "consume").Observe(float64(len(msg.Value)))
 	if err := c.processWithRetry(claim.Context(), msg); err != nil {
@@ -182,6 +260,10 @@ func (c *ConsumerGroup) processOne(claim Claim, msg *Message) {
 			)
 			return
 		}
+	}
+	if c.deferredCommit {
+		pendingMarks[msg.Offset] = msg
+		return
 	}
 	claim.MarkMessage(msg)
 }

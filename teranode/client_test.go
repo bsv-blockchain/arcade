@@ -62,7 +62,7 @@ func TestSubmitTransactions_Batch(t *testing.T) {
 	client := NewClient([]string{server.URL}, "", HealthConfig{})
 	rawTxs := [][]byte{{0x01, 0x02}, {0x03, 0x04, 0x05}}
 
-	code, err := client.SubmitTransactions(context.Background(), server.URL, rawTxs)
+	code, _, err := client.SubmitTransactions(context.Background(), server.URL, rawTxs)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

@@ -145,7 +145,7 @@ func TestProcessOne_DLQPublishFailureDoesNotMark(t *testing.T) {
 
 	before := testutil.ToFloat64(metrics.KafkaDLQPublishFailures.WithLabelValues(topic))
 
-	c.processOne(claim, msg)
+	c.processOne(claim, msg, map[int64]*Message{})
 
 	if claim.Marked() != 0 {
 		t.Fatalf("MarkMessage was called %d times; expected 0 so Kafka redelivers", claim.Marked())
@@ -182,7 +182,7 @@ func TestProcessOne_DLQPublishSuccessMarks(t *testing.T) {
 
 	before := testutil.ToFloat64(metrics.KafkaDLQPublishFailures.WithLabelValues(topic))
 
-	c.processOne(claim, msg)
+	c.processOne(claim, msg, map[int64]*Message{})
 
 	if claim.Marked() != 1 {
 		t.Fatalf("MarkMessage was called %d times; expected 1 (DLQ succeeded)", claim.Marked())
@@ -231,7 +231,7 @@ func TestProcessOne_HappyPathMarks(t *testing.T) {
 	claim := newFakeClaim()
 	msg := &Message{Topic: topic, Partition: 0, Offset: 99, Value: []byte("payload")}
 
-	c.processOne(claim, msg)
+	c.processOne(claim, msg, map[int64]*Message{})
 
 	if claim.Marked() != 1 {
 		t.Fatalf("MarkMessage was called %d times; expected 1", claim.Marked())

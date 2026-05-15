@@ -667,8 +667,25 @@ func (c *Client) SubmitTransaction(ctx context.Context, endpoint string, rawTx [
 
 // SubmitTransactions submits multiple transactions as a batch to a single endpoint.
 // The raw transaction bytes are concatenated into a single body and POSTed to /txs.
-// Returns the HTTP status code on success.
-func (c *Client) SubmitTransactions(ctx context.Context, endpoint string, rawTxs [][]byte) (int, error) {
+// Returns the HTTP status code and a per-slot result list parsed from the response
+// body. The per-slot list is len(rawTxs) long whenever the response carries
+// authoritative per-slot information:
+//
+//   - HTTP 200 + body "OK" / "OK\n": every slot succeeded, result is nil so callers
+//     short-circuit without per-slot inspection.
+//   - HTTP 500 + a body of newline-separated lines, one per submission slot
+//     (post-bsv-blockchain/teranode#879+#881): each line is either "OK" (slot
+//     succeeded) or "<TERANODE_CODE_NAME> (<num>)" (slot failed with the named
+//     code, e.g. "TX_INVALID (31)"). The returned per-slot slice carries those
+//     strings verbatim so the caller can switch on them. When the body cannot be
+//     parsed into len(rawTxs) lines, per-slot is nil and the caller treats the
+//     batch as a pure infra failure (whole batch requeued).
+//   - Anything else (4xx, transport error): per-slot is nil; the caller decides
+//     by HTTP status / error.
+//
+// The "OK" sentinel on a per-slot line is exposed as TxsResultOK to keep
+// the parsing contract grep-able from call sites.
+func (c *Client) SubmitTransactions(ctx context.Context, endpoint string, rawTxs [][]byte) (int, []string, error) {
 	start := time.Now()
 	// Calculate total size for pre-allocation
 	totalSize := 0
@@ -686,7 +703,7 @@ func (c *Client) SubmitTransactions(ctx context.Context, endpoint string, rawTxs
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		observeRequest("submit_txs", 0, start)
-		return 0, fmt.Errorf("failed to create request: %w", err)
+		return 0, nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/octet-stream")
@@ -697,17 +714,57 @@ func (c *Client) SubmitTransactions(ctx context.Context, endpoint string, rawTxs
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		observeRequest("submit_txs", 0, start)
-		return 0, fmt.Errorf("failed to submit transactions: %w", err)
+		return 0, nil, fmt.Errorf("failed to submit transactions: %w", err)
 	}
 	defer drainAndClose(resp.Body)
 	defer observeRequest("submit_txs", resp.StatusCode, start)
 
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return resp.StatusCode, fmt.Errorf("%w %d: %s", errUnexpectedStatusCode, resp.StatusCode, string(respBody))
+	respBody, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode == http.StatusOK {
+		return resp.StatusCode, nil, nil
 	}
 
-	return resp.StatusCode, nil
+	if resp.StatusCode == http.StatusInternalServerError {
+		slots := parseTxsPerSlot(respBody, len(rawTxs))
+		if slots != nil {
+			return resp.StatusCode, slots, fmt.Errorf("%w %d", errUnexpectedStatusCode, resp.StatusCode)
+		}
+	}
+
+	return resp.StatusCode, nil, fmt.Errorf("%w %d: %s", errUnexpectedStatusCode, resp.StatusCode, string(respBody))
+}
+
+// TxsResultOK is the per-slot string emitted by Teranode for a successful
+// submission slot in the /txs response body.
+const TxsResultOK = "OK"
+
+// parseTxsPerSlot extracts the per-submission-slot results from a /txs
+// 500 response body. The post-#881 format is:
+//
+//	"OK\n<NAME> (<num>)\nOK\n…\n"
+//
+// optionally preceded by a "Failed to process transactions:" heading line.
+// Returns a slice of len expected results, or nil when the body cannot be
+// parsed into exactly that many slot lines (in which case the caller
+// treats the batch as a pure infra failure).
+func parseTxsPerSlot(body []byte, expected int) []string {
+	if expected <= 0 {
+		return nil
+	}
+	text := string(body)
+	text = strings.TrimRight(text, "\n")
+	if text == "" {
+		return nil
+	}
+	lines := strings.Split(text, "\n")
+	if len(lines) > 0 && strings.HasPrefix(lines[0], "Failed to process transactions") {
+		lines = lines[1:]
+	}
+	if len(lines) != expected {
+		return nil
+	}
+	return lines
 }
 
 // newBroadcastTransport configures an http.Transport sized for fan-out

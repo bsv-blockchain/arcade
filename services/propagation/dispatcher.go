@@ -41,10 +41,13 @@ type admitResult struct {
 }
 
 // admitRequest is the protocol between handleMessage and the
-// dispatcher goroutine.
+// dispatcher goroutine. offset is the Kafka offset the message came
+// from; the dispatcher tracks it on the offsetTracker so the Kafka
+// commit watermark cannot advance past unfinished work.
 type admitRequest struct {
-	msg   propagationMsg
-	reply chan admitResult
+	msg    propagationMsg
+	offset int64
+	reply  chan admitResult
 }
 
 // terminalEvent is the protocol between applyTerminalStatuses and the
@@ -71,6 +74,32 @@ type drainRequest struct {
 	reply chan []propagationMsg
 }
 
+// watermarkRequest asks the dispatcher for the lowest in-flight Kafka
+// offset on the offsetTracker. Used by the propagator's watermark
+// ticker; the consumer's commit position must not advance past this
+// value. ok is false when nothing is in-flight (or nothing has ever
+// been admitted), in which case the ticker leaves the consumer
+// watermark unchanged.
+type watermarkRequest struct {
+	reply chan watermarkReply
+}
+
+type watermarkReply struct {
+	offset int64
+	ok     bool
+}
+
+// requeueRequest re-injects a slice of propagation messages into the
+// dispatcher after an infra-failed broadcast. The dispatcher re-runs
+// admission logic on each message — txs whose parents have terminalized
+// in the meantime go to pendingMsgs; those still blocked move (back) to
+// heldMsgs. The originating offsets stay in inFlight and on the
+// offsetTracker for the whole loop, so no Kafka commit can advance
+// past them.
+type requeueRequest struct {
+	msgs []propagationMsg
+}
+
 // dispatcherConfig is the small subset of Propagator config the
 // dispatcher needs at runtime.
 type dispatcherConfig struct {
@@ -84,14 +113,15 @@ type dispatcherConfig struct {
 // body — nothing leaks out, so nothing else can mutate it without
 // going through the channels.
 func (p *Propagator) runDispatcher(ctx context.Context, cfg dispatcherConfig) {
-	// inFlight is the set of txids the dispatcher is aware of and has
-	// not yet seen a terminal status for. Anything in pendingMsgs,
-	// already broadcasting, or held as a waiter is in this set.
+	// inFlight maps txid → Kafka offset for every tx the dispatcher
+	// is aware of and has not yet seen a terminal status for. Stores
+	// the offset so terminal/cascade paths can mark the offsetTracker
+	// without needing a separate txid→offset map.
 	// A child of any in-flight parent gets held — Teranode processes
 	// bulk submissions in parallel, so parent and child must be in
 	// SEPARATE batches with the parent terminalized before the child
 	// is admitted.
-	inFlight := make(map[string]struct{})
+	inFlight := make(map[string]int64)
 
 	// waiters maps a parent txid to the set of children currently
 	// waiting on it. Populated by admit (when a child has any
@@ -113,6 +143,11 @@ func (p *Propagator) runDispatcher(ctx context.Context, cfg dispatcherConfig) {
 	// goroutine — no locks.
 	var pendingMsgs []propagationMsg
 
+	// tracker holds the in-flight Kafka offsets. Add on admit, Done
+	// on terminal/cascade. The watermark ticker reads
+	// LowestUnfinished via watermarkCh.
+	tracker := newOffsetTracker()
+
 	for {
 		// Nil-channel trick: when pendingMsgs is at the configured cap,
 		// exclude admitCh from the select so handleMessage's send
@@ -131,17 +166,35 @@ func (p *Propagator) runDispatcher(ctx context.Context, cfg dispatcherConfig) {
 			return
 
 		case req := <-admitChIfRoom:
-			res := handleAdmit(req.msg, inFlight, waiters, heldMsgs, &pendingMsgs)
+			res := handleAdmit(req.msg, req.offset, inFlight, waiters, heldMsgs, &pendingMsgs, tracker)
 			req.reply <- res
 
 		case ev := <-p.terminalCh:
-			result := handleTerminal(ev, inFlight, waiters, heldMsgs, &pendingMsgs)
+			result := handleTerminal(ev, inFlight, waiters, heldMsgs, &pendingMsgs, tracker)
 			ev.reply <- result
 
 		case req := <-p.drainCh:
 			batch := pendingMsgs
 			pendingMsgs = nil
 			req.reply <- batch
+
+		case req := <-p.requeueCh:
+			// Requeue path: an infra-failed broadcast wants these
+			// messages back in the broadcast queue. Each tx is
+			// already on the tracker (its offset was added on the
+			// original admit and never marked Done since broadcast
+			// didn't terminalize). Re-run admission so a tx whose
+			// parents are no longer in-flight goes to pendingMsgs,
+			// while one whose parents are still in-flight goes
+			// (back) to heldMsgs. inFlight already contains the txid,
+			// so handleRequeue skips the offsetTracker.Add.
+			for _, msg := range req.msgs {
+				handleRequeue(msg, inFlight, waiters, heldMsgs, &pendingMsgs)
+			}
+
+		case req := <-p.watermarkCh:
+			off, ok := tracker.LowestUnfinished()
+			req.reply <- watermarkReply{offset: off, ok: ok}
 		}
 	}
 }
@@ -162,12 +215,17 @@ func (p *Propagator) runDispatcher(ctx context.Context, cfg dispatcherConfig) {
 //
 // The maxPending cap is enforced upstream by the select loop's
 // nil-channel pattern; handleAdmit never sees a full-queue admit.
+//
+// The Kafka offset is recorded on tracker so the commit watermark
+// can never advance past this in-flight tx.
 func handleAdmit(
 	msg propagationMsg,
-	inFlight map[string]struct{},
+	offset int64,
+	inFlight map[string]int64,
 	waiters map[string]map[string]struct{},
 	heldMsgs map[string]propagationMsg,
 	pendingMsgs *[]propagationMsg,
+	tracker *offsetTracker,
 ) admitResult {
 	// Identify blocking parents — any input that's currently in
 	// flight, regardless of whether it's in pendingMsgs or already
@@ -187,11 +245,16 @@ func handleAdmit(
 		blocking[parent] = struct{}{}
 	}
 
+	// Record the offset on the tracker for either branch — both held
+	// and admitted txs are in-flight from the consumer's perspective
+	// and must pin the commit watermark below this offset.
+	inFlight[msg.TXID] = offset
+	tracker.Add(offset)
+
 	if len(blocking) > 0 {
 		// Hold as a waiter. Held txs DO go into inFlight (so
 		// descendants can register on them) but NOT into pendingMsgs
 		// (they're not on the broadcast path yet).
-		inFlight[msg.TXID] = struct{}{}
 		for parent := range blocking {
 			set, ok := waiters[parent]
 			if !ok {
@@ -204,10 +267,64 @@ func handleAdmit(
 		return admitResult{held: true}
 	}
 
-	// Eligible for broadcast. Add to inFlight and pendingMsgs.
-	inFlight[msg.TXID] = struct{}{}
+	// Eligible for broadcast. Add to pendingMsgs.
 	*pendingMsgs = append(*pendingMsgs, msg)
 	return admitResult{admitted: true}
+}
+
+// handleRequeue re-injects a previously-admitted message into the
+// dispatcher after an infra-failed broadcast. The tx is already in
+// inFlight and on the offsetTracker (the original admit added it and
+// nothing has marked it Done since the broadcast didn't terminalize),
+// so the offset stays pinned. We only need to re-evaluate dependency
+// state: if every parent has terminalized in the meantime, the tx
+// goes back to pendingMsgs; if any parent is still in-flight, the tx
+// (re-)enters heldMsgs and registers as a waiter.
+func handleRequeue(
+	msg propagationMsg,
+	inFlight map[string]int64,
+	waiters map[string]map[string]struct{},
+	heldMsgs map[string]propagationMsg,
+	pendingMsgs *[]propagationMsg,
+) {
+	// Defensive: if the tx is no longer tracked (e.g. terminalized on
+	// some racing path), drop the requeue. Without inFlight entry we
+	// can't pin a watermark anyway.
+	if _, ok := inFlight[msg.TXID]; !ok {
+		return
+	}
+
+	var blocking map[string]struct{}
+	for _, parent := range msg.InputTXIDs {
+		if parent == "" || parent == msg.TXID {
+			continue
+		}
+		if _, inFlt := inFlight[parent]; !inFlt {
+			continue
+		}
+		if blocking == nil {
+			blocking = make(map[string]struct{})
+		}
+		blocking[parent] = struct{}{}
+	}
+
+	if len(blocking) > 0 {
+		for parent := range blocking {
+			set, ok := waiters[parent]
+			if !ok {
+				set = make(map[string]struct{})
+				waiters[parent] = set
+			}
+			set[msg.TXID] = struct{}{}
+		}
+		heldMsgs[msg.TXID] = msg
+		return
+	}
+
+	// Parents all terminalized — drop any stale heldMsgs entry and
+	// put the tx back into the broadcast queue.
+	delete(heldMsgs, msg.TXID)
+	*pendingMsgs = append(*pendingMsgs, msg)
 }
 
 // handleTerminal processes a terminal status flip for txid. ACCEPTED
@@ -215,27 +332,39 @@ func handleAdmit(
 // each released waiter goes into pendingMsgs (and its own waiters
 // stay held until IT terminalizes; no recursive cascade). REJECTED
 // recursively cascade-rejects every descendant.
+//
+// Both branches mark the txid's offset Done on the tracker (and every
+// cascaded descendant's offset too) so the Kafka commit watermark can
+// advance past them.
 func handleTerminal(
 	ev terminalEvent,
-	inFlight map[string]struct{},
+	inFlight map[string]int64,
 	waiters map[string]map[string]struct{},
 	heldMsgs map[string]propagationMsg,
 	pendingMsgs *[]propagationMsg,
+	tracker *offsetTracker,
 ) terminalResult {
-	delete(inFlight, ev.txid)
-
 	switch ev.status {
 	case models.StatusAcceptedByNetwork:
+		if offset, ok := inFlight[ev.txid]; ok {
+			tracker.Done(offset)
+		}
+		delete(inFlight, ev.txid)
 		releaseWaiters(ev.txid, inFlight, waiters, heldMsgs, pendingMsgs)
 		return terminalResult{}
 
 	case models.StatusRejected:
+		if offset, ok := inFlight[ev.txid]; ok {
+			tracker.Done(offset)
+		}
+		delete(inFlight, ev.txid)
 		return terminalResult{
-			cascaded: cascadeReject(ev.txid, inFlight, waiters, heldMsgs),
+			cascaded: cascadeReject(ev.txid, inFlight, waiters, heldMsgs, tracker),
 		}
 
 	default:
-		// Intermediate statuses don't change dispatcher state.
+		// Intermediate statuses don't change dispatcher state and
+		// don't advance the offset watermark.
 		return terminalResult{}
 	}
 }
@@ -249,7 +378,7 @@ func handleTerminal(
 // grandchild can't share a batch).
 func releaseWaiters(
 	parentTxID string,
-	inFlight map[string]struct{},
+	inFlight map[string]int64,
 	waiters map[string]map[string]struct{},
 	heldMsgs map[string]propagationMsg,
 	pendingMsgs *[]propagationMsg,
@@ -276,7 +405,7 @@ func releaseWaiters(
 // maintain a per-child pending-parent count.
 func canRelease(
 	child string,
-	inFlight map[string]struct{},
+	inFlight map[string]int64,
 	heldMsgs map[string]propagationMsg,
 ) (propagationMsg, bool) {
 	msg, ok := heldMsgs[child]
@@ -298,12 +427,15 @@ func canRelease(
 // returns every descendant that should be terminally rejected. The
 // caller writes a REJECTED row for each, with "parent rejected" as
 // the ExtraInfo — the descendants didn't fail for any reason of
-// their own, only because an ancestor did.
+// their own, only because an ancestor did. Every cascaded descendant's
+// Kafka offset is marked Done on the tracker so the commit watermark
+// can advance past them once the caller writes the REJECTED rows.
 func cascadeReject(
 	rejectedTxID string,
-	inFlight map[string]struct{},
+	inFlight map[string]int64,
 	waiters map[string]map[string]struct{},
 	heldMsgs map[string]propagationMsg,
+	tracker *offsetTracker,
 ) []string {
 	var cascaded []string
 	queue := []string{rejectedTxID}
@@ -318,6 +450,9 @@ func cascadeReject(
 		for child := range children {
 			cleanupWaiterEntries(child, parent, waiters, heldMsgs)
 			delete(heldMsgs, child)
+			if offset, ok := inFlight[child]; ok {
+				tracker.Done(offset)
+			}
 			delete(inFlight, child)
 			cascaded = append(cascaded, child)
 			queue = append(queue, child)
@@ -364,11 +499,11 @@ func cleanupWaiterEntries(
 // workers.
 const dispatcherChannelBuffer = 256
 
-// admitToDispatcher is the consumer-side helper. Sends the tx, waits
-// for the dispatcher's verdict, returns it.
-func (p *Propagator) admitToDispatcher(msg propagationMsg) admitResult {
+// admitToDispatcher is the consumer-side helper. Sends the tx and its
+// Kafka offset, waits for the dispatcher's verdict, returns it.
+func (p *Propagator) admitToDispatcher(msg propagationMsg, offset int64) admitResult {
 	reply := make(chan admitResult, 1)
-	p.admitCh <- admitRequest{msg: msg, reply: reply}
+	p.admitCh <- admitRequest{msg: msg, offset: offset, reply: reply}
 	return <-reply
 }
 
@@ -389,4 +524,26 @@ func (p *Propagator) drainPending() []propagationMsg {
 	reply := make(chan []propagationMsg, 1)
 	p.drainCh <- drainRequest{reply: reply}
 	return <-reply
+}
+
+// requeueToDispatcher sends a batch of propagation messages back to
+// the dispatcher after an infra-failed broadcast. Fire-and-forget — the
+// caller (a processBatch goroutine that just finished its short
+// post-failure wait) doesn't need a reply.
+func (p *Propagator) requeueToDispatcher(msgs []propagationMsg) {
+	if len(msgs) == 0 {
+		return
+	}
+	p.requeueCh <- requeueRequest{msgs: msgs}
+}
+
+// lowestUnfinishedOffset asks the dispatcher for the smallest in-flight
+// Kafka offset on the offsetTracker, or (0, false) when nothing is in
+// flight. Used by the watermark ticker to drive the Kafka consumer's
+// SetCommitWatermark.
+func (p *Propagator) lowestUnfinishedOffset() (int64, bool) {
+	reply := make(chan watermarkReply, 1)
+	p.watermarkCh <- watermarkRequest{reply: reply}
+	r := <-reply
+	return r.offset, r.ok
 }
