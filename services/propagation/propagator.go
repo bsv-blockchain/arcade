@@ -522,15 +522,15 @@ func (p *Propagator) handleMessage(_ context.Context, msg *kafka.Message) error 
 		return fmt.Errorf("propagation message has empty raw_tx")
 	}
 
-	// All admission logic — parent dep check, maxPending cap,
-	// pendingMsgs append — happens on the dispatcher goroutine.
-	// Synchronous reply tells us whether to surface backpressure to
-	// the Kafka consumer (full=true) or just acknowledge (admitted
-	// or held).
-	res := p.admitToDispatcher(propMsg)
-	if res.full {
-		return fmt.Errorf("propagation pending queue full (max=%d)", p.maxPending)
-	}
+	// All admission logic — parent dep check, pendingMsgs append —
+	// happens on the dispatcher goroutine. When pending is at its cap,
+	// the dispatcher's select excludes admitCh, so this send blocks.
+	// The Kafka consumer goroutine waits here until the dispatcher
+	// has room, which naturally pauses Kafka pulls and lets
+	// backpressure flow back to the broker. No DLQ, no error to the
+	// client; the only observable effect is briefly increased
+	// consumer lag.
+	_ = p.admitToDispatcher(propMsg)
 	return nil
 }
 

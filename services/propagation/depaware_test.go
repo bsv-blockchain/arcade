@@ -197,11 +197,17 @@ func TestHandleMessage_ParentNotInFlight_AdmitsChildDirectly(t *testing.T) {
 	}
 }
 
-// TestHandleMessage_MaxPendingFull_ReturnsErrorWithoutLeakingInFlight
-// verifies item 17 from the audit: when pendingMsgs is at maxPending,
-// admission returns an error AND the txid is NOT leaked into
-// in-flight state (which would otherwise prevent retry).
-func TestHandleMessage_MaxPendingFull_ReturnsErrorWithoutLeakingInFlight(t *testing.T) {
+// TestHandleMessage_MaxPendingFull_BlocksUntilDrained verifies the
+// pending-cap backpressure mechanism: when pendingMsgs is at its
+// configured maximum, handleMessage BLOCKS rather than returning an
+// error. As soon as a drain or terminal event shrinks pending under
+// the cap, the blocked handleMessage unblocks and the tx is admitted.
+//
+// This is the "natural backpressure" pattern: blocking the consumer
+// goroutine pauses Kafka pulls, which lets the partition grow on the
+// broker side without losing messages through a DLQ or retry-exhaust
+// path.
+func TestHandleMessage_MaxPendingFull_BlocksUntilDrained(t *testing.T) {
 	ms := newMockStore()
 	cfg := &config.Config{}
 	cfg.Propagation.MaxPending = 1 // saturate after a single admit
@@ -209,33 +215,48 @@ func TestHandleMessage_MaxPendingFull_ReturnsErrorWithoutLeakingInFlight(t *test
 	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, nil)
 	defer p.dispatcherCancel()
 
-	// First admit lands.
+	// First admit lands immediately.
 	if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg("tx1"))); err != nil {
 		t.Fatalf("first admit: %v", err)
 	}
-	// Second admit rejected because pending is full.
-	if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg("tx2"))); err == nil {
-		t.Errorf("second admit should fail with full-queue error")
+
+	// Second admit should block — pending is now at cap. Run it in a
+	// goroutine and verify it hasn't returned within a generous
+	// timeout. If it returns prematurely, that's a regression to the
+	// old error-return-on-full behavior.
+	tx2Done := make(chan error, 1)
+	go func() {
+		tx2Done <- p.handleMessage(context.Background(), consumerMsg(makePropMsg("tx2")))
+	}()
+
+	select {
+	case err := <-tx2Done:
+		t.Fatalf("tx2 admit should have blocked while pending was full; returned err=%v", err)
+	case <-time.After(100 * time.Millisecond):
+		// expected: still blocked
 	}
 
-	// Drain to clear pending.
+	// Drain pending. tx1 leaves, capacity opens up, tx2's blocked
+	// admit should unblock and complete.
 	pending := drainSet(p)
-	if pending["tx2"] {
-		t.Errorf("tx2 should not have entered pending batch; got %v", pending)
-	}
 	if !pending["tx1"] {
 		t.Errorf("tx1 should be in pending batch; got %v", pending)
 	}
-
-	// Now that pending is empty, tx2 should be admittable again on
-	// retry — confirms tx2 didn't leak into in-flight state on the
-	// first attempt (which would have made it look like a known tx
-	// that's already being handled).
-	if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg("tx2"))); err != nil {
-		t.Errorf("re-admit of tx2 after drain should succeed; got %v", err)
+	if pending["tx2"] {
+		t.Errorf("tx2 should not have been in the drained batch yet — it was still blocked; got %v", pending)
 	}
+
+	select {
+	case err := <-tx2Done:
+		if err != nil {
+			t.Errorf("tx2 admit should complete after drain; got err=%v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("tx2 admit didn't unblock after pending drain")
+	}
+
 	pending = drainSet(p)
 	if !pending["tx2"] {
-		t.Errorf("tx2 should be in pending batch after re-admit; got %v", pending)
+		t.Errorf("tx2 should be in pending batch after unblocking; got %v", pending)
 	}
 }

@@ -34,11 +34,16 @@ import (
 // propagation pipeline's dep-aware path.
 
 // admitResult tells handleMessage what the dispatcher did with the
-// admitted tx. Exactly one of admitted / held / full is true.
+// admitted tx. Exactly one of admitted / held is true. There is no
+// "full" state — when the pending-broadcast slice is at maxPending,
+// the dispatcher simply stops reading from admitCh until pending
+// drains. handleMessage's send to admitCh blocks; the Kafka consumer
+// goroutine is therefore blocked too, which pauses Kafka pulls and
+// lets backpressure flow back to the broker naturally. No DLQ
+// pathway, no error to the client.
 type admitResult struct {
 	admitted bool // true: tx was added to pendingMsgs, broadcast pending
 	held     bool // true: registered as a waiter on in-flight parents
-	full     bool // true: pendingMsgs is at its cap; caller signals backpressure
 }
 
 // admitRequest is the protocol between handleMessage and the
@@ -123,12 +128,26 @@ func (p *Propagator) runDispatcher(ctx context.Context, cfg dispatcherConfig) {
 	var pendingMsgs []propagationMsg
 
 	for {
+		// Nil-channel trick: when pendingMsgs is at the configured cap,
+		// exclude admitCh from the select so handleMessage's send
+		// blocks. The Kafka consumer goroutine sits inside handleMessage
+		// → no more pulls from claim.Messages() → Kafka's offset
+		// doesn't advance → broker holds the messages on its side.
+		// Terminal and drain events keep firing in the meantime; the
+		// instant they shrink pendingMsgs back under the cap, admitCh
+		// is included again and the blocked send unblocks. No DLQ, no
+		// dropped messages, just natural backpressure to the broker.
+		var admitChIfRoom <-chan admitRequest
+		if cfg.maxPending <= 0 || len(pendingMsgs) < cfg.maxPending {
+			admitChIfRoom = p.admitCh
+		}
+
 		select {
 		case <-ctx.Done():
 			return
 
-		case req := <-p.admitCh:
-			res := handleAdmit(req.msg, inFlight, waiters, pendingParents, heldMsgs, &pendingMsgs, cfg.maxPending)
+		case req := <-admitChIfRoom:
+			res := handleAdmit(req.msg, inFlight, waiters, pendingParents, heldMsgs, &pendingMsgs)
 			req.reply <- res
 
 		case ev := <-p.terminalCh:
@@ -146,16 +165,13 @@ func (p *Propagator) runDispatcher(ctx context.Context, cfg dispatcherConfig) {
 // handleAdmit decides what to do with a new tx:
 //   - If any input txid is in inFlight, register the tx as a waiter
 //     on each such parent and return held (no append to pendingMsgs).
-//   - Otherwise, if pendingMsgs is already at maxPending capacity,
-//     return full WITHOUT adding to inFlight — the caller will
-//     surface backpressure to the Kafka consumer and the message
-//     won't be processed at all. (No leak into inFlight.)
-//   - Otherwise, add to inFlight, append to pendingMsgs, return
+//   - Otherwise add to inFlight, append to pendingMsgs, return
 //     admitted.
 //
-// Order of these checks matters: parent check first so children of
-// in-flight parents never count against the maxPending cap (they're
-// not on the broadcast path yet).
+// The maxPending cap is enforced upstream by the select loop's
+// nil-channel pattern (we don't read from admitCh when pending is
+// full), so this function never sees a full-queue admit and doesn't
+// need to handle it.
 func handleAdmit(
 	msg propagationMsg,
 	inFlight map[string]struct{},
@@ -163,7 +179,6 @@ func handleAdmit(
 	pendingParents map[string]map[string]struct{},
 	heldMsgs map[string]propagationMsg,
 	pendingMsgs *[]propagationMsg,
-	maxPending int,
 ) admitResult {
 	// Identify in-flight parents.
 	var pending map[string]struct{}
@@ -196,13 +211,6 @@ func handleAdmit(
 		}
 		heldMsgs[msg.TXID] = msg
 		return admitResult{held: true}
-	}
-
-	// No in-flight parents — eligible for broadcast. Cap check
-	// happens BEFORE we add to inFlight so a rejection never leaks
-	// state.
-	if maxPending > 0 && len(*pendingMsgs) >= maxPending {
-		return admitResult{full: true}
 	}
 
 	inFlight[msg.TXID] = struct{}{}
