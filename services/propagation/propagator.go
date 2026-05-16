@@ -580,7 +580,7 @@ func (p *Propagator) Stop() error {
 	// reaper is mid-IterateStatusesSince or mid-lease-release on a
 	// closed store, the goroutine panics and the test framework
 	// attributes the failure to t.Cleanup. Their parent ctx has
-	// already been cancelled by the caller, so this only blocks on
+	// already been canceled by the caller, so this only blocks on
 	// in-flight scan/release work.
 	p.backgroundWG.Wait()
 	return consumerErr
