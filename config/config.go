@@ -368,7 +368,7 @@ type PropagationConfig struct {
 	// pipeline times without flooding merkle-service or teranode.
 	MaxConcurrentBatches int `mapstructure:"max_concurrent_batches"`
 	// BroadcastWorkers sizes the persistent goroutine pool that runs every
-	// per-endpoint SubmitTransaction(s) HTTP call. Peak in-flight jobs is
+	// per-endpoint POST /txs HTTP call. Peak in-flight jobs is
 	// MaxConcurrentBatches × MaxParallelChunks × len(healthy endpoints).
 	// Under-sized workers serialize the pool and eat the parallelism gain
 	// from smaller chunks — at 8 concurrent batches × 4 chunks × 8 endpoints

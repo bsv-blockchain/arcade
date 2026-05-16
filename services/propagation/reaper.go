@@ -161,8 +161,7 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 
 	var accepted, rejected int
 	terminalStatuses := make([]*models.TransactionStatus, 0, len(results))
-	var inFlightTxIDs []string
-	for i, res := range results {
+	for _, res := range results {
 		switch res.class {
 		case txResultClassAccepted:
 			accepted++
@@ -174,17 +173,12 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 			if res.status != nil {
 				terminalStatuses = append(terminalStatuses, res.status)
 			}
-		case txResultClassInFlight:
-			inFlightTxIDs = append(inFlightTxIDs, registered[i].TXID)
 		case txResultClassUnknown, txResultClassSkip:
 			// Skip / Unknown: leave the row alone so the next reaper
 			// tick picks it up.
 		}
 	}
 	p.applyTerminalStatuses(ctx, terminalStatuses, accepted, rejected)
-	for _, txid := range inFlightTxIDs {
-		p.notifyTerminalToDispatcher(txid, models.StatusAcceptedByNetwork)
-	}
 }
 
 // errReaperBatchFull halts the IterateStatusesSince walk once we've

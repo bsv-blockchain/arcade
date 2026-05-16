@@ -170,15 +170,7 @@ var PropagationOutcomeTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 var PropagationChunkTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_propagation_chunk_total",
 	Help: "Number of chunk broadcasts issued, by fallback decision.",
-}, []string{"fallback"}) // none, per_tx_after_all_rejected
-
-// PropagationInlineRetryTotal counts inline retry attempts (Fix #7) — how
-// often a transient broadcast failure was caught at the validator step before
-// going to durable PENDING_RETRY.
-var PropagationInlineRetryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_propagation_inline_retry_total",
-	Help: "Inline retry attempts on broadcastSingleToEndpoints.",
-}, []string{labelOutcome}) // recovered, exhausted
+}, []string{"fallback"}) // none
 
 // PropagationMerkleRegisterDuration measures the merkle-service registration
 // wall time for one flushBatch — a single bounded-concurrency fan-out over

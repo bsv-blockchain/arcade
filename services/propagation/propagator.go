@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -71,12 +70,12 @@ type Propagator struct {
 	holderID          string
 	leaseTTL          time.Duration
 
-	// broadcastJobs feeds the persistent worker pool that runs all
-	// per-endpoint SubmitTransaction / SubmitTransactions calls. Replaces
-	// the previous per-broadcast `go func(ep)` spawn loop so sustained
-	// 50+ TPS doesn't produce constant goroutine churn — total broadcast
-	// goroutine count stays bounded at broadcastWorkers regardless of
-	// flush rate. Workers exit when broadcastJobs is closed in Stop().
+	// broadcastJobs feeds the persistent worker pool that runs every
+	// per-endpoint POST /txs call. Replaces the previous per-broadcast
+	// `go func(ep)` spawn loop so sustained 50+ TPS doesn't produce
+	// constant goroutine churn — total broadcast goroutine count stays
+	// bounded at broadcastWorkers regardless of flush rate. Workers
+	// exit when broadcastJobs is closed in Stop().
 	broadcastJobs    chan broadcastJob
 	broadcastWG      sync.WaitGroup
 	broadcastRunning atomic.Bool // true while Start() workers are running
@@ -105,9 +104,9 @@ type Propagator struct {
 }
 
 // broadcastJob is the unit of work the persistent broadcast pool consumes.
-// One job represents one HTTP call to one endpoint; the caller bundles a
-// per-call result channel so it can collect outcomes from multiple endpoints
-// in parallel without each worker carrying that bookkeeping.
+// One job represents one POST /txs call to one endpoint; the caller bundles
+// a per-call result channel so it can collect outcomes from multiple
+// endpoints in parallel without each worker carrying that bookkeeping.
 //
 // The ctx field is intentionally part of the value — the job travels through
 // a channel so the cancellation token has to ride with it. The standard
@@ -116,8 +115,6 @@ type Propagator struct {
 type broadcastJob struct {
 	ctx      context.Context //nolint:containedctx // travels with the work item through broadcastJobs channel
 	endpoint string
-	// Exactly one of rawTx (single /tx) or rawTxs (batch /txs) is set.
-	rawTx    []byte
 	rawTxs   [][]byte
 	resultCh chan<- broadcastJobResult
 }
@@ -127,16 +124,16 @@ type broadcastJobResult struct {
 	statusCode int
 	// perSlot is the per-submission-slot result list from /txs. Populated
 	// only when /txs returns 207 Multi-Status with a parseable body
-	// (Teranode #879 + #881); nil for /tx jobs, nil for 200, nil for any
-	// other HTTP outcome. Each non-nil entry is either teranode.TxsResultOK
-	// ("OK") or a Teranode error code string like "TX_INVALID (31)".
+	// (Teranode #879 + #881); nil for 200 and any other HTTP outcome.
+	// Each non-nil entry is either teranode.TxsResultOK ("OK") or a
+	// Teranode error code string like "TX_INVALID (31)".
 	perSlot []string
 	err     error
 }
 
 // txResultClass categorizes a per-tx broadcast outcome into the action
 // the caller should take. The dep-aware pipeline collapses Teranode's
-// rich error vocabulary into four buckets.
+// rich error vocabulary into three buckets.
 type txResultClass int
 
 const (
@@ -152,21 +149,13 @@ const (
 	// rejects descendants. errMsg carries the Teranode code (e.g.
 	// "TX_INVALID (31)") so it shows up in the wallet-visible row.
 	txResultClassRejected
-	// txResultClassInFlight: at least one peer 2xx'd the broadcast
-	// (typically all 202). The tx is in the network's mempool and
-	// merkle-service's /watch will deliver the next status flip via the
-	// callback path. processBatch notifies the dispatcher with
-	// StatusAcceptedByNetwork so the Kafka offset advances and any
-	// dep-waiters release, but writes nothing to the status store —
-	// the SEEN_ON_NETWORK / MINED callback owns the row from here.
-	txResultClassInFlight
 	// txResultClassSkip: broadcast did not produce a useful outcome
-	// (no peer reachable, batch 500 with no parseable body, per-slot
-	// PROCESSING / infra-bucket code). processBatch writes nothing
-	// and does NOT notify the dispatcher — the tx stays at RECEIVED
-	// in the DB and remains in the dispatcher's inFlight set, so the
-	// Kafka offset is pinned. The reaper picks the row up later and
-	// rebroadcasts.
+	// (no peer reachable, /txs returned 4xx/5xx with no per-slot body,
+	// per-slot PROCESSING / infra-bucket code). processBatch writes
+	// nothing and does NOT notify the dispatcher — the tx stays at
+	// RECEIVED in the DB and remains in the dispatcher's inFlight set,
+	// so the Kafka offset is pinned. The reaper picks the row up later
+	// and rebroadcasts.
 	txResultClassSkip
 )
 
@@ -273,21 +262,14 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 	return p
 }
 
-// runBroadcastWorker pulls jobs off broadcastJobs and runs the HTTP submit
-// against the named endpoint. Exits when broadcastJobs is closed (Stop()).
-// The job's context governs cancellation — a winning sibling cancels the
-// per-call broadcastCtx and a 15s deadline bounds worst-case wall time.
+// runBroadcastWorker pulls jobs off broadcastJobs and runs POST /txs against
+// the named endpoint. Exits when broadcastJobs is closed (Stop()). The job's
+// context governs cancellation — a winning sibling cancels the per-call
+// broadcastCtx and a 15s deadline bounds worst-case wall time.
 func (p *Propagator) runBroadcastWorker() {
 	defer p.broadcastWG.Done()
 	for job := range p.broadcastJobs {
-		var statusCode int
-		var perSlot []string
-		var err error
-		if job.rawTxs != nil {
-			statusCode, perSlot, err = p.teranodeClient.SubmitTransactions(job.ctx, job.endpoint, job.rawTxs)
-		} else {
-			statusCode, err = p.teranodeClient.SubmitTransaction(job.ctx, job.endpoint, job.rawTx)
-		}
+		statusCode, perSlot, err := p.teranodeClient.SubmitTransactions(job.ctx, job.endpoint, job.rawTxs)
 		// Non-blocking send — the caller always allocates resultCh with
 		// capacity ≥ number of jobs it submits, so this never blocks. Using
 		// non-blocking lets a Stop() racing with in-flight broadcasts not
@@ -858,10 +840,9 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) {
 
 	seenEndpoints := make(map[string]struct{})
 	var successEndpoints []string
-	var accepted, rejected, inFlight, skipped int
+	var accepted, rejected, skipped int
 	terminalStatuses := make([]*models.TransactionStatus, 0, len(results))
-	var inFlightTxIDs []string
-	for i, res := range results {
+	for _, res := range results {
 		if res.successEndpoint != "" {
 			if _, ok := seenEndpoints[res.successEndpoint]; !ok {
 				seenEndpoints[res.successEndpoint] = struct{}{}
@@ -879,9 +860,6 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) {
 			if res.status != nil {
 				terminalStatuses = append(terminalStatuses, res.status)
 			}
-		case txResultClassInFlight:
-			inFlight++
-			inFlightTxIDs = append(inFlightTxIDs, batch[i].TXID)
 		default:
 			// txResultClassSkip / Unknown: leave at RECEIVED. Do NOT notify
 			// the dispatcher — the offset stays pinned so the reaper can
@@ -892,18 +870,8 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) {
 	}
 
 	p.applyTerminalStatuses(ctx, terminalStatuses, accepted, rejected)
-	// In-flight (2xx-without-verdict) txs aren't terminal in the status
-	// store — merkle-service's SEEN_ON_NETWORK / MINED callback writes the
-	// next row — but from the dispatcher's perspective the tx is in the
-	// network, so we notify with StatusAcceptedByNetwork to mark the Kafka
-	// offset Done and release any held descendants. Skipping this would
-	// pin the offset forever for 2xx-only outcomes.
-	for _, txid := range inFlightTxIDs {
-		p.notifyTerminalToDispatcher(txid, models.StatusAcceptedByNetwork)
-	}
 	metrics.PropagationOutcomeTotal.WithLabelValues("accepted").Add(float64(accepted))
 	metrics.PropagationOutcomeTotal.WithLabelValues("rejected").Add(float64(rejected))
-	metrics.PropagationOutcomeTotal.WithLabelValues("no_verdict").Add(float64(inFlight))
 	metrics.PropagationOutcomeTotal.WithLabelValues("skipped").Add(float64(skipped))
 
 	p.logger.Info(
@@ -911,7 +879,6 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) {
 		zap.Int("count", len(batch)),
 		zap.Int("accepted", accepted),
 		zap.Int("rejected", rejected),
-		zap.Int("in_flight", inFlight),
 		zap.Int("skipped", skipped),
 		zap.Strings("success_endpoints", successEndpoints),
 	)
@@ -967,183 +934,14 @@ func (p *Propagator) broadcastInChunks(ctx context.Context, batch []propagationM
 	return results
 }
 
-// broadcastChunk broadcasts a single chunk (≤ teranodeBatchCap) via /txs
-// (multi-tx) or /tx (single-tx) and writes per-tx classifications into
-// out. No per-tx fallback: with #879+#881 the /txs response carries
-// per-slot info for arcade to classify each tx directly.
+// broadcastChunk broadcasts a single chunk (≤ teranodeBatchCap) via POST
+// /txs and writes per-tx classifications into out. /txs handles any chunk
+// size — a chunk of one is just one tx's bytes — so there's a single
+// classification path regardless of count.
 func (p *Propagator) broadcastChunk(ctx context.Context, chunk []propagationMsg, rawTxs [][]byte, out []txResult) {
 	metrics.PropagationChunkTotal.WithLabelValues("none").Inc()
-	if len(chunk) == 1 {
-		br := p.broadcastSingleToEndpoints(ctx, rawTxs[0], chunk[0].TXID)
-		out[0] = singleResultToTxResult(br, chunk[0])
-		return
-	}
-
 	results, _ := p.broadcastBatchToEndpoints(ctx, rawTxs, chunk)
 	copy(out, results)
-}
-
-// singleResultToTxResult maps a single-tx broadcastResult (returned by
-// the /tx fan-out) into a txResult with the dispatcher action class set.
-// Without per-slot info from /tx the classification comes from the
-// HTTP status code that one peer returned: 200 → accepted, 4xx → rejected
-// with the Teranode body as errMsg, 5xx / unreachable → requeue. The
-// "in-flight, no verdict" case (every peer 202 without a definitive
-// answer) leaves status nil and class accepted: the merkle-service
-// callback will move the tx forward.
-func singleResultToTxResult(br broadcastResult, msg propagationMsg) txResult {
-	if br.Status != nil {
-		switch br.Status.Status { //nolint:exhaustive // only ACCEPTED and REJECTED are emitted by broadcastSingleOnce
-		case models.StatusAcceptedByNetwork:
-			return txResult{
-				class:           txResultClassAccepted,
-				status:          br.Status,
-				rawTx:           msg.RawTx,
-				successEndpoint: br.SuccessEndpoint,
-			}
-		case models.StatusRejected:
-			return txResult{
-				class:  txResultClassRejected,
-				status: br.Status,
-				errMsg: br.ErrorMsg,
-				rawTx:  msg.RawTx,
-			}
-		}
-	}
-	if br.Acknowledged {
-		// In-flight: at least one peer 2xx'd but no verdict. Leave the
-		// tx alone — merkle-service callback drives it forward. The
-		// dispatcher's offset stays in flight; no terminal write.
-		return txResult{
-			class:           txResultClassInFlight,
-			rawTx:           msg.RawTx,
-			successEndpoint: br.SuccessEndpoint,
-		}
-	}
-	// No peer reachable / all timed out — infra failure, requeue.
-	return txResult{
-		class: txResultClassSkip,
-		rawTx: msg.RawTx,
-	}
-}
-
-// broadcastResult holds the outcome of a single-tx broadcast across all endpoints.
-type broadcastResult struct {
-	Status          *models.TransactionStatus
-	ErrorMsg        string // best error message from endpoints (for retryable classification)
-	SuccessEndpoint string // URL of the peer that accepted the tx (empty if none did)
-	// Acknowledged is true when at least one endpoint responded with 2xx
-	// (200 OK or 202 Accepted). Distinguishes "peer received the tx but
-	// won't issue a definitive verdict yet" (Status=nil, Acknowledged=true)
-	// from "no peer was reachable" (Status=nil, Acknowledged=false). The
-	// former is in-flight and shouldn't be retried; the latter must go to
-	// PENDING_RETRY or the tx stays stuck in RECEIVED forever.
-	Acknowledged bool
-}
-
-// inlineRetryAttempts is the number of *additional* attempts to make after
-// the first broadcast fails with a retryable error. Total attempts therefore
-// are inlineRetryAttempts+1. Kept small because each attempt already fans out
-// across all healthy endpoints; the goal is to ride out transient network
-// blips without waiting the full reaper_interval for PENDING_RETRY.
-// broadcastSingleToEndpoints submits a single transaction to each healthy
-// teranode endpoint using POST /tx. On the first accepting endpoint (200 OK)
-// the shared broadcast context is canceled so slower sibling requests don't
-// gate wall-time on the slowest peer. Per-endpoint outcomes are recorded into
-// the teranode client's circuit-breaker so repeatedly failing peers are
-// sidelined from future broadcasts.
-//
-// No inline retry: transient failures classify as txResultClassSkip at
-// the call site (see singleResultToTxResult), and the dispatcher's requeue
-// path picks them up after a short flat wait.
-func (p *Propagator) broadcastSingleToEndpoints(ctx context.Context, rawTx []byte, txid string) broadcastResult {
-	return p.broadcastSingleOnce(ctx, rawTx, txid)
-}
-
-// broadcastSingleOnce is one attempt of a single-tx broadcast. Split out so
-// broadcastSingleToEndpoints can loop around it for inline retries.
-func (p *Propagator) broadcastSingleOnce(ctx context.Context, rawTx []byte, txid string) broadcastResult {
-	start := time.Now()
-	defer func() {
-		metrics.PropagationBroadcastDuration.WithLabelValues("single").Observe(time.Since(start).Seconds())
-	}()
-	endpoints := p.teranodeClient.GetHealthyEndpoints()
-	if len(endpoints) == 0 {
-		p.logger.Error("no healthy teranode endpoints")
-		return broadcastResult{}
-	}
-
-	submitCtx, cancelSubmit := context.WithTimeout(ctx, 15*time.Second)
-	defer cancelSubmit()
-	broadcastCtx, cancelBroadcast := context.WithCancel(submitCtx)
-	defer cancelBroadcast()
-
-	// Submit one job per endpoint to the persistent worker pool. resultCh is
-	// sized to len(endpoints) so worker sends never block. The for-range
-	// drains exactly len(endpoints) results before exiting — no separate
-	// goroutine to close the channel.
-	resultCh := make(chan broadcastJobResult, len(endpoints))
-	submitted := p.submitBroadcastJobs(broadcastCtx, endpoints, rawTx, nil, resultCh)
-
-	// Collect every non-canceled result first so the circuit-breaker can
-	// reason about the whole broadcast attempt at once (network-consensus
-	// detection). Per-result aggregation of bestStatus stays in the loop —
-	// we still need it to decide the tx's status update.
-	outcomes := make([]endpointOutcome, 0, submitted)
-	var bestStatus models.Status
-	var lastErrMsg string
-	var successEndpoint string
-	acknowledged := false
-	for i := 0; i < submitted; i++ {
-		result := <-resultCh
-		// A sibling request canceled by a winning race is not a real failure —
-		// the peer didn't misbehave, we called off the race. Skip health
-		// recording and status aggregation for that case.
-		if isCanceledByBroadcast(broadcastCtx, result.err) {
-			continue
-		}
-		outcomes = append(outcomes, endpointOutcome{endpoint: result.endpoint, statusCode: result.statusCode})
-		if result.err != nil {
-			lastErrMsg = result.err.Error()
-			if statusPriority(models.StatusRejected) > statusPriority(bestStatus) {
-				bestStatus = models.StatusRejected
-			}
-			continue
-		}
-		switch result.statusCode {
-		case http.StatusOK:
-			acknowledged = true
-			if statusPriority(models.StatusAcceptedByNetwork) > statusPriority(bestStatus) {
-				bestStatus = models.StatusAcceptedByNetwork
-				successEndpoint = result.endpoint
-			}
-			// Early-cancel: the first 200 is the verdict. Sibling requests
-			// observe broadcastCtx.Err() and return quickly.
-			cancelBroadcast()
-		case http.StatusAccepted:
-			// 202 means the peer accepted the tx but won't tell us yet —
-			// matching original behavior, no tx-level status update, but
-			// flag Acknowledged so the caller knows the tx reached a peer.
-			acknowledged = true
-			cancelBroadcast()
-		}
-	}
-	recordBroadcastOutcomes(p.teranodeClient, outcomes)
-
-	if bestStatus == "" {
-		return broadcastResult{Acknowledged: acknowledged}
-	}
-
-	return broadcastResult{
-		Status: &models.TransactionStatus{
-			TxID:      txid,
-			Status:    bestStatus,
-			Timestamp: time.Now(),
-		},
-		ErrorMsg:        lastErrMsg,
-		SuccessEndpoint: successEndpoint,
-		Acknowledged:    acknowledged,
-	}
 }
 
 // isCanceledByBroadcast reports whether err is a context.Canceled directly
@@ -1234,7 +1032,7 @@ func recordBroadcastOutcomes(tc *teranode.Client, outcomes []endpointOutcome) {
 
 // submitBroadcastJobs enqueues one broadcast job per endpoint to the
 // persistent worker pool, returning the number of jobs actually queued.
-// Exactly one of rawTx (single /tx) or rawTxs (batch /txs) must be non-nil.
+// Each job POSTs the same rawTxs slice to its endpoint.
 //
 // If the job channel is full or nil (tests construct Propagator without
 // Start() — broadcastJobs is initialized in New but the pool may not be
@@ -1242,14 +1040,13 @@ func recordBroadcastOutcomes(tc *teranode.Client, outcomes []endpointOutcome) {
 // so behavior matches the persistent-pool path. Result channel ordering is
 // independent of submission order, which is fine — callers aggregate by
 // endpoint, not position.
-func (p *Propagator) submitBroadcastJobs(ctx context.Context, endpoints []string, rawTx []byte, rawTxs [][]byte, resultCh chan<- broadcastJobResult) int {
+func (p *Propagator) submitBroadcastJobs(ctx context.Context, endpoints []string, rawTxs [][]byte, resultCh chan<- broadcastJobResult) int {
 	submitted := 0
 	useChannel := p.broadcastRunning.Load()
 	for _, endpoint := range endpoints {
 		job := broadcastJob{
 			ctx:      ctx,
 			endpoint: endpoint,
-			rawTx:    rawTx,
 			rawTxs:   rawTxs,
 			resultCh: resultCh,
 		}
@@ -1265,14 +1062,7 @@ func (p *Propagator) submitBroadcastJobs(ctx context.Context, endpoints []string
 		}
 		submitted++
 		go func(j broadcastJob) {
-			var statusCode int
-			var perSlot []string
-			var err error
-			if j.rawTxs != nil {
-				statusCode, perSlot, err = p.teranodeClient.SubmitTransactions(j.ctx, j.endpoint, j.rawTxs)
-			} else {
-				statusCode, err = p.teranodeClient.SubmitTransaction(j.ctx, j.endpoint, j.rawTx)
-			}
+			statusCode, perSlot, err := p.teranodeClient.SubmitTransactions(j.ctx, j.endpoint, j.rawTxs)
 			select {
 			case j.resultCh <- broadcastJobResult{endpoint: j.endpoint, statusCode: statusCode, perSlot: perSlot, err: err}:
 			default:
@@ -1318,7 +1108,7 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 	defer cancelBroadcast()
 
 	resultCh := make(chan broadcastJobResult, len(endpoints))
-	submitted := p.submitBroadcastJobs(broadcastCtx, endpoints, nil, rawTxs, resultCh)
+	submitted := p.submitBroadcastJobs(broadcastCtx, endpoints, rawTxs, resultCh)
 
 	outcomes := make([]endpointOutcome, 0, submitted)
 	anySuccess := false
@@ -1440,18 +1230,4 @@ func makeSkipResults(batch []propagationMsg) []txResult {
 		}
 	}
 	return results
-}
-
-// statusPriority returns a numeric priority for broadcast result aggregation.
-func statusPriority(s models.Status) int {
-	switch s {
-	case models.StatusAcceptedByNetwork:
-		return 3
-	case models.StatusSentToNetwork:
-		return 2
-	case models.StatusRejected:
-		return 1
-	default:
-		return 0
-	}
 }

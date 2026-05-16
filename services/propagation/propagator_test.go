@@ -286,12 +286,6 @@ func (m *mockStore) IterateStatusesSince(_ context.Context, since time.Time, fn 
 	return nil
 }
 
-func (m *mockStore) pendingRetryCount() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return len(m.pendingRetries)
-}
-
 func (m *mockStore) updateCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -339,12 +333,10 @@ func newMerkleServer(log *eventLog, statusCode int) *httptest.Server {
 }
 
 func newTeranodeServer(log *eventLog, statusCode int) *httptest.Server {
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/txs" {
-			log.add("broadcast-batch")
-		} else {
-			log.add("broadcast")
-		}
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Only /txs is exercised post-collapse; a single event label is
+		// enough for ordering / count assertions in the tests.
+		log.add("broadcast")
 		w.WriteHeader(statusCode)
 	}))
 }
@@ -456,7 +448,7 @@ func TestHandleMessage_RegistrationBeforeBroadcast(t *testing.T) {
 		t.Errorf("expected first event to be register, got: %s", events[0])
 	}
 	if events[1] != "broadcast" {
-		t.Errorf("expected second event to be 'broadcast' (single /tx), got: %s", events[1])
+		t.Errorf("expected second event to be 'broadcast', got: %s", events[1])
 	}
 
 	if ms.updateCount() != 1 {
@@ -508,8 +500,8 @@ func TestHandleMessage_BatchAllRegistered(t *testing.T) {
 		t.Errorf("expected 5 register events, got %d", log.count("register:"))
 	}
 	// Single batch POST to teranode /txs
-	if log.count("broadcast-batch") != 1 {
-		t.Errorf("expected 1 batch broadcast call, got %d", log.count("broadcast-batch"))
+	if log.count("broadcast") != 1 {
+		t.Errorf("expected 1 batch broadcast call, got %d", log.count("broadcast"))
 	}
 	if ms.updateCount() != 5 {
 		t.Errorf("expected 5 UpdateStatus calls, got %d", ms.updateCount())
@@ -540,9 +532,6 @@ func TestHandleMessage_NoMerkleClient_SkipsRegistration(t *testing.T) {
 	}
 	if log.count("broadcast") != 1 {
 		t.Error("teranode should have received exactly 1 broadcast request")
-	}
-	if log.count("broadcast-batch") != 0 {
-		t.Error("single tx should not use batch endpoint")
 	}
 }
 
@@ -575,9 +564,6 @@ func TestHandleMessage_NoCallbackURL_SkipsRegistration(t *testing.T) {
 	}
 	if log.count("broadcast") != 1 {
 		t.Error("teranode should have received exactly 1 broadcast request")
-	}
-	if log.count("broadcast-batch") != 0 {
-		t.Error("single tx should not use batch endpoint")
 	}
 }
 
@@ -1178,61 +1164,11 @@ func TestProcessBatch_NilMerkleClient_SkipsRegistration(t *testing.T) {
 	}
 }
 
-// Test 10: Single transaction uses /tx endpoint, not /txs
-func TestSingleTransaction_UsesTxEndpoint(t *testing.T) {
-	log := &eventLog{}
-	ms := newMockStore()
-
-	teranodeSrv := newTeranodeServer(log, http.StatusOK)
-	defer teranodeSrv.Close()
-
-	p := newPropagator("", teranodeSrv.URL, ms)
-
-	err := handleAndFlush(t, p, makePropMsg("single-tx"))
-	if err != nil {
-		t.Fatalf("expected no error, got: %v", err)
-	}
-
-	if log.count("broadcast") != 1 {
-		t.Errorf("expected 1 broadcast event, got %d", log.count("broadcast"))
-	}
-	if log.count("broadcast-batch") != 0 {
-		t.Error("single tx should hit /tx, not /txs")
-	}
-}
-
-// Test 11: Batch transactions use /txs endpoint, not /tx
-func TestBatchTransactions_UsesTxsEndpoint(t *testing.T) {
-	log := &eventLog{}
-	ms := newMockStore()
-
-	teranodeSrv := newTeranodeServer(log, http.StatusOK)
-	defer teranodeSrv.Close()
-
-	p := newPropagator("", teranodeSrv.URL, ms)
-
-	for i := 0; i < 3; i++ {
-		_ = p.handleMessage(context.Background(), consumerMsg(makePropMsg(fmt.Sprintf("tx%d", i))))
-	}
-
-	if err := flushSync(t, p); err != nil {
-		t.Fatalf("flush error: %v", err)
-	}
-
-	if log.count("broadcast-batch") != 1 {
-		t.Errorf("expected 1 batch broadcast, got %d", log.count("broadcast-batch"))
-	}
-	// Verify no single-tx broadcasts occurred
-	events := log.all()
-	for _, ev := range events {
-		if ev == "broadcast" {
-			t.Error("batch should not hit /tx single endpoint")
-		}
-	}
-}
-
-// Test 12: Single transaction 200 → AcceptedByNetwork
-func TestSingleTransaction_Status200_AcceptedByNetwork(t *testing.T) {
+// TestSizeOneBatch_Status200_AcceptedByNetwork verifies that a flush with a
+// single tx still terminalizes as ACCEPTED_BY_NETWORK. Post-collapse there's
+// no /tx fast path — the same /txs pipeline handles size-1 chunks via the
+// "200 → whole batch accepted" branch.
+func TestSizeOneBatch_Status200_AcceptedByNetwork(t *testing.T) {
 	ms := newMockStore()
 
 	teranodeSrv := newTeranodeServer(&eventLog{}, http.StatusOK)
@@ -1252,30 +1188,6 @@ func TestSingleTransaction_Status200_AcceptedByNetwork(t *testing.T) {
 	defer ms.mu.Unlock()
 	if ms.updates[0].Status != models.StatusAcceptedByNetwork {
 		t.Errorf("expected AcceptedByNetwork, got %s", ms.updates[0].Status)
-	}
-}
-
-// Test 13: Single transaction 202 → no status update (matching original behavior)
-func TestSingleTransaction_Status202_NoStatusUpdate(t *testing.T) {
-	ms := newMockStore()
-
-	teranodeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusAccepted)
-	}))
-	defer teranodeSrv.Close()
-
-	p := newPropagator("", teranodeSrv.URL, ms)
-
-	err := handleAndFlush(t, p, makePropMsg("tx-202"))
-	if err != nil {
-		t.Fatalf("expected no error, got: %v", err)
-	}
-
-	if ms.updateCount() != 0 {
-		t.Errorf("expected 0 UpdateStatus calls for 202 response, got %d", ms.updateCount())
-	}
-	if ms.pendingRetryCount() != 0 {
-		t.Errorf("202 ack must NOT route to PENDING_RETRY (tx is in flight); got %d", ms.pendingRetryCount())
 	}
 }
 
