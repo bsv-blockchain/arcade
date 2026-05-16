@@ -632,6 +632,42 @@ func observeRequest(op string, statusCode int, start time.Time) {
 	metrics.TeranodeRequestDuration.WithLabelValues(op, metrics.ObserveStatusClass(statusCode)).Observe(time.Since(start).Seconds())
 }
 
+// SubmitTransaction submits a single transaction to a Teranode endpoint via
+// POST /tx. Returns the HTTP status code (200 = accepted, 202 = queued).
+// Not consumed by the propagation pipeline (which uses POST /txs for all
+// batch sizes including one) — kept on the client so callers needing the
+// single-tx endpoint directly don't have to reimplement it.
+func (c *Client) SubmitTransaction(ctx context.Context, endpoint string, rawTx []byte) (int, error) {
+	start := time.Now()
+	url := endpoint + "/tx"
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(rawTx))
+	if err != nil {
+		observeRequest("submit_tx", 0, start)
+		return 0, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/octet-stream")
+	if c.authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.authToken)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		observeRequest("submit_tx", 0, start)
+		return 0, fmt.Errorf("failed to submit transaction: %w", err)
+	}
+	defer drainAndClose(resp.Body)
+	defer observeRequest("submit_tx", resp.StatusCode, start)
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, fmt.Errorf("%w %d: %s", errUnexpectedStatusCode, resp.StatusCode, string(body))
+	}
+
+	return resp.StatusCode, nil
+}
+
 // SubmitTransactions submits multiple transactions as a batch to a single endpoint.
 // The raw transaction bytes are concatenated into a single body and POSTed to /txs.
 // Returns the HTTP status code and a per-slot result list parsed from the response
