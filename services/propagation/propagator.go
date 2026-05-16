@@ -125,12 +125,11 @@ type broadcastJob struct {
 type broadcastJobResult struct {
 	endpoint   string
 	statusCode int
-	// perSlot is the per-submission-slot result list from /txs (post-#881).
-	// nil for /tx (single-tx) jobs, nil for /txs jobs whose body couldn't
-	// be parsed into one line per submission slot, and nil for any HTTP
-	// outcome other than 500-with-parseable-body. Each non-nil entry is
-	// either teranode.TxsResultOK ("OK") or a Teranode error code string
-	// like "TX_INVALID (31)".
+	// perSlot is the per-submission-slot result list from /txs. Populated
+	// only when /txs returns 207 Multi-Status with a parseable body
+	// (Teranode #879 + #881); nil for /tx jobs, nil for 200, nil for any
+	// other HTTP outcome. Each non-nil entry is either teranode.TxsResultOK
+	// ("OK") or a Teranode error code string like "TX_INVALID (31)".
 	perSlot []string
 	err     error
 }
@@ -1287,14 +1286,14 @@ func (p *Propagator) submitBroadcastJobs(ctx context.Context, endpoints []string
 // endpoint via /txs and produces per-tx classifications:
 //
 //   - Any endpoint returning 200 → every slot accepted (the peer accepted
-//     the whole batch; per-slot info from other peers' 500 responses is
+//     the whole batch; per-slot info from other peers' 207 responses is
 //     superseded).
-//   - All endpoints failed with HTTP 500 and at least one carried a
-//     parseable per-slot body (post-#881) → per-slot classification.
-//     Each slot is accepted, rejected (named Teranode code), or
-//     requeued (infra-bucket code).
+//   - No endpoint returned 200, but at least one returned 207 with a
+//     parseable per-slot body (Teranode #879 + #881) → per-slot
+//     classification. Each slot is accepted, rejected (named Teranode
+//     code), or skipped (infra-bucket code).
 //   - All endpoints failed without per-slot info, or no healthy endpoints
-//     existed → every slot requeued (pure batch-level infra failure).
+//     existed → every slot skipped (pure batch-level infra failure).
 //
 // Per-endpoint outcomes are recorded into the circuit-breaker regardless
 // of verdict so a peer returning 500 doesn't get sidelined when the

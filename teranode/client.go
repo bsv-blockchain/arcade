@@ -671,17 +671,17 @@ func (c *Client) SubmitTransaction(ctx context.Context, endpoint string, rawTx [
 // body. The per-slot list is len(rawTxs) long whenever the response carries
 // authoritative per-slot information:
 //
-//   - HTTP 200 + body "OK" / "OK\n": every slot succeeded, result is nil so callers
-//     short-circuit without per-slot inspection.
-//   - HTTP 500 + a body of newline-separated lines, one per submission slot
-//     (post-bsv-blockchain/teranode#879+#881): each line is either "OK" (slot
-//     succeeded) or "<TERANODE_CODE_NAME> (<num>)" (slot failed with the named
-//     code, e.g. "TX_INVALID (31)"). The returned per-slot slice carries those
-//     strings verbatim so the caller can switch on them. When the body cannot be
-//     parsed into len(rawTxs) lines, per-slot is nil and the caller treats the
-//     batch as a pure infra failure (whole batch requeued).
-//   - Anything else (4xx, transport error): per-slot is nil; the caller decides
-//     by HTTP status / error.
+//   - HTTP 200: every slot succeeded. Result is nil so callers short-circuit
+//     without per-slot inspection.
+//   - HTTP 207 Multi-Status + a body of newline-separated lines, one per
+//     submission slot (bsv-blockchain/teranode#879 + #881): each line is
+//     either "OK" (slot succeeded) or "<TERANODE_CODE_NAME> (<num>)" (slot
+//     failed with the named code, e.g. "TX_INVALID (31)"). The returned
+//     per-slot slice carries those strings verbatim so the caller can switch
+//     on them.
+//   - Anything else (4xx, 5xx, transport error): per-slot is nil; the caller
+//     treats the batch as a pure infra failure (whole batch left at RECEIVED
+//     for the reaper to retry).
 //
 // The "OK" sentinel on a per-slot line is exposed as TxsResultOK to keep
 // the parsing contract grep-able from call sites.
@@ -725,7 +725,9 @@ func (c *Client) SubmitTransactions(ctx context.Context, endpoint string, rawTxs
 		return resp.StatusCode, nil, nil
 	}
 
-	if resp.StatusCode == http.StatusInternalServerError {
+	// 207 Multi-Status is the per-slot response (Teranode #879 + #881).
+	// Any other 4xx/5xx is a real error — no per-slot body to parse.
+	if resp.StatusCode == http.StatusMultiStatus {
 		slots := parseTxsPerSlot(respBody, len(rawTxs))
 		if slots != nil {
 			return resp.StatusCode, slots, fmt.Errorf("%w %d", errUnexpectedStatusCode, resp.StatusCode)
@@ -740,7 +742,7 @@ func (c *Client) SubmitTransactions(ctx context.Context, endpoint string, rawTxs
 const TxsResultOK = "OK"
 
 // parseTxsPerSlot extracts the per-submission-slot results from a /txs
-// 500 response body. The post-#881 format is:
+// 207 Multi-Status response body. The format is:
 //
 //	"OK\n<NAME> (<num>)\nOK\n…\n"
 //
