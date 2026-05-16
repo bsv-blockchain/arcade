@@ -713,7 +713,6 @@ const TxsResultOK = "OK"
 //
 //	"OK\n<NAME> (<num>)\nOK\n…\n"
 //
-// optionally preceded by a "Failed to process transactions:" heading line.
 // Returns a slice of len expected results, or nil when the body cannot be
 // parsed into exactly that many slot lines (in which case the caller
 // treats the batch as a pure infra failure).
@@ -727,9 +726,6 @@ func parseTxsPerSlot(body []byte, expected int) []string {
 		return nil
 	}
 	lines := strings.Split(text, "\n")
-	if len(lines) > 0 && strings.HasPrefix(lines[0], "Failed to process transactions") {
-		lines = lines[1:]
-	}
 	if len(lines) != expected {
 		return nil
 	}

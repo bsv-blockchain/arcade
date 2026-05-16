@@ -1209,9 +1209,7 @@ func TestSizeOneBatch_Status200_AcceptedByNetwork(t *testing.T) {
 
 // --- Retry Tests ---
 
-// (removed: Reaper / PENDING_RETRY / TestRetry_PermanentError_ImmediateReject
-// and the other reaper-flow tests. The reaper, retryable.go, backoff.go,
-// PENDING_RETRY status, and handleRetryableFailure are all gone in the
-// dep-aware design. Infra failures retry forever via the
-// inline-register-retry path or the dispatcher requeue path; real per-tx
-// rejections are terminal and exercised by other tests.)
+// (removed: TestRetry_PermanentError_ImmediateReject and other tests that
+// exercised the per-message PENDING_RETRY+DLQ path. Real per-tx rejections
+// are terminal and covered by other tests; infra failures retry via the
+// reaper.)

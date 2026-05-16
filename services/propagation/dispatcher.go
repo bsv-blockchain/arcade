@@ -80,6 +80,16 @@ type drainRequest struct {
 	reply chan []propagationMsg
 }
 
+// requeueRequest sends an already-in-flight tx back through admission
+// after a transient infra failure (Teranode infra slot, merkle /watch
+// error, etc.). The tx is already in inFlight and its offset is already
+// on the tracker — the dispatcher just re-checks parents and routes to
+// either heldMsgs or pendingMsgs. No reply: the caller doesn't need to
+// know which bucket the tx landed in.
+type requeueRequest struct {
+	msg propagationMsg
+}
+
 // dispatcherConfig is the small subset of Propagator config the
 // dispatcher needs at runtime.
 type dispatcherConfig struct {
@@ -176,6 +186,9 @@ func (p *Propagator) runDispatcher(ctx context.Context, claim kafka.Claim, cfg d
 		case req := <-admitChIfRoom:
 			res := handleAdmit(req.msg, req.offset, inFlight, waiters, heldMsgs, &pendingMsgs, tracker)
 			req.reply <- res
+
+		case req := <-p.requeueCh:
+			handleRequeue(req.msg, inFlight, waiters, heldMsgs, &pendingMsgs)
 
 		case ev := <-p.terminalCh:
 			result := handleTerminal(ev, inFlight, waiters, heldMsgs, &pendingMsgs, tracker)
@@ -306,6 +319,57 @@ func handleAdmit(
 	// Eligible for broadcast. Add to pendingMsgs.
 	*pendingMsgs = append(*pendingMsgs, msg)
 	return admitResult{admitted: true}
+}
+
+// handleRequeue re-routes an already-in-flight tx after a transient
+// infra failure. The tx is already in inFlight (from the original
+// handleAdmit) and its offset is already on the tracker, so this only
+// has to re-check parents and place the msg into either heldMsgs or
+// pendingMsgs.
+//
+// A tx whose own status flipped terminal (e.g. via a sibling's cascade)
+// won't be in inFlight anymore; in that case the requeue is a no-op.
+func handleRequeue(
+	msg propagationMsg,
+	inFlight map[string]int64,
+	waiters map[string]map[string]struct{},
+	heldMsgs map[string]propagationMsg,
+	pendingMsgs *[]propagationMsg,
+) {
+	if _, ok := inFlight[msg.TXID]; !ok {
+		// Terminalized between the failed broadcast and the requeue
+		// (e.g. cascade-rejected by a parent). Drop on the floor.
+		return
+	}
+
+	var blocking map[string]struct{}
+	for _, parent := range msg.InputTXIDs {
+		if parent == "" || parent == msg.TXID {
+			continue
+		}
+		if _, inFlt := inFlight[parent]; !inFlt {
+			continue
+		}
+		if blocking == nil {
+			blocking = make(map[string]struct{})
+		}
+		blocking[parent] = struct{}{}
+	}
+
+	if len(blocking) > 0 {
+		for parent := range blocking {
+			set, ok := waiters[parent]
+			if !ok {
+				set = make(map[string]struct{})
+				waiters[parent] = set
+			}
+			set[msg.TXID] = struct{}{}
+		}
+		heldMsgs[msg.TXID] = msg
+		return
+	}
+
+	*pendingMsgs = append(*pendingMsgs, msg)
 }
 
 // handleTerminal processes a terminal status flip for txid. ACCEPTED
@@ -505,4 +569,13 @@ func (p *Propagator) drainPending() []propagationMsg {
 	reply := make(chan []propagationMsg, 1)
 	p.drainCh <- drainRequest{reply: reply}
 	return <-reply
+}
+
+// requeueToDispatcher sends a tx back through admission after a
+// transient infra failure. Fire-and-forget — the dispatcher's reply
+// (held vs pending) doesn't change anything the caller can act on.
+// The send is buffered (dispatcherChannelBuffer); a momentarily
+// saturated buffer applies natural backpressure to the caller.
+func (p *Propagator) requeueToDispatcher(msg propagationMsg) {
+	p.requeueCh <- requeueRequest{msg: msg}
 }

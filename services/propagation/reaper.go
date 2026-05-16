@@ -13,11 +13,6 @@ import (
 
 // Stale thresholds for the reaper rebroadcast scan.
 //
-// staleReceivedAge: a row at RECEIVED that's older than this hasn't seen
-// the broadcast pipeline make progress on it. Pick it up and try again.
-// Comfortably larger than the 15s teranode broadcast timeout so we don't
-// fight an in-flight processBatch goroutine that's mid-broadcast.
-//
 // staleSeenOnNetworkAge: a row at SEEN_ON_NETWORK that's older than this
 // is in a Teranode mempool somewhere but not advancing to MINED. Rebroadcast
 // to refresh upstream state — a peer may have evicted the tx, a fee bump
@@ -29,7 +24,6 @@ import (
 // responsibility — the operator surfaces them with `arcade tools surface
 // stuck` if a deeper sweep is needed.
 const (
-	staleReceivedAge       = 30 * time.Second
 	staleSeenOnNetworkAge  = time.Hour
 	staleScanLookback      = 24 * time.Hour
 	reaperRebroadcastBatch = 200
@@ -88,21 +82,23 @@ func (p *Propagator) tryReap(ctx context.Context) {
 	p.reapOnce(ctx)
 }
 
-// reapOnce scans rows updated within staleScanLookback, picks out those
-// stuck at RECEIVED past staleReceivedAge or SEEN_ON_NETWORK past
-// staleSeenOnNetworkAge, and rebroadcasts them through the same
-// registerBatch + broadcastInChunks + applyTerminalStatuses path that
-// processBatch uses. The reaper bypasses the dispatcher entirely — its
-// rebroadcasts go directly to teranode, and any resulting terminal
-// status update notifies the dispatcher through applyTerminalStatuses
-// so the Kafka offset for the original message advances naturally.
+// reapOnce rebroadcasts rows stuck at SEEN_ON_NETWORK past
+// staleSeenOnNetworkAge (peer mempool eviction, dropped BLOCK_PROCESSED
+// callback, fee bump needed). RECEIVED rows are intentionally not
+// rebroadcast — the submitter got an error from intake on Kafka publish
+// failure and owns the decision to retry.
+//
+// Rebroadcasts go through the same registerBatch + broadcastInChunks +
+// applyTerminalStatuses pipeline as processBatch but bypass the
+// dispatcher's admission — these rows are no longer in inFlight, so any
+// resulting terminal status notifies the dispatcher via applyTerminalStatuses
+// only as a no-op for offset bookkeeping.
 //
 // Bounded by reaperRebroadcastBatch per tick so a backlog can't pin the
 // reaper into a single multi-minute call.
 func (p *Propagator) reapOnce(ctx context.Context) {
 	now := time.Now()
 	since := now.Add(-staleScanLookback)
-	receivedDeadline := now.Add(-staleReceivedAge)
 	seenDeadline := now.Add(-staleSeenOnNetworkAge)
 
 	stuck := make([]propagationMsg, 0, reaperRebroadcastBatch)
@@ -116,17 +112,15 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 			return nil
 		}
 		switch st.Status {
-		case models.StatusReceived:
-			if !st.Timestamp.Before(receivedDeadline) {
-				return nil
-			}
 		case models.StatusSeenOnNetwork, models.StatusSeenMultipleNodes:
 			if !st.Timestamp.Before(seenDeadline) {
 				return nil
 			}
 		default:
-			// Terminal statuses, MINED, IMMUTABLE, RECEIVED-but-still-fresh,
-			// etc. — not the reaper's job.
+			// RECEIVED rows are intentionally NOT rebroadcast — the
+			// submitter got an error from intake on Kafka publish
+			// failure and is responsible for deciding whether to retry.
+			// Terminal statuses, MINED, IMMUTABLE — not the reaper's job.
 			return nil
 		}
 		stuck = append(stuck, propagationMsg{TXID: st.TxID, RawTx: st.RawTx})
@@ -143,13 +137,13 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 	p.logger.Info("reaper: rebroadcasting stuck txs", zap.Int("count", len(stuck)))
 	metrics.PropagationReaperReadyDepth.Set(float64(len(stuck)))
 
-	// Use the same broadcast pipeline as processBatch so all the
-	// per-tx classification (Accepted / Rejected / InFlight / Skip)
-	// applies uniformly. applyTerminalStatuses writes terminal rows
-	// AND notifies the dispatcher — txids the dispatcher doesn't know
-	// about (because the original Kafka message terminated long ago)
-	// get a no-op notify, which is fine.
-	registered := p.registerBatch(ctx, stuck)
+	// Use the same broadcast pipeline as processBatch so the per-tx
+	// classification (Accepted / Rejected / Requeue) applies uniformly.
+	// applyTerminalStatuses writes terminal rows AND notifies the
+	// dispatcher — txids the dispatcher doesn't know about (because the
+	// original Kafka message terminated long ago) get a no-op notify,
+	// which is fine.
+	registered, _ := p.registerBatch(ctx, stuck)
 	if len(registered) == 0 {
 		return
 	}
@@ -173,9 +167,12 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 			if res.status != nil {
 				terminalStatuses = append(terminalStatuses, res.status)
 			}
-		case txResultClassUnknown, txResultClassSkip:
-			// Skip / Unknown: leave the row alone so the next reaper
-			// tick picks it up.
+		case txResultClassUnknown, txResultClassRequeue:
+			// Requeue / Unknown from the reaper's rebroadcast path:
+			// leave the row alone so the next reaper tick picks it up.
+			// The reaper bypasses the dispatcher, so there's no inFlight
+			// entry to requeue against — natural retry is just the next
+			// tick.
 		}
 	}
 	p.applyTerminalStatuses(ctx, terminalStatuses, accepted, rejected)
