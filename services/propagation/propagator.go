@@ -95,6 +95,13 @@ type Propagator struct {
 	// worker pool so an in-flight batch doesn't lose its broadcast
 	// results to a closed jobs channel.
 	inflightBatches sync.WaitGroup
+	// backgroundWG tracks the long-running Start-spawned goroutines —
+	// runReaper, runMerkleReplay — so Stop can wait for them to exit
+	// before the surrounding app cleanup closes the store backing them.
+	// Without this, a reaper mid-lease-release or mid-status-scan
+	// races with store.Close and the test framework attributes the
+	// resulting goroutine panic to the test's Cleanup callback.
+	backgroundWG sync.WaitGroup
 }
 
 // broadcastJob is the unit of work the persistent broadcast pool consumes.
@@ -486,7 +493,11 @@ func (p *Propagator) Start(ctx context.Context) error {
 	// its own. Compensates for /watch state loss on the merkle-service side
 	// (recreated namespace, data wipe, schema migration) which otherwise
 	// silently disables STUMP callbacks for every previously-submitted tx.
-	go p.runMerkleReplay(ctx)
+	p.backgroundWG.Add(1)
+	go func() {
+		defer p.backgroundWG.Done()
+		p.runMerkleReplay(ctx)
+	}()
 
 	// Reaper: scans the status store for non-terminal rows that have
 	// been stuck longer than the per-status thresholds and rebroadcasts
@@ -494,7 +505,11 @@ func (p *Propagator) Start(ctx context.Context) error {
 	// itself runs each tx through the broadcast pipeline exactly once
 	// and relies on the reaper to retry anything that didn't reach a
 	// terminal verdict.
-	go p.runReaper(ctx)
+	p.backgroundWG.Add(1)
+	go func() {
+		defer p.backgroundWG.Done()
+		p.runReaper(ctx)
+	}()
 
 	p.logger.Info(
 		"propagation service started",
@@ -559,6 +574,15 @@ func (p *Propagator) Stop() error {
 	if p.dispatcherCancel != nil {
 		p.dispatcherCancel()
 	}
+	// Wait for the long-running Start-spawned goroutines (reaper,
+	// merkle replay) to exit before returning. The surrounding app
+	// cleanup will close the store as soon as Stop returns; if the
+	// reaper is mid-IterateStatusesSince or mid-lease-release on a
+	// closed store, the goroutine panics and the test framework
+	// attributes the failure to t.Cleanup. Their parent ctx has
+	// already been cancelled by the caller, so this only blocks on
+	// in-flight scan/release work.
+	p.backgroundWG.Wait()
 	return consumerErr
 }
 
