@@ -602,6 +602,10 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 			TxID:      txid,
 			Status:    models.StatusReceived,
 			Timestamp: time.Now(),
+			// Carry the raw bytes on the status row so the propagation
+			// reaper can rebroadcast txs that are stuck in non-terminal
+			// states without re-fetching from Kafka or the API caller.
+			RawTx: rawTx,
 		}
 		existing, inserted, dedupErr := s.store.GetOrInsertStatus(c.Request.Context(), row)
 		switch {
@@ -779,6 +783,9 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				TxID:      p.txid,
 				Status:    models.StatusReceived,
 				Timestamp: time.Now(),
+				// Carry the raw bytes on the row so the propagation
+				// reaper can rebroadcast stuck txs without re-fetching.
+				RawTx: p.raw,
 			}
 			existing, inserted, dedupErr := s.store.GetOrInsertStatus(ctx, row)
 			switch {

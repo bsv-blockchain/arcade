@@ -80,17 +80,6 @@ type drainRequest struct {
 	reply chan []propagationMsg
 }
 
-// requeueRequest re-injects a slice of propagation messages into the
-// dispatcher after an infra-failed broadcast. The dispatcher re-runs
-// admission logic on each message — txs whose parents have terminalized
-// in the meantime go to pendingMsgs; those still blocked move (back) to
-// heldMsgs. The originating offsets stay in inFlight and on the
-// offsetTracker for the whole loop, so no Kafka commit can advance
-// past them.
-type requeueRequest struct {
-	msgs []propagationMsg
-}
-
 // dispatcherConfig is the small subset of Propagator config the
 // dispatcher needs at runtime.
 type dispatcherConfig struct {
@@ -192,19 +181,6 @@ func (p *Propagator) runDispatcher(ctx context.Context, claim kafka.Claim, cfg d
 			result := handleTerminal(ev, inFlight, waiters, heldMsgs, &pendingMsgs, tracker)
 			ev.reply <- result
 			advanceMarks(claim, tracker, pendingMarks)
-
-		case req := <-p.requeueCh:
-			// Requeue path: an infra-failed broadcast wants these
-			// messages back in the broadcast queue. Each tx is
-			// already on the tracker (its offset was added on the
-			// original admit and never marked Done since broadcast
-			// didn't terminalize). Re-run admission so a tx whose
-			// parents are no longer in-flight goes to pendingMsgs,
-			// while one whose parents are still in-flight goes
-			// (back) to heldMsgs.
-			for _, msg := range req.msgs {
-				handleRequeue(msg, inFlight, waiters, heldMsgs, &pendingMsgs)
-			}
 
 		case req := <-p.drainCh:
 			batch := pendingMsgs
@@ -330,61 +306,6 @@ func handleAdmit(
 	// Eligible for broadcast. Add to pendingMsgs.
 	*pendingMsgs = append(*pendingMsgs, msg)
 	return admitResult{admitted: true}
-}
-
-// handleRequeue re-injects a previously-admitted message into the
-// dispatcher after an infra-failed broadcast. The tx is already in
-// inFlight and on the offsetTracker (the original admit added it and
-// nothing has marked it Done since the broadcast didn't terminalize),
-// so the offset stays pinned. We only need to re-evaluate dependency
-// state: if every parent has terminalized in the meantime, the tx
-// goes back to pendingMsgs; if any parent is still in-flight, the tx
-// (re-)enters heldMsgs and registers as a waiter.
-func handleRequeue(
-	msg propagationMsg,
-	inFlight map[string]int64,
-	waiters map[string]map[string]struct{},
-	heldMsgs map[string]propagationMsg,
-	pendingMsgs *[]propagationMsg,
-) {
-	// Defensive: if the tx is no longer tracked (e.g. terminalized on
-	// some racing path), drop the requeue. Without inFlight entry we
-	// can't pin a watermark anyway.
-	if _, ok := inFlight[msg.TXID]; !ok {
-		return
-	}
-
-	var blocking map[string]struct{}
-	for _, parent := range msg.InputTXIDs {
-		if parent == "" || parent == msg.TXID {
-			continue
-		}
-		if _, inFlt := inFlight[parent]; !inFlt {
-			continue
-		}
-		if blocking == nil {
-			blocking = make(map[string]struct{})
-		}
-		blocking[parent] = struct{}{}
-	}
-
-	if len(blocking) > 0 {
-		for parent := range blocking {
-			set, ok := waiters[parent]
-			if !ok {
-				set = make(map[string]struct{})
-				waiters[parent] = set
-			}
-			set[msg.TXID] = struct{}{}
-		}
-		heldMsgs[msg.TXID] = msg
-		return
-	}
-
-	// Parents all terminalized — drop any stale heldMsgs entry and
-	// put the tx back into the broadcast queue.
-	delete(heldMsgs, msg.TXID)
-	*pendingMsgs = append(*pendingMsgs, msg)
 }
 
 // handleTerminal processes a terminal status flip for txid. ACCEPTED
@@ -584,15 +505,4 @@ func (p *Propagator) drainPending() []propagationMsg {
 	reply := make(chan []propagationMsg, 1)
 	p.drainCh <- drainRequest{reply: reply}
 	return <-reply
-}
-
-// requeueToDispatcher sends a batch of propagation messages back to
-// the dispatcher after an infra-failed broadcast. Fire-and-forget — the
-// caller (a processBatch goroutine that just finished its short
-// post-failure wait) doesn't need a reply.
-func (p *Propagator) requeueToDispatcher(msgs []propagationMsg) {
-	if len(msgs) == 0 {
-		return
-	}
-	p.requeueCh <- requeueRequest{msgs: msgs}
 }

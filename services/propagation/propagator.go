@@ -52,16 +52,15 @@ type Propagator struct {
 	consumer       *kafka.ConsumerGroup
 
 	maxPending int
-	// admitCh, terminalCh, drainCh, and requeueCh feed runDispatcher's
-	// single state-owning loop. The loop selects on these channels (and,
-	// in production, claim.Messages()) and runs ALL dep-aware state
+	// admitCh, terminalCh, and drainCh feed runDispatcher's single
+	// state-owning loop. The loop selects on these channels (and, in
+	// production, claim.Messages()) and runs ALL dep-aware state
 	// mutations — inFlight, waiters, heldMsgs, pendingMsgs, the
 	// offsetTracker, and the pendingMarks map — inside the goroutine
 	// that owns the loop. No locks, no atomics. See dispatcher.go.
 	admitCh           chan admitRequest
 	terminalCh        chan terminalEvent
 	drainCh           chan drainRequest
-	requeueCh         chan requeueRequest
 	dispatcherCancel  context.CancelFunc
 	merkleConcurrency int
 	reaperInterval    time.Duration
@@ -136,10 +135,10 @@ type txResultClass int
 
 const (
 	// txResultClassUnknown is the zero value — a result that hasn't been
-	// classified yet. Should never reach the caller; if it does, the
-	// default branch in processBatch's classification loop treats it as
-	// a requeue to avoid silently losing the tx.
-	txResultClassUnknown txResultClass = iota //nolint:unused // reserved for the zero-value defensive branch in processBatch
+	// classified yet. Should never reach the caller; if it does,
+	// processBatch's default branch treats it the same as Skip (leave
+	// at RECEIVED, reaper will rebroadcast).
+	txResultClassUnknown txResultClass = iota
 	// txResultClassAccepted: terminalize as ACCEPTED_BY_NETWORK, dispatcher
 	// releases waiters.
 	txResultClassAccepted
@@ -147,19 +146,22 @@ const (
 	// rejects descendants. errMsg carries the Teranode code (e.g.
 	// "TX_INVALID (31)") so it shows up in the wallet-visible row.
 	txResultClassRejected
-	// txResultClassRequeue: infra failure (no peer reachable, batch 500
-	// with no parseable body, per-slot PROCESSING code). Tx is not
-	// terminal — dispatcher keeps the offset alive and processBatch
-	// sends the original propagation message back to the dispatcher
-	// after a short flat wait.
-	txResultClassRequeue
-	// txResultClassInFlight: at least one peer 2xx'd the broadcast but
-	// no peer gave a verdict (typically all 202). The tx is in-flight
-	// on the network and merkle-service's eventual callback flips its
-	// status. processBatch writes nothing, requeues nothing, and the
-	// dispatcher's offset stays alive until the callback handler sends
-	// a terminal event.
+	// txResultClassInFlight: at least one peer 2xx'd the broadcast
+	// (typically all 202). The tx is in the network's mempool and
+	// merkle-service's /watch will deliver the next status flip via the
+	// callback path. processBatch notifies the dispatcher with
+	// StatusAcceptedByNetwork so the Kafka offset advances and any
+	// dep-waiters release, but writes nothing to the status store —
+	// the SEEN_ON_NETWORK / MINED callback owns the row from here.
 	txResultClassInFlight
+	// txResultClassSkip: broadcast did not produce a useful outcome
+	// (no peer reachable, batch 500 with no parseable body, per-slot
+	// PROCESSING / infra-bucket code). processBatch writes nothing
+	// and does NOT notify the dispatcher — the tx stays at RECEIVED
+	// in the DB and remains in the dispatcher's inFlight set, so the
+	// Kafka offset is pinned. The reaper picks the row up later and
+	// rebroadcasts.
+	txResultClassSkip
 )
 
 // broadcastJobBuffer sizes the job channel between broadcast helpers and the
@@ -248,7 +250,6 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 		admitCh:           make(chan admitRequest, dispatcherChannelBuffer),
 		terminalCh:        make(chan terminalEvent, dispatcherChannelBuffer),
 		drainCh:           make(chan drainRequest),
-		requeueCh:         make(chan requeueRequest, dispatcherChannelBuffer),
 	}
 	// Start a dispatcher goroutine with a nil claim so tests that
 	// construct via New and drive via admitCh / drainCh have a running
@@ -487,10 +488,17 @@ func (p *Propagator) Start(ctx context.Context) error {
 	// silently disables STUMP callbacks for every previously-submitted tx.
 	go p.runMerkleReplay(ctx)
 
+	// Reaper: scans the status store for non-terminal rows that have
+	// been stuck longer than the per-status thresholds and rebroadcasts
+	// them. The reaper is the durable retry surface — processBatch
+	// itself runs each tx through the broadcast pipeline exactly once
+	// and relies on the reaper to retry anything that didn't reach a
+	// terminal verdict.
+	go p.runReaper(ctx)
+
 	p.logger.Info(
 		"propagation service started",
 		zap.Duration("reaper_interval", p.reaperInterval),
-		zap.Int("reaper_batch_size", p.reaperBatchSize),
 		zap.Int("broadcast_workers", p.broadcastWorkers),
 		zap.Int("max_parallel_chunks", p.maxParallelChunks),
 	)
@@ -644,19 +652,14 @@ func (p *Propagator) flushBatch(ctx context.Context) error {
 }
 
 // registerBatch invokes merkle-service /watch for every tx in the batch and
-// partitions the result into "registered" (broadcast-eligible) and "failed"
-// registers every tx with merkle-service /watch before broadcast.
-//
-// Merkle-service /watch is binary: the only per-tx variation is the txid
-// string, so a failure means the upstream is unavailable, not that any
-// particular tx is malformed. The function retries the whole batch
-// inline with capped-exponential backoff (merkleRetryBackoffs), forever.
-// While this loop is running it holds the caller's processBatchSem slot,
-// which produces the backpressure we want: once all slots are held, the
-// consumer stops admitting new work until merkle-service recovers.
+// returns the subset that registered successfully. Txs whose /watch failed
+// are dropped from the broadcast slice and left at their existing DB status
+// (RECEIVED) — the reaper picks them up later and tries again. There's no
+// inline retry here: a single attempt per tx, with the reaper as the durable
+// retry surface.
 //
 // When the merkle integration is disabled (client nil or no callback URL),
-// every tx is treated as registered — there's no registration step to fail.
+// every tx is treated as registered.
 func (p *Propagator) registerBatch(ctx context.Context, batch []propagationMsg) []propagationMsg {
 	if p.merkleClient == nil || p.cfg.CallbackURL == "" {
 		return batch
@@ -671,105 +674,58 @@ func (p *Propagator) registerBatch(ctx context.Context, batch []propagationMsg) 
 		}
 	}
 
-	attempt := 0
-	for {
-		start := time.Now()
-		errs := p.merkleClient.RegisterBatchWithResults(ctx, regs, p.merkleConcurrency)
-		metrics.PropagationMerkleRegisterDuration.Observe(time.Since(start).Seconds())
+	start := time.Now()
+	errs := p.merkleClient.RegisterBatchWithResults(ctx, regs, p.merkleConcurrency)
+	metrics.PropagationMerkleRegisterDuration.Observe(time.Since(start).Seconds())
 
-		var failedCount int
-		for _, err := range errs {
-			if err != nil {
-				failedCount++
-			}
+	registered := make([]propagationMsg, 0, len(batch))
+	successTxIDs := make([]string, 0, len(batch))
+	var failedCount int
+	var sampleErr error
+	for i, err := range errs {
+		if err == nil {
+			registered = append(registered, batch[i])
+			successTxIDs = append(successTxIDs, batch[i].TXID)
+			continue
 		}
+		failedCount++
+		if sampleErr == nil {
+			sampleErr = err
+		}
+		metrics.PropagationMerkleRegisterFailures.WithLabelValues("register_error").Inc()
+	}
 
-		if failedCount == 0 {
-			metrics.PropagationMerkleRegisterBatchOutcomeTotal.WithLabelValues("fully_ok").Inc()
-			// Stamp merkle_registered_at on every tx we successfully registered.
-			// The startup replay loop reads this and skips rows registered within
-			// MerkleReplaySkipRecentMinutes — without it, every restart re-walks
-			// the whole watchlist regardless of whether merkle-service already
-			// has it (issue #145). A store-write failure here must not block
-			// broadcast: the mark is a hint, not part of the F-024 invariant.
-			txids := make([]string, len(batch))
-			for i, m := range batch {
-				txids[i] = m.TXID
-			}
-			if err := p.store.MarkMerkleRegisteredByTxIDs(ctx, txids, time.Now()); err != nil {
-				p.logger.Warn(
-					"mark merkle-registered failed",
-					zap.Int("count", len(txids)),
-					zap.Error(err),
-				)
-			}
-			return batch
-		}
-
-		// At least one /watch failed. Treat as upstream-unavailable and
-		// retry the WHOLE batch — a partial failure on a per-tx-uniform
-		// payload (only the txid varies) indicates the merkle-service
-		// itself is in distress, not that a specific tx is special.
-		metrics.PropagationMerkleRegisterFailures.WithLabelValues("register_error").Add(float64(failedCount))
-		if failedCount == len(batch) {
-			metrics.PropagationMerkleRegisterBatchOutcomeTotal.WithLabelValues("all_failed").Inc()
-		} else {
-			metrics.PropagationMerkleRegisterBatchOutcomeTotal.WithLabelValues("partial").Inc()
-		}
-
-		// Pull a representative error for the log line.
-		var sampleErr error
-		for _, err := range errs {
-			if err != nil {
-				sampleErr = err
-				break
-			}
-		}
+	switch {
+	case failedCount == 0:
+		metrics.PropagationMerkleRegisterBatchOutcomeTotal.WithLabelValues("fully_ok").Inc()
+	case len(registered) == 0:
+		metrics.PropagationMerkleRegisterBatchOutcomeTotal.WithLabelValues("all_failed").Inc()
+	default:
+		metrics.PropagationMerkleRegisterBatchOutcomeTotal.WithLabelValues("partial").Inc()
+	}
+	if failedCount > 0 {
 		p.logger.Warn(
-			"merkle-service /watch failing; retrying batch",
+			"merkle-service /watch partial/all failure; reaper will retry",
 			zap.Int("batch_size", len(batch)),
 			zap.Int("failed", failedCount),
-			zap.Int("attempt", attempt+1),
+			zap.Int("registered", len(registered)),
 			zap.Error(sampleErr),
 		)
+	}
 
-		backoff := merkleRetryBackoff(attempt)
-		attempt++
-		select {
-		case <-ctx.Done():
-			// Claim ended (shutdown / rebalance). Return the original
-			// batch unregistered; the next consumer of this partition
-			// will replay these messages because their Kafka offsets
-			// remain in flight on the dispatcher's tracker.
-			return nil
-		case <-time.After(backoff):
+	// Stamp merkle_registered_at on the successful subset so the startup
+	// replay loop can skip them. A store-write failure here must not block
+	// broadcast — the mark is a hint, not part of the F-024 invariant.
+	if len(successTxIDs) > 0 {
+		if err := p.store.MarkMerkleRegisteredByTxIDs(ctx, successTxIDs, time.Now()); err != nil {
+			p.logger.Warn(
+				"mark merkle-registered failed",
+				zap.Int("count", len(successTxIDs)),
+				zap.Error(err),
+			)
 		}
 	}
-}
-
-// merkleRetryBackoffs is the capped-exponential schedule for the
-// registerBatch inline retry: 100ms → 500ms → 2s → 5s → 10s, then 10s
-// steady. Driven by the agreed "retry forever for infra failures" rule
-// from docs/plans/dependency-aware-dispatch.md.
-var merkleRetryBackoffs = []time.Duration{
-	100 * time.Millisecond,
-	500 * time.Millisecond,
-	2 * time.Second,
-	5 * time.Second,
-	10 * time.Second,
-}
-
-// merkleRetryBackoff returns the backoff for retry attempt n (0-indexed).
-// Clamps to the last entry of merkleRetryBackoffs once the schedule is
-// exhausted — every attempt after the schedule waits the cap.
-func merkleRetryBackoff(attempt int) time.Duration {
-	if attempt < 0 {
-		attempt = 0
-	}
-	if attempt >= len(merkleRetryBackoffs) {
-		return merkleRetryBackoffs[len(merkleRetryBackoffs)-1]
-	}
-	return merkleRetryBackoffs[attempt]
+	return registered
 }
 
 // txResult carries per-tx outcome of a broadcast. class is the
@@ -800,7 +756,7 @@ func classifyPerSlotLine(line string) (txResultClass, string) {
 	if isTeranodeTerminalCode(line) {
 		return txResultClassRejected, line
 	}
-	return txResultClassRequeue, line
+	return txResultClassSkip, line
 }
 
 // teranodeTerminalCodes is the set of post-#881 Teranode error code
@@ -836,35 +792,26 @@ func isTeranodeTerminalCode(line string) bool {
 	return ok
 }
 
-// requeueWait is the short flat delay before processBatch sends an
-// infra-failed sub-batch back to the dispatcher. Kept short enough to
-// pick up Teranode/merkle-service recovery promptly, long enough that a
-// sustained outage doesn't busy-loop the processBatch slot.
-const requeueWait = 2 * time.Second
-
-// processBatch handles a batch of propagation messages:
-//  1. Register every tx with merkle-service (batched, bounded concurrency).
-//     Failed-register txs go to handleRetryableFailure and are EXCLUDED from
-//     the broadcast pass — preserves the F-024 "register before broadcast"
-//     invariant at batch granularity.
-//  2. Broadcast registered txs to teranode endpoints, chunked to
-//     teranodeBatchCap.
-//  3. Update status for each transaction.
+// processBatch handles one drained batch:
+//  1. Register every tx with merkle-service. Txs whose /watch failed are
+//     dropped from the broadcast slice and left at RECEIVED for the reaper.
+//  2. Broadcast the registered subset to teranode in /txs chunks.
+//  3. For each per-tx result, apply the corresponding action:
+//     - Accepted    → terminal ACCEPTED row + dispatcher notify (releases waiters)
+//     - Rejected    → terminal REJECTED row + dispatcher notify (cascade)
+//     - InFlight    → dispatcher notify with AcceptedByNetwork (releases
+//     waiters, marks the Kafka offset Done), no status row write
+//     - Skip        → leave at RECEIVED, do NOT notify the dispatcher. The
+//     Kafka offset stays pinned and the reaper picks the row up later.
 //
-// All failure paths are absorbed internally: per-tx failures route to
-// PENDING_RETRY or get logged-and-skipped, and a batch-wide store error is
-// logged on the goroutine spawned by flushBatch. There is no caller that
-// reacts to an aggregate error here, so the function returns void.
+// Failure paths are absorbed internally — there's no caller that reacts
+// to an aggregate error here, so the function returns void.
 func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) {
-	// Step 1: register all txs with merkle-service in parallel. Drops any tx
-	// whose registration failed — that tx is already queued for durable retry
-	// via handleRetryableFailure inside registerBatch.
 	batch = p.registerBatch(ctx, batch)
 	if len(batch) == 0 {
 		return
 	}
 
-	// Log batch summary for traceability
 	txidSample := make([]string, 0, 5)
 	for i, msg := range batch {
 		if i >= 5 {
@@ -880,25 +827,17 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) {
 
 	metrics.PropagationBatchSize.Observe(float64(len(batch)))
 
-	// Step 2: Broadcast in chunks bounded by teranodeBatchCap so a single
-	// oversized Kafka flush doesn't blow past Teranode's /txs size limit.
 	rawTxs := make([][]byte, len(batch))
 	for i, msg := range batch {
 		rawTxs[i] = msg.RawTx
 	}
 	results := p.broadcastInChunks(ctx, batch, rawTxs)
 
-	// Step 2: Classify per-tx outcomes by txResultClass.
-	//   accepted → terminal ACCEPTED status write, dispatcher releases waiters
-	//   rejected → terminal REJECTED status write, dispatcher cascade-rejects
-	//   inFlight → no terminal write; merkle-service callback drives forward
-	//   requeue  → no terminal write; the original propagationMsg goes back
-	//              to the dispatcher after a short flat wait
 	seenEndpoints := make(map[string]struct{})
 	var successEndpoints []string
-	var accepted, rejected, inFlight int
+	var accepted, rejected, inFlight, skipped int
 	terminalStatuses := make([]*models.TransactionStatus, 0, len(results))
-	requeueMsgs := make([]propagationMsg, 0)
+	var inFlightTxIDs []string
 	for i, res := range results {
 		if res.successEndpoint != "" {
 			if _, ok := seenEndpoints[res.successEndpoint]; !ok {
@@ -919,20 +858,30 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) {
 			}
 		case txResultClassInFlight:
 			inFlight++
-		case txResultClassRequeue:
-			requeueMsgs = append(requeueMsgs, batch[i])
+			inFlightTxIDs = append(inFlightTxIDs, batch[i].TXID)
 		default:
-			// Unknown class — defensive: requeue so we don't silently lose
-			// the tx and the dispatcher's offset stays alive.
-			requeueMsgs = append(requeueMsgs, batch[i])
+			// txResultClassSkip / Unknown: leave at RECEIVED. Do NOT notify
+			// the dispatcher — the offset stays pinned so the reaper can
+			// rebroadcast and the natural terminal flow can mark the offset
+			// Done when it eventually completes.
+			skipped++
 		}
 	}
 
 	p.applyTerminalStatuses(ctx, terminalStatuses, accepted, rejected)
+	// In-flight (2xx-without-verdict) txs aren't terminal in the status
+	// store — merkle-service's SEEN_ON_NETWORK / MINED callback writes the
+	// next row — but from the dispatcher's perspective the tx is in the
+	// network, so we notify with StatusAcceptedByNetwork to mark the Kafka
+	// offset Done and release any held descendants. Skipping this would
+	// pin the offset forever for 2xx-only outcomes.
+	for _, txid := range inFlightTxIDs {
+		p.notifyTerminalToDispatcher(txid, models.StatusAcceptedByNetwork)
+	}
 	metrics.PropagationOutcomeTotal.WithLabelValues("accepted").Add(float64(accepted))
 	metrics.PropagationOutcomeTotal.WithLabelValues("rejected").Add(float64(rejected))
 	metrics.PropagationOutcomeTotal.WithLabelValues("no_verdict").Add(float64(inFlight))
-	metrics.PropagationOutcomeTotal.WithLabelValues("requeue").Add(float64(len(requeueMsgs)))
+	metrics.PropagationOutcomeTotal.WithLabelValues("skipped").Add(float64(skipped))
 
 	p.logger.Info(
 		"batch propagated",
@@ -940,22 +889,9 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) {
 		zap.Int("accepted", accepted),
 		zap.Int("rejected", rejected),
 		zap.Int("in_flight", inFlight),
-		zap.Int("requeue", len(requeueMsgs)),
+		zap.Int("skipped", skipped),
 		zap.Strings("success_endpoints", successEndpoints),
 	)
-
-	if len(requeueMsgs) > 0 {
-		// Wait a short flat period so a brief upstream blip has time to
-		// recover before we re-enter the batch into the dispatcher. The
-		// processBatch slot stays held during the wait, which is the
-		// natural backpressure we want when upstream is unhealthy.
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(requeueWait):
-		}
-		p.requeueToDispatcher(requeueMsgs)
-	}
 }
 
 // Per-batch chunk parallelism is now config-driven via
@@ -1063,7 +999,7 @@ func singleResultToTxResult(br broadcastResult, msg propagationMsg) txResult {
 	}
 	// No peer reachable / all timed out — infra failure, requeue.
 	return txResult{
-		class: txResultClassRequeue,
+		class: txResultClassSkip,
 		rawTx: msg.RawTx,
 	}
 }
@@ -1094,7 +1030,7 @@ type broadcastResult struct {
 // the teranode client's circuit-breaker so repeatedly failing peers are
 // sidelined from future broadcasts.
 //
-// No inline retry: transient failures classify as txResultClassRequeue at
+// No inline retry: transient failures classify as txResultClassSkip at
 // the call site (see singleResultToTxResult), and the dispatcher's requeue
 // path picks them up after a short flat wait.
 func (p *Propagator) broadcastSingleToEndpoints(ctx context.Context, rawTx []byte, txid string) broadcastResult {
@@ -1350,7 +1286,7 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 	endpoints := p.teranodeClient.GetHealthyEndpoints()
 	if len(endpoints) == 0 {
 		p.logger.Error("no healthy teranode endpoints")
-		return makeRequeueResults(batch), ""
+		return makeSkipResults(batch), ""
 	}
 
 	submitCtx, cancelSubmit := context.WithTimeout(ctx, 15*time.Second)
@@ -1455,7 +1391,7 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 				}
 			default:
 				results[i] = txResult{
-					class:  txResultClassRequeue,
+					class:  txResultClassSkip,
 					errMsg: errMsg,
 					rawTx:  msg.RawTx,
 				}
@@ -1466,17 +1402,17 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 
 	// All endpoints failed and none had a parseable per-slot body —
 	// treat the whole batch as infra and requeue every tx.
-	return makeRequeueResults(batch), ""
+	return makeSkipResults(batch), ""
 }
 
-// makeRequeueResults builds a per-tx requeue result list for a batch
+// makeSkipResults builds a per-tx skip result list for a batch
 // that hit a pure infra failure (no healthy endpoints, no parseable
 // per-slot body, etc.).
-func makeRequeueResults(batch []propagationMsg) []txResult {
+func makeSkipResults(batch []propagationMsg) []txResult {
 	results := make([]txResult, len(batch))
 	for i, msg := range batch {
 		results[i] = txResult{
-			class: txResultClassRequeue,
+			class: txResultClassSkip,
 			rawTx: msg.RawTx,
 		}
 	}
