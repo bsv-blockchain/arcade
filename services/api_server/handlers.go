@@ -620,6 +620,14 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		}
 	}
 
+	// Register the tx with the in-process TxTracker so the bump-builder
+	// recognizes it when its block is processed. Same reason as the
+	// bulk handler: tx_validator's Add is gone, so the api_server has
+	// to do it.
+	if s.txTracker != nil {
+		s.txTracker.Add(txid, models.StatusReceived)
+	}
+
 	// Record the callback subscription BEFORE publishing to Kafka so
 	// any status events fired on this txid can find a matching row.
 	s.recordSubmission(c.Request.Context(), txid, opts)
@@ -786,6 +794,18 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 		}
 	} else {
 		toPublish = parsed
+	}
+
+	// Register every accepted tx with the in-process TxTracker so the
+	// bump-builder's filterTrackedTxids will recognize them when their
+	// block is processed. Previously this was the tx_validator service's
+	// job; with validation collapsed into the api_server we have to do
+	// it here, otherwise tracked-only fan-out drops every MINED transition
+	// and txs end up stuck at SEEN_ON_NETWORK forever.
+	if s.txTracker != nil {
+		for _, p := range toPublish {
+			s.txTracker.Add(p.txid, models.StatusReceived)
+		}
 	}
 
 	// Record subscriptions BEFORE publishing so any status events that
