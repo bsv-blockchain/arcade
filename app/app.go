@@ -30,7 +30,6 @@ import (
 	"github.com/bsv-blockchain/arcade/services/p2p_client"
 	"github.com/bsv-blockchain/arcade/services/propagation"
 	"github.com/bsv-blockchain/arcade/services/sse"
-	"github.com/bsv-blockchain/arcade/services/tx_validator"
 	"github.com/bsv-blockchain/arcade/services/watchdog"
 	"github.com/bsv-blockchain/arcade/services/webhook"
 	"github.com/bsv-blockchain/arcade/store"
@@ -279,12 +278,6 @@ func BuildServices(d *Deps) []services.Service {
 			d.Logger.Info("chaintracks skipped: chaintracks_server.enabled=false (regtest force-disables this)")
 		}
 	}
-	// tx-validator no longer registered: intake handler now performs
-	// parse + policy validation + dedup synchronously and publishes
-	// directly to the propagation topic with input_txids populated.
-	// The package and its queue-processing scaffolding stay in the
-	// source tree for future reuse.
-	_ = tx_validator.New
 	if shouldRun("propagation") {
 		svcs = append(svcs, propagation.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.Leaser, d.TeranodeClient, d.MerkleClient))
 	}

@@ -109,9 +109,8 @@ func TestBatchGetOrInsertStatusParallel_AllDuplicates(t *testing.T) {
 }
 
 // Mixed: input is a blend of new and duplicate txids. Output positions must
-// match input positions (no implicit reordering). This is the property
-// tx_validator relies on to stitch results back into per-position validatedTx
-// records.
+// match input positions (no implicit reordering). Required for per-position
+// result stitching by callers.
 func TestBatchGetOrInsertStatusParallel_MixedPreservesOrder(t *testing.T) {
 	f := newFakeStore()
 	f.existing["tx-2"] = models.StatusSeenOnNetwork
@@ -136,8 +135,8 @@ func TestBatchGetOrInsertStatusParallel_MixedPreservesOrder(t *testing.T) {
 
 // A single-row failure must not pollute the rest of the batch — the parallel
 // loop returns the first error encountered, but the other rows still complete
-// and their results are populated. This is the partial-success contract that
-// phaseDedup in tx_validator relies on for "drop one bad tx, keep the rest".
+// and their results are populated. Partial-success contract: drop one bad tx,
+// keep the rest.
 func TestBatchGetOrInsertStatusParallel_PartialFailure(t *testing.T) {
 	f := newFakeStore()
 	wantErr := errors.New("transient db error")

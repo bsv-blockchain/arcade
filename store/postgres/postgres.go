@@ -193,8 +193,8 @@ func (s *Store) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.T
 	// Normalise inputs the same way GetOrInsertStatus does — empty Status
 	// becomes RECEIVED, missing timestamps default to now, CreatedAt is set.
 	// Defaults are computed into local variables, never written back to the
-	// caller's struct: callers (e.g. tx_validator) may share the same input
-	// slice across goroutines, and mutating shared pointers would race.
+	// caller's struct: callers may share the same input slice across
+	// goroutines, and mutating shared pointers would race.
 	// Postgres rejects multi-row INSERT…ON CONFLICT DO UPDATE when the same
 	// key appears twice in VALUES (SQLSTATE 21000), so dedupe by txid here
 	// and stitch results back to every duplicate position after the round
@@ -300,7 +300,7 @@ RETURNING txid, status, status_code, block_hash, block_height, merkle_path,
 		res := byTxID[st.TxID]
 		// Only the first input slot for a given txid keeps Inserted=true;
 		// later duplicates report as already-existing so callers don't
-		// double-process the same tx (e.g. tx_validator validating twice).
+		// double-process the same tx.
 		if i != firstPos[st.TxID] && res.Inserted {
 			first := statuses[firstPos[st.TxID]]
 			cp := *first

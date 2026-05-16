@@ -44,8 +44,6 @@ func TestObserveStatusClass(t *testing.T) {
 // scrape config will rely on.
 func TestMetricsHandlerScrapes(t *testing.T) {
 	// Touch a couple of metrics so they actually exist on the registry.
-	TxValidatorPendingDepth.Set(7)
-	TxValidatorOutcomeTotal.WithLabelValues("accepted").Inc()
 	BumpBuilderBlocksProcessedTotal.Inc()
 	PropagationOutcomeTotal.WithLabelValues("accepted").Add(3)
 
@@ -67,8 +65,6 @@ func TestMetricsHandlerScrapes(t *testing.T) {
 
 	body := readAll(t, resp)
 	for _, expected := range []string{
-		"arcade_tx_validator_pending_depth 7",
-		"arcade_tx_validator_outcome_total{outcome=\"accepted\"}",
 		"arcade_bump_builder_blocks_processed_total",
 		"arcade_propagation_outcome_total{outcome=\"accepted\"}",
 	} {

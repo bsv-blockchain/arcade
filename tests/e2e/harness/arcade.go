@@ -223,8 +223,8 @@ func buildArcadeConfig(t *testing.T, port int, opts ArcadeOptions) *config.Confi
 
 // waitReady polls /health until arcade's api-server starts answering
 // or the timeout elapses. Mostly cosmetic — the bump-builder and
-// tx-validator come up almost instantly with a memory broker, but
-// gin's listener takes ~50ms to bind.
+// propagation services come up almost instantly with a memory broker,
+// but gin's listener takes ~50ms to bind.
 func (rt *ArcadeRuntime) waitReady(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {

@@ -118,7 +118,6 @@ type Config struct {
 	P2P           P2PConfig           `mapstructure:"p2p"`
 	Health        HealthConfig        `mapstructure:"health"`
 	Propagation   PropagationConfig   `mapstructure:"propagation"`
-	TxValidator   TxValidatorConfig   `mapstructure:"tx_validator"`
 	BumpBuilder   BumpBuilderConfig   `mapstructure:"bump_builder"`
 	Watchdog      WatchdogConfig      `mapstructure:"watchdog"`
 	SSE           SSEConfig           `mapstructure:"sse"`
@@ -166,10 +165,9 @@ type Kafka struct {
 	MaxRetries    int      `mapstructure:"max_retries"`
 	BufferSize    int      `mapstructure:"buffer_size"`
 	// MinPartitions is the minimum number of partitions every hot-path topic
-	// must have at startup. Set to the expected replica count of the largest
-	// horizontally-scaled consumer (tx-validator or propagation) so arcade
-	// fails fast when the cluster can't actually fan out across pods. Leave
-	// at 0 or 1 in standalone/single-replica deployments.
+	// must have at startup. Set to the expected replica count of the propagation
+	// consumer so arcade fails fast when the cluster can't actually fan out
+	// across pods. Leave at 0 or 1 in standalone/single-replica deployments.
 	MinPartitions int `mapstructure:"min_partitions"`
 	// SendTimeoutMs bounds how long the in-process memory broker waits for a
 	// slot in a full mailbox before returning ErrBrokerBackpressure to the
@@ -577,23 +575,8 @@ type EventsConfig struct {
 // status-update bursts without committing significant memory upfront.
 const DefaultEventsSubscriberBuffer = 4096
 
-// TxValidatorConfig tunes the parallel batch validation pipeline. Parallelism
-// caps how many transactions are parsed and validated concurrently inside a
-// single flush window — bounded so a huge in-flight batch can't open more
-// goroutines than the host has cores. Zero or negative falls back to
-// runtime.NumCPU at construction time.
-type TxValidatorConfig struct {
-	Parallelism int `mapstructure:"parallelism"`
-	// MaxPending caps the in-memory pending-validation slice the validator
-	// consumer accumulates between flushes. Once full, new messages are
-	// returned as errors from handleMessage so the Kafka consumer's
-	// retry+DLQ path sheds load instead of growing the slice to OOM.
-	// Defaults to 50000.
-	MaxPending int `mapstructure:"max_pending"`
-}
-
 func BindFlags(cmd *cobra.Command) {
-	cmd.Flags().String("mode", "all", "Service mode: all, api-server, bump-builder, tx-validator, propagation, p2p-client")
+	cmd.Flags().String("mode", "all", "Service mode: all, api-server, bump-builder, propagation, p2p-client")
 	cmd.Flags().String("config", "", "Path to config file")
 	cmd.Flags().String("log-level", "info", "Log level: debug, info, warn, error")
 	_ = viper.BindPFlag("mode", cmd.Flags().Lookup("mode"))
@@ -863,11 +846,11 @@ func validate(cfg *Config) error {
 	validModes := map[string]bool{
 		"all": true, "api-server": true,
 		"bump-builder": true,
-		"tx-validator": true, "propagation": true,
-		"p2p-client":  true,
-		"chaintracks": true,
-		"sse":         true,
-		"watchdog":    true,
+		"propagation":  true,
+		"p2p-client":   true,
+		"chaintracks":  true,
+		"sse":          true,
+		"watchdog":     true,
 	}
 	if !validModes[cfg.Mode] {
 		return fmt.Errorf("invalid mode %q", cfg.Mode)

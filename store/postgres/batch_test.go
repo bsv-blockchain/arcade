@@ -76,7 +76,8 @@ func TestBatchGetOrInsertStatus_AllDuplicates(t *testing.T) {
 
 // Mixed batch: input ordering must be preserved. Postgres doesn't guarantee
 // RETURNING order matches input order, so the implementation explicitly
-// reassembles by txid. Regressing the reassembly silently breaks tx_validator.
+// reassembles by txid. Regressing the reassembly silently breaks any caller
+// that relies on positional results.
 func TestBatchGetOrInsertStatus_MixedPreservesOrder(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
@@ -156,7 +157,7 @@ func TestBatchGetOrInsertStatus_ConcurrentRace(t *testing.T) {
 // INSERT … ON CONFLICT DO UPDATE (Postgres rejects with SQLSTATE 21000 if
 // the same key appears twice in VALUES). The first occurrence keeps the
 // real Inserted flag; later occurrences must report Inserted=false with
-// Existing populated, so callers like tx_validator don't double-process.
+// Existing populated, so callers don't double-process.
 func TestBatchGetOrInsertStatus_DuplicateInBatch(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
@@ -287,7 +288,7 @@ func TestBatchOps_Empty(t *testing.T) {
 }
 
 // BenchmarkBatchVsSerialInsert compares the batched xmax SQL against the
-// per-row INSERT loop the old tx_validator path used. Run with:
+// per-row INSERT loop the legacy serial-insert path used. Run with:
 //
 //	go test -tags=postgres -bench=BatchVsSerialInsert ./store/postgres/...
 //

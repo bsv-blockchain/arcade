@@ -28,7 +28,7 @@ import (
 // The check exercises every wiring the harness touches:
 //
 //   - arcade boots in-process and accepts POST /tx
-//   - the tx-validator parses and structurally validates the tx
+//   - the intake handler parses and structurally validates the tx
 //   - the propagation service consumes from kafka and calls
 //     merkleClient.Register
 //   - merkle-service in its container reaches its registration store
@@ -67,7 +67,7 @@ func TestSmoke_TxRegistersWithMerkleService(t *testing.T) {
 	}
 	t.Logf("broadcast tx %s", txid)
 
-	// arcade's tx-validator + propagation pipeline is asynchronous.
+	// arcade's propagation pipeline is asynchronous.
 	// Poll merkle-service's lookup endpoint until the registration
 	// shows up.
 	if err := waitForMerkleRegistration(ctx, h.Containers.MerkleHostURL, txid, 30*time.Second); err != nil {

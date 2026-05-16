@@ -79,8 +79,7 @@ func TestBatchGetOrInsertStatus_AllDuplicates(t *testing.T) {
 }
 
 // Mixed batch (some new, some duplicates) must preserve input ordering in
-// the output. tx_validator's phaseDedup relies on this for per-position
-// stitching.
+// the output. Callers depend on this for per-position stitching.
 func TestBatchGetOrInsertStatus_MixedPreservesOrder(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

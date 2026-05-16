@@ -50,7 +50,7 @@ func TestSmoke_RealBlockMined_SingleSubtree(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Minute)
 	defer cancel()
 
-	// 1. Submit each picked tx through arcade. arcade's tx-validator
+	// 1. Submit each picked tx through arcade. arcade's intake handler
 	//    structurally validates + propagation calls merkle-service
 	//    /watch with arcade's callback URL + token.
 	txids, err := harness.BroadcastRawTxs(ctx, t, rt, fix.PickedRawTxs)

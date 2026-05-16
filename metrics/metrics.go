@@ -18,8 +18,6 @@
 //
 // Service ownership
 //
-//   - tx_validator: pipeline depth, flush latency/size, parse fails, accept
-//     vs reject vs duplicate counts.
 //   - propagation: batch size, broadcast latency per outcome, chunk count,
 //     pending-retry depth, reaper lease and tick outcomes, inline retries,
 //     merkle registration latency.
@@ -61,49 +59,6 @@ var sizeBuckets = []float64{
 var bytesBuckets = []float64{
 	256, 1024, 4096, 16 * 1024, 64 * 1024, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024,
 }
-
-// ---------------------------------------------------------------------------
-// tx_validator
-// ---------------------------------------------------------------------------
-
-// TxValidatorPendingDepth is the size of the pending-validation slice. Sustained
-// growth means handleMessage is queueing faster than flushValidations can
-// process — likely time to increase tx_validator.parallelism or partition count.
-var TxValidatorPendingDepth = promauto.NewGauge(prometheus.GaugeOpts{
-	Name: "arcade_tx_validator_pending_depth",
-	Help: "Number of raw tx messages buffered awaiting flush.",
-})
-
-// TxValidatorPublishCarryDepth is the size of the publish-carry slice. Non-zero
-// means the propagation Kafka topic is rejecting publishes — investigate Kafka
-// health.
-var TxValidatorPublishCarryDepth = promauto.NewGauge(prometheus.GaugeOpts{
-	Name: "arcade_tx_validator_publish_carry_depth",
-	Help: "Number of validated propagation messages awaiting Kafka publish retry.",
-})
-
-// TxValidatorFlushDuration measures end-to-end wall time of one flush window
-// (parse + dedup + validate + persist + publish).
-var TxValidatorFlushDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
-	Name:    "arcade_tx_validator_flush_duration_seconds",
-	Help:    "Wall time of one tx_validator flush window, by outcome.",
-	Buckets: latencyBuckets,
-}, []string{labelOutcome}) // success, publish_failed
-
-// TxValidatorFlushSize captures how many txs each flush processed. Tracking the
-// distribution surfaces whether parallelism is being applied at all (a stuck
-// at size=1 means we're effectively serial).
-var TxValidatorFlushSize = promauto.NewHistogram(prometheus.HistogramOpts{
-	Name:    "arcade_tx_validator_flush_size",
-	Help:    "Number of txs processed per flush window.",
-	Buckets: sizeBuckets,
-})
-
-// TxValidatorOutcomeTotal counts per-tx outcomes from the validation phase.
-var TxValidatorOutcomeTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_tx_validator_outcome_total",
-	Help: "Per-tx validation outcome counts.",
-}, []string{labelOutcome}) // accepted, rejected, duplicate, parse_fail, store_error
 
 // ---------------------------------------------------------------------------
 // propagation

@@ -71,9 +71,9 @@ func newE2EHarness(t *testing.T) *e2eHarness {
 	}
 }
 
-// publishAndPersist mirrors what tx_validator does in production: it
-// writes the status row to the store first, then publishes onto the
-// events stream.
+// publishAndPersist mirrors what the api_server intake does in
+// production: it writes the status row to the store first, then
+// publishes onto the events stream.
 func (h *e2eHarness) publishAndPersist(t *testing.T, status *models.TransactionStatus) {
 	t.Helper()
 	h.store.setStatus(status.TxID, status)

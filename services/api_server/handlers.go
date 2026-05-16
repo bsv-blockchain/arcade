@@ -21,9 +21,26 @@ import (
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/services/tx_validator"
 	"github.com/bsv-blockchain/arcade/teranode"
 )
+
+// collectInputTXIDs returns the parent txids referenced by every input of
+// tx. Empty for coinbase. Used to populate the propagation envelope's
+// input_txids field so the dispatcher can detect parent-child
+// relationships without re-parsing the raw bytes downstream.
+func collectInputTXIDs(tx *sdkTx.Transaction) []string {
+	if tx == nil || len(tx.Inputs) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(tx.Inputs))
+	for _, in := range tx.Inputs {
+		if in == nil || in.SourceTXID == nil {
+			continue
+		}
+		out = append(out, in.SourceTXID.String())
+	}
+	return out
+}
 
 const jsonKeyError = "error"
 
@@ -578,8 +595,7 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// and re-encode it downstream.
 	txid := parsedTx.TxID().String()
 
-	// Synchronous policy validation. Matches the legacy tx_validator
-	// service's behavior (skipFees=true, skipScripts=true) — fee and
+	// Synchronous policy validation (skipFees=true, skipScripts=true) — fee and
 	// script checks remain Teranode's job. Validation failure writes a
 	// terminal REJECTED row to the store and returns 400 to the client
 	// so the failure is durable AND immediate.
@@ -625,9 +641,7 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	}
 
 	// Register the tx with the in-process TxTracker so the bump-builder
-	// recognizes it when its block is processed. Same reason as the
-	// bulk handler: tx_validator's Add is gone, so the api_server has
-	// to do it.
+	// recognizes it when its block is processed.
 	if s.txTracker != nil {
 		s.txTracker.Add(txid, models.StatusReceived)
 	}
@@ -639,7 +653,7 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	msg := map[string]interface{}{
 		"txid":        txid,
 		"raw_tx":      rawTx,
-		"input_txids": tx_validator.CollectInputTXIDs(parsedTx),
+		"input_txids": collectInputTXIDs(parsedTx),
 	}
 	if err := s.producer.Send(kafka.TopicPropagation, txid, msg); err != nil {
 		if errors.Is(err, kafka.ErrBrokerBackpressure) {
@@ -804,11 +818,9 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	}
 
 	// Register every accepted tx with the in-process TxTracker so the
-	// bump-builder's filterTrackedTxids will recognize them when their
-	// block is processed. Previously this was the tx_validator service's
-	// job; with validation collapsed into the api_server we have to do
-	// it here, otherwise tracked-only fan-out drops every MINED transition
-	// and txs end up stuck at SEEN_ON_NETWORK forever.
+	// bump-builder's filterTrackedTxids recognizes them when their block
+	// is processed. Without this, tracked-only fan-out drops every MINED
+	// transition and txs stay stuck at SEEN_ON_NETWORK forever.
 	if s.txTracker != nil {
 		for _, p := range toPublish {
 			s.txTracker.Add(p.txid, models.StatusReceived)
@@ -833,7 +845,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				Value: map[string]interface{}{
 					"txid":        p.txid,
 					"raw_tx":      p.raw,
-					"input_txids": tx_validator.CollectInputTXIDs(p.tx),
+					"input_txids": collectInputTXIDs(p.tx),
 				},
 			})
 		}

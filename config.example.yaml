@@ -3,7 +3,7 @@
 # All values can be overridden with ARCADE_ prefixed env vars
 # (e.g. ARCADE_LOG_LEVEL, ARCADE_KAFKA_BROKERS).
 
-# Service mode: all, api-server, bump-builder, tx-validator, propagation
+# Service mode: all, api-server, bump-builder, propagation
 mode: all
 
 log_level: info
@@ -154,12 +154,6 @@ health:
 #     # synchronously on Start (capped at 2s) so a freshly started pod sees
 #     # the current registry before serving traffic.
 #     refresh_interval_ms: 30000
-
-tx_validator:
-# Maximum concurrent transactions parsed and validated inside a single flush
-# window. Validation is CPU-bound and stateless, so the sweet spot is around
-# NumCPU. Set 0 to take runtime.NumCPU() at startup.
-# parallelism: 0
 
 bump_builder:
   # Grace window after BLOCK_PROCESSED before reading STUMPs, to allow for
