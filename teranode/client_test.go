@@ -75,43 +75,52 @@ func TestSubmitTransactions_Batch(t *testing.T) {
 	}
 }
 
-// TestSubmitTransactions_PerSlot_207 exercises the post-#881 Teranode
-// response: HTTP 207 Multi-Status with a body of newline-separated per-slot
-// results. The client must parse the body into a per-slot slice and return
-// the status code along with an error (so the caller's err != nil branch
-// kicks in and routes through the per-slot classification path).
-func TestSubmitTransactions_PerSlot_207(t *testing.T) {
+// TestSubmitTransactions_FailureList_500 exercises Teranode upstream main
+// post-#879: HTTP 500 with body "Failed to process transactions:\n<line>\n…"
+// where each non-header line is "<NAME> (<num>): [ProcessTransaction][<txid>] ...".
+// The client must extract the per-txid failure map and return the status
+// code along with an error so the caller's err != nil branch routes through
+// the per-txid classification path.
+func TestSubmitTransactions_FailureList_500(t *testing.T) {
+	const (
+		txidA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		txidB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	)
+	body := "Failed to process transactions:\n" +
+		"TX_INVALID (31): [ProcessTransaction][" + txidA + "] tx is invalid because UTXO_SPENT\n" +
+		"UTXO_SPENT (28): [ProcessTransaction][" + txidB + "] utxo already spent\n"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusMultiStatus)
-		// Format matches Teranode #881: one line per submission slot,
-		// "OK" or "<NAME> (<num>)".
-		_, _ = w.Write([]byte("OK\nTX_INVALID (31)\nOK\n"))
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(body))
 	}))
 	defer server.Close()
 
 	client := NewClient([]string{server.URL}, "", HealthConfig{})
 	rawTxs := [][]byte{{0x01}, {0x02}, {0x03}}
 
-	code, slots, err := client.SubmitTransactions(context.Background(), server.URL, rawTxs)
+	code, failures, err := client.SubmitTransactions(context.Background(), server.URL, rawTxs)
 	if err == nil {
-		t.Fatalf("expected non-nil error for 207 (caller routes off err != nil)")
+		t.Fatalf("expected non-nil error for 500 (caller routes off err != nil)")
 	}
-	if code != http.StatusMultiStatus {
-		t.Errorf("expected 207, got %d", code)
+	if code != http.StatusInternalServerError {
+		t.Errorf("expected 500, got %d", code)
 	}
-	if len(slots) != 3 {
-		t.Fatalf("expected 3 per-slot entries, got %d", len(slots))
+	if len(failures) != 2 {
+		t.Fatalf("expected 2 failure entries, got %d (%#v)", len(failures), failures)
 	}
-	if slots[0] != "OK" || slots[1] != "TX_INVALID (31)" || slots[2] != "OK" {
-		t.Errorf("unexpected per-slot contents: %#v", slots)
+	if _, ok := failures[txidA]; !ok {
+		t.Errorf("expected failure for txidA, got %#v", failures)
+	}
+	if _, ok := failures[txidB]; !ok {
+		t.Errorf("expected failure for txidB, got %#v", failures)
 	}
 }
 
-// TestSubmitTransactions_500_NoPerSlot asserts that a 500 (genuine server
-// error, e.g. echo recover middleware) returns nil per-slot and an error
-// so the caller treats the batch as a pure infra failure. Per-slot is
-// exclusively a 207 Multi-Status payload.
-func TestSubmitTransactions_500_NoPerSlot(t *testing.T) {
+// TestSubmitTransactions_500_NoFailureList asserts that a 500 without the
+// "Failed to process transactions:" header (e.g. echo recover middleware
+// panic body, gateway proxy 500) returns nil failures so the caller treats
+// the batch as a pure infra failure.
+func TestSubmitTransactions_500_NoFailureList(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte("internal error\n"))
@@ -121,15 +130,37 @@ func TestSubmitTransactions_500_NoPerSlot(t *testing.T) {
 	client := NewClient([]string{server.URL}, "", HealthConfig{})
 	rawTxs := [][]byte{{0x01}, {0x02}}
 
-	code, slots, err := client.SubmitTransactions(context.Background(), server.URL, rawTxs)
+	code, failures, err := client.SubmitTransactions(context.Background(), server.URL, rawTxs)
 	if err == nil {
 		t.Fatalf("expected non-nil error for 500")
 	}
 	if code != http.StatusInternalServerError {
 		t.Errorf("expected 500, got %d", code)
 	}
-	if slots != nil {
-		t.Errorf("expected nil per-slot for 500, got %#v", slots)
+	if failures != nil {
+		t.Errorf("expected nil failures for non-Teranode 500 body, got %#v", failures)
+	}
+}
+
+// TestSubmitTransactions_FailureList_HeaderOnly asserts that a 500 carrying
+// only the header line (no failure entries) returns nil failures — there's
+// no way to tell which txs failed, so the caller must requeue the batch.
+func TestSubmitTransactions_FailureList_HeaderOnly(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("Failed to process transactions:\n"))
+	}))
+	defer server.Close()
+
+	client := NewClient([]string{server.URL}, "", HealthConfig{})
+	rawTxs := [][]byte{{0x01}, {0x02}}
+
+	_, failures, err := client.SubmitTransactions(context.Background(), server.URL, rawTxs)
+	if err == nil {
+		t.Fatalf("expected non-nil error")
+	}
+	if failures != nil {
+		t.Errorf("expected nil failures for header-only body, got %#v", failures)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -670,25 +671,23 @@ func (c *Client) SubmitTransaction(ctx context.Context, endpoint string, rawTx [
 
 // SubmitTransactions submits multiple transactions as a batch to a single endpoint.
 // The raw transaction bytes are concatenated into a single body and POSTed to /txs.
-// Returns the HTTP status code and a per-slot result list parsed from the response
-// body. The per-slot list is len(rawTxs) long whenever the response carries
-// authoritative per-slot information:
+// Returns the HTTP status code and, when the response carries Teranode's
+// structured failure list, a per-txid map naming the failed txs and their
+// Teranode error code strings:
 //
-//   - HTTP 200: every slot succeeded. Result is nil so callers short-circuit
-//     without per-slot inspection.
-//   - HTTP 207 Multi-Status + a body of newline-separated lines, one per
-//     submission slot (bsv-blockchain/teranode#879 + #881): each line is
-//     either "OK" (slot succeeded) or "<TERANODE_CODE_NAME> (<num>)" (slot
-//     failed with the named code, e.g. "TX_INVALID (31)"). The returned
-//     per-slot slice carries those strings verbatim so the caller can switch
-//     on them.
-//   - Anything else (4xx, 5xx, transport error): per-slot is nil; the caller
-//     treats the batch as a pure infra failure (whole batch left at RECEIVED
-//     for the reaper to retry).
-//
-// The "OK" sentinel on a per-slot line is exposed as TxsResultOK to keep
-// the parsing contract grep-able from call sites.
-func (c *Client) SubmitTransactions(ctx context.Context, endpoint string, rawTxs [][]byte) (int, []string, error) {
+//   - HTTP 200: every tx accepted. failures is nil so callers short-circuit
+//     without per-tx inspection.
+//   - HTTP 500 + body starting "Failed to process transactions:" (Teranode
+//     upstream main #879): each subsequent line is one tx's error in the
+//     form "<TERANODE_CODE_NAME> (<num>): <message containing the txid via
+//     [ProcessTransaction][<txid>]>". The returned map is keyed by the
+//     extracted txid; the value is the full line verbatim so callers can
+//     surface the Teranode code in wallet-visible rows. Txs not in the map
+//     are assumed to have been accepted.
+//   - Anything else (4xx, 5xx with non-Teranode body, transport error):
+//     failures is nil; the caller treats the batch as a pure infra failure
+//     (whole batch requeued for another attempt).
+func (c *Client) SubmitTransactions(ctx context.Context, endpoint string, rawTxs [][]byte) (int, map[string]string, error) {
 	start := time.Now()
 	// Calculate total size for pre-allocation
 	totalSize := 0
@@ -728,44 +727,71 @@ func (c *Client) SubmitTransactions(ctx context.Context, endpoint string, rawTxs
 		return resp.StatusCode, nil, nil
 	}
 
-	// 207 Multi-Status is the per-slot response (Teranode #879 + #881).
-	// Any other 4xx/5xx is a real error — no per-slot body to parse.
-	if resp.StatusCode == http.StatusMultiStatus {
-		slots := parseTxsPerSlot(respBody, len(rawTxs))
-		if slots != nil {
-			return resp.StatusCode, slots, fmt.Errorf("%w %d", errUnexpectedStatusCode, resp.StatusCode)
+	// HTTP 500 with the Teranode failure-list body (#879) — extract a
+	// per-txid map. Any other 5xx/4xx (echo recover panic, gateway 502/503,
+	// proxy-injected error pages, etc.) falls through to the infra-failure
+	// path with failures==nil.
+	if resp.StatusCode == http.StatusInternalServerError {
+		failures := parseTxsFailures(respBody)
+		if failures != nil {
+			return resp.StatusCode, failures, fmt.Errorf("%w %d", errUnexpectedStatusCode, resp.StatusCode)
 		}
 	}
 
 	return resp.StatusCode, nil, fmt.Errorf("%w %d: %s", errUnexpectedStatusCode, resp.StatusCode, string(respBody))
 }
 
-// TxsResultOK is the per-slot string emitted by Teranode for a successful
-// submission slot in the /txs response body.
-const TxsResultOK = "OK"
+// txsFailureHeader is the literal prefix Teranode's /txs handler emits when
+// any submitted tx failed. The remaining lines each describe one failure.
+const txsFailureHeader = "Failed to process transactions:"
 
-// parseTxsPerSlot extracts the per-submission-slot results from a /txs
-// 207 Multi-Status response body. The format is:
+// txsTxidPattern matches a 64-hex-char txid anywhere in a Teranode error
+// line. Teranode wraps in-process tx errors with "[ProcessTransaction][<txid>]"
+// so the txid is reliably present for any failure originating in
+// processTransactionInternal. Case-insensitive — Teranode normalizes to
+// lowercase but the regex stays defensive.
+var txsTxidPattern = regexp.MustCompile(`[0-9a-fA-F]{64}`)
+
+// parseTxsFailures extracts the per-txid failure list from a /txs HTTP 500
+// response body. The expected format is:
 //
-//	"OK\n<NAME> (<num>)\nOK\n…\n"
+//	"Failed to process transactions:
+//	<NAME> (<num>): [ProcessTransaction][<txid>] <message>
+//	<NAME> (<num>): [ProcessTransaction][<txid>] <message>
+//	…
+//	"
 //
-// Returns a slice of len expected results, or nil when the body cannot be
-// parsed into exactly that many slot lines (in which case the caller
-// treats the batch as a pure infra failure).
-func parseTxsPerSlot(body []byte, expected int) []string {
-	if expected <= 0 {
-		return nil
-	}
-	text := string(body)
-	text = strings.TrimRight(text, "\n")
+// Returns a txid → full-line map naming every failed tx, or nil if the body
+// doesn't match Teranode's failure-list shape (in which case the caller
+// treats the batch as a pure infra failure). Lines whose txid couldn't be
+// extracted are dropped — the contract is "if you appear in the map you
+// failed; if you don't you're accepted," so a malformed line with no
+// recognizable txid would otherwise be silently lost. A trailing nil-map
+// return when nothing parsed forces the whole-batch requeue.
+func parseTxsFailures(body []byte) map[string]string {
+	text := strings.TrimRight(string(body), "\n")
 	if text == "" {
 		return nil
 	}
 	lines := strings.Split(text, "\n")
-	if len(lines) != expected {
+	if len(lines) == 0 || lines[0] != txsFailureHeader {
 		return nil
 	}
-	return lines
+	failures := make(map[string]string, len(lines)-1)
+	for _, line := range lines[1:] {
+		if line == "" {
+			continue
+		}
+		txid := txsTxidPattern.FindString(line)
+		if txid == "" {
+			continue
+		}
+		failures[strings.ToLower(txid)] = line
+	}
+	if len(failures) == 0 {
+		return nil
+	}
+	return failures
 }
 
 // newBroadcastTransport configures an http.Transport sized for fan-out

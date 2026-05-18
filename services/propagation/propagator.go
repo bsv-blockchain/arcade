@@ -121,13 +121,17 @@ type broadcastJob struct {
 type broadcastJobResult struct {
 	endpoint   string
 	statusCode int
-	// perSlot is the per-submission-slot result list from /txs. Populated
-	// only when /txs returns 207 Multi-Status with a parseable body
-	// (Teranode #879 + #881); nil for 200 and any other HTTP outcome.
-	// Each non-nil entry is either teranode.TxsResultOK ("OK") or a
-	// Teranode error code string like "TX_INVALID (31)".
-	perSlot []string
-	err     error
+	// failures is the per-txid failure map extracted from a /txs HTTP 500
+	// "Failed to process transactions:" body (Teranode upstream main, post
+	// #879). Each entry is keyed by the txid embedded in
+	// "[ProcessTransaction][<txid>]" and the value is the full error line
+	// verbatim (e.g. "TX_INVALID (31): [ProcessTransaction][<txid>] tx is
+	// invalid because..."). Absent here means accepted (after a peer 500).
+	// nil for 200, transport errors, and any 5xx that doesn't match the
+	// Teranode failure-list shape — those cases drive the whole-batch
+	// requeue path.
+	failures map[string]string
+	err      error
 }
 
 // txResultClass categorizes a per-tx broadcast outcome into the action
@@ -265,13 +269,13 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 func (p *Propagator) runBroadcastWorker() {
 	defer p.broadcastWG.Done()
 	for job := range p.broadcastJobs {
-		statusCode, perSlot, err := p.teranodeClient.SubmitTransactions(job.ctx, job.endpoint, job.rawTxs)
+		statusCode, failures, err := p.teranodeClient.SubmitTransactions(job.ctx, job.endpoint, job.rawTxs)
 		// Non-blocking send — the caller always allocates resultCh with
 		// capacity ≥ number of jobs it submits, so this never blocks. Using
 		// non-blocking lets a Stop() racing with in-flight broadcasts not
 		// deadlock the worker on an abandoned channel.
 		select {
-		case job.resultCh <- broadcastJobResult{endpoint: job.endpoint, statusCode: statusCode, perSlot: perSlot, err: err}:
+		case job.resultCh <- broadcastJobResult{endpoint: job.endpoint, statusCode: statusCode, failures: failures, err: err}:
 		default:
 		}
 	}
@@ -742,24 +746,23 @@ type txResult struct {
 	successEndpoint string
 }
 
-// classifyPerSlotLine maps a /txs per-slot line (post-#881) into the
-// dispatcher action bucket. "OK" → accepted. A terminal Teranode code
-// → rejected. An infra-bucket code (or anything unrecognized) →
-// requeue. The errMsg returned is the per-slot line itself, kept
-// verbatim so wallet rows surface the actual Teranode code.
-func classifyPerSlotLine(line string) (txResultClass, string) {
-	if line == teranode.TxsResultOK {
-		return txResultClassAccepted, ""
-	}
+// classifyFailureLine maps one Teranode /txs failure line into a dispatcher
+// action bucket. The line is the full UserMessage produced by Teranode,
+// e.g. "TX_INVALID (31): [ProcessTransaction][<txid>] ...". A line in the
+// terminal-rejection bucket (TX_INVALID, UTXO_SPENT, etc.) → rejected.
+// Anything else (PROCESSING wrapper, unrecognized code, malformed line) →
+// requeue so the next attempt has a chance to produce a verdict. errMsg is
+// the line verbatim so wallet rows surface the actual Teranode code.
+func classifyFailureLine(line string) (txResultClass, string) {
 	if isTeranodeTerminalCode(line) {
 		return txResultClassRejected, line
 	}
 	return txResultClassRequeue, line
 }
 
-// teranodeTerminalCodes is the set of post-#881 Teranode error code
-// strings (NAME-portion only) that classify a tx as terminally rejected.
-// PROCESSING and anything else falls through to requeue (infra failure).
+// teranodeTerminalCodes is the set of upstream Teranode error code names
+// that classify a tx as terminally rejected. PROCESSING and anything else
+// falls through to requeue (infra-bucket failure that should be retried).
 var teranodeTerminalCodes = map[string]struct{}{
 	"TX_INVALID":              {},
 	"TX_INVALID_DOUBLE_SPEND": {},
@@ -776,10 +779,10 @@ var teranodeTerminalCodes = map[string]struct{}{
 	"INVALID_ARGUMENT":        {},
 }
 
-// isTeranodeTerminalCode reports whether a per-slot line names a
-// Teranode code in the terminal-rejection bucket. Matches the NAME
-// portion of "NAME (num)" or just "NAME". Anything else (including
-// the default PROCESSING wrapper, network-only codes, or unrecognized
+// isTeranodeTerminalCode reports whether a failure line names a Teranode
+// code in the terminal-rejection bucket. Matches the leading NAME of
+// "NAME (num): <message>" (the first whitespace-delimited token).
+// Anything else (PROCESSING wrapper, network-only codes, unrecognized
 // strings) is treated as infra → requeue.
 func isTeranodeTerminalCode(line string) bool {
 	name := line
@@ -1083,9 +1086,9 @@ func (p *Propagator) submitBroadcastJobs(ctx context.Context, endpoints []string
 		}
 		submitted++
 		go func(j broadcastJob) {
-			statusCode, perSlot, err := p.teranodeClient.SubmitTransactions(j.ctx, j.endpoint, j.rawTxs)
+			statusCode, failures, err := p.teranodeClient.SubmitTransactions(j.ctx, j.endpoint, j.rawTxs)
 			select {
-			case j.resultCh <- broadcastJobResult{endpoint: j.endpoint, statusCode: statusCode, perSlot: perSlot, err: err}:
+			case j.resultCh <- broadcastJobResult{endpoint: j.endpoint, statusCode: statusCode, failures: failures, err: err}:
 			default:
 			}
 		}(job)
@@ -1096,15 +1099,17 @@ func (p *Propagator) submitBroadcastJobs(ctx context.Context, endpoints []string
 // broadcastBatchToEndpoints submits a batch to each healthy teranode
 // endpoint via /txs and produces per-tx classifications:
 //
-//   - Any endpoint returning 200 → every slot accepted (the peer accepted
-//     the whole batch; per-slot info from other peers' 207 responses is
-//     superseded).
-//   - No endpoint returned 200, but at least one returned 207 with a
-//     parseable per-slot body (Teranode #879 + #881) → per-slot
-//     classification. Each slot is accepted, rejected (named Teranode
-//     code), or requeued (infra-bucket code).
-//   - All endpoints failed without per-slot info, or no healthy endpoints
-//     existed → every slot requeued (pure batch-level infra failure).
+//   - Any endpoint returning 200 → every tx accepted (the peer accepted
+//     the whole batch; per-tx failure info from other peers' 500 responses
+//     is superseded).
+//   - No endpoint returned 200, but at least one returned the Teranode
+//     "Failed to process transactions:" 500 body → per-tx classification.
+//     Each txid named in the failure body is rejected (terminal Teranode
+//     code) or requeued (infra-bucket code); every other tx in the batch
+//     is treated as accepted.
+//   - All endpoints failed without a parseable Teranode failure body, or
+//     no healthy endpoints existed → every tx requeued (pure batch-level
+//     infra failure).
 //
 // Per-endpoint outcomes are recorded into the circuit-breaker regardless
 // of verdict so a peer returning 500 doesn't get sidelined when the
@@ -1133,7 +1138,7 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 
 	outcomes := make([]endpointOutcome, 0, submitted)
 	anySuccess := false
-	var perSlot []string // first endpoint's per-slot body, used when no peer succeeded
+	var failures map[string]string // first endpoint's failure map, used when no peer succeeded
 	for i := 0; i < submitted; i++ {
 		result := <-resultCh
 		if isCanceledByBroadcast(broadcastCtx, result.err) {
@@ -1148,9 +1153,9 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 				zap.Int("status_code", result.statusCode),
 				zap.Error(result.err),
 			)
-			// Save the first per-slot body we see for the fallback path.
-			if perSlot == nil && len(result.perSlot) == len(batch) {
-				perSlot = result.perSlot
+			// Save the first parseable failure map we see for the fallback path.
+			if failures == nil && len(result.failures) > 0 {
+				failures = result.failures
 			}
 			continue
 		}
@@ -1195,13 +1200,13 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 		return results, successEndpoint
 	}
 
-	if perSlot != nil {
-		// All endpoints failed but at least one carried a per-slot body
-		// (post-#881). Classify each slot from its line.
+	if failures != nil {
+		// All endpoints failed but at least one carried a Teranode
+		// failure-list body. A txid in the map failed; absent means the
+		// peer accepted that tx into its pipeline.
 		for i, msg := range batch {
-			class, errMsg := classifyPerSlotLine(perSlot[i])
-			switch class {
-			case txResultClassAccepted:
+			line, failed := failures[strings.ToLower(msg.TXID)]
+			if !failed {
 				results[i] = txResult{
 					class: txResultClassAccepted,
 					status: &models.TransactionStatus{
@@ -1211,6 +1216,10 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 					},
 					rawTx: msg.RawTx,
 				}
+				continue
+			}
+			class, errMsg := classifyFailureLine(line)
+			switch class {
 			case txResultClassRejected:
 				results[i] = txResult{
 					class:  txResultClassRejected,
@@ -1234,7 +1243,7 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 		return results, ""
 	}
 
-	// All endpoints failed and none had a parseable per-slot body —
+	// All endpoints failed and none had a parseable Teranode failure body —
 	// treat the whole batch as infra and requeue every tx.
 	return makeRequeueResults(batch), ""
 }
