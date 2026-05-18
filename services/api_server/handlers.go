@@ -687,12 +687,23 @@ func (s *Server) persistRejectedAtIntake(ctx context.Context, txid, reason strin
 		ExtraInfo: reason,
 		Timestamp: time.Now(),
 	}
-	if _, _, err := s.store.GetOrInsertStatus(ctx, row); err != nil {
+	_, inserted, err := s.store.GetOrInsertStatus(ctx, row)
+	if err != nil {
 		s.logger.Warn(
 			"intake rejection persist failed",
 			zap.String("txid", txid),
 			zap.Error(err),
 		)
+		return
+	}
+	if !inserted {
+		if err := s.store.UpdateStatus(ctx, row); err != nil {
+			s.logger.Warn(
+				"intake rejection status update failed",
+				zap.String("txid", txid),
+				zap.Error(err),
+			)
+		}
 	}
 }
 
