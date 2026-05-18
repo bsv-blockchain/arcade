@@ -56,10 +56,11 @@ func drainSet(p *Propagator) map[string]bool {
 	return out
 }
 
-// TestHandleMessage_SameBatchAdmission verifies the dep-aware
-// optimization: a parent and its child both arrive before the next
-// flush. Both end up in the same broadcast batch — Teranode handles
-// the dependency ordering inside its /txs POST.
+// TestHandleMessage_HoldsChildWhenParentInFlight verifies the
+// dep-aware admission rule for Teranode's parallel /txs processing:
+// even if a parent and child both arrive before the next flush, they
+// must NOT be co-batched. The child is held while the parent is
+// in-flight and can only be broadcast in a later batch.
 func TestHandleMessage_HoldsChildWhenParentInFlight(t *testing.T) {
 	ms := newMockStore()
 	p, cancel := newPropagatorForDepTest(t, ms)
