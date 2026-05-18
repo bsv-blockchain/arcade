@@ -787,13 +787,19 @@ func parseTxsFailures(body []byte, logger *zap.Logger) map[string]string {
 		}
 		txid := txsTxidPattern.FindString(line)
 		if txid == "" {
+			// Fail-closed: an orphan line means the response isn't fully
+			// trustworthy (Teranode processOne panic, or a future format
+			// drift we don't recognize). Returning nil drops to the
+			// whole-batch requeue path so we re-broadcast every tx
+			// rather than risk mis-marking the orphan's owner as
+			// ACCEPTED.
 			if logger != nil {
 				logger.Warn(
-					"parseTxsFailures: failure line with no extractable txid; dropping",
+					"parseTxsFailures: failure line with no extractable txid; whole-batch requeue",
 					zap.String("line", line),
 				)
 			}
-			continue
+			return nil
 		}
 		failures[strings.ToLower(txid)] = line
 	}

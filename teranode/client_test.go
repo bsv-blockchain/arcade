@@ -164,15 +164,15 @@ func TestSubmitTransactions_FailureList_HeaderOnly(t *testing.T) {
 	}
 }
 
-// TestSubmitTransactions_FailureList_GarbledLineKeepsValidFailures locks in
-// the fail-open contract on parseTxsFailures: a body that mixes a valid
-// failure line with one the txid regex can't parse must still return a
-// map containing the parseable txid. Mis-classifying that failure as
-// accepted is a known acknowledged trade-off (the malformed line is
-// logged at Warn so operators see drift) — the test guards against an
-// accidental switch to fail-closed behavior that would whole-batch-
-// requeue forever if Teranode ever ships a line we don't recognize.
-func TestSubmitTransactions_FailureList_GarbledLineKeepsValidFailures(t *testing.T) {
+// TestSubmitTransactions_FailureList_GarbledLineWholeBatchRequeue locks in
+// the fail-closed contract on parseTxsFailures: any non-empty failure line
+// without an extractable txid means the response isn't fully trustworthy
+// (Teranode processOne panic recovery is the known offender — it doesn't
+// include the tx's id in the recover wrapper, even though the tx is in
+// scope). Returning nil here drops the caller to the whole-batch requeue
+// path so every tx is re-broadcast rather than risk silently marking the
+// orphan's owner as ACCEPTED.
+func TestSubmitTransactions_FailureList_GarbledLineWholeBatchRequeue(t *testing.T) {
 	const txidA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	body := "Failed to process transactions:\n" +
 		"TX_INVALID (31): [ProcessTransaction][" + txidA + "] tx is invalid because UTXO_SPENT\n" +
@@ -190,11 +190,8 @@ func TestSubmitTransactions_FailureList_GarbledLineKeepsValidFailures(t *testing
 	if err == nil {
 		t.Fatalf("expected non-nil error")
 	}
-	if len(failures) != 1 {
-		t.Fatalf("fail-open contract: garbled line drops, valid line stays; expected 1 failure entry, got %d (%#v)", len(failures), failures)
-	}
-	if _, ok := failures[txidA]; !ok {
-		t.Errorf("expected the parseable txid to survive the garbled-line drop; got %#v", failures)
+	if failures != nil {
+		t.Errorf("fail-closed contract: any orphan line → whole-batch requeue; expected nil failures, got %#v", failures)
 	}
 }
 
