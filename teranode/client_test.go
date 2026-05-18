@@ -164,6 +164,40 @@ func TestSubmitTransactions_FailureList_HeaderOnly(t *testing.T) {
 	}
 }
 
+// TestSubmitTransactions_FailureList_GarbledLineKeepsValidFailures locks in
+// the fail-open contract on parseTxsFailures: a body that mixes a valid
+// failure line with one the txid regex can't parse must still return a
+// map containing the parseable txid. Mis-classifying that failure as
+// accepted is a known acknowledged trade-off (the malformed line is
+// logged at Warn so operators see drift) — the test guards against an
+// accidental switch to fail-closed behavior that would whole-batch-
+// requeue forever if Teranode ever ships a line we don't recognize.
+func TestSubmitTransactions_FailureList_GarbledLineKeepsValidFailures(t *testing.T) {
+	const txidA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	body := "Failed to process transactions:\n" +
+		"TX_INVALID (31): [ProcessTransaction][" + txidA + "] tx is invalid because UTXO_SPENT\n" +
+		"GARBLED: no txid in this line at all\n"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer server.Close()
+
+	client := NewClient([]string{server.URL}, "", HealthConfig{})
+	rawTxs := [][]byte{{0x01}, {0x02}}
+
+	_, failures, err := client.SubmitTransactions(context.Background(), server.URL, rawTxs)
+	if err == nil {
+		t.Fatalf("expected non-nil error")
+	}
+	if len(failures) != 1 {
+		t.Fatalf("fail-open contract: garbled line drops, valid line stays; expected 1 failure entry, got %d (%#v)", len(failures), failures)
+	}
+	if _, ok := failures[txidA]; !ok {
+		t.Errorf("expected the parseable txid to survive the garbled-line drop; got %#v", failures)
+	}
+}
+
 func TestGetEndpoints(t *testing.T) {
 	endpoints := []string{"http://a", "http://b", "http://c"}
 	client := NewClient(endpoints, "", HealthConfig{})

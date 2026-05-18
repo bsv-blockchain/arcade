@@ -40,10 +40,15 @@ import (
 // flows back to the broker naturally, no DLQ.
 
 // admitResult tells handleMessage what the dispatcher did with the
-// admitted tx. Exactly one of admitted / held is true.
+// admitted tx. Exactly one of admitted / held / duplicate is true.
+// duplicate means the same txid was already in flight: the original
+// admission still owns the broadcast and waiter graph, and the new
+// message's Kafka offset has been added-and-immediately-marked-done
+// on the tracker so it does not pin the commit watermark.
 type admitResult struct {
-	admitted bool // true: tx was added to pendingMsgs, broadcast pending
-	held     bool // true: registered as a waiter on in-flight parents
+	admitted  bool // true: tx was added to pendingMsgs, broadcast pending
+	held      bool // true: registered as a waiter on in-flight parents
+	duplicate bool // true: txid already in flight; offset bookkept and dropped
 }
 
 // admitRequest is the protocol between handleMessage and the
@@ -276,6 +281,20 @@ func handleAdmit(
 	pendingMsgs *[]propagationMsg,
 	tracker *offsetTracker,
 ) admitResult {
+	// Duplicate admission: the same txid is already in flight (Kafka
+	// redelivery, or a publisher that slipped past the intake dedup
+	// CAS). The original entry still owns the broadcast and waiter
+	// graph — overwriting inFlight[msg.TXID] would strand its offset
+	// on the tracker forever, freezing the commit watermark. Add the
+	// new offset and immediately mark it done so advanceMarks can
+	// flush it once the original terminalizes, and return without
+	// touching pendingMsgs.
+	if _, exists := inFlight[msg.TXID]; exists {
+		tracker.Add(offset)
+		tracker.Done(offset)
+		return admitResult{duplicate: true}
+	}
+
 	// Identify blocking parents — any input that's currently in
 	// flight, regardless of whether it's in pendingMsgs or already
 	// broadcasting. Teranode's parallel bulk processing means we

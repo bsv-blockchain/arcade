@@ -60,6 +60,7 @@ type Propagator struct {
 	terminalCh        chan terminalEvent
 	drainCh           chan drainRequest
 	dispatcherCancel  context.CancelFunc
+	dispatcherDone    chan struct{}
 	merkleConcurrency int
 	reaperInterval    time.Duration
 	reaperBatchSize   int
@@ -251,10 +252,14 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 	// state machine without needing to invoke Start. In production
 	// Start replaces this with the same loop running inside the kafka
 	// ClaimHandler — see Start. The two paths can't both be live at
-	// once: Start cancels this context before subscribing.
+	// once: Start cancels this context AND waits on dispatcherDone
+	// before subscribing, guaranteeing the test-mode goroutine has
+	// fully exited before any production dispatcher loop runs.
 	dispatcherCtx, dispatcherCancel := context.WithCancel(context.Background())
 	p.dispatcherCancel = dispatcherCancel
+	p.dispatcherDone = make(chan struct{})
 	go func() {
+		defer close(p.dispatcherDone)
 		if err := p.runDispatcher(dispatcherCtx, nil, dispatcherConfig{maxPending: maxPending}); err != nil {
 			p.logger.Error("test-mode dispatcher exited with error", zap.Error(err))
 		}
@@ -439,10 +444,18 @@ func (p *Propagator) Start(ctx context.Context) error {
 	// Stop the test-mode dispatcher goroutine started in New(); the
 	// production lifecycle runs the same loop inside the kafka
 	// ClaimHandler so dep state + offset marking stay on a single
-	// goroutine.
+	// goroutine. Wait for dispatcherDone before subscribing — cancel()
+	// returns immediately, and the loop may still be parked on a
+	// channel read when it does. Any future caller that pushes to
+	// admitCh / requeueCh / terminalCh / drainCh during Start would
+	// otherwise race the old goroutine.
 	if p.dispatcherCancel != nil {
 		p.dispatcherCancel()
 		p.dispatcherCancel = nil
+		if p.dispatcherDone != nil {
+			<-p.dispatcherDone
+			p.dispatcherDone = nil
+		}
 	}
 
 	consumer, err := kafka.NewConsumerGroup(kafka.ConsumerConfig{
@@ -550,10 +563,16 @@ func (p *Propagator) Stop() error {
 		close(p.broadcastJobs)
 		p.broadcastWG.Wait()
 	}
-	// Cancel the dispatcher goroutine started in New. Safe to call
-	// multiple times (CancelFunc is idempotent).
+	// Cancel the test-mode dispatcher goroutine started in New (if
+	// Start was never called and so didn't already drain it). Wait on
+	// dispatcherDone so the goroutine has fully exited before Stop
+	// returns — otherwise it may still be holding references to the
+	// store the surrounding test cleanup is about to close.
 	if p.dispatcherCancel != nil {
 		p.dispatcherCancel()
+		if p.dispatcherDone != nil {
+			<-p.dispatcherDone
+		}
 	}
 	// Wait for the long-running Start-spawned goroutines (reaper,
 	// merkle replay) to exit before returning. The surrounding app

@@ -732,7 +732,7 @@ func (c *Client) SubmitTransactions(ctx context.Context, endpoint string, rawTxs
 	// proxy-injected error pages, etc.) falls through to the infra-failure
 	// path with failures==nil.
 	if resp.StatusCode == http.StatusInternalServerError {
-		failures := parseTxsFailures(respBody)
+		failures := parseTxsFailures(respBody, c.logger)
 		if failures != nil {
 			return resp.StatusCode, failures, fmt.Errorf("%w %d", errUnexpectedStatusCode, resp.StatusCode)
 		}
@@ -767,8 +767,11 @@ var txsTxidPattern = regexp.MustCompile(`[0-9a-fA-F]{64}`)
 // extracted are dropped — the contract is "if you appear in the map you
 // failed; if you don't you're accepted," so a malformed line with no
 // recognizable txid would otherwise be silently lost. A trailing nil-map
-// return when nothing parsed forces the whole-batch requeue.
-func parseTxsFailures(body []byte) map[string]string {
+// return when nothing parsed forces the whole-batch requeue. Dropped
+// lines are logged at Warn so operators see when Teranode emits a
+// failure line the txid regex can't parse — if this becomes frequent it
+// is a Teranode-format drift bug.
+func parseTxsFailures(body []byte, logger *zap.Logger) map[string]string {
 	text := strings.TrimRight(string(body), "\n")
 	if text == "" {
 		return nil
@@ -784,6 +787,12 @@ func parseTxsFailures(body []byte) map[string]string {
 		}
 		txid := txsTxidPattern.FindString(line)
 		if txid == "" {
+			if logger != nil {
+				logger.Warn(
+					"parseTxsFailures: failure line with no extractable txid; dropping",
+					zap.String("line", line),
+				)
+			}
 			continue
 		}
 		failures[strings.ToLower(txid)] = line

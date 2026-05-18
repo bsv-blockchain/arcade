@@ -1,6 +1,6 @@
 # Dependency-Aware Dispatch
 
-Plan to add parent-child dependency awareness to Arcade's broadcast pipeline so that transactions in the queue with parent-child relationships are sequenced correctly when sent to Teranode. The redesign also simplifies the pipeline: validation moves to intake, the `tx_validator` service is removed, PENDING_RETRY status and the reaper are removed, and the dispatcher holds Kafka offsets in flight until each tx terminalizes so a crash replays everything that wasn't done.
+Plan to add parent-child dependency awareness to Arcade's broadcast pipeline so that transactions in the queue with parent-child relationships are sequenced correctly when sent to Teranode. The redesign also simplifies the pipeline: validation moves to intake, the `tx_validator` service is removed, the `PENDING_RETRY` status is removed (transient infra failures are kept in-memory and requeued through the dispatcher), the reaper is narrowed to rebroadcasting stale `SEEN_ON_NETWORK` rows that the dispatcher's in-flight set can't see, and the dispatcher holds Kafka offsets in flight until each tx terminalizes so a crash replays everything that wasn't done.
 
 ## Problem
 
@@ -79,23 +79,29 @@ The dispatcher tracks Kafka offsets for in-flight transactions in an `offsetTrac
 
 On restart, replay starts from the last committed offset and the dep index rebuilds as messages flow through the dispatcher again — same code path as live operation. A tx that was held or in-flight when the process crashed re-enters the same flow on consume.
 
+### Reaper (narrowed)
+
+The reaper is retained but its role is narrowed. The dispatcher's `offsetTracker` covers everything in flight — held children, broadcasting batches, retrying-forever infra failures — but goes blind once a tx reaches `SEEN_ON_NETWORK` or `SEEN_MULTIPLE_NODES`. Those rows aren't in `inFlight` anymore (the dispatcher's tracker `Done`-d their offset when broadcast accepted them), so the dispatcher can't notice when a peer evicts them from its mempool, a `BLOCK_PROCESSED` callback gets dropped, or a fee bump is needed to land them.
+
+The reaper covers that gap. On a fixed interval (`reaperInterval`) the lease-holding replica scans `IterateStatusesSince` for rows at `SEEN_ON_NETWORK` or `SEEN_MULTIPLE_NODES` older than `staleSeenOnNetworkAge` (currently 1h) and rebroadcasts them through the same `registerBatch` + `broadcastInChunks` pipeline as `processBatch`. The scan is bounded by `reaperRebroadcastBatch` (200) per tick to keep a backlog from pinning the reaper into a single multi-minute call. `RECEIVED` rows are intentionally not rebroadcast — those are owned by the submitter, who got an error from intake on Kafka publish failure and decides whether to retry.
+
+Rebroadcasts bypass the dispatcher's admission (these txids are no longer in `inFlight`); resulting terminal statuses flow into `applyTerminalStatuses` as before but the dispatcher-notify side becomes a no-op for offset bookkeeping.
+
 ### Retry handling
 
-PENDING_RETRY status and the reaper go away. Infrastructure failures retry forever; the mechanism differs by failure mode because merkle-service is binary while Teranode is per-tx.
+`PENDING_RETRY` status goes away. Infrastructure failures retry forever through the dispatcher's requeue path, not via a status-store-backed reaper. The merkle-service and Teranode paths share the same retry surface: any tx that didn't terminalize on a given attempt is sent back through `requeueAfterDelay` → `requeueCh`, the dispatcher re-runs dep-aware admission on it, and it lands back in either `heldMsgs` (if a parent is still in flight) or `pendingMsgs` for the next flush. The Kafka offset stays pinned because the original `inFlight` entry is preserved across the requeue.
 
-**Merkle-service `/watch` failure — inline retry, whole batch.** `registerBatch` sleeps with capped-exponential backoff and retries the whole batch. The merkle-service `/watch` payload's only per-tx variation is the txid string — a failure is always all-or-nothing, so splitting buys nothing. The `processBatch` goroutine holds a `processBatchSem` slot during the retry loop, which is the natural backpressure we want: once all slots are held, the consumer stops pulling new work.
+**Merkle-service `/watch` failure — per-tx requeue.** `registerBatch` calls `merkleClient.RegisterBatchWithResults` and partitions the results into `(registered, failed)` per-tx; `processBatch` sends the failed subset through `requeueAfterDelay` so each tx individually flows back to the dispatcher. `RegisterBatchWithResults` parallelizes its per-tx HTTP calls internally — a single flaky `/watch` call no longer fails the whole batch, and the successful subset proceeds straight to broadcast.
 
-Backoff: **100ms → 500ms → 2s → 5s → 10s, then 10s steady, retrying forever**.
-
-**Teranode `/txs` per-slot infra failures — requeue individually, short flat wait.** With #879 + #881, the `/txs` response delivers per-slot Teranode codes. `broadcastInChunks` walks the per-slot lines and partitions them:
+**Teranode `/txs` per-slot infra failures — per-tx requeue, same path.** With #879 + #881, the `/txs` response delivers per-slot Teranode codes. `broadcastInChunks` walks the per-slot lines and partitions them:
 
 - `"OK"` → terminalize as `ACCEPTED_BY_NETWORK`.
 - Terminal Teranode code (`TX_INVALID (31)`, `TX_CONFLICTING (36)`, `UTXO_FROZEN (72)`, etc.) → terminalize as `REJECTED`, cascade as before.
 - Infra-classified code (e.g. `PROCESSING (4)`) → infra slot.
 
-For infra slots, the processBatch goroutine waits a short flat period (a few seconds), then sends a requeue event to the dispatcher with the original propagation messages. The dispatcher re-runs admission on each — if the tx's parents are still in-flight, it goes back to `heldMsgs`; otherwise it goes back to `pendingMsgs`. The offset stays pinned the whole time (the slot never terminalized, so the tracker never marked it `Done`).
+For infra slots, `processBatch` sends them through `requeueAfterDelay` after a flat `requeueDelay` wait (currently 2s, tunable as a single constant in `propagator.go`). The dispatcher re-runs admission on each — if the tx's parents are still in flight, it goes back to `heldMsgs`; otherwise it goes back to `pendingMsgs`. The offset stays pinned the whole time (the slot never terminalized, so the tracker never marked it `Done`).
 
-A batch-level HTTP 500 with no parseable body is treated as every-slot-infra: every tx in the batch is requeued.
+A batch-level HTTP 500 with no parseable body is treated as every-slot-infra: every tx in the batch is requeued through the same path.
 
 **No healthy endpoints / no peer reachable** — same as Teranode infra: requeue every tx in the batch.
 
@@ -161,7 +167,8 @@ Single binary deploy with the new code. The new code:
 - Performs all intake work synchronously, including validation
 - Runs the dispatcher inside the propagator (single state-owning goroutine, channel-fed) in place of the old parallel consumer pool
 - Defers Kafka offset commits to a watermark driven by the dispatcher's `offsetTracker`
-- Retries infrastructure failures inline, forever, with bounded backoff; no reaper, no PENDING_RETRY
+- Retries infrastructure failures by requeuing through the dispatcher with a short flat delay (`requeueDelay`, currently 2s); no `PENDING_RETRY` status
+- Keeps the reaper, narrowed to rebroadcasting stale `SEEN_ON_NETWORK`/`SEEN_MULTIPLE_NODES` rows past `staleSeenOnNetworkAge` (1h)
 - Parses Teranode `/txs` per-slot response for per-tx classification (no per-tx `/tx` fallback)
 
 The old `TopicTransaction` and any prior PENDING_RETRY rows can be cleaned up after deploy.

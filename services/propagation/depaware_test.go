@@ -30,7 +30,8 @@ func makePropMsgWithParents(txid string, parents []string) []byte {
 
 // newPropagatorForDepTest constructs a Propagator with a minimal mock
 // store. Its dispatcher goroutine starts inside New; the returned
-// cleanup cancels it when the test ends.
+// cleanup cancels it and waits for the goroutine to exit before the
+// test returns (otherwise it can outlive the mockStore the test owns).
 func newPropagatorForDepTest(t *testing.T, ms *mockStore) (*Propagator, func()) {
 	t.Helper()
 	cfg := &config.Config{}
@@ -39,6 +40,9 @@ func newPropagatorForDepTest(t *testing.T, ms *mockStore) (*Propagator, func()) 
 	return p, func() {
 		if p.dispatcherCancel != nil {
 			p.dispatcherCancel()
+			if p.dispatcherDone != nil {
+				<-p.dispatcherDone
+			}
 		}
 	}
 }
@@ -323,5 +327,58 @@ func TestHandleMessage_MaxPendingFull_BlocksUntilDrained(t *testing.T) {
 
 	if got := drainSet(p); !got["tx2"] {
 		t.Errorf("tx2 should be in pending batch after unblocking; got %v", got)
+	}
+}
+
+// TestHandleAdmit_DuplicateTxid_DoesNotStrandOffset guards the
+// Kafka-redelivery edge case: if the same txid is admitted twice, the
+// second admission must not overwrite the inFlight entry's offset.
+// Doing so would leave the first offset on the tracker with no path to
+// Done — LowestUnfinished would pin to it forever and freeze the
+// commit watermark. The dispatcher's contract is that the new offset
+// is bookkept on the tracker (added and immediately marked done) so
+// the consumer's offset commit can advance past the redelivery once
+// the original terminalizes, but the broadcast / waiter graph is
+// untouched.
+func TestHandleAdmit_DuplicateTxid_DoesNotStrandOffset(t *testing.T) {
+	inFlight := make(map[string]int64)
+	waiters := make(map[string]map[string]struct{})
+	heldMsgs := make(map[string]propagationMsg)
+	var pendingMsgs []propagationMsg
+	tracker := newOffsetTracker()
+
+	msg := propagationMsg{TXID: "X", RawTx: []byte{0xde, 0xad}}
+
+	first := handleAdmit(msg, 100, inFlight, waiters, heldMsgs, &pendingMsgs, tracker)
+	if !first.admitted || first.held || first.duplicate {
+		t.Fatalf("first admit should be admitted; got %+v", first)
+	}
+	if got := inFlight["X"]; got != 100 {
+		t.Fatalf("inFlight[X] should be 100 after first admit; got %d", got)
+	}
+	if len(pendingMsgs) != 1 {
+		t.Fatalf("pendingMsgs should have 1 entry after first admit; got %d", len(pendingMsgs))
+	}
+
+	second := handleAdmit(msg, 200, inFlight, waiters, heldMsgs, &pendingMsgs, tracker)
+	if !second.duplicate || second.admitted || second.held {
+		t.Fatalf("second admit should be duplicate; got %+v", second)
+	}
+	if got := inFlight["X"]; got != 100 {
+		t.Fatalf("inFlight[X] must still point at the original offset 100; got %d", got)
+	}
+	if len(pendingMsgs) != 1 {
+		t.Fatalf("pendingMsgs should still have 1 entry after duplicate; got %d", len(pendingMsgs))
+	}
+	if low, ok := tracker.LowestUnfinished(); !ok || low != 100 {
+		t.Fatalf("LowestUnfinished must remain 100 while original is in-flight; got (%d, %v)", low, ok)
+	}
+
+	// Terminalize the original. Both offsets should now be free —
+	// the duplicate's offset was already marked done at admit time,
+	// and the original's Done call here clears the last anchor.
+	tracker.Done(inFlight["X"])
+	if !tracker.Empty() {
+		t.Fatal("tracker must be empty after the original terminalizes; the duplicate's offset must not strand")
 	}
 }
