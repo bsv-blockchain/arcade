@@ -71,9 +71,9 @@ func newE2EHarness(t *testing.T) *e2eHarness {
 	}
 }
 
-// publishAndPersist mirrors what the api_server intake does in
-// production: it writes the status row to the store first, then
-// publishes onto the events stream.
+// publishAndPersist sets up the test state expected by this SSE e2e
+// harness: it writes the status row to the stub store first, then
+// publishes the status onto the events stream.
 func (h *e2eHarness) publishAndPersist(t *testing.T, status *models.TransactionStatus) {
 	t.Helper()
 	h.store.setStatus(status.TxID, status)
