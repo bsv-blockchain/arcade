@@ -109,7 +109,7 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		ProbeTimeout:              time.Duration(cfg.Propagation.EndpointHealth.ProbeTimeoutMs) * time.Millisecond,
 		MinHealthyEndpoints:       cfg.Propagation.EndpointHealth.MinHealthyEndpoints,
 		RefreshInterval:           time.Duration(cfg.Propagation.EndpointHealth.RefreshIntervalMs) * time.Millisecond,
-		Source:                    endpointSource{st: st, network: cfg.Network},
+		Source:                    endpointSource{st: st, network: cfg.Network, includeDiscovered: cfg.P2P.DatahubDiscovery},
 		Logger:                    logger,
 	})
 
@@ -307,10 +307,14 @@ func (a chaintracksHeaderReader) GetHeaderByHash(ctx context.Context, hash *chai
 // endpointSource adapts store.Store to teranode.EndpointSource by extracting
 // just the URL list. network scopes the listing to the configured Bitcoin
 // network so a store shared across pods (or reused after a network change)
-// never replays peers from a different network.
+// never replays peers from a different network. When includeDiscovered is
+// false (operator disabled p2p.datahub_discovery), rows persisted as
+// source=discovered by prior runs are filtered out — the toggle now means
+// "ignore discovered URLs" end-to-end, not just "stop discovering new ones."
 type endpointSource struct {
-	st      store.Store
-	network string
+	st                store.Store
+	network           string
+	includeDiscovered bool
 }
 
 func (a endpointSource) ListEndpointURLs(ctx context.Context) ([]string, error) {
@@ -320,6 +324,9 @@ func (a endpointSource) ListEndpointURLs(ctx context.Context) ([]string, error) 
 	}
 	out := make([]string, 0, len(eps))
 	for _, ep := range eps {
+		if !a.includeDiscovered && ep.Source == store.DatahubEndpointSourceDiscovered {
+			continue
+		}
 		out = append(out, ep.URL)
 	}
 	return out, nil
