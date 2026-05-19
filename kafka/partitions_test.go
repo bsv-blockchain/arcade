@@ -72,13 +72,23 @@ func TestCheckExactPartitions_MismatchFailsStartup(t *testing.T) {
 	}
 }
 
-// TestCheckExactPartitions_TopicMissing_Warns pins the soft-fail path:
-// a missing topic is logged but doesn't block startup (Kafka will
-// auto-create on first publish), matching CheckPartitions's behavior.
-func TestCheckExactPartitions_TopicMissing_Warns(t *testing.T) {
+// TestCheckExactPartitions_TopicMissing_FailsStartup pins the hard-fail
+// contract: a missing topic is a startup error for correctness-
+// constrained topics. Auto-create on first publish would use the
+// broker's default partition count, silently breaking the dispatcher's
+// single-partition invariant (see CheckExactPartitions doc and the
+// call site in app/app.go that propagates the error to abort startup).
+func TestCheckExactPartitions_TopicMissing_FailsStartup(t *testing.T) {
 	br := &stubPartitionBroker{} // no entries → ErrTopicNotFound
-	if err := CheckExactPartitions(br, TopicPropagation, 1, zap.NewNop()); err != nil {
-		t.Fatalf("expected nil error for missing topic, got %v", err)
+	err := CheckExactPartitions(br, TopicPropagation, 1, zap.NewNop())
+	if err == nil {
+		t.Fatal("expected error for missing correctness-constrained topic, got nil")
+	}
+	if !strings.Contains(err.Error(), "not found on broker") {
+		t.Errorf("error %q should reference the not-found state", err.Error())
+	}
+	if !strings.Contains(err.Error(), "correctness requirement") {
+		t.Errorf("error %q should flag this as a correctness-requirement violation", err.Error())
 	}
 }
 
