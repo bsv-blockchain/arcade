@@ -601,7 +601,7 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// so the failure is durable AND immediate.
 	if s.validator != nil {
 		if err := s.validator.ValidateTransaction(c.Request.Context(), parsedTx, true, true); err != nil {
-			s.persistRejectedAtIntake(c.Request.Context(), txid, err.Error())
+			s.rejectAtIntake(c.Request.Context(), txid, err.Error(), opts)
 			c.JSON(http.StatusBadRequest, gin.H{
 				jsonKeyError: "transaction failed validation",
 				"reason":     err.Error(),
@@ -679,6 +679,41 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusAccepted, gin.H{"status": "submitted"})
+}
+
+// rejectAtIntake is the terminal-rejection counterpart to the intake
+// success sequence. It persists a REJECTED row, records the submission
+// so SSE/webhook can resolve the callback URL+token on delivery, then
+// publishes the REJECTED status to TopicStatusUpdate so live
+// subscribers see the terminal outcome. Every step is best-effort —
+// the client has already received its 400 by the time this runs, so a
+// store or publish failure does not change the HTTP outcome.
+//
+// Order matches the success path: persist row, then queue submission,
+// then publish. Queuing the submission before the publish minimizes
+// the window in which an SSE/webhook subscriber receives the event
+// without a matching submission row (the recorder pool is async, so
+// the window can't be eliminated entirely without making the row
+// write synchronous — a trade-off the success path also accepts).
+func (s *Server) rejectAtIntake(ctx context.Context, txid, reason string, opts submitOptions) {
+	s.persistRejectedAtIntake(ctx, txid, reason)
+	s.recordSubmission(ctx, txid, opts)
+	if s.publisher == nil {
+		return
+	}
+	status := &models.TransactionStatus{
+		TxID:      txid,
+		Status:    models.StatusRejected,
+		ExtraInfo: reason,
+		Timestamp: time.Now(),
+	}
+	if err := s.publisher.Publish(ctx, status); err != nil {
+		s.logger.Warn(
+			"intake rejection publish failed",
+			zap.String("txid", txid),
+			zap.Error(err),
+		)
+	}
 }
 
 // persistRejectedAtIntake writes a terminal REJECTED row for a tx that
@@ -793,7 +828,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 		ctx := c.Request.Context()
 		for _, p := range parsed {
 			if vErr := s.validator.ValidateTransaction(ctx, p.tx, true, true); vErr != nil {
-				s.persistRejectedAtIntake(ctx, p.txid, vErr.Error())
+				s.rejectAtIntake(ctx, p.txid, vErr.Error(), opts)
 				c.JSON(http.StatusBadRequest, gin.H{
 					jsonKeyError: "transaction failed validation",
 					"txid":       p.txid,
