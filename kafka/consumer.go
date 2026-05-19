@@ -77,6 +77,13 @@ func NewConsumerGroup(cfg ConsumerConfig) (*ConsumerGroup, error) {
 	if cfg.Broker == nil {
 		return nil, fmt.Errorf("ConsumerConfig.Broker is required")
 	}
+	// Require exactly one of (Handler, ClaimHandler). Without this guard a
+	// nil Handler in legacy mode panics inside the per-message dispatch
+	// loop the first time a message arrives — failing fast at construction
+	// turns that latent panic into a startup error operators can act on.
+	if cfg.Handler == nil && cfg.ClaimHandler == nil {
+		return nil, fmt.Errorf("ConsumerConfig: either Handler or ClaimHandler must be set")
+	}
 	sub, err := cfg.Broker.Subscribe(cfg.GroupID, cfg.Topics)
 	if err != nil {
 		return nil, fmt.Errorf("subscribing: %w", err)

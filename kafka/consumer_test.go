@@ -244,3 +244,63 @@ func TestProcessOne_HappyPathMarks(t *testing.T) {
 		t.Errorf("expected 0 Sends on happy path, got %d", sends)
 	}
 }
+
+// TestNewConsumerGroup_RequiresHandler pins the fail-fast contract that
+// catches the suppressed Copilot concern: a ConsumerConfig with both
+// Handler and ClaimHandler nil would have silently constructed and then
+// panicked the first time a message arrived in legacy mode. The
+// constructor now refuses the misconfiguration at startup.
+func TestNewConsumerGroup_RequiresHandler(t *testing.T) {
+	cases := []struct {
+		name      string
+		handler   MessageHandler
+		claimFn   ClaimHandler
+		wantError bool
+	}{
+		{
+			name:      "both nil rejected",
+			wantError: true,
+		},
+		{
+			name:    "handler set ok",
+			handler: func(context.Context, *Message) error { return nil },
+		},
+		{
+			name:    "claim handler set ok",
+			claimFn: func(Claim) error { return nil },
+		},
+		{
+			name:    "both set ok (claim wins by config contract)",
+			handler: func(context.Context, *Message) error { return nil },
+			claimFn: func(Claim) error { return nil },
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			broker := NewMemoryBroker(8)
+			cg, err := NewConsumerGroup(ConsumerConfig{
+				Broker:       broker,
+				GroupID:      "g",
+				Topics:       []string{"t"},
+				Handler:      tc.handler,
+				ClaimHandler: tc.claimFn,
+				Logger:       zap.NewNop(),
+			})
+			if tc.wantError {
+				if err == nil {
+					t.Fatal("expected error for nil Handler + nil ClaimHandler, got nil — fail-fast guard missing")
+				}
+				if cg != nil {
+					t.Fatalf("expected nil ConsumerGroup on error, got %v", cg)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cg != nil {
+				_ = cg.Close()
+			}
+		})
+	}
+}

@@ -19,8 +19,9 @@
 // Service ownership
 //
 //   - propagation: batch size, broadcast latency per outcome, chunk count,
-//     pending-retry depth, reaper lease and tick outcomes, inline retries,
-//     merkle registration latency.
+//     dispatcher pending depth, deferred-requeue gauge, reaper lease and
+//     tick outcomes, narrowed-reaper rebroadcast depth, merkle registration
+//     latency.
 //   - bump_builder: build duration, blocks processed, BUMP outcomes, STUMP
 //     and grace-window stats.
 //   - api_server: request latency by route + status, in-flight gauge.
@@ -84,15 +85,28 @@ var PropagationBroadcastConsensus = promauto.NewCounterVec(prometheus.CounterOpt
 	Help: "Per-broadcast consensus outcome across all responding endpoints.",
 }, []string{"verdict"}) // accepted, unanimous_reject, mixed, unreachable
 
-// PropagationPendingDepth gauges how many propagationMsgs are buffered in
-// the propagator's accumulator slice between flushes. Sustained growth
-// indicates downstream (teranode broadcast or merkle-service register) is
-// not keeping up with ingest — combined with the publish-carry gauge on the
-// validator side, this is the canonical "kafka consumer falling behind"
-// signal.
+// PropagationPendingDepth gauges how many propagationMsgs the dep-aware
+// dispatcher is currently holding in its pendingMsgs accumulator awaiting
+// the next flush. The dispatcher owns the slice on a single goroutine,
+// so the gauge tracks its length at every mutation point. Sustained
+// growth indicates downstream (teranode broadcast or merkle-service
+// register) is not keeping up with ingest.
 var PropagationPendingDepth = promauto.NewGauge(prometheus.GaugeOpts{
 	Name: "arcade_propagation_pending_depth",
-	Help: "Number of propagation messages buffered awaiting flush.",
+	Help: "Number of propagation messages buffered in the dispatcher awaiting flush.",
+})
+
+// PropagationPendingRequeues gauges how many delayed-requeue goroutines
+// are currently parked waiting for their flat requeueDelay to elapse
+// before pushing back onto the dispatcher. Each Teranode infra-failure
+// (no peer reachable, parseable 500, per-slot PROCESSING) drives a
+// new requeue, so a sustained high value points to upstream pressure
+// — pair it with TeranodeEndpointHealth to confirm. Inc'd on entry,
+// Dec'd via defer regardless of whether the goroutine exits via timer
+// or ctx.Done.
+var PropagationPendingRequeues = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "arcade_propagation_pending_requeues",
+	Help: "Number of requeueAfterDelay goroutines currently awaiting their delay before re-admitting messages.",
 })
 
 // PropagationInflightBatches gauges how many flushBatch goroutines are
@@ -173,12 +187,16 @@ var PropagationReaperTickTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "Reaper tick outcomes.",
 }, []string{labelOutcome}) // ran, skipped_no_leader, lease_error
 
-// PropagationReaperReadyDepth is the count of PENDING_RETRY rows that the last
-// reaper tick observed as ready. Sustained high values indicate a struggling
-// downstream (datahubs flapping, merkle slow).
+// PropagationReaperReadyDepth is the count of stale SEEN_ON_NETWORK /
+// SEEN_MULTIPLE_NODES rows the last reaper tick observed as candidates
+// for rebroadcast. Set on every tick (including to 0 when the queue
+// clears) so dashboards reflect current state, not the last non-zero
+// scan. Sustained high values indicate a struggling downstream
+// (datahubs flapping, merkle slow) blocking SEEN_ON_NETWORK txs from
+// reaching ACCEPTED.
 var PropagationReaperReadyDepth = promauto.NewGauge(prometheus.GaugeOpts{
 	Name: "arcade_propagation_reaper_ready_depth",
-	Help: "Number of PENDING_RETRY rows ready at the last reaper tick.",
+	Help: "Number of stale SEEN_ON_NETWORK rows ready for rebroadcast at the last reaper tick.",
 })
 
 // ---------------------------------------------------------------------------

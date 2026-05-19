@@ -57,6 +57,11 @@ type mockStore struct {
 	// batchUpdatePrevFunc lets a test inject previous-row data per-txid for
 	// transition-age assertions. Returning nil mirrors the not-found path.
 	batchUpdatePrevFunc func(txid string) *models.TransactionStatus
+	// getOrInsertFn lets tests drive the dedup CAS path: when non-nil it
+	// is consulted on each GetOrInsertStatus call and its return value is
+	// used directly. Default behavior (nil hook) is the legacy "always
+	// fresh insert" stub: (nil, false, nil).
+	getOrInsertFn func(status *models.TransactionStatus) (*models.TransactionStatus, bool, error)
 }
 
 func (m *mockStore) UpdateStatus(_ context.Context, status *models.TransactionStatus) error {
@@ -67,7 +72,10 @@ func (m *mockStore) UpdateStatus(_ context.Context, status *models.TransactionSt
 	return nil
 }
 
-func (m *mockStore) GetOrInsertStatus(context.Context, *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+func (m *mockStore) GetOrInsertStatus(_ context.Context, status *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+	if m.getOrInsertFn != nil {
+		return m.getOrInsertFn(status)
+	}
 	return nil, false, nil
 }
 
@@ -438,6 +446,175 @@ func TestHandleSubmitTransactions_KafkaFailure_Returns500(t *testing.T) {
 
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestHandleSubmitTransaction_DedupBranch_PopulatesTxTracker pins the
+// invariant that an idempotent re-submit (dedup CAS reports the txid
+// already exists) still registers the txid with the in-process TxTracker
+// using the persisted status. Without this, a client retrying after a
+// process restart would leave the tx invisible to bump-builder's
+// tracked-only filter and silently drop subsequent MINED/IMMUTABLE
+// transitions.
+func TestHandleSubmitTransaction_DedupBranch_PopulatesTxTracker(t *testing.T) {
+	rawTx := makeMinimalTx()
+	parsed, _, err := sdkTx.NewTransactionFromStream(rawTx)
+	if err != nil {
+		t.Fatalf("parsing test tx: %v", err)
+	}
+	wantTxID := parsed.TxID().String()
+
+	const persistedStatus = models.StatusAcceptedByNetwork
+	ms := &mockStore{
+		getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+			// Simulate the dedup-loser branch: return the existing row
+			// with its already-persisted status and inserted=false.
+			return &models.TransactionStatus{
+				TxID:   in.TxID,
+				Status: persistedStatus,
+			}, false, nil
+		},
+	}
+	tracker := store.NewTxTracker()
+	broker := &kafka.RecordingBroker{}
+	gin.SetMode(gin.TestMode)
+	srv := &Server{
+		cfg:            &config.Config{CallbackToken: testCallbackToken},
+		logger:         zap.NewNop(),
+		producer:       kafka.NewProducer(broker),
+		store:          ms,
+		txTracker:      tracker,
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
+	}
+	router := gin.New()
+	srv.registerRoutes(router)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/tx", bytes.NewReader(rawTx))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["status"] != "already submitted" {
+		t.Errorf("expected status=already submitted, got %v", resp["status"])
+	}
+
+	gotStatus, ok := tracker.GetStatus(wantTxID)
+	if !ok {
+		t.Fatalf("tracker missing dedup'd txid %s — bug would let bump-builder skip MINED transitions after restart", wantTxID)
+	}
+	if gotStatus != persistedStatus {
+		t.Errorf("tracker status = %q, want %q (persisted, not RECEIVED) — a downgrade would mis-represent state", gotStatus, persistedStatus)
+	}
+
+	// Dedup means we must NOT re-publish to Kafka — assert no broadcast
+	// occurred to lock in the idempotency contract.
+	if totalMessages(broker) != 0 {
+		t.Errorf("dedup branch should not publish to Kafka, got %d messages", totalMessages(broker))
+	}
+}
+
+// TestHandleSubmitTransactions_DedupBranch_PopulatesTxTracker is the
+// batch-path mirror of the single-submit dedup test. A batch with one
+// duplicate must add that duplicate to TxTracker with the persisted
+// status while still publishing the non-duplicate txs.
+func TestHandleSubmitTransactions_DedupBranch_PopulatesTxTracker(t *testing.T) {
+	// Two distinct minimal txs so we can route one through the dedup
+	// branch and one through the fresh-insert branch. Encoding two
+	// identical minimal txs back-to-back would parse as two but the
+	// store path keys by txid so we'd just see one dedup hit twice;
+	// distinct txs make the assertion unambiguous.
+	rawA := makeMinimalTx()
+	parsedA, _, err := sdkTx.NewTransactionFromStream(rawA)
+	if err != nil {
+		t.Fatalf("parse A: %v", err)
+	}
+	txidA := parsedA.TxID().String()
+
+	txB := sdkTx.NewTransaction()
+	// Inject a single dummy locking-script output so wire bytes differ
+	// from the empty minimal tx — drives a different txid.
+	txB.AddOutput(&sdkTx.TransactionOutput{
+		Satoshis:      0,
+		LockingScript: &script.Script{},
+	})
+	rawB := txB.Bytes()
+	parsedB, _, err := sdkTx.NewTransactionFromStream(rawB)
+	if err != nil {
+		t.Fatalf("parse B: %v", err)
+	}
+	txidB := parsedB.TxID().String()
+	if txidA == txidB {
+		t.Fatalf("expected distinct txids, got identical %s — adjust txB to ensure divergence", txidA)
+	}
+
+	const persistedStatus = models.StatusSeenMultipleNodes
+	ms := &mockStore{
+		getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+			if in.TxID == txidA {
+				// A is the duplicate.
+				return &models.TransactionStatus{
+					TxID:   in.TxID,
+					Status: persistedStatus,
+				}, false, nil
+			}
+			// B is the fresh insert (legacy stub semantics).
+			return nil, true, nil
+		},
+	}
+	tracker := store.NewTxTracker()
+	broker := &kafka.RecordingBroker{}
+	gin.SetMode(gin.TestMode)
+	srv := &Server{
+		cfg:            &config.Config{CallbackToken: testCallbackToken},
+		logger:         zap.NewNop(),
+		producer:       kafka.NewProducer(broker),
+		store:          ms,
+		txTracker:      tracker,
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
+	}
+	router := gin.New()
+	srv.registerRoutes(router)
+
+	body := append(append([]byte(nil), rawA...), rawB...)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/txs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Duplicate (A) must land in the tracker with the persisted status.
+	gotA, okA := tracker.GetStatus(txidA)
+	if !okA {
+		t.Fatalf("tracker missing dedup'd batch txid %s — bug would let bump-builder skip MINED after restart", txidA)
+	}
+	if gotA != persistedStatus {
+		t.Errorf("tracker[A].Status = %q, want %q (persisted, not RECEIVED)", gotA, persistedStatus)
+	}
+
+	// Fresh insert (B) must also be in the tracker (existing behavior;
+	// guards against regressing the non-dedup path).
+	gotB, okB := tracker.GetStatus(txidB)
+	if !okB {
+		t.Fatalf("tracker missing fresh-insert txid %s", txidB)
+	}
+	if gotB != models.StatusReceived {
+		t.Errorf("tracker[B].Status = %q, want RECEIVED", gotB)
+	}
+
+	// Only the non-duplicate (B) is republished — duplicates must not
+	// re-enter the propagation topic.
+	if got := totalMessages(broker); got != 1 {
+		t.Errorf("expected 1 published message (only B), got %d", got)
 	}
 }
 

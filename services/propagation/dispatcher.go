@@ -147,6 +147,14 @@ func (p *Propagator) runDispatcher(ctx context.Context, claim kafka.Claim, cfg d
 	}
 
 	for {
+		// Keep the pending-depth gauge in sync at the top of every
+		// iteration. Every branch below that mutates pendingMsgs
+		// (handleAdmit, handleRequeue, handleTerminal, drain, flush)
+		// is observed exactly once before the next select fires.
+		// One atomic write per iteration is negligible vs the throughput
+		// the dispatcher handles.
+		metrics.PropagationPendingDepth.Set(float64(len(pendingMsgs)))
+
 		// Backpressure: nil-channel trick excludes incoming-message
 		// sources from the select when pendingMsgs is at cap. Both
 		// claim.Messages() and admitCh participate, so the same cap

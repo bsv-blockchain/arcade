@@ -45,3 +45,37 @@ func CheckPartitions(broker Broker, topics []string, minPartitions int, logger *
 	}
 	return nil
 }
+
+// CheckExactPartitions verifies that `topic` exists on the broker with
+// exactly `want` partitions. Returns an error on mismatch. Used for
+// topics where partition count is a correctness constraint (not a
+// scaling hint), e.g. the dep-aware dispatcher requires
+// TopicPropagation to be single-partition so its single-goroutine state
+// ownership covers the entire topic.
+//
+// Missing topics are reported as warnings (matching CheckPartitions's
+// behavior) — Kafka auto-creates on first publish, and we'd rather log
+// than block startup on a topic the operator may be about to populate.
+func CheckExactPartitions(broker Broker, topic string, want int, logger *zap.Logger) error {
+	count, err := broker.PartitionCount(topic)
+	if errors.Is(err, ErrTopicNotFound) {
+		logger.Warn(
+			"topic not found on broker — will be auto-created on first publish; ensure exact partition count matches the correctness requirement",
+			zap.String("topic", topic),
+			zap.Int("want_partitions", want),
+		)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("querying partition count for %s: %w", topic, err)
+	}
+	if count != want {
+		return fmt.Errorf("topic %s has %d partitions, want exactly %d (correctness requirement)", topic, count, want)
+	}
+	logger.Info(
+		"topic partition count matches required exact value",
+		zap.String("topic", topic),
+		zap.Int("partitions", count),
+	)
+	return nil
+}

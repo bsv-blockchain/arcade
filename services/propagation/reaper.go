@@ -130,12 +130,19 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 		p.logger.Error("reaper: scan failed", zap.Error(err))
 		return
 	}
+
+	// Publish the post-scan depth on every tick BEFORE the early-return
+	// so the gauge reflects "what the last reaper observed" — including
+	// the queue-is-clear case. Setting it only on the non-empty branch
+	// leaves a stale non-zero value visible to dashboards after the
+	// backlog drains, which used to make the metric misleading.
+	metrics.PropagationReaperReadyDepth.Set(float64(len(stuck)))
+
 	if len(stuck) == 0 {
 		return
 	}
 
 	p.logger.Info("reaper: rebroadcasting stuck txs", zap.Int("count", len(stuck)))
-	metrics.PropagationReaperReadyDepth.Set(float64(len(stuck)))
 
 	// Use the same broadcast pipeline as processBatch so the per-tx
 	// classification (Accepted / Rejected / Requeue) applies uniformly.

@@ -75,7 +75,9 @@ func (p *KafkaPublisher) Publish(ctx context.Context, status *models.Transaction
 		return err
 	}
 	start := time.Now()
-	err := p.producer.Send(kafka.TopicStatusUpdate, status.TxID, status) //nolint:contextcheck // kafka.Producer.Send doesn't take a context; ctx already checked above
+	// kafka.Producer.Send doesn't take a context; ctx already checked above.
+	//nolint:contextcheck // see above
+	err := p.producer.Send(kafka.TopicStatusUpdate, status.TxID, status)
 	outcome := "success"
 	if err != nil {
 		outcome = "error"
@@ -105,7 +107,9 @@ func (p *KafkaPublisher) PublishBulk(ctx context.Context, template *models.Trans
 		key = "bulk-" + template.TxIDs[0]
 	}
 	start := time.Now()
-	err := p.producer.Send(kafka.TopicStatusUpdate, key, template) //nolint:contextcheck // kafka.Producer.Send doesn't take a context; ctx already checked above
+	// kafka.Producer.Send doesn't take a context; ctx already checked above.
+	//nolint:contextcheck // see above
+	err := p.producer.Send(kafka.TopicStatusUpdate, key, template)
 	outcome := "success"
 	if err != nil {
 		outcome = "error"

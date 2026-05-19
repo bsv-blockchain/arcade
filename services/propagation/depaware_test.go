@@ -6,9 +6,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/teranode"
 )
@@ -380,5 +382,57 @@ func TestHandleAdmit_DuplicateTxid_DoesNotStrandOffset(t *testing.T) {
 	tracker.Done(inFlight["X"])
 	if !tracker.Empty() {
 		t.Fatal("tracker must be empty after the original terminalizes; the duplicate's offset must not strand")
+	}
+}
+
+// TestRequeueAfterDelay_PendingRequeuesGauge pins the Inc/Dec contract on
+// PropagationPendingRequeues. The gauge needs to reflect parked
+// requeue goroutines so a sustained upstream outage shows up in
+// dashboards. Without the dec on early-exit via ctx.Done, the gauge
+// would drift up forever after every shutdown / claim revocation.
+func TestRequeueAfterDelay_PendingRequeuesGauge(t *testing.T) {
+	p, cleanup := newPropagatorForDepTest(t, &mockStore{})
+	t.Cleanup(cleanup)
+
+	startVal := testutil.ToFloat64(metrics.PropagationPendingRequeues)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+
+	msgs := []propagationMsg{{TXID: "a", RawTx: []byte{0x01}}}
+	p.requeueAfterDelay(ctx, msgs)
+
+	if got := testutil.ToFloat64(metrics.PropagationPendingRequeues); got != startVal+1 {
+		t.Fatalf("after requeueAfterDelay gauge = %v, want %v (inc by 1)", got, startVal+1)
+	}
+
+	// Cancel context — the goroutine bails before the timer fires and
+	// the defer must dec the gauge back. Poll for ≤500ms so a slow
+	// scheduler doesn't make the test flake.
+	cancel()
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if testutil.ToFloat64(metrics.PropagationPendingRequeues) == startVal {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := testutil.ToFloat64(metrics.PropagationPendingRequeues); got != startVal {
+		t.Fatalf("after ctx.Done gauge = %v, want %v (dec back to baseline) — defer is not reconciling the goroutine exit", got, startVal)
+	}
+}
+
+// TestRequeueAfterDelay_EmptyMsgs_NoGaugeChange ensures the cheap
+// early-return path (no msgs) does not perturb the gauge — important
+// because the dispatcher path can call requeueAfterDelay with an empty
+// slice and we shouldn't pollute the metric in that case.
+func TestRequeueAfterDelay_EmptyMsgs_NoGaugeChange(t *testing.T) {
+	p, cleanup := newPropagatorForDepTest(t, &mockStore{})
+	t.Cleanup(cleanup)
+
+	startVal := testutil.ToFloat64(metrics.PropagationPendingRequeues)
+	p.requeueAfterDelay(t.Context(), nil)
+	if got := testutil.ToFloat64(metrics.PropagationPendingRequeues); got != startVal {
+		t.Fatalf("empty-msgs early-return mutated gauge: got %v, want %v", got, startVal)
 	}
 }

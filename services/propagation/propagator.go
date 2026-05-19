@@ -921,7 +921,15 @@ func (p *Propagator) requeueAfterDelay(ctx context.Context, msgs []propagationMs
 	if len(msgs) == 0 {
 		return
 	}
+	// Track pending requeue goroutines on the metric so sustained
+	// upstream pressure shows up in dashboards without needing to
+	// introspect goroutines. Per-call goroutine + timer is intentional
+	// (see the requeueDelay comment) — the gauge is the observability
+	// hook for catching the failure mode where TPS × requeueDelay
+	// fans out further than capacity tolerates.
+	metrics.PropagationPendingRequeues.Inc()
 	go func(msgs []propagationMsg) {
+		defer metrics.PropagationPendingRequeues.Dec()
 		select {
 		case <-time.After(requeueDelay):
 		case <-ctx.Done():

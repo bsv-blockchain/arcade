@@ -77,8 +77,22 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 	}
 	producer := kafka.NewProducer(broker)
 
+	// Hard requirement: TopicPropagation MUST be single-partition. The
+	// dep-aware dispatcher's single-goroutine state ownership relies on
+	// total order at the topic level — parent/child txids on different
+	// partitions would bypass the in-memory dep index and reintroduce
+	// the cross-batch "missing inputs" race we just removed. Check this
+	// on every startup regardless of MinPartitions.
+	if pErr := kafka.CheckExactPartitions(broker, kafka.TopicPropagation, 1, logger); pErr != nil {
+		_ = producer.Close()
+		return nil, nil, fmt.Errorf("kafka partition check: %w", pErr)
+	}
+	// MinPartitions is a soft hint for horizontally-scaled topics. There
+	// are currently no other hot-path topics that need it (TopicTransaction
+	// was retired with tx_validator) but the knob is retained so a future
+	// fan-out topic can opt into the check without re-introducing config.
 	if cfg.Kafka.MinPartitions > 1 {
-		if pErr := kafka.CheckPartitions(broker, []string{kafka.TopicTransaction, kafka.TopicPropagation}, cfg.Kafka.MinPartitions, logger); pErr != nil {
+		if pErr := kafka.CheckPartitions(broker, nil, cfg.Kafka.MinPartitions, logger); pErr != nil {
 			_ = producer.Close()
 			return nil, nil, fmt.Errorf("kafka partition check: %w", pErr)
 		}
@@ -162,6 +176,37 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 			return nil, nil, fmt.Errorf("chaintracks init: %w", ctErr)
 		}
 		chainTracks = ct
+	}
+
+	// Hydrate the TxTracker from the store BEFORE handing it to services.
+	// Without this, a process restart leaves the in-memory tracker empty
+	// and bump-builder's tracked-only filtering silently drops MINED /
+	// IMMUTABLE transitions for any tx that was already in-flight at the
+	// previous shutdown. Chain height is used to skip deeply-confirmed
+	// rows; when chaintracks is disabled we pass 0, which preserves every
+	// MINED row in the tracker — safe (loads a bit more) and the operator
+	// can prune later.
+	var hydrateHeight uint64
+	if chainTracks != nil {
+		hydrateHeight = uint64(chainTracks.GetHeight(ctx))
+	}
+	hydrateStart := time.Now()
+	loaded, hydrateErr := txTracker.LoadFromStore(ctx, st, hydrateHeight)
+	if hydrateErr != nil {
+		logger.Warn(
+			"tx tracker hydration partial",
+			zap.Int("loaded", loaded),
+			zap.Uint64("current_height", hydrateHeight),
+			zap.Duration("elapsed", time.Since(hydrateStart)),
+			zap.Error(hydrateErr),
+		)
+	} else {
+		logger.Info(
+			"tx tracker hydrated",
+			zap.Int("loaded", loaded),
+			zap.Uint64("current_height", hydrateHeight),
+			zap.Duration("elapsed", time.Since(hydrateStart)),
+		)
 	}
 
 	deps := &Deps{

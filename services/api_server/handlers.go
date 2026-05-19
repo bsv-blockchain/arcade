@@ -630,6 +630,15 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 			// Best-effort: continue with publish. The propagator's
 			// in-flight set catches duplicates that slip past.
 		case !inserted && existing != nil:
+			// Idempotent re-submit: row already exists. Register the txid
+			// with the in-process TxTracker using the persisted status so
+			// bump-builder's tracked-only filtering recognizes it. Without
+			// this, a re-submit after process restart leaves the tx
+			// invisible to bump-builder and subsequent MINED/IMMUTABLE
+			// transitions are silently dropped.
+			if s.txTracker != nil {
+				s.txTracker.Add(txid, existing.Status)
+			}
 			s.recordSubmission(c.Request.Context(), txid, opts)
 			c.JSON(http.StatusAccepted, gin.H{
 				"status": "already submitted",
@@ -819,6 +828,13 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				toPublish = append(toPublish, p)
 			case !inserted && existing != nil:
 				duplicates++
+				// Idempotent re-submit: register the txid with the
+				// in-process TxTracker using the persisted status so
+				// bump-builder's tracked-only filtering recognizes it.
+				// Mirrors the single-submit dedup branch (handleSubmitTransaction).
+				if s.txTracker != nil {
+					s.txTracker.Add(p.txid, existing.Status)
+				}
 				s.recordSubmission(ctx, p.txid, opts)
 			default:
 				toPublish = append(toPublish, p)

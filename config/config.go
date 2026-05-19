@@ -164,10 +164,13 @@ type Kafka struct {
 	ConsumerGroup string   `mapstructure:"consumer_group"`
 	MaxRetries    int      `mapstructure:"max_retries"`
 	BufferSize    int      `mapstructure:"buffer_size"`
-	// MinPartitions is the minimum number of partitions every hot-path topic
-	// must have at startup. Set to the expected replica count of the propagation
-	// consumer so arcade fails fast when the cluster can't actually fan out
-	// across pods. Leave at 0 or 1 in standalone/single-replica deployments.
+	// MinPartitions is a soft minimum-partition hint for horizontally-scaled
+	// topics; arcade fails fast at startup when an existing topic has fewer.
+	// Independent of this knob, TopicPropagation is ALWAYS checked for an
+	// exact partition count of 1 — the dep-aware dispatcher's single-goroutine
+	// state ownership requires total order at the topic level, so multiple
+	// partitions would reintroduce the cross-batch "missing inputs" race.
+	// Leave at 0 or 1 in standalone/single-replica deployments.
 	MinPartitions int `mapstructure:"min_partitions"`
 	// SendTimeoutMs bounds how long the in-process memory broker waits for a
 	// slot in a full mailbox before returning ErrBrokerBackpressure to the

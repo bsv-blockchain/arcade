@@ -55,7 +55,7 @@ On terminal status events (sent via channel from broadcast workers and the merkl
 - `ACCEPTED_BY_NETWORK`: pop the txid from `inFlight`, mark its offset `Done` on the tracker, release any waiters that no longer have an in-flight parent.
 - `REJECTED`: pop the txid from `inFlight`, mark its offset `Done`, walk waiters/`heldMsgs` for the cascade subtree, write terminal REJECTED rows for every cascaded descendant, mark their offsets `Done` too.
 
-Infra failures (Teranode 500, no-peer-reachable, merkle-service /watch failure) are NOT terminal status events — the broadcast worker retries inline (see "Retry handling"). The offset stays alive on the tracker for the entire retry loop, so the Kafka commit watermark cannot advance past a stuck tx.
+Infra failures (Teranode 500, no-peer-reachable, merkle-service /watch failure) are NOT terminal status events — the broadcast worker schedules a deferred requeue through the dispatcher (see "Retry handling"). The offset stays alive on the tracker for the entire retry loop, so the Kafka commit watermark cannot advance past a stuck tx.
 
 ### Batching
 
