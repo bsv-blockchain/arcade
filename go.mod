@@ -3,14 +3,14 @@ module github.com/bsv-blockchain/arcade
 go 1.26.0
 
 require (
-	github.com/IBM/sarama v1.48.1
+	github.com/IBM/sarama v1.49.0
 	github.com/aerospike/aerospike-client-go/v7 v7.10.2
 	github.com/bsv-blockchain/go-bt/v2 v2.6.3
 	github.com/bsv-blockchain/go-chaintracks v1.2.6
 	github.com/bsv-blockchain/go-p2p-message-bus v0.1.18
 	github.com/bsv-blockchain/go-sdk v1.2.23
 	github.com/bsv-blockchain/go-teranode-p2p-client v0.2.5
-	github.com/bsv-blockchain/teranode v0.15.0-beta-9
+	github.com/bsv-blockchain/teranode v0.15.1-beta-2
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/fergusstrange/embedded-postgres v1.34.0
 	github.com/gin-gonic/gin v1.12.0
@@ -58,12 +58,12 @@ require (
 	github.com/benbjohnson/clock v1.3.5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bsv-blockchain/go-batcher/v2 v2.0.0 // indirect
-	github.com/bsv-blockchain/go-chaincfg v1.5.7 // indirect
+	github.com/bsv-blockchain/go-chaincfg v1.5.8 // indirect
 	github.com/bsv-blockchain/go-lockfree-queue v1.1.3 // indirect
-	github.com/bsv-blockchain/go-safe-conversion v1.1.3 // indirect
-	github.com/bsv-blockchain/go-subtree v1.3.1 // indirect
-	github.com/bsv-blockchain/go-tx-map v1.3.5 // indirect
-	github.com/bsv-blockchain/go-wire v1.2.3 // indirect
+	github.com/bsv-blockchain/go-safe-conversion v1.2.0 // indirect
+	github.com/bsv-blockchain/go-subtree v1.4.1 // indirect
+	github.com/bsv-blockchain/go-tx-map v1.3.7 // indirect
+	github.com/bsv-blockchain/go-wire v1.2.5 // indirect
 	github.com/bytedance/gopkg v0.1.4 // indirect
 	github.com/bytedance/sonic v1.15.1 // indirect
 	github.com/bytedance/sonic/loader v0.5.1 // indirect
