@@ -770,19 +770,31 @@ RETURNING t.txid, prev.status, prev.timestamp_at, prev.block_hash, prev.block_he
 			txid          string
 			prevStatus    string
 			prevTimestamp time.Time
-			prevBlockHash string
-			prevHeight    int64
+			// transactions.block_hash / block_height are nullable for any
+			// pre-MINED status (RECEIVED / SENT_TO_NETWORK / SEEN_*). The CTE
+			// captures the pre-update row so these will be NULL whenever a tx
+			// transitions to MINED for the first time. Scan via pointer so a
+			// NULL doesn't fail the scan; an empty BlockHash on the returned
+			// prev snapshot is the correct "no block yet" representation
+			// (matches models.TransactionStatus zero values used elsewhere).
+			prevBlockHash *string
+			prevHeight    *int64
 		)
 		if err := rows.Scan(&txid, &prevStatus, &prevTimestamp, &prevBlockHash, &prevHeight); err != nil {
 			return prevs, out, err
 		}
-		prevs = append(prevs, &models.TransactionStatus{
-			TxID:        txid,
-			Status:      models.Status(prevStatus),
-			Timestamp:   prevTimestamp,
-			BlockHash:   prevBlockHash,
-			BlockHeight: uint64(prevHeight), //nolint:gosec // value originated as uint64 in this column
-		})
+		prev := &models.TransactionStatus{
+			TxID:      txid,
+			Status:    models.Status(prevStatus),
+			Timestamp: prevTimestamp,
+		}
+		if prevBlockHash != nil {
+			prev.BlockHash = *prevBlockHash
+		}
+		if prevHeight != nil {
+			prev.BlockHeight = uint64(*prevHeight) //nolint:gosec // value originated as uint64 in this column
+		}
+		prevs = append(prevs, prev)
 		out = append(out, &models.TransactionStatus{
 			TxID:        txid,
 			Status:      models.StatusMined,

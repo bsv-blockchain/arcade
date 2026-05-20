@@ -1062,3 +1062,36 @@ func hashesOf(rows []*models.BlockProcessingStatus) []string {
 	}
 	return out
 }
+
+// Regression: a tx at any pre-MINED status has NULL block_hash / block_height,
+// so the CTE in SetMinedByTxIDs returns NULLs for the previous-row snapshot.
+// Scanning those NULLs into bare string/int64 used to error with
+// "cannot scan NULL into *string", which then caused bump-builder to log
+// "failed to set mined status" and drop the MINED transition entirely.
+func TestSetMinedByTxIDs_HandlesNullPrevBlock(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	in := &models.TransactionStatus{TxID: "tx-prev-null", Status: models.StatusReceived}
+	if _, _, err := s.GetOrInsertStatus(ctx, in); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	prevs, mined, err := s.SetMinedByTxIDs(ctx, "blockhashX", 42, []string{"tx-prev-null"})
+	if err != nil {
+		t.Fatalf("SetMinedByTxIDs: %v", err)
+	}
+	if len(prevs) != 1 || len(mined) != 1 {
+		t.Fatalf("prevs=%d mined=%d want 1/1", len(prevs), len(mined))
+	}
+	if prevs[0].Status != models.StatusReceived {
+		t.Errorf("prev status = %q, want RECEIVED", prevs[0].Status)
+	}
+	if prevs[0].BlockHash != "" || prevs[0].BlockHeight != 0 {
+		t.Errorf("prev block fields should be zero for pre-MINED row, got hash=%q height=%d",
+			prevs[0].BlockHash, prevs[0].BlockHeight)
+	}
+	if mined[0].BlockHash != "blockhashX" || mined[0].BlockHeight != 42 {
+		t.Errorf("mined snapshot mismatch: %+v", mined[0])
+	}
+}

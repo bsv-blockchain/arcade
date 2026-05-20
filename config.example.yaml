@@ -181,8 +181,19 @@ chaintracks_server:
 
 # go-chaintracks library config. See that library's docs for the full set.
 # Defaults are inherited from the library's SetDefaults — uncomment to override.
+#
+# In single-binary (mode=all) and the dedicated chaintracks pod, leave mode at
+# the default "embedded" so this process owns the header store and the P2P
+# subscription. In a microservice deployment every OTHER consumer pod
+# (bump-builder) should run mode="remote" with url pointed at the chaintracks
+# pod's HTTP endpoint — otherwise each pod spins up its own embedded
+# ChainManager and hits the upstream node N times. arcade additionally skips
+# the chaintracks library entirely in modes that don't read from it
+# (api-server, sse, propagation, p2p-client, watchdog), so those pods need no
+# chaintracks config at all.
 # chaintracks:
-#   mode: embedded         # or "remote" with url set to a running chaintracks
-#   storage_path: ""       # defaults to <storage_path>/chaintracks
-#   bootstrap_url: ""
-#   bootstrap_mode: api
+#   mode: embedded         # or "remote" with url set
+#   url: ""                # required when mode=remote, e.g. http://chaintracks:8083
+#   storage_path: ""       # embedded mode only; defaults to <storage_path>/chaintracks
+#   bootstrap_url: ""      # embedded mode only
+#   bootstrap_mode: api    # embedded mode only

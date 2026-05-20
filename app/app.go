@@ -162,13 +162,19 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 
 	teranodeClient.Start(ctx)
 
-	// Construct chaintracks once at process startup so every consumer
-	// (chaintracks_server, bump-builder canonical-root validation, watchdog
-	// future use) shares one P2P subscription and header cache. Skipped when
-	// chaintracks_server is disabled — that flag is already the operator's
-	// process-wide "no chaintracks" switch (regtest force-disables it).
+	// Construct chaintracks once at process startup so every in-process
+	// consumer (chaintracks_server, bump-builder canonical-root validation)
+	// shares one P2P subscription and header cache. Skipped when:
+	//   - cfg.ChaintracksServer.Enabled is false (operator-wide off switch;
+	//     regtest force-disables it via config.validate), or
+	//   - the configured mode never dereferences deps.Chaintracks. Without
+	//     this gate every microservice pod (api-server, sse, propagation, …)
+	//     would spin up an embedded ChainManager and poll the upstream node
+	//     even though nothing in that pod reads from it. In microservice
+	//     deployments the chaintracks pod runs embedded and bump-builder
+	//     points chaintracks.mode=remote at it; everything else skips here.
 	var chainTracks chaintrackslib.Chaintracks
-	if cfg.ChaintracksServer.Enabled {
+	if cfg.ChaintracksServer.Enabled && modeNeedsChaintracks(cfg.Mode) {
 		ct, ctErr := initChaintracks(ctx, cfg, logger)
 		if ctErr != nil {
 			_ = st.Close()
@@ -231,6 +237,25 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		_ = producer.Close()
 	}
 	return deps, cleanup, nil
+}
+
+// modeNeedsChaintracks reports whether the configured service mode constructs
+// at least one service that reads from deps.Chaintracks. Other modes
+// (api-server, sse, propagation, p2p-client, watchdog) never dereference it,
+// so initializing it would spin up an unused embedded ChainManager + upstream
+// header poller in every pod — which is exactly the wrong thing for
+// microservice deployments where the dedicated chaintracks pod owns the
+// header store and bump-builder reads via chaintracks.mode=remote.
+//
+// Keep this list in sync with BuildServices: any new mode that wires
+// deps.Chaintracks into a service must be added here.
+func modeNeedsChaintracks(mode string) bool {
+	switch mode {
+	case "all", "chaintracks", "bump-builder":
+		return true
+	default:
+		return false
+	}
 }
 
 // initChaintracks brings up the embedded go-chaintracks instance shared

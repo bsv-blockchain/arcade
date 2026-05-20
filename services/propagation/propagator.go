@@ -46,7 +46,11 @@ type Propagator struct {
 	leaser         store.Leaser
 	teranodeClient *teranode.Client
 	merkleClient   *merkleservice.Client
-	consumer       *kafka.ConsumerGroup
+	// consumer is written by Start (after kafka.NewConsumerGroup returns) and
+	// read by Stop. atomic.Pointer makes that handoff race-free without
+	// needing a mutex: in tests the harness can call Stop concurrently with
+	// an in-flight Start that's still blocked initializing the consumer.
+	consumer atomic.Pointer[kafka.ConsumerGroup]
 
 	maxPending int
 	// admitCh, requeueCh, terminalCh, and drainCh feed runDispatcher's
@@ -470,7 +474,7 @@ func (p *Propagator) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("creating consumer group: %w", err)
 	}
-	p.consumer = consumer
+	p.consumer.Store(consumer)
 
 	// Spin up the persistent broadcast worker pool. Workers exit when
 	// Stop() closes the job channel; the WaitGroup lets Stop() block until
@@ -547,8 +551,8 @@ func (p *Propagator) WaitForBatches() {
 func (p *Propagator) Stop() error {
 	p.logger.Info("stopping propagation service")
 	var consumerErr error
-	if p.consumer != nil {
-		consumerErr = p.consumer.Close()
+	if c := p.consumer.Load(); c != nil {
+		consumerErr = c.Close()
 	}
 	// Wait for in-flight processBatch goroutines to finish before tearing
 	// down the broadcast worker pool. Otherwise an in-flight batch would

@@ -39,6 +39,13 @@ spec:
               value: "aerospike-0.aerospike.arcade.svc.cluster.local:3000"
             - name: ARCADE_AEROSPIKE_NAMESPACE
               value: "arcade"
+            # Talk to the chaintracks pod over HTTP instead of running an
+            # embedded ChainManager + upstream header poller in this pod.
+            # The chaintracks Service exposes /chaintracks/v1/* on 8083.
+            - name: ARCADE_CHAINTRACKS_MODE
+              value: "remote"
+            - name: ARCADE_CHAINTRACKS_URL
+              value: "http://chaintracks.arcade.svc.cluster.local:8083"
           readinessProbe:
             httpGet:
               path: /health
