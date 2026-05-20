@@ -12,15 +12,22 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
+	"time"
 
 	"github.com/bsv-blockchain/arcade/services/api_server"
 )
 
 func main() {
-	addr := ":8080"
+	port := 8080
 	if p := os.Getenv("PORT"); p != "" {
-		addr = ":" + p
+		parsed, err := strconv.Atoi(p)
+		if err != nil || parsed < 1 || parsed > 65535 {
+			log.Fatal("invalid PORT: must be an integer between 1 and 65535")
+		}
+		port = parsed
 	}
+	addr := ":" + strconv.Itoa(port)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -35,8 +42,17 @@ func main() {
 		}
 	})
 
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
 	log.Printf("arcade docs preview listening on http://localhost%s/", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }

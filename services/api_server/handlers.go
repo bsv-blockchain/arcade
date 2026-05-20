@@ -351,7 +351,8 @@ func (s *Server) applySeenCallback(c *gin.Context, msg models.CallbackMessage, l
 	prevs, err := s.store.BatchUpdateStatusReturning(ctx, statuses)
 	if err != nil {
 		outcome = "error"
-		logger.Warn("batch update seen status failed",
+		logger.Warn(
+			"batch update seen status failed",
 			zap.String("type", metricLabel),
 			zap.Int("batch_size", len(txids)),
 			zap.Error(err),
@@ -406,7 +407,8 @@ func (s *Server) applySeenCallback(c *gin.Context, msg models.CallbackMessage, l
 			TxIDs:     successful,
 		}
 		if pubErr := s.publisher.PublishBulk(ctx, template); pubErr != nil {
-			logger.Warn("failed to publish bulk seen-status",
+			logger.Warn(
+				"failed to publish bulk seen-status",
 				zap.String("type", metricLabel),
 				zap.Int("count", len(successful)),
 				zap.Error(pubErr),

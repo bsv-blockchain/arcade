@@ -825,7 +825,8 @@ func (s *Store) MarkMerkleRegisteredByTxIDs(ctx context.Context, txids []string,
 			if err != nil {
 				continue
 			}
-			records[j] = aero.NewBatchWrite(bwp, key,
+			records[j] = aero.NewBatchWrite(
+				bwp, key,
 				aero.PutOp(aero.NewBin("merkle_registered_at", ts.UnixMilli())),
 			)
 		}

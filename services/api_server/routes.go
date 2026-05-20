@@ -58,7 +58,7 @@ var callbackSubscriptionHeaders = []RouteHeader{
 	{
 		Name:        "X-FullStatusUpdates",
 		Requirement: "Optional",
-		Description: "Set to \"true\" to receive every status transition (RECEIVED, SEEN_ON_NETWORK, SEEN_ON_MULTIPLE_NODES, MINED, IMMUTABLE). Default behaviour delivers only terminal/notable transitions.",
+		Description: "Set to \"true\" to receive every status transition (RECEIVED, SEEN_ON_NETWORK, SEEN_ON_MULTIPLE_NODES, MINED, IMMUTABLE). Default behavior delivers only terminal/notable transitions.",
 	},
 }
 
@@ -92,7 +92,7 @@ var routeDocs = []RouteDoc{
 			},
 		},
 		ResponseStatus: "200 OK",
-		ResponseBody: "{\n  \"txid\": \"<hex>\",\n  \"txStatus\": \"SEEN_ON_NETWORK\",\n  \"status\": \"SEEN_ON_NETWORK\",\n  \"timestamp\": \"2026-05-20T12:00:00Z\",\n  \"blockHash\": \"<hex|null>\",\n  \"blockHeight\": 870123,\n  \"merklePath\": \"<BUMP hex|null>\",\n  \"extraInfo\": \"\",\n  \"competingTxs\": []\n}",
+		ResponseBody:   "{\n  \"txid\": \"<hex>\",\n  \"txStatus\": \"SEEN_ON_NETWORK\",\n  \"status\": \"SEEN_ON_NETWORK\",\n  \"timestamp\": \"2026-05-20T12:00:00Z\",\n  \"blockHash\": \"<hex|null>\",\n  \"blockHeight\": 870123,\n  \"merklePath\": \"<BUMP hex|null>\",\n  \"extraInfo\": \"\",\n  \"competingTxs\": []\n}",
 		Notes:          "Returns 404 if the txid has never been submitted to this Arcade instance.",
 	},
 	{
