@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
+	_ "embed"
 	"encoding/hex"
 	"errors"
 	"html/template"
@@ -143,38 +144,8 @@ func newSubmissionID() (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 
-const docsTemplate = `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Arcade API</title>
-<style>
-  body { font-family: system-ui, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; color: #333; }
-  h1 { border-bottom: 2px solid #eee; padding-bottom: 10px; }
-  table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #eee; }
-  th { background: #f8f8f8; font-weight: 600; }
-  code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; }
-  .method { font-weight: bold; }
-  .get { color: #2e7d32; }
-  .post { color: #1565c0; }
-</style>
-</head>
-<body>
-<h1>Arcade API</h1>
-<p>Available routes:</p>
-<table>
-  <tr><th>Method</th><th>Path</th><th>Description</th><th>Request</th><th>Response</th></tr>
-  {{range .}}<tr>
-    <td class="method {{.Method | lower}}">{{.Method}}</td>
-    <td><code>{{.Path}}</code></td>
-    <td>{{.Description}}</td>
-    <td>{{.RequestFormat}}</td>
-    <td><code>{{.ResponseFormat}}</code></td>
-  </tr>{{end}}
-</table>
-</body>
-</html>`
+//go:embed docs.html
+var docsTemplate string
 
 var docsTmpl = template.Must(template.New("docs").Funcs(template.FuncMap{
 	"lower": strings.ToLower,
@@ -183,7 +154,7 @@ var docsTmpl = template.Must(template.New("docs").Funcs(template.FuncMap{
 func (s *Server) handleDocs(c *gin.Context) {
 	c.Header("Content-Type", "text/html; charset=utf-8")
 	c.Status(http.StatusOK)
-	if err := docsTmpl.Execute(c.Writer, routeDocs); err != nil {
+	if err := docsTmpl.Execute(c.Writer, docsPage{Routes: routeDocs}); err != nil {
 		s.logger.Error("failed to render docs", zap.Error(err))
 	}
 }

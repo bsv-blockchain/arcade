@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arcade — The world's most scalable transaction broadcast manager</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --bg-elev: #f6f8fa;
+    --bg-code: #f6f8fa;
+    --border: #d0d7de;
+    --border-strong: #afb8c1;
+    --text: #1f2328;
+    --text-muted: #57606a;
+    --text-faint: #818b98;
+    --accent: #0969da;
+    --accent-soft: rgba(9, 105, 218, 0.08);
+    --get: #1a7f37;
+    --get-soft: rgba(26, 127, 55, 0.10);
+    --post: #0969da;
+    --post-soft: rgba(9, 105, 218, 0.10);
+    --shadow: 0 1px 0 rgba(31, 35, 40, 0.04), 0 8px 24px rgba(31, 35, 40, 0.06);
+    --radius: 12px;
+    --radius-sm: 6px;
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", system-ui, sans-serif;
+    --font-mono: "JetBrains Mono", "SF Mono", ui-monospace, "Cascadia Code", Menlo, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --bg-elev: #161b22;
+      --bg-code: #0b1018;
+      --border: #30363d;
+      --border-strong: #484f58;
+      --text: #e6edf3;
+      --text-muted: #8d96a0;
+      --text-faint: #6e7681;
+      --accent: #58a6ff;
+      --accent-soft: rgba(88, 166, 255, 0.12);
+      --get: #3fb950;
+      --get-soft: rgba(63, 185, 80, 0.14);
+      --post: #58a6ff;
+      --post-soft: rgba(88, 166, 255, 0.14);
+      --shadow: 0 1px 0 rgba(0, 0, 0, 0.4), 0 12px 32px rgba(0, 0, 0, 0.45);
+    }
+  }
+
+  html[data-theme="light"] {
+    --bg: #ffffff;
+    --bg-elev: #f6f8fa;
+    --bg-code: #f6f8fa;
+    --border: #d0d7de;
+    --border-strong: #afb8c1;
+    --text: #1f2328;
+    --text-muted: #57606a;
+    --text-faint: #818b98;
+    --accent: #0969da;
+    --accent-soft: rgba(9, 105, 218, 0.08);
+    --get: #1a7f37;
+    --get-soft: rgba(26, 127, 55, 0.10);
+    --post: #0969da;
+    --post-soft: rgba(9, 105, 218, 0.10);
+    --shadow: 0 1px 0 rgba(31, 35, 40, 0.04), 0 8px 24px rgba(31, 35, 40, 0.06);
+  }
+
+  html[data-theme="dark"] {
+    --bg: #0d1117;
+    --bg-elev: #161b22;
+    --bg-code: #0b1018;
+    --border: #30363d;
+    --border-strong: #484f58;
+    --text: #e6edf3;
+    --text-muted: #8d96a0;
+    --text-faint: #6e7681;
+    --accent: #58a6ff;
+    --accent-soft: rgba(88, 166, 255, 0.12);
+    --get: #3fb950;
+    --get-soft: rgba(63, 185, 80, 0.14);
+    --post: #58a6ff;
+    --post-soft: rgba(88, 166, 255, 0.14);
+    --shadow: 0 1px 0 rgba(0, 0, 0, 0.4), 0 12px 32px rgba(0, 0, 0, 0.45);
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: var(--font-sans);
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    transition: background-color 0.2s ease, color 0.2s ease;
+  }
+
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  code, pre, .mono { font-family: var(--font-mono); }
+
+  .hero {
+    position: relative;
+    padding: 96px 24px 72px;
+    text-align: center;
+    background:
+      radial-gradient(ellipse at 50% 0%, var(--accent-soft), transparent 60%),
+      linear-gradient(180deg, var(--bg) 0%, var(--bg) 100%);
+    border-bottom: 1px solid var(--border);
+    overflow: hidden;
+  }
+
+  .hero::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background-image:
+      linear-gradient(var(--border) 1px, transparent 1px),
+      linear-gradient(90deg, var(--border) 1px, transparent 1px);
+    background-size: 48px 48px;
+    background-position: -1px -1px;
+    mask-image: radial-gradient(ellipse at 50% 0%, rgba(0, 0, 0, 0.6) 0%, transparent 70%);
+    -webkit-mask-image: radial-gradient(ellipse at 50% 0%, rgba(0, 0, 0, 0.6) 0%, transparent 70%);
+    opacity: 0.35;
+    pointer-events: none;
+  }
+
+  .hero-inner { position: relative; max-width: 880px; margin: 0 auto; }
+
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 14px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--bg-elev);
+    color: var(--text-muted);
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .badge .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--get); box-shadow: 0 0 8px var(--get);
+  }
+
+  .hero h1 {
+    margin: 24px 0 16px;
+    font-size: clamp(36px, 6vw, 64px);
+    line-height: 1.05;
+    font-weight: 700;
+    letter-spacing: -0.025em;
+    background: linear-gradient(180deg, var(--text) 0%, var(--text-muted) 140%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  .hero .tagline {
+    margin: 0 auto;
+    max-width: 640px;
+    font-size: 17px;
+    color: var(--text-muted);
+  }
+
+  .theme-toggle {
+    position: absolute;
+    top: 20px;
+    right: 20px;
+    width: 40px;
+    height: 40px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--bg-elev);
+    color: var(--text);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: background-color 0.15s ease, border-color 0.15s ease;
+  }
+  .theme-toggle:hover { border-color: var(--border-strong); }
+  .theme-toggle svg { width: 18px; height: 18px; }
+  .theme-toggle .icon-sun { display: none; }
+  html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+  html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+  @media (prefers-color-scheme: dark) {
+    html:not([data-theme="light"]) .theme-toggle .icon-sun { display: block; }
+    html:not([data-theme="light"]) .theme-toggle .icon-moon { display: none; }
+  }
+
+  main {
+    max-width: 1080px;
+    margin: 0 auto;
+    padding: 56px 24px 96px;
+  }
+
+  .intro { margin-bottom: 40px; }
+  .intro h2 {
+    margin: 0 0 8px;
+    font-size: 24px;
+    letter-spacing: -0.01em;
+  }
+  .intro p { margin: 0; color: var(--text-muted); }
+
+  .meta-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 12px;
+    margin: 24px 0 8px;
+  }
+  .meta-card {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 14px 16px;
+    background: var(--bg-elev);
+  }
+  .meta-card .label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-faint);
+    font-weight: 600;
+  }
+  .meta-card .value {
+    margin-top: 4px;
+    font-size: 14px;
+    color: var(--text);
+    font-family: var(--font-mono);
+  }
+
+  .routes { display: flex; flex-direction: column; gap: 14px; }
+
+  .route {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-elev);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+    transition: border-color 0.15s ease;
+  }
+  .route:hover { border-color: var(--border-strong); }
+  .route.open { border-color: var(--accent); }
+
+  .route-header {
+    display: grid;
+    grid-template-columns: 80px auto 1fr auto;
+    gap: 16px;
+    align-items: center;
+    padding: 16px 20px;
+    cursor: pointer;
+    user-select: none;
+    background: transparent;
+    border: 0;
+    width: 100%;
+    text-align: left;
+    color: var(--text);
+    font: inherit;
+  }
+  .route-header:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+
+  .method {
+    display: inline-flex;
+    justify-content: center;
+    align-items: center;
+    height: 28px;
+    padding: 0 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    font-family: var(--font-mono);
+  }
+  .method-get { color: var(--get); background: var(--get-soft); }
+  .method-post { color: var(--post); background: var(--post-soft); }
+
+  .route-header .path {
+    font-family: var(--font-mono);
+    font-size: 14px;
+    color: var(--text);
+    background: var(--bg-code);
+    padding: 6px 10px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100%;
+  }
+
+  .route-header .summary {
+    color: var(--text-muted);
+    font-size: 14px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .chevron {
+    width: 18px;
+    height: 18px;
+    color: var(--text-faint);
+    transition: transform 0.2s ease;
+  }
+  .route.open .chevron { transform: rotate(180deg); color: var(--accent); }
+
+  .route-body {
+    display: none;
+    padding: 4px 20px 24px;
+    border-top: 1px solid var(--border);
+  }
+  .route.open .route-body { display: block; }
+
+  .route-body .description {
+    margin: 16px 0 0;
+    color: var(--text);
+    font-size: 14.5px;
+    line-height: 1.6;
+  }
+
+  .section { margin-top: 24px; }
+  .section h3 {
+    margin: 0 0 12px;
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+    font-weight: 600;
+  }
+
+  .headers-table {
+    width: 100%;
+    border-collapse: collapse;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    font-size: 13.5px;
+  }
+  .headers-table th, .headers-table td {
+    text-align: left;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  .headers-table thead th {
+    background: var(--bg-code);
+    color: var(--text-muted);
+    font-weight: 600;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .headers-table tbody tr:last-child td { border-bottom: 0; }
+  .headers-table .hdr-name { font-family: var(--font-mono); color: var(--text); white-space: nowrap; }
+  .headers-table .hdr-desc { color: var(--text-muted); }
+
+  .pill {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    background: var(--bg);
+  }
+  .pill-required { color: #b62324; border-color: rgba(182, 35, 36, 0.35); background: rgba(182, 35, 36, 0.08); }
+  .pill-recommended { color: #9a6700; border-color: rgba(154, 103, 0, 0.35); background: rgba(154, 103, 0, 0.10); }
+  .pill-optional { color: var(--text-muted); }
+
+  @media (prefers-color-scheme: dark) {
+    .pill-required { color: #ff7b72; border-color: rgba(255, 123, 114, 0.35); background: rgba(255, 123, 114, 0.10); }
+    .pill-recommended { color: #d29922; border-color: rgba(210, 153, 34, 0.35); background: rgba(210, 153, 34, 0.10); }
+  }
+  html[data-theme="dark"] .pill-required { color: #ff7b72; border-color: rgba(255, 123, 114, 0.35); background: rgba(255, 123, 114, 0.10); }
+  html[data-theme="dark"] .pill-recommended { color: #d29922; border-color: rgba(210, 153, 34, 0.35); background: rgba(210, 153, 34, 0.10); }
+  html[data-theme="light"] .pill-required { color: #b62324; border-color: rgba(182, 35, 36, 0.35); background: rgba(182, 35, 36, 0.08); }
+  html[data-theme="light"] .pill-recommended { color: #9a6700; border-color: rgba(154, 103, 0, 0.35); background: rgba(154, 103, 0, 0.10); }
+
+  .tabs {
+    display: flex;
+    gap: 4px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+  }
+  .tab {
+    background: transparent;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    padding: 8px 12px;
+    margin-bottom: -1px;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    color: var(--text-muted);
+    cursor: pointer;
+    border-radius: 0;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
+
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+  .tab-panel .hint {
+    margin: 0 0 8px;
+    color: var(--text-muted);
+    font-size: 13.5px;
+  }
+
+  pre {
+    margin: 0;
+    padding: 14px 16px;
+    background: var(--bg-code);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    overflow-x: auto;
+    font-size: 13px;
+    line-height: 1.55;
+    color: var(--text);
+  }
+  pre code { font-family: var(--font-mono); }
+
+  .response-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 0 10px;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+  .response-status .code {
+    font-family: var(--font-mono);
+    font-weight: 600;
+    color: var(--text);
+    padding: 2px 8px;
+    background: var(--bg-code);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+  }
+
+  .note {
+    margin-top: 20px;
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: var(--radius-sm);
+    background: var(--accent-soft);
+    color: var(--text);
+    font-size: 13.5px;
+  }
+  .note strong { color: var(--accent); }
+
+  footer {
+    border-top: 1px solid var(--border);
+    padding: 32px 24px;
+    text-align: center;
+    color: var(--text-faint);
+    font-size: 13px;
+  }
+
+  @media (max-width: 720px) {
+    .hero { padding: 64px 20px 48px; }
+    main { padding: 40px 16px 64px; }
+    .route-header {
+      grid-template-columns: auto 1fr auto;
+      grid-template-areas:
+        "method path chev"
+        "summary summary summary";
+      row-gap: 8px;
+    }
+    .route-header .method { grid-area: method; }
+    .route-header .path { grid-area: path; }
+    .route-header .chevron { grid-area: chev; }
+    .route-header .summary { grid-area: summary; white-space: normal; }
+  }
+</style>
+</head>
+<body>
+  <header class="hero">
+    <button class="theme-toggle" type="button" aria-label="Toggle color theme" onclick="toggleTheme()">
+      <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+    </button>
+    <div class="hero-inner">
+      <span class="badge"><span class="dot"></span>Arcade · BSV Transaction Broadcaster</span>
+      <h1>The world's most scalable transaction broadcast manager</h1>
+      <p class="tagline">A high-throughput, callback-driven gateway for submitting Bitcoin SV transactions, tracking their lifecycle, and streaming status updates to subscribers in real time.</p>
+    </div>
+  </header>
+
+  <main>
+    <section class="intro">
+      <h2>API Reference</h2>
+      <p>Click any endpoint to expand its full request / response contract, headers, and examples. The defaults below cover the everyday submit-and-track flow.</p>
+      <div class="meta-grid">
+        <div class="meta-card">
+          <div class="label">Base URL</div>
+          <div class="value" id="base-url">—</div>
+        </div>
+        <div class="meta-card">
+          <div class="label">Content Encoding</div>
+          <div class="value">UTF-8</div>
+        </div>
+        <div class="meta-card">
+          <div class="label">Status Codes</div>
+          <div class="value">2xx · 4xx · 5xx</div>
+        </div>
+      </div>
+    </section>
+
+    <div class="routes">
+      {{range $i, $r := .Routes}}
+      <article class="route" data-method="{{$r.Method}}">
+        <button class="route-header" type="button" onclick="toggleRoute(this)" aria-expanded="false">
+          <span class="method method-{{$r.Method | lower}}">{{$r.Method}}</span>
+          <code class="path">{{$r.Path}}</code>
+          <span class="summary">{{$r.Summary}}</span>
+          <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+        </button>
+        <div class="route-body">
+          {{if $r.Description}}<p class="description">{{$r.Description}}</p>{{end}}
+
+          {{if $r.Headers}}
+          <section class="section">
+            <h3>Headers</h3>
+            <table class="headers-table">
+              <thead>
+                <tr><th>Header</th><th>Requirement</th><th>Description</th></tr>
+              </thead>
+              <tbody>
+                {{range $r.Headers}}
+                <tr>
+                  <td class="hdr-name">{{.Name}}</td>
+                  <td><span class="pill pill-{{.Requirement | lower}}">{{.Requirement}}</span></td>
+                  <td class="hdr-desc">{{.Description}}</td>
+                </tr>
+                {{end}}
+              </tbody>
+            </table>
+          </section>
+          {{end}}
+
+          {{if $r.RequestBodies}}
+          <section class="section">
+            <h3>Request Body</h3>
+            {{if gt (len $r.RequestBodies) 1}}
+            <div class="tabs" role="tablist" data-tab-group="route-{{$i}}">
+              {{range $j, $b := $r.RequestBodies}}
+              <button type="button" class="tab {{if eq $j 0}}active{{end}}" role="tab" data-tab-target="route-{{$i}}-panel-{{$j}}" onclick="switchTab(this)">{{$b.ContentType}}</button>
+              {{end}}
+            </div>
+            {{end}}
+            {{range $j, $b := $r.RequestBodies}}
+            <div class="tab-panel {{if eq $j 0}}active{{end}}" data-tab-panel="route-{{$i}}-panel-{{$j}}">
+              {{if $b.Description}}<p class="hint">{{$b.Description}}</p>{{end}}
+              {{if $b.Example}}<pre><code>{{$b.Example}}</code></pre>{{end}}
+            </div>
+            {{end}}
+          </section>
+          {{end}}
+
+          <section class="section">
+            <h3>Response</h3>
+            {{if $r.ResponseStatus}}
+            <div class="response-status"><span class="code">{{$r.ResponseStatus}}</span></div>
+            {{end}}
+            {{if $r.ResponseBody}}<pre><code>{{$r.ResponseBody}}</code></pre>{{end}}
+          </section>
+
+          {{if $r.Notes}}
+          <aside class="note"><strong>Note:</strong> {{$r.Notes}}</aside>
+          {{end}}
+        </div>
+      </article>
+      {{end}}
+    </div>
+  </main>
+
+  <footer>
+    Built for scale · Arcade powers BSV transaction broadcasts on the world's most performant ledger.
+  </footer>
+
+  <script>
+    (function () {
+      try {
+        var stored = localStorage.getItem("arcade-theme");
+        if (stored === "light" || stored === "dark") {
+          document.documentElement.setAttribute("data-theme", stored);
+        }
+      } catch (e) { /* localStorage unavailable; fall back to prefers-color-scheme */ }
+      var baseEl = document.getElementById("base-url");
+      if (baseEl) baseEl.textContent = window.location.origin;
+    })();
+
+    function toggleTheme() {
+      var current = document.documentElement.getAttribute("data-theme");
+      if (!current) {
+        var prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+        current = prefersDark ? "dark" : "light";
+      }
+      var next = current === "dark" ? "light" : "dark";
+      document.documentElement.setAttribute("data-theme", next);
+      try { localStorage.setItem("arcade-theme", next); } catch (e) { /* ignore */ }
+    }
+
+    function toggleRoute(btn) {
+      var route = btn.closest(".route");
+      if (!route) return;
+      var willOpen = !route.classList.contains("open");
+      route.classList.toggle("open", willOpen);
+      btn.setAttribute("aria-expanded", willOpen ? "true" : "false");
+    }
+
+    function switchTab(btn) {
+      var group = btn.closest(".tabs");
+      if (!group) return;
+      var target = btn.getAttribute("data-tab-target");
+      group.querySelectorAll(".tab").forEach(function (t) { t.classList.remove("active"); });
+      btn.classList.add("active");
+      var container = group.parentElement;
+      container.querySelectorAll(".tab-panel").forEach(function (p) {
+        p.classList.toggle("active", p.getAttribute("data-tab-panel") === target);
+      });
+    }
+  </script>
+</body>
+</html>
