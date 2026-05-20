@@ -154,9 +154,17 @@ var docsTmpl = template.Must(template.New("docs").Funcs(template.FuncMap{
 func (s *Server) handleDocs(c *gin.Context) {
 	c.Header("Content-Type", "text/html; charset=utf-8")
 	c.Status(http.StatusOK)
-	if err := docsTmpl.Execute(c.Writer, docsPage{Routes: routeDocs}); err != nil {
+	if err := RenderDocs(c.Writer); err != nil {
 		s.logger.Error("failed to render docs", zap.Error(err))
 	}
+}
+
+// RenderDocs writes the rendered API docs HTML to w. Exported so the
+// docs-preview dev command (cmd/docs-preview) can spin up the same page
+// without standing up the full API server with its Kafka / store / etc
+// dependencies.
+func RenderDocs(w io.Writer) error {
+	return docsTmpl.Execute(w, docsPage{Routes: routeDocs})
 }
 
 // healthResponse is the schema of GET /health. The top-level "status":"ok"
