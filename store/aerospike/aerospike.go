@@ -378,7 +378,7 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 		bins["merkle_path"] = []byte(status.MerklePath)
 	}
 	if !status.MerkleRegisteredAt.IsZero() {
-		bins["merkle_registered_at"] = status.MerkleRegisteredAt.UnixMilli()
+		bins["merkle_reg_at"] = status.MerkleRegisteredAt.UnixMilli()
 	}
 
 	// Enforce the status lattice: refuse to overwrite a terminal status with a
@@ -798,7 +798,7 @@ func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeig
 	return prevs, statuses, nil
 }
 
-// MarkMerkleRegisteredByTxIDs writes merkle_registered_at = ts.UnixMilli() on
+// MarkMerkleRegisteredByTxIDs writes merkle_reg_at = ts.UnixMilli() on
 // every existing transaction record in the txid list. Unknown txids are
 // silently skipped via UPDATE_ONLY (matching SetMinedByTxIDs). Used by the
 // startup replay loop to skip rows registered recently (issue #145).
@@ -827,7 +827,7 @@ func (s *Store) MarkMerkleRegisteredByTxIDs(ctx context.Context, txids []string,
 			}
 			records[j] = aero.NewBatchWrite(
 				bwp, key,
-				aero.PutOp(aero.NewBin("merkle_registered_at", ts.UnixMilli())),
+				aero.PutOp(aero.NewBin("merkle_reg_at", ts.UnixMilli())),
 			)
 		}
 
@@ -1214,13 +1214,15 @@ func (s *Store) InsertSubmission(ctx context.Context, sub *models.Submission) er
 	if err != nil {
 		return err
 	}
+	// Bin names must be <=15 chars (Aerospike limit) — a longer name
+	// fails the whole Put with BIN_NAME_TOO_LONG.
 	bins := aero.BinMap{
-		"submission_id":       sub.SubmissionID,
-		"txid":                sub.TxID,
-		"callback_url":        sub.CallbackURL,
-		"callback_token":      sub.CallbackToken,
-		"full_status_updates": sub.FullStatusUpdates,
-		"created_at":          sub.CreatedAt.UnixMilli(),
+		"submission_id":  sub.SubmissionID,
+		"txid":           sub.TxID,
+		"callback_url":   sub.CallbackURL,
+		"callback_token": sub.CallbackToken,
+		"full_updates":   sub.FullStatusUpdates,
+		"created_at":     sub.CreatedAt.UnixMilli(),
 	}
 	return s.client.Put(s.writePolicy(ctx), key, bins)
 }
@@ -1312,9 +1314,10 @@ func (s *Store) UpdateDeliveryStatus(ctx context.Context, submissionID string, l
 	if err != nil {
 		return err
 	}
+	// Bin names must be <=15 chars (Aerospike limit).
 	bins := aero.BinMap{
-		"last_delivered_status": string(lastStatus),
-		"retry_count":           retryCount,
+		"last_status": string(lastStatus),
+		"retry_count": retryCount,
 	}
 	if nextRetry != nil {
 		bins["next_retry_at"] = nextRetry.UnixMilli()
@@ -1805,7 +1808,7 @@ func recordToStatus(rec *aero.Record, txid string) *models.TransactionStatus {
 			status.CreatedAt = time.UnixMilli(int64(ms))
 		}
 	}
-	if v, ok := rec.Bins["merkle_registered_at"]; ok {
+	if v, ok := rec.Bins["merkle_reg_at"]; ok {
 		if ms, ok := v.(int); ok {
 			status.MerkleRegisteredAt = time.UnixMilli(int64(ms))
 		}
@@ -1903,7 +1906,7 @@ func recordToSubmission(rec *aero.Record) *models.Submission {
 			sub.CallbackToken = s
 		}
 	}
-	if v, ok := rec.Bins["full_status_updates"]; ok {
+	if v, ok := rec.Bins["full_updates"]; ok {
 		if b, ok := v.(bool); ok {
 			sub.FullStatusUpdates = b
 		}
