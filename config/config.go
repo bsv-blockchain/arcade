@@ -743,6 +743,9 @@ func setDefaults() {
 	// to the upstream SetDefaults so any new fields are picked up automatically.
 	var ct chaintracksconfig.Config
 	ct.SetDefaults(viper.GetViper(), "chaintracks")
+	// go-chaintracks SetDefaults omits chaintracks.url, so viper.AutomaticEnv()
+	// can't see ARCADE_CHAINTRACKS_URL — register the key explicitly here.
+	viper.SetDefault("chaintracks.url", "")
 	viper.SetDefault("bump_builder.grace_window_ms", 30000)
 	// 1 GiB — DataHub /block/<hash> responses contain block metadata
 	// (header + subtree hashes + coinbase tx + coinbase BUMP). 1 GiB is
