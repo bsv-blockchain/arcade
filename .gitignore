@@ -53,4 +53,4 @@ config.yaml
 bin/
 
 .mage-cache/
-docs-preview
+/docs-preview

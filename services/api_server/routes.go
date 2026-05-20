@@ -96,6 +96,44 @@ var routeDocs = []RouteDoc{
 		Notes:          "Returns 404 if the txid has never been submitted to this Arcade instance.",
 	},
 	{
+		Method:      "GET",
+		Path:        "/events",
+		Summary:     "Stream status updates over Server-Sent Events · separate service, default port 8082",
+		Description: "Long-lived Server-Sent Events stream that pushes lifecycle updates for every transaction submitted under the supplied callback token. Hosted by Arcade's standalone SSE service — a separate listener from the main API (default port 8082, fronted by its own Kubernetes Service in production). CORS is permissive on this endpoint so browsers can connect directly with the EventSource API.",
+		Headers: []RouteHeader{
+			{
+				Name:        "Accept",
+				Requirement: "Recommended",
+				Description: "text/event-stream",
+			},
+			{
+				Name:        "Last-Event-ID",
+				Requirement: "Optional",
+				Description: "Nanosecond timestamp returned by Arcade as the id of the last event the client received. Triggers a catchup replay of every status update that occurred strictly after this timestamp. Omit on first connect to receive the current persisted status of every txid registered under the token.",
+			},
+		},
+		RequestBodies: []RouteBody{
+			{
+				ContentType: "(query parameters)",
+				Description: "?callbackToken=<token>   the same opaque token sent as X-CallbackToken when submitting transactions. Scopes the stream to that token's transactions.",
+				Example:     "GET /events?callbackToken=my-token",
+			},
+			{
+				ContentType: "(browser, EventSource)",
+				Description: "Open a stream from JavaScript. Last-Event-ID is handled automatically by the browser on reconnect.",
+				Example:     "const es = new EventSource(\n  \"https://arcade.example.com/events?callbackToken=my-token\"\n);\nes.addEventListener(\"status\", (e) => {\n  const status = JSON.parse(e.data);\n  console.log(status.txid, status.txStatus);\n});",
+			},
+			{
+				ContentType: "(cli, curl)",
+				Description: "Tail the stream from a shell.",
+				Example:     "curl -N \"https://arcade.example.com/events?callbackToken=my-token\"",
+			},
+		},
+		ResponseStatus: "200 OK · text/event-stream",
+		ResponseBody:   "id: 1716205200123456789\nevent: status\ndata: {\"txid\":\"<hex>\",\"txStatus\":\"SEEN_ON_NETWORK\",\"timestamp\":\"2026-05-20T12:00:00Z\"}\n\nid: 1716205260987654321\nevent: status\ndata: {\"txid\":\"<hex>\",\"txStatus\":\"MINED\",\"timestamp\":\"2026-05-20T12:01:00Z\"}\n\n: keepalive\n\n",
+		Notes:          "Lines prefixed with ':' are SSE comments — Arcade sends a `: keepalive` comment every 15 seconds to hold the connection open through intermediaries. The 'id' field is the event timestamp in nanoseconds; clients reconnecting after a network blip should send it back as Last-Event-ID. The SSE service exposes its own /health and /ready endpoints on the same port. Possible txStatus values: RECEIVED, SEEN_ON_NETWORK, SEEN_ON_MULTIPLE_NODES, MINED, IMMUTABLE, REJECTED.",
+	},
+	{
 		Method:      "POST",
 		Path:        "/tx",
 		Summary:     "Submit a single transaction",
