@@ -56,6 +56,17 @@ const (
 	bumpChunkKeyFormat        = "%s:c:%08d"
 )
 
+// STUMP chunking mirrors BUMP chunking above — a single subtree's STUMP on a
+// busy block also overruns Aerospike's per-record ceiling, and an unchunked
+// InsertStump then fails with RECORD_TOO_BIG, losing the block's STUMPs so the
+// bump builder never marks its txs MINED. See the STUMP Operations section for
+// the manifest/chunk layout. The chunk size is shared with BUMP (bumpChunkSize)
+// since the same namespace write-block-size bounds both record types.
+const (
+	stumpFormatVersion  = 1
+	stumpChunkKeyFormat = "%s:%d:c:%08d"
+)
+
 // Ensure Store implements the store interfaces.
 var (
 	_ store.Store  = (*Store)(nil)
@@ -378,7 +389,7 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 		bins["merkle_path"] = []byte(status.MerklePath)
 	}
 	if !status.MerkleRegisteredAt.IsZero() {
-		bins["merkle_registered_at"] = status.MerkleRegisteredAt.UnixMilli()
+		bins["merkle_reg_at"] = status.MerkleRegisteredAt.UnixMilli()
 	}
 
 	// Enforce the status lattice: refuse to overwrite a terminal status with a
@@ -798,7 +809,7 @@ func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeig
 	return prevs, statuses, nil
 }
 
-// MarkMerkleRegisteredByTxIDs writes merkle_registered_at = ts.UnixMilli() on
+// MarkMerkleRegisteredByTxIDs writes merkle_reg_at = ts.UnixMilli() on
 // every existing transaction record in the txid list. Unknown txids are
 // silently skipped via UPDATE_ONLY (matching SetMinedByTxIDs). Used by the
 // startup replay loop to skip rows registered recently (issue #145).
@@ -827,7 +838,7 @@ func (s *Store) MarkMerkleRegisteredByTxIDs(ctx context.Context, txids []string,
 			}
 			records[j] = aero.NewBatchWrite(
 				bwp, key,
-				aero.PutOp(aero.NewBin("merkle_registered_at", ts.UnixMilli())),
+				aero.PutOp(aero.NewBin("merkle_reg_at", ts.UnixMilli())),
 			)
 		}
 
@@ -1103,23 +1114,107 @@ func (s *Store) deleteBumpChunkRange(ctx context.Context, blockHash string, from
 	return nil
 }
 
-// --- STUMP Operations (keyed by blockHash:subtreeIndex) ---
+// --- STUMP Operations ---
+//
+// A STUMP is stored exactly like a BUMP (see above): a manifest record plus N
+// chunk records, because a single subtree's STUMP on a busy block routinely
+// exceeds Aerospike's per-record ceiling (write-block-size, default 1 MiB, max
+// 8 MiB). An unchunked write fails with RECORD_TOO_BIG.
+//
+// Manifest record — primary key <blockHash>:<subtreeIndex>, bins: block_hash,
+// subtree_index, chunk_count, total_size, format_version. It carries no
+// stump_data; it points at chunk records. Only the manifest carries the
+// block_hash bin, so the arcade_idx_stumps_block_hash secondary index — and
+// therefore GetStumpsByBlockHash — sees manifests only, never chunks.
+//
+// Chunk record — primary key <blockHash>:<subtreeIndex>:c:<index>, bins:
+// chunk_index, chunk_data. Deliberately no block_hash bin (see above).
+//
+// Atomicity matches InsertBUMP: chunks are written first, then the manifest,
+// which is the linearization point a concurrent reader keys off.
 
+// stumpManifestKey builds the primary key for a STUMP manifest record.
+func (s *Store) stumpManifestKey(blockHash string, subtreeIndex int) (*aero.Key, error) {
+	return s.key(setStumps, fmt.Sprintf("%s:%d", blockHash, subtreeIndex))
+}
+
+// stumpChunkKey builds the primary key for one chunk of a STUMP. The index is
+// zero-padded so chunk keys sort lexicographically and never collide with a
+// manifest key (which has no ":c:" segment).
+func (s *Store) stumpChunkKey(blockHash string, subtreeIndex, idx int) (*aero.Key, error) {
+	return s.key(setStumps, fmt.Sprintf(stumpChunkKeyFormat, blockHash, subtreeIndex, idx))
+}
+
+// InsertStump stores a STUMP as a manifest plus chunk records. Chunks are
+// written before the manifest so a concurrent reader observing the new
+// manifest is guaranteed to find every chunk it references.
 func (s *Store) InsertStump(ctx context.Context, stump *models.Stump) error {
-	pk := fmt.Sprintf("%s:%d", stump.BlockHash, stump.SubtreeIndex)
-	key, err := s.key(setStumps, pk)
+	if stump.BlockHash == "" {
+		return fmt.Errorf("insert stump: empty block hash")
+	}
+
+	// Read the previous manifest's chunk count so we can clean up orphan
+	// chunks if this rewrite produces fewer of them. Failure here is non-fatal
+	// — without it we skip cleanup and orphans only waste disk.
+	oldChunkCount := 0
+	if oldKey, err := s.stumpManifestKey(stump.BlockHash, stump.SubtreeIndex); err == nil {
+		if rec, err := s.client.Get(s.readPolicy(ctx), oldKey, "chunk_count"); err == nil && rec != nil {
+			if v, ok := rec.Bins["chunk_count"].(int); ok && v > 0 {
+				oldChunkCount = v
+			}
+		}
+	}
+
+	newChunkCount := 1
+	if len(stump.StumpData) > s.bumpChunkSize {
+		newChunkCount = (len(stump.StumpData) + s.bumpChunkSize - 1) / s.bumpChunkSize
+	}
+
+	if err := s.writeStumpChunks(ctx, stump.BlockHash, stump.SubtreeIndex, stump.StumpData, newChunkCount); err != nil {
+		return fmt.Errorf("write stump chunks for %s:%d: %w", stump.BlockHash, stump.SubtreeIndex, err)
+	}
+
+	manifestKey, err := s.stumpManifestKey(stump.BlockHash, stump.SubtreeIndex)
 	if err != nil {
 		return err
 	}
+	wp := s.writePolicy(ctx)
+	wp.RecordExistsAction = aero.REPLACE
 	bins := aero.BinMap{
-		"block_hash":    stump.BlockHash,
-		"subtree_index": stump.SubtreeIndex,
-		"stump_data":    stump.StumpData,
+		"block_hash":     stump.BlockHash,
+		"subtree_index":  stump.SubtreeIndex,
+		"chunk_count":    newChunkCount,
+		"total_size":     len(stump.StumpData),
+		"format_version": stumpFormatVersion,
 	}
-	return s.client.Put(s.writePolicy(ctx), key, bins)
+	if err := s.client.Put(wp, manifestKey, bins); err != nil {
+		return fmt.Errorf("write stump manifest for %s:%d: %w", stump.BlockHash, stump.SubtreeIndex, err)
+	}
+
+	// Best-effort cleanup of orphan chunks left by a prior larger write for
+	// the same (blockHash, subtreeIndex). They are unreferenced now that the
+	// manifest caps at newChunkCount, so a failure here only wastes disk.
+	if oldChunkCount > newChunkCount {
+		if err := s.deleteStumpChunkRange(ctx, stump.BlockHash, stump.SubtreeIndex, newChunkCount, oldChunkCount); err != nil {
+			_ = err
+		}
+	}
+	return nil
 }
 
-func (s *Store) GetStumpsByBlockHash(ctx context.Context, blockHash string) ([]*models.Stump, error) {
+// stumpManifest is the metadata read from a manifest record before its chunks
+// are fetched. It is internal scaffolding for GetStumpsByBlockHash and
+// DeleteStumpsByBlockHash.
+type stumpManifest struct {
+	subtreeIndex int
+	chunkCount   int
+	totalSize    int
+}
+
+// queryStumpManifests runs the block_hash secondary-index query and returns
+// every manifest for the block. Chunk records carry no block_hash bin, so the
+// index never surfaces them here.
+func (s *Store) queryStumpManifests(ctx context.Context, blockHash string) ([]stumpManifest, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -1135,8 +1230,8 @@ func (s *Store) GetStumpsByBlockHash(ctx context.Context, blockHash string) ([]*
 	}
 
 	var (
-		stumps  []*models.Stump
-		loopErr error
+		manifests []stumpManifest
+		loopErr   error
 	)
 loop:
 	for {
@@ -1152,56 +1247,216 @@ loop:
 				loopErr = rec.Err
 				break loop
 			}
-			stump := &models.Stump{
-				BlockHash: getString(rec.Record, "block_hash"),
+			m := stumpManifest{}
+			if v, ok := rec.Record.Bins["subtree_index"].(int); ok {
+				m.subtreeIndex = v
 			}
-			if v, ok := rec.Record.Bins["subtree_index"]; ok {
-				if n, ok := v.(int); ok {
-					stump.SubtreeIndex = n
-				}
+			if v, ok := rec.Record.Bins["chunk_count"].(int); ok {
+				m.chunkCount = v
 			}
-			if v, ok := rec.Record.Bins["stump_data"]; ok {
-				if b, ok := v.([]byte); ok {
-					stump.StumpData = b
-				}
+			if v, ok := rec.Record.Bins["total_size"].(int); ok {
+				m.totalSize = v
 			}
-			stumps = append(stumps, stump)
+			fv, _ := rec.Record.Bins["format_version"].(int)
+			if m.chunkCount <= 0 || m.totalSize < 0 || fv != stumpFormatVersion {
+				loopErr = fmt.Errorf(
+					"stumps %s: invalid manifest for subtree %d (chunk_count=%d total_size=%d format_version=%d)",
+					blockHash, m.subtreeIndex, m.chunkCount, m.totalSize, fv,
+				)
+				break loop
+			}
+			manifests = append(manifests, m)
 		}
 	}
 	if loopErr != nil {
 		return nil, loopErr
 	}
+	return manifests, nil
+}
+
+// GetStumpsByBlockHash retrieves every STUMP for a block. The secondary index
+// returns manifest records only; each manifest's chunks are then batch-read
+// and reassembled into the original stump_data.
+func (s *Store) GetStumpsByBlockHash(ctx context.Context, blockHash string) ([]*models.Stump, error) {
+	manifests, err := s.queryStumpManifests(ctx, blockHash)
+	if err != nil {
+		return nil, err
+	}
+
+	stumps := make([]*models.Stump, 0, len(manifests))
+	for _, m := range manifests {
+		data, err := s.readStumpChunks(ctx, blockHash, m.subtreeIndex, m.chunkCount, m.totalSize)
+		if err != nil {
+			return nil, fmt.Errorf("get stumps %s: subtree %d: %w", blockHash, m.subtreeIndex, err)
+		}
+		stumps = append(stumps, &models.Stump{
+			BlockHash:    blockHash,
+			SubtreeIndex: m.subtreeIndex,
+			StumpData:    data,
+		})
+	}
 	return stumps, nil
 }
 
+// writeStumpChunks slices stumpData into chunkCount chunk records under the
+// (blockHash, subtreeIndex) namespace and writes them with REPLACE semantics
+// so stale state from a previously failed write at the same key is dropped.
+func (s *Store) writeStumpChunks(ctx context.Context, blockHash string, subtreeIndex int, stumpData []byte, chunkCount int) error {
+	bwp := aero.NewBatchWritePolicy()
+	bwp.RecordExistsAction = aero.REPLACE
+
+	for start := 0; start < chunkCount; start += s.batchSize {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		end := start + s.batchSize
+		if end > chunkCount {
+			end = chunkCount
+		}
+
+		records := make([]aero.BatchRecordIfc, 0, end-start)
+		for i := start; i < end; i++ {
+			off := i * s.bumpChunkSize
+			tail := off + s.bumpChunkSize
+			if tail > len(stumpData) {
+				tail = len(stumpData)
+			}
+			key, err := s.stumpChunkKey(blockHash, subtreeIndex, i)
+			if err != nil {
+				return err
+			}
+			// No block_hash bin: chunk records must stay out of the
+			// arcade_idx_stumps_block_hash index so manifest queries don't
+			// surface them.
+			ops := []*aero.Operation{
+				aero.PutOp(aero.NewBin("chunk_index", i)),
+				aero.PutOp(aero.NewBin("chunk_data", stumpData[off:tail])),
+			}
+			records = append(records, aero.NewBatchWrite(bwp, key, ops...))
+		}
+		if err := s.client.BatchOperate(s.batchPolicy(ctx), records); err != nil {
+			return fmt.Errorf("batch write stump chunks: %w", err)
+		}
+		for _, r := range records {
+			if br := r.BatchRec(); br != nil && br.Err != nil {
+				return fmt.Errorf("write stump chunk: %w", br.Err)
+			}
+		}
+	}
+	return nil
+}
+
+// readStumpChunks batch-reads chunkCount chunk records and assembles them into
+// a single byte slice of length totalSize, rejecting any missing chunk, index
+// mismatch, or length overflow.
+func (s *Store) readStumpChunks(ctx context.Context, blockHash string, subtreeIndex, chunkCount, totalSize int) ([]byte, error) {
+	out := make([]byte, totalSize)
+	written := 0
+
+	for start := 0; start < chunkCount; start += s.batchSize {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		end := start + s.batchSize
+		if end > chunkCount {
+			end = chunkCount
+		}
+
+		keys := make([]*aero.Key, 0, end-start)
+		for i := start; i < end; i++ {
+			key, err := s.stumpChunkKey(blockHash, subtreeIndex, i)
+			if err != nil {
+				return nil, err
+			}
+			keys = append(keys, key)
+		}
+
+		recs, err := s.client.BatchGet(s.batchPolicy(ctx), keys, "chunk_index", "chunk_data")
+		if err != nil {
+			return nil, fmt.Errorf("batch get stump chunks: %w", err)
+		}
+		if len(recs) != len(keys) {
+			return nil, fmt.Errorf("batch get stump chunks: got %d records, want %d", len(recs), len(keys))
+		}
+
+		for j, r := range recs {
+			idx := start + j
+			if r == nil {
+				return nil, fmt.Errorf("missing stump chunk %d", idx)
+			}
+			gotIdx, ok := r.Bins["chunk_index"].(int)
+			if !ok || gotIdx != idx {
+				return nil, fmt.Errorf("stump chunk %d: chunk_index mismatch (got %v)", idx, r.Bins["chunk_index"])
+			}
+			data, ok := r.Bins["chunk_data"].([]byte)
+			if !ok {
+				return nil, fmt.Errorf("stump chunk %d: chunk_data missing or wrong type", idx)
+			}
+			off := idx * s.bumpChunkSize
+			if off+len(data) > totalSize {
+				return nil, fmt.Errorf("stump chunk %d: would overflow assembled buffer (off=%d len=%d total=%d)", idx, off, len(data), totalSize)
+			}
+			copy(out[off:], data)
+			written += len(data)
+		}
+	}
+
+	if written != totalSize {
+		return nil, fmt.Errorf("assembled %d bytes, manifest says %d", written, totalSize)
+	}
+	return out, nil
+}
+
+// deleteStumpChunkRange batch-deletes chunk records at indices [fromIdx,
+// toExcl) for one (blockHash, subtreeIndex) STUMP.
+func (s *Store) deleteStumpChunkRange(ctx context.Context, blockHash string, subtreeIndex, fromIdx, toExcl int) error {
+	if toExcl <= fromIdx {
+		return nil
+	}
+	for start := fromIdx; start < toExcl; start += s.batchSize {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		end := start + s.batchSize
+		if end > toExcl {
+			end = toExcl
+		}
+		records := make([]aero.BatchRecordIfc, 0, end-start)
+		for i := start; i < end; i++ {
+			key, err := s.stumpChunkKey(blockHash, subtreeIndex, i)
+			if err != nil {
+				return err
+			}
+			records = append(records, aero.NewBatchDelete(nil, key))
+		}
+		if err := s.client.BatchOperate(s.batchPolicy(ctx), records); err != nil {
+			return fmt.Errorf("batch delete stump chunks: %w", err)
+		}
+	}
+	return nil
+}
+
+// DeleteStumpsByBlockHash removes every STUMP (manifests and chunks) for a
+// block. Used during reorg cleanup. For each STUMP the manifest is deleted
+// before its chunks: a crash mid-delete then leaves only unreferenced orphan
+// chunks (harmless disk waste) rather than a manifest pointing at missing
+// chunks (a hard read error).
 func (s *Store) DeleteStumpsByBlockHash(ctx context.Context, blockHash string) error {
-	stumps, err := s.GetStumpsByBlockHash(ctx, blockHash)
+	manifests, err := s.queryStumpManifests(ctx, blockHash)
 	if err != nil {
 		return err
 	}
 
-	for i := 0; i < len(stumps); i += s.batchSize {
-		if err := ctx.Err(); err != nil {
+	for _, m := range manifests {
+		manifestKey, err := s.stumpManifestKey(blockHash, m.subtreeIndex)
+		if err != nil {
 			return err
 		}
-		end := i + s.batchSize
-		if end > len(stumps) {
-			end = len(stumps)
+		if _, err := s.client.Delete(s.writePolicy(ctx), manifestKey); err != nil {
+			return fmt.Errorf("delete stump manifest %s:%d: %w", blockHash, m.subtreeIndex, err)
 		}
-		batch := stumps[i:end]
-
-		keys := make([]*aero.Key, len(batch))
-		for j, st := range batch {
-			pk := fmt.Sprintf("%s:%d", st.BlockHash, st.SubtreeIndex)
-			keys[j], _ = s.key(setStumps, pk)
-		}
-
-		records := make([]aero.BatchRecordIfc, len(keys))
-		for j, key := range keys {
-			records[j] = aero.NewBatchDelete(nil, key)
-		}
-		if err := s.client.BatchOperate(s.batchPolicy(ctx), records); err != nil {
-			return fmt.Errorf("batch delete stumps: %w", err)
+		if err := s.deleteStumpChunkRange(ctx, blockHash, m.subtreeIndex, 0, m.chunkCount); err != nil {
+			return fmt.Errorf("delete stump chunks %s:%d: %w", blockHash, m.subtreeIndex, err)
 		}
 	}
 	return nil
@@ -1214,13 +1469,15 @@ func (s *Store) InsertSubmission(ctx context.Context, sub *models.Submission) er
 	if err != nil {
 		return err
 	}
+	// Bin names must be <=15 chars (Aerospike limit) — a longer name
+	// fails the whole Put with BIN_NAME_TOO_LONG.
 	bins := aero.BinMap{
-		"submission_id":       sub.SubmissionID,
-		"txid":                sub.TxID,
-		"callback_url":        sub.CallbackURL,
-		"callback_token":      sub.CallbackToken,
-		"full_status_updates": sub.FullStatusUpdates,
-		"created_at":          sub.CreatedAt.UnixMilli(),
+		"submission_id":  sub.SubmissionID,
+		"txid":           sub.TxID,
+		"callback_url":   sub.CallbackURL,
+		"callback_token": sub.CallbackToken,
+		"full_updates":   sub.FullStatusUpdates,
+		"created_at":     sub.CreatedAt.UnixMilli(),
 	}
 	return s.client.Put(s.writePolicy(ctx), key, bins)
 }
@@ -1312,9 +1569,10 @@ func (s *Store) UpdateDeliveryStatus(ctx context.Context, submissionID string, l
 	if err != nil {
 		return err
 	}
+	// Bin names must be <=15 chars (Aerospike limit).
 	bins := aero.BinMap{
-		"last_delivered_status": string(lastStatus),
-		"retry_count":           retryCount,
+		"last_status": string(lastStatus),
+		"retry_count": retryCount,
 	}
 	if nextRetry != nil {
 		bins["next_retry_at"] = nextRetry.UnixMilli()
@@ -1805,7 +2063,7 @@ func recordToStatus(rec *aero.Record, txid string) *models.TransactionStatus {
 			status.CreatedAt = time.UnixMilli(int64(ms))
 		}
 	}
-	if v, ok := rec.Bins["merkle_registered_at"]; ok {
+	if v, ok := rec.Bins["merkle_reg_at"]; ok {
 		if ms, ok := v.(int); ok {
 			status.MerkleRegisteredAt = time.UnixMilli(int64(ms))
 		}
@@ -1903,7 +2161,7 @@ func recordToSubmission(rec *aero.Record) *models.Submission {
 			sub.CallbackToken = s
 		}
 	}
-	if v, ok := rec.Bins["full_status_updates"]; ok {
+	if v, ok := rec.Bins["full_updates"]; ok {
 		if b, ok := v.(bool); ok {
 			sub.FullStatusUpdates = b
 		}
