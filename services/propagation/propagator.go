@@ -816,49 +816,20 @@ type txResult struct {
 
 // classifyFailureLine maps one Teranode /txs failure line into a dispatcher
 // action bucket. The line is the full UserMessage produced by Teranode,
-// e.g. "TX_INVALID (31): [ProcessTransaction][<txid>] ...". A line in the
-// terminal-rejection bucket (TX_INVALID, UTXO_SPENT, etc.) → rejected.
-// Anything else (PROCESSING wrapper, unrecognized code, malformed line) →
-// requeue so the next attempt has a chance to produce a verdict. errMsg is
-// the line verbatim so wallet rows surface the actual Teranode code.
+// e.g. "PROCESSING (4): [ProcessTransaction][<txid>] failed to validate
+// transaction" or "TX_INVALID (31): [ProcessTransaction][<txid>] ...".
+//
+// Any per-txid line returned by Teranode is treated as terminally rejected.
+// Teranode wraps real validator failures with NewProcessingError (see
+// services/propagation/Server.go:1236), so PROCESSING is the catch-all
+// "this tx is bad" code in practice — we can't distinguish a transient
+// infra issue from a permanent validation failure by code alone. The
+// authoritative requeue signal is a 5xx batch response with no parseable
+// per-tx body (handled separately in broadcastBatchToEndpoints), which
+// reflects a true infra outage rather than a tx-level verdict. errMsg is
+// the line verbatim so wallet rows surface the actual Teranode message.
 func classifyFailureLine(line string) (txResultClass, string) {
-	if isTeranodeTerminalCode(line) {
-		return txResultClassRejected, line
-	}
-	return txResultClassRequeue, line
-}
-
-// teranodeTerminalCodes is the set of upstream Teranode error code names
-// that classify a tx as terminally rejected. PROCESSING and anything else
-// falls through to requeue (infra-bucket failure that should be retried).
-var teranodeTerminalCodes = map[string]struct{}{
-	"TX_INVALID":              {},
-	"TX_INVALID_DOUBLE_SPEND": {},
-	"TX_CONFLICTING":          {},
-	"TX_LOCKED":               {},
-	"TX_LOCK_TIME":            {},
-	"TX_POLICY":               {},
-	"TX_COINBASE_IMMATURE":    {},
-	"TX_MISSING_PARENT":       {},
-	"UTXO_FROZEN":             {},
-	"UTXO_SPENT":              {},
-	"UTXO_NON_FINAL":          {},
-	"UTXO_INVALID_SIZE":       {},
-	"INVALID_ARGUMENT":        {},
-}
-
-// isTeranodeTerminalCode reports whether a failure line names a Teranode
-// code in the terminal-rejection bucket. Matches the leading NAME of
-// "NAME (num): <message>" (the first whitespace-delimited token).
-// Anything else (PROCESSING wrapper, network-only codes, unrecognized
-// strings) is treated as infra → requeue.
-func isTeranodeTerminalCode(line string) bool {
-	name := line
-	if idx := strings.IndexByte(name, ' '); idx >= 0 {
-		name = name[:idx]
-	}
-	_, ok := teranodeTerminalCodes[name]
-	return ok
+	return txResultClassRejected, line
 }
 
 // processBatch handles one drained batch:
@@ -1180,9 +1151,11 @@ func (p *Propagator) submitBroadcastJobs(ctx context.Context, endpoints []string
 //     is superseded).
 //   - No endpoint returned 200, but at least one returned the Teranode
 //     "Failed to process transactions:" 500 body → per-tx classification.
-//     Each txid named in the failure body is rejected (terminal Teranode
-//     code) or requeued (infra-bucket code); every other tx in the batch
-//     is treated as accepted.
+//     Each txid named in the failure body is rejected; every other tx in
+//     the batch is treated as accepted. We treat any per-tx line as
+//     terminal because Teranode wraps real validator failures as
+//     PROCESSING (catch-all "this tx is bad"), so a returned line cannot
+//     be reliably distinguished from a transient infra issue by code.
 //   - All endpoints failed without a parseable Teranode failure body, or
 //     no healthy endpoints existed → every tx requeued (pure batch-level
 //     infra failure).
