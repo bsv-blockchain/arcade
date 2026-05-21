@@ -22,6 +22,7 @@ import (
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -39,9 +40,19 @@ var (
 )
 
 // Store is the Postgres-backed implementation of the store interfaces.
+// bumpCacheSize bounds how many parsed compound BUMPs the store keeps
+// resident for merkle-path enrichment. enrichMerklePath runs on every
+// GetStatus of a mined tx and would otherwise re-fetch and re-parse the
+// whole block BUMP on each call — the dominant heap consumer under
+// sustained status-lookup load. Status lookups cluster on recently-mined
+// blocks, so a small LRU gives a
+// high hit rate while keeping the resident set bounded.
+const bumpCacheSize = 8
+
 type Store struct {
-	pool    *pgxpool.Pool
-	stopEmb func() error
+	pool      *pgxpool.Pool
+	stopEmb   func() error
+	bumpCache *lru.Cache[string, *transaction.MerklePath]
 }
 
 // New connects to Postgres (optionally starting the embedded-postgres process
@@ -78,7 +89,16 @@ func New(ctx context.Context, cfg config.Postgres) (*Store, error) {
 		return nil, fmt.Errorf("connect postgres: %w", err)
 	}
 
-	return &Store{pool: pool, stopEmb: stopEmbedded}, nil
+	bumpCache, err := lru.New[string, *transaction.MerklePath](bumpCacheSize)
+	if err != nil {
+		pool.Close()
+		if stopEmbedded != nil {
+			_ = stopEmbedded()
+		}
+		return nil, fmt.Errorf("init bump cache: %w", err)
+	}
+
+	return &Store{pool: pool, stopEmb: stopEmbedded, bumpCache: bumpCache}, nil
 }
 
 // EnsureIndexes applies the schema. Safe to call repeatedly — every CREATE
@@ -1398,18 +1418,37 @@ func (s *Store) enrichMerklePath(ctx context.Context, status *models.Transaction
 	if status.Status != models.StatusMined && status.Status != models.StatusImmutable {
 		return
 	}
-	_, bumpData, err := s.GetBUMP(ctx, status.BlockHash)
-	if err != nil || len(bumpData) == 0 {
+	compound := s.compoundBUMP(ctx, status.BlockHash)
+	if compound == nil {
 		return
 	}
-	status.MerklePath = extractMinimalPathForTx(bumpData, status.TxID)
+	status.MerklePath = extractMinimalPathForTx(compound, status.TxID)
 }
 
-func extractMinimalPathForTx(bumpData []byte, txid string) []byte {
+// compoundBUMP returns the parsed compound BUMP for a block, caching the
+// parsed form so repeated status lookups for txs in the same block reuse
+// it instead of re-fetching and re-parsing the (potentially large) BUMP.
+// The returned value is shared and must be treated as read-only.
+func (s *Store) compoundBUMP(ctx context.Context, blockHash string) *transaction.MerklePath {
+	if c, ok := s.bumpCache.Get(blockHash); ok {
+		return c
+	}
+	_, bumpData, err := s.GetBUMP(ctx, blockHash)
+	if err != nil || len(bumpData) == 0 {
+		return nil
+	}
 	compound, err := transaction.NewMerklePathFromBinary(bumpData)
 	if err != nil {
 		return nil
 	}
+	s.bumpCache.Add(blockHash, compound)
+	return compound
+}
+
+// extractMinimalPathForTx extracts a per-tx minimal merkle path from an
+// already-parsed compound BUMP. compound is shared via the store's bump
+// cache, so this only reads from it and builds a fresh MerklePath result.
+func extractMinimalPathForTx(compound *transaction.MerklePath, txid string) []byte {
 	txHash, err := chainhash.NewHashFromHex(txid)
 	if err != nil {
 		return nil
