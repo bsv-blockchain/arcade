@@ -128,6 +128,12 @@ type mockStore struct {
 	// markErr forces MarkMerkleRegisteredByTxIDs to return this error.
 	// Used by tests that verify a mark failure doesn't block broadcast.
 	markErr error
+	// returningPrev, when non-nil, overrides the synthetic previous-status
+	// row BatchUpdateStatusReturning hands back for each input. The default
+	// (RECEIVED prev) always reads as a real transition; this hook lets
+	// tests drive the lattice-no-op (prev.Status == new.Status) and
+	// reaped-row (prev == nil) paths a Kafka-replayed tx actually hits.
+	returningPrev func(*models.TransactionStatus) *models.TransactionStatus
 }
 
 type clearedCall struct {
@@ -166,6 +172,10 @@ func (m *mockStore) BatchUpdateStatusReturning(_ context.Context, statuses []*mo
 	prevs := make([]*models.TransactionStatus, len(statuses))
 	for i, s := range statuses {
 		m.updates = append(m.updates, s)
+		if m.returningPrev != nil {
+			prevs[i] = m.returningPrev(s)
+			continue
+		}
 		prevs[i] = &models.TransactionStatus{
 			TxID:      s.TxID,
 			Status:    models.StatusReceived,
