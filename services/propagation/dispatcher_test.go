@@ -216,8 +216,10 @@ func TestDispatcherOffsets_HeldTxReleasedThenTerminal(t *testing.T) {
 // real Kafka commit-watermark signal, so a test can assert the
 // dispatcher actually advanced the watermark.
 type fakeClaim struct {
-	ch  chan *kafka.Message
-	ctx context.Context
+	ch chan *kafka.Message
+	// a kafka.Claim must expose Context(); fakeClaim has to store the
+	// claim context to return it, exactly as the real saramaClaim does.
+	ctx context.Context //nolint:containedctx // satisfies the kafka.Claim interface
 
 	mu     sync.Mutex
 	marked map[int64]bool
