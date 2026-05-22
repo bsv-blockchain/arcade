@@ -686,7 +686,7 @@ func setDefaults() {
 	// 0 keeps New()'s 3×reaper_interval default, so changing reaper_interval
 	// automatically moves the lease TTL unless the operator opts into a fixed value.
 	viper.SetDefault("propagation.lease_ttl_ms", 0)
-	viper.SetDefault("propagation.teranode_max_batch_size", 100)
+	viper.SetDefault("propagation.teranode_max_batch_size", 1024)
 	viper.SetDefault("propagation.max_concurrent_batches", 4)
 	viper.SetDefault("propagation.broadcast_workers", 256)
 	viper.SetDefault("propagation.max_parallel_chunks", 4)
