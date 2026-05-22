@@ -603,7 +603,19 @@ func (p *Propagator) notifyTerminalToDispatcher(ctx context.Context, txid string
 	case r := <-reply:
 		return r
 	case <-ctx.Done():
-		return terminalResult{}
+		// ctx and reply can both be ready at once, and select picks a
+		// ready case at random — so a teardown could win even though the
+		// dispatcher already processed the event and replied. That reply
+		// carries cascaded txids the caller must persist; dropping it
+		// leaves those REJECTED rows unwritten even though the dispatcher
+		// already advanced the offset. Prefer a ready reply over the
+		// cancellation with a final non-blocking read.
+		select {
+		case r := <-reply:
+			return r
+		default:
+			return terminalResult{}
+		}
 	}
 }
 

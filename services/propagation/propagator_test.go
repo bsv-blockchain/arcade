@@ -134,6 +134,10 @@ type mockStore struct {
 	// tests drive the lattice-no-op (prev.Status == new.Status) and
 	// reaped-row (prev == nil) paths a Kafka-replayed tx actually hits.
 	returningPrev func(*models.TransactionStatus) *models.TransactionStatus
+	// returningErr, when non-nil, is the error BatchUpdateStatusReturning
+	// returns — simulating a store write failure so tests can exercise the
+	// at-least-once guard that skips dispatcher notification on error.
+	returningErr error
 }
 
 type clearedCall struct {
@@ -182,7 +186,7 @@ func (m *mockStore) BatchUpdateStatusReturning(_ context.Context, statuses []*mo
 			Timestamp: time.Now(),
 		}
 	}
-	return prevs, nil
+	return prevs, m.returningErr
 }
 
 func (m *mockStore) BumpRetryCount(_ context.Context, txid string) (int, error) {

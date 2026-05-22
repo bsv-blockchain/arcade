@@ -423,6 +423,21 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 	p.publishBulkStatus(ctx, models.StatusAcceptedByNetwork, publishedAccepted, now)
 	p.publishBulkStatus(ctx, models.StatusRejected, publishedRejected, now)
 
+	// Notify the dispatcher ONLY when the batch status write fully
+	// succeeded. BatchUpdateStatusReturning surfaces per-row failures as
+	// a non-nil err with no per-row detail — so on any error we cannot
+	// tell which rows actually persisted. Notifying anyway would mark
+	// those txs' Kafka offsets Done and let the commit watermark advance
+	// past a tx whose terminal status never reached the store, breaking
+	// the at-least-once coupling between Kafka and the status ledger.
+	// Skipping the notify leaves the whole batch's offsets uncommitted;
+	// the next claim replays it and re-terminalizes once the store
+	// recovers (the reaper is the secondary backstop). A partial-batch
+	// over-replay on a rare store error is the correct trade.
+	if err != nil {
+		return
+	}
+
 	// Notify the dispatcher of every terminal status flip. ACCEPTED
 	// releases waiters via the dispatcher itself (no caller action
 	// needed — released msgs are appended directly to the

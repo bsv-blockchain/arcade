@@ -2,6 +2,7 @@ package propagation
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"sync"
 	"testing"
@@ -354,4 +355,61 @@ func TestRunDispatcher_ReapedRowTerminal_AdvancesCommitWatermark(t *testing.T) {
 	claim.ch <- &kafka.Message{Offset: 5, Value: makePropMsg("reaped-row-tx")}
 	waitForMark(t, claim, 5,
 		"a terminal for a reaped (nil-prev) row must still notify the dispatcher")
+}
+
+// --- store-error guard: offsets must not release on a failed write ------
+
+// TestApplyTerminalStatuses_StoreError_DoesNotReleaseOffset is the
+// at-least-once guard. When BatchUpdateStatusReturning fails the terminal
+// status did not durably persist, so the dispatcher must NOT be notified —
+// otherwise the tx's Kafka offset would be marked Done and the commit
+// watermark would advance past a tx whose status never reached the store.
+// The tx must stay in-flight so the offset stays uncommitted and the next
+// claim replays it.
+func TestApplyTerminalStatuses_StoreError_DoesNotReleaseOffset(t *testing.T) {
+	ms := newMockStore()
+	ms.returningErr = errors.New("store write failed")
+	p, cancel := newPropagatorForDepTest(t, ms)
+	defer cancel()
+
+	// Admit a tx and move it onto the broadcasting path.
+	if res := p.admitToDispatcher(propagationMsg{TXID: "x", RawTx: []byte{0x01}}, 5); !res.admitted {
+		t.Fatalf("first admit should be admitted; got %+v", res)
+	}
+	_ = p.drainPending()
+
+	// Terminalize it — but the store write fails.
+	p.applyTerminalStatuses(context.Background(), []*models.TransactionStatus{
+		{TxID: "x", Status: models.StatusAcceptedByNetwork, Timestamp: time.Now()},
+	}, 1, 0)
+
+	// The dispatcher must NOT have been notified: "x" is still in flight,
+	// so a re-admission is detected as a duplicate (offset bookkept, not a
+	// fresh admit). Had the notify fired, "x" would be gone from inFlight
+	// and this would come back admitted.
+	if res := p.admitToDispatcher(propagationMsg{TXID: "x", RawTx: []byte{0x01}}, 6); !res.duplicate {
+		t.Fatalf("after a failed status write the tx must stay in-flight (offset uncommitted for replay); re-admit got %+v, want duplicate", res)
+	}
+}
+
+// TestApplyTerminalStatuses_StoreOK_ReleasesOffset is the positive control:
+// a successful status write DOES notify the dispatcher, so the tx leaves
+// the in-flight set and a re-admission is a fresh admit.
+func TestApplyTerminalStatuses_StoreOK_ReleasesOffset(t *testing.T) {
+	ms := newMockStore()
+	p, cancel := newPropagatorForDepTest(t, ms)
+	defer cancel()
+
+	if res := p.admitToDispatcher(propagationMsg{TXID: "y", RawTx: []byte{0x01}}, 5); !res.admitted {
+		t.Fatalf("first admit should be admitted; got %+v", res)
+	}
+	_ = p.drainPending()
+
+	p.applyTerminalStatuses(context.Background(), []*models.TransactionStatus{
+		{TxID: "y", Status: models.StatusAcceptedByNetwork, Timestamp: time.Now()},
+	}, 1, 0)
+
+	if res := p.admitToDispatcher(propagationMsg{TXID: "y", RawTx: []byte{0x01}}, 6); !res.admitted {
+		t.Fatalf("after a successful terminal write the tx must be released from in-flight; re-admit got %+v, want admitted", res)
+	}
 }
