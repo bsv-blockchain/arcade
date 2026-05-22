@@ -175,25 +175,25 @@ func TestValidate_RegtestRequiresBootstrapPeers(t *testing.T) {
 	})
 }
 
-// chaintracks has no regtest genesis header, so validate() force-disables the
-// embedded server when network=regtest. Otherwise api-server crashes at init
-// with ErrUnknownNetwork.
-func TestValidate_RegtestAutoDisablesChaintracksServer(t *testing.T) {
+// go-chaintracks now sources the regtest genesis header from go-chaincfg, so
+// validate() no longer force-disables chaintracks_server for regtest. The
+// operator's chaintracks_server.enabled choice must be respected.
+func TestValidate_RegtestPreservesChaintracksServerEnabled(t *testing.T) {
 	cfg := baseValidConfig()
 	cfg.Network = NetworkRegtest
 	cfg.ChaintracksServer.Enabled = true
 	if err := validate(cfg); err != nil {
 		t.Fatalf("unexpected validate error: %v", err)
 	}
-	if cfg.ChaintracksServer.Enabled {
-		t.Error("expected chaintracks_server.enabled to be flipped to false for regtest")
+	if !cfg.ChaintracksServer.Enabled {
+		t.Error("expected chaintracks_server.enabled to remain true for regtest")
 	}
 }
 
 // ResolveChaintracksNetwork translates to go-chaintracks's stricter accepted
 // set. Regressing this is the bug that crashed prod with "unknown network:
 // mainnet" — chainmanager.getGenesisHeader is an exact-match switch over
-// "main"/"test"/"teratest"/"teratestnet".
+// "main"/"test"/"teratest"/"teratestnet"/"regtest".
 func TestResolveChaintracksNetwork(t *testing.T) {
 	cases := []struct {
 		network string
@@ -202,6 +202,7 @@ func TestResolveChaintracksNetwork(t *testing.T) {
 		{NetworkMainnet, "main"},
 		{NetworkTestnet, "test"},
 		{NetworkTeratestnet, NetworkTeratestnet},
+		{NetworkRegtest, NetworkRegtest},
 		{"", "main"},
 	}
 	for _, tc := range cases {

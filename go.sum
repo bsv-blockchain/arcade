@@ -119,8 +119,8 @@ github.com/bsv-blockchain/go-bt/v2 v2.6.3 h1:LtbJNgXQRFBsI+Iti1X6ccaCRrT43Ps66V5
 github.com/bsv-blockchain/go-bt/v2 v2.6.3/go.mod h1:AkVfArL+yEiA2luWAVdDtwadgzngPsayg45ISwbtvaU=
 github.com/bsv-blockchain/go-chaincfg v1.5.8 h1:zhmi42r71mAqPChhSVggzzxaseTvLqC+zipyL2fAN0g=
 github.com/bsv-blockchain/go-chaincfg v1.5.8/go.mod h1:n/Q8aGScTgydZ2Bsjfic7v8ulHBIpgI0WVyqE5mFMxU=
-github.com/bsv-blockchain/go-chaintracks v1.2.6 h1:2M6Ge3OE2lPcWl57V7X6bkRRrnsojKji31fzDA77Y3A=
-github.com/bsv-blockchain/go-chaintracks v1.2.6/go.mod h1:6C84jel9wRLe8CtmTg1XdMkXVSqt7TN6QfO8+rrE7G8=
+github.com/bsv-blockchain/go-chaintracks v1.2.7 h1:s+Lbs/NSMwfD1/EKaRLIDIr1cf7GJtULUxxyo3vVTyE=
+github.com/bsv-blockchain/go-chaintracks v1.2.7/go.mod h1:l0ch8FkIbRQI8D/uCilooZtVeUdg8sUz86fEu4uX3os=
 github.com/bsv-blockchain/go-lockfree-queue v1.1.3 h1:80OgLGs/oil6Uc8M8y09E9VgmLYy55wLTiX44yNA2Vg=
 github.com/bsv-blockchain/go-lockfree-queue v1.1.3/go.mod h1:1ah9XaAKnXdZwoAAlBZCX+cd3mMRDTlxKIRY6tVsiOM=
 github.com/bsv-blockchain/go-p2p-message-bus v0.1.18 h1:iNkivyy536Z54VY7P/bhNr5jf0z0ivESjUpV2v6ZlM8=
@@ -952,8 +952,8 @@ golang.org/x/crypto v0.0.0-20210322153248-0c34fe9e7dc2/go.mod h1:T9bdIzuCu7OtxOm
 golang.org/x/crypto v0.0.0-20210711020723-a769d52b0f97/go.mod h1:GvvjBRRGRdwPK5ydBHafDWAxML/pGHZbMvKqRZ5+Abc=
 golang.org/x/crypto v0.0.0-20210921155107-089bfa567519/go.mod h1:GvvjBRRGRdwPK5ydBHafDWAxML/pGHZbMvKqRZ5+Abc=
 golang.org/x/crypto v0.6.0/go.mod h1:OFC/31mSvZgRz0V1QTNCzfAI1aIRzbiufJtkMIlEp58=
-golang.org/x/crypto v0.51.0 h1:IBPXwPfKxY7cWQZ38ZCIRPI50YLeevDLlLnyC5wRGTI=
-golang.org/x/crypto v0.51.0/go.mod h1:8AdwkbraGNABw2kOX6YFPs3WM22XqI4EXEd8g+x7Oc8=
+golang.org/x/crypto v0.52.0 h1:RMs7fP2rXdep0CftQlK8Uf+kibLm7qkCcradZWYz988=
+golang.org/x/crypto v0.52.0/go.mod h1:1QgfPxDqh0T2M/elOJtp9RvuR95kVjir0e6/BvEmGbc=
 golang.org/x/exp v0.0.0-20190121172915-509febef88a4/go.mod h1:CJ0aWSM057203Lf6IL+f9T1iT9GByDxfZKAQTCR3kQA=
 golang.org/x/exp v0.0.0-20190306152737-a1d7652674e8/go.mod h1:CJ0aWSM057203Lf6IL+f9T1iT9GByDxfZKAQTCR3kQA=
 golang.org/x/exp v0.0.0-20190510132918-efd6b22b2522/go.mod h1:ZjyILWgesfNpC6sMxTJOJm9Kp84zZh5NQWvqDGG3Qr8=
@@ -1124,8 +1124,8 @@ golang.org/x/sys v0.0.0-20220722155257-8c9f86f7a55f/go.mod h1:oPkhp1MJrh7nUepCBc
 golang.org/x/sys v0.1.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
 golang.org/x/sys v0.5.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
 golang.org/x/sys v0.6.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
-golang.org/x/sys v0.44.0 h1:ildZl3J4uzeKP07r2F++Op7E9B29JRUy+a27EibtBTQ=
-golang.org/x/sys v0.44.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
+golang.org/x/sys v0.45.0 h1:dO4czNzziLiiXplLQgBCEpCvXQ3dnkn0SdaZSYdQ+FY=
+golang.org/x/sys v0.45.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
 golang.org/x/telemetry v0.0.0-20260428171046-76f71b9afea0 h1:ER5jHKKGuNOscKUx6ChPob4dxC3gP5lkzWXa0JPJWRQ=
 golang.org/x/telemetry v0.0.0-20260428171046-76f71b9afea0/go.mod h1:kHjTxDEnAu6/Nl9lDkzjWpR+bmKfxeiRuSDlsMb70gE=
 golang.org/x/term v0.0.0-20201126162022-7de9c90e9dd1/go.mod h1:bj7SfCRtBDWHUb9snDiAeCFNEtKQo2Wmx5Cou7ajbmo=

@@ -79,18 +79,17 @@ func ResolveP2PNetwork(network string) (topicNetwork string, bootstrapPeers []st
 
 // ResolveChaintracksNetwork maps a canonical arcade network name to the value
 // go-chaintracks accepts at config.P2P.Network. Its chainmanager.getGenesisHeader
-// only knows "main"/"test"/"teratest"/"teratestnet", so we translate at the
-// boundary instead of leaking upstream naming into the arcade config surface.
-//
-// Regtest is intentionally absent: chaintracks has no regtest genesis header,
-// so validate() force-disables chaintracks_server when network=regtest and this
-// function is never reached with that value.
+// is an exact-match switch over "main"/"test"/"teratest"/"teratestnet"/"regtest",
+// so we translate at the boundary instead of leaking upstream naming into the
+// arcade config surface.
 func ResolveChaintracksNetwork(network string) string {
 	switch network {
 	case NetworkTestnet:
 		return "test"
 	case NetworkTeratestnet:
 		return NetworkTeratestnet
+	case NetworkRegtest:
+		return NetworkRegtest
 	case NetworkMainnet, "":
 		fallthrough
 	default:
@@ -841,10 +840,6 @@ func validate(cfg *Config) error {
 			cfg.Network, NetworkMainnet, NetworkTestnet, NetworkTeratestnet, NetworkRegtest)
 	}
 	if cfg.Network == NetworkRegtest {
-		// chaintracks has no regtest genesis header — initializing it would
-		// crash with ErrUnknownNetwork. Force-disable so operators only need to
-		// set network: regtest without also remembering chaintracks_server.
-		cfg.ChaintracksServer.Enabled = false
 		if cfg.P2P.DatahubDiscovery && len(cfg.P2P.BootstrapPeers) == 0 {
 			return fmt.Errorf("p2p.bootstrap_peers is required when network=regtest and p2p.datahub_discovery=true")
 		}
