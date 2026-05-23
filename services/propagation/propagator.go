@@ -1217,9 +1217,6 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 			successEndpoint = result.endpoint
 		}
 		anySuccess = true
-		// Early-cancel: an accepting endpoint settles the batch's network
-		// verdict; siblings still in flight stop wasting time.
-		cancelBroadcast()
 	}
 	recordBroadcastOutcomes(p.teranodeClient, outcomes)
 

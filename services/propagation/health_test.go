@@ -19,27 +19,32 @@ import (
 	"github.com/bsv-blockchain/arcade/teranode"
 )
 
-// TestBroadcastSingle_FirstSuccessWins_DoesNotWaitForSlowPeer verifies that
-// once one endpoint returns 200, the broadcast returns in ~fast-peer time
-// rather than waiting for the slow peer. The slow peer's handler eventually
-// observes context cancellation (its r.Context().Done() fires when the
-// client closes the connection), but we measure the outcome via wall-time
-// to avoid pinning the test to net/http server-side context propagation
-// internals.
-func TestBroadcastSingle_FirstSuccessWins_DoesNotWaitForSlowPeer(t *testing.T) {
+// TestBroadcastSingle_WaitsForSlowPeer verifies that once one endpoint
+// returns 200, the broadcast still waits for the slow peer to finish its
+// HTTP call rather than cancelling it. Every Teranode in the healthy set
+// must receive every tx so subsequent dependent broadcasts don't hit a
+// node that's missing the parent.
+func TestBroadcastSingle_WaitsForSlowPeer(t *testing.T) {
 	fastSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer fastSrv.Close()
 
+	const slowDelay = 2 * time.Second
+	slowHit := make(chan struct{}, 1)
 	slowSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Sleep or abort-on-cancel, whichever comes first. The handler will
-		// eventually return; the broadcast must not wait for it.
 		select {
-		case <-r.Context().Done():
-		case <-time.After(5 * time.Second):
+		case slowHit <- struct{}{}:
+		default:
 		}
-		w.WriteHeader(http.StatusOK)
+		select {
+		case <-time.After(slowDelay):
+			w.WriteHeader(http.StatusOK)
+		case <-r.Context().Done():
+			// If the broadcast cancels us early, fail the request loudly so
+			// the assertion below catches it.
+			w.WriteHeader(http.StatusGatewayTimeout)
+		}
 	}))
 	defer slowSrv.Close()
 
@@ -55,10 +60,14 @@ func TestBroadcastSingle_FirstSuccessWins_DoesNotWaitForSlowPeer(t *testing.T) {
 	}
 	elapsed := time.Since(start)
 
-	// Slow peer sleeps 5s. If we were waiting for it, elapsed would be ~5s.
-	// With first-success early-cancel, elapsed should be well under 1s.
-	if elapsed > 1*time.Second {
-		t.Fatalf("broadcast wall-time %v — did not early-cancel slow peer", elapsed)
+	select {
+	case <-slowHit:
+	default:
+		t.Fatalf("slow peer never received the broadcast")
+	}
+
+	if elapsed < slowDelay {
+		t.Fatalf("broadcast wall-time %v < slow peer delay %v — slow peer was cancelled early", elapsed, slowDelay)
 	}
 }
 
@@ -215,9 +224,8 @@ func TestPeerUnreachable_Trips(t *testing.T) {
 
 // TestBadPeer_SkippedAfterTrip verifies that once the bad endpoint is tripped
 // to unhealthy, subsequent broadcasts do not send it any traffic. The trip is
-// induced deterministically via RecordFailure calls — inducing it via real
-// broadcasts is racy because the early-cancel can abort bad's request before
-// it reaches the server, preventing the hit from being recorded.
+// induced deterministically via RecordFailure calls so the assertion doesn't
+// depend on the worker pool's per-call scheduling.
 func TestBadPeer_SkippedAfterTrip(t *testing.T) {
 	var okHits, badHits atomic.Int32
 
