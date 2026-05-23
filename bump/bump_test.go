@@ -7,6 +7,7 @@ import (
 	"math"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
@@ -1813,5 +1814,75 @@ func TestAssembleBUMP_SingleSubtree_Unaffected(t *testing.T) {
 	}
 	if *root != expectedRoot {
 		t.Fatalf("root mismatch: got %s, want %s", root, expectedRoot)
+	}
+}
+
+// TestBuildCompoundBUMP_LargeBlock_DoesNotOOM exercises BuildCompoundBUMP at a
+// scale that the previous per-STUMP-then-merge implementation could not
+// survive. The old algorithm called assembleFullPath once per STUMP, each
+// call allocating the entire block-level tree (subtree-root layer + log₂(N)
+// padding layers) and running computeMissingHashes — so memory grew as
+// O(N²) PathElements and time as O(N²·log N) findLeafByOffset scans. For a
+// block of this size that path would either OOM (verified 2026-05-22 against
+// real mainnet block 950028: 24,896 STUMPs drove arcade to 13 GB RAM and
+// 100% CPU with no completion after 8+ min) or take many tens of minutes.
+//
+// The current direct-build implementation must finish well inside this
+// test's timeout and produce a compound whose root matches the canonical
+// merkle root computed independently by multiSubtreeTestSetup. This test
+// will regress hard (timeout / >>10× runtime) if the algorithm ever slips
+// back to per-STUMP merging.
+func TestBuildCompoundBUMP_LargeBlock_DoesNotOOM(t *testing.T) {
+	const (
+		numSubtrees = 4096
+		subtreeSize = 16 // internal height 4
+	)
+	allLeaves, subtreeHashes, blockRoot := multiSubtreeTestSetup(numSubtrees, subtreeSize)
+
+	stumps := make([]*models.Stump, numSubtrees)
+	for s := 0; s < numSubtrees; s++ {
+		stumps[s] = &models.Stump{
+			BlockHash:    "deadbeef",
+			SubtreeIndex: s,
+			StumpData:    buildFullSTUMP(allLeaves[s], 0, 900000),
+		}
+	}
+
+	start := time.Now()
+	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, nil)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("BuildCompoundBUMP failed for large block: %v", err)
+	}
+	if err := ValidateCompoundRoot(compound, &blockRoot); err != nil {
+		t.Fatalf("root mismatch on %d-subtree compound: %v", numSubtrees, err)
+	}
+
+	// Soft upper bound. Locally this finishes well under 5 s; the limit is
+	// loose so CI runners on slower hardware don't flap, while still catching
+	// a regression to the old quadratic behaviour (which timed out at several
+	// minutes on the same input shape).
+	if elapsed > 30*time.Second {
+		t.Errorf("BuildCompoundBUMP took %s for %d subtrees × %d leaves — likely an algorithmic regression",
+			elapsed, numSubtrees, subtreeSize)
+	}
+
+	// Spot-check: every subtree's first and last leaf must extract to a
+	// minimal path that verifies against the same block root.
+	for _, s := range []int{0, 1, numSubtrees / 2, numSubtrees - 1} {
+		for _, localOffset := range []int{0, subtreeSize - 1} {
+			globalOffset := uint64(s*subtreeSize + localOffset) //nolint:gosec
+			minimal := ExtractMinimalPath(compound, globalOffset)
+			if minimal == nil {
+				t.Fatalf("ExtractMinimalPath returned nil for subtree %d local %d (global %d)", s, localOffset, globalOffset)
+			}
+			root, err := minimal.ComputeRoot(&allLeaves[s][localOffset])
+			if err != nil {
+				t.Fatalf("ComputeRoot failed for subtree %d local %d: %v", s, localOffset, err)
+			}
+			if *root != blockRoot {
+				t.Fatalf("subtree %d local %d: minimal-path root mismatch", s, localOffset)
+			}
+		}
 	}
 }

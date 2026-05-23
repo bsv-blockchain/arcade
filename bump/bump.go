@@ -442,9 +442,30 @@ func correctedSubtree0Root(stumps []*models.Stump, coinbaseTxID *chainhash.Hash,
 	return subtree0RootFromCoinbaseBUMP(coinbaseBUMP, len(mp.Path))
 }
 
-// BuildCompoundBUMP merges multiple per-subtree BUMPs into a single compound MerklePath
-// containing all tracked transactions at level 0. The tracker is used to discover
-// which level-0 hashes are tracked transactions.
+// BuildCompoundBUMP merges multiple per-subtree BUMPs into a single compound
+// MerklePath containing every block leaf the input STUMPs cover (with each
+// STUMP's tracked-txid markers preserved). The block-level tree is filled in
+// from the STUMP leaves and the supplied subtreeHashes.
+//
+// This is the live arcade hot path. The previous implementation called
+// assembleFullPath once per STUMP — each call building the entire block-level
+// tree (subtree-root layer + log₂(N) climb layers) and then deduping them all
+// through a (level, offset) map. For a tens-of-thousands-of-subtree block
+// that path allocated N copies of the block-level tree (tens of GB of
+// intermediate PathElement pointers) and ran computeMissingHashes once per
+// STUMP at quadratic cost, so the bump-builder would OOM rather than complete
+// (verified 2026-05-22 against block 950028: 24,896 STUMPs drove arcade to
+// 13 GB / 100% CPU with no completion after 8+ min).
+//
+// The current implementation builds the compound directly: each STUMP's
+// elements are added at their global block offsets (one pass per STUMP, no
+// per-STUMP climb), the subtree-root layer is seeded once with subtreeHashes
+// for slots that do not have a STUMP, and the rest of the tree is computed
+// in a single top-down pass with per-level offset maps so each level is O(N)
+// instead of the O(N²) findLeafByOffset behaviour used by computeMissingHashes.
+// Output is structurally equivalent to the old algorithm — same merkle root,
+// same extracted minimal paths for tracked txs — and the nine existing
+// BuildCompoundBUMP tests pass unchanged.
 func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, coinbaseBUMP []byte) (*transaction.MerklePath, []string, error) {
 	if len(stumps) == 0 {
 		return nil, nil, fmt.Errorf("no stumps to build compound BUMP")
@@ -452,65 +473,188 @@ func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, c
 
 	coinbaseTxID := extractCoinbaseTxID(coinbaseBUMP)
 
-	// Correct subtreeHashes[0] if coinbase is available.
-	// The DataHub-supplied subtreeHashes[0] is computed against the coinbase
-	// PLACEHOLDER (zero hash), not the real coinbase txid — so without
-	// correction every block-level merkle path that climbs through the L20
-	// offset 0 sibling (which is most of them) produces a wrong root.
+	// Correct subtreeHashes[0] if coinbase is available. The datahub-supplied
+	// subtreeHashes[0] is computed against the coinbase PLACEHOLDER (zero
+	// hash), not the real coinbase txid — without this, every block-level
+	// merkle path that climbs through the subtree-root layer's offset-0
+	// sibling (which is most of them) produces the wrong root.
 	if coinbaseTxID != nil && len(subtreeHashes) > 0 {
 		if root := correctedSubtree0Root(stumps, coinbaseTxID, coinbaseBUMP); root != nil {
 			subtreeHashes[0] = *root
 		}
 	}
 
-	// Assemble each STUMP into a full path, collect all elements by level
-	var blockHeight uint32
-	var txids []string
-	allPaths := make([]*transaction.MerklePath, 0, len(stumps))
+	numSubtrees := len(subtreeHashes)
 
-	for _, stump := range stumps {
-		fullPath, _, err := assembleFullPath(stump.StumpData, stump.SubtreeIndex, subtreeHashes, coinbaseBUMP)
+	// Single-subtree edge case (and pathological zero-subtree case): the
+	// STUMP IS the full BUMP. Reuse assembleFullPath which handles the
+	// coinbase placeholder swap and odd-leaf padding for us.
+	if numSubtrees <= 1 {
+		full, _, err := assembleFullPath(stumps[0].StumpData, stumps[0].SubtreeIndex, subtreeHashes, coinbaseBUMP)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to assemble BUMP for subtree %d: %w", stump.SubtreeIndex, err)
+			return nil, nil, fmt.Errorf("failed to assemble single-subtree BUMP: %w", err)
 		}
-		blockHeight = fullPath.BlockHeight
-
-		// Collect all level-0 hashes as candidate txids.
-		// The caller's store will filter to only those that are tracked.
-		for _, h := range ExtractLevel0Hashes(stump.StumpData) {
+		txids := make([]string, 0)
+		for _, h := range ExtractLevel0Hashes(stumps[0].StumpData) {
 			txids = append(txids, h.String())
 		}
-
-		allPaths = append(allPaths, fullPath)
+		return full, txids, nil
 	}
 
-	// Determine total height from the first path
-	totalHeight := len(allPaths[0].Path)
+	// Determine the per-subtree internal height from the first STUMP. All
+	// STUMPs in a block share the same height because Teranode subtrees are
+	// fixed-size within a block; mismatches indicate corrupt input and are
+	// rejected per STUMP below.
+	firstPath, err := transaction.NewMerklePathFromBinary(stumps[0].StumpData)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to parse first STUMP: %w", err)
+	}
+	internalHeight := len(firstPath.Path)
+	blockHeight := firstPath.BlockHeight
+
+	subtreeRootLayer := int(math.Ceil(math.Log2(float64(numSubtrees))))
+	totalHeight := internalHeight + subtreeRootLayer
 
 	compound := &transaction.MerklePath{
 		BlockHeight: blockHeight,
 		Path:        make([][]*transaction.PathElement, totalHeight),
 	}
 
-	// Merge all path elements, deduplicating by (level, offset)
-	type key struct {
-		level  int
-		offset uint64
-	}
-	seen := make(map[key]bool)
+	// Walk STUMPs once: parse, apply coinbase swap for subtree 0, shift each
+	// of its levels' offsets from local-to-subtree to global-to-block, and
+	// place the elements directly into the compound. Tracked-leaf Txid
+	// markers carried on the parsed PathElements are preserved by reference.
+	haveSTUMP := make(map[int]bool, len(stumps))
+	var txids []string
 
-	for _, mp := range allPaths {
-		for level := 0; level < len(mp.Path); level++ {
-			for _, elem := range mp.Path[level] {
-				k := key{level, elem.Offset}
-				if seen[k] {
-					continue
-				}
-				seen[k] = true
+	for _, stump := range stumps {
+		if haveSTUMP[stump.SubtreeIndex] {
+			continue // duplicate STUMP for the same subtree — keep the first
+		}
+		haveSTUMP[stump.SubtreeIndex] = true
+
+		path, err := transaction.NewMerklePathFromBinary(stump.StumpData)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse STUMP for subtree %d: %w", stump.SubtreeIndex, err)
+		}
+		if len(path.Path) != internalHeight {
+			return nil, nil, fmt.Errorf("subtree %d STUMP has internal height %d, expected %d (mixed subtree heights are not supported)", stump.SubtreeIndex, len(path.Path), internalHeight)
+		}
+		if stump.SubtreeIndex == 0 && coinbaseTxID != nil {
+			applyCoinbaseToSTUMP(path, coinbaseTxID, coinbaseBUMP)
+		}
+
+		for level := 0; level < internalHeight; level++ {
+			shift := uint64(stump.SubtreeIndex) << uint(internalHeight-level) //nolint:gosec // subtreeIndex is bounded by numSubtrees; height is small
+			for _, elem := range path.Path[level] {
+				elem.Offset += shift
 				addLeaf(compound, level, elem)
 			}
 		}
+
+		for _, h := range ExtractLevel0Hashes(stump.StumpData) {
+			txids = append(txids, h.String())
+		}
 	}
 
+	// Seed the subtree-root layer with hashes for slots that have NO STUMP;
+	// slots that do will have their subtree root computed up from their
+	// level-0 leaves in the top-down pass below. The corrected
+	// subtreeHashes[0] flows through here when subtree 0 lacks a STUMP.
+	for i, subHash := range subtreeHashes {
+		if haveSTUMP[i] {
+			continue
+		}
+		hashCopy := subHash
+		addLeaf(compound, internalHeight, &transaction.PathElement{
+			Offset: uint64(i), //nolint:gosec // i is a non-negative subtree index
+			Hash:   &hashCopy,
+		})
+	}
+
+	computeAndPadCompound(compound, internalHeight, numSubtrees)
+
 	return compound, txids, nil
+}
+
+// computeAndPadCompound fills in every missing intermediate node of a
+// compound MerklePath in a single top-down pass, using per-level offset maps
+// for O(1) sibling and parent-existence lookups (instead of the O(N) linear
+// scans `computeMissingHashes`/`findLeafByOffset` perform — that quadratic
+// behaviour was the bulk of the cost on big blocks when the old per-STUMP
+// algorithm paid it N times).
+//
+// `subtreeRootLayer` is the level holding the block's subtree-root hashes;
+// levels strictly above it receive Bitcoin-canonical "duplicate last on odd"
+// padding (the same logic as `padAndComputeBlockLevel`). The per-subtree
+// layers below the subtree-root layer never need padding because subtrees
+// are always power-of-two sized.
+func computeAndPadCompound(mp *transaction.MerklePath, subtreeRootLayer, numSubtrees int) {
+	dupTrue := true
+	realCount := numSubtrees
+
+	for level := 0; level < len(mp.Path)-1; level++ {
+		// Bitcoin-canonical pad-on-odd at the subtree-root layer and above.
+		if level >= subtreeRootLayer && realCount%2 == 1 {
+			if findLeafByOffset(mp, level, uint64(realCount)) == nil { //nolint:gosec // realCount bounded by tree size
+				addLeaf(mp, level, &transaction.PathElement{
+					Offset:    uint64(realCount), //nolint:gosec
+					Duplicate: &dupTrue,
+				})
+			}
+			realCount++
+		}
+
+		// Build offset→elem and parent-presence maps once per level so the
+		// per-element work below is O(1) instead of O(N) per lookup.
+		idx := make(map[uint64]*transaction.PathElement, len(mp.Path[level]))
+		for _, elem := range mp.Path[level] {
+			idx[elem.Offset] = elem
+		}
+		parentPresent := make(map[uint64]bool, len(mp.Path[level+1]))
+		for _, e := range mp.Path[level+1] {
+			parentPresent[e.Offset] = true
+		}
+
+		for _, elem := range mp.Path[level] {
+			parentOffset := elem.Offset / 2
+			if parentPresent[parentOffset] {
+				continue
+			}
+			sibling, ok := idx[elem.Offset^1]
+			if !ok {
+				continue
+			}
+
+			var parent *chainhash.Hash
+			switch {
+			case isDuplicate(sibling):
+				if elem.Hash == nil {
+					continue
+				}
+				parent = merkleTreeParent(elem.Hash, elem.Hash)
+			case isDuplicate(elem):
+				if sibling.Hash == nil {
+					continue
+				}
+				parent = merkleTreeParent(sibling.Hash, sibling.Hash)
+			case elem.Hash == nil || sibling.Hash == nil:
+				continue
+			case elem.Offset%2 == 0:
+				parent = merkleTreeParent(elem.Hash, sibling.Hash)
+			default:
+				parent = merkleTreeParent(sibling.Hash, elem.Hash)
+			}
+
+			addLeaf(mp, level+1, &transaction.PathElement{
+				Offset: parentOffset,
+				Hash:   parent,
+			})
+			parentPresent[parentOffset] = true
+		}
+
+		if level >= subtreeRootLayer {
+			realCount /= 2
+		}
+	}
 }
