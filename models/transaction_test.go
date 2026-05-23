@@ -31,11 +31,12 @@ func TestStatus_IsTerminal(t *testing.T) {
 }
 
 // TestStatus_CanTransitionFrom_TerminalStaysTerminal is the regression for
-// F-003: once a tx is MINED/IMMUTABLE/REJECTED/DOUBLE_SPEND_ATTEMPTED, no
-// in-flight status update may regress it.
+// F-003: once a tx is MINED/IMMUTABLE/DOUBLE_SPEND_ATTEMPTED, no in-flight
+// status update may regress it. REJECTED is covered separately because it
+// allows forward recovery to ACCEPTED_BY_NETWORK / SEEN_ON_NETWORK /
+// SEEN_MULTIPLE_NODES.
 func TestStatus_CanTransitionFrom_TerminalStaysTerminal(t *testing.T) {
 	terminals := []Status{
-		StatusRejected,
 		StatusDoubleSpendAttempted,
 		StatusMined,
 		StatusImmutable,
@@ -55,6 +56,37 @@ func TestStatus_CanTransitionFrom_TerminalStaysTerminal(t *testing.T) {
 			if next.CanTransitionFrom(prev) {
 				t.Errorf("regression allowed: %s → %s should be rejected", prev, next)
 			}
+		}
+	}
+}
+
+// TestStatus_CanTransitionFrom_RejectedRecovery pins the partial-terminal
+// behavior of REJECTED: forward acceptance/seen states must be reachable so
+// late callbacks from a peer that did accept can correct the status, but
+// regressions to pre-broadcast or retry states must still be blocked.
+func TestStatus_CanTransitionFrom_RejectedRecovery(t *testing.T) {
+	allowedForward := []Status{
+		StatusAcceptedByNetwork,
+		StatusSeenOnNetwork,
+		StatusSeenMultipleNodes,
+		StatusMined,
+		StatusImmutable,
+	}
+	for _, next := range allowedForward {
+		if !next.CanTransitionFrom(StatusRejected) {
+			t.Errorf("forward recovery wrongly blocked: REJECTED → %s", next)
+		}
+	}
+	blocked := []Status{
+		StatusUnknown,
+		StatusReceived,
+		StatusSentToNetwork,
+		StatusPendingRetry,
+		StatusStumpProcessing,
+	}
+	for _, next := range blocked {
+		if next.CanTransitionFrom(StatusRejected) {
+			t.Errorf("regression allowed: REJECTED → %s should be rejected", next)
 		}
 	}
 }
@@ -99,6 +131,9 @@ func TestStatus_CanTransitionFrom_HappyPath(t *testing.T) {
 		{StatusPendingRetry, StatusSentToNetwork},         // reaper retry
 		{StatusReceived, StatusReceived},                  // idempotent dup
 		{StatusMined, StatusMined},                        // idempotent dup
+		{StatusRejected, StatusAcceptedByNetwork},         // peer accepted after another rejected
+		{StatusRejected, StatusSeenOnNetwork},             // SEEN callback after REJECTED
+		{StatusRejected, StatusSeenMultipleNodes},         // SEEN_MULTIPLE callback after REJECTED
 	}
 	for _, c := range allowed {
 		if !c.next.CanTransitionFrom(c.prev) {
@@ -120,7 +155,6 @@ func TestStatus_CanTransitionFrom_Regressions(t *testing.T) {
 		{StatusMined, StatusRejected, "late rejection after MINED"},
 		{StatusImmutable, StatusMined, "MINED must not pull tx out of IMMUTABLE"},
 		{StatusImmutable, StatusSeenOnNetwork, "late SEEN after IMMUTABLE"},
-		{StatusRejected, StatusSeenOnNetwork, "late SEEN after REJECTED"},
 		{StatusRejected, StatusSentToNetwork, "republish after REJECTED"},
 		{StatusDoubleSpendAttempted, StatusSeenOnNetwork, "late SEEN after DOUBLE_SPEND_ATTEMPTED"},
 		{StatusSeenMultipleNodes, StatusSeenOnNetwork, "single-peer downgrade"},

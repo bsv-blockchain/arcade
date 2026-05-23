@@ -150,24 +150,24 @@ func (s Status) DisallowedPreviousStatuses() []Status {
 		return []Status{
 			StatusAcceptedByNetwork,
 			StatusSeenOnNetwork, StatusSeenMultipleNodes,
-			StatusRejected, StatusDoubleSpendAttempted,
+			StatusDoubleSpendAttempted,
 			StatusMined, StatusImmutable,
 		}
 	case StatusSeenOnNetwork:
-		// SEEN_ON_NETWORK is a forward step from earlier states only — once a
-		// tx has progressed to SEEN_MULTIPLE_NODES, a terminal state, or is in
-		// the retry side-branch it must not regress to SEEN_ON_NETWORK.
+		// SEEN_ON_NETWORK is a forward step that can follow earlier states or
+		// recover a previously-REJECTED tx (e.g., a peer accepted after another
+		// peer rejected, or the underlying cause of the rejection cleared).
 		return []Status{
 			StatusSeenOnNetwork, StatusSeenMultipleNodes,
 			StatusPendingRetry,
-			StatusRejected, StatusDoubleSpendAttempted,
+			StatusDoubleSpendAttempted,
 			StatusMined, StatusImmutable,
 		}
 	case StatusSeenMultipleNodes:
 		return []Status{
 			StatusSeenMultipleNodes,
 			StatusPendingRetry,
-			StatusRejected, StatusDoubleSpendAttempted,
+			StatusDoubleSpendAttempted,
 			StatusMined, StatusImmutable,
 		}
 	case StatusPendingRetry:
