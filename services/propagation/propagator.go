@@ -226,7 +226,7 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 	}
 	teranodeBatchCap := cfg.Propagation.TeranodeMaxBatchSize
 	if teranodeBatchCap <= 0 {
-		teranodeBatchCap = 100
+		teranodeBatchCap = 1024
 	}
 	maxPending := cfg.Propagation.MaxPending
 	if maxPending <= 0 {
