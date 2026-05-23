@@ -16,6 +16,7 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/teranode"
 )
 
@@ -397,6 +398,104 @@ func TestMinHealthyWarning_ZeroDisables(t *testing.T) {
 
 	if got := recorded.FilterMessage("healthy endpoint count below minimum").Len(); got != 0 {
 		t.Fatalf("warning must be disabled with MinHealthyEndpoints=0, got %d", got)
+	}
+}
+
+// TestBroadcast_PerPeerAggregation_AcceptanceWins covers the per-tx
+// aggregation across peer responses: when one peer rejects a tx but
+// another peer accepts it (by 500-ing without naming it), the acceptance
+// must win. Two endpoints each return 500 with different failure maps
+// such that each tx is rejected by one peer and implicitly accepted by
+// the other. Both txs should land as ACCEPTED_BY_NETWORK.
+func TestBroadcast_PerPeerAggregation_AcceptanceWins(t *testing.T) {
+	const (
+		txidA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		txidB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	)
+	// Peer A rejects txidA, implicitly accepts txidB.
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("Failed to process transactions:\n" +
+			"TX_INVALID (31): [ProcessTransaction][" + txidA + "] missing input\n"))
+	}))
+	defer srvA.Close()
+	// Peer B rejects txidB, implicitly accepts txidA.
+	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("Failed to process transactions:\n" +
+			"TX_INVALID (31): [ProcessTransaction][" + txidB + "] missing input\n"))
+	}))
+	defer srvB.Close()
+
+	ms := newMockStore()
+	cfg := &config.Config{}
+	cfg.Propagation.MerkleConcurrency = 10
+	tc := teranode.NewClient([]string{srvA.URL, srvB.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, nil)
+
+	for _, txid := range []string{txidA, txidB} {
+		if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg(txid))); err != nil {
+			t.Fatalf("handleMessage(%s): %v", txid, err)
+		}
+	}
+	if err := flushSync(t, p); err != nil {
+		t.Fatalf("flush error: %v", err)
+	}
+
+	for _, txid := range []string{txidA, txidB} {
+		got := ms.lastUpdateForTxid(txid)
+		if got == nil {
+			t.Fatalf("no status update recorded for %s", txid)
+		}
+		if got.Status != models.StatusAcceptedByNetwork {
+			t.Errorf("%s: expected ACCEPTED_BY_NETWORK, got %s (reason=%q)", txid, got.Status, got.ExtraInfo)
+		}
+	}
+}
+
+// TestBroadcast_PerPeerAggregation_UnanimousRejection covers the other
+// half: when every peer that gave us a parseable response named the same
+// tx as failed, the tx is REJECTED. Two endpoints both 500 with the
+// same txid in their failure maps; a second txid is absent from both
+// and should still be ACCEPTED.
+func TestBroadcast_PerPeerAggregation_UnanimousRejection(t *testing.T) {
+	const (
+		txidRejected = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+		txidAccepted = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	)
+	body := "Failed to process transactions:\n" +
+		"TX_INVALID (31): [ProcessTransaction][" + txidRejected + "] tx is invalid\n"
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srvA.Close()
+	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srvB.Close()
+
+	ms := newMockStore()
+	cfg := &config.Config{}
+	cfg.Propagation.MerkleConcurrency = 10
+	tc := teranode.NewClient([]string{srvA.URL, srvB.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, nil)
+
+	for _, txid := range []string{txidRejected, txidAccepted} {
+		if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg(txid))); err != nil {
+			t.Fatalf("handleMessage(%s): %v", txid, err)
+		}
+	}
+	if err := flushSync(t, p); err != nil {
+		t.Fatalf("flush error: %v", err)
+	}
+
+	if got := ms.lastUpdateForTxid(txidRejected); got == nil || got.Status != models.StatusRejected {
+		t.Errorf("%s: expected REJECTED, got %+v", txidRejected, got)
+	}
+	if got := ms.lastUpdateForTxid(txidAccepted); got == nil || got.Status != models.StatusAcceptedByNetwork {
+		t.Errorf("%s: expected ACCEPTED_BY_NETWORK, got %+v", txidAccepted, got)
 	}
 }
 
