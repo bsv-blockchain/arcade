@@ -118,7 +118,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 	go func() {
 		<-ctx.Done()
-		_ = s.Stop()
+		_ = s.Stop() //nolint:contextcheck // Stop uses context.Background() so the 15s drain outlives the parent ctx that just fired.
 		recorderWG.Wait()
 	}()
 
