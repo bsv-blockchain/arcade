@@ -58,6 +58,7 @@ type Server struct {
 	// (errors are logged, not surfaced to the client).
 	submissionCh   chan submissionRecord
 	submissionStop chan struct{}
+	stopOnce       sync.Once
 }
 
 // submissionRecord is the in-memory payload the async recorder consumes.
@@ -223,14 +224,12 @@ func (s *Server) recoverPanic(c *gin.Context, recovered any) {
 }
 
 func (s *Server) Stop() error {
-	// Signal recorder workers to exit. Safe to call multiple times via the
-	// guard pattern below; Stop() is invoked by the Start ctx-watcher and may
-	// race with an explicit caller.
-	select {
-	case <-s.submissionStop:
-	default:
+	// Stop() is invoked by the Start ctx-watcher and may race with an explicit
+	// supervisor caller; sync.Once is the only race-free way to ensure the
+	// channel close happens exactly once.
+	s.stopOnce.Do(func() {
 		close(s.submissionStop)
-	}
+	})
 	if s.server != nil {
 		s.logger.Info("shutting down API server")
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
