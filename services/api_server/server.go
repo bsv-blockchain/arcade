@@ -233,7 +233,9 @@ func (s *Server) Stop() error {
 	}
 	if s.server != nil {
 		s.logger.Info("shutting down API server")
-		return s.server.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		return s.server.Shutdown(ctx)
 	}
 	return nil
 }

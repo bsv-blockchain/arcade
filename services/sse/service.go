@@ -97,7 +97,9 @@ func (s *Service) Start(ctx context.Context) error {
 func (s *Service) Stop() error {
 	if s.server != nil {
 		s.logger.Info("shutting down SSE service")
-		return s.server.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		return s.server.Shutdown(ctx)
 	}
 	return nil
 }
