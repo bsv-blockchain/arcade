@@ -1860,7 +1860,7 @@ func TestBuildCompoundBUMP_LargeBlock_DoesNotOOM(t *testing.T) {
 
 	// Soft upper bound. Locally this finishes well under 5 s; the limit is
 	// loose so CI runners on slower hardware don't flap, while still catching
-	// a regression to the old quadratic behaviour (which timed out at several
+	// a regression to the old quadratic behavior (which timed out at several
 	// minutes on the same input shape).
 	if elapsed > 30*time.Second {
 		t.Errorf("BuildCompoundBUMP took %s for %d subtrees × %d leaves — likely an algorithmic regression",
@@ -1871,7 +1871,7 @@ func TestBuildCompoundBUMP_LargeBlock_DoesNotOOM(t *testing.T) {
 	// minimal path that verifies against the same block root.
 	for _, s := range []int{0, 1, numSubtrees / 2, numSubtrees - 1} {
 		for _, localOffset := range []int{0, subtreeSize - 1} {
-			globalOffset := uint64(s*subtreeSize + localOffset) //nolint:gosec
+			globalOffset := uint64(s*subtreeSize + localOffset) //nolint:gosec // s, subtreeSize, localOffset are loop-bounded non-negative ints
 			minimal := ExtractMinimalPath(compound, globalOffset)
 			if minimal == nil {
 				t.Fatalf("ExtractMinimalPath returned nil for subtree %d local %d (global %d)", s, localOffset, globalOffset)

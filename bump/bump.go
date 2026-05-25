@@ -462,7 +462,7 @@ func correctedSubtree0Root(stumps []*models.Stump, coinbaseTxID *chainhash.Hash,
 // per-STUMP climb), the subtree-root layer is seeded once with subtreeHashes
 // for slots that do not have a STUMP, and the rest of the tree is computed
 // in a single top-down pass with per-level offset maps so each level is O(N)
-// instead of the O(N²) findLeafByOffset behaviour used by computeMissingHashes.
+// instead of the O(N²) findLeafByOffset behavior used by computeMissingHashes.
 // Output is structurally equivalent to the old algorithm — same merkle root,
 // same extracted minimal paths for tracked txs — and the nine existing
 // BuildCompoundBUMP tests pass unchanged.
@@ -567,7 +567,7 @@ func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, c
 		}
 		hashCopy := subHash
 		addLeaf(compound, internalHeight, &transaction.PathElement{
-			Offset: uint64(i), //nolint:gosec // i is a non-negative subtree index
+			Offset: uint64(i),
 			Hash:   &hashCopy,
 		})
 	}
@@ -581,7 +581,7 @@ func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, c
 // compound MerklePath in a single top-down pass, using per-level offset maps
 // for O(1) sibling and parent-existence lookups (instead of the O(N) linear
 // scans `computeMissingHashes`/`findLeafByOffset` perform — that quadratic
-// behaviour was the bulk of the cost on big blocks when the old per-STUMP
+// behavior was the bulk of the cost on big blocks when the old per-STUMP
 // algorithm paid it N times).
 //
 // `subtreeRootLayer` is the level holding the block's subtree-root hashes;
@@ -598,7 +598,7 @@ func computeAndPadCompound(mp *transaction.MerklePath, subtreeRootLayer, numSubt
 		if level >= subtreeRootLayer && realCount%2 == 1 {
 			if findLeafByOffset(mp, level, uint64(realCount)) == nil { //nolint:gosec // realCount bounded by tree size
 				addLeaf(mp, level, &transaction.PathElement{
-					Offset:    uint64(realCount), //nolint:gosec
+					Offset:    uint64(realCount), //nolint:gosec // realCount bounded by tree size
 					Duplicate: &dupTrue,
 				})
 			}
