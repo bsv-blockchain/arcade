@@ -8,7 +8,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: arcade-watchdog
+  name: watchdog
   namespace: arcade
   labels:
     app.kubernetes.io/name: watchdog
@@ -25,36 +25,33 @@ spec:
         app.kubernetes.io/part-of: arcade
     spec:
       containers:
-        - name: arcade
-          image: ghcr.io/bsv-blockchain/arcade:latest
+        - name: watchdog
+          image: ghcr.io/bsv-blockchain/arcade:v0.6.5
+          imagePullPolicy: Always
           args: ["--mode", "watchdog"]
           ports:
             - containerPort: 8081
               name: health
               protocol: TCP
-          env:
-            - name: ARCADE_KAFKA_BROKERS
-              value: "kafka-0.kafka.arcade.svc.cluster.local:9092"
-            - name: ARCADE_AEROSPIKE_HOSTS
-              value: "aerospike-0.aerospike.arcade.svc.cluster.local:3000"
-            - name: ARCADE_AEROSPIKE_NAMESPACE
-              value: "arcade"
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: health
-            initialDelaySeconds: 5
-            periodSeconds: 10
+          volumeMounts:
+            - name: config
+              mountPath: /etc/arcade/config.yaml
+              subPath: config.yaml
+              readOnly: true
           livenessProbe:
             httpGet:
               path: /health
               port: health
             initialDelaySeconds: 10
-            periodSeconds: 30
+            periodSeconds: 60
           resources:
             requests:
               cpu: 50m
-              memory: 64Mi
-            limits:
-              cpu: 200m
               memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+      volumes:
+        - name: config
+          configMap:
+            name: arcade-config

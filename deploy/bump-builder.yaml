@@ -8,7 +8,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: arcade-bump-builder
+  name: bump-builder
   namespace: arcade
   labels:
     app.kubernetes.io/name: bump-builder
@@ -25,43 +25,44 @@ spec:
         app.kubernetes.io/part-of: arcade
     spec:
       containers:
-        - name: arcade
-          image: ghcr.io/bsv-blockchain/arcade:latest
+        - name: bump-builder
+          image: ghcr.io/bsv-blockchain/arcade:v0.6.5
+          imagePullPolicy: Always
           args: ["--mode", "bump-builder"]
           ports:
             - containerPort: 8081
               name: health
               protocol: TCP
           env:
-            - name: ARCADE_KAFKA_BROKERS
-              value: "kafka-0.kafka.arcade.svc.cluster.local:9092"
-            - name: ARCADE_AEROSPIKE_HOSTS
-              value: "aerospike-0.aerospike.arcade.svc.cluster.local:3000"
-            - name: ARCADE_AEROSPIKE_NAMESPACE
-              value: "arcade"
             # Talk to the chaintracks pod over HTTP instead of running an
             # embedded ChainManager + upstream header poller in this pod.
             # The chaintracks Service exposes /chaintracks/v1/* on 8083.
+            # Without these overrides every bump-builder replica would
+            # independently poll the upstream node, duplicating work the
+            # chaintracks pod already does.
             - name: ARCADE_CHAINTRACKS_MODE
               value: "remote"
             - name: ARCADE_CHAINTRACKS_URL
-              value: "http://chaintracks.arcade.svc.cluster.local:8083"
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: health
-            initialDelaySeconds: 5
-            periodSeconds: 10
+              value: "http://chaintracks:8083"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/arcade/config.yaml
+              subPath: config.yaml
+              readOnly: true
           livenessProbe:
             httpGet:
               path: /health
               port: health
             initialDelaySeconds: 10
-            periodSeconds: 30
+            periodSeconds: 60
           resources:
             requests:
               cpu: 100m
-              memory: 128Mi
-            limits:
-              cpu: 500m
               memory: 256Mi
+            limits:
+              cpu: 250m
+              memory: 512Mi
+      volumes:
+        - name: config
+          configMap:
+            name: arcade-config

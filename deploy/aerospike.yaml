@@ -1,5 +1,11 @@
 # Aerospike StatefulSet — single-node instance for development/staging.
 # For production, use the Aerospike Kubernetes Operator.
+#
+# Note: mainnet uses postgres as the arcade store backend, not aerospike,
+# so this StatefulSet is shipped for parity but not consumed by the
+# default deploy/config.yaml. To use aerospike instead, set
+# store.backend: aerospike in deploy/config.yaml and add an
+# store.aerospike block (see /git/arcade/config.example.yaml).
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -11,34 +17,48 @@ metadata:
 data:
   aerospike.conf: |
     service {
-      proto-fd-max 1024
+        proto-fd-max 15000
+        cluster-name arcade
     }
+
     logging {
-      console {
-        context any info
-      }
+        console {
+            context any info
+        }
     }
+
     network {
-      service {
-        address any
-        port 3000
-      }
-      heartbeat {
-        mode mesh
-        port 3002
-      }
-      fabric {
-        port 3001
-      }
+        service {
+            address any
+            port 3000
+        }
+
+        heartbeat {
+            mode mesh
+            port 3002
+            interval 150
+            timeout 10
+        }
+
+        fabric {
+            port 3001
+        }
+
+        info {
+            port 3003
+        }
     }
+
     namespace arcade {
-      replication-factor 1
-      memory-size 1G
-      storage-engine device {
-        file /opt/aerospike/data/arcade.dat
-        filesize 8G
-        data-in-memory false
-      }
+        replication-factor 1
+        default-ttl 0
+        nsup-period 120
+
+        storage-engine device {
+            file /opt/aerospike/data/arcade.dat
+            filesize 8G
+            read-page-cache true
+        }
     }
 ---
 apiVersion: apps/v1
@@ -61,9 +81,12 @@ spec:
         app.kubernetes.io/name: aerospike
         app.kubernetes.io/part-of: arcade
     spec:
+      securityContext:
+        fsGroup: 1000
       containers:
         - name: aerospike
-          image: aerospike/aerospike-server:7.0
+          image: docker.io/aerospike/aerospike-server:8.1
+          command: ["asd", "--foreground", "--config-file", "/opt/aerospike/etc/aerospike.conf"]
           ports:
             - containerPort: 3000
               name: service
@@ -74,29 +97,32 @@ spec:
             - containerPort: 3002
               name: heartbeat
               protocol: TCP
+            - containerPort: 3003
+              name: info
+              protocol: TCP
           readinessProbe:
             tcpSocket:
-              port: 3000
-            initialDelaySeconds: 10
+              port: service
+            initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
             tcpSocket:
-              port: 3000
-            initialDelaySeconds: 15
-            periodSeconds: 15
+              port: service
+            initialDelaySeconds: 10
+            periodSeconds: 30
           resources:
             requests:
               cpu: 250m
               memory: 1Gi
             limits:
-              cpu: "1"
+              cpu: "2"
               memory: 2Gi
           volumeMounts:
             - name: config
               mountPath: /opt/aerospike/etc/aerospike.conf
               subPath: aerospike.conf
               readOnly: true
-            - name: aerospike-data
+            - name: data
               mountPath: /opt/aerospike/data
       volumes:
         - name: config
@@ -104,7 +130,10 @@ spec:
             name: aerospike-config
   volumeClaimTemplates:
     - metadata:
-        name: aerospike-data
+        name: data
+        labels:
+          app.kubernetes.io/name: aerospike
+          app.kubernetes.io/part-of: arcade
       spec:
         accessModes: ["ReadWriteOnce"]
         resources:
@@ -129,3 +158,11 @@ spec:
       targetPort: service
       protocol: TCP
       name: service
+    - port: 3001
+      targetPort: fabric
+      protocol: TCP
+      name: fabric
+    - port: 3002
+      targetPort: heartbeat
+      protocol: TCP
+      name: heartbeat

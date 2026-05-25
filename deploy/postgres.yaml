@@ -1,0 +1,161 @@
+# Postgres StatefulSet — single-node instance for development/staging.
+#
+# arcade uses postgres as its store backend in the mainnet deployment.
+# The schema is created on first start by api-server.
+#
+# The credentials in postgres-secret below are the same arcade/arcade pair
+# referenced in deploy/config.yaml's store.postgres.dsn. Replace BOTH
+# before exposing this beyond a sandbox.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+  namespace: arcade
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: arcade
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-secret
+  namespace: arcade
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: arcade
+type: Opaque
+stringData:
+  postgres-user: arcade
+  postgres-password: arcade
+  postgres-db: arcade
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-config
+  namespace: arcade
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: arcade
+data:
+  POSTGRES_DB: arcade
+  POSTGRES_USER: arcade
+  PGDATA: /var/lib/postgresql/data/pgdata
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: arcade
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: arcade
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/part-of: arcade
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          # Tuning sized for the mainnet client population (~19 pods × 25
+          # conns/pod = 475 worst case); leave at these values even for
+          # single-pod runs so the example matches what we run in production.
+          args:
+            - "-c"
+            - "max_connections=500"
+            - "-c"
+            - "shared_buffers=2GB"
+            - "-c"
+            - "effective_cache_size=6GB"
+            - "-c"
+            - "work_mem=16MB"
+            - "-c"
+            - "maintenance_work_mem=256MB"
+            - "-c"
+            - "random_page_cost=1.1"
+            - "-c"
+            - "effective_io_concurrency=200"
+            - "-c"
+            - "max_wal_size=4GB"
+            - "-c"
+            - "wal_compression=on"
+          ports:
+            - containerPort: 5432
+              name: postgres
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: postgres-config
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: postgres-password
+          volumeMounts:
+            - name: postgres-storage
+              mountPath: /var/lib/postgresql/data
+          resources:
+            requests:
+              cpu: "1"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - arcade
+                - -d
+                - arcade
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - arcade
+                - -d
+                - arcade
+            initialDelaySeconds: 30
+            periodSeconds: 10
+      volumes:
+        - name: postgres-storage
+          persistentVolumeClaim:
+            claimName: postgres-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: arcade
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: arcade
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+      protocol: TCP
+      name: postgres

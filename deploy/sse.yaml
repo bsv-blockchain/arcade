@@ -4,15 +4,15 @@
 # updates. Extracted from api-server so slow SSE consumers can't
 # backpressure /submit handling.
 #
-# Subscribes to the shared Kafka topic for status updates and reads
-# submission metadata + per-tx status from the shared store for
+# Subscribes to the shared Kafka/Redpanda topic for status updates and
+# reads submission metadata + per-tx status from the shared store for
 # Last-Event-ID catchup. The pod is horizontally scalable — each replica
-# binds its own Kafka consumer group so every replica receives every
-# event independently.
+# binds its own consumer group so every replica receives every event
+# independently.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: arcade-sse
+  name: sse
   namespace: arcade
   labels:
     app.kubernetes.io/name: sse
@@ -29,47 +29,47 @@ spec:
         app.kubernetes.io/part-of: arcade
     spec:
       containers:
-        - name: arcade
-          image: ghcr.io/bsv-blockchain/arcade:latest
+        - name: sse
+          image: ghcr.io/bsv-blockchain/arcade:v0.6.5
+          imagePullPolicy: Always
           args: ["--mode", "sse"]
           ports:
             - containerPort: 8082
               name: http
               protocol: TCP
-            - containerPort: 8081
-              name: health
-              protocol: TCP
-          env:
-            - name: ARCADE_KAFKA_BROKERS
-              value: "kafka-0.kafka.arcade.svc.cluster.local:9092"
-            - name: ARCADE_AEROSPIKE_HOSTS
-              value: "aerospike-0.aerospike.arcade.svc.cluster.local:3000"
-            - name: ARCADE_AEROSPIKE_NAMESPACE
-              value: "arcade"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/arcade/config.yaml
+              subPath: config.yaml
+              readOnly: true
           readinessProbe:
             httpGet:
-              path: /health
-              port: health
+              path: /ready
+              port: http
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /health
-              port: health
+              port: http
             initialDelaySeconds: 10
-            periodSeconds: 30
+            periodSeconds: 60
           resources:
             requests:
               cpu: 100m
               memory: 128Mi
             limits:
               cpu: 500m
-              memory: 256Mi
+              memory: 512Mi
+      volumes:
+        - name: config
+          configMap:
+            name: arcade-config
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: arcade-sse
+  name: sse
   namespace: arcade
   labels:
     app.kubernetes.io/name: sse

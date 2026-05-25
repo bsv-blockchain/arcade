@@ -1,11 +1,11 @@
 # Propagation Service Deployment
 #
-# Consumes from Kafka, broadcasts transactions to Teranode endpoints.
+# Consumes from Kafka/Redpanda, broadcasts transactions to Teranode endpoints.
 # Manages retry buffer for dependent transaction chains.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: arcade-propagation
+  name: propagation
   namespace: arcade
   labels:
     app.kubernetes.io/name: propagation
@@ -22,36 +22,33 @@ spec:
         app.kubernetes.io/part-of: arcade
     spec:
       containers:
-        - name: arcade
-          image: ghcr.io/bsv-blockchain/arcade:latest
+        - name: propagation
+          image: ghcr.io/bsv-blockchain/arcade:v0.6.5
+          imagePullPolicy: Always
           args: ["--mode", "propagation"]
           ports:
             - containerPort: 8081
               name: health
               protocol: TCP
-          env:
-            - name: ARCADE_KAFKA_BROKERS
-              value: "kafka-0.kafka.arcade.svc.cluster.local:9092"
-            - name: ARCADE_AEROSPIKE_HOSTS
-              value: "aerospike-0.aerospike.arcade.svc.cluster.local:3000"
-            - name: ARCADE_AEROSPIKE_NAMESPACE
-              value: "arcade"
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: health
-            initialDelaySeconds: 5
-            periodSeconds: 10
+          volumeMounts:
+            - name: config
+              mountPath: /etc/arcade/config.yaml
+              subPath: config.yaml
+              readOnly: true
           livenessProbe:
             httpGet:
               path: /health
               port: health
             initialDelaySeconds: 10
-            periodSeconds: 30
+            periodSeconds: 60
           resources:
             requests:
               cpu: 100m
               memory: 128Mi
             limits:
-              cpu: 500m
+              cpu: 200m
               memory: 256Mi
+      volumes:
+        - name: config
+          configMap:
+            name: arcade-config

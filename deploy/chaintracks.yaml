@@ -6,17 +6,17 @@
 # services (watchdog, api-server) consume block-header data from the
 # shared store rather than calling into chaintracks directly.
 #
-# replicas MUST be 1: chaintracks owns local header storage (a single
-# bbolt file in /data/chaintracks) and is not designed for multi-writer
-# coordination. To run hot-standby, set up a separate Deployment with
-# its own PVC and load-balance reads at the Service layer.
+# replicas MUST be 1: chaintracks owns local header storage and is not
+# designed for multi-writer coordination. To run hot-standby, set up a
+# separate Deployment with its own PVC and load-balance reads at the
+# Service layer.
 #
 # Exposes /chaintracks/v1 (legacy RPC-style) and /chaintracks/v2 (JSON +
 # binary + SSE) on port 8083 to external clients.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: arcade-chaintracks
+  name: chaintracks
   namespace: arcade
   labels:
     app.kubernetes.io/name: chaintracks
@@ -35,71 +35,54 @@ spec:
         app.kubernetes.io/part-of: arcade
     spec:
       containers:
-        - name: arcade
-          image: ghcr.io/bsv-blockchain/arcade:latest
+        - name: chaintracks
+          image: ghcr.io/bsv-blockchain/arcade:v0.6.5
+          imagePullPolicy: Always
           args: ["--mode", "chaintracks"]
+          env:
+            # Override the shared config.yaml's chaintracks.mode=remote.
+            # This pod IS the chaintracks server — it has to run the
+            # embedded ChainManager + upstream header poller; everyone
+            # else (bump-builder, all-mode) treats it as a remote.
+            - name: ARCADE_CHAINTRACKS_MODE
+              value: "embedded"
           ports:
             - containerPort: 8083
               name: http
               protocol: TCP
-            - containerPort: 8081
-              name: health
-              protocol: TCP
-          env:
-            - name: ARCADE_KAFKA_BROKERS
-              value: "kafka-0.kafka.arcade.svc.cluster.local:9092"
-            - name: ARCADE_AEROSPIKE_HOSTS
-              value: "aerospike-0.aerospike.arcade.svc.cluster.local:3000"
-            - name: ARCADE_AEROSPIKE_NAMESPACE
-              value: "arcade"
-            - name: ARCADE_STORAGE_PATH
-              value: "/data"
           volumeMounts:
-            - name: data
-              mountPath: /data
+            - name: config
+              mountPath: /etc/arcade/config.yaml
+              subPath: config.yaml
+              readOnly: true
           readinessProbe:
             httpGet:
-              path: /health
-              port: health
+              path: /ready
+              port: http
             initialDelaySeconds: 10
             periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /health
-              port: health
+              port: http
             initialDelaySeconds: 30
-            periodSeconds: 30
+            periodSeconds: 60
           resources:
             requests:
-              cpu: 200m
+              cpu: 100m
               memory: 256Mi
             limits:
-              cpu: 1000m
+              cpu: 500m
               memory: 1Gi
       volumes:
-        - name: data
-          persistentVolumeClaim:
-            claimName: arcade-chaintracks-data
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: arcade-chaintracks-data
-  namespace: arcade
-  labels:
-    app.kubernetes.io/name: chaintracks
-    app.kubernetes.io/part-of: arcade
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 10Gi
+        - name: config
+          configMap:
+            name: arcade-config
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: arcade-chaintracks
+  name: chaintracks
   namespace: arcade
   labels:
     app.kubernetes.io/name: chaintracks

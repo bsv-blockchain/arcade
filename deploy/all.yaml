@@ -7,6 +7,11 @@
 #   - 8081: health probe (shared)
 #   - 8082: sse
 #   - 8083: chaintracks
+#
+# This mode is intentionally NOT how mainnet runs — production uses the
+# per-mode microservices (api-server, sse, chaintracks, propagation,
+# bump-builder, watchdog). Use mode=all only for local development or
+# evaluating arcade end-to-end against a single Redpanda + Postgres.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -28,8 +33,14 @@ spec:
     spec:
       containers:
         - name: arcade
-          image: ghcr.io/bsv-blockchain/arcade:latest
+          image: ghcr.io/bsv-blockchain/arcade:v0.6.5
+          imagePullPolicy: Always
           args: ["--mode", "all"]
+          env:
+            # mode=all owns its own embedded chaintracks instance in-process,
+            # so override the shared config.yaml's chaintracks.mode=remote.
+            - name: ARCADE_CHAINTRACKS_MODE
+              value: "embedded"
           ports:
             - containerPort: 8080
               name: http
@@ -43,13 +54,11 @@ spec:
             - containerPort: 8083
               name: chaintracks
               protocol: TCP
-          env:
-            - name: ARCADE_KAFKA_BROKERS
-              value: "kafka-0.kafka.arcade.svc.cluster.local:9092"
-            - name: ARCADE_AEROSPIKE_HOSTS
-              value: "aerospike-0.aerospike.arcade.svc.cluster.local:3000"
-            - name: ARCADE_AEROSPIKE_NAMESPACE
-              value: "arcade"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/arcade/config.yaml
+              subPath: config.yaml
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /health
@@ -69,3 +78,7 @@ spec:
             limits:
               cpu: "1"
               memory: 512Mi
+      volumes:
+        - name: config
+          configMap:
+            name: arcade-config
