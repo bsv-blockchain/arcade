@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
@@ -53,8 +54,9 @@ func run(cmd *cobra.Command, _ []string) error {
 	svcs := app.BuildServices(deps)
 
 	// Start health server for non-API modes (api-server serves /health on its own port)
+	var hs *services.HealthServer
 	if cfg.Mode != "api-server" {
-		hs := services.NewHealthServer(cfg.Health.Port, logger)
+		hs = services.NewHealthServer(cfg.Health.Port, logger)
 		hs.Start(ctx)
 	}
 
@@ -76,6 +78,10 @@ func run(cmd *cobra.Command, _ []string) error {
 		}(svc)
 	}
 
+	if hs != nil {
+		hs.SetReady(true)
+	}
+
 	select {
 	case sig := <-sigCh:
 		logger.Info("received signal, shutting down", zap.String("signal", sig.String()))
@@ -83,17 +89,33 @@ func run(cmd *cobra.Command, _ []string) error {
 		logger.Error("service error, shutting down", zap.Error(err))
 	}
 
+	// Fail readiness, then wait for kube-proxy to drop the endpoint before draining.
+	if hs != nil {
+		hs.SetReady(false)
+	}
+	time.Sleep(5 * time.Second)
+
 	cancel()
 
-	for _, svc := range svcs {
-		logger.Info("stopping service", zap.String("service", svc.Name()))
-		if err := svc.Stop(); err != nil {
-			logger.Error("error stopping service", zap.String("service", svc.Name()), zap.Error(err))
+	// Bound shutdown so a hung Stop() can't outlive terminationGracePeriodSeconds.
+	done := make(chan struct{})
+	go func() {
+		for _, svc := range svcs {
+			logger.Info("stopping service", zap.String("service", svc.Name()))
+			if err := svc.Stop(); err != nil {
+				logger.Error("error stopping service", zap.String("service", svc.Name()), zap.Error(err))
+			}
 		}
-	}
+		wg.Wait()
+		close(done)
+	}()
 
-	wg.Wait()
-	logger.Info("arcade stopped")
+	select {
+	case <-done:
+		logger.Info("arcade stopped")
+	case <-time.After(30 * time.Second):
+		logger.Warn("shutdown timed out after 30s, forcing exit")
+	}
 	return nil
 }
 

@@ -90,12 +90,9 @@ change only the lines shown below.
 network: mainnet
 ```
 
-Caution: this is the live network. Two things to consider before exposing it:
-
-- Set `merkle_service.url` and `callback_token` together if you want STUMP
-  callbacks. arcade refuses to start with one set and the other empty.
-- Bind `api.host` to a private interface (or front it with auth) if the host is
-  reachable from the public internet.
+Caution: this is the live network. Bind `api.host` to a private interface (or
+front it with auth) if the host is reachable from the public internet. See the
+[Merkle Service](#merkle-service) section below for the mainnet endpoint.
 
 ### testnet — public BSV testnet
 
@@ -129,6 +126,70 @@ Two regtest-specific constraints, enforced at config load:
 - `chaintracks_server` is auto-disabled regardless of what you set; the
   embedded chaintracks library has no regtest genesis header.
 
+## Merkle Service
+
+Arcade delegates merkle-proof construction to a separate **Merkle Service**.
+The service watches the network for arcade's registered txids and drives the
+transaction lifecycle forward via callbacks
+(`SEEN_ON_NETWORK` → `MINED` → `IMMUTABLE`).
+
+**If `merkle_service.url` is left empty, arcade still accepts and broadcasts
+transactions, but every row stays at `RECEIVED` forever** — no callback source
+means nothing advances the state machine. Configure Merkle Service whenever
+you want real status progression.
+
+### Public Merkle Service endpoints
+
+| Network       | URL                                                 |
+| ------------- | --------------------------------------------------- |
+| `mainnet`     | `https://merkle-service-us-1.bsvb.tech`             |
+| `testnet`     | `https://merkle-service-testnet-us-1.bsvb.tech`     |
+| `teratestnet` | `https://merkle-service-ttn-us-1.bsvb.tech`         |
+| `regtest`     | bring your own — no public instance                 |
+
+### Generate a callback auth token
+
+Merkle Service authenticates its inbound callbacks to arcade with a bearer
+token. Generate a high-entropy value:
+
+```bash
+openssl rand -hex 32
+```
+
+The same value must also be configured on the Merkle Service side so it can
+attach `Authorization: Bearer <token>` to its callback requests. Arcade
+**refuses to start** when `merkle_service.url` is set without `callback_token`
+— an unauthenticated callback receiver would accept forged status updates for
+any txid.
+
+### Set `callback_url`
+
+`callback_url` is the **public URL at which Merkle Service can reach this
+arcade instance**, with path `/api/v1/merkle-service/callback`. Merkle
+Service POSTs status updates here, so it must be resolvable and routable
+*from Merkle Service*, not just from your laptop.
+
+Examples:
+
+- Public deployment: `https://arcade.example.com/api/v1/merkle-service/callback`
+- Local dev with Merkle Service running in Docker on the same host:
+  `http://host.docker.internal:8080/api/v1/merkle-service/callback`
+
+### Example config block
+
+Append the following to your `config.yaml`. Note that `callback_url` and
+`callback_token` are **top-level** keys; only `url` and `auth_token` live
+under `merkle_service:`.
+
+```yaml
+callback_url: "https://arcade.example.com/api/v1/merkle-service/callback"
+callback_token: "<output of openssl rand -hex 32>"
+
+merkle_service:
+  url: "https://merkle-service-ttn-us-1.bsvb.tech"  # match your network
+  auth_token: ""  # only if your Merkle Service requires outbound auth from arcade
+```
+
 ## Verify it's running
 
 ```bash
@@ -158,15 +219,16 @@ curl http://localhost:8080/tx/<txid>
 
 ## Common next steps
 
-- **Enable Merkle Service callbacks** — set `merkle_service.url` and
-  `callback_token` in `config.yaml`. Both are required together. See
-  [`config.example.yaml`](../config.example.yaml).
+- **Enable Merkle Service callbacks** — without this, all transactions stay
+  at `RECEIVED`. See the [Merkle Service](#merkle-service) section above.
 - **Use embedded PostgreSQL instead of Pebble** — uncomment the alternative
   `store:` block in [`config.example.standalone.yaml`](../config.example.standalone.yaml).
   The first run extracts the postgres binary, which takes a few seconds.
 - **Production deployment** — start from
   [`config.example.yaml`](../config.example.yaml), which uses external Kafka
-  brokers and an Aerospike cluster.
+  brokers and an Aerospike cluster. Pre-create Kafka topics per
+  [`docs/production-kafka.md`](production-kafka.md) — arcade does not create
+  them and `arcade.propagation` has a hard partition-count constraint.
 
 Any value above can be overridden by an environment variable prefixed with
 `ARCADE_`, e.g. `ARCADE_LOG_LEVEL=debug` or `ARCADE_NETWORK=mainnet`.

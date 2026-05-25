@@ -84,7 +84,7 @@ func (s *Service) Start(ctx context.Context) error {
 
 	go func() {
 		<-ctx.Done()
-		_ = s.Stop()
+		_ = s.Stop() //nolint:contextcheck // Stop uses context.Background() so the 15s drain outlives the parent ctx that just fired.
 	}()
 
 	if err := s.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -97,7 +97,9 @@ func (s *Service) Start(ctx context.Context) error {
 func (s *Service) Stop() error {
 	if s.server != nil {
 		s.logger.Info("shutting down SSE service")
-		return s.server.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		return s.server.Shutdown(ctx)
 	}
 	return nil
 }

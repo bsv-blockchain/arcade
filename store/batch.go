@@ -19,7 +19,7 @@ import (
 // validator parallelism (which defaults to runtime.NumCPU). Stored as int32
 // atomically so concurrent batch calls observe the latest value without a
 // lock on every read.
-var batchConcurrency int32 = int32(runtime.NumCPU())
+var batchConcurrency = int32(runtime.NumCPU())
 
 // SetBatchConcurrency overrides the parallel-loop helper concurrency at
 // process start. Zero or negative values restore the runtime.NumCPU default.
