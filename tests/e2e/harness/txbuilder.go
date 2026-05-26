@@ -65,19 +65,22 @@ func BuildTxs(n int, startNonce uint32) []*bt.Tx {
 }
 
 // BuildValidatableTxs returns n synthetic transactions that pass
-// arcade's structural validator (the only validator step left after
-// scripts and fees are skipped). Each tx has:
+// arcade's intake validator (structural policy + script execution +
+// fee check; merkle proofs on parents are trusted). Each tx has:
 //
-//   - One input pointing at a non-zero source txid + non-data locking
-//     script + finite satoshis (so checkInputs accepts it as not-coinbase).
-//   - One output with non-data locking script + 1 satoshi (passes
-//     checkOutputs).
+//   - One input pointing at a non-zero source txid + OP_TRUE locking
+//     script + 10_000 satoshis (passes checkInputs as non-coinbase and
+//     covers the fee floor by a wide margin).
+//   - One output with OP_TRUE locking script + 1 satoshi (passes
+//     checkOutputs; remaining ~9999 sats become fee).
 //   - LockTime = startNonce + i, ensuring each tx hashes differently.
 //
-// Scripts are intentionally minimal (OP_TRUE, single byte 0x51) — that
-// satisfies arcade's IsData heuristic without dragging in real
-// signing. The result serializes to ~62 bytes, just over the
-// minTxSizeBytes=61 floor.
+// OP_TRUE (0x51) is a trivially-satisfied locking script — an empty
+// unlocking script evaluates to true against it, so script execution
+// inside spv.Verify succeeds without any signing. Callers must serialize
+// these via ExtendedBytes() so arcade's go-sdk parser sees the per-input
+// source script + satoshis (otherwise GetFee returns "PreviousTx not
+// supplied" inside the fee check).
 func BuildValidatableTxs(n int, startNonce uint32) []*bt.Tx {
 	out := make([]*bt.Tx, n)
 	// Reused across all txs so we don't re-allocate the same constant
@@ -87,20 +90,15 @@ func BuildValidatableTxs(n int, startNonce uint32) []*bt.Tx {
 	for i := 0; i < n; i++ {
 		tx := bt.NewTx()
 		tx.LockTime = startNonce + uint32(i) //nolint:gosec // bounded by caller
-		// Input: previous-output-script and previous-output-satoshis are
-		// what bt persists into UTXO data, used by validators that walk
-		// inputs. Empty unlocking script is fine since scripts are
-		// skipped at validation time.
 		input := &bt.Input{
 			SequenceNumber: 0xffffffff,
 		}
 		_ = input.PreviousTxIDAdd(toChainHashBT(prevTxIDBytes))
 		input.PreviousTxOutIndex = 0
 		input.PreviousTxScript = nonDataScript()
-		input.PreviousTxSatoshis = 1000
+		input.PreviousTxSatoshis = 10000
 		input.UnlockingScript = emptyScript()
 		tx.Inputs = append(tx.Inputs, input)
-		// Output: 1 satoshi to a non-data script (single OP_TRUE).
 		tx.AddOutput(&bt.Output{
 			Satoshis:      1,
 			LockingScript: nonDataScript(),

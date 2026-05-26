@@ -19,12 +19,14 @@ import (
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 )
 
-// BroadcastTx submits a single transaction to arcade via POST /tx.
-// The body is the raw tx bytes; arcade auto-detects the format.
+// BroadcastTx submits a single transaction to arcade via POST /tx in
+// Extended Format. Arcade's intake validator runs script execution and
+// fee verification against the per-input source data EF carries; raw
+// (non-EF) bytes would be rejected for "PreviousTx not supplied".
 // Returns the txid arcade derived from the parsed transaction.
 func BroadcastTx(ctx context.Context, t *testing.T, rt *ArcadeRuntime, tx *bt.Tx) (string, error) {
 	t.Helper()
-	body := bytes.NewReader(tx.Bytes())
+	body := bytes.NewReader(tx.ExtendedBytes())
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rt.BaseURL+"/tx", body)
 	if err != nil {
 		return "", fmt.Errorf("build request: %w", err)
