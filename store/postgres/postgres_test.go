@@ -412,6 +412,83 @@ func TestSubmissions_InsertAndQueryByTxID(t *testing.T) {
 	}
 }
 
+// TestUpdateDeliveryStatusCAS_RowAffected is the postgres-side regression for
+// issue #166: only one of two concurrent claims with the same `expected`
+// value can win. Asserts (a) the first call returns claimed=true and the row
+// advances, (b) a second call with the same `expected` returns claimed=false
+// and leaves the row alone, (c) the first-delivery case (expected="") works
+// both against a NULL-valued row (the InsertSubmission default) and after a
+// prior CAS that explicitly set the bin.
+func TestUpdateDeliveryStatusCAS_RowAffected(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	sub := &models.Submission{
+		SubmissionID: "sub-cas",
+		TxID:         "tx-cas",
+		CallbackURL:  "https://example.test/cb",
+		CreatedAt:    time.Now(),
+	}
+	if err := s.InsertSubmission(ctx, sub); err != nil {
+		t.Fatal(err)
+	}
+
+	// First-delivery claim: expected is the zero-value Status, stored is NULL.
+	claimed, err := s.UpdateDeliveryStatusCAS(ctx, "sub-cas", "", models.StatusSeenOnNetwork)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimed {
+		t.Fatalf("first claim should succeed (expected='' matches NULL row)")
+	}
+
+	// Second call with the same expected must lose — the row has moved on.
+	claimed, err = s.UpdateDeliveryStatusCAS(ctx, "sub-cas", "", models.StatusMined)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed {
+		t.Fatalf("stale-expected claim should fail after a prior winner")
+	}
+
+	// Subsequent claim with the correct current expected must succeed.
+	claimed, err = s.UpdateDeliveryStatusCAS(ctx, "sub-cas", models.StatusSeenOnNetwork, models.StatusMined)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimed {
+		t.Fatalf("matching-expected claim should succeed")
+	}
+
+	// Confirm the final row state — LastDeliveredStatus advanced, retry
+	// state cleared.
+	got, err := s.GetSubmissionsByTxID(ctx, "tx-cas")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 submission, got %d", len(got))
+	}
+	if got[0].LastDeliveredStatus != models.StatusMined {
+		t.Errorf("LastDeliveredStatus = %q, want MINED", got[0].LastDeliveredStatus)
+	}
+	if got[0].RetryCount != 0 {
+		t.Errorf("RetryCount = %d, want 0 (cleared by CAS)", got[0].RetryCount)
+	}
+	if got[0].NextRetryAt != nil {
+		t.Errorf("NextRetryAt = %v, want nil (cleared by CAS)", got[0].NextRetryAt)
+	}
+
+	// Unknown submission: claim must report false without an error.
+	claimed, err = s.UpdateDeliveryStatusCAS(ctx, "no-such-row", "", models.StatusMined)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed {
+		t.Errorf("claim on missing row should return false")
+	}
+}
+
 func TestLease_AcquireAndRenew(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

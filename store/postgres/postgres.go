@@ -1131,6 +1131,26 @@ WHERE submission_id=$1`
 	return nil
 }
 
+// UpdateDeliveryStatusCAS implements store.Store. The predicate matches both
+// SQL NULL (submission has never been delivered) and the empty string (some
+// callers may persist Status("") explicitly) when expected is the zero value,
+// so the very first delivery for a submission claims correctly.
+func (s *Store) UpdateDeliveryStatusCAS(ctx context.Context, submissionID string, expected, next models.Status) (bool, error) {
+	const q = `
+UPDATE submissions
+SET last_delivered_status=$3, retry_count=0, next_retry_at=NULL
+WHERE submission_id=$1
+  AND (
+    ($2 = '' AND (last_delivered_status IS NULL OR last_delivered_status = ''))
+    OR last_delivered_status = $2
+  )`
+	tag, err := s.pool.Exec(ctx, q, submissionID, string(expected), string(next))
+	if err != nil {
+		return false, fmt.Errorf("update delivery cas: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
 // --- Leaser ---
 
 // TryAcquireOrRenew uses a single CTE to perform CAS-like acquire-or-renew:

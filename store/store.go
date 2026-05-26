@@ -211,6 +211,19 @@ type Store interface {
 	// UpdateDeliveryStatus updates the delivery tracking for a submission
 	UpdateDeliveryStatus(ctx context.Context, submissionID string, lastStatus models.Status, retryCount int, nextRetry *time.Time) error
 
+	// UpdateDeliveryStatusCAS atomically advances LastDeliveredStatus from
+	// `expected` to `next` for the given submission. Returns true iff a row
+	// was updated; false means another replica has already advanced this
+	// submission and the caller should silently skip its POST. The retry
+	// counter and next-retry timestamp are cleared on success — those are
+	// only meaningful while a delivery is in retry state.
+	//
+	// Used by webhook delivery to coordinate exactly-once POSTs across
+	// horizontally-scaled api-server pods. Each replica's events.Publisher
+	// subscription gets its own Kafka consumer group, so every pod sees
+	// every status update; the CAS funnels concurrent attempts down to one.
+	UpdateDeliveryStatusCAS(ctx context.Context, submissionID string, expected, next models.Status) (claimed bool, err error)
+
 	// STUMP operations for Merkle Service integration
 
 	// InsertStump stores a STUMP for a subtree in a specific block.

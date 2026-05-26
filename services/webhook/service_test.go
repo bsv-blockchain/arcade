@@ -66,6 +66,34 @@ func (s *fakeStore) UpdateDeliveryStatus(_ context.Context, id string, last mode
 	return nil
 }
 
+// UpdateDeliveryStatusCAS mirrors the Postgres semantics: the row is updated
+// iff its current LastDeliveredStatus matches `expected`. Concurrent callers
+// in the issue-#166 regression test rely on this behaving as a single-writer
+// CAS, so the mutation runs under s.mu.
+func (s *fakeStore) UpdateDeliveryStatusCAS(_ context.Context, id string, expected, next models.Status) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, list := range s.subs {
+		for _, sub := range list {
+			if sub.SubmissionID != id {
+				continue
+			}
+			if sub.LastDeliveredStatus != expected {
+				return false, nil
+			}
+			sub.LastDeliveredStatus = next
+			sub.RetryCount = 0
+			sub.NextRetryAt = nil
+			s.deliveries = append(s.deliveries, deliveryRecord{
+				SubmissionID: id,
+				LastStatus:   next,
+			})
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // Stubs to satisfy the store.Store interface without referencing the full set.
 func (s *fakeStore) GetOrInsertStatus(context.Context, *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
 	return nil, false, nil
@@ -312,10 +340,14 @@ func TestRetryOnFailure(t *testing.T) {
 		Timestamp: time.Now(),
 	})
 
-	if len(st.deliveries) != 1 {
-		t.Fatalf("expected 1 delivery record, got %d", len(st.deliveries))
+	// CAS claim writes first (advances LastDeliveredStatus, clears retry
+	// state), then recordFailure writes the retry bookkeeping. Both are
+	// captured in st.deliveries by the fakeStore; the retry record is the
+	// last one.
+	if len(st.deliveries) != 2 {
+		t.Fatalf("expected 2 delivery records (CAS claim + retry write), got %d", len(st.deliveries))
 	}
-	d := st.deliveries[0]
+	d := st.deliveries[len(st.deliveries)-1]
 	if d.RetryCount != 1 {
 		t.Errorf("RetryCount = %d, want 1", d.RetryCount)
 	}
@@ -403,11 +435,13 @@ func TestSSRFGuardBlocksLoopbackDial(t *testing.T) {
 	if hits.Load() != 0 {
 		t.Errorf("expected 0 hits (dial refused), got %d", hits.Load())
 	}
-	if len(st.deliveries) != 1 {
-		t.Fatalf("expected 1 delivery record (retry scheduled), got %d", len(st.deliveries))
+	// CAS claim runs before the dial-time SSRF guard fires, so we observe
+	// two records: the claim, then the retry write from recordFailure.
+	if len(st.deliveries) != 2 {
+		t.Fatalf("expected 2 delivery records (CAS claim + retry write), got %d", len(st.deliveries))
 	}
-	if st.deliveries[0].RetryCount != 1 {
-		t.Errorf("RetryCount = %d, want 1", st.deliveries[0].RetryCount)
+	if st.deliveries[len(st.deliveries)-1].RetryCount != 1 {
+		t.Errorf("RetryCount = %d, want 1", st.deliveries[len(st.deliveries)-1].RetryCount)
 	}
 }
 
@@ -526,5 +560,69 @@ func TestStartDecouplesSlowDelivery(t *testing.T) {
 	case <-startErr:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Start did not return after ctx cancel")
+	}
+}
+
+// TestDeliver_ExactlyOnceAcrossConcurrentReplicas is the canonical regression
+// for issue #166. Two Service instances share a single fakeStore — the
+// production equivalent of two api-server pods talking to the same Postgres.
+// Both receive the same status update concurrently. Exactly one POST must
+// reach the receiver; the other instance must record a CAS-lost.
+//
+// Before the CAS fix this test would observe 2 POSTs (one per replica). The
+// shouldDeliver in-memory dedup catches sequential repeats but not concurrent
+// processing across pods.
+func TestDeliver_ExactlyOnceAcrossConcurrentReplicas(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	// Single shared fakeStore — both Service instances see (and mutate) the
+	// same submission row, which is the actual sharing model in production.
+	st := &fakeStore{
+		subs: map[string][]*models.Submission{
+			txA: {{
+				SubmissionID: "sub-1",
+				TxID:         txA,
+				CallbackURL:  srv.URL,
+			}},
+		},
+	}
+
+	cfg := config.WebhookConfig{HTTPTimeoutMs: 1000, MaxRetries: 3, InitialBackoffMs: 1}
+	cb := config.CallbackConfig{AllowPrivateIPs: true}
+	svcA := New(cfg, cb, zap.NewNop(), recordingPub{}, st)
+	svcB := New(cfg, cb, zap.NewNop(), recordingPub{}, st)
+
+	status := &models.TransactionStatus{
+		TxID:      txA,
+		Status:    models.StatusMined,
+		Timestamp: time.Now(),
+	}
+
+	// Race both replicas through handleUpdate against the same status.
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for _, svc := range []*Service{svcA, svcB} {
+		svc := svc
+		go func() {
+			defer wg.Done()
+			<-start
+			svc.handleUpdate(t.Context(), status)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 callback POST, got %d (CAS fix regressed — issue #166)", got)
+	}
+	// Exactly one delivery record (the winner's CAS-success path appends one).
+	if len(st.deliveries) != 1 || st.deliveries[0].LastStatus != models.StatusMined {
+		t.Errorf("expected one MINED delivery record, got %+v", st.deliveries)
 	}
 }

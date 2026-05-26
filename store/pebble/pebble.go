@@ -51,6 +51,11 @@ type Store struct {
 	cfg       config.Pebble
 	insertMu  [getOrInsertShards]sync.Mutex
 	leaseMu   sync.Mutex
+	// submissionMu serializes the read-modify-write sequence in
+	// UpdateDeliveryStatusCAS. Pebble is embedded and single-process, so
+	// a single mutex across all submissions is enough — webhook CAS
+	// contention is in the low-Hz range even at peak.
+	submissionMu sync.Mutex
 }
 
 // storedStatus is the persistence shape for TransactionStatus rows. We keep
@@ -1550,6 +1555,51 @@ func (s *Store) UpdateDeliveryStatus(ctx context.Context, submissionID string, l
 		return err
 	}
 	return s.db.Set(subKey(submissionID), payload, s.writeOpts)
+}
+
+// UpdateDeliveryStatusCAS implements store.Store. The read-modify-write is
+// serialized via submissionMu so a concurrent caller can't observe a stale
+// LastDeliveredStatus between our Get and Set. Pebble has no native CAS;
+// process-local serialization is sufficient because the database is
+// embedded and webhook-delivery contention is exclusively cross-replica in
+// the Postgres deployment shape, not within one Pebble process.
+func (s *Store) UpdateDeliveryStatusCAS(ctx context.Context, submissionID string, expected, next models.Status) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	s.submissionMu.Lock()
+	defer s.submissionMu.Unlock()
+
+	v, closer, err := s.db.Get(subKey(submissionID))
+	if errors.Is(err, pebbledb.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var ss storedSubmission
+	if uErr := json.Unmarshal(v, &ss); uErr != nil {
+		_ = closer.Close()
+		return false, uErr
+	}
+	_ = closer.Close()
+
+	if models.Status(ss.LastDeliveredStatus) != expected {
+		return false, nil
+	}
+
+	ss.LastDeliveredStatus = string(next)
+	ss.RetryCount = 0
+	ss.NextRetryUnixNs = 0
+
+	payload, err := json.Marshal(ss)
+	if err != nil {
+		return false, err
+	}
+	if err := s.db.Set(subKey(submissionID), payload, s.writeOpts); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // --- Leaser ---

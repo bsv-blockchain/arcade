@@ -259,18 +259,36 @@ func shouldDeliver(sub *models.Submission, status *models.TransactionStatus) boo
 	}
 }
 
-// deliver attempts a single POST and records the outcome. On failure, it
-// schedules a retry by writing RetryCount+1 and NextRetryAt back to the
-// store; the retry is picked up by a subsequent invocation rather than
-// looping inline, so a slow callback target doesn't block other deliveries.
+// deliver attempts a single POST and records the outcome.
 //
-// On success, it writes LastDeliveredStatus and clears retry state.
+// Cross-replica coordination uses store.UpdateDeliveryStatusCAS as a claim
+// primitive: before POSTing, the caller advances LastDeliveredStatus from
+// the value it observed (sub.LastDeliveredStatus) to the new value with a
+// conditional UPDATE. With N api-server replicas all subscribed to the
+// same Kafka topic (each via its own consumer group, so each pod sees
+// every event), exactly one wins the CAS for each transition; the rest
+// silently skip. Issue #166.
+//
+// On POST failure, recordFailure increments RetryCount and writes
+// NextRetryAt. Note that LastDeliveredStatus has already advanced as
+// part of the claim, so the retry path needs a separate event or sweep
+// to re-fire — see the follow-up issue tracked in the PR description.
 func (s *Service) deliver(ctx context.Context, sub *models.Submission, status *models.TransactionStatus) {
 	logger := s.logger.With(
 		zap.String("txid", status.TxID),
 		zap.String("callback_url", sub.CallbackURL),
 		zap.String("status", string(status.Status)),
 	)
+
+	claimed, err := s.store.UpdateDeliveryStatusCAS(ctx, sub.SubmissionID, sub.LastDeliveredStatus, status.Status)
+	if err != nil {
+		logger.Warn("delivery cas failed", zap.Error(err))
+		return
+	}
+	if !claimed {
+		metrics.WebhookCASLostTotal.Inc()
+		return
+	}
 
 	body, err := json.Marshal(status)
 	if err != nil {
@@ -299,9 +317,9 @@ func (s *Service) deliver(ctx context.Context, sub *models.Submission, status *m
 		return
 	}
 
-	if err := s.store.UpdateDeliveryStatus(ctx, sub.SubmissionID, status.Status, 0, nil); err != nil {
-		logger.Warn("updating delivery status after success failed", zap.Error(err))
-	}
+	// CAS already advanced LastDeliveredStatus and cleared retry state, so
+	// there's no second store write on success. recordFailure remains the
+	// only post-claim writer.
 	logger.Debug("callback delivered")
 }
 

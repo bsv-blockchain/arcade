@@ -375,6 +375,19 @@ var WebhookPoolSaturatedTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "Status updates dropped by the webhook service because its delivery worker pool was full.",
 })
 
+// WebhookCASLostTotal counts claim-then-POST attempts that lost the CAS to
+// another replica — the other pod already advanced LastDeliveredStatus for
+// the same submission, so this pod silently skipped its POST. With N
+// horizontally-scaled api-server replicas, this counter is expected to
+// increase at roughly (N - 1) × deliveries: the winner POSTs, the (N - 1)
+// losers count here. A flat zero on a multi-replica deployment means events
+// are not actually flowing through CAS — either the schema migration is
+// missing or only one pod is producing events.
+var WebhookCASLostTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "arcade_webhook_cas_lost_total",
+	Help: "Webhook deliveries skipped because another replica won the LastDeliveredStatus CAS.",
+})
+
 // ---------------------------------------------------------------------------
 // teranode (HTTP client)
 // ---------------------------------------------------------------------------

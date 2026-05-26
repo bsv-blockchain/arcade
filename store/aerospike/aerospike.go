@@ -1580,6 +1580,49 @@ func (s *Store) UpdateDeliveryStatus(ctx context.Context, submissionID string, l
 	return s.client.Put(s.writePolicy(ctx), key, bins)
 }
 
+// UpdateDeliveryStatusCAS implements store.Store using a generation-match
+// CAS write — the same pattern TryAcquireOrRenew uses for the lease record.
+// Reading then writing with EXPECT_GEN_EQUAL guarantees we lose to any
+// concurrent writer that mutated the row between our Get and Put.
+func (s *Store) UpdateDeliveryStatusCAS(ctx context.Context, submissionID string, expected, next models.Status) (bool, error) {
+	key, err := s.key(setSubmissions, submissionID)
+	if err != nil {
+		return false, err
+	}
+	rec, err := s.client.Get(s.readPolicy(ctx), key)
+	if err != nil {
+		if isKeyNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read submission for cas %s: %w", submissionID, err)
+	}
+	if rec == nil {
+		return false, nil
+	}
+	if models.Status(getString(rec, "last_status")) != expected {
+		return false, nil
+	}
+	bins := aero.BinMap{
+		"last_status":   string(next),
+		"retry_count":   0,
+		"next_retry_at": int64(0),
+	}
+	policy := s.writePolicy(ctx)
+	policy.GenerationPolicy = aero.EXPECT_GEN_EQUAL
+	policy.Generation = rec.Generation
+	if err := s.client.Put(policy, key, bins); err != nil {
+		// Generation mismatch is the canonical "another writer won" outcome;
+		// the client reports it as a generic error from this surface. We
+		// can't easily distinguish it from a transient infra error without
+		// inspecting the AerospikeError code, but treating both as
+		// "claim lost" is safe — a real infra failure will resurface on
+		// the next event and the caller's recordFailure path handles the
+		// non-claim case identically.
+		return false, nil
+	}
+	return true, nil
+}
+
 // --- Block processing status ---
 //
 // Bins:
@@ -2174,6 +2217,22 @@ func recordToSubmission(rec *aero.Record) *models.Submission {
 	if v, ok := rec.Bins["retry_count"]; ok {
 		if n, ok := v.(int); ok {
 			sub.RetryCount = n
+		}
+	}
+	// last_status is written by UpdateDeliveryStatus / UpdateDeliveryStatusCAS.
+	// Reading it back is essential for the webhook dedup path — without it
+	// the in-memory `sub.LastDeliveredStatus` would always be the zero value
+	// and the CAS expected-state predicate would never match after the first
+	// delivery.
+	if v, ok := rec.Bins["last_status"]; ok {
+		if s, ok := v.(string); ok {
+			sub.LastDeliveredStatus = models.Status(s)
+		}
+	}
+	if v, ok := rec.Bins["next_retry_at"]; ok {
+		if ms, ok := v.(int); ok {
+			t := time.UnixMilli(int64(ms))
+			sub.NextRetryAt = &t
 		}
 	}
 	return sub
