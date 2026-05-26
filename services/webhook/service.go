@@ -327,6 +327,13 @@ func (s *Service) deliver(ctx context.Context, sub *models.Submission, status *m
 // next-retry timestamp using exponential backoff bounded by MaxBackoffMs.
 // Once RetryCount exceeds MaxRetries the submission is marked terminal so
 // the reaper / future retry sweeps skip it.
+//
+// IMPORTANT: must write status.Status (the post-CAS value) as the lastStatus
+// argument, NOT sub.LastDeliveredStatus (the pre-CAS in-memory value).
+// Writing the pre-CAS value here would amount to an unconditional rollback
+// of the claim and could clobber a concurrent CAS-success on a later
+// transition — see issue #166. The CAS is the authoritative state advance;
+// recordFailure only updates retry bookkeeping.
 func (s *Service) recordFailure(ctx context.Context, sub *models.Submission, status *models.TransactionStatus, logger *zap.Logger, reason string) {
 	maxRetries := s.cfg.MaxRetries
 	if maxRetries <= 0 {
@@ -345,7 +352,7 @@ func (s *Service) recordFailure(ctx context.Context, sub *models.Submission, sta
 
 	backoff := s.computeBackoff(nextCount)
 	next := time.Now().Add(backoff)
-	if err := s.store.UpdateDeliveryStatus(ctx, sub.SubmissionID, sub.LastDeliveredStatus, nextCount, &next); err != nil {
+	if err := s.store.UpdateDeliveryStatus(ctx, sub.SubmissionID, status.Status, nextCount, &next); err != nil {
 		logger.Warn("scheduling retry failed", zap.Error(err))
 	}
 }
