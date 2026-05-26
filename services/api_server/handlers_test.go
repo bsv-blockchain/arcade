@@ -179,6 +179,10 @@ func (m *mockStore) UpdateDeliveryStatusCAS(context.Context, string, models.Stat
 	return true, nil
 }
 
+func (m *mockStore) ListSubmissionsReadyForRetry(context.Context, time.Time, int) ([]*models.Submission, error) {
+	return nil, nil
+}
+
 func (m *mockStore) InsertStump(_ context.Context, stump *models.Stump) error {
 	if m.insertStumpErr != nil {
 		return m.insertStumpErr

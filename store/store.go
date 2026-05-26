@@ -224,6 +224,15 @@ type Store interface {
 	// every status update; the CAS funnels concurrent attempts down to one.
 	UpdateDeliveryStatusCAS(ctx context.Context, submissionID string, expected, next models.Status) (claimed bool, err error)
 
+	// ListSubmissionsReadyForRetry returns up to limit submissions whose
+	// delivery is in retry state (retry_count > 0 and next_retry_at <= now).
+	// The webhook reaper consumes this to re-fire deliveries whose POST
+	// failed after CAS already advanced LastDeliveredStatus — without this
+	// sweep, the retry bookkeeping written by recordFailure would never be
+	// consumed and a single-attempt failure would be a permanent loss.
+	// Ordered by next_retry_at ASC so the oldest backlog drains first.
+	ListSubmissionsReadyForRetry(ctx context.Context, now time.Time, limit int) ([]*models.Submission, error)
+
 	// STUMP operations for Merkle Service integration
 
 	// InsertStump stores a STUMP for a subtree in a specific block.

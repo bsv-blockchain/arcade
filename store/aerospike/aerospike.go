@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/bsv-blockchain/go-sdk/transaction"
 
 	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
 )
@@ -1611,16 +1613,95 @@ func (s *Store) UpdateDeliveryStatusCAS(ctx context.Context, submissionID string
 	policy.GenerationPolicy = aero.EXPECT_GEN_EQUAL
 	policy.Generation = rec.Generation
 	if err := s.client.Put(policy, key, bins); err != nil {
-		// Generation mismatch is the canonical "another writer won" outcome;
-		// the client reports it as a generic error from this surface. We
-		// can't easily distinguish it from a transient infra error without
-		// inspecting the AerospikeError code, but treating both as
-		// "claim lost" is safe — a real infra failure will resurface on
-		// the next event and the caller's recordFailure path handles the
-		// non-claim case identically.
+		// Generation mismatch is the canonical "another writer won" outcome
+		// and is treated as a normal claim-lost — the caller silently skips
+		// its POST. A non-gen error (network blip, namespace unhealthy, etc.)
+		// is also behaviorally safe to surface as claim-lost (the next event
+		// or webhook-reaper tick retries), but it should NOT be invisible:
+		// without a counter, a flat WebhookCASLostTotal in production could
+		// hide a backend that's failing every CAS write. Emit a distinct
+		// metric so the two are distinguishable on dashboards.
+		if !isGenerationErr(err) {
+			metrics.WebhookCASErrorTotal.Inc()
+		}
 		return false, nil
 	}
 	return true, nil
+}
+
+// ListSubmissionsReadyForRetry returns up to limit submissions whose POST
+// previously failed (retry_count > 0) and whose next_retry_at has elapsed.
+// There is no secondary index on submission retry bins (the in-retry working
+// set is small enough that the cost of an index isn't justified), so this
+// scans the set and filters in code — the same approach GetReadyRetries uses
+// against the transactions set.
+func (s *Store) ListSubmissionsReadyForRetry(ctx context.Context, now time.Time, limit int) ([]*models.Submission, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	stmt := aero.NewStatement(s.namespace, setSubmissions)
+	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
+	if rs != nil {
+		defer func() { _ = rs.Close() }()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query submissions ready for retry: %w", err)
+	}
+
+	nowMs := now.UnixMilli()
+	type candidate struct {
+		sub    *models.Submission
+		nextMs int64
+	}
+	candidates := make([]candidate, 0, limit)
+	var loopErr error
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			loopErr = ctx.Err()
+			break loop
+		case rec, ok := <-rs.Results():
+			if !ok {
+				break loop
+			}
+			if rec.Err != nil {
+				loopErr = rec.Err
+				break loop
+			}
+			retry := getInt(rec.Record, "retry_count")
+			nextMs := getInt64(rec.Record, "next_retry_at")
+			if retry <= 0 || nextMs <= 0 || nextMs > nowMs {
+				continue
+			}
+			sub := recordToSubmission(rec.Record)
+			if sub == nil {
+				continue
+			}
+			candidates = append(candidates, candidate{sub: sub, nextMs: nextMs})
+		}
+	}
+	if loopErr != nil {
+		return nil, loopErr
+	}
+
+	// Sort by next_retry_at ASC so the oldest backlog drains first, then
+	// truncate. Sorting after the scan avoids reading the whole set into a
+	// heap; backlog is bounded by failed-callback cardinality.
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].nextMs < candidates[j].nextMs
+	})
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	out := make([]*models.Submission, len(candidates))
+	for i, c := range candidates {
+		out[i] = c.sub
+	}
+	return out, nil
 }
 
 // --- Block processing status ---

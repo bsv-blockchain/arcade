@@ -525,6 +525,16 @@ type WebhookConfig struct {
 	// budget. Increase only if pool saturation
 	// (arcade_webhook_pool_saturated_total) shows non-trivial drop rate.
 	MaxConcurrentDeliveries int `mapstructure:"max_concurrent_deliveries"`
+	// ReaperIntervalMs controls how often the webhook retry sweep runs.
+	// The sweep re-fires deliveries whose POST failed and whose
+	// NextRetryAt has elapsed — without it, the CAS-at-claim-time advance
+	// of LastDeliveredStatus would leave a single-attempt failure as a
+	// permanent loss. Default 30s, matching propagation's reaper cadence.
+	ReaperIntervalMs int `mapstructure:"reaper_interval_ms"`
+	// LeaseTTLMs controls how long the webhook-reaper lease is valid.
+	// Only the lease holder runs the sweep; the rest of the replicas
+	// no-op. Default 3 × ReaperIntervalMs.
+	LeaseTTLMs int `mapstructure:"lease_ttl_ms"`
 }
 
 // CallbackConfig governs the SSRF guard that protects api-server's

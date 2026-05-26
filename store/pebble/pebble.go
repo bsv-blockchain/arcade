@@ -1602,6 +1602,57 @@ func (s *Store) UpdateDeliveryStatusCAS(ctx context.Context, submissionID string
 	return true, nil
 }
 
+// ListSubmissionsReadyForRetry walks the sub: prefix and returns rows where
+// RetryCount > 0 and NextRetryUnixNs has elapsed. There is no native ordered
+// retry index on submissions (the in-retry working set is small enough that
+// the cost of building one isn't justified), so the iteration is followed by
+// an in-code sort.
+func (s *Store) ListSubmissionsReadyForRetry(ctx context.Context, now time.Time, limit int) ([]*models.Submission, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	prefix := []byte(prefixSub)
+	iter, err := s.db.NewIter(&pebbledb.IterOptions{
+		LowerBound: prefix,
+		UpperBound: endOfPrefix(prefix),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = iter.Close() }()
+
+	nowNs := now.UnixNano()
+	candidates := make([]storedSubmission, 0)
+	for iter.First(); iter.Valid(); iter.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		var ss storedSubmission
+		if err := json.Unmarshal(iter.Value(), &ss); err != nil {
+			continue
+		}
+		if ss.RetryCount <= 0 || ss.NextRetryUnixNs <= 0 || ss.NextRetryUnixNs > nowNs {
+			continue
+		}
+		candidates = append(candidates, ss)
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].NextRetryUnixNs < candidates[j].NextRetryUnixNs
+	})
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	out := make([]*models.Submission, len(candidates))
+	for i, ss := range candidates {
+		out[i] = ss.toModel()
+	}
+	return out, nil
+}
+
 // --- Leaser ---
 
 // TryAcquireOrRenew uses a single mutex across all lease names — standalone

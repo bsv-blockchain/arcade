@@ -352,7 +352,7 @@ func BuildServices(d *Deps) []services.Service {
 		svcs = append(svcs, propagation.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.Leaser, d.TeranodeClient, d.MerkleClient))
 	}
 	if shouldRun("api-server") || shouldRun("webhook") {
-		svcs = append(svcs, webhook.New(cfg.Webhook, cfg.Callback, d.Logger, d.Publisher, d.Store))
+		svcs = append(svcs, webhook.New(cfg.Webhook, cfg.Callback, d.Logger, d.Publisher, d.Store, d.Leaser))
 	}
 	if shouldRun("propagation") || shouldRun("p2p-client") {
 		svcs = append(svcs, p2p_client.New(cfg, d.Logger, d.Producer, d.TeranodeClient, d.Store))

@@ -388,6 +388,43 @@ var WebhookCASLostTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "Webhook deliveries skipped because another replica won the LastDeliveredStatus CAS.",
 })
 
+// WebhookCASErrorTotal counts CAS attempts that failed with a real infra
+// error rather than a generation mismatch — surfaced separately so a flat
+// WebhookCASLostTotal can't mask a backend that's silently failing every
+// write. Only the Aerospike backend emits this today: its CAS path collapses
+// gen-mismatch and infra errors into the same (false, nil) return shape, so
+// the metric is the one observable signal that distinguishes them. Postgres
+// and Pebble propagate infra errors through the function's `err` return and
+// the caller already logs those.
+var WebhookCASErrorTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "arcade_webhook_cas_error_total",
+	Help: "Webhook CAS writes that failed with an infra error (distinct from generation mismatch).",
+})
+
+// WebhookReaperLease is 1 when this pod holds the webhook-reaper lease, 0
+// otherwise. With N replicas, exactly one is expected to be 1 at any time.
+var WebhookReaperLease = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "arcade_webhook_reaper_lease",
+	Help: "1 when this pod holds the webhook-reaper lease, 0 otherwise.",
+})
+
+// WebhookReaperTickTotal tracks reaper ticks by outcome (ran /
+// skipped_no_leader / lease_error). Skipped_no_leader is the expected steady
+// state on N-1 replicas; a sustained lease_error rate points at the store
+// backend being unhealthy.
+var WebhookReaperTickTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_webhook_reaper_tick_total",
+	Help: "Webhook reaper ticks by outcome (ran / skipped_no_leader / lease_error).",
+}, []string{labelOutcome})
+
+// WebhookReaperReadyDepth is the number of submissions the most recent reaper
+// tick observed as ready-for-retry. A sustained non-zero value means the
+// backlog of failed POSTs is growing faster than the reaper can drain it.
+var WebhookReaperReadyDepth = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "arcade_webhook_reaper_ready_depth",
+	Help: "Submissions the last webhook-reaper tick observed as ready-for-retry.",
+})
+
 // ---------------------------------------------------------------------------
 // teranode (HTTP client)
 // ---------------------------------------------------------------------------

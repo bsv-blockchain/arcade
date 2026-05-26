@@ -1151,6 +1151,54 @@ WHERE submission_id=$1
 	return tag.RowsAffected() == 1, nil
 }
 
+// ListSubmissionsReadyForRetry returns up to limit submissions whose POST
+// previously failed (retry_count > 0) and whose backoff has elapsed
+// (next_retry_at <= now). Backed by the idx_sub_retry_ready partial index so
+// the scan stays proportional to the in-retry backlog, not to the full
+// submissions table.
+func (s *Store) ListSubmissionsReadyForRetry(ctx context.Context, now time.Time, limit int) ([]*models.Submission, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	const q = `
+SELECT submission_id, txid, callback_url, callback_token, full_status_updates,
+       last_delivered_status, retry_count, next_retry_at, created_at
+FROM submissions
+WHERE retry_count > 0
+  AND next_retry_at IS NOT NULL
+  AND next_retry_at <= $1
+ORDER BY next_retry_at ASC
+LIMIT $2`
+	rows, err := s.pool.Query(ctx, q, now, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list submissions ready for retry: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*models.Submission
+	for rows.Next() {
+		sub := &models.Submission{}
+		var lastStatus *string
+		var nextRetry *time.Time
+		if err := rows.Scan(
+			&sub.SubmissionID, &sub.TxID, &sub.CallbackURL, &sub.CallbackToken,
+			&sub.FullStatusUpdates, &lastStatus, &sub.RetryCount, &nextRetry,
+			&sub.CreatedAt,
+		); err != nil {
+			return out, err
+		}
+		if lastStatus != nil {
+			sub.LastDeliveredStatus = models.Status(*lastStatus)
+		}
+		if nextRetry != nil {
+			t := *nextRetry
+			sub.NextRetryAt = &t
+		}
+		out = append(out, sub)
+	}
+	return out, rows.Err()
+}
+
 // --- Leaser ---
 
 // TryAcquireOrRenew uses a single CTE to perform CAS-like acquire-or-renew:

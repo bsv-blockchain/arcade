@@ -10,10 +10,13 @@ package webhook
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -49,31 +52,72 @@ type Service struct {
 	store     store.Store
 	client    *http.Client
 
+	// leaser, holderID, reaperInterval and leaseTTL govern the webhook
+	// retry sweep — see reaper.go. leaser may be nil in tests and single-
+	// process deployments; the sweep is then skipped and event-driven
+	// delivery is the only retry path.
+	leaser         store.Leaser
+	holderID       string
+	reaperInterval time.Duration
+	leaseTTL       time.Duration
+
 	mu      sync.Mutex
 	running bool
 }
 
 // New constructs a Service. publisher must be non-nil; store provides
-// submission lookup and retry persistence. The HTTP client is constructed
-// here so each Service has its own pool — keeps tests hermetic.
+// submission lookup and retry persistence. leaser may be nil — in that case
+// the retry sweep is disabled and event-driven delivery is the only retry
+// path (acceptable for tests and single-process deployments). The HTTP
+// client is constructed here so each Service has its own pool — keeps tests
+// hermetic.
 //
 // callbackCfg threads the SSRF guard through to the dialer: when
 // AllowPrivateIPs is false (the default), the underlying transport
 // refuses to connect to loopback / link-local / RFC1918 / metadata IPs
 // even if a host previously survived registration-time validation
 // (catches DNS rebinding). See finding F-017 / issue #75.
-func New(cfg config.WebhookConfig, callbackCfg config.CallbackConfig, logger *zap.Logger, publisher events.Publisher, st store.Store) *Service {
+func New(cfg config.WebhookConfig, callbackCfg config.CallbackConfig, logger *zap.Logger, publisher events.Publisher, st store.Store, leaser store.Leaser) *Service {
 	timeout := time.Duration(cfg.HTTPTimeoutMs) * time.Millisecond
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
-	return &Service{
-		cfg:       cfg,
-		logger:    logger.Named("webhook"),
-		publisher: publisher,
-		store:     st,
-		client:    newCallbackClient(timeout, callbackCfg.AllowPrivateIPs),
+	reaperInterval := time.Duration(cfg.ReaperIntervalMs) * time.Millisecond
+	if reaperInterval <= 0 {
+		reaperInterval = 30 * time.Second
 	}
+	leaseTTL := time.Duration(cfg.LeaseTTLMs) * time.Millisecond
+	if leaseTTL <= 0 {
+		leaseTTL = 3 * reaperInterval
+	}
+	return &Service{
+		cfg:            cfg,
+		logger:         logger.Named("webhook"),
+		publisher:      publisher,
+		store:          st,
+		client:         newCallbackClient(timeout, callbackCfg.AllowPrivateIPs),
+		leaser:         leaser,
+		holderID:       newHolderID(),
+		reaperInterval: reaperInterval,
+		leaseTTL:       leaseTTL,
+	}
+}
+
+// newHolderID returns a lease-holder identifier stable for this process's
+// lifetime: "<hostname>-<8-hex-chars>". The random suffix disambiguates
+// restarts — if an old expired-but-not-yet-purged record still names the
+// previous incarnation by hostname alone, the new process will see it as a
+// foreign holder and wait for TTL rather than believe it already owns the
+// lease. Mirrors propagation.newHolderID; kept separate to avoid a
+// cross-package import for a five-line helper.
+func newHolderID() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown"
+	}
+	var buf [4]byte
+	_, _ = rand.Read(buf[:])
+	return host + "-" + hex.EncodeToString(buf[:])
 }
 
 // newCallbackClient builds an http.Client whose dialer enforces the SSRF
@@ -149,9 +193,22 @@ func (s *Service) Start(ctx context.Context) error {
 			}
 		}()
 	}
+	// Retry sweep — re-fires deliveries whose POST failed and whose
+	// NextRetryAt has elapsed. Without this, the CAS-at-claim-time advance
+	// of LastDeliveredStatus would make a single-attempt failure permanent.
+	// Skipped when no leaser is wired (tests / single-process).
+	var reaperWG sync.WaitGroup
+	if s.leaser != nil {
+		reaperWG.Add(1)
+		go func() {
+			defer reaperWG.Done()
+			s.runReaper(ctx)
+		}()
+	}
 	defer func() {
 		close(work)
 		wg.Wait()
+		reaperWG.Wait()
 	}()
 
 	for {
@@ -270,9 +327,12 @@ func shouldDeliver(sub *models.Submission, status *models.TransactionStatus) boo
 // silently skip. Issue #166.
 //
 // On POST failure, recordFailure increments RetryCount and writes
-// NextRetryAt. Note that LastDeliveredStatus has already advanced as
-// part of the claim, so the retry path needs a separate event or sweep
-// to re-fire — see the follow-up issue tracked in the PR description.
+// NextRetryAt. LastDeliveredStatus has already advanced as part of the
+// claim, so an event re-arriving with the same status is now a dedup
+// rather than a retry trigger. The lease-gated webhook reaper
+// (see reaper.go) closes that gap: it sweeps submissions whose
+// NextRetryAt has elapsed and re-runs deliver for them, so a transient
+// 5xx no longer translates into permanent loss.
 func (s *Service) deliver(ctx context.Context, sub *models.Submission, status *models.TransactionStatus) {
 	logger := s.logger.With(
 		zap.String("txid", status.TxID),

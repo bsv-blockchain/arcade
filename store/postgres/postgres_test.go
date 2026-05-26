@@ -489,6 +489,93 @@ func TestUpdateDeliveryStatusCAS_RowAffected(t *testing.T) {
 	}
 }
 
+// TestListSubmissionsReadyForRetry covers the webhook reaper's scan predicate:
+// only rows whose retry_count > 0 AND next_retry_at <= now appear, ordered by
+// next_retry_at ASC, and `limit` truncates correctly. Backed by
+// idx_sub_retry_ready (partial index, defined in schema.sql).
+func TestListSubmissionsReadyForRetry(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	now := time.Now()
+	past := now.Add(-1 * time.Minute)
+	earlier := now.Add(-5 * time.Minute)
+	future := now.Add(1 * time.Minute)
+
+	// Seed: three submissions in retry (ready now), one ready-but-in-future,
+	// one with retry_count=0 (not in retry at all).
+	rows := []struct {
+		id    string
+		count int
+		next  *time.Time
+	}{
+		{"sub-ready-old", 2, &earlier},  // oldest ready — expect first
+		{"sub-ready-new", 1, &past},     // ready, but newer than -old
+		{"sub-future", 1, &future},      // not yet due
+		{"sub-no-retry", 0, nil},        // never failed — not in retry
+		{"sub-ready-third", 3, &past},   // ready, second in time order
+	}
+	for _, r := range rows {
+		sub := &models.Submission{
+			SubmissionID: r.id,
+			TxID:         "tx-" + r.id,
+			CallbackURL:  "https://example.test/cb",
+			CreatedAt:    now,
+		}
+		if err := s.InsertSubmission(ctx, sub); err != nil {
+			t.Fatalf("insert %s: %v", r.id, err)
+		}
+		// InsertSubmission doesn't set retry bins; use UpdateDeliveryStatus
+		// to populate them after insert.
+		if r.count > 0 {
+			if err := s.UpdateDeliveryStatus(ctx, r.id, models.StatusMined, r.count, r.next); err != nil {
+				t.Fatalf("update %s: %v", r.id, err)
+			}
+		}
+	}
+
+	// Limit=10 should return the three ready rows in next_retry_at ASC order.
+	got, err := s.ListSubmissionsReadyForRetry(ctx, now, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("expected 3 ready submissions, got %d (%+v)", len(got), got)
+	}
+	wantOrder := []string{"sub-ready-old", "sub-ready-new", "sub-ready-third"}
+	for i, w := range wantOrder {
+		if got[i].SubmissionID != w {
+			t.Errorf("position %d: got %q, want %q (full order: %v)", i, got[i].SubmissionID, w, submissionIDs(got))
+		}
+	}
+
+	// Limit=1 should return only the earliest.
+	got, err = s.ListSubmissionsReadyForRetry(ctx, now, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].SubmissionID != "sub-ready-old" {
+		t.Fatalf("limit=1 returned %+v, want [sub-ready-old]", submissionIDs(got))
+	}
+
+	// Limit=0 short-circuits to empty (matches the documented contract).
+	got, err = s.ListSubmissionsReadyForRetry(ctx, now, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("limit=0 should return empty, got %+v", got)
+	}
+}
+
+func submissionIDs(subs []*models.Submission) []string {
+	out := make([]string, len(subs))
+	for i, s := range subs {
+		out[i] = s.SubmissionID
+	}
+	return out
+}
+
 func TestLease_AcquireAndRenew(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
