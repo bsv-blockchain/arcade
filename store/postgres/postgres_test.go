@@ -590,14 +590,17 @@ func TestDatahubEndpoints_UpsertOverwrites(t *testing.T) {
 }
 
 // TestUpdateStatus_TerminalNotOverwritten is the regression for F-003 (#61):
-// once a tx is in a terminal status (MINED, IMMUTABLE, REJECTED,
+// once a tx is in a strictly-terminal status (MINED, IMMUTABLE,
 // DOUBLE_SPEND_ATTEMPTED), a later lower-priority UpdateStatus call (e.g. a
 // stray SEEN_ON_NETWORK callback) must be a silent no-op rather than a clobber.
+// REJECTED is covered separately in TestUpdateStatus_RejectedRecovery —
+// it allows forward recovery to ACCEPTED_BY_NETWORK / SEEN_ON_NETWORK /
+// SEEN_MULTIPLE_NODES so a late peer acceptance can correct an earlier
+// rejection.
 func TestUpdateStatus_TerminalNotOverwritten(t *testing.T) {
 	terminals := []models.Status{
 		models.StatusMined,
 		models.StatusImmutable,
-		models.StatusRejected,
 		models.StatusDoubleSpendAttempted,
 	}
 	regressions := []models.Status{
@@ -642,6 +645,81 @@ func TestUpdateStatus_TerminalNotOverwritten(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestUpdateStatus_RejectedRecovery pins REJECTED's partial-terminal
+// behavior at the postgres layer: forward acceptance/seen states must
+// be reachable so late callbacks from a peer that did accept the tx
+// can correct the status, but regressions to pre-broadcast or retry
+// states must still be silently dropped.
+func TestUpdateStatus_RejectedRecovery(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	allowedForward := []models.Status{
+		models.StatusAcceptedByNetwork,
+		models.StatusSeenOnNetwork,
+		models.StatusSeenMultipleNodes,
+	}
+	for _, next := range allowedForward {
+		t.Run("REJECTED_then_"+string(next), func(t *testing.T) {
+			txid := "tx-rejrec-" + string(next)
+			if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+				TxID: txid, Status: models.StatusReceived,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.UpdateStatus(ctx, &models.TransactionStatus{
+				TxID: txid, Status: models.StatusRejected, Timestamp: time.Now(),
+			}); err != nil {
+				t.Fatalf("seed REJECTED: %v", err)
+			}
+			if err := s.UpdateStatus(ctx, &models.TransactionStatus{
+				TxID: txid, Status: next, Timestamp: time.Now(),
+			}); err != nil {
+				t.Fatalf("forward update: %v", err)
+			}
+			got, err := s.GetStatus(ctx, txid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Status != next {
+				t.Fatalf("REJECTED → %s wrongly dropped (got %s)", next, got.Status)
+			}
+		})
+	}
+
+	blockedRegressions := []models.Status{
+		models.StatusSentToNetwork,
+		models.StatusPendingRetry,
+	}
+	for _, next := range blockedRegressions {
+		t.Run("REJECTED_then_"+string(next)+"_blocked", func(t *testing.T) {
+			txid := "tx-rejblk-" + string(next)
+			if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+				TxID: txid, Status: models.StatusReceived,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.UpdateStatus(ctx, &models.TransactionStatus{
+				TxID: txid, Status: models.StatusRejected, Timestamp: time.Now(),
+			}); err != nil {
+				t.Fatalf("seed REJECTED: %v", err)
+			}
+			if err := s.UpdateStatus(ctx, &models.TransactionStatus{
+				TxID: txid, Status: next, Timestamp: time.Now(),
+			}); err != nil {
+				t.Fatalf("regression update: %v", err)
+			}
+			got, err := s.GetStatus(ctx, txid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Status != models.StatusRejected {
+				t.Fatalf("REJECTED overwritten by %s (got %s)", next, got.Status)
+			}
+		})
 	}
 }
 
@@ -716,10 +794,13 @@ func TestBatchUpdateStatus_TerminalNotOverwritten(t *testing.T) {
 		seedTerm models.Status
 		regress  models.Status
 	}
+	// REJECTED only blocks backward regressions (e.g., SENT_TO_NETWORK),
+	// not forward acceptance/seen states — see TestUpdateStatus_RejectedRecovery
+	// for the full lattice coverage.
 	rows := []row{
 		{"tx-mined", models.StatusMined, models.StatusSeenOnNetwork},
 		{"tx-immutable", models.StatusImmutable, models.StatusSeenOnNetwork},
-		{"tx-rejected", models.StatusRejected, models.StatusSeenMultipleNodes},
+		{"tx-rejected", models.StatusRejected, models.StatusSentToNetwork},
 		{"tx-dsa", models.StatusDoubleSpendAttempted, models.StatusPendingRetry},
 	}
 
