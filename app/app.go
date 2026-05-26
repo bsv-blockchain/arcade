@@ -258,6 +258,30 @@ func modeNeedsChaintracks(mode string) bool {
 	}
 }
 
+// resolveChaintracksBootstrapPeers picks the bootstrap peer list passed
+// to chaintracks' embedded p2p client. Precedence, highest first:
+//  1. chaintracks.p2p.msgbus.bootstrappeers — explicit chaintracks-only
+//     override. The upstream msgbus.Config field has no mapstructure
+//     tag, so YAML must use the camelCase-flattened key
+//     ("bootstrappeers", not "bootstrap_peers"); viper matches case-
+//     insensitively but does not translate snake_case.
+//  2. p2p.bootstrap_peers — the well-documented arcade key, shared
+//     with services/p2p_client. Configuring it once at the p2p block
+//     lets both the p2p-client and chaintracks pick it up, which is
+//     what almost every private-network deployment wants.
+//  3. The network-derived default from ResolveP2PNetwork — mainnet/
+//     testnet/teratestnet DNS bootstrap, nil for regtest.
+func resolveChaintracksBootstrapPeers(cfg *config.Config) []string {
+	if len(cfg.Chaintracks.P2P.MsgBus.BootstrapPeers) > 0 {
+		return cfg.Chaintracks.P2P.MsgBus.BootstrapPeers
+	}
+	if len(cfg.P2P.BootstrapPeers) > 0 {
+		return cfg.P2P.BootstrapPeers
+	}
+	_, defaultBootstrap := config.ResolveP2PNetwork(cfg.Network)
+	return defaultBootstrap
+}
+
 // initChaintracks brings up the embedded go-chaintracks instance shared
 // across the process. Caller gates the enabled-ness check; this function
 // always tries to construct and returns an error on failure.
@@ -284,11 +308,8 @@ func initChaintracks(ctx context.Context, cfg *config.Config, logger *zap.Logger
 	// Thread the top-level network into chaintracks' embedded p2p config.
 	// Without this go-chaintracks falls back to "main" silently. Chaintracks
 	// needs the upstream-strict spelling ("main"/"test"/"teratestnet").
-	_, defaultBootstrap := config.ResolveP2PNetwork(cfg.Network)
 	cfg.Chaintracks.P2P.Network = config.ResolveChaintracksNetwork(cfg.Network)
-	if len(cfg.Chaintracks.P2P.MsgBus.BootstrapPeers) == 0 {
-		cfg.Chaintracks.P2P.MsgBus.BootstrapPeers = defaultBootstrap
-	}
+	cfg.Chaintracks.P2P.MsgBus.BootstrapPeers = resolveChaintracksBootstrapPeers(cfg)
 
 	ct, err := cfg.Chaintracks.Initialize(ctx, "arcade", nil)
 	if err != nil {
