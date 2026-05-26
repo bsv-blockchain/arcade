@@ -156,7 +156,7 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		merkleClient.SetLogger(logger.Named("merkle-client"))
 	}
 
-	txVal := validator.NewValidator(nil)
+	txVal := validator.NewValidator(validatorPolicyFromConfig(cfg))
 
 	publisher := events.NewKafkaPublisher(producer, logger, cfg.Events.SubscriberBuffer)
 
@@ -237,6 +237,17 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		_ = producer.Close()
 	}
 	return deps, cleanup, nil
+}
+
+// validatorPolicyFromConfig builds the validator.Policy from cfg.Validator.
+// Returns nil when no operator-facing fields are set so NewValidator's
+// built-in defaults apply unchanged.
+func validatorPolicyFromConfig(cfg *config.Config) *validator.Policy {
+	if cfg.Validator.MinFeePerKB == 0 {
+		return nil
+	}
+	min := cfg.Validator.MinFeePerKB
+	return &validator.Policy{MinFeePerKB: &min}
 }
 
 // modeNeedsChaintracks reports whether the configured service mode constructs

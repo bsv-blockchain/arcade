@@ -123,6 +123,7 @@ type Config struct {
 	Webhook       WebhookConfig       `mapstructure:"webhook"`
 	Callback      CallbackConfig      `mapstructure:"callback"`
 	Events        EventsConfig        `mapstructure:"events"`
+	Validator     ValidatorConfig     `mapstructure:"validator"`
 	// ChaintracksServer gates whether the embedded go-chaintracks HTTP API
 	// runs alongside api-server. Default is on so the refactor is a drop-in
 	// replacement for the original single-binary arcade.
@@ -577,6 +578,23 @@ type EventsConfig struct {
 // status-update bursts without committing significant memory upfront.
 const DefaultEventsSubscriberBuffer = 4096
 
+// ValidatorConfig controls intake-time transaction validation: the fee
+// floor enforced against EF/BEEF submissions and the policy-level
+// per-tx and per-script limits. Wired through to validator.Policy at
+// process startup.
+type ValidatorConfig struct {
+	// MinFeePerKB is the network's minimum acceptable fee rate in
+	// satoshis per kilobyte. Transactions below this rate are rejected
+	// at intake. Zero falls back to DefaultValidatorMinFeePerKB.
+	MinFeePerKB uint64 `mapstructure:"min_fee_per_kb"`
+}
+
+// DefaultValidatorMinFeePerKB is the production fee floor in satoshis
+// per kilobyte. 100 reflects the current BSV miner policy minimum.
+// Tests and ad-hoc deployments may set ValidatorConfig.MinFeePerKB to
+// a lower value to accept older or non-standard txs.
+const DefaultValidatorMinFeePerKB = 100
+
 func BindFlags(cmd *cobra.Command) {
 	cmd.Flags().String("mode", "all", "Service mode: all, api-server, bump-builder, propagation, p2p-client")
 	cmd.Flags().String("config", "", "Path to config file")
@@ -779,6 +797,10 @@ func setDefaults() {
 	// (mode=all).
 	viper.SetDefault("chaintracks_server.host", "0.0.0.0")
 	viper.SetDefault("chaintracks_server.port", 8083)
+
+	// Intake validator fee floor in satoshis per KB. Matches the
+	// current BSV miner policy minimum.
+	viper.SetDefault("validator.min_fee_per_kb", DefaultValidatorMinFeePerKB)
 }
 
 func validate(cfg *Config) error {
