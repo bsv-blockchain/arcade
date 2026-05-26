@@ -121,6 +121,26 @@ func FetchBlockDataForBUMPWithOptions(ctx context.Context, datahubURLs []string,
 				continue
 			}
 		}
+		// Reject endpoints whose coinbase BUMP does not reconcile to the header
+		// merkle root they served. The coinbase tx sits at level 0 offset 0 of
+		// the block merkle tree, so its BUMP MUST compute that header root; an
+		// endpoint that serves a coinbase BUMP computing a different root is
+		// internally inconsistent (stale/pruned/buggy peer) and would only
+		// produce a compound BUMP that fails the post-build ValidateCompoundRoot.
+		// Without this, a bad peer that sorts ahead of a good one is selected on
+		// every fetch and every retry, deterministically blocking the block from
+		// ever building a valid BUMP even when a consistent peer is healthy.
+		// Skipping it here lets the loop fall through to that consistent peer.
+		if cbErr := coinbaseBUMPReconciles(cbBUMP, root); cbErr != nil {
+			logger.Warn(
+				"datahub coinbase BUMP does not reconcile to header merkle root",
+				zap.Int("idx", i),
+				zap.String("url", dataHubURL),
+				zap.Error(cbErr),
+			)
+			urlErrors = append(urlErrors, fmt.Sprintf("url[%d] %q: coinbase BUMP mismatch: %v", i, dataHubURL, cbErr))
+			continue
+		}
 		return hashes, cbBUMP, root, nil
 	}
 	return nil, nil, nil, fmt.Errorf("all DataHub URLs failed for block %s:\n  %s", blockHash, strings.Join(urlErrors, "\n  "))
@@ -145,6 +165,35 @@ func SubtreeCountValidator(minSubtrees int) BlockDataValidator {
 		}
 		return nil
 	}
+}
+
+// coinbaseBUMPReconciles verifies that the coinbase BUMP computes the expected
+// block-header merkle root. The coinbase transaction is leaf 0 of the block
+// merkle tree, so folding it up its own BUMP must yield the header merkle root.
+//
+// Returns nil when there is nothing to check: a nil expected root, or an empty
+// coinbase BUMP (some peers legitimately omit it; downstream BUMP construction
+// handles a missing coinbase BUMP separately, so we must not reject those here).
+func coinbaseBUMPReconciles(coinbaseBUMP []byte, headerMerkleRoot *chainhash.Hash) error {
+	if headerMerkleRoot == nil || len(coinbaseBUMP) == 0 {
+		return nil
+	}
+	cbPath, err := transaction.NewMerklePathFromBinary(coinbaseBUMP)
+	if err != nil {
+		return fmt.Errorf("parse coinbase BUMP: %w", err)
+	}
+	cbTxID := extractCoinbaseTxID(coinbaseBUMP)
+	if cbTxID == nil {
+		return fmt.Errorf("coinbase BUMP has no coinbase txid at level 0 offset 0")
+	}
+	got, err := cbPath.ComputeRoot(cbTxID)
+	if err != nil {
+		return fmt.Errorf("compute coinbase BUMP root: %w", err)
+	}
+	if !got.IsEqual(headerMerkleRoot) {
+		return fmt.Errorf("coinbase BUMP root %s != header merkle root %s", got, headerMerkleRoot)
+	}
+	return nil
 }
 
 // fetchBlockBinary fetches a block from the binary endpoint and parses
