@@ -246,8 +246,8 @@ func validatorPolicyFromConfig(cfg *config.Config) *validator.Policy {
 	if cfg.Validator.MinFeePerKB == 0 {
 		return nil
 	}
-	min := cfg.Validator.MinFeePerKB
-	return &validator.Policy{MinFeePerKB: &min}
+	minFee := cfg.Validator.MinFeePerKB
+	return &validator.Policy{MinFeePerKB: &minFee}
 }
 
 // modeNeedsChaintracks reports whether the configured service mode constructs

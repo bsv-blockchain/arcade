@@ -22,11 +22,16 @@ func nonDataScript() *bscript.Script {
 	return &s
 }
 
-// emptyScript is the unlocking-script placeholder for inputs whose real
-// unlocking-script content doesn't matter (scripts are skipped at
-// validation time in arcade).
-func emptyScript() *bscript.Script {
-	s := bscript.Script(nil)
+// minimalPushScript is a single-byte OP_0 push, the smallest push-only
+// script that's non-empty. arcade's policy pushDataCheck requires the
+// unlocking script to be push-only, and go-sdk's SatoshisPerKilobyte
+// fee model rejects inputs with an empty unlocking script
+// (ErrNoUnlockingScript) because it can't size the witness. OP_0
+// pushes an empty byte string onto the stack, which the OP_TRUE
+// locking script ignores when it pushes 1 — script execution still
+// succeeds.
+func minimalPushScript() *bscript.Script {
+	s := bscript.Script([]byte{0x00})
 	return &s
 }
 
@@ -97,7 +102,7 @@ func BuildValidatableTxs(n int, startNonce uint32) []*bt.Tx {
 		input.PreviousTxOutIndex = 0
 		input.PreviousTxScript = nonDataScript()
 		input.PreviousTxSatoshis = 10000
-		input.UnlockingScript = emptyScript()
+		input.UnlockingScript = minimalPushScript()
 		tx.Inputs = append(tx.Inputs, input)
 		tx.AddOutput(&bt.Output{
 			Satoshis:      1,
