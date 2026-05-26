@@ -34,11 +34,16 @@ func TestHealthServer_PprofGating(t *testing.T) {
 			hs.Start(ctx)
 			waitForListening(t, port)
 
-			resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/debug/pprof/heap", port))
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+				fmt.Sprintf("http://127.0.0.1:%d/debug/pprof/heap", port), nil)
+			if err != nil {
+				t.Fatalf("build request: %v", err)
+			}
+			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
 				t.Fatalf("GET /debug/pprof/heap: %v", err)
 			}
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 			_, _ = io.Copy(io.Discard, resp.Body)
 
 			if resp.StatusCode != tc.wantStatus {
@@ -59,12 +64,17 @@ func TestHealthServer_HealthAlwaysReachable(t *testing.T) {
 	waitForListening(t, port)
 
 	for _, path := range []string{"/health", "/metrics"} {
-		resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d%s", port, path))
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+			fmt.Sprintf("http://127.0.0.1:%d%s", port, path), nil)
+		if err != nil {
+			t.Fatalf("build request for %s: %v", path, err)
+		}
+		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatalf("GET %s: %v", path, err)
 		}
 		_, _ = io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("%s: got %d, want 200", path, resp.StatusCode)
 		}
@@ -73,7 +83,7 @@ func TestHealthServer_HealthAlwaysReachable(t *testing.T) {
 
 func freePort(t *testing.T) int {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -87,9 +97,10 @@ func freePort(t *testing.T) int {
 // the first request can race the listener bind without this poll.
 func waitForListening(t *testing.T, port int) {
 	t.Helper()
+	dialer := &net.Dialer{Timeout: 50 * time.Millisecond}
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 50*time.Millisecond)
+		c, err := dialer.DialContext(t.Context(), "tcp", fmt.Sprintf("127.0.0.1:%d", port))
 		if err == nil {
 			_ = c.Close()
 			return
