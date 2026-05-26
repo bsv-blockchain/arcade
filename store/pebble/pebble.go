@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -999,7 +1000,7 @@ func (s *Store) GetReapCandidates(ctx context.Context, since, seenDeadline, rebr
 	deadlineNs := seenDeadline.UnixNano()
 	type candidate struct {
 		st            *models.TransactionStatus
-		lastRebcastNs int64 // 0 == never rebroadcast (sorts first)
+		lastRebcastNs int64 // math.MinInt64 sentinel == never rebroadcast (sorts first)
 	}
 	var candidates []candidate
 	for iter.First(); iter.Valid(); iter.Next() {
@@ -1024,7 +1025,7 @@ func (s *Store) GetReapCandidates(ctx context.Context, since, seenDeadline, rebr
 		if !st.LastRebroadcastAt.IsZero() && !st.LastRebroadcastAt.Before(rebroadcastBefore) {
 			continue
 		}
-		var lastNs int64
+		lastNs := int64(math.MinInt64)
 		if !st.LastRebroadcastAt.IsZero() {
 			lastNs = st.LastRebroadcastAt.UnixNano()
 		}

@@ -71,11 +71,15 @@ type Propagator struct {
 	// reaperRebroadcastInterval is the minimum gap between successive
 	// rebroadcasts of the same stuck tx. See ReaperRebroadcastIntervalMs.
 	reaperRebroadcastInterval time.Duration
-	teranodeBatchCap          int
-	broadcastWorkers          int
-	maxParallelChunks         int
-	holderID                  string
-	leaseTTL                  time.Duration
+	// reaperRequeueBackoff is the shorter retry delay for stuck txs whose
+	// rebroadcast hit a transient failure (Teranode requeue / failed merkle
+	// registration). See ReaperRequeueBackoffMs.
+	reaperRequeueBackoff time.Duration
+	teranodeBatchCap     int
+	broadcastWorkers     int
+	maxParallelChunks    int
+	holderID             string
+	leaseTTL             time.Duration
 
 	// broadcastJobs feeds the persistent worker pool that runs every
 	// per-endpoint POST /txs call. Replaces the previous per-broadcast
@@ -227,6 +231,16 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 	if reaperRebroadcastInterval <= 0 {
 		reaperRebroadcastInterval = time.Hour
 	}
+	reaperRequeueBackoff := time.Duration(cfg.Propagation.ReaperRequeueBackoffMs) * time.Millisecond
+	if reaperRequeueBackoff <= 0 {
+		reaperRequeueBackoff = time.Minute
+	}
+	// A requeue backoff longer than the full rebroadcast interval is
+	// meaningless — clamp so the transient-failure path never waits longer
+	// than the steady-state refresh.
+	if reaperRequeueBackoff > reaperRebroadcastInterval {
+		reaperRequeueBackoff = reaperRebroadcastInterval
+	}
 	leaseTTL := time.Duration(cfg.Propagation.LeaseTTLMs) * time.Millisecond
 	if leaseTTL <= 0 {
 		leaseTTL = 3 * reaperInterval
@@ -265,6 +279,7 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 		reaperInterval:            reaperInterval,
 		reaperBatchSize:           reaperBatch,
 		reaperRebroadcastInterval: reaperRebroadcastInterval,
+		reaperRequeueBackoff:      reaperRequeueBackoff,
 		teranodeBatchCap:          teranodeBatchCap,
 		broadcastWorkers:          broadcastWorkers,
 		maxParallelChunks:         maxParallelChunks,

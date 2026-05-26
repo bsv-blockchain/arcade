@@ -835,7 +835,7 @@ func (s *Store) GetReapCandidates(ctx context.Context, since, seenDeadline, rebr
 SELECT txid, raw_tx FROM transactions
 WHERE status IN ('SEEN_ON_NETWORK', 'SEEN_MULTIPLE_NODES')
   AND timestamp_at >= $1 AND timestamp_at < $2
-  AND raw_tx IS NOT NULL
+  AND length(raw_tx) > 0
   AND (last_rebroadcast_at IS NULL OR last_rebroadcast_at < $3)
 ORDER BY last_rebroadcast_at ASC NULLS FIRST
 LIMIT $4`

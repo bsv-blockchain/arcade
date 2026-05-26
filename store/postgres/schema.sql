@@ -41,6 +41,10 @@ CREATE INDEX IF NOT EXISTS idx_tx_retry_ready
 -- Partial index for the reaper's rebroadcast-candidate scan: only rows in a
 -- non-terminal SEEN_* state are eligible, and ordering by last_rebroadcast_at
 -- (NULLs first) drives the oldest-unserved-first fairness query.
+-- Note: the timestamp_at range and length(raw_tx) > 0 predicates are inline
+-- rechecks, not part of this index. At a very large SEEN_* population the scan
+-- may touch many index/heap rows before LIMIT is satisfied; if that shows up in
+-- query plans, consider a composite/covering index — fine at current scale.
 CREATE INDEX IF NOT EXISTS idx_tx_reap_due
     ON transactions(last_rebroadcast_at NULLS FIRST)
     WHERE status IN ('SEEN_ON_NETWORK', 'SEEN_MULTIPLE_NODES');

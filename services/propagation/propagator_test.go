@@ -132,6 +132,10 @@ type mockStore struct {
 	// rebroadcastMarks records every MarkRebroadcastByTxIDs call as one slice
 	// per call. Lets reaper tests assert which txids were stamped on attempt.
 	rebroadcastMarks [][]string
+	// rebroadcastMarkTs records the ts arg of each MarkRebroadcastByTxIDs call,
+	// index-aligned with rebroadcastMarks. Lets tests distinguish the
+	// full-interval stamp (≈now) from the backdated short-backoff stamp.
+	rebroadcastMarkTs []time.Time
 	// reapErr forces GetReapCandidates to return this error.
 	reapErr error
 	// returningPrev, when non-nil, overrides the synthetic previous-status
@@ -361,6 +365,7 @@ func (m *mockStore) MarkRebroadcastByTxIDs(_ context.Context, txids []string, ts
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.rebroadcastMarks = append(m.rebroadcastMarks, append([]string(nil), txids...))
+	m.rebroadcastMarkTs = append(m.rebroadcastMarkTs, ts)
 	marked := make(map[string]struct{}, len(txids))
 	for _, t := range txids {
 		marked[t] = struct{}{}
