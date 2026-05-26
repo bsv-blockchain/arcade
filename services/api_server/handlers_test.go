@@ -636,7 +636,7 @@ func TestHandleSubmitTransaction_ValidationFailure_RecordsSubmissionAndPublishes
 
 	ms := &mockStore{}
 	pub := &recordingCallbackPub{}
-	val := validator.NewValidator(nil, nil)
+	val := validator.NewValidator(nil)
 	broker := &kafka.RecordingBroker{}
 	gin.SetMode(gin.TestMode)
 	srv := &Server{
@@ -727,7 +727,7 @@ func TestHandleSubmitTransaction_ValidationFailure_NoCallback_StillPublishes(t *
 
 	ms := &mockStore{}
 	pub := &recordingCallbackPub{}
-	val := validator.NewValidator(nil, nil)
+	val := validator.NewValidator(nil)
 	broker := &kafka.RecordingBroker{}
 	gin.SetMode(gin.TestMode)
 	srv := &Server{
@@ -778,7 +778,7 @@ func TestHandleSubmitTransaction_ValidationFailure_NoCallback_StillPublishes(t *
 func TestHandleSubmitTransaction_ValidationFailure_NilPublisher_NoPanic(t *testing.T) {
 	rawTx := makeMinimalTx()
 	ms := &mockStore{}
-	val := validator.NewValidator(nil, nil)
+	val := validator.NewValidator(nil)
 	gin.SetMode(gin.TestMode)
 	srv := &Server{
 		cfg:            &config.Config{CallbackToken: testCallbackToken},
@@ -819,7 +819,7 @@ func TestHandleSubmitTransactions_ValidationFailure_RecordsSubmissionAndPublishe
 
 	ms := &mockStore{}
 	pub := &recordingCallbackPub{}
-	val := validator.NewValidator(nil, nil)
+	val := validator.NewValidator(nil)
 	broker := &kafka.RecordingBroker{}
 	gin.SetMode(gin.TestMode)
 	srv := &Server{
