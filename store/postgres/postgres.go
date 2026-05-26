@@ -822,6 +822,57 @@ func (s *Store) MarkMerkleRegisteredByTxIDs(ctx context.Context, txids []string,
 	return nil
 }
 
+// GetReapCandidates returns the SEEN_* rows the reaper should rebroadcast,
+// oldest-unserved first. See store.Store for the full contract. Only txid and
+// raw_tx are selected — the reaper needs nothing else, and ordering by
+// last_rebroadcast_at NULLS FIRST is what spreads each tick's bounded batch
+// across the whole backlog instead of re-sending the same rows every tick.
+func (s *Store) GetReapCandidates(ctx context.Context, since, seenDeadline, rebroadcastBefore time.Time, limit int) ([]*models.TransactionStatus, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	const q = `
+SELECT txid, raw_tx FROM transactions
+WHERE status IN ('SEEN_ON_NETWORK', 'SEEN_MULTIPLE_NODES')
+  AND timestamp_at >= $1 AND timestamp_at < $2
+  AND raw_tx IS NOT NULL
+  AND (last_rebroadcast_at IS NULL OR last_rebroadcast_at < $3)
+ORDER BY last_rebroadcast_at ASC NULLS FIRST
+LIMIT $4`
+	rows, err := s.pool.Query(ctx, q, since, seenDeadline, rebroadcastBefore, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []*models.TransactionStatus
+	for rows.Next() {
+		var (
+			txid  string
+			rawTx []byte
+		)
+		if err := rows.Scan(&txid, &rawTx); err != nil {
+			return results, err
+		}
+		results = append(results, &models.TransactionStatus{TxID: txid, RawTx: rawTx})
+	}
+	return results, rows.Err()
+}
+
+// MarkRebroadcastByTxIDs stamps last_rebroadcast_at = $1 on every existing row
+// whose txid is in $2. Unknown txids are silently no-ops, mirroring
+// MarkMerkleRegisteredByTxIDs.
+func (s *Store) MarkRebroadcastByTxIDs(ctx context.Context, txids []string, ts time.Time) error {
+	if len(txids) == 0 {
+		return nil
+	}
+	const q = `UPDATE transactions SET last_rebroadcast_at = $1 WHERE txid = ANY($2)`
+	if _, err := s.pool.Exec(ctx, q, ts, txids); err != nil {
+		return fmt.Errorf("mark rebroadcast: %w", err)
+	}
+	return nil
+}
+
 // --- BUMP / STUMP ---
 
 func (s *Store) InsertBUMP(ctx context.Context, blockHash string, blockHeight uint64, bumpData []byte) error {

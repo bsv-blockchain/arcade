@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -128,6 +129,11 @@ type mockStore struct {
 	// markErr forces MarkMerkleRegisteredByTxIDs to return this error.
 	// Used by tests that verify a mark failure doesn't block broadcast.
 	markErr error
+	// rebroadcastMarks records every MarkRebroadcastByTxIDs call as one slice
+	// per call. Lets reaper tests assert which txids were stamped on attempt.
+	rebroadcastMarks [][]string
+	// reapErr forces GetReapCandidates to return this error.
+	reapErr error
 	// returningPrev, when non-nil, overrides the synthetic previous-status
 	// row BatchUpdateStatusReturning hands back for each input. The default
 	// (RECEIVED prev) always reads as a real transition; this hook lets
@@ -295,6 +301,73 @@ func (m *mockStore) IterateStatusesSince(_ context.Context, since time.Time, fn 
 		}
 		if err := fn(r); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// GetReapCandidates mirrors the Postgres query over replayRows: SEEN_* rows
+// with a timestamp in [since, seenDeadline), a non-empty RawTx, and a
+// last_rebroadcast_at that is zero or older than rebroadcastBefore, ordered
+// oldest-rebroadcast-first (zero/never sorts first) and capped at limit.
+func (m *mockStore) GetReapCandidates(_ context.Context, since, seenDeadline, rebroadcastBefore time.Time, limit int) ([]*models.TransactionStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.reapErr != nil {
+		return nil, m.reapErr
+	}
+	if limit <= 0 {
+		return nil, nil
+	}
+	var out []*models.TransactionStatus
+	for _, r := range m.replayRows {
+		if r.Status != models.StatusSeenOnNetwork && r.Status != models.StatusSeenMultipleNodes {
+			continue
+		}
+		if r.Timestamp.Before(since) || !r.Timestamp.Before(seenDeadline) {
+			continue
+		}
+		if len(r.RawTx) == 0 {
+			continue
+		}
+		if !r.LastRebroadcastAt.IsZero() && !r.LastRebroadcastAt.Before(rebroadcastBefore) {
+			continue
+		}
+		out = append(out, &models.TransactionStatus{TxID: r.TxID, RawTx: r.RawTx, LastRebroadcastAt: r.LastRebroadcastAt})
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		// zero (never rebroadcast) sorts first
+		zi, zj := out[i].LastRebroadcastAt.IsZero(), out[j].LastRebroadcastAt.IsZero()
+		if zi != zj {
+			return zi
+		}
+		return out[i].LastRebroadcastAt.Before(out[j].LastRebroadcastAt)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	// Strip the marker from the returned rows — the reaper only consumes
+	// TxID + RawTx, matching the real backends.
+	for _, r := range out {
+		r.LastRebroadcastAt = time.Time{}
+	}
+	return out, nil
+}
+
+// MarkRebroadcastByTxIDs records the call and stamps LastRebroadcastAt on the
+// matching replayRows so a subsequent GetReapCandidates within the interval
+// excludes them — mirroring the real backends.
+func (m *mockStore) MarkRebroadcastByTxIDs(_ context.Context, txids []string, ts time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rebroadcastMarks = append(m.rebroadcastMarks, append([]string(nil), txids...))
+	marked := make(map[string]struct{}, len(txids))
+	for _, t := range txids {
+		marked[t] = struct{}{}
+	}
+	for _, r := range m.replayRows {
+		if _, ok := marked[r.TxID]; ok {
+			r.LastRebroadcastAt = ts
 		}
 	}
 	return nil

@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -390,6 +392,9 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 	}
 	if !status.MerkleRegisteredAt.IsZero() {
 		bins["merkle_reg_at"] = status.MerkleRegisteredAt.UnixMilli()
+	}
+	if !status.LastRebroadcastAt.IsZero() {
+		bins["rebroadcast_at"] = status.LastRebroadcastAt.UnixMilli()
 	}
 
 	// Enforce the status lattice: refuse to overwrite a terminal status with a
@@ -844,6 +849,122 @@ func (s *Store) MarkMerkleRegisteredByTxIDs(ctx context.Context, txids []string,
 
 		if err := s.client.BatchOperate(s.batchPolicy(ctx), records); err != nil {
 			return fmt.Errorf("batch mark merkle registered: %w", err)
+		}
+	}
+	return nil
+}
+
+// GetReapCandidates scans the transactions set and returns up to limit SEEN_*
+// rows the reaper should rebroadcast, oldest-unserved first. Aerospike has no
+// secondary index for this predicate and the query API does not order results,
+// so the filter and the oldest-first sort are done in-process over a full set
+// scan. This is acceptable because production runs on Postgres; the Aerospike
+// path exists for parity. See store.Store for the contract.
+func (s *Store) GetReapCandidates(ctx context.Context, since, seenDeadline, rebroadcastBefore time.Time, limit int) ([]*models.TransactionStatus, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	stmt := aero.NewStatement(s.namespace, setTransactions)
+	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
+	if rs != nil {
+		defer func() { _ = rs.Close() }()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query reap candidates: %w", err)
+	}
+
+	type candidate struct {
+		st            *models.TransactionStatus
+		lastRebcastMs int64 // math.MinInt64 sentinel == never rebroadcast (sorts first)
+	}
+	var candidates []candidate
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case rec, ok := <-rs.Results():
+			if !ok {
+				goto done
+			}
+			if rec.Err != nil {
+				return nil, rec.Err
+			}
+			txid := getString(rec.Record, "txid")
+			st := recordToStatus(rec.Record, txid)
+			if st.Status != models.StatusSeenOnNetwork && st.Status != models.StatusSeenMultipleNodes {
+				continue
+			}
+			if st.Timestamp.Before(since) || !st.Timestamp.Before(seenDeadline) {
+				continue
+			}
+			rawTx, _ := rec.Record.Bins["raw_tx"].([]byte)
+			if len(rawTx) == 0 {
+				continue
+			}
+			if !st.LastRebroadcastAt.IsZero() && !st.LastRebroadcastAt.Before(rebroadcastBefore) {
+				continue
+			}
+			lastMs := int64(math.MinInt64)
+			if !st.LastRebroadcastAt.IsZero() {
+				lastMs = st.LastRebroadcastAt.UnixMilli()
+			}
+			candidates = append(candidates, candidate{
+				st:            &models.TransactionStatus{TxID: txid, RawTx: rawTx},
+				lastRebcastMs: lastMs,
+			})
+		}
+	}
+done:
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].lastRebcastMs < candidates[j].lastRebcastMs
+	})
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	results := make([]*models.TransactionStatus, len(candidates))
+	for i, c := range candidates {
+		results[i] = c.st
+	}
+	return results, nil
+}
+
+// MarkRebroadcastByTxIDs writes rebroadcast_at = ts.UnixMilli() on every
+// existing transaction record in the txid list. Unknown txids are silently
+// skipped via UPDATE_ONLY, mirroring MarkMerkleRegisteredByTxIDs.
+func (s *Store) MarkRebroadcastByTxIDs(ctx context.Context, txids []string, ts time.Time) error {
+	if len(txids) == 0 {
+		return nil
+	}
+	bwp := aero.NewBatchWritePolicy()
+	bwp.RecordExistsAction = aero.UPDATE_ONLY
+
+	for i := 0; i < len(txids); i += s.batchSize {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		end := i + s.batchSize
+		if end > len(txids) {
+			end = len(txids)
+		}
+		batch := txids[i:end]
+
+		records := make([]aero.BatchRecordIfc, len(batch))
+		for j, txid := range batch {
+			key, err := s.key(setTransactions, txid)
+			if err != nil {
+				continue
+			}
+			records[j] = aero.NewBatchWrite(
+				bwp, key,
+				aero.PutOp(aero.NewBin("rebroadcast_at", ts.UnixMilli())),
+			)
+		}
+
+		if err := s.client.BatchOperate(s.batchPolicy(ctx), records); err != nil {
+			return fmt.Errorf("batch mark rebroadcast: %w", err)
 		}
 	}
 	return nil
@@ -2066,6 +2187,11 @@ func recordToStatus(rec *aero.Record, txid string) *models.TransactionStatus {
 	if v, ok := rec.Bins["merkle_reg_at"]; ok {
 		if ms, ok := v.(int); ok {
 			status.MerkleRegisteredAt = time.UnixMilli(int64(ms))
+		}
+	}
+	if v, ok := rec.Bins["rebroadcast_at"]; ok {
+		if ms, ok := v.(int); ok {
+			status.LastRebroadcastAt = time.UnixMilli(int64(ms))
 		}
 	}
 	return status

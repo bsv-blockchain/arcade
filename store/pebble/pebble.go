@@ -72,6 +72,7 @@ type storedStatus struct {
 	CreatedUnixNs          int64    `json:"created_at,omitempty"`
 	NextRetryUnixNs        int64    `json:"next_retry_at,omitempty"`
 	MerkleRegisteredUnixNs int64    `json:"merkle_registered_at,omitempty"`
+	LastRebroadcastUnixNs  int64    `json:"last_rebroadcast_at,omitempty"`
 }
 
 func (s storedStatus) toModel() *models.TransactionStatus {
@@ -98,6 +99,9 @@ func (s storedStatus) toModel() *models.TransactionStatus {
 	}
 	if s.MerkleRegisteredUnixNs != 0 {
 		out.MerkleRegisteredAt = time.Unix(0, s.MerkleRegisteredUnixNs)
+	}
+	if s.LastRebroadcastUnixNs != 0 {
+		out.LastRebroadcastAt = time.Unix(0, s.LastRebroadcastUnixNs)
 	}
 	return out
 }
@@ -126,6 +130,9 @@ func fromModel(m *models.TransactionStatus) storedStatus {
 	}
 	if !m.MerkleRegisteredAt.IsZero() {
 		out.MerkleRegisteredUnixNs = m.MerkleRegisteredAt.UnixNano()
+	}
+	if !m.LastRebroadcastAt.IsZero() {
+		out.LastRebroadcastUnixNs = m.LastRebroadcastAt.UnixNano()
 	}
 	return out
 }
@@ -491,6 +498,9 @@ func mergeStatus(existing *storedStatus, update *models.TransactionStatus) store
 	}
 	if !update.MerkleRegisteredAt.IsZero() {
 		out.MerkleRegisteredUnixNs = update.MerkleRegisteredAt.UnixNano()
+	}
+	if !update.LastRebroadcastAt.IsZero() {
+		out.LastRebroadcastUnixNs = update.LastRebroadcastAt.UnixNano()
 	}
 	return out
 }
@@ -954,6 +964,122 @@ func (s *Store) MarkMerkleRegisteredByTxIDs(ctx context.Context, txids []string,
 			return err
 		}
 		// No index churn: merkle_registered_at isn't indexed.
+		err = s.db.Set(txKey(txid), payload, s.writeOpts)
+		mu.Unlock()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// GetReapCandidates walks the updated-at index (oldest-first) and returns up to
+// limit SEEN_* rows the reaper should rebroadcast, ordered oldest-unserved
+// first. The updated-at index is timestamp-ordered, not last_rebroadcast_at-
+// ordered, so the due-filter and the final oldest-rebroadcast-first sort are
+// applied in-process over the filtered set. See store.Store for the contract.
+func (s *Store) GetReapCandidates(ctx context.Context, since, seenDeadline, rebroadcastBefore time.Time, limit int) ([]*models.TransactionStatus, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	prefix := idxTxUpdatedPrefix()
+	iter, err := s.db.NewIter(&pebbledb.IterOptions{
+		LowerBound: prefix,
+		UpperBound: endOfPrefix(prefix),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = iter.Close() }()
+
+	sinceNs := since.UnixNano()
+	deadlineNs := seenDeadline.UnixNano()
+	type candidate struct {
+		st            *models.TransactionStatus
+		lastRebcastNs int64 // 0 == never rebroadcast (sorts first)
+	}
+	var candidates []candidate
+	for iter.First(); iter.Valid(); iter.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		txid := lastSegment(iter.Key())
+		st, err := s.readStatus(txid)
+		if err != nil || st == nil {
+			continue
+		}
+		if st.Status != models.StatusSeenOnNetwork && st.Status != models.StatusSeenMultipleNodes {
+			continue
+		}
+		tsNs := st.Timestamp.UnixNano()
+		if tsNs < sinceNs || tsNs >= deadlineNs {
+			continue
+		}
+		if len(st.RawTx) == 0 {
+			continue
+		}
+		if !st.LastRebroadcastAt.IsZero() && !st.LastRebroadcastAt.Before(rebroadcastBefore) {
+			continue
+		}
+		var lastNs int64
+		if !st.LastRebroadcastAt.IsZero() {
+			lastNs = st.LastRebroadcastAt.UnixNano()
+		}
+		candidates = append(candidates, candidate{
+			st:            &models.TransactionStatus{TxID: st.TxID, RawTx: st.RawTx},
+			lastRebcastNs: lastNs,
+		})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].lastRebcastNs < candidates[j].lastRebcastNs
+	})
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	results := make([]*models.TransactionStatus, len(candidates))
+	for i, c := range candidates {
+		results[i] = c.st
+	}
+	return results, nil
+}
+
+// MarkRebroadcastByTxIDs stamps last_rebroadcast_at on every existing row in
+// the txid list. Unknown txids are silently no-ops, mirroring
+// MarkMerkleRegisteredByTxIDs (last_rebroadcast_at is not indexed, so no index
+// churn).
+func (s *Store) MarkRebroadcastByTxIDs(ctx context.Context, txids []string, ts time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	tsNs := ts.UnixNano()
+	for _, txid := range txids {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		mu := s.shardFor(txid)
+		mu.Lock()
+
+		existing, err := s.readStoredStatus(txid)
+		if err != nil {
+			mu.Unlock()
+			return err
+		}
+		if existing == nil {
+			mu.Unlock()
+			continue
+		}
+
+		updated := *existing
+		updated.LastRebroadcastUnixNs = tsNs
+
+		payload, err := json.Marshal(updated)
+		if err != nil {
+			mu.Unlock()
+			return err
+		}
 		err = s.db.Set(txKey(txid), payload, s.writeOpts)
 		mu.Unlock()
 		if err != nil {

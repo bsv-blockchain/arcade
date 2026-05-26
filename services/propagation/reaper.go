@@ -19,14 +19,16 @@ import (
 // may be needed, or a callback may have been dropped. Long enough that we
 // don't rebroadcast every tx that takes a few minutes to mine.
 //
-// staleScanLookback bounds how far back IterateStatusesSince walks. Rows
+// staleScanLookback bounds how far back the candidate scan walks. Rows
 // older than this are assumed permanently stuck and outside the reaper's
 // responsibility — the operator surfaces them with `arcade tools surface
 // stuck` if a deeper sweep is needed.
+//
+// The per-tick batch size is configurable (reaper_batch_size); the per-tx
+// rebroadcast cadence is reaper_rebroadcast_interval_ms.
 const (
-	staleSeenOnNetworkAge  = time.Hour
-	staleScanLookback      = 24 * time.Hour
-	reaperRebroadcastBatch = 200
+	staleSeenOnNetworkAge = time.Hour
+	staleScanLookback     = 24 * time.Hour
 )
 
 // reaperLeaseName is the well-known key every replica uses to coordinate
@@ -82,11 +84,18 @@ func (p *Propagator) tryReap(ctx context.Context) {
 	p.reapOnce(ctx)
 }
 
-// reapOnce rebroadcasts rows stuck at SEEN_ON_NETWORK past
-// staleSeenOnNetworkAge (peer mempool eviction, dropped BLOCK_PROCESSED
-// callback, fee bump needed). RECEIVED rows are intentionally not
-// rebroadcast — the submitter got an error from intake on Kafka publish
-// failure and owns the decision to retry.
+// reapOnce rebroadcasts rows stuck at SEEN_ON_NETWORK / SEEN_MULTIPLE_NODES
+// past staleSeenOnNetworkAge (peer mempool eviction, dropped BLOCK_PROCESSED
+// callback, unconfirmed ancestor that has since confirmed). RECEIVED rows are
+// intentionally not rebroadcast — the submitter got an error from intake on
+// Kafka publish failure and owns the decision to retry.
+//
+// Candidates come from GetReapCandidates ordered oldest-rebroadcast-first, and
+// each attempted txid is stamped via MarkRebroadcastByTxIDs so it isn't re-sent
+// again for reaperRebroadcastInterval. That per-tx throttle is what keeps a
+// backlog larger than reaperBatchSize from starving older rows: capacity
+// spreads across the whole backlog over one interval instead of re-sending the
+// same rows every tick.
 //
 // Rebroadcasts go through the same registerBatch + broadcastInChunks +
 // applyTerminalStatuses pipeline as processBatch but bypass the
@@ -94,41 +103,25 @@ func (p *Propagator) tryReap(ctx context.Context) {
 // resulting terminal status notifies the dispatcher via applyTerminalStatuses
 // only as a no-op for offset bookkeeping.
 //
-// Bounded by reaperRebroadcastBatch per tick so a backlog can't pin the
-// reaper into a single multi-minute call.
+// Bounded by reaperBatchSize per tick so a backlog can't pin the reaper into a
+// single multi-minute call.
 func (p *Propagator) reapOnce(ctx context.Context) {
 	now := time.Now()
 	since := now.Add(-staleScanLookback)
 	seenDeadline := now.Add(-staleSeenOnNetworkAge)
+	rebroadcastBefore := now.Add(-p.reaperRebroadcastInterval)
 
-	stuck := make([]propagationMsg, 0, reaperRebroadcastBatch)
-	err := p.store.IterateStatusesSince(ctx, since, func(st *models.TransactionStatus) error {
-		if len(stuck) >= reaperRebroadcastBatch {
-			return errReaperBatchFull
+	candidates, err := p.store.GetReapCandidates(ctx, since, seenDeadline, rebroadcastBefore, p.reaperBatchSize)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			p.logger.Error("reaper: scan failed", zap.Error(err))
 		}
-		if len(st.RawTx) == 0 {
-			// No body to rebroadcast. Pre-reaper-population rows
-			// won't have it; just skip.
-			return nil
-		}
-		switch st.Status {
-		case models.StatusSeenOnNetwork, models.StatusSeenMultipleNodes:
-			if !st.Timestamp.Before(seenDeadline) {
-				return nil
-			}
-		default:
-			// RECEIVED rows are intentionally NOT rebroadcast — the
-			// submitter got an error from intake on Kafka publish
-			// failure and is responsible for deciding whether to retry.
-			// Terminal statuses, MINED, IMMUTABLE — not the reaper's job.
-			return nil
-		}
-		stuck = append(stuck, propagationMsg{TXID: st.TxID, RawTx: st.RawTx})
-		return nil
-	})
-	if err != nil && !errors.Is(err, errReaperBatchFull) && !errors.Is(err, context.Canceled) {
-		p.logger.Error("reaper: scan failed", zap.Error(err))
 		return
+	}
+
+	stuck := make([]propagationMsg, 0, len(candidates))
+	for _, st := range candidates {
+		stuck = append(stuck, propagationMsg{TXID: st.TxID, RawTx: st.RawTx})
 	}
 
 	// Publish the post-scan depth on every tick BEFORE the early-return
@@ -155,10 +148,22 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 		return
 	}
 	rawTxs := make([][]byte, len(registered))
+	attemptedTxids := make([]string, len(registered))
 	for i, m := range registered {
 		rawTxs[i] = m.RawTx
+		attemptedTxids[i] = m.TXID
 	}
 	results := p.broadcastInChunks(ctx, registered, rawTxs)
+
+	// Stamp last_rebroadcast_at on every tx we attempted to broadcast (not
+	// just the ones that succeeded) so a perpetually-requeueing tx cedes its
+	// slot for one interval and can't re-monopolize the batch. Rows whose
+	// merkle /watch registration failed are intentionally NOT marked — they
+	// weren't broadcast, and a global merkle outage should not push every
+	// stuck tx past its rebroadcast window.
+	if err := p.store.MarkRebroadcastByTxIDs(ctx, attemptedTxids, now); err != nil {
+		p.logger.Warn("reaper: mark rebroadcast failed", zap.Error(err))
+	}
 
 	var accepted, rejected int
 	terminalStatuses := make([]*models.TransactionStatus, 0, len(results))
@@ -184,9 +189,3 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 	}
 	p.applyTerminalStatuses(ctx, terminalStatuses, accepted, rejected)
 }
-
-// errReaperBatchFull halts the IterateStatusesSince walk once we've
-// accumulated reaperRebroadcastBatch stuck rows. Sentinel error so
-// IterateStatusesSince surfaces it cleanly without being mistaken for
-// a backend error.
-var errReaperBatchFull = errors.New("reaper batch full")

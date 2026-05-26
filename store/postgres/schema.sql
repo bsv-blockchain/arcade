@@ -15,13 +15,19 @@ CREATE TABLE IF NOT EXISTS transactions (
     next_retry_at        TIMESTAMPTZ,
     timestamp_at         TIMESTAMPTZ NOT NULL,
     created_at           TIMESTAMPTZ NOT NULL,
-    merkle_registered_at TIMESTAMPTZ
+    merkle_registered_at TIMESTAMPTZ,
+    last_rebroadcast_at  TIMESTAMPTZ
 );
 
 -- Idempotent column add for stores created before merkle_registered_at was
 -- introduced. Existing rows keep NULL until the next successful /watch call
 -- repopulates the marker — see issue #145.
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS merkle_registered_at TIMESTAMPTZ;
+
+-- Idempotent column add for stores created before last_rebroadcast_at was
+-- introduced. NULL means "never rebroadcast", so existing stuck rows become
+-- immediately eligible for the reaper's first rebroadcast.
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS last_rebroadcast_at TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS idx_tx_status        ON transactions(status);
 CREATE INDEX IF NOT EXISTS idx_tx_block_hash    ON transactions(block_hash);
@@ -32,6 +38,12 @@ CREATE INDEX IF NOT EXISTS idx_tx_updated       ON transactions(timestamp_at);
 CREATE INDEX IF NOT EXISTS idx_tx_retry_ready
     ON transactions(next_retry_at)
     WHERE status = 'PENDING_RETRY';
+-- Partial index for the reaper's rebroadcast-candidate scan: only rows in a
+-- non-terminal SEEN_* state are eligible, and ordering by last_rebroadcast_at
+-- (NULLs first) drives the oldest-unserved-first fairness query.
+CREATE INDEX IF NOT EXISTS idx_tx_reap_due
+    ON transactions(last_rebroadcast_at NULLS FIRST)
+    WHERE status IN ('SEEN_ON_NETWORK', 'SEEN_MULTIPLE_NODES');
 
 CREATE TABLE IF NOT EXISTS bumps (
     block_hash   TEXT PRIMARY KEY,
