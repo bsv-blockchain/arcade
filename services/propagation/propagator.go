@@ -329,10 +329,28 @@ func (p *Propagator) Name() string { return "propagation" }
 
 // applyTerminalStatuses persists the per-tx terminal statuses produced by
 // processBatch in one BatchUpdateStatusReturning call, observes the
-// RECEIVED→{ACCEPTED_BY_NETWORK,REJECTED} transition age, and emits one
-// PublishBulk per terminal status. Lattice no-ops (prev.Status == st.Status)
-// and unknown txids (prev == nil — row reaped between RECEIVED and
-// broadcast) are excluded from the bulk publish to avoid phantom events.
+// RECEIVED→{ACCEPTED_BY_NETWORK,REJECTED} transition age, emits one
+// PublishBulk per terminal status, and notifies the dispatcher so it can
+// release/cascade waiters and mark the Kafka offset Done.
+//
+// It walks the batch with two deliberately separate accounting passes:
+//
+//   - Dispatcher notification covers EVERY terminalized tx. Each tx in
+//     terminalStatuses still holds a live Kafka offset on the dispatcher's
+//     offsetTracker; the dispatcher only marks that offset Done when it
+//     receives the terminal event. This pass MUST NOT be filtered by
+//     whether the store write moved the row — a tx re-read from Kafka
+//     after a rebalance is typically already at its terminal status, so
+//     BatchUpdateStatusReturning reports a lattice no-op (prev.Status ==
+//     st.Status) or an unknown row (prev == nil, row reaped). Skipping the
+//     notify for those strands the offset on the tracker and pins
+//     LowestUnfinished() — the Kafka commit watermark — forever, so the
+//     consumer group never commits and every restart re-reads the whole
+//     topic from offset 0.
+//
+//   - Bulk publish covers only rows that actually transitioned. A lattice
+//     no-op or a reaped row would be a phantom SSE/webhook event.
+//
 // Split out of processBatch so the surrounding flush loop stays under
 // nesting-complexity limits.
 func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses []*models.TransactionStatus, accepted, rejected int) {
@@ -347,19 +365,41 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 			zap.Error(err),
 		)
 		// Continue: per-row entries may still be valid; bulk-publish
-		// those whose prev row is populated below.
+		// those whose prev row is populated below. The dispatcher
+		// notification below runs regardless — the offset still has to
+		// be released even when the store write failed.
 	}
 
-	acceptedTxIDs := make([]string, 0, accepted)
-	rejectedTxIDs := make([]string, 0, rejected)
+	// terminalAccepted/terminalRejected drive the dispatcher notification:
+	// every terminalized tx, unconditionally.
+	terminalAccepted := make([]string, 0, accepted)
+	terminalRejected := make([]string, 0, rejected)
+	// publishedAccepted/publishedRejected drive the bulk publish: only
+	// rows whose store status actually transitioned.
+	publishedAccepted := make([]string, 0, accepted)
+	publishedRejected := make([]string, 0, rejected)
 	now := time.Now()
 	for i, st := range terminalStatuses {
 		var prev *models.TransactionStatus
 		if i < len(prevs) {
 			prev = prevs[i]
 		}
-		// Unknown txid (row was reaped between RECEIVED and broadcast)
-		// or per-row store error. Skip publish to avoid phantom events.
+
+		// Dispatcher accounting — unconditional. processBatch only routes
+		// ACCEPTED_BY_NETWORK and REJECTED into terminalStatuses; the
+		// defensive default keeps the switch exhaustive.
+		switch st.Status {
+		case models.StatusAcceptedByNetwork:
+			terminalAccepted = append(terminalAccepted, st.TxID)
+		case models.StatusRejected:
+			terminalRejected = append(terminalRejected, st.TxID)
+		default:
+		}
+
+		// Publish accounting — only real transitions. An unknown txid
+		// (row reaped between RECEIVED and broadcast, or a per-row store
+		// error) or a lattice no-op is skipped here to avoid a phantom
+		// event; the dispatcher notify above still fires for it.
 		if prev == nil {
 			continue
 		}
@@ -368,25 +408,35 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 				WithLabelValues(string(prev.Status), string(st.Status)).
 				Observe(time.Since(prev.Timestamp).Seconds())
 		}
-		// Lattice no-op — no transition to fan out.
 		if prev.Status == st.Status {
 			continue
 		}
 		switch st.Status {
 		case models.StatusAcceptedByNetwork:
-			acceptedTxIDs = append(acceptedTxIDs, st.TxID)
+			publishedAccepted = append(publishedAccepted, st.TxID)
 		case models.StatusRejected:
-			rejectedTxIDs = append(rejectedTxIDs, st.TxID)
+			publishedRejected = append(publishedRejected, st.TxID)
 		default:
-			// processBatch only routes ACCEPTED_BY_NETWORK and REJECTED
-			// terminal statuses into this slice; other statuses are
-			// either retryable (re-queued) or no_verdict (no store
-			// update). A defensive default keeps the switch exhaustive.
 		}
 	}
 
-	p.publishBulkStatus(ctx, models.StatusAcceptedByNetwork, acceptedTxIDs, now)
-	p.publishBulkStatus(ctx, models.StatusRejected, rejectedTxIDs, now)
+	p.publishBulkStatus(ctx, models.StatusAcceptedByNetwork, publishedAccepted, now)
+	p.publishBulkStatus(ctx, models.StatusRejected, publishedRejected, now)
+
+	// Notify the dispatcher ONLY when the batch status write fully
+	// succeeded. BatchUpdateStatusReturning surfaces per-row failures as
+	// a non-nil err with no per-row detail — so on any error we cannot
+	// tell which rows actually persisted. Notifying anyway would mark
+	// those txs' Kafka offsets Done and let the commit watermark advance
+	// past a tx whose terminal status never reached the store, breaking
+	// the at-least-once coupling between Kafka and the status ledger.
+	// Skipping the notify leaves the whole batch's offsets uncommitted;
+	// the next claim replays it and re-terminalizes once the store
+	// recovers (the reaper is the secondary backstop). A partial-batch
+	// over-replay on a rare store error is the correct trade.
+	if err != nil {
+		return
+	}
 
 	// Notify the dispatcher of every terminal status flip. ACCEPTED
 	// releases waiters via the dispatcher itself (no caller action
@@ -396,11 +446,11 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 	// always "parent rejected" regardless of the parent's actual
 	// cause — see persistCascadeRejections.
 	var allCascaded []string
-	for _, txid := range acceptedTxIDs {
-		p.notifyTerminalToDispatcher(txid, models.StatusAcceptedByNetwork)
+	for _, txid := range terminalAccepted {
+		p.notifyTerminalToDispatcher(ctx, txid, models.StatusAcceptedByNetwork)
 	}
-	for _, txid := range rejectedTxIDs {
-		r := p.notifyTerminalToDispatcher(txid, models.StatusRejected)
+	for _, txid := range terminalRejected {
+		r := p.notifyTerminalToDispatcher(ctx, txid, models.StatusRejected)
 		allCascaded = append(allCascaded, r.cascaded...)
 	}
 	if len(allCascaded) > 0 {
@@ -937,6 +987,15 @@ const requeueDelay = 2 * time.Second
 // dispatcher. Spawns a goroutine that sleeps requeueDelay then sends
 // each msg to requeueCh. The goroutine bails on ctx cancellation so
 // claim revocation and shutdown don't hold txs in limbo.
+//
+// Bailing on ctx.Done is safe for at-least-once delivery: a requeue
+// dropped here leaves the tx in the dispatcher's inFlight set with its
+// Kafka offset still un-Done on the (per-claim) offsetTracker, so that
+// offset is never marked for commit. When the claim is replaced the
+// next claim re-reads the tx from Kafka and reprocesses it — the
+// uncommitted offset IS the retry. The drop must not be silent though:
+// it's logged so a teardown that strands a large requeue batch is
+// visible in the operator's logs rather than looking like lost work.
 func (p *Propagator) requeueAfterDelay(ctx context.Context, msgs []propagationMsg) {
 	if len(msgs) == 0 {
 		return
@@ -953,15 +1012,23 @@ func (p *Propagator) requeueAfterDelay(ctx context.Context, msgs []propagationMs
 		select {
 		case <-time.After(requeueDelay):
 		case <-ctx.Done():
+			p.logger.Debug(
+				"requeue dropped before delay elapsed; txs left uncommitted for replay",
+				zap.Int("dropped", len(msgs)),
+			)
 			return
 		}
-		for _, m := range msgs {
-			select {
-			case <-ctx.Done():
+		for i, m := range msgs {
+			// requeueToDispatcher selects on ctx, so a teardown mid-loop
+			// unblocks the send instead of leaking this goroutine on a
+			// requeueCh whose dispatcher has already exited.
+			if !p.requeueToDispatcher(ctx, m) {
+				p.logger.Debug(
+					"requeue dropped mid-batch; txs left uncommitted for replay",
+					zap.Int("dropped", len(msgs)-i),
+				)
 				return
-			default:
 			}
-			p.requeueToDispatcher(m)
 		}
 	}(msgs)
 }
