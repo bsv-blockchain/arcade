@@ -267,6 +267,7 @@ func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatu
 	if c.store == nil {
 		// Constructor always supplies a writer in production; a nil store
 		// only happens in narrow tests of unrelated branches above.
+		metrics.P2PEndpointDiscoveryTotal.WithLabelValues("no_store").Inc()
 		return
 	}
 	upsertCtx, cancel := context.WithTimeout(ctx, 5*time.Second)

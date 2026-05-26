@@ -96,11 +96,14 @@ type EndpointStatus struct {
 // with zap.NewNop() so callers don't have to plumb a logger when they don't
 // care about transition logs.
 //
-// Source + RefreshInterval enable distributed endpoint discovery: when Source
-// is non-nil the client polls it on RefreshInterval and merges the URLs into
-// the in-memory list via AddEndpoints. This is how a bump-builder pod sees
-// URLs that the p2p-client pod discovered. Leave Source nil in monolith mode
-// or in tests that don't care about discovery.
+// Source + RefreshInterval enable distributed endpoint discovery: the client
+// polls Source on RefreshInterval and merges the URLs into the in-memory list
+// via AddEndpoints. This is the only mechanism by which URLs the p2p-client
+// pod discovered reach a consumer pod's broadcast set — every deployment
+// mode, including --mode all, requires a non-nil Source. A nil Source
+// silently disables cross-peer discovery and is reserved for tests that do
+// not exercise it. In monolith/dev mode a newly discovered URL becomes
+// broadcastable up to one RefreshInterval (default 30s) after announcement.
 type HealthConfig struct {
 	FailureThreshold int
 	// BroadcastFailureThreshold is the slow-track circuit breaker — how
@@ -287,9 +290,10 @@ func (c *Client) Close() {
 }
 
 // refreshLoop polls the EndpointSource on the configured interval and merges
-// new URLs via AddEndpoints. The merge is idempotent (AddEndpoints dedupes by
-// the seen map) so the loop is safe to run alongside p2p_client's direct
-// AddEndpoints calls in monolith mode.
+// new URLs via AddEndpoints. It is the sole path by which URLs persisted by
+// p2p_client's handleNodeStatus reach this client's in-memory broadcast set.
+// The merge is idempotent (AddEndpoints dedupes by the seen map), so repeated
+// ticks against an unchanged source set are cheap.
 func (c *Client) refreshLoop(ctx context.Context) {
 	defer close(c.refreshDone)
 	ticker := time.NewTicker(c.refreshInterval)
