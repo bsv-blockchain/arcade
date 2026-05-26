@@ -80,21 +80,31 @@ func run(cfg config) error {
 	//    expects when it parses /block/<hash>.
 	blockBin := teranodeBlock
 
-	// 7. Pick N random non-coinbase txids and fetch their raw bytes.
-	//    Pace fetches at one every ~300ms so we stay below WoC's free-
-	//    tier rate limit for sequential requests (the retry loop handles
-	//    sporadic 429s on top of this).
+	// 7. Pick N random non-coinbase txids, fetch each picked tx, then
+	//    enrich it with per-input source script + satoshis pulled from
+	//    each input's parent. The resulting bytes are Extended Format
+	//    (EF) so arcade's intake validator can execute scripts and
+	//    verify fees without needing a chaintracker. Pace fetches at
+	//    one every ~300ms so we stay below WoC's free-tier rate limit
+	//    (retry loop handles sporadic 429s on top of this).
 	picked := pickRandomTxIDs(txids[1:], cfg.pickN, cfg.rng)
 	rawTxs := make(map[string][]byte, len(picked))
-	for i, id := range picked {
-		if i > 0 {
+	parentCache := make(map[string]*sdkTx.Transaction)
+	first := true
+	for _, id := range picked {
+		if !first {
 			time.Sleep(300 * time.Millisecond)
 		}
+		first = false
 		raw, fErr := fetchRawTx(cfg.wocURL, id)
 		if fErr != nil {
 			return fmt.Errorf("fetch raw tx %s: %w", id, fErr)
 		}
-		rawTxs[id] = raw
+		efRaw, fErr := enrichToEF(cfg.wocURL, raw, parentCache)
+		if fErr != nil {
+			return fmt.Errorf("enrich tx %s to EF: %w", id, fErr)
+		}
+		rawTxs[id] = efRaw
 	}
 
 	// 8. Write everything to disk.
@@ -384,4 +394,48 @@ func fetchRawTx(wocBase, txid string) ([]byte, error) {
 		return nil, fmt.Errorf("decode hex: %w (preview=%q)", err, preview)
 	}
 	return raw, nil
+}
+
+// enrichToEF takes canonical raw tx bytes, fetches each input's parent
+// tx from WoC (using the parentCache to deduplicate shared parents
+// across picked txs), injects the source script + satoshis into each
+// input via SetSourceTxOutput, and returns the Extended Format bytes.
+// Pace between WoC calls is ~300ms to stay under the free-tier rate
+// limit, same cadence as the picked-tx loop.
+func enrichToEF(wocBase string, raw []byte, parentCache map[string]*sdkTx.Transaction) ([]byte, error) {
+	tx, err := sdkTx.NewTransactionFromBytes(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse picked tx: %w", err)
+	}
+	for vin, input := range tx.Inputs {
+		parentTXID := input.SourceTXID.String()
+		parent, ok := parentCache[parentTXID]
+		if !ok {
+			time.Sleep(300 * time.Millisecond)
+			parentRaw, fErr := fetchRawTx(wocBase, parentTXID)
+			if fErr != nil {
+				return nil, fmt.Errorf("input %d: fetch parent %s: %w", vin, parentTXID, fErr)
+			}
+			p, pErr := sdkTx.NewTransactionFromBytes(parentRaw)
+			if pErr != nil {
+				return nil, fmt.Errorf("input %d: parse parent %s: %w", vin, parentTXID, pErr)
+			}
+			parentCache[parentTXID] = p
+			parent = p
+		}
+		if int(input.SourceTxOutIndex) >= len(parent.Outputs) {
+			return nil, fmt.Errorf("input %d: parent %s has %d outputs, vout=%d",
+				vin, parentTXID, len(parent.Outputs), input.SourceTxOutIndex)
+		}
+		out := parent.Outputs[input.SourceTxOutIndex]
+		input.SetSourceTxOutput(&sdkTx.TransactionOutput{
+			Satoshis:      out.Satoshis,
+			LockingScript: out.LockingScript,
+		})
+	}
+	efBytes, err := tx.EF()
+	if err != nil {
+		return nil, fmt.Errorf("serialize EF: %w", err)
+	}
+	return efBytes, nil
 }
