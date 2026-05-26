@@ -106,7 +106,8 @@ p2p:
   # listen_port: 9905
   # dht_mode: off              # "server", "client", or "off" (library default is "off")
   # storage_path: ""           # defaults to <top-level storage_path>/p2p; stores p2p_key.hex for stable peer ID
-  # bootstrap_peers: []        # override or extend the built-in defaults
+  # bootstrap_peers: []        # override the built-in defaults; also feeds chaintracks
+                               # (unless chaintracks.p2p.msgbus.bootstrappeers is set explicitly)
   # enable_mdns: false
   # allow_private_urls: false  # accept loopback/RFC1918/link-local URLs from peers
 
@@ -203,3 +204,15 @@ chaintracks_server:
 #   storage_path: ""       # embedded mode only; defaults to <storage_path>/chaintracks
 #   bootstrap_url: ""      # embedded mode only
 #   bootstrap_mode: api    # embedded mode only
+#   # Bootstrap peers default to the network-derived list, falling back to
+#   # p2p.bootstrap_peers when that's set — configure peers once at the p2p
+#   # block and both the p2p-client and chaintracks pick them up. Only set
+#   # the explicit override below when chaintracks needs a different peer
+#   # set than the p2p-client (rare). The upstream msgbus.Config struct has
+#   # no mapstructure tags, so the YAML key is the camelCase-flattened name
+#   # ("bootstrappeers", not "bootstrap_peers") — viper matches case-
+#   # insensitively but does not translate snake_case.
+#   p2p:
+#     msgbus:
+#       bootstrappeers:
+#         - /dns4/peer.example.cluster.local/tcp/9905/p2p/12D3Koo...
