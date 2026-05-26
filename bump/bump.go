@@ -71,8 +71,18 @@ func assembleFullPath(stumpData []byte, subtreeIndex int, subtreeHashes []chainh
 
 	numSubtrees := len(subtreeHashes)
 	if numSubtrees <= 1 {
-		// Single subtree: STUMP IS the full BUMP.
+		// Single subtree: the STUMP covers the subtree-internal levels.
 		computeMissingHashes(stumpPath)
+		// The block tree may be taller than this subtree. When the coinbase tx
+		// sits outside the subtree, the block merkle root is one or more levels
+		// above the subtree root, and the STUMP's internal height is short of
+		// the true block height. The coinbase BUMP is the authoritative full
+		// block-level path (it computes the block-header merkle root from the
+		// coinbase txid), so fold the subtree root up to the block root using
+		// its left-spine siblings. Without this, a single-subtree block whose
+		// coinbase adds a block level computes the subtree root instead of the
+		// block root and fails ValidateCompoundRoot (issue #167).
+		extendSubtreeToBlockRoot(stumpPath, coinbaseBUMP, internalHeight)
 		var txOffset uint64
 		if internalHeight > 0 {
 			for _, leaf := range stumpPath.Path[0] {
@@ -141,6 +151,43 @@ func assembleFullPath(stumpData []byte, subtreeIndex int, subtreeHashes []chainh
 	// this index at height: N".
 	padAndComputeBlockLevel(fullPath, internalHeight, numSubtrees)
 	return fullPath, txOffset, nil
+}
+
+// extendSubtreeToBlockRoot lifts a single-subtree path from the subtree root up
+// to the true block-header merkle root when the block tree is taller than the
+// subtree (the coinbase tx sits outside the subtree, adding one or more
+// block-levels above the subtree-root layer).
+//
+// The coinbase BUMP is the canonical full block-level path: the coinbase txid
+// climbs the block's left spine (offset 0 at every level) to the block root, so
+// its sibling at each level above the subtree's internal height is exactly the
+// right-hand sibling the subtree root must fold with. Subtree 0 contains the
+// coinbase, so it occupies that same left spine — its accumulated node stays at
+// offset 0 and the sibling sits at offset 1. Appending those siblings lets
+// ComputeRoot fold every tracked tx's path through to the block root.
+//
+// No-op when there is no coinbase BUMP or when it is not taller than the STUMP
+// (the common case where the subtree root already is the block root), so this
+// is safe for power-of-two single-subtree blocks that previously worked.
+func extendSubtreeToBlockRoot(stumpPath *transaction.MerklePath, coinbaseBUMP []byte, internalHeight int) {
+	if len(coinbaseBUMP) == 0 {
+		return
+	}
+	cbPath, err := transaction.NewMerklePathFromBinary(coinbaseBUMP)
+	if err != nil || len(cbPath.Path) <= internalHeight {
+		return
+	}
+	for level := internalHeight; level < len(cbPath.Path); level++ {
+		sib := findLeafByOffset(cbPath, level, 1)
+		if sib == nil || sib.Hash == nil {
+			return
+		}
+		if findLeafByOffset(stumpPath, level, 1) != nil {
+			continue
+		}
+		h := *sib.Hash
+		addLeaf(stumpPath, level, &transaction.PathElement{Offset: 1, Hash: &h})
+	}
 }
 
 // extractCoinbaseTxID parses a BRC-74 coinbase BUMP and returns the real
