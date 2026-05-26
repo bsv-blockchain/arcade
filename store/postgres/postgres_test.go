@@ -509,11 +509,11 @@ func TestListSubmissionsReadyForRetry(t *testing.T) {
 		count int
 		next  *time.Time
 	}{
-		{"sub-ready-old", 2, &earlier},  // oldest ready — expect first
-		{"sub-ready-new", 1, &past},     // ready, but newer than -old
-		{"sub-future", 1, &future},      // not yet due
-		{"sub-no-retry", 0, nil},        // never failed — not in retry
-		{"sub-ready-third", 3, &past},   // ready, second in time order
+		{"sub-ready-old", 2, &earlier}, // oldest ready — expect first
+		{"sub-ready-new", 1, &past},    // ready, but newer than -old
+		{"sub-future", 1, &future},     // not yet due
+		{"sub-no-retry", 0, nil},       // never failed — not in retry
+		{"sub-ready-third", 3, &past},  // ready, second in time order
 	}
 	for _, r := range rows {
 		sub := &models.Submission{
