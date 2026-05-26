@@ -22,7 +22,7 @@ import (
 
 // TestBroadcastSingle_WaitsForSlowPeer verifies that once one endpoint
 // returns 200, the broadcast still waits for the slow peer to finish its
-// HTTP call rather than cancelling it. Every Teranode in the healthy set
+// HTTP call rather than canceling it. Every Teranode in the healthy set
 // must receive every tx so subsequent dependent broadcasts don't hit a
 // node that's missing the parent.
 func TestBroadcastSingle_WaitsForSlowPeer(t *testing.T) {
@@ -68,7 +68,7 @@ func TestBroadcastSingle_WaitsForSlowPeer(t *testing.T) {
 	}
 
 	if elapsed < slowDelay {
-		t.Fatalf("broadcast wall-time %v < slow peer delay %v — slow peer was cancelled early", elapsed, slowDelay)
+		t.Fatalf("broadcast wall-time %v < slow peer delay %v — slow peer was canceled early", elapsed, slowDelay)
 	}
 }
 
