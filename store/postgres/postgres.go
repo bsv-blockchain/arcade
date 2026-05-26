@@ -269,7 +269,7 @@ VALUES ` + values.String() + `
 ON CONFLICT (txid) DO UPDATE SET txid = transactions.txid
 RETURNING txid, status, status_code, block_hash, block_height, merkle_path,
           extra_info, competing_txs, raw_tx, retry_count, next_retry_at,
-          timestamp_at, created_at, merkle_registered_at, (xmax = 0) AS inserted`
+          timestamp_at, created_at, merkle_registered_at, last_rebroadcast_at, (xmax = 0) AS inserted`
 
 	rows, err := s.pool.Query(ctx, q, args...)
 	if err != nil {
@@ -551,7 +551,7 @@ func (s *Store) GetStatus(ctx context.Context, txid string) (*models.Transaction
 	const q = `
 SELECT txid, status, status_code, block_hash, block_height, merkle_path,
        extra_info, competing_txs, raw_tx, retry_count, next_retry_at,
-       timestamp_at, created_at, merkle_registered_at
+       timestamp_at, created_at, merkle_registered_at, last_rebroadcast_at
 FROM transactions WHERE txid = $1`
 	row := s.pool.QueryRow(ctx, q, txid)
 	st, err := scanStatus(row)
@@ -569,7 +569,7 @@ func (s *Store) GetStatusesSince(ctx context.Context, since time.Time) ([]*model
 	const q = `
 SELECT txid, status, status_code, block_hash, block_height, merkle_path,
        extra_info, competing_txs, raw_tx, retry_count, next_retry_at,
-       timestamp_at, created_at, merkle_registered_at
+       timestamp_at, created_at, merkle_registered_at, last_rebroadcast_at
 FROM transactions WHERE timestamp_at >= $1
 ORDER BY timestamp_at DESC`
 	rows, err := s.pool.Query(ctx, q, since)
@@ -596,7 +596,7 @@ func (s *Store) IterateStatusesSince(ctx context.Context, since time.Time, fn fu
 	const q = `
 SELECT txid, status, status_code, block_hash, block_height, merkle_path,
        extra_info, competing_txs, raw_tx, retry_count, next_retry_at,
-       timestamp_at, created_at, merkle_registered_at
+       timestamp_at, created_at, merkle_registered_at, last_rebroadcast_at
 FROM transactions WHERE timestamp_at >= $1
 ORDER BY timestamp_at DESC`
 	rows, err := s.pool.Query(ctx, q, since)
@@ -1277,6 +1277,7 @@ func scanStatusWithInserted(row rowScanner) (*models.TransactionStatus, bool, er
 		rawTx              []byte
 		nextRetry          *time.Time
 		merkleRegisteredAt *time.Time
+		lastRebroadcastAt  *time.Time
 		inserted           bool
 	)
 	if err := row.Scan(
@@ -1284,7 +1285,7 @@ func scanStatusWithInserted(row rowScanner) (*models.TransactionStatus, bool, er
 		&blockHash, &blockHeight, &merklePath,
 		&extraInfo, &competingTxs, &rawTx,
 		&st.RetryCount, &nextRetry,
-		&st.Timestamp, &st.CreatedAt, &merkleRegisteredAt, &inserted,
+		&st.Timestamp, &st.CreatedAt, &merkleRegisteredAt, &lastRebroadcastAt, &inserted,
 	); err != nil {
 		return nil, false, err
 	}
@@ -1315,6 +1316,9 @@ func scanStatusWithInserted(row rowScanner) (*models.TransactionStatus, bool, er
 	if merkleRegisteredAt != nil {
 		st.MerkleRegisteredAt = *merkleRegisteredAt
 	}
+	if lastRebroadcastAt != nil {
+		st.LastRebroadcastAt = *lastRebroadcastAt
+	}
 	return &st, inserted, nil
 }
 
@@ -1330,13 +1334,14 @@ func scanStatus(row rowScanner) (*models.TransactionStatus, error) {
 		rawTx              []byte
 		nextRetry          *time.Time
 		merkleRegisteredAt *time.Time
+		lastRebroadcastAt  *time.Time
 	)
 	if err := row.Scan(
 		&st.TxID, &st.Status, &statusCode,
 		&blockHash, &blockHeight, &merklePath,
 		&extraInfo, &competingTxs, &rawTx,
 		&st.RetryCount, &nextRetry,
-		&st.Timestamp, &st.CreatedAt, &merkleRegisteredAt,
+		&st.Timestamp, &st.CreatedAt, &merkleRegisteredAt, &lastRebroadcastAt,
 	); err != nil {
 		return nil, err
 	}
@@ -1366,6 +1371,9 @@ func scanStatus(row rowScanner) (*models.TransactionStatus, error) {
 	}
 	if merkleRegisteredAt != nil {
 		st.MerkleRegisteredAt = *merkleRegisteredAt
+	}
+	if lastRebroadcastAt != nil {
+		st.LastRebroadcastAt = *lastRebroadcastAt
 	}
 	return &st, nil
 }

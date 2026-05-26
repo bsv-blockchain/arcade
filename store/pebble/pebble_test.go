@@ -1006,3 +1006,66 @@ func hashesOf(rows []*models.BlockProcessingStatus) []string {
 	}
 	return out
 }
+
+// TestGetReapCandidates_WindowEligibilityAndBoundedOrder exercises the Pebble
+// reaper-candidate query: the [since, seenDeadline) window filter, the
+// raw_tx/status/recently-rebroadcast eligibility checks, and the bounded
+// oldest-rebroadcast-first selection (limit < eligible count).
+func TestGetReapCandidates_WindowEligibilityAndBoundedOrder(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	insertSeen := func(txid string, ts time.Time, raw []byte, status models.Status) {
+		_, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+			TxID:      txid,
+			Status:    status,
+			RawTx:     raw,
+			Timestamp: ts,
+		})
+		if err != nil {
+			t.Fatalf("insert %s: %v", txid, err)
+		}
+	}
+	raw := []byte{0x01, 0x02}
+
+	// In-window (now-2h) SEEN rows with distinct last_rebroadcast times.
+	insertSeen("never", now.Add(-2*time.Hour), raw, models.StatusSeenMultipleNodes) // oldest (never)
+	insertSeen("rb5h", now.Add(-2*time.Hour), raw, models.StatusSeenMultipleNodes)
+	insertSeen("rb3h", now.Add(-2*time.Hour), raw, models.StatusSeenOnNetwork)
+	insertSeen("rb2h", now.Add(-2*time.Hour), raw, models.StatusSeenMultipleNodes) // most-recently rebroadcast (evicted at limit=3)
+	// Excluded rows:
+	insertSeen("recent", now.Add(-2*time.Hour), raw, models.StatusSeenMultipleNodes)    // rebroadcast within interval
+	insertSeen("received", now.Add(-2*time.Hour), raw, models.StatusReceived)           // wrong status
+	insertSeen("noraw", now.Add(-2*time.Hour), nil, models.StatusSeenMultipleNodes)     // empty raw_tx
+	insertSeen("tooOld", now.Add(-30*time.Hour), raw, models.StatusSeenMultipleNodes)   // before since
+	insertSeen("tooNew", now.Add(-30*time.Minute), raw, models.StatusSeenMultipleNodes) // after deadline
+
+	mark := func(txid string, ts time.Time) {
+		if err := s.MarkRebroadcastByTxIDs(ctx, []string{txid}, ts); err != nil {
+			t.Fatalf("mark %s: %v", txid, err)
+		}
+	}
+	mark("rb5h", now.Add(-5*time.Hour))
+	mark("rb3h", now.Add(-3*time.Hour))
+	mark("rb2h", now.Add(-2*time.Hour))
+	mark("recent", now.Add(-30*time.Minute)) // within the 1h interval → not eligible
+
+	got, err := s.GetReapCandidates(ctx, now.Add(-24*time.Hour), now.Add(-time.Hour), now.Add(-time.Hour), 3)
+	if err != nil {
+		t.Fatalf("GetReapCandidates: %v", err)
+	}
+	gotTxids := make([]string, len(got))
+	for i, r := range got {
+		gotTxids[i] = r.TxID
+		if len(r.RawTx) == 0 {
+			t.Fatalf("candidate %s returned with empty RawTx", r.TxID)
+		}
+	}
+	// limit=3 of the eligible {never, rb5h, rb3h, rb2h}: the 3 oldest-rebroadcast,
+	// ascending. rb2h (most recent) is evicted.
+	want := []string{"never", "rb5h", "rb3h"}
+	if fmt.Sprintf("%v", gotTxids) != fmt.Sprintf("%v", want) {
+		t.Fatalf("got %v, want %v", gotTxids, want)
+	}
+}

@@ -14,6 +14,7 @@
 package pebble
 
 import (
+	"container/heap"
 	"context"
 	"encoding/json"
 	"errors"
@@ -974,11 +975,36 @@ func (s *Store) MarkMerkleRegisteredByTxIDs(ctx context.Context, txids []string,
 	return nil
 }
 
-// GetReapCandidates walks the updated-at index (oldest-first) and returns up to
-// limit SEEN_* rows the reaper should rebroadcast, ordered oldest-unserved
-// first. The updated-at index is timestamp-ordered, not last_rebroadcast_at-
-// ordered, so the due-filter and the final oldest-rebroadcast-first sort are
-// applied in-process over the filtered set. See store.Store for the contract.
+// reapCandidate is one row under consideration by GetReapCandidates.
+type reapCandidate struct {
+	txid          string
+	rawTx         []byte
+	lastRebcastNs int64 // math.MinInt64 == never rebroadcast (oldest)
+}
+
+// reapHeap is a bounded MAX-heap on lastRebcastNs (largest on top). Pushing and
+// popping-when-over-limit keeps the `limit` SMALLEST (oldest-rebroadcast)
+// candidates, so GetReapCandidates stays O(limit) memory over a large backlog.
+type reapHeap []reapCandidate
+
+func (h *reapHeap) Len() int           { return len(*h) }
+func (h *reapHeap) Less(i, j int) bool { return (*h)[i].lastRebcastNs > (*h)[j].lastRebcastNs }
+func (h *reapHeap) Swap(i, j int)      { (*h)[i], (*h)[j] = (*h)[j], (*h)[i] }
+func (h *reapHeap) Push(x any)         { *h = append(*h, x.(reapCandidate)) }
+func (h *reapHeap) Pop() any {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	*h = old[:n-1]
+	return item
+}
+
+// GetReapCandidates walks the updated-at index within [since, seenDeadline) and
+// returns up to limit SEEN_* rows the reaper should rebroadcast, ordered
+// oldest-rebroadcast-first. The updated-at index is timestamp-ordered (not
+// last_rebroadcast_at-ordered), so the scan is bounded by the timestamp window
+// and a bounded max-heap selects the oldest-rebroadcast subset. See store.Store
+// for the contract.
 func (s *Store) GetReapCandidates(ctx context.Context, since, seenDeadline, rebroadcastBefore time.Time, limit int) ([]*models.TransactionStatus, error) {
 	if limit <= 0 {
 		return nil, nil
@@ -987,8 +1013,14 @@ func (s *Store) GetReapCandidates(ctx context.Context, since, seenDeadline, rebr
 		return nil, err
 	}
 	prefix := idxTxUpdatedPrefix()
+	sinceNs := since.UnixNano()
+	deadlineNs := seenDeadline.UnixNano()
+	// Bound the scan to [since, seenDeadline): the idx:tx:updated keyspace is
+	// ordered by timestamp (hex-encoded unix nanos), so start at the first key
+	// at/after `since` and stop as soon as a row's timestamp reaches the
+	// deadline — no need to walk the full history every tick.
 	iter, err := s.db.NewIter(&pebbledb.IterOptions{
-		LowerBound: prefix,
+		LowerBound: idxTxUpdatedKey(sinceNs, ""),
 		UpperBound: endOfPrefix(prefix),
 	})
 	if err != nil {
@@ -996,13 +1028,10 @@ func (s *Store) GetReapCandidates(ctx context.Context, since, seenDeadline, rebr
 	}
 	defer func() { _ = iter.Close() }()
 
-	sinceNs := since.UnixNano()
-	deadlineNs := seenDeadline.UnixNano()
-	type candidate struct {
-		st            *models.TransactionStatus
-		lastRebcastNs int64 // math.MinInt64 sentinel == never rebroadcast (sorts first)
-	}
-	var candidates []candidate
+	// Keep only the `limit` oldest-rebroadcast candidates via a bounded
+	// max-heap (largest lastRebcastNs on top, evicted when full) so memory
+	// stays O(limit) regardless of backlog. math.MinInt64 == never rebroadcast.
+	h := &reapHeap{}
 	for iter.First(); iter.Valid(); iter.Next() {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -1012,11 +1041,15 @@ func (s *Store) GetReapCandidates(ctx context.Context, since, seenDeadline, rebr
 		if err != nil || st == nil {
 			continue
 		}
-		if st.Status != models.StatusSeenOnNetwork && st.Status != models.StatusSeenMultipleNodes {
+		tsNs := st.Timestamp.UnixNano()
+		if tsNs >= deadlineNs {
+			// Index is timestamp-ascending, so nothing past here is in-window.
+			break
+		}
+		if tsNs < sinceNs {
 			continue
 		}
-		tsNs := st.Timestamp.UnixNano()
-		if tsNs < sinceNs || tsNs >= deadlineNs {
+		if st.Status != models.StatusSeenOnNetwork && st.Status != models.StatusSeenMultipleNodes {
 			continue
 		}
 		if len(st.RawTx) == 0 {
@@ -1029,20 +1062,16 @@ func (s *Store) GetReapCandidates(ctx context.Context, since, seenDeadline, rebr
 		if !st.LastRebroadcastAt.IsZero() {
 			lastNs = st.LastRebroadcastAt.UnixNano()
 		}
-		candidates = append(candidates, candidate{
-			st:            &models.TransactionStatus{TxID: st.TxID, RawTx: st.RawTx},
-			lastRebcastNs: lastNs,
-		})
+		heap.Push(h, reapCandidate{txid: st.TxID, rawTx: st.RawTx, lastRebcastNs: lastNs})
+		if h.Len() > limit {
+			heap.Pop(h) // evict the most-recently-rebroadcast (largest)
+		}
 	}
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].lastRebcastNs < candidates[j].lastRebcastNs
-	})
-	if len(candidates) > limit {
-		candidates = candidates[:limit]
-	}
-	results := make([]*models.TransactionStatus, len(candidates))
-	for i, c := range candidates {
-		results[i] = c.st
+	// Heap holds the `limit` oldest-rebroadcast rows; emit ascending.
+	results := make([]*models.TransactionStatus, h.Len())
+	for i := len(results) - 1; i >= 0; i-- {
+		c := heap.Pop(h).(reapCandidate)
+		results[i] = &models.TransactionStatus{TxID: c.txid, RawTx: c.rawTx}
 	}
 	return results, nil
 }
