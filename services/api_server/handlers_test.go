@@ -627,6 +627,142 @@ func TestHandleSubmitTransactions_DedupBranch_PopulatesTxTracker(t *testing.T) {
 	}
 }
 
+// TestHandleSubmitTransaction_ResubmitRejected_RepublishesToKafka pins the
+// resubmission contract: when a client POSTs a tx whose existing store row
+// is REJECTED, the handler must NOT echo back the rejection — it must
+// republish to Kafka so the propagator re-runs the broadcast pipeline.
+// The status row is left as REJECTED until the new broadcast produces a
+// verdict; the lattice already allows REJECTED → ACCEPTED / SEEN_* so the
+// eventual terminal write will land cleanly.
+func TestHandleSubmitTransaction_ResubmitRejected_RepublishesToKafka(t *testing.T) {
+	rawTx := makeMinimalTx()
+	parsed, _, err := sdkTx.NewTransactionFromStream(rawTx)
+	if err != nil {
+		t.Fatalf("parsing test tx: %v", err)
+	}
+	wantTxID := parsed.TxID().String()
+
+	ms := &mockStore{
+		getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+			return &models.TransactionStatus{
+				TxID:   in.TxID,
+				Status: models.StatusRejected,
+			}, false, nil
+		},
+	}
+	tracker := store.NewTxTracker()
+	broker := &kafka.RecordingBroker{}
+	gin.SetMode(gin.TestMode)
+	srv := &Server{
+		cfg:            &config.Config{CallbackToken: testCallbackToken},
+		logger:         zap.NewNop(),
+		producer:       kafka.NewProducer(broker),
+		store:          ms,
+		txTracker:      tracker,
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
+	}
+	router := gin.New()
+	srv.registerRoutes(router)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/tx", bytes.NewReader(rawTx))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["status"] == "already submitted" {
+		t.Errorf("REJECTED resubmit must not return 'already submitted', got %v", resp)
+	}
+
+	// Tracker must still know about the txid (so bump-builder's tracked-only
+	// filtering keeps working after a future MINED transition).
+	if _, ok := tracker.GetStatus(wantTxID); !ok {
+		t.Errorf("tracker missing resubmitted txid %s", wantTxID)
+	}
+
+	// Resubmit must reach Kafka — otherwise the propagator never sees the
+	// new attempt and the row stays REJECTED forever.
+	if got := totalMessages(broker); got != 1 {
+		t.Errorf("REJECTED resubmit must publish to Kafka, got %d messages", got)
+	}
+}
+
+// TestHandleSubmitTransactions_BatchResubmitRejected_RepublishesToKafka is
+// the batch-path mirror: a batch containing one REJECTED resubmit and one
+// fresh-insert must publish both. The REJECTED resubmit is NOT counted as
+// a duplicate.
+func TestHandleSubmitTransactions_BatchResubmitRejected_RepublishesToKafka(t *testing.T) {
+	rawA := makeMinimalTx()
+	parsedA, _, err := sdkTx.NewTransactionFromStream(rawA)
+	if err != nil {
+		t.Fatalf("parse A: %v", err)
+	}
+	txidA := parsedA.TxID().String()
+
+	txB := sdkTx.NewTransaction()
+	txB.AddOutput(&sdkTx.TransactionOutput{
+		Satoshis:      0,
+		LockingScript: &script.Script{},
+	})
+	rawB := txB.Bytes()
+	parsedB, _, err := sdkTx.NewTransactionFromStream(rawB)
+	if err != nil {
+		t.Fatalf("parse B: %v", err)
+	}
+	txidB := parsedB.TxID().String()
+	if txidA == txidB {
+		t.Fatalf("expected distinct txids, got identical %s", txidA)
+	}
+
+	ms := &mockStore{
+		getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+			if in.TxID == txidA {
+				return &models.TransactionStatus{
+					TxID:   in.TxID,
+					Status: models.StatusRejected,
+				}, false, nil
+			}
+			return nil, true, nil
+		},
+	}
+	tracker := store.NewTxTracker()
+	broker := &kafka.RecordingBroker{}
+	gin.SetMode(gin.TestMode)
+	srv := &Server{
+		cfg:            &config.Config{CallbackToken: testCallbackToken},
+		logger:         zap.NewNop(),
+		producer:       kafka.NewProducer(broker),
+		store:          ms,
+		txTracker:      tracker,
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
+	}
+	router := gin.New()
+	srv.registerRoutes(router)
+
+	body := append(append([]byte(nil), rawA...), rawB...)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/txs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Both txs must reach Kafka: A as a REJECTED resubmit, B as a fresh
+	// insert.
+	if got := totalMessages(broker); got != 2 {
+		t.Errorf("expected 2 published messages (A resubmit + B fresh), got %d", got)
+	}
+}
+
 // TestHandleSubmitTransaction_ValidationFailure_RecordsSubmissionAndPublishes
 // pins the intake-rejection contract: when a tx fails validation, the
 // handler must (1) persist a REJECTED row, (2) queue an InsertSubmission

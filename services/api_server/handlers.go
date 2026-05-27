@@ -612,13 +612,21 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 			s.logger.Error("dedup CAS failed", zap.String("txid", txid), zap.Error(dedupErr))
 			// Best-effort: continue with publish. The propagator's
 			// in-flight set catches duplicates that slip past.
+		case !inserted && existing != nil && existing.Status == models.StatusRejected:
+			// Resubmission of a previously-rejected tx: republish to Kafka
+			// so the propagator re-runs the broadcast pipeline. The status
+			// row stays at REJECTED until the new broadcast produces a
+			// verdict; the lattice already allows REJECTED → ACCEPTED /
+			// SEEN_* so the eventual terminal write lands cleanly.
+			if s.txTracker != nil {
+				s.txTracker.Add(txid, existing.Status)
+			}
 		case !inserted && existing != nil:
-			// Idempotent re-submit: row already exists. Register the txid
-			// with the in-process TxTracker using the persisted status so
-			// bump-builder's tracked-only filtering recognizes it. Without
-			// this, a re-submit after process restart leaves the tx
-			// invisible to bump-builder and subsequent MINED/IMMUTABLE
-			// transitions are silently dropped.
+			// Idempotent re-submit: row already exists at a non-REJECTED
+			// status. Register the txid with the in-process TxTracker so
+			// bump-builder's tracked-only filtering recognizes it after a
+			// process restart, then echo back the existing state without
+			// re-publishing.
 			if s.txTracker != nil {
 				s.txTracker.Add(txid, existing.Status)
 			}
@@ -846,12 +854,21 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 			case dedupErr != nil:
 				s.logger.Error("dedup CAS failed", zap.String("txid", p.txid), zap.Error(dedupErr))
 				toPublish = append(toPublish, p)
+			case !inserted && existing != nil && existing.Status == models.StatusRejected:
+				// Resubmission of a previously-rejected tx: republish so
+				// the propagator re-runs the broadcast pipeline. The
+				// status row stays at REJECTED until the new broadcast
+				// produces a verdict. Mirrors handleSubmitTransaction.
+				if s.txTracker != nil {
+					s.txTracker.Add(p.txid, existing.Status)
+				}
+				toPublish = append(toPublish, p)
 			case !inserted && existing != nil:
 				duplicates++
-				// Idempotent re-submit: register the txid with the
-				// in-process TxTracker using the persisted status so
-				// bump-builder's tracked-only filtering recognizes it.
-				// Mirrors the single-submit dedup branch (handleSubmitTransaction).
+				// Idempotent re-submit at a non-REJECTED status: register
+				// the txid with the in-process TxTracker using the
+				// persisted status so bump-builder's tracked-only filtering
+				// recognizes it. Mirrors the single-submit dedup branch.
 				if s.txTracker != nil {
 					s.txTracker.Add(p.txid, existing.Status)
 				}
