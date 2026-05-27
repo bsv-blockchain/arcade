@@ -326,7 +326,7 @@ func parseBlockBinary(data []byte) ([]chainhash.Hash, []byte, *chainhash.Hash, e
 	if uint64(subtreeCount) > maxSubtreeCount {
 		return nil, nil, nil, fmt.Errorf("subtree count %d exceeds maximum of %d", uint64(subtreeCount), maxSubtreeCount)
 	}
-	if uint64(subtreeCount) > uint64(r.Len()/32) {
+	if uint64(subtreeCount) > uint64(r.Len()/32) { //nolint:gosec // bytes.Reader.Len() is always non-negative (remaining unread bytes)
 		return nil, nil, nil, fmt.Errorf("subtree count %d exceeds remaining body capacity (%d bytes for %d-byte hashes)", uint64(subtreeCount), r.Len(), 32)
 	}
 
@@ -378,7 +378,7 @@ func parseBlockBinary(data []byte) ([]chainhash.Hash, []byte, *chainhash.Hash, e
 	// lengths as "no coinbase BUMP available" — matching the existing
 	// best-effort posture of the coinbase-tail parsing below the subtree
 	// hashes. See finding F-008.
-	if uint64(cbBUMPLen) > uint64(r.Len()) {
+	if uint64(cbBUMPLen) > uint64(r.Len()) { //nolint:gosec // bytes.Reader.Len() is always non-negative (remaining unread bytes)
 		return hashes, nil, headerMerkleRoot, nil
 	}
 
