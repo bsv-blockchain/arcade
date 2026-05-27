@@ -16,7 +16,7 @@ import (
 // BroadcastTx would silently route everything to REJECTED before
 // merkle-service ever sees a watch registration.
 func TestBuildValidatableTxs_PassesArcadePolicyValidator(t *testing.T) {
-	v := validator.NewValidator(nil, nil)
+	v := validator.NewValidator(nil)
 	txs := BuildValidatableTxs(5, 100)
 
 	for i, tx := range txs {

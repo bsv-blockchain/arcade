@@ -16,30 +16,36 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/teranode"
 )
 
-// TestBroadcastSingle_FirstSuccessWins_DoesNotWaitForSlowPeer verifies that
-// once one endpoint returns 200, the broadcast returns in ~fast-peer time
-// rather than waiting for the slow peer. The slow peer's handler eventually
-// observes context cancellation (its r.Context().Done() fires when the
-// client closes the connection), but we measure the outcome via wall-time
-// to avoid pinning the test to net/http server-side context propagation
-// internals.
-func TestBroadcastSingle_FirstSuccessWins_DoesNotWaitForSlowPeer(t *testing.T) {
+// TestBroadcastSingle_WaitsForSlowPeer verifies that once one endpoint
+// returns 200, the broadcast still waits for the slow peer to finish its
+// HTTP call rather than canceling it. Every Teranode in the healthy set
+// must receive every tx so subsequent dependent broadcasts don't hit a
+// node that's missing the parent.
+func TestBroadcastSingle_WaitsForSlowPeer(t *testing.T) {
 	fastSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer fastSrv.Close()
 
+	const slowDelay = 2 * time.Second
+	slowHit := make(chan struct{}, 1)
 	slowSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Sleep or abort-on-cancel, whichever comes first. The handler will
-		// eventually return; the broadcast must not wait for it.
 		select {
-		case <-r.Context().Done():
-		case <-time.After(5 * time.Second):
+		case slowHit <- struct{}{}:
+		default:
 		}
-		w.WriteHeader(http.StatusOK)
+		select {
+		case <-time.After(slowDelay):
+			w.WriteHeader(http.StatusOK)
+		case <-r.Context().Done():
+			// If the broadcast cancels us early, fail the request loudly so
+			// the assertion below catches it.
+			w.WriteHeader(http.StatusGatewayTimeout)
+		}
 	}))
 	defer slowSrv.Close()
 
@@ -55,10 +61,14 @@ func TestBroadcastSingle_FirstSuccessWins_DoesNotWaitForSlowPeer(t *testing.T) {
 	}
 	elapsed := time.Since(start)
 
-	// Slow peer sleeps 5s. If we were waiting for it, elapsed would be ~5s.
-	// With first-success early-cancel, elapsed should be well under 1s.
-	if elapsed > 1*time.Second {
-		t.Fatalf("broadcast wall-time %v — did not early-cancel slow peer", elapsed)
+	select {
+	case <-slowHit:
+	default:
+		t.Fatalf("slow peer never received the broadcast")
+	}
+
+	if elapsed < slowDelay {
+		t.Fatalf("broadcast wall-time %v < slow peer delay %v — slow peer was canceled early", elapsed, slowDelay)
 	}
 }
 
@@ -215,9 +225,8 @@ func TestPeerUnreachable_Trips(t *testing.T) {
 
 // TestBadPeer_SkippedAfterTrip verifies that once the bad endpoint is tripped
 // to unhealthy, subsequent broadcasts do not send it any traffic. The trip is
-// induced deterministically via RecordFailure calls — inducing it via real
-// broadcasts is racy because the early-cancel can abort bad's request before
-// it reaches the server, preventing the hit from being recorded.
+// induced deterministically via RecordFailure calls so the assertion doesn't
+// depend on the worker pool's per-call scheduling.
 func TestBadPeer_SkippedAfterTrip(t *testing.T) {
 	var okHits, badHits atomic.Int32
 
@@ -389,6 +398,104 @@ func TestMinHealthyWarning_ZeroDisables(t *testing.T) {
 
 	if got := recorded.FilterMessage("healthy endpoint count below minimum").Len(); got != 0 {
 		t.Fatalf("warning must be disabled with MinHealthyEndpoints=0, got %d", got)
+	}
+}
+
+// TestBroadcast_PerPeerAggregation_AcceptanceWins covers the per-tx
+// aggregation across peer responses: when one peer rejects a tx but
+// another peer accepts it (by 500-ing without naming it), the acceptance
+// must win. Two endpoints each return 500 with different failure maps
+// such that each tx is rejected by one peer and implicitly accepted by
+// the other. Both txs should land as ACCEPTED_BY_NETWORK.
+func TestBroadcast_PerPeerAggregation_AcceptanceWins(t *testing.T) {
+	const (
+		txidA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		txidB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	)
+	// Peer A rejects txidA, implicitly accepts txidB.
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("Failed to process transactions:\n" +
+			"TX_INVALID (31): [ProcessTransaction][" + txidA + "] missing input\n"))
+	}))
+	defer srvA.Close()
+	// Peer B rejects txidB, implicitly accepts txidA.
+	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("Failed to process transactions:\n" +
+			"TX_INVALID (31): [ProcessTransaction][" + txidB + "] missing input\n"))
+	}))
+	defer srvB.Close()
+
+	ms := newMockStore()
+	cfg := &config.Config{}
+	cfg.Propagation.MerkleConcurrency = 10
+	tc := teranode.NewClient([]string{srvA.URL, srvB.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, nil)
+
+	for _, txid := range []string{txidA, txidB} {
+		if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg(txid))); err != nil {
+			t.Fatalf("handleMessage(%s): %v", txid, err)
+		}
+	}
+	if err := flushSync(t, p); err != nil {
+		t.Fatalf("flush error: %v", err)
+	}
+
+	for _, txid := range []string{txidA, txidB} {
+		got := ms.lastUpdateForTxid(txid)
+		if got == nil {
+			t.Fatalf("no status update recorded for %s", txid)
+		}
+		if got.Status != models.StatusAcceptedByNetwork {
+			t.Errorf("%s: expected ACCEPTED_BY_NETWORK, got %s (reason=%q)", txid, got.Status, got.ExtraInfo)
+		}
+	}
+}
+
+// TestBroadcast_PerPeerAggregation_UnanimousRejection covers the other
+// half: when every peer that gave us a parseable response named the same
+// tx as failed, the tx is REJECTED. Two endpoints both 500 with the
+// same txid in their failure maps; a second txid is absent from both
+// and should still be ACCEPTED.
+func TestBroadcast_PerPeerAggregation_UnanimousRejection(t *testing.T) {
+	const (
+		txidRejected = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+		txidAccepted = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	)
+	body := "Failed to process transactions:\n" +
+		"TX_INVALID (31): [ProcessTransaction][" + txidRejected + "] tx is invalid\n"
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srvA.Close()
+	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srvB.Close()
+
+	ms := newMockStore()
+	cfg := &config.Config{}
+	cfg.Propagation.MerkleConcurrency = 10
+	tc := teranode.NewClient([]string{srvA.URL, srvB.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, nil)
+
+	for _, txid := range []string{txidRejected, txidAccepted} {
+		if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg(txid))); err != nil {
+			t.Fatalf("handleMessage(%s): %v", txid, err)
+		}
+	}
+	if err := flushSync(t, p); err != nil {
+		t.Fatalf("flush error: %v", err)
+	}
+
+	if got := ms.lastUpdateForTxid(txidRejected); got == nil || got.Status != models.StatusRejected {
+		t.Errorf("%s: expected REJECTED, got %+v", txidRejected, got)
+	}
+	if got := ms.lastUpdateForTxid(txidAccepted); got == nil || got.Status != models.StatusAcceptedByNetwork {
+		t.Errorf("%s: expected ACCEPTED_BY_NETWORK, got %+v", txidAccepted, got)
 	}
 }
 

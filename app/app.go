@@ -156,7 +156,7 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		merkleClient.SetLogger(logger.Named("merkle-client"))
 	}
 
-	txVal := validator.NewValidator(nil, nil)
+	txVal := validator.NewValidator(validatorPolicyFromConfig(cfg))
 
 	publisher := events.NewKafkaPublisher(producer, logger, cfg.Events.SubscriberBuffer)
 
@@ -237,6 +237,17 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		_ = producer.Close()
 	}
 	return deps, cleanup, nil
+}
+
+// validatorPolicyFromConfig builds the validator.Policy from cfg.Validator.
+// Returns nil when no operator-facing fields are set so NewValidator's
+// built-in defaults apply unchanged.
+func validatorPolicyFromConfig(cfg *config.Config) *validator.Policy {
+	if cfg.Validator.MinFeePerKB == 0 {
+		return nil
+	}
+	minFee := cfg.Validator.MinFeePerKB
+	return &validator.Policy{MinFeePerKB: &minFee}
 }
 
 // modeNeedsChaintracks reports whether the configured service mode constructs
@@ -373,7 +384,7 @@ func BuildServices(d *Deps) []services.Service {
 		svcs = append(svcs, propagation.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.Leaser, d.TeranodeClient, d.MerkleClient))
 	}
 	if shouldRun("api-server") || shouldRun("webhook") {
-		svcs = append(svcs, webhook.New(cfg.Webhook, cfg.Callback, d.Logger, d.Publisher, d.Store))
+		svcs = append(svcs, webhook.New(cfg.Webhook, cfg.Callback, d.Logger, d.Publisher, d.Store, d.Leaser))
 	}
 	// p2p_client is intentionally NOT bundled with propagation. Running a
 	// libp2p host inside the propagation pod duplicates the peer discovery

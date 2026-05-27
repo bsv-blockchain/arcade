@@ -175,6 +175,14 @@ func (m *mockStore) UpdateDeliveryStatus(context.Context, string, models.Status,
 	return nil
 }
 
+func (m *mockStore) UpdateDeliveryStatusCAS(context.Context, string, models.Status, models.Status) (bool, error) {
+	return true, nil
+}
+
+func (m *mockStore) ListSubmissionsReadyForRetry(context.Context, time.Time, int) ([]*models.Submission, error) {
+	return nil, nil
+}
+
 func (m *mockStore) InsertStump(_ context.Context, stump *models.Stump) error {
 	if m.insertStumpErr != nil {
 		return m.insertStumpErr
@@ -636,7 +644,7 @@ func TestHandleSubmitTransaction_ValidationFailure_RecordsSubmissionAndPublishes
 
 	ms := &mockStore{}
 	pub := &recordingCallbackPub{}
-	val := validator.NewValidator(nil, nil)
+	val := validator.NewValidator(nil)
 	broker := &kafka.RecordingBroker{}
 	gin.SetMode(gin.TestMode)
 	srv := &Server{
@@ -727,7 +735,7 @@ func TestHandleSubmitTransaction_ValidationFailure_NoCallback_StillPublishes(t *
 
 	ms := &mockStore{}
 	pub := &recordingCallbackPub{}
-	val := validator.NewValidator(nil, nil)
+	val := validator.NewValidator(nil)
 	broker := &kafka.RecordingBroker{}
 	gin.SetMode(gin.TestMode)
 	srv := &Server{
@@ -778,7 +786,7 @@ func TestHandleSubmitTransaction_ValidationFailure_NoCallback_StillPublishes(t *
 func TestHandleSubmitTransaction_ValidationFailure_NilPublisher_NoPanic(t *testing.T) {
 	rawTx := makeMinimalTx()
 	ms := &mockStore{}
-	val := validator.NewValidator(nil, nil)
+	val := validator.NewValidator(nil)
 	gin.SetMode(gin.TestMode)
 	srv := &Server{
 		cfg:            &config.Config{CallbackToken: testCallbackToken},
@@ -819,7 +827,7 @@ func TestHandleSubmitTransactions_ValidationFailure_RecordsSubmissionAndPublishe
 
 	ms := &mockStore{}
 	pub := &recordingCallbackPub{}
-	val := validator.NewValidator(nil, nil)
+	val := validator.NewValidator(nil)
 	broker := &kafka.RecordingBroker{}
 	gin.SetMode(gin.TestMode)
 	srv := &Server{

@@ -181,6 +181,13 @@ func buildArcadeConfig(t *testing.T, port int, opts ArcadeOptions) *config.Confi
 		Events: config.EventsConfig{
 			SubscriberBuffer: config.DefaultEventsSubscriberBuffer,
 		},
+		// Lower fee floor for fixture compatibility: the committed
+		// mainnet fixture txs pay ~80 sat/KB, below the production
+		// default of 100. Tests aren't asserting on fee enforcement;
+		// they just need to get past intake.
+		Validator: config.ValidatorConfig{
+			MinFeePerKB: 50,
+		},
 		// Disable chaintracks: regtest has no embedded genesis, and the
 		// smoke test doesn't need header tracking — block announcements
 		// flow direct from harness libp2p host to merkle-service.

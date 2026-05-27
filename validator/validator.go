@@ -11,7 +11,6 @@ import (
 	"github.com/bsv-blockchain/go-sdk/script/interpreter"
 	"github.com/bsv-blockchain/go-sdk/spv"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
-	"github.com/bsv-blockchain/go-sdk/transaction/chaintracker"
 	feemodel "github.com/bsv-blockchain/go-sdk/transaction/fee_model"
 
 	arcerrors "github.com/bsv-blockchain/arcade/errors"
@@ -52,14 +51,14 @@ type Policy struct {
 	MinFeePerKB             *uint64
 }
 
-// Validator performs local transaction validation before submission
+// Validator performs local transaction validation before submission.
 type Validator struct {
-	policy       *Policy
-	chainTracker chaintracker.ChainTracker
+	policy *Policy
 }
 
-// NewValidator creates a new transaction validator with policy and optional chaintracker
-func NewValidator(policy *Policy, ct chaintracker.ChainTracker) *Validator {
+// NewValidator creates a new transaction validator with the given policy.
+// A nil policy uses defaults.
+func NewValidator(policy *Policy) *Validator {
 	if policy == nil {
 		policy = &Policy{}
 	}
@@ -72,10 +71,7 @@ func NewValidator(policy *Policy, ct chaintracker.ChainTracker) *Validator {
 	if policy.MinFeePerKB == nil {
 		policy.MinFeePerKB = &DefaultMinFeePerKB
 	}
-	return &Validator{
-		policy:       policy,
-		chainTracker: ct,
-	}
+	return &Validator{policy: policy}
 }
 
 // ValidatePolicy validates a transaction against node policy rules
@@ -118,18 +114,18 @@ func (v *Validator) MinFeePerKB() uint64 {
 	return *v.policy.MinFeePerKB
 }
 
-// ValidateTransaction validates policy, and optionally fees and scripts.
-// Uses go-sdk v1.2.19's spv.Verify which takes a context.Context as its first
-// argument. Callers that don't have a ctx can pass context.TODO().
+// ValidateTransaction runs policy validation, script execution on every
+// input, and optionally fee adequacy. Merkle-proof verification on BEEF
+// parents is always skipped (GullibleHeadersClient) because arcade does
+// not own a chaintracker on the intake path — script execution against
+// the source data carried in EF/BEEF is the meaningful per-tx check at
+// submit time. spv.Verify takes a context.Context as its first argument;
+// callers that don't have a ctx can pass context.TODO().
 //
 //nolint:contextcheck // ctx==nil callers are explicitly supported via TODO fallback below
-func (v *Validator) ValidateTransaction(ctx context.Context, tx *sdkTx.Transaction, skipFees, skipScripts bool) error {
+func (v *Validator) ValidateTransaction(ctx context.Context, tx *sdkTx.Transaction, skipFees bool) error {
 	if err := v.ValidatePolicy(tx); err != nil {
 		return v.wrapPolicyError(err)
-	}
-
-	if skipFees && skipScripts {
-		return nil
 	}
 
 	var feeModel sdkTx.FeeModel
@@ -137,19 +133,12 @@ func (v *Validator) ValidateTransaction(ctx context.Context, tx *sdkTx.Transacti
 		feeModel = &feemodel.SatoshisPerKilobyte{Satoshis: *v.policy.MinFeePerKB}
 	}
 
-	ct := v.chainTracker
-	if skipScripts {
-		ct = &spv.GullibleHeadersClient{}
-	}
-
 	if ctx == nil {
 		ctx = context.TODO()
 	}
 
-	if ct != nil || feeModel != nil {
-		if _, err := spv.Verify(ctx, tx, ct, feeModel); err != nil {
-			return v.wrapSPVError(err)
-		}
+	if _, err := spv.Verify(ctx, tx, &spv.GullibleHeadersClient{}, feeModel); err != nil {
+		return v.wrapSPVError(err)
 	}
 
 	return nil

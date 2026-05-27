@@ -412,6 +412,170 @@ func TestSubmissions_InsertAndQueryByTxID(t *testing.T) {
 	}
 }
 
+// TestUpdateDeliveryStatusCAS_RowAffected is the postgres-side regression for
+// issue #166: only one of two concurrent claims with the same `expected`
+// value can win. Asserts (a) the first call returns claimed=true and the row
+// advances, (b) a second call with the same `expected` returns claimed=false
+// and leaves the row alone, (c) the first-delivery case (expected="") works
+// both against a NULL-valued row (the InsertSubmission default) and after a
+// prior CAS that explicitly set the bin.
+func TestUpdateDeliveryStatusCAS_RowAffected(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	sub := &models.Submission{
+		SubmissionID: "sub-cas",
+		TxID:         "tx-cas",
+		CallbackURL:  "https://example.test/cb",
+		CreatedAt:    time.Now(),
+	}
+	if err := s.InsertSubmission(ctx, sub); err != nil {
+		t.Fatal(err)
+	}
+
+	// First-delivery claim: expected is the zero-value Status, stored is NULL.
+	claimed, err := s.UpdateDeliveryStatusCAS(ctx, "sub-cas", "", models.StatusSeenOnNetwork)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimed {
+		t.Fatalf("first claim should succeed (expected='' matches NULL row)")
+	}
+
+	// Second call with the same expected must lose — the row has moved on.
+	claimed, err = s.UpdateDeliveryStatusCAS(ctx, "sub-cas", "", models.StatusMined)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed {
+		t.Fatalf("stale-expected claim should fail after a prior winner")
+	}
+
+	// Subsequent claim with the correct current expected must succeed.
+	claimed, err = s.UpdateDeliveryStatusCAS(ctx, "sub-cas", models.StatusSeenOnNetwork, models.StatusMined)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimed {
+		t.Fatalf("matching-expected claim should succeed")
+	}
+
+	// Confirm the final row state — LastDeliveredStatus advanced, retry
+	// state cleared.
+	got, err := s.GetSubmissionsByTxID(ctx, "tx-cas")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 submission, got %d", len(got))
+	}
+	if got[0].LastDeliveredStatus != models.StatusMined {
+		t.Errorf("LastDeliveredStatus = %q, want MINED", got[0].LastDeliveredStatus)
+	}
+	if got[0].RetryCount != 0 {
+		t.Errorf("RetryCount = %d, want 0 (cleared by CAS)", got[0].RetryCount)
+	}
+	if got[0].NextRetryAt != nil {
+		t.Errorf("NextRetryAt = %v, want nil (cleared by CAS)", got[0].NextRetryAt)
+	}
+
+	// Unknown submission: claim must report false without an error.
+	claimed, err = s.UpdateDeliveryStatusCAS(ctx, "no-such-row", "", models.StatusMined)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed {
+		t.Errorf("claim on missing row should return false")
+	}
+}
+
+// TestListSubmissionsReadyForRetry covers the webhook reaper's scan predicate:
+// only rows whose retry_count > 0 AND next_retry_at <= now appear, ordered by
+// next_retry_at ASC, and `limit` truncates correctly. Backed by
+// idx_sub_retry_ready (partial index, defined in schema.sql).
+func TestListSubmissionsReadyForRetry(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	now := time.Now()
+	past := now.Add(-1 * time.Minute)
+	earlier := now.Add(-5 * time.Minute)
+	future := now.Add(1 * time.Minute)
+
+	// Seed: three submissions in retry (ready now), one ready-but-in-future,
+	// one with retry_count=0 (not in retry at all).
+	rows := []struct {
+		id    string
+		count int
+		next  *time.Time
+	}{
+		{"sub-ready-old", 2, &earlier}, // oldest ready — expect first
+		{"sub-ready-new", 1, &past},    // ready, but newer than -old
+		{"sub-future", 1, &future},     // not yet due
+		{"sub-no-retry", 0, nil},       // never failed — not in retry
+		{"sub-ready-third", 3, &past},  // ready, second in time order
+	}
+	for _, r := range rows {
+		sub := &models.Submission{
+			SubmissionID: r.id,
+			TxID:         "tx-" + r.id,
+			CallbackURL:  "https://example.test/cb",
+			CreatedAt:    now,
+		}
+		if err := s.InsertSubmission(ctx, sub); err != nil {
+			t.Fatalf("insert %s: %v", r.id, err)
+		}
+		// InsertSubmission doesn't set retry bins; use UpdateDeliveryStatus
+		// to populate them after insert.
+		if r.count > 0 {
+			if err := s.UpdateDeliveryStatus(ctx, r.id, models.StatusMined, r.count, r.next); err != nil {
+				t.Fatalf("update %s: %v", r.id, err)
+			}
+		}
+	}
+
+	// Limit=10 should return the three ready rows in next_retry_at ASC order.
+	got, err := s.ListSubmissionsReadyForRetry(ctx, now, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("expected 3 ready submissions, got %d (%+v)", len(got), got)
+	}
+	wantOrder := []string{"sub-ready-old", "sub-ready-new", "sub-ready-third"}
+	for i, w := range wantOrder {
+		if got[i].SubmissionID != w {
+			t.Errorf("position %d: got %q, want %q (full order: %v)", i, got[i].SubmissionID, w, submissionIDs(got))
+		}
+	}
+
+	// Limit=1 should return only the earliest.
+	got, err = s.ListSubmissionsReadyForRetry(ctx, now, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].SubmissionID != "sub-ready-old" {
+		t.Fatalf("limit=1 returned %+v, want [sub-ready-old]", submissionIDs(got))
+	}
+
+	// Limit=0 short-circuits to empty (matches the documented contract).
+	got, err = s.ListSubmissionsReadyForRetry(ctx, now, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("limit=0 should return empty, got %+v", got)
+	}
+}
+
+func submissionIDs(subs []*models.Submission) []string {
+	out := make([]string, len(subs))
+	for i, s := range subs {
+		out[i] = s.SubmissionID
+	}
+	return out
+}
+
 func TestLease_AcquireAndRenew(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
@@ -590,14 +754,17 @@ func TestDatahubEndpoints_UpsertOverwrites(t *testing.T) {
 }
 
 // TestUpdateStatus_TerminalNotOverwritten is the regression for F-003 (#61):
-// once a tx is in a terminal status (MINED, IMMUTABLE, REJECTED,
+// once a tx is in a strictly-terminal status (MINED, IMMUTABLE,
 // DOUBLE_SPEND_ATTEMPTED), a later lower-priority UpdateStatus call (e.g. a
 // stray SEEN_ON_NETWORK callback) must be a silent no-op rather than a clobber.
+// REJECTED is covered separately in TestUpdateStatus_RejectedRecovery —
+// it allows forward recovery to ACCEPTED_BY_NETWORK / SEEN_ON_NETWORK /
+// SEEN_MULTIPLE_NODES so a late peer acceptance can correct an earlier
+// rejection.
 func TestUpdateStatus_TerminalNotOverwritten(t *testing.T) {
 	terminals := []models.Status{
 		models.StatusMined,
 		models.StatusImmutable,
-		models.StatusRejected,
 		models.StatusDoubleSpendAttempted,
 	}
 	regressions := []models.Status{
@@ -642,6 +809,81 @@ func TestUpdateStatus_TerminalNotOverwritten(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestUpdateStatus_RejectedRecovery pins REJECTED's partial-terminal
+// behavior at the postgres layer: forward acceptance/seen states must
+// be reachable so late callbacks from a peer that did accept the tx
+// can correct the status, but regressions to pre-broadcast or retry
+// states must still be silently dropped.
+func TestUpdateStatus_RejectedRecovery(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	allowedForward := []models.Status{
+		models.StatusAcceptedByNetwork,
+		models.StatusSeenOnNetwork,
+		models.StatusSeenMultipleNodes,
+	}
+	for _, next := range allowedForward {
+		t.Run("REJECTED_then_"+string(next), func(t *testing.T) {
+			txid := "tx-rejrec-" + string(next)
+			if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+				TxID: txid, Status: models.StatusReceived,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.UpdateStatus(ctx, &models.TransactionStatus{
+				TxID: txid, Status: models.StatusRejected, Timestamp: time.Now(),
+			}); err != nil {
+				t.Fatalf("seed REJECTED: %v", err)
+			}
+			if err := s.UpdateStatus(ctx, &models.TransactionStatus{
+				TxID: txid, Status: next, Timestamp: time.Now(),
+			}); err != nil {
+				t.Fatalf("forward update: %v", err)
+			}
+			got, err := s.GetStatus(ctx, txid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Status != next {
+				t.Fatalf("REJECTED → %s wrongly dropped (got %s)", next, got.Status)
+			}
+		})
+	}
+
+	blockedRegressions := []models.Status{
+		models.StatusSentToNetwork,
+		models.StatusPendingRetry,
+	}
+	for _, next := range blockedRegressions {
+		t.Run("REJECTED_then_"+string(next)+"_blocked", func(t *testing.T) {
+			txid := "tx-rejblk-" + string(next)
+			if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+				TxID: txid, Status: models.StatusReceived,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.UpdateStatus(ctx, &models.TransactionStatus{
+				TxID: txid, Status: models.StatusRejected, Timestamp: time.Now(),
+			}); err != nil {
+				t.Fatalf("seed REJECTED: %v", err)
+			}
+			if err := s.UpdateStatus(ctx, &models.TransactionStatus{
+				TxID: txid, Status: next, Timestamp: time.Now(),
+			}); err != nil {
+				t.Fatalf("regression update: %v", err)
+			}
+			got, err := s.GetStatus(ctx, txid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Status != models.StatusRejected {
+				t.Fatalf("REJECTED overwritten by %s (got %s)", next, got.Status)
+			}
+		})
 	}
 }
 
@@ -716,10 +958,13 @@ func TestBatchUpdateStatus_TerminalNotOverwritten(t *testing.T) {
 		seedTerm models.Status
 		regress  models.Status
 	}
+	// REJECTED only blocks backward regressions (e.g., SENT_TO_NETWORK),
+	// not forward acceptance/seen states — see TestUpdateStatus_RejectedRecovery
+	// for the full lattice coverage.
 	rows := []row{
 		{"tx-mined", models.StatusMined, models.StatusSeenOnNetwork},
 		{"tx-immutable", models.StatusImmutable, models.StatusSeenOnNetwork},
-		{"tx-rejected", models.StatusRejected, models.StatusSeenMultipleNodes},
+		{"tx-rejected", models.StatusRejected, models.StatusSentToNetwork},
 		{"tx-dsa", models.StatusDoubleSpendAttempted, models.StatusPendingRetry},
 	}
 
