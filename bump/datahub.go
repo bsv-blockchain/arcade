@@ -43,6 +43,22 @@ const maxErrorBodyBytes int64 = 512
 // multi-petabyte preallocation. See finding F-008.
 const maxSubtreeCount uint64 = 10_000_000
 
+// maxTxCount caps the txCount metadata varint that prefixes the binary block
+// payload. The /block endpoint records the block's total transaction count;
+// even Teranode-class blocks stay well under a billion, so 1e9 is comfortable
+// headroom and rejects obviously-bogus 2^60-style varints. The value is
+// currently only consumed to advance the reader cursor, but bounding it now
+// prevents a future refactor from introducing an allocation path on
+// untrusted input and surfaces malformed responses earlier. See F-008.
+const maxTxCount uint64 = 1_000_000_000
+
+// maxBlockSizeBytes caps the sizeBytes metadata varint. The /block endpoint
+// records the total on-chain block size including subtree files served
+// separately, so this is a logical block-size limit (1 TiB) rather than a
+// response-body limit — the response body itself is enforced by
+// DefaultMaxBlockBytes. Defense-in-depth rationale matches maxTxCount.
+const maxBlockSizeBytes uint64 = 1 << 40
+
 // BlockDataValidator is an optional response-acceptance predicate run after a
 // successful datahub fetch. Returning a non-nil error causes the fetch loop
 // to discard that peer's response (logging the reason into urlErrors) and try
@@ -282,11 +298,17 @@ func parseBlockBinary(data []byte) ([]chainhash.Hash, []byte, *chainhash.Hash, e
 	if _, rErr := txCount.ReadFrom(r); rErr != nil {
 		return nil, nil, nil, fmt.Errorf("failed to read transaction count: %w", rErr)
 	}
+	if uint64(txCount) > maxTxCount {
+		return nil, nil, nil, fmt.Errorf("tx count %d exceeds maximum of %d", uint64(txCount), maxTxCount)
+	}
 
 	// Read size in bytes (varint)
 	var sizeBytes util.VarInt
 	if _, rErr := sizeBytes.ReadFrom(r); rErr != nil {
 		return nil, nil, nil, fmt.Errorf("failed to read size in bytes: %w", rErr)
+	}
+	if uint64(sizeBytes) > maxBlockSizeBytes {
+		return nil, nil, nil, fmt.Errorf("block size %d exceeds maximum of %d", uint64(sizeBytes), maxBlockSizeBytes)
 	}
 
 	// Read subtree count (varint)

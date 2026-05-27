@@ -480,3 +480,48 @@ func TestParseBlockBinary_RejectsCoinbaseBUMPLengthAboveBodyCapacity(t *testing.
 		t.Errorf("expected non-nil header merkle root")
 	}
 }
+
+// TestParseBlockBinary_RejectsHugeTxCount verifies that a txCount varint
+// claiming far more transactions than maxTxCount is rejected before the
+// parser advances. txCount is not currently used for allocation, but bounding
+// it is defense-in-depth against future refactors that begin to use the
+// value and surfaces bogus payloads earlier.
+func TestParseBlockBinary_RejectsHugeTxCount(t *testing.T) {
+	var buf bytes.Buffer
+	buf.Write(make([]byte, 80)) // header (zeroed)
+	// txCount as 0xFF + uint64 LE — the largest VarInt encoding form.
+	buf.WriteByte(0xff)
+	var le [8]byte
+	binary.LittleEndian.PutUint64(le[:], 1<<60)
+	buf.Write(le[:])
+
+	_, _, _, err := parseBlockBinary(buf.Bytes())
+	if err == nil {
+		t.Fatal("expected error for oversized tx count varint")
+	}
+	if !strings.Contains(err.Error(), "tx count") {
+		t.Errorf("expected error mentioning tx count, got: %v", err)
+	}
+}
+
+// TestParseBlockBinary_RejectsHugeSizeBytes verifies that a sizeBytes varint
+// claiming a block size beyond maxBlockSizeBytes is rejected. Same rationale
+// as TestParseBlockBinary_RejectsHugeTxCount — defense-in-depth.
+func TestParseBlockBinary_RejectsHugeSizeBytes(t *testing.T) {
+	var buf bytes.Buffer
+	buf.Write(make([]byte, 80)) // header (zeroed)
+	buf.WriteByte(0x00)         // txCount = 0
+	// sizeBytes as 0xFF + uint64 LE — the largest VarInt encoding form.
+	buf.WriteByte(0xff)
+	var le [8]byte
+	binary.LittleEndian.PutUint64(le[:], 1<<60)
+	buf.Write(le[:])
+
+	_, _, _, err := parseBlockBinary(buf.Bytes())
+	if err == nil {
+		t.Fatal("expected error for oversized size bytes varint")
+	}
+	if !strings.Contains(err.Error(), "block size") {
+		t.Errorf("expected error mentioning block size, got: %v", err)
+	}
+}
