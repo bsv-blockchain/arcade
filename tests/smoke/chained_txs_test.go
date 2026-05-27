@@ -146,12 +146,15 @@ func buildSubmissionBatches(chains [][]*bt.Tx, batchSize int) [][]*bt.Tx {
 }
 
 // postTxs POSTs a batch to arcade's /txs endpoint and returns nil on a
-// 2xx response. The body is concatenated raw tx bytes — same shape
-// production ARC clients use.
+// 2xx response. The body is concatenated raw tx bytes in BSV Extended
+// Format — arcade's validator (post PR #171) calls spv.Verify
+// unconditionally, which needs each input's PreviousTxScript +
+// PreviousTxSatoshis. Those bins live on the wire only in EF; sending
+// standard-format bytes is rejected with "'PreviousTx' not supplied".
 func postTxs(rt *arcadeRuntime, txs []*bt.Tx) error {
 	var body bytes.Buffer
 	for _, tx := range txs {
-		body.Write(tx.Bytes())
+		body.Write(tx.ExtendedBytes())
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
