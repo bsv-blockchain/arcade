@@ -40,7 +40,17 @@ type deliveryRecord struct {
 func (s *fakeStore) GetSubmissionsByTxID(_ context.Context, txid string) ([]*models.Submission, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.subs[txid], nil
+	// Return value-copies so callers don't share state with the store's
+	// internal map — mirrors Postgres semantics and prevents the data race
+	// between concurrent deliver() reads and CAS/UpdateDeliveryStatus writes
+	// in TestDeliver_ExactlyOnceAcrossConcurrentReplicas.
+	list := s.subs[txid]
+	out := make([]*models.Submission, len(list))
+	for i, sub := range list {
+		cp := *sub
+		out[i] = &cp
+	}
+	return out, nil
 }
 
 func (s *fakeStore) UpdateDeliveryStatus(_ context.Context, id string, last models.Status, retry int, nextRetry *time.Time) error {
