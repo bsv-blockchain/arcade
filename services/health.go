@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	nhpprof "net/http/pprof"
 	"sync/atomic"
 	"time"
 
@@ -19,7 +20,7 @@ type HealthServer struct {
 	logger *zap.Logger
 }
 
-func NewHealthServer(port int, logger *zap.Logger) *HealthServer {
+func NewHealthServer(port int, pprofEnabled bool, logger *zap.Logger) *HealthServer {
 	hs := &HealthServer{
 		logger: logger.Named("health"),
 	}
@@ -42,6 +43,20 @@ func NewHealthServer(port int, logger *zap.Logger) *HealthServer {
 	// registers all its vectors against; promhttp handles content negotiation
 	// (text vs OpenMetrics) and per-collector errors.
 	mux.Handle("/metrics", promhttp.Handler())
+
+	if pprofEnabled {
+		// Mount net/http/pprof handlers under /debug/pprof on the same
+		// listener. The package's init() only registers on the default
+		// mux, so each handler is wired explicitly here to keep this mux
+		// scoped. Use kubectl port-forward to reach this in production —
+		// the health port is not exposed via a Service.
+		mux.HandleFunc("/debug/pprof/", nhpprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", nhpprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", nhpprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", nhpprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", nhpprof.Trace)
+		hs.logger.Info("pprof handlers mounted under /debug/pprof")
+	}
 
 	hs.server = &http.Server{
 		Addr:              fmt.Sprintf(":%d", port),

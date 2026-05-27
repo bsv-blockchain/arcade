@@ -509,7 +509,7 @@ var P2PNodeStatusMessagesTotal = promauto.NewCounter(prometheus.CounterOpts{
 var P2PEndpointDiscoveryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_p2p_endpoint_discovery_total",
 	Help: "Datahub URL discovery outcomes from peer announcements.",
-}, []string{labelOutcome}) // registered, duplicate, invalid, no_url
+}, []string{labelOutcome}) // registered, invalid, no_url, error
 
 // ---------------------------------------------------------------------------
 // callback path — inbound merkle-service callbacks

@@ -386,8 +386,16 @@ func BuildServices(d *Deps) []services.Service {
 	if shouldRun("api-server") || shouldRun("webhook") {
 		svcs = append(svcs, webhook.New(cfg.Webhook, cfg.Callback, d.Logger, d.Publisher, d.Store, d.Leaser))
 	}
-	if shouldRun("propagation") || shouldRun("p2p-client") {
-		svcs = append(svcs, p2p_client.New(cfg, d.Logger, d.Producer, d.TeranodeClient, d.Store))
+	// p2p_client is intentionally NOT bundled with propagation. Running a
+	// libp2p host inside the propagation pod duplicates the peer discovery
+	// the dedicated p2p-client deployment already performs and is a
+	// significant memory cost that OOMKilled propagation in arcade-v2 at
+	// 512Mi. Propagation now reads discovered URLs from the shared store
+	// via teranode.Client's refresh loop (see teranode/client.go:refreshLoop).
+	// In --mode all the shouldRun gate still matches via the cfg.Mode=="all"
+	// branch, so single-process development is unchanged.
+	if shouldRun("p2p-client") {
+		svcs = append(svcs, p2p_client.New(cfg, d.Logger, d.Producer, d.Store))
 	}
 
 	return svcs

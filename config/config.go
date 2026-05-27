@@ -291,6 +291,12 @@ type P2PConfig struct {
 
 type HealthConfig struct {
 	Port int `mapstructure:"port"`
+	// PprofEnabled mounts net/http/pprof handlers under /debug/pprof on the
+	// health server when true. Off by default: pprof's CPU and trace
+	// endpoints are expensive to capture and the heap profile carries
+	// information an operator may not want exposed continuously. Toggle on
+	// in the ConfigMap when capturing a profile, then toggle back off.
+	PprofEnabled bool `mapstructure:"pprof_enabled"`
 }
 
 type PropagationConfig struct {
