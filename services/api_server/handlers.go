@@ -613,14 +613,16 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 			// Best-effort: continue with publish. The propagator's
 			// in-flight set catches duplicates that slip past.
 		case !inserted && existing != nil && existing.Status == models.StatusRejected:
-			// Resubmission of a previously-rejected tx: republish to Kafka
-			// so the propagator re-runs the broadcast pipeline. The status
-			// row stays at REJECTED until the new broadcast produces a
-			// verdict; the lattice already allows REJECTED → ACCEPTED /
-			// SEEN_* so the eventual terminal write lands cleanly.
-			if s.txTracker != nil {
-				s.txTracker.Add(txid, existing.Status)
-			}
+			// Resubmission of a previously-rejected tx: fall through to
+			// the normal publish path so the propagator re-runs the
+			// broadcast pipeline. The status row stays at REJECTED until
+			// the new broadcast produces a verdict; the lattice already
+			// allows REJECTED → ACCEPTED / SEEN_* so the eventual
+			// terminal write lands cleanly. The TxTracker gets updated
+			// by the StatusReceived Add below alongside fresh inserts —
+			// both RECEIVED and REJECTED produce the same callback
+			// prefilter behavior because every forward status allows
+			// transitioning from either.
 		case !inserted && existing != nil:
 			// Idempotent re-submit: row already exists at a non-REJECTED
 			// status. Register the txid with the in-process TxTracker so
@@ -855,13 +857,13 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				s.logger.Error("dedup CAS failed", zap.String("txid", p.txid), zap.Error(dedupErr))
 				toPublish = append(toPublish, p)
 			case !inserted && existing != nil && existing.Status == models.StatusRejected:
-				// Resubmission of a previously-rejected tx: republish so
-				// the propagator re-runs the broadcast pipeline. The
-				// status row stays at REJECTED until the new broadcast
-				// produces a verdict. Mirrors handleSubmitTransaction.
-				if s.txTracker != nil {
-					s.txTracker.Add(p.txid, existing.Status)
-				}
+				// Resubmission of a previously-rejected tx: add to
+				// toPublish so the StatusReceived Add in the
+				// post-loop tracker fan-out also runs against this
+				// txid, and the propagator re-runs the broadcast
+				// pipeline. The status row stays at REJECTED until the
+				// new broadcast produces a verdict. Mirrors
+				// handleSubmitTransaction.
 				toPublish = append(toPublish, p)
 			case !inserted && existing != nil:
 				duplicates++

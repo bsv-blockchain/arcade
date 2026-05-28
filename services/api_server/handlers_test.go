@@ -675,9 +675,11 @@ func TestHandleSubmitTransaction_ResubmitRejected_RepublishesToKafka(t *testing.
 	}
 
 	var resp map[string]interface{}
-	_ = json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp["status"] == "already submitted" {
-		t.Errorf("REJECTED resubmit must not return 'already submitted', got %v", resp)
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v (body=%q)", err, w.Body.String())
+	}
+	if got := resp["status"]; got != "submitted" {
+		t.Errorf("expected status=%q (fresh-submit shape), got %v", "submitted", got)
 	}
 
 	// Tracker must still know about the txid (so bump-builder's tracked-only
