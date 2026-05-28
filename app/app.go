@@ -241,8 +241,16 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 
 // validatorPolicyFromConfig builds the validator.Policy from cfg.Validator.
 // Returns nil when no operator-facing fields are set so NewValidator's
-// built-in defaults apply unchanged.
+// built-in defaults apply unchanged. When AcceptZeroFee is set, returns
+// a policy with an explicit pointer-to-zero MinFeePerKB so that
+// NewValidator preserves it (its nil-check is on the pointer, not the
+// value) and ValidateTransaction feeds Satoshis=0 to spv.Verify, which
+// accepts any non-negative fee — including fee=0.
 func validatorPolicyFromConfig(cfg *config.Config) *validator.Policy {
+	if cfg.Validator.AcceptZeroFee {
+		zero := uint64(0)
+		return &validator.Policy{MinFeePerKB: &zero}
+	}
 	if cfg.Validator.MinFeePerKB == 0 {
 		return nil
 	}

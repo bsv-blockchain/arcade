@@ -45,6 +45,20 @@ func TestMinFeePerKB(t *testing.T) {
 	}
 }
 
+// TestNewValidator_PreservesExplicitZeroFee guards the invariant that
+// validatorPolicyFromConfig (app/app.go) relies on to implement
+// validator.accept_zero_fee: NewValidator's default substitution fires
+// only when the MinFeePerKB *pointer* is nil, so a non-nil pointer to a
+// zero value must be preserved verbatim. If this test ever fails the
+// zero-fee config flag silently regresses to the 100 sat/kB default.
+func TestNewValidator_PreservesExplicitZeroFee(t *testing.T) {
+	zero := uint64(0)
+	v := NewValidator(&Policy{MinFeePerKB: &zero})
+	if v.MinFeePerKB() != 0 {
+		t.Errorf("expected MinFeePerKB=0, got %d", v.MinFeePerKB())
+	}
+}
+
 func TestWrapPolicyError_Malformed(t *testing.T) {
 	v := NewValidator(nil)
 	err := v.wrapPolicyError(ErrNoInputsOrOutputs)
