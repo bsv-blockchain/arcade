@@ -114,6 +114,16 @@ p2p:
 health:
   port: 8081
 
+# Intake-time transaction validator. The default rejects txs whose
+# fee rate is below the BSV miner policy minimum of 100 sat/kB.
+# validator:
+#   min_fee_per_kb: 100
+#   # accept_zero_fee, when true, pins the floor to 0 sat/kB so any tx
+#   # (including fee=0) is accepted at intake. Intended for
+#   # teratestnet/regtest where the upstream Teranode is also configured
+#   # to accept zero-fee txs. Leave false on mainnet and testnet.
+#   # accept_zero_fee: false
+
 # SSRF guard for client-supplied callback URLs. The api-server rejects
 # X-CallbackUrl values whose host is loopback / link-local / RFC1918 /
 # cloud-metadata, and the webhook delivery client refuses to dial those
