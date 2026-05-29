@@ -601,8 +601,17 @@ const DefaultEventsSubscriberBuffer = 4096
 type ValidatorConfig struct {
 	// MinFeePerKB is the network's minimum acceptable fee rate in
 	// satoshis per kilobyte. Transactions below this rate are rejected
-	// at intake. Zero falls back to DefaultValidatorMinFeePerKB.
+	// at intake. Zero falls back to DefaultValidatorMinFeePerKB unless
+	// AcceptZeroFee is true (which forces a zero floor regardless).
 	MinFeePerKB uint64 `mapstructure:"min_fee_per_kb"`
+
+	// AcceptZeroFee, when true, pins the validator's fee floor to exactly
+	// 0 sat/kB, so any transaction including fee=0 is accepted at intake.
+	// Intended for testnet/regtest/teratestnet environments where the
+	// upstream Teranode is also configured to accept zero-fee txs. Leave
+	// false (default) on mainnet and any environment that should enforce
+	// the production fee floor. Takes precedence over MinFeePerKB.
+	AcceptZeroFee bool `mapstructure:"accept_zero_fee"`
 }
 
 // DefaultValidatorMinFeePerKB is the production fee floor in satoshis

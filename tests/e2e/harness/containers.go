@@ -191,7 +191,7 @@ func startContainersOnNetwork(ctx context.Context, t *testing.T, opts MerkleStar
 	// helper for host-side test debug.
 	rp, err := redpanda.Run(
 		ctx,
-		"docker.redpanda.com/redpandadata/redpanda:v25.2.4",
+		"docker.redpanda.com/redpandadata/redpanda:v26.1.9",
 		redpanda.WithAutoCreateTopics(),
 		redpanda.WithListener(fmt.Sprintf("%s:%d", netAliasRedpanda, inNetworkKafkaPort)),
 		network.WithNetwork([]string{netAliasRedpanda}, nw),
