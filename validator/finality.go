@@ -3,6 +3,7 @@ package validator
 import (
 	"context"
 	"errors"
+	"math"
 	"time"
 
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
@@ -89,10 +90,11 @@ func (v *Validator) checkFinality(ctx context.Context, tx *sdkTx.Transaction) er
 		}
 		h, err := v.chainTip.GetActiveTipBlockHeight(ctx)
 		if err != nil {
+			//nolint:nilerr // chain-tip read failure must not block submission (graceful degradation)
 			return nil
 		}
 		// A submitted tx targets the next block, so evaluate against height+1.
-		if validLockTime(tx.LockTime, uint32(h+1), 0) {
+		if validLockTime(tx.LockTime, clampToU32(h+1), 0) {
 			return nil
 		}
 		return ErrTxNotFinal
@@ -104,8 +106,30 @@ func (v *Validator) checkFinality(ctx context.Context, tx *sdkTx.Transaction) er
 	if now == nil {
 		now = func() int64 { return time.Now().Unix() }
 	}
-	if validLockTime(tx.LockTime, 0, uint32(now())) {
+	if validLockTime(tx.LockTime, 0, clampI64ToU32(now())) {
 		return nil
 	}
 	return ErrTxNotFinal
+}
+
+// clampToU32 saturates a uint64 to the uint32 range. Block heights never
+// approach 2^32 in practice; the clamp makes the conversion provably bounded
+// (gosec G115) instead of relying on that assumption.
+func clampToU32(v uint64) uint32 {
+	if v > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(v)
+}
+
+// clampI64ToU32 saturates an int64 (Unix seconds) to the uint32 range. Unix
+// time stays within uint32 until 2106; negative values clamp to 0.
+func clampI64ToU32(v int64) uint32 {
+	if v < 0 {
+		return 0
+	}
+	if v > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(v)
 }
