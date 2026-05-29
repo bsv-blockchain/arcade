@@ -157,6 +157,10 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 	}
 
 	txVal := validator.NewValidator(validatorPolicyFromConfig(cfg))
+	// Wire the store as the chain-height source so height-based nLockTime
+	// finality can be evaluated at submit time. Time-based locktimes use the
+	// wall clock and need no wiring.
+	txVal.SetChainTip(st)
 
 	publisher := events.NewKafkaPublisher(producer, logger, cfg.Events.SubscriberBuffer)
 
