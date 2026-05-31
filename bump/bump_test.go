@@ -963,6 +963,45 @@ func TestBuildCompoundBUMP_CoinbaseReplacement(t *testing.T) {
 	}
 }
 
+// TestBuildCompoundBUMP_NoCoinbaseBUMP_MultiSubtree_FailsSafe documents the
+// coinbase-BUMP-absent fallback for multi-subtree blocks. Ingestion does not
+// guarantee a coinbase BUMP (bump/datahub.go treats a zero-length coinbase-BUMP
+// field as "absent" and coinbaseBUMPReconciles passes on an empty one), so a
+// multi-subtree block can reach BuildCompoundBUMP with coinbaseBUMP == nil.
+// Without it, subtree 0's root cannot be corrected — the datahub computes it
+// against the coinbase placeholder, and there is no real coinbase txid to fold
+// nor a full-block path to bound the climb — so the compound root cannot match
+// the header root. This must fail loud: BuildCompoundBUMP still produces a
+// compound, but ValidateCompoundRoot rejects it against the true block root, so
+// the builder refuses to persist and the tx stays non-MINED. It must NEVER
+// silently validate against the placeholder-derived root (which would forge an
+// accepted proof).
+func TestBuildCompoundBUMP_NoCoinbaseBUMP_MultiSubtree_FailsSafe(t *testing.T) {
+	allLeaves, _, subtreeHashes, _, trueBlockRoot := setupCoinbaseBlock(3, 4)
+
+	stump0 := buildFullSTUMP(allLeaves[0], 1, 1000002)
+	stump1 := buildFullSTUMP(allLeaves[1], 0, 1000002)
+	stump2 := buildFullSTUMP(allLeaves[2], 0, 1000002)
+
+	stumps := []*models.Stump{
+		{BlockHash: "block3", SubtreeIndex: 0, StumpData: stump0},
+		{BlockHash: "block3", SubtreeIndex: 1, StumpData: stump1},
+		{BlockHash: "block3", SubtreeIndex: 2, StumpData: stump2},
+	}
+
+	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, nil)
+	if err != nil {
+		t.Fatalf("BuildCompoundBUMP failed: %v", err)
+	}
+	if compound == nil {
+		t.Fatal("expected a compound BUMP, got nil")
+	}
+
+	if err := ValidateCompoundRoot(compound, &trueBlockRoot); err == nil {
+		t.Fatal("expected ValidateCompoundRoot to REJECT the compound when no coinbase BUMP is supplied for a multi-subtree block (subtree-0 root uncorrected) — got nil error, which would mean a placeholder-derived root was accepted")
+	}
+}
+
 func TestBuildCompoundBUMP_CoinbaseReplacement_SingleSubtree(t *testing.T) {
 	allLeaves, trueAllLeaves, subtreeHashes, coinbaseTxID, trueBlockRoot := setupCoinbaseBlock(1, 4)
 	placeholder := allLeaves[0][0]
