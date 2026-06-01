@@ -852,6 +852,11 @@ ON CONFLICT (block_hash) DO UPDATE SET block_height=EXCLUDED.block_height, bump_
 	if err != nil {
 		return fmt.Errorf("insert bump %s: %w", blockHash, err)
 	}
+	// ON CONFLICT DO UPDATE means a rebuild can overwrite bump_data for an
+	// existing block hash (e.g. late STUMP callbacks produce a more complete
+	// sparse compound). Drop any cached parse so the next status lookup
+	// re-fetches the current stored BUMP instead of serving a stale compound.
+	s.bumpCache.Remove(blockHash)
 	return nil
 }
 
