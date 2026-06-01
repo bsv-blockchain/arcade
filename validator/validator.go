@@ -144,8 +144,13 @@ func (v *Validator) ValidateTransaction(ctx context.Context, tx *sdkTx.Transacti
 		return v.wrapPolicyError(err)
 	}
 
+	if ctx == nil {
+		ctx = context.TODO()
+	}
+
 	if err := v.checkFinality(ctx, tx); err != nil {
 		return v.wrapPolicyError(err)
+	}
 	}
 
 	var feeModel sdkTx.FeeModel
