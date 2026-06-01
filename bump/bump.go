@@ -273,29 +273,6 @@ func applyCoinbaseToSTUMP(stumpPath *transaction.MerklePath, coinbaseTxID *chain
 	}
 }
 
-// computeCorrectedSubtreeRoot parses a subtree 0 STUMP, replaces the placeholder
-// with the real coinbase txid, and returns the corrected subtree root by climbing
-// from the coinbase leaf via the BRC-74 ComputeRoot algorithm.
-//
-// The prior implementation built only the STUMP's level 0 and called
-// computeMissingHashes, then returned mp.Path[height-1][0].Hash — but that
-// element is the LEFT child of the subtree root, not the root itself
-// (the root is H(mp.Path[height-1][0], mp.Path[height-1][1])). For any
-// pow2-sized subtree ≥2 leaves, the returned value was a mid-level hash, and
-// subtreeHashes[0] was silently corrupted. The compound BUMP merge uses
-// first-seen-wins by (level, offset), so the bug only surfaced when subtree 0
-// was not the first stump processed — i.e., it depended on the Aerospike read
-// order and went undetected until a production block with 6 subtrees was
-// delivered in order [2,4,5,3,0,1].
-func computeCorrectedSubtreeRoot(stumpData []byte, coinbaseTxID *chainhash.Hash) (*chainhash.Hash, error) {
-	stumpPath, err := transaction.NewMerklePathFromBinary(stumpData)
-	if err != nil {
-		return nil, err
-	}
-	applyCoinbaseToSTUMP(stumpPath, coinbaseTxID, nil)
-	return stumpPath.ComputeRoot(coinbaseTxID)
-}
-
 // subtree0RootFromCoinbaseBUMP derives the real subtree-0 root by walking the
 // coinbase BUMP (which is a full block-level path for the coinbase tx) from
 // level 0 up through the subtree-internal levels.
@@ -461,32 +438,33 @@ func ValidateCompoundRoot(compound *transaction.MerklePath, expected *chainhash.
 	return nil
 }
 
-// correctedSubtree0Root returns the corrected root for subtree 0 derived from the
-// real coinbase txid. Prefers the subtree-0 STUMP when present; otherwise falls
-// back to deriving the root from the coinbase BUMP using the height of any
-// available STUMP. Returns nil if no correction is possible.
-func correctedSubtree0Root(stumps []*models.Stump, coinbaseTxID *chainhash.Hash, coinbaseBUMP []byte) *chainhash.Hash {
-	for _, stump := range stumps {
-		if stump.SubtreeIndex != 0 {
-			continue
-		}
-		if root, err := computeCorrectedSubtreeRoot(stump.StumpData, coinbaseTxID); err == nil {
-			return root
-		}
+// correctedSubtree0Root returns the corrected root for subtree 0, derived
+// SOLELY from the coinbase BUMP. The datahub-supplied subtreeHashes[0] is
+// computed against the coinbase placeholder (zero hash), not the real coinbase
+// txid, so it must be recomputed from the real coinbase path.
+//
+// The coinbase BUMP is a full-block-height path: the coinbase txid climbs the
+// block's left spine to the block-header merkle root. Its first internalHeight
+// levels are exactly subtree 0, where internalHeight = (coinbase BUMP height) −
+// (subtree-root layer). We never trust a STUMP's height here: merkle-service
+// sometimes delivers subtree 0's STUMP at full block height, and climbing every
+// level of such a STUMP overshoots the subtree-0 root and lands on the BLOCK
+// root (the 2026-05-30 block-951360 incident). Deriving internalHeight from the
+// coinbase BUMP and folding only that many levels is immune to over-tall STUMPs.
+//
+// Returns nil if there is no coinbase BUMP, it is malformed, or the derived
+// internal height is non-positive.
+func correctedSubtree0Root(coinbaseBUMP []byte, numSubtrees int) *chainhash.Hash {
+	cbPath, err := transaction.NewMerklePathFromBinary(coinbaseBUMP)
+	if err != nil || len(cbPath.Path) == 0 {
 		return nil
 	}
-	// No subtree-0 STUMP delivered (merkle-service didn't track any txid in
-	// subtree 0). Derive the corrected root directly from the coinbase BUMP.
-	// Any STUMP carries a parsable BRC-74 path so internalHeight is the same
-	// across all stumps for the block.
-	if len(stumps) == 0 {
+	subtreeRootLayer := int(math.Ceil(math.Log2(float64(numSubtrees))))
+	internalHeight := len(cbPath.Path) - subtreeRootLayer
+	if internalHeight <= 0 {
 		return nil
 	}
-	mp, err := transaction.NewMerklePathFromBinary(stumps[0].StumpData)
-	if err != nil || len(mp.Path) == 0 {
-		return nil
-	}
-	return subtree0RootFromCoinbaseBUMP(coinbaseBUMP, len(mp.Path))
+	return subtree0RootFromCoinbaseBUMP(coinbaseBUMP, internalHeight)
 }
 
 // BuildCompoundBUMP merges multiple per-subtree BUMPs into a single compound
@@ -526,7 +504,7 @@ func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, c
 	// merkle path that climbs through the subtree-root layer's offset-0
 	// sibling (which is most of them) produces the wrong root.
 	if coinbaseTxID != nil && len(subtreeHashes) > 0 {
-		if root := correctedSubtree0Root(stumps, coinbaseTxID, coinbaseBUMP); root != nil {
+		if root := correctedSubtree0Root(coinbaseBUMP, len(subtreeHashes)); root != nil {
 			subtreeHashes[0] = *root
 		}
 	}
@@ -548,18 +526,26 @@ func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, c
 		return full, txids, nil
 	}
 
-	// Determine the per-subtree internal height from the first STUMP. All
-	// STUMPs in a block share the same height because Teranode subtrees are
-	// fixed-size within a block; mismatches indicate corrupt input and are
-	// rejected per STUMP below.
 	firstPath, err := transaction.NewMerklePathFromBinary(stumps[0].StumpData)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to parse first STUMP: %w", err)
 	}
-	internalHeight := len(firstPath.Path)
 	blockHeight := firstPath.BlockHeight
 
 	subtreeRootLayer := int(math.Ceil(math.Log2(float64(numSubtrees))))
+
+	// Determine the per-subtree internal height. The coinbase BUMP is a
+	// full-block-height path, so internalHeight = (coinbase BUMP height) −
+	// (subtree-root layer); this is authoritative and immune to STUMPs that
+	// merkle-service delivers over-tall (the block-951360 incident). Fall back
+	// to the first STUMP's height only when no coinbase BUMP is available.
+	internalHeight := len(firstPath.Path)
+	if cbPath, cbErr := transaction.NewMerklePathFromBinary(coinbaseBUMP); cbErr == nil {
+		if h := len(cbPath.Path) - subtreeRootLayer; h > 0 {
+			internalHeight = h
+		}
+	}
+
 	totalHeight := internalHeight + subtreeRootLayer
 
 	compound := &transaction.MerklePath{
@@ -584,8 +570,13 @@ func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, c
 		if err != nil {
 			return nil, nil, fmt.Errorf("parse STUMP for subtree %d: %w", stump.SubtreeIndex, err)
 		}
-		if len(path.Path) != internalHeight {
-			return nil, nil, fmt.Errorf("subtree %d STUMP has internal height %d, expected %d (mixed subtree heights are not supported)", stump.SubtreeIndex, len(path.Path), internalHeight)
+		// A STUMP taller than internalHeight is tolerated: merkle-service
+		// sometimes delivers a STUMP at full block height, and only its first
+		// internalHeight levels are the subtree-internal path — the placement
+		// loop below reads exactly those. A STUMP SHORTER than internalHeight
+		// cannot cover its subtree and is rejected.
+		if len(path.Path) < internalHeight {
+			return nil, nil, fmt.Errorf("subtree %d STUMP has internal height %d, expected at least %d", stump.SubtreeIndex, len(path.Path), internalHeight)
 		}
 		if stump.SubtreeIndex == 0 && coinbaseTxID != nil {
 			applyCoinbaseToSTUMP(path, coinbaseTxID, coinbaseBUMP)
