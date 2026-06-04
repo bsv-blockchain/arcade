@@ -679,6 +679,12 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 // the window can't be eliminated entirely without making the row
 // write synchronous — a trade-off the success path also accepts).
 func (s *Server) rejectAtIntake(ctx context.Context, txid, reason string, opts submitOptions) {
+	s.logger.Info(
+		"transaction rejected",
+		zap.String("txid", txid),
+		zap.String("reason", reason),
+		zap.String("stage", "intake"),
+	)
 	s.persistRejectedAtIntake(ctx, txid, reason)
 	s.recordSubmission(ctx, txid, opts)
 	if s.publisher == nil {

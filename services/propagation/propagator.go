@@ -416,6 +416,12 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 			publishedAccepted = append(publishedAccepted, st.TxID)
 		case models.StatusRejected:
 			publishedRejected = append(publishedRejected, st.TxID)
+			p.logger.Info(
+				"transaction rejected",
+				zap.String("txid", st.TxID),
+				zap.String("reason", st.ExtraInfo),
+				zap.String("stage", "network"),
+			)
 		default:
 		}
 	}
@@ -478,6 +484,12 @@ func (p *Propagator) persistCascadeRejections(ctx context.Context, txids []strin
 			// via the dep graph if they care.
 			ExtraInfo: "parent rejected",
 		}
+		p.logger.Info(
+			"transaction rejected",
+			zap.String("txid", txid),
+			zap.String("reason", "parent rejected"),
+			zap.String("stage", "cascade"),
+		)
 	}
 	if _, err := p.store.BatchUpdateStatusReturning(ctx, statuses); err != nil {
 		p.logger.Warn(
