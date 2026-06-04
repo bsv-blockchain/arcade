@@ -119,12 +119,54 @@ func computeBlockMerkleRoot(subtreeLeaves [][]chainhash.Hash) chainhash.Hash {
 	return computeMerkleRootFromLeaves(subtreeRoots)
 }
 
-// buildCoinbaseBUMP constructs a coinbase BUMP for the coinbase transaction in subtree 0.
-func buildCoinbaseBUMP(subtree0Leaves []chainhash.Hash, coinbaseTxID chainhash.Hash, blockHeight uint32) []byte {
+// buildCoinbaseBUMP constructs a coinbase BUMP for the coinbase transaction in
+// subtree 0. In production the coinbase BUMP is a FULL-BLOCK-height path: the
+// coinbase txid climbs the block's left spine (offset 0 at every level) all the
+// way to the block-header merkle root. We mirror that here by building the
+// subtree-internal path over the real-coinbase leaves and then appending the
+// block-level climb. subtreeRoots are the block's subtree-root-layer leaves
+// (subtree 0 at offset 0); pass nil or a length-≤1 slice for single-subtree
+// blocks, where the subtree root already is the block root.
+func buildCoinbaseBUMP(subtree0Leaves []chainhash.Hash, coinbaseTxID chainhash.Hash, blockHeight uint32, subtreeRoots []chainhash.Hash) []byte {
 	trueLeaves := make([]chainhash.Hash, len(subtree0Leaves))
 	copy(trueLeaves, subtree0Leaves)
 	trueLeaves[0] = coinbaseTxID
-	return buildSTUMP(trueLeaves, 0, blockHeight)
+	base := buildSTUMP(trueLeaves, 0, blockHeight)
+	return appendBlockClimb(base, subtreeRoots)
+}
+
+// appendBlockClimb extends a subtree-internal merkle path (rooted at the
+// subtree-0 root, climbing from offset 0) with the block-level climb up to the
+// block root, producing a full-block-height path. This is the production shape
+// for both the coinbase BUMP and an over-tall subtree-0 STUMP. The appended
+// siblings are taken from the subtree-root merkle tree along the left spine
+// (offset 0 → sibling at offset 1 each level), with Bitcoin-canonical
+// duplicate-on-odd padding. Returns baseBytes unchanged for ≤1 subtree.
+func appendBlockClimb(baseBytes []byte, subtreeRoots []chainhash.Hash) []byte {
+	if len(subtreeRoots) <= 1 {
+		return baseBytes
+	}
+	mp, err := transaction.NewMerklePathFromBinary(baseBytes)
+	if err != nil {
+		panic(err)
+	}
+	tree := buildMerkleTree(subtreeRoots)
+	offset := uint64(0)
+	for level := 0; level < len(tree)-1; level++ {
+		sibOffset := offset ^ 1
+		levelHashes := tree[level]
+		if len(levelHashes)%2 == 1 {
+			levelHashes = append(levelHashes, levelHashes[len(levelHashes)-1])
+		}
+		var elems []*transaction.PathElement
+		if sibOffset < uint64(len(levelHashes)) {
+			h := levelHashes[sibOffset]
+			elems = append(elems, &transaction.PathElement{Offset: sibOffset, Hash: &h})
+		}
+		mp.Path = append(mp.Path, elems)
+		offset = offset >> 1
+	}
+	return mp.Bytes()
 }
 
 // buildFullSTUMP constructs a STUMP containing ALL level-0 hashes for a subtree.
@@ -168,6 +210,18 @@ func buildFullSTUMP(leaves []chainhash.Hash, txOffset uint64, blockHeight uint32
 	}
 
 	return mp.Bytes()
+}
+
+// buildFullBlockSubtree0STUMP constructs a subtree-0 STUMP that merkle-service
+// delivered at FULL BLOCK HEIGHT — the defect shape behind the block-951360
+// incident. The first levels are byte-identical to the normal subtree-internal
+// full STUMP; the block-level climb (subtree-root layer + log2(N) levels) is
+// then appended so the encoded treeHeight = internalHeight + ceil(log2(N)).
+// Climbing every level of such a STUMP overshoots the subtree-0 root and lands
+// on the block root.
+func buildFullBlockSubtree0STUMP(leaves []chainhash.Hash, txOffset uint64, blockHeight uint32, subtreeRoots []chainhash.Hash) []byte {
+	base := buildFullSTUMP(leaves, txOffset, blockHeight)
+	return appendBlockClimb(base, subtreeRoots)
 }
 
 // multiSubtreeTestSetup creates a block with numSubtrees subtrees of subtreeSize txs each.
@@ -511,7 +565,7 @@ func TestAssembleBUMP_Subtree0_CoinbaseReplacement(t *testing.T) {
 
 	trueBlockRoot := computeBlockMerkleRoot([][]chainhash.Hash{trueSubtree0Leaves, subtree1Leaves})
 
-	cbBUMP := buildCoinbaseBUMP(subtree0Leaves, coinbaseTxID, 950000)
+	cbBUMP := buildCoinbaseBUMP(subtree0Leaves, coinbaseTxID, 950000, subtreeHashes)
 	result, _, err := AssembleBUMP(stump, 0, subtreeHashes, cbBUMP)
 	if err != nil {
 		t.Fatalf("AssembleBUMP failed: %v", err)
@@ -555,7 +609,7 @@ func TestAssembleBUMP_Subtree0_CoinbaseReplacement_Offset3(t *testing.T) {
 
 	trueBlockRoot := computeBlockMerkleRoot([][]chainhash.Hash{trueSubtree0Leaves, subtree1Leaves})
 
-	cbBUMP := buildCoinbaseBUMP(subtree0Leaves, coinbaseTxID, 950001)
+	cbBUMP := buildCoinbaseBUMP(subtree0Leaves, coinbaseTxID, 950001, subtreeHashes)
 	result, _, err := AssembleBUMP(stump, 0, subtreeHashes, cbBUMP)
 	if err != nil {
 		t.Fatalf("AssembleBUMP failed: %v", err)
@@ -652,7 +706,7 @@ func TestAssembleBUMP_4Subtrees_Subtree0_CoinbaseReplacement(t *testing.T) {
 
 	trueBlockRoot := computeBlockMerkleRoot(trueAllLeaves)
 
-	cbBUMP := buildCoinbaseBUMP(allLeaves[0], coinbaseTxID, 950003)
+	cbBUMP := buildCoinbaseBUMP(allLeaves[0], coinbaseTxID, 950003, subtreeHashes)
 	result, _, err := AssembleBUMP(stump, 0, subtreeHashes, cbBUMP)
 	if err != nil {
 		t.Fatalf("AssembleBUMP failed: %v", err)
@@ -850,7 +904,7 @@ func TestBuildCompoundBUMP_CoinbaseReplacement(t *testing.T) {
 		{BlockHash: "block1", SubtreeIndex: 1, StumpData: stump1},
 	}
 
-	cbBUMP := buildCoinbaseBUMP(allLeaves[0], coinbaseTxID, 1000000)
+	cbBUMP := buildCoinbaseBUMP(allLeaves[0], coinbaseTxID, 1000000, subtreeHashes)
 
 	compound, txids, err := BuildCompoundBUMP(stumps, subtreeHashes, cbBUMP)
 	if err != nil {
@@ -909,6 +963,45 @@ func TestBuildCompoundBUMP_CoinbaseReplacement(t *testing.T) {
 	}
 }
 
+// TestBuildCompoundBUMP_NoCoinbaseBUMP_MultiSubtree_FailsSafe documents the
+// coinbase-BUMP-absent fallback for multi-subtree blocks. Ingestion does not
+// guarantee a coinbase BUMP (bump/datahub.go treats a zero-length coinbase-BUMP
+// field as "absent" and coinbaseBUMPReconciles passes on an empty one), so a
+// multi-subtree block can reach BuildCompoundBUMP with coinbaseBUMP == nil.
+// Without it, subtree 0's root cannot be corrected — the datahub computes it
+// against the coinbase placeholder, and there is no real coinbase txid to fold
+// nor a full-block path to bound the climb — so the compound root cannot match
+// the header root. This must fail loud: BuildCompoundBUMP still produces a
+// compound, but ValidateCompoundRoot rejects it against the true block root, so
+// the builder refuses to persist and the tx stays non-MINED. It must NEVER
+// silently validate against the placeholder-derived root (which would forge an
+// accepted proof).
+func TestBuildCompoundBUMP_NoCoinbaseBUMP_MultiSubtree_FailsSafe(t *testing.T) {
+	allLeaves, _, subtreeHashes, _, trueBlockRoot := setupCoinbaseBlock(3, 4)
+
+	stump0 := buildFullSTUMP(allLeaves[0], 1, 1000002)
+	stump1 := buildFullSTUMP(allLeaves[1], 0, 1000002)
+	stump2 := buildFullSTUMP(allLeaves[2], 0, 1000002)
+
+	stumps := []*models.Stump{
+		{BlockHash: "block3", SubtreeIndex: 0, StumpData: stump0},
+		{BlockHash: "block3", SubtreeIndex: 1, StumpData: stump1},
+		{BlockHash: "block3", SubtreeIndex: 2, StumpData: stump2},
+	}
+
+	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, nil)
+	if err != nil {
+		t.Fatalf("BuildCompoundBUMP failed: %v", err)
+	}
+	if compound == nil {
+		t.Fatal("expected a compound BUMP, got nil")
+	}
+
+	if err := ValidateCompoundRoot(compound, &trueBlockRoot); err == nil {
+		t.Fatal("expected ValidateCompoundRoot to REJECT the compound when no coinbase BUMP is supplied for a multi-subtree block (subtree-0 root uncorrected) — got nil error, which would mean a placeholder-derived root was accepted")
+	}
+}
+
 func TestBuildCompoundBUMP_CoinbaseReplacement_SingleSubtree(t *testing.T) {
 	allLeaves, trueAllLeaves, subtreeHashes, coinbaseTxID, trueBlockRoot := setupCoinbaseBlock(1, 4)
 	placeholder := allLeaves[0][0]
@@ -919,7 +1012,7 @@ func TestBuildCompoundBUMP_CoinbaseReplacement_SingleSubtree(t *testing.T) {
 		{BlockHash: "block2", SubtreeIndex: 0, StumpData: stump0},
 	}
 
-	cbBUMP := buildCoinbaseBUMP(allLeaves[0], coinbaseTxID, 1000001)
+	cbBUMP := buildCoinbaseBUMP(allLeaves[0], coinbaseTxID, 1000001, subtreeHashes)
 
 	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, cbBUMP)
 	if err != nil {
@@ -1431,7 +1524,7 @@ func TestBuildCompoundBUMP_NonPow2_WithCoinbase(t *testing.T) {
 		subtreeSize = 4
 	)
 	allLeaves, trueAllLeaves, subtreeHashes, coinbaseTxID, trueBlockRoot := setupCoinbaseBlock(numSubtrees, subtreeSize)
-	cbBUMP := buildCoinbaseBUMP(trueAllLeaves[0], coinbaseTxID, 700000)
+	cbBUMP := buildCoinbaseBUMP(trueAllLeaves[0], coinbaseTxID, 700000, subtreeHashes)
 
 	stumps := make([]*models.Stump, numSubtrees)
 	for s := 0; s < numSubtrees; s++ {
@@ -1532,7 +1625,7 @@ func TestBuildCompoundBUMP_CoinbaseReplacement_OrderIndependence(t *testing.T) {
 		subtreeSize = 8 // pow2 ≥2 is sufficient to reproduce; larger only adds runtime
 	)
 	allLeaves, trueAllLeaves, subtreeHashes, coinbaseTxID, trueBlockRoot := setupCoinbaseBlock(numSubtrees, subtreeSize)
-	cbBUMP := buildCoinbaseBUMP(trueAllLeaves[0], coinbaseTxID, 700000)
+	cbBUMP := buildCoinbaseBUMP(trueAllLeaves[0], coinbaseTxID, 700000, subtreeHashes)
 
 	orderings := [][]int{
 		{0, 1, 2, 3, 4, 5}, // baseline — this was the only order the old code happened to handle
@@ -1592,22 +1685,105 @@ func TestBuildCompoundBUMP_CoinbaseReplacement_OrderIndependence(t *testing.T) {
 // coinbase), the returned hash must equal the merkle root of the same leaves
 // with offset 0 replaced by the real coinbase txid — NOT the left child of
 // that root. Covers multiple subtree heights so no pow2 case regresses.
-func TestComputeCorrectedSubtreeRoot_ReturnsRealRoot(t *testing.T) {
+func TestSubtree0RootFromCoinbaseBUMP_ReturnsRealRoot(t *testing.T) {
 	sizes := []int{2, 4, 8, 16, 32, 1024}
 	for _, size := range sizes {
 		t.Run(fmt.Sprintf("subtreeSize_%d", size), func(t *testing.T) {
 			allLeaves, trueAllLeaves, _, coinbaseTxID, _ := setupCoinbaseBlock(1, size)
-			stumpData := buildFullSTUMP(allLeaves[0], 0, 700000)
+			internalHeight := int(math.Ceil(math.Log2(float64(size))))
+			cbBUMP := buildCoinbaseBUMP(allLeaves[0], coinbaseTxID, 700000, nil)
 
-			got, err := computeCorrectedSubtreeRoot(stumpData, &coinbaseTxID)
-			if err != nil {
-				t.Fatalf("computeCorrectedSubtreeRoot failed: %v", err)
+			got := subtree0RootFromCoinbaseBUMP(cbBUMP, internalHeight)
+			if got == nil {
+				t.Fatalf("size=%d: subtree0RootFromCoinbaseBUMP returned nil", size)
 			}
 			want := computeMerkleRootFromLeaves(trueAllLeaves[0])
 			if *got != want {
 				t.Fatalf("size=%d: got %s, want %s (actual subtree root)", size, got, want)
 			}
 		})
+	}
+}
+
+// TestCorrectedSubtree0Root_Block951360_FromCoinbaseBUMP pins the over-climb fix
+// at the incident shape: a 3-subtree block whose coinbase BUMP spans full block
+// height. correctedSubtree0Root must fold only the subtree-internal levels and
+// return the REAL subtree-0 root — never the block root (the value the old
+// unbounded climb produced and which poisoned subtreeHashes[0]).
+func TestCorrectedSubtree0Root_Block951360_FromCoinbaseBUMP(t *testing.T) {
+	const (
+		numSubtrees = 3
+		subtreeSize = 8
+	)
+	_, trueAllLeaves, subtreeHashes, coinbaseTxID, trueBlockRoot := setupCoinbaseBlock(numSubtrees, subtreeSize)
+	cbBUMP := buildCoinbaseBUMP(trueAllLeaves[0], coinbaseTxID, 951360, subtreeHashes)
+
+	got := correctedSubtree0Root(cbBUMP, numSubtrees)
+	if got == nil {
+		t.Fatal("correctedSubtree0Root returned nil")
+	}
+	want := computeMerkleRootFromLeaves(trueAllLeaves[0])
+	if *got != want {
+		t.Fatalf("corrected subtree-0 root = %s, want real subtree root %s", got, want)
+	}
+	if *got == trueBlockRoot {
+		t.Fatal("corrected subtree-0 root equals the BLOCK root — over-climb regression")
+	}
+}
+
+// TestBuildCompoundBUMP_FullBlockSubtree0STUMP_Block951360 reproduces the
+// 2026-05-30 mainnet block-951360 incident: merkle-service delivered subtree
+// 0's STUMP at FULL BLOCK HEIGHT (treeHeight 17 on-chain; internalHeight +
+// ceil(log2(N)) here) rather than the subtree-internal height. The old
+// correction climbed every level of that STUMP, overshooting the subtree-0
+// root and landing on the BLOCK root, which it then wrote into
+// subtreeHashes[0]; the placement step also keyed internal height off the raw
+// STUMP height. Either way the compound BUMP's root diverged from the block
+// header merkle root and ValidateCompoundRoot rejected it, so the tx was never
+// marked MINED.
+//
+// Pre-fix this fails (placement rejects the height mismatch / the over-climbed
+// root poisons the tree). Post-fix the corrected subtree-0 root is derived from
+// the coinbase BUMP and the placement height is taken from it, so the over-tall
+// STUMP is truncated to its true subtree-internal levels and the compound
+// validates.
+func TestBuildCompoundBUMP_FullBlockSubtree0STUMP_Block951360(t *testing.T) {
+	const (
+		numSubtrees = 3 // matches block 951360's subtreeCount
+		subtreeSize = 8
+	)
+	allLeaves, trueAllLeaves, subtreeHashes, coinbaseTxID, trueBlockRoot := setupCoinbaseBlock(numSubtrees, subtreeSize)
+	cbBUMP := buildCoinbaseBUMP(trueAllLeaves[0], coinbaseTxID, 951360, subtreeHashes)
+
+	// Subtree 0's STUMP arrives at full block height (the defect); subtrees 1
+	// and 2 at the normal subtree-internal height.
+	stumps := []*models.Stump{
+		{BlockHash: "blk951360", SubtreeIndex: 0, StumpData: buildFullBlockSubtree0STUMP(allLeaves[0], 0, 951360, subtreeHashes)},
+		{BlockHash: "blk951360", SubtreeIndex: 1, StumpData: buildFullSTUMP(allLeaves[1], 0, 951360)},
+		{BlockHash: "blk951360", SubtreeIndex: 2, StumpData: buildFullSTUMP(allLeaves[2], 0, 951360)},
+	}
+
+	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, cbBUMP)
+	if err != nil {
+		t.Fatalf("BuildCompoundBUMP failed: %v", err)
+	}
+	if vErr := ValidateCompoundRoot(compound, &trueBlockRoot); vErr != nil {
+		t.Fatalf("compound BUMP did not validate against block header merkle root: %v", vErr)
+	}
+
+	// Every true leaf (including the coinbase at subtree 0, offset 0) must climb
+	// cleanly to the block root.
+	for s := 0; s < numSubtrees; s++ {
+		for i := 0; i < subtreeSize; i++ {
+			leaf := trueAllLeaves[s][i]
+			root, rErr := compound.ComputeRoot(&leaf)
+			if rErr != nil {
+				t.Fatalf("subtree %d tx %d: ComputeRoot: %v", s, i, rErr)
+			}
+			if *root != trueBlockRoot {
+				t.Fatalf("subtree %d tx %d: root mismatch: got %s, want %s", s, i, root, trueBlockRoot)
+			}
+		}
 	}
 }
 
@@ -1641,7 +1817,7 @@ func TestBuildCompoundBUMP_NoSubtree0Stump_NonPow2(t *testing.T) {
 		{BlockHash: "blkNonPow2", SubtreeIndex: trackedSubtree, StumpData: stump7},
 	}
 
-	cbBUMP := buildCoinbaseBUMP(allLeaves[0], coinbaseTxID, 1234567)
+	cbBUMP := buildCoinbaseBUMP(allLeaves[0], coinbaseTxID, 1234567, subtreeHashes)
 
 	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, cbBUMP)
 	if err != nil {
