@@ -32,6 +32,33 @@ const DefaultMaxBlockBytes int64 = 1 * 1024 * 1024 * 1024 // 1 GiB
 // stops a hostile server from inflating arcade's log lines.
 const maxErrorBodyBytes int64 = 512
 
+// maxSubtreeCount caps the number of subtree hashes parseBlockBinary will
+// preallocate before reading them from the response. PR#107 / F-007 caps the
+// total response body at DefaultMaxBlockBytes (1 GiB), and each subtree hash
+// is exactly 32 bytes on the wire, so the absolute upper bound implied by the
+// body cap is DefaultMaxBlockBytes/32 ≈ 33.5 million entries. We pick a
+// round, well-under-the-ceiling cap of 10 million, which is comfortably above
+// any plausible Teranode block (millions of subtrees) while preventing a
+// hostile DataHub from pushing a varint of, say, 2^60 and forcing a
+// multi-petabyte preallocation. See finding F-008.
+const maxSubtreeCount uint64 = 10_000_000
+
+// maxTxCount caps the txCount metadata varint that prefixes the binary block
+// payload. The /block endpoint records the block's total transaction count;
+// even Teranode-class blocks stay well under a billion, so 1e9 is comfortable
+// headroom and rejects obviously-bogus 2^60-style varints. The value is
+// currently only consumed to advance the reader cursor, but bounding it now
+// prevents a future refactor from introducing an allocation path on
+// untrusted input and surfaces malformed responses earlier. See F-008.
+const maxTxCount uint64 = 1_000_000_000
+
+// maxBlockSizeBytes caps the sizeBytes metadata varint. The /block endpoint
+// records the total on-chain block size including subtree files served
+// separately, so this is a logical block-size limit (1 TiB) rather than a
+// response-body limit — the response body itself is enforced by
+// DefaultMaxBlockBytes. Defense-in-depth rationale matches maxTxCount.
+const maxBlockSizeBytes uint64 = 1 << 40
+
 // BlockDataValidator is an optional response-acceptance predicate run after a
 // successful datahub fetch. Returning a non-nil error causes the fetch loop
 // to discard that peer's response (logging the reason into urlErrors) and try
@@ -271,17 +298,36 @@ func parseBlockBinary(data []byte) ([]chainhash.Hash, []byte, *chainhash.Hash, e
 	if _, rErr := txCount.ReadFrom(r); rErr != nil {
 		return nil, nil, nil, fmt.Errorf("failed to read transaction count: %w", rErr)
 	}
+	if uint64(txCount) > maxTxCount {
+		return nil, nil, nil, fmt.Errorf("tx count %d exceeds maximum of %d", uint64(txCount), maxTxCount)
+	}
 
 	// Read size in bytes (varint)
 	var sizeBytes util.VarInt
 	if _, rErr := sizeBytes.ReadFrom(r); rErr != nil {
 		return nil, nil, nil, fmt.Errorf("failed to read size in bytes: %w", rErr)
 	}
+	if uint64(sizeBytes) > maxBlockSizeBytes {
+		return nil, nil, nil, fmt.Errorf("block size %d exceeds maximum of %d", uint64(sizeBytes), maxBlockSizeBytes)
+	}
 
 	// Read subtree count (varint)
 	var subtreeCount util.VarInt
 	if _, rErr := subtreeCount.ReadFrom(r); rErr != nil {
 		return nil, nil, nil, fmt.Errorf("failed to read subtree count: %w", rErr)
+	}
+
+	// Reject implausible subtree counts before allocating. A hostile or
+	// buggy DataHub could otherwise send a 9-byte varint encoding ~2^64-1
+	// and force a multi-petabyte preallocation. A count that cannot
+	// physically fit in the remaining body (32 bytes per hash) is also
+	// rejected so we never allocate space we are guaranteed never to fill.
+	// See finding F-008.
+	if uint64(subtreeCount) > maxSubtreeCount {
+		return nil, nil, nil, fmt.Errorf("subtree count %d exceeds maximum of %d", uint64(subtreeCount), maxSubtreeCount)
+	}
+	if uint64(subtreeCount) > uint64(r.Len()/32) { //nolint:gosec // bytes.Reader.Len() is always non-negative (remaining unread bytes)
+		return nil, nil, nil, fmt.Errorf("subtree count %d exceeds remaining body capacity (%d bytes for %d-byte hashes)", uint64(subtreeCount), r.Len(), 32)
 	}
 
 	// Read subtree hashes (32 bytes each)
@@ -321,6 +367,18 @@ func parseBlockBinary(data []byte) ([]chainhash.Hash, []byte, *chainhash.Hash, e
 	}
 
 	if uint64(cbBUMPLen) == 0 {
+		return hashes, nil, headerMerkleRoot, nil
+	}
+
+	// Reject coinbase BUMP lengths that cannot physically fit in the
+	// remaining response body before allocating. The body itself was
+	// already capped by FetchBlockDataForBUMPWithCap, but the in-band
+	// varint is still untrusted, so a 2^64-sized cbBUMPLen would force an
+	// enormous preallocation here without this check. We treat oversize
+	// lengths as "no coinbase BUMP available" — matching the existing
+	// best-effort posture of the coinbase-tail parsing below the subtree
+	// hashes. See finding F-008.
+	if uint64(cbBUMPLen) > uint64(r.Len()) { //nolint:gosec // bytes.Reader.Len() is always non-negative (remaining unread bytes)
 		return hashes, nil, headerMerkleRoot, nil
 	}
 

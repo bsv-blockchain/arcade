@@ -22,6 +22,7 @@ import (
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -39,9 +40,19 @@ var (
 )
 
 // Store is the Postgres-backed implementation of the store interfaces.
+// bumpCacheSize bounds how many parsed compound BUMPs the store keeps
+// resident for merkle-path enrichment. enrichMerklePath runs on every
+// GetStatus of a mined tx and would otherwise re-fetch and re-parse the
+// whole block BUMP on each call — the dominant heap consumer under
+// sustained status-lookup load. Status lookups cluster on recently-mined
+// blocks, so a small LRU gives a
+// high hit rate while keeping the resident set bounded.
+const bumpCacheSize = 8
+
 type Store struct {
-	pool    *pgxpool.Pool
-	stopEmb func() error
+	pool      *pgxpool.Pool
+	stopEmb   func() error
+	bumpCache *lru.Cache[string, *transaction.MerklePath]
 }
 
 // New connects to Postgres (optionally starting the embedded-postgres process
@@ -78,7 +89,16 @@ func New(ctx context.Context, cfg config.Postgres) (*Store, error) {
 		return nil, fmt.Errorf("connect postgres: %w", err)
 	}
 
-	return &Store{pool: pool, stopEmb: stopEmbedded}, nil
+	bumpCache, err := lru.New[string, *transaction.MerklePath](bumpCacheSize)
+	if err != nil {
+		pool.Close()
+		if stopEmbedded != nil {
+			_ = stopEmbedded()
+		}
+		return nil, fmt.Errorf("init bump cache: %w", err)
+	}
+
+	return &Store{pool: pool, stopEmb: stopEmbedded, bumpCache: bumpCache}, nil
 }
 
 // EnsureIndexes applies the schema. Safe to call repeatedly — every CREATE
@@ -883,6 +903,11 @@ ON CONFLICT (block_hash) DO UPDATE SET block_height=EXCLUDED.block_height, bump_
 	if err != nil {
 		return fmt.Errorf("insert bump %s: %w", blockHash, err)
 	}
+	// ON CONFLICT DO UPDATE means a rebuild can overwrite bump_data for an
+	// existing block hash (e.g. late STUMP callbacks produce a more complete
+	// sparse compound). Drop any cached parse so the next status lookup
+	// re-fetches the current stored BUMP instead of serving a stale compound.
+	s.bumpCache.Remove(blockHash)
 	return nil
 }
 
@@ -1182,6 +1207,74 @@ WHERE submission_id=$1`
 	return nil
 }
 
+// UpdateDeliveryStatusCAS implements store.Store. The predicate matches both
+// SQL NULL (submission has never been delivered) and the empty string (some
+// callers may persist Status("") explicitly) when expected is the zero value,
+// so the very first delivery for a submission claims correctly.
+func (s *Store) UpdateDeliveryStatusCAS(ctx context.Context, submissionID string, expected, next models.Status) (bool, error) {
+	const q = `
+UPDATE submissions
+SET last_delivered_status=$3, retry_count=0, next_retry_at=NULL
+WHERE submission_id=$1
+  AND (
+    ($2 = '' AND (last_delivered_status IS NULL OR last_delivered_status = ''))
+    OR last_delivered_status = $2
+  )`
+	tag, err := s.pool.Exec(ctx, q, submissionID, string(expected), string(next))
+	if err != nil {
+		return false, fmt.Errorf("update delivery cas: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// ListSubmissionsReadyForRetry returns up to limit submissions whose POST
+// previously failed (retry_count > 0) and whose backoff has elapsed
+// (next_retry_at <= now). Backed by the idx_sub_retry_ready partial index so
+// the scan stays proportional to the in-retry backlog, not to the full
+// submissions table.
+func (s *Store) ListSubmissionsReadyForRetry(ctx context.Context, now time.Time, limit int) ([]*models.Submission, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	const q = `
+SELECT submission_id, txid, callback_url, callback_token, full_status_updates,
+       last_delivered_status, retry_count, next_retry_at, created_at
+FROM submissions
+WHERE retry_count > 0
+  AND next_retry_at IS NOT NULL
+  AND next_retry_at <= $1
+ORDER BY next_retry_at ASC
+LIMIT $2`
+	rows, err := s.pool.Query(ctx, q, now, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list submissions ready for retry: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*models.Submission
+	for rows.Next() {
+		sub := &models.Submission{}
+		var lastStatus *string
+		var nextRetry *time.Time
+		if err := rows.Scan(
+			&sub.SubmissionID, &sub.TxID, &sub.CallbackURL, &sub.CallbackToken,
+			&sub.FullStatusUpdates, &lastStatus, &sub.RetryCount, &nextRetry,
+			&sub.CreatedAt,
+		); err != nil {
+			return out, err
+		}
+		if lastStatus != nil {
+			sub.LastDeliveredStatus = models.Status(*lastStatus)
+		}
+		if nextRetry != nil {
+			t := *nextRetry
+			sub.NextRetryAt = &t
+		}
+		out = append(out, sub)
+	}
+	return out, rows.Err()
+}
+
 // --- Leaser ---
 
 // TryAcquireOrRenew uses a single CTE to perform CAS-like acquire-or-renew:
@@ -1389,18 +1482,37 @@ func (s *Store) enrichMerklePath(ctx context.Context, status *models.Transaction
 	if status.Status != models.StatusMined && status.Status != models.StatusImmutable {
 		return
 	}
-	_, bumpData, err := s.GetBUMP(ctx, status.BlockHash)
-	if err != nil || len(bumpData) == 0 {
+	compound := s.compoundBUMP(ctx, status.BlockHash)
+	if compound == nil {
 		return
 	}
-	status.MerklePath = extractMinimalPathForTx(bumpData, status.TxID)
+	status.MerklePath = extractMinimalPathForTx(compound, status.TxID)
 }
 
-func extractMinimalPathForTx(bumpData []byte, txid string) []byte {
+// compoundBUMP returns the parsed compound BUMP for a block, caching the
+// parsed form so repeated status lookups for txs in the same block reuse
+// it instead of re-fetching and re-parsing the (potentially large) BUMP.
+// The returned value is shared and must be treated as read-only.
+func (s *Store) compoundBUMP(ctx context.Context, blockHash string) *transaction.MerklePath {
+	if c, ok := s.bumpCache.Get(blockHash); ok {
+		return c
+	}
+	_, bumpData, err := s.GetBUMP(ctx, blockHash)
+	if err != nil || len(bumpData) == 0 {
+		return nil
+	}
 	compound, err := transaction.NewMerklePathFromBinary(bumpData)
 	if err != nil {
 		return nil
 	}
+	s.bumpCache.Add(blockHash, compound)
+	return compound
+}
+
+// extractMinimalPathForTx extracts a per-tx minimal merkle path from an
+// already-parsed compound BUMP. compound is shared via the store's bump
+// cache, so this only reads from it and builds a fresh MerklePath result.
+func extractMinimalPathForTx(compound *transaction.MerklePath, txid string) []byte {
 	txHash, err := chainhash.NewHashFromHex(txid)
 	if err != nil {
 		return nil

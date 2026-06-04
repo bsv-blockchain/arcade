@@ -576,12 +576,14 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// and re-encode it downstream.
 	txid := parsedTx.TxID().String()
 
-	// Synchronous policy validation (skipFees=true, skipScripts=true) — fee and
-	// script checks remain Teranode's job. Validation failure writes a
-	// terminal REJECTED row to the store and returns 400 to the client
-	// so the failure is durable AND immediate.
+	// Synchronous policy, script, and fee validation. Merkle proofs on
+	// BEEF parents are trusted (arcade doesn't own a chaintracker on the
+	// intake path); script execution against per-input source data still
+	// runs, which catches malformed unlocking scripts, bad signatures,
+	// and underpaid txs. Failures write a terminal REJECTED row and
+	// return 400 so the outcome is both durable and immediate.
 	if s.validator != nil {
-		if err := s.validator.ValidateTransaction(c.Request.Context(), parsedTx, true, true); err != nil {
+		if err := s.validator.ValidateTransaction(c.Request.Context(), parsedTx, false); err != nil {
 			s.rejectAtIntake(c.Request.Context(), txid, err.Error(), opts)
 			c.JSON(http.StatusBadRequest, gin.H{
 				jsonKeyError: "transaction failed validation",
@@ -801,14 +803,16 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 		return
 	}
 
-	// Phase 2: synchronous policy validation per tx. Any failure aborts
+	// Phase 2: synchronous policy + script + fee validation per tx
+	// (merkle proofs on BEEF parents are trusted; see
+	// handleSubmitTransaction for the rationale). Any failure aborts
 	// the whole batch with 400 — matches the single-tx contract. The
 	// failed tx gets a durable REJECTED row before the response so
 	// SSE/webhook subscribers can resolve the outcome.
 	if s.validator != nil {
 		ctx := c.Request.Context()
 		for _, p := range parsed {
-			if vErr := s.validator.ValidateTransaction(ctx, p.tx, true, true); vErr != nil {
+			if vErr := s.validator.ValidateTransaction(ctx, p.tx, false); vErr != nil {
 				s.rejectAtIntake(ctx, p.txid, vErr.Error(), opts)
 				c.JSON(http.StatusBadRequest, gin.H{
 					jsonKeyError: "transaction failed validation",

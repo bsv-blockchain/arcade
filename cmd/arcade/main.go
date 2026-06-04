@@ -56,7 +56,7 @@ func run(cmd *cobra.Command, _ []string) error {
 	// Start health server for non-API modes (api-server serves /health on its own port)
 	var hs *services.HealthServer
 	if cfg.Mode != "api-server" {
-		hs = services.NewHealthServer(cfg.Health.Port, logger)
+		hs = services.NewHealthServer(cfg.Health.Port, cfg.Health.PprofEnabled, logger)
 		hs.Start(ctx)
 	}
 

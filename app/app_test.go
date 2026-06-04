@@ -32,6 +32,64 @@ func TestModeNeedsChaintracks(t *testing.T) {
 	}
 }
 
+func TestValidatorPolicyFromConfig(t *testing.T) {
+	cases := []struct {
+		name        string
+		acceptZero  bool
+		minFeePerKB uint64
+		wantNil     bool
+		wantFee     uint64
+	}{
+		{
+			name:    "unset config returns nil so NewValidator applies its default",
+			wantNil: true,
+		},
+		{
+			name:        "explicit min_fee_per_kb threads through",
+			minFeePerKB: 50,
+			wantFee:     50,
+		},
+		{
+			name:        "min_fee_per_kb=0 without flag still falls back to default",
+			minFeePerKB: 0,
+			wantNil:     true,
+		},
+		{
+			name:       "accept_zero_fee pins fee to zero",
+			acceptZero: true,
+			wantFee:    0,
+		},
+		{
+			name:        "accept_zero_fee wins over min_fee_per_kb",
+			acceptZero:  true,
+			minFeePerKB: 500,
+			wantFee:     0,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{}
+			cfg.Validator.AcceptZeroFee = tc.acceptZero
+			cfg.Validator.MinFeePerKB = tc.minFeePerKB
+
+			got := validatorPolicyFromConfig(cfg)
+			if tc.wantNil {
+				if got != nil {
+					t.Fatalf("expected nil policy, got %+v", got)
+				}
+				return
+			}
+			if got == nil || got.MinFeePerKB == nil {
+				t.Fatalf("expected non-nil policy with MinFeePerKB set, got %+v", got)
+			}
+			if *got.MinFeePerKB != tc.wantFee {
+				t.Errorf("MinFeePerKB = %d, want %d", *got.MinFeePerKB, tc.wantFee)
+			}
+		})
+	}
+}
+
 func TestResolveChaintracksBootstrapPeers(t *testing.T) {
 	const sharedPeer = "/dns4/shared.example/tcp/9905/p2p/12D3KooWShared"
 	const ctSpecific = "/dns4/chaintracks.example/tcp/9905/p2p/12D3KooWCT"

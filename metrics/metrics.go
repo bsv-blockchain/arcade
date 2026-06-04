@@ -375,6 +375,56 @@ var WebhookPoolSaturatedTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "Status updates dropped by the webhook service because its delivery worker pool was full.",
 })
 
+// WebhookCASLostTotal counts claim-then-POST attempts that lost the CAS to
+// another replica — the other pod already advanced LastDeliveredStatus for
+// the same submission, so this pod silently skipped its POST. With N
+// horizontally-scaled api-server replicas, this counter is expected to
+// increase at roughly (N - 1) × deliveries: the winner POSTs, the (N - 1)
+// losers count here. A flat zero on a multi-replica deployment means events
+// are not actually flowing through CAS — either the schema migration is
+// missing or only one pod is producing events.
+var WebhookCASLostTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "arcade_webhook_cas_lost_total",
+	Help: "Webhook deliveries skipped because another replica won the LastDeliveredStatus CAS.",
+})
+
+// WebhookCASErrorTotal counts CAS attempts that failed with a real infra
+// error rather than a generation mismatch — surfaced separately so a flat
+// WebhookCASLostTotal can't mask a backend that's silently failing every
+// write. Only the Aerospike backend emits this today: its CAS path collapses
+// gen-mismatch and infra errors into the same (false, nil) return shape, so
+// the metric is the one observable signal that distinguishes them. Postgres
+// and Pebble propagate infra errors through the function's `err` return and
+// the caller already logs those.
+var WebhookCASErrorTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "arcade_webhook_cas_error_total",
+	Help: "Webhook CAS writes that failed with an infra error (distinct from generation mismatch).",
+})
+
+// WebhookReaperLease is 1 when this pod holds the webhook-reaper lease, 0
+// otherwise. With N replicas, exactly one is expected to be 1 at any time.
+var WebhookReaperLease = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "arcade_webhook_reaper_lease",
+	Help: "1 when this pod holds the webhook-reaper lease, 0 otherwise.",
+})
+
+// WebhookReaperTickTotal tracks reaper ticks by outcome (ran /
+// skipped_no_leader / lease_error). Skipped_no_leader is the expected steady
+// state on N-1 replicas; a sustained lease_error rate points at the store
+// backend being unhealthy.
+var WebhookReaperTickTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_webhook_reaper_tick_total",
+	Help: "Webhook reaper ticks by outcome (ran / skipped_no_leader / lease_error).",
+}, []string{labelOutcome})
+
+// WebhookReaperReadyDepth is the number of submissions the most recent reaper
+// tick observed as ready-for-retry. A sustained non-zero value means the
+// backlog of failed POSTs is growing faster than the reaper can drain it.
+var WebhookReaperReadyDepth = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "arcade_webhook_reaper_ready_depth",
+	Help: "Submissions the last webhook-reaper tick observed as ready-for-retry.",
+})
+
 // ---------------------------------------------------------------------------
 // teranode (HTTP client)
 // ---------------------------------------------------------------------------
@@ -459,7 +509,7 @@ var P2PNodeStatusMessagesTotal = promauto.NewCounter(prometheus.CounterOpts{
 var P2PEndpointDiscoveryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_p2p_endpoint_discovery_total",
 	Help: "Datahub URL discovery outcomes from peer announcements.",
-}, []string{labelOutcome}) // registered, duplicate, invalid, no_url
+}, []string{labelOutcome}) // registered, invalid, no_url, error
 
 // ---------------------------------------------------------------------------
 // callback path — inbound merkle-service callbacks

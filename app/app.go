@@ -156,7 +156,7 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		merkleClient.SetLogger(logger.Named("merkle-client"))
 	}
 
-	txVal := validator.NewValidator(nil, nil)
+	txVal := validator.NewValidator(validatorPolicyFromConfig(cfg))
 
 	publisher := events.NewKafkaPublisher(producer, logger, cfg.Events.SubscriberBuffer)
 
@@ -237,6 +237,25 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		_ = producer.Close()
 	}
 	return deps, cleanup, nil
+}
+
+// validatorPolicyFromConfig builds the validator.Policy from cfg.Validator.
+// Returns nil when no operator-facing fields are set so NewValidator's
+// built-in defaults apply unchanged. When AcceptZeroFee is set, returns
+// a policy with an explicit pointer-to-zero MinFeePerKB so that
+// NewValidator preserves it (its nil-check is on the pointer, not the
+// value) and ValidateTransaction feeds Satoshis=0 to spv.Verify, which
+// accepts any non-negative fee — including fee=0.
+func validatorPolicyFromConfig(cfg *config.Config) *validator.Policy {
+	if cfg.Validator.AcceptZeroFee {
+		zero := uint64(0)
+		return &validator.Policy{MinFeePerKB: &zero}
+	}
+	if cfg.Validator.MinFeePerKB == 0 {
+		return nil
+	}
+	minFee := cfg.Validator.MinFeePerKB
+	return &validator.Policy{MinFeePerKB: &minFee}
 }
 
 // modeNeedsChaintracks reports whether the configured service mode constructs
@@ -373,10 +392,18 @@ func BuildServices(d *Deps) []services.Service {
 		svcs = append(svcs, propagation.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.Leaser, d.TeranodeClient, d.MerkleClient))
 	}
 	if shouldRun("api-server") || shouldRun("webhook") {
-		svcs = append(svcs, webhook.New(cfg.Webhook, cfg.Callback, d.Logger, d.Publisher, d.Store))
+		svcs = append(svcs, webhook.New(cfg.Webhook, cfg.Callback, d.Logger, d.Publisher, d.Store, d.Leaser))
 	}
-	if shouldRun("propagation") || shouldRun("p2p-client") {
-		svcs = append(svcs, p2p_client.New(cfg, d.Logger, d.Producer, d.TeranodeClient, d.Store))
+	// p2p_client is intentionally NOT bundled with propagation. Running a
+	// libp2p host inside the propagation pod duplicates the peer discovery
+	// the dedicated p2p-client deployment already performs and is a
+	// significant memory cost that OOMKilled propagation in arcade-v2 at
+	// 512Mi. Propagation now reads discovered URLs from the shared store
+	// via teranode.Client's refresh loop (see teranode/client.go:refreshLoop).
+	// In --mode all the shouldRun gate still matches via the cfg.Mode=="all"
+	// branch, so single-process development is unchanged.
+	if shouldRun("p2p-client") {
+		svcs = append(svcs, p2p_client.New(cfg, d.Logger, d.Producer, d.Store))
 	}
 
 	return svcs

@@ -1234,26 +1234,35 @@ func (p *Propagator) submitBroadcastJobs(ctx context.Context, endpoints []string
 }
 
 // broadcastBatchToEndpoints submits a batch to each healthy teranode
-// endpoint via /txs and produces per-tx classifications:
+// endpoint via /txs and aggregates every peer's response into a per-tx
+// verdict:
 //
-//   - Any endpoint returning 200 → every tx accepted (the peer accepted
-//     the whole batch; per-tx failure info from other peers' 500 responses
-//     is superseded).
-//   - No endpoint returned 200, but at least one returned the Teranode
-//     "Failed to process transactions:" 500 body → per-tx classification.
-//     Each txid named in the failure body is rejected; every other tx in
-//     the batch is treated as accepted. We treat any per-tx line as
-//     terminal because Teranode wraps real validator failures as
-//     PROCESSING (catch-all "this tx is bad"), so a returned line cannot
-//     be reliably distinguished from a transient infra issue by code.
-//   - All endpoints failed without a parseable Teranode failure body, or
-//     no healthy endpoints existed → every tx requeued (pure batch-level
-//     infra failure).
+//   - HTTP 200 from a peer → that peer accepted the whole batch, so
+//     every tx in the batch gets a sticky acceptance vote.
+//   - HTTP 5xx with a parseable "Failed to process transactions:"
+//     body → that peer rejected the listed txids and accepted the
+//     rest. Each accepted tx gets an acceptance vote; each rejected
+//     tx gets a rejection vote carrying the verbatim error line.
+//   - HTTP 5xx with no parseable body, network error, or no healthy
+//     endpoints → no per-tx information from that peer.
+//
+// After all responses are in (or the 15s submitCtx timeout fires), each
+// tx is classified:
+//
+//   - Any acceptance vote → ACCEPTED_BY_NETWORK.
+//   - Otherwise, at least one rejection vote → REJECTED with the
+//     first peer's rejection line.
+//   - Otherwise (no information from any peer) → Requeue.
+//
+// We treat any per-tx rejection line as terminal because Teranode wraps
+// real validator failures as PROCESSING (catch-all "this tx is bad"),
+// so a returned line cannot be reliably distinguished from a transient
+// infra issue by code.
 //
 // Per-endpoint outcomes are recorded into the circuit-breaker regardless
 // of verdict so a peer returning 500 doesn't get sidelined when the
 // 500 was a per-tx verdict, not the peer's fault. The returned
-// successEndpoint is the URL of the first peer that accepted the batch
+// successEndpoint is the URL of the first peer that returned HTTP 200
 // (empty when none did).
 func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]byte, batch []propagationMsg) (results []txResult, successEndpoint string) {
 	start := time.Now()
@@ -1275,41 +1284,73 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 	resultCh := make(chan broadcastJobResult, len(endpoints))
 	submitted := p.submitBroadcastJobs(broadcastCtx, endpoints, rawTxs, resultCh)
 
+	// Precompute lowercase txids so failure-map lookups against
+	// Teranode's lower-cased keys don't allocate inside the per-result
+	// loop below.
+	lowerTxids := make([]string, len(batch))
+	for i, msg := range batch {
+		lowerTxids[i] = strings.ToLower(msg.TXID)
+	}
+
+	// Per-tx accumulation across every peer response. Acceptance is
+	// sticky: any peer that accepts a tx wins for that tx, regardless
+	// of what other peers say or which response arrived first. A tx is
+	// only REJECTED when every peer that gave us a parseable response
+	// explicitly listed it as failed.
 	outcomes := make([]endpointOutcome, 0, submitted)
+	acceptedByAny := make([]bool, len(batch))
+	rejectionLine := make([]string, len(batch))
 	anySuccess := false
-	var failures map[string]string // first endpoint's failure map, used when no peer succeeded
 	for i := 0; i < submitted; i++ {
 		result := <-resultCh
 		if isCanceledByBroadcast(broadcastCtx, result.err) {
 			continue
 		}
 		outcomes = append(outcomes, endpointOutcome{endpoint: result.endpoint, statusCode: result.statusCode})
-		if result.err != nil {
-			p.logger.Warn(
-				"batch broadcast endpoint failed",
+
+		if result.err == nil {
+			// HTTP 200 — peer accepted the entire batch.
+			p.logger.Debug(
+				"batch broadcast endpoint succeeded",
 				zap.String("endpoint", result.endpoint),
 				zap.Int("batch_size", len(batch)),
-				zap.Int("status_code", result.statusCode),
-				zap.Error(result.err),
 			)
-			// Save the first parseable failure map we see for the fallback path.
-			if failures == nil && len(result.failures) > 0 {
-				failures = result.failures
+			if !anySuccess {
+				successEndpoint = result.endpoint
+			}
+			anySuccess = true
+			for j := range batch {
+				acceptedByAny[j] = true
 			}
 			continue
 		}
-		p.logger.Debug(
-			"batch broadcast endpoint succeeded",
+
+		p.logger.Warn(
+			"batch broadcast endpoint failed",
 			zap.String("endpoint", result.endpoint),
 			zap.Int("batch_size", len(batch)),
+			zap.Int("status_code", result.statusCode),
+			zap.Error(result.err),
 		)
-		if !anySuccess {
-			successEndpoint = result.endpoint
+
+		if len(result.failures) == 0 {
+			// Non-parseable failure — this peer carried no per-tx info.
+			continue
 		}
-		anySuccess = true
-		// Early-cancel: an accepting endpoint settles the batch's network
-		// verdict; siblings still in flight stop wasting time.
-		cancelBroadcast()
+
+		// Parseable 500: peer accepted every tx not in the failure
+		// map and rejected the listed ones. An acceptance vote from
+		// any peer makes the tx ACCEPTED; a rejection vote only
+		// matters if no peer ever accepts.
+		for j, lower := range lowerTxids {
+			if line, failed := result.failures[lower]; failed {
+				if rejectionLine[j] == "" {
+					rejectionLine[j] = line
+				}
+			} else {
+				acceptedByAny[j] = true
+			}
+		}
 	}
 	recordBroadcastOutcomes(p.teranodeClient, outcomes)
 
@@ -1321,10 +1362,9 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 	)
 
 	results = make([]txResult, len(batch))
-
-	if anySuccess {
-		// Network accepted — every tx becomes ACCEPTED_BY_NETWORK.
-		for i, msg := range batch {
+	for i, msg := range batch {
+		switch {
+		case acceptedByAny[i]:
 			results[i] = txResult{
 				class: txResultClassAccepted,
 				status: &models.TransactionStatus{
@@ -1335,56 +1375,27 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 				rawTx:           msg.RawTx,
 				successEndpoint: successEndpoint,
 			}
-		}
-		return results, successEndpoint
-	}
-
-	if failures != nil {
-		// All endpoints failed but at least one carried a Teranode
-		// failure-list body. A txid in the map failed; absent means the
-		// peer accepted that tx into its pipeline.
-		for i, msg := range batch {
-			line, failed := failures[strings.ToLower(msg.TXID)]
-			if !failed {
-				results[i] = txResult{
-					class: txResultClassAccepted,
-					status: &models.TransactionStatus{
-						TxID:      msg.TXID,
-						Status:    models.StatusAcceptedByNetwork,
-						Timestamp: now,
-					},
-					rawTx: msg.RawTx,
-				}
-				continue
+		case rejectionLine[i] != "":
+			_, errMsg := classifyFailureLine(rejectionLine[i])
+			results[i] = txResult{
+				class:  txResultClassRejected,
+				errMsg: errMsg,
+				status: &models.TransactionStatus{
+					TxID:      msg.TXID,
+					Status:    models.StatusRejected,
+					Timestamp: now,
+					ExtraInfo: errMsg,
+				},
+				rawTx: msg.RawTx,
 			}
-			class, errMsg := classifyFailureLine(line)
-			switch class {
-			case txResultClassRejected:
-				results[i] = txResult{
-					class:  txResultClassRejected,
-					errMsg: errMsg,
-					status: &models.TransactionStatus{
-						TxID:      msg.TXID,
-						Status:    models.StatusRejected,
-						Timestamp: now,
-						ExtraInfo: errMsg,
-					},
-					rawTx: msg.RawTx,
-				}
-			default:
-				results[i] = txResult{
-					class:  txResultClassRequeue,
-					errMsg: errMsg,
-					rawTx:  msg.RawTx,
-				}
+		default:
+			results[i] = txResult{
+				class: txResultClassRequeue,
+				rawTx: msg.RawTx,
 			}
 		}
-		return results, ""
 	}
-
-	// All endpoints failed and none had a parseable Teranode failure body —
-	// treat the whole batch as infra and requeue every tx.
-	return makeRequeueResults(batch), ""
+	return results, successEndpoint
 }
 
 // makeRequeueResults builds a per-tx requeue result list for a batch

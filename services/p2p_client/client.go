@@ -1,18 +1,18 @@
 // Package p2p_client subscribes to teranode's node_status topic via
-// go-teranode-p2p-client and registers each peer's advertised datahub URL
-// with the shared teranode.Client. It runs only when
-// `p2p.datahub_discovery: true`; when disabled, Start blocks on ctx with no
-// libp2p port opened.
+// go-teranode-p2p-client and persists each peer's advertised datahub URL to
+// the shared store. It runs only when `p2p.datahub_discovery: true`; when
+// disabled, Start blocks on ctx with no libp2p port opened.
+//
+// This service is the sole libp2p host in a microservice deployment. Other
+// pods (propagation, bump-builder, api-server, sse, watchdog) learn about
+// discovered peer endpoints by polling the shared DatahubEndpoint registry
+// via teranode.Client's refresh loop — they do not run their own libp2p
+// stack.
 //
 // Using the wrapper library means we inherit:
 //   - embedded bootstrap peers for main/test/stn (no operator config needed)
 //   - canonical topic names (`teranode/bitcoin/1.0.0/{network}-node_status`)
 //   - persistent peer identity stored under StoragePath as p2p_key.hex
-//
-// Discovered URLs are additive: statically configured `datahub_urls` are
-// seeded into teranode.Client at startup and never reordered or evicted. A
-// runtime announcement that matches a static entry (including a trailing-
-// slash variant) is silently deduplicated.
 package p2p_client
 
 import (
@@ -30,7 +30,6 @@ import (
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/store"
-	"github.com/bsv-blockchain/arcade/teranode"
 )
 
 // BlockNotification is retained from the earlier scaffold. It is not used by
@@ -71,7 +70,6 @@ type Client struct {
 	cfg           *config.Config
 	logger        *zap.Logger
 	producer      *kafka.Producer
-	teranode      *teranode.Client
 	store         EndpointWriter
 	clientFactory clientFactory
 	bus           teraClient
@@ -80,12 +78,11 @@ type Client struct {
 	stopOnce      sync.Once
 }
 
-func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, teranodeClient *teranode.Client, st EndpointWriter) *Client {
+func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, st EndpointWriter) *Client {
 	return &Client{
 		cfg:           cfg,
 		logger:        logger.Named("p2p-client"),
 		producer:      producer,
-		teranode:      teranodeClient,
 		store:         st,
 		clientFactory: defaultClientFactory,
 		done:          make(chan struct{}),
@@ -201,7 +198,7 @@ func (c *Client) consume(ctx context.Context, msgs <-chan teranodep2p.NodeStatus
 }
 
 // handleNodeStatus extracts a datahub URL from a node_status announcement,
-// validates it, and registers it with the shared teranode.Client. The
+// validates it, and persists it to the shared DatahubEndpoint registry. The
 // wrapper library has already JSON-decoded the payload; spoofing defense is
 // left to the libp2p layer since the wrapper drops FromID before fan-out.
 func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatusMessage) {
@@ -261,47 +258,41 @@ func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatu
 		return
 	}
 
-	added := c.teranode.AddEndpoints([]string{normalized})
-	if added == 0 {
-		metrics.P2PEndpointDiscoveryTotal.WithLabelValues("duplicate").Inc()
-	} else {
-		metrics.P2PEndpointDiscoveryTotal.WithLabelValues("registered").Inc()
+	// Persist the discovery to the shared DatahubEndpoint registry. Every
+	// consumer pod's teranode.Client polls this registry on its refresh
+	// tick (see teranode/client.go:refreshLoop) and merges new URLs into
+	// its in-memory broadcast set — that is the single mechanism by which
+	// peer URLs reach broadcast paths. Upserts are idempotent: a known URL
+	// just advances LastSeen.
+	if c.store == nil {
+		// Constructor always supplies a writer in production; a nil store
+		// only happens in narrow tests of unrelated branches above.
+		metrics.P2PEndpointDiscoveryTotal.WithLabelValues("no_store").Inc()
+		return
 	}
-	if added == 1 {
-		eps := c.teranode.GetEndpoints()
-		c.logger.Info(
-			"registered peer datahub url",
-			zap.String("peer_id", msg.PeerID),
+	upsertCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	err = c.store.UpsertDatahubEndpoint(upsertCtx, store.DatahubEndpoint{
+		URL:      normalized,
+		Network:  c.cfg.Network,
+		Source:   store.DatahubEndpointSourceDiscovered,
+		LastSeen: time.Now(),
+	})
+	cancel()
+	if err != nil {
+		metrics.P2PEndpointDiscoveryTotal.WithLabelValues("error").Inc()
+		c.logger.Warn(
+			"failed to persist discovered datahub url",
 			zap.String("url", normalized),
+			zap.Error(err),
 		)
-		c.logger.Debug(
-			"endpoint count changed",
-			zap.Int("total_endpoints", len(eps)),
-		)
+		return
 	}
-
-	// Mirror to the shared store so other pods (propagation, bump-builder)
-	// pick up the URL on their next teranode.Client refresh tick. Idempotent:
-	// the upsert always advances LastSeen even when the URL was already known
-	// to the local in-memory client. Failure here is a soft warning — the
-	// local pod still works, only cross-pod visibility is delayed.
-	if c.store != nil {
-		upsertCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		err := c.store.UpsertDatahubEndpoint(upsertCtx, store.DatahubEndpoint{
-			URL:      normalized,
-			Network:  c.cfg.Network,
-			Source:   store.DatahubEndpointSourceDiscovered,
-			LastSeen: time.Now(),
-		})
-		cancel()
-		if err != nil {
-			c.logger.Warn(
-				"failed to persist discovered datahub url",
-				zap.String("url", normalized),
-				zap.Error(err),
-			)
-		}
-	}
+	metrics.P2PEndpointDiscoveryTotal.WithLabelValues("registered").Inc()
+	c.logger.Info(
+		"registered peer datahub url",
+		zap.String("peer_id", msg.PeerID),
+		zap.String("url", normalized),
+	)
 }
 
 // zapBusLogger adapts *zap.Logger to the message-bus logger interface, which

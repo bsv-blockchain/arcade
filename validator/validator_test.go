@@ -13,7 +13,7 @@ import (
 )
 
 func TestNewValidator_Defaults(t *testing.T) {
-	v := NewValidator(nil, nil)
+	v := NewValidator(nil)
 	if v.policy.MaxTxSizePolicy != maxBlockSize {
 		t.Errorf("expected maxBlockSize default, got %d", v.policy.MaxTxSizePolicy)
 	}
@@ -29,7 +29,7 @@ func TestNewValidator_CustomPolicy(t *testing.T) {
 		MaxTxSigopsCountsPolicy: 500,
 		MinFeePerKB:             &minFee,
 	}
-	v := NewValidator(p, nil)
+	v := NewValidator(p)
 	if v.policy.MaxTxSizePolicy != 1000 {
 		t.Errorf("expected 1000, got %d", v.policy.MaxTxSizePolicy)
 	}
@@ -39,14 +39,28 @@ func TestNewValidator_CustomPolicy(t *testing.T) {
 }
 
 func TestMinFeePerKB(t *testing.T) {
-	v := NewValidator(nil, nil)
+	v := NewValidator(nil)
 	if v.MinFeePerKB() != DefaultMinFeePerKB {
 		t.Errorf("expected %d, got %d", DefaultMinFeePerKB, v.MinFeePerKB())
 	}
 }
 
+// TestNewValidator_PreservesExplicitZeroFee guards the invariant that
+// validatorPolicyFromConfig (app/app.go) relies on to implement
+// validator.accept_zero_fee: NewValidator's default substitution fires
+// only when the MinFeePerKB *pointer* is nil, so a non-nil pointer to a
+// zero value must be preserved verbatim. If this test ever fails the
+// zero-fee config flag silently regresses to the 100 sat/kB default.
+func TestNewValidator_PreservesExplicitZeroFee(t *testing.T) {
+	zero := uint64(0)
+	v := NewValidator(&Policy{MinFeePerKB: &zero})
+	if v.MinFeePerKB() != 0 {
+		t.Errorf("expected MinFeePerKB=0, got %d", v.MinFeePerKB())
+	}
+}
+
 func TestWrapPolicyError_Malformed(t *testing.T) {
-	v := NewValidator(nil, nil)
+	v := NewValidator(nil)
 	err := v.wrapPolicyError(ErrNoInputsOrOutputs)
 
 	arcErr := arcerrors.GetArcError(err)
@@ -59,7 +73,7 @@ func TestWrapPolicyError_Malformed(t *testing.T) {
 }
 
 func TestWrapPolicyError_TxSize(t *testing.T) {
-	v := NewValidator(nil, nil)
+	v := NewValidator(nil)
 	err := v.wrapPolicyError(ErrTxSizeGreaterThanMax)
 
 	arcErr := arcerrors.GetArcError(err)
@@ -72,7 +86,7 @@ func TestWrapPolicyError_TxSize(t *testing.T) {
 }
 
 func TestWrapPolicyError_Inputs(t *testing.T) {
-	v := NewValidator(nil, nil)
+	v := NewValidator(nil)
 	err := v.wrapPolicyError(ErrTxInputInvalid)
 
 	arcErr := arcerrors.GetArcError(err)
@@ -85,7 +99,7 @@ func TestWrapPolicyError_Inputs(t *testing.T) {
 }
 
 func TestWrapPolicyError_Outputs(t *testing.T) {
-	v := NewValidator(nil, nil)
+	v := NewValidator(nil)
 	err := v.wrapPolicyError(ErrTxOutputInvalid)
 
 	arcErr := arcerrors.GetArcError(err)
@@ -98,7 +112,7 @@ func TestWrapPolicyError_Outputs(t *testing.T) {
 }
 
 func TestWrapPolicyError_UnlockingScripts(t *testing.T) {
-	v := NewValidator(nil, nil)
+	v := NewValidator(nil)
 	err := v.wrapPolicyError(ErrUnlockingScriptHasTooManySigOps)
 
 	arcErr := arcerrors.GetArcError(err)
@@ -132,7 +146,7 @@ func nonZeroSourceTXID() *chainhash.Hash {
 // the per-iteration guard must reject this before the unbounded total can
 // be relied upon.
 func TestCheckOutputs_OverflowGuarded(t *testing.T) {
-	v := NewValidator(nil, nil)
+	v := NewValidator(nil)
 
 	tx := &sdkTx.Transaction{
 		Outputs: []*sdkTx.TransactionOutput{
@@ -158,7 +172,7 @@ func TestCheckOutputs_OverflowGuarded(t *testing.T) {
 // the regression case for F-004: prior to the fix a sequence of values that
 // summed past 2^64 could wrap and slip past the post-loop check.
 func TestCheckOutputs_ManySmallOutputsCannotOverflow(t *testing.T) {
-	v := NewValidator(nil, nil)
+	v := NewValidator(nil)
 
 	half := uint64(maxSatoshis / 2)
 	tx := &sdkTx.Transaction{
@@ -181,7 +195,7 @@ func TestCheckOutputs_ManySmallOutputsCannotOverflow(t *testing.T) {
 // TestCheckOutputs_ValidPasses confirms a legitimate transaction is still
 // accepted by checkOutputs after the overflow guard is added.
 func TestCheckOutputs_ValidPasses(t *testing.T) {
-	v := NewValidator(nil, nil)
+	v := NewValidator(nil)
 
 	tx := &sdkTx.Transaction{
 		Outputs: []*sdkTx.TransactionOutput{
@@ -200,7 +214,7 @@ func TestCheckOutputs_ValidPasses(t *testing.T) {
 // exceeds maxSatoshis. Without the per-iteration guard a uint64 wrap could
 // allow the post-loop check to pass.
 func TestCheckInputs_OverflowGuarded(t *testing.T) {
-	v := NewValidator(nil, nil)
+	v := NewValidator(nil)
 
 	makeInput := func(sats uint64) *sdkTx.TransactionInput {
 		in := &sdkTx.TransactionInput{SourceTXID: nonZeroSourceTXID()}
@@ -230,7 +244,7 @@ func TestCheckInputs_OverflowGuarded(t *testing.T) {
 // TestCheckInputs_ManySmallInputsCannotOverflow exercises the per-iteration
 // guard via accumulation across multiple inputs.
 func TestCheckInputs_ManySmallInputsCannotOverflow(t *testing.T) {
-	v := NewValidator(nil, nil)
+	v := NewValidator(nil)
 
 	half := uint64(maxSatoshis / 2)
 	makeInput := func(sats uint64) *sdkTx.TransactionInput {
@@ -359,7 +373,7 @@ func TestCountSigOps_OpZeroIsNotSmallInt(t *testing.T) {
 // TestCheckInputs_ValidPasses confirms a legitimate transaction is still
 // accepted by checkInputs after the overflow guard is added.
 func TestCheckInputs_ValidPasses(t *testing.T) {
-	v := NewValidator(nil, nil)
+	v := NewValidator(nil)
 
 	makeInput := func(sats uint64) *sdkTx.TransactionInput {
 		in := &sdkTx.TransactionInput{SourceTXID: nonZeroSourceTXID()}

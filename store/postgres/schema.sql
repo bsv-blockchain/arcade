@@ -97,8 +97,21 @@ CREATE TABLE IF NOT EXISTS submissions (
     next_retry_at         TIMESTAMPTZ,
     created_at            TIMESTAMPTZ NOT NULL
 );
+-- Idempotent column adds for stores created before the exactly-once webhook
+-- delivery columns existed (commit d0a3a39). Without these, a deployed
+-- database upgraded in place would silently miss last_delivered_status and
+-- the CAS predicate would match no rows, leaving WebhookCASLostTotal as
+-- the only outward symptom.
+ALTER TABLE submissions ADD COLUMN IF NOT EXISTS last_delivered_status TEXT;
+ALTER TABLE submissions ADD COLUMN IF NOT EXISTS retry_count           INT NOT NULL DEFAULT 0;
+ALTER TABLE submissions ADD COLUMN IF NOT EXISTS next_retry_at         TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_sub_txid   ON submissions(txid);
 CREATE INDEX IF NOT EXISTS idx_sub_token  ON submissions(callback_token);
+-- Partial index keyed off the webhook reaper's scan predicate; stays
+-- proportional to the in-retry backlog, not the full submissions table.
+CREATE INDEX IF NOT EXISTS idx_sub_retry_ready
+    ON submissions(next_retry_at)
+    WHERE retry_count > 0;
 
 CREATE TABLE IF NOT EXISTS leases (
     name       TEXT PRIMARY KEY,

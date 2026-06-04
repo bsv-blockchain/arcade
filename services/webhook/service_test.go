@@ -40,7 +40,17 @@ type deliveryRecord struct {
 func (s *fakeStore) GetSubmissionsByTxID(_ context.Context, txid string) ([]*models.Submission, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.subs[txid], nil
+	// Return value-copies so callers don't share state with the store's
+	// internal map — mirrors Postgres semantics and prevents the data race
+	// between concurrent deliver() reads and CAS/UpdateDeliveryStatus writes
+	// in TestDeliver_ExactlyOnceAcrossConcurrentReplicas.
+	list := s.subs[txid]
+	out := make([]*models.Submission, len(list))
+	for i, sub := range list {
+		cp := *sub
+		out[i] = &cp
+	}
+	return out, nil
 }
 
 func (s *fakeStore) UpdateDeliveryStatus(_ context.Context, id string, last models.Status, retry int, nextRetry *time.Time) error {
@@ -64,6 +74,34 @@ func (s *fakeStore) UpdateDeliveryStatus(_ context.Context, id string, last mode
 		}
 	}
 	return nil
+}
+
+// UpdateDeliveryStatusCAS mirrors the Postgres semantics: the row is updated
+// iff its current LastDeliveredStatus matches `expected`. Concurrent callers
+// in the issue-#166 regression test rely on this behaving as a single-writer
+// CAS, so the mutation runs under s.mu.
+func (s *fakeStore) UpdateDeliveryStatusCAS(_ context.Context, id string, expected, next models.Status) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, list := range s.subs {
+		for _, sub := range list {
+			if sub.SubmissionID != id {
+				continue
+			}
+			if sub.LastDeliveredStatus != expected {
+				return false, nil
+			}
+			sub.LastDeliveredStatus = next
+			sub.RetryCount = 0
+			sub.NextRetryAt = nil
+			s.deliveries = append(s.deliveries, deliveryRecord{
+				SubmissionID: id,
+				LastStatus:   next,
+			})
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // Stubs to satisfy the store.Store interface without referencing the full set.
@@ -130,6 +168,32 @@ func (s *fakeStore) SetPendingRetryFields(context.Context, string, []byte, time.
 
 func (s *fakeStore) GetReadyRetries(context.Context, time.Time, int) ([]*store.PendingRetry, error) {
 	return nil, nil
+}
+
+// ListSubmissionsReadyForRetry returns submissions with retry_count > 0 and
+// NextRetryAt <= now, ordered by NextRetryAt ASC. Mirrors the production
+// backends' contract so reaper-driven tests exercise the same code path.
+func (s *fakeStore) ListSubmissionsReadyForRetry(_ context.Context, now time.Time, limit int) ([]*models.Submission, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*models.Submission
+	for _, list := range s.subs {
+		for _, sub := range list {
+			if sub.RetryCount <= 0 || sub.NextRetryAt == nil || sub.NextRetryAt.After(now) {
+				continue
+			}
+			out = append(out, sub)
+		}
+	}
+	// Stable insertion order is enough for the existing tests; we don't
+	// need a real sort here.
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
 func (s *fakeStore) ClearRetryState(context.Context, string, models.Status, string) error {
@@ -228,7 +292,7 @@ func TestDeliverSuccess(t *testing.T) {
 		// httptest.Server listens on 127.0.0.1 — opt into private dials so
 		// the SSRF guard doesn't block the test client.
 		config.CallbackConfig{AllowPrivateIPs: true},
-		zap.NewNop(), recordingPub{}, st,
+		zap.NewNop(), recordingPub{}, st, nil,
 	)
 
 	svc.handleUpdate(t.Context(), &models.TransactionStatus{
@@ -278,7 +342,7 @@ func TestSkipIntermediateWhenNotFullUpdates(t *testing.T) {
 	svc := New(
 		config.WebhookConfig{HTTPTimeoutMs: 1000},
 		config.CallbackConfig{AllowPrivateIPs: true},
-		zap.NewNop(), recordingPub{}, st,
+		zap.NewNop(), recordingPub{}, st, nil,
 	)
 
 	svc.handleUpdate(t.Context(), &models.TransactionStatus{
@@ -308,7 +372,7 @@ func TestRetryOnFailure(t *testing.T) {
 	svc := New(
 		config.WebhookConfig{HTTPTimeoutMs: 1000, MaxRetries: 5, InitialBackoffMs: 50, MaxBackoffMs: 1000},
 		config.CallbackConfig{AllowPrivateIPs: true},
-		zap.NewNop(), recordingPub{}, st,
+		zap.NewNop(), recordingPub{}, st, nil,
 	)
 
 	before := time.Now()
@@ -318,10 +382,14 @@ func TestRetryOnFailure(t *testing.T) {
 		Timestamp: time.Now(),
 	})
 
-	if len(st.deliveries) != 1 {
-		t.Fatalf("expected 1 delivery record, got %d", len(st.deliveries))
+	// CAS claim writes first (advances LastDeliveredStatus, clears retry
+	// state), then recordFailure writes the retry bookkeeping. Both are
+	// captured in st.deliveries by the fakeStore; the retry record is the
+	// last one.
+	if len(st.deliveries) != 2 {
+		t.Fatalf("expected 2 delivery records (CAS claim + retry write), got %d", len(st.deliveries))
 	}
-	d := st.deliveries[0]
+	d := st.deliveries[len(st.deliveries)-1]
 	if d.RetryCount != 1 {
 		t.Errorf("RetryCount = %d, want 1", d.RetryCount)
 	}
@@ -353,7 +421,7 @@ func TestDedupOnRepeatedStatus(t *testing.T) {
 	svc := New(
 		config.WebhookConfig{HTTPTimeoutMs: 1000, MaxRetries: 3},
 		config.CallbackConfig{AllowPrivateIPs: true},
-		zap.NewNop(), recordingPub{}, st,
+		zap.NewNop(), recordingPub{}, st, nil,
 	)
 
 	svc.handleUpdate(t.Context(), &models.TransactionStatus{
@@ -397,7 +465,7 @@ func TestSSRFGuardBlocksLoopbackDial(t *testing.T) {
 		config.WebhookConfig{HTTPTimeoutMs: 1000, MaxRetries: 3, InitialBackoffMs: 1, MaxBackoffMs: 100},
 		// Default-safe: SSRF guard ON.
 		config.CallbackConfig{AllowPrivateIPs: false},
-		zap.NewNop(), recordingPub{}, st,
+		zap.NewNop(), recordingPub{}, st, nil,
 	)
 
 	svc.handleUpdate(t.Context(), &models.TransactionStatus{
@@ -409,11 +477,13 @@ func TestSSRFGuardBlocksLoopbackDial(t *testing.T) {
 	if hits.Load() != 0 {
 		t.Errorf("expected 0 hits (dial refused), got %d", hits.Load())
 	}
-	if len(st.deliveries) != 1 {
-		t.Fatalf("expected 1 delivery record (retry scheduled), got %d", len(st.deliveries))
+	// CAS claim runs before the dial-time SSRF guard fires, so we observe
+	// two records: the claim, then the retry write from recordFailure.
+	if len(st.deliveries) != 2 {
+		t.Fatalf("expected 2 delivery records (CAS claim + retry write), got %d", len(st.deliveries))
 	}
-	if st.deliveries[0].RetryCount != 1 {
-		t.Errorf("RetryCount = %d, want 1", st.deliveries[0].RetryCount)
+	if st.deliveries[len(st.deliveries)-1].RetryCount != 1 {
+		t.Errorf("RetryCount = %d, want 1", st.deliveries[len(st.deliveries)-1].RetryCount)
 	}
 }
 
@@ -481,7 +551,7 @@ func TestStartDecouplesSlowDelivery(t *testing.T) {
 			MaxConcurrentDeliveries: 2,
 		},
 		config.CallbackConfig{AllowPrivateIPs: true}, // server is on 127.0.0.1
-		zap.NewNop(), pub, st,
+		zap.NewNop(), pub, st, nil,
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -532,5 +602,171 @@ func TestStartDecouplesSlowDelivery(t *testing.T) {
 	case <-startErr:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Start did not return after ctx cancel")
+	}
+}
+
+// TestDeliver_ExactlyOnceAcrossConcurrentReplicas is the canonical regression
+// for issue #166. Two Service instances share a single fakeStore — the
+// production equivalent of two api-server pods talking to the same Postgres.
+// Both receive the same status update concurrently. Exactly one POST must
+// reach the receiver; the other instance must record a CAS-lost.
+//
+// Before the CAS fix this test would observe 2 POSTs (one per replica). The
+// shouldDeliver in-memory dedup catches sequential repeats but not concurrent
+// processing across pods.
+func TestDeliver_ExactlyOnceAcrossConcurrentReplicas(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	// Single shared fakeStore — both Service instances see (and mutate) the
+	// same submission row, which is the actual sharing model in production.
+	st := &fakeStore{
+		subs: map[string][]*models.Submission{
+			txA: {{
+				SubmissionID: "sub-1",
+				TxID:         txA,
+				CallbackURL:  srv.URL,
+			}},
+		},
+	}
+
+	cfg := config.WebhookConfig{HTTPTimeoutMs: 1000, MaxRetries: 3, InitialBackoffMs: 1}
+	cb := config.CallbackConfig{AllowPrivateIPs: true}
+	svcA := New(cfg, cb, zap.NewNop(), recordingPub{}, st, nil)
+	svcB := New(cfg, cb, zap.NewNop(), recordingPub{}, st, nil)
+
+	status := &models.TransactionStatus{
+		TxID:      txA,
+		Status:    models.StatusMined,
+		Timestamp: time.Now(),
+	}
+
+	// Race both replicas through handleUpdate against the same status.
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for _, svc := range []*Service{svcA, svcB} {
+		go func() {
+			defer wg.Done()
+			<-start
+			svc.handleUpdate(t.Context(), status)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 callback POST, got %d (CAS fix regressed — issue #166)", got)
+	}
+	// Exactly one delivery record (the winner's CAS-success path appends one).
+	if len(st.deliveries) != 1 || st.deliveries[0].LastStatus != models.StatusMined {
+		t.Errorf("expected one MINED delivery record, got %+v", st.deliveries)
+	}
+}
+
+// fakeLeaser is a minimal store.Leaser stand-in for the reaper tests.
+// grant=true returns a non-zero held-until time (lease acquired);
+// grant=false returns the zero time (another holder owns it).
+type fakeLeaser struct {
+	grant bool
+}
+
+func (l *fakeLeaser) TryAcquireOrRenew(context.Context, string, string, time.Duration) (time.Time, error) {
+	if !l.grant {
+		return time.Time{}, nil
+	}
+	return time.Now().Add(time.Minute), nil
+}
+func (l *fakeLeaser) Release(context.Context, string, string) error { return nil }
+
+// TestReaper_LeaseHeld_RefiresReadySubmission asserts the retry-sweep path
+// closes the failure-path regression rafa-js called out on PR #170: a row
+// whose POST failed has a NextRetryAt that, before this fix, nothing
+// consumed. With the reaper running and the lease granted, reapOnce should
+// re-POST to the receiver and clear the retry state.
+func TestReaper_LeaseHeld_RefiresReadySubmission(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	past := time.Now().Add(-1 * time.Second)
+	st := &fakeStore{
+		subs: map[string][]*models.Submission{
+			txA: {{
+				SubmissionID:        "sub-retry",
+				TxID:                txA,
+				CallbackURL:         srv.URL,
+				LastDeliveredStatus: models.StatusMined,
+				RetryCount:          2,
+				NextRetryAt:         &past,
+			}},
+		},
+	}
+	svc := New(
+		config.WebhookConfig{HTTPTimeoutMs: 1000, MaxRetries: 5, InitialBackoffMs: 1},
+		config.CallbackConfig{AllowPrivateIPs: true},
+		zap.NewNop(), recordingPub{}, st, &fakeLeaser{grant: true},
+	)
+
+	// Drive a single reaper pass directly — tryReap acquires the lease,
+	// reapOnce lists ready rows and re-fires deliver for each.
+	svc.tryReap(t.Context())
+
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 retry POST, got %d", got)
+	}
+	// Verify the submission's retry state was cleared by the CAS.
+	got, _ := st.GetSubmissionsByTxID(t.Context(), txA)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 submission, got %d", len(got))
+	}
+	if got[0].RetryCount != 0 {
+		t.Errorf("RetryCount = %d, want 0 (cleared by CAS)", got[0].RetryCount)
+	}
+	if got[0].NextRetryAt != nil {
+		t.Errorf("NextRetryAt = %v, want nil (cleared by CAS)", got[0].NextRetryAt)
+	}
+}
+
+// TestReaper_LeaseDenied_SkipsTick asserts a replica that loses the lease
+// race performs no work — the canonical N-1 idle case in production.
+func TestReaper_LeaseDenied_SkipsTick(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	past := time.Now().Add(-1 * time.Second)
+	st := &fakeStore{
+		subs: map[string][]*models.Submission{
+			txA: {{
+				SubmissionID:        "sub-retry",
+				TxID:                txA,
+				CallbackURL:         srv.URL,
+				LastDeliveredStatus: models.StatusMined,
+				RetryCount:          2,
+				NextRetryAt:         &past,
+			}},
+		},
+	}
+	svc := New(
+		config.WebhookConfig{HTTPTimeoutMs: 1000, MaxRetries: 5, InitialBackoffMs: 1},
+		config.CallbackConfig{AllowPrivateIPs: true},
+		zap.NewNop(), recordingPub{}, st, &fakeLeaser{grant: false},
+	)
+
+	svc.tryReap(t.Context())
+
+	if got := hits.Load(); got != 0 {
+		t.Fatalf("expected 0 POSTs from non-leader tick, got %d", got)
 	}
 }
