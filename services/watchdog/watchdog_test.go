@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"sort"
@@ -400,7 +401,7 @@ func TestWatchdog_DoesNotRetryProcessedRows(t *testing.T) {
 }
 
 func TestProportionalJitter_StaysWithinSpread(t *testing.T) {
-	const trials = 1000
+	const trials = 10000
 	base := time.Minute
 	spread := time.Duration(float64(base) * backoffJitterFraction)
 	lo := base - spread
@@ -415,12 +416,19 @@ func TestProportionalJitter_StaysWithinSpread(t *testing.T) {
 		sumDelta += int64(got) - int64(base)
 	}
 
-	// Mean of a uniform distribution centered on 0 with N samples should
-	// hug 0; allow ±5% of the spread as a loose sanity check that the
-	// jitter is genuinely centered and not biased high/low.
+	// The per-sample delta is (very nearly) uniform on [-spread, +spread],
+	// whose standard deviation is spread/sqrt(3). The mean of N such samples
+	// therefore has a standard error of spread/sqrt(3*N). Comparing the
+	// observed mean against a fixed fraction of the spread is statistically
+	// flaky (it false-fails whenever the random mean happens to wander a few
+	// hundred ms from 0). Instead, allow 6 standard errors of slack: a
+	// genuinely centered generator trips this only ~2e-9 of the time, while a
+	// real directional bias is many standard errors out and still fails.
 	meanDelta := time.Duration(sumDelta / trials)
-	if meanDelta > spread/20 || meanDelta < -spread/20 {
-		t.Errorf("mean jitter=%v leans too far from 0 (spread=%v)", meanDelta, spread)
+	stdErr := float64(spread) / math.Sqrt(3*float64(trials))
+	tolerance := time.Duration(6 * stdErr)
+	if meanDelta > tolerance || meanDelta < -tolerance {
+		t.Errorf("mean jitter=%v leans too far from 0 (spread=%v, tolerance=±%v)", meanDelta, spread, tolerance)
 	}
 }
 
