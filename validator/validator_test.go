@@ -485,13 +485,13 @@ func TestPushDataCheck_MultiInputVersionGate(t *testing.T) {
 // transaction whose input carries a functional opcode in the unlocking script
 // must not be rejected on push-only grounds. The transaction is padded to clear
 // the minimum-size policy and given a valid non-data output so the only
-// behaviour under test is the Chronicle gate.
+// behavior under test is the Chronicle gate.
 func TestValidatePolicy_Version3NonPushAccepted(t *testing.T) {
 	v := NewValidator(nil)
 
 	in := &sdkTx.TransactionInput{SourceTXID: nonZeroSourceTXID()}
 	// PUSH(60 bytes) OP_SHA256: a non-push-only unlocking script large enough
-	// that the serialised tx clears minTxSizeBytes.
+	// that the serialized tx clears minTxSizeBytes.
 	padded := append([]byte{0x3c}, make([]byte, 0x3c)...)
 	padded = append(padded, script.OpSHA256)
 	us := script.Script(padded)
