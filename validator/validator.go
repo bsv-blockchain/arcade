@@ -318,10 +318,29 @@ func multisigSigOpCount(s interpreter.ParsedScript, i int) int64 {
 	return int64(interpreter.MaxPubKeysPerMultiSigBeforeGenesis)
 }
 
+// pushDataCheck enforces the "data only in unlocking script" rule: an input's
+// unlocking script may contain only data-push operations, never functional
+// opcodes.
+//
+// The Chronicle upgrade (BSV mainnet block 943,816) lifted this rule for
+// transactions that opt in with a version greater than 1. Version 0/1
+// transactions retain the original push-only requirement; for version >= 2 the
+// unlocking script may carry functional opcodes. This mirrors svnode/BDK, where
+// the same relaxation is gated on the transaction version, not the block
+// height, so the gate here is purely version-based.
+// https://docs.bsvblockchain.org/network-topology/nodes/sv-node/chronicle-release
+//
+// The empty-unlocking-script rejection is independent of the push-only rule and
+// is applied to every transaction regardless of version.
 func (v *Validator) pushDataCheck(tx *sdkTx.Transaction) error {
+	enforcePushOnly := tx.Version < 2
+
 	for _, input := range tx.Inputs {
 		if input.UnlockingScript == nil {
 			return ErrEmptyUnlockingScript
+		}
+		if !enforcePushOnly {
+			continue
 		}
 		parser := interpreter.DefaultOpcodeParser{}
 		parsedUnlockingScript, err := parser.Parse(input.UnlockingScript)

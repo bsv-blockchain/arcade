@@ -370,6 +370,172 @@ func TestCountSigOps_OpZeroIsNotSmallInt(t *testing.T) {
 	}
 }
 
+// nonPushUnlockingScript returns the unlocking script PUSH(0x21) OP_SHA256
+// (hex 0121a8). The leading 0x01 pushes one byte (0x21); 0xa8 is OP_SHA256, a
+// functional (non-push) opcode. This is the exact shape that triggered the
+// Chronicle push-only regression report. IsPushOnly() returns false for it.
+func nonPushUnlockingScript() *script.Script {
+	s := script.Script([]byte{0x01, 0x21, script.OpSHA256})
+	return &s
+}
+
+// pushOnlyUnlockingScript returns a minimal push-only unlocking script: a
+// single OP_0 (0x00) push. IsPushOnly() returns true for it.
+func pushOnlyUnlockingScript() *script.Script {
+	s := script.Script([]byte{script.Op0})
+	return &s
+}
+
+// txWithUnlockingScript builds a transaction at the given version with a single
+// input carrying the supplied unlocking script. A nil unlockingScript leaves
+// the input's UnlockingScript nil (exercising the empty-script path).
+func txWithUnlockingScript(version uint32, unlockingScript *script.Script) *sdkTx.Transaction {
+	in := &sdkTx.TransactionInput{SourceTXID: nonZeroSourceTXID()}
+	in.UnlockingScript = unlockingScript
+	return &sdkTx.Transaction{
+		Version: version,
+		Inputs:  []*sdkTx.TransactionInput{in},
+	}
+}
+
+// TestPushDataCheck_ChronicleVersionGate is the core regression test for the
+// Chronicle "data only in unlocking script" relaxation. Transactions with
+// version < 2 must still reject functional opcodes in the unlocking script;
+// transactions with version >= 2 must accept them. Push-only and empty scripts
+// behave the same across all versions.
+func TestPushDataCheck_ChronicleVersionGate(t *testing.T) {
+	v := NewValidator(nil)
+
+	cases := []struct {
+		name      string
+		version   uint32
+		unlocking *script.Script
+		wantErr   error // nil means accepted
+	}{
+		// version < 2 keeps the strict push-only rule
+		{"v0 non-push rejected", 0, nonPushUnlockingScript(), ErrUnlockingScriptNotPushOnly},
+		{"v1 non-push rejected", 1, nonPushUnlockingScript(), ErrUnlockingScriptNotPushOnly},
+
+		// version >= 2 opts into the Chronicle relaxation
+		{"v2 non-push accepted", 2, nonPushUnlockingScript(), nil},
+		{"v3 non-push accepted", 3, nonPushUnlockingScript(), nil},
+
+		// push-only is always valid, regardless of version
+		{"v1 push-only accepted", 1, pushOnlyUnlockingScript(), nil},
+		{"v2 push-only accepted", 2, pushOnlyUnlockingScript(), nil},
+		{"v3 push-only accepted", 3, pushOnlyUnlockingScript(), nil},
+
+		// the empty-script rejection is independent of the version gate
+		{"v1 empty rejected", 1, nil, ErrEmptyUnlockingScript},
+		{"v2 empty rejected", 2, nil, ErrEmptyUnlockingScript},
+		{"v3 empty rejected", 3, nil, ErrEmptyUnlockingScript},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := v.pushDataCheck(txWithUnlockingScript(tc.version, tc.unlocking))
+			switch {
+			case tc.wantErr == nil && err != nil:
+				t.Fatalf("expected acceptance, got %v", err)
+			case tc.wantErr != nil && !errors.Is(err, tc.wantErr):
+				t.Fatalf("expected %v, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+// TestPushDataCheck_MultiInputVersionGate confirms the version gate applies to
+// every input, not just the first: a version-1 transaction is rejected if any
+// input is non-push, while a version-2 transaction accepts a mix of push-only
+// and non-push inputs.
+func TestPushDataCheck_MultiInputVersionGate(t *testing.T) {
+	v := NewValidator(nil)
+
+	makeInput := func(s *script.Script) *sdkTx.TransactionInput {
+		in := &sdkTx.TransactionInput{SourceTXID: nonZeroSourceTXID()}
+		in.UnlockingScript = s
+		return in
+	}
+
+	v1 := &sdkTx.Transaction{
+		Version: 1,
+		Inputs: []*sdkTx.TransactionInput{
+			makeInput(pushOnlyUnlockingScript()),
+			makeInput(nonPushUnlockingScript()),
+		},
+	}
+	if err := v.pushDataCheck(v1); !errors.Is(err, ErrUnlockingScriptNotPushOnly) {
+		t.Fatalf("v1 mixed inputs: expected ErrUnlockingScriptNotPushOnly, got %v", err)
+	}
+
+	v2 := &sdkTx.Transaction{
+		Version: 2,
+		Inputs: []*sdkTx.TransactionInput{
+			makeInput(pushOnlyUnlockingScript()),
+			makeInput(nonPushUnlockingScript()),
+		},
+	}
+	if err := v.pushDataCheck(v2); err != nil {
+		t.Fatalf("v2 mixed inputs: expected acceptance, got %v", err)
+	}
+}
+
+// TestValidatePolicy_Version3NonPushAccepted exercises the full policy path
+// (not just pushDataCheck in isolation) for the reported scenario: a version-3
+// transaction whose input carries a functional opcode in the unlocking script
+// must not be rejected on push-only grounds. The transaction is padded to clear
+// the minimum-size policy and given a valid non-data output so the only
+// behaviour under test is the Chronicle gate.
+func TestValidatePolicy_Version3NonPushAccepted(t *testing.T) {
+	v := NewValidator(nil)
+
+	in := &sdkTx.TransactionInput{SourceTXID: nonZeroSourceTXID()}
+	// PUSH(60 bytes) OP_SHA256: a non-push-only unlocking script large enough
+	// that the serialised tx clears minTxSizeBytes.
+	padded := append([]byte{0x3c}, make([]byte, 0x3c)...)
+	padded = append(padded, script.OpSHA256)
+	us := script.Script(padded)
+	in.UnlockingScript = &us
+
+	tx := &sdkTx.Transaction{
+		Version: 3,
+		Inputs:  []*sdkTx.TransactionInput{in},
+		Outputs: []*sdkTx.TransactionOutput{
+			{Satoshis: 1_000, LockingScript: nonDataLockingScript()},
+		},
+	}
+
+	if err := v.ValidatePolicy(tx); err != nil {
+		t.Fatalf("v3 non-push unlocking script must pass policy validation, got %v", err)
+	}
+}
+
+// TestValidatePolicy_Version1NonPushRejected is the negative counterpart: the
+// same non-push unlocking script in a version-1 transaction must still be
+// rejected with the unlocking-scripts ARC status.
+func TestValidatePolicy_Version1NonPushRejected(t *testing.T) {
+	v := NewValidator(nil)
+
+	in := &sdkTx.TransactionInput{SourceTXID: nonZeroSourceTXID()}
+	padded := append([]byte{0x3c}, make([]byte, 0x3c)...)
+	padded = append(padded, script.OpSHA256)
+	us := script.Script(padded)
+	in.UnlockingScript = &us
+
+	tx := &sdkTx.Transaction{
+		Version: 1,
+		Inputs:  []*sdkTx.TransactionInput{in},
+		Outputs: []*sdkTx.TransactionOutput{
+			{Satoshis: 1_000, LockingScript: nonDataLockingScript()},
+		},
+	}
+
+	err := v.ValidatePolicy(tx)
+	if !errors.Is(err, ErrUnlockingScriptNotPushOnly) {
+		t.Fatalf("v1 non-push unlocking script must be rejected, got %v", err)
+	}
+}
+
 // TestCheckInputs_ValidPasses confirms a legitimate transaction is still
 // accepted by checkInputs after the overflow guard is added.
 func TestCheckInputs_ValidPasses(t *testing.T) {
