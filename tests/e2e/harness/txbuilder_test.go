@@ -3,6 +3,7 @@
 package harness
 
 import (
+	"context"
 	"testing"
 
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
@@ -10,25 +11,34 @@ import (
 	"github.com/bsv-blockchain/arcade/validator"
 )
 
-// TestBuildValidatableTxs_PassesArcadePolicyValidator confirms our
-// synthetic-tx builder produces transactions that survive arcade's
-// structural validator. Without this assertion, smoke_test.go's
-// BroadcastTx would silently route everything to REJECTED before
-// merkle-service ever sees a watch registration.
-func TestBuildValidatableTxs_PassesArcadePolicyValidator(t *testing.T) {
-	v := validator.NewValidator(nil)
+// TestBuildValidatableTxs_RejectedByGoBDKValidator documents that arcade's
+// validator now delegates to go-bdk (the same consensus engine as Teranode),
+// which performs full script execution rather than the old structural-only
+// policy check. The synthetic txs from BuildValidatableTxs (fake prevout,
+// dummy push unlocking script, non-extended) are NOT consensus-valid and are
+// not in extended format, so go-bdk rejects them.
+//
+// CONSEQUENCE FOR THE SMOKE HARNESS: smoke_test.go's BroadcastTx must be
+// updated to submit real, signed extended-format (EF/BEEF) transactions;
+// synthetic txs will now be REJECTED at arcade intake. Tracked as follow-up to
+// the go-bdk validation migration.
+func TestBuildValidatableTxs_RejectedByGoBDKValidator(t *testing.T) {
+	v, err := validator.NewValidator(nil)
+	if err != nil {
+		t.Fatalf("NewValidator: %v", err)
+	}
 	txs := BuildValidatableTxs(5, 100)
 
 	for i, tx := range txs {
 		// arcade parses txs via go-sdk, not go-bt — round-trip via
 		// raw bytes so we exercise the same path.
 		raw := tx.Bytes()
-		sdkParsed, err := sdkTx.NewTransactionFromBytes(raw)
-		if err != nil {
-			t.Fatalf("tx %d: sdk parse: %v (raw=%x)", i, err, raw)
+		sdkParsed, parseErr := sdkTx.NewTransactionFromBytes(raw)
+		if parseErr != nil {
+			t.Fatalf("tx %d: sdk parse: %v (raw=%x)", i, parseErr, raw)
 		}
-		if err := v.ValidatePolicy(sdkParsed); err != nil {
-			t.Errorf("tx %d: ValidatePolicy: %v (size=%d)", i, err, sdkParsed.Size())
+		if vErr := v.ValidateTransaction(context.Background(), sdkParsed, false); vErr == nil {
+			t.Errorf("tx %d: expected go-bdk rejection of synthetic tx, got acceptance", i)
 		}
 	}
 }

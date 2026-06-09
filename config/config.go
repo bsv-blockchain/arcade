@@ -612,7 +612,20 @@ type ValidatorConfig struct {
 	// false (default) on mainnet and any environment that should enforce
 	// the production fee floor. Takes precedence over MinFeePerKB.
 	AcceptZeroFee bool `mapstructure:"accept_zero_fee"`
+
+	// ValidationBlockHeight is the candidate/UTXO block height arcade reports
+	// to the go-bdk script engine for policy validation. arcade owns no UTXO
+	// set or chaintracker, so it cannot supply real per-input heights; a fixed
+	// height past every network's Chronicle activation makes BDK evaluate all
+	// inputs under the current ruleset. Zero falls back to
+	// DefaultValidationBlockHeight.
+	ValidationBlockHeight int32 `mapstructure:"validation_block_height"`
 }
+
+// DefaultValidationBlockHeight is the default candidate height reported to
+// go-bdk. It sits far past every network's Chronicle activation (mainnet
+// 943,816) so intake validation applies the current (post-Chronicle) ruleset.
+const DefaultValidationBlockHeight int32 = 1_000_000
 
 // DefaultValidatorMinFeePerKB is the production fee floor in satoshis
 // per kilobyte. 100 reflects the current BSV miner policy minimum.
@@ -826,6 +839,8 @@ func setDefaults() {
 	// Intake validator fee floor in satoshis per KB. Matches the
 	// current BSV miner policy minimum.
 	viper.SetDefault("validator.min_fee_per_kb", DefaultValidatorMinFeePerKB)
+	// Candidate height reported to go-bdk for policy validation.
+	viper.SetDefault("validator.validation_block_height", DefaultValidationBlockHeight)
 }
 
 func validate(cfg *Config) error {

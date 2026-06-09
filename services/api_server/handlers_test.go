@@ -26,8 +26,21 @@ import (
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
-	"github.com/bsv-blockchain/arcade/validator"
 )
+
+// stubValidator is a test double for the api-server's txValidator dependency,
+// keeping handler tests decoupled from the cgo-backed go-bdk engine. A non-nil
+// err makes every ValidateTransaction call fail, exercising the intake-
+// rejection path.
+type stubValidator struct{ err error }
+
+func (s stubValidator) ValidateTransaction(context.Context, *sdkTx.Transaction, bool) error {
+	return s.err
+}
+
+// errStubValidation is the canned rejection reason used by validation-failure
+// handler tests (mirrors the old empty-tx ErrNoInputsOrOutputs outcome).
+var errStubValidation = errors.New("transaction has no inputs or outputs")
 
 // mockStore implements store.Store for testing callback handlers.
 //
@@ -773,7 +786,7 @@ func TestHandleSubmitTransactions_BatchResubmitRejected_RepublishesToKafka(t *te
 // outcome. Without all three, an intake-rejected tx leaves clients
 // silent — no callback, no SSE event — until they manually re-query.
 func TestHandleSubmitTransaction_ValidationFailure_RecordsSubmissionAndPublishes(t *testing.T) {
-	rawTx := makeMinimalTx() // empty tx → ErrNoInputsOrOutputs from ValidatePolicy
+	rawTx := makeMinimalTx() // stub validator rejects it (errStubValidation)
 	parsed, _, err := sdkTx.NewTransactionFromStream(rawTx)
 	if err != nil {
 		t.Fatalf("parsing minimal tx: %v", err)
@@ -782,7 +795,7 @@ func TestHandleSubmitTransaction_ValidationFailure_RecordsSubmissionAndPublishes
 
 	ms := &mockStore{}
 	pub := &recordingCallbackPub{}
-	val := validator.NewValidator(nil)
+	val := stubValidator{err: errStubValidation}
 	broker := &kafka.RecordingBroker{}
 	gin.SetMode(gin.TestMode)
 	srv := &Server{
@@ -873,7 +886,7 @@ func TestHandleSubmitTransaction_ValidationFailure_NoCallback_StillPublishes(t *
 
 	ms := &mockStore{}
 	pub := &recordingCallbackPub{}
-	val := validator.NewValidator(nil)
+	val := stubValidator{err: errStubValidation}
 	broker := &kafka.RecordingBroker{}
 	gin.SetMode(gin.TestMode)
 	srv := &Server{
@@ -924,7 +937,7 @@ func TestHandleSubmitTransaction_ValidationFailure_NoCallback_StillPublishes(t *
 func TestHandleSubmitTransaction_ValidationFailure_NilPublisher_NoPanic(t *testing.T) {
 	rawTx := makeMinimalTx()
 	ms := &mockStore{}
-	val := validator.NewValidator(nil)
+	val := stubValidator{err: errStubValidation}
 	gin.SetMode(gin.TestMode)
 	srv := &Server{
 		cfg:            &config.Config{CallbackToken: testCallbackToken},
@@ -965,7 +978,7 @@ func TestHandleSubmitTransactions_ValidationFailure_RecordsSubmissionAndPublishe
 
 	ms := &mockStore{}
 	pub := &recordingCallbackPub{}
-	val := validator.NewValidator(nil)
+	val := stubValidator{err: errStubValidation}
 	broker := &kafka.RecordingBroker{}
 	gin.SetMode(gin.TestMode)
 	srv := &Server{

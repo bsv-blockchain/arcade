@@ -20,8 +20,17 @@ import (
 	"github.com/bsv-blockchain/arcade/services/httpmiddleware"
 	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/teranode"
-	"github.com/bsv-blockchain/arcade/validator"
+
+	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 )
+
+// txValidator is the subset of *validator.Validator the api-server depends on.
+// Declaring it as an interface (rather than the concrete type) keeps the
+// handler decoupled from the cgo-backed go-bdk engine and lets tests inject a
+// lightweight stub.
+type txValidator interface {
+	ValidateTransaction(ctx context.Context, tx *sdkTx.Transaction, skipFees bool) error
+}
 
 const (
 	// submissionRecorderBuffer caps the in-memory queue depth feeding the
@@ -48,7 +57,7 @@ type Server struct {
 	// Nil-safe: tests that use struct-literal construction may leave it
 	// unset, in which case the handler skips validation. Production
 	// wiring through New requires it.
-	validator *validator.Validator
+	validator txValidator
 	server    *http.Server
 
 	// submissionCh decouples the InsertSubmission Pebble write from the HTTP
@@ -70,7 +79,7 @@ type submissionRecord struct {
 	sub *models.Submission
 }
 
-func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publisher events.Publisher, st store.Store, tracker *store.TxTracker, tc *teranode.Client, mc *merkleservice.Client, val *validator.Validator) *Server {
+func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publisher events.Publisher, st store.Store, tracker *store.TxTracker, tc *teranode.Client, mc *merkleservice.Client, val txValidator) *Server {
 	return &Server{
 		cfg:            cfg,
 		logger:         logger.Named("api-server"),

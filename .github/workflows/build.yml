@@ -181,9 +181,22 @@ jobs:
       # Step 3: build the binary natively into the dist layout the Dockerfile
       # expects. GOOS/GOARCH are explicit so the path matches even if a future
       # runner image defaults differ.
+      #
+      # CGO_ENABLED=1: transaction validation links go-bdk's C++ script engine.
+      # The build must therefore be native (it is — each matrix entry runs on a
+      # runner of its target arch) with a C++ toolchain present. ubuntu-24.04
+      # runners ship g++/libstdc++ dev; the step below ensures it explicitly so
+      # a minimal runner image still links. The go-bdk native lib is statically
+      # linked into the binary (the runtime image only needs libstdc++6).
+      - name: Ensure C++ toolchain (cgo / go-bdk)
+        run: |
+          if ! command -v g++ >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends g++
+          fi
       - name: Build arcade binary
         env:
-          CGO_ENABLED: '0'
+          CGO_ENABLED: '1'
           GOOS: linux
           GOARCH: ${{ matrix.arch }}
         run: |

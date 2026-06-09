@@ -64,6 +64,8 @@ github.com/benbjohnson/clock v1.3.5 h1:VvXlSJBzZpA/zum6Sj74hxwYI2DIxRWuNIoXAzHZz
 github.com/benbjohnson/clock v1.3.5/go.mod h1:J11/hYXuz8f4ySSvYwY0FKfm+ezbsZBKZxNJlLklBHA=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
 github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
+github.com/bitcoin-sv/bdk/module/gobdk v1.2.5-0.20260526081552-cdfa7814ee5d h1:bSTJ5f/DpTWPpnheayyZje7MK0bMSgB5xuWaxh/AOHY=
+github.com/bitcoin-sv/bdk/module/gobdk v1.2.5-0.20260526081552-cdfa7814ee5d/go.mod h1:XxBr/Y+e+pMw3+e2xYECvEayfZM3RX3n0jVvOGC3krE=
 github.com/bsv-blockchain/go-batcher/v2 v2.0.3 h1:UKKHJRfCtBx1MJd2OiPxb/ADzm+QAN2HFD+SME7b2Q4=
 github.com/bsv-blockchain/go-batcher/v2 v2.0.3/go.mod h1:7Q3E4JR2+HT1Bi007hTs9W8FTDISMYGOiBGTMBW4ZDo=
 github.com/bsv-blockchain/go-bc v1.1.5 h1:G9hioz7yz6ARS5YHYJhA4c0xCU5EnRm6PsjDM8C6DTA=

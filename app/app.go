@@ -156,7 +156,12 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		merkleClient.SetLogger(logger.Named("merkle-client"))
 	}
 
-	txVal := validator.NewValidator(validatorPolicyFromConfig(cfg))
+	txVal, valErr := validator.NewValidator(validatorPolicyFromConfig(cfg))
+	if valErr != nil {
+		_ = st.Close()
+		_ = producer.Close()
+		return nil, nil, fmt.Errorf("validator init: %w", valErr)
+	}
 
 	publisher := events.NewKafkaPublisher(producer, logger, cfg.Events.SubscriberBuffer)
 
@@ -239,23 +244,27 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 	return deps, cleanup, nil
 }
 
-// validatorPolicyFromConfig builds the validator.Policy from cfg.Validator.
-// Returns nil when no operator-facing fields are set so NewValidator's
-// built-in defaults apply unchanged. When AcceptZeroFee is set, returns
-// a policy with an explicit pointer-to-zero MinFeePerKB so that
-// NewValidator preserves it (its nil-check is on the pointer, not the
-// value) and ValidateTransaction feeds Satoshis=0 to spv.Verify, which
-// accepts any non-negative fee — including fee=0.
+// validatorPolicyFromConfig builds the validator.Policy from cfg. It always
+// carries the network and validation block height so go-bdk evaluates inputs
+// under the correct (post-Chronicle) ruleset. The fee floor follows
+// cfg.Validator: AcceptZeroFee pins a zero floor (pointer-to-zero, which
+// go-bdk accepts as "no fee policy"); otherwise an explicit MinFeePerKB
+// overrides the validator default, and leaving MinFeePerKB nil falls back to
+// validator.DefaultMinFeePerKB.
 func validatorPolicyFromConfig(cfg *config.Config) *validator.Policy {
-	if cfg.Validator.AcceptZeroFee {
+	policy := &validator.Policy{
+		Network:               cfg.Network,
+		ValidationBlockHeight: cfg.Validator.ValidationBlockHeight,
+	}
+	switch {
+	case cfg.Validator.AcceptZeroFee:
 		zero := uint64(0)
-		return &validator.Policy{MinFeePerKB: &zero}
+		policy.MinFeePerKB = &zero
+	case cfg.Validator.MinFeePerKB != 0:
+		minFee := cfg.Validator.MinFeePerKB
+		policy.MinFeePerKB = &minFee
 	}
-	if cfg.Validator.MinFeePerKB == 0 {
-		return nil
-	}
-	minFee := cfg.Validator.MinFeePerKB
-	return &validator.Policy{MinFeePerKB: &minFee}
+	return policy
 }
 
 // modeNeedsChaintracks reports whether the configured service mode constructs

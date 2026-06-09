@@ -5,7 +5,9 @@ go 1.26.0
 require (
 	github.com/IBM/sarama v1.50.1
 	github.com/aerospike/aerospike-client-go/v7 v7.10.2
+	github.com/bitcoin-sv/bdk/module/gobdk v1.2.5-0.20260526081552-cdfa7814ee5d
 	github.com/bsv-blockchain/go-bt/v2 v2.6.5
+	github.com/bsv-blockchain/go-chaincfg v1.5.9
 	github.com/bsv-blockchain/go-chaintracks v1.2.7
 	github.com/bsv-blockchain/go-p2p-message-bus v0.1.19
 	github.com/bsv-blockchain/go-sdk v1.2.24
@@ -59,7 +61,6 @@ require (
 	github.com/benbjohnson/clock v1.3.5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bsv-blockchain/go-batcher/v2 v2.0.3 // indirect
-	github.com/bsv-blockchain/go-chaincfg v1.5.9 // indirect
 	github.com/bsv-blockchain/go-lockfree-queue v1.2.0 // indirect
 	github.com/bsv-blockchain/go-safe-conversion v1.2.0 // indirect
 	github.com/bsv-blockchain/go-subtree v1.4.3 // indirect
