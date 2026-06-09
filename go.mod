@@ -3,14 +3,14 @@ module github.com/bsv-blockchain/arcade
 go 1.26.0
 
 require (
-	github.com/IBM/sarama v1.50.1
+	github.com/IBM/sarama v1.50.2
 	github.com/aerospike/aerospike-client-go/v7 v7.10.2
-	github.com/bsv-blockchain/go-bt/v2 v2.6.5
-	github.com/bsv-blockchain/go-chaintracks v1.2.7
+	github.com/bsv-blockchain/go-bt/v2 v2.6.6
+	github.com/bsv-blockchain/go-chaintracks v1.2.8
 	github.com/bsv-blockchain/go-p2p-message-bus v0.1.19
 	github.com/bsv-blockchain/go-sdk v1.2.24
 	github.com/bsv-blockchain/go-teranode-p2p-client v0.2.6
-	github.com/bsv-blockchain/teranode v0.15.1
+	github.com/bsv-blockchain/teranode v0.15.2-beta-7
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/fergusstrange/embedded-postgres v1.34.0
 	github.com/gin-gonic/gin v1.12.0
@@ -25,7 +25,7 @@ require (
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.42.0
 	github.com/testcontainers/testcontainers-go/modules/redpanda v0.42.0
 	go.uber.org/zap v1.28.0
-	golang.org/x/sync v0.20.0
+	golang.org/x/sync v0.21.0
 )
 
 require (
@@ -36,7 +36,6 @@ require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2 // indirect
 	github.com/DataDog/zstd v1.5.7 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
-	github.com/aerospike/aerospike-client-go/v8 v8.7.0 // indirect
 	github.com/aws/aws-sdk-go-v2 v1.41.11 // indirect
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.12 // indirect
 	github.com/aws/aws-sdk-go-v2/config v1.32.22 // indirect
@@ -58,6 +57,7 @@ require (
 	github.com/aws/smithy-go v1.27.0 // indirect
 	github.com/benbjohnson/clock v1.3.5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
+	github.com/bsv-blockchain/aerospike-client-go/v8 v8.7.1-bsv3 // indirect
 	github.com/bsv-blockchain/go-batcher/v2 v2.0.3 // indirect
 	github.com/bsv-blockchain/go-chaincfg v1.5.9 // indirect
 	github.com/bsv-blockchain/go-lockfree-queue v1.2.0 // indirect
