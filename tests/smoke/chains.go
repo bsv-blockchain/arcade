@@ -91,7 +91,7 @@ func buildOneChain(depth int, nonceBase uint32) []*bt.Tx {
 // (prevTxID, prevOutputIdx). LockTime is set to nonce so the txid stays
 // unique across the entire forest — without that, two chains of identical
 // shape would collide.
-func newValidatableTx(prevTxID []byte, prevOutputIdx uint32, nonce uint32) *bt.Tx {
+func newValidatableTx(prevTxID []byte, prevOutputIdx, nonce uint32) *bt.Tx {
 	tx := bt.NewTx()
 	tx.LockTime = nonce
 	input := &bt.Input{
