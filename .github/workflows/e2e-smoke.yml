@@ -3,8 +3,8 @@ name: e2e-smoke
 # ------------------------------------------------------------------------------------
 #  arcade ↔ merkle-service end-to-end smoke
 # ------------------------------------------------------------------------------------
-# Boots Postgres, Redpanda, and ghcr.io/bsv-blockchain/merkle-service:latest via
-# testcontainers-go alongside an in-process arcade instance, then drives a
+# Boots Postgres, Redpanda, and a digest-pinned ghcr.io/bsv-blockchain/merkle-service
+# via testcontainers-go alongside an in-process arcade instance, then drives a
 # representative tx-flow scenario through both services.
 #
 # Required PR gate: every PR must show a green run before merging. The job
@@ -43,8 +43,13 @@ jobs:
       # Pre-pulling pins image-fetch time outside the test's wait strategies so
       # the harness's own timeouts only have to cover container startup, not
       # registry pulls. ghcr.io is unauthenticated for public images.
+      #
+      # Pinned to the same immutable digest as defaultMerkleImage in
+      # tests/e2e/harness/containers.go — keep the two in sync. We pin (not
+      # `:latest`) because upstream republishes `:latest` out-of-band and a
+      # bad build silently reds every PR. See that const for the full story.
       - name: Pre-pull merkle-service image
-        run: docker pull ghcr.io/bsv-blockchain/merkle-service:latest
+        run: docker pull ghcr.io/bsv-blockchain/merkle-service@sha256:04d87f10d4c04643c78709c01ac58560393ba17c75fb8f14253eccf68222a3ae
 
       - name: Run e2e smoke tests
         env:

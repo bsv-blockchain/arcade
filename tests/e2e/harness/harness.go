@@ -184,8 +184,9 @@ func defaultOptions() harnessOptions {
 	}
 }
 
-// WithMerkleImage overrides the merkle-service image. Default is
-// ghcr.io/bsv-blockchain/merkle-service:latest.
+// WithMerkleImage overrides the merkle-service image. Default is the
+// digest-pinned defaultMerkleImage (see containers.go) rather than the
+// floating `:latest` tag, which has regressed the round-trip in the past.
 func WithMerkleImage(image string) Option {
 	return func(o *harnessOptions) { o.merkleStart.Image = image }
 }

@@ -1,9 +1,15 @@
 # End-to-end smoke tests
 
 This directory holds the arcade ↔ merkle-service integration tests. The
-suite boots a real `ghcr.io/bsv-blockchain/merkle-service:latest`
+suite boots a real, digest-pinned `ghcr.io/bsv-blockchain/merkle-service`
 container alongside Postgres + Redpanda (via testcontainers-go), wires
 arcade in-process against them, and drives representative scenarios.
+
+> **Note:** the merkle-service image is pinned to an immutable digest
+> (`defaultMerkleImage` in `harness/containers.go`) rather than `:latest`.
+> The floating `:latest` tag is republished out-of-band and has regressed
+> the block round-trip before; bump the pinned digest deliberately once a
+> newer build is confirmed compatible.
 
 ## Layout
 
