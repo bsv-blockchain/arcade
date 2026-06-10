@@ -34,7 +34,15 @@ func (f *fakeSyncProducer) AddMessageToTxn(*sarama.ConsumerMessage, string, *str
 	return nil
 }
 
+func (f *fakeSyncProducer) AddMessageToTxnWithGroupMetadata(*sarama.ConsumerMessage, *sarama.ConsumerGroupMetadata, *string) error {
+	return nil
+}
+
 func (f *fakeSyncProducer) AddOffsetsToTxn(map[string][]*sarama.PartitionOffsetMetadata, string) error {
+	return nil
+}
+
+func (f *fakeSyncProducer) AddOffsetsToTxnWithGroupMetadata(map[string][]*sarama.PartitionOffsetMetadata, *sarama.ConsumerGroupMetadata) error {
 	return nil
 }
 
