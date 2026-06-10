@@ -107,7 +107,7 @@ p2p:
   # dht_mode: off              # "server", "client", or "off" (library default is "off")
   # storage_path: ""           # defaults to <top-level storage_path>/p2p; stores p2p_key.hex for stable peer ID
   # bootstrap_peers: []        # override the built-in defaults; also feeds chaintracks
-                               # (unless chaintracks.p2p.msgbus.bootstrappeers is set explicitly)
+  # (unless chaintracks.p2p.msgbus.bootstrappeers is set explicitly)
   # enable_mdns: false
   # allow_private_urls: false  # accept loopback/RFC1918/link-local URLs from peers
 
