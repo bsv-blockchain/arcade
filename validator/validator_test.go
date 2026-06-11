@@ -181,7 +181,8 @@ func spendableSource(unlocking []byte, prevSats uint64, prevLock []byte) *sdkTx.
 // evaluates to true. This is the exact shape the Chronicle upgrade re-allowed
 // for version>=2 transactions (issue #192).
 func nonPushUnlocking() []byte {
-	b := []byte{0x32} // push 50 bytes
+	b := make([]byte, 0, 52)
+	b = append(b, 0x32) // push 50 bytes
 	b = append(b, make([]byte, 50)...)
 	b = append(b, script.OpDROP)
 	return b

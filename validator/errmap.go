@@ -33,6 +33,10 @@ func mapTeranodeError(err error) error {
 			return arcerrors.NewArcErrorWithInfo(err, arcerrors.StatusGeneric, msg)
 		case tnerr.ERR_INVALID_ARGUMENT:
 			return arcerrors.NewArcErrorWithInfo(err, arcerrors.StatusMalformed, msg)
+		default:
+			// Every other teranode code (notably ERR_TX_INVALID, which wraps
+			// fee/script/policy failures) is classified from the message text.
+			return classifyByMessage(err, msg)
 		}
 	}
 
