@@ -178,12 +178,20 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # Step 2b: install the C/C++ toolchain. The transaction validator links
+      # the BSV BDK C++ library (gobdk) via cgo, so the build needs gcc/g++ and
+      # libstdc++. This runs natively on each arch's runner — no cross-compiler.
+      - name: Install C/C++ toolchain (cgo)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential
+
       # Step 3: build the binary natively into the dist layout the Dockerfile
       # expects. GOOS/GOARCH are explicit so the path matches even if a future
-      # runner image defaults differ.
+      # runner image defaults differ. CGO_ENABLED=1 because the validator links
+      # gobdk (BSV BDK C++); the build is native per arch so the matching
+      # prebuilt gobdk static archive links without a cross-compiler.
       - name: Build arcade binary
         env:
-          CGO_ENABLED: '0'
+          CGO_ENABLED: '1'
           GOOS: linux
           GOARCH: ${{ matrix.arch }}
         run: |

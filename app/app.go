@@ -156,7 +156,12 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		merkleClient.SetLogger(logger.Named("merkle-client"))
 	}
 
-	txVal := validator.NewValidator(validatorPolicyFromConfig(cfg))
+	txVal, err := validator.NewValidatorForNetwork(cfg.Network, validatorPolicyFromConfig(cfg))
+	if err != nil {
+		_ = st.Close()
+		_ = producer.Close()
+		return nil, nil, fmt.Errorf("creating validator: %w", err)
+	}
 
 	publisher := events.NewKafkaPublisher(producer, logger, cfg.Events.SubscriberBuffer)
 

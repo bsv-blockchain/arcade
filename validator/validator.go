@@ -1,355 +1,230 @@
 // Package validator provides transaction validation functionality.
+//
+// Validation is delegated to teranode's BDK-backed TxValidator
+// (github.com/bsv-blockchain/teranode/services/validator), the exact validator
+// teranode/svnode use to admit transactions. This guarantees that arcade's
+// intake decision matches node consensus across protocol upgrades instead of
+// re-implementing the rules in pure Go, which previously drifted (e.g. the
+// Chronicle push-only relaxation had to be hand-patched here). See issue #192.
+//
+// Because the BDK engine is a cgo binding to the BSV C++ consensus library,
+// this package requires CGO_ENABLED=1 and the gobdk static archive (delivered
+// by `go mod download`) to build and run.
 package validator
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
-	"github.com/bsv-blockchain/go-sdk/chainhash"
-	"github.com/bsv-blockchain/go-sdk/script"
-	"github.com/bsv-blockchain/go-sdk/script/interpreter"
-	"github.com/bsv-blockchain/go-sdk/spv"
+	chaincfg "github.com/bsv-blockchain/go-chaincfg"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
-	feemodel "github.com/bsv-blockchain/go-sdk/transaction/fee_model"
-
-	arcerrors "github.com/bsv-blockchain/arcade/errors"
+	tnvalidator "github.com/bsv-blockchain/teranode/services/validator"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 const (
-	maxBlockSize                       = 4 * 1024 * 1024 * 1024
-	maxSatoshis                        = 21_000_000_00_000_000
-	maxTxSigopsCountPolicyAfterGenesis = ^uint32(0)
-	minTxSizeBytes                     = 61
-	dustLimit                          = 1
+	// allForksActiveHeight is the block height arcade reports to the BDK
+	// validator at intake. It sits above every network's Genesis and Chronicle
+	// activation heights — so all protocol upgrades evaluate as active and
+	// arcade validates against current consensus rules — yet stays below
+	// math.MaxInt32. The BDK adapter converts the height to int32 and, in policy
+	// mode, evaluates blockHeight-1, so math.MaxUint32 would overflow and reject
+	// every transaction. arcade's intake is height-agnostic post-Genesis, so a
+	// static height avoids a chain-tip lookup on the hot path.
+	allForksActiveHeight uint32 = 2_000_000_000
+
+	// assumedUTXOHeight is the per-input source height arcade reports for every
+	// spent output. arcade does not track per-UTXO confirmation heights on the
+	// intake path, so it reports a height far below allForksActiveHeight; every
+	// input therefore appears mature. This matches arcade's prior behaviour of
+	// not enforcing coinbase maturity / relative locktime at intake — teranode
+	// remains the authority and re-checks with real heights downstream.
+	assumedUTXOHeight uint32 = 1
+
+	// maxTxSizePolicyConsensusLimit is the BDK consensus ceiling on the policy
+	// max-tx-size setting; the engine rejects construction above it.
+	maxTxSizePolicyConsensusLimit = 1_000_000_000
+
+	// defaultNetwork is used by NewValidator, which retains the legacy
+	// network-less constructor for tests and callers that do not select one.
+	defaultNetwork = "mainnet"
 )
 
-// DefaultMinFeePerKB defines the minimum fee per kilobyte.
+// DefaultMinFeePerKB defines the default minimum fee per kilobyte, in satoshis.
 var DefaultMinFeePerKB = uint64(100)
 
-var (
-	ErrNoInputsOrOutputs               = errors.New("transaction has no inputs or outputs")
-	ErrTxOutputInvalid                 = errors.New("transaction output is invalid")
-	ErrTxOutputSatoshisInvalid         = errors.New("output satoshis is invalid")
-	ErrTxOutputNonZeroOpReturn         = errors.New("output has non 0 value op return")
-	ErrTxOutputTotalSatoshisTooHigh    = errors.New("output total satoshis is too high")
-	ErrTxInputInvalid                  = errors.New("transaction input is invalid")
-	ErrTxInputCoinbaseInput            = errors.New("input is a coinbase input")
-	ErrTxInputSatoshisTooHigh          = errors.New("input satoshis is too high")
-	ErrTxInputTotalSatoshisTooHigh     = errors.New("input total satoshis is too high")
-	ErrUnlockingScriptHasTooManySigOps = errors.New("transaction unlocking scripts have too many sigops")
-	ErrEmptyUnlockingScript            = errors.New("transaction input unlocking script is empty")
-	ErrUnlockingScriptNotPushOnly      = errors.New("transaction input unlocking script is not push only")
-	ErrTxSizeLessThanMinSize           = fmt.Errorf("transaction size in bytes is less than %d bytes", minTxSizeBytes)
-	ErrTxSizeGreaterThanMax            = fmt.Errorf("transaction size in bytes is greater than %d bytes", maxBlockSize)
-)
-
-// Policy defines validation policy settings
+// Policy defines the operator-facing validation policy. Fields left at their
+// zero value fall back to arcade/teranode defaults.
 type Policy struct {
-	MaxTxSizePolicy         int
+	// MaxTxSizePolicy caps transaction size in bytes (0 => defaultMaxTxSizePolicy).
+	MaxTxSizePolicy int
+	// MaxTxSigopsCountsPolicy caps sigops per transaction (0 => unlimited, the
+	// BSV post-Genesis default).
 	MaxTxSigopsCountsPolicy int64
-	MinFeePerKB             *uint64
+	// MinFeePerKB is the fee floor in satoshis/kB. A nil pointer uses
+	// DefaultMinFeePerKB; an explicit pointer-to-zero accepts any fee.
+	MinFeePerKB *uint64
 }
 
-// Validator performs local transaction validation before submission.
+// Validator performs intake transaction validation by delegating to teranode's
+// BDK-backed TxValidator. It holds two validators: one that enforces the fee
+// floor and one that does not, so ValidateTransaction can honour skipFees
+// without disabling the script/standardness checks (which SkipPolicyChecks
+// would also turn off).
 type Validator struct {
-	policy *Policy
+	tv          *tnvalidator.TxValidator
+	tvNoFee     *tnvalidator.TxValidator
+	minFeePerKB uint64
 }
 
-// NewValidator creates a new transaction validator with the given policy.
-// A nil policy uses defaults.
+// NewValidator creates a validator for mainnet with the given policy. A nil
+// policy uses defaults. Retained for backward compatibility; production wiring
+// should use NewValidatorForNetwork to select the configured network.
 func NewValidator(policy *Policy) *Validator {
-	if policy == nil {
-		policy = &Policy{}
+	v, err := NewValidatorForNetwork(defaultNetwork, policy)
+	if err != nil {
+		// mainnet params always resolve; a failure here is a programming error.
+		panic(err)
 	}
-	if policy.MaxTxSizePolicy == 0 {
-		policy.MaxTxSizePolicy = maxBlockSize
-	}
-	if policy.MaxTxSigopsCountsPolicy == 0 {
-		policy.MaxTxSigopsCountsPolicy = int64(maxTxSigopsCountPolicyAfterGenesis)
-	}
-	if policy.MinFeePerKB == nil {
-		policy.MinFeePerKB = &DefaultMinFeePerKB
-	}
-	return &Validator{policy: policy}
+	return v
 }
 
-// ValidatePolicy validates a transaction against node policy rules
-func (v *Validator) ValidatePolicy(tx *sdkTx.Transaction) error {
-	txSize := tx.Size()
-
-	if len(tx.Inputs) == 0 || len(tx.Outputs) == 0 {
-		return ErrNoInputsOrOutputs
+// NewValidatorForNetwork creates a validator bound to the given network
+// (mainnet/testnet/teratestnet/regtest). It returns an error for an unknown
+// network rather than letting the BDK adapter fail fatally.
+func NewValidatorForNetwork(network string, policy *Policy) (*Validator, error) {
+	params, err := chaincfg.GetChainParams(network)
+	if err != nil {
+		return nil, fmt.Errorf("validator: resolve chain params for network %q: %w", network, err)
 	}
 
-	if txSize > v.policy.MaxTxSizePolicy {
-		return ErrTxSizeGreaterThanMax
+	minFee := DefaultMinFeePerKB
+	if policy != nil && policy.MinFeePerKB != nil {
+		minFee = *policy.MinFeePerKB
 	}
 
-	if txSize < minTxSizeBytes {
-		return ErrTxSizeLessThanMinSize
+	// 0 => keep the canonical default from defaultPolicySettings. An explicit
+	// override is capped at the BDK consensus limit so construction never panics.
+	maxTxSize := 0
+	if policy != nil && policy.MaxTxSizePolicy > 0 {
+		maxTxSize = policy.MaxTxSizePolicy
+		if maxTxSize > maxTxSizePolicyConsensusLimit {
+			maxTxSize = maxTxSizePolicyConsensusLimit
+		}
 	}
 
-	if err := v.checkInputs(tx); err != nil {
-		return err
+	var maxSigops int64 // 0 => unlimited (BSV post-Genesis)
+	if policy != nil && policy.MaxTxSigopsCountsPolicy > 0 {
+		maxSigops = policy.MaxTxSigopsCountsPolicy
 	}
 
-	if err := v.checkOutputs(tx); err != nil {
-		return err
-	}
+	logger := ulogger.New("arcade-validator")
 
-	if err := v.sigOpsCheck(tx); err != nil {
-		return err
-	}
-
-	if err := v.pushDataCheck(tx); err != nil {
-		return err
-	}
-
-	return nil
+	return &Validator{
+		tv:          tnvalidator.NewTxValidator(logger, buildSettings(params, maxTxSize, maxSigops, minFee)),
+		tvNoFee:     tnvalidator.NewTxValidator(logger, buildSettings(params, maxTxSize, maxSigops, 0)),
+		minFeePerKB: minFee,
+	}, nil
 }
 
-// MinFeePerKB returns the configured minimum fee per KB
+// MinFeePerKB returns the configured minimum fee per kB, in satoshis.
 func (v *Validator) MinFeePerKB() uint64 {
-	return *v.policy.MinFeePerKB
+	return v.minFeePerKB
 }
 
-// ValidateTransaction runs policy validation, script execution on every
-// input, and optionally fee adequacy. Merkle-proof verification on BEEF
-// parents is always skipped (GullibleHeadersClient) because arcade does
-// not own a chaintracker on the intake path — script execution against
-// the source data carried in EF/BEEF is the meaningful per-tx check at
-// submit time. spv.Verify takes a context.Context as its first argument;
-// callers that don't have a ctx can pass context.TODO().
+// ValidateTransaction validates a transaction against current node consensus
+// rules using the BDK engine. The transaction is converted to extended go-bt
+// form from the source data carried in EF/BEEF; a missing source output is a
+// hard rejection (StatusTxFormat). When skipFees is true the fee floor is not
+// enforced but all script and standardness checks still run.
 //
-//nolint:contextcheck // ctx==nil callers are explicitly supported via TODO fallback below
-func (v *Validator) ValidateTransaction(ctx context.Context, tx *sdkTx.Transaction, skipFees bool) error {
-	if err := v.ValidatePolicy(tx); err != nil {
-		return v.wrapPolicyError(err)
+// ctx is accepted for call-site compatibility; BDK validation is synchronous
+// and does not observe it.
+func (v *Validator) ValidateTransaction(_ context.Context, tx *sdkTx.Transaction, skipFees bool) error {
+	btx, err := toExtendedBT(tx)
+	if err != nil {
+		return mapTeranodeError(err)
 	}
 
-	var feeModel sdkTx.FeeModel
-	if !skipFees {
-		feeModel = &feemodel.SatoshisPerKilobyte{Satoshis: *v.policy.MinFeePerKB}
+	utxoHeights := make([]uint32, len(btx.Inputs))
+	for i := range utxoHeights {
+		utxoHeights[i] = assumedUTXOHeight
 	}
 
-	if ctx == nil {
-		ctx = context.TODO()
+	tv := v.tv
+	if skipFees {
+		tv = v.tvNoFee
 	}
 
-	if _, err := spv.Verify(ctx, tx, &spv.GullibleHeadersClient{}, feeModel); err != nil {
-		return v.wrapSPVError(err)
-	}
-
-	return nil
-}
-
-// wrapPolicyError wraps policy validation errors with ARC-compatible status codes.
-func (v *Validator) wrapPolicyError(err error) error {
-	switch {
-	case errors.Is(err, ErrNoInputsOrOutputs):
-		return arcerrors.NewArcError(err, arcerrors.StatusMalformed)
-	case errors.Is(err, ErrTxSizeGreaterThanMax), errors.Is(err, ErrTxSizeLessThanMinSize):
-		return arcerrors.NewArcError(err, arcerrors.StatusTxSize)
-	case errors.Is(err, ErrTxInputInvalid):
-		return arcerrors.NewArcError(err, arcerrors.StatusInputs)
-	case errors.Is(err, ErrTxOutputInvalid):
-		return arcerrors.NewArcError(err, arcerrors.StatusOutputs)
-	case errors.Is(err, ErrUnlockingScriptHasTooManySigOps),
-		errors.Is(err, ErrEmptyUnlockingScript),
-		errors.Is(err, ErrUnlockingScriptNotPushOnly):
-		return arcerrors.NewArcError(err, arcerrors.StatusUnlockingScripts)
-	default:
-		return arcerrors.NewArcError(err, arcerrors.StatusMalformed)
-	}
-}
-
-// wrapSPVError wraps SPV verification errors with ARC-compatible status codes.
-func (v *Validator) wrapSPVError(err error) error {
-	errStr := err.Error()
-	switch {
-	case contains(errStr, "fee"):
-		return arcerrors.NewArcErrorWithInfo(err, arcerrors.StatusFees, errStr)
-	case contains(errStr, "script"):
-		return arcerrors.NewArcError(err, arcerrors.StatusUnlockingScripts)
-	case contains(errStr, "input"), contains(errStr, "source"):
-		return arcerrors.NewArcError(err, arcerrors.StatusInputs)
-	case contains(errStr, "merkle"):
-		return arcerrors.NewArcError(err, arcerrors.StatusGeneric)
-	default:
-		return arcerrors.NewArcError(err, arcerrors.StatusGeneric)
-	}
-}
-
-func contains(s, sub string) bool {
-	return len(s) >= len(sub) && (s == sub || len(s) > 0 && containsStr(s, sub))
-}
-
-func containsStr(s, sub string) bool {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
-}
-
-func (v *Validator) checkOutputs(tx *sdkTx.Transaction) error {
-	total := uint64(0)
-	for _, output := range tx.Outputs {
-		isData := output.LockingScript.IsData()
-		switch {
-		case !isData && (output.Satoshis > maxSatoshis || output.Satoshis < dustLimit):
-			return errors.Join(ErrTxOutputInvalid, ErrTxOutputSatoshisInvalid)
-		case isData && output.Satoshis != 0:
-			return errors.Join(ErrTxOutputInvalid, ErrTxOutputNonZeroOpReturn)
-		}
-		// Overflow-safe accumulation: both total and output.Satoshis are
-		// individually <= maxSatoshis here, so maxSatoshis - output.Satoshis
-		// cannot underflow and the comparison catches any wrap before it
-		// happens.
-		if total > maxSatoshis-output.Satoshis {
-			return errors.Join(ErrTxOutputInvalid, ErrTxOutputTotalSatoshisTooHigh)
-		}
-		total += output.Satoshis
-	}
-	if total > maxSatoshis {
-		return errors.Join(ErrTxOutputInvalid, ErrTxOutputTotalSatoshisTooHigh)
+	if vErr := tv.ValidateTransaction(btx, allForksActiveHeight, utxoHeights, tnvalidator.NewDefaultOptions()); vErr != nil {
+		return mapTeranodeError(vErr)
 	}
 	return nil
 }
 
-func (v *Validator) checkInputs(tx *sdkTx.Transaction) error {
-	total := uint64(0)
-	for _, input := range tx.Inputs {
-		if *input.SourceTXID == (chainhash.Hash{}) {
-			return errors.Join(ErrTxInputInvalid, ErrTxInputCoinbaseInput)
-		}
-
-		inputSatoshis := uint64(0)
-		if input.SourceTxSatoshis() != nil {
-			inputSatoshis = *input.SourceTxSatoshis()
-		}
-
-		if inputSatoshis > maxSatoshis {
-			return errors.Join(ErrTxInputInvalid, ErrTxInputSatoshisTooHigh)
-		}
-		// Overflow-safe accumulation: both total and inputSatoshis are
-		// individually <= maxSatoshis here, so maxSatoshis - inputSatoshis
-		// cannot underflow and the comparison catches any wrap before it
-		// happens.
-		if total > maxSatoshis-inputSatoshis {
-			return errors.Join(ErrTxInputInvalid, ErrTxInputTotalSatoshisTooHigh)
-		}
-		total += inputSatoshis
-	}
-	if total > maxSatoshis {
-		return errors.Join(ErrTxInputInvalid, ErrTxInputTotalSatoshisTooHigh)
-	}
-	return nil
+// ValidatePolicy runs structural, script and standardness validation without
+// enforcing the fee floor. Retained for callers that want a fee-agnostic check.
+func (v *Validator) ValidatePolicy(tx *sdkTx.Transaction) error {
+	return v.ValidateTransaction(context.Background(), tx, true)
 }
 
-func (v *Validator) sigOpsCheck(tx *sdkTx.Transaction) error {
-	parser := interpreter.DefaultOpcodeParser{}
-	numSigOps := int64(0)
-
-	for _, input := range tx.Inputs {
-		parsedUnlockingScript, err := parser.Parse(input.UnlockingScript)
-		if err != nil {
-			return err
-		}
-		numSigOps += countSigOps(parsedUnlockingScript)
+// buildSettings assembles a teranode settings.Settings for the BDK validator:
+// canonical BSV policy defaults, with the operator-controlled tx-size, sigop
+// and fee values applied. minFeePerKB is in satoshis/kB and converted to the
+// BSV/kB units teranode's fee check expects (0 => no fee floor).
+func buildSettings(params *chaincfg.Params, maxTxSize int, maxSigops int64, minFeePerKB uint64) *settings.Settings {
+	pol := defaultPolicySettings()
+	if maxTxSize > 0 {
+		pol.MaxTxSizePolicy = maxTxSize
 	}
-
-	for _, output := range tx.Outputs {
-		parsedLockingScript, err := parser.Parse(output.LockingScript)
-		if err != nil {
-			return err
-		}
-		numSigOps += countSigOps(parsedLockingScript)
-	}
-
-	if numSigOps > v.policy.MaxTxSigopsCountsPolicy {
-		return ErrUnlockingScriptHasTooManySigOps
-	}
-	return nil
+	pol.MaxTxSigopsCountsPolicy = maxSigops
+	pol.MinMiningTxFee = satPerKBToBSVPerKB(minFeePerKB)
+	return &settings.Settings{ChainCfgParams: params, Policy: pol}
 }
 
-// countSigOps counts the signature operations contained in a parsed script.
-//
-// The accounting follows the standard Bitcoin policy used by node
-// implementations:
-//
-//   - OP_CHECKSIG and OP_CHECKSIGVERIFY each contribute 1 sigop.
-//   - OP_CHECKMULTISIG and OP_CHECKMULTISIGVERIFY contribute the value of
-//     the immediately-preceding small-int opcode (OP_1..OP_16), or
-//     MaxPubKeysPerMultiSigBeforeGenesis (20) if no small-int precedes.
-//
-// This is the cheap, static count used to enforce the policy budget
-// (MaxTxSigopsCountsPolicy). It does not recurse into P2SH redeem scripts;
-// BSV has disabled P2SH at the consensus level so that case is intentionally
-// out of scope here.
-func countSigOps(lockingScript interpreter.ParsedScript) int64 {
-	numSigOps := int64(0)
-	for i, op := range lockingScript {
-		switch op.Value() {
-		case script.OpCHECKSIG, script.OpCHECKSIGVERIFY:
-			numSigOps++
-		case script.OpCHECKMULTISIG, script.OpCHECKMULTISIGVERIFY:
-			numSigOps += multisigSigOpCount(lockingScript, i)
-		}
+// defaultPolicySettings returns teranode's canonical BSV policy values.
+// settings.NewPolicySettings() returns an all-zero struct (zeros would make the
+// C++ engine reject memory-bound scripts), so every field the BDK adapter reads
+// is set explicitly. DataCarrier is enabled because arcade accepts OP_RETURN
+// data transactions; MaxTxSizePolicy and MinMiningTxFee are overwritten by
+// buildSettings.
+func defaultPolicySettings() *settings.PolicySettings {
+	return &settings.PolicySettings{
+		ExcessiveBlockSize:              4294967296,
+		MaxTxSizePolicy:                 10485760,
+		MaxOrphanTxSize:                 1000000,
+		DataCarrierSize:                 1000000,
+		MaxScriptSizePolicy:             500000,
+		MaxOpsPerScriptPolicy:           1000000,
+		MaxScriptNumLengthPolicy:        10000,
+		MaxPubKeysPerMultisigPolicy:     0,
+		MaxTxSigopsCountsPolicy:         0,
+		MaxStackMemoryUsagePolicy:       104857600,
+		MaxStackMemoryUsageConsensus:    0,
+		LimitAncestorCount:              1000000,
+		LimitCPFPGroupMembersCount:      1000000,
+		AcceptNonStdOutputs:             true,
+		RequireStandard:                 false,
+		DataCarrier:                     true,
+		PermitBareMultisig:              true,
+		MinMiningTxFee:                  0,
+		MaxStdTxValidationDuration:      3,
+		MaxNonStdTxValidationDuration:   1000,
+		MaxTxChainValidationBudget:      50,
+		ValidationClockCPU:              false,
+		MinConsolidationFactor:          20,
+		MaxConsolidationInputScriptSize: 150,
+		MinConfConsolidationInput:       6,
+		MinConsolidationInputMaturity:   6,
+		AcceptNonStdConsolidationInput:  false,
+		MaxCoinsViewCacheSize:           0,
 	}
-	return numSigOps
 }
 
-// multisigSigOpCount returns the sigop weight of an OP_CHECKMULTISIG[VERIFY]
-// at index i in script. If the immediately-preceding opcode is OP_1..OP_16,
-// the weight is that small int (1..16); otherwise the weight defaults to
-// MaxPubKeysPerMultiSigBeforeGenesis (20), the standard upper bound applied
-// by Bitcoin-family nodes when the explicit pubkey count is not statically
-// visible.
-func multisigSigOpCount(s interpreter.ParsedScript, i int) int64 {
-	if i > 0 {
-		prev := s[i-1].Value()
-		if prev >= script.Op1 && prev <= script.Op16 {
-			return int64(prev-script.Op1) + 1
-		}
-	}
-	return int64(interpreter.MaxPubKeysPerMultiSigBeforeGenesis)
-}
-
-// pushDataCheck enforces the "data only in unlocking script" rule: an input's
-// unlocking script may contain only data-push operations, never functional
-// opcodes.
-//
-// The Chronicle upgrade (BSV mainnet block 943,816) lifted this rule for
-// transactions that opt in with a version greater than 1. Version 0/1
-// transactions retain the original push-only requirement; for version >= 2 the
-// unlocking script may carry functional opcodes. This mirrors svnode/BDK, where
-// the same relaxation is gated on the transaction version, not the block
-// height, so the gate here is purely version-based.
-// https://docs.bsvblockchain.org/network-topology/nodes/sv-node/chronicle-release
-//
-// The empty-unlocking-script rejection is independent of the push-only rule and
-// is applied to every transaction regardless of version.
-func (v *Validator) pushDataCheck(tx *sdkTx.Transaction) error {
-	enforcePushOnly := tx.Version < 2
-
-	for _, input := range tx.Inputs {
-		if input.UnlockingScript == nil {
-			return ErrEmptyUnlockingScript
-		}
-		if !enforcePushOnly {
-			continue
-		}
-		parser := interpreter.DefaultOpcodeParser{}
-		parsedUnlockingScript, err := parser.Parse(input.UnlockingScript)
-		if err != nil {
-			return err
-		}
-		if !parsedUnlockingScript.IsPushOnly() {
-			return ErrUnlockingScriptNotPushOnly
-		}
-	}
-	return nil
+// satPerKBToBSVPerKB converts a satoshis/kB fee rate to BSV/kB, the unit
+// teranode's checkFees expects (it converts back via *1e8/1000). 100 sat/kB =>
+// 0.000001 BSV/kB.
+func satPerKBToBSVPerKB(satPerKB uint64) float64 {
+	return float64(satPerKB) / 1e8
 }
