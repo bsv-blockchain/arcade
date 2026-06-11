@@ -109,9 +109,10 @@ func newValidatableTx(prevTxID []byte, prevOutputIdx, nonce uint32) *bt.Tx {
 	input.PreviousTxSatoshis = 10000
 	// OP_0 (single byte 0x00) is the smallest push-only, non-empty
 	// unlocking script. arcade's pushDataCheck rejects empty unlocking
-	// scripts (ErrEmptyUnlockingScript / ErrUnlockingScriptNotPushOnly),
-	// and OP_0 pushes an empty byte string the OP_TRUE locking script
-	// happily ignores when it pushes 1 — script execution still succeeds.
+	// scripts (ErrEmptyUnlockingScript / ErrUnlockingScriptNotPushOnly).
+	// The empty byte string OP_0 pushes is popped by the OP_DROP in
+	// opTrueScript, so OP_TRUE leaves a single truthy element on a clean
+	// stack — required by the BDK validator's CLEANSTACK rule.
 	input.UnlockingScript = minimalPushScript()
 	tx.Inputs = append(tx.Inputs, input)
 	tx.AddOutput(&bt.Output{
@@ -127,11 +128,15 @@ func asChainHash(b []byte) *chainhash.Hash {
 	return &h
 }
 
-// opTrueScript is a single-byte OP_TRUE script. arcade's validator
-// classifies it as non-data so checkInputs and checkOutputs both accept
-// it without needing real signing or pushdata.
+// opTrueScript is an OP_DROP OP_TRUE script. Paired with the OP_0 unlocking
+// script (minimalPushScript) the full evaluation is OP_0 OP_DROP OP_TRUE: the
+// empty push is dropped and OP_TRUE leaves a single truthy element on a clean
+// stack, which the BDK validator's post-Genesis CLEANSTACK rule requires (a
+// bare OP_TRUE would leave two elements and be rejected). arcade's validator
+// classifies it as non-data so checkInputs and checkOutputs both accept it, and
+// non-standard scripts are fine because the validator runs RequireStandard=false.
 func opTrueScript() *bscript.Script {
-	s := bscript.Script([]byte{0x51})
+	s := bscript.Script([]byte{0x75, 0x51})
 	return &s
 }
 
@@ -140,9 +145,9 @@ func opTrueScript() *bscript.Script {
 // requires the unlocking script to be push-only, and go-sdk's
 // SatoshisPerKilobyte fee model rejects inputs with an empty unlocking
 // script (ErrNoUnlockingScript) because it can't size the witness.
-// OP_0 pushes an empty byte string onto the stack, which the OP_TRUE
-// locking script ignores when it pushes 1 — script execution still
-// succeeds. Mirrors tests/e2e/harness/txbuilder.go:minimalPushScript.
+// OP_0 pushes an empty byte string that the OP_DROP in opTrueScript pops back
+// off, leaving a clean stack — see opTrueScript. Mirrors
+// tests/e2e/harness/txbuilder.go:minimalPushScript.
 func minimalPushScript() *bscript.Script {
 	s := bscript.Script([]byte{0x00})
 	return &s

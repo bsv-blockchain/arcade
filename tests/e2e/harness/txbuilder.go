@@ -14,11 +14,16 @@ import (
 	"github.com/bsv-blockchain/teranode/model"
 )
 
-// nonDataScript returns a single-byte OP_TRUE locking script. arcade's
-// validator considers this non-data (so checkOutputs accepts it) and
-// it's accepted by checkInputs as a non-coinbase witness.
+// nonDataScript returns an OP_DROP OP_TRUE locking script. Paired with the
+// OP_0 unlocking script (minimalPushScript), the full evaluation is
+// OP_0 OP_DROP OP_TRUE: the empty push is dropped and OP_TRUE leaves a single
+// truthy element, so the stack is clean. The BDK validator enforces the
+// post-Genesis CLEANSTACK rule (exactly one truthy element must remain after
+// execution), which a bare OP_TRUE paired with OP_0 would violate (it leaves
+// two elements). It is non-data so checkOutputs accepts it, and non-standard
+// scripts are fine because the validator runs with RequireStandard=false.
 func nonDataScript() *bscript.Script {
-	s := bscript.Script([]byte{0x51})
+	s := bscript.Script([]byte{0x75, 0x51})
 	return &s
 }
 
@@ -26,10 +31,9 @@ func nonDataScript() *bscript.Script {
 // script that's non-empty. arcade's policy pushDataCheck requires the
 // unlocking script to be push-only, and go-sdk's SatoshisPerKilobyte
 // fee model rejects inputs with an empty unlocking script
-// (ErrNoUnlockingScript) because it can't size the witness. OP_0
-// pushes an empty byte string onto the stack, which the OP_TRUE
-// locking script ignores when it pushes 1 — script execution still
-// succeeds.
+// (ErrNoUnlockingScript) because it can't size the witness. OP_0 pushes an
+// empty byte string that the OP_DROP in nonDataScript pops back off, leaving a
+// clean stack — see nonDataScript for why the drop is required.
 func minimalPushScript() *bscript.Script {
 	s := bscript.Script([]byte{0x00})
 	return &s
@@ -73,19 +77,18 @@ func BuildTxs(n int, startNonce uint32) []*bt.Tx {
 // arcade's intake validator (structural policy + script execution +
 // fee check; merkle proofs on parents are trusted). Each tx has:
 //
-//   - One input pointing at a non-zero source txid + OP_TRUE locking
-//     script + 10_000 satoshis (passes checkInputs as non-coinbase and
-//     covers the fee floor by a wide margin).
-//   - One output with OP_TRUE locking script + 1 satoshi (passes
+//   - One input pointing at a non-zero source txid + OP_DROP OP_TRUE
+//     locking script + 10_000 satoshis (passes checkInputs as
+//     non-coinbase and covers the fee floor by a wide margin).
+//   - One output with OP_DROP OP_TRUE locking script + 1 satoshi (passes
 //     checkOutputs; remaining ~9999 sats become fee).
 //   - LockTime = startNonce + i, ensuring each tx hashes differently.
 //
-// OP_TRUE (0x51) is a trivially-satisfied locking script — an empty
-// unlocking script evaluates to true against it, so script execution
-// inside spv.Verify succeeds without any signing. Callers must serialize
-// these via ExtendedBytes() so arcade's go-sdk parser sees the per-input
-// source script + satoshis (otherwise GetFee returns "PreviousTx not
-// supplied" inside the fee check).
+// The OP_0 unlocking script + OP_DROP OP_TRUE locking script evaluate to a
+// single truthy element on a clean stack, which the BDK validator's CLEANSTACK
+// rule requires (see nonDataScript). Callers must serialize these via
+// ExtendedBytes() so arcade's go-sdk parser sees the per-input source script +
+// satoshis (otherwise the fee check fails with "PreviousTx not supplied").
 func BuildValidatableTxs(n int, startNonce uint32) []*bt.Tx {
 	out := make([]*bt.Tx, n)
 	// Reused across all txs so we don't re-allocate the same constant
