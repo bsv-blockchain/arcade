@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/script"
@@ -54,7 +55,22 @@ type Policy struct {
 // Validator performs local transaction validation before submission.
 type Validator struct {
 	policy *Policy
+	// chainTip supplies the current block height for height-based nLockTime
+	// finality. Optional; nil disables height-lock evaluation (see
+	// checkFinality).
+	chainTip ChainTip
+	// now returns the current Unix time for time-based nLockTime finality.
+	// Indirected for deterministic tests; defaults to time.Now().Unix().
+	now func() int64
 }
+
+// SetChainTip wires the chain-height source used for height-based nLockTime
+// finality. Call once during construction before the validator is shared.
+func (v *Validator) SetChainTip(ct ChainTip) { v.chainTip = ct }
+
+// SetNowFunc overrides the clock used for time-based nLockTime finality.
+// Intended for tests.
+func (v *Validator) SetNowFunc(now func() int64) { v.now = now }
 
 // NewValidator creates a new transaction validator with the given policy.
 // A nil policy uses defaults.
@@ -71,7 +87,7 @@ func NewValidator(policy *Policy) *Validator {
 	if policy.MinFeePerKB == nil {
 		policy.MinFeePerKB = &DefaultMinFeePerKB
 	}
-	return &Validator{policy: policy}
+	return &Validator{policy: policy, now: func() int64 { return time.Now().Unix() }}
 }
 
 // ValidatePolicy validates a transaction against node policy rules
@@ -128,6 +144,15 @@ func (v *Validator) ValidateTransaction(ctx context.Context, tx *sdkTx.Transacti
 		return v.wrapPolicyError(err)
 	}
 
+	if ctx == nil {
+		ctx = context.TODO()
+	}
+
+	if err := v.checkFinality(ctx, tx); err != nil {
+		return v.wrapPolicyError(err)
+	}
+	}
+
 	var feeModel sdkTx.FeeModel
 	if !skipFees {
 		feeModel = &feemodel.SatoshisPerKilobyte{Satoshis: *v.policy.MinFeePerKB}
@@ -151,6 +176,8 @@ func (v *Validator) wrapPolicyError(err error) error {
 		return arcerrors.NewArcError(err, arcerrors.StatusMalformed)
 	case errors.Is(err, ErrTxSizeGreaterThanMax), errors.Is(err, ErrTxSizeLessThanMinSize):
 		return arcerrors.NewArcError(err, arcerrors.StatusTxSize)
+	case errors.Is(err, ErrTxNotFinal):
+		return arcerrors.NewArcError(err, arcerrors.StatusMalformed)
 	case errors.Is(err, ErrTxInputInvalid):
 		return arcerrors.NewArcError(err, arcerrors.StatusInputs)
 	case errors.Is(err, ErrTxOutputInvalid):
