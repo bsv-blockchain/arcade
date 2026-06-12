@@ -1,0 +1,1312 @@
+openapi: 3.0.3
+info:
+  title: Arcade API
+  description: |
+    REST API for **Arcade** — a Bitcoin SV transaction broadcasting and
+    lifecycle-tracking service. Clients submit transactions, look up their
+    status, subscribe to status updates (via webhooks or Server-Sent Events),
+    and inspect block-processing milestones.
+
+    ## Services and ports
+
+    Arcade is decomposed into independent services, each binding its own HTTP
+    port. The endpoints in this document are split across three of them:
+
+    | Service       | Default port | Endpoints                                                                 |
+    |---------------|--------------|---------------------------------------------------------------------------|
+    | `api-server`  | `8080`       | `/`, `/health`, `/ready`, `/metrics`, `/tx`, `/txs`, `/tx/{txid}`, `/api/v1/*` |
+    | `sse`         | `8082`       | `/events`                                                                 |
+    | `chaintracks` | `8083`       | `/chaintracks/v1/*`, `/chaintracks/v2/*`                                   |
+
+    Operations that are not served by the default `api-server` declare their own
+    `servers` override. Adjust the host/port to match your deployment — in
+    production each service sits behind its own Kubernetes Service.
+
+    ## Callback subscriptions
+
+    `POST /tx` and `POST /txs` accept optional `X-CallbackUrl` /
+    `X-CallbackToken` / `X-FullStatusUpdates` headers. Supplying a callback URL
+    registers an outbound webhook; supplying a token scopes a Server-Sent Events
+    stream on the `sse` service. See the individual operations for details.
+  version: "1.0.0"
+  license:
+    name: Open BSV License
+    url: https://github.com/bsv-blockchain/arcade/blob/main/LICENSE
+
+servers:
+  - url: http://localhost:8080
+    description: api-server (local default)
+  - url: https://arcade.example.com
+    description: Production api-server (behind ingress)
+
+# Endpoints are unauthenticated by default; the Merkle Service callback
+# overrides this with bearer auth at the operation level.
+security: []
+
+tags:
+  - name: Transactions
+    description: Submit transactions and look up their lifecycle status.
+  - name: Blocks
+    description: Inspect block-processing milestones and trigger reprocessing.
+  - name: Callbacks
+    description: Internal endpoint used by the Merkle Service to deliver events.
+  - name: Events
+    description: |
+      Server-Sent Events stream of transaction status updates. Hosted by the
+      standalone `sse` service (default port **8082**), not the api-server.
+  - name: Chaintracks
+    description: |
+      Embedded block-header tracker (go-chaintracks). Hosted by the standalone
+      `chaintracks` service (default port **8083**). Exposes JSON and binary
+      header endpoints plus tip/reorg SSE streams under `/chaintracks/v1`
+      (legacy RPC-style) and `/chaintracks/v2` (current).
+  - name: Operations
+    description: Liveness, readiness, and metrics endpoints.
+
+paths:
+  /:
+    get:
+      operationId: getDocsPage
+      tags: [Operations]
+      summary: API documentation page
+      description: Renders the human-readable HTML API documentation page.
+      responses:
+        "200":
+          description: HTML documentation page.
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /health:
+    get:
+      operationId: getHealth
+      tags: [Operations]
+      summary: Liveness probe
+      description: |
+        Reports liveness of the API server process and the upstream Datahub
+        endpoints it depends on. Suitable as a Kubernetes liveness probe.
+      responses:
+        "200":
+          description: Process is live.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: ok
+                datahub_urls:
+                  - url: https://datahub.example.com
+                    healthy: true
+
+  /ready:
+    get:
+      operationId: getReady
+      tags: [Operations]
+      summary: Readiness probe
+      description: |
+        Indicates that the process has finished start-up and is ready to accept
+        traffic. Suitable as a Kubernetes readiness probe.
+      responses:
+        "200":
+          description: Process is ready.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ready
+
+  /metrics:
+    get:
+      operationId: getMetrics
+      tags: [Operations]
+      summary: Prometheus metrics
+      description: |
+        Prometheus scrape endpoint exposing process and application metrics in
+        the Prometheus text exposition format.
+      responses:
+        "200":
+          description: Metrics in Prometheus text format.
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /tx:
+    post:
+      operationId: submitTransaction
+      tags: [Transactions]
+      summary: Submit a single transaction
+      description: |
+        Submits one Bitcoin SV transaction for validation, propagation, and
+        lifecycle tracking. Synchronous policy/script/fee validation runs before
+        the `202` is returned; fee and script checks are delegated to the
+        network. Pick the body encoding that matches your client — raw bytes are
+        the most efficient.
+
+        The canonical txid is derived from the parsed transaction structure (so
+        Extended Format submissions key correctly), not from a hash of the wire
+        bytes.
+
+        Bodies are capped at **32 MiB**.
+      parameters:
+        - $ref: "#/components/parameters/ContentTypeSingleTx"
+        - $ref: "#/components/parameters/XCallbackUrl"
+        - $ref: "#/components/parameters/XCallbackToken"
+        - $ref: "#/components/parameters/XFullStatusUpdates"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+              description: Raw serialized transaction bytes. Supports Extended Format.
+          text/plain:
+            schema:
+              type: string
+              description: Hex-encoded serialized transaction. Whitespace is trimmed before decoding.
+              example: "0100000001abc...def00000000"
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubmitTxJSON"
+      responses:
+        "202":
+          description: |
+            Transaction accepted for processing, or an idempotent re-submit of a
+            txid Arcade has already seen.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/SubmitAcceptedResponse"
+                  - $ref: "#/components/schemas/AlreadySubmittedResponse"
+              examples:
+                submitted:
+                  summary: New submission
+                  value:
+                    status: submitted
+                alreadySubmitted:
+                  summary: Idempotent re-submit
+                  value:
+                    status: already submitted
+                    txid: "<hex>"
+                    state: SEEN_ON_NETWORK
+        "400":
+          description: |
+            Malformed request, decode failure, empty transaction, validation
+            failure, or unsafe callback URL. On validation failure a terminal
+            `REJECTED` row is persisted so subscribers see the outcome.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ValidationErrorResponse"
+              example:
+                error: transaction failed validation
+                reason: "script evaluation failed"
+        "503":
+          description: |
+            Broker is under backpressure; the transaction was not queued and a
+            retry is safe.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+                example: 1
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /txs:
+    post:
+      operationId: submitTransactions
+      tags: [Transactions]
+      summary: Submit a batch of transactions
+      description: |
+        Submits a batch of concatenated raw transactions in a single HTTP
+        request. Each transaction is parsed, validated, dedup-CAS'd, and
+        published as part of one fan-out. No length prefixes or separators —
+        each transaction is parsed sequentially using the stream parser.
+
+        Bodies are capped at **256 MiB**. If any transaction in the batch fails
+        validation the whole call returns `400` with the offending txid and
+        reason; the failed transaction is recorded as `REJECTED`.
+      parameters:
+        - name: Content-Type
+          in: header
+          required: true
+          description: Must be `application/octet-stream` — the only encoding accepted for batches.
+          schema:
+            type: string
+            enum: [application/octet-stream]
+        - $ref: "#/components/parameters/XCallbackUrl"
+        - $ref: "#/components/parameters/XCallbackToken"
+        - $ref: "#/components/parameters/XFullStatusUpdates"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+              description: Concatenated raw transaction bytes.
+      responses:
+        "202":
+          description: Batch accepted; counts reconcile submitted vs duplicates vs total parsed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchSubmitResponse"
+              example:
+                submitted: 42
+                duplicates: 3
+                total: 45
+        "400":
+          description: |
+            Wrong content type, empty body, parse failure, no transactions
+            parsed, validation failure, or unsafe callback URL.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ValidationErrorResponse"
+        "503":
+          description: Broker backpressure; retry is safe.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+                example: 1
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /tx/{txid}:
+    get:
+      operationId: getTransaction
+      tags: [Transactions]
+      summary: Look up transaction status by txid
+      description: |
+        Returns the current lifecycle state of a previously submitted
+        transaction, including its merkle path once mined.
+      parameters:
+        - name: txid
+          in: path
+          required: true
+          description: Transaction id (hex).
+          schema:
+            type: string
+            example: "<hex>"
+      responses:
+        "200":
+          description: Current transaction status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TransactionStatus"
+        "404":
+          description: The txid has never been submitted to this Arcade instance.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: transaction not found
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/blocks/processing-status:
+    get:
+      operationId: listBlockProcessingStatus
+      tags: [Blocks]
+      summary: List block processing milestones
+      description: |
+        Lists block processing milestones (header seen, `BLOCK_PROCESSED`
+        received, compound BUMP built) in descending-height order. Paginates via
+        a height-cursor; pass the lowest height returned from the previous page
+        as `before-height` to fetch the next page.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Page size. Default 50, max 200.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - name: before-height
+          in: query
+          required: false
+          description: Cursor — pass the lowest height from the previous page.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+      responses:
+        "200":
+          description: A page of block processing milestones.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListBlockProcessingStatusResponse"
+        "400":
+          description: Invalid `limit` or `before-height` query parameter.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/blocks/processing-status/{blockHash}:
+    get:
+      operationId: getBlockProcessingStatus
+      tags: [Blocks]
+      summary: Get processing status for a single block
+      description: Returns the block processing milestones for one block, looked up by block hash.
+      parameters:
+        - $ref: "#/components/parameters/BlockHashPath"
+      responses:
+        "200":
+          description: Block processing milestones.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BlockProcessingStatus"
+        "404":
+          description: Arcade has no record of the block hash.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/blocks/{blockHash}/reprocess:
+    post:
+      operationId: reprocessBlock
+      tags: [Blocks]
+      summary: Ask Merkle Service to re-emit STUMP + BLOCK_PROCESSED
+      description: |
+        Requests that the upstream Merkle Service re-emit `STUMP` and
+        `BLOCK_PROCESSED` callbacks for the given block hash. Useful for healing
+        a deployment whose callback stream missed a block.
+      parameters:
+        - $ref: "#/components/parameters/BlockHashPath"
+      responses:
+        "202":
+          description: Reprocess request accepted by Merkle Service.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: accepted
+                  blockHash:
+                    type: string
+        "400":
+          description: Missing or malformed block hash (must be 64 hex characters).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: |
+            Merkle Service responded 4xx — typically "block isn't on the
+            consensus chain"; retrying without changing input won't help.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpstreamErrorResponse"
+        "502":
+          description: Merkle Service responded 5xx — transient infrastructure failure; the caller can retry.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpstreamErrorResponse"
+        "503":
+          description: No Merkle Service is configured for this deployment.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Transport-level failure (network, marshaling).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/merkle-service/callback:
+    post:
+      operationId: merkleServiceCallback
+      tags: [Callbacks]
+      summary: Internal — receive callbacks from Merkle Service
+      description: |
+        Internal endpoint used by the Merkle Service to deliver
+        `SEEN_ON_NETWORK`, `SEEN_MULTIPLE_NODES`, `STUMP` and `BLOCK_PROCESSED`
+        events. Bearer authentication is mandatory; the deployment refuses to
+        start without a configured callback token.
+
+        Request bodies are capped (default 16 MiB) to bound the memory cost of
+        embedded STUMP blobs; oversize bodies return `413`.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CallbackMessage"
+      responses:
+        "200":
+          description: Callback accepted (empty body).
+        "400":
+          description: Malformed JSON body, or required fields missing for the callback type.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: unauthorized
+        "413":
+          description: Request body exceeded the configured maximum.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /events:
+    get:
+      operationId: streamEvents
+      tags: [Events]
+      summary: Stream status updates over Server-Sent Events
+      description: |
+        Long-lived Server-Sent Events stream that pushes lifecycle updates for
+        every transaction submitted under the supplied callback token. Hosted by
+        Arcade's standalone SSE service — a separate listener from the main API
+        (default port **8082**). CORS is permissive so browsers can connect
+        directly with the `EventSource` API.
+
+        Lines prefixed with `:` are SSE comments — Arcade sends a `: keepalive`
+        comment every 15 seconds. The `id` field is the event timestamp in
+        nanoseconds; clients reconnecting after a network blip should send it
+        back as `Last-Event-ID` to trigger a catchup replay of every status
+        update that occurred strictly after that timestamp.
+      servers:
+        - url: http://localhost:8082
+          description: sse service (local default)
+        - url: https://arcade.example.com
+          description: Production sse service (behind ingress)
+      parameters:
+        - name: callbackToken
+          in: query
+          required: true
+          description: The same opaque token sent as `X-CallbackToken` when submitting transactions. Scopes the stream to that token's transactions.
+          schema:
+            type: string
+        - name: Accept
+          in: header
+          required: false
+          schema:
+            type: string
+            example: text/event-stream
+        - name: Last-Event-ID
+          in: header
+          required: false
+          description: |
+            Nanosecond timestamp of the last event the client received. Triggers
+            a catchup replay of every status update after this timestamp. Omit on
+            first connect to receive the current persisted status of every txid
+            registered under the token.
+          schema:
+            type: string
+            example: "1716205200123456789"
+      responses:
+        "200":
+          description: An event stream of status updates.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              example: |
+                id: 1716205200123456789
+                event: status
+                data: {"txid":"<hex>","txStatus":"SEEN_ON_NETWORK","timestamp":"2026-05-20T12:00:00Z"}
+
+                id: 1716205260987654321
+                event: status
+                data: {"txid":"<hex>","txStatus":"MINED","timestamp":"2026-05-20T12:01:00Z"}
+
+                : keepalive
+
+  /chaintracks/v2/network:
+    get:
+      operationId: chaintracksGetNetwork
+      tags: [Chaintracks]
+      summary: Get the active network
+      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      responses:
+        "200":
+          description: The configured network.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  network:
+                    type: string
+                    example: main
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /chaintracks/v2/height:
+    get:
+      operationId: chaintracksGetHeight
+      tags: [Chaintracks]
+      summary: Get the current chain height
+      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      responses:
+        "200":
+          description: Current best-chain height.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  height:
+                    type: integer
+                    format: int64
+                    example: 870123
+
+  /chaintracks/v2/tip:
+    get:
+      operationId: chaintracksGetTip
+      tags: [Chaintracks]
+      summary: Get the current chain tip header (JSON)
+      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      responses:
+        "200":
+          description: The chain tip block header. The `X-Block-Height` response header carries the tip height.
+          headers:
+            X-Block-Height:
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChaintracksHeader"
+        "404":
+          description: Chain tip not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /chaintracks/v2/tip.bin:
+    get:
+      operationId: chaintracksGetTipBinary
+      tags: [Chaintracks]
+      summary: Get the current chain tip header (binary)
+      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      responses:
+        "200":
+          description: The serialized 80-byte block header.
+          headers:
+            X-Block-Height:
+              schema:
+                type: integer
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: Chain tip not found.
+
+  /chaintracks/v2/headers:
+    get:
+      operationId: chaintracksGetHeadersBinary
+      tags: [Chaintracks]
+      summary: Get a run of serialized headers (binary)
+      description: Returns `count` consecutive serialized headers starting at `height`, concatenated as raw bytes.
+      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      parameters:
+        - name: height
+          in: query
+          required: true
+          schema:
+            type: integer
+            format: int64
+        - name: count
+          in: query
+          required: true
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "200":
+          description: Concatenated serialized headers.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "400":
+          description: Missing or invalid `height`/`count`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /chaintracks/v2/header/height/{height}:
+    get:
+      operationId: chaintracksGetHeaderByHeight
+      tags: [Chaintracks]
+      summary: Get a header by height
+      description: |
+        Returns the header at the given height. Append `.bin` to the height
+        (e.g. `/header/height/870123.bin`) to receive the serialized binary
+        header instead of JSON.
+      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      parameters:
+        - name: height
+          in: path
+          required: true
+          schema:
+            type: string
+            example: "870123"
+      responses:
+        "200":
+          description: The block header (JSON, or binary when the `.bin` suffix is used).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChaintracksHeader"
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "400":
+          description: Invalid height parameter.
+        "404":
+          description: Header not found.
+
+  /chaintracks/v2/header/hash/{hash}:
+    get:
+      operationId: chaintracksGetHeaderByHash
+      tags: [Chaintracks]
+      summary: Get a header by block hash
+      description: |
+        Returns the header for the given block hash. Append `.bin` to the hash
+        to receive the serialized binary header instead of JSON.
+      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      parameters:
+        - name: hash
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The block header (JSON, or binary when the `.bin` suffix is used).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChaintracksHeader"
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "400":
+          description: Invalid hash parameter.
+        "404":
+          description: Header not found.
+
+  /chaintracks/v2/tip/stream:
+    get:
+      operationId: chaintracksStreamTip
+      tags: [Chaintracks]
+      summary: Stream chain-tip updates (SSE)
+      description: |
+        Server-Sent Events stream that emits the current tip immediately on
+        connect and then pushes each new tip as blocks arrive. A `: keepalive`
+        comment is sent every 15 seconds.
+      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      responses:
+        "200":
+          description: An event stream of tip headers.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
+  /chaintracks/v2/reorg/stream:
+    get:
+      operationId: chaintracksStreamReorg
+      tags: [Chaintracks]
+      summary: Stream chain-reorg events (SSE)
+      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      responses:
+        "200":
+          description: An event stream of reorg events.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
+  /chaintracks/v1/getChain:
+    get:
+      operationId: chaintracksLegacyGetChain
+      tags: [Chaintracks]
+      summary: "Legacy: get the active network"
+      description: |
+        Legacy RPC-style endpoint. Responses are wrapped in a
+        `{ status, value }` envelope (or `{ status, code, description }` on
+        error). The `/chaintracks/v1` prefix also serves the full JSON/binary
+        surface available under `/chaintracks/v2`.
+      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      responses:
+        "200":
+          description: Wrapped network value.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LegacyResponse"
+
+  /chaintracks/v1/getPresentHeight:
+    get:
+      operationId: chaintracksLegacyGetPresentHeight
+      tags: [Chaintracks]
+      summary: "Legacy: get the current height"
+      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      responses:
+        "200":
+          description: Wrapped height value.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LegacyResponse"
+
+  /chaintracks/v1/findChainTipHashHex:
+    get:
+      operationId: chaintracksLegacyFindChainTipHashHex
+      tags: [Chaintracks]
+      summary: "Legacy: get the chain tip hash (hex)"
+      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      responses:
+        "200":
+          description: Wrapped tip-hash value.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LegacyResponse"
+        "404":
+          description: Chain tip not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LegacyResponse"
+
+  /chaintracks/v1/findChainTipHeaderHex:
+    get:
+      operationId: chaintracksLegacyFindChainTipHeaderHex
+      tags: [Chaintracks]
+      summary: "Legacy: get the chain tip header"
+      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      responses:
+        "200":
+          description: Wrapped tip-header value.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LegacyResponse"
+        "404":
+          description: Chain tip not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LegacyResponse"
+
+  /chaintracks/v1/findHeaderHexForHeight:
+    get:
+      operationId: chaintracksLegacyFindHeaderHexForHeight
+      tags: [Chaintracks]
+      summary: "Legacy: get a header by height"
+      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      parameters:
+        - name: height
+          in: query
+          required: true
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "200":
+          description: Wrapped header value.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LegacyResponse"
+        "400":
+          description: Missing or invalid height parameter.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LegacyResponse"
+        "404":
+          description: Header not found at the requested height.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LegacyResponse"
+
+  /chaintracks/v1/findHeaderHexForBlockHash:
+    get:
+      operationId: chaintracksLegacyFindHeaderHexForBlockHash
+      tags: [Chaintracks]
+      summary: "Legacy: get a header by block hash"
+      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      parameters:
+        - name: hash
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Wrapped header value.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LegacyResponse"
+        "400":
+          description: Missing or invalid hash parameter.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LegacyResponse"
+        "404":
+          description: Header not found for the requested hash.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LegacyResponse"
+
+  /chaintracks/v1/getHeaders:
+    get:
+      operationId: chaintracksLegacyGetHeaders
+      tags: [Chaintracks]
+      summary: "Legacy: get a run of headers (hex)"
+      description: Returns `count` consecutive headers starting at `height`, concatenated and hex-encoded inside the `value` field.
+      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      parameters:
+        - name: height
+          in: query
+          required: true
+          schema:
+            type: integer
+            format: int64
+        - name: count
+          in: query
+          required: true
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "200":
+          description: Wrapped hex-encoded header run.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LegacyResponse"
+        "400":
+          description: Missing or invalid `height`/`count`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LegacyResponse"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Bearer token shared between the Merkle Service and Arcade. Compared in
+        constant time against the configured callback token.
+
+  parameters:
+    BlockHashPath:
+      name: blockHash
+      in: path
+      required: true
+      description: Block hash (64 hex characters).
+      schema:
+        type: string
+        pattern: "^[0-9a-fA-F]{64}$"
+    ContentTypeSingleTx:
+      name: Content-Type
+      in: header
+      required: true
+      description: One of `application/octet-stream`, `text/plain` (hex), or `application/json`.
+      schema:
+        type: string
+        enum:
+          - application/octet-stream
+          - text/plain
+          - application/json
+    XCallbackUrl:
+      name: X-CallbackUrl
+      in: header
+      required: false
+      description: |
+        Webhook URL Arcade should POST status events to as this transaction
+        progresses. Must be a public HTTPS endpoint; private/loopback hosts are
+        rejected unless the deployment is configured to allow them.
+      schema:
+        type: string
+        format: uri
+    XCallbackToken:
+      name: X-CallbackToken
+      in: header
+      required: false
+      description: |
+        Opaque bearer token. Sent on every outbound webhook as
+        `Authorization: Bearer <token>`, and used to scope Server-Sent Events
+        streams when the client subscribes via SSE.
+      schema:
+        type: string
+    XFullStatusUpdates:
+      name: X-FullStatusUpdates
+      in: header
+      required: false
+      description: |
+        Set to `true` to receive every status transition. Default behavior
+        delivers only terminal/notable transitions.
+      schema:
+        type: string
+        enum: ["true", "false"]
+
+  responses:
+    InternalError:
+      description: Internal server error.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+  schemas:
+    Status:
+      type: string
+      description: A transaction's lifecycle state.
+      enum:
+        - UNKNOWN
+        - RECEIVED
+        - SENT_TO_NETWORK
+        - ACCEPTED_BY_NETWORK
+        - SEEN_ON_NETWORK
+        - SEEN_MULTIPLE_NODES
+        - DOUBLE_SPEND_ATTEMPTED
+        - REJECTED
+        - PENDING_RETRY
+        - STUMP_PROCESSING
+        - MINED
+        - IMMUTABLE
+
+    TransactionStatus:
+      type: object
+      properties:
+        txid:
+          type: string
+          description: Transaction id (hex).
+        txStatus:
+          $ref: "#/components/schemas/Status"
+        status:
+          type: integer
+          description: Numeric status code (omitted when zero).
+        timestamp:
+          type: string
+          format: date-time
+        txids:
+          type: array
+          description: Present only on bulk-transition events on the publisher channel; never on rows read from the store.
+          items:
+            type: string
+        blockHash:
+          type: string
+        blockHeight:
+          type: integer
+          format: int64
+        merklePath:
+          type: string
+          nullable: true
+          description: BUMP merkle path, hex-encoded. Null/absent until mined.
+        extraInfo:
+          type: string
+          description: Free-form detail (e.g. rejection reason).
+        competingTxs:
+          type: array
+          items:
+            type: string
+        rawTx:
+          type: string
+          description: Raw transaction bytes, hex-encoded. Set only while in PENDING_RETRY.
+        retryCount:
+          type: integer
+        nextRetryAt:
+          type: string
+          format: date-time
+        merkleRegisteredAt:
+          type: string
+          format: date-time
+      required:
+        - txid
+        - txStatus
+        - timestamp
+
+    SubmitTxJSON:
+      type: object
+      description: JSON envelope carrying the hex-encoded transaction.
+      properties:
+        rawTx:
+          type: string
+          description: Hex-encoded serialized transaction.
+          example: "0100000001abc...def00000000"
+      required:
+        - rawTx
+
+    SubmitAcceptedResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: submitted
+      required:
+        - status
+
+    AlreadySubmittedResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: already submitted
+        txid:
+          type: string
+        state:
+          $ref: "#/components/schemas/Status"
+      required:
+        - status
+        - txid
+        - state
+
+    BatchSubmitResponse:
+      type: object
+      properties:
+        submitted:
+          type: integer
+          description: Number of transactions newly published.
+        duplicates:
+          type: integer
+          description: Number of transactions already seen and skipped.
+        total:
+          type: integer
+          description: Total number of transactions parsed from the body.
+      required:
+        - submitted
+        - duplicates
+        - total
+
+    BlockProcessingStatus:
+      type: object
+      properties:
+        blockHash:
+          type: string
+        blockHeight:
+          type: integer
+          format: int64
+        headerSeenAt:
+          type: string
+          format: date-time
+        processedAt:
+          type: string
+          format: date-time
+        bumpBuiltAt:
+          type: string
+          format: date-time
+        status:
+          type: string
+          description: Whether the block is still on the active chain or was orphaned by a reorg.
+          enum: [active, orphaned]
+        orphanedAt:
+          type: string
+          format: date-time
+        hasBlockProcessed:
+          type: boolean
+        hasCompoundBUMP:
+          type: boolean
+      required:
+        - blockHash
+        - blockHeight
+        - status
+        - hasBlockProcessed
+        - hasCompoundBUMP
+
+    ListBlockProcessingStatusResponse:
+      type: object
+      properties:
+        blocks:
+          type: array
+          items:
+            $ref: "#/components/schemas/BlockProcessingStatus"
+        nextCursor:
+          type: integer
+          format: int64
+          description: Lowest height on this page; pass as `before-height` for the next page. Absent on the last page.
+      required:
+        - blocks
+
+    CallbackMessage:
+      type: object
+      description: Payload received from the Merkle Service. The `type` field discriminates the variant.
+      properties:
+        type:
+          type: string
+          enum:
+            - SEEN_ON_NETWORK
+            - SEEN_MULTIPLE_NODES
+            - STUMP
+            - BLOCK_PROCESSED
+        txid:
+          type: string
+        txids:
+          type: array
+          items:
+            type: string
+        blockHash:
+          type: string
+        subtreeIndex:
+          type: integer
+        stump:
+          type: string
+          description: STUMP blob, hex-encoded.
+      required:
+        - type
+
+    ChaintracksHeader:
+      type: object
+      description: |
+        Block header as serialized by the embedded go-chaintracks library. The
+        exact field set is owned by that library; the properties below are
+        indicative.
+      additionalProperties: true
+      properties:
+        hash:
+          type: string
+        height:
+          type: integer
+          format: int64
+        version:
+          type: integer
+        previousblockhash:
+          type: string
+        merkleroot:
+          type: string
+        time:
+          type: integer
+        bits:
+          type: integer
+        nonce:
+          type: integer
+
+    LegacyResponse:
+      type: object
+      description: Legacy v1 RPC-style envelope.
+      properties:
+        status:
+          type: string
+          enum: [success, error]
+        value:
+          description: Present on success; type varies by endpoint.
+        code:
+          type: string
+          description: Error code (present on error).
+        description:
+          type: string
+          description: Human-readable error description (present on error).
+      required:
+        - status
+
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ok
+        datahub_urls:
+          type: array
+          items:
+            $ref: "#/components/schemas/EndpointStatus"
+      required:
+        - status
+
+    EndpointStatus:
+      type: object
+      properties:
+        url:
+          type: string
+        healthy:
+          type: boolean
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+      required:
+        - error
+
+    ValidationErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+        reason:
+          type: string
+          description: Validation failure detail (present when a transaction fails validation).
+        txid:
+          type: string
+          description: The offending txid (present for batch validation failures).
+      required:
+        - error
+
+    UpstreamErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+        upstreamStatus:
+          type: integer
+        upstreamMessage:
+          type: string
+      required:
+        - error
