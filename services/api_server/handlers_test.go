@@ -156,6 +156,14 @@ func (m *mockStore) MarkMerkleRegisteredByTxIDs(context.Context, []string, time.
 	return nil
 }
 
+func (m *mockStore) GetReapCandidates(context.Context, time.Time, time.Time, time.Time, int) ([]*models.TransactionStatus, error) {
+	return nil, nil
+}
+
+func (m *mockStore) MarkRebroadcastByTxIDs(context.Context, []string, time.Time) error {
+	return nil
+}
+
 func (m *mockStore) InsertSubmission(_ context.Context, sub *models.Submission) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
