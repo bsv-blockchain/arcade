@@ -239,6 +239,18 @@ var BumpBuilderDatahubFetchDuration = promauto.NewHistogram(prometheus.Histogram
 	Buckets: latencyBuckets,
 })
 
+// BumpBuilderBlockDataSourceTotal counts which source supplied the subtree
+// hashes + coinbase BUMP + header merkle root used to build a compound BUMP:
+// "callback" when merkle-service enriched BLOCK_PROCESSED (datahub-independent
+// path, issue #195) or "datahub" when bump-builder fell back to fetching the
+// block. A healthy fully-rolled-out deployment trends to source="callback"; a
+// sustained source="datahub" rate signals an un-upgraded merkle-service or
+// blocks whose enrichment fields couldn't be built/validated upstream.
+var BumpBuilderBlockDataSourceTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_bump_builder_block_data_source_total",
+	Help: "Block data source used for compound BUMP construction, by source (callback|datahub).",
+}, []string{"source"})
+
 // BumpBuilderGraceWaitTotal counts how often the grace window was respected.
 // (Almost always; useful as a smoke metric.)
 var BumpBuilderGraceWaitTotal = promauto.NewCounter(prometheus.CounterOpts{

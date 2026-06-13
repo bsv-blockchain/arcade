@@ -2094,3 +2094,66 @@ func TestHandleCallback_BodySizeLimit_DefaultsToConfigConstant(t *testing.T) {
 		t.Errorf("explicit value: got %d, want %d", got, 1<<10)
 	}
 }
+
+// TestHandleCallback_BlockProcessed_ForwardsEnrichmentFields pins issue #195's
+// wire contract: a BLOCK_PROCESSED carrying merkleRoot + subtreeCount +
+// subtreeHashes + coinbaseBump is forwarded to the arcade.block_processed Kafka
+// topic with all four fields intact, so the bump_builder consumer can build a
+// datahub-independent compound BUMP. Guards against accidental field stripping
+// in the producer/serialization path.
+func TestHandleCallback_BlockProcessed_ForwardsEnrichmentFields(t *testing.T) {
+	broker := &kafka.RecordingBroker{}
+	ms := &mockStore{}
+	_, router := setupServerWithStore(broker, ms)
+
+	const (
+		blockHash  = "00000000c57cfda6619dd099aa447a28353cfaca71942770273f5818778f64f7"
+		merkleRoot = "215b459eb39fb46220c591d89dffa89def1cf03f327765e6009b949aed741414"
+		subtree0   = "1111111111111111111111111111111111111111111111111111111111111111"
+		subtree1   = "2222222222222222222222222222222222222222222222222222222222222222"
+	)
+	in := models.CallbackMessage{
+		Type:          models.CallbackBlockProcessed,
+		BlockHash:     blockHash,
+		MerkleRoot:    merkleRoot,
+		SubtreeCount:  2,
+		SubtreeHashes: []string{subtree0, subtree1},
+		CoinbaseBUMP:  models.HexBytes{0xde, 0xad, 0xbe, 0xef},
+	}
+	body, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, authedCallbackRequest(t, body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	broker.Lock()
+	defer broker.Unlock()
+	if len(broker.Sends) != 1 {
+		t.Fatalf("expected 1 Send on arcade.block_processed, got %d", len(broker.Sends))
+	}
+	sent := broker.Sends[0]
+	if sent.Topic != kafka.TopicBlockProcessed {
+		t.Errorf("topic = %q, want %q", sent.Topic, kafka.TopicBlockProcessed)
+	}
+
+	var decoded models.CallbackMessage
+	if err := json.Unmarshal(sent.Value, &decoded); err != nil {
+		t.Fatalf("unmarshal kafka value: %v", err)
+	}
+	if decoded.MerkleRoot != merkleRoot {
+		t.Errorf("MerkleRoot = %q, want %q", decoded.MerkleRoot, merkleRoot)
+	}
+	if decoded.SubtreeCount != 2 {
+		t.Errorf("SubtreeCount = %d, want 2", decoded.SubtreeCount)
+	}
+	if len(decoded.SubtreeHashes) != 2 || decoded.SubtreeHashes[0] != subtree0 || decoded.SubtreeHashes[1] != subtree1 {
+		t.Errorf("SubtreeHashes = %v, want [%s %s]", decoded.SubtreeHashes, subtree0, subtree1)
+	}
+	if string(decoded.CoinbaseBUMP) != string([]byte{0xde, 0xad, 0xbe, 0xef}) {
+		t.Errorf("CoinbaseBUMP = %x, want deadbeef", decoded.CoinbaseBUMP)
+	}
+}

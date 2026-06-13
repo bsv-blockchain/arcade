@@ -30,16 +30,29 @@ func TestSmoke_RealBlockMined_SingleSubtree(t *testing.T) {
 		fix.Height, fix.TxCount, len(fix.PickedTxIDs), len(fix.Subtrees))
 
 	h := harness.New(t)
-	datahub := h.NewDatahub(t)
-	datahub.StageFixture(fix)
+
+	// Two independent datahub instances so the test can prove arcade builds
+	// the compound BUMP from the merkle-service callback enrichment (issue
+	// #195) without ever fetching the block itself:
+	//   - msDatahub serves /block + /subtree to merkle-service (which MUST
+	//     fetch them to compute STUMPs and the enrichment fields).
+	//   - arcadeDatahub is arcade's only datahub. With v0.2.4 emitting the
+	//     enrichment, arcade never GETs /block here, so its BlockFetches()
+	//     stays 0. We still stage the fixture on it so that, were arcade to
+	//     fall back, the build would succeed (and only the assertion below
+	//     would flag the regression) rather than 404-cascading.
+	msDatahub := h.NewDatahub(t)
+	msDatahub.StageFixture(fix)
+	arcadeDatahub := h.NewDatahub(t)
+	arcadeDatahub.StageFixture(fix)
 
 	rt := harness.StartArcade(t, harness.ArcadeOptions{
 		MerkleServiceURL: h.Containers.MerkleHostURL,
 		// arcade runs on the host; from here the datahub is reachable
 		// via loopback. merkle-service inside its container reaches
-		// the same listener via the gateway IP — that URL goes into
+		// its own datahub via the gateway IP — that URL goes into
 		// the libp2p BlockMessage / SubtreeMessage payloads below.
-		DatahubURL:      datahub.LocalURL(),
+		DatahubURL:      arcadeDatahub.LocalURL(),
 		LibP2PBootstrap: h.LibP2P.BootstrapMultiaddr(),
 		MerkleAuthToken: "e2e-watch-token",
 		CallbackToken:   "e2e-callback-token",
@@ -83,7 +96,7 @@ func TestSmoke_RealBlockMined_SingleSubtree(t *testing.T) {
 	for _, st := range fix.Subtrees {
 		if err := h.LibP2P.PublishSubtree(ctx, teranode.SubtreeMessage{
 			Hash:       st.Hash.String(),
-			DataHubURL: datahub.HostURL(),
+			DataHubURL: msDatahub.HostURL(),
 		}); err != nil {
 			t.Fatalf("publish subtree %s: %v", st.Hash, err)
 		}
@@ -91,7 +104,7 @@ func TestSmoke_RealBlockMined_SingleSubtree(t *testing.T) {
 	if err := h.LibP2P.PublishBlock(ctx, teranode.BlockMessage{
 		Hash:       fix.BlockHash.String(),
 		Height:     fix.Height,
-		DataHubURL: datahub.HostURL(),
+		DataHubURL: msDatahub.HostURL(),
 	}); err != nil {
 		t.Fatalf("publish block: %v", err)
 	}
@@ -108,4 +121,18 @@ func TestSmoke_RealBlockMined_SingleSubtree(t *testing.T) {
 	//    confused-deputy bug between merkle-service and arcade's
 	//    compound BUMP that the MINED-only assertion wouldn't catch.
 	harness.AssertMerklePathsMatchHeaderRoot(t, rt, fix.MerkleRoot, txids)
+
+	// 6. Issue #195: with v0.2.4 enriching BLOCK_PROCESSED, arcade builds the
+	//    compound BUMP straight from the callback fields and never fetches the
+	//    block. arcadeDatahub is arcade's only datahub, so it must have served
+	//    ZERO /block/<hash> GETs. A non-zero count means arcade fell back to
+	//    the datahub — either the image regressed and stopped emitting the
+	//    enrichment (esp. coinbaseBump), or the consume path broke.
+	if got := arcadeDatahub.BlockFetches(); got != 0 {
+		t.Fatalf("arcade made %d datahub /block fetches; want 0 — the compound BUMP "+
+			"should be built from the merkle-service callback enrichment (issue #195), "+
+			"not a datahub fetch. Check that the pinned merkle-service image emits "+
+			"merkleRoot/subtreeCount/subtreeHashes/coinbaseBump for this block.", got)
+	}
+	t.Logf("datahub-independent: arcade built the BUMP from callback enrichment (0 /block fetches)")
 }
