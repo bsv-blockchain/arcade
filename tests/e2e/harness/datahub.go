@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -34,6 +35,13 @@ type Datahub struct {
 	mu       sync.RWMutex
 	blocks   map[string][]byte
 	subtrees map[string][]byte
+
+	// Per-path fetch counters. blockFetches is load-bearing for the issue
+	// #195 datahub-independence assertion: when merkle-service enriches
+	// BLOCK_PROCESSED, arcade builds the compound BUMP without ever fetching
+	// /block/<hash>, so a dedicated arcade datahub sees zero block fetches.
+	blockFetches   atomic.Int64
+	subtreeFetches atomic.Int64
 }
 
 // DatahubOptions tunes the announce hostname/IP the datahub publishes
@@ -116,6 +124,16 @@ func (d *Datahub) LocalURL() string {
 	return fmt.Sprintf("http://127.0.0.1:%d", d.port)
 }
 
+// BlockFetches returns how many GET /block/<hash> requests this datahub has
+// served. Zero on a datahub wired only to arcade proves arcade built the
+// compound BUMP from the merkle-service callback enrichment (issue #195)
+// rather than fetching the block.
+func (d *Datahub) BlockFetches() int64 { return d.blockFetches.Load() }
+
+// SubtreeFetches returns how many GET /subtree/<hash> requests this datahub
+// has served.
+func (d *Datahub) SubtreeFetches() int64 { return d.subtreeFetches.Load() }
+
 // StageBlock registers a block binary keyed by its hash. The hash must
 // match the hash merkle-service / arcade will GET — typically the block
 // hash the test publishes via libp2p.
@@ -155,6 +173,7 @@ func (d *Datahub) Close() {
 func (d *Datahub) handle(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/block/"):
+		d.blockFetches.Add(1)
 		hash := strings.TrimPrefix(r.URL.Path, "/block/")
 		d.mu.RLock()
 		payload, ok := d.blocks[hash]
@@ -166,6 +185,7 @@ func (d *Datahub) handle(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		_, _ = w.Write(payload)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/subtree/"):
+		d.subtreeFetches.Add(1)
 		hash := strings.TrimPrefix(r.URL.Path, "/subtree/")
 		d.mu.RLock()
 		payload, ok := d.subtrees[hash]
