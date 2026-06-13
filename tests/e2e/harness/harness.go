@@ -5,6 +5,7 @@ package harness
 import (
 	"context"
 	"fmt"
+	"io"
 	"testing"
 	"time"
 )
@@ -132,6 +133,19 @@ func New(t *testing.T, opts ...Option) *Harness {
 
 	h := &Harness{Containers: containers, LibP2P: libp2p, Datahub: datahub}
 	t.Cleanup(func() {
+		// Post-mortem: on a failed e2e test, dump the merkle-service container
+		// logs before teardown. These round-trips fail upstream of arcade more
+		// often than not (merkle-service didn't emit callbacks, /reprocess
+		// errored, …) and the container logs are the only place that's visible.
+		if t.Failed() && containers != nil && containers.Merkle != nil {
+			logCtx, logCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if r, lErr := containers.Merkle.Logs(logCtx); lErr == nil {
+				b, _ := io.ReadAll(r)
+				_ = r.Close()
+				t.Logf("=== merkle-service container logs (test failed) ===\n%s\n=== end merkle-service logs ===", b)
+			}
+			logCancel()
+		}
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer closeCancel()
 		if err := containers.Close(closeCtx); err != nil {

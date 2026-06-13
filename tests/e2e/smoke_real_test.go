@@ -105,6 +105,13 @@ func TestSmoke_RealBlockMined_SingleSubtree(t *testing.T) {
 		Hash:       fix.BlockHash.String(),
 		Height:     fix.Height,
 		DataHubURL: msDatahub.HostURL(),
+		// teranode announces the header + coinbase tx inline; merkle-service
+		// builds the BLOCK_PROCESSED enrichment (merkleRoot + coinbaseBump)
+		// from these, NOT from a datahub fetch. Without them arcade can't take
+		// the datahub-free callback path and the BlockFetches()==0 assertion
+		// below fails (issue #195).
+		Header:   fix.HeaderHex,
+		Coinbase: fix.CoinbaseHex,
 	}); err != nil {
 		t.Fatalf("publish block: %v", err)
 	}

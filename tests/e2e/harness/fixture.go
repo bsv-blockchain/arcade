@@ -3,9 +3,11 @@
 package harness
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -13,6 +15,8 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-sdk/transaction"
+	"github.com/bsv-blockchain/go-sdk/util"
 )
 
 // RealBlockFixture is the on-disk artifact set the e2e tests consume
@@ -44,6 +48,15 @@ type RealBlockFixture struct {
 	MerkleRoot   string
 	CoinbaseTxID string
 	TxCount      uint64
+
+	// HeaderHex (80-byte block header) and CoinbaseHex (coinbase tx) are
+	// parsed out of BlockBin. teranode's p2p BlockMessage carries both, and
+	// merkle-service builds the BLOCK_PROCESSED enrichment (merkleRoot +
+	// coinbaseBump) from them — NOT from a datahub fetch. Tests must feed
+	// these into LibP2P.PublishBlock so merkle-service can emit the
+	// enrichment; otherwise arcade falls back to a datahub fetch (issue #195).
+	HeaderHex   string
+	CoinbaseHex string
 }
 
 // SubtreeFixture is one entry in RealBlockFixture.Subtrees: the
@@ -121,6 +134,14 @@ func LoadBlockFixture(t *testing.T, blockHash string) *RealBlockFixture {
 		t.Fatalf("decode block hash from header: %v", err)
 	}
 
+	headerHex, coinbaseHex, coinbaseTxID, err := extractHeaderAndCoinbase(blockBin)
+	if err != nil {
+		t.Fatalf("extract header/coinbase from block.bin: %v", err)
+	}
+	if coinbaseTxID != meta.CoinbaseTxID {
+		t.Fatalf("parsed coinbase txid %s != meta.json coinbaseTxID %s", coinbaseTxID, meta.CoinbaseTxID)
+	}
+
 	picked := append([]string(nil), meta.PickedTxIDs...)
 	sort.Strings(picked)
 
@@ -134,7 +155,51 @@ func LoadBlockFixture(t *testing.T, blockHash string) *RealBlockFixture {
 		MerkleRoot:   meta.MerkleRoot,
 		CoinbaseTxID: meta.CoinbaseTxID,
 		TxCount:      meta.TxCount,
+		HeaderHex:    headerHex,
+		CoinbaseHex:  coinbaseHex,
 	}
+}
+
+// extractHeaderAndCoinbase pulls the 80-byte block header and the coinbase
+// transaction out of the teranode datahub block binary (the bytes served at
+// /block/<hash>). Layout:
+//
+//	header(80) | txCount(varint) | sizeBytes(varint) | subtreeCount(varint) |
+//	subtreeHashes(N*32) | coinbaseTx(variable) | ...
+//
+// Both are returned as hex, matching teranode's p2p BlockMessage.Header /
+// .Coinbase fields that merkle-service consumes to build the BLOCK_PROCESSED
+// enrichment. The coinbase txid is returned too so the caller can verify the
+// parse against meta.json.
+func extractHeaderAndCoinbase(blockBin []byte) (headerHex, coinbaseHex, coinbaseTxID string, err error) {
+	if len(blockBin) < 80 {
+		return "", "", "", fmt.Errorf("block.bin too short for header: %d bytes", len(blockBin))
+	}
+	headerHex = hex.EncodeToString(blockBin[:80])
+
+	r := bytes.NewReader(blockBin[80:])
+	var txCount, sizeBytes, subtreeCount util.VarInt
+	if _, e := txCount.ReadFrom(r); e != nil {
+		return "", "", "", fmt.Errorf("read tx count: %w", e)
+	}
+	if _, e := sizeBytes.ReadFrom(r); e != nil {
+		return "", "", "", fmt.Errorf("read size bytes: %w", e)
+	}
+	if _, e := subtreeCount.ReadFrom(r); e != nil {
+		return "", "", "", fmt.Errorf("read subtree count: %w", e)
+	}
+	if _, e := io.CopyN(io.Discard, r, int64(subtreeCount)*32); e != nil {
+		return "", "", "", fmt.Errorf("skip %d subtree hashes: %w", uint64(subtreeCount), e)
+	}
+
+	remaining := blockBin[len(blockBin)-r.Len():]
+	tx, used, e := transaction.NewTransactionFromStream(remaining)
+	if e != nil {
+		return "", "", "", fmt.Errorf("parse coinbase tx: %w", e)
+	}
+	coinbaseHex = hex.EncodeToString(remaining[:used])
+	coinbaseTxID = tx.TxID().String()
+	return headerHex, coinbaseHex, coinbaseTxID, nil
 }
 
 // findFixtureRoot walks up from the test file's directory until it
