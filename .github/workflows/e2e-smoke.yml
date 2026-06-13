@@ -49,7 +49,7 @@ jobs:
       # `:latest`) because upstream republishes `:latest` out-of-band and a
       # bad build silently reds every PR. See that const for the full story.
       - name: Pre-pull merkle-service image
-        run: docker pull ghcr.io/bsv-blockchain/merkle-service@sha256:04d87f10d4c04643c78709c01ac58560393ba17c75fb8f14253eccf68222a3ae
+        run: docker pull ghcr.io/bsv-blockchain/merkle-service@sha256:6c8dca5ea092390ece08850c45e924c2155964de63b06ff4b40a810a7d3ba0fb
 
       - name: Run e2e smoke tests
         env:

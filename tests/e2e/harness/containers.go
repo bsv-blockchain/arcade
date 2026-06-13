@@ -49,14 +49,20 @@ const (
 	// BLOCK_PROCESSED callbacks → txs never reach MINED), turning every
 	// arcade CI run red regardless of arcade's own changes.
 	//
-	// This digest is the v0.2.4 release, the first merkle-service build that
-	// enriches BLOCK_PROCESSED with merkleRoot + subtreeCount + subtreeHashes
-	// + coinbaseBump (issue #195 producer side). arcade consumes those fields
-	// to build the compound BUMP without any datahub fetch — the e2e
-	// TestSmoke_RealBlockMined_SingleSubtree asserts the datahub-free path.
-	// Re-point this at a newer digest once upstream merkle-service is
-	// confirmed compatible (track via the e2e suite), rather than `:latest`.
-	defaultMerkleImage = "ghcr.io/bsv-blockchain/merkle-service@sha256:6f723f1ea2cbbf3d9abd70f5eb0947430ce79f810dc366af3e4efc0576c31b95"
+	// This digest is the post-v0.2.4 main build (merkle-service PR #145,
+	// commit f224c61) that both (a) enriches BLOCK_PROCESSED with merkleRoot +
+	// subtreeCount + subtreeHashes + coinbaseBump (issue #195 producer side) and
+	// (b) restores broker-side topic auto-creation that the sarama->franz-go
+	// migration dropped. v0.2.3/v0.2.4 had the enrichment but a broken round-trip
+	// (franz didn't set AllowAutoTopicCreation → produce failed with
+	// UNKNOWN_TOPIC_OR_PARTITION: "failed to enqueue", no BLOCK_PROCESSED). arcade
+	// consumes the enrichment to build the compound BUMP without any datahub
+	// fetch — the e2e TestSmoke_RealBlockMined_SingleSubtree asserts the
+	// datahub-free path. Re-point this at a newer digest once upstream
+	// merkle-service is confirmed compatible (track via the e2e suite), rather
+	// than `:latest`. Keep in sync with the pre-pull digest in
+	// .github/workflows/e2e-smoke.yml.
+	defaultMerkleImage = "ghcr.io/bsv-blockchain/merkle-service@sha256:6c8dca5ea092390ece08850c45e924c2155964de63b06ff4b40a810a7d3ba0fb"
 )
 
 // Containers holds the running container set the harness manages and the
