@@ -20,9 +20,11 @@ func TestBuildValidatableTxs_PassesArcadePolicyValidator(t *testing.T) {
 	txs := BuildValidatableTxs(5, 100)
 
 	for i, tx := range txs {
-		// arcade parses txs via go-sdk, not go-bt — round-trip via
-		// raw bytes so we exercise the same path.
-		raw := tx.Bytes()
+		// arcade parses txs via go-sdk, not go-bt, and clients POST the
+		// extended (EF) serialization — round-trip via ExtendedBytes so the
+		// parsed tx carries the per-input source script + satoshis the BDK
+		// validator needs (BroadcastTx posts tx.ExtendedBytes() too).
+		raw := tx.ExtendedBytes()
 		sdkParsed, err := sdkTx.NewTransactionFromBytes(raw)
 		if err != nil {
 			t.Fatalf("tx %d: sdk parse: %v (raw=%x)", i, err, raw)

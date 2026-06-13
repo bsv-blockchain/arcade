@@ -594,10 +594,11 @@ type EventsConfig struct {
 // status-update bursts without committing significant memory upfront.
 const DefaultEventsSubscriberBuffer = 4096
 
-// ValidatorConfig controls intake-time transaction validation: the fee
-// floor enforced against EF/BEEF submissions and the policy-level
-// per-tx and per-script limits. Wired through to validator.Policy at
-// process startup.
+// ValidatorConfig controls intake-time transaction validation. It carries the
+// operator-facing fee floor enforced against EF/BEEF submissions; the consensus
+// and policy script rules come from teranode's BDK-backed validator (keyed by
+// the top-level network), not from this config. Wired through to the validator
+// at process startup.
 type ValidatorConfig struct {
 	// MinFeePerKB is the network's minimum acceptable fee rate in
 	// satoshis per kilobyte. Transactions below this rate are rejected
