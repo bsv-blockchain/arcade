@@ -33,6 +33,15 @@ import (
 // Unlike the round-trip test this path doesn't require libp2p
 // mesh formation, so it passes locally on rootless podman too.
 func TestSmoke_RealBlockMined_ViaReprocess(t *testing.T) {
+	// QUARANTINED: merkle-service's /reprocess enqueues the block message (HTTP
+	// 202) but its franz block-processor consumer never fetches it, so no
+	// callbacks are emitted and the txs never reach MINED — a regression from the
+	// sarama->franz migration that only affects the recovery path (the live
+	// round-trip in TestSmoke_RealBlockMined_SingleSubtree, which covers the
+	// datahub-free callback path, passes). Tracked in
+	// bsv-blockchain/merkle-service#148; re-enable once that ships.
+	t.Skip("quarantined pending bsv-blockchain/merkle-service#148 (/reprocess block message not consumed by franz block-processor)")
+
 	skipIfNoDocker(t)
 	const blockHash = "000000000000000001bc8a601dd5f0659d36a9b077808850375dfa2d9f009396"
 
