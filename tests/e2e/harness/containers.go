@@ -49,20 +49,20 @@ const (
 	// BLOCK_PROCESSED callbacks → txs never reach MINED), turning every
 	// arcade CI run red regardless of arcade's own changes.
 	//
-	// This digest is the post-v0.2.4 main build (merkle-service PR #145,
-	// commit f224c61) that both (a) enriches BLOCK_PROCESSED with merkleRoot +
-	// subtreeCount + subtreeHashes + coinbaseBump (issue #195 producer side) and
-	// (b) restores broker-side topic auto-creation that the sarama->franz-go
-	// migration dropped. v0.2.3/v0.2.4 had the enrichment but a broken round-trip
-	// (franz didn't set AllowAutoTopicCreation → produce failed with
-	// UNKNOWN_TOPIC_OR_PARTITION: "failed to enqueue", no BLOCK_PROCESSED). arcade
-	// consumes the enrichment to build the compound BUMP without any datahub
-	// fetch — the e2e TestSmoke_RealBlockMined_SingleSubtree asserts the
-	// datahub-free path. Re-point this at a newer digest once upstream
-	// merkle-service is confirmed compatible (track via the e2e suite), rather
-	// than `:latest`. Keep in sync with the pre-pull digest in
-	// .github/workflows/e2e-smoke.yml.
-	defaultMerkleImage = "ghcr.io/bsv-blockchain/merkle-service@sha256:6c8dca5ea092390ece08850c45e924c2155964de63b06ff4b40a810a7d3ba0fb"
+	// This digest is the merkle-service v0.2.5 release, which both (a) enriches
+	// BLOCK_PROCESSED with merkleRoot + subtreeCount + subtreeHashes +
+	// coinbaseBump (issue #195 producer side) and (b) fixes the round-trip
+	// regressions the sarama->franz-go migration introduced: producers/consumers
+	// now set AllowAutoTopicCreation (#145) and consumers create their topics
+	// before joining the group (#147). v0.2.3/v0.2.4 had the enrichment but a
+	// broken round-trip — produce failed with UNKNOWN_TOPIC_OR_PARTITION ("failed
+	// to enqueue") and /reprocess block messages sat unconsumed. arcade consumes
+	// the enrichment to build the compound BUMP without any datahub fetch — the
+	// e2e TestSmoke_RealBlockMined_SingleSubtree asserts the datahub-free path.
+	// Re-point this at a newer digest once upstream merkle-service is confirmed
+	// compatible (track via the e2e suite), rather than `:latest`. Keep in sync
+	// with the pre-pull digest in .github/workflows/e2e-smoke.yml.
+	defaultMerkleImage = "ghcr.io/bsv-blockchain/merkle-service@sha256:ff4ae409df2680c54267c27887dc1744fb3b64e5ddc5636882185ce82b35ced3"
 )
 
 // Containers holds the running container set the harness manages and the
