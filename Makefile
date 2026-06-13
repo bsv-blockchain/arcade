@@ -24,7 +24,13 @@ docker-down:
 # Build a single-arch image for local use that matches the CI layout. The
 # Dockerfile expects a binary at dist/linux-<arch>/arcade; this target produces
 # that layout for the host's architecture and tags the image arcade:local.
+# Requires a Linux host: CGO + gobdk's per-platform static archive cannot
+# cross-compile to linux, so building the binary off-Linux would fail.
 docker-build:
+	@if [ "$$(go env GOOS)" != "linux" ]; then \
+		echo "docker-build requires a Linux host: CGO + gobdk cannot cross-compile a linux binary from $$(go env GOOS). Run on Linux or inside a Linux container."; \
+		exit 1; \
+	fi
 	mkdir -p dist/linux-$(GOARCH)
 	CGO_ENABLED=1 GOOS=linux GOARCH=$(GOARCH) go build -trimpath -ldflags="-s -w" -o dist/linux-$(GOARCH)/arcade ./cmd/arcade
 	docker build --platform=linux/$(GOARCH) -t arcade:local .

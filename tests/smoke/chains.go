@@ -35,9 +35,9 @@ type ChainOpts struct {
 // populate the propagation envelope's input_txids field.
 //
 // Callers MUST serialize each tx via tx.ExtendedBytes() before posting
-// to arcade — the validator's spv.Verify call reads the per-input
-// PreviousTxScript + PreviousTxSatoshis the EF wire encoding carries,
-// and rejects standard-format txs with "'PreviousTx' not supplied".
+// to arcade — the validator reads the per-input PreviousTxScript +
+// PreviousTxSatoshis the EF wire encoding carries to build the extended
+// tx that BDK validates, and rejects standard-format txs that omit it.
 // See validator/validator.go:ValidateTransaction and PR #171.
 //
 // The returned slice is shaped [chain][tx-in-chain]; flatten as needed.
@@ -100,16 +100,13 @@ func newValidatableTx(prevTxID []byte, prevOutputIdx, nonce uint32) *bt.Tx {
 	_ = input.PreviousTxIDAdd(asChainHash(prevTxID))
 	input.PreviousTxOutIndex = prevOutputIdx
 	input.PreviousTxScript = opTrueScript()
-	// Generous source-satoshi budget so the fee check (now enabled by
-	// the validator's spv.Verify call) has plenty of headroom: with a
-	// 1-sat output this leaves 9999 sats of fee against a ~62-byte tx,
-	// far above any plausible MinFeePerKB. Mirror the e2e harness's
-	// BuildValidatableTxs which raised this from 1000 → 10000 when
-	// PR #171 tightened the validator.
+	// Generous source-satoshi budget so the validator's fee check has
+	// plenty of headroom: with a 1-sat output this leaves 9999 sats of
+	// fee against a ~62-byte tx, far above any plausible MinFeePerKB.
+	// Mirror the e2e harness's BuildValidatableTxs which raised this from
+	// 1000 → 10000 when PR #171 tightened the validator.
 	input.PreviousTxSatoshis = 10000
-	// OP_0 (single byte 0x00) is the smallest push-only, non-empty
-	// unlocking script. arcade's pushDataCheck rejects empty unlocking
-	// scripts (ErrEmptyUnlockingScript / ErrUnlockingScriptNotPushOnly).
+	// OP_0 (single byte 0x00) is the smallest non-empty unlocking script.
 	// The empty byte string OP_0 pushes is popped by the OP_DROP in
 	// opTrueScript, so OP_TRUE leaves a single truthy element on a clean
 	// stack — required by the BDK validator's CLEANSTACK rule.
@@ -132,21 +129,17 @@ func asChainHash(b []byte) *chainhash.Hash {
 // script (minimalPushScript) the full evaluation is OP_0 OP_DROP OP_TRUE: the
 // empty push is dropped and OP_TRUE leaves a single truthy element on a clean
 // stack, which the BDK validator's post-Genesis CLEANSTACK rule requires (a
-// bare OP_TRUE would leave two elements and be rejected). arcade's validator
-// classifies it as non-data so checkInputs and checkOutputs both accept it, and
-// non-standard scripts are fine because the validator runs RequireStandard=false.
+// bare OP_TRUE would leave two elements and be rejected). The script is
+// non-standard, which the BDK validator accepts because it runs with
+// RequireStandard=false.
 func opTrueScript() *bscript.Script {
 	s := bscript.Script([]byte{0x75, 0x51})
 	return &s
 }
 
-// minimalPushScript is a single-byte OP_0 (0x00) push, the smallest
-// push-only script that's non-empty. arcade's policy pushDataCheck
-// requires the unlocking script to be push-only, and go-sdk's
-// SatoshisPerKilobyte fee model rejects inputs with an empty unlocking
-// script (ErrNoUnlockingScript) because it can't size the witness.
-// OP_0 pushes an empty byte string that the OP_DROP in opTrueScript pops back
-// off, leaving a clean stack — see opTrueScript. Mirrors
+// minimalPushScript is a single-byte OP_0 (0x00) push, the smallest non-empty
+// unlocking script. OP_0 pushes an empty byte string that the OP_DROP in
+// opTrueScript pops back off, leaving a clean stack — see opTrueScript. Mirrors
 // tests/e2e/harness/txbuilder.go:minimalPushScript.
 func minimalPushScript() *bscript.Script {
 	s := bscript.Script([]byte{0x00})

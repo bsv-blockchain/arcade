@@ -20,20 +20,17 @@ import (
 // truthy element, so the stack is clean. The BDK validator enforces the
 // post-Genesis CLEANSTACK rule (exactly one truthy element must remain after
 // execution), which a bare OP_TRUE paired with OP_0 would violate (it leaves
-// two elements). It is non-data so checkOutputs accepts it, and non-standard
-// scripts are fine because the validator runs with RequireStandard=false.
+// two elements). The script is non-standard, which the BDK validator accepts
+// because it runs with RequireStandard=false.
 func nonDataScript() *bscript.Script {
 	s := bscript.Script([]byte{0x75, 0x51})
 	return &s
 }
 
-// minimalPushScript is a single-byte OP_0 push, the smallest push-only
-// script that's non-empty. arcade's policy pushDataCheck requires the
-// unlocking script to be push-only, and go-sdk's SatoshisPerKilobyte
-// fee model rejects inputs with an empty unlocking script
-// (ErrNoUnlockingScript) because it can't size the witness. OP_0 pushes an
-// empty byte string that the OP_DROP in nonDataScript pops back off, leaving a
-// clean stack — see nonDataScript for why the drop is required.
+// minimalPushScript is a single-byte OP_0 push, the smallest non-empty
+// unlocking script. OP_0 pushes an empty byte string that the OP_DROP in
+// nonDataScript pops back off, leaving a clean stack — see nonDataScript for
+// why the drop is required.
 func minimalPushScript() *bscript.Script {
 	s := bscript.Script([]byte{0x00})
 	return &s
@@ -78,10 +75,10 @@ func BuildTxs(n int, startNonce uint32) []*bt.Tx {
 // fee check; merkle proofs on parents are trusted). Each tx has:
 //
 //   - One input pointing at a non-zero source txid + OP_DROP OP_TRUE
-//     locking script + 10_000 satoshis (passes checkInputs as
-//     non-coinbase and covers the fee floor by a wide margin).
-//   - One output with OP_DROP OP_TRUE locking script + 1 satoshi (passes
-//     checkOutputs; remaining ~9999 sats become fee).
+//     locking script + 10_000 satoshis (non-coinbase, covering the fee
+//     floor by a wide margin).
+//   - One output with OP_DROP OP_TRUE locking script + 1 satoshi
+//     (remaining ~9999 sats become fee).
 //   - LockTime = startNonce + i, ensuring each tx hashes differently.
 //
 // The OP_0 unlocking script + OP_DROP OP_TRUE locking script evaluate to a

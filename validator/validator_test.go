@@ -222,10 +222,12 @@ func TestValidate_ChronicleVersionGate(t *testing.T) {
 }
 
 // TestValidate_FeeTooLow confirms an underpaid transaction is rejected with the
-// fee status. The output consumes all but 1 satoshi of a large input across a
-// padded transaction, so the fee is below the 100 sat/kB floor.
+// fee status. The validator is built with a deliberately high fee floor so the
+// 1-satoshi fee (a 100_000-sat input spent to a 99_999-sat output) is
+// unambiguously below it regardless of BDK's default fee policy.
 func TestValidate_FeeTooLow(t *testing.T) {
-	v := NewValidator(nil)
+	highFee := uint64(1_000_000) // 1M sat/kB — any realistic tx underpays.
+	v := NewValidator(&Policy{MinFeePerKB: &highFee})
 	in := spendableSource(nonPushUnlocking(), 100_000, []byte{script.OpTRUE})
 	tx := &sdkTx.Transaction{
 		Version: 2,
@@ -235,13 +237,13 @@ func TestValidate_FeeTooLow(t *testing.T) {
 
 	err := v.ValidateTransaction(context.Background(), tx, false)
 	if err == nil {
-		t.Skip("BDK accepted near-zero fee; min fee policy may differ from expectation")
+		t.Fatal("underpaid tx must be rejected with a fee error")
 	}
 	if arcErr := arcerrors.GetArcError(err); arcErr == nil || arcErr.StatusCode != arcerrors.StatusFees {
 		t.Errorf("expected StatusFees, got %v", err)
 	}
 
-	// skipFees must accept the same transaction.
+	// skipFees must accept the same transaction (tvNoFee ignores the floor).
 	if err := v.ValidateTransaction(context.Background(), tx, true); err != nil {
 		t.Errorf("skipFees should accept underpaid tx, got %v", err)
 	}
