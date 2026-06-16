@@ -409,49 +409,40 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	logger.Info("building compound BUMP", zap.Int("stump_count", len(stumps)))
 	logStumpInputs(logger, stumps)
 
-	// 2. Fetch subtree hashes + coinbase BUMP + header merkle root from datahub.
-	// Pull the live URL list from the shared teranode.Client so this picks up
-	// p2p-discovered URLs in addition to statically configured ones. Fall back
-	// to the full set if every endpoint is currently sidelined by the circuit
-	// breaker — better to retry against a sidelined URL than fail with zero
-	// attempts.
-	endpoints := b.teranode.GetHealthyEndpoints()
-	if len(endpoints) == 0 {
-		endpoints = b.teranode.GetEndpoints()
-	}
-	// Build a response validator from the STUMPs we already have. A datahub
-	// claiming fewer subtrees than max(stump.SubtreeIndex)+1 is provably
-	// wrong — without this guard, a pruned/lying peer's "200 OK" with a
-	// truncated subtree list poisons every retry until the message DLQs.
+	// 2. Obtain subtree hashes + coinbase BUMP + header merkle root. Prefer the
+	// enrichment fields merkle-service attaches to BLOCK_PROCESSED (issue #195):
+	// when present they are authoritative and let us build the compound BUMP
+	// with ZERO datahub calls, closing the pruned/poisoned-datahub failure
+	// class. Otherwise fall back to fetching the block from a datahub.
+	//
+	// minSubtrees = max(stump.SubtreeIndex)+1 is the floor any valid block
+	// representation must satisfy. It validates the datahub response (a peer
+	// claiming fewer subtrees is provably wrong) and likewise rejects a callback
+	// whose subtree list can't index every STUMP we already hold.
 	minSubtrees := 0
 	for _, s := range stumps {
 		if s.SubtreeIndex+1 > minSubtrees {
 			minSubtrees = s.SubtreeIndex + 1
 		}
 	}
-	validator := bump.SubtreeCountValidator(minSubtrees)
-	if b.chainHeader != nil {
-		validator = combineValidators(validator, b.chainHeaderRootValidator(ctx, blockHash, logger))
+
+	subtreeHashes, coinbaseBUMP, headerMerkleRoot, ok := callbackBlockData(&callback, minSubtrees, logger)
+	if ok {
+		metrics.BumpBuilderBlockDataSourceTotal.WithLabelValues("callback").Inc()
+		logger.Info(
+			"using merkle-service callback block data; skipping datahub fetch",
+			zap.Int("subtree_count", len(subtreeHashes)),
+		)
+	} else {
+		var fetchErr error
+		subtreeHashes, coinbaseBUMP, headerMerkleRoot, fetchErr = b.fetchBlockDataFromDatahub(ctx, blockHash, minSubtrees, logger)
+		if fetchErr != nil {
+			outcome = "fetch_failed"
+			return fmt.Errorf("fetching block data: %w", fetchErr)
+		}
+		metrics.BumpBuilderBlockDataSourceTotal.WithLabelValues("datahub").Inc()
 	}
 
-	logger.Debug(
-		"fetching block data from datahub",
-		zap.Strings("datahub_urls", endpoints),
-		zap.Int("min_subtrees", minSubtrees),
-	)
-	fetchStart := time.Now()
-	subtreeHashes, coinbaseBUMP, headerMerkleRoot, err := bump.FetchBlockDataForBUMPWithOptions(ctx, endpoints, blockHash, b.cfg.BumpBuilder.DataHubMaxBlockBytes, validator, logger)
-	metrics.BumpBuilderDatahubFetchDuration.Observe(time.Since(fetchStart).Seconds())
-	if err != nil {
-		outcome = "fetch_failed"
-		return fmt.Errorf("fetching block data: %w", err)
-	}
-	logger.Debug(
-		"datahub fetch succeeded",
-		zap.Int("subtree_count", len(subtreeHashes)),
-		zap.Bool("has_coinbase_bump", coinbaseBUMP != nil),
-		zap.Bool("has_header_merkle_root", headerMerkleRoot != nil),
-	)
 	logBlockInputs(logger, subtreeHashes, coinbaseBUMP)
 
 	if len(subtreeHashes) == 0 {
@@ -522,6 +513,116 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 		zap.Int("stumps_pruned", len(stumps)),
 	)
 	return nil
+}
+
+// fetchBlockDataFromDatahub is the datahub fallback for block inputs: used when
+// a BLOCK_PROCESSED callback carries no usable enrichment (older merkle-service,
+// or fields that failed callbackBlockData's consistency checks). It pulls the
+// live URL list from the shared teranode.Client — so p2p-discovered URLs are
+// included alongside statically configured ones — falling back to the full set
+// when every endpoint is currently sidelined by the circuit breaker (better to
+// retry a sidelined URL than fail with zero attempts).
+//
+// minSubtrees = max(stump.SubtreeIndex)+1 builds a response validator that
+// rejects any datahub claiming fewer subtrees than the STUMPs we already hold —
+// without it, a pruned/lying peer's "200 OK" with a truncated subtree list
+// poisons every retry until the message DLQs.
+func (b *Builder) fetchBlockDataFromDatahub(ctx context.Context, blockHash string, minSubtrees int, logger *zap.Logger) ([]chainhash.Hash, []byte, *chainhash.Hash, error) {
+	endpoints := b.teranode.GetHealthyEndpoints()
+	if len(endpoints) == 0 {
+		endpoints = b.teranode.GetEndpoints()
+	}
+	validator := bump.SubtreeCountValidator(minSubtrees)
+	if b.chainHeader != nil {
+		validator = combineValidators(validator, b.chainHeaderRootValidator(ctx, blockHash, logger))
+	}
+
+	logger.Debug(
+		"callback missing enrichment fields; fetching block data from datahub",
+		zap.Strings("datahub_urls", endpoints),
+		zap.Int("min_subtrees", minSubtrees),
+	)
+	fetchStart := time.Now()
+	subtreeHashes, coinbaseBUMP, headerMerkleRoot, err := bump.FetchBlockDataForBUMPWithOptions(ctx, endpoints, blockHash, b.cfg.BumpBuilder.DataHubMaxBlockBytes, validator, logger)
+	metrics.BumpBuilderDatahubFetchDuration.Observe(time.Since(fetchStart).Seconds())
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	logger.Debug(
+		"datahub fetch succeeded",
+		zap.Int("subtree_count", len(subtreeHashes)),
+		zap.Bool("has_coinbase_bump", coinbaseBUMP != nil),
+		zap.Bool("has_header_merkle_root", headerMerkleRoot != nil),
+	)
+	return subtreeHashes, coinbaseBUMP, headerMerkleRoot, nil
+}
+
+// callbackBlockData extracts the datahub-independent block inputs from a
+// BLOCK_PROCESSED callback enriched by merkle-service (issue #195). It returns
+// ok=false — signalling the caller to fall back to the datahub fetch — when the
+// enrichment is absent or fails a consistency check. It never returns an error:
+// a missing or malformed enrichment must degrade to the existing datahub path,
+// not fail the block.
+//
+// merkleRoot and subtreeHashes arrive as display-order hex (same convention as
+// blockHash) and are decoded with chainhash.NewHashFromHex, which reverses
+// display->internal order to match the chainhash.Hash values the datahub binary
+// parser produces (it uses chainhash.NewHash on raw, already-internal bytes).
+// coinbaseBump is the hex of the raw BRC-74 bytes and is used as-is — the same
+// []byte BuildCompoundBUMP / NewMerklePathFromBinary expect.
+//
+// All three of merkleRoot, subtreeHashes and coinbaseBump are required:
+// merkleRoot to validate the assembled compound against, subtreeHashes to seed
+// the block-level tree, and coinbaseBump to correct subtreeHashes[0] (the
+// canonical subtree-0 root is computed against the coinbase placeholder, so
+// without the coinbase path the assembled root never matches the header root).
+//
+// minSubtrees is max(stump.SubtreeIndex)+1: a callback whose subtree list can't
+// index every STUMP we already hold is provably inconsistent, so we reject it
+// and let the datahub path (with its own validators) try instead.
+func callbackBlockData(callback *models.CallbackMessage, minSubtrees int, logger *zap.Logger) (subtreeHashes []chainhash.Hash, coinbaseBUMP []byte, headerMerkleRoot *chainhash.Hash, ok bool) {
+	if callback.MerkleRoot == "" || len(callback.SubtreeHashes) == 0 || len(callback.CoinbaseBUMP) == 0 {
+		return nil, nil, nil, false
+	}
+
+	if callback.SubtreeCount != 0 && callback.SubtreeCount != len(callback.SubtreeHashes) {
+		logger.Warn(
+			"callback subtreeCount disagrees with subtreeHashes length; falling back to datahub",
+			zap.Int("subtree_count", callback.SubtreeCount),
+			zap.Int("subtree_hashes", len(callback.SubtreeHashes)),
+		)
+		return nil, nil, nil, false
+	}
+
+	if len(callback.SubtreeHashes) < minSubtrees {
+		logger.Warn(
+			"callback subtreeHashes can't index every held STUMP; falling back to datahub",
+			zap.Int("subtree_hashes", len(callback.SubtreeHashes)),
+			zap.Int("min_subtrees", minSubtrees),
+		)
+		return nil, nil, nil, false
+	}
+
+	root, err := chainhash.NewHashFromHex(callback.MerkleRoot)
+	if err != nil {
+		logger.Warn("callback merkleRoot is not valid hex; falling back to datahub", zap.Error(err))
+		return nil, nil, nil, false
+	}
+
+	hashes := make([]chainhash.Hash, len(callback.SubtreeHashes))
+	for i, h := range callback.SubtreeHashes {
+		sh, hErr := chainhash.NewHashFromHex(h)
+		if hErr != nil {
+			logger.Warn(
+				"callback subtreeHash is not valid hex; falling back to datahub",
+				zap.Int("index", i), zap.Error(hErr),
+			)
+			return nil, nil, nil, false
+		}
+		hashes[i] = *sh
+	}
+
+	return hashes, []byte(callback.CoinbaseBUMP), root, true
 }
 
 // tryShortCircuit attempts the BUMP-already-exists redelivery path. Returns

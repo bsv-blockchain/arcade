@@ -22,6 +22,31 @@ type CallbackMessage struct {
 	BlockHash    string       `json:"blockHash,omitempty"`
 	SubtreeIndex int          `json:"subtreeIndex,omitempty"`
 	Stump        HexBytes     `json:"stump,omitempty"`
+
+	// The following fields enrich BLOCK_PROCESSED so a consumer can build and
+	// validate a compound BUMP without fetching the block from a datahub. They
+	// are populated by merkle-service >= v0.2.4 and are all additive +
+	// omitempty: an older producer (or one that couldn't build them) omits
+	// them, and bump-builder falls back to the datahub fetch. See issue #195.
+
+	// MerkleRoot is the canonical block-header merkle root in DISPLAY-order hex
+	// (same convention as BlockHash). Decode with chainhash.NewHashFromHex,
+	// which reverses display->internal order — NOT HexBytes, which does not
+	// reverse.
+	MerkleRoot string `json:"merkleRoot,omitempty"`
+	// SubtreeCount is the canonical number of subtrees in the block.
+	SubtreeCount int `json:"subtreeCount,omitempty"`
+	// SubtreeHashes are the canonical, coinbase-placeholder-based subtree roots
+	// in subtree-index order, DISPLAY-order hex (same decoding as MerkleRoot).
+	// subtreeHashes[0] is still corrected from the coinbase BUMP inside
+	// BuildCompoundBUMP.
+	SubtreeHashes []string `json:"subtreeHashes,omitempty"`
+	// CoinbaseBUMP is a BRC-74 merkle path of the coinbase transaction up to the
+	// block merkle root — a drop-in replacement for the coinbase BUMP arcade
+	// otherwise parses out of the datahub binary response. It is the hex of the
+	// raw BRC-74 bytes, so HexBytes (a plain, non-reversing hex decode) is the
+	// correct type here.
+	CoinbaseBUMP HexBytes `json:"coinbaseBump,omitempty"`
 }
 
 // ResolveSeenTxIDs returns the list of txids from either the batched TxIDs
