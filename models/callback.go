@@ -47,6 +47,19 @@ type CallbackMessage struct {
 	// raw BRC-74 bytes, so HexBytes (a plain, non-reversing hex decode) is the
 	// correct type here.
 	CoinbaseBUMP HexBytes `json:"coinbaseBump,omitempty"`
+
+	// ExpectedSubtreeIndices is the set of subtree indices (ascending) that
+	// produced a STUMP for THIS callback URL in THIS block, as computed by
+	// merkle-service (merkle PR #162). STUMPs are sparse — only a subtree
+	// containing a tracked tx produces one — so without this set arcade cannot
+	// tell a lost STUMP from a legitimately-absent one, and a partial set would
+	// build a compound BUMP that validates while silently dropping the missing
+	// subtree's txs. bump-builder compares this against the STUMPs it actually
+	// stored and defers finalization (leaving processed_at NULL for watchdog
+	// /reprocess recovery) when any are missing. Additive + omitempty: an empty
+	// or absent set means "expect zero STUMPs" — the pre-#162 merkle case and
+	// the legitimate no-tracked-tx block both finalize exactly as before.
+	ExpectedSubtreeIndices []int `json:"expectedSubtreeIndices,omitempty"`
 }
 
 // ResolveSeenTxIDs returns the list of txids from either the batched TxIDs

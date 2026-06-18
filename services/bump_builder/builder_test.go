@@ -50,12 +50,14 @@ type mockStore struct {
 	minedCalls       []minedCall
 	deletedBlocks    []string
 	bumpBuiltCalls   []bumpBuiltCall
+	processedCalls   []bumpBuiltCall
 	getStumpsErr     error
 	insertBUMPErr    error
 	insertStumpErr   error
 	setMinedErr      error
 	deleteStumpsErr  error
 	markBumpBuiltErr error
+	markProcessedErr error
 
 	// Janitor fixtures: tipHeight feeds GetActiveTipBlockHeight; blockProc
 	// feeds ListBlockProcessingStatus. Both default empty so existing tests
@@ -218,6 +220,20 @@ func (m *mockStore) MarkBlockBUMPBuilt(_ context.Context, blockHash string, bloc
 	return nil
 }
 
+// MarkBlockProcessed records the call so tests can assert that bump-builder —
+// not the HTTP handler — stamps processed_at, and only on a finalized block.
+// markProcessedErr injects a failure to verify the soft-fail (warn + continue)
+// path that the watchdog backstops.
+func (m *mockStore) MarkBlockProcessed(_ context.Context, blockHash string, blockHeight uint64, _ time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.markProcessedErr != nil {
+		return m.markProcessedErr
+	}
+	m.processedCalls = append(m.processedCalls, bumpBuiltCall{blockHash: blockHash, blockHeight: blockHeight})
+	return nil
+}
+
 func (m *mockStore) addStump(blockHash string, subtreeIndex int, stumpData []byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -235,6 +251,25 @@ func makeBlockProcessedMsg(blockHash string) *kafka.Message {
 	callback := models.CallbackMessage{
 		Type:      models.CallbackBlockProcessed,
 		BlockHash: blockHash,
+	}
+	data, err := json.Marshal(callback)
+	if err != nil {
+		panic(err)
+	}
+	return &kafka.Message{
+		Topic: "arcade.block_processed",
+		Value: data,
+	}
+}
+
+// makeBlockProcessedMsgWithExpected is makeBlockProcessedMsg plus the merkle
+// expected-STUMP index set (PR #162), so completeness-gate tests can pin which
+// subtrees merkle says should have produced a STUMP for this block.
+func makeBlockProcessedMsgWithExpected(blockHash string, expected []int) *kafka.Message {
+	callback := models.CallbackMessage{
+		Type:                   models.CallbackBlockProcessed,
+		BlockHash:              blockHash,
+		ExpectedSubtreeIndices: expected,
 	}
 	data, err := json.Marshal(callback)
 	if err != nil {
@@ -590,6 +625,13 @@ func TestBuilder_HandleMessage_ShortCircuit_BUMPAlreadyExists(t *testing.T) {
 	if len(got.txids) != 1 || got.txids[0] != testTxidHex {
 		t.Errorf("mined txids=%v want [%q]", got.txids, testTxidHex)
 	}
+
+	// The short-circuit must stamp processed_at: the typical trigger is the
+	// watchdog re-firing BLOCK_PROCESSED for a built-but-unstamped block, and
+	// without this stamp the block would loop in the watchdog forever.
+	if len(ms.processedCalls) != 1 || ms.processedCalls[0].blockHash != blockHash {
+		t.Errorf("short-circuit must stamp MarkBlockProcessed(%s), got %+v", blockHash, ms.processedCalls)
+	}
 }
 
 // TestBuilder_PruneOrphanStumps_DeletesAfterSuccess verifies the startup
@@ -682,6 +724,188 @@ func TestBuilder_HandleMessage_HappyPath_SingleSubtree(t *testing.T) {
 	// Verify the block-processing observability row was updated.
 	if len(ms.bumpBuiltCalls) != 1 || ms.bumpBuiltCalls[0].blockHash != blockHash {
 		t.Errorf("expected MarkBlockBUMPBuilt(%s), got %+v", blockHash, ms.bumpBuiltCalls)
+	}
+
+	// Finalization: bump-builder (not the HTTP handler) now owns the
+	// processed_at stamp, and must set it on a fully-built block.
+	if len(ms.processedCalls) != 1 || ms.processedCalls[0].blockHash != blockHash {
+		t.Errorf("expected MarkBlockProcessed(%s) on a finalized block, got %+v", blockHash, ms.processedCalls)
+	}
+}
+
+// TestBuilder_HandleMessage_ProcessedStampSoftFails_SelfHealsOnRedelivery
+// verifies the recovery contract for a transient store error while stamping
+// processed_at on a successful build: the build still completes (BUMP stored,
+// txs MINED) but processed_at stays NULL, so the block remains in the watchdog's
+// stale scan. When the watchdog re-drives BLOCK_PROCESSED, the short-circuit
+// finds the existing BUMP and re-stamps processed_at — the block self-heals
+// rather than wedging.
+func TestBuilder_HandleMessage_ProcessedStampSoftFails_SelfHealsOnRedelivery(t *testing.T) {
+	ms := newMockStore()
+	blockHash := testBlockHash
+	txidHex := testTxidHex
+
+	stumpData := makeMinimalSTUMP(txidHex)
+	ms.addStump(blockHash, 0, stumpData)
+	subtreeHash := mustHash(t, txidHex)
+	root := expectedCompoundRoot(t,
+		[]*models.Stump{{BlockHash: blockHash, SubtreeIndex: 0, StumpData: stumpData}},
+		[]chainhash.Hash{subtreeHash}, nil)
+	datahub := newDatahubServer(root, []chainhash.Hash{subtreeHash})
+	defer datahub.Close()
+
+	b := newTestBuilder(ms, datahub.URL)
+
+	// First delivery: the processed_at stamp fails transiently.
+	ms.markProcessedErr = errors.New("store down")
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsgWithExpected(blockHash, []int{0})); err != nil {
+		t.Fatalf("a soft processed_at failure must not fail the build, got: %v", err)
+	}
+	ms.mu.Lock()
+	if _, ok := ms.bumps[blockHash]; !ok {
+		t.Error("BUMP should be stored even though the processed_at stamp failed")
+	}
+	if len(ms.processedCalls) != 0 {
+		t.Errorf("processed_at must remain unstamped after a soft failure, got %+v", ms.processedCalls)
+	}
+	ms.mu.Unlock()
+
+	// Watchdog re-drives BLOCK_PROCESSED; the store has recovered. The
+	// short-circuit must find the existing BUMP and re-stamp processed_at.
+	ms.markProcessedErr = nil
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsgWithExpected(blockHash, []int{0})); err != nil {
+		t.Fatalf("redelivery short-circuit returned error: %v", err)
+	}
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if len(ms.processedCalls) != 1 || ms.processedCalls[0].blockHash != blockHash {
+		t.Errorf("short-circuit must re-stamp MarkBlockProcessed(%s) on redelivery, got %+v", blockHash, ms.processedCalls)
+	}
+}
+
+// TestBuilder_HandleMessage_IncompleteExpectedSet_DefersFinalization is the
+// core of the silent-loss fix: merkle says subtrees {0,1,2} should each have a
+// STUMP, but only {0,2} arrived. The block must NOT be finalized — no BUMP, no
+// processed_at stamp — so the watchdog can recover it via /reprocess. Returns
+// nil (not an error) so Kafka doesn't replay against the same gap.
+func TestBuilder_HandleMessage_IncompleteExpectedSet_DefersFinalization(t *testing.T) {
+	ms := newMockStore()
+	blockHash := testBlockHash
+
+	// Store STUMPs for subtrees 0 and 2 only; merkle expected 0, 1, 2.
+	ms.addStump(blockHash, 0, makeMinimalSTUMP(testTxidHex))
+	ms.addStump(blockHash, 2, makeMinimalSTUMP(testTxidHex))
+
+	// No datahub server, teranode nil: if the builder wrongly proceeds to build,
+	// it crashes on the fetch path — which would itself fail the test.
+	b := &Builder{
+		cfg:    &config.Config{},
+		logger: zap.NewNop().Named("bump-builder"),
+		store:  ms,
+	}
+
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsgWithExpected(blockHash, []int{0, 1, 2})); err != nil {
+		t.Fatalf("incomplete-set handleMessage must return nil (watchdog recovers), got: %v", err)
+	}
+
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if len(ms.bumps) != 0 {
+		t.Errorf("no BUMP should be built for an incomplete block, got %d", len(ms.bumps))
+	}
+	if len(ms.processedCalls) != 0 {
+		t.Errorf("processed_at must NOT be stamped for an incomplete block (watchdog recovery depends on it), got %+v", ms.processedCalls)
+	}
+}
+
+// TestBuilder_HandleMessage_IndexMismatchSameCount_Incomplete proves the gate
+// compares set membership, not counts: merkle expected {0,2}, but the stored
+// STUMPs are {0,3} — same count, yet subtree 2 is genuinely missing (and the
+// extra 3 must not mask it).
+func TestBuilder_HandleMessage_IndexMismatchSameCount_Incomplete(t *testing.T) {
+	ms := newMockStore()
+	blockHash := testBlockHash
+
+	ms.addStump(blockHash, 0, makeMinimalSTUMP(testTxidHex))
+	ms.addStump(blockHash, 3, makeMinimalSTUMP(testTxidHex))
+
+	b := &Builder{
+		cfg:    &config.Config{},
+		logger: zap.NewNop().Named("bump-builder"),
+		store:  ms,
+	}
+
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsgWithExpected(blockHash, []int{0, 2})); err != nil {
+		t.Fatalf("count-equal index-mismatch must return nil, got: %v", err)
+	}
+
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if len(ms.bumps) != 0 || len(ms.processedCalls) != 0 {
+		t.Errorf("count-equal but index-mismatched set must be treated as incomplete; bumps=%d processed=%d", len(ms.bumps), len(ms.processedCalls))
+	}
+}
+
+// TestBuilder_HandleMessage_CompleteExpectedSet_Finalizes is the happy path with
+// the expected set fully satisfied: merkle expected {0}, subtree 0's STUMP is
+// present, so the BUMP builds and processed_at is stamped.
+func TestBuilder_HandleMessage_CompleteExpectedSet_Finalizes(t *testing.T) {
+	ms := newMockStore()
+	blockHash := testBlockHash
+	txidHex := testTxidHex
+
+	stumpData := makeMinimalSTUMP(txidHex)
+	ms.addStump(blockHash, 0, stumpData)
+
+	subtreeHash := mustHash(t, txidHex)
+	root := expectedCompoundRoot(t,
+		[]*models.Stump{{BlockHash: blockHash, SubtreeIndex: 0, StumpData: stumpData}},
+		[]chainhash.Hash{subtreeHash}, nil)
+	datahub := newDatahubServer(root, []chainhash.Hash{subtreeHash})
+	defer datahub.Close()
+
+	b := newTestBuilder(ms, datahub.URL)
+
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsgWithExpected(blockHash, []int{0})); err != nil {
+		t.Fatalf("complete-set handleMessage returned error: %v", err)
+	}
+
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if _, ok := ms.bumps[blockHash]; !ok {
+		t.Error("expected BUMP to be stored for a complete block")
+	}
+	if len(ms.processedCalls) != 1 || ms.processedCalls[0].blockHash != blockHash {
+		t.Errorf("expected MarkBlockProcessed(%s) on a complete block, got %+v", blockHash, ms.processedCalls)
+	}
+}
+
+// TestBuilder_HandleMessage_EmptyExpectedSet_ZeroStumps_Finalizes covers the
+// pre-#162 merkle case and the legitimate no-tracked-tx block: an empty/absent
+// expected set with zero stored STUMPs must finalize (stamp processed_at) so the
+// watchdog doesn't endlessly re-drive a complete block.
+func TestBuilder_HandleMessage_EmptyExpectedSet_ZeroStumps_Finalizes(t *testing.T) {
+	ms := newMockStore()
+	blockHash := testBlockHash
+
+	b := &Builder{
+		cfg:    &config.Config{},
+		logger: zap.NewNop().Named("bump-builder"),
+		store:  ms,
+	}
+
+	// No expected set, no STUMPs — exactly today's behavior, plus the stamp.
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash)); err != nil {
+		t.Fatalf("empty-set zero-stump handleMessage returned error: %v", err)
+	}
+
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if len(ms.bumps) != 0 {
+		t.Errorf("no BUMP should be built with zero STUMPs, got %d", len(ms.bumps))
+	}
+	if len(ms.processedCalls) != 1 || ms.processedCalls[0].blockHash != blockHash {
+		t.Errorf("a no-tracked-tx block IS finalized — expected MarkBlockProcessed(%s), got %+v", blockHash, ms.processedCalls)
 	}
 }
 
