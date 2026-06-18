@@ -909,6 +909,58 @@ func TestBuilder_HandleMessage_EmptyExpectedSet_ZeroStumps_Finalizes(t *testing.
 	}
 }
 
+// TestBuilder_HandleMessage_FieldAbsentFromWire_BuildsNormally is the
+// old-merkle regression guard. It feeds a raw BLOCK_PROCESSED payload with the
+// expectedSubtreeIndices key ENTIRELY ABSENT — the exact wire format a
+// merkle-service older than PR #162 emits — rather than relying on Go's
+// omitempty marshalling. A block with tracked txs must still build its compound
+// BUMP and finalize (stamp processed_at) exactly as before: an absent field
+// decodes to a nil slice, the completeness gate is inert, and arcade neither
+// crashes nor defers. This pins the graceful-degradation contract so a future
+// change can't accidentally make the expected set load-bearing for decode.
+func TestBuilder_HandleMessage_FieldAbsentFromWire_BuildsNormally(t *testing.T) {
+	ms := newMockStore()
+	blockHash := testBlockHash
+	txidHex := testTxidHex
+
+	stumpData := makeMinimalSTUMP(txidHex)
+	ms.addStump(blockHash, 0, stumpData)
+	subtreeHash := mustHash(t, txidHex)
+	root := expectedCompoundRoot(t,
+		[]*models.Stump{{BlockHash: blockHash, SubtreeIndex: 0, StumpData: stumpData}},
+		[]chainhash.Hash{subtreeHash}, nil)
+	datahub := newDatahubServer(root, []chainhash.Hash{subtreeHash})
+	defer datahub.Close()
+
+	b := newTestBuilder(ms, datahub.URL)
+
+	// Hand-built wire bytes with NO expectedSubtreeIndices key — what pre-#162
+	// merkle sends. Document the decode contract: the absent key yields a nil
+	// slice, never an error.
+	rawWire := []byte(`{"type":"BLOCK_PROCESSED","blockHash":"` + blockHash + `"}`)
+	var decoded models.CallbackMessage
+	if err := json.Unmarshal(rawWire, &decoded); err != nil {
+		t.Fatalf("pre-#162 wire format must decode cleanly, got: %v", err)
+	}
+	if decoded.ExpectedSubtreeIndices != nil {
+		t.Fatalf("absent field must decode to nil, got %v", decoded.ExpectedSubtreeIndices)
+	}
+
+	msg := &kafka.Message{Topic: "arcade.block_processed", Value: rawWire}
+	if err := b.handleMessage(context.Background(), msg); err != nil {
+		t.Fatalf("old-merkle BLOCK_PROCESSED must build normally, got: %v", err)
+	}
+
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if _, ok := ms.bumps[blockHash]; !ok {
+		t.Error("expected BUMP to be built for an old-merkle (field-absent) block")
+	}
+	if len(ms.processedCalls) != 1 || ms.processedCalls[0].blockHash != blockHash {
+		t.Errorf("old-merkle block must finalize as before — expected MarkBlockProcessed(%s), got %+v", blockHash, ms.processedCalls)
+	}
+}
+
 func TestBuilder_HandleMessage_BumpBuiltStoreError_StillSucceeds(t *testing.T) {
 	ms := newMockStore()
 	ms.markBumpBuiltErr = errors.New("store down")
