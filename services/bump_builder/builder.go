@@ -393,6 +393,29 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	}
 
 	metrics.BumpBuilderStumpCount.Observe(float64(len(stumps)))
+
+	// Completeness gate. merkle-service (PR #162) tells us exactly which subtree
+	// indices produced a STUMP for this block. If any are still missing once the
+	// grace window has elapsed, leave the block un-finalized: do NOT stamp
+	// processed_at, so ListStaleBlockProcessingStatus surfaces it and the
+	// watchdog re-drives it via /reprocess (which re-emits the missing STUMPs and
+	// BLOCK_PROCESSED). Returning nil — not an error — because a Kafka requeue
+	// would just replay against the same gap; only /reprocess can fill it, and
+	// the durable processed_at IS NULL is the recovery signal. An empty/absent
+	// expected set (pre-#162 merkle, or a block with no tracked txs) yields no
+	// missing indices and falls through to the existing behavior below.
+	if missing := missingStumpIndices(callback.ExpectedSubtreeIndices, stumps); len(missing) > 0 {
+		outcome = "incomplete_stumps"
+		metrics.BumpBuilderIncompleteStumpsTotal.Inc()
+		logger.Error(
+			"BLOCK_PROCESSED is missing expected STUMPs — deferring finalization so the watchdog can recover via /reprocess",
+			zap.Ints("missing_subtree_indices", missing),
+			zap.Int("expected_stumps", len(callback.ExpectedSubtreeIndices)),
+			zap.Int("received_stumps", len(stumps)),
+		)
+		return nil
+	}
+
 	if len(stumps) == 0 {
 		outcome = "no_stumps"
 		metrics.BumpBuilderEmptyStumpBlocksTotal.Inc()
@@ -402,7 +425,15 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 		// need to see this rate in logs; a sustained stream while watched
 		// txs are in flight is the signal that merkle-service callbacks
 		// aren't landing.
+		//
+		// Reaching here means the expected set was empty (a non-empty set with
+		// zero received STUMPs would have been caught by the completeness gate
+		// above), so this block has no tracked txs and IS finalized — stamp
+		// processed_at so the watchdog doesn't keep re-driving a complete block.
+		// blockHeight is unknown on this path (no compound built); pass 0, which
+		// the upsert leaves the chaintracks-supplied height intact on conflict.
 		logger.Warn("BLOCK_PROCESSED arrived with zero STUMPs for this block — either no tracked txs in this block, or upstream STUMP callbacks were dropped (check merkle-service callback delivery)")
+		b.markBlockProcessed(ctx, logger, blockHash, 0)
 		return nil
 	}
 
@@ -484,6 +515,13 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	if err := b.store.MarkBlockBUMPBuilt(ctx, blockHash, blockHeight, time.Now()); err != nil {
 		logger.Warn("failed to record bump_built status", zap.Error(err))
 	}
+
+	// Finalize: the BUMP is built and validated and every expected STUMP was
+	// present, so stamp processed_at. This (not the HTTP handler) is now the
+	// sole owner of the stamp — see handleBlockProcessed. A soft failure here is
+	// self-healing: processed_at stays NULL, the watchdog re-drives the block,
+	// and tryShortCircuit re-stamps it on the redelivered BLOCK_PROCESSED.
+	b.markBlockProcessed(ctx, logger, blockHash, blockHeight)
 
 	// 6. Set tracked transactions to MINED.
 	// blockHeight is threaded through here (and asserted on the returned
@@ -667,6 +705,14 @@ func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, block
 	if len(txids) > 0 {
 		b.markMinedAndPublish(ctx, logger, blockHash, existingHeight, txids)
 	}
+	// Stamp processed_at on the redelivery too. The typical short-circuit
+	// trigger IS the watchdog re-firing BLOCK_PROCESSED for a block whose BUMP
+	// was built but whose processed_at never got stamped (e.g. a crash between
+	// InsertBUMP and the stamp, or a soft stamp failure on the original build).
+	// Without re-stamping here that block would loop in the watchdog forever,
+	// since the stale query keys on processed_at IS NULL and a built block can
+	// never be re-detected as incomplete.
+	b.markBlockProcessed(ctx, logger, blockHash, existingHeight)
 	// STUMP rows for this block should already have been pruned at the end
 	// of the original build; ensure stragglers are cleared in case a STUMP
 	// arrived after pruning ran.
@@ -674,6 +720,56 @@ func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, block
 		logger.Warn("failed to clean up STUMPs on short-circuit", zap.Error(delErr))
 	}
 	return true
+}
+
+// markBlockProcessed stamps processed_at on the block-processing row — the
+// signal that arcade considers the block fully finalized (all expected STUMPs
+// present, BUMP built and validated, or a legitimate no-tracked-tx block). It
+// is the single chokepoint that moved out of the HTTP handler so that a block
+// stays recoverable (processed_at NULL) until finalization genuinely completes.
+//
+// Failure is soft by design: leaving processed_at NULL keeps the block in the
+// watchdog's stale scan, which re-drives it via /reprocess and re-stamps on the
+// short-circuit path — so a transient store error self-heals rather than
+// wedging the block. blockHeight may be 0 on the no-STUMP finalize path; the
+// MarkBlockProcessed upsert preserves any chaintracks-supplied height on
+// conflict and only writes processed_at.
+func (b *Builder) markBlockProcessed(ctx context.Context, logger *zap.Logger, blockHash string, blockHeight uint64) {
+	if err := b.store.MarkBlockProcessed(ctx, blockHash, blockHeight, time.Now()); err != nil {
+		// Include the block identity: a sustained stream of these is the signal
+		// that finalized blocks are looping through the watchdog (processed_at
+		// never lands), which an aggregator can only group by block hash.
+		logger.Warn(
+			"failed to record block_processed status; block will re-drive via watchdog until the stamp lands",
+			zap.String("block_hash", blockHash),
+			zap.Uint64("block_height", blockHeight),
+			zap.Error(err),
+		)
+	}
+}
+
+// missingStumpIndices returns the subtree indices merkle-service expected to
+// produce a STUMP for this block (callback.ExpectedSubtreeIndices) that are NOT
+// present among the STUMPs arcade actually stored, preserving the ascending
+// order merkle promises. An empty expected set — pre-#162 merkle, or a block
+// with no tracked txs — yields no missing indices, so the caller finalizes
+// normally. Comparison is by set membership, never count: a duplicate or extra
+// STUMP must never be able to mask a genuinely missing one.
+func missingStumpIndices(expected []int, stumps []*models.Stump) []int {
+	if len(expected) == 0 {
+		return nil
+	}
+	received := make(map[int]struct{}, len(stumps))
+	for _, s := range stumps {
+		received[s.SubtreeIndex] = struct{}{}
+	}
+	var missing []int
+	for _, idx := range expected {
+		if _, ok := received[idx]; !ok {
+			missing = append(missing, idx)
+		}
+	}
+	return missing
 }
 
 // levelZeroTxidsFromBUMP parses a stored compound BUMP and returns every

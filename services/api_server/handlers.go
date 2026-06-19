@@ -447,14 +447,25 @@ func (s *Server) handleBlockProcessed(c *gin.Context, msg models.CallbackMessage
 		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "blockHash is required"})
 		return
 	}
-	// Record the milestone for observability before enqueueing — this is
-	// load-bearing only for the /api/v1/blocks/processing-status surface,
-	// not for BUMP construction. The callback message currently carries no
-	// block height, so 0 is passed; UpsertBlockHeaderSeen on the chaintracks
-	// path is authoritative for height and will overwrite a 0 placeholder.
-	if err := s.store.MarkBlockProcessed(c.Request.Context(), msg.BlockHash, 0, time.Now()); err != nil {
-		logger.Warn("failed to record block_processed status", zap.Error(err))
-	}
+	// Do NOT stamp processed_at here. processed_at is the watchdog's
+	// recovery signal — a block_processing row with header_seen_at set (by the
+	// chaintracks UpsertBlockHeaderSeen path, which is authoritative for height)
+	// but processed_at NULL is what ListStaleBlockProcessingStatus picks up to
+	// re-drive via /reprocess. Stamping it the instant BLOCK_PROCESSED arrives
+	// (as this handler used to) blinds the watchdog to the silent partial-STUMP
+	// loss: bump-builder may receive an incomplete STUMP set and build a BUMP
+	// that drops the missing subtree's txs, yet processed_at would already be
+	// set so the block could never be recovered. Ownership of the stamp now
+	// belongs to bump-builder, which sets it only once the block is genuinely
+	// finalized (all expected STUMPs present and the BUMP built/validated).
+	//
+	// Recovery of a deferred (incomplete) block relies on the watchdog finding a
+	// block_processing row with processed_at NULL — which requires a real-height
+	// header_seen_at row from the chaintracks UpsertBlockHeaderSeen path (the
+	// watchdog's stale query filters on both header_seen_at and block_height, so
+	// the height-0 placeholder this handler used to write was never recoverable
+	// anyway). That chaintracks dependency is pre-existing and unchanged here;
+	// see services/watchdog.
 	if err := s.producer.Send(kafka.TopicBlockProcessed, msg.BlockHash, msg); err != nil {
 		logger.Error("failed to publish block_processed", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to enqueue"})

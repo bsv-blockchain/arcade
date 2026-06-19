@@ -285,10 +285,18 @@ func TestHandleGetBlockProcessingStatus_NotFound(t *testing.T) {
 	}
 }
 
-func TestHandleBlockProcessed_RecordsStatusBeforeKafka(t *testing.T) {
+// TestHandleBlockProcessed_EnqueuesWithoutStamping pins the consuming-side
+// contract introduced for merkle PR #162: the HTTP handler must NOT stamp
+// processed_at. processed_at is the watchdog's recovery signal, and bump-builder
+// is now its sole owner — it sets it only once the block is genuinely finalized
+// (all expected STUMPs present, BUMP built). Stamping here, as the handler used
+// to, blinds the watchdog to the silent partial-STUMP loss. The handler must
+// still enqueue BLOCK_PROCESSED for bump-builder to consume.
+func TestHandleBlockProcessed_EnqueuesWithoutStamping(t *testing.T) {
 	bs := newBlockProcStore()
-	srv, router := setupServerWithStoreAndBlockProc(t, bs)
-	_ = srv
+	broker := &kafka.RecordingBroker{}
+	srv, router := setupServerWithStore(broker, &bs.mockStore)
+	srv.store = bs
 
 	body := mustMarshalJSON(t, models.CallbackMessage{
 		Type:      models.CallbackBlockProcessed,
@@ -300,16 +308,23 @@ func TestHandleBlockProcessed_RecordsStatusBeforeKafka(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if len(bs.processedCalls) != 1 || bs.processedCalls[0] != "blk-1" {
-		t.Errorf("processedCalls=%v want [blk-1]", bs.processedCalls)
+	if len(bs.processedCalls) != 0 {
+		t.Errorf("handler must not stamp processed_at (bump-builder owns finalization), got processedCalls=%v", bs.processedCalls)
+	}
+	if len(broker.Sends) != 1 || broker.Sends[0].Topic != kafka.TopicBlockProcessed || broker.Sends[0].Key != "blk-1" {
+		t.Errorf("expected one BLOCK_PROCESSED enqueue keyed by block hash, got %+v", broker.Sends)
 	}
 }
 
-func TestHandleBlockProcessed_StoreErrorDoesNotFailRequest(t *testing.T) {
+// TestHandleBlockProcessed_KafkaErrorFailsRequest verifies the handler surfaces
+// an enqueue failure as a 500 so merkle-service retries — losing the
+// BLOCK_PROCESSED message would otherwise strand the block until the watchdog
+// notices.
+func TestHandleBlockProcessed_KafkaErrorFailsRequest(t *testing.T) {
 	bs := newBlockProcStore()
-	bs.markProcessedErr = errors.New("store down")
-	srv, router := setupServerWithStoreAndBlockProc(t, bs)
-	_ = srv
+	broker := &kafka.RecordingBroker{SendErr: errors.New("kafka down")}
+	srv, router := setupServerWithStore(broker, &bs.mockStore)
+	srv.store = bs
 
 	body := mustMarshalJSON(t, models.CallbackMessage{
 		Type:      models.CallbackBlockProcessed,
@@ -318,8 +333,8 @@ func TestHandleBlockProcessed_StoreErrorDoesNotFailRequest(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := authedCallbackRequest(t, body)
 	router.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Errorf("status=%d want 200 (store error must not fail request)", rec.Code)
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("status=%d want 500 when the BLOCK_PROCESSED enqueue fails", rec.Code)
 	}
 }
 

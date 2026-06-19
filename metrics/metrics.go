@@ -270,6 +270,20 @@ var BumpBuilderEmptyStumpBlocksTotal = promauto.NewCounter(prometheus.CounterOpt
 	Help: "BLOCK_PROCESSED messages handled with zero STUMPs in the store for the block.",
 })
 
+// BumpBuilderIncompleteStumpsTotal counts BLOCK_PROCESSED messages whose
+// merkle-supplied expected-STUMP set (CallbackMessage.ExpectedSubtreeIndices)
+// was NOT fully satisfied by the STUMPs arcade had stored once the grace window
+// elapsed. Such a block is deliberately left un-finalized (processed_at stays
+// NULL) so the watchdog re-drives it via merkle's /reprocess, which re-emits the
+// missing STUMPs and BLOCK_PROCESSED. This is the metric that makes the
+// previously-silent partial-STUMP drop visible: unlike the all-missing case
+// (empty_stump_blocks_total), a block missing only SOME of its STUMPs used to
+// build a valid-looking BUMP and lose the absent subtree's txs with no signal.
+var BumpBuilderIncompleteStumpsTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "arcade_bump_builder_incomplete_stumps_total",
+	Help: "BLOCK_PROCESSED messages left un-finalized because expected STUMPs were still missing after the grace window.",
+})
+
 // BumpBuilderShortCircuitTotal counts BLOCK_PROCESSED messages handled by the
 // short-circuit path — the BUMP already exists in the store and this is a
 // redelivery (typically from /reprocess re-emitting BLOCK_PROCESSED). Tracks
