@@ -23,6 +23,7 @@ import (
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/teranode"
+	"github.com/bsv-blockchain/arcade/version"
 )
 
 // collectInputTXIDs returns the parent txids referenced by every input of
@@ -167,18 +168,30 @@ func RenderDocs(w io.Writer) error {
 	return docsTmpl.Execute(w, docsPage{Routes: routeDocs})
 }
 
-// healthResponse is the schema of GET /health. The top-level "status":"ok"
-// preserves backwards compatibility with existing health checkers that
-// only grep the response for liveness. Chaintracks moved out of api-server
-// in the microservice decomposition — its health is now reported by the
-// standalone chaintracks pod's /health endpoint.
+// healthResponse is the schema of GET /health. The leading "healthy" bool and
+// "version" string are the ARC health contract (github.com/bitcoin-sv/arc) — ARC
+// clients deserialise against it and gate transaction submission on
+// healthy == true, so a missing field makes them reject an otherwise-healthy
+// node (issue #208). The top-level "status":"ok" and "datahub_urls" are retained
+// for backwards compatibility with existing health checkers. As a liveness
+// probe, "healthy" is always true here: if the process answers, it is alive —
+// per-endpoint Datahub health stays in datahub_urls[].healthy. Chaintracks moved
+// out of api-server in the microservice decomposition — its health is now
+// reported by the standalone chaintracks pod's /health endpoint.
 type healthResponse struct {
+	Healthy     bool                      `json:"healthy"`
+	Version     string                    `json:"version"`
 	Status      string                    `json:"status"`
 	DatahubURLs []teranode.EndpointStatus `json:"datahub_urls"`
 }
 
 func (s *Server) handleHealth(c *gin.Context) {
-	resp := healthResponse{Status: "ok", DatahubURLs: []teranode.EndpointStatus{}}
+	resp := healthResponse{
+		Healthy:     true,
+		Version:     version.Version,
+		Status:      "ok",
+		DatahubURLs: []teranode.EndpointStatus{},
+	}
 	if s.teranode != nil {
 		resp.DatahubURLs = s.teranode.GetEndpointStatuses()
 	}

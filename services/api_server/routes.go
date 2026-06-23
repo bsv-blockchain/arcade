@@ -69,7 +69,7 @@ var routeDocs = []RouteDoc{
 		Summary:        "Liveness probe",
 		Description:    "Reports liveness of the API server process and the upstream Datahub endpoints it depends on. Suitable as a Kubernetes liveness probe.",
 		ResponseStatus: "200 OK",
-		ResponseBody:   "{\n  \"status\": \"ok\",\n  \"datahub_urls\": [\n    { \"url\": \"https://...\", \"healthy\": true }\n  ]\n}",
+		ResponseBody:   "{\n  \"healthy\": true,\n  \"version\": \"v0.8.0\",\n  \"status\": \"ok\",\n  \"datahub_urls\": [\n    { \"url\": \"https://...\", \"healthy\": true }\n  ]\n}",
 	},
 	{
 		Method:         "GET",

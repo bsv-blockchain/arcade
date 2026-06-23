@@ -94,6 +94,8 @@ paths:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
               example:
+                healthy: true
+                version: v0.8.0
                 status: ok
                 datahub_urls:
                   - url: https://datahub.example.com
@@ -1254,6 +1256,14 @@ components:
     HealthResponse:
       type: object
       properties:
+        healthy:
+          type: boolean
+          description: ARC health contract — true whenever the process is live.
+          example: true
+        version:
+          type: string
+          description: Build version of the running arcade binary (git tag).
+          example: v0.8.0
         status:
           type: string
           example: ok
@@ -1262,6 +1272,8 @@ components:
           items:
             $ref: "#/components/schemas/EndpointStatus"
       required:
+        - healthy
+        - version
         - status
 
     EndpointStatus:
