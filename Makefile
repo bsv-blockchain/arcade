@@ -2,6 +2,10 @@
 
 GOARCH ?= $(shell go env GOARCH)
 
+# Version stamped into the binary (exposed via GET /health, issue #208). Derived
+# from the git tag; falls back to "dev" outside a tagged checkout.
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+
 # CGO is required: the transaction validator links the BSV BDK C++ consensus
 # library (gobdk) via cgo, so a C/C++ toolchain (gcc/g++, libstdc++) must be
 # present to build and test. Builds are native per arch — gobdk ships a
@@ -32,7 +36,7 @@ docker-build:
 		exit 1; \
 	fi
 	mkdir -p dist/linux-$(GOARCH)
-	CGO_ENABLED=1 GOOS=linux GOARCH=$(GOARCH) go build -trimpath -ldflags="-s -w" -o dist/linux-$(GOARCH)/arcade ./cmd/arcade
+	CGO_ENABLED=1 GOOS=linux GOARCH=$(GOARCH) go build -trimpath -ldflags="-s -w -X github.com/bsv-blockchain/arcade/version.Version=$(VERSION)" -o dist/linux-$(GOARCH)/arcade ./cmd/arcade
 	docker build --platform=linux/$(GOARCH) -t arcade:local .
 
 run:

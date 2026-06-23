@@ -189,14 +189,18 @@ jobs:
       # runner image defaults differ. CGO_ENABLED=1 because the validator links
       # gobdk (BSV BDK C++); the build is native per arch so the matching
       # prebuilt gobdk static archive links without a cross-compiler.
+      # version.Version is stamped from the deployment tag computed by the
+      # get_tag job (vX.Y.Z on tag pushes, "latest" otherwise) so GET /health
+      # reports the running build (issue #208).
       - name: Build arcade binary
         env:
           CGO_ENABLED: '1'
           GOOS: linux
           GOARCH: ${{ matrix.arch }}
+          VERSION: ${{ needs.get_tag.outputs.deployment_tag }}
         run: |
           mkdir -p dist/linux-${{ matrix.arch }}
-          go build -trimpath -ldflags="-s -w" -o dist/linux-${{ matrix.arch }}/arcade ./cmd/arcade
+          go build -trimpath -ldflags="-s -w -X github.com/bsv-blockchain/arcade/version.Version=${VERSION}" -o dist/linux-${{ matrix.arch }}/arcade ./cmd/arcade
 
       # Step 4: Set up Docker Buildx (no QEMU needed — single-platform build on
       # a native runner of that platform).
