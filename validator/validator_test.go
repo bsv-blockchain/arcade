@@ -3,12 +3,14 @@ package validator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/script"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 	tnerr "github.com/bsv-blockchain/teranode/errors"
+	tnvalidator "github.com/bsv-blockchain/teranode/services/validator"
 
 	arcerrors "github.com/bsv-blockchain/arcade/errors"
 )
@@ -174,18 +176,29 @@ func spendableSource(unlocking []byte, prevSats uint64, prevLock []byte) *sdkTx.
 	return in
 }
 
-// nonPushUnlocking returns an unlocking script that pushes a 50-byte blob then
-// OP_DROP — a functional (non-push-only) opcode. The leading data push also pads
-// the transaction comfortably past any minimum-size rule. After it runs the
-// stack is empty; paired with an OP_TRUE locking script the combined script
-// evaluates to true. This is the exact shape the Chronicle upgrade re-allowed
-// for version>=2 transactions (issue #192).
+// pushDropUnlocking returns an unlocking script that pushes n bytes then OP_DROP
+// — a functional (non-push-only) opcode that leaves the stack empty, so paired
+// with an OP_TRUE locking script the combined script evaluates to true. Because
+// it is non-push-only it is only accepted for version>=2 (post-Chronicle)
+// transactions (issue #192). AppendPushData emits the minimal push encoding
+// (direct, OP_PUSHDATA1 or OP_PUSHDATA2), so element sizes above the historical
+// 520-byte pre-Genesis limit are exercised faithfully (issue #214).
+func pushDropUnlocking(n int) []byte {
+	s := &script.Script{}
+	if err := s.AppendPushData(make([]byte, n)); err != nil {
+		panic(err)
+	}
+	if err := s.AppendOpcodes(script.OpDROP); err != nil {
+		panic(err)
+	}
+	return *s
+}
+
+// nonPushUnlocking pushes a 50-byte blob then OP_DROP. The leading data push also
+// pads the transaction comfortably past any minimum-size rule. This is the exact
+// shape the Chronicle upgrade re-allowed for version>=2 transactions (issue #192).
 func nonPushUnlocking() []byte {
-	b := make([]byte, 0, 52)
-	b = append(b, 0x32) // push 50 bytes
-	b = append(b, make([]byte, 50)...)
-	b = append(b, script.OpDROP)
-	return b
+	return pushDropUnlocking(50)
 }
 
 func chronicleTx(version uint32) *sdkTx.Transaction {
@@ -218,6 +231,73 @@ func TestValidate_ChronicleVersionGate(t *testing.T) {
 	}
 	if arcErr := arcerrors.GetArcError(err); arcErr == nil || arcErr.StatusCode != arcerrors.StatusUnlockingScripts {
 		t.Errorf("expected StatusUnlockingScripts, got %v", err)
+	}
+}
+
+// largePushTx builds a version-2 transaction whose single input spends an OP_TRUE
+// (anyone-can-spend) source output with a <pushSize-byte push> OP_DROP unlocking
+// script. The input is funded generously so fees can never be the reason a size is
+// rejected — the only variable under test is the pushed-element size.
+func largePushTx(pushSize int) *sdkTx.Transaction {
+	in := spendableSource(pushDropUnlocking(pushSize), 100_000, []byte{script.OpTRUE})
+	return &sdkTx.Transaction{
+		Version: 2,
+		Inputs:  []*sdkTx.TransactionInput{in},
+		Outputs: []*sdkTx.TransactionOutput{{Satoshis: 10_000, LockingScript: scriptFromBytes([]byte{script.OpTRUE})}},
+	}
+}
+
+// TestValidate_PostGenesisLargePushes is the #214 regression, driven through the
+// real BDK engine. The historical 520-byte MAX_SCRIPT_ELEMENT_SIZE_BEFORE_GENESIS
+// limit is keyed off the *source UTXO height*, not the spending block height. Arcade
+// reported height 1 (pre-Genesis) for every input, so BDK applied the limit to
+// post-Genesis spends and rejected otherwise-valid transactions that push >520-byte
+// elements (the same transactions ARC accepts and miners mine).
+//
+// The fix reports the unknown-parent sentinel instead, which teranode resolves to the
+// post-Genesis candidate block height in policy mode — so the limit no longer applies.
+// Each case proves the rejection is purely a function of the reported source height:
+// at pre-Genesis height 1 BDK rejects >520-byte pushes, at a post-Genesis height it
+// accepts them, and arcade's public intake (which now reports the sentinel) accepts.
+func TestValidate_PostGenesisLargePushes(t *testing.T) {
+	v := NewValidator(nil)
+	ctx := context.Background()
+
+	// A concrete, unambiguously post-Genesis source height (well above every
+	// network's Genesis/Chronicle activation height, at/below the spending height).
+	const postGenesisHeight = allForksActiveHeight - 1
+
+	for _, size := range []int{520, 521, 5210} {
+		t.Run(fmt.Sprintf("push_%d_bytes", size), func(t *testing.T) {
+			tx := largePushTx(size)
+			overLimit := size > 520
+
+			// Root-cause control: call the BDK validator directly, varying only the
+			// source UTXO height. Use the fee-agnostic validator so fees never
+			// interfere; NewDefaultOptions keeps it in policy mode (arcade's mode).
+			btx, err := toExtendedBT(tx)
+			if err != nil {
+				t.Fatalf("toExtendedBT: %v", err)
+			}
+			preGenesisErr := v.tvNoFee.ValidateTransaction(btx, allForksActiveHeight, []uint32{1}, tnvalidator.NewDefaultOptions())
+			postGenesisErr := v.tvNoFee.ValidateTransaction(btx, allForksActiveHeight, []uint32{postGenesisHeight}, tnvalidator.NewDefaultOptions())
+
+			if overLimit && preGenesisErr == nil {
+				t.Errorf("BDK must reject a %d-byte push at pre-Genesis source height 1 (pre-Genesis 520-byte limit)", size)
+			}
+			if !overLimit && preGenesisErr != nil {
+				t.Errorf("BDK must accept a %d-byte push even at source height 1, got %v", size, preGenesisErr)
+			}
+			if postGenesisErr != nil {
+				t.Errorf("BDK must accept a %d-byte push at a post-Genesis source height, got %v", size, postGenesisErr)
+			}
+
+			// Regression guard: arcade's public intake must accept all sizes. Before
+			// the fix this fails for 521 and 5210 with a push-value-size error.
+			if err := v.ValidateTransaction(ctx, tx, true); err != nil {
+				t.Errorf("arcade intake must accept a %d-byte post-Genesis push, got %v", size, err)
+			}
+		})
 	}
 }
 

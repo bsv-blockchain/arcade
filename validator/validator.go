@@ -15,6 +15,7 @@ package validator
 import (
 	"context"
 	"fmt"
+	"math"
 
 	chaincfg "github.com/bsv-blockchain/go-chaincfg"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
@@ -34,13 +35,33 @@ const (
 	// static height avoids a chain-tip lookup on the hot path.
 	allForksActiveHeight uint32 = 2_000_000_000
 
-	// assumedUTXOHeight is the per-input source height arcade reports for every
+	// unknownParentHeight is the per-input source height arcade reports for every
 	// spent output. arcade does not track per-UTXO confirmation heights on the
-	// intake path, so it reports a height far below allForksActiveHeight; every
-	// input therefore appears mature. This matches arcade's prior behaviour of
-	// not enforcing coinbase maturity / relative locktime at intake — teranode
-	// remains the authority and re-checks with real heights downstream.
-	assumedUTXOHeight uint32 = 1
+	// intake path, so instead of fabricating a concrete height it reports the
+	// "parent height unknown" sentinel — the value of teranode's internal
+	// unconfirmedParentHeight (teranode .../services/validator/Validator.go), which
+	// teranode itself stamps for parents whose height it cannot resolve.
+	//
+	// In policy mode — arcade's only mode; NewDefaultOptions sets
+	// SkipPolicyChecks=false — teranode's BDK adapter (substituteUnconfirmedHeights
+	// in .../services/validator/ScriptVerifierGoBDK.go) resolves this sentinel to
+	// the candidate block height (allForksActiveHeight), which is post-Genesis and
+	// post-Chronicle. Every input is therefore evaluated against current consensus,
+	// matching how teranode's own mempool intake treats an unconfirmed parent.
+	//
+	// The previous value of 1 was below every network's Genesis activation height,
+	// so BDK keyed each input's protocol era to pre-Genesis and wrongly enforced the
+	// historical 520-byte MAX_SCRIPT_ELEMENT_SIZE_BEFORE_GENESIS limit on modern
+	// post-Genesis spends (issue #214). The per-input UTXO height — not the spending
+	// block height — selects that limit, so reporting a post-Genesis source height is
+	// what lifts it. arcade's path runs no coinbase-maturity or relative-locktime
+	// check, so reporting an "immature" height has no downside here; teranode remains
+	// the authority and re-checks with real heights downstream.
+	//
+	// This is correct only in policy mode: in consensus mode the adapter maps the
+	// sentinel to MEMPOOL_HEIGHT and BDK rejects every transaction as having an
+	// unconfirmed input. arcade never validates in consensus mode.
+	unknownParentHeight uint32 = math.MaxUint32
 
 	// maxTxSizePolicyConsensusLimit is the BDK consensus ceiling on the policy
 	// max-tx-size setting; the engine rejects construction above it.
@@ -149,7 +170,7 @@ func (v *Validator) ValidateTransaction(_ context.Context, tx *sdkTx.Transaction
 
 	utxoHeights := make([]uint32, len(btx.Inputs))
 	for i := range utxoHeights {
-		utxoHeights[i] = assumedUTXOHeight
+		utxoHeights[i] = unknownParentHeight
 	}
 
 	tv := v.tv
