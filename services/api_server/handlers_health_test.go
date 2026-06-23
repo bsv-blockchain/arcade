@@ -11,13 +11,17 @@ import (
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/teranode"
+	"github.com/bsv-blockchain/arcade/version"
 )
 
 // healthResp mirrors the server's healthResponse shape but uses generic
 // Go types so test code does not depend on unexported fields.
 // Chaintracks moved out of api-server in the microservice decomposition,
-// so the response no longer includes a chaintracks block.
+// so the response no longer includes a chaintracks block. The healthy/version
+// fields are the ARC health contract (issue #208).
 type healthResp struct {
+	Healthy     bool                      `json:"healthy"`
+	Version     string                    `json:"version"`
 	Status      string                    `json:"status"`
 	DatahubURLs []teranode.EndpointStatus `json:"datahub_urls"`
 }
@@ -65,6 +69,13 @@ func TestHandleHealth_StructuredResponse(t *testing.T) {
 	if resp.Status != "ok" {
 		t.Fatalf("expected status=ok, got %q", resp.Status)
 	}
+	// ARC contract: clients gate submission on healthy == true and read version.
+	if !resp.Healthy {
+		t.Errorf("expected healthy=true, got %v (body=%s)", resp.Healthy, string(body))
+	}
+	if resp.Version != version.Version {
+		t.Errorf("expected version=%q, got %q", version.Version, resp.Version)
+	}
 
 	want := []teranode.EndpointStatus{
 		{URL: "https://a.example", Source: "configured", Healthy: true},
@@ -103,5 +114,10 @@ func TestHandleHealth_NilTeranode_ReturnsEmptyArray(t *testing.T) {
 	}
 	if string(raw["datahub_urls"]) != "[]" {
 		t.Errorf("expected datahub_urls to be `[]` in JSON, got %s", string(raw["datahub_urls"]))
+	}
+	// ARC clients require a literal `"healthy": true` — ensure the field is
+	// present and not dropped/renamed by marshalling (issue #208).
+	if string(raw["healthy"]) != "true" {
+		t.Errorf("expected healthy to be `true` in JSON, got %s", string(raw["healthy"]))
 	}
 }
