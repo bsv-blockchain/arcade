@@ -519,6 +519,17 @@ const (
 	maxBatchBytes    = 256 << 20 // 256 MiB per batch submit
 )
 
+// submitResponse is the ARC-compatible body for POST /tx. status mirrors the
+// HTTP code (202 Accepted) as an integer — ARC clients deserialise status as an
+// integer and abort on a string, so a fully-accepted tx looked like a failure
+// (issue #209). txStatus carries the lifecycle state and txid lets the client
+// track the submission, matching the GET /tx read shape (models.TransactionStatus).
+type submitResponse struct {
+	TxID     string        `json:"txid"`
+	Status   int           `json:"status"`
+	TxStatus models.Status `json:"txStatus"`
+}
+
 // handleSubmitTransaction accepts transactions for validation and propagation.
 // Supports application/octet-stream, text/plain (hex), and JSON.
 func (s *Server) handleSubmitTransaction(c *gin.Context) {
@@ -657,10 +668,10 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 				s.txTracker.Add(txid, existing.Status)
 			}
 			s.recordSubmission(c.Request.Context(), txid, opts)
-			c.JSON(http.StatusAccepted, gin.H{
-				"status": "already submitted",
-				"txid":   txid,
-				"state":  string(existing.Status),
+			c.JSON(http.StatusAccepted, submitResponse{
+				TxID:     txid,
+				Status:   http.StatusAccepted,
+				TxStatus: existing.Status,
 			})
 			return
 		}
@@ -695,7 +706,11 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusAccepted, gin.H{"status": "submitted"})
+	c.JSON(http.StatusAccepted, submitResponse{
+		TxID:     txid,
+		Status:   http.StatusAccepted,
+		TxStatus: models.StatusReceived,
+	})
 }
 
 // rejectAtIntake is the terminal-rejection counterpart to the intake

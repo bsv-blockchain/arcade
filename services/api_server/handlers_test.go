@@ -458,6 +458,70 @@ func TestHandleSubmitTransactions_KafkaFailure_Returns500(t *testing.T) {
 	}
 }
 
+// TestHandleSubmitTransaction_FreshSubmit_ReturnsARCResponse pins the ARC
+// contract for a brand-new submission: HTTP 202 with a body carrying the txid,
+// an integer status (202), and txStatus RECEIVED. ARC clients deserialise
+// status as an integer and need the txid to track the tx (issue #209).
+func TestHandleSubmitTransaction_FreshSubmit_ReturnsARCResponse(t *testing.T) {
+	rawTx := makeMinimalTx()
+	parsed, _, err := sdkTx.NewTransactionFromStream(rawTx)
+	if err != nil {
+		t.Fatalf("parsing test tx: %v", err)
+	}
+	wantTxID := parsed.TxID().String()
+
+	ms := &mockStore{
+		getOrInsertFn: func(_ *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+			// Fresh insert: no existing row, inserted=true.
+			return nil, true, nil
+		},
+	}
+	broker := &kafka.RecordingBroker{}
+	gin.SetMode(gin.TestMode)
+	srv := &Server{
+		cfg:            &config.Config{CallbackToken: testCallbackToken},
+		logger:         zap.NewNop(),
+		producer:       kafka.NewProducer(broker),
+		store:          ms,
+		txTracker:      store.NewTxTracker(),
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
+	}
+	router := gin.New()
+	srv.registerRoutes(router)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/tx", bytes.NewReader(rawTx))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v (body=%q)", err, w.Body.String())
+	}
+	if resp["txid"] != wantTxID {
+		t.Errorf("expected txid=%s, got %v", wantTxID, resp["txid"])
+	}
+	if resp["status"] != float64(http.StatusAccepted) {
+		t.Errorf("expected status=202 (integer), got %v", resp["status"])
+	}
+	if resp["txStatus"] != string(models.StatusReceived) {
+		t.Errorf("expected txStatus=RECEIVED, got %v", resp["txStatus"])
+	}
+	// The legacy string-status shape ("submitted" / "state") must be gone.
+	if _, ok := resp["state"]; ok {
+		t.Errorf("unexpected legacy field %q in response: %v", "state", resp)
+	}
+
+	// A fresh submission must be published to Kafka exactly once.
+	if got := totalMessages(broker); got != 1 {
+		t.Errorf("fresh submit must publish to Kafka once, got %d messages", got)
+	}
+}
+
 // TestHandleSubmitTransaction_DedupBranch_PopulatesTxTracker pins the
 // invariant that an idempotent re-submit (dedup CAS reports the txid
 // already exists) still registers the txid with the in-process TxTracker
@@ -509,8 +573,16 @@ func TestHandleSubmitTransaction_DedupBranch_PopulatesTxTracker(t *testing.T) {
 	}
 	var resp map[string]interface{}
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp["status"] != "already submitted" {
-		t.Errorf("expected status=already submitted, got %v", resp["status"])
+	// ARC contract: integer status (decodes to float64), txid present, and the
+	// existing lifecycle state echoed back in txStatus (issue #209).
+	if resp["status"] != float64(http.StatusAccepted) {
+		t.Errorf("expected status=202 (integer), got %v", resp["status"])
+	}
+	if resp["txid"] != wantTxID {
+		t.Errorf("expected txid=%s, got %v", wantTxID, resp["txid"])
+	}
+	if resp["txStatus"] != string(persistedStatus) {
+		t.Errorf("expected txStatus=%s, got %v", persistedStatus, resp["txStatus"])
 	}
 
 	gotStatus, ok := tracker.GetStatus(wantTxID)
@@ -678,8 +750,16 @@ func TestHandleSubmitTransaction_ResubmitRejected_RepublishesToKafka(t *testing.
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode response: %v (body=%q)", err, w.Body.String())
 	}
-	if got := resp["status"]; got != "submitted" {
-		t.Errorf("expected status=%q (fresh-submit shape), got %v", "submitted", got)
+	// Fresh-submit shape: integer status 202, txid present, txStatus RECEIVED
+	// (the rejected resubmit re-enters the accept path) — issue #209.
+	if got := resp["status"]; got != float64(http.StatusAccepted) {
+		t.Errorf("expected status=202 (integer, fresh-submit shape), got %v", got)
+	}
+	if resp["txid"] != wantTxID {
+		t.Errorf("expected txid=%s, got %v", wantTxID, resp["txid"])
+	}
+	if resp["txStatus"] != string(models.StatusReceived) {
+		t.Errorf("expected txStatus=RECEIVED, got %v", resp["txStatus"])
 	}
 
 	// Tracker must still know about the txid (so bump-builder's tracked-only
