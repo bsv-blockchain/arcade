@@ -166,7 +166,7 @@ var routeDocs = []RouteDoc{
 			},
 		},
 		ResponseStatus: "202 Accepted",
-		ResponseBody:   "{\n  \"status\": \"submitted\"\n}\n\n// Idempotent re-submit of a txid Arcade has already seen:\n{\n  \"status\": \"already submitted\",\n  \"txid\": \"<hex>\",\n  \"state\": \"SEEN_ON_NETWORK\"\n}",
+		ResponseBody:   "{\n  \"txid\": \"<hex>\",\n  \"status\": 202,\n  \"txStatus\": \"RECEIVED\"\n}\n\n// Idempotent re-submit of a txid Arcade has already seen (txStatus echoes the existing state):\n{\n  \"txid\": \"<hex>\",\n  \"status\": 202,\n  \"txStatus\": \"SEEN_ON_NETWORK\"\n}",
 		Notes:          "Returns 400 with a reason field on validation failure (also persisted as a terminal REJECTED row, so subscribers see the outcome). 503 with Retry-After: 1 is returned when the broker is under backpressure; the transaction was not queued and a retry is safe.",
 	},
 	{

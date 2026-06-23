@@ -181,20 +181,20 @@ paths:
           content:
             application/json:
               schema:
-                oneOf:
-                  - $ref: "#/components/schemas/SubmitAcceptedResponse"
-                  - $ref: "#/components/schemas/AlreadySubmittedResponse"
+                $ref: "#/components/schemas/SubmitResponse"
               examples:
                 submitted:
                   summary: New submission
                   value:
-                    status: submitted
-                alreadySubmitted:
-                  summary: Idempotent re-submit
-                  value:
-                    status: already submitted
                     txid: "<hex>"
-                    state: SEEN_ON_NETWORK
+                    status: 202
+                    txStatus: RECEIVED
+                alreadySubmitted:
+                  summary: Idempotent re-submit (txStatus echoes the existing state)
+                  value:
+                    txid: "<hex>"
+                    status: 202
+                    txStatus: SEEN_ON_NETWORK
         "400":
           description: |
             Malformed request, decode failure, empty transaction, validation
@@ -1095,29 +1095,24 @@ components:
       required:
         - rawTx
 
-    SubmitAcceptedResponse:
+    SubmitResponse:
       type: object
+      description: |
+        ARC-compatible response for a successful single-transaction submission
+        (both new submissions and idempotent re-submits). status is the integer
+        HTTP code (202 Accepted); txStatus carries the lifecycle state.
       properties:
-        status:
-          type: string
-          example: submitted
-      required:
-        - status
-
-    AlreadySubmittedResponse:
-      type: object
-      properties:
-        status:
-          type: string
-          example: already submitted
         txid:
           type: string
-        state:
+        status:
+          type: integer
+          example: 202
+        txStatus:
           $ref: "#/components/schemas/Status"
       required:
-        - status
         - txid
-        - state
+        - status
+        - txStatus
 
     BatchSubmitResponse:
       type: object
