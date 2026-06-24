@@ -179,37 +179,55 @@ func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, b
 			WithLabelValues(string(prev.Status), string(models.StatusMined)).
 			Observe(time.Since(prev.Timestamp).Seconds())
 	}
-	if len(mined) == 0 {
+	if len(mined) == 0 || b.publisher == nil {
 		return
 	}
-	// Coalesce the N-per-block MINED fan-out into ONE bulk event. Without
-	// this, a single BUMP build for a 14k-tx block produced 14k individual
-	// publish calls, which overran the webhook service's 1024-cap work
-	// queue and triggered ~185k drops/block. Subscribers (SSE, webhook)
-	// unfan from the bulk template in their own handlers — they own the
-	// per-tx delivery cost, but they don't pay the channel-saturation cost.
+	// Coalesce the N-per-block MINED fan-out into bulk events. Without this, a
+	// single BUMP build for a 14k-tx block produced 14k individual publish
+	// calls, which overran the webhook service's 1024-cap work queue and
+	// triggered ~185k drops/block. Subscribers (SSE, webhook) unfan from the
+	// bulk template in their own handlers.
+	//
+	// Chunk the txids so one event never exceeds the Kafka producer's max
+	// message size: a ~27k-tx block serialized to ~1.85 MB, over the 1 MiB
+	// default Producer.MaxMessageBytes, so PublishBulk failed and the MINED
+	// event was silently dropped for large blocks (the DB status was still
+	// MINED, but SSE/webhook subscribers never saw it). Each txid is ~67 bytes
+	// of JSON, so maxTxIDsPerBulkEvent keeps every event well under the limit.
 	publishTxIDs := make([]string, 0, len(mined))
 	for _, st := range mined {
 		publishTxIDs = append(publishTxIDs, st.TxID)
 	}
-	template := &models.TransactionStatus{
-		Status:      models.StatusMined,
-		BlockHash:   blockHash,
-		BlockHeight: blockHeight,
-		Timestamp:   time.Now(),
-		TxIDs:       publishTxIDs,
-	}
-	if b.publisher != nil {
+	for start := 0; start < len(publishTxIDs); start += maxTxIDsPerBulkEvent {
+		end := start + maxTxIDsPerBulkEvent
+		if end > len(publishTxIDs) {
+			end = len(publishTxIDs)
+		}
+		template := &models.TransactionStatus{
+			Status:      models.StatusMined,
+			BlockHash:   blockHash,
+			BlockHeight: blockHeight,
+			Timestamp:   time.Now(),
+			TxIDs:       publishTxIDs[start:end],
+		}
 		if pubErr := b.publisher.PublishBulk(ctx, template); pubErr != nil {
 			logger.Warn(
 				"failed to publish bulk MINED",
 				zap.String("block_hash", blockHash),
-				zap.Int("txid_count", len(publishTxIDs)),
+				zap.Int("chunk_start", start),
+				zap.Int("chunk_size", end-start),
+				zap.Int("txid_total", len(publishTxIDs)),
 				zap.Error(pubErr),
 			)
 		}
 	}
 }
+
+// maxTxIDsPerBulkEvent caps how many txids ride in a single bulk MINED event.
+// A txid is 64 hex chars (~67 bytes of JSON with quoting + comma); 5000 keeps a
+// bulk event around 340 KB, comfortably under the 1 MiB default Kafka
+// Producer.MaxMessageBytes even with the status envelope.
+const maxTxIDsPerBulkEvent = 5000
 
 func (b *Builder) Name() string { return "bump-builder" }
 
