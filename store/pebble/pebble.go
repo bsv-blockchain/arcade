@@ -14,11 +14,13 @@
 package pebble
 
 import (
+	"container/heap"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -77,6 +79,7 @@ type storedStatus struct {
 	CreatedUnixNs          int64    `json:"created_at,omitempty"`
 	NextRetryUnixNs        int64    `json:"next_retry_at,omitempty"`
 	MerkleRegisteredUnixNs int64    `json:"merkle_registered_at,omitempty"`
+	LastRebroadcastUnixNs  int64    `json:"last_rebroadcast_at,omitempty"`
 }
 
 func (s storedStatus) toModel() *models.TransactionStatus {
@@ -103,6 +106,9 @@ func (s storedStatus) toModel() *models.TransactionStatus {
 	}
 	if s.MerkleRegisteredUnixNs != 0 {
 		out.MerkleRegisteredAt = time.Unix(0, s.MerkleRegisteredUnixNs)
+	}
+	if s.LastRebroadcastUnixNs != 0 {
+		out.LastRebroadcastAt = time.Unix(0, s.LastRebroadcastUnixNs)
 	}
 	return out
 }
@@ -131,6 +137,9 @@ func fromModel(m *models.TransactionStatus) storedStatus {
 	}
 	if !m.MerkleRegisteredAt.IsZero() {
 		out.MerkleRegisteredUnixNs = m.MerkleRegisteredAt.UnixNano()
+	}
+	if !m.LastRebroadcastAt.IsZero() {
+		out.LastRebroadcastUnixNs = m.LastRebroadcastAt.UnixNano()
 	}
 	return out
 }
@@ -496,6 +505,9 @@ func mergeStatus(existing *storedStatus, update *models.TransactionStatus) store
 	}
 	if !update.MerkleRegisteredAt.IsZero() {
 		out.MerkleRegisteredUnixNs = update.MerkleRegisteredAt.UnixNano()
+	}
+	if !update.LastRebroadcastAt.IsZero() {
+		out.LastRebroadcastUnixNs = update.LastRebroadcastAt.UnixNano()
 	}
 	return out
 }
@@ -959,6 +971,150 @@ func (s *Store) MarkMerkleRegisteredByTxIDs(ctx context.Context, txids []string,
 			return err
 		}
 		// No index churn: merkle_registered_at isn't indexed.
+		err = s.db.Set(txKey(txid), payload, s.writeOpts)
+		mu.Unlock()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reapCandidate is one row under consideration by GetReapCandidates.
+type reapCandidate struct {
+	txid          string
+	rawTx         []byte
+	lastRebcastNs int64 // math.MinInt64 == never rebroadcast (oldest)
+}
+
+// reapHeap is a bounded MAX-heap on lastRebcastNs (largest on top). Pushing and
+// popping-when-over-limit keeps the `limit` SMALLEST (oldest-rebroadcast)
+// candidates, so GetReapCandidates stays O(limit) memory over a large backlog.
+type reapHeap []reapCandidate
+
+func (h *reapHeap) Len() int           { return len(*h) }
+func (h *reapHeap) Less(i, j int) bool { return (*h)[i].lastRebcastNs > (*h)[j].lastRebcastNs }
+func (h *reapHeap) Swap(i, j int)      { (*h)[i], (*h)[j] = (*h)[j], (*h)[i] }
+func (h *reapHeap) Push(x any)         { *h = append(*h, x.(reapCandidate)) }
+func (h *reapHeap) Pop() any {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	*h = old[:n-1]
+	return item
+}
+
+// GetReapCandidates walks the updated-at index within [since, seenDeadline) and
+// returns up to limit SEEN_* rows the reaper should rebroadcast, ordered
+// oldest-rebroadcast-first. The updated-at index is timestamp-ordered (not
+// last_rebroadcast_at-ordered), so the scan is bounded by the timestamp window
+// and a bounded max-heap selects the oldest-rebroadcast subset. See store.Store
+// for the contract.
+func (s *Store) GetReapCandidates(ctx context.Context, since, seenDeadline, rebroadcastBefore time.Time, limit int) ([]*models.TransactionStatus, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	prefix := idxTxUpdatedPrefix()
+	sinceNs := since.UnixNano()
+	deadlineNs := seenDeadline.UnixNano()
+	// Bound the scan to [since, seenDeadline): the idx:tx:updated keyspace is
+	// ordered by timestamp (hex-encoded unix nanos), so start at the first key
+	// at/after `since` and stop as soon as a row's timestamp reaches the
+	// deadline — no need to walk the full history every tick.
+	iter, err := s.db.NewIter(&pebbledb.IterOptions{
+		LowerBound: idxTxUpdatedKey(sinceNs, ""),
+		UpperBound: endOfPrefix(prefix),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = iter.Close() }()
+
+	// Keep only the `limit` oldest-rebroadcast candidates via a bounded
+	// max-heap (largest lastRebcastNs on top, evicted when full) so memory
+	// stays O(limit) regardless of backlog. math.MinInt64 == never rebroadcast.
+	h := &reapHeap{}
+	for iter.First(); iter.Valid(); iter.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		txid := lastSegment(iter.Key())
+		st, err := s.readStatus(txid)
+		if err != nil || st == nil {
+			continue
+		}
+		tsNs := st.Timestamp.UnixNano()
+		if tsNs >= deadlineNs {
+			// Index is timestamp-ascending, so nothing past here is in-window.
+			break
+		}
+		if tsNs < sinceNs {
+			continue
+		}
+		if st.Status != models.StatusSeenOnNetwork && st.Status != models.StatusSeenMultipleNodes {
+			continue
+		}
+		if len(st.RawTx) == 0 {
+			continue
+		}
+		if !st.LastRebroadcastAt.IsZero() && !st.LastRebroadcastAt.Before(rebroadcastBefore) {
+			continue
+		}
+		lastNs := int64(math.MinInt64)
+		if !st.LastRebroadcastAt.IsZero() {
+			lastNs = st.LastRebroadcastAt.UnixNano()
+		}
+		heap.Push(h, reapCandidate{txid: st.TxID, rawTx: st.RawTx, lastRebcastNs: lastNs})
+		if h.Len() > limit {
+			heap.Pop(h) // evict the most-recently-rebroadcast (largest)
+		}
+	}
+	// Heap holds the `limit` oldest-rebroadcast rows; emit ascending.
+	results := make([]*models.TransactionStatus, h.Len())
+	for i := len(results) - 1; i >= 0; i-- {
+		c := heap.Pop(h).(reapCandidate)
+		results[i] = &models.TransactionStatus{TxID: c.txid, RawTx: c.rawTx}
+	}
+	return results, nil
+}
+
+// MarkRebroadcastByTxIDs stamps last_rebroadcast_at on every existing row in
+// the txid list. Unknown txids are silently no-ops, mirroring
+// MarkMerkleRegisteredByTxIDs (last_rebroadcast_at is not indexed, so no index
+// churn).
+func (s *Store) MarkRebroadcastByTxIDs(ctx context.Context, txids []string, ts time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	tsNs := ts.UnixNano()
+	for _, txid := range txids {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		mu := s.shardFor(txid)
+		mu.Lock()
+
+		existing, err := s.readStoredStatus(txid)
+		if err != nil {
+			mu.Unlock()
+			return err
+		}
+		if existing == nil {
+			mu.Unlock()
+			continue
+		}
+
+		updated := *existing
+		updated.LastRebroadcastUnixNs = tsNs
+
+		payload, err := json.Marshal(updated)
+		if err != nil {
+			mu.Unlock()
+			return err
+		}
 		err = s.db.Set(txKey(txid), payload, s.writeOpts)
 		mu.Unlock()
 		if err != nil {

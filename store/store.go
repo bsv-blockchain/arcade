@@ -271,6 +271,24 @@ type Store interface {
 	// issue #145.
 	MarkMerkleRegisteredByTxIDs(ctx context.Context, txids []string, ts time.Time) error
 
+	// GetReapCandidates returns up to limit transactions the reaper should
+	// rebroadcast: rows in a non-terminal SEEN_* state (SEEN_ON_NETWORK or
+	// SEEN_MULTIPLE_NODES) whose timestamp is in [since, seenDeadline), that
+	// carry a non-empty raw_tx, and whose last_rebroadcast_at is either unset
+	// or older than rebroadcastBefore. Rows are ordered by last_rebroadcast_at
+	// ascending (NULLs first) so the longest-unserved txs are returned first —
+	// this is the fairness guarantee that prevents head-of-line starvation
+	// under a backlog larger than limit. Each returned row carries at least
+	// TxID and RawTx so the reaper can rebroadcast without a second read.
+	GetReapCandidates(ctx context.Context, since, seenDeadline, rebroadcastBefore time.Time, limit int) ([]*models.TransactionStatus, error)
+
+	// MarkRebroadcastByTxIDs stamps last_rebroadcast_at = ts for the given
+	// txids. Unknown txids are silently skipped (matching
+	// MarkMerkleRegisteredByTxIDs semantics). The reaper calls this for every
+	// txid it attempted to rebroadcast — on attempt, not just success — so a
+	// perpetually-requeueing tx cedes its slot for one rebroadcast interval.
+	MarkRebroadcastByTxIDs(ctx context.Context, txids []string, ts time.Time) error
+
 	// EnsureIndexes creates any required secondary indexes for query operations.
 	EnsureIndexes() error
 

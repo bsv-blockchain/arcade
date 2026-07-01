@@ -146,6 +146,12 @@ func (s *fakeStore) SetMinedByTxIDs(context.Context, string, uint64, []string) (
 func (s *fakeStore) MarkMerkleRegisteredByTxIDs(context.Context, []string, time.Time) error {
 	return nil
 }
+func (s *fakeStore) GetReapCandidates(context.Context, time.Time, time.Time, time.Time, int) ([]*models.TransactionStatus, error) {
+	return nil, nil
+}
+func (s *fakeStore) MarkRebroadcastByTxIDs(context.Context, []string, time.Time) error {
+	return nil
+}
 func (s *fakeStore) InsertSubmission(context.Context, *models.Submission) error { return nil }
 func (s *fakeStore) GetSubmissionsByToken(context.Context, string) ([]*models.Submission, error) {
 	return nil, nil
