@@ -153,6 +153,10 @@ func (b *memoryBroker) publish(ctx context.Context, topic, key string, value []b
 		Partition: 0,
 		Offset:    offset,
 		Timestamp: time.Now(),
+		// Injects the producer's trace context (nil on the disabled/no-span
+		// path — no allocation) so standalone mode round-trips traces the
+		// same way the Sarama-backed broker does end-to-end.
+		Headers: InjectTraceContext(ctx),
 	}
 
 	for _, t := range targets {

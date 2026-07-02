@@ -479,7 +479,7 @@ func (s *Server) handleBlockProcessed(c *gin.Context, msg models.CallbackMessage
 	// the height-0 placeholder this handler used to write was never recoverable
 	// anyway). That chaintracks dependency is pre-existing and unchanged here;
 	// see services/watchdog.
-	if err := s.producer.Send(kafka.TopicBlockProcessed, msg.BlockHash, msg); err != nil {
+	if err := s.producer.Send(c.Request.Context(), kafka.TopicBlockProcessed, msg.BlockHash, msg); err != nil {
 		logger.Error("failed to publish block_processed", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to enqueue"})
 		return
@@ -692,7 +692,7 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		"raw_tx":      rawTx,
 		"input_txids": collectInputTXIDs(parsedTx),
 	}
-	if err := s.producer.Send(kafka.TopicPropagation, txid, msg); err != nil {
+	if err := s.producer.Send(c.Request.Context(), kafka.TopicPropagation, txid, msg); err != nil {
 		if errors.Is(err, kafka.ErrBrokerBackpressure) {
 			// Backpressure → shed load to the client. The tx was never queued,
 			// so a retry is safe and is the contract the 503 expresses.
@@ -960,7 +960,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				},
 			})
 		}
-		if err := s.producer.SendBatch(kafka.TopicPropagation, msgs); err != nil {
+		if err := s.producer.SendBatch(ctx, kafka.TopicPropagation, msgs); err != nil {
 			if errors.Is(err, kafka.ErrBrokerBackpressure) {
 				s.logger.Warn("batch submit rejected: kafka backpressure", zap.Int("count", len(msgs)))
 				c.Header("Retry-After", "1")

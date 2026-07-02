@@ -13,6 +13,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/config"
@@ -25,6 +28,17 @@ import (
 	"github.com/bsv-blockchain/arcade/teranode"
 )
 
+// propagationTracerName identifies this package's spans/tracer to the OTEL
+// SDK, per the same package-import-path convention as kafka.tracerName.
+const propagationTracerName = "github.com/bsv-blockchain/arcade/services/propagation"
+
+// batchSpanMaxLinks caps the number of producer-span links attached to a
+// propagation.broadcast span. Per OTel's recommended batch-messaging
+// pattern, individual producer spans are linked (not parented) onto the one
+// batch span rather than opening a span per message — this bounds per-span
+// overhead even when a flush batch is very large.
+const batchSpanMaxLinks = 128
+
 type propagationMsg struct {
 	TXID string `json:"txid"`
 	// RawTx is the serialized transaction as raw bytes. encoding/json encodes
@@ -35,6 +49,16 @@ type propagationMsg struct {
 	// so the propagator can decide eligibility without re-parsing the raw
 	// bytes. Empty means coinbase or no in-flight parents.
 	InputTXIDs []string `json:"input_txids,omitempty"`
+	// spanCtx is the trace context extracted from the Kafka producer's
+	// message headers at decode/admit time (see runDispatcher and
+	// handleMessage). It is NOT serialized — trace.SpanContext has no
+	// exported json-visible fields and this field is unexported regardless,
+	// so encoding/json silently skips it on both Marshal and Unmarshal.
+	// Zero value (invalid) when the producer never injected a trace context
+	// (telemetry disabled, or no active span at produce time). Consumed by
+	// processBatch to link the batch's "propagation.broadcast" span back to
+	// each tx's originating producer span — see startBroadcastSpan.
+	spanCtx trace.SpanContext
 }
 
 type Propagator struct {
@@ -707,7 +731,7 @@ func (p *Propagator) Stop() error {
 //
 // A high-water-mark on pendingMsgs guards against unbounded growth if a
 // downstream stall lasts longer than the consumer's offset commit window.
-func (p *Propagator) handleMessage(_ context.Context, msg *kafka.Message) error {
+func (p *Propagator) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	var propMsg propagationMsg
 	if err := json.Unmarshal(msg.Value, &propMsg); err != nil {
 		return fmt.Errorf("unmarshaling propagation message: %w", err)
@@ -716,6 +740,14 @@ func (p *Propagator) handleMessage(_ context.Context, msg *kafka.Message) error 
 	if len(propMsg.RawTx) == 0 {
 		return fmt.Errorf("propagation message has empty raw_tx")
 	}
+
+	// See runDispatcher's claim branch for the production decode path; this
+	// mirrors it so the two decode sites behave identically — including the
+	// caveat that the base ctx must not carry an ambient span (a header-less
+	// message would otherwise inherit it as a bogus producer span). In tests
+	// this is called with context.Background(); in production handleMessage
+	// runs only via the ClaimHandler path whose ctx carries no span.
+	propMsg.spanCtx = trace.SpanContextFromContext(kafka.ExtractTraceContext(ctx, msg.Headers))
 
 	// All admission logic — parent dep check, pendingMsgs append,
 	// offset tracker bookkeeping — happens on the dispatcher
@@ -894,6 +926,48 @@ func classifyFailureLine(line string) (txResultClass, string) {
 	return txResultClassRejected, line
 }
 
+// startBroadcastSpan opens one "propagation.broadcast" span per flushed
+// batch and links it back to up to batchSpanMaxLinks producer spans found on
+// the batch's messages (propagationMsg.spanCtx, populated at decode/admit
+// time by ExtractTraceContext — see runDispatcher and handleMessage). This
+// is the OTel batch-messaging pattern of linking, not parenting, individual
+// producer spans onto one span per batch, so a large flush never opens a
+// span per message on the hot path.
+//
+// The returned ctx carries the new span and must be used for
+// broadcastInChunks so the otelhttp client spans issued against every
+// teranode endpoint nest under it. The returned func ends the span and must
+// be called exactly once (callers should defer it).
+//
+// Building the link list and attributes is deferred behind
+// span.IsRecording() — mirroring startProduceSpan/startConsumeSpan in
+// package kafka — so the disabled/no-op path (default no-op TracerProvider)
+// costs one no-op Start call and nothing else, independent of batch size.
+func (p *Propagator) startBroadcastSpan(ctx context.Context, batch []propagationMsg) (context.Context, func()) {
+	spanCtx, span := otel.Tracer(propagationTracerName).Start(ctx, "propagation.broadcast")
+	if span.IsRecording() {
+		links := 0
+		for _, msg := range batch {
+			if links >= batchSpanMaxLinks {
+				break
+			}
+			if !msg.spanCtx.IsValid() {
+				continue
+			}
+			span.AddLink(trace.Link{SpanContext: msg.spanCtx})
+			links++
+		}
+		// Record batch size alongside the actual link count so operators
+		// can see when the batchSpanMaxLinks cap truncated the links (i.e.
+		// batch_size had >128 valid producer contexts but only 128 linked).
+		span.SetAttributes(
+			attribute.Int("broadcast.batch_size", len(batch)),
+			attribute.Int("broadcast.linked_count", links),
+		)
+	}
+	return spanCtx, func() { span.End() }
+}
+
 // processBatch handles one drained batch:
 //  1. Register every tx with merkle-service. Txs whose /watch failed are
 //     requeued through the dispatcher after a short flat wait.
@@ -937,7 +1011,18 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) {
 	for i, msg := range batch {
 		rawTxs[i] = msg.RawTx
 	}
-	results := p.broadcastInChunks(ctx, batch, rawTxs)
+
+	// One span per flushed batch (never per message — see batchSpanMaxLinks)
+	// links back to each tx's producer span, and its ctx becomes the parent
+	// for broadcastInChunks so the otelhttp client spans to every teranode
+	// endpoint nest under it. No-op (and effectively free) when telemetry is
+	// disabled: startBroadcastSpan defers all string/attribute/link
+	// construction behind span.IsRecording(). defer (rather than ending
+	// immediately after broadcastInChunks) guarantees the span still closes
+	// if anything downstream in this function panics.
+	broadcastCtx, endSpan := p.startBroadcastSpan(ctx, batch)
+	defer endSpan()
+	results := p.broadcastInChunks(broadcastCtx, batch, rawTxs)
 
 	seenEndpoints := make(map[string]struct{})
 	var successEndpoints []string

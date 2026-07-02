@@ -62,11 +62,9 @@ func NewKafkaPublisher(producer *kafka.Producer, logger *zap.Logger, subscriberB
 
 // Publish serializes status to JSON and sends it on TopicStatusUpdate. Errors
 // are returned to the caller; the call site decides whether to log-and-continue
-// (the default for status mutations) or propagate.
-//
-// The kafka.Producer.Send signature does not take a context — the underlying
-// broker uses an internal background context for at-most-once produce; we
-// honor cancellation by short-circuiting before the call.
+// (the default for status mutations) or propagate. ctx is forwarded to the
+// producer so an active caller span becomes the parent of the Kafka producer
+// span and propagates onto the message headers.
 func (p *KafkaPublisher) Publish(ctx context.Context, status *models.TransactionStatus) error {
 	if status == nil {
 		return fmt.Errorf("nil status")
@@ -75,9 +73,7 @@ func (p *KafkaPublisher) Publish(ctx context.Context, status *models.Transaction
 		return err
 	}
 	start := time.Now()
-	// kafka.Producer.Send doesn't take a context; ctx already checked above.
-	//nolint:contextcheck // see above
-	err := p.producer.Send(kafka.TopicStatusUpdate, status.TxID, status)
+	err := p.producer.Send(ctx, kafka.TopicStatusUpdate, status.TxID, status)
 	outcome := "success"
 	if err != nil {
 		outcome = "error"
@@ -107,9 +103,7 @@ func (p *KafkaPublisher) PublishBulk(ctx context.Context, template *models.Trans
 		key = "bulk-" + template.TxIDs[0]
 	}
 	start := time.Now()
-	// kafka.Producer.Send doesn't take a context; ctx already checked above.
-	//nolint:contextcheck // see above
-	err := p.producer.Send(kafka.TopicStatusUpdate, key, template)
+	err := p.producer.Send(ctx, kafka.TopicStatusUpdate, key, template)
 	outcome := "success"
 	if err != nil {
 		outcome = "error"
