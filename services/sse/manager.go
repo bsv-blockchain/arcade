@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/events"
+	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
@@ -164,7 +165,7 @@ func (m *Manager) fanOut(ctx context.Context, status *models.TransactionStatus) 
 			m.logger.Warn(
 				"dropping update for slow SSE client",
 				zap.Int64("client_id", c.ID),
-				zap.String("txid", status.TxID),
+				logfields.TxID(status.TxID),
 			)
 		}
 	}

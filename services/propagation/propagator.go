@@ -21,6 +21,7 @@ import (
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/events"
 	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
@@ -442,9 +443,9 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 			publishedRejected = append(publishedRejected, st.TxID)
 			p.logger.Info(
 				"transaction rejected",
-				zap.String("txid", st.TxID),
+				logfields.TxID(st.TxID),
 				zap.String("reason", st.ExtraInfo),
-				zap.String("stage", "network"),
+				logfields.Stage("network"),
 			)
 		default:
 		}
@@ -510,9 +511,9 @@ func (p *Propagator) persistCascadeRejections(ctx context.Context, txids []strin
 		}
 		p.logger.Info(
 			"transaction rejected",
-			zap.String("txid", txid),
+			logfields.TxID(txid),
 			zap.String("reason", "parent rejected"),
-			zap.String("stage", "cascade"),
+			logfields.Stage("cascade"),
 		)
 	}
 	if _, err := p.store.BatchUpdateStatusReturning(ctx, statuses); err != nil {
@@ -542,7 +543,7 @@ func (p *Propagator) publishBulkStatus(ctx context.Context, status models.Status
 	if err := p.publisher.PublishBulk(ctx, template); err != nil {
 		p.logger.Warn(
 			"failed to publish bulk propagation status",
-			zap.String("status", string(status)),
+			logfields.Status(string(status)),
 			zap.Int("count", len(txids)),
 			zap.Error(err),
 		)
@@ -1001,8 +1002,8 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) {
 	}
 	p.logger.Info(
 		"processing batch",
-		zap.Int("count", len(batch)),
-		zap.Strings("txids_sample", txidSample),
+		logfields.TxIDCount(len(batch)),
+		logfields.TxIDs(txidSample),
 	)
 
 	metrics.PropagationBatchSize.Observe(float64(len(batch)))
@@ -1066,7 +1067,7 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) {
 
 	p.logger.Info(
 		"batch propagated",
-		zap.Int("count", len(batch)),
+		logfields.TxIDCount(len(batch)),
 		zap.Int("accepted", accepted),
 		zap.Int("rejected", rejected),
 		zap.Int("requeued", len(toRequeue)),

@@ -18,6 +18,7 @@ import (
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/events"
 	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
@@ -127,7 +128,7 @@ func (b *Builder) chainHeaderRootValidator(ctx context.Context, blockHash string
 			if lookupErr != nil && !errors.Is(lookupErr, context.Canceled) {
 				logger.Debug(
 					"chaintracks header lookup failed; skipping canonical-root validation",
-					zap.String("block_hash", blockHash),
+					logfields.BlockHash(blockHash),
 					zap.Error(lookupErr),
 				)
 			}
@@ -164,7 +165,7 @@ func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, b
 	logger.Info(
 		"set transactions to MINED",
 		zap.Int("count", len(mined)),
-		zap.Uint64("block_height", blockHeight),
+		logfields.BlockHeight(blockHeight),
 	)
 	metrics.BumpBuilderTxidsMinedTotal.Add(float64(len(mined)))
 	// Observe the per-tx age of the previous status row so an operator can see
@@ -213,10 +214,10 @@ func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, b
 		if pubErr := b.publisher.PublishBulk(ctx, template); pubErr != nil {
 			logger.Warn(
 				"failed to publish bulk MINED",
-				zap.String("block_hash", blockHash),
+				logfields.BlockHash(blockHash),
 				zap.Int("chunk_start", start),
 				zap.Int("chunk_size", end-start),
-				zap.Int("txid_total", len(publishTxIDs)),
+				logfields.TxIDCount(len(publishTxIDs)),
 				zap.Error(pubErr),
 			)
 		}
@@ -322,7 +323,7 @@ func (b *Builder) pruneOrphanStumps(ctx context.Context) {
 			if err := b.store.DeleteStumpsByBlockHash(ctx, r.BlockHash); err != nil {
 				b.logger.Warn(
 					"orphan-stump prune: delete failed",
-					zap.String("block_hash", r.BlockHash),
+					logfields.BlockHash(r.BlockHash),
 					zap.Error(err),
 				)
 				continue
@@ -379,7 +380,7 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 		return fmt.Errorf("empty block hash in block_processed message")
 	}
 
-	logger := b.logger.With(zap.String("block_hash", blockHash))
+	logger := b.logger.With(logfields.BlockHash(blockHash))
 
 	// Short-circuit: if a compound BUMP already exists for this block, skip
 	// the datahub fetch + recompute path entirely. See tryShortCircuit for
@@ -718,7 +719,7 @@ func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, block
 	logger.Info(
 		"BUMP already built — skipping datahub fetch on redelivery",
 		zap.Int("level0_count", len(txids)),
-		zap.Uint64("block_height", existingHeight),
+		logfields.BlockHeight(existingHeight),
 	)
 	if len(txids) > 0 {
 		b.markMinedAndPublish(ctx, logger, blockHash, existingHeight, txids)
@@ -759,8 +760,8 @@ func (b *Builder) markBlockProcessed(ctx context.Context, logger *zap.Logger, bl
 		// never lands), which an aggregator can only group by block hash.
 		logger.Warn(
 			"failed to record block_processed status; block will re-drive via watchdog until the stamp lands",
-			zap.String("block_hash", blockHash),
-			zap.Uint64("block_height", blockHeight),
+			logfields.BlockHash(blockHash),
+			logfields.BlockHeight(blockHeight),
 			zap.Error(err),
 		)
 	}
@@ -922,8 +923,8 @@ func logCompoundBUMP(logger *zap.Logger, compound *transaction.MerklePath, bumpB
 		zap.Int("levels", len(compound.Path)),
 		zap.Int("bytes", len(bumpBytes)),
 		zap.String("hex", hex.EncodeToString(bumpBytes)),
-		zap.Int("txid_count", len(txids)),
-		zap.Strings("txids", txids),
+		logfields.TxIDCount(len(txids)),
+		logfields.TxIDs(txids),
 	)
 	for level, elems := range compound.Path {
 		logger.Debug(
@@ -986,8 +987,8 @@ func dumpBUMPFailureInputs(
 		zap.String("compound_hex", hex.EncodeToString(compoundBytes)),
 		zap.Int("compound_levels", len(compound.Path)),
 		zap.Strings("compound_by_level", levelDumps),
-		zap.Int("txid_count", len(txids)),
-		zap.Strings("txids", txids),
+		logfields.TxIDCount(len(txids)),
+		logfields.TxIDs(txids),
 	)
 }
 

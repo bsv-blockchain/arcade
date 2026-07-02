@@ -15,6 +15,7 @@ import (
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/events"
 	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
@@ -190,7 +191,7 @@ func (s *Server) runSubmissionRecorder(parentCtx context.Context, wg *sync.WaitG
 			if err := s.store.InsertSubmission(ctx, rec.sub); err != nil {
 				s.logger.Warn(
 					"failed to insert submission (async)",
-					zap.String("txid", rec.sub.TxID),
+					logfields.TxID(rec.sub.TxID),
 					zap.Error(err),
 				)
 			}

@@ -26,6 +26,7 @@ import (
 	"github.com/bsv-blockchain/arcade/callbackurl"
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/events"
+	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
@@ -241,8 +242,8 @@ func (s *Service) Start(ctx context.Context) error {
 				metrics.WebhookPoolSaturatedTotal.Inc()
 				s.logger.Warn(
 					"webhook delivery pool saturated, dropping status",
-					zap.String("txid", status.TxID),
-					zap.String("status", string(status.Status)),
+					logfields.TxID(status.TxID),
+					logfields.Status(string(status.Status)),
 				)
 			}
 		}
@@ -285,7 +286,7 @@ func (s *Service) dispatchOne(ctx context.Context, status *models.TransactionSta
 	if err != nil {
 		s.logger.Warn(
 			"submission lookup failed",
-			zap.String("txid", status.TxID),
+			logfields.TxID(status.TxID),
 			zap.Error(err),
 		)
 		return
@@ -341,9 +342,9 @@ func shouldDeliver(sub *models.Submission, status *models.TransactionStatus) boo
 // 5xx no longer translates into permanent loss.
 func (s *Service) deliver(ctx context.Context, sub *models.Submission, status *models.TransactionStatus) {
 	logger := s.logger.With(
-		zap.String("txid", status.TxID),
-		zap.String("callback_url", sub.CallbackURL),
-		zap.String("status", string(status.Status)),
+		logfields.TxID(status.TxID),
+		logfields.CallbackURL(sub.CallbackURL),
+		logfields.Status(string(status.Status)),
 	)
 
 	claimed, err := s.store.UpdateDeliveryStatusCAS(ctx, sub.SubmissionID, sub.LastDeliveredStatus, status.Status)

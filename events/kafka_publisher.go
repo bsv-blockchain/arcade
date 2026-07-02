@@ -13,6 +13,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 )
@@ -175,8 +176,8 @@ func (p *KafkaPublisher) Subscribe(ctx context.Context, caller string) (<-chan *
 					p.logger.Warn(
 						"subscriber channel full, dropping update",
 						zap.String("caller", caller),
-						zap.String("txid", status.TxID),
-						zap.String("status", string(status.Status)),
+						logfields.TxID(status.TxID),
+						logfields.Status(string(status.Status)),
 					)
 				}
 			}

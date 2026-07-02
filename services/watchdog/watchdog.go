@@ -30,6 +30,7 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
@@ -296,8 +297,8 @@ func (w *Watchdog) dispatch(ctx context.Context, rows []*models.BlockProcessingS
 // state based on the outcome.
 func (w *Watchdog) reprocessOne(ctx context.Context, row *models.BlockProcessingStatus) {
 	logger := w.logger.With(
-		zap.String("block_hash", row.BlockHash),
-		zap.Uint64("block_height", row.BlockHeight),
+		logfields.BlockHash(row.BlockHash),
+		logfields.BlockHeight(row.BlockHeight),
 	)
 	logger.Info("watchdog: requesting /reprocess for stale block")
 

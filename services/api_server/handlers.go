@@ -20,6 +20,7 @@ import (
 	"github.com/bsv-blockchain/arcade/callbackurl"
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/teranode"
@@ -130,7 +131,7 @@ func (s *Server) recordSubmission(_ context.Context, txid string, opts submitOpt
 		metrics.APISubmissionRecorderDropTotal.Inc()
 		s.logger.Warn(
 			"submission recorder queue full; dropping (best-effort)",
-			zap.String("txid", txid),
+			logfields.TxID(txid),
 		)
 	}
 }
@@ -264,9 +265,9 @@ func (s *Server) handleCallback(c *gin.Context) {
 
 	logger := s.logger.With(
 		zap.String("type", string(msg.Type)),
-		zap.String("txid", msg.TxID),
-		zap.Strings("txids", msg.TxIDs),
-		zap.String("blockHash", msg.BlockHash),
+		logfields.TxID(msg.TxID),
+		logfields.TxIDs(msg.TxIDs),
+		logfields.BlockHash(msg.BlockHash),
 	)
 
 	switch msg.Type {
@@ -381,7 +382,7 @@ func (s *Server) applySeenCallback(c *gin.Context, msg models.CallbackMessage, l
 			metrics.CallbackUnknownTxIDTotal.WithLabelValues(metricLabel).Inc()
 			logger.Warn("dropping callback for unknown txid",
 				zap.String("type", metricLabel),
-				zap.String("txid", keptTxIDs[i]))
+				logfields.TxID(keptTxIDs[i]))
 			continue
 		}
 		// Observe transition age — the headline metric the user asked for.
@@ -497,7 +498,7 @@ func (s *Server) handleGetTransaction(c *gin.Context) {
 
 	status, err := s.store.GetStatus(c.Request.Context(), txid)
 	if err != nil {
-		s.logger.Error("failed to get status", zap.String("txid", txid), zap.Error(err))
+		s.logger.Error("failed to get status", logfields.TxID(txid), zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "internal error"})
 		return
 	}
@@ -644,7 +645,7 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		existing, inserted, dedupErr := s.store.GetOrInsertStatus(c.Request.Context(), row)
 		switch {
 		case dedupErr != nil:
-			s.logger.Error("dedup CAS failed", zap.String("txid", txid), zap.Error(dedupErr))
+			s.logger.Error("dedup CAS failed", logfields.TxID(txid), zap.Error(dedupErr))
 			// Best-effort: continue with publish. The propagator's
 			// in-flight set catches duplicates that slip past.
 		case !inserted && existing != nil && existing.Status == models.StatusRejected:
@@ -696,7 +697,7 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		if errors.Is(err, kafka.ErrBrokerBackpressure) {
 			// Backpressure → shed load to the client. The tx was never queued,
 			// so a retry is safe and is the contract the 503 expresses.
-			s.logger.Warn("submit rejected: kafka backpressure", zap.String("txid", txid))
+			s.logger.Warn("submit rejected: kafka backpressure", logfields.TxID(txid))
 			c.Header("Retry-After", "1")
 			c.JSON(http.StatusServiceUnavailable, gin.H{jsonKeyError: "service overloaded, retry shortly"})
 			return
@@ -730,9 +731,9 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 func (s *Server) rejectAtIntake(ctx context.Context, txid, reason string, opts submitOptions) {
 	s.logger.Info(
 		"transaction rejected",
-		zap.String("txid", txid),
+		logfields.TxID(txid),
 		zap.String("reason", reason),
-		zap.String("stage", "intake"),
+		logfields.Stage("intake"),
 	)
 	s.persistRejectedAtIntake(ctx, txid, reason)
 	s.recordSubmission(ctx, txid, opts)
@@ -748,7 +749,7 @@ func (s *Server) rejectAtIntake(ctx context.Context, txid, reason string, opts s
 	if err := s.publisher.Publish(ctx, status); err != nil {
 		s.logger.Warn(
 			"intake rejection publish failed",
-			zap.String("txid", txid),
+			logfields.TxID(txid),
 			zap.Error(err),
 		)
 	}
@@ -773,7 +774,7 @@ func (s *Server) persistRejectedAtIntake(ctx context.Context, txid, reason strin
 	if err != nil {
 		s.logger.Warn(
 			"intake rejection persist failed",
-			zap.String("txid", txid),
+			logfields.TxID(txid),
 			zap.Error(err),
 		)
 		return
@@ -782,7 +783,7 @@ func (s *Server) persistRejectedAtIntake(ctx context.Context, txid, reason strin
 		if err := s.store.UpdateStatus(ctx, row); err != nil {
 			s.logger.Warn(
 				"intake rejection status update failed",
-				zap.String("txid", txid),
+				logfields.TxID(txid),
 				zap.Error(err),
 			)
 		}
@@ -899,7 +900,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 			existing, inserted, dedupErr := s.store.GetOrInsertStatus(ctx, row)
 			switch {
 			case dedupErr != nil:
-				s.logger.Error("dedup CAS failed", zap.String("txid", p.txid), zap.Error(dedupErr))
+				s.logger.Error("dedup CAS failed", logfields.TxID(p.txid), zap.Error(dedupErr))
 				toPublish = append(toPublish, p)
 			case !inserted && existing != nil && existing.Status == models.StatusRejected:
 				// Resubmission of a previously-rejected tx: add to
