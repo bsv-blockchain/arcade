@@ -232,7 +232,11 @@ func (s *Server) requestLogger() gin.HandlerFunc {
 		fields := append([]zap.Field{
 			zap.String("method", c.Request.Method),
 			zap.String("path", c.Request.URL.Path),
-			zap.Int("status", status),
+			// status_code (HTTP), not "status": the canonical "status" field is
+			// reserved for the transaction-status string (logfields.Status), so
+			// an HTTP status int must use a distinct key to avoid a mixed-type
+			// collision in the shared log-field namespace.
+			zap.Int("status_code", status),
 			zap.Duration("latency", time.Since(start)),
 			zap.String("client_ip", c.ClientIP()),
 		}, telemetry.Fields(c.Request.Context())...)

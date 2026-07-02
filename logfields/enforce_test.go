@@ -15,7 +15,7 @@ import (
 )
 
 // bannedKeys are field-name string literals that must never appear as the
-// first argument to a zap.String/Strings/Int/Uint64 call outside this
+// first argument to one of the zapFieldFuncs constructors outside this
 // package. The live canonical keys catch a regression back to an ad-hoc
 // zap.X("txid", ...) call instead of the logfields constructor; the
 // retired keys catch a regression back to a name Task 4 explicitly
@@ -30,6 +30,7 @@ var bannedKeys = map[string]struct{}{
 	"block_height": {},
 	"subtree_hash": {},
 	"callback_url": {},
+	"status":       {},
 	"stage":        {},
 	// retired ad-hoc variants
 	"txids_sample": {},
@@ -37,19 +38,27 @@ var bannedKeys = map[string]struct{}{
 	"blockHash":    {},
 }
 
-// zapFieldFuncs are the zap constructor names this guard inspects. Each
-// takes the field name as its first argument.
+// zapFieldFuncs are the zap constructor names this guard inspects, each of
+// which takes the field name as its first string argument. Coverage is
+// deliberately broad: the strongly-typed constructors actually used for
+// these keys (String/Strings/Int/Uint64), PLUS the escape-hatch
+// constructors (Any/Reflect) that could otherwise smuggle a canonical key
+// past the guard with an untyped value. Adding another zap.<Fn>("txid",…)
+// shape to the codebase means adding its name here too.
 var zapFieldFuncs = map[string]struct{}{
 	"String":  {},
 	"Strings": {},
 	"Int":     {},
 	"Uint64":  {},
+	"Any":     {},
+	"Reflect": {},
 }
 
 // scanForViolations walks every non-test .go file under root (skipping
 // .git/vendor/node_modules and the logfields package itself) and returns
-// one human-readable violation string per zap.String/Strings/Int/Uint64
-// call whose first argument is a banned field-name literal.
+// one human-readable violation string per zapFieldFuncs call (see that
+// var for the exact constructor coverage) whose first argument is a banned
+// field-name literal.
 func scanForViolations(root string) ([]string, error) {
 	var violations []string
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -138,10 +147,10 @@ func repoRoot(t *testing.T) string {
 
 // TestNoCanonicalKeyLiteralsOutsidePackage is the enforcement guard: it
 // fails if any non-test .go file outside package logfields constructs one
-// of the canonical (or retired) log-field keys via a raw zap.String/
-// Strings/Int/Uint64 call instead of going through this package's
-// constructors. This is what prevents the field-name migration from
-// regressing once merged.
+// of the canonical (or retired) log-field keys via a raw zap constructor
+// (see zapFieldFuncs for the exact coverage) instead of going through this
+// package's constructors. This is what prevents the field-name migration
+// from regressing once merged.
 func TestNoCanonicalKeyLiteralsOutsidePackage(t *testing.T) {
 	violations, err := scanForViolations(repoRoot(t))
 	if err != nil {
@@ -161,38 +170,46 @@ func TestNoCanonicalKeyLiteralsOutsidePackage(t *testing.T) {
 // asserts scanForViolations flags it, then asserts a clean sibling file in
 // the same temp directory produces no violation.
 func TestScanDetectsViolation(t *testing.T) {
-	dir := t.TempDir()
-
-	bad := `package scratch
-
-import "go.uber.org/zap"
-
-func bad() zap.Field {
-	return zap.String("txid", "deadbeef")
-}
-`
-	if err := os.WriteFile(filepath.Join(dir, "bad.go"), []byte(bad), 0o600); err != nil {
-		t.Fatalf("writing synthetic bad file: %v", err)
+	// Each probe is one synthetic bad call the guard MUST flag. Coverage
+	// spans the string constructor (txid), the canonical "status" key (the
+	// gap this review closed), and the Any/Reflect escape hatches that could
+	// otherwise smuggle a canonical key past a String/Strings/Int/Uint64-only
+	// scan.
+	probes := []struct {
+		name string
+		call string // the zap.<Fn>(...) expression under test
+		want string // substring the violation message must contain
+	}{
+		{"string_txid", `zap.String("txid", "deadbeef")`, `zap.String("txid"`},
+		{"string_status", `zap.String("status", "MINED")`, `zap.String("status"`},
+		{"any_txid", `zap.Any("txid", 42)`, `zap.Any("txid"`},
+		{"reflect_block_hash", `zap.Reflect("block_hash", nil)`, `zap.Reflect("block_hash"`},
+	}
+	for _, p := range probes {
+		t.Run(p.name, func(t *testing.T) {
+			dir := t.TempDir()
+			src := "package scratch\n\nimport \"go.uber.org/zap\"\n\nfunc bad() zap.Field {\n\treturn " + p.call + "\n}\n"
+			if err := os.WriteFile(filepath.Join(dir, "bad.go"), []byte(src), 0o600); err != nil {
+				t.Fatalf("writing synthetic bad file: %v", err)
+			}
+			violations, err := scanForViolations(dir)
+			if err != nil {
+				t.Fatalf("scanForViolations: %v", err)
+			}
+			if len(violations) != 1 {
+				t.Fatalf("found %d violations, want 1: %v", len(violations), violations)
+			}
+			if !strings.Contains(violations[0], p.want) {
+				t.Errorf("violation message = %q, want it to contain %q", violations[0], p.want)
+			}
+		})
 	}
 
-	violations, err := scanForViolations(dir)
-	if err != nil {
-		t.Fatalf("scanForViolations: %v", err)
-	}
-	if len(violations) != 1 {
-		t.Fatalf("scanForViolations found %d violations in synthetic bad file, want 1: %v", len(violations), violations)
-	}
-	if !strings.Contains(violations[0], `zap.String("txid"`) {
-		t.Errorf("violation message = %q, want it to mention zap.String(\"txid\"", violations[0])
-	}
-
-	// Remove the bad file and confirm a clean file in the same directory
-	// produces zero violations — proves the scanner isn't just always
-	// failing.
-	if removeErr := os.Remove(filepath.Join(dir, "bad.go")); removeErr != nil {
-		t.Fatalf("removing synthetic bad file: %v", removeErr)
-	}
-	good := `package scratch
+	// A clean file (non-canonical key) must produce zero violations — proves
+	// the scanner isn't just always failing.
+	t.Run("clean_file_no_violation", func(t *testing.T) {
+		dir := t.TempDir()
+		good := `package scratch
 
 import "go.uber.org/zap"
 
@@ -200,14 +217,15 @@ func good() zap.Field {
 	return zap.String("not_a_canonical_key", "deadbeef")
 }
 `
-	if writeErr := os.WriteFile(filepath.Join(dir, "good.go"), []byte(good), 0o600); writeErr != nil {
-		t.Fatalf("writing synthetic good file: %v", writeErr)
-	}
-	violations, err = scanForViolations(dir)
-	if err != nil {
-		t.Fatalf("scanForViolations: %v", err)
-	}
-	if len(violations) != 0 {
-		t.Fatalf("scanForViolations found %d violations in clean file, want 0: %v", len(violations), violations)
-	}
+		if err := os.WriteFile(filepath.Join(dir, "good.go"), []byte(good), 0o600); err != nil {
+			t.Fatalf("writing synthetic good file: %v", err)
+		}
+		violations, err := scanForViolations(dir)
+		if err != nil {
+			t.Fatalf("scanForViolations: %v", err)
+		}
+		if len(violations) != 0 {
+			t.Fatalf("found %d violations in clean file, want 0: %v", len(violations), violations)
+		}
+	})
 }

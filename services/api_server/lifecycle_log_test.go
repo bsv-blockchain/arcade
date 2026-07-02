@@ -97,12 +97,13 @@ func TestHandleSubmitTransaction_LogsReceived(t *testing.T) {
 	}
 }
 
-// TestHandleSubmitTransactions_LogsReceivedBatch closes the RECEIVED log gap
-// for the batch submit path: a successful POST /txs must emit at least one
-// Info "transactions received" line whose txid_count reflects the TRUE
-// total published, using ForEachTxIDChunk so a batch bigger than one chunk
-// would still surface every txid across multiple lines.
-func TestHandleSubmitTransactions_LogsReceivedBatch(t *testing.T) {
+// TestHandleSubmitTransactions_LogsReceivedBounded pins the RECEIVED batch
+// line to a BOUNDED single line even when the batch exceeds one chunk: this
+// runs synchronously before the HTTP response, so it must NOT do unbounded
+// sequential chunk writes in the client's latency path. txid_count carries
+// the TRUE total while the txids list is capped; full per-txid coverage
+// arrives later on the async ACCEPTED line.
+func TestHandleSubmitTransactions_LogsReceivedBounded(t *testing.T) {
 	core, recorded := observer.New(zapcore.InfoLevel)
 	logger := zap.New(core)
 
@@ -117,9 +118,11 @@ func TestHandleSubmitTransactions_LogsReceivedBatch(t *testing.T) {
 	router := gin.New()
 	srv.registerRoutes(router)
 
-	// Concatenate 3 minimal transactions — store is nil so every parsed tx
-	// flows straight to toPublish (mirrors TestHandleSubmitTransactions_BatchPublish).
-	body := bytes.Repeat(makeMinimalTx(), 3)
+	// 1001 concatenated minimal txs — store is nil so every parsed tx flows
+	// straight to toPublish. 1001 > logfields.maxTxIDsPerLine (1000), so a
+	// chunked implementation would emit 2 lines; the bounded one emits 1.
+	const n = 1001
+	body := bytes.Repeat(makeMinimalTx(), n)
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/txs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/octet-stream")
 	w := httptest.NewRecorder()
@@ -130,23 +133,31 @@ func TestHandleSubmitTransactions_LogsReceivedBatch(t *testing.T) {
 	}
 
 	entries := recorded.FilterMessage("transactions received").All()
-	if len(entries) == 0 {
-		t.Fatal("expected at least 1 'transactions received' log line, got 0")
+	if len(entries) != 1 {
+		t.Fatalf("expected exactly 1 (bounded) 'transactions received' log line, got %d", len(entries))
 	}
 	fields := entries[0].ContextMap()
-	if got := int64Field(t, fields, "txid_count"); got != 3 {
-		t.Errorf("txid_count = %d, want 3 (true total, not chunk size)", got)
+	if got := int64Field(t, fields, "txid_count"); got != n {
+		t.Errorf("txid_count = %d, want %d (true total, not the capped list length)", got, n)
 	}
 	if got := stringField(t, fields, "status"); got != string(models.StatusReceived) {
 		t.Errorf("status = %q, want %q", got, models.StatusReceived)
 	}
+	list, ok := fields["txids"].([]interface{})
+	if !ok {
+		t.Fatalf("txids field missing or wrong type: %#v", fields["txids"])
+	}
+	if len(list) > 1000 {
+		t.Errorf("txids list length = %d, want capped at <= 1000", len(list))
+	}
 }
 
-// TestApplySeenCallback_LogsTransactionsSeen closes the SEEN_ON_NETWORK /
-// SEEN_MULTIPLE_NODES log gap: a callback that transitions a batch of
-// txids must emit an Info "transactions seen" line carrying the target
-// status and the batch's txid count/list.
-func TestApplySeenCallback_LogsTransactionsSeen(t *testing.T) {
+// TestApplySeenCallback_LogsTransactionsSeenChunked closes the SEEN_ON_NETWORK
+// / SEEN_MULTIPLE_NODES log gap with FULL coverage: this callback path is
+// merkle-service-driven (off the client submit hot path), so like MINED it
+// chunks via ForEachTxIDChunk and every seen txid must appear across the
+// chunk lines — with the TRUE total on every line.
+func TestApplySeenCallback_LogsTransactionsSeenChunked(t *testing.T) {
 	core, recorded := observer.New(zapcore.InfoLevel)
 	logger := zap.New(core)
 
@@ -165,10 +176,12 @@ func TestApplySeenCallback_LogsTransactionsSeen(t *testing.T) {
 	router := gin.New()
 	srv.registerRoutes(router)
 
-	const n = 10
+	// 2300 spans logfields.maxTxIDsPerLine (1000) → 1000 + 1000 + 300 = 3 lines.
+	const n = 2300
+	const wantChunks = 3
 	txids := make([]string, n)
 	for i := range txids {
-		txids[i] = fmt.Sprintf("seen-tx-%02d", i)
+		txids[i] = fmt.Sprintf("seen-tx-%05d", i)
 	}
 	payload := models.CallbackMessage{Type: models.CallbackSeenOnNetwork, TxIDs: txids}
 	req := authedCallbackRequest(t, mustMarshalJSON(t, payload))
@@ -180,15 +193,35 @@ func TestApplySeenCallback_LogsTransactionsSeen(t *testing.T) {
 	}
 
 	entries := recorded.FilterMessage("transactions seen").All()
-	if len(entries) != 1 {
-		t.Fatalf("expected exactly 1 'transactions seen' log line, got %d", len(entries))
+	if len(entries) != wantChunks {
+		t.Fatalf("expected %d 'transactions seen' log lines, got %d", wantChunks, len(entries))
 	}
-	fields := entries[0].ContextMap()
-	if got := stringField(t, fields, "status"); got != string(models.StatusSeenOnNetwork) {
-		t.Errorf("status = %q, want %q", got, models.StatusSeenOnNetwork)
+	seen := make(map[string]bool, n)
+	for i, e := range entries {
+		fields := e.ContextMap()
+		if got := stringField(t, fields, "status"); got != string(models.StatusSeenOnNetwork) {
+			t.Errorf("entry %d: status = %q, want %q", i, got, models.StatusSeenOnNetwork)
+		}
+		if got := int64Field(t, fields, "txid_count"); got != n {
+			t.Errorf("entry %d: txid_count = %d, want %d (true total on every chunk)", i, got, n)
+		}
+		if got := int64Field(t, fields, "chunk_total"); got != wantChunks {
+			t.Errorf("entry %d: chunk_total = %d, want %d", i, got, wantChunks)
+		}
+		list, ok := fields["txids"].([]interface{})
+		if !ok {
+			t.Fatalf("entry %d: txids field missing or wrong type: %#v", i, fields["txids"])
+		}
+		for _, v := range list {
+			s, _ := v.(string)
+			if seen[s] {
+				t.Fatalf("txid %q appeared in more than one chunk", s)
+			}
+			seen[s] = true
+		}
 	}
-	if got := int64Field(t, fields, "txid_count"); got != n {
-		t.Errorf("txid_count = %d, want %d", got, n)
+	if len(seen) != n {
+		t.Fatalf("chunks covered %d distinct txids, want %d (every seen txid must appear exactly once)", len(seen), n)
 	}
 }
 

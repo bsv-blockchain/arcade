@@ -68,8 +68,18 @@ func Status(status string) zap.Field {
 	return zap.String("status", status)
 }
 
+// Canonical pipeline-stage values for the Stage field. Using these
+// constants at call sites (instead of free-form string literals) prevents
+// silent typos that would fragment a stage filter in Coralogix.
+const (
+	StageIntake  = "intake"
+	StageNetwork = "network"
+	StageCascade = "cascade"
+)
+
 // Stage returns the canonical field for the pipeline stage a rejection (or
-// other lifecycle event) occurred at (e.g. "intake", "network", "cascade").
+// other lifecycle event) occurred at. Prefer passing one of the Stage*
+// constants above.
 func Stage(stage string) zap.Field {
 	return zap.String("stage", stage)
 }

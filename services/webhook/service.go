@@ -389,7 +389,9 @@ func (s *Service) deliver(ctx context.Context, sub *models.Submission, status *m
 	// only post-claim writer. Info (not Debug): only subscribed txs reach
 	// here, so volume is bounded by callback subscriptions, not raw TPS —
 	// and this is the terminal-delivery lifecycle line for the
-	// txid/callback_url/status search story.
+	// txid/callback_url/status search story. No telemetry.LoggerWith here:
+	// deliver runs on the delivery worker pool from a Kafka-fed status
+	// event, not an HTTP request, so no per-request span ctx is plumbed in.
 	logger.Info("callback delivered")
 }
 

@@ -139,7 +139,10 @@ func FetchBlockDataForBUMPWithOptions(ctx context.Context, datahubURLs []string,
 			"datahub fetch attempt",
 			zap.Int("idx", i),
 			zap.String("url", dataHubURL),
-			zap.Int("status", status),
+			// status_code (HTTP), not "status": the canonical "status" field is
+			// reserved for the transaction-status string, so an HTTP status int
+			// uses a distinct key to avoid a mixed-type namespace collision.
+			zap.Int("status_code", status),
 			zap.Duration("elapsed", time.Since(start)),
 			zap.Int64("max_block_bytes", maxBlockBytes),
 			zap.Error(fetchErr),

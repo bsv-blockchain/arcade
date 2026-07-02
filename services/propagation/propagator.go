@@ -445,16 +445,29 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 				"transaction rejected",
 				logfields.TxID(st.TxID),
 				zap.String("reason", st.ExtraInfo),
-				logfields.Stage("network"),
+				logfields.Stage(logfields.StageNetwork),
 			)
 		default:
 		}
 	}
 
-	if len(publishedAccepted) > 0 {
-		acceptedFields := append([]zap.Field{logfields.Stage("network")}, logfields.TxIDBatch(publishedAccepted)...)
-		p.logger.Info("transactions accepted by network", acceptedFields...)
-	}
+	// Full-coverage ACCEPTED_BY_NETWORK line(s): this runs on the async
+	// processBatch goroutine (off the client's request path), so it's the
+	// right place to emit every accepted txid — chunked, never capped — so a
+	// txid search always finds the RECEIVED→ACCEPTED transition. The plain
+	// component logger is used deliberately: a flushed batch aggregates txs
+	// from many unrelated producer traces, so there is no single trace_id to
+	// attach via telemetry.LoggerWith.
+	logfields.ForEachTxIDChunk(publishedAccepted, func(chunk []string, chunkIdx, totalChunks int) {
+		p.logger.Info(
+			"transactions accepted by network",
+			logfields.Stage(logfields.StageNetwork),
+			logfields.TxIDCount(len(publishedAccepted)),
+			logfields.TxIDs(chunk),
+			zap.Int("chunk_index", chunkIdx),
+			zap.Int("chunk_total", totalChunks),
+		)
+	})
 
 	p.publishBulkStatus(ctx, models.StatusAcceptedByNetwork, publishedAccepted, now)
 	p.publishBulkStatus(ctx, models.StatusRejected, publishedRejected, now)
@@ -518,7 +531,7 @@ func (p *Propagator) persistCascadeRejections(ctx context.Context, txids []strin
 			"transaction rejected",
 			logfields.TxID(txid),
 			zap.String("reason", "parent rejected"),
-			logfields.Stage("cascade"),
+			logfields.Stage(logfields.StageCascade),
 		)
 	}
 	if _, err := p.store.BatchUpdateStatusReturning(ctx, statuses); err != nil {
@@ -1003,17 +1016,14 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) {
 	}
 	batch = registered
 
-	txidSample := make([]string, 0, 5)
-	for i, msg := range batch {
-		if i >= 5 {
-			break
-		}
-		txidSample = append(txidSample, msg.TXID)
-	}
+	// Batch-size only — no txid list. The full accepted-txid set is logged
+	// (chunked, searchable) on the "transactions accepted by network" line
+	// after broadcast; shipping a 5-item preview here under the canonical
+	// "txids" key would collide with that full-list semantic and mislead a
+	// txid search.
 	p.logger.Info(
 		"processing batch",
 		logfields.TxIDCount(len(batch)),
-		logfields.TxIDs(txidSample),
 	)
 
 	metrics.PropagationBatchSize.Observe(float64(len(batch)))
@@ -1112,7 +1122,11 @@ func (p *Propagator) requeueAfterDelay(ctx context.Context, msgs []propagationMs
 	for i, m := range msgs {
 		requeueTxIDs[i] = m.TXID
 	}
-	requeueFields := append([]zap.Field{logfields.Stage("network")}, logfields.TxIDBatch(requeueTxIDs)...)
+	// Failure-path only (register blip / no verdict), so volume is low and a
+	// bounded TxIDBatch line suffices. Plain component logger, not
+	// telemetry.LoggerWith: a requeued batch aggregates txs from many
+	// unrelated producer traces, so there is no single trace_id to attach.
+	requeueFields := append([]zap.Field{logfields.Stage(logfields.StageNetwork)}, logfields.TxIDBatch(requeueTxIDs)...)
 	p.logger.Info("transactions requeued for retry", requeueFields...)
 
 	// Track pending requeue goroutines on the metric so sustained

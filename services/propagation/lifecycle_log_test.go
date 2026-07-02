@@ -51,6 +51,12 @@ func TestApplyTerminalStatuses_LogsAcceptedByNetwork(t *testing.T) {
 	if got, _ := fields["txid_count"].(int64); got != 1 {
 		t.Errorf("txid_count = %d, want 1", got)
 	}
+	// chunk_total pins the full-coverage (ForEachTxIDChunk) path: this async
+	// line must carry every accepted txid across chunks, so a revert to a
+	// bounded TxIDBatch line (which has no chunk_total field) fails here.
+	if got, ok := fields["chunk_total"].(int64); !ok || got != 1 {
+		t.Errorf("chunk_total = %v (ok=%v), want 1 — expected the chunked full-coverage path", fields["chunk_total"], ok)
+	}
 }
 
 // TestRequeueAfterDelay_LogsRequeueForRetry closes the PENDING_RETRY log

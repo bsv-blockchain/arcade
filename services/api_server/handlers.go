@@ -411,10 +411,20 @@ func (s *Server) applySeenCallback(c *gin.Context, msg models.CallbackMessage, l
 		}
 	}
 
-	if len(successful) > 0 {
-		seenFields := append([]zap.Field{logfields.Status(string(targetStatus))}, logfields.TxIDBatch(successful)...)
-		logger.Info("transactions seen", seenFields...)
-	}
+	// Full-coverage SEEN line(s): this callback path is driven by
+	// merkle-service (not the client submit request), so it's off the
+	// synchronous hot path — emit every seen txid, chunked and never capped,
+	// matching MINED, so a txid search finds the SEEN transition.
+	logfields.ForEachTxIDChunk(successful, func(chunk []string, chunkIdx, totalChunks int) {
+		logger.Info(
+			"transactions seen",
+			logfields.Status(string(targetStatus)),
+			logfields.TxIDCount(len(successful)),
+			logfields.TxIDs(chunk),
+			zap.Int("chunk_index", chunkIdx),
+			zap.Int("chunk_total", totalChunks),
+		)
+	})
 
 	// Single PublishBulk for the whole batch — drops the per-txid Kafka send
 	// down to one event regardless of N. Subscribers (SSE, webhook) unfan in
@@ -751,7 +761,7 @@ func (s *Server) rejectAtIntake(ctx context.Context, txid, reason string, opts s
 		"transaction rejected",
 		logfields.TxID(txid),
 		zap.String("reason", reason),
-		logfields.Stage("intake"),
+		logfields.Stage(logfields.StageIntake),
 	)
 	s.persistRejectedAtIntake(ctx, txid, reason)
 	s.recordSubmission(ctx, txid, opts)
@@ -991,21 +1001,18 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 			return
 		}
 
-		receivedLogger := telemetry.LoggerWith(ctx, s.logger)
 		publishedTxIDs := make([]string, len(toPublish))
 		for i, p := range toPublish {
 			publishedTxIDs[i] = p.txid
 		}
-		logfields.ForEachTxIDChunk(publishedTxIDs, func(chunk []string, chunkIdx, totalChunks int) {
-			receivedLogger.Info(
-				"transactions received",
-				logfields.Status(string(models.StatusReceived)),
-				logfields.TxIDCount(len(publishedTxIDs)),
-				logfields.TxIDs(chunk),
-				zap.Int("chunk_index", chunkIdx),
-				zap.Int("chunk_total", totalChunks),
-			)
-		})
+		// Bounded (TxIDBatch: true count + capped list), NOT chunked: this
+		// runs synchronously before the HTTP response and /txs accepts up to
+		// 256 MiB, so unbounded sequential chunk writes would land in the
+		// client's request latency. Full per-txid coverage arrives shortly
+		// after on the async "transactions accepted by network" line; a tx
+		// rejected at intake is covered by the existing REJECTED line.
+		receivedFields := append([]zap.Field{logfields.Status(string(models.StatusReceived))}, logfields.TxIDBatch(publishedTxIDs)...)
+		telemetry.LoggerWith(ctx, s.logger).Info("transactions received", receivedFields...)
 	}
 
 	c.JSON(http.StatusAccepted, gin.H{
