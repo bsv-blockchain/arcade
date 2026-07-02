@@ -386,8 +386,11 @@ func (s *Service) deliver(ctx context.Context, sub *models.Submission, status *m
 
 	// CAS already advanced LastDeliveredStatus and cleared retry state, so
 	// there's no second store write on success. recordFailure remains the
-	// only post-claim writer.
-	logger.Debug("callback delivered")
+	// only post-claim writer. Info (not Debug): only subscribed txs reach
+	// here, so volume is bounded by callback subscriptions, not raw TPS —
+	// and this is the terminal-delivery lifecycle line for the
+	// txid/callback_url/status search story.
+	logger.Info("callback delivered")
 }
 
 // recordFailure increments the submission's retry counter and computes the

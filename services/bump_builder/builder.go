@@ -22,6 +22,7 @@ import (
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/arcade/telemetry"
 	"github.com/bsv-blockchain/arcade/teranode"
 )
 
@@ -180,6 +181,29 @@ func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, b
 			WithLabelValues(string(prev.Status), string(models.StatusMined)).
 			Observe(time.Since(prev.Timestamp).Seconds())
 	}
+
+	minedTxIDs := make([]string, len(mined))
+	for i, st := range mined {
+		minedTxIDs[i] = st.TxID
+	}
+	// Full-searchability MINED line(s): every txid appears in the log stream
+	// (chunked, never capped) so a txid or block_hash search in Coralogix
+	// finds the MINED transition regardless of block size. A 14k-tx block
+	// produces ~14 lines at maxTxIDsPerLine=1000 — intended. Independent of
+	// b.publisher wiring below, since this is the lifecycle log, not the
+	// downstream fan-out.
+	logfields.ForEachTxIDChunk(minedTxIDs, func(chunk []string, chunkIdx, totalChunks int) {
+		logger.Info(
+			"transactions mined",
+			logfields.BlockHash(blockHash),
+			logfields.BlockHeight(blockHeight),
+			logfields.TxIDCount(len(minedTxIDs)),
+			logfields.TxIDs(chunk),
+			zap.Int("chunk_index", chunkIdx),
+			zap.Int("chunk_total", totalChunks),
+		)
+	})
+
 	if len(mined) == 0 || b.publisher == nil {
 		return
 	}
@@ -195,10 +219,7 @@ func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, b
 	// event was silently dropped for large blocks (the DB status was still
 	// MINED, but SSE/webhook subscribers never saw it). Each txid is ~67 bytes
 	// of JSON, so maxTxIDsPerBulkEvent keeps every event well under the limit.
-	publishTxIDs := make([]string, 0, len(mined))
-	for _, st := range mined {
-		publishTxIDs = append(publishTxIDs, st.TxID)
-	}
+	publishTxIDs := minedTxIDs
 	for start := 0; start < len(publishTxIDs); start += maxTxIDsPerBulkEvent {
 		end := start + maxTxIDsPerBulkEvent
 		if end > len(publishTxIDs) {
@@ -380,7 +401,7 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 		return fmt.Errorf("empty block hash in block_processed message")
 	}
 
-	logger := b.logger.With(logfields.BlockHash(blockHash))
+	logger := telemetry.LoggerWith(ctx, b.logger.With(logfields.BlockHash(blockHash)))
 
 	// Short-circuit: if a compound BUMP already exists for this block, skip
 	// the datahub fetch + recompute path entirely. See tryShortCircuit for

@@ -23,6 +23,7 @@ import (
 	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/telemetry"
 	"github.com/bsv-blockchain/arcade/teranode"
 	"github.com/bsv-blockchain/arcade/version"
 )
@@ -263,12 +264,12 @@ func (s *Server) handleCallback(c *gin.Context) {
 		return
 	}
 
-	logger := s.logger.With(
+	logger := telemetry.LoggerWith(c.Request.Context(), s.logger.With(
 		zap.String("type", string(msg.Type)),
 		logfields.TxID(msg.TxID),
 		logfields.TxIDs(msg.TxIDs),
 		logfields.BlockHash(msg.BlockHash),
-	)
+	))
 
 	switch msg.Type {
 	case models.CallbackSeenOnNetwork:
@@ -410,6 +411,11 @@ func (s *Server) applySeenCallback(c *gin.Context, msg models.CallbackMessage, l
 		}
 	}
 
+	if len(successful) > 0 {
+		seenFields := append([]zap.Field{logfields.Status(string(targetStatus))}, logfields.TxIDBatch(successful)...)
+		logger.Info("transactions seen", seenFields...)
+	}
+
 	// Single PublishBulk for the whole batch — drops the per-txid Kafka send
 	// down to one event regardless of N. Subscribers (SSE, webhook) unfan in
 	// their own handler, where they pay the per-tx cost without saturating
@@ -453,6 +459,11 @@ func (s *Server) handleStump(c *gin.Context, msg models.CallbackMessage, logger 
 		return
 	}
 
+	logger.Info(
+		"stump stored",
+		logfields.BlockHash(msg.BlockHash),
+		zap.Int("subtree_index", msg.SubtreeIndex),
+	)
 	c.Status(http.StatusOK)
 }
 
@@ -485,6 +496,7 @@ func (s *Server) handleBlockProcessed(c *gin.Context, msg models.CallbackMessage
 		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to enqueue"})
 		return
 	}
+	logger.Info("block_processed enqueued", logfields.BlockHash(msg.BlockHash))
 	c.Status(http.StatusOK)
 }
 
@@ -706,6 +718,12 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to submit"})
 		return
 	}
+
+	telemetry.LoggerWith(c.Request.Context(), s.logger).Info(
+		"transaction received",
+		logfields.TxID(txid),
+		logfields.Status(string(models.StatusReceived)),
+	)
 
 	c.JSON(http.StatusAccepted, submitResponse{
 		TxID:     txid,
@@ -972,6 +990,22 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to submit"})
 			return
 		}
+
+		receivedLogger := telemetry.LoggerWith(ctx, s.logger)
+		publishedTxIDs := make([]string, len(toPublish))
+		for i, p := range toPublish {
+			publishedTxIDs[i] = p.txid
+		}
+		logfields.ForEachTxIDChunk(publishedTxIDs, func(chunk []string, chunkIdx, totalChunks int) {
+			receivedLogger.Info(
+				"transactions received",
+				logfields.Status(string(models.StatusReceived)),
+				logfields.TxIDCount(len(publishedTxIDs)),
+				logfields.TxIDs(chunk),
+				zap.Int("chunk_index", chunkIdx),
+				zap.Int("chunk_total", totalChunks),
+			)
+		})
 	}
 
 	c.JSON(http.StatusAccepted, gin.H{

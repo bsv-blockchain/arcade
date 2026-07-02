@@ -451,6 +451,11 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 		}
 	}
 
+	if len(publishedAccepted) > 0 {
+		acceptedFields := append([]zap.Field{logfields.Stage("network")}, logfields.TxIDBatch(publishedAccepted)...)
+		p.logger.Info("transactions accepted by network", acceptedFields...)
+	}
+
 	p.publishBulkStatus(ctx, models.StatusAcceptedByNetwork, publishedAccepted, now)
 	p.publishBulkStatus(ctx, models.StatusRejected, publishedRejected, now)
 
@@ -889,6 +894,11 @@ func (p *Propagator) registerBatch(ctx context.Context, batch []propagationMsg) 
 				zap.Error(err),
 			)
 		}
+		// Debug, not Info: this isn't a status-lattice transition, just an
+		// F-024 durability checkpoint. Keeps Info-level volume flat while
+		// still making the registration searchable by txid when debug
+		// logging is enabled.
+		p.logger.Debug("registered with merkle-service", logfields.TxIDBatch(successTxIDs)...)
 	}
 	return registered, failed
 }
@@ -1098,6 +1108,13 @@ func (p *Propagator) requeueAfterDelay(ctx context.Context, msgs []propagationMs
 	if len(msgs) == 0 {
 		return
 	}
+	requeueTxIDs := make([]string, len(msgs))
+	for i, m := range msgs {
+		requeueTxIDs[i] = m.TXID
+	}
+	requeueFields := append([]zap.Field{logfields.Stage("network")}, logfields.TxIDBatch(requeueTxIDs)...)
+	p.logger.Info("transactions requeued for retry", requeueFields...)
+
 	// Track pending requeue goroutines on the metric so sustained
 	// upstream pressure shows up in dashboards without needing to
 	// introspect goroutines. Per-call goroutine + timer is intentional
