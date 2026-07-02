@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/metrics"
@@ -203,7 +204,7 @@ func NewClient(endpoints []string, authToken string, hc HealthConfig) *Client {
 		authToken: authToken,
 		httpClient: &http.Client{
 			Timeout:   defaultTimeout,
-			Transport: newBroadcastTransport(),
+			Transport: otelhttp.NewTransport(newBroadcastTransport()),
 		},
 		failureThreshold:          hc.FailureThreshold,
 		broadcastFailureThreshold: hc.BroadcastFailureThreshold,

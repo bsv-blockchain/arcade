@@ -5,6 +5,12 @@ server (port `health.port`, default `8081`) and the API server (port
 `api.port`, default `8080`). Either is fine — pick the one your service mode
 runs.
 
+These same `arcade_*` metrics are also dual-exported over OTLP (bridged
+straight from this Prometheus registry) when telemetry is enabled — see
+[`docs/observability.md`](../docs/observability.md) for the OTLP pipeline,
+config/env reference, and the structured-log field canon used for
+transaction-lifecycle logging.
+
 All metric names start with `arcade_` so they live in their own namespace.
 
 ## What to alert on

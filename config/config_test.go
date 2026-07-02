@@ -226,3 +226,99 @@ func TestDefaultCallbackMaxBodyBytes(t *testing.T) {
 		t.Errorf("DefaultCallbackMaxBodyBytes = %d, want %d", DefaultCallbackMaxBodyBytes, want)
 	}
 }
+
+// telemetryValidConfig extends baseValidConfig with an enabled, valid
+// telemetry block so each telemetry-validation test can break exactly one
+// rule at a time.
+func telemetryValidConfig() *Config {
+	cfg := baseValidConfig()
+	cfg.Telemetry.Enabled = true
+	cfg.Telemetry.Protocol = "grpc"
+	cfg.Telemetry.SampleRatio = 1.0
+	return cfg
+}
+
+// Telemetry validation only applies when telemetry.enabled=true: a disabled
+// block may carry garbage values (typical of half-filled config templates)
+// without blocking startup, because none of it is ever read.
+func TestValidate_TelemetryDisabledSkipsChecks(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.Telemetry.Enabled = false
+	cfg.Telemetry.Protocol = "carrier-pigeon"
+	cfg.Telemetry.SampleRatio = 42
+	cfg.Telemetry.Endpoint = "http://collector:4317"
+	if err := validate(cfg); err != nil {
+		t.Fatalf("disabled telemetry block must not be validated, got: %v", err)
+	}
+}
+
+func TestValidate_TelemetryAcceptsValidConfig(t *testing.T) {
+	for _, protocol := range []string{"grpc", "http"} {
+		t.Run(protocol, func(t *testing.T) {
+			cfg := telemetryValidConfig()
+			cfg.Telemetry.Protocol = protocol
+			// Endpoint intentionally empty: the env fallback is resolved in
+			// telemetry.Init, not validate().
+			if err := validate(cfg); err != nil {
+				t.Fatalf("valid telemetry config rejected: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidate_TelemetryRejectsBadProtocol(t *testing.T) {
+	cfg := telemetryValidConfig()
+	cfg.Telemetry.Protocol = "carrier-pigeon"
+	err := validate(cfg)
+	if err == nil {
+		t.Fatal("expected error for telemetry.protocol=carrier-pigeon when enabled")
+	}
+	if !strings.Contains(err.Error(), "telemetry.protocol") {
+		t.Errorf("error should name telemetry.protocol, got: %v", err)
+	}
+}
+
+func TestValidate_TelemetryRejectsOutOfRangeSampleRatio(t *testing.T) {
+	for _, ratio := range []float64{-0.1, 1.5} {
+		cfg := telemetryValidConfig()
+		cfg.Telemetry.SampleRatio = ratio
+		err := validate(cfg)
+		if err == nil {
+			t.Fatalf("expected error for telemetry.sample_ratio=%v when enabled", ratio)
+		}
+		if !strings.Contains(err.Error(), "telemetry.sample_ratio") {
+			t.Errorf("error should name telemetry.sample_ratio, got: %v", err)
+		}
+	}
+}
+
+// Both the gRPC and HTTP OTLP exporters' WithEndpoint dial telemetry.endpoint
+// verbatim as host:port; a scheme prefix fails silently inside the
+// background exporter goroutine for either protocol (for HTTP the scheme is
+// instead controlled by telemetry.insecure), so validate() rejects a
+// scheme-prefixed endpoint regardless of telemetry.protocol.
+func TestValidate_TelemetryRejectsSchemedEndpoint(t *testing.T) {
+	for _, protocol := range []string{"grpc", "http"} {
+		for _, endpoint := range []string{"http://collector:4317", "https://collector:4317"} {
+			t.Run(protocol+"/"+endpoint, func(t *testing.T) {
+				cfg := telemetryValidConfig()
+				cfg.Telemetry.Protocol = protocol
+				cfg.Telemetry.Endpoint = endpoint
+				err := validate(cfg)
+				if err == nil {
+					t.Fatalf("expected error for scheme-prefixed endpoint %q with protocol=%s", endpoint, protocol)
+				}
+				if !strings.Contains(err.Error(), "telemetry.endpoint") {
+					t.Errorf("error should name telemetry.endpoint, got: %v", err)
+				}
+			})
+		}
+
+		cfg := telemetryValidConfig()
+		cfg.Telemetry.Protocol = protocol
+		cfg.Telemetry.Endpoint = "collector:4317"
+		if err := validate(cfg); err != nil {
+			t.Fatalf("plain host:port endpoint rejected for protocol=%s: %v", protocol, err)
+		}
+	}
+}

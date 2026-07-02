@@ -46,6 +46,25 @@ spec:
               value: "aerospike-0.aerospike.arcade.svc.cluster.local:3000"
             - name: ARCADE_AEROSPIKE_NAMESPACE
               value: "arcade"
+            # HOST_IP feeds OTEL_EXPORTER_OTLP_ENDPOINT below to reach the
+            # node-local OTLP collector via the Kubernetes downward API; it
+            # MUST be defined before its $(HOST_IP) use. Telemetry itself
+            # stays off (ARCADE_TELEMETRY_ENABLED=false) until an operator
+            # opts in — see docs/observability.md.
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://$(HOST_IP):4317"
+            - name: ARCADE_TELEMETRY_ENABLED
+              value: "false"
+            - name: ARCADE_TELEMETRY_INSECURE
+              value: "true"
           readinessProbe:
             httpGet:
               path: /health

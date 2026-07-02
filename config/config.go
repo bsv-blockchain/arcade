@@ -116,6 +116,7 @@ type Config struct {
 	MerkleService MerkleServiceConfig `mapstructure:"merkle_service"`
 	P2P           P2PConfig           `mapstructure:"p2p"`
 	Health        HealthConfig        `mapstructure:"health"`
+	Telemetry     TelemetryConfig     `mapstructure:"telemetry"`
 	Propagation   PropagationConfig   `mapstructure:"propagation"`
 	BumpBuilder   BumpBuilderConfig   `mapstructure:"bump_builder"`
 	Watchdog      WatchdogConfig      `mapstructure:"watchdog"`
@@ -297,6 +298,45 @@ type HealthConfig struct {
 	// information an operator may not want exposed continuously. Toggle on
 	// in the ConfigMap when capturing a profile, then toggle back off.
 	PprofEnabled bool `mapstructure:"pprof_enabled"`
+}
+
+// TelemetryConfig configures OpenTelemetry export to an external OTLP
+// collector (see docs/plans/otel-integration.md). Disabled by default:
+// with Enabled=false, telemetry.Init installs no-op providers and opens
+// no network connections, so runtime behaviour matches the pre-OTEL build
+// exactly. When Enabled, Endpoint may be left empty to fall back to the
+// standard OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_EXPORTER_OTLP_*_ENDPOINT
+// environment variables (resolved inside telemetry.Init, not here).
+type TelemetryConfig struct {
+	Enabled bool `mapstructure:"enabled"`
+	// Endpoint is the host:port of the OTLP collector. May be left empty
+	// when Enabled=true — the exporter then falls back to the standard
+	// OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_EXPORTER_OTLP_{TRACES,METRICS}_ENDPOINT
+	// env vars.
+	Endpoint string `mapstructure:"endpoint"`
+	// Protocol selects the OTLP transport: "grpc" (default) or "http".
+	Protocol string `mapstructure:"protocol"`
+	// Insecure skips TLS when dialing the collector (e.g. an in-cluster
+	// collector reachable without TLS).
+	Insecure bool `mapstructure:"insecure"`
+	// ServiceName sets the resource's service.name attribute. Default "arcade".
+	ServiceName string `mapstructure:"service_name"`
+	// Namespace sets the resource's service.namespace attribute (e.g. the
+	// downstream solution's name). Omitted from the resource when empty.
+	Namespace string `mapstructure:"namespace"`
+	// Traces enables the OTLP trace pipeline. Default true.
+	Traces bool `mapstructure:"traces"`
+	// Metrics enables the OTLP metric pipeline (Prometheus bridge). Default true.
+	Metrics bool `mapstructure:"metrics"`
+	// Logs, when true, only logs a warning that OTLP log export is not
+	// implemented; logs continue to ship via stdout JSON. Default false.
+	Logs bool `mapstructure:"logs"`
+	// SampleRatio is the ratio (0.0-1.0) fed to a ParentBased(TraceIDRatioBased)
+	// sampler. Default 1.0 (sample everything).
+	SampleRatio float64 `mapstructure:"sample_ratio"`
+	// ExportTimeoutMs bounds Shutdown's ForceFlush+Shutdown of every
+	// provider. Default 10000 (10s).
+	ExportTimeoutMs int `mapstructure:"export_timeout_ms"`
 }
 
 type PropagationConfig struct {
@@ -722,6 +762,25 @@ func setDefaults() {
 	viper.SetDefault("store.postgres.embedded_cache_dir", "~/.arcade/postgres-cache")
 	viper.SetDefault("store.postgres.max_conns", 16)
 	viper.SetDefault("health.port", 8081)
+
+	// OTEL telemetry export: off by default. See TelemetryConfig doc comment
+	// and docs/plans/otel-integration.md. Every field gets an explicit
+	// SetDefault — including the zero-valued ones — because viper's
+	// AutomaticEnv only recognizes ARCADE_TELEMETRY_* overrides for keys it
+	// already knows about (same reasoning as the chaintracks.url default
+	// below); without these, ARCADE_TELEMETRY_ENDPOINT/NAMESPACE/INSECURE
+	// would silently be ignored.
+	viper.SetDefault("telemetry.enabled", false)
+	viper.SetDefault("telemetry.endpoint", "")
+	viper.SetDefault("telemetry.protocol", "grpc")
+	viper.SetDefault("telemetry.insecure", false)
+	viper.SetDefault("telemetry.service_name", "arcade")
+	viper.SetDefault("telemetry.namespace", "")
+	viper.SetDefault("telemetry.traces", true)
+	viper.SetDefault("telemetry.metrics", true)
+	viper.SetDefault("telemetry.logs", false)
+	viper.SetDefault("telemetry.sample_ratio", 1.0)
+	viper.SetDefault("telemetry.export_timeout_ms", 10000)
 	viper.SetDefault("propagation.merkle_concurrency", 10)
 	viper.SetDefault("propagation.retry_max_attempts", 5)
 	viper.SetDefault("propagation.retry_backoff_ms", 500)
@@ -910,6 +969,31 @@ func validate(cfg *Config) error {
 		}
 		if cfg.Watchdog.RecencyDepth <= 0 {
 			return fmt.Errorf("watchdog.recency_depth must be > 0 when watchdog.enabled")
+		}
+	}
+	if cfg.Telemetry.Enabled {
+		switch cfg.Telemetry.Protocol {
+		case "grpc", "http":
+		default:
+			return fmt.Errorf("invalid telemetry.protocol %q (expected grpc or http)", cfg.Telemetry.Protocol)
+		}
+		// Both the gRPC and HTTP exporters' WithEndpoint dial the value
+		// verbatim as host:port; a scheme prefix makes the dial fail silently
+		// in the background exporter goroutine (for HTTP the scheme is instead
+		// controlled by telemetry.insecure), so fail fast here for either
+		// protocol. Only the OTEL_EXPORTER_OTLP_ENDPOINT env var understands a
+		// scheme-prefixed URL.
+		if strings.HasPrefix(cfg.Telemetry.Endpoint, "http://") || strings.HasPrefix(cfg.Telemetry.Endpoint, "https://") {
+			return fmt.Errorf("telemetry.endpoint %q must be host:port without a scheme "+
+				"(e.g. \"collector:4317\"); scheme-prefixed URLs are only understood by the OTEL_EXPORTER_OTLP_ENDPOINT env var",
+				cfg.Telemetry.Endpoint)
+		}
+		// telemetry.endpoint is intentionally not required here: an empty
+		// value falls back to the standard OTEL_EXPORTER_OTLP_ENDPOINT /
+		// OTEL_EXPORTER_OTLP_{TRACES,METRICS}_ENDPOINT env vars, resolved
+		// inside telemetry.Init (which errors if neither is set).
+		if cfg.Telemetry.SampleRatio < 0 || cfg.Telemetry.SampleRatio > 1 {
+			return fmt.Errorf("telemetry.sample_ratio must be between 0 and 1, got %v", cfg.Telemetry.SampleRatio)
 		}
 	}
 	return nil

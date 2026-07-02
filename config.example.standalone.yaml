@@ -28,6 +28,31 @@ api:
 health:
   port: 8081
 
+# OpenTelemetry export to an external OTLP collector (traces + metrics; the
+# existing Prometheus /metrics scrape keeps working unchanged either way).
+# Disabled by default: with enabled=false, no OTEL providers are created and
+# no network connections are opened, so runtime behaviour is identical to a
+# build with no OTEL support at all.
+#
+# endpoint may be left blank when enabled=true: the exporters then fall back
+# to the standard OTEL_EXPORTER_OTLP_ENDPOINT (or the more specific
+# OTEL_EXPORTER_OTLP_TRACES_ENDPOINT / OTEL_EXPORTER_OTLP_METRICS_ENDPOINT)
+# environment variables, e.g. for a node-local collector reached via the
+# Kubernetes downward API host IP:
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://$(HOST_IP):4317
+# telemetry:
+#   enabled: false
+#   endpoint: ""                # host:port of the OTLP collector; see env fallback above
+#   protocol: grpc              # "grpc" (default, port 4317) or "http" (port 4318)
+#   insecure: false             # skip TLS; typically true for an in-cluster/local collector
+#   service_name: arcade
+#   namespace: ""                # service.namespace resource attribute (e.g. downstream solution name)
+#   traces: true
+#   metrics: true
+#   logs: false                  # OTLP log export is not implemented; logs always ship via stdout JSON
+#   sample_ratio: 1.0            # ParentBased(TraceIDRatioBased) sampler ratio, 0.0-1.0
+#   export_timeout_ms: 10000
+
 # In-memory broker: publishes and consumes stay inside the process. No
 # Kafka/Sarama connection is attempted. Messages are at-most-once on crash,
 # which is fine for single-node evaluation and local development.

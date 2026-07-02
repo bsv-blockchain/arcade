@@ -62,7 +62,7 @@ func (f *fakeSyncProducer) TxnAddOffsetsToTxn(map[string][]*sarama.PartitionOffs
 // Return.Successes/Return.Errors flags the production broker uses, so the
 // drainer goroutines see the same channel behavior they would in a real
 // deployment.
-func newAsyncProducerMock(t *testing.T) *mocks.AsyncProducer {
+func newAsyncProducerMock(t testing.TB) *mocks.AsyncProducer {
 	t.Helper()
 	cfg := sarama.NewConfig()
 	cfg.Producer.Return.Successes = true

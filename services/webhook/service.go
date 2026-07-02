@@ -20,11 +20,13 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/callbackurl"
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/events"
+	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
@@ -126,22 +128,27 @@ func newHolderID() string {
 // an error from the callbackurl package — the request never leaves the
 // machine. Pulled out of New so tests can construct an equivalent client
 // without instantiating the whole Service.
+//
+// The SSRF-guarding *http.Transport is wrapped by otelhttp so outbound spans
+// and traceparent propagation are added on top — the guard remains the inner
+// RoundTripper and still runs on every dial, unaffected by the wrapping.
 func newCallbackClient(timeout time.Duration, allowPrivate bool) *http.Client {
 	dialer := &net.Dialer{
 		Timeout:   timeout,
 		KeepAlive: 30 * time.Second,
 		Control:   callbackurl.DialControl(allowPrivate),
 	}
+	guardedTransport := &http.Transport{
+		DialContext:           dialer.DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: timeout,
+		ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2:     true,
+		IdleConnTimeout:       90 * time.Second,
+	}
 	return &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			DialContext:           dialer.DialContext,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: timeout,
-			ExpectContinueTimeout: 1 * time.Second,
-			ForceAttemptHTTP2:     true,
-			IdleConnTimeout:       90 * time.Second,
-		},
+		Timeout:   timeout,
+		Transport: otelhttp.NewTransport(guardedTransport),
 	}
 }
 
@@ -235,8 +242,8 @@ func (s *Service) Start(ctx context.Context) error {
 				metrics.WebhookPoolSaturatedTotal.Inc()
 				s.logger.Warn(
 					"webhook delivery pool saturated, dropping status",
-					zap.String("txid", status.TxID),
-					zap.String("status", string(status.Status)),
+					logfields.TxID(status.TxID),
+					logfields.Status(string(status.Status)),
 				)
 			}
 		}
@@ -279,7 +286,7 @@ func (s *Service) dispatchOne(ctx context.Context, status *models.TransactionSta
 	if err != nil {
 		s.logger.Warn(
 			"submission lookup failed",
-			zap.String("txid", status.TxID),
+			logfields.TxID(status.TxID),
 			zap.Error(err),
 		)
 		return
@@ -335,9 +342,9 @@ func shouldDeliver(sub *models.Submission, status *models.TransactionStatus) boo
 // 5xx no longer translates into permanent loss.
 func (s *Service) deliver(ctx context.Context, sub *models.Submission, status *models.TransactionStatus) {
 	logger := s.logger.With(
-		zap.String("txid", status.TxID),
-		zap.String("callback_url", sub.CallbackURL),
-		zap.String("status", string(status.Status)),
+		logfields.TxID(status.TxID),
+		logfields.CallbackURL(sub.CallbackURL),
+		logfields.Status(string(status.Status)),
 	)
 
 	claimed, err := s.store.UpdateDeliveryStatusCAS(ctx, sub.SubmissionID, sub.LastDeliveredStatus, status.Status)
@@ -379,8 +386,13 @@ func (s *Service) deliver(ctx context.Context, sub *models.Submission, status *m
 
 	// CAS already advanced LastDeliveredStatus and cleared retry state, so
 	// there's no second store write on success. recordFailure remains the
-	// only post-claim writer.
-	logger.Debug("callback delivered")
+	// only post-claim writer. Info (not Debug): only subscribed txs reach
+	// here, so volume is bounded by callback subscriptions, not raw TPS —
+	// and this is the terminal-delivery lifecycle line for the
+	// txid/callback_url/status search story. No telemetry.LoggerWith here:
+	// deliver runs on the delivery worker pool from a Kafka-fed status
+	// event, not an HTTP request, so no per-request span ctx is plumbed in.
+	logger.Info("callback delivered")
 }
 
 // recordFailure increments the submission's retry counter and computes the

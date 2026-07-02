@@ -18,9 +18,11 @@ import (
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/events"
 	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/arcade/telemetry"
 	"github.com/bsv-blockchain/arcade/teranode"
 )
 
@@ -127,7 +129,7 @@ func (b *Builder) chainHeaderRootValidator(ctx context.Context, blockHash string
 			if lookupErr != nil && !errors.Is(lookupErr, context.Canceled) {
 				logger.Debug(
 					"chaintracks header lookup failed; skipping canonical-root validation",
-					zap.String("block_hash", blockHash),
+					logfields.BlockHash(blockHash),
 					zap.Error(lookupErr),
 				)
 			}
@@ -164,7 +166,7 @@ func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, b
 	logger.Info(
 		"set transactions to MINED",
 		zap.Int("count", len(mined)),
-		zap.Uint64("block_height", blockHeight),
+		logfields.BlockHeight(blockHeight),
 	)
 	metrics.BumpBuilderTxidsMinedTotal.Add(float64(len(mined)))
 	// Observe the per-tx age of the previous status row so an operator can see
@@ -179,6 +181,29 @@ func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, b
 			WithLabelValues(string(prev.Status), string(models.StatusMined)).
 			Observe(time.Since(prev.Timestamp).Seconds())
 	}
+
+	minedTxIDs := make([]string, len(mined))
+	for i, st := range mined {
+		minedTxIDs[i] = st.TxID
+	}
+	// Full-searchability MINED line(s): every txid appears in the log stream
+	// (chunked, never capped) so a txid or block_hash search in Coralogix
+	// finds the MINED transition regardless of block size. A 14k-tx block
+	// produces ~14 lines at maxTxIDsPerLine=1000 — intended. Independent of
+	// b.publisher wiring below, since this is the lifecycle log, not the
+	// downstream fan-out.
+	logfields.ForEachTxIDChunk(minedTxIDs, func(chunk []string, chunkIdx, totalChunks int) {
+		logger.Info(
+			"transactions mined",
+			logfields.BlockHash(blockHash),
+			logfields.BlockHeight(blockHeight),
+			logfields.TxIDCount(len(minedTxIDs)),
+			logfields.TxIDs(chunk),
+			zap.Int("chunk_index", chunkIdx),
+			zap.Int("chunk_total", totalChunks),
+		)
+	})
+
 	if len(mined) == 0 || b.publisher == nil {
 		return
 	}
@@ -194,10 +219,7 @@ func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, b
 	// event was silently dropped for large blocks (the DB status was still
 	// MINED, but SSE/webhook subscribers never saw it). Each txid is ~67 bytes
 	// of JSON, so maxTxIDsPerBulkEvent keeps every event well under the limit.
-	publishTxIDs := make([]string, 0, len(mined))
-	for _, st := range mined {
-		publishTxIDs = append(publishTxIDs, st.TxID)
-	}
+	publishTxIDs := minedTxIDs
 	for start := 0; start < len(publishTxIDs); start += maxTxIDsPerBulkEvent {
 		end := start + maxTxIDsPerBulkEvent
 		if end > len(publishTxIDs) {
@@ -213,10 +235,10 @@ func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, b
 		if pubErr := b.publisher.PublishBulk(ctx, template); pubErr != nil {
 			logger.Warn(
 				"failed to publish bulk MINED",
-				zap.String("block_hash", blockHash),
+				logfields.BlockHash(blockHash),
 				zap.Int("chunk_start", start),
 				zap.Int("chunk_size", end-start),
-				zap.Int("txid_total", len(publishTxIDs)),
+				logfields.TxIDCount(len(publishTxIDs)),
 				zap.Error(pubErr),
 			)
 		}
@@ -322,7 +344,7 @@ func (b *Builder) pruneOrphanStumps(ctx context.Context) {
 			if err := b.store.DeleteStumpsByBlockHash(ctx, r.BlockHash); err != nil {
 				b.logger.Warn(
 					"orphan-stump prune: delete failed",
-					zap.String("block_hash", r.BlockHash),
+					logfields.BlockHash(r.BlockHash),
 					zap.Error(err),
 				)
 				continue
@@ -379,7 +401,7 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 		return fmt.Errorf("empty block hash in block_processed message")
 	}
 
-	logger := b.logger.With(zap.String("block_hash", blockHash))
+	logger := telemetry.LoggerWith(ctx, b.logger.With(logfields.BlockHash(blockHash)))
 
 	// Short-circuit: if a compound BUMP already exists for this block, skip
 	// the datahub fetch + recompute path entirely. See tryShortCircuit for
@@ -718,7 +740,7 @@ func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, block
 	logger.Info(
 		"BUMP already built — skipping datahub fetch on redelivery",
 		zap.Int("level0_count", len(txids)),
-		zap.Uint64("block_height", existingHeight),
+		logfields.BlockHeight(existingHeight),
 	)
 	if len(txids) > 0 {
 		b.markMinedAndPublish(ctx, logger, blockHash, existingHeight, txids)
@@ -759,8 +781,8 @@ func (b *Builder) markBlockProcessed(ctx context.Context, logger *zap.Logger, bl
 		// never lands), which an aggregator can only group by block hash.
 		logger.Warn(
 			"failed to record block_processed status; block will re-drive via watchdog until the stamp lands",
-			zap.String("block_hash", blockHash),
-			zap.Uint64("block_height", blockHeight),
+			logfields.BlockHash(blockHash),
+			logfields.BlockHeight(blockHeight),
 			zap.Error(err),
 		)
 	}
@@ -922,8 +944,8 @@ func logCompoundBUMP(logger *zap.Logger, compound *transaction.MerklePath, bumpB
 		zap.Int("levels", len(compound.Path)),
 		zap.Int("bytes", len(bumpBytes)),
 		zap.String("hex", hex.EncodeToString(bumpBytes)),
-		zap.Int("txid_count", len(txids)),
-		zap.Strings("txids", txids),
+		logfields.TxIDCount(len(txids)),
+		logfields.TxIDs(txids),
 	)
 	for level, elems := range compound.Path {
 		logger.Debug(
@@ -986,8 +1008,8 @@ func dumpBUMPFailureInputs(
 		zap.String("compound_hex", hex.EncodeToString(compoundBytes)),
 		zap.Int("compound_levels", len(compound.Path)),
 		zap.Strings("compound_by_level", levelDumps),
-		zap.Int("txid_count", len(txids)),
-		zap.Strings("txids", txids),
+		logfields.TxIDCount(len(txids)),
+		logfields.TxIDs(txids),
 	)
 }
 

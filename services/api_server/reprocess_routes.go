@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/merkleservice"
 )
 
@@ -64,7 +65,7 @@ func (s *Server) handleReprocessBlock(c *gin.Context) {
 	if errors.As(err, &fail) {
 		s.logger.Warn(
 			"reprocess rejected by merkle-service",
-			zap.String("block_hash", hash),
+			logfields.BlockHash(hash),
 			zap.Int("upstream_status", fail.StatusCode),
 			zap.String("upstream_body", fail.Body),
 		)
@@ -84,7 +85,7 @@ func (s *Server) handleReprocessBlock(c *gin.Context) {
 
 	s.logger.Error(
 		"reprocess transport failure",
-		zap.String("block_hash", hash),
+		logfields.BlockHash(hash),
 		zap.Error(err),
 	)
 	c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to contact merkle service"})

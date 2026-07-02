@@ -24,13 +24,18 @@ func NewProducer(broker Broker) *Producer {
 	return &Producer{broker: broker}
 }
 
-// Send JSON-marshals value and publishes synchronously.
-func (p *Producer) Send(topic, key string, value any) error {
+// Send JSON-marshals value and publishes synchronously. ctx is forwarded to
+// the broker — callers should pass the request/handler context so an active
+// span (server, consumer, ...) becomes the parent of the Kafka producer span
+// and its trace context propagates onto the message headers (see
+// InjectTraceContext). A context with no active span costs nothing extra:
+// the inject/span-creation paths are no-ops in that case.
+func (p *Producer) Send(ctx context.Context, topic, key string, value any) error {
 	data, err := marshalValue(value)
 	if err != nil {
 		return fmt.Errorf("marshaling message: %w", err)
 	}
-	if err := p.broker.Send(context.Background(), topic, key, data); err != nil {
+	if err := p.broker.Send(ctx, topic, key, data); err != nil {
 		if errors.Is(err, ErrBrokerBackpressure) {
 			metrics.KafkaBackpressureTotal.WithLabelValues(topic).Inc()
 		} else {
@@ -43,13 +48,14 @@ func (p *Producer) Send(topic, key string, value any) error {
 	return nil
 }
 
-// SendAsync JSON-marshals value and publishes fire-and-forget.
-func (p *Producer) SendAsync(topic, key string, value any) error {
+// SendAsync JSON-marshals value and publishes fire-and-forget. See Send for
+// the ctx/trace-propagation contract.
+func (p *Producer) SendAsync(ctx context.Context, topic, key string, value any) error {
 	data, err := marshalValue(value)
 	if err != nil {
 		return fmt.Errorf("marshaling message: %w", err)
 	}
-	if err := p.broker.SendAsync(context.Background(), topic, key, data); err != nil {
+	if err := p.broker.SendAsync(ctx, topic, key, data); err != nil {
 		metrics.KafkaProduceErrors.WithLabelValues(topic).Inc()
 		return err
 	}
@@ -59,9 +65,11 @@ func (p *Producer) SendAsync(topic, key string, value any) error {
 }
 
 // SendBatch publishes multiple values to the same topic. Each KeyValue.Value
-// is JSON-marshaled before the batch is forwarded to the broker.
-func (p *Producer) SendBatch(topic string, msgs []KeyValue) error {
-	if err := p.broker.SendBatch(context.Background(), topic, msgs); err != nil {
+// is JSON-marshaled before the batch is forwarded to the broker. See Send for
+// the ctx/trace-propagation contract; every message in the batch is tagged
+// with the same parent trace context.
+func (p *Producer) SendBatch(ctx context.Context, topic string, msgs []KeyValue) error {
+	if err := p.broker.SendBatch(ctx, topic, msgs); err != nil {
 		if errors.Is(err, ErrBrokerBackpressure) {
 			metrics.KafkaBackpressureTotal.WithLabelValues(topic).Inc()
 		} else {
@@ -74,9 +82,9 @@ func (p *Producer) SendBatch(topic string, msgs []KeyValue) error {
 }
 
 // SendRaw publishes pre-marshaled bytes. Used by consumer DLQ routing so we
-// don't double-encode.
-func (p *Producer) SendRaw(topic, key string, value []byte) error {
-	if err := p.broker.Send(context.Background(), topic, key, value); err != nil {
+// don't double-encode. See Send for the ctx/trace-propagation contract.
+func (p *Producer) SendRaw(ctx context.Context, topic, key string, value []byte) error {
+	if err := p.broker.Send(ctx, topic, key, value); err != nil {
 		if errors.Is(err, ErrBrokerBackpressure) {
 			metrics.KafkaBackpressureTotal.WithLabelValues(topic).Inc()
 		} else {

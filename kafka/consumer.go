@@ -6,6 +6,10 @@ import (
 	"fmt"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/metrics"
@@ -204,16 +208,34 @@ func (c *ConsumerGroup) handleClaim(claim Claim) error {
 // marks the offset. On DLQ-publish failure the offset is left unmarked so
 // Kafka redelivers on the next session — preferable to silent message
 // loss.
+//
+// The handler and DLQ publish both run under mctx: claim.Context() extended
+// with the trace context carried on msg.Headers (a no-op extend when the
+// producer never injected one — see ExtractTraceContext), wrapped in a
+// "kafka.consume <topic>" span so the whole per-message pipeline — retries,
+// DLQ routing, and any further Kafka produces the handler makes — nests
+// under one consumer span. The span is a no-op (and this whole path costs
+// nothing extra) when telemetry is disabled.
 func (c *ConsumerGroup) processOne(claim Claim, msg *Message) {
 	metrics.KafkaMessagesTotal.WithLabelValues(msg.Topic, "consume").Inc()
 	metrics.KafkaMessageBytes.WithLabelValues(msg.Topic, "consume").Observe(float64(len(msg.Value)))
-	if err := c.processWithRetry(claim.Context(), msg); err != nil {
+
+	mctx := ExtractTraceContext(claim.Context(), msg.Headers)
+	mctx, span := startConsumeSpan(mctx, msg)
+	defer span.End()
+
+	if err := c.processWithRetry(mctx, msg); err != nil {
+		// Flag the span as failed so a DLQ'd / retry-exhausted message
+		// doesn't look identical to a successful consume in the trace.
+		// No-op when the span isn't recording (telemetry disabled).
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "message processing failed after retries")
 		// If DLQ publish also fails (e.g. transient outage on the DLQ
 		// topic) we deliberately do NOT mark the offset. Leaving it
 		// uncommitted causes Kafka to redeliver on the next session,
 		// which is preferable to silent message loss. The next
 		// rebalance / pod restart will retry from the same offset.
-		if dlqErr := c.sendToDLQ(msg, err); dlqErr != nil {
+		if dlqErr := c.sendToDLQ(mctx, msg, err); dlqErr != nil {
 			metrics.KafkaDLQPublishFailures.WithLabelValues(msg.Topic).Inc()
 			c.logger.Error(
 				"DLQ publish failed; leaving offset uncommitted for redelivery",
@@ -276,7 +298,7 @@ func (c *ConsumerGroup) processWithRetry(ctx context.Context, msg *Message) erro
 // dropped, which preserves the historical behavior for that mode.
 // Marshal failures also return nil because retrying will not help and
 // dropping is the only sane outcome.
-func (c *ConsumerGroup) sendToDLQ(msg *Message, processErr error) error {
+func (c *ConsumerGroup) sendToDLQ(ctx context.Context, msg *Message, processErr error) error {
 	if c.producer == nil {
 		c.logger.Error(
 			"no producer configured for DLQ — dropping failed message",
@@ -299,7 +321,7 @@ func (c *ConsumerGroup) sendToDLQ(msg *Message, processErr error) error {
 		c.logger.Error("failed to marshal DLQ message", zap.Error(err))
 		return nil
 	}
-	if err := c.producer.SendRaw(dlqTopic, string(msg.Key), data); err != nil {
+	if err := c.producer.SendRaw(ctx, dlqTopic, string(msg.Key), data); err != nil {
 		c.logger.Error(
 			"failed to send to DLQ",
 			zap.String("dlq_topic", dlqTopic),
@@ -316,4 +338,34 @@ func (c *ConsumerGroup) sendToDLQ(msg *Message, processErr error) error {
 		zap.Int64("offset", msg.Offset),
 	)
 	return nil
+}
+
+// startConsumeSpan starts a Kafka consumer span for msg, parented on ctx's
+// existing span (normally set by ExtractTraceContext from msg.Headers just
+// before this call). The span name is low-cardinality (topic only — never a
+// txid or key) per the metrics-package rule; partition/offset ride as
+// attributes instead.
+//
+// When ctx carries no valid span — telemetry disabled end-to-end, or a
+// message whose producer never injected one — span creation is skipped
+// entirely and ctx is returned unchanged with trace.SpanFromContext(ctx) (a
+// shared no-op singleton — zero allocation), mirroring startProduceSpan's
+// guard in package kafka's Sarama broker. When ctx does carry a valid
+// parent, the per-topic name string and attribute values are still only
+// built once span.IsRecording() is true.
+func startConsumeSpan(ctx context.Context, msg *Message) (context.Context, trace.Span) {
+	if !trace.SpanContextFromContext(ctx).IsValid() {
+		return ctx, trace.SpanFromContext(ctx)
+	}
+	ctx, span := otel.Tracer(tracerName).Start(ctx, "kafka.consume")
+	if span.IsRecording() {
+		span.SetName("kafka.consume " + msg.Topic)
+		span.SetAttributes(
+			semconv.MessagingSystemKafka,
+			semconv.MessagingDestinationName(msg.Topic),
+			semconv.MessagingDestinationPartitionID(fmt.Sprintf("%d", msg.Partition)),
+			semconv.MessagingKafkaOffset(int(msg.Offset)),
+		)
+	}
+	return ctx, span
 }

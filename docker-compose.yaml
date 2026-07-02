@@ -40,6 +40,26 @@ services:
     networks:
       - arcade-net
 
+  # Local validation collector for the OTEL telemetry pipeline (see
+  # docs/plans/otel-integration.md and tools/otel-collector.yaml). Not
+  # required for normal development: telemetry defaults to disabled, and
+  # arcade behaves identically whether or not this service is running.
+  # Enable telemetry against it with
+  #   ARCADE_TELEMETRY_ENABLED=true ARCADE_TELEMETRY_ENDPOINT=localhost:4317
+  # (or the standard OTEL_EXPORTER_OTLP_ENDPOINT=http://$(HOST_IP):4317 in a
+  # cluster where the collector runs as a node-local agent), then
+  # `docker compose logs otel-collector` to see traces/metrics land.
+  otel-collector:
+    image: docker.io/otel/opentelemetry-collector-contrib:0.142.0
+    command: ["--config=/etc/otel-collector.yaml"]
+    volumes:
+      - ./tools/otel-collector.yaml:/etc/otel-collector.yaml:Z
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    networks:
+      - arcade-net
+
 networks:
   arcade-net:
     driver: bridge

@@ -16,6 +16,8 @@ import (
 	"github.com/bsv-blockchain/arcade/app"
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/services"
+	"github.com/bsv-blockchain/arcade/telemetry"
+	"github.com/bsv-blockchain/arcade/version"
 )
 
 func main() {
@@ -24,6 +26,11 @@ func main() {
 		Short: "Arcade transaction management service",
 		RunE:  run,
 	}
+	// Errors are logged through zap inside run(); the fmt.Fprintf below
+	// remains the single place a bare error hits stderr, so cobra must not
+	// also print its own usage/error text.
+	rootCmd.SilenceErrors = true
+	rootCmd.SilenceUsage = true
 
 	config.BindFlags(rootCmd)
 
@@ -42,11 +49,36 @@ func run(cmd *cobra.Command, _ []string) error {
 	logger := newLogger(cfg.LogLevel)
 	defer func() { _ = logger.Sync() }()
 
+	// Capture stdlib log.* output (gocore and other libraries that log
+	// through the standard library's package-global logger) as structured
+	// JSON alongside every other log line, instead of leaking unstructured
+	// text to stderr.
+	undo := zap.RedirectStdLog(logger.Named("stdlog"))
+	defer undo()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	tShutdown, err := telemetry.Init(ctx, cfg.Telemetry, telemetry.Options{
+		Version: version.Version,
+		Mode:    cfg.Mode,
+		Logger:  logger,
+	})
+	if err != nil {
+		return fmt.Errorf("telemetry init: %w", err)
+	}
+	defer func() {
+		// Bound the final flush by the configured export timeout, floored at
+		// 10s so a small or unset value never truncates the last export.
+		shutdownTimeout := max(10*time.Second, time.Duration(cfg.Telemetry.ExportTimeoutMs)*time.Millisecond)
+		sctx, scancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer scancel()
+		_ = tShutdown(sctx)
+	}()
+
 	deps, cleanup, err := app.Bootstrap(ctx, cfg, logger)
 	if err != nil {
+		logger.Error("bootstrap failed", zap.Error(err))
 		return err
 	}
 	defer cleanup()

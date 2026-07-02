@@ -149,7 +149,7 @@ func TestMemoryBroker_ConsumerGroupDrainThenFlush(t *testing.T) {
 	// delivers immediately, all five should land in the consumer's channel
 	// before the drain loop spins — meaning flush fires once, not five times.
 	for i := 0; i < 5; i++ {
-		if err := producer.Send("drain", "", map[string]int{"i": i}); err != nil {
+		if err := producer.Send(ctx, "drain", "", map[string]int{"i": i}); err != nil {
 			t.Fatalf("send: %v", err)
 		}
 	}

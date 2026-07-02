@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/kafka"
@@ -193,6 +194,23 @@ func (p *Propagator) runDispatcher(ctx context.Context, claim kafka.Claim, cfg d
 				claim.MarkMessage(msg)
 				continue
 			}
+			// Stash the producer's trace context (invalid/zero-value, at no
+			// extra cost, when msg.Headers is nil — telemetry disabled or
+			// the producer never injected one). processBatch links the
+			// batch's broadcast span back to it; see startBroadcastSpan. The
+			// derived context from ExtractTraceContext is discarded
+			// immediately — only the SpanContext value is kept.
+			//
+			// CAVEAT: the base ctx must NOT carry an ambient span. For a
+			// header-less message ExtractTraceContext returns the base ctx
+			// unchanged, so an ambient span on it would be mis-attributed as
+			// that message's producer span and linked onto the batch. The
+			// dispatcher's ctx (service ctx → claim ctx) carries no span
+			// today — nothing starts a root span around the propagation
+			// service (only otelgin/otelhttp and the per-message kafka
+			// spans create spans, none of which wrap this loop) — so ctx is
+			// safe to use here.
+			propMsg.spanCtx = trace.SpanContextFromContext(kafka.ExtractTraceContext(ctx, msg.Headers))
 			handleAdmit(propMsg, msg.Offset, inFlight, waiters, heldMsgs, &pendingMsgs, tracker)
 			pendingMarks[msg.Offset] = msg
 

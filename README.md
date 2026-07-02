@@ -569,6 +569,7 @@ Read the [AI Usage & Assistant Guidelines](.github/tech-conventions/ai-complianc
 ## 📚 Resources
 
 - [Architecture Documentation](docs/ARCHITECTURE.md)
+- [Observability](docs/observability.md) — OTLP traces/metrics, structured log field canon, and transaction-lifecycle logging
 - [Teranode Documentation](https://docs.bsvblockchain.org/)
 - [Arc API Reference](https://github.com/bitcoin-sv/arc)
 

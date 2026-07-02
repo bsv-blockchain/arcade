@@ -12,8 +12,11 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/bsv-blockchain/arcade/logfields"
 )
 
 const defaultTimeout = 30 * time.Second
@@ -35,7 +38,8 @@ func NewClient(baseURL, authToken string, timeout time.Duration) *Client {
 		baseURL:   strings.TrimSuffix(baseURL, "/"),
 		authToken: authToken,
 		httpClient: &http.Client{
-			Timeout: timeout,
+			Timeout:   timeout,
+			Transport: otelhttp.NewTransport(http.DefaultTransport),
 		},
 	}
 }
@@ -99,7 +103,7 @@ func (c *Client) Register(ctx context.Context, txid, callbackURL, callbackToken 
 			c.logger.Debug(
 				"merkle service registration failed",
 				zap.String("url", url),
-				zap.String("txid", txid),
+				logfields.TxID(txid),
 				zap.Int("status_code", resp.StatusCode),
 				zap.String("response_body", string(body)),
 			)
@@ -170,7 +174,7 @@ func (c *Client) Reprocess(ctx context.Context, blockHash, callbackURL, callback
 			c.logger.Debug(
 				"merkle service /reprocess failed",
 				zap.String("url", url),
-				zap.String("block_hash", blockHash),
+				logfields.BlockHash(blockHash),
 				zap.Int("status_code", resp.StatusCode),
 				zap.String("response_body", fail.Body),
 			)

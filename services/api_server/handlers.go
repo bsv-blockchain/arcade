@@ -20,8 +20,10 @@ import (
 	"github.com/bsv-blockchain/arcade/callbackurl"
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/telemetry"
 	"github.com/bsv-blockchain/arcade/teranode"
 	"github.com/bsv-blockchain/arcade/version"
 )
@@ -130,7 +132,7 @@ func (s *Server) recordSubmission(_ context.Context, txid string, opts submitOpt
 		metrics.APISubmissionRecorderDropTotal.Inc()
 		s.logger.Warn(
 			"submission recorder queue full; dropping (best-effort)",
-			zap.String("txid", txid),
+			logfields.TxID(txid),
 		)
 	}
 }
@@ -262,12 +264,12 @@ func (s *Server) handleCallback(c *gin.Context) {
 		return
 	}
 
-	logger := s.logger.With(
+	logger := telemetry.LoggerWith(c.Request.Context(), s.logger.With(
 		zap.String("type", string(msg.Type)),
-		zap.String("txid", msg.TxID),
-		zap.Strings("txids", msg.TxIDs),
-		zap.String("blockHash", msg.BlockHash),
-	)
+		logfields.TxID(msg.TxID),
+		logfields.TxIDs(msg.TxIDs),
+		logfields.BlockHash(msg.BlockHash),
+	))
 
 	switch msg.Type {
 	case models.CallbackSeenOnNetwork:
@@ -381,7 +383,7 @@ func (s *Server) applySeenCallback(c *gin.Context, msg models.CallbackMessage, l
 			metrics.CallbackUnknownTxIDTotal.WithLabelValues(metricLabel).Inc()
 			logger.Warn("dropping callback for unknown txid",
 				zap.String("type", metricLabel),
-				zap.String("txid", keptTxIDs[i]))
+				logfields.TxID(keptTxIDs[i]))
 			continue
 		}
 		// Observe transition age — the headline metric the user asked for.
@@ -408,6 +410,21 @@ func (s *Server) applySeenCallback(c *gin.Context, msg models.CallbackMessage, l
 			s.txTracker.UpdateStatus(keptTxIDs[i], targetStatus)
 		}
 	}
+
+	// Full-coverage SEEN line(s): this callback path is driven by
+	// merkle-service (not the client submit request), so it's off the
+	// synchronous hot path — emit every seen txid, chunked and never capped,
+	// matching MINED, so a txid search finds the SEEN transition.
+	logfields.ForEachTxIDChunk(successful, func(chunk []string, chunkIdx, totalChunks int) {
+		logger.Info(
+			"transactions seen",
+			logfields.Status(string(targetStatus)),
+			logfields.TxIDCount(len(successful)),
+			logfields.TxIDs(chunk),
+			zap.Int("chunk_index", chunkIdx),
+			zap.Int("chunk_total", totalChunks),
+		)
+	})
 
 	// Single PublishBulk for the whole batch — drops the per-txid Kafka send
 	// down to one event regardless of N. Subscribers (SSE, webhook) unfan in
@@ -452,6 +469,11 @@ func (s *Server) handleStump(c *gin.Context, msg models.CallbackMessage, logger 
 		return
 	}
 
+	logger.Info(
+		"stump stored",
+		logfields.BlockHash(msg.BlockHash),
+		zap.Int("subtree_index", msg.SubtreeIndex),
+	)
 	c.Status(http.StatusOK)
 }
 
@@ -479,11 +501,12 @@ func (s *Server) handleBlockProcessed(c *gin.Context, msg models.CallbackMessage
 	// the height-0 placeholder this handler used to write was never recoverable
 	// anyway). That chaintracks dependency is pre-existing and unchanged here;
 	// see services/watchdog.
-	if err := s.producer.Send(kafka.TopicBlockProcessed, msg.BlockHash, msg); err != nil {
+	if err := s.producer.Send(c.Request.Context(), kafka.TopicBlockProcessed, msg.BlockHash, msg); err != nil {
 		logger.Error("failed to publish block_processed", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to enqueue"})
 		return
 	}
+	logger.Info("block_processed enqueued", logfields.BlockHash(msg.BlockHash))
 	c.Status(http.StatusOK)
 }
 
@@ -497,7 +520,7 @@ func (s *Server) handleGetTransaction(c *gin.Context) {
 
 	status, err := s.store.GetStatus(c.Request.Context(), txid)
 	if err != nil {
-		s.logger.Error("failed to get status", zap.String("txid", txid), zap.Error(err))
+		s.logger.Error("failed to get status", logfields.TxID(txid), zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "internal error"})
 		return
 	}
@@ -644,7 +667,7 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		existing, inserted, dedupErr := s.store.GetOrInsertStatus(c.Request.Context(), row)
 		switch {
 		case dedupErr != nil:
-			s.logger.Error("dedup CAS failed", zap.String("txid", txid), zap.Error(dedupErr))
+			s.logger.Error("dedup CAS failed", logfields.TxID(txid), zap.Error(dedupErr))
 			// Best-effort: continue with publish. The propagator's
 			// in-flight set catches duplicates that slip past.
 		case !inserted && existing != nil && existing.Status == models.StatusRejected:
@@ -692,11 +715,11 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		"raw_tx":      rawTx,
 		"input_txids": collectInputTXIDs(parsedTx),
 	}
-	if err := s.producer.Send(kafka.TopicPropagation, txid, msg); err != nil {
+	if err := s.producer.Send(c.Request.Context(), kafka.TopicPropagation, txid, msg); err != nil {
 		if errors.Is(err, kafka.ErrBrokerBackpressure) {
 			// Backpressure → shed load to the client. The tx was never queued,
 			// so a retry is safe and is the contract the 503 expresses.
-			s.logger.Warn("submit rejected: kafka backpressure", zap.String("txid", txid))
+			s.logger.Warn("submit rejected: kafka backpressure", logfields.TxID(txid))
 			c.Header("Retry-After", "1")
 			c.JSON(http.StatusServiceUnavailable, gin.H{jsonKeyError: "service overloaded, retry shortly"})
 			return
@@ -705,6 +728,12 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to submit"})
 		return
 	}
+
+	telemetry.LoggerWith(c.Request.Context(), s.logger).Info(
+		"transaction received",
+		logfields.TxID(txid),
+		logfields.Status(string(models.StatusReceived)),
+	)
 
 	c.JSON(http.StatusAccepted, submitResponse{
 		TxID:     txid,
@@ -730,9 +759,9 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 func (s *Server) rejectAtIntake(ctx context.Context, txid, reason string, opts submitOptions) {
 	s.logger.Info(
 		"transaction rejected",
-		zap.String("txid", txid),
+		logfields.TxID(txid),
 		zap.String("reason", reason),
-		zap.String("stage", "intake"),
+		logfields.Stage(logfields.StageIntake),
 	)
 	s.persistRejectedAtIntake(ctx, txid, reason)
 	s.recordSubmission(ctx, txid, opts)
@@ -748,7 +777,7 @@ func (s *Server) rejectAtIntake(ctx context.Context, txid, reason string, opts s
 	if err := s.publisher.Publish(ctx, status); err != nil {
 		s.logger.Warn(
 			"intake rejection publish failed",
-			zap.String("txid", txid),
+			logfields.TxID(txid),
 			zap.Error(err),
 		)
 	}
@@ -773,7 +802,7 @@ func (s *Server) persistRejectedAtIntake(ctx context.Context, txid, reason strin
 	if err != nil {
 		s.logger.Warn(
 			"intake rejection persist failed",
-			zap.String("txid", txid),
+			logfields.TxID(txid),
 			zap.Error(err),
 		)
 		return
@@ -782,7 +811,7 @@ func (s *Server) persistRejectedAtIntake(ctx context.Context, txid, reason strin
 		if err := s.store.UpdateStatus(ctx, row); err != nil {
 			s.logger.Warn(
 				"intake rejection status update failed",
-				zap.String("txid", txid),
+				logfields.TxID(txid),
 				zap.Error(err),
 			)
 		}
@@ -899,7 +928,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 			existing, inserted, dedupErr := s.store.GetOrInsertStatus(ctx, row)
 			switch {
 			case dedupErr != nil:
-				s.logger.Error("dedup CAS failed", zap.String("txid", p.txid), zap.Error(dedupErr))
+				s.logger.Error("dedup CAS failed", logfields.TxID(p.txid), zap.Error(dedupErr))
 				toPublish = append(toPublish, p)
 			case !inserted && existing != nil && existing.Status == models.StatusRejected:
 				// Resubmission of a previously-rejected tx: add to
@@ -960,7 +989,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				},
 			})
 		}
-		if err := s.producer.SendBatch(kafka.TopicPropagation, msgs); err != nil {
+		if err := s.producer.SendBatch(ctx, kafka.TopicPropagation, msgs); err != nil {
 			if errors.Is(err, kafka.ErrBrokerBackpressure) {
 				s.logger.Warn("batch submit rejected: kafka backpressure", zap.Int("count", len(msgs)))
 				c.Header("Retry-After", "1")
@@ -971,6 +1000,19 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to submit"})
 			return
 		}
+
+		publishedTxIDs := make([]string, len(toPublish))
+		for i, p := range toPublish {
+			publishedTxIDs[i] = p.txid
+		}
+		// Bounded (TxIDBatch: true count + capped list), NOT chunked: this
+		// runs synchronously before the HTTP response and /txs accepts up to
+		// 256 MiB, so unbounded sequential chunk writes would land in the
+		// client's request latency. Full per-txid coverage arrives shortly
+		// after on the async "transactions accepted by network" line; a tx
+		// rejected at intake is covered by the existing REJECTED line.
+		receivedFields := append([]zap.Field{logfields.Status(string(models.StatusReceived))}, logfields.TxIDBatch(publishedTxIDs)...)
+		telemetry.LoggerWith(ctx, s.logger).Info("transactions received", receivedFields...)
 	}
 
 	c.JSON(http.StatusAccepted, gin.H{

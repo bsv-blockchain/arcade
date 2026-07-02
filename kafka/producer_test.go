@@ -1,6 +1,7 @@
 package kafka
 
 import (
+	"context"
 	"errors"
 	"testing"
 )
@@ -15,7 +16,7 @@ func TestProducer_SendBatch_Success(t *testing.T) {
 		{Key: "tx3", Value: map[string]string{"txid": "tx3"}},
 	}
 
-	if err := p.SendBatch("test-topic", msgs); err != nil {
+	if err := p.SendBatch(context.Background(), "test-topic", msgs); err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
 
@@ -31,7 +32,7 @@ func TestProducer_SendBatch_EmptyReturnsNil(t *testing.T) {
 	rb := &RecordingBroker{}
 	p := NewProducer(rb)
 
-	if err := p.SendBatch("test-topic", nil); err != nil {
+	if err := p.SendBatch(context.Background(), "test-topic", nil); err != nil {
 		t.Fatalf("expected no error for empty batch, got: %v", err)
 	}
 }
@@ -42,7 +43,7 @@ func TestProducer_SendBatch_ErrorPropagation(t *testing.T) {
 
 	msgs := []KeyValue{{Key: "tx1", Value: map[string]string{"txid": "tx1"}}}
 
-	if err := p.SendBatch("test-topic", msgs); err == nil {
+	if err := p.SendBatch(context.Background(), "test-topic", msgs); err == nil {
 		t.Fatal("expected error, got nil")
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"github.com/bsv-blockchain/go-chaintracks/chaintracks"
 	"go.uber.org/zap"
 
+	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/store"
 )
 
@@ -77,7 +78,7 @@ func (t *blockStatusTracker) recordHeader(ctx context.Context, h *chaintracks.Bl
 	hash := h.Hash.String()
 	if err := t.store.UpsertBlockHeaderSeen(ctx, hash, uint64(h.Height), time.Now()); err != nil {
 		t.logger.Warn("failed to record header seen",
-			zap.String("block_hash", hash),
+			logfields.BlockHash(hash),
 			zap.Uint32("height", h.Height),
 			zap.Error(err))
 	}
