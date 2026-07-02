@@ -12,10 +12,23 @@ import (
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/bsv-blockchain/go-sdk/util"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.uber.org/zap"
 )
 
-var httpClient = &http.Client{Timeout: 5 * time.Minute}
+// httpClient wraps http.DefaultTransport with otelhttp so outbound DataHub
+// requests get client spans and traceparent propagation. otelhttp captures
+// the global propagator/tracer-provider delegate at construction time — since
+// this var is initialized at package load (before telemetry.Init runs in
+// main), that capture happens against OTEL's default no-op delegate objects.
+// That's safe: SetTracerProvider/SetTextMapPropagator (called later by
+// telemetry.Init, if enabled) configure those same delegate singletons in
+// place, so this pre-captured Transport starts propagating real trace context
+// as soon as Init runs — well before any DataHub request is issued.
+var httpClient = &http.Client{
+	Timeout:   5 * time.Minute,
+	Transport: otelhttp.NewTransport(http.DefaultTransport),
+}
 
 // DefaultMaxBlockBytes caps a single /block/<hash> binary response from a
 // DataHub endpoint. The endpoint serves block metadata: 80-byte header,

@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/callbackurl"
@@ -126,22 +127,27 @@ func newHolderID() string {
 // an error from the callbackurl package — the request never leaves the
 // machine. Pulled out of New so tests can construct an equivalent client
 // without instantiating the whole Service.
+//
+// The SSRF-guarding *http.Transport is wrapped by otelhttp so outbound spans
+// and traceparent propagation are added on top — the guard remains the inner
+// RoundTripper and still runs on every dial, unaffected by the wrapping.
 func newCallbackClient(timeout time.Duration, allowPrivate bool) *http.Client {
 	dialer := &net.Dialer{
 		Timeout:   timeout,
 		KeepAlive: 30 * time.Second,
 		Control:   callbackurl.DialControl(allowPrivate),
 	}
+	guardedTransport := &http.Transport{
+		DialContext:           dialer.DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: timeout,
+		ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2:     true,
+		IdleConnTimeout:       90 * time.Second,
+	}
 	return &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			DialContext:           dialer.DialContext,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: timeout,
-			ExpectContinueTimeout: 1 * time.Second,
-			ForceAttemptHTTP2:     true,
-			IdleConnTimeout:       90 * time.Second,
-		},
+		Timeout:   timeout,
+		Transport: otelhttp.NewTransport(guardedTransport),
 	}
 }
 
