@@ -977,12 +977,14 @@ func validate(cfg *Config) error {
 		default:
 			return fmt.Errorf("invalid telemetry.protocol %q (expected grpc or http)", cfg.Telemetry.Protocol)
 		}
-		// The gRPC exporter's WithEndpoint dials the value verbatim as
-		// host:port; a scheme prefix makes the dial fail silently in the
-		// background exporter goroutine, so fail fast here instead.
-		if cfg.Telemetry.Protocol == "grpc" &&
-			(strings.HasPrefix(cfg.Telemetry.Endpoint, "http://") || strings.HasPrefix(cfg.Telemetry.Endpoint, "https://")) {
-			return fmt.Errorf("telemetry.endpoint %q must be host:port without a scheme when telemetry.protocol=grpc "+
+		// Both the gRPC and HTTP exporters' WithEndpoint dial the value
+		// verbatim as host:port; a scheme prefix makes the dial fail silently
+		// in the background exporter goroutine (for HTTP the scheme is instead
+		// controlled by telemetry.insecure), so fail fast here for either
+		// protocol. Only the OTEL_EXPORTER_OTLP_ENDPOINT env var understands a
+		// scheme-prefixed URL.
+		if strings.HasPrefix(cfg.Telemetry.Endpoint, "http://") || strings.HasPrefix(cfg.Telemetry.Endpoint, "https://") {
+			return fmt.Errorf("telemetry.endpoint %q must be host:port without a scheme "+
 				"(e.g. \"collector:4317\"); scheme-prefixed URLs are only understood by the OTEL_EXPORTER_OTLP_ENDPOINT env var",
 				cfg.Telemetry.Endpoint)
 		}

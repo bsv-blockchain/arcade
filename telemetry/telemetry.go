@@ -145,10 +145,17 @@ func Init(ctx context.Context, cfg config.TelemetryConfig, opts Options) (func(c
 	if mp != nil {
 		otel.SetMeterProvider(mp)
 	}
-	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
-		propagation.TraceContext{},
-		propagation.Baggage{},
-	))
+	// Only install the propagator when at least one signal pipeline was
+	// built. With enabled=true but both traces and metrics off, nothing was
+	// created, so leaving the global propagator untouched keeps the
+	// disabled-is-noop posture rather than mutating a global for a fully
+	// inert config.
+	if tp != nil || mp != nil {
+		otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+			propagation.TraceContext{},
+			propagation.Baggage{},
+		))
+	}
 
 	// Partial export/shutdown failures are logged, not surfaced as an error:
 	// a slow or unreachable collector at process exit must never turn into a
@@ -254,18 +261,21 @@ func initTraces(ctx context.Context, cfg config.TelemetryConfig, res *resource.R
 		httpOpts := []otlptracehttp.Option{}
 		if cfg.Endpoint != "" {
 			httpOpts = append(httpOpts, otlptracehttp.WithEndpoint(cfg.Endpoint))
-			if cfg.Insecure {
-				httpOpts = append(httpOpts, otlptracehttp.WithInsecure())
-			}
+		}
+		// WithInsecure applies regardless of whether the endpoint came from
+		// cfg or the OTEL_EXPORTER_OTLP_*_ENDPOINT env var, so it must live
+		// outside the endpoint guard.
+		if cfg.Insecure {
+			httpOpts = append(httpOpts, otlptracehttp.WithInsecure())
 		}
 		exp, err = otlptracehttp.New(ctx, httpOpts...)
 	default: // "grpc" and any unvalidated value fall back to grpc
 		grpcOpts := []otlptracegrpc.Option{}
 		if cfg.Endpoint != "" {
 			grpcOpts = append(grpcOpts, otlptracegrpc.WithEndpoint(cfg.Endpoint))
-			if cfg.Insecure {
-				grpcOpts = append(grpcOpts, otlptracegrpc.WithInsecure())
-			}
+		}
+		if cfg.Insecure {
+			grpcOpts = append(grpcOpts, otlptracegrpc.WithInsecure())
 		}
 		exp, err = otlptracegrpc.New(ctx, grpcOpts...)
 	}
@@ -301,18 +311,21 @@ func initMetrics(ctx context.Context, cfg config.TelemetryConfig, res *resource.
 		httpOpts := []otlpmetrichttp.Option{}
 		if cfg.Endpoint != "" {
 			httpOpts = append(httpOpts, otlpmetrichttp.WithEndpoint(cfg.Endpoint))
-			if cfg.Insecure {
-				httpOpts = append(httpOpts, otlpmetrichttp.WithInsecure())
-			}
+		}
+		// WithInsecure applies regardless of whether the endpoint came from
+		// cfg or the OTEL_EXPORTER_OTLP_*_ENDPOINT env var, so it must live
+		// outside the endpoint guard.
+		if cfg.Insecure {
+			httpOpts = append(httpOpts, otlpmetrichttp.WithInsecure())
 		}
 		exp, err = otlpmetrichttp.New(ctx, httpOpts...)
 	default: // "grpc" and any unvalidated value fall back to grpc
 		grpcOpts := []otlpmetricgrpc.Option{}
 		if cfg.Endpoint != "" {
 			grpcOpts = append(grpcOpts, otlpmetricgrpc.WithEndpoint(cfg.Endpoint))
-			if cfg.Insecure {
-				grpcOpts = append(grpcOpts, otlpmetricgrpc.WithInsecure())
-			}
+		}
+		if cfg.Insecure {
+			grpcOpts = append(grpcOpts, otlpmetricgrpc.WithInsecure())
 		}
 		exp, err = otlpmetricgrpc.New(ctx, grpcOpts...)
 	}

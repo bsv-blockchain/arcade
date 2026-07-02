@@ -207,6 +207,63 @@ func TestInit_HTTPExportsTracesAndBridgedMetrics(t *testing.T) {
 	}
 }
 
+// TestInit_InsecureAppliesToEnvSuppliedEndpoint guards against the
+// WithInsecure hoist regression: cfg.Insecure must apply even when the
+// endpoint comes from OTEL_EXPORTER_OTLP_ENDPOINT rather than cfg.Endpoint.
+// Before the fix, WithInsecure was only appended inside the `cfg.Endpoint !=
+// ""` branch, so an env-supplied endpoint silently dropped
+// telemetry.insecure=true and the HTTP exporter defaulted to TLS — which
+// fails outright against this plaintext httptest server, so a zero hit count
+// here is exactly the symptom the fix prevents.
+//
+// The env value is deliberately a scheme-less "//host:port" network-path
+// reference rather than server.URL's "http://host:port": the OTLP exporter's
+// own env parsing (go.opentelemetry.io/otel/exporters/otlp/.../envconfig)
+// infers Insecure from a "http"/"https" scheme on the endpoint URL, which
+// would make an "http://..." env value auto-insecure independent of this
+// package's cfg.Insecure plumbing and mask the bug under test. A scheme-less
+// value still resolves to the right host:port but leaves the library
+// defaulting to secure, so only this package's own (post-fix) WithInsecure
+// call can make the export succeed.
+func TestInit_InsecureAppliesToEnvSuppliedEndpoint(t *testing.T) {
+	restoreOTELGlobals(t)
+
+	collector := newCapturingCollector()
+	server := httptest.NewServer(collector.handler())
+	defer server.Close()
+
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "//"+strings.TrimPrefix(server.URL, "http://"))
+
+	cfg := config.TelemetryConfig{
+		Enabled:         true,
+		Protocol:        "http",
+		Insecure:        true,
+		ServiceName:     "arcade-telemetry-test",
+		Traces:          true,
+		SampleRatio:     1.0,
+		ExportTimeoutMs: 5000,
+	}
+
+	shutdown, err := Init(context.Background(), cfg, Options{Version: "test", Mode: "test"})
+	if err != nil {
+		t.Fatalf("Init returned error: %v", err)
+	}
+
+	_, span := otel.Tracer("telemetry-test").Start(context.Background(), "test-span")
+	span.End()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := shutdown(ctx); err != nil {
+		t.Fatalf("shutdown returned error: %v", err)
+	}
+
+	if got := collector.hitsFor("/v1/traces"); got == 0 {
+		t.Error("expected at least one non-empty POST to /v1/traces via the env-supplied endpoint, got none " +
+			"(telemetry.insecure=true was not honored, so the exporter likely attempted TLS against a plaintext server)")
+	}
+}
+
 // TestInit_EndpointFallsBackToEnv covers the two documented endpoint
 // resolution rules: an empty telemetry.endpoint defers to the standard
 // OTEL_EXPORTER_OTLP_ENDPOINT env var, and Init fails fast when neither is

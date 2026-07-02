@@ -292,28 +292,33 @@ func TestValidate_TelemetryRejectsOutOfRangeSampleRatio(t *testing.T) {
 	}
 }
 
-// The gRPC OTLP exporter dials telemetry.endpoint verbatim as host:port; a
-// scheme prefix would fail silently inside the background exporter
-// goroutine, so validate() rejects it up front. The same value is legal for
-// protocol=http (whose WithEndpoint also wants host:port, but the failure
-// mode there is an immediate, visible export error) — only grpc gets the
-// fail-fast rule.
-func TestValidate_TelemetryRejectsSchemedEndpointForGRPC(t *testing.T) {
-	for _, endpoint := range []string{"http://collector:4317", "https://collector:4317"} {
-		cfg := telemetryValidConfig()
-		cfg.Telemetry.Endpoint = endpoint
-		err := validate(cfg)
-		if err == nil {
-			t.Fatalf("expected error for scheme-prefixed grpc endpoint %q", endpoint)
+// Both the gRPC and HTTP OTLP exporters' WithEndpoint dial telemetry.endpoint
+// verbatim as host:port; a scheme prefix fails silently inside the
+// background exporter goroutine for either protocol (for HTTP the scheme is
+// instead controlled by telemetry.insecure), so validate() rejects a
+// scheme-prefixed endpoint regardless of telemetry.protocol.
+func TestValidate_TelemetryRejectsSchemedEndpoint(t *testing.T) {
+	for _, protocol := range []string{"grpc", "http"} {
+		for _, endpoint := range []string{"http://collector:4317", "https://collector:4317"} {
+			t.Run(protocol+"/"+endpoint, func(t *testing.T) {
+				cfg := telemetryValidConfig()
+				cfg.Telemetry.Protocol = protocol
+				cfg.Telemetry.Endpoint = endpoint
+				err := validate(cfg)
+				if err == nil {
+					t.Fatalf("expected error for scheme-prefixed endpoint %q with protocol=%s", endpoint, protocol)
+				}
+				if !strings.Contains(err.Error(), "telemetry.endpoint") {
+					t.Errorf("error should name telemetry.endpoint, got: %v", err)
+				}
+			})
 		}
-		if !strings.Contains(err.Error(), "telemetry.endpoint") {
-			t.Errorf("error should name telemetry.endpoint, got: %v", err)
-		}
-	}
 
-	cfg := telemetryValidConfig()
-	cfg.Telemetry.Endpoint = "collector:4317"
-	if err := validate(cfg); err != nil {
-		t.Fatalf("plain host:port grpc endpoint rejected: %v", err)
+		cfg := telemetryValidConfig()
+		cfg.Telemetry.Protocol = protocol
+		cfg.Telemetry.Endpoint = "collector:4317"
+		if err := validate(cfg); err != nil {
+			t.Fatalf("plain host:port endpoint rejected for protocol=%s: %v", protocol, err)
+		}
 	}
 }
