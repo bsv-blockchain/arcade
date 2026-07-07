@@ -6,11 +6,11 @@ require (
 	github.com/IBM/sarama v1.50.3
 	github.com/aerospike/aerospike-client-go/v7 v7.10.2
 	github.com/bsv-blockchain/go-bt/v2 v2.6.7
-	github.com/bsv-blockchain/go-chaincfg v1.5.10
+	github.com/bsv-blockchain/go-chaincfg v1.6.0
 	github.com/bsv-blockchain/go-chaintracks v1.2.10
-	github.com/bsv-blockchain/go-p2p-message-bus v0.1.20
+	github.com/bsv-blockchain/go-p2p-message-bus v0.1.21
 	github.com/bsv-blockchain/go-sdk v1.2.24
-	github.com/bsv-blockchain/go-teranode-p2p-client v0.2.7
+	github.com/bsv-blockchain/go-teranode-p2p-client v0.2.8
 	github.com/bsv-blockchain/teranode v0.16.0-beta-2
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/fergusstrange/embedded-postgres v1.34.0
