@@ -109,15 +109,20 @@ func ResolveConfig(c config.WatchdogConfig) Config {
 	if terminal <= 0 {
 		terminal = 4 * time.Hour
 	}
+	// Pass the cap knobs through directly: a value <= 0 means "disabled", so
+	// (unlike the backoff fields above) we must NOT substitute a default here —
+	// the viper SetDefault already supplies 10 / 6h when the operator is silent.
 	return Config{
-		Interval:        interval,
-		StaleThreshold:  stale,
-		RecencyDepth:    recency,
-		BatchSize:       batch,
-		MaxConcurrent:   maxConc,
-		LeaseTTL:        leaseTTL,
-		InitialBackoff:  initBackoff,
-		MaxBackoff:      maxBackoff,
-		TerminalBackoff: terminal,
+		Interval:             interval,
+		StaleThreshold:       stale,
+		RecencyDepth:         recency,
+		BatchSize:            batch,
+		MaxConcurrent:        maxConc,
+		LeaseTTL:             leaseTTL,
+		InitialBackoff:       initBackoff,
+		MaxBackoff:           maxBackoff,
+		TerminalBackoff:      terminal,
+		MaxReprocessAttempts: c.MaxReprocessAttempts,
+		MaxStaleAge:          time.Duration(c.MaxStaleAgeMs) * time.Millisecond,
 	}
 }
