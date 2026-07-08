@@ -514,6 +514,15 @@ type WatchdogConfig struct {
 	// block likely isn't on the consensus chain, so retrying soon would
 	// produce the same disagreement. Default 4 h.
 	TerminalBackoffMs int `mapstructure:"terminal_backoff_ms"`
+	// MaxReprocessAttempts caps total /reprocess dispatches per block; once a
+	// block is re-driven this many times it is parked (reprocessing stops) so a
+	// permanently un-finalizable block can't flood arcade.block_processed and
+	// starve the bump-builder consumer. Default 10; <= 0 disables the cap.
+	MaxReprocessAttempts int `mapstructure:"max_reprocess_attempts"`
+	// MaxStaleAgeMs parks a block whose header_seen_at is older than this,
+	// regardless of attempt count — a restart-proof backstop (the in-memory
+	// attempt counter resets on redeploy). Default 6 h; <= 0 disables it.
+	MaxStaleAgeMs int `mapstructure:"max_stale_age_ms"`
 }
 
 // SSEConfig governs the standalone SSE (server-sent events) service.
@@ -869,6 +878,8 @@ func setDefaults() {
 	viper.SetDefault("watchdog.initial_backoff_ms", 60000)
 	viper.SetDefault("watchdog.max_backoff_ms", 1800000)
 	viper.SetDefault("watchdog.terminal_backoff_ms", 14400000)
+	viper.SetDefault("watchdog.max_reprocess_attempts", 10)
+	viper.SetDefault("watchdog.max_stale_age_ms", 21600000) // 6h
 
 	// SSE standalone service (mode=sse, or in-process under mode=all):
 	// enabled by default. Distinct port from api.port avoids the bind

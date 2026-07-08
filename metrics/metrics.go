@@ -324,6 +324,15 @@ var WatchdogBackoffDepth = promauto.NewGauge(prometheus.GaugeOpts{
 	Help: "Number of blocks currently held in the watchdog's in-memory backoff map.",
 })
 
+// WatchdogParkedTotal counts blocks the watchdog has parked (stopped
+// re-driving) because they hit the reprocess cap. A non-zero value means
+// blocks are permanently un-finalizable — inspect bump-builder for the
+// underlying reason (e.g. incomplete STUMPs / merkle-root mismatch).
+var WatchdogParkedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_watchdog_parked_total",
+	Help: "Blocks parked by the watchdog (reprocessing stopped), by reason.",
+}, []string{"reason"}) // max_attempts, max_age
+
 // ---------------------------------------------------------------------------
 // api_server
 // ---------------------------------------------------------------------------
