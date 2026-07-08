@@ -19,12 +19,23 @@ import (
 // may be needed, or a callback may have been dropped. Long enough that we
 // don't rebroadcast every tx that takes a few minutes to mine.
 //
+// staleReceivedAge: a row still at RECEIVED older than this never advanced to
+// a network verdict — its broadcast produced no verdict (downstream timeout /
+// 5xx / no per-slot body) and the in-memory requeue was lost (propagation
+// restart, ctx cancellation), or an intake Kafka-publish failure stranded it
+// and the submitter never retried. Rebroadcast to self-heal: the row carries
+// RawTx and is a validated tx (intake validation failures land at REJECTED,
+// never RECEIVED), so we accepted responsibility to propagate it. Long enough
+// that the normal intake→ACCEPTED path (seconds) and the 2s in-memory requeue
+// are never pre-empted by the reaper.
+//
 // staleScanLookback bounds how far back IterateStatusesSince walks. Rows
 // older than this are assumed permanently stuck and outside the reaper's
 // responsibility — the operator surfaces them with `arcade tools surface
 // stuck` if a deeper sweep is needed.
 const (
 	staleSeenOnNetworkAge  = time.Hour
+	staleReceivedAge       = time.Hour
 	staleScanLookback      = 24 * time.Hour
 	reaperRebroadcastBatch = 200
 )
@@ -82,11 +93,15 @@ func (p *Propagator) tryReap(ctx context.Context) {
 	p.reapOnce(ctx)
 }
 
-// reapOnce rebroadcasts rows stuck at SEEN_ON_NETWORK past
-// staleSeenOnNetworkAge (peer mempool eviction, dropped BLOCK_PROCESSED
-// callback, fee bump needed). RECEIVED rows are intentionally not
-// rebroadcast — the submitter got an error from intake on Kafka publish
-// failure and owns the decision to retry.
+// reapOnce rebroadcasts rows stuck past their stale-age threshold:
+// SEEN_ON_NETWORK / SEEN_MULTIPLE_NODES past staleSeenOnNetworkAge (peer
+// mempool eviction, dropped BLOCK_PROCESSED callback, fee bump needed), and
+// RECEIVED past staleReceivedAge (a no-verdict broadcast whose in-memory
+// requeue was lost, or an intake Kafka-publish failure the submitter never
+// retried). Both carry RawTx and are validated txs we accepted responsibility
+// to propagate, so rebroadcasting self-heals a transient downstream outage.
+// Recent RECEIVED rows (still in the normal intake/requeue path) and body-less
+// rows are left alone.
 //
 // Rebroadcasts go through the same registerBatch + broadcastInChunks +
 // applyTerminalStatuses pipeline as processBatch but bypass the
@@ -100,6 +115,7 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 	now := time.Now()
 	since := now.Add(-staleScanLookback)
 	seenDeadline := now.Add(-staleSeenOnNetworkAge)
+	receivedDeadline := now.Add(-staleReceivedAge)
 
 	stuck := make([]propagationMsg, 0, reaperRebroadcastBatch)
 	err := p.store.IterateStatusesSince(ctx, since, func(st *models.TransactionStatus) error {
@@ -116,11 +132,19 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 			if !st.Timestamp.Before(seenDeadline) {
 				return nil
 			}
+		case models.StatusReceived:
+			// A RawTx-carrying row still at RECEIVED past staleReceivedAge
+			// never got a network verdict — its no-verdict requeue was lost,
+			// or intake's Kafka publish failed and the submitter never
+			// retried. Rebroadcast to self-heal. Recent rows are still in
+			// the normal intake/requeue path, so leave them alone.
+			if !st.Timestamp.Before(receivedDeadline) {
+				return nil
+			}
 		default:
-			// RECEIVED rows are intentionally NOT rebroadcast — the
-			// submitter got an error from intake on Kafka publish
-			// failure and is responsible for deciding whether to retry.
-			// Terminal statuses, MINED, IMMUTABLE — not the reaper's job.
+			// Terminal statuses (REJECTED, DOUBLE_SPEND_ATTEMPTED, MINED,
+			// IMMUTABLE) and transient in-between states are not the
+			// reaper's job.
 			return nil
 		}
 		stuck = append(stuck, propagationMsg{TXID: st.TxID, RawTx: st.RawTx})
