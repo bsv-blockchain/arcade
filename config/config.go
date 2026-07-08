@@ -345,6 +345,21 @@ type PropagationConfig struct {
 	RetryBackoffMs    int `mapstructure:"retry_backoff_ms"`
 	ReaperIntervalMs  int `mapstructure:"reaper_interval_ms"`
 	ReaperBatchSize   int `mapstructure:"reaper_batch_size"`
+	// ReaperRebroadcastIntervalMs is the minimum time between successive
+	// rebroadcasts of the same stuck tx. The reaper only re-sends a SEEN_*
+	// row whose last_rebroadcast_at is NULL or older than this window, so each
+	// tick's batch spreads across the whole backlog instead of re-sending the
+	// same rows every interval — this is what prevents head-of-line starvation
+	// when the backlog exceeds reaper_batch_size. Defaults to 1h.
+	ReaperRebroadcastIntervalMs int `mapstructure:"reaper_rebroadcast_interval_ms"`
+	// ReaperRequeueBackoffMs is the (shorter) delay before retrying a stuck tx
+	// whose rebroadcast hit a TRANSIENT failure — a Teranode requeue verdict or
+	// a failed merkle /watch registration. These rows stay SEEN_* and would
+	// otherwise wait the full ReaperRebroadcastIntervalMs; that is too slow for
+	// a transient blip, so they get this shorter backoff instead. Capped at
+	// ReaperRebroadcastIntervalMs (a requeue backoff longer than the full
+	// interval is meaningless). Defaults to 60000 (1 min).
+	ReaperRequeueBackoffMs int `mapstructure:"reaper_requeue_backoff_ms"`
 	// LeaseTTLMs bounds how long the reaper lease remains valid without a
 	// renewal. Set to at least 2–3× reaper_interval_ms so a missed tick
 	// doesn't trigger a false-positive failover. Defaults to 3× interval.
@@ -786,6 +801,8 @@ func setDefaults() {
 	viper.SetDefault("propagation.retry_backoff_ms", 500)
 	viper.SetDefault("propagation.reaper_interval_ms", 30000)
 	viper.SetDefault("propagation.reaper_batch_size", 500)
+	viper.SetDefault("propagation.reaper_rebroadcast_interval_ms", 3600000)
+	viper.SetDefault("propagation.reaper_requeue_backoff_ms", 60000)
 	// 0 keeps New()'s 3×reaper_interval default, so changing reaper_interval
 	// automatically moves the lease TTL unless the operator opts into a fixed value.
 	viper.SetDefault("propagation.lease_ttl_ms", 0)

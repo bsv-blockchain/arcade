@@ -93,11 +93,18 @@ type Propagator struct {
 	merkleConcurrency int
 	reaperInterval    time.Duration
 	reaperBatchSize   int
-	teranodeBatchCap  int
-	broadcastWorkers  int
-	maxParallelChunks int
-	holderID          string
-	leaseTTL          time.Duration
+	// reaperRebroadcastInterval is the minimum gap between successive
+	// rebroadcasts of the same stuck tx. See ReaperRebroadcastIntervalMs.
+	reaperRebroadcastInterval time.Duration
+	// reaperRequeueBackoff is the shorter retry delay for stuck txs whose
+	// rebroadcast hit a transient failure (Teranode requeue / failed merkle
+	// registration). See ReaperRequeueBackoffMs.
+	reaperRequeueBackoff time.Duration
+	teranodeBatchCap     int
+	broadcastWorkers     int
+	maxParallelChunks    int
+	holderID             string
+	leaseTTL             time.Duration
 
 	// broadcastJobs feeds the persistent worker pool that runs every
 	// per-endpoint POST /txs call. Replaces the previous per-broadcast
@@ -245,6 +252,20 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 	if reaperBatch <= 0 {
 		reaperBatch = 500
 	}
+	reaperRebroadcastInterval := time.Duration(cfg.Propagation.ReaperRebroadcastIntervalMs) * time.Millisecond
+	if reaperRebroadcastInterval <= 0 {
+		reaperRebroadcastInterval = time.Hour
+	}
+	reaperRequeueBackoff := time.Duration(cfg.Propagation.ReaperRequeueBackoffMs) * time.Millisecond
+	if reaperRequeueBackoff <= 0 {
+		reaperRequeueBackoff = time.Minute
+	}
+	// A requeue backoff longer than the full rebroadcast interval is
+	// meaningless — clamp so the transient-failure path never waits longer
+	// than the steady-state refresh.
+	if reaperRequeueBackoff > reaperRebroadcastInterval {
+		reaperRequeueBackoff = reaperRebroadcastInterval
+	}
 	leaseTTL := time.Duration(cfg.Propagation.LeaseTTLMs) * time.Millisecond
 	if leaseTTL <= 0 {
 		leaseTTL = 3 * reaperInterval
@@ -270,30 +291,32 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 		maxParallelChunks = defaultMaxParallelChunks
 	}
 	p := &Propagator{
-		cfg:               cfg,
-		logger:            logger.Named("propagation"),
-		producer:          producer,
-		publisher:         publisher,
-		store:             st,
-		leaser:            leaser,
-		teranodeClient:    tc,
-		merkleClient:      mc,
-		maxPending:        maxPending,
-		merkleConcurrency: merkleConcurrency,
-		reaperInterval:    reaperInterval,
-		reaperBatchSize:   reaperBatch,
-		teranodeBatchCap:  teranodeBatchCap,
-		broadcastWorkers:  broadcastWorkers,
-		maxParallelChunks: maxParallelChunks,
-		holderID:          newHolderID(),
-		leaseTTL:          leaseTTL,
-		broadcastJobs:     make(chan broadcastJob, broadcastJobBuffer),
-		processBatchSem:   make(chan struct{}, maxConcurrentBatches),
-		admitCh:           make(chan admitRequest, dispatcherChannelBuffer),
-		requeueCh:         make(chan requeueRequest, dispatcherChannelBuffer),
-		terminalCh:        make(chan terminalEvent, dispatcherChannelBuffer),
-		drainCh:           make(chan drainRequest),
-		initDone:          make(chan struct{}),
+		cfg:                       cfg,
+		logger:                    logger.Named("propagation"),
+		producer:                  producer,
+		publisher:                 publisher,
+		store:                     st,
+		leaser:                    leaser,
+		teranodeClient:            tc,
+		merkleClient:              mc,
+		maxPending:                maxPending,
+		merkleConcurrency:         merkleConcurrency,
+		reaperInterval:            reaperInterval,
+		reaperBatchSize:           reaperBatch,
+		reaperRebroadcastInterval: reaperRebroadcastInterval,
+		reaperRequeueBackoff:      reaperRequeueBackoff,
+		teranodeBatchCap:          teranodeBatchCap,
+		broadcastWorkers:          broadcastWorkers,
+		maxParallelChunks:         maxParallelChunks,
+		holderID:                  newHolderID(),
+		leaseTTL:                  leaseTTL,
+		broadcastJobs:             make(chan broadcastJob, broadcastJobBuffer),
+		processBatchSem:           make(chan struct{}, maxConcurrentBatches),
+		admitCh:                   make(chan admitRequest, dispatcherChannelBuffer),
+		requeueCh:                 make(chan requeueRequest, dispatcherChannelBuffer),
+		terminalCh:                make(chan terminalEvent, dispatcherChannelBuffer),
+		drainCh:                   make(chan drainRequest),
+		initDone:                  make(chan struct{}),
 	}
 	// Start a dispatcher goroutine with a nil claim so tests that
 	// construct via New and drive via admitCh / drainCh have a running

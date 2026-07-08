@@ -68,6 +68,13 @@ type TransactionStatus struct {
 	// added). The startup replay loop reads this to skip rows registered
 	// within MerkleReplaySkipRecentMinutes — see issue #145.
 	MerkleRegisteredAt time.Time `json:"merkleRegisteredAt,omitempty"`
+	// LastRebroadcastAt is the wall-clock time of the most recent reaper
+	// rebroadcast attempt for this txid. Zero value means "never rebroadcast"
+	// (or rebroadcast before this field was added). The reaper reads it to
+	// throttle re-sends to at most once per reaper_rebroadcast_interval_ms, so
+	// a saturated backlog can't starve older stuck rows by re-sending the same
+	// newest rows every tick.
+	LastRebroadcastAt time.Time `json:"lastRebroadcastAt,omitempty"`
 }
 
 // Status represents the various states a transaction can be in
