@@ -156,11 +156,21 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		merkleClient.SetLogger(logger.Named("merkle-client"))
 	}
 
-	txVal, err := validator.NewValidatorForNetwork(cfg.Network, validatorPolicyFromConfig(cfg))
-	if err != nil {
-		_ = st.Close()
-		_ = producer.Close()
-		return nil, nil, fmt.Errorf("creating validator: %w", err)
+	// Build the GoBDK transaction validator only for modes that actually
+	// validate submissions (api-server). NewValidatorForNetwork constructs
+	// two cgo/BDK script-verification engines; standing them up in modes that
+	// never call Validator.ValidateTransaction (sse, watchdog, propagation,
+	// p2p-client, bump-builder, chaintracks) is pure per-pod memory overhead.
+	// Keep in sync with BuildServices / modeNeedsValidator.
+	var txVal *validator.Validator
+	if modeNeedsValidator(cfg.Mode) {
+		v, verr := validator.NewValidatorForNetwork(cfg.Network, validatorPolicyFromConfig(cfg))
+		if verr != nil {
+			_ = st.Close()
+			_ = producer.Close()
+			return nil, nil, fmt.Errorf("creating validator: %w", verr)
+		}
+		txVal = v
 	}
 
 	publisher := events.NewKafkaPublisher(producer, logger, cfg.Events.SubscriberBuffer)
@@ -189,35 +199,40 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		chainTracks = ct
 	}
 
-	// Hydrate the TxTracker from the store BEFORE handing it to services.
-	// Without this, a process restart leaves the in-memory tracker empty
-	// and bump-builder's tracked-only filtering silently drops MINED /
-	// IMMUTABLE transitions for any tx that was already in-flight at the
-	// previous shutdown. Chain height is used to skip deeply-confirmed
-	// rows; when chaintracks is disabled we pass 0, which preserves every
-	// MINED row in the tracker — safe (loads a bit more) and the operator
-	// can prune later.
-	var hydrateHeight uint64
-	if chainTracks != nil {
-		hydrateHeight = uint64(chainTracks.GetHeight(ctx))
-	}
-	hydrateStart := time.Now()
-	loaded, hydrateErr := txTracker.LoadFromStore(ctx, st, hydrateHeight)
-	if hydrateErr != nil {
-		logger.Warn(
-			"tx tracker hydration partial",
-			zap.Int("loaded", loaded),
-			zap.Uint64("current_height", hydrateHeight),
-			zap.Duration("elapsed", time.Since(hydrateStart)),
-			zap.Error(hydrateErr),
-		)
-	} else {
-		logger.Info(
-			"tx tracker hydrated",
-			zap.Int("loaded", loaded),
-			zap.Uint64("current_height", hydrateHeight),
-			zap.Duration("elapsed", time.Since(hydrateStart)),
-		)
+	// Hydrate the TxTracker from the store BEFORE handing it to api-server.
+	// Gated to modes that actually consume it: only api-server reads
+	// deps.TxTracker (see BuildServices). Without hydration a restart leaves the
+	// tracker empty and in-flight transitions can be dropped until re-observed.
+	// LoadFromStore streams the full transactions history into an in-memory map,
+	// a cost that scales with tx volume; running it in modes that never read the
+	// tracker (sse, watchdog, propagation, p2p-client, bump-builder, chaintracks)
+	// is what OOMKilled every 512Mi arcade-v2 component after the v0.9.0 rollout.
+	// Chain height skips deeply-confirmed rows; when chaintracks is disabled we
+	// pass 0 (preserves every MINED row — safe, prunable later).
+	// Keep in sync with BuildServices / modeNeedsTxTracker.
+	if modeNeedsTxTracker(cfg.Mode) {
+		var hydrateHeight uint64
+		if chainTracks != nil {
+			hydrateHeight = uint64(chainTracks.GetHeight(ctx))
+		}
+		hydrateStart := time.Now()
+		loaded, hydrateErr := txTracker.LoadFromStore(ctx, st, hydrateHeight)
+		if hydrateErr != nil {
+			logger.Warn(
+				"tx tracker hydration partial",
+				zap.Int("loaded", loaded),
+				zap.Uint64("current_height", hydrateHeight),
+				zap.Duration("elapsed", time.Since(hydrateStart)),
+				zap.Error(hydrateErr),
+			)
+		} else {
+			logger.Info(
+				"tx tracker hydrated",
+				zap.Int("loaded", loaded),
+				zap.Uint64("current_height", hydrateHeight),
+				zap.Duration("elapsed", time.Since(hydrateStart)),
+			)
+		}
 	}
 
 	deps := &Deps{
@@ -276,6 +291,40 @@ func validatorPolicyFromConfig(cfg *config.Config) *validator.Policy {
 func modeNeedsChaintracks(mode string) bool {
 	switch mode {
 	case "all", "chaintracks", "bump-builder":
+		return true
+	default:
+		return false
+	}
+}
+
+// modeNeedsTxTracker reports whether the configured mode constructs a service
+// that reads deps.TxTracker. Only api-server does (see BuildServices). Other
+// modes must not hydrate it: TxTracker.LoadFromStore streams the entire
+// transactions history into an in-memory map, a cost that scales with tx volume
+// and OOMKilled the 512Mi arcade-v2 components (sse, watchdog, p2p-client,
+// bump-builder) after the v0.9.0 rollout.
+//
+// Keep this list in sync with BuildServices: any new mode that wires
+// deps.TxTracker into a service must be added here.
+func modeNeedsTxTracker(mode string) bool {
+	switch mode {
+	case "all", "api-server":
+		return true
+	default:
+		return false
+	}
+}
+
+// modeNeedsValidator reports whether the configured mode constructs a service
+// that calls deps.Validator.ValidateTransaction. Only api-server does (see
+// BuildServices). NewValidatorForNetwork builds two cgo/BDK script-verification
+// engines, so constructing it in other modes is pure per-pod memory overhead.
+//
+// Keep this list in sync with BuildServices: any new mode that wires
+// deps.Validator into a service must be added here.
+func modeNeedsValidator(mode string) bool {
+	switch mode {
+	case "all", "api-server":
 		return true
 	default:
 		return false

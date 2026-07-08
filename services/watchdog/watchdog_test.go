@@ -330,6 +330,67 @@ func TestWatchdog_BacksOffHeavilyOn4xx(t *testing.T) {
 	}
 }
 
+// TestWatchdog_CapsReprocessAtMaxAttempts reproduces the reprocess-storm:
+// merkle keeps ACCEPTING /reprocess (202) but the block never finalizes
+// (processed_at stays NULL), so the row is re-listed every stale window. With
+// MaxReprocessAttempts the watchdog must stop re-driving after N dispatches
+// instead of forever (the old recordSuccess reset the counter each time).
+func TestWatchdog_CapsReprocessAtMaxAttempts(t *testing.T) {
+	srv := newReprocessServer(t) // default responder returns 202 Accepted
+	mc := merkleservice.NewClient(srv.server.URL, "auth", 5*time.Second)
+
+	now := time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC)
+	st := &watchdogStore{
+		tipHeight: 1000,
+		stale: []*models.BlockProcessingStatus{
+			{BlockHash: "blk-1", BlockHeight: 1000, HeaderSeenAt: now.Add(-10 * time.Minute), Status: models.BlockStatusActive},
+		},
+	}
+	w := newTestWatchdog(t, st, alwaysLeader(), mc)
+	w.cfg.MaxReprocessAttempts = 3
+	w.cfg.MaxStaleAge = 0 // isolate the attempt cap
+
+	// Tick well past the cap, advancing > StaleThreshold each time so backoff
+	// never gates (only the cap should).
+	for i := 0; i < 6; i++ {
+		w.now = func() time.Time { return now.Add(time.Duration(i) * 3 * time.Minute) }
+		w.tick(context.Background())
+	}
+
+	if got := srv.callCount(); got != 3 {
+		t.Fatalf("reprocess not capped: calls=%d want 3 (MaxReprocessAttempts)", got)
+	}
+}
+
+// TestWatchdog_ParksBlockOlderThanMaxStaleAge verifies the restart-proof age
+// backstop: a block whose header_seen_at is older than MaxStaleAge is parked
+// without ever being dispatched, even with the attempt cap disabled and no
+// prior in-memory attempt state.
+func TestWatchdog_ParksBlockOlderThanMaxStaleAge(t *testing.T) {
+	srv := newReprocessServer(t)
+	mc := merkleservice.NewClient(srv.server.URL, "auth", 5*time.Second)
+
+	now := time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC)
+	st := &watchdogStore{
+		tipHeight: 1000,
+		stale: []*models.BlockProcessingStatus{
+			// height-recent (within RecencyDepth) but stuck for 2h.
+			{BlockHash: "blk-old", BlockHeight: 1000, HeaderSeenAt: now.Add(-2 * time.Hour), Status: models.BlockStatusActive},
+		},
+	}
+	w := newTestWatchdog(t, st, alwaysLeader(), mc)
+	w.cfg.MaxReprocessAttempts = 0 // disable attempt cap; isolate the age cap
+	w.cfg.MaxStaleAge = time.Hour
+	w.now = func() time.Time { return now }
+
+	w.tick(context.Background())
+	w.tick(context.Background())
+
+	if got := srv.callCount(); got != 0 {
+		t.Fatalf("block older than MaxStaleAge should be parked, not dispatched: calls=%d want 0", got)
+	}
+}
+
 func TestWatchdog_LeaseSkipsWhenNotLeader(t *testing.T) {
 	srv := newReprocessServer(t)
 	mc := merkleservice.NewClient(srv.server.URL, "auth", 5*time.Second)
