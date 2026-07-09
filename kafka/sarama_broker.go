@@ -270,16 +270,28 @@ func buildRecordHeaders(hdrs map[string][]byte) []sarama.RecordHeader {
 	return rh
 }
 
-func (b *saramaBroker) Subscribe(groupID string, topics []string) (Subscription, error) {
-	saramaCfg := sarama.NewConfig()
-	saramaCfg.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{sarama.NewBalanceStrategyRoundRobin()}
-	saramaCfg.Consumer.Offsets.Initial = sarama.OffsetOldest
-
-	group, err := sarama.NewConsumerGroup(b.brokers, groupID, saramaCfg)
+func (b *saramaBroker) Subscribe(groupID string, topics []string, start StartOffset) (Subscription, error) {
+	group, err := sarama.NewConsumerGroup(b.brokers, groupID, newSaramaConsumerConfig(start))
 	if err != nil {
 		return nil, fmt.Errorf("creating consumer group %s: %w", groupID, err)
 	}
 	return &saramaSubscription{group: group, topics: topics}, nil
+}
+
+// newSaramaConsumerConfig maps the broker-neutral StartOffset onto Sarama's
+// Consumer.Offsets.Initial. Initial is only consulted when the group has no
+// committed offsets, so durable stable-group consumers are unaffected by it
+// after their first commit; for fresh random groups it decides between
+// replaying the topic's entire retained backlog (OffsetOldest) and starting
+// at the head (OffsetNewest).
+func newSaramaConsumerConfig(start StartOffset) *sarama.Config {
+	saramaCfg := sarama.NewConfig()
+	saramaCfg.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{sarama.NewBalanceStrategyRoundRobin()}
+	saramaCfg.Consumer.Offsets.Initial = sarama.OffsetOldest
+	if start == StartLatest {
+		saramaCfg.Consumer.Offsets.Initial = sarama.OffsetNewest
+	}
+	return saramaCfg
 }
 
 func (b *saramaBroker) PartitionCount(topic string) (int, error) {

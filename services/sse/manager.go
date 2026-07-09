@@ -50,11 +50,14 @@ type Client struct {
 // every update out to every registered client. New clients register at
 // /events connect time; deregister on disconnect.
 //
+// The subscription is live-only (it starts at the topic head): anything a
+// client missed while disconnected is served from the store by sendCatchup
+// via Last-Event-ID, never by Kafka replay.
+//
 // Token-based filtering happens in the fan-out path: every event is
-// checked against each client's token via store.GetSubmissionsByToken.
-// The implementation is O(clients × submissions) per event, which is
-// acceptable for the workloads this service targets; a follow-up could
-// cache token→txid mappings if hot.
+// checked against each client's token via the indexed existence probe
+// store.TokenHasSubmissionForTx — O(1)-ish per (event, client). Nothing on
+// this path may materialize a token's full submission list (see #237/#238).
 type Manager struct {
 	publisher events.Publisher
 	store     store.Store

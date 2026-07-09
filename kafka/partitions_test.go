@@ -17,7 +17,7 @@ type stubPartitionBroker struct {
 	err    error
 }
 
-func (b *stubPartitionBroker) Subscribe(string, []string) (Subscription, error) {
+func (b *stubPartitionBroker) Subscribe(string, []string, StartOffset) (Subscription, error) {
 	panic("stubPartitionBroker: Subscribe not implemented")
 }
 

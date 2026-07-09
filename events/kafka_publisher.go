@@ -30,8 +30,11 @@ const dropLogInterval = 5 * time.Second
 // change. Publish JSON-encodes the TransactionStatus and sends it under
 // kafka.TopicStatusUpdate keyed by txid (so updates for the same tx land on
 // the same partition in real Kafka). Subscribe spins up a dedicated
-// consumer group with a random ID — every caller gets every message,
-// regardless of how many other subscribers are running.
+// consumer group with a random ID — every caller gets every message
+// published after it subscribed, regardless of how many other subscribers
+// are running. History is never served from Kafka: subscribers are
+// live-only by contract, and missed events recover through store-backed
+// paths (SSE Last-Event-ID catchup, webhook retry reaper).
 // DefaultSubscriberBuffer is the fallback channel capacity used when
 // NewKafkaPublisher is called with a non-positive subscriberBuffer.
 const DefaultSubscriberBuffer = 4096
@@ -115,9 +118,17 @@ func (p *KafkaPublisher) PublishBulk(ctx context.Context, template *models.Trans
 
 // Subscribe joins a fresh consumer group on TopicStatusUpdate and returns a
 // channel that yields decoded TransactionStatus values until ctx is canceled.
-// The unique groupID guarantees this subscriber sees every message — useful
-// when multiple subscribers (SSE manager + webhook service) coexist in the
-// same process or across pods.
+// The unique groupID guarantees this subscriber sees every message published
+// from subscription time onward — useful when multiple subscribers (SSE
+// manager + webhook service) coexist in the same process or across pods.
+//
+// The group starts at the LATEST offset. A fresh random group with
+// StartOldest silently replays the topic's entire retained backlog on every
+// pod start (~145k messages / >1GB of JSON in a busy deployment — this
+// OOM-crashlooped the 512Mi sse pods) and delivers stale duplicates to any
+// client connected mid-replay. Subscribers here are live-only by contract:
+// history belongs to the store (SSE Last-Event-ID catchup, webhook reaper),
+// never to Kafka replay.
 //
 // caller is a low-cardinality identifier (e.g. "sse", "webhook") used as a
 // Prometheus label on EventsSubscriberDroppedTotal so an operator can tell
@@ -151,6 +162,10 @@ func (p *KafkaPublisher) Subscribe(ctx context.Context, caller string) (<-chan *
 		Broker:  p.producer.Broker(),
 		GroupID: groupID,
 		Topics:  []string{kafka.TopicStatusUpdate},
+		// Live-only: see the Subscribe doc comment. Never StartOldest here —
+		// a random per-process group has no committed offsets, so oldest
+		// means a full backlog replay on every single pod start.
+		StartOffset: kafka.StartLatest,
 		Handler: func(ctx context.Context, msg *kafka.Message) error {
 			var status models.TransactionStatus
 			if jsonErr := json.Unmarshal(msg.Value, &status); jsonErr != nil {
@@ -232,7 +247,8 @@ type kafkaSubscription struct {
 
 // uniqueGroupID returns a per-call group identifier. Used so each Subscribe
 // gets its own consumer group, which in turn guarantees every subscriber
-// sees every message (the broker fans out across distinct groups).
+// sees every message published after it joined (the broker fans out across
+// distinct groups; each group starts at the topic head — see Subscribe).
 func uniqueGroupID() (string, error) {
 	var b [12]byte
 	if _, err := rand.Read(b[:]); err != nil {

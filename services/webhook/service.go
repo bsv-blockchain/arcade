@@ -234,11 +234,13 @@ func (s *Service) Start(ctx context.Context) error {
 			default:
 				// Pool saturated — every worker is blocked on a slow
 				// callback and the work queue is full. Drop with metric;
-				// the lost update is recoverable via the durable Kafka
-				// offset on reconnect, and we'd rather drop here than
-				// back-pressure the upstream subscriber channel (which
-				// would multiply the impact across this and other
-				// subscribers in the same publisher).
+				// recovery is store-backed (failed-POST retries via
+				// NextRetryAt swept by the reaper, plus CAS dedup gating on
+				// the next transition), NOT Kafka replay — the subscription
+				// is an ephemeral random group with no durable offsets. We'd
+				// rather drop here than back-pressure the upstream subscriber
+				// channel (which would multiply the impact across this and
+				// other subscribers in the same publisher).
 				metrics.WebhookPoolSaturatedTotal.Inc()
 				s.logger.Warn(
 					"webhook delivery pool saturated, dropping status",
