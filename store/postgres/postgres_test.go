@@ -1402,6 +1402,7 @@ func TestBlockProcessing_MarkParked_SkipsOrphanedAndMissing(t *testing.T) {
 		t.Errorf("Status=%q, want orphaned (park must not override)", got.Status)
 	}
 }
+
 // TestIterateStatusesByToken covers the SSE-catchup hot path: distinct
 // txids, since/only filters, ascending order, and the no-heavy-fields
 // projection (raw tx / merkle path stripped).
