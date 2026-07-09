@@ -1517,6 +1517,21 @@ func (s *Store) GetSubmissionsByToken(ctx context.Context, callbackToken string)
 	return s.submissionsByIndex(ctx, idxSubTokenPrefix(callbackToken))
 }
 
+// TokenHasSubmissionForTx resolves via the by-txid index (a txid has a
+// handful of submissions) — never the token index, which can hold millions.
+func (s *Store) TokenHasSubmissionForTx(ctx context.Context, callbackToken, txid string) (bool, error) {
+	subs, err := s.GetSubmissionsByTxID(ctx, txid)
+	if err != nil {
+		return false, err
+	}
+	for _, sub := range subs {
+		if sub.CallbackToken == callbackToken {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (s *Store) IterateStatusesByToken(ctx context.Context, callbackToken string, since time.Time, onlyStatuses []models.Status, fn func(*models.TransactionStatus) error) error {
 	subs, err := s.GetSubmissionsByToken(ctx, callbackToken)
 	if err != nil {

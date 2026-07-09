@@ -173,13 +173,16 @@ func (m *Manager) fanOut(ctx context.Context, status *models.TransactionStatus) 
 }
 
 // txBelongsToToken reports whether txid was submitted with the given
-// callback token. Per-event submissions lookup; cached only by the
-// database layer.
+// callback token. Runs once per event per token-filtered client, so it
+// uses the store's indexed by-txid existence probe. It MUST NOT load the
+// token's submission list: a token can hold millions of submissions, and
+// materializing them per event is what OOM-killed this service the
+// moment a mega-token client survived catchup into fan-out.
 func (m *Manager) txBelongsToToken(ctx context.Context, txid, token string) bool {
 	if m.store == nil {
 		return false
 	}
-	subs, err := m.store.GetSubmissionsByToken(ctx, token)
+	ok, err := m.store.TokenHasSubmissionForTx(ctx, token, txid)
 	if err != nil {
 		m.logger.Warn(
 			"submission lookup failed",
@@ -188,12 +191,7 @@ func (m *Manager) txBelongsToToken(ctx context.Context, txid, token string) bool
 		)
 		return false
 	}
-	for _, s := range subs {
-		if s.TxID == txid {
-			return true
-		}
-	}
-	return false
+	return ok
 }
 
 // Register adds a client to the registry.
