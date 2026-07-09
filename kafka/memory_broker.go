@@ -203,7 +203,10 @@ func (b *memoryBroker) publish(ctx context.Context, topic, key string, value []b
 	return nil
 }
 
-func (b *memoryBroker) Subscribe(groupID string, topics []string) (Subscription, error) {
+// Subscribe ignores the StartOffset parameter: the memory broker retains
+// nothing, so every subscription is inherently StartLatest — only messages
+// published while a mailbox exists are ever delivered.
+func (b *memoryBroker) Subscribe(groupID string, topics []string, _ StartOffset) (Subscription, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.closed {

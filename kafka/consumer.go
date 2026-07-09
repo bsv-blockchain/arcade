@@ -75,6 +75,12 @@ type ConsumerConfig struct {
 	// per-partition state in local variables without any cross-goroutine
 	// synchronization.
 	ClaimHandler ClaimHandler
+	// StartOffset selects where the group begins when it has no committed
+	// offsets. The zero value (StartOldest) is correct for durable
+	// stable-group consumers that must not skip history on first deployment;
+	// ephemeral random-group subscribers should set StartLatest so a fresh
+	// pod doesn't replay the topic's entire retained backlog.
+	StartOffset StartOffset
 }
 
 func NewConsumerGroup(cfg ConsumerConfig) (*ConsumerGroup, error) {
@@ -88,7 +94,7 @@ func NewConsumerGroup(cfg ConsumerConfig) (*ConsumerGroup, error) {
 	if cfg.Handler == nil && cfg.ClaimHandler == nil {
 		return nil, fmt.Errorf("ConsumerConfig: either Handler or ClaimHandler must be set")
 	}
-	sub, err := cfg.Broker.Subscribe(cfg.GroupID, cfg.Topics)
+	sub, err := cfg.Broker.Subscribe(cfg.GroupID, cfg.Topics, cfg.StartOffset)
 	if err != nil {
 		return nil, fmt.Errorf("subscribing: %w", err)
 	}

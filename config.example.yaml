@@ -175,6 +175,9 @@ health:
 # Going beyond ~65536 just delays the drop rather than addressing the
 # slow-consumer root cause. Memory cost is roughly
 # subscribers × subscriber_buffer × ~500 bytes per slot.
+# Subscribers are live-only: their consumer groups start at the topic head,
+# and history missed while a pod was down recovers via store-backed paths
+# (SSE Last-Event-ID catchup, webhook retry reaper), not Kafka replay.
 # events:
 #   subscriber_buffer: 4096
 

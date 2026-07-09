@@ -77,7 +77,7 @@ func (b *RecordingBroker) SendBatch(_ context.Context, _ string, msgs []KeyValue
 
 // Subscribe is not implemented — callers that need real delivery should use
 // NewMemoryBroker instead.
-func (b *RecordingBroker) Subscribe(string, []string) (Subscription, error) {
+func (b *RecordingBroker) Subscribe(string, []string, StartOffset) (Subscription, error) {
 	panic("RecordingBroker: Subscribe not supported — use NewMemoryBroker for consume tests")
 }
 
