@@ -21,14 +21,24 @@ type Block struct {
 }
 
 // BlockProcessingStatusValue tracks whether a block tracked by chaintracks
-// is still on the active chain or has been orphaned by a reorg. Stored as a
-// short string for backend portability (Postgres TEXT, Aerospike string bin,
-// Pebble byte slice).
+// is still on the active chain, has been orphaned by a reorg, or has been
+// parked by the watchdog (reprocess caps exhausted — needs explicit triage,
+// no longer re-driven). Stored as a short string for backend portability
+// (Postgres TEXT, Aerospike string bin, Pebble byte slice).
 type BlockProcessingStatusValue string
 
 const (
 	BlockStatusActive   BlockProcessingStatusValue = "active"
 	BlockStatusOrphaned BlockProcessingStatusValue = "orphaned"
+	// BlockStatusParked marks an on-chain block the watchdog gave up
+	// re-driving (MaxReprocessAttempts / MaxStaleAge crossed). Unlike
+	// orphaned it IS on the active chain — its compound BUMP is genuinely
+	// missing. Parked rows leave the watchdog's stale scan (status='active'
+	// predicate) so they surface as an explicit triage backlog instead of
+	// silent processed_at=NULL churn; a fresh header arrival for the same
+	// hash resets status='active' (UpsertBlockHeaderSeen conflict path) and
+	// revives recovery.
+	BlockStatusParked BlockProcessingStatusValue = "parked"
 )
 
 // BlockProcessingStatus records the milestones we've reached for one block:

@@ -157,6 +157,15 @@ type Store interface {
 	// service started recording).
 	MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) error
 
+	// MarkBlocksParked transitions every named block from status='active' to
+	// status='parked' — the watchdog's terminal state for blocks whose
+	// reprocess caps (attempts/age) are exhausted. Rows that are missing or
+	// not 'active' (orphaned rows stay orphaned) are silently skipped. Parked
+	// rows drop out of ListStaleBlockProcessingStatus so they read as an
+	// explicit triage backlog rather than perpetual stale churn; a later
+	// UpsertBlockHeaderSeen for the same hash resets them to 'active'.
+	MarkBlocksParked(ctx context.Context, blockHashes []string) error
+
 	// GetBlockProcessingStatus returns the row keyed by blockHash. Returns
 	// ErrNotFound if no row exists.
 	GetBlockProcessingStatus(ctx context.Context, blockHash string) (*models.BlockProcessingStatus, error)
