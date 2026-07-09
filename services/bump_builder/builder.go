@@ -72,6 +72,11 @@ func New(
 	teranodeClient *teranode.Client,
 	chainHeader ChainHeaderReader,
 ) *Builder {
+	// Export every series this service can emit at 0 from the first scrape —
+	// a series born mid-burst is invisible to increase() until its second
+	// sample, which made a whole block's MINED transitions vanish from
+	// dashboards after every rollout.
+	metrics.PreRegisterStatusTransitions(models.StatusMined)
 	return &Builder{
 		cfg:         cfg,
 		logger:      logger.Named("bump-builder"),

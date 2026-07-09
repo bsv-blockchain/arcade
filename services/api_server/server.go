@@ -74,6 +74,11 @@ type submissionRecord struct {
 }
 
 func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publisher events.Publisher, st store.Store, tracker *store.TxTracker, tc *teranode.Client, mc *merkleservice.Client, val *validator.Validator) *Server {
+	// Export every series this service can emit at 0 from the first scrape —
+	// a series born mid-burst is invisible to increase() until its second
+	// sample, which undercounted submissions after every rollout.
+	metrics.PreRegisterTxSubmissions()
+	metrics.PreRegisterStatusTransitions(models.StatusSeenOnNetwork, models.StatusSeenMultipleNodes)
 	return &Server{
 		cfg:            cfg,
 		logger:         logger.Named("api-server"),

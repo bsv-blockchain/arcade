@@ -231,6 +231,10 @@ const defaultMaxParallelChunks = 4
 // don't need coordination. In production every replica should receive a
 // non-nil Leaser so only one reaper is active at a time across the cluster.
 func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publisher events.Publisher, st store.Store, leaser store.Leaser, tc *teranode.Client, mc *merkleservice.Client) *Propagator {
+	// Export every series this service can emit at 0 from the first scrape —
+	// a series born mid-burst is invisible to increase() until its second
+	// sample, which zeroed the REJECTED count after every rollout.
+	metrics.PreRegisterStatusTransitions(models.StatusAcceptedByNetwork, models.StatusRejected)
 	merkleConcurrency := cfg.Propagation.MerkleConcurrency
 	if merkleConcurrency <= 0 {
 		merkleConcurrency = 10
