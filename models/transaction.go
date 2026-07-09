@@ -119,6 +119,19 @@ func (s Status) IsTerminal() bool {
 	return ok
 }
 
+// NonTerminalStatuses returns the statuses a transaction can still move on
+// from — the "pending" set a reconnecting client needs replayed. Everything
+// terminal (MINED, IMMUTABLE, REJECTED, DOUBLE_SPEND_ATTEMPTED) is excluded:
+// terminal history is queryable via the REST API and replaying it wholesale
+// is what made SSE catchup unbounded.
+func NonTerminalStatuses() []Status {
+	return []Status{
+		StatusReceived, StatusSentToNetwork, StatusAcceptedByNetwork,
+		StatusSeenOnNetwork, StatusSeenMultipleNodes,
+		StatusPendingRetry, StatusStumpProcessing,
+	}
+}
+
 // DisallowedPreviousStatuses returns statuses that CANNOT transition to this status.
 // Used by stores' UpdateStatus implementations (and CanTransitionFrom) to prevent
 // invalid status transitions — most importantly, to prevent terminal statuses
