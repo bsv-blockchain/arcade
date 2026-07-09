@@ -2238,3 +2238,79 @@ func TestHandleCallback_BlockProcessed_ForwardsEnrichmentFields(t *testing.T) {
 		t.Errorf("CoinbaseBUMP = %x, want deadbeef", decoded.CoinbaseBUMP)
 	}
 }
+
+// counterVal reads a labeled counter for delta assertions.
+func counterVal(route, result string) float64 {
+	return testutil.ToFloat64(metrics.APITxsSubmittedTotal.WithLabelValues(route, result))
+}
+
+// TestSubmitCounters_BatchCountsPerTransaction is the regression for the
+// submissions-metric bug: the HTTP request histogram counts one sample per
+// request, so a 3-tx /txs batch read as ONE submission on dashboards.
+// arcade_api_txs_submitted_total must count per transaction.
+func TestSubmitCounters_BatchCountsPerTransaction(t *testing.T) {
+	broker := &kafka.RecordingBroker{}
+	_, router := setupServer(broker) // no store: every parsed tx counts as new
+
+	before := counterVal("/txs", "new")
+
+	body := bytes.Repeat(makeMinimalTx(), 3)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/txs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := counterVal("/txs", "new") - before; got != 3 {
+		t.Errorf("txs_submitted{/txs,new} delta = %v, want 3 (one per transaction, not per request)", got)
+	}
+}
+
+// TestSubmitCounters_SingleDedupResults pins the result label on the single
+// submit route: a fresh insert counts as new; an idempotent resubmit counts
+// as duplicate (and is not double-counted as new).
+func TestSubmitCounters_SingleDedupResults(t *testing.T) {
+	broker := &kafka.RecordingBroker{}
+
+	// Fresh insert.
+	msNew := &mockStore{getOrInsertFn: func(st *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+		return st, true, nil
+	}}
+	_, router := setupServerWithStore(broker, msNew)
+	beforeNew, beforeDup := counterVal("/tx", "new"), counterVal("/tx", "duplicate")
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/tx", bytes.NewReader(makeMinimalTx()))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := counterVal("/tx", "new") - beforeNew; got != 1 {
+		t.Errorf("txs_submitted{/tx,new} delta = %v, want 1", got)
+	}
+
+	// Idempotent duplicate.
+	existing := &models.TransactionStatus{Status: models.StatusSeenOnNetwork}
+	msDup := &mockStore{getOrInsertFn: func(st *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+		return existing, false, nil
+	}}
+	_, router2 := setupServerWithStore(broker, msDup)
+	beforeNew = counterVal("/tx", "new")
+
+	req2 := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/tx", bytes.NewReader(makeMinimalTx()))
+	req2.Header.Set("Content-Type", "application/octet-stream")
+	w2 := httptest.NewRecorder()
+	router2.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusAccepted {
+		t.Fatalf("duplicate resubmit: expected 202, got %d: %s", w2.Code, w2.Body.String())
+	}
+	if got := counterVal("/tx", "duplicate") - beforeDup; got != 1 {
+		t.Errorf("txs_submitted{/tx,duplicate} delta = %v, want 1", got)
+	}
+	if got := counterVal("/tx", "new") - beforeNew; got != 0 {
+		t.Errorf("duplicate resubmit must not count as new (delta %v)", got)
+	}
+}

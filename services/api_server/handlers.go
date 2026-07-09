@@ -654,6 +654,7 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// Dedup CAS via GetOrInsertStatus. Two submitters racing on the
 	// same txid both attempt the insert; the loser sees inserted=false
 	// and returns 202 idempotently without re-publishing.
+	submitResult := "new"
 	if s.store != nil {
 		row := &models.TransactionStatus{
 			TxID:      txid,
@@ -681,6 +682,7 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 			// both RECEIVED and REJECTED produce the same callback
 			// prefilter behavior because every forward status allows
 			// transitioning from either.
+			submitResult = "retry_rejected"
 		case !inserted && existing != nil:
 			// Idempotent re-submit: row already exists at a non-REJECTED
 			// status. Register the txid with the in-process TxTracker so
@@ -690,6 +692,7 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 			if s.txTracker != nil {
 				s.txTracker.Add(txid, existing.Status)
 			}
+			metrics.APITxsSubmittedTotal.WithLabelValues("/tx", "duplicate").Inc()
 			s.recordSubmission(c.Request.Context(), txid, opts)
 			c.JSON(http.StatusAccepted, submitResponse{
 				TxID:     txid,
@@ -699,6 +702,8 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 			return
 		}
 	}
+
+	metrics.APITxsSubmittedTotal.WithLabelValues("/tx", submitResult).Inc()
 
 	// Register the tx with the in-process TxTracker so the bump-builder
 	// recognizes it when its block is processed.
@@ -914,6 +919,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	// best-effort behavior.
 	toPublish := make([]parsedItem, 0, len(parsed))
 	duplicates := 0
+	newSubmits, retryRejected := 0, 0
 	if s.store != nil {
 		ctx := c.Request.Context()
 		for _, p := range parsed {
@@ -929,6 +935,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 			switch {
 			case dedupErr != nil:
 				s.logger.Error("dedup CAS failed", logfields.TxID(p.txid), zap.Error(dedupErr))
+				newSubmits++
 				toPublish = append(toPublish, p)
 			case !inserted && existing != nil && existing.Status == models.StatusRejected:
 				// Resubmission of a previously-rejected tx: add to
@@ -938,6 +945,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				// pipeline. The status row stays at REJECTED until the
 				// new broadcast produces a verdict. Mirrors
 				// handleSubmitTransaction.
+				retryRejected++
 				toPublish = append(toPublish, p)
 			case !inserted && existing != nil:
 				duplicates++
@@ -950,12 +958,17 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				}
 				s.recordSubmission(ctx, p.txid, opts)
 			default:
+				newSubmits++
 				toPublish = append(toPublish, p)
 			}
 		}
 	} else {
 		toPublish = parsed
+		newSubmits = len(parsed)
 	}
+	metrics.APITxsSubmittedTotal.WithLabelValues("/txs", "new").Add(float64(newSubmits))
+	metrics.APITxsSubmittedTotal.WithLabelValues("/txs", "duplicate").Add(float64(duplicates))
+	metrics.APITxsSubmittedTotal.WithLabelValues("/txs", "retry_rejected").Add(float64(retryRejected))
 
 	// Register every accepted tx with the in-process TxTracker so the
 	// bump-builder's filterTrackedTxids recognizes them when their block

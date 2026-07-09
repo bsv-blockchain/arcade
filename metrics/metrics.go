@@ -199,6 +199,19 @@ var PropagationReaperReadyDepth = promauto.NewGauge(prometheus.GaugeOpts{
 	Help: "Number of stale SEEN_ON_NETWORK rows ready for rebroadcast at the last reaper tick.",
 })
 
+// APITxsSubmittedTotal counts individual transactions submitted through the
+// API, by route and dedup result. Unlike the HTTP request histogram (one
+// sample per request), this counts PER TRANSACTION — the /txs batch route
+// submits many txs in one request, so request counts undercount submissions
+// by the batch factor. result=new is the "unique txids submitted" series
+// dashboards should use; duplicate = idempotent resubmit of a known txid;
+// retry_rejected = resubmit of a previously rejected txid (re-enters the
+// broadcast pipeline).
+var APITxsSubmittedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_api_txs_submitted_total",
+	Help: "Transactions submitted via the API by route and dedup result (new|duplicate|retry_rejected). Counted per transaction, not per request.",
+}, []string{"route", "result"})
+
 // StuckTransientTxs counts transactions sitting in a transient status
 // (RECEIVED, ACCEPTED_BY_NETWORK) for longer than the stale-transient
 // threshold (1h), within the reaper's 24h scan lookback. Unlike
