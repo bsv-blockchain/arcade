@@ -199,6 +199,41 @@ var PropagationReaperReadyDepth = promauto.NewGauge(prometheus.GaugeOpts{
 	Help: "Number of stale SEEN_ON_NETWORK rows ready for rebroadcast at the last reaper tick.",
 })
 
+// APITxsSubmittedTotal counts individual transactions submitted through the
+// API, by route and dedup result. Unlike the HTTP request histogram (one
+// sample per request), this counts PER TRANSACTION — the /txs batch route
+// submits many txs in one request, so request counts undercount submissions
+// by the batch factor. result=new is the "unique txids submitted" series
+// dashboards should use; duplicate = idempotent resubmit of a known txid;
+// retry_rejected = resubmit of a previously rejected txid (re-enters the
+// broadcast pipeline).
+var APITxsSubmittedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_api_txs_submitted_total",
+	Help: "Transactions submitted via the API by route and dedup result (new|duplicate|retry_rejected). Counted per transaction, not per request.",
+}, []string{"route", "result"})
+
+// StuckTransientTxs counts transactions sitting in a transient status
+// (RECEIVED, ACCEPTED_BY_NETWORK) for longer than the stale-transient
+// threshold (1h), within the reaper's 24h scan lookback. Unlike
+// PropagationReaperReadyDepth it is uncapped, split per status, and covers
+// ACCEPTED_BY_NETWORK (which the rebroadcast path deliberately ignores).
+// Computed on the leader's reaper tick; non-leaders report 0, so aggregate
+// with max() across pods. A sustained non-zero value means the SEEN
+// state-transfer for those txs never arrived — the primary alerting signal
+// for a stalled subtree-callback pipeline.
+var StuckTransientTxs = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "arcade_stuck_transient_txs",
+	Help: "Transactions stuck in a transient status for over 1h (24h lookback), by status. Leader-computed; aggregate with max().",
+}, []string{"status"})
+
+// OldestTransientTxAge reports the age in seconds of the oldest transaction
+// currently stuck in each transient status (0 when none). Same computation
+// cadence and aggregation semantics as StuckTransientTxs.
+var OldestTransientTxAge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "arcade_oldest_transient_tx_age_seconds",
+	Help: "Age of the oldest transaction stuck in each transient status (seconds; 0 when none). Leader-computed; aggregate with max().",
+}, []string{"status"})
+
 // ---------------------------------------------------------------------------
 // bump_builder
 // ---------------------------------------------------------------------------

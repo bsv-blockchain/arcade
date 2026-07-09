@@ -7,6 +7,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 )
@@ -38,7 +39,33 @@ const (
 	staleReceivedAge       = time.Hour
 	staleScanLookback      = 24 * time.Hour
 	reaperRebroadcastBatch = 200
+
+	// stuckTransientAge is the threshold for the StuckTransientTxs /
+	// OldestTransientTxAge gauges: a tx sitting in RECEIVED or
+	// ACCEPTED_BY_NETWORK longer than this counts as stuck — the SEEN
+	// state-transfer for it never arrived. Kept equal to the rebroadcast
+	// stale ages so "stuck" means the same thing everywhere.
+	stuckTransientAge = time.Hour
 )
+
+// stuckTransientStatuses are the transient statuses the stuck gauges track.
+// RECEIVED is partially self-healed by the rebroadcast arm below;
+// ACCEPTED_BY_NETWORK has no self-heal path, which is exactly why it needs
+// the visibility.
+var stuckTransientStatuses = []models.Status{
+	models.StatusReceived,
+	models.StatusAcceptedByNetwork,
+}
+
+// zeroStuckTransientGauges resets the leader-computed stuck gauges. Called on
+// non-leader ticks so a pod that lost the lease doesn't keep exporting its
+// last leader-era values (the current leader's values then win under max()).
+func zeroStuckTransientGauges() {
+	for _, st := range stuckTransientStatuses {
+		metrics.StuckTransientTxs.WithLabelValues(string(st)).Set(0)
+		metrics.OldestTransientTxAge.WithLabelValues(string(st)).Set(0)
+	}
+}
 
 // reaperLeaseName is the well-known key every replica uses to coordinate
 // reaper ownership. One lease per propagation deployment.
@@ -84,6 +111,7 @@ func (p *Propagator) tryReap(ctx context.Context) {
 		if heldUntil.IsZero() {
 			metrics.PropagationReaperTickTotal.WithLabelValues("skipped_no_leader").Inc()
 			metrics.PropagationReaperLease.Set(0)
+			zeroStuckTransientGauges()
 			p.logger.Debug("reaper: not leader, skipping tick")
 			return
 		}
@@ -117,10 +145,34 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 	seenDeadline := now.Add(-staleSeenOnNetworkAge)
 	receivedDeadline := now.Add(-staleReceivedAge)
 
+	stuckTransientDeadline := now.Add(-stuckTransientAge)
+	type transientStats struct {
+		count  int
+		oldest time.Time
+	}
+	stuckTransient := make(map[models.Status]*transientStats, len(stuckTransientStatuses))
+	for _, s := range stuckTransientStatuses {
+		stuckTransient[s] = &transientStats{}
+	}
+
 	stuck := make([]propagationMsg, 0, reaperRebroadcastBatch)
 	err := p.store.IterateStatusesSince(ctx, since, func(st *models.TransactionStatus) error {
+		// Stuck-transient accounting runs on EVERY row (regardless of RawTx
+		// or the rebroadcast cap): the gauges must be an uncapped census of
+		// txs whose SEEN state-transfer never arrived, including
+		// ACCEPTED_BY_NETWORK rows the rebroadcast arm below never touches.
+		if ts, ok := stuckTransient[st.Status]; ok && st.Timestamp.Before(stuckTransientDeadline) {
+			ts.count++
+			if ts.oldest.IsZero() || st.Timestamp.Before(ts.oldest) {
+				ts.oldest = st.Timestamp
+			}
+		}
+
 		if len(stuck) >= reaperRebroadcastBatch {
-			return errReaperBatchFull
+			// Rebroadcast batch is full — keep walking for the census, just
+			// stop collecting. (Previously the walk aborted here, which also
+			// capped any counting at the batch size.)
+			return nil
 		}
 		if len(st.RawTx) == 0 {
 			// No body to rebroadcast. Pre-reaper-population rows
@@ -144,13 +196,13 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 		default:
 			// Terminal statuses (REJECTED, DOUBLE_SPEND_ATTEMPTED, MINED,
 			// IMMUTABLE) and transient in-between states are not the
-			// reaper's job.
+			// reaper's job to rebroadcast.
 			return nil
 		}
 		stuck = append(stuck, propagationMsg{TXID: st.TxID, RawTx: st.RawTx})
 		return nil
 	})
-	if err != nil && !errors.Is(err, errReaperBatchFull) && !errors.Is(err, context.Canceled) {
+	if err != nil && !errors.Is(err, context.Canceled) {
 		p.logger.Error("reaper: scan failed", zap.Error(err))
 		return
 	}
@@ -161,6 +213,23 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 	// leaves a stale non-zero value visible to dashboards after the
 	// backlog drains, which used to make the metric misleading.
 	metrics.PropagationReaperReadyDepth.Set(float64(len(stuck)))
+
+	// Publish the stuck-transient census the same way: every tick, zero
+	// included, so the gauges always reflect the latest completed scan.
+	for status, ts := range stuckTransient {
+		metrics.StuckTransientTxs.WithLabelValues(string(status)).Set(float64(ts.count))
+		age := 0.0
+		if !ts.oldest.IsZero() {
+			age = now.Sub(ts.oldest).Seconds()
+		}
+		metrics.OldestTransientTxAge.WithLabelValues(string(status)).Set(age)
+		if ts.count > 0 {
+			p.logger.Warn("reaper: transactions stuck in transient status past threshold",
+				logfields.Status(string(status)),
+				zap.Int("count", ts.count),
+				zap.Float64("oldest_age_seconds", age))
+		}
+	}
 
 	if len(stuck) == 0 {
 		return
@@ -208,9 +277,3 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 	}
 	p.applyTerminalStatuses(ctx, terminalStatuses, accepted, rejected)
 }
-
-// errReaperBatchFull halts the IterateStatusesSince walk once we've
-// accumulated reaperRebroadcastBatch stuck rows. Sentinel error so
-// IterateStatusesSince surfaces it cleanly without being mistaken for
-// a backend error.
-var errReaperBatchFull = errors.New("reaper batch full")
