@@ -100,6 +100,18 @@ const (
 	StatusImmutable = Status("IMMUTABLE")
 )
 
+// AllStatuses returns every defined Status, in lifecycle order. Callers that
+// enumerate the status domain (metric pre-registration, exhaustive lattice
+// checks) use this instead of maintaining their own copy of the const block.
+func AllStatuses() []Status {
+	return []Status{
+		StatusUnknown, StatusReceived, StatusSentToNetwork,
+		StatusAcceptedByNetwork, StatusSeenOnNetwork, StatusSeenMultipleNodes,
+		StatusDoubleSpendAttempted, StatusRejected, StatusPendingRetry,
+		StatusStumpProcessing, StatusMined, StatusImmutable,
+	}
+}
+
 // terminalStatuses lists statuses that represent a final outcome for a
 // transaction. A row already in one of these states must never be overwritten
 // by a lower-priority update (e.g. a late SEEN_ON_NETWORK callback arriving
