@@ -1845,6 +1845,39 @@ func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, or
 	return nil
 }
 
+func (s *Store) MarkBlocksParked(ctx context.Context, blockHashes []string) error {
+	if len(blockHashes) == 0 {
+		return nil
+	}
+	for _, h := range blockHashes {
+		key, err := s.key(setBlockProcessing, h)
+		if err != nil {
+			return err
+		}
+		rec, err := s.client.Get(s.readPolicy(ctx), key, binStatus)
+		if err != nil {
+			if isKeyNotFound(err) {
+				continue
+			}
+			return fmt.Errorf("read block_processing %s: %w", h, err)
+		}
+		// Only 'active' rows park: missing rows are skipped, and an orphaned
+		// row is off-chain (a more specific terminal state) that must not be
+		// relabeled as a missing-BUMP backlog.
+		if rec == nil {
+			continue
+		}
+		if status, _ := rec.Bins[binStatus].(string); status != string(models.BlockStatusActive) {
+			continue
+		}
+		if _, err := s.client.Operate(s.writePolicy(ctx), key,
+			aero.PutOp(aero.NewBin(binStatus, string(models.BlockStatusParked)))); err != nil {
+			return fmt.Errorf("mark parked %s: %w", h, err)
+		}
+	}
+	return nil
+}
+
 func (s *Store) GetBlockProcessingStatus(ctx context.Context, blockHash string) (*models.BlockProcessingStatus, error) {
 	key, err := s.key(setBlockProcessing, blockHash)
 	if err != nil {

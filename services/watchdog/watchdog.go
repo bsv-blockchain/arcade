@@ -264,7 +264,18 @@ func (w *Watchdog) runOnce(ctx context.Context) {
 		return
 	}
 
-	eligible := w.filterEligible(candidates, now)
+	eligible, newlyParked := w.filterEligible(candidates, now)
+	if len(newlyParked) > 0 {
+		// Persist the park as a terminal status so the rows leave the stale
+		// scan (status='active' predicate) and read as an explicit triage
+		// backlog instead of perpetual processed_at=NULL churn. Best-effort:
+		// the in-memory parked flag already stops reprocessing this run, and
+		// a redeploy would re-try once then re-park (rewriting the status).
+		if err := w.store.MarkBlocksParked(ctx, newlyParked); err != nil {
+			w.logger.Warn("watchdog: failed to persist parked status",
+				zap.Int("blocks", len(newlyParked)), zap.Error(err))
+		}
+	}
 	if len(eligible) == 0 {
 		w.gc(now)
 		return
@@ -275,8 +286,10 @@ func (w *Watchdog) runOnce(ctx context.Context) {
 }
 
 // filterEligible drops candidates whose in-memory backoff hasn't expired.
-// Returns the rows that should actually trigger a /reprocess this tick.
-func (w *Watchdog) filterEligible(rows []*models.BlockProcessingStatus, now time.Time) []*models.BlockProcessingStatus {
+// Returns the rows that should actually trigger a /reprocess this tick, plus
+// the block hashes that crossed a park cap on THIS pass (first time only) so
+// the caller can persist their terminal status.
+func (w *Watchdog) filterEligible(rows []*models.BlockProcessingStatus, now time.Time) (eligible []*models.BlockProcessingStatus, newlyParked []string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -284,11 +297,12 @@ func (w *Watchdog) filterEligible(rows []*models.BlockProcessingStatus, now time
 	for _, r := range rows {
 		st := w.attempts[r.BlockHash]
 		// Cap reprocessing: a block re-driven MaxReprocessAttempts times (or
-		// stale longer than MaxStaleAge) is parked — we stop issuing /reprocess
-		// so a permanently un-finalizable block can't soak the
-		// arcade.block_processed topic indefinitely (the reprocess storm that
-		// saturates the single bump-builder consumer). Parked entries age out
-		// via gc / RecencyDepth; a redeploy re-tries once more then re-parks.
+		// stale longer than MaxStaleAge, after at least one attempt) is
+		// parked — we stop issuing /reprocess so a permanently un-finalizable
+		// block can't soak the arcade.block_processed topic indefinitely (the
+		// reprocess storm that saturates the single bump-builder consumer).
+		// The park is persisted as status='parked' by the caller, so the row
+		// stops surfacing here at all; a redeploy re-tries once then re-parks.
 		if reason := w.parkReason(r, st, now); reason != "" {
 			if st == nil {
 				st = &attemptState{lastTriedAt: now}
@@ -296,6 +310,7 @@ func (w *Watchdog) filterEligible(rows []*models.BlockProcessingStatus, now time
 			}
 			if !st.parked {
 				st.parked = true
+				newlyParked = append(newlyParked, r.BlockHash)
 				metrics.WatchdogParkedTotal.WithLabelValues(reason).Inc()
 				w.logger.Warn("watchdog: parking block; stopping reprocess",
 					logfields.BlockHash(r.BlockHash),
@@ -310,19 +325,29 @@ func (w *Watchdog) filterEligible(rows []*models.BlockProcessingStatus, now time
 		}
 		out = append(out, r)
 	}
-	return out
+	return out, newlyParked
 }
 
 // parkReason returns a non-empty reason ("max_age" | "max_attempts") when the
 // block should be parked (reprocessing stopped), or "" to keep re-driving.
-// Each bound is disabled when its config value is <= 0. The max-age bound reads
-// only r.HeaderSeenAt, so it also caps blocks the attempts map hasn't seen yet
-// and survives redeploys (which reset the in-memory attempt counters).
+// Each bound is disabled when its config value is <= 0.
+//
+// The max-age bound only fires after at least one dispatch for the block: a
+// block ALREADY past MaxStaleAge when first seen (an incident backlog
+// surfacing late, or a redeploy resetting the in-memory counters) gets
+// exactly one recovery attempt instead of being abandoned with zero —
+// age-parking at attempts:0 silently strands recoverable blocks forever.
+// The next tick re-consults parkReason with total >= 1, so the park still
+// lands promptly after that single attempt.
 func (w *Watchdog) parkReason(r *models.BlockProcessingStatus, st *attemptState, now time.Time) string {
-	if w.cfg.MaxStaleAge > 0 && now.Sub(r.HeaderSeenAt) > w.cfg.MaxStaleAge {
+	attempts := 0
+	if st != nil {
+		attempts = st.total
+	}
+	if w.cfg.MaxStaleAge > 0 && attempts > 0 && now.Sub(r.HeaderSeenAt) > w.cfg.MaxStaleAge {
 		return "max_age"
 	}
-	if w.cfg.MaxReprocessAttempts > 0 && st != nil && st.total >= w.cfg.MaxReprocessAttempts {
+	if w.cfg.MaxReprocessAttempts > 0 && attempts >= w.cfg.MaxReprocessAttempts {
 		return "max_attempts"
 	}
 	return ""

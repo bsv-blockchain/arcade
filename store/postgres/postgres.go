@@ -970,6 +970,23 @@ WHERE block_hash = ANY($1)`
 	return nil
 }
 
+func (s *Store) MarkBlocksParked(ctx context.Context, blockHashes []string) error {
+	if len(blockHashes) == 0 {
+		return nil
+	}
+	// Only 'active' rows park: an orphaned row is off-chain (a more specific
+	// terminal state) and must not be relabeled as a missing-BUMP backlog.
+	const q = `
+UPDATE block_processing
+SET status = 'parked'
+WHERE block_hash = ANY($1) AND status = 'active'`
+	_, err := s.pool.Exec(ctx, q, blockHashes)
+	if err != nil {
+		return fmt.Errorf("mark blocks parked: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) GetBlockProcessingStatus(ctx context.Context, blockHash string) (*models.BlockProcessingStatus, error) {
 	const q = `
 SELECT block_hash, block_height, header_seen_at, processed_at, bump_built_at, status, orphaned_at

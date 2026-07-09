@@ -31,7 +31,8 @@ type watchdogStore struct {
 	stale     []*models.BlockProcessingStatus
 	staleErr  error
 
-	listCalls []listStaleCall
+	listCalls   []listStaleCall
+	parkedCalls [][]string
 }
 
 type listStaleCall struct {
@@ -92,6 +93,33 @@ func (s *watchdogStore) captureListCalls() []listStaleCall {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]listStaleCall(nil), s.listCalls...)
+}
+
+// MarkBlocksParked mirrors the real backends: records the call and flips
+// active rows to parked, so subsequent ListStaleBlockProcessingStatus calls
+// exclude them (the status filter above).
+func (s *watchdogStore) MarkBlocksParked(_ context.Context, hashes []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.parkedCalls = append(s.parkedCalls, append([]string(nil), hashes...))
+	for _, h := range hashes {
+		for _, r := range s.stale {
+			if r.BlockHash == h && (r.Status == "" || r.Status == models.BlockStatusActive) {
+				r.Status = models.BlockStatusParked
+			}
+		}
+	}
+	return nil
+}
+
+func (s *watchdogStore) parkedHashes() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []string
+	for _, call := range s.parkedCalls {
+		out = append(out, call...)
+	}
+	return out
 }
 
 type watchdogLeaser struct {
@@ -360,12 +388,16 @@ func TestWatchdog_CapsReprocessAtMaxAttempts(t *testing.T) {
 	if got := srv.callCount(); got != 3 {
 		t.Fatalf("reprocess not capped: calls=%d want 3 (MaxReprocessAttempts)", got)
 	}
+	if parked := st.parkedHashes(); len(parked) != 1 || parked[0] != "blk-1" {
+		t.Fatalf("attempt-cap park must be persisted via MarkBlocksParked: got %v want [blk-1]", parked)
+	}
 }
 
-// TestWatchdog_ParksBlockOlderThanMaxStaleAge verifies the restart-proof age
-// backstop: a block whose header_seen_at is older than MaxStaleAge is parked
-// without ever being dispatched, even with the attempt cap disabled and no
-// prior in-memory attempt state.
+// TestWatchdog_ParksBlockOlderThanMaxStaleAge verifies the age backstop AND
+// its one-attempt guarantee: a block already older than MaxStaleAge when
+// first seen (incident backlog, or a redeploy reset the in-memory counters)
+// gets exactly ONE recovery dispatch, then parks — and the park is persisted
+// as a terminal status so the row leaves the stale scan entirely.
 func TestWatchdog_ParksBlockOlderThanMaxStaleAge(t *testing.T) {
 	srv := newReprocessServer(t)
 	mc := merkleservice.NewClient(srv.server.URL, "auth", 5*time.Second)
@@ -381,13 +413,36 @@ func TestWatchdog_ParksBlockOlderThanMaxStaleAge(t *testing.T) {
 	w := newTestWatchdog(t, st, alwaysLeader(), mc)
 	w.cfg.MaxReprocessAttempts = 0 // disable attempt cap; isolate the age cap
 	w.cfg.MaxStaleAge = time.Hour
+
+	// Tick 1: aged block with zero attempts must be dispatched once, not
+	// silently abandoned.
 	w.now = func() time.Time { return now }
-
 	w.tick(context.Background())
-	w.tick(context.Background())
+	if got := srv.callCount(); got != 1 {
+		t.Fatalf("aged block must get one recovery attempt before parking: calls=%d want 1", got)
+	}
 
-	if got := srv.callCount(); got != 0 {
-		t.Fatalf("block older than MaxStaleAge should be parked, not dispatched: calls=%d want 0", got)
+	// Tick 2 (past the post-success nextEligibleAt gate): the block now has
+	// one attempt recorded, so the age cap parks it — no further dispatch,
+	// and the terminal status is persisted.
+	w.now = func() time.Time { return now.Add(3 * time.Minute) }
+	w.tick(context.Background())
+	if got := srv.callCount(); got != 1 {
+		t.Fatalf("block older than MaxStaleAge should park after its single attempt: calls=%d want 1", got)
+	}
+	if parked := st.parkedHashes(); len(parked) != 1 || parked[0] != "blk-old" {
+		t.Fatalf("park must be persisted via MarkBlocksParked: got %v want [blk-old]", parked)
+	}
+
+	// Tick 3: the persisted status removes the row from the stale scan — the
+	// watchdog no longer even sees it (no re-park, no dispatch).
+	w.now = func() time.Time { return now.Add(6 * time.Minute) }
+	w.tick(context.Background())
+	if got := srv.callCount(); got != 1 {
+		t.Fatalf("parked block resurfaced: calls=%d want 1", got)
+	}
+	if parked := st.parkedHashes(); len(parked) != 1 {
+		t.Fatalf("parked status should be persisted exactly once: got %v", parked)
 	}
 }
 
