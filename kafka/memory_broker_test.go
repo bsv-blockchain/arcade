@@ -17,7 +17,7 @@ func TestMemoryBroker_PublishSubscribe(t *testing.T) {
 	b := NewMemoryBroker(16)
 	defer func() { _ = b.Close() }()
 
-	sub, err := b.Subscribe("group-a", []string{"topic-x"})
+	sub, err := b.Subscribe("group-a", []string{"topic-x"}, StartOldest)
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestMemoryBroker_MultipleGroupsBroadcast(t *testing.T) {
 	wg.Add(2)
 
 	start := func(groupID string, counter *atomic.Int32) {
-		sub, err := b.Subscribe(groupID, []string{"fanout"})
+		sub, err := b.Subscribe(groupID, []string{"fanout"}, StartOldest)
 		if err != nil {
 			t.Errorf("subscribe %s: %v", groupID, err)
 			return
@@ -193,7 +193,7 @@ func TestMemoryBroker_CloseRacePublish(t *testing.T) {
 		const numGroups = 8
 		subs := make([]Subscription, 0, numGroups)
 		for g := 0; g < numGroups; g++ {
-			s, err := b.Subscribe(fmt.Sprintf("g-%d", g), []string{"race"})
+			s, err := b.Subscribe(fmt.Sprintf("g-%d", g), []string{"race"}, StartOldest)
 			if err != nil {
 				t.Fatalf("subscribe: %v", err)
 			}
@@ -280,7 +280,7 @@ func TestMemoryBroker_CloseAfterAllowsNewSendsToFail(t *testing.T) {
 	if err := b.SendBatch(context.Background(), "t", []KeyValue{{Key: "k", Value: "v"}}); err == nil {
 		t.Errorf("expected error batch-sending to closed broker, got nil")
 	}
-	if _, err := b.Subscribe("g", []string{"t"}); err == nil {
+	if _, err := b.Subscribe("g", []string{"t"}, StartOldest); err == nil {
 		t.Errorf("expected error subscribing to closed broker, got nil")
 	}
 
@@ -298,7 +298,7 @@ func TestMemoryBroker_CloseAfterAllowsNewSendsToFail(t *testing.T) {
 func TestMemoryBroker_SlowSubscriberDoesNotBlockClose(t *testing.T) {
 	b := NewMemoryBroker(2) // tiny buffer so we can fill it fast
 
-	sub, err := b.Subscribe("slow", []string{"t"})
+	sub, err := b.Subscribe("slow", []string{"t"}, StartOldest)
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
@@ -361,7 +361,7 @@ func TestMemoryBroker_SendTimeoutBackpressure(t *testing.T) {
 	// drains the per-(group, topic) mailbox into a merged channel of equal
 	// capacity, so the total slack between the producer's Send and a stuck
 	// consumer is 2 * buffer + 1 (one in-flight in forward).
-	sub, err := b.Subscribe("group-stall", []string{"topic-stall"})
+	sub, err := b.Subscribe("group-stall", []string{"topic-stall"}, StartOldest)
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
@@ -385,5 +385,78 @@ func TestMemoryBroker_SendTimeoutBackpressure(t *testing.T) {
 	}
 	if elapsed < 40*time.Millisecond || elapsed > 500*time.Millisecond {
 		t.Errorf("expected ~50ms backpressure wait, got %v", elapsed)
+	}
+}
+
+// TestMemoryBroker_SubscribeIsLiveOnly locks in the semantics the
+// StartOffset design leans on: the memory broker retains nothing, so a
+// subscription only ever sees messages published while its mailbox exists —
+// regardless of the StartOffset requested. Messages published before
+// Subscribe are gone for good.
+func TestMemoryBroker_SubscribeIsLiveOnly(t *testing.T) {
+	for _, start := range []StartOffset{StartOldest, StartLatest} {
+		t.Run(fmt.Sprintf("start=%d", start), func(t *testing.T) {
+			b := NewMemoryBroker(16)
+			defer func() { _ = b.Close() }()
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+
+			// Publish history with no subscriber — must never be delivered.
+			// SendAsync (not Send) because with no mailbox Send has nowhere
+			// to deliver; either way the message is dropped, which is the
+			// semantics under test.
+			for i := 0; i < 3; i++ {
+				if err := b.SendAsync(ctx, "live-only", "k", []byte(fmt.Sprintf("history-%d", i))); err != nil {
+					t.Fatalf("send history: %v", err)
+				}
+			}
+
+			sub, err := b.Subscribe("group-live", []string{"live-only"}, start)
+			if err != nil {
+				t.Fatalf("subscribe: %v", err)
+			}
+			defer func() { _ = sub.Close() }()
+
+			received := make(chan *Message, 8)
+			go func() {
+				_ = sub.Consume(ctx, func(claim Claim) error {
+					for {
+						select {
+						case msg, ok := <-claim.Messages():
+							if !ok {
+								return nil
+							}
+							received <- msg
+						case <-claim.Context().Done():
+							return nil
+						}
+					}
+				})
+			}()
+
+			// Give the consumer a moment to engage before publishing live.
+			time.Sleep(10 * time.Millisecond)
+
+			if err := b.Send(ctx, "live-only", "k", []byte("live")); err != nil {
+				t.Fatalf("send live: %v", err)
+			}
+
+			select {
+			case msg := <-received:
+				if string(msg.Value) != "live" {
+					t.Fatalf("first delivered message = %q, want %q — pre-subscription history leaked", msg.Value, "live")
+				}
+			case <-ctx.Done():
+				t.Fatal("timed out waiting for live message")
+			}
+
+			// Nothing else may arrive: history must not trickle in late.
+			select {
+			case msg := <-received:
+				t.Fatalf("unexpected extra message %q — pre-subscription history leaked", msg.Value)
+			case <-time.After(50 * time.Millisecond):
+			}
+		})
 	}
 }

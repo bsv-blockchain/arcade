@@ -180,3 +180,29 @@ func TestSaramaBroker_Close_WaitsForDrainers(t *testing.T) {
 		t.Fatal("drainer goroutines leaked past Close()")
 	}
 }
+
+// TestNewSaramaConsumerConfig_StartOffset pins the StartOffset →
+// Consumer.Offsets.Initial mapping. This is the primary guard for the
+// live-only events-subscriber contract: sarama consumer groups aren't
+// mockable, so the config seam is the closest unit-testable point. A
+// regression back to OffsetOldest for StartLatest callers silently
+// reintroduces the full-backlog replay that OOM-crashlooped the sse pods.
+func TestNewSaramaConsumerConfig_StartOffset(t *testing.T) {
+	tests := []struct {
+		name  string
+		start StartOffset
+		want  int64
+	}{
+		{name: "zero value defaults to oldest", start: StartOldest, want: sarama.OffsetOldest},
+		{name: "latest maps to newest", start: StartLatest, want: sarama.OffsetNewest},
+		{name: "out-of-range values fall back to oldest", start: StartOffset(42), want: sarama.OffsetOldest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := newSaramaConsumerConfig(tt.start)
+			if got := cfg.Consumer.Offsets.Initial; got != tt.want {
+				t.Errorf("Consumer.Offsets.Initial = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
