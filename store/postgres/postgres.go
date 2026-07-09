@@ -1127,6 +1127,18 @@ func (s *Store) GetSubmissionsByToken(ctx context.Context, token string) ([]*mod
 	return s.submissions(ctx, "callback_token = $1", token)
 }
 
+// TokenHasSubmissionForTx is an indexed existence probe: keyed on txid
+// first (idx_sub_txid; a txid has a handful of submissions) rather than
+// the token side (idx_sub_token; a token can have millions).
+func (s *Store) TokenHasSubmissionForTx(ctx context.Context, callbackToken, txid string) (bool, error) {
+	const q = `SELECT EXISTS(SELECT 1 FROM submissions WHERE txid = $1 AND callback_token = $2)`
+	var exists bool
+	if err := s.pool.QueryRow(ctx, q, txid, callbackToken).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
 func (s *Store) IterateStatusesByToken(ctx context.Context, callbackToken string, since time.Time, onlyStatuses []models.Status, fn func(*models.TransactionStatus) error) error {
 	// Projection only — no raw_tx, no merkle_path, no enrichment. This is
 	// the SSE catchup hot path over potentially millions of submissions.

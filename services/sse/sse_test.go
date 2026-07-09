@@ -123,6 +123,18 @@ func (s *sseStoreStub) IterateStatusesByToken(_ context.Context, token string, s
 	return nil
 }
 
+// TokenHasSubmissionForTx mirrors the real backends' membership probe.
+func (s *sseStoreStub) TokenHasSubmissionForTx(_ context.Context, token, txid string) (bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, sub := range s.subsByToken[token] {
+		if sub.TxID == txid {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (s *sseStoreStub) setStatus(txid string, status *models.TransactionStatus) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

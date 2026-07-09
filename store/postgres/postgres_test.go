@@ -1490,3 +1490,41 @@ func TestIterateStatusesByToken(t *testing.T) {
 		t.Errorf("iteration continued after fn error: %d calls", calls)
 	}
 }
+
+// TestTokenHasSubmissionForTx covers the SSE fan-out membership probe:
+// match, wrong-token, and unknown-txid cases.
+func TestTokenHasSubmissionForTx(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	subs := []*models.Submission{
+		{SubmissionID: "p1", TxID: "tx-probe", CallbackToken: "tok-1", CreatedAt: time.Now()},
+		{SubmissionID: "p2", TxID: "tx-probe", CallbackToken: "tok-2", CreatedAt: time.Now()},
+		{SubmissionID: "p3", TxID: "tx-solo", CallbackToken: "tok-1", CreatedAt: time.Now()},
+	}
+	for _, sub := range subs {
+		if err := s.InsertSubmission(ctx, sub); err != nil {
+			t.Fatalf("insert %s: %v", sub.SubmissionID, err)
+		}
+	}
+
+	cases := []struct {
+		token, txid string
+		want        bool
+	}{
+		{"tok-1", "tx-probe", true},
+		{"tok-2", "tx-probe", true},
+		{"tok-2", "tx-solo", false},  // txid exists, different token
+		{"tok-1", "tx-ghost", false}, // unknown txid
+		{"tok-none", "tx-probe", false},
+	}
+	for _, tc := range cases {
+		got, err := s.TokenHasSubmissionForTx(ctx, tc.token, tc.txid)
+		if err != nil {
+			t.Fatalf("TokenHasSubmissionForTx(%s,%s): %v", tc.token, tc.txid, err)
+		}
+		if got != tc.want {
+			t.Errorf("TokenHasSubmissionForTx(%s,%s) = %v, want %v", tc.token, tc.txid, got, tc.want)
+		}
+	}
+}

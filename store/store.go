@@ -217,6 +217,15 @@ type Store interface {
 	// GetSubmissionsByToken retrieves all submissions for a callback token
 	GetSubmissionsByToken(ctx context.Context, callbackToken string) ([]*models.Submission, error)
 
+	// TokenHasSubmissionForTx reports whether txid has a submission registered
+	// under callbackToken. This is the SSE fan-out hot path — called once per
+	// event per token-filtered client — so implementations MUST resolve it via
+	// the by-txid index (a txid has a handful of submissions) and MUST NOT
+	// materialize the token's submission list: a single token can hold
+	// millions of submissions, and loading them per event is what OOM-killed
+	// the SSE service.
+	TokenHasSubmissionForTx(ctx context.Context, callbackToken, txid string) (bool, error)
+
 	// IterateStatusesByToken streams the current status of every DISTINCT
 	// txid registered under callbackToken through fn, in ascending
 	// status-timestamp order. Rows are PROJECTED for streaming delivery —

@@ -154,6 +154,10 @@ func (s *fakeStore) GetSubmissionsByToken(context.Context, string) ([]*models.Su
 func (s *fakeStore) IterateStatusesByToken(context.Context, string, time.Time, []models.Status, func(*models.TransactionStatus) error) error {
 	return nil
 }
+
+func (s *fakeStore) TokenHasSubmissionForTx(context.Context, string, string) (bool, error) {
+	return false, nil
+}
 func (s *fakeStore) InsertStump(context.Context, *models.Stump) error { return nil }
 func (s *fakeStore) GetStumpsByBlockHash(context.Context, string) ([]*models.Stump, error) {
 	return nil, nil
