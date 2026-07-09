@@ -462,6 +462,16 @@ type EndpointHealthConfig struct {
 // giving merkle-service retries time to land for any STUMPs that initially got a 5xx.
 type BumpBuilderConfig struct {
 	GraceWindowMs int `mapstructure:"grace_window_ms"`
+	// HeaderWaitMs bounds how long the DataHub-fetch canonical-root
+	// validator waits for chaintracks to learn a freshly-mined block's
+	// header before giving up and skipping the cross-check. bump-builder is
+	// driven by the BLOCK_PROCESSED Kafka message while chaintracks ingests
+	// headers over an independent teranode P2P subscription; for a block
+	// mined seconds earlier the Kafka path usually wins that race, and
+	// without a wait the validator silently skipped its only independent
+	// canonicality check. <= 0 disables the wait (single lookup, legacy
+	// behavior).
+	HeaderWaitMs int `mapstructure:"header_wait_ms"`
 	// DataHubMaxBlockBytes caps a single /block/<hash> response body fetched
 	// from a DataHub endpoint, in bytes. The DataHub serves block metadata
 	// (header + subtree-hash list + coinbase tx + coinbase BUMP), so the
@@ -858,6 +868,11 @@ func setDefaults() {
 	// can't see ARCADE_CHAINTRACKS_URL — register the key explicitly here.
 	viper.SetDefault("chaintracks.url", "")
 	viper.SetDefault("bump_builder.grace_window_ms", 30000)
+	// 10s covers the observed chaintracks P2P-ingestion lag for a
+	// freshly-mined block (typically < 2s) with margin, while bounding how
+	// long a DataHub fetch can stall when chaintracks genuinely never
+	// learns the header (e.g. it is down).
+	viper.SetDefault("bump_builder.header_wait_ms", 10000)
 	// 1 GiB — DataHub /block/<hash> responses contain block metadata
 	// (header + subtree hashes + coinbase tx + coinbase BUMP). 1 GiB is
 	// two-plus orders of magnitude of headroom over a realistic payload

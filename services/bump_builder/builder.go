@@ -101,17 +101,27 @@ func combineValidators(a, b bump.BlockDataValidator) bump.BlockDataValidator {
 	}
 }
 
+// headerWaitPollInterval is the pause between chaintracks header lookups
+// while chainHeaderRootValidator waits out the ingestion race (see below).
+// 1s keeps the wait responsive without hammering the chaintracks API.
+const headerWaitPollInterval = time.Second
+
 // chainHeaderRootValidator returns a validator that compares the datahub's
 // header merkle root against the canonical merkle root from chaintracks. A
 // mismatch means the datahub returned a block representation that doesn't
 // belong to the canonical chain (pruned peer, stale cache, malicious peer),
 // so the fetch loop should fall through to the next URL.
 //
-// Soft-fails to "no validation" when chaintracks doesn't know the header
-// yet — this is a real race in mode=all where chaintracks's P2P subscription
-// is independent of the BLOCK_PROCESSED message that drives bump-builder.
-// The post-build ValidateCompoundRoot at builder.go still runs and catches
-// any compound that doesn't reconcile.
+// chaintracks not knowing the header yet is a real race: its teranode P2P
+// subscription is independent of the Kafka BLOCK_PROCESSED message that
+// drives bump-builder, and for a block mined seconds earlier the Kafka path
+// usually wins. The validator retries the lookup for up to
+// bump_builder.header_wait_ms so the race resolves into a real cross-check
+// instead of a silent skip; only when chaintracks still doesn't know the
+// header after the wait does it soft-fail to "no validation" (post-build
+// ValidateCompoundRoot still runs and catches any compound that doesn't
+// reconcile — but that check uses the datahub's own root, so it cannot
+// prove canonicality the way this one does).
 func (b *Builder) chainHeaderRootValidator(ctx context.Context, blockHash string, logger *zap.Logger) bump.BlockDataValidator {
 	if b.chainHeader == nil {
 		return nil
@@ -121,15 +131,25 @@ func (b *Builder) chainHeaderRootValidator(ctx context.Context, blockHash string
 		logger.Warn("skipping canonical-root validation: invalid block hash", zap.Error(err))
 		return nil
 	}
+	// One wall-clock budget for the whole block, shared by every per-URL
+	// invocation of the validator: the race being waited out is chaintracks
+	// ingesting THIS block, so the clock starts once. If chaintracks is
+	// genuinely down, only the first fetch attempt pays the wait — later
+	// URLs find the budget spent and degrade to a single lookup each.
+	var headerWaitDeadline time.Time
+	if wait := time.Duration(b.cfg.BumpBuilder.HeaderWaitMs) * time.Millisecond; wait > 0 {
+		headerWaitDeadline = time.Now().Add(wait)
+	}
 	return func(_ []chainhash.Hash, fetchedRoot *chainhash.Hash) error {
-		header, lookupErr := b.chainHeader.GetHeaderByHash(ctx, hashObj)
+		header, lookupErr := b.lookupHeaderWithWait(ctx, hashObj, headerWaitDeadline, logger)
 		if lookupErr != nil || header == nil {
 			// Soft-fail: log and accept the response. Post-build
 			// ValidateCompoundRoot is still the final guard.
 			if lookupErr != nil && !errors.Is(lookupErr, context.Canceled) {
-				logger.Debug(
-					"chaintracks header lookup failed; skipping canonical-root validation",
+				logger.Warn(
+					"chaintracks header still unknown after wait; skipping canonical-root validation",
 					logfields.BlockHash(blockHash),
+					zap.Int("header_wait_ms", b.cfg.BumpBuilder.HeaderWaitMs),
 					zap.Error(lookupErr),
 				)
 			}
@@ -148,6 +168,39 @@ func (b *Builder) chainHeaderRootValidator(ctx context.Context, blockHash string
 		}
 		return nil
 	}
+}
+
+// lookupHeaderWithWait fetches the block header from chaintracks, retrying
+// until deadline while chaintracks catches up on a freshly-mined block (its
+// P2P ingestion races the Kafka path that drives bump-builder). Returns the
+// last lookup outcome once the deadline passes; a zero/past deadline
+// degrades to a single lookup. Context cancellation aborts the wait
+// immediately.
+func (b *Builder) lookupHeaderWithWait(ctx context.Context, hashObj *chainhash.Hash, deadline time.Time, logger *zap.Logger) (*chaintrackslib.BlockHeader, error) {
+	header, lookupErr := b.chainHeader.GetHeaderByHash(ctx, hashObj)
+	if (lookupErr == nil && header != nil) || errors.Is(lookupErr, context.Canceled) {
+		return header, lookupErr
+	}
+	if !time.Now().Before(deadline) {
+		return header, lookupErr
+	}
+
+	logger.Debug("chaintracks header not yet known; waiting for ingestion",
+		zap.Duration("budget", time.Until(deadline)))
+	ticker := time.NewTicker(headerWaitPollInterval)
+	defer ticker.Stop()
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
+		header, lookupErr = b.chainHeader.GetHeaderByHash(ctx, hashObj)
+		if (lookupErr == nil && header != nil) || errors.Is(lookupErr, context.Canceled) {
+			return header, lookupErr
+		}
+	}
+	return header, lookupErr
 }
 
 // markMinedAndPublish moves the txids to MINED and fans the resulting status
