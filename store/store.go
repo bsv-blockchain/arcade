@@ -217,6 +217,19 @@ type Store interface {
 	// GetSubmissionsByToken retrieves all submissions for a callback token
 	GetSubmissionsByToken(ctx context.Context, callbackToken string) ([]*models.Submission, error)
 
+	// IterateStatusesByToken streams the current status of every DISTINCT
+	// txid registered under callbackToken through fn, in ascending
+	// status-timestamp order. Rows are PROJECTED for streaming delivery —
+	// txid, status, timestamp, block hash/height only. Implementations MUST
+	// NOT load raw_tx or enrich the merkle path: this is the SSE catchup hot
+	// path, called for tokens with millions of submissions, and per-row
+	// compound-BUMP parsing is what OOMed the SSE service. Filters: when
+	// since is non-zero, only statuses with Timestamp strictly after since
+	// are emitted; when onlyStatuses is non-empty, only rows in one of those
+	// statuses are emitted. fn returning a non-nil error stops the iteration
+	// and surfaces that error to the caller.
+	IterateStatusesByToken(ctx context.Context, callbackToken string, since time.Time, onlyStatuses []models.Status, fn func(*models.TransactionStatus) error) error
+
 	// UpdateDeliveryStatus updates the delivery tracking for a submission
 	UpdateDeliveryStatus(ctx context.Context, submissionID string, lastStatus models.Status, retryCount int, nextRetry *time.Time) error
 

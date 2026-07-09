@@ -171,6 +171,10 @@ func (m *mockStore) GetSubmissionsByToken(context.Context, string) ([]*models.Su
 	return nil, nil
 }
 
+func (m *mockStore) IterateStatusesByToken(context.Context, string, time.Time, []models.Status, func(*models.TransactionStatus) error) error {
+	return nil
+}
+
 func (m *mockStore) UpdateDeliveryStatus(context.Context, string, models.Status, int, *time.Time) error {
 	return nil
 }

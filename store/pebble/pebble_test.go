@@ -1148,3 +1148,91 @@ func TestBlockProcessing_MarkParked_SkipsOrphanedAndMissing(t *testing.T) {
 		t.Errorf("Status=%q, want orphaned (park must not override)", got.Status)
 	}
 }
+
+// TestIterateStatusesByToken covers the SSE-catchup hot path: distinct
+// txids, since/only filters, ascending order, and the no-heavy-fields
+// projection (raw tx / merkle path stripped).
+func TestIterateStatusesByToken(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	base := time.Now().Add(-time.Hour).UTC().Truncate(time.Millisecond)
+	rows := []*models.TransactionStatus{
+		{TxID: "tx-mined", Status: models.StatusMined, Timestamp: base, RawTx: []byte{0xde, 0xad}, MerklePath: []byte{0xbe, 0xef}},
+		{TxID: "tx-pending", Status: models.StatusSeenOnNetwork, Timestamp: base.Add(time.Minute)},
+		{TxID: "tx-received", Status: models.StatusReceived, Timestamp: base.Add(2 * time.Minute)},
+		{TxID: "tx-other", Status: models.StatusReceived, Timestamp: base.Add(3 * time.Minute)},
+	}
+	for _, r := range rows {
+		if _, _, err := s.GetOrInsertStatus(ctx, r); err != nil {
+			t.Fatalf("insert %s: %v", r.TxID, err)
+		}
+	}
+	subs := []*models.Submission{
+		{SubmissionID: "s1", TxID: "tx-mined", CallbackToken: "tok-1", CreatedAt: base},
+		{SubmissionID: "s2", TxID: "tx-pending", CallbackToken: "tok-1", CreatedAt: base},
+		// Duplicate submission for the same txid — must not double-emit.
+		{SubmissionID: "s3", TxID: "tx-pending", CallbackToken: "tok-1", CreatedAt: base},
+		{SubmissionID: "s4", TxID: "tx-received", CallbackToken: "tok-1", CreatedAt: base},
+		{SubmissionID: "s5", TxID: "tx-other", CallbackToken: "tok-2", CreatedAt: base},
+	}
+	for _, sub := range subs {
+		if err := s.InsertSubmission(ctx, sub); err != nil {
+			t.Fatalf("insert submission %s: %v", sub.SubmissionID, err)
+		}
+	}
+
+	collect := func(since time.Time, only []models.Status) []*models.TransactionStatus {
+		t.Helper()
+		var got []*models.TransactionStatus
+		if err := s.IterateStatusesByToken(ctx, "tok-1", since, only, func(st *models.TransactionStatus) error {
+			got = append(got, st)
+			return nil
+		}); err != nil {
+			t.Fatalf("IterateStatusesByToken: %v", err)
+		}
+		return got
+	}
+
+	// Unfiltered: 3 distinct txids in ascending timestamp order, projected.
+	got := collect(time.Time{}, nil)
+	if len(got) != 3 {
+		t.Fatalf("unfiltered rows = %d, want 3 (%+v)", len(got), got)
+	}
+	wantOrder := []string{"tx-mined", "tx-pending", "tx-received"}
+	for i, want := range wantOrder {
+		if got[i].TxID != want {
+			t.Errorf("row %d = %s, want %s", i, got[i].TxID, want)
+		}
+	}
+	if len(got[0].RawTx) != 0 || len(got[0].MerklePath) != 0 {
+		t.Errorf("projection leaked heavy fields: rawTx=%d merklePath=%d bytes", len(got[0].RawTx), len(got[0].MerklePath))
+	}
+
+	// onlyStatuses filter: non-terminal only drops the MINED row.
+	got = collect(time.Time{}, models.NonTerminalStatuses())
+	if len(got) != 2 || got[0].TxID != "tx-pending" || got[1].TxID != "tx-received" {
+		t.Fatalf("non-terminal rows = %+v, want [tx-pending tx-received]", got)
+	}
+
+	// since filter is strictly-after: cutting at tx-pending's timestamp
+	// leaves only tx-received.
+	got = collect(base.Add(time.Minute), nil)
+	if len(got) != 1 || got[0].TxID != "tx-received" {
+		t.Fatalf("since rows = %+v, want [tx-received]", got)
+	}
+
+	// fn error stops iteration and propagates.
+	sentinel := errors.New("stop")
+	calls := 0
+	err := s.IterateStatusesByToken(ctx, "tok-1", time.Time{}, nil, func(*models.TransactionStatus) error {
+		calls++
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Errorf("fn error not propagated: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("iteration continued after fn error: %d calls", calls)
+	}
+}

@@ -1127,6 +1127,49 @@ func (s *Store) GetSubmissionsByToken(ctx context.Context, token string) ([]*mod
 	return s.submissions(ctx, "callback_token = $1", token)
 }
 
+func (s *Store) IterateStatusesByToken(ctx context.Context, callbackToken string, since time.Time, onlyStatuses []models.Status, fn func(*models.TransactionStatus) error) error {
+	// Projection only — no raw_tx, no merkle_path, no enrichment. This is
+	// the SSE catchup hot path over potentially millions of submissions.
+	q := `
+SELECT t.txid, t.status, t.timestamp_at, COALESCE(t.block_hash, ''), COALESCE(t.block_height, 0)
+FROM transactions t
+WHERE t.txid IN (SELECT DISTINCT txid FROM submissions WHERE callback_token = $1)`
+	args := []any{callbackToken}
+	if !since.IsZero() {
+		args = append(args, since)
+		q += fmt.Sprintf(" AND t.timestamp_at > $%d", len(args))
+	}
+	if len(onlyStatuses) > 0 {
+		vals := make([]string, len(onlyStatuses))
+		for i, st := range onlyStatuses {
+			vals[i] = string(st)
+		}
+		args = append(args, vals)
+		q += fmt.Sprintf(" AND t.status = ANY($%d)", len(args))
+	}
+	q += " ORDER BY t.timestamp_at ASC"
+
+	rows, err := s.pool.Query(ctx, q, args...)
+	if err != nil {
+		return fmt.Errorf("iterate statuses by token: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		st := &models.TransactionStatus{}
+		var status string
+		var height int64
+		if err := rows.Scan(&st.TxID, &status, &st.Timestamp, &st.BlockHash, &height); err != nil {
+			return fmt.Errorf("scan status row: %w", err)
+		}
+		st.Status = models.Status(status)
+		st.BlockHeight = uint64(height) //nolint:gosec // heights are non-negative
+		if err := fn(st); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
 func (s *Store) submissions(ctx context.Context, where string, arg any) ([]*models.Submission, error) {
 	q := `
 SELECT submission_id, txid, callback_url, callback_token, full_status_updates,

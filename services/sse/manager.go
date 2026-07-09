@@ -3,6 +3,7 @@ package sse
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -302,27 +303,47 @@ func (s *Service) handleEvents(c *gin.Context) {
 	}
 }
 
-// sendCatchup replays the current persisted status of every txid
-// registered under the supplied token. When `since` is non-zero only
-// statuses with a timestamp strictly after `since` are emitted (the
-// Last-Event-ID reconnect contract). When `since` is zero every status
-// is emitted — used as the initial-state replay on a fresh connect.
+// catchupMaxFrames bounds a single catchup replay. A well-behaved token
+// has a small pending set (fresh connect) or a short disconnect window
+// (Last-Event-ID), so the cap only bites pathological histories — where
+// truncating beats the alternative this cap replaced: replaying millions
+// of frames used to OOM the whole pod, killing every connected client.
+const catchupMaxFrames = 10_000
+
+// errCatchupCapped stops the catchup iteration at catchupMaxFrames.
+// Internal sentinel, never surfaced to the client.
+var errCatchupCapped = errors.New("sse catchup frame cap reached")
+
+// sendCatchup replays persisted statuses for txids registered under the
+// supplied token. When `since` is non-zero, every status with a timestamp
+// strictly after `since` is emitted (the Last-Event-ID reconnect contract —
+// the window is naturally bounded by the disconnect duration). When `since`
+// is zero (fresh connect), only NON-TERMINAL statuses are replayed: that's
+// the actionable pending state a client needs on connect; terminal history
+// is queryable via GET /tx/:id, and replaying it wholesale is what used to
+// OOM this service (a token with 2.2M submissions × a GetStatus per txid,
+// each MINED row parsing its block's compound BUMP, inside a 512Mi limit).
+//
+// The store streams a projection (no raw tx, no merkle-path enrichment) in
+// ascending timestamp order, so replayed event ids stay monotonic for
+// Last-Event-ID resume.
 func (s *Service) sendCatchup(ctx context.Context, w *sseWriter, token string, since time.Time) {
-	subs, err := s.store.GetSubmissionsByToken(ctx, token)
-	if err != nil {
-		return
+	var only []models.Status
+	if since.IsZero() {
+		only = models.NonTerminalStatuses()
 	}
-	for _, sub := range subs {
-		status, err := s.store.GetStatus(ctx, sub.TxID)
-		if err != nil || status == nil {
-			continue
+	frames := 0
+	err := s.store.IterateStatusesByToken(ctx, token, since, only, func(status *models.TransactionStatus) error {
+		if frames >= catchupMaxFrames {
+			return errCatchupCapped
 		}
-		if !since.IsZero() && !status.Timestamp.After(since) {
-			continue
-		}
-		if err := writeStatus(w, status); err != nil {
-			return
-		}
+		frames++
+		return writeStatus(w, status)
+	})
+	if errors.Is(err, errCatchupCapped) {
+		s.logger.Warn("sse catchup truncated at frame cap",
+			zap.Int("cap", catchupMaxFrames),
+			zap.Bool("fresh_connect", since.IsZero()))
 	}
 }
 

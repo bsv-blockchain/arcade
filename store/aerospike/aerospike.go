@@ -1525,6 +1525,65 @@ loop:
 	return subs, nil
 }
 
+func (s *Store) IterateStatusesByToken(ctx context.Context, callbackToken string, since time.Time, onlyStatuses []models.Status, fn func(*models.TransactionStatus) error) error {
+	subs, err := s.GetSubmissionsByToken(ctx, callbackToken)
+	if err != nil {
+		return err
+	}
+	only := make(map[models.Status]struct{}, len(onlyStatuses))
+	for _, st := range onlyStatuses {
+		only[st] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(subs))
+	// Projection only — per-key Get with just the status/timestamp/block
+	// bins (never raw_tx or merkle_path) and no enrichMerklePath. Filter
+	// BEFORE collecting so the sort buffer holds the matching set only.
+	matched := make([]*models.TransactionStatus, 0, 64)
+	for _, sub := range subs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if _, dup := seen[sub.TxID]; dup {
+			continue
+		}
+		seen[sub.TxID] = struct{}{}
+		key, kErr := s.key(setTransactions, sub.TxID)
+		if kErr != nil {
+			continue
+		}
+		rec, gErr := s.client.Get(s.readPolicy(ctx), key, "status", "timestamp", "block_hash", "block_height")
+		if gErr != nil || rec == nil {
+			continue
+		}
+		st := recordToStatus(rec, sub.TxID)
+		if st == nil {
+			continue
+		}
+		if !since.IsZero() && !st.Timestamp.After(since) {
+			continue
+		}
+		if len(only) > 0 {
+			if _, ok := only[st.Status]; !ok {
+				continue
+			}
+		}
+		matched = append(matched, &models.TransactionStatus{
+			TxID:        st.TxID,
+			Status:      st.Status,
+			Timestamp:   st.Timestamp,
+			BlockHash:   st.BlockHash,
+			BlockHeight: st.BlockHeight,
+		})
+	}
+	sort.Slice(matched, func(i, j int) bool { return matched[i].Timestamp.Before(matched[j].Timestamp) })
+	for _, st := range matched {
+		if err := fn(st); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) GetSubmissionsByToken(ctx context.Context, token string) ([]*models.Submission, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err

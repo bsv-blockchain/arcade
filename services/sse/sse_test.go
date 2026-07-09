@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"runtime"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -24,6 +26,8 @@ import (
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
 )
+
+const tokA = "tok-A"
 
 // fakePublisher is a test-only events.Publisher. It captures published
 // updates and lets tests synthesize subscriber-side delivery.
@@ -62,8 +66,9 @@ func (p *fakePublisher) Subscribe(_ context.Context, _ string) (<-chan *models.T
 func (p *fakePublisher) Close() error { return nil }
 
 // sseStoreStub is a minimum-surface fake. The SSE service only touches
-// GetSubmissionsByToken and GetStatus on the Store; embed the interface
-// so every other method panics if accidentally called.
+// GetSubmissionsByToken, GetStatus, and IterateStatusesByToken on the
+// Store; embed the interface so every other method panics if
+// accidentally called.
 type sseStoreStub struct {
 	store.Store
 
@@ -82,6 +87,40 @@ func (s *sseStoreStub) GetStatus(_ context.Context, txid string) (*models.Transa
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.statusByTx[txid], nil
+}
+
+// IterateStatusesByToken mirrors the real backends: distinct txids under
+// the token, current status projection, since/only filters, ascending
+// timestamp order.
+func (s *sseStoreStub) IterateStatusesByToken(_ context.Context, token string, since time.Time, onlyStatuses []models.Status, fn func(*models.TransactionStatus) error) error {
+	s.mu.RLock()
+	seen := make(map[string]bool)
+	var statuses []*models.TransactionStatus
+	for _, sub := range s.subsByToken[token] {
+		if seen[sub.TxID] {
+			continue
+		}
+		seen[sub.TxID] = true
+		st := s.statusByTx[sub.TxID]
+		if st == nil {
+			continue
+		}
+		if !since.IsZero() && !st.Timestamp.After(since) {
+			continue
+		}
+		if len(onlyStatuses) > 0 && !slices.Contains(onlyStatuses, st.Status) {
+			continue
+		}
+		statuses = append(statuses, st)
+	}
+	s.mu.RUnlock()
+	sort.Slice(statuses, func(i, j int) bool { return statuses[i].Timestamp.Before(statuses[j].Timestamp) })
+	for _, st := range statuses {
+		if err := fn(st); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *sseStoreStub) setStatus(txid string, status *models.TransactionStatus) {
@@ -119,7 +158,7 @@ func setupSSEService(t *testing.T, st *sseStoreStub) (*Service, *gin.Engine, *fa
 func TestSSEFrameFormat(t *testing.T) {
 	st := &sseStoreStub{
 		subsByToken: map[string][]*models.Submission{
-			"tok-A": {{TxID: "abc", CallbackToken: "tok-A"}},
+			tokA: {{TxID: "abc", CallbackToken: tokA}},
 		},
 	}
 	_, router, pub, cancel := setupSSEService(t, st)
@@ -128,7 +167,7 @@ func TestSSEFrameFormat(t *testing.T) {
 	srv := httptest.NewServer(router)
 	defer srv.Close()
 
-	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/events?callbackToken=tok-A", nil)
+	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/events?callbackToken="+tokA, nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("GET /events: %v", err)
@@ -174,7 +213,7 @@ func TestSSEFrameFormat(t *testing.T) {
 func TestSSETokenFilter(t *testing.T) {
 	st := &sseStoreStub{
 		subsByToken: map[string][]*models.Submission{
-			"tok-A": {{TxID: "match", CallbackToken: "tok-A"}},
+			tokA: {{TxID: "match", CallbackToken: tokA}},
 		},
 	}
 	_, router, pub, cancel := setupSSEService(t, st)
@@ -183,7 +222,7 @@ func TestSSETokenFilter(t *testing.T) {
 	srv := httptest.NewServer(router)
 	defer srv.Close()
 
-	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/events?callbackToken=tok-A", nil)
+	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/events?callbackToken="+tokA, nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("GET /events: %v", err)
@@ -212,9 +251,9 @@ func TestSSECatchup(t *testing.T) {
 
 	st := &sseStoreStub{
 		subsByToken: map[string][]*models.Submission{
-			"tok-A": {
-				{TxID: "old", CallbackToken: "tok-A"},
-				{TxID: "new", CallbackToken: "tok-A"},
+			tokA: {
+				{TxID: "old", CallbackToken: tokA},
+				{TxID: "new", CallbackToken: tokA},
 			},
 		},
 		statusByTx: map[string]*models.TransactionStatus{
@@ -229,7 +268,7 @@ func TestSSECatchup(t *testing.T) {
 	defer srv.Close()
 
 	since := older.Add(time.Minute).UnixNano() // strictly between older and newer
-	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/events?callbackToken=tok-A", nil)
+	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/events?callbackToken="+tokA, nil)
 	req.Header.Set("Last-Event-ID", fmt.Sprintf("%d", since))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -246,6 +285,133 @@ func TestSSECatchup(t *testing.T) {
 	}
 	if strings.Contains(frame, `"txid":"old"`) {
 		t.Errorf("older tx should not have replayed: %q", frame)
+	}
+}
+
+// TestSSECatchupFreshConnectNonTerminalOnly verifies the OOM fix: a
+// connect WITHOUT Last-Event-ID replays only non-terminal statuses.
+// Terminal history (MINED/REJECTED/...) is queryable via the REST API
+// and replaying it wholesale is what used to OOM the pod.
+func TestSSECatchupFreshConnectNonTerminalOnly(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	st := &sseStoreStub{
+		subsByToken: map[string][]*models.Submission{
+			tokA: {
+				{TxID: "mined", CallbackToken: tokA},
+				{TxID: "rejected", CallbackToken: tokA},
+				{TxID: "pending", CallbackToken: tokA},
+			},
+		},
+		statusByTx: map[string]*models.TransactionStatus{
+			"mined":    {TxID: "mined", Status: models.StatusMined, Timestamp: now.Add(-2 * time.Minute)},
+			"rejected": {TxID: "rejected", Status: models.StatusRejected, Timestamp: now.Add(-time.Minute)},
+			"pending":  {TxID: "pending", Status: models.StatusSeenOnNetwork, Timestamp: now},
+		},
+	}
+	_, router, _, cancel := setupSSEService(t, st)
+	defer cancel()
+
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	// Fresh connect: no Last-Event-ID header.
+	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/events?callbackToken="+tokA, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /events: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	frame, err := readNextSSEFrame(resp.Body, 2*time.Second)
+	if err != nil {
+		t.Fatalf("read frame: %v", err)
+	}
+	if !strings.Contains(frame, `"txid":"pending"`) {
+		t.Errorf("expected non-terminal tx in catchup, got %q", frame)
+	}
+	if strings.Contains(frame, `"txid":"mined"`) || strings.Contains(frame, `"txid":"rejected"`) {
+		t.Errorf("terminal statuses must not replay on fresh connect: %q", frame)
+	}
+}
+
+// TestSSECatchupReconnectIncludesTerminal verifies the Last-Event-ID
+// contract survives the OOM fix: a reconnect with a since watermark
+// still replays terminal transitions that happened during the
+// disconnect window (that's how a client learns its tx mined).
+func TestSSECatchupReconnectIncludesTerminal(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	st := &sseStoreStub{
+		subsByToken: map[string][]*models.Submission{
+			tokA: {{TxID: "minedRecently", CallbackToken: tokA}},
+		},
+		statusByTx: map[string]*models.TransactionStatus{
+			"minedRecently": {TxID: "minedRecently", Status: models.StatusMined, Timestamp: now},
+		},
+	}
+	_, router, _, cancel := setupSSEService(t, st)
+	defer cancel()
+
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	since := now.Add(-time.Minute).UnixNano()
+	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/events?callbackToken="+tokA, nil)
+	req.Header.Set("Last-Event-ID", fmt.Sprintf("%d", since))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /events: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	frame, err := readNextSSEFrame(resp.Body, 2*time.Second)
+	if err != nil {
+		t.Fatalf("read frame: %v", err)
+	}
+	if !strings.Contains(frame, `"txid":"minedRecently"`) {
+		t.Errorf("expected terminal tx in reconnect catchup, got %q", frame)
+	}
+}
+
+// nopFlusher satisfies the sseWriter flusher contract without a live
+// HTTP connection so the cap test doesn't stream 10k frames through
+// httptest.
+type nopFlusher struct{ http.ResponseWriter }
+
+func (nopFlusher) Flush() {}
+
+// TestSSECatchupFrameCap verifies the backstop: catchup stops at
+// catchupMaxFrames instead of replaying an unbounded history.
+func TestSSECatchupFrameCap(t *testing.T) {
+	n := catchupMaxFrames + 500
+	subs := make([]*models.Submission, 0, n)
+	statuses := make(map[string]*models.TransactionStatus, n)
+	base := time.Now().UTC().Add(-time.Duration(n) * time.Second)
+	for i := 0; i < n; i++ {
+		txid := fmt.Sprintf("tx-%06d", i)
+		subs = append(subs, &models.Submission{TxID: txid, CallbackToken: "tok-big"})
+		statuses[txid] = &models.TransactionStatus{
+			TxID:      txid,
+			Status:    models.StatusSeenOnNetwork,
+			Timestamp: base.Add(time.Duration(i) * time.Second),
+		}
+	}
+	st := &sseStoreStub{
+		subsByToken: map[string][]*models.Submission{"tok-big": subs},
+		statusByTx:  statuses,
+	}
+	svc := &Service{
+		cfg:    &config.Config{SSE: config.SSEConfig{Enabled: true}},
+		logger: zap.NewNop(),
+		store:  st,
+	}
+
+	rec := httptest.NewRecorder()
+	w := &sseWriter{w: rec, f: nopFlusher{rec}}
+	svc.sendCatchup(t.Context(), w, "tok-big", time.Time{})
+
+	frames := strings.Count(rec.Body.String(), "\nevent: status\n")
+	if frames != catchupMaxFrames {
+		t.Errorf("catchup frames = %d, want cap %d", frames, catchupMaxFrames)
 	}
 }
 
