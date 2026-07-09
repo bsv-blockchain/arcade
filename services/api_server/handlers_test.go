@@ -2294,7 +2294,7 @@ func TestSubmitCounters_SingleDedupResults(t *testing.T) {
 
 	// Idempotent duplicate.
 	existing := &models.TransactionStatus{Status: models.StatusSeenOnNetwork}
-	msDup := &mockStore{getOrInsertFn: func(st *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+	msDup := &mockStore{getOrInsertFn: func(_ *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
 		return existing, false, nil
 	}}
 	_, router2 := setupServerWithStore(broker, msDup)
