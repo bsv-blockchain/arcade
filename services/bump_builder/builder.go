@@ -579,7 +579,7 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	logPerStumpAssembly(logger, stumps, subtreeHashes, coinbaseBUMP)
 
 	// 3. Build compound BUMP (STUMPs are sparse — only for subtrees with tracked txs)
-	compound, txids, err := bump.BuildCompoundBUMP(stumps, subtreeHashes, coinbaseBUMP)
+	compound, txids, err := bump.BuildCompoundBUMP(stumps, subtreeHashes, coinbaseBUMP, headerMerkleRoot)
 	if err != nil {
 		return fmt.Errorf("building compound BUMP: %w", err)
 	}

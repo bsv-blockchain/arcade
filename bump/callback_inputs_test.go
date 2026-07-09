@@ -45,7 +45,7 @@ func TestBuildCompoundBUMP_CallbackInputs_16Subtrees(t *testing.T) {
 	cbSubtreeHashes := decodeHashesViaDisplayHex(t, subtreeHashes)
 	cbRoot := decodeHashViaDisplayHex(t, trueBlockRoot)
 
-	compound, _, err := BuildCompoundBUMP(stumps, cbSubtreeHashes, cbBUMP)
+	compound, _, err := BuildCompoundBUMP(stumps, cbSubtreeHashes, cbBUMP, nil)
 	if err != nil {
 		t.Fatalf("BuildCompoundBUMP (callback inputs): %v", err)
 	}

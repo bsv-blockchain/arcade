@@ -414,7 +414,7 @@ func expectedCompoundRoot(t *testing.T, stumps []*models.Stump, subtreeHashes []
 	hashesCopy := make([]chainhash.Hash, len(subtreeHashes))
 	copy(hashesCopy, subtreeHashes)
 
-	compound, _, err := bump.BuildCompoundBUMP(stumpsCopy, hashesCopy, coinbaseBUMP)
+	compound, _, err := bump.BuildCompoundBUMP(stumpsCopy, hashesCopy, coinbaseBUMP, nil)
 	if err != nil {
 		t.Fatalf("BuildCompoundBUMP failed: %v", err)
 	}
@@ -591,7 +591,7 @@ func TestBuilder_HandleMessage_ShortCircuit_BUMPAlreadyExists(t *testing.T) {
 	subtreeHash := mustHash(t, testTxidHex)
 	compound, _, err := bump.BuildCompoundBUMP(
 		[]*models.Stump{{BlockHash: blockHash, SubtreeIndex: 0, StumpData: stumpData}},
-		[]chainhash.Hash{subtreeHash}, nil,
+		[]chainhash.Hash{subtreeHash}, nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("BuildCompoundBUMP: %v", err)

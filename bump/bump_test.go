@@ -824,7 +824,7 @@ func TestBuildCompoundBUMP_AllTxsExtractable(t *testing.T) {
 		{BlockHash: "blockhash", SubtreeIndex: 1, StumpData: stump1},
 	}
 
-	compound, txids, err := BuildCompoundBUMP(stumps, subtreeHashes, nil)
+	compound, txids, err := BuildCompoundBUMP(stumps, subtreeHashes, nil, nil)
 	if err != nil {
 		t.Fatalf("BuildCompoundBUMP failed: %v", err)
 	}
@@ -906,7 +906,7 @@ func TestBuildCompoundBUMP_CoinbaseReplacement(t *testing.T) {
 
 	cbBUMP := buildCoinbaseBUMP(allLeaves[0], coinbaseTxID, 1000000, subtreeHashes)
 
-	compound, txids, err := BuildCompoundBUMP(stumps, subtreeHashes, cbBUMP)
+	compound, txids, err := BuildCompoundBUMP(stumps, subtreeHashes, cbBUMP, nil)
 	if err != nil {
 		t.Fatalf("BuildCompoundBUMP failed: %v", err)
 	}
@@ -989,7 +989,7 @@ func TestBuildCompoundBUMP_NoCoinbaseBUMP_MultiSubtree_FailsSafe(t *testing.T) {
 		{BlockHash: "block3", SubtreeIndex: 2, StumpData: stump2},
 	}
 
-	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, nil)
+	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, nil, nil)
 	if err != nil {
 		t.Fatalf("BuildCompoundBUMP failed: %v", err)
 	}
@@ -1014,7 +1014,7 @@ func TestBuildCompoundBUMP_CoinbaseReplacement_SingleSubtree(t *testing.T) {
 
 	cbBUMP := buildCoinbaseBUMP(allLeaves[0], coinbaseTxID, 1000001, subtreeHashes)
 
-	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, cbBUMP)
+	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, cbBUMP, nil)
 	if err != nil {
 		t.Fatalf("BuildCompoundBUMP failed: %v", err)
 	}
@@ -1141,7 +1141,7 @@ func TestExtractMinimalPathForTx_AllTxsExtractable(t *testing.T) {
 		{BlockHash: "blockhash", SubtreeIndex: 1, StumpData: stump1},
 	}
 
-	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, nil)
+	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, nil, nil)
 	if err != nil {
 		t.Fatalf("BuildCompoundBUMP failed: %v", err)
 	}
@@ -1182,7 +1182,7 @@ func TestExtractMinimalPathForTx_TxNotFound(t *testing.T) {
 		{BlockHash: "blockhash", SubtreeIndex: 0, StumpData: stump0},
 	}
 
-	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes[:1], nil)
+	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes[:1], nil, nil)
 	if err != nil {
 		t.Fatalf("BuildCompoundBUMP failed: %v", err)
 	}
@@ -1212,7 +1212,7 @@ func TestValidateCompoundRoot_Passes(t *testing.T) {
 		}
 	}
 
-	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, nil)
+	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, nil, nil)
 	if err != nil {
 		t.Fatalf("BuildCompoundBUMP failed: %v", err)
 	}
@@ -1233,7 +1233,7 @@ func TestValidateCompoundRoot_RejectsMismatch(t *testing.T) {
 		}
 	}
 
-	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, nil)
+	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, nil, nil)
 	if err != nil {
 		t.Fatalf("BuildCompoundBUMP failed: %v", err)
 	}
@@ -1386,7 +1386,7 @@ func TestBuildCompoundBUMP_NonPow2SubtreeCounts(t *testing.T) {
 				}
 			}
 
-			compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, nil)
+			compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, nil, nil)
 			if err != nil {
 				t.Fatalf("BuildCompoundBUMP failed: %v", err)
 			}
@@ -1436,7 +1436,7 @@ func TestBuildCompoundBUMP_39Subtrees_StructuralShape(t *testing.T) {
 			StumpData:    buildFullSTUMP(allLeaves[s], 0, 700000),
 		}
 	}
-	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, nil)
+	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, nil, nil)
 	if err != nil {
 		t.Fatalf("BuildCompoundBUMP failed: %v", err)
 	}
@@ -1535,7 +1535,7 @@ func TestBuildCompoundBUMP_NonPow2_WithCoinbase(t *testing.T) {
 		}
 	}
 
-	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, cbBUMP)
+	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, cbBUMP, nil)
 	if err != nil {
 		t.Fatalf("BuildCompoundBUMP failed: %v", err)
 	}
@@ -1651,7 +1651,7 @@ func TestBuildCompoundBUMP_CoinbaseReplacement_OrderIndependence(t *testing.T) {
 				}
 			}
 
-			compound, _, err := BuildCompoundBUMP(stumps, localHashes, cbBUMP)
+			compound, _, err := BuildCompoundBUMP(stumps, localHashes, cbBUMP, nil)
 			if err != nil {
 				t.Fatalf("BuildCompoundBUMP failed: %v", err)
 			}
@@ -1763,7 +1763,7 @@ func TestBuildCompoundBUMP_FullBlockSubtree0STUMP_Block951360(t *testing.T) {
 		{BlockHash: "blk951360", SubtreeIndex: 2, StumpData: buildFullSTUMP(allLeaves[2], 0, 951360)},
 	}
 
-	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, cbBUMP)
+	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, cbBUMP, nil)
 	if err != nil {
 		t.Fatalf("BuildCompoundBUMP failed: %v", err)
 	}
@@ -1819,7 +1819,7 @@ func TestBuildCompoundBUMP_NoSubtree0Stump_NonPow2(t *testing.T) {
 
 	cbBUMP := buildCoinbaseBUMP(allLeaves[0], coinbaseTxID, 1234567, subtreeHashes)
 
-	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, cbBUMP)
+	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, cbBUMP, nil)
 	if err != nil {
 		t.Fatalf("BuildCompoundBUMP failed: %v", err)
 	}
@@ -2025,7 +2025,7 @@ func TestBuildCompoundBUMP_LargeBlock_DoesNotOOM(t *testing.T) {
 	}
 
 	start := time.Now()
-	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, nil)
+	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, nil, nil)
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("BuildCompoundBUMP failed for large block: %v", err)
