@@ -1340,3 +1340,65 @@ func TestSetMinedByTxIDs_HandlesNullPrevBlock(t *testing.T) {
 		t.Errorf("mined snapshot mismatch: %+v", mined[0])
 	}
 }
+
+func TestBlockProcessing_MarkParked(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	t0 := time.Now().Add(-time.Hour).UTC().Truncate(time.Millisecond)
+
+	if err := s.UpsertBlockHeaderSeen(ctx, "parkme", 500, t0); err != nil {
+		t.Fatalf("seen: %v", err)
+	}
+	if err := s.MarkBlocksParked(ctx, []string{"parkme"}); err != nil {
+		t.Fatalf("park: %v", err)
+	}
+	got, err := s.GetBlockProcessingStatus(ctx, "parkme")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status != models.BlockStatusParked {
+		t.Errorf("Status=%q, want parked", got.Status)
+	}
+
+	// Parked rows leave the stale scan (status='active' predicate).
+	stale, err := s.ListStaleBlockProcessingStatus(ctx, time.Now(), 0, 10)
+	if err != nil {
+		t.Fatalf("list stale: %v", err)
+	}
+	for _, r := range stale {
+		if r.BlockHash == "parkme" {
+			t.Error("parked row must not surface in the stale scan")
+		}
+	}
+
+	// A fresh header arrival revives the row to active (recovery resumes).
+	if err := s.UpsertBlockHeaderSeen(ctx, "parkme", 500, t0.Add(time.Minute)); err != nil {
+		t.Fatalf("re-seen: %v", err)
+	}
+	got, _ = s.GetBlockProcessingStatus(ctx, "parkme")
+	if got.Status != models.BlockStatusActive {
+		t.Errorf("Status after re-seen=%q, want active", got.Status)
+	}
+}
+
+func TestBlockProcessing_MarkParked_SkipsOrphanedAndMissing(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	t0 := time.Now().Add(-time.Hour)
+
+	if err := s.UpsertBlockHeaderSeen(ctx, "reorged-park", 501, t0); err != nil {
+		t.Fatalf("seen: %v", err)
+	}
+	if err := s.MarkBlocksOrphaned(ctx, []string{"reorged-park"}, t0.Add(time.Minute)); err != nil {
+		t.Fatalf("orphan: %v", err)
+	}
+	// Parking must not relabel an orphaned (off-chain) row, and a missing
+	// row is a silent no-op.
+	if err := s.MarkBlocksParked(ctx, []string{"reorged-park", "never-seen"}); err != nil {
+		t.Fatalf("park: %v", err)
+	}
+	got, _ := s.GetBlockProcessingStatus(ctx, "reorged-park")
+	if got.Status != models.BlockStatusOrphaned {
+		t.Errorf("Status=%q, want orphaned (park must not override)", got.Status)
+	}
+}

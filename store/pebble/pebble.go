@@ -1253,6 +1253,36 @@ func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, or
 	return nil
 }
 
+func (s *Store) MarkBlocksParked(ctx context.Context, blockHashes []string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	for _, h := range blockHashes {
+		mu := s.shardFor(h)
+		mu.Lock()
+		prev, err := s.readBlockProc(h)
+		if err != nil {
+			mu.Unlock()
+			return err
+		}
+		// Only 'active' rows park: missing rows are skipped, and an orphaned
+		// row is off-chain (a more specific terminal state) that must not be
+		// relabeled as a missing-BUMP backlog.
+		if prev == nil || prev.Status != string(models.BlockStatusActive) {
+			mu.Unlock()
+			continue
+		}
+		cur := *prev
+		cur.Status = string(models.BlockStatusParked)
+		if err := s.writeBlockProc(prev, &cur); err != nil {
+			mu.Unlock()
+			return err
+		}
+		mu.Unlock()
+	}
+	return nil
+}
+
 func (s *Store) GetBlockProcessingStatus(ctx context.Context, blockHash string) (*models.BlockProcessingStatus, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
