@@ -109,7 +109,10 @@ p2p:
   # bootstrap_peers: []        # override the built-in defaults; also feeds chaintracks
   # (unless chaintracks.p2p.msgbus.bootstrappeers is set explicitly)
   # enable_mdns: false
-  # allow_private_urls: false  # accept loopback/RFC1918/link-local URLs from peers
+  # allow_private_urls: false  # accept discovered URLs on loopback/RFC1918/link-local/CGNAT
+  # addresses, including DNS names that RESOLVE to those ranges. Unresolvable
+  # hostnames (e.g. a peer announcing its cluster-internal service name) are
+  # rejected regardless. Statically configured datahub_urls are never validated.
 
 health:
   port: 8081

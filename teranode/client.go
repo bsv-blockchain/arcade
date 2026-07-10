@@ -60,11 +60,11 @@ const (
 // guarded by the enclosing Client's RWMutex — the struct itself is not
 // independently thread-safe.
 //
-// Two parallel failure counters drive the same `state` field:
+// Three parallel failure counters drive the same `state` field:
 //
 //   - consecutiveFailures: fast track for reachability failures (no HTTP
-//     response received — DNS, transport, timeout). Trips at
-//     failureThreshold (default 3).
+//     response received — DNS, transport, timeout) observed on the
+//     broadcast path. Trips at failureThreshold (default 3).
 //   - consecutiveBroadcastFailures: slow track for non-2xx responses. Trips
 //     at broadcastFailureThreshold (default 10). Catches the case where an
 //     endpoint is responding but consistently rejecting our payload —
@@ -72,12 +72,24 @@ const (
 //     peers whose validation rules disagree with ours, are alive but
 //     useless to us. Without this, every broadcast wasted a worker slot on
 //     them.
+//   - consecutiveProbeFailures: reachability failures observed by the
+//     background probe loop, which probes EVERY endpoint (not just
+//     unhealthy ones). Trips at failureThreshold. This is what lets pods
+//     that never broadcast (api-server, sse, watchdog) demote a dead
+//     endpoint so their /health output reflects reality. It is deliberately
+//     a separate counter: a probe success on a healthy endpoint must NOT
+//     reset the broadcast-path counters, otherwise a 30s probe cadence
+//     against an endpoint whose /health answers — but whose POST /txs
+//     always fails — would keep resetting the slow track and the breaker
+//     could never trip.
 //
-// Either counter tripping marks the endpoint unhealthy; a single 2xx
-// response resets both.
+// Any counter tripping marks the endpoint unhealthy; a single 2xx broadcast
+// response (RecordSuccess) or a probe success on an unhealthy endpoint
+// resets all three.
 type endpointHealth struct {
 	consecutiveFailures          int
 	consecutiveBroadcastFailures int
+	consecutiveProbeFailures     int
 	lastFailure                  time.Time
 	state                        healthState
 	source                       healthSource
@@ -364,7 +376,7 @@ func (c *Client) AddEndpoints(urls []string) int {
 	return added
 }
 
-// RecordSuccess resets both failure counters to zero (a successful 2xx
+// RecordSuccess resets all failure counters to zero (a successful 2xx
 // response is the canonical signal of full endpoint health) and, if the
 // endpoint was previously unhealthy, transitions it back to healthy.
 // Unknown URLs are silently ignored so callers don't need to pre-check.
@@ -379,6 +391,7 @@ func (c *Client) RecordSuccess(url string) {
 	transitioned := h.state == stateUnhealthy
 	h.consecutiveFailures = 0
 	h.consecutiveBroadcastFailures = 0
+	h.consecutiveProbeFailures = 0
 	h.state = stateHealthy
 	source := h.source
 	c.recomputeBelowThresholdLocked()
@@ -471,6 +484,83 @@ func (c *Client) RecordBroadcastFailure(url string) {
 			zap.String("reason", "persistent_non_2xx"),
 		)
 	}
+}
+
+// recordProbeFailure increments the probe-failure counter for an endpoint
+// and transitions it to unhealthy once the counter reaches failureThreshold.
+// Kept separate from RecordFailure so probe outcomes and broadcast outcomes
+// can't mask each other (see the endpointHealth doc comment).
+func (c *Client) recordProbeFailure(url string) {
+	n := normalizeURL(url)
+	c.mu.Lock()
+	h, ok := c.health[n]
+	if !ok {
+		c.mu.Unlock()
+		return
+	}
+	h.consecutiveProbeFailures++
+	h.lastFailure = time.Now()
+	transitioned := false
+	if h.state == stateHealthy && h.consecutiveProbeFailures >= c.failureThreshold {
+		h.state = stateUnhealthy
+		transitioned = true
+	}
+	source := h.source
+	consecutive := h.consecutiveProbeFailures
+	c.recomputeBelowThresholdLocked()
+	c.mu.Unlock()
+	if transitioned {
+		metrics.TeranodeEndpointHealth.WithLabelValues(n, sourceLabel(source)).Set(0)
+		c.logger.Warn(
+			"endpoint unhealthy",
+			zap.String("endpoint", n),
+			zap.Int("consecutive_probe_failures", consecutive),
+			zap.String("from", "healthy"),
+			zap.String("to", "unhealthy"),
+			zap.String("reason", "probe"),
+		)
+	}
+}
+
+// recordProbeSuccess handles a successful probe (any HTTP response).
+//
+// For an unhealthy endpoint this is the recovery signal and behaves exactly
+// like RecordSuccess: all counters reset, state flips back to healthy —
+// preserving the long-standing probe-recovery contract (any response, even
+// 4xx/5xx, proves reachability; usefulness is re-judged by the slow track
+// once broadcasts resume).
+//
+// For a healthy endpoint it resets ONLY the probe counter. The broadcast
+// counters are deliberately untouched: /health answering says nothing about
+// whether POST /txs works, and zeroing them here would neuter both
+// broadcast-path breakers for any pod running probes (i.e. all of them).
+func (c *Client) recordProbeSuccess(url string) {
+	n := normalizeURL(url)
+	c.mu.Lock()
+	h, ok := c.health[n]
+	if !ok {
+		c.mu.Unlock()
+		return
+	}
+	if h.state == stateUnhealthy {
+		h.consecutiveFailures = 0
+		h.consecutiveBroadcastFailures = 0
+		h.consecutiveProbeFailures = 0
+		h.state = stateHealthy
+		source := h.source
+		c.recomputeBelowThresholdLocked()
+		c.mu.Unlock()
+		metrics.TeranodeEndpointHealth.WithLabelValues(n, sourceLabel(source)).Set(1)
+		c.logger.Info(
+			"endpoint healthy",
+			zap.String("endpoint", n),
+			zap.String("from", "unhealthy"),
+			zap.String("to", "healthy"),
+		)
+		return
+	}
+	h.consecutiveProbeFailures = 0
+	c.mu.Unlock()
 }
 
 // sourceLabel converts the internal healthSource enum to the metric label value.
@@ -582,16 +672,19 @@ func (c *Client) probeLoop(ctx context.Context) {
 	}
 }
 
-// probeOnce collects the current unhealthy set under an RLock, then probes
+// probeOnce snapshots the full endpoint list under an RLock, then probes
 // each endpoint concurrently so one slow probe doesn't block the others.
+//
+// Healthy endpoints are probed too — not just unhealthy ones. Pods that
+// never broadcast (api-server, sse, watchdog) have no other signal that a
+// registered endpoint went dark, so without this their health map (and the
+// public /health datahub_urls output) reported dead endpoints healthy
+// forever. Probe outcomes feed the dedicated probe counter, never the
+// broadcast counters (see recordProbeSuccess).
 func (c *Client) probeOnce(ctx context.Context) {
 	c.mu.RLock()
-	var targets []string
-	for _, ep := range c.endpoints {
-		if h, ok := c.health[ep]; ok && h.state == stateUnhealthy {
-			targets = append(targets, ep)
-		}
-	}
+	targets := make([]string, len(c.endpoints))
+	copy(targets, c.endpoints)
 	c.mu.RUnlock()
 	if len(targets) == 0 {
 		return
@@ -610,7 +703,9 @@ func (c *Client) probeOnce(ctx context.Context) {
 
 // probeEndpoint issues a single GET /health. A non-nil HTTP response counts
 // as reachable regardless of status code; a transport error or context
-// timeout counts as a failure.
+// timeout counts as a failure. Outcomes are recorded on the probe-specific
+// counter so probes can demote unreachable endpoints (and recover unhealthy
+// ones) without touching the broadcast-path breaker counters.
 func (c *Client) probeEndpoint(ctx context.Context, endpoint string) {
 	start := time.Now()
 	probeCtx, cancel := context.WithTimeout(ctx, c.probeTimeout)
@@ -618,18 +713,18 @@ func (c *Client) probeEndpoint(ctx context.Context, endpoint string) {
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, endpoint+"/health", nil)
 	if err != nil {
 		observeRequest("probe", 0, start)
-		c.RecordFailure(endpoint)
+		c.recordProbeFailure(endpoint)
 		return
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		observeRequest("probe", 0, start)
-		c.RecordFailure(endpoint)
+		c.recordProbeFailure(endpoint)
 		return
 	}
 	observeRequest("probe", resp.StatusCode, start)
 	drainAndClose(resp.Body)
-	c.RecordSuccess(endpoint)
+	c.recordProbeSuccess(endpoint)
 }
 
 // observeRequest records latency + status class for an outbound HTTP request.

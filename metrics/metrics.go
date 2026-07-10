@@ -522,6 +522,16 @@ var TeranodeEndpointCount = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "Number of registered datahub endpoints, by source.",
 }, []string{"source"})
 
+// TeranodeEndpointRefreshRejectedTotal counts registry rows rejected by URL
+// validation at refresh time (app.endpointSource). Nonzero means the shared
+// DatahubEndpoint registry contains rows that predate discovery-time
+// validation (or a peer's DNS broke after registration) — candidates for
+// pruning.
+var TeranodeEndpointRefreshRejectedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_teranode_endpoint_refresh_rejected_total",
+	Help: "Registry datahub endpoints rejected at refresh time by URL validation.",
+}, []string{labelOutcome}) // blocked, invalid
+
 // ---------------------------------------------------------------------------
 // kafka
 // ---------------------------------------------------------------------------
@@ -579,7 +589,7 @@ var P2PNodeStatusMessagesTotal = promauto.NewCounter(prometheus.CounterOpts{
 var P2PEndpointDiscoveryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_p2p_endpoint_discovery_total",
 	Help: "Datahub URL discovery outcomes from peer announcements.",
-}, []string{labelOutcome}) // registered, invalid, no_url, error
+}, []string{labelOutcome}) // registered, invalid, blocked, no_url, error
 
 // ---------------------------------------------------------------------------
 // callback path — inbound merkle-service callbacks

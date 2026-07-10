@@ -17,7 +17,9 @@ package p2p_client
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"sync"
 	"time"
 
@@ -29,6 +31,7 @@ import (
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/metrics"
+	"github.com/bsv-blockchain/arcade/ssrfguard"
 	"github.com/bsv-blockchain/arcade/store"
 )
 
@@ -66,6 +69,24 @@ func defaultClientFactory(ctx context.Context, cfg p2pclient.Config) (teraClient
 	return cfg.Initialize(ctx, "arcade")
 }
 
+// dnsLookupTimeout bounds each DNS resolution performed while validating a
+// discovered URL. handleNodeStatus runs on the single consume goroutine, so
+// an unbounded lookup against a dead resolver would stall all announcement
+// processing.
+const dnsLookupTimeout = 2 * time.Second
+
+// discoveryValidationTTL is how long a successfully validated URL skips
+// re-validation (including the DNS round-trip). Success-only: rejections are
+// never cached, so a peer that fixes its DNS or config is re-accepted on its
+// very next announcement. Mirrors merkle-service's announcement validation.
+const discoveryValidationTTL = 5 * time.Minute
+
+// validatedURL is the value cached per raw announced URL.
+type validatedURL struct {
+	normalized string
+	expiry     int64 // UnixNano
+}
+
 type Client struct {
 	cfg           *config.Config
 	logger        *zap.Logger
@@ -76,6 +97,14 @@ type Client struct {
 	done          chan struct{}
 	wg            sync.WaitGroup
 	stopOnce      sync.Once
+
+	// lookupIP resolves a hostname during URL validation. Overridable in
+	// tests so validation never hits real DNS; nil is never stored — New
+	// installs the bounded default.
+	lookupIP func(ctx context.Context, host string) ([]net.IP, error)
+	// validatedURLs caches successful validations (raw URL → validatedURL)
+	// so repeat announcements of the same URL skip the DNS round-trip.
+	validatedURLs sync.Map
 }
 
 func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, st EndpointWriter) *Client {
@@ -86,6 +115,11 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, st En
 		store:         st,
 		clientFactory: defaultClientFactory,
 		done:          make(chan struct{}),
+		lookupIP: func(ctx context.Context, host string) ([]net.IP, error) {
+			lctx, cancel := context.WithTimeout(ctx, dnsLookupTimeout)
+			defer cancel()
+			return net.DefaultResolver.LookupIP(lctx, "ip", host)
+		},
 	}
 }
 
@@ -246,15 +280,8 @@ func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatu
 		return
 	}
 
-	normalized, err := validateURL(raw, c.cfg.P2P.AllowPrivateURLs)
-	if err != nil {
-		metrics.P2PEndpointDiscoveryTotal.WithLabelValues("invalid").Inc()
-		c.logger.Warn(
-			"rejected discovered datahub url",
-			zap.String("peer_id", msg.PeerID),
-			zap.String("url", raw),
-			zap.Error(err),
-		)
+	normalized, ok := c.validateDatahubURL(ctx, msg.PeerID, raw)
+	if !ok {
 		return
 	}
 
@@ -271,7 +298,7 @@ func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatu
 		return
 	}
 	upsertCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	err = c.store.UpsertDatahubEndpoint(upsertCtx, store.DatahubEndpoint{
+	err := c.store.UpsertDatahubEndpoint(upsertCtx, store.DatahubEndpoint{
 		URL:      normalized,
 		Network:  c.cfg.Network,
 		Source:   store.DatahubEndpointSourceDiscovered,
@@ -293,6 +320,46 @@ func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatu
 		zap.String("peer_id", msg.PeerID),
 		zap.String("url", normalized),
 	)
+}
+
+// validateDatahubURL runs the full discovered-URL validation (scheme, SSRF
+// ranges, DNS resolvability — see validateURL) behind a success-only TTL
+// cache, so repeat announcements of a known-good URL skip the DNS
+// round-trip. Rejections are metered by kind: "blocked" for SSRF-policy
+// rejections (private/metadata destinations), "invalid" for everything else
+// (malformed, bad scheme, unresolvable hostname).
+func (c *Client) validateDatahubURL(ctx context.Context, peerID, raw string) (string, bool) {
+	if v, ok := c.validatedURLs.Load(raw); ok {
+		entry := v.(validatedURL)
+		if time.Now().UnixNano() < entry.expiry {
+			return entry.normalized, true
+		}
+		c.validatedURLs.Delete(raw)
+	}
+
+	normalized, err := validateURL(raw, c.cfg.P2P.AllowPrivateURLs, func(host string) ([]net.IP, error) {
+		return c.lookupIP(ctx, host)
+	})
+	if err != nil {
+		outcome := "invalid"
+		if errors.Is(err, ssrfguard.ErrBlockedAddress) {
+			outcome = "blocked"
+		}
+		metrics.P2PEndpointDiscoveryTotal.WithLabelValues(outcome).Inc()
+		c.logger.Warn(
+			"rejected discovered datahub url",
+			zap.String("peer_id", peerID),
+			zap.String("url", raw),
+			zap.Error(err),
+		)
+		return "", false
+	}
+
+	c.validatedURLs.Store(raw, validatedURL{
+		normalized: normalized,
+		expiry:     time.Now().Add(discoveryValidationTTL).UnixNano(),
+	})
+	return normalized, true
 }
 
 // zapBusLogger adapts *zap.Logger to the message-bus logger interface, which
