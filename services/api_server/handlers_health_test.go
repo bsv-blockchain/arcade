@@ -1,10 +1,12 @@
 package api_server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -120,4 +122,44 @@ func TestHandleHealth_NilTeranode_ReturnsEmptyArray(t *testing.T) {
 	if string(raw["healthy"]) != "true" {
 		t.Errorf("expected healthy to be `true` in JSON, got %s", string(raw["healthy"]))
 	}
+}
+
+// TestHandleHealth_UnreachableEndpointFlipsUnhealthy is the end-to-end proof
+// for the production complaint: /health reported a registered-but-dead
+// endpoint as healthy:true forever, because the api-server pod never
+// broadcasts and the probe loop only targeted already-unhealthy endpoints.
+// With probe-all, the endpoint flips to healthy:false with zero broadcast
+// traffic — driven purely by the background probe loop.
+func TestHandleHealth_UnreachableEndpointFlipsUnhealthy(t *testing.T) {
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	deadURL := dead.URL
+	dead.Close() // port now refuses connections
+
+	tc := teranode.NewClient([]string{deadURL}, "", teranode.HealthConfig{
+		FailureThreshold: 3,
+		ProbeInterval:    10 * time.Millisecond,
+		ProbeTimeout:     200 * time.Millisecond,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tc.Start(ctx)
+	defer tc.Close()
+
+	srv := &Server{
+		cfg:      &config.Config{},
+		logger:   zap.NewNop(),
+		teranode: tc,
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		_, resp, _ := doHealth(t, srv)
+		if len(resp.DatahubURLs) == 1 && !resp.DatahubURLs[0].Healthy {
+			return // /health now tells the truth
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("/health kept reporting an unreachable endpoint as healthy for 2s")
 }

@@ -108,7 +108,9 @@ p2p:
   # storage_path: ""           # defaults to <storage_path>/p2p; stores p2p_key.hex
   # bootstrap_peers: []        # override/extend the built-in defaults for the selected network
   # enable_mdns: false
-  # allow_private_urls: false  # accept loopback/RFC1918 URLs from peers
+  # allow_private_urls: false  # accept discovered URLs on loopback/RFC1918/link-local/CGNAT
+  # addresses, including DNS names that RESOLVE to those ranges. Unresolvable
+  # hostnames are rejected regardless. Configured datahub_urls are never validated.
 
 # Embedded block-header tracker. Serves /chaintracks/v1/* and /chaintracks/v2/*
 # on the api-server. Default storage is <storage_path>/chaintracks.

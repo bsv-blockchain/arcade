@@ -10,9 +10,12 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path"
+	"sync"
 	"time"
 
 	chaintrackslib "github.com/bsv-blockchain/go-chaintracks/chaintracks"
@@ -23,6 +26,7 @@ import (
 	"github.com/bsv-blockchain/arcade/events"
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/merkleservice"
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/services"
 	"github.com/bsv-blockchain/arcade/services/api_server"
 	"github.com/bsv-blockchain/arcade/services/bump_builder"
@@ -32,6 +36,7 @@ import (
 	"github.com/bsv-blockchain/arcade/services/sse"
 	"github.com/bsv-blockchain/arcade/services/watchdog"
 	"github.com/bsv-blockchain/arcade/services/webhook"
+	"github.com/bsv-blockchain/arcade/ssrfguard"
 	"github.com/bsv-blockchain/arcade/store"
 	storefactory "github.com/bsv-blockchain/arcade/store/factory"
 	"github.com/bsv-blockchain/arcade/teranode"
@@ -123,7 +128,7 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		ProbeTimeout:              time.Duration(cfg.Propagation.EndpointHealth.ProbeTimeoutMs) * time.Millisecond,
 		MinHealthyEndpoints:       cfg.Propagation.EndpointHealth.MinHealthyEndpoints,
 		RefreshInterval:           time.Duration(cfg.Propagation.EndpointHealth.RefreshIntervalMs) * time.Millisecond,
-		Source:                    endpointSource{st: st, network: cfg.Network, includeDiscovered: cfg.P2P.DatahubDiscovery},
+		Source:                    newEndpointSource(st, cfg.Network, cfg.P2P.DatahubDiscovery, cfg.P2P.AllowPrivateURLs, logger),
 		Logger:                    logger,
 	})
 
@@ -476,30 +481,161 @@ func (a chaintracksHeaderReader) GetHeaderByHash(ctx context.Context, hash *chai
 	return a.ct.GetHeaderByHash(ctx, hash)
 }
 
-// endpointSource adapts store.Store to teranode.EndpointSource by extracting
-// just the URL list. network scopes the listing to the configured Bitcoin
-// network so a store shared across pods (or reused after a network change)
-// never replays peers from a different network. When includeDiscovered is
-// false (operator disabled p2p.datahub_discovery), rows persisted as
-// source=discovered by prior runs are filtered out — the toggle now means
-// "ignore discovered URLs" end-to-end, not just "stop discovering new ones."
-type endpointSource struct {
-	st                store.Store
-	network           string
-	includeDiscovered bool
+// endpointSourceValidationTTL is how long a discovered URL that passed
+// validation skips re-validation (including its DNS round-trip) on
+// subsequent refresh ticks. Success-only: rejected URLs are re-checked
+// every tick so a row whose DNS recovers is admitted within one interval.
+const endpointSourceValidationTTL = 5 * time.Minute
+
+// endpointSourceValidationCacheMax bounds the validation cache. Discovered
+// registry rows originate from untrusted p2p announcements; the cap keeps a
+// registry flooded with unique URLs from growing process memory without
+// bound. Far above the size of any real datahub fleet.
+const endpointSourceValidationCacheMax = 512
+
+// endpointSourceLookupTimeout bounds each DNS lookup during refresh so a
+// dead resolver cannot wedge the refresh tick (the synchronous first
+// refresh in teranode.Client.Start is separately capped, and lookups
+// derive from the tick's ctx).
+const endpointSourceLookupTimeout = 2 * time.Second
+
+// datahubLister is the narrow store contract endpointSource needs;
+// extracted so tests can fake the registry without a real store.
+type datahubLister interface {
+	ListDatahubEndpoints(ctx context.Context, network string) ([]store.DatahubEndpoint, error)
 }
 
-func (a endpointSource) ListEndpointURLs(ctx context.Context) ([]string, error) {
+// endpointSource adapts the store's DatahubEndpoint registry to
+// teranode.EndpointSource. network scopes the listing to the configured
+// Bitcoin network so a store shared across pods (or reused after a network
+// change) never replays peers from a different network. When
+// includeDiscovered is false (operator disabled p2p.datahub_discovery),
+// rows persisted as source=discovered by prior runs are filtered out — the
+// toggle means "ignore discovered URLs" end-to-end, not just "stop
+// discovering new ones."
+//
+// Discovered rows are additionally re-validated with ssrfguard on every
+// listing (behind a success-only TTL cache): the p2p_client validates at
+// announcement intake, but rows persisted before that guard existed — or by
+// older builds — would otherwise flow straight into every pod's endpoint
+// set forever, since the registry has no eviction. Operator-configured rows
+// are exempt: static datahub_urls may legitimately point at
+// cluster-internal names.
+type endpointSource struct {
+	st                datahubLister
+	network           string
+	includeDiscovered bool
+	allowPrivate      bool
+
+	// lookupIP is the DNS seam; nil is never stored — newEndpointSource
+	// installs the bounded default.
+	lookupIP func(ctx context.Context, host string) ([]net.IP, error)
+	// validated caches URLs that passed validation. Bounded — see
+	// endpointSourceValidationCacheMax.
+	validated *ssrfguard.SuccessCache
+	// warned tracks URLs already logged at WARN so each rejected row logs
+	// loudly once per process and quietly (DEBUG) on the ~30s re-checks.
+	// Pruned against every listing, so it is bounded by the registry's
+	// current row count rather than by everything ever seen.
+	warnedMu sync.Mutex
+	warned   map[string]struct{}
+	logger   *zap.Logger
+}
+
+func newEndpointSource(st datahubLister, network string, includeDiscovered, allowPrivate bool, logger *zap.Logger) *endpointSource {
+	return &endpointSource{
+		st:                st,
+		network:           network,
+		includeDiscovered: includeDiscovered,
+		allowPrivate:      allowPrivate,
+		validated:         ssrfguard.NewSuccessCache(endpointSourceValidationTTL, endpointSourceValidationCacheMax),
+		warned:            map[string]struct{}{},
+		logger:            logger,
+		lookupIP: func(ctx context.Context, host string) ([]net.IP, error) {
+			lctx, cancel := context.WithTimeout(ctx, endpointSourceLookupTimeout)
+			defer cancel()
+			return net.DefaultResolver.LookupIP(lctx, "ip", host)
+		},
+	}
+}
+
+func (a *endpointSource) ListEndpointURLs(ctx context.Context) ([]string, error) {
 	eps, err := a.st.ListDatahubEndpoints(ctx, a.network)
 	if err != nil {
 		return nil, err
 	}
+	current := make(map[string]struct{}, len(eps))
 	out := make([]string, 0, len(eps))
 	for _, ep := range eps {
-		if !a.includeDiscovered && ep.Source == store.DatahubEndpointSourceDiscovered {
-			continue
+		current[ep.URL] = struct{}{}
+		if ep.Source == store.DatahubEndpointSourceDiscovered {
+			if !a.includeDiscovered {
+				continue
+			}
+			if !a.validDiscoveredURL(ctx, ep.URL) {
+				continue
+			}
 		}
 		out = append(out, ep.URL)
 	}
+	a.pruneWarned(current)
 	return out, nil
+}
+
+// pruneWarned drops warn-dampening entries for URLs no longer present in
+// the registry listing, keeping the map bounded by the registry's current
+// size. A row that later reappears simply WARNs once more.
+func (a *endpointSource) pruneWarned(current map[string]struct{}) {
+	a.warnedMu.Lock()
+	defer a.warnedMu.Unlock()
+	for url := range a.warned {
+		if _, ok := current[url]; !ok {
+			delete(a.warned, url)
+		}
+	}
+}
+
+// validDiscoveredURL runs ssrfguard validation behind the success-only TTL
+// cache and handles rejection metering/log dampening.
+func (a *endpointSource) validDiscoveredURL(ctx context.Context, url string) bool {
+	if _, ok := a.validated.Get(url); ok {
+		return true
+	}
+
+	err := ssrfguard.ValidateURL(url, a.allowPrivate, func(host string) ([]net.IP, error) {
+		return a.lookupIP(ctx, host)
+	})
+	if err != nil {
+		outcome := "invalid"
+		if errors.Is(err, ssrfguard.ErrBlockedAddress) {
+			outcome = "blocked"
+		}
+		metrics.TeranodeEndpointRefreshRejectedTotal.WithLabelValues(outcome).Inc()
+		a.logRejection(url, err)
+		return false
+	}
+
+	a.validated.Put(url, "")
+	a.warnedMu.Lock()
+	delete(a.warned, url) // if it later goes bad again, WARN once more
+	a.warnedMu.Unlock()
+	return true
+}
+
+// logRejection logs a rejected registry row at WARN the first time a URL is
+// seen and DEBUG thereafter. A bad row is re-listed every refresh tick in
+// every pod; an unconditional WARN would drip permanently from a registry
+// row nobody has pruned yet.
+func (a *endpointSource) logRejection(url string, err error) {
+	a.warnedMu.Lock()
+	_, already := a.warned[url]
+	if !already {
+		a.warned[url] = struct{}{}
+	}
+	a.warnedMu.Unlock()
+	if already {
+		a.logger.Debug("skipping invalid discovered datahub url", zap.String("url", url), zap.Error(err))
+		return
+	}
+	a.logger.Warn("skipping invalid discovered datahub url", zap.String("url", url), zap.Error(err))
 }
