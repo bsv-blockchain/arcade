@@ -23,7 +23,7 @@ All metric names start with `arcade_` so they live in their own namespace.
 | Broadcast tail latency | `histogram_quantile(0.95, rate(arcade_propagation_broadcast_duration_seconds_bucket[5m]))` | `> 5s` |
 | Reaper not running anywhere | `sum(arcade_propagation_reaper_lease_held)` | `< 1 for 5m` (failover stuck) |
 | Reaper running on multiple replicas | `sum(arcade_propagation_reaper_lease_held)` | `> 1 for 30s` (split brain) |
-| BUMP build failures | `arcade_bump_builder_build_duration_seconds_count` by `outcome` | see note below |
+| BUMP build failures | `arcade_bump_builder_build_duration_seconds_count` by `outcome` | copy-pasteable PromQL in the note below (a regex over the failure outcomes; its `\|` chars can't live in a table cell) |
 | Blocks arriving with no STUMPs | `rate(arcade_bump_builder_empty_stump_blocks_total[5m])` | `> 0 for 15m` (see note) |
 | Datahub endpoint flapping | `changes(arcade_teranode_endpoint_healthy[5m])` | `> 4` |
 | All datahubs unhealthy | `sum(arcade_teranode_endpoint_healthy{}) == 0` | for 1m |

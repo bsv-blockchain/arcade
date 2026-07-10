@@ -112,7 +112,7 @@ func TestPreRegisterBumpOutcomesCreatesEveryOutcomeChildAtZero(t *testing.T) {
 
 	// Every outcome — the failure labels especially — must exist at zero so a
 	// first-occurrence build failure is countable by increase() immediately.
-	for _, outcome := range BumpBuildOutcomes {
+	for _, outcome := range bumpBuildOutcomes {
 		m, ok := found[outcome]
 		if !ok {
 			t.Errorf("outcome child %q not pre-registered", outcome)

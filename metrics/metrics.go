@@ -250,9 +250,11 @@ var OldestTransientTxAge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 //	parse_failed, incomplete_stumps, fetch_failed, no_subtrees,
 //	build_failed, validation_failed, store_failed
 //
-// Alert on the failure set by excluding the benign outcomes by name. Do NOT
-// write outcome!="success": that fires on short_circuited and context_canceled,
-// and it silently stops matching whenever a benign outcome is added. Keep this
+// Alert by matching the failure outcomes positively — outcome=~"parse_failed|
+// incomplete_stumps|fetch_failed|no_subtrees|build_failed|validation_failed|
+// store_failed" (the list above). Do NOT write outcome!="success": besides
+// success, it also matches the benign short_circuited/no_stumps/context_canceled,
+// and it silently starts matching any new benign outcome someone adds. Keep this
 // list and the rule in README.md in sync when adding an outcome.
 var BumpBuilderBuildDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Name:    "arcade_bump_builder_build_duration_seconds",

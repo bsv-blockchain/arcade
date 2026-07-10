@@ -35,13 +35,14 @@ func PreRegisterTxSubmissions() {
 	}
 }
 
-// BumpBuildOutcomes is the closed set of outcome labels handleMessage can
+// bumpBuildOutcomes is the closed set of outcome labels handleMessage can
 // stamp on BumpBuilderBuildDuration. Keep it in sync with the outcome
 // assignments in services/bump_builder/builder.go and the doc comment on
 // BumpBuilderBuildDuration. A failure alert that never fires because its
 // outcome series was never born is exactly the blind spot pre-registration
-// exists to close, so the failure outcomes matter most here.
-var BumpBuildOutcomes = []string{
+// exists to close, so the failure outcomes matter most here. Unexported so no
+// other package can mutate the shared slice.
+var bumpBuildOutcomes = []string{
 	// benign
 	"success", "short_circuited", "no_stumps", "context_canceled",
 	// failures
@@ -56,7 +57,7 @@ var BumpBuildOutcomes = []string{
 // is invisible to increase()/rate() until its second sample — precisely when
 // an operator most needs the alert to fire.
 func PreRegisterBumpOutcomes() {
-	for _, outcome := range BumpBuildOutcomes {
+	for _, outcome := range bumpBuildOutcomes {
 		BumpBuilderBuildDuration.WithLabelValues(outcome)
 	}
 }
