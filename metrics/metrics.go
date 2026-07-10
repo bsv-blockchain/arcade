@@ -240,11 +240,27 @@ var OldestTransientTxAge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 
 // BumpBuilderBuildDuration measures end-to-end wall time from BLOCK_PROCESSED
 // receipt (after grace window) to BUMP persisted.
+//
+// Every terminal disposition of handleMessage lands here exactly once. Only
+// `success` means a BUMP was built and persisted. Three outcomes are benign
+// non-failures: `short_circuited` (a BUMP already existed, so a redelivery was
+// skipped), `no_stumps` (block contains no tracked txs) and `context_canceled`
+// (shutdown). The rest are failures:
+//
+//	parse_failed, incomplete_stumps, fetch_failed, no_subtrees,
+//	build_failed, validation_failed, store_failed
+//
+// Alert by matching the failure outcomes positively — outcome=~"parse_failed|
+// incomplete_stumps|fetch_failed|no_subtrees|build_failed|validation_failed|
+// store_failed" (the list above). Do NOT write outcome!="success": besides
+// success, it also matches the benign short_circuited/no_stumps/context_canceled,
+// and it silently starts matching any new benign outcome someone adds. Keep this
+// list and the rule in README.md in sync when adding an outcome.
 var BumpBuilderBuildDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Name:    "arcade_bump_builder_build_duration_seconds",
 	Help:    "Time to build and persist one compound BUMP, by outcome.",
 	Buckets: latencyBuckets,
-}, []string{labelOutcome}) // success, no_stumps, fetch_failed, validation_failed, store_failed
+}, []string{labelOutcome})
 
 // BumpBuilderBlocksProcessedTotal counts BLOCK_PROCESSED messages handled.
 var BumpBuilderBlocksProcessedTotal = promauto.NewCounter(prometheus.CounterOpts{

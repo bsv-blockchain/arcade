@@ -96,3 +96,30 @@ func TestPreRegisterTxSubmissionsCreatesAllRouteResultChildrenAtZero(t *testing.
 		}
 	}
 }
+
+func TestPreRegisterBumpOutcomesCreatesEveryOutcomeChildAtZero(t *testing.T) {
+	PreRegisterBumpOutcomes()
+
+	fam := gatherFamily(t, "arcade_bump_builder_build_duration_seconds")
+	if fam == nil {
+		t.Fatal("arcade_bump_builder_build_duration_seconds has no series after pre-registration")
+	}
+
+	found := map[string]*dto.Metric{}
+	for _, m := range fam.GetMetric() {
+		found[labelValue(m, "outcome")] = m
+	}
+
+	// Every outcome — the failure labels especially — must exist at zero so a
+	// first-occurrence build failure is countable by increase() immediately.
+	for _, outcome := range bumpBuildOutcomes {
+		m, ok := found[outcome]
+		if !ok {
+			t.Errorf("outcome child %q not pre-registered", outcome)
+			continue
+		}
+		if got := m.GetHistogram().GetSampleCount(); got != 0 {
+			t.Errorf("outcome %q sample count = %d, want 0", outcome, got)
+		}
+	}
+}

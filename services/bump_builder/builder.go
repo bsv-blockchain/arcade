@@ -75,8 +75,10 @@ func New(
 	// Export every series this service can emit at 0 from the first scrape —
 	// a series born mid-burst is invisible to increase() until its second
 	// sample, which made a whole block's MINED transitions vanish from
-	// dashboards after every rollout.
+	// dashboards after every rollout. The build-outcome children matter most:
+	// a first-occurrence build failure must not be swallowed by increase().
 	metrics.PreRegisterStatusTransitions(models.StatusMined)
+	metrics.PreRegisterBumpOutcomes()
 	return &Builder{
 		cfg:         cfg,
 		logger:      logger.Named("bump-builder"),
@@ -575,6 +577,7 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	logBlockInputs(logger, subtreeHashes, coinbaseBUMP)
 
 	if len(subtreeHashes) == 0 {
+		outcome = "no_subtrees"
 		logger.Warn("block has no subtrees, cannot construct BUMPs")
 		return nil
 	}
@@ -586,6 +589,7 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	// 3. Build compound BUMP (STUMPs are sparse — only for subtrees with tracked txs)
 	compound, txids, err := bump.BuildCompoundBUMP(stumps, subtreeHashes, coinbaseBUMP, headerMerkleRoot)
 	if err != nil {
+		outcome = "build_failed"
 		return fmt.Errorf("building compound BUMP: %w", err)
 	}
 
@@ -599,12 +603,14 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	// fails ComputeRoot, and leave txs non-MINED + STUMPs intact so a retry can
 	// rebuild once the inputs are correct.
 	if err := bump.ValidateCompoundRoot(compound, headerMerkleRoot); err != nil {
+		outcome = "validation_failed"
 		dumpBUMPFailureInputs(logger, stumps, subtreeHashes, coinbaseBUMP, headerMerkleRoot, compound, bumpBytes, txids, err)
 		return fmt.Errorf("compound BUMP root mismatch for block %s: %w", blockHash, err)
 	}
 
 	// 5. Store compound BUMP as binary
 	if err := b.store.InsertBUMP(ctx, blockHash, blockHeight, bumpBytes); err != nil {
+		outcome = "store_failed"
 		return fmt.Errorf("storing BUMP: %w", err)
 	}
 
