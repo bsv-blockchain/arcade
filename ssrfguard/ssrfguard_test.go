@@ -6,6 +6,7 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestIsBlockedIP(t *testing.T) {
@@ -278,5 +279,38 @@ func TestCheckDialAddress_Malformed(t *testing.T) {
 	// non-IP host is anomalous and must fail closed.
 	if err := CheckDialAddress("example.com:80", false); !errors.Is(err, ErrBlockedAddress) {
 		t.Fatalf("expected ErrBlockedAddress for non-IP host, got %v", err)
+	}
+}
+
+func TestSuccessCache_TTLAndBound(t *testing.T) {
+	c := NewSuccessCache(50*time.Millisecond, 2)
+
+	c.Put("a", "va")
+	if v, ok := c.Get("a"); !ok || v != "va" {
+		t.Fatalf("Get(a) = %q,%v — want va,true", v, ok)
+	}
+
+	// At capacity with unexpired entries, new keys are not cached (safe
+	// failure mode: validation still runs, just uncached).
+	c.Put("b", "vb")
+	c.Put("c", "vc")
+	if _, ok := c.Get("c"); ok {
+		t.Fatal("cache exceeded its bound: c should not have been cached")
+	}
+
+	// Updating an existing key at capacity must still work.
+	c.Put("a", "va2")
+	if v, _ := c.Get("a"); v != "va2" {
+		t.Fatalf("update at capacity failed: got %q", v)
+	}
+
+	// After TTL, expired entries are swept on Put and misses on Get.
+	time.Sleep(60 * time.Millisecond)
+	if _, ok := c.Get("a"); ok {
+		t.Fatal("expired entry served")
+	}
+	c.Put("c", "vc")
+	if v, ok := c.Get("c"); !ok || v != "vc" {
+		t.Fatalf("Put after expiry sweep failed: %q,%v", v, ok)
 	}
 }

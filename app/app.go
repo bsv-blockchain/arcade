@@ -487,6 +487,12 @@ func (a chaintracksHeaderReader) GetHeaderByHash(ctx context.Context, hash *chai
 // every tick so a row whose DNS recovers is admitted within one interval.
 const endpointSourceValidationTTL = 5 * time.Minute
 
+// endpointSourceValidationCacheMax bounds the validation cache. Discovered
+// registry rows originate from untrusted p2p announcements; the cap keeps a
+// registry flooded with unique URLs from growing process memory without
+// bound. Far above the size of any real datahub fleet.
+const endpointSourceValidationCacheMax = 512
+
 // endpointSourceLookupTimeout bounds each DNS lookup during refresh so a
 // dead resolver cannot wedge the refresh tick (the synchronous first
 // refresh in teranode.Client.Start is separately capped, and lookups
@@ -524,10 +530,13 @@ type endpointSource struct {
 	// lookupIP is the DNS seam; nil is never stored — newEndpointSource
 	// installs the bounded default.
 	lookupIP func(ctx context.Context, host string) ([]net.IP, error)
-	// validated caches URLs that passed validation (URL → expiry UnixNano).
-	validated sync.Map
+	// validated caches URLs that passed validation. Bounded — see
+	// endpointSourceValidationCacheMax.
+	validated *ssrfguard.SuccessCache
 	// warned tracks URLs already logged at WARN so each rejected row logs
 	// loudly once per process and quietly (DEBUG) on the ~30s re-checks.
+	// Pruned against every listing, so it is bounded by the registry's
+	// current row count rather than by everything ever seen.
 	warnedMu sync.Mutex
 	warned   map[string]struct{}
 	logger   *zap.Logger
@@ -539,6 +548,7 @@ func newEndpointSource(st datahubLister, network string, includeDiscovered, allo
 		network:           network,
 		includeDiscovered: includeDiscovered,
 		allowPrivate:      allowPrivate,
+		validated:         ssrfguard.NewSuccessCache(endpointSourceValidationTTL, endpointSourceValidationCacheMax),
 		warned:            map[string]struct{}{},
 		logger:            logger,
 		lookupIP: func(ctx context.Context, host string) ([]net.IP, error) {
@@ -554,8 +564,10 @@ func (a *endpointSource) ListEndpointURLs(ctx context.Context) ([]string, error)
 	if err != nil {
 		return nil, err
 	}
+	current := make(map[string]struct{}, len(eps))
 	out := make([]string, 0, len(eps))
 	for _, ep := range eps {
+		current[ep.URL] = struct{}{}
 		if ep.Source == store.DatahubEndpointSourceDiscovered {
 			if !a.includeDiscovered {
 				continue
@@ -566,17 +578,28 @@ func (a *endpointSource) ListEndpointURLs(ctx context.Context) ([]string, error)
 		}
 		out = append(out, ep.URL)
 	}
+	a.pruneWarned(current)
 	return out, nil
+}
+
+// pruneWarned drops warn-dampening entries for URLs no longer present in
+// the registry listing, keeping the map bounded by the registry's current
+// size. A row that later reappears simply WARNs once more.
+func (a *endpointSource) pruneWarned(current map[string]struct{}) {
+	a.warnedMu.Lock()
+	defer a.warnedMu.Unlock()
+	for url := range a.warned {
+		if _, ok := current[url]; !ok {
+			delete(a.warned, url)
+		}
+	}
 }
 
 // validDiscoveredURL runs ssrfguard validation behind the success-only TTL
 // cache and handles rejection metering/log dampening.
 func (a *endpointSource) validDiscoveredURL(ctx context.Context, url string) bool {
-	if v, ok := a.validated.Load(url); ok {
-		if time.Now().UnixNano() < v.(int64) {
-			return true
-		}
-		a.validated.Delete(url)
+	if _, ok := a.validated.Get(url); ok {
+		return true
 	}
 
 	err := ssrfguard.ValidateURL(url, a.allowPrivate, func(host string) ([]net.IP, error) {
@@ -592,7 +615,7 @@ func (a *endpointSource) validDiscoveredURL(ctx context.Context, url string) boo
 		return false
 	}
 
-	a.validated.Store(url, time.Now().Add(endpointSourceValidationTTL).UnixNano())
+	a.validated.Put(url, "")
 	a.warnedMu.Lock()
 	delete(a.warned, url) // if it later goes bad again, WARN once more
 	a.warnedMu.Unlock()

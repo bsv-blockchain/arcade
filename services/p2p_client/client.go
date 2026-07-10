@@ -81,11 +81,11 @@ const dnsLookupTimeout = 2 * time.Second
 // very next announcement. Mirrors merkle-service's announcement validation.
 const discoveryValidationTTL = 5 * time.Minute
 
-// validatedURL is the value cached per raw announced URL.
-type validatedURL struct {
-	normalized string
-	expiry     int64 // UnixNano
-}
+// discoveryValidationCacheMax bounds the validation cache. Announced URLs
+// are attacker-influenced input; the cap keeps a peer spraying unique valid
+// URLs from growing process memory without bound. Far above the size of any
+// real datahub fleet.
+const discoveryValidationCacheMax = 512
 
 type Client struct {
 	cfg           *config.Config
@@ -102,9 +102,10 @@ type Client struct {
 	// tests so validation never hits real DNS; nil is never stored — New
 	// installs the bounded default.
 	lookupIP func(ctx context.Context, host string) ([]net.IP, error)
-	// validatedURLs caches successful validations (raw URL → validatedURL)
+	// validatedURLs caches successful validations (raw URL → normalized)
 	// so repeat announcements of the same URL skip the DNS round-trip.
-	validatedURLs sync.Map
+	// Bounded — see discoveryValidationCacheMax.
+	validatedURLs *ssrfguard.SuccessCache
 }
 
 func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, st EndpointWriter) *Client {
@@ -120,6 +121,7 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, st En
 			defer cancel()
 			return net.DefaultResolver.LookupIP(lctx, "ip", host)
 		},
+		validatedURLs: ssrfguard.NewSuccessCache(discoveryValidationTTL, discoveryValidationCacheMax),
 	}
 }
 
@@ -329,12 +331,8 @@ func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatu
 // rejections (private/metadata destinations), "invalid" for everything else
 // (malformed, bad scheme, unresolvable hostname).
 func (c *Client) validateDatahubURL(ctx context.Context, peerID, raw string) (string, bool) {
-	if v, ok := c.validatedURLs.Load(raw); ok {
-		entry := v.(validatedURL)
-		if time.Now().UnixNano() < entry.expiry {
-			return entry.normalized, true
-		}
-		c.validatedURLs.Delete(raw)
+	if normalized, ok := c.validatedURLs.Get(raw); ok {
+		return normalized, true
 	}
 
 	normalized, err := validateURL(raw, c.cfg.P2P.AllowPrivateURLs, func(host string) ([]net.IP, error) {
@@ -355,10 +353,7 @@ func (c *Client) validateDatahubURL(ctx context.Context, peerID, raw string) (st
 		return "", false
 	}
 
-	c.validatedURLs.Store(raw, validatedURL{
-		normalized: normalized,
-		expiry:     time.Now().Add(discoveryValidationTTL).UnixNano(),
-	})
+	c.validatedURLs.Put(raw, normalized)
 	return normalized, true
 }
 

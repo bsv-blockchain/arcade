@@ -19,9 +19,17 @@
 // and either turn arcade's propagation path into an SSRF primitive against
 // cloud metadata endpoints / RFC1918 neighbors, or pollute the shared
 // endpoint registry with URLs that can never be reached from this cluster.
-// We block by destination IP rather than hostname so an announcer cannot
-// bypass via DNS, IP literal, or rebinding, and we treat DNS-resolution
-// failure as invalid — an unresolvable name must not enter the registry.
+// ValidateURL blocks by destination IP rather than hostname — checking
+// every address the name resolves to at validation time — and treats
+// DNS-resolution failure as invalid, so an unresolvable name never enters
+// the registry.
+//
+// Validation-time resolution alone does not defeat DNS rebinding: a
+// hostname can resolve publicly when validated and privately when later
+// dialed. Closing that window requires wiring CheckDialAddress into the
+// dialer (net.Dialer.Control) of any client that connects to validated
+// URLs; callers that skip the dial-time hook accept the rebinding
+// residual risk.
 package ssrfguard
 
 import (
