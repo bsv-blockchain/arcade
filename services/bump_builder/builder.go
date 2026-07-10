@@ -75,8 +75,10 @@ func New(
 	// Export every series this service can emit at 0 from the first scrape —
 	// a series born mid-burst is invisible to increase() until its second
 	// sample, which made a whole block's MINED transitions vanish from
-	// dashboards after every rollout.
+	// dashboards after every rollout. The build-outcome children matter most:
+	// a first-occurrence build failure must not be swallowed by increase().
 	metrics.PreRegisterStatusTransitions(models.StatusMined)
+	metrics.PreRegisterBumpOutcomes()
 	return &Builder{
 		cfg:         cfg,
 		logger:      logger.Named("bump-builder"),

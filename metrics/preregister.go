@@ -34,3 +34,29 @@ func PreRegisterTxSubmissions() {
 		}
 	}
 }
+
+// BumpBuildOutcomes is the closed set of outcome labels handleMessage can
+// stamp on BumpBuilderBuildDuration. Keep it in sync with the outcome
+// assignments in services/bump_builder/builder.go and the doc comment on
+// BumpBuilderBuildDuration. A failure alert that never fires because its
+// outcome series was never born is exactly the blind spot pre-registration
+// exists to close, so the failure outcomes matter most here.
+var BumpBuildOutcomes = []string{
+	// benign
+	"success", "short_circuited", "no_stumps", "context_canceled",
+	// failures
+	"parse_failed", "incomplete_stumps", "fetch_failed",
+	"no_subtrees", "build_failed", "validation_failed", "store_failed",
+}
+
+// PreRegisterBumpOutcomes instantiates every outcome child of
+// BumpBuilderBuildDuration so each series is exported from the first scrape.
+// The bump-builder calls this at construction time. Without it a
+// first-occurrence failure (e.g. the first validation_failed after a deploy)
+// is invisible to increase()/rate() until its second sample — precisely when
+// an operator most needs the alert to fire.
+func PreRegisterBumpOutcomes() {
+	for _, outcome := range BumpBuildOutcomes {
+		BumpBuilderBuildDuration.WithLabelValues(outcome)
+	}
+}
