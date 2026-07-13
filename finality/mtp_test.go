@@ -2,6 +2,7 @@ package finality
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"testing"
 	"time"
@@ -41,7 +42,10 @@ func header(height uint32, timestamp uint32) *chaintracks.BlockHeader {
 		Header: &block.Header{Timestamp: timestamp},
 		Height: height,
 	}
-	h.Hash = chainhash.HashH([]byte{byte(height), byte(height >> 8), byte(height >> 16), byte(timestamp)})
+	var seed [8]byte
+	binary.BigEndian.PutUint32(seed[:4], height)
+	binary.BigEndian.PutUint32(seed[4:], timestamp)
+	h.Hash = chainhash.HashH(seed[:])
 	return h
 }
 
@@ -49,8 +53,10 @@ func header(height uint32, timestamp uint32) *chaintracks.BlockHeader {
 // timestamps for the last len(timestamps) blocks ending at the tip.
 func chainAt(tipHeight uint32, timestamps ...uint32) *fakeReader {
 	headers := make([]*chaintracks.BlockHeader, len(timestamps))
-	for i, ts := range timestamps {
-		headers[i] = header(tipHeight-uint32(len(timestamps)-1-i), ts)
+	height := tipHeight
+	for i := len(timestamps) - 1; i >= 0; i-- {
+		headers[i] = header(height, timestamps[i])
+		height--
 	}
 	return &fakeReader{tip: headers[len(headers)-1], headers: headers}
 }
@@ -212,6 +218,114 @@ func TestCheckerFetchBudget(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Errorf("Check took %v, want bounded by fetch timeout", elapsed)
+	}
+}
+
+// fakeHeightReader is a HeightReader with programmable results.
+type fakeHeightReader struct {
+	height uint64
+	err    error
+	calls  int
+}
+
+func (f *fakeHeightReader) GetActiveTipBlockHeight(context.Context) (uint64, error) {
+	f.calls++
+	return f.height, f.err
+}
+
+func TestCheckerHeightFallbackGatesHeightLocks(t *testing.T) {
+	// No full ChainReader — only the store-height fallback (#181's stance).
+	c := NewChecker(nil, nil, WithHeightFallback(&fakeHeightReader{height: 799_999}))
+	if c == nil {
+		t.Fatal("NewChecker with height fallback only must yield a checker")
+	}
+
+	// Next block = 800_000; a lock at exactly that height is non-final
+	// (strict inequality, matching teranode).
+	err := c.Check(context.Background(), txWith(800_000, 0xfffffffe))
+	var nfe *NotFinalError
+	if !errors.As(err, &nfe) {
+		t.Fatalf("Check() = %v, want *NotFinalError", err)
+	}
+	if !nfe.HeightBased || nfe.NextBlockHeight != 800_000 {
+		t.Errorf("got HeightBased=%v NextBlockHeight=%d, want true/800000", nfe.HeightBased, nfe.NextBlockHeight)
+	}
+
+	// A lock below the next height is final.
+	c2 := NewChecker(nil, nil, WithHeightFallback(&fakeHeightReader{height: 800_000}))
+	if err := c2.Check(context.Background(), txWith(800_000, 0xfffffffe)); err != nil {
+		t.Fatalf("Check() = %v, want nil (next height 800001 > lock 800000)", err)
+	}
+}
+
+func TestCheckerHeightFallbackFailsOpenForTimestampLocks(t *testing.T) {
+	unavailable := 0
+	c := NewChecker(nil, nil,
+		WithHeightFallback(&fakeHeightReader{height: 800_000}),
+		WithUnavailableHook(func() { unavailable++ }))
+
+	if err := c.Check(context.Background(), nonFinalTx(2_000_000_000)); err != nil {
+		t.Fatalf("Check() = %v, want nil (timestamp lock needs MTP, fail open)", err)
+	}
+	if unavailable != 1 {
+		t.Errorf("unavailable hook calls = %d, want 1", unavailable)
+	}
+}
+
+func TestCheckerHeightFallbackFailsOpenOnErrorOrZeroHeight(t *testing.T) {
+	tests := []struct {
+		name string
+		hr   *fakeHeightReader
+	}{
+		{"height error", &fakeHeightReader{err: errors.New("boom")}},
+		{"zero height (empty store)", &fakeHeightReader{height: 0}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			unavailable := 0
+			c := NewChecker(nil, nil,
+				WithHeightFallback(tt.hr),
+				WithUnavailableHook(func() { unavailable++ }))
+			if err := c.Check(context.Background(), txWith(800_000, 0xfffffffe)); err != nil {
+				t.Fatalf("Check() = %v, want nil (fail open)", err)
+			}
+			if unavailable != 1 {
+				t.Errorf("unavailable hook calls = %d, want 1", unavailable)
+			}
+		})
+	}
+}
+
+func TestCheckerPrefersFullReaderOverHeightFallback(t *testing.T) {
+	reader := chainAt(100, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010)
+	hr := &fakeHeightReader{height: 999_999}
+	c := NewChecker(reader, nil, WithHeightFallback(hr))
+
+	err := c.Check(context.Background(), nonFinalTx(2_000_000_000))
+	var nfe *NotFinalError
+	if !errors.As(err, &nfe) || nfe.NextBlockHeight != 101 {
+		t.Fatalf("Check() = %v, want NotFinalError with NextBlockHeight 101 from the full reader", err)
+	}
+	if hr.calls != 0 {
+		t.Errorf("height fallback consulted %d times despite healthy full reader, want 0", hr.calls)
+	}
+}
+
+func TestCheckerFallsBackToHeightWhenReaderFails(t *testing.T) {
+	// Full reader configured but broken: height locks still gate via the
+	// store fallback; the unavailability is still counted.
+	unavailable := 0
+	c := NewChecker(&fakeReader{tip: nil}, nil,
+		WithHeightFallback(&fakeHeightReader{height: 799_998}),
+		WithUnavailableHook(func() { unavailable++ }))
+
+	err := c.Check(context.Background(), txWith(800_000, 0xfffffffe))
+	var nfe *NotFinalError
+	if !errors.As(err, &nfe) || !nfe.HeightBased {
+		t.Fatalf("Check() = %v, want height-based NotFinalError via fallback", err)
+	}
+	if unavailable != 1 {
+		t.Errorf("unavailable hook calls = %d, want 1 (MTP source failed)", unavailable)
 	}
 }
 

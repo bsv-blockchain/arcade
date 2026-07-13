@@ -29,6 +29,16 @@ type ChainReader interface {
 	GetHeaders(ctx context.Context, height, count uint32) ([]*chaintracks.BlockHeader, error)
 }
 
+// HeightReader supplies just the current best block height. The arcade store
+// satisfies it (GetActiveTipBlockHeight). It backs the height-only fallback:
+// height-based locktimes can be gated from the store alone — no chaintracks
+// required — while timestamp locktimes need MTP and fail open without a full
+// ChainReader. (Adopted from PR #181, which used the store as its only
+// height source.)
+type HeightReader interface {
+	GetActiveTipBlockHeight(ctx context.Context) (uint64, error)
+}
+
 // CheckerOption configures a Checker.
 type CheckerOption func(*Checker)
 
@@ -50,6 +60,13 @@ func WithUnavailableHook(fn func()) CheckerOption {
 	return func(c *Checker) { c.onUnavailable = fn }
 }
 
+// WithHeightFallback wires a height-only chain source consulted when the
+// full ChainReader is absent or failing. Height-based locktimes are then
+// still gated; timestamp locktimes fail open (they need MTP).
+func WithHeightFallback(hr HeightReader) CheckerOption {
+	return func(c *Checker) { c.heightReader = hr }
+}
+
 type snapshot struct {
 	tipHash   chainhash.Hash
 	tipHeight uint32
@@ -68,6 +85,7 @@ type snapshot struct {
 // rejection, a false reject clears on resubmission.
 type Checker struct {
 	reader        ChainReader
+	heightReader  HeightReader
 	logger        *zap.Logger
 	ttl           time.Duration
 	fetchTimeout  time.Duration
@@ -77,12 +95,10 @@ type Checker struct {
 	snap snapshot
 }
 
-// NewChecker builds a Checker over the given chain source. A nil reader
-// yields a nil Checker (checks disabled, everything accepted).
+// NewChecker builds a Checker over the given chain source(s). With neither a
+// reader nor a WithHeightFallback source it yields a nil Checker (checks
+// disabled, everything accepted).
 func NewChecker(reader ChainReader, logger *zap.Logger, opts ...CheckerOption) *Checker {
-	if reader == nil {
-		return nil
-	}
 	if logger == nil {
 		logger = zap.NewNop()
 	}
@@ -94,6 +110,9 @@ func NewChecker(reader ChainReader, logger *zap.Logger, opts ...CheckerOption) *
 	}
 	for _, opt := range opts {
 		opt(c)
+	}
+	if c.reader == nil && c.heightReader == nil {
+		return nil
 	}
 	return c
 }
@@ -113,12 +132,58 @@ func (c *Checker) Check(ctx context.Context, tx *sdkTx.Transaction) error {
 		return nil
 	}
 
-	tipHeight, mtp, ok := c.chainState(ctx)
-	if !ok {
+	if c.reader != nil {
+		if tipHeight, mtp, ok := c.chainState(ctx); ok {
+			return IsTransactionFinal(tx, tipHeight+1, mtp)
+		}
+		// chainState already logged and counted the unavailability; the
+		// height-only fallback below may still gate height-based locks.
+	}
+
+	return c.checkHeightOnly(ctx, tx)
+}
+
+// checkHeightOnly gates height-based locktimes from the HeightReader alone.
+// Timestamp locktimes need MTP, which a height source cannot supply — those
+// fail open. The height source is the local store, so no caching is needed.
+func (c *Checker) checkHeightOnly(ctx context.Context, tx *sdkTx.Transaction) error {
+	if c.heightReader == nil {
 		return nil
 	}
 
-	return IsTransactionFinal(tx, tipHeight+1, mtp)
+	if tx.LockTime >= lockTimeThreshold {
+		if c.reader == nil {
+			// With a full reader this was already counted by chainState.
+			c.noteUnavailable("timestamp locktime needs median-time-past; only a height source is configured", nil)
+		}
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, c.fetchTimeout)
+	defer cancel()
+
+	height, err := c.heightReader.GetActiveTipBlockHeight(ctx)
+	if err != nil {
+		c.noteUnavailable("chain height unavailable", err)
+		return nil
+	}
+	if height == 0 {
+		// A store with no mined rows yet reports 0; rejecting against a
+		// fabricated next-height of 1 would bounce every height-locked tx.
+		c.noteUnavailable("chain height is zero (no mined rows yet)", nil)
+		return nil
+	}
+
+	return IsTransactionFinal(tx, nextHeightU32(height), 0)
+}
+
+// nextHeightU32 saturates height+1 to the uint32 range. Real heights never
+// approach 2^32; the clamp makes the conversion provably bounded (gosec G115).
+func nextHeightU32(height uint64) uint32 {
+	if height >= uint64(^uint32(0)) {
+		return ^uint32(0)
+	}
+	return uint32(height) + 1
 }
 
 // lockTimeIrrelevant reports whether finality is decidable as "final" without
@@ -196,9 +261,13 @@ func (c *Checker) chainState(ctx context.Context) (tipHeight, mtp uint32, ok boo
 }
 
 func (c *Checker) unavailable(reason string, err error) (uint32, uint32, bool) {
-	c.logger.Warn("finality pre-check skipped: "+reason, zap.Error(err))
+	c.noteUnavailable(reason, err)
+	return 0, 0, false
+}
+
+func (c *Checker) noteUnavailable(reason string, err error) {
+	c.logger.Warn("finality pre-check degraded: "+reason, zap.Error(err))
 	if c.onUnavailable != nil {
 		c.onUnavailable()
 	}
-	return 0, 0, false
 }

@@ -210,34 +210,7 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		chainTracks = ct
 	}
 
-	// Chain source for the api-server's nLockTime/BIP113 finality gate
-	// (issue #245). In mode=all the embedded chaintracks above is reused; in
-	// microservice deployments the api-server pod runs with chaintracks
-	// disabled (see modeNeedsChaintracks), so when the operator points
-	// chaintracks.mode=remote at the chaintracks pod we construct the cheap
-	// HTTP client here — no P2P, no storage, no ChainManager. No source →
-	// nil checker → gate off (fail-open by design; teranode stays the
-	// authority).
-	var finalityChecker *finality.Checker
-	if !cfg.Validator.DisableFinalityCheck && modeNeedsFinality(cfg.Mode) {
-		var reader finality.ChainReader
-		if chainTracks != nil {
-			reader = chainTracks
-		} else if cfg.Chaintracks.Mode == chaintracksconfig.ModeRemote && cfg.Chaintracks.URL != "" {
-			remote, remoteErr := cfg.Chaintracks.Initialize(ctx, "arcade-finality", nil)
-			if remoteErr != nil {
-				logger.Warn("finality pre-check disabled: remote chaintracks init failed", zap.Error(remoteErr))
-			} else {
-				reader = remote
-			}
-		}
-		if reader != nil {
-			finalityChecker = finality.NewChecker(reader, logger,
-				finality.WithUnavailableHook(metrics.APIFinalityPrecheckUnavailableTotal.Inc))
-		} else {
-			logger.Info("finality pre-check disabled: no chain source (enable chaintracks_server or set chaintracks.mode=remote with a URL)")
-		}
-	}
+	finalityChecker := buildFinalityChecker(ctx, cfg, chainTracks, st, logger)
 
 	// Hydrate the TxTracker from the store BEFORE handing it to api-server.
 	// Gated to modes that actually consume it: only api-server reads
@@ -345,6 +318,49 @@ func modeNeedsChaintracks(mode string) bool {
 // so api-server pods never spin up an embedded ChainManager.
 func modeNeedsFinality(mode string) bool {
 	return mode == "all" || mode == "api-server"
+}
+
+// buildFinalityChecker wires the chain sources for the api-server's
+// nLockTime/BIP113 finality gate (issue #245). In mode=all the embedded
+// chaintracks is reused; in microservice deployments the api-server pod runs
+// with chaintracks disabled (see modeNeedsChaintracks), so when the operator
+// points chaintracks.mode=remote at the chaintracks pod the cheap HTTP
+// client is constructed here — no P2P, no storage, no ChainManager. The
+// store always backs a height-only fallback (adopted from PR #181): without
+// any chaintracks source, height-based locktimes are still gated while
+// timestamp locktimes fail open (they need MTP). Teranode stays the
+// authority in every degraded mode.
+func buildFinalityChecker(ctx context.Context, cfg *config.Config, chainTracks chaintrackslib.Chaintracks, st store.Store, logger *zap.Logger) *finality.Checker {
+	if cfg.Validator.DisableFinalityCheck || !modeNeedsFinality(cfg.Mode) {
+		return nil
+	}
+
+	reader := finalityChainReader(ctx, cfg, chainTracks, logger)
+	if reader == nil {
+		logger.Info("finality pre-check degraded to height-only: no MTP source (enable chaintracks_server or set chaintracks.mode=remote with a URL)")
+	}
+
+	return finality.NewChecker(reader, logger,
+		finality.WithHeightFallback(st),
+		finality.WithUnavailableHook(metrics.APIFinalityPrecheckUnavailableTotal.Inc))
+}
+
+// finalityChainReader picks the finality gate's chain source: the shared
+// embedded chaintracks when it exists, else a remote go-chaintracks client
+// when configured, else nil.
+func finalityChainReader(ctx context.Context, cfg *config.Config, chainTracks chaintrackslib.Chaintracks, logger *zap.Logger) finality.ChainReader {
+	if chainTracks != nil {
+		return chainTracks
+	}
+	if cfg.Chaintracks.Mode != chaintracksconfig.ModeRemote || cfg.Chaintracks.URL == "" {
+		return nil
+	}
+	remote, err := cfg.Chaintracks.Initialize(ctx, "arcade-finality", nil)
+	if err != nil {
+		logger.Warn("finality pre-check disabled: remote chaintracks init failed", zap.Error(err))
+		return nil
+	}
+	return remote
 }
 
 // modeNeedsTxTracker reports whether the configured mode constructs a service
