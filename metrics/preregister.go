@@ -32,6 +32,7 @@ func PreRegisterTxSubmissions() {
 		for _, result := range []string{"new", "duplicate", "retry_rejected"} {
 			APITxsSubmittedTotal.WithLabelValues(route, result)
 		}
+		APIFinalityRejectionsTotal.WithLabelValues(route)
 	}
 }
 

@@ -43,6 +43,16 @@ spec:
               value: "aerospike-0.aerospike.arcade.svc.cluster.local:3000"
             - name: ARCADE_AEROSPIKE_NAMESPACE
               value: "arcade"
+            # Chain source for the nLockTime/BIP113 finality gate at intake
+            # (issue #245): the remote client keeps this pod free of an
+            # embedded ChainManager. The URL must include the /chaintracks
+            # path prefix — the go-chaintracks client appends /v2/* to it
+            # and arcade's chaintracks pod serves /chaintracks/v2/*.
+            # Without these vars the gate is skipped (fail-open).
+            - name: ARCADE_CHAINTRACKS_MODE
+              value: "remote"
+            - name: ARCADE_CHAINTRACKS_URL
+              value: "http://chaintracks.arcade.svc.cluster.local:8083/chaintracks"
             # HOST_IP feeds OTEL_EXPORTER_OTLP_ENDPOINT below to reach the
             # node-local OTLP collector via the Kubernetes downward API; it
             # MUST be defined before its $(HOST_IP) use. Telemetry itself

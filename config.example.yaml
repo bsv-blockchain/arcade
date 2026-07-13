@@ -151,6 +151,14 @@ health:
 #   # teratestnet/regtest where the upstream Teranode is also configured
 #   # to accept zero-fee txs. Leave false on mainnet and testnet.
 #   # accept_zero_fee: false
+#   # disable_finality_check turns off the nLockTime/BIP113 intake gate
+#   # that rejects provably non-final txs with an actionable reason
+#   # (issue #245). The gate needs a chain source: the embedded
+#   # chaintracks (mode=all) or chaintracks.mode=remote pointed at the
+#   # chaintracks pod (note: the URL must include the /chaintracks path
+#   # prefix). Without one it silently fails open, so this switch is only
+#   # an emergency escape hatch.
+#   # disable_finality_check: false
 
 # SSRF guard for client-supplied callback URLs. The api-server rejects
 # X-CallbackUrl values whose host is loopback / link-local / RFC1918 /

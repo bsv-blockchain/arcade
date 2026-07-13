@@ -651,6 +651,21 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		}
 	}
 
+	// nLockTime/BIP113 finality gate. The embedded validator above does not
+	// check finality (teranode enforces it a layer above the TxValidator it
+	// wraps), so without this a non-final tx is broadcast and bounced by the
+	// network with an opaque generic error (issue #245). Runs after the
+	// validator so its fail-open behavior can never mask a validation error.
+	if err := s.finality.Check(c.Request.Context(), parsedTx); err != nil {
+		metrics.APIFinalityRejectionsTotal.WithLabelValues("/tx").Inc()
+		s.rejectAtIntake(c.Request.Context(), txid, err.Error(), opts)
+		c.JSON(http.StatusBadRequest, gin.H{
+			jsonKeyError: "transaction failed validation",
+			"reason":     err.Error(),
+		})
+		return
+	}
+
 	// Dedup CAS via GetOrInsertStatus. Two submitters racing on the
 	// same txid both attempt the insert; the loser sees inserted=false
 	// and returns 202 idempotently without re-publishing.
@@ -910,6 +925,22 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				})
 				return
 			}
+		}
+	}
+
+	// nLockTime/BIP113 finality gate per tx; see handleSubmitTransaction for
+	// the rationale. Aborts the whole batch naming the offending txid —
+	// matches the validation contract above.
+	for _, p := range parsed {
+		if fErr := s.finality.Check(c.Request.Context(), p.tx); fErr != nil {
+			metrics.APIFinalityRejectionsTotal.WithLabelValues("/txs").Inc()
+			s.rejectAtIntake(c.Request.Context(), p.txid, fErr.Error(), opts)
+			c.JSON(http.StatusBadRequest, gin.H{
+				jsonKeyError: "transaction failed validation",
+				"txid":       p.txid,
+				"reason":     fErr.Error(),
+			})
+			return
 		}
 	}
 

@@ -672,6 +672,12 @@ type ValidatorConfig struct {
 	// false (default) on mainnet and any environment that should enforce
 	// the production fee floor. Takes precedence over MinFeePerKB.
 	AcceptZeroFee bool `mapstructure:"accept_zero_fee"`
+
+	// DisableFinalityCheck turns off the api-server's nLockTime/BIP113
+	// intake gate (issue #245). The gate is UX-only — teranode remains
+	// authoritative and the check fails open when chain state is
+	// unavailable — so this exists purely as an emergency escape hatch.
+	DisableFinalityCheck bool `mapstructure:"disable_finality_check"`
 }
 
 // DefaultValidatorMinFeePerKB is the production fee floor in satoshis

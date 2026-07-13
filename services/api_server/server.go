@@ -14,6 +14,7 @@ import (
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/events"
+	"github.com/bsv-blockchain/arcade/finality"
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/merkleservice"
@@ -52,7 +53,12 @@ type Server struct {
 	// unset, in which case the handler skips validation. Production
 	// wiring through New requires it.
 	validator *validator.Validator
-	server    *http.Server
+	// finality runs the nLockTime/BIP113 pre-check in the submit handler,
+	// rejecting provably non-final txs with an actionable reason instead of
+	// letting teranode bounce them with a generic error (issue #245).
+	// Nil-safe: nil (no chain source configured, or disabled) skips the gate.
+	finality *finality.Checker
+	server   *http.Server
 
 	// submissionCh decouples the InsertSubmission Pebble write from the HTTP
 	// handler tail latency. recordSubmission enqueues onto it via a non-
@@ -73,7 +79,7 @@ type submissionRecord struct {
 	sub *models.Submission
 }
 
-func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publisher events.Publisher, st store.Store, tracker *store.TxTracker, tc *teranode.Client, mc *merkleservice.Client, val *validator.Validator) *Server {
+func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publisher events.Publisher, st store.Store, tracker *store.TxTracker, tc *teranode.Client, mc *merkleservice.Client, val *validator.Validator, fin *finality.Checker) *Server {
 	// Export every series this service can emit at 0 from the first scrape —
 	// a series born mid-burst is invisible to increase() until its second
 	// sample, which undercounted submissions after every rollout.
@@ -89,6 +95,7 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 		teranode:       tc,
 		merkleClient:   mc,
 		validator:      val,
+		finality:       fin,
 		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
 		submissionStop: make(chan struct{}),
 	}

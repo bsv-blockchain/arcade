@@ -41,11 +41,14 @@ spec:
               value: "arcade"
             # Talk to the chaintracks pod over HTTP instead of running an
             # embedded ChainManager + upstream header poller in this pod.
-            # The chaintracks Service exposes /chaintracks/v1/* on 8083.
+            # The URL must include the /chaintracks path prefix: the
+            # go-chaintracks remote client appends /v2/* to the base URL and
+            # arcade's chaintracks pod serves /chaintracks/v2/*. The previous
+            # suffix-less value 404'd on every request.
             - name: ARCADE_CHAINTRACKS_MODE
               value: "remote"
             - name: ARCADE_CHAINTRACKS_URL
-              value: "http://chaintracks.arcade.svc.cluster.local:8083"
+              value: "http://chaintracks.arcade.svc.cluster.local:8083/chaintracks"
             # HOST_IP feeds OTEL_EXPORTER_OTLP_ENDPOINT below to reach the
             # node-local OTLP collector via the Kubernetes downward API; it
             # MUST be defined before its $(HOST_IP) use. Telemetry itself
