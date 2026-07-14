@@ -11,7 +11,7 @@ require (
 	github.com/bsv-blockchain/go-p2p-message-bus v0.1.21
 	github.com/bsv-blockchain/go-sdk v1.2.24
 	github.com/bsv-blockchain/go-teranode-p2p-client v0.2.8
-	github.com/bsv-blockchain/teranode v0.16.0-beta-2
+	github.com/bsv-blockchain/teranode v0.16.0-beta-4
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/fergusstrange/embedded-postgres v1.34.0
 	github.com/gin-gonic/gin v1.12.0
@@ -72,8 +72,8 @@ require (
 	github.com/benbjohnson/clock v1.3.5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bitcoin-sv/bdk/module/gobdk v1.2.5-0.20260526081552-cdfa7814ee5d // indirect
-	github.com/bsv-blockchain/aerospike-client-go/v8 v8.7.1-bsv4 // indirect
-	github.com/bsv-blockchain/go-batcher/v2 v2.0.5 // indirect
+	github.com/bsv-blockchain/aerospike-client-go/v8 v8.7.1-bsv5 // indirect
+	github.com/bsv-blockchain/go-batcher/v2 v2.0.6 // indirect
 	github.com/bsv-blockchain/go-lockfree-queue v1.2.0 // indirect
 	github.com/bsv-blockchain/go-safe-conversion v1.2.0 // indirect
 	github.com/bsv-blockchain/go-subtree v1.4.4 // indirect
@@ -234,7 +234,7 @@ require (
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opencontainers/image-spec v1.1.1 // indirect
-	github.com/ordishs/gocore v1.0.81 // indirect
+	github.com/ordishs/gocore v1.0.82 // indirect
 	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58 // indirect
 	github.com/pelletier/go-toml/v2 v2.4.2 // indirect
 	github.com/pierrec/lz4/v4 v4.1.27 // indirect
