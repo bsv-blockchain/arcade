@@ -202,6 +202,13 @@ paths:
             Malformed request, decode failure, empty transaction, validation
             failure, or unsafe callback URL. On validation failure a terminal
             `REJECTED` row is persisted so subscribers see the outcome.
+
+            Validation includes an nLockTime/BIP113 finality gate: a
+            transaction whose locktime is still ahead of the chain's
+            median-time-past (with a non-final input sequence) is rejected
+            with a reason stating when it becomes final. Resubmit the
+            identical transaction after that time and it re-enters the
+            broadcast pipeline.
           content:
             application/json:
               schema:

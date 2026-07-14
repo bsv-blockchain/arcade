@@ -19,6 +19,7 @@ import (
 
 	"github.com/bsv-blockchain/arcade/callbackurl"
 	"github.com/bsv-blockchain/arcade/config"
+	arcerrors "github.com/bsv-blockchain/arcade/errors"
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/metrics"
@@ -651,6 +652,24 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		}
 	}
 
+	// nLockTime/BIP113 finality gate. The embedded validator above does not
+	// check finality (teranode enforces it a layer above the TxValidator it
+	// wraps), so without this a non-final tx is broadcast and bounced by the
+	// network with an opaque generic error (issue #245). Runs after the
+	// validator so its fail-open behavior can never mask a validation error.
+	// The ArcError wrap attaches StatusNotFinal for structured consumers
+	// without changing the reason text (same pattern as mapTeranodeError).
+	if fErr := s.finality.Check(c.Request.Context(), parsedTx); fErr != nil {
+		fErr = arcerrors.NewArcError(fErr, arcerrors.StatusNotFinal)
+		metrics.APIFinalityRejectionsTotal.WithLabelValues("/tx").Inc()
+		s.rejectAtIntake(c.Request.Context(), txid, fErr.Error(), opts)
+		c.JSON(http.StatusBadRequest, gin.H{
+			jsonKeyError: "transaction failed validation",
+			"reason":     fErr.Error(),
+		})
+		return
+	}
+
 	// Dedup CAS via GetOrInsertStatus. Two submitters racing on the
 	// same txid both attempt the insert; the loser sees inserted=false
 	// and returns 202 idempotently without re-publishing.
@@ -910,6 +929,23 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				})
 				return
 			}
+		}
+	}
+
+	// nLockTime/BIP113 finality gate per tx; see handleSubmitTransaction for
+	// the rationale. Aborts the whole batch naming the offending txid —
+	// matches the validation contract above.
+	for _, p := range parsed {
+		if fErr := s.finality.Check(c.Request.Context(), p.tx); fErr != nil {
+			fErr = arcerrors.NewArcError(fErr, arcerrors.StatusNotFinal)
+			metrics.APIFinalityRejectionsTotal.WithLabelValues("/txs").Inc()
+			s.rejectAtIntake(c.Request.Context(), p.txid, fErr.Error(), opts)
+			c.JSON(http.StatusBadRequest, gin.H{
+				jsonKeyError: "transaction failed validation",
+				"txid":       p.txid,
+				"reason":     fErr.Error(),
+			})
+			return
 		}
 	}
 

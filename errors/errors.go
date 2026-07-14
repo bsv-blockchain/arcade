@@ -51,6 +51,13 @@ const (
 	StatusTxSize StatusCode = 474
 	// StatusMinedAncestorsNotInBUMP indicates mined ancestors not found in BUMPs.
 	StatusMinedAncestorsNotInBUMP StatusCode = 475
+	// StatusNotFinal indicates a non-final transaction: its nLockTime has not
+	// been reached (BIP113 median-time-past for timestamps, next block height
+	// for heights) and at least one input sequence is non-final. Resubmitting
+	// the identical transaction after the lock expires is expected to succeed.
+	// 474/475 already extend ARC's published table (which ends at 473); 476
+	// continues that arcade-local range.
+	StatusNotFinal StatusCode = 476
 )
 
 // arcDocURL is the base URL for ARC error documentation.
@@ -186,6 +193,9 @@ func NewErrorFields(status StatusCode, extraInfo string) *ErrorFields {
 	case StatusMinedAncestorsNotInBUMP:
 		fields.Title = "Mined ancestors not found in BUMPs"
 		fields.Detail = "BEEF validation failed: couldn't find mined ancestor of the transaction in provided BUMPs"
+	case StatusNotFinal:
+		fields.Title = "Transaction not final"
+		fields.Detail = "Transaction nLockTime is in the future and input sequence numbers are not final; resubmit once the locktime expires"
 	default:
 		fields.Status = int(StatusGeneric)
 		fields.Type = fmt.Sprintf("%s%d", arcDocURL, StatusGeneric)

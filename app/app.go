@@ -19,11 +19,13 @@ import (
 	"time"
 
 	chaintrackslib "github.com/bsv-blockchain/go-chaintracks/chaintracks"
+	chaintracksconfig "github.com/bsv-blockchain/go-chaintracks/config"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/events"
+	"github.com/bsv-blockchain/arcade/finality"
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/metrics"
@@ -62,6 +64,10 @@ type Deps struct {
 	// that consume it (chaintracks_server, bump-builder canonical-root
 	// validation) must nil-guard.
 	Chaintracks chaintrackslib.Chaintracks
+	// FinalityChecker runs the api-server's nLockTime/BIP113 intake gate.
+	// nil (no chain source, or validator.disable_finality_check) disables
+	// the gate; the checker itself is nil-receiver-safe.
+	FinalityChecker *finality.Checker
 }
 
 // Bootstrap creates every shared dependency the services rely on, in the
@@ -204,6 +210,8 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		chainTracks = ct
 	}
 
+	finalityChecker := buildFinalityChecker(ctx, cfg, chainTracks, st, logger)
+
 	// Hydrate the TxTracker from the store BEFORE handing it to api-server.
 	// Gated to modes that actually consume it: only api-server reads
 	// deps.TxTracker (see BuildServices). Without hydration a restart leaves the
@@ -241,18 +249,19 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 	}
 
 	deps := &Deps{
-		Cfg:            cfg,
-		Logger:         logger,
-		Broker:         broker,
-		Producer:       producer,
-		Publisher:      publisher,
-		Store:          st,
-		Leaser:         leaser,
-		TxTracker:      txTracker,
-		TeranodeClient: teranodeClient,
-		MerkleClient:   merkleClient,
-		Validator:      txVal,
-		Chaintracks:    chainTracks,
+		Cfg:             cfg,
+		Logger:          logger,
+		Broker:          broker,
+		Producer:        producer,
+		Publisher:       publisher,
+		Store:           st,
+		Leaser:          leaser,
+		TxTracker:       txTracker,
+		TeranodeClient:  teranodeClient,
+		MerkleClient:    merkleClient,
+		Validator:       txVal,
+		Chaintracks:     chainTracks,
+		FinalityChecker: finalityChecker,
 	}
 
 	cleanup := func() {
@@ -300,6 +309,58 @@ func modeNeedsChaintracks(mode string) bool {
 	default:
 		return false
 	}
+}
+
+// modeNeedsFinality reports whether the configured mode constructs a service
+// that consumes Deps.FinalityChecker — only api-server does (the intake
+// finality gate). Deliberately NOT part of modeNeedsChaintracks: the gate
+// uses the remote chaintracks client in microservice deployments precisely
+// so api-server pods never spin up an embedded ChainManager.
+func modeNeedsFinality(mode string) bool {
+	return mode == "all" || mode == "api-server"
+}
+
+// buildFinalityChecker wires the chain sources for the api-server's
+// nLockTime/BIP113 finality gate (issue #245). In mode=all the embedded
+// chaintracks is reused; in microservice deployments the api-server pod runs
+// with chaintracks disabled (see modeNeedsChaintracks), so when the operator
+// points chaintracks.mode=remote at the chaintracks pod the cheap HTTP
+// client is constructed here — no P2P, no storage, no ChainManager. The
+// store always backs a height-only fallback (adopted from PR #181): without
+// any chaintracks source, height-based locktimes are still gated while
+// timestamp locktimes fail open (they need MTP). Teranode stays the
+// authority in every degraded mode.
+func buildFinalityChecker(ctx context.Context, cfg *config.Config, chainTracks chaintrackslib.Chaintracks, st store.Store, logger *zap.Logger) *finality.Checker {
+	if cfg.Validator.DisableFinalityCheck || !modeNeedsFinality(cfg.Mode) {
+		return nil
+	}
+
+	reader := finalityChainReader(ctx, cfg, chainTracks, logger)
+	if reader == nil {
+		logger.Info("finality pre-check degraded to height-only: no MTP source (enable chaintracks_server or set chaintracks.mode=remote with a URL)")
+	}
+
+	return finality.NewChecker(reader, logger,
+		finality.WithHeightFallback(st),
+		finality.WithUnavailableHook(metrics.APIFinalityPrecheckUnavailableTotal.Inc))
+}
+
+// finalityChainReader picks the finality gate's chain source: the shared
+// embedded chaintracks when it exists, else a remote go-chaintracks client
+// when configured, else nil.
+func finalityChainReader(ctx context.Context, cfg *config.Config, chainTracks chaintrackslib.Chaintracks, logger *zap.Logger) finality.ChainReader {
+	if chainTracks != nil {
+		return chainTracks
+	}
+	if cfg.Chaintracks.Mode != chaintracksconfig.ModeRemote || cfg.Chaintracks.URL == "" {
+		return nil
+	}
+	remote, err := cfg.Chaintracks.Initialize(ctx, "arcade-finality", nil)
+	if err != nil {
+		logger.Warn("finality pre-check disabled: remote chaintracks init failed", zap.Error(err))
+		return nil
+	}
+	return remote
 }
 
 // modeNeedsTxTracker reports whether the configured mode constructs a service
@@ -415,7 +476,7 @@ func BuildServices(d *Deps) []services.Service {
 	}
 
 	if shouldRun("api-server") {
-		svcs = append(svcs, api_server.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.TxTracker, d.TeranodeClient, d.MerkleClient, d.Validator))
+		svcs = append(svcs, api_server.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.TxTracker, d.TeranodeClient, d.MerkleClient, d.Validator, d.FinalityChecker))
 	}
 	if shouldRun("bump-builder") {
 		// chainHeader is nil when chaintracks is disabled — bump-builder

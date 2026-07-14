@@ -212,6 +212,25 @@ var APITxsSubmittedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "Transactions submitted via the API by route and dedup result (new|duplicate|retry_rejected). Counted per transaction, not per request.",
 }, []string{"route", "result"})
 
+// APIFinalityRejectionsTotal counts transactions rejected at intake by the
+// nLockTime/BIP113 finality gate, by route. These are terminal REJECTED
+// verdicts with an actionable reason; the submitter is expected to resubmit
+// once the lock expires (issue #245).
+var APIFinalityRejectionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_api_finality_rejections_total",
+	Help: "Transactions rejected at intake as non-final (nLockTime/BIP113), by route.",
+}, []string{"route"})
+
+// APIFinalityPrecheckUnavailableTotal counts finality pre-checks skipped
+// because chain state (tip/headers via chaintracks) was unavailable. The
+// gate fails open — teranode remains the authority — so a sustained rate
+// here means non-final txs are once again bouncing off the network with
+// generic errors instead of being caught at intake.
+var APIFinalityPrecheckUnavailableTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "arcade_api_finality_precheck_unavailable_total",
+	Help: "Finality pre-checks skipped (failed open) because chain state was unavailable.",
+})
+
 // StuckTransientTxs counts transactions sitting in a transient status
 // (RECEIVED, ACCEPTED_BY_NETWORK) for longer than the stale-transient
 // threshold (1h), within the reaper's 24h scan lookback. Unlike
