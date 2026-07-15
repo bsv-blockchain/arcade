@@ -1,0 +1,64 @@
+# Shared arcade config for the local podman-compose stack — compose analogue
+# of bsva-infra-flux/apps/base/arcade-v2/teratestnet/configmap.yaml, adapted
+# to compose service hostnames. Mounted read-only at /etc/arcade/config.yaml
+# in all seven arcade containers.
+#
+# Deliberately NOT named config.yaml: .gitignore ignores that name at any
+# depth, and arcade's own config discovery (./config.yaml, /etc/arcade) can
+# never pick this file up from a host-run binary.
+
+log_level: debug
+network: teratestnet
+
+# Dev-only shared secret, distinct from any production token. arcade forwards
+# it to merkle-service per tx registration; merkle-service presents it as
+# `Authorization: Bearer` when delivering callbacks to callback_url below.
+callback_token: 1f2e3d4c5b6a79880102030405060708090a0b0c0d0e0f101112131415161718
+
+# k8s points this at the public ingress; in compose merkle-service reaches
+# api-server directly on the bridge network (requires
+# CALLBACK_ALLOW_PRIVATE_IPS=true on merkle-service, set in docker-compose.yaml).
+callback_url: http://api-server:8080/api/v1/merkle-service/callback
+
+kafka:
+  brokers:
+    - redpanda:9092
+
+events:
+  subscriber_buffer: 16384
+
+bump_builder:
+  # Grace wait before a BLOCK_PROCESSED looks up its STUMPs, to absorb a
+  # STUMP that is delivered slightly after its block's BLOCK_PROCESSED.
+  # 15000ms mirrors the teratestnet overlay (down from the 30000ms default).
+  grace_window_ms: 15000
+
+store:
+  backend: postgres
+  postgres:
+    dsn: postgres://arcade:arcade@postgres:5432/arcade?sslmode=disable&pool_max_conn_idle_time=60s&pool_max_conn_lifetime=15m
+    max_conns: 25
+
+datahub_urls:
+  - https://teranode-eks-ttn-eu-1.bsvb.tech/api/v1
+  - http://bsva-ovh-teranode-ttn-eu-2.bsvb.tech:8000/api/v1
+
+p2p:
+  datahub_discovery: true
+  allow_private_urls: false
+
+validator:
+  accept_zero_fee: true
+
+merkle_service:
+  url: http://merkle-service:8080
+
+# Every chaintracks consumer (bump-builder header lookups, the validator
+# finality gate in api-server) reads headers from the chaintracks service
+# over HTTP. Base URL only, no path — same shape as the k8s
+# ARCADE_CHAINTRACKS_URL env. In k8s this wiring is env-injected per
+# deployment; the chaintracks container overrides mode to embedded via
+# ARCADE_CHAINTRACKS_MODE.
+chaintracks:
+  mode: remote
+  url: http://chaintracks:8083

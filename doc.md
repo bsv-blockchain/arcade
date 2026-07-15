@@ -74,13 +74,29 @@ This profile uses:
 - Pebble embedded KV (no Aerospike/Postgres)
 - libp2p with Teranode bootstrap peers for discovery (optional)
 
-### Docker / Podman compose
+### Docker / Podman compose (microservices)
+
+`docker-compose.yaml` mirrors the Kubernetes deployment in
+`bsva-infra-flux/apps/base/arcade-v2` (teratestnet overlay), one replica each:
+the seven arcade services (`api-server`, `propagation`, `bump-builder`, `sse`,
+`chaintracks`, `watchdog`, `p2p-client`) as separate `--mode` containers, plus
+Redpanda (topics pre-created by `compose/topic-init.sh`), Postgres,
+merkle-service (with its own Postgres), and the OTel collector. The shared
+service config lives in `compose/arcade-config.yaml`, mounted at
+`/etc/arcade/config.yaml` in every arcade container.
 
 ```bash
-make docker-up         # brings up aerospike + kafka + zookeeper
-make run               # runs arcade with config.yaml
+make docker-up                            # published ghcr.io/bsv-blockchain/arcade:latest
+ARCADE_IMAGE=arcade:local make docker-up  # your working tree, after `make docker-build`
 make docker-down
 ```
+
+Published ports: api-server `8080`, sse `8082`, chaintracks `8083`,
+merkle-service `18080`, postgres `15432`/`15433`, Redpanda Kafka `19092`
+(admin `19644`), OTLP `4317`/`4318`.
+
+`make run` remains the standalone single-binary path (`mode: all`, no
+containers needed with the standalone config).
 
 ### Build and test
 
