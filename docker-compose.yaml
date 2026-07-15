@@ -1,54 +1,184 @@
+# Local microservices stack — compose analogue of the Kubernetes deployment in
+# bsva-infra-flux/apps/base/arcade-v2 (teratestnet overlay), one replica each.
+#
+#   make docker-up                            # ghcr.io/bsv-blockchain/arcade:latest
+#   ARCADE_IMAGE=arcade:local make docker-up  # after `make docker-build`
+#
+# Arcade containers are distroless (no shell/curl) so they cannot carry compose
+# healthchecks; ordering gates on infra healthchecks + topic-init, and
+# `restart: on-failure` converges the rest (arcade fails fast when
+# kafka/store/topics are not ready).
+
+# Never group into a shared pod: all seven arcade services bind 8081 (health)
+# and both postgreses bind 5432 — collisions in a shared netns.
+x-podman:
+  in_pod: false
+
+# Compose analogue of the arcade-v2-env ConfigMap (_base/telemetry-env.yaml)
+# plus per-deployment OTEL env; HOST_IP node agent replaced by otel-collector.
+x-arcade-env: &arcade-env
+  ARCADE_TELEMETRY_ENABLED: "true"
+  ARCADE_TELEMETRY_INSECURE: "true"
+  ARCADE_TELEMETRY_SAMPLE_RATIO: "0.1"
+  OTEL_METRIC_EXPORT_INTERVAL: "15000"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+  OTEL_RESOURCE_ATTRIBUTES: "service.namespace=arcade-compose"
+
+# Every mode's bootstrap connects to Kafka AND the store and verifies topics
+# (hard-failing unless arcade.propagation has exactly 1 partition).
+x-arcade-depends: &arcade-depends
+  redpanda:
+    condition: service_healthy
+  topic-init:
+    condition: service_completed_successfully
+  postgres:
+    condition: service_healthy
+
+# The shared config mount uses :z (shared SELinux label): it is mounted into
+# seven containers, and :Z's private per-container label would let the
+# last-started container lock the others out. Single-consumer mounts keep :Z.
+x-arcade-common: &arcade-common
+  image: ${ARCADE_IMAGE:-ghcr.io/bsv-blockchain/arcade:latest}
+  volumes:
+    - ./compose/arcade-config.yaml:/etc/arcade/config.yaml:ro,z
+  networks:
+    - arcade-net
+  restart: on-failure
+  depends_on:
+    <<: *arcade-depends
+
 services:
-  aerospike:
-    image: docker.io/aerospike/aerospike-server:latest
+  # --- Infrastructure -------------------------------------------------------
+
+  # Mirrors _base/redpanda.yaml: kafka API 9092, TLS off. Dual listeners:
+  # internal for containers, external published for host tools.
+  # docker.io mirror of docker.redpanda.com/redpandadata/redpanda — the
+  # vendor registry stalls podman pulls from some networks.
+  redpanda:
+    image: docker.io/redpandadata/redpanda:v26.1.9
+    command:
+      - redpanda
+      - start
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --rpc-addr=redpanda:33145
+      - --advertise-rpc-addr=redpanda:33145
+      - --mode=dev-container
+      - --smp=1
+      - --default-log-level=info
     ports:
-      - "3200:3000"
-      - "3201:3001"
-      - "3202:3002"
+      - "19092:19092"   # host tools: rpk -X brokers=localhost:19092
+      - "19644:9644"    # admin API
     volumes:
-      - aerospike-data:/opt/aerospike/data:Z
-      - ./aerospike.conf:/opt/aerospike/etc/aerospike.conf:Z
-    command: ["--config-file", "/opt/aerospike/etc/aerospike.conf"]
+      - redpanda-data:/var/lib/redpanda/data:Z
     networks:
       - arcade-net
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
 
-  zookeeper:
-    image: docker.io/confluentinc/cp-zookeeper:7.6.0
-    environment:
-      ZOOKEEPER_CLIENT_PORT: "2181"
-      ZOOKEEPER_TICK_TIME: "2000"
-    ports:
-      - "2181:2181"
+  # One-shot analogue of _base/topics.yaml; see compose/topic-init.sh.
+  topic-init:
+    image: docker.io/redpandadata/redpanda:v26.1.9
+    entrypoint: ["/bin/bash", "/topic-init.sh"]
+    volumes:
+      - ./compose/topic-init.sh:/topic-init.sh:ro,Z
     networks:
       - arcade-net
-
-  kafka:
-    image: docker.io/confluentinc/cp-kafka:7.6.0
+    restart: "no"
     depends_on:
-      - zookeeper
-    ports:
-      - "9492:9492"
+      redpanda:
+        condition: service_healthy
+
+  # Mirrors _base/postgres.yaml. max_connections=500 is load-bearing:
+  # 7 services x max_conns 25 = 175 > the alpine default of 100. The other
+  # k8s tuning flags (2GB shared_buffers etc.) are dropped — laptop-sized.
+  postgres:
+    image: docker.io/library/postgres:16-alpine
+    command: ["-c", "max_connections=500"]
     environment:
-      KAFKA_BROKER_ID: "1"
-      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT"
-      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9492"
-      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9492"
-      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      POSTGRES_DB: arcade
+      POSTGRES_USER: arcade
+      POSTGRES_PASSWORD: arcade
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "15432:5432"    # 5432 left free for a host postgres
+    volumes:
+      - postgres-data:/var/lib/postgresql/data:Z
     networks:
       - arcade-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U arcade -d arcade"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
 
-  # Local validation collector for the OTEL telemetry pipeline (see
-  # docs/plans/otel-integration.md and tools/otel-collector.yaml). Not
-  # required for normal development: telemetry defaults to disabled, and
-  # arcade behaves identically whether or not this service is running.
-  # Enable telemetry against it with
-  #   ARCADE_TELEMETRY_ENABLED=true ARCADE_TELEMETRY_ENDPOINT=localhost:4317
-  # (or the standard OTEL_EXPORTER_OTLP_ENDPOINT=http://$(HOST_IP):4317 in a
-  # cluster where the collector runs as a node-local agent), then
-  # `docker compose logs otel-collector` to see traces/metrics land.
+  # merkle-service's own database (never shared with arcade's; postgres:17
+  # matches tests/e2e/harness/containers.go).
+  merkle-postgres:
+    image: docker.io/library/postgres:17-alpine
+    environment:
+      POSTGRES_DB: merkle
+      POSTGRES_USER: merkle
+      POSTGRES_PASSWORD: merkle
+    ports:
+      - "15433:5432"
+    volumes:
+      - merkle-postgres-data:/var/lib/postgresql/data:Z
+    networks:
+      - arcade-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U merkle -d merkle"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  # In k8s this is a separate app arcade calls over HTTP; included here so the
+  # tx lifecycle works locally. Env layout proven by
+  # tests/e2e/harness/containers.go:227-263; p2p values from the
+  # merkle-service teratestnet configmap. Image digest = v0.2.5, same pin as
+  # the e2e suite (`:latest` has regressed the BLOCK_PROCESSED round-trip).
+  # CALLBACK_ALLOW_PRIVATE_IPS=true is REQUIRED: http://api-server:8080 is
+  # RFC1918 and merkle-service's SSRF guard would otherwise reject it. arcade
+  # forwards callback_url + callback_token per tx registration.
+  merkle-service:
+    image: ${MERKLE_IMAGE:-ghcr.io/bsv-blockchain/merkle-service@sha256:ff4ae409df2680c54267c27887dc1744fb3b64e5ddc5636882185ce82b35ced3}
+    environment:
+      MODE: all-in-one
+      LOG_LEVEL: info
+      STORE_BACKEND: sql
+      STORE_SQL_DRIVER: postgres
+      STORE_SQL_DSN: postgres://merkle:merkle@merkle-postgres:5432/merkle?sslmode=disable
+      KAFKA_BROKERS: redpanda:9092
+      P2P_NETWORK: teratestnet
+      P2P_BOOTSTRAP_PEERS: /dnsaddr/teratestnet.bootstrap.teranode.bsvb.tech
+      P2P_DHT_MODE: "off"
+      P2P_ENABLE_NAT: "false"
+      P2P_ENABLE_MDNS: "false"
+      CALLBACK_ALLOW_PRIVATE_IPS: "true"
+      DATAHUB_ALLOW_PRIVATE_IPS: "true"
+      BLOB_STORE_URL: "memory:"
+    ports:
+      - "18080:8080"    # health/debug from the host (8080 is taken by api-server)
+    networks:
+      - arcade-net
+    depends_on:
+      merkle-postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    restart: on-failure
+
+  # OTLP sink for the telemetry env above (tools/otel-collector.yaml
+  # unchanged; debug exporter dumps traces/metrics to its logs).
   otel-collector:
     image: docker.io/otel/opentelemetry-collector-contrib:0.142.0
     command: ["--config=/etc/otel-collector.yaml"]
@@ -59,10 +189,99 @@ services:
       - "4318:4318"
     networks:
       - arcade-net
+    restart: unless-stopped
+
+  # --- Arcade services: same image, role via --mode (mirrors _base/*.yaml) ---
+
+  # http 8080; health/ready/metrics are on 8080 in this mode (not 8081).
+  api-server:
+    <<: *arcade-common
+    command: ["--mode", "api-server"]
+    environment:
+      <<: *arcade-env
+      OTEL_SERVICE_NAME: arcade-api-server
+    ports:
+      - "8080:8080"
+    depends_on:
+      <<: *arcade-depends
+      chaintracks:
+        condition: service_started
+      merkle-service:
+        condition: service_started
+
+  propagation:            # health 8081 only (unpublished)
+    <<: *arcade-common
+    command: ["--mode", "propagation"]
+    environment:
+      <<: *arcade-env
+      OTEL_SERVICE_NAME: arcade-propagation
+
+  # Mirrors _base/bump-builder.yaml env: header lookups against the
+  # chaintracks service instead of an embedded ChainManager.
+  bump-builder:           # health 8081 (unpublished)
+    <<: *arcade-common
+    command: ["--mode", "bump-builder"]
+    environment:
+      <<: *arcade-env
+      OTEL_SERVICE_NAME: arcade-bump-builder
+      ARCADE_CHAINTRACKS_MODE: remote
+      ARCADE_CHAINTRACKS_URL: http://chaintracks:8083
+    depends_on:
+      <<: *arcade-depends
+      chaintracks:
+        condition: service_started
+
+  # GOMEMLIMIT mirrors _base/sse.yaml (kafka backlog replay bursts).
+  sse:                    # http 8082 (SSE + /health /ready on same port)
+    <<: *arcade-common
+    command: ["--mode", "sse"]
+    environment:
+      <<: *arcade-env
+      OTEL_SERVICE_NAME: arcade-sse
+      GOMEMLIMIT: 400MiB
+    ports:
+      - "8082:8082"
+
+  # Env pins THIS process to embedded mode (owns the header store) while the
+  # shared config points every other consumer at it via remote mode. Named
+  # volume persists synced headers across down/up — deviation from k8s (which
+  # re-syncs per pod restart); cheap local QoL. volumes restated because YAML
+  # merge keys do not merge lists.
+  chaintracks:            # http 8083 (+8081 health, unpublished)
+    <<: *arcade-common
+    command: ["--mode", "chaintracks"]
+    environment:
+      <<: *arcade-env
+      OTEL_SERVICE_NAME: arcade-chaintracks
+      ARCADE_CHAINTRACKS_MODE: embedded
+    ports:
+      - "8083:8083"
+    volumes:
+      - ./compose/arcade-config.yaml:/etc/arcade/config.yaml:ro,z
+      - chaintracks-data:/root/.arcade:Z
+
+  watchdog:               # health 8081 only (unpublished)
+    <<: *arcade-common
+    command: ["--mode", "watchdog"]
+    environment:
+      <<: *arcade-env
+      OTEL_SERVICE_NAME: arcade-watchdog
+
+  # libp2p 9905 NOT published — k8s exposes no Service for it (outbound-only
+  # discovery). Fresh peer key per recreate, same as the no-PVC k8s pod.
+  p2p-client:
+    <<: *arcade-common
+    command: ["--mode", "p2p-client"]
+    environment:
+      <<: *arcade-env
+      OTEL_SERVICE_NAME: arcade-p2p-client
 
 networks:
   arcade-net:
     driver: bridge
 
 volumes:
-  aerospike-data:
+  redpanda-data:
+  postgres-data:
+  merkle-postgres-data:
+  chaintracks-data:
