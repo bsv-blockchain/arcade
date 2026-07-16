@@ -257,7 +257,8 @@ This is what makes Teranode-native broadcast and proof retrieval practical at th
 
 ## Resources
 
-- **Merkle Service:** https://github.com/galt-tr/merkle-service
-- **Arcade v2:** https://github.com/galt-tr/arcade-refactor
-- **Full design document:** https://github.com/galt-tr/merkle-service/blob/master/docs/design.md
+- **Merkle Service:** https://github.com/bsv-blockchain/merkle-service
+- **Arcade v2:** https://github.com/bsv-blockchain/arcade-refactor
+- **Full design document:** https://github.com/bsv-blockchain/merkle-service/blob/master/docs/design.md
 - **ARC (the predecessor Arcade was built to replace):** https://github.com/bsv-blockchain/arc
+- **Swimlane Diagram** https://github.com/bsv-blockchain/arcade/blob/main/docs/swimlanes.png
