@@ -258,23 +258,29 @@ var OldestTransientTxAge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 // ---------------------------------------------------------------------------
 
 // BumpBuilderBuildDuration measures end-to-end wall time from BLOCK_PROCESSED
-// receipt (after grace window) to BUMP persisted.
+// receipt to terminal disposition — including the grace-window wait when one
+// was needed (completeness-first ordering skips the wait entirely when
+// merkle's expected-STUMP set is already satisfied on arrival).
 //
-// Every terminal disposition of handleMessage lands here exactly once. Only
-// `success` means a BUMP was built and persisted. Three outcomes are benign
-// non-failures: `short_circuited` (a BUMP already existed, so a redelivery was
-// skipped), `no_stumps` (block contains no tracked txs) and `context_canceled`
+// Every terminal disposition of handleMessage lands here exactly once. Two
+// outcomes mean a BUMP was built and persisted: `finalized_complete_no_grace`
+// (expected-STUMP set complete on the first read — no grace wait) and
+// `grace_waited` (built via the grace-window path; also stamped when the
+// window is configured to 0). Three more are benign non-failures:
+// `short_circuited` (a BUMP already existed, so a redelivery was skipped),
+// `no_stumps` (block contains no tracked txs) and `context_canceled`
 // (shutdown). The rest are failures:
 //
-//	parse_failed, incomplete_stumps, fetch_failed, no_subtrees,
+//	parse_failed, deferred_incomplete, fetch_failed, no_subtrees,
 //	build_failed, validation_failed, store_failed
 //
 // Alert by matching the failure outcomes positively — outcome=~"parse_failed|
-// incomplete_stumps|fetch_failed|no_subtrees|build_failed|validation_failed|
-// store_failed" (the list above). Do NOT write outcome!="success": besides
-// success, it also matches the benign short_circuited/no_stumps/context_canceled,
-// and it silently starts matching any new benign outcome someone adds. Keep this
-// list and the rule in README.md in sync when adding an outcome.
+// deferred_incomplete|fetch_failed|no_subtrees|build_failed|validation_failed|
+// store_failed" (the list above). Do NOT negate the benign labels (e.g.
+// outcome!~"finalized_complete_no_grace|grace_waited"): a negation also
+// matches short_circuited/no_stumps/context_canceled, and it silently starts
+// matching any new benign outcome someone adds. Keep this list and the rule
+// in README.md in sync when adding an outcome.
 var BumpBuilderBuildDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Name:    "arcade_bump_builder_build_duration_seconds",
 	Help:    "Time to build and persist one compound BUMP, by outcome.",
@@ -321,11 +327,16 @@ var BumpBuilderBlockDataSourceTotal = promauto.NewCounterVec(prometheus.CounterO
 	Help: "Block data source used for compound BUMP construction, by source (callback|datahub).",
 }, []string{"source"})
 
-// BumpBuilderGraceWaitTotal counts how often the grace window was respected.
-// (Almost always; useful as a smoke metric.)
+// BumpBuilderGraceWaitTotal counts BLOCK_PROCESSED handlers that actually
+// waited the grace window before re-reading STUMPs — i.e. completeness could
+// not be verified from the first STUMP read (expected set unsatisfied, or
+// absent with STUMPs present). Handlers whose expected-STUMP set was already
+// complete on arrival skip the wait and never increment this, so the ratio of
+// this counter to blocks_processed_total tracks how often the window still
+// earns its latency cost.
 var BumpBuilderGraceWaitTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "arcade_bump_builder_grace_window_waits_total",
-	Help: "BLOCK_PROCESSED handlers that waited the grace window before reading STUMPs.",
+	Help: "BLOCK_PROCESSED handlers that waited the grace window before re-reading STUMPs.",
 })
 
 // BumpBuilderEmptyStumpBlocksTotal counts BLOCK_PROCESSED messages that
@@ -345,7 +356,9 @@ var BumpBuilderEmptyStumpBlocksTotal = promauto.NewCounter(prometheus.CounterOpt
 // was NOT fully satisfied by the STUMPs arcade had stored once the grace window
 // elapsed. Such a block is deliberately left un-finalized (processed_at stays
 // NULL) so the watchdog re-drives it via merkle's /reprocess, which re-emits the
-// missing STUMPs and BLOCK_PROCESSED. This is the metric that makes the
+// missing STUMPs and BLOCK_PROCESSED. On BumpBuilderBuildDuration these land
+// as outcome="deferred_incomplete" (renamed from "incomplete_stumps" when
+// completeness-first grace handling landed). This is the metric that makes the
 // previously-silent partial-STUMP drop visible: unlike the all-missing case
 // (empty_stump_blocks_total), a block missing only SOME of its STUMPs used to
 // build a valid-looking BUMP and lose the absent subtree's txs with no signal.

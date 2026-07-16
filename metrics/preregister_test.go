@@ -97,6 +97,32 @@ func TestPreRegisterTxSubmissionsCreatesAllRouteResultChildrenAtZero(t *testing.
 	}
 }
 
+// TestBumpOutcomesIncludeGraceDispositions pins the outcome-label migration
+// that landed with completeness-first grace handling: the flat `success`
+// label split into the two benign build dispositions
+// (`finalized_complete_no_grace` when the expected-STUMP set was already
+// complete on arrival, `grace_waited` otherwise), and the failure label
+// `incomplete_stumps` was renamed `deferred_incomplete`. The closed set must
+// carry the new labels — and must NOT resurrect the retired ones, or the
+// pre-registration guarantee (and the alert recipe in README.md) silently
+// diverges from what builder.go actually stamps.
+func TestBumpOutcomesIncludeGraceDispositions(t *testing.T) {
+	got := make(map[string]bool, len(bumpBuildOutcomes))
+	for _, o := range bumpBuildOutcomes {
+		got[o] = true
+	}
+	for _, want := range []string{"finalized_complete_no_grace", "grace_waited", "deferred_incomplete"} {
+		if !got[want] {
+			t.Errorf("bumpBuildOutcomes missing %q", want)
+		}
+	}
+	for _, retired := range []string{"success", "incomplete_stumps"} {
+		if got[retired] {
+			t.Errorf("bumpBuildOutcomes still contains retired label %q", retired)
+		}
+	}
+}
+
 func TestPreRegisterBumpOutcomesCreatesEveryOutcomeChildAtZero(t *testing.T) {
 	PreRegisterBumpOutcomes()
 
