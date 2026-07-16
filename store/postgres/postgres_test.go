@@ -1300,6 +1300,57 @@ func TestBlockProcessing_ListStale_FiltersAndOrders(t *testing.T) {
 	}
 }
 
+// TestBlockProcessing_ListStale_ExcludesFinalizedEmptyBlock pins the
+// watchdog-interplay contract for empty-block finalization: bump-builder
+// finalizes a zero-STUMP block with MarkBlockProcessed(hash, 0, now) — height
+// 0 because no compound was built — and that exact call must (a) remove the
+// row from ListStaleBlockProcessingStatus (the stale predicate keys on
+// processed_at IS NULL, NOT on bump_built_at) so the watchdog never re-drives
+// a complete empty block, and (b) preserve the chaintracks-supplied height on
+// conflict. A future predicate change (e.g. adding bump_built_at IS NULL)
+// would silently resurrect the empty-block re-drive storm; this test makes
+// that loud.
+func TestBlockProcessing_ListStale_ExcludesFinalizedEmptyBlock(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	baseSeen := time.Unix(1700003000, 0).UTC()
+	threshold := baseSeen.Add(5 * time.Minute) // anything < threshold is stale
+
+	// Empty-block finalize: header seen, then the exact bump-builder call.
+	if err := s.UpsertBlockHeaderSeen(ctx, "empty-finalized", 300, baseSeen); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkBlockProcessed(ctx, "empty-finalized", 0, baseSeen.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Control: identical header-seen row without the stamp must still surface.
+	if err := s.UpsertBlockHeaderSeen(ctx, "still-stale", 310, baseSeen); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.ListStaleBlockProcessingStatus(ctx, threshold, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].BlockHash != "still-stale" {
+		t.Errorf("finalized empty block must be excluded from the stale scan, got %v", hashesOf(rows))
+	}
+
+	// The height-0 stamp must not clobber the chaintracks-supplied height:
+	// the upsert's conflict clause only writes processed_at.
+	all, err := s.ListBlockProcessingStatus(ctx, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range all {
+		if r.BlockHash == "empty-finalized" && r.BlockHeight != 300 {
+			t.Errorf("empty-block finalize clobbered block_height: got %d, want 300", r.BlockHeight)
+		}
+	}
+}
+
 func hashesOf(rows []*models.BlockProcessingStatus) []string {
 	out := make([]string, len(rows))
 	for i, r := range rows {

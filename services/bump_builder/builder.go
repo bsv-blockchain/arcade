@@ -442,9 +442,14 @@ func (b *Builder) Stop() error {
 func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	overallStart := time.Now()
 	metrics.BumpBuilderBlocksProcessedTotal.Inc()
-	// outcome reflects the terminal disposition of this BLOCK_PROCESSED. Set
-	// before each return so the duration histogram lands in the right bucket.
-	outcome := "success"
+	// outcome reflects the terminal disposition of this BLOCK_PROCESSED. Every
+	// return path assigns it before returning so the duration histogram lands
+	// in the right bucket. There is no bare "success" label: a successful
+	// build lands as finalized_complete_no_grace (expected-STUMP set already
+	// complete on arrival, grace window skipped) or grace_waited (built after
+	// the grace-window path). The label set is closed — keep it in sync with
+	// metrics/preregister.go's bumpBuildOutcomes.
+	outcome := "grace_waited"
 	defer func() {
 		metrics.BumpBuilderBuildDuration.WithLabelValues(outcome).Observe(time.Since(overallStart).Seconds())
 	}()
@@ -471,71 +476,23 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 		return nil
 	}
 
-	// Grace window: merkle-service's stumpGate only waits for the first HTTP attempt
-	// of each STUMP before releasing BLOCK_PROCESSED. STUMPs that got a 5xx on the
-	// first attempt retry asynchronously and may land after BLOCK_PROCESSED.
-	if grace := time.Duration(b.cfg.BumpBuilder.GraceWindowMs) * time.Millisecond; grace > 0 {
-		metrics.BumpBuilderGraceWaitTotal.Inc()
-		logger.Debug("waiting grace window", zap.Duration("duration", grace))
-		select {
-		case <-ctx.Done():
-			outcome = "context_canceled"
-			return ctx.Err()
-		case <-time.After(grace):
-		}
-	}
-
-	// 1. Get all STUMPs for this block
-	stumps, err := b.store.GetStumpsByBlockHash(ctx, blockHash)
+	// Resolve the STUMP set with completeness-first ordering: STUMPs are read
+	// BEFORE any grace-window wait, so a block whose expected-STUMP set is
+	// already complete (or provably empty) finalizes immediately instead of
+	// burning the window. Only an unverifiable set still waits + re-reads.
+	// See resolveStumps for the full contract.
+	stumps, disposition, done, err := b.resolveStumps(ctx, logger, &callback)
 	if err != nil {
-		outcome = "store_failed"
-		return fmt.Errorf("getting STUMPs for block: %w", err)
+		outcome = disposition
+		return err
 	}
-
-	metrics.BumpBuilderStumpCount.Observe(float64(len(stumps)))
-
-	// Completeness gate. merkle-service (PR #162) tells us exactly which subtree
-	// indices produced a STUMP for this block. If any are still missing once the
-	// grace window has elapsed, leave the block un-finalized: do NOT stamp
-	// processed_at, so ListStaleBlockProcessingStatus surfaces it and the
-	// watchdog re-drives it via /reprocess (which re-emits the missing STUMPs and
-	// BLOCK_PROCESSED). Returning nil — not an error — because a Kafka requeue
-	// would just replay against the same gap; only /reprocess can fill it, and
-	// the durable processed_at IS NULL is the recovery signal. An empty/absent
-	// expected set (pre-#162 merkle, or a block with no tracked txs) yields no
-	// missing indices and falls through to the existing behavior below.
-	if missing := missingStumpIndices(callback.ExpectedSubtreeIndices, stumps); len(missing) > 0 {
-		outcome = "incomplete_stumps"
-		metrics.BumpBuilderIncompleteStumpsTotal.Inc()
-		logger.Error(
-			"BLOCK_PROCESSED is missing expected STUMPs — deferring finalization so the watchdog can recover via /reprocess",
-			zap.Ints("missing_subtree_indices", missing),
-			zap.Int("expected_stumps", len(callback.ExpectedSubtreeIndices)),
-			zap.Int("received_stumps", len(stumps)),
-		)
+	if done {
+		outcome = disposition
 		return nil
 	}
-
-	if len(stumps) == 0 {
-		outcome = "no_stumps"
-		metrics.BumpBuilderEmptyStumpBlocksTotal.Inc()
-		// Warn — not Info — because the legitimate case (block contains no
-		// tracked txs) is indistinguishable from the silent-drop case
-		// (STUMP callbacks were dedup'd / DLQ'd / lost upstream). Operators
-		// need to see this rate in logs; a sustained stream while watched
-		// txs are in flight is the signal that merkle-service callbacks
-		// aren't landing.
-		//
-		// Reaching here means the expected set was empty (a non-empty set with
-		// zero received STUMPs would have been caught by the completeness gate
-		// above), so this block has no tracked txs and IS finalized — stamp
-		// processed_at so the watchdog doesn't keep re-driving a complete block.
-		// blockHeight is unknown on this path (no compound built); pass 0, which
-		// the upsert leaves the chaintracks-supplied height intact on conflict.
-		logger.Warn("BLOCK_PROCESSED arrived with zero STUMPs for this block — either no tracked txs in this block, or upstream STUMP callbacks were dropped (check merkle-service callback delivery)")
-		b.markBlockProcessed(ctx, logger, blockHash, 0)
-		return nil
-	}
+	// The build proceeds under its benign disposition; any later failure
+	// return overrides outcome with its failure label.
+	outcome = disposition
 
 	logger.Info("building compound BUMP", zap.Int("stump_count", len(stumps)))
 	logStumpInputs(logger, stumps)
@@ -655,6 +612,138 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 		zap.Int("stumps_pruned", len(stumps)),
 	)
 	return nil
+}
+
+// resolveStumps decides which STUMP set handleMessage builds from and whether
+// the grace window has to be waited at all. Extracted from handleMessage to
+// keep its nesting under the lint bar (same motivation as tryShortCircuit).
+//
+// Completeness-first ordering: STUMPs are read BEFORE the grace window.
+// merkle-service (PR #162) tells us exactly which subtree indices produced a
+// STUMP for this block, and the grace window exists only to ride out STUMP
+// callbacks whose first HTTP attempt got a 5xx and are retrying
+// asynchronously (merkle's stumpGate only waits for the first attempt before
+// releasing BLOCK_PROCESSED). So:
+//
+//   - Expected set present and fully satisfied → nothing can still be in
+//     flight that we need; skip the window and build now
+//     (disposition finalized_complete_no_grace).
+//   - Expected set absent AND zero STUMPs stored → merkle ≥ v0.4.5 omits the
+//     field exactly when the block has no tracked txs, so "expect zero, have
+//     zero" is complete; finalize immediately (disposition no_stumps,
+//     done=true).
+//   - Anything else (expected set unsatisfied, or absent with STUMPs present
+//     — pre-#162 merkle, unverifiable) → wait the grace window, re-read, and
+//     re-run the completeness gate (disposition grace_waited on success).
+//
+// The returned disposition is always a valid outcome label for
+// BumpBuilderBuildDuration: on err it is the failure label to stamp; with
+// done=true it is the terminal benign/failure label and handleMessage must
+// return nil; otherwise it is the benign label the successful build lands
+// under. BumpBuilderStumpCount is observed exactly once per message, on the
+// STUMP set that reaches the decision.
+func (b *Builder) resolveStumps(ctx context.Context, logger *zap.Logger, callback *models.CallbackMessage) (stumps []*models.Stump, disposition string, done bool, err error) {
+	blockHash := callback.BlockHash
+	expected := callback.ExpectedSubtreeIndices
+
+	stumps, err = b.store.GetStumpsByBlockHash(ctx, blockHash)
+	if err != nil {
+		return nil, "store_failed", false, fmt.Errorf("getting STUMPs for block: %w", err)
+	}
+
+	switch {
+	case len(expected) > 0 && len(missingStumpIndices(expected, stumps)) == 0:
+		// Complete: every subtree index merkle told us to expect already has
+		// a stored STUMP — there is nothing left to wait for.
+		logger.Info(
+			"expected STUMP set complete — skipping grace window",
+			zap.Int("expected_stumps", len(expected)),
+			zap.Int("received_stumps", len(stumps)),
+		)
+		metrics.BumpBuilderStumpCount.Observe(float64(len(stumps)))
+		return stumps, "finalized_complete_no_grace", false, nil
+
+	case len(expected) == 0 && len(stumps) == 0:
+		// Absent + zero: complete by the absent-means-expect-zero contract —
+		// finalize now instead of burning the grace window first.
+		metrics.BumpBuilderStumpCount.Observe(0)
+		b.finalizeEmptyBlock(ctx, logger, blockHash)
+		return nil, "no_stumps", true, nil
+	}
+
+	// Incomplete (expected set not yet satisfied) or absent-with-STUMPs (no
+	// set to verify against): completeness cannot be established from the
+	// first read, so the grace window is still the only defense against late
+	// STUMP retries.
+	if len(expected) == 0 {
+		logger.Warn(
+			"BLOCK_PROCESSED lacks expected-STUMP set but STUMPs exist — cannot verify completeness; waiting grace window",
+			zap.Int("received_stumps", len(stumps)),
+		)
+	}
+	if grace := time.Duration(b.cfg.BumpBuilder.GraceWindowMs) * time.Millisecond; grace > 0 {
+		metrics.BumpBuilderGraceWaitTotal.Inc()
+		logger.Debug("waiting grace window", zap.Duration("duration", grace))
+		select {
+		case <-ctx.Done():
+			return nil, "context_canceled", false, ctx.Err()
+		case <-time.After(grace):
+		}
+		// Re-read: catching late arrivals is the whole point of the wait.
+		stumps, err = b.store.GetStumpsByBlockHash(ctx, blockHash)
+		if err != nil {
+			return nil, "store_failed", false, fmt.Errorf("getting STUMPs for block: %w", err)
+		}
+	}
+
+	metrics.BumpBuilderStumpCount.Observe(float64(len(stumps)))
+
+	// Completeness gate. If expected STUMPs are still missing once the grace
+	// window has elapsed, leave the block un-finalized: do NOT stamp
+	// processed_at, so ListStaleBlockProcessingStatus surfaces it and the
+	// watchdog re-drives it via /reprocess (which re-emits the missing STUMPs
+	// and BLOCK_PROCESSED). Returning done — not an error — because a Kafka
+	// requeue would just replay against the same gap; only /reprocess can fill
+	// it, and the durable processed_at IS NULL is the recovery signal.
+	if missing := missingStumpIndices(expected, stumps); len(missing) > 0 {
+		metrics.BumpBuilderIncompleteStumpsTotal.Inc()
+		logger.Error(
+			"BLOCK_PROCESSED is missing expected STUMPs — deferring finalization so the watchdog can recover via /reprocess",
+			zap.Ints("missing_subtree_indices", missing),
+			zap.Int("expected_stumps", len(expected)),
+			zap.Int("received_stumps", len(stumps)),
+		)
+		return nil, "deferred_incomplete", true, nil
+	}
+
+	// Zero STUMPs after the wait — only reachable with an absent expected set
+	// (a non-empty set with zero STUMPs is caught by the gate above): the
+	// pre-#162 no-tracked-tx block. Same empty-block finalize.
+	if len(stumps) == 0 {
+		b.finalizeEmptyBlock(ctx, logger, blockHash)
+		return nil, "no_stumps", true, nil
+	}
+
+	return stumps, "grace_waited", false, nil
+}
+
+// finalizeEmptyBlock finalizes a BLOCK_PROCESSED whose block has no stored
+// STUMPs and no unsatisfied expected set — a block with no tracked txs.
+//
+// Warn — not Info — because the legitimate case (block contains no tracked
+// txs) is indistinguishable from the silent-drop case (STUMP callbacks were
+// dedup'd / DLQ'd / lost upstream). Operators need to see this rate in logs;
+// a sustained stream while watched txs are in flight is the signal that
+// merkle-service callbacks aren't landing.
+//
+// The block IS finalized — stamp processed_at so the watchdog doesn't keep
+// re-driving a complete block. blockHeight is unknown on this path (no
+// compound built); pass 0, which the upsert leaves the chaintracks-supplied
+// height intact on conflict.
+func (b *Builder) finalizeEmptyBlock(ctx context.Context, logger *zap.Logger, blockHash string) {
+	metrics.BumpBuilderEmptyStumpBlocksTotal.Inc()
+	logger.Warn("BLOCK_PROCESSED arrived with zero STUMPs for this block — either no tracked txs in this block, or upstream STUMP callbacks were dropped (check merkle-service callback delivery)")
+	b.markBlockProcessed(ctx, logger, blockHash, 0)
 }
 
 // fetchBlockDataFromDatahub is the datahub fallback for block inputs: used when

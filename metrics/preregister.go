@@ -44,10 +44,13 @@ func PreRegisterTxSubmissions() {
 // exists to close, so the failure outcomes matter most here. Unexported so no
 // other package can mutate the shared slice.
 var bumpBuildOutcomes = []string{
-	// benign
-	"success", "short_circuited", "no_stumps", "context_canceled",
+	// benign — the two build dispositions (finalized_complete_no_grace when
+	// the expected-STUMP set was already complete on arrival and the grace
+	// window was skipped, grace_waited otherwise) plus the non-build ones
+	"finalized_complete_no_grace", "grace_waited",
+	"short_circuited", "no_stumps", "context_canceled",
 	// failures
-	"parse_failed", "incomplete_stumps", "fetch_failed",
+	"parse_failed", "deferred_incomplete", "fetch_failed",
 	"no_subtrees", "build_failed", "validation_failed", "store_failed",
 }
 

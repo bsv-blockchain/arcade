@@ -37,13 +37,19 @@ Alert on the failure outcomes, enumerated explicitly:
 
 ```promql
 rate(arcade_bump_builder_build_duration_seconds_count{
-  outcome=~"parse_failed|incomplete_stumps|fetch_failed|no_subtrees|build_failed|validation_failed|store_failed"
+  outcome=~"parse_failed|deferred_incomplete|fetch_failed|no_subtrees|build_failed|validation_failed|store_failed"
 }[5m]) > 0
 ```
 
-**Do not** write `{outcome!="success"}` — three outcomes are benign and would
-fire it:
+**Do not** negate the successful-build labels (e.g.
+`{outcome!~"finalized_complete_no_grace|grace_waited"}`) — five outcomes are
+benign and would fire it:
 
+- `finalized_complete_no_grace` — BUMP built; merkle's expected-STUMP set was
+  already complete on arrival, so the grace window was skipped. The common
+  case on a healthy deployment.
+- `grace_waited` — BUMP built via the grace-window path (completeness could
+  not be verified up-front).
 - `short_circuited` — a BUMP already existed, so a redelivered `BLOCK_PROCESSED`
   skipped the rebuild. Expected whenever `/reprocess` re-drives a block.
 - `no_stumps` — the block contained no tracked txs. Expected on most blocks.
@@ -52,8 +58,9 @@ fire it:
 `no_stumps` is benign *per block* but its rate is a real signal: it cannot be
 distinguished from "merkle-service STUMP callbacks were dropped". Alert on
 `arcade_bump_builder_empty_stump_blocks_total` separately, and read it next to
-`arcade_bump_builder_build_duration_seconds_count{outcome="success"}` — a high
-empty-stump rate with a near-zero success rate means STUMPs are not landing.
+`arcade_bump_builder_build_duration_seconds_count{outcome=~"finalized_complete_no_grace|grace_waited"}`
+— a high empty-stump rate with a near-zero build rate means STUMPs are not
+landing.
 
 ## Dashboard recipes
 

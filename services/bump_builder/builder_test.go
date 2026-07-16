@@ -1020,29 +1020,35 @@ func TestBuilder_HandleMessage_InvalidJSON_ReturnsError(t *testing.T) {
 	}
 }
 
-// TestBuilder_LateSTUMP_ArrivesDuringGraceWindow simulates a late-retry STUMP that
-// lands after BLOCK_PROCESSED but within the grace window. The builder should wait
-// the grace window, then find the STUMP and build the BUMP successfully.
-func TestBuilder_LateSTUMP_ArrivesDuringGraceWindow(t *testing.T) {
+// TestBuilder_LateSTUMP_AbsentExpectedSet_FinalizesWithoutWaiting pins the
+// absent-means-expect-zero semantics of completeness-first grace handling: a
+// BLOCK_PROCESSED with NO expectedSubtreeIndices field and zero stored STUMPs
+// finalizes immediately as an empty block — it does NOT wait the grace window
+// for a STUMP that might land later. merkle ≥ v0.4.5 always sends the
+// expected set when the block has tracked txs, so a late STUMP is announced
+// by an (initially unsatisfied) expected set and rides the grace window via
+// that path — see TestBuilder_HandleMessage_IncompleteThenCompleteWithinGrace_Builds,
+// which took over the mid-grace-arrival coverage this test used to provide
+// under the wait-first ordering.
+func TestBuilder_LateSTUMP_AbsentExpectedSet_FinalizesWithoutWaiting(t *testing.T) {
 	ms := newMockStore()
 	blockHash := testBlockHash
 	txidHex := testTxidHex
 
-	// Compute what the late-arriving STUMP will produce so the datahub header
-	// merkle root set up ahead of time matches the compound the builder builds
-	// after the grace window.
 	lateStump := makeMinimalSTUMP(txidHex)
-	subtreeHash := mustHash(t, txidHex)
-	root := expectedCompoundRoot(t,
-		[]*models.Stump{{BlockHash: blockHash, SubtreeIndex: 0, StumpData: lateStump}},
-		[]chainhash.Hash{subtreeHash}, nil)
-	datahub := newDatahubServer(root, []chainhash.Hash{subtreeHash})
-	defer datahub.Close()
 
-	b := newTestBuilder(ms, datahub.URL)
-	b.cfg.BumpBuilder.GraceWindowMs = 100 // short grace for the test
+	// No datahub, teranode nil: the empty-block path must finalize before any
+	// build work; reaching the fetch path would crash the test.
+	b := &Builder{
+		cfg:    &config.Config{},
+		logger: zap.NewNop().Named("bump-builder"),
+		store:  ms,
+	}
+	b.cfg.BumpBuilder.GraceWindowMs = 100
 
-	// Insert STUMP mid-grace-window from another goroutine
+	// A STUMP shows up where the old wait-first ordering would still have been
+	// inside the grace window. Under absent-means-expect-zero it arrives after
+	// the block already finalized as empty.
 	go func() {
 		time.Sleep(30 * time.Millisecond)
 		_ = ms.InsertStump(context.Background(), &models.Stump{
@@ -1052,14 +1058,21 @@ func TestBuilder_LateSTUMP_ArrivesDuringGraceWindow(t *testing.T) {
 		})
 	}()
 
+	start := time.Now()
 	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash)); err != nil {
 		t.Fatalf("expected success, got: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed >= 100*time.Millisecond {
+		t.Errorf("absent set + zero STUMPs must not wait the grace window; took %v", elapsed)
 	}
 
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
-	if _, ok := ms.bumps[blockHash]; !ok {
-		t.Error("expected BUMP to be stored after late STUMP landed in grace window")
+	if len(ms.bumps) != 0 {
+		t.Errorf("no BUMP should be built on the empty-block finalize path, got %d", len(ms.bumps))
+	}
+	if len(ms.processedCalls) != 1 || ms.processedCalls[0].blockHash != blockHash {
+		t.Errorf("expected MarkBlockProcessed(%s) on the empty-block finalize path, got %+v", blockHash, ms.processedCalls)
 	}
 }
 
