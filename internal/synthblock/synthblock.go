@@ -45,7 +45,7 @@ func Build(numTxs int, height uint64) (Block, error) {
 	for i := range leaves {
 		var seed [12]byte
 		copy(seed[:], "synthblock")
-		binary.BigEndian.PutUint16(seed[10:], uint16(i)) //nolint:gosec // test data
+		binary.BigEndian.PutUint16(seed[10:], uint16(i))
 		h := chainhash.DoubleHashH(seed[:])
 		leaves[i] = &h
 		txids[i] = h.String()

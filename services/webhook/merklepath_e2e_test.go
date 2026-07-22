@@ -48,20 +48,20 @@ func mineBlock(t *testing.T, st *pebble.Store, insertBump bool) synthblock.Block
 		t.Fatalf("synthblock.Build: %v", err)
 	}
 	for _, txid := range blk.Txids {
-		if _, _, err := st.GetOrInsertStatus(ctx, &models.TransactionStatus{
+		if _, _, sErr := st.GetOrInsertStatus(ctx, &models.TransactionStatus{
 			TxID:      txid,
 			Status:    models.StatusSeenOnNetwork,
 			Timestamp: time.Now().UTC(),
-		}); err != nil {
-			t.Fatalf("seed row %s: %v", txid, err)
+		}); sErr != nil {
+			t.Fatalf("seed row %s: %v", txid, sErr)
 		}
 	}
-	if _, _, err := st.SetMinedByTxIDs(ctx, e2eBlockHash, e2eHeight, blk.Txids); err != nil {
-		t.Fatalf("SetMinedByTxIDs: %v", err)
+	if _, _, mErr := st.SetMinedByTxIDs(ctx, e2eBlockHash, e2eHeight, blk.Txids); mErr != nil {
+		t.Fatalf("SetMinedByTxIDs: %v", mErr)
 	}
 	if insertBump {
-		if err := st.InsertBUMP(ctx, e2eBlockHash, e2eHeight, blk.BumpBytes); err != nil {
-			t.Fatalf("InsertBUMP: %v", err)
+		if bErr := st.InsertBUMP(ctx, e2eBlockHash, e2eHeight, blk.BumpBytes); bErr != nil {
+			t.Fatalf("InsertBUMP: %v", bErr)
 		}
 	}
 	return blk

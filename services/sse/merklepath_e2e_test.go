@@ -62,22 +62,22 @@ func newMerkleSSEHarness(t *testing.T, token string, subIdx int) *merkleSSEHarne
 		t.Fatalf("synthblock.Build: %v", err)
 	}
 	for _, txid := range blk.Txids {
-		if _, _, err := st.GetOrInsertStatus(ctx, &models.TransactionStatus{
+		if _, _, sErr := st.GetOrInsertStatus(ctx, &models.TransactionStatus{
 			TxID: txid, Status: models.StatusSeenOnNetwork, Timestamp: time.Now().UTC(),
-		}); err != nil {
-			t.Fatalf("seed row: %v", err)
+		}); sErr != nil {
+			t.Fatalf("seed row: %v", sErr)
 		}
 	}
-	if _, _, err := st.SetMinedByTxIDs(ctx, sseBlockHash, sseHeight, blk.Txids); err != nil {
-		t.Fatalf("SetMinedByTxIDs: %v", err)
+	if _, _, mErr := st.SetMinedByTxIDs(ctx, sseBlockHash, sseHeight, blk.Txids); mErr != nil {
+		t.Fatalf("SetMinedByTxIDs: %v", mErr)
 	}
-	if err := st.InsertBUMP(ctx, sseBlockHash, sseHeight, blk.BumpBytes); err != nil {
-		t.Fatalf("InsertBUMP: %v", err)
+	if bErr := st.InsertBUMP(ctx, sseBlockHash, sseHeight, blk.BumpBytes); bErr != nil {
+		t.Fatalf("InsertBUMP: %v", bErr)
 	}
-	if err := st.InsertSubmission(ctx, &models.Submission{
+	if subErr := st.InsertSubmission(ctx, &models.Submission{
 		SubmissionID: "sub-" + token, TxID: blk.Txids[subIdx], CallbackToken: token,
-	}); err != nil {
-		t.Fatalf("InsertSubmission: %v", err)
+	}); subErr != nil {
+		t.Fatalf("InsertSubmission: %v", subErr)
 	}
 
 	broker := kafka.NewMemoryBroker(64)
@@ -140,15 +140,15 @@ func assertMinedFrameCarriesProof(t *testing.T, frame, txid, root string) {
 }
 
 func TestSSE_E2E_MinedLiveFrameCarriesProof(t *testing.T) {
-	const token = "tok-sse-live"
-	h := newMerkleSSEHarness(t, token, 3)
+	const liveTok = "tok-sse-live"
+	h := newMerkleSSEHarness(t, liveTok, 3)
 	defer h.Close()
 	waitForSubscriberReady()
 
 	subTxid := h.block.Txids[3]
 
 	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet,
-		h.httpSrv.URL+"/events?callbackToken="+token, nil)
+		h.httpSrv.URL+"/events?callbackToken="+liveTok, nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("GET /events: %v", err)
@@ -157,14 +157,14 @@ func TestSSE_E2E_MinedLiveFrameCarriesProof(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// The bulk MINED event bump_builder publishes: block fields + all txids, no path.
-	if err := h.pub.PublishBulk(t.Context(), &models.TransactionStatus{
+	if pErr := h.pub.PublishBulk(t.Context(), &models.TransactionStatus{
 		Status:      models.StatusMined,
 		BlockHash:   sseBlockHash,
 		BlockHeight: sseHeight,
 		Timestamp:   time.Now().UTC(),
 		TxIDs:       h.block.Txids,
-	}); err != nil {
-		t.Fatalf("PublishBulk: %v", err)
+	}); pErr != nil {
+		t.Fatalf("PublishBulk: %v", pErr)
 	}
 
 	frame, err := readNextSSEFrame(resp.Body, 3*time.Second)
@@ -175,8 +175,8 @@ func TestSSE_E2E_MinedLiveFrameCarriesProof(t *testing.T) {
 }
 
 func TestSSE_E2E_MinedCatchupFrameCarriesProof(t *testing.T) {
-	const token = "tok-sse-catchup"
-	h := newMerkleSSEHarness(t, token, 5)
+	const catchupTok = "tok-sse-catchup"
+	h := newMerkleSSEHarness(t, catchupTok, 5)
 	defer h.Close()
 	waitForSubscriberReady()
 
@@ -186,7 +186,7 @@ func TestSSE_E2E_MinedCatchupFrameCarriesProof(t *testing.T) {
 	// the catchup replay emits the terminal MINED frame.
 	since := time.Now().Add(-time.Hour)
 	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet,
-		h.httpSrv.URL+"/events?callbackToken="+token, nil)
+		h.httpSrv.URL+"/events?callbackToken="+catchupTok, nil)
 	req.Header.Set("Last-Event-ID", fmt.Sprintf("%d", since.UnixNano()))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
