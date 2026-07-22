@@ -108,10 +108,11 @@ type Store interface {
 	// MINED/IMMUTABLE, or the block's BUMP cannot be retrieved/parsed — so callers
 	// on push paths can invoke it unconditionally and treat the proof as
 	// best-effort (never a delivery gate). Safe to call repeatedly across all the
-	// txids of one block: implementations cache the parsed compound BUMP and its
-	// txid→offset index per block, so per-tx enrichment is O(tree depth), not a
-	// re-parse. Unlike GetStatus this does not read the full row (no RawTx), which
-	// keeps it cheap enough for the SSE/webhook fan-out hot path.
+	// txids of one block: implementations share the bounded bumpcache of parsed,
+	// indexed compound BUMPs (see store/bumpcache), so per-tx enrichment is
+	// O(tree depth · log level-size), not a re-parse. Unlike GetStatus this does
+	// not read the full row (no RawTx), which keeps it cheap enough for the
+	// SSE/webhook fan-out hot path.
 	EnrichMerklePath(ctx context.Context, status *models.TransactionStatus)
 
 	// GetStatusesSince retrieves all transactions updated since a given timestamp

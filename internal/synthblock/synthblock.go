@@ -39,13 +39,16 @@ func Build(numTxs int, height uint64) (Block, error) {
 		return Block{}, fmt.Errorf("synthblock: numTxs must be a power of two ≥ 1, got %d", numTxs)
 	}
 
-	// Level 0: deterministic, distinct leaf hashes.
+	// Level 0: deterministic, distinct leaf hashes. The counter is 32-bit so
+	// leaf seeds stay unique for any block size a test could realistically
+	// build (a 16-bit counter would silently wrap past 65 535 leaves and
+	// produce duplicate txids).
 	leaves := make([]*chainhash.Hash, numTxs)
 	txids := make([]string, numTxs)
 	for i := range leaves {
-		var seed [12]byte
+		var seed [14]byte
 		copy(seed[:], "synthblock")
-		binary.BigEndian.PutUint16(seed[10:], uint16(i))
+		binary.BigEndian.PutUint32(seed[10:], uint32(i))
 		h := chainhash.DoubleHashH(seed[:])
 		leaves[i] = &h
 		txids[i] = h.String()
