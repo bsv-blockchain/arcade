@@ -81,13 +81,21 @@ func newFinalityTestServer(broker *kafka.RecordingBroker, ms *mockStore, pub *re
 	return srv, router
 }
 
-// TestHandleSubmitTransaction_NonFinal_RejectedWithReason pins the intake
-// finality gate (issue #245): a tx whose timestamp locktime is ahead of the
-// chain MTP with a non-final input sequence must be rejected synchronously
-// with an actionable reason, persist a REJECTED row with that reason, and
-// never reach the propagation topic.
-func TestHandleSubmitTransaction_NonFinal_RejectedWithReason(t *testing.T) {
+// TestHandleSubmitTransaction_NonFinal_NoVerdictPersisted pins the intake
+// finality gate's zero-state contract (issues #245/#254): a non-final tx is
+// answered with an actionable 400 carrying the ARC 476 code, but NOTHING is
+// persisted or published — no REJECTED row (GET /tx keeps returning 404,
+// "no verdict", so resubmission policies keyed on no-verdict work), no
+// status event, no Kafka publish. A non-final verdict reflects arcade's
+// current chain view, not the transaction bytes, so it must never become a
+// durable verdict that could stick after the tx mines elsewhere — nor
+// clobber an existing in-flight row on a resubmit under a stale tip.
+func TestHandleSubmitTransaction_NonFinal_NoVerdictPersisted(t *testing.T) {
 	ms := &mockStore{}
+	ms.getOrInsertFn = func(st *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+		t.Errorf("GetOrInsertStatus must not be called for a non-final tx, got %+v", st)
+		return nil, false, nil
+	}
 	pub := &recordingCallbackPub{}
 	broker := &kafka.RecordingBroker{}
 	_, router := newFinalityTestServer(broker, ms, pub)
@@ -104,36 +112,30 @@ func TestHandleSubmitTransaction_NonFinal_RejectedWithReason(t *testing.T) {
 	if !strings.Contains(w.Body.String(), "transaction is not final") {
 		t.Errorf("response %q missing finality reason", w.Body.String())
 	}
+	// The ARC taxonomy rides alongside the legacy reason (additive).
+	if !strings.Contains(w.Body.String(), `"status":476`) {
+		t.Errorf("response %q missing ARC 476 status code", w.Body.String())
+	}
 
 	// Nothing may reach Kafka — the tx must not be broadcast.
 	if got := totalMessages(broker); got != 0 {
 		t.Errorf("expected 0 published Kafka messages for non-final tx, got %d", got)
 	}
 
-	// A terminal REJECTED row with the finality reason must be persisted.
+	// Zero persistence: no status row writes of any kind...
 	ms.mu.Lock()
-	calls := append([]*models.TransactionStatus(nil), ms.updateStatusCalls...)
+	updates := append([]*models.TransactionStatus(nil), ms.updateStatusCalls...)
 	ms.mu.Unlock()
-	var sawReject bool
-	for _, c := range calls {
-		if c.Status == models.StatusRejected && strings.Contains(c.ExtraInfo, "transaction is not final") {
-			sawReject = true
-			break
-		}
+	if len(updates) != 0 {
+		t.Errorf("expected no status writes for non-final tx, got %v", updates)
 	}
-	if !sawReject {
-		t.Errorf("expected REJECTED row carrying the finality reason; UpdateStatus calls=%v", calls)
-	}
-
-	// Live subscribers must see the terminal outcome with the reason.
+	// ...and no status event for live subscribers: with no durable row a
+	// published REJECTED would be a verdict GET could never corroborate.
 	pub.mu.Lock()
 	publishes := append([]*models.TransactionStatus(nil), pub.publishes...)
 	pub.mu.Unlock()
-	if len(publishes) != 1 || publishes[0].Status != models.StatusRejected {
-		t.Fatalf("expected exactly 1 REJECTED publish, got %v", publishes)
-	}
-	if !strings.Contains(publishes[0].ExtraInfo, "transaction is not final") {
-		t.Errorf("publish ExtraInfo %q missing finality reason", publishes[0].ExtraInfo)
+	if len(publishes) != 0 {
+		t.Fatalf("expected no publishes for non-final tx, got %v", publishes)
 	}
 }
 
@@ -190,9 +192,14 @@ func TestHandleSubmitTransaction_NoFinalityChecker_Proceeds(t *testing.T) {
 
 // TestHandleSubmitTransactions_BatchNonFinal_AbortsWithTxid mirrors the
 // batch contract for validation failures: the offending txid is named and
-// the whole batch aborts before any publish.
+// the whole batch aborts before any publish — and, like the single-tx path,
+// a non-final verdict persists and publishes nothing (zero-state contract).
 func TestHandleSubmitTransactions_BatchNonFinal_AbortsWithTxid(t *testing.T) {
 	ms := &mockStore{}
+	ms.getOrInsertFn = func(st *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+		t.Errorf("GetOrInsertStatus must not be called for a non-final batch, got %+v", st)
+		return nil, false, nil
+	}
 	pub := &recordingCallbackPub{}
 	broker := &kafka.RecordingBroker{}
 	_, router := newFinalityTestServer(broker, ms, pub)
@@ -221,5 +228,17 @@ func TestHandleSubmitTransactions_BatchNonFinal_AbortsWithTxid(t *testing.T) {
 	}
 	if got := totalMessages(broker); got != 0 {
 		t.Errorf("expected 0 published Kafka messages for aborted batch, got %d", got)
+	}
+	ms.mu.Lock()
+	updates := len(ms.updateStatusCalls)
+	ms.mu.Unlock()
+	if updates != 0 {
+		t.Errorf("expected no status writes for non-final batch, got %d", updates)
+	}
+	pub.mu.Lock()
+	publishes := len(pub.publishes)
+	pub.mu.Unlock()
+	if publishes != 0 {
+		t.Errorf("expected no publishes for non-final batch, got %d", publishes)
 	}
 }

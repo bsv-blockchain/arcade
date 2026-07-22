@@ -3,6 +3,7 @@ package propagation
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -191,8 +192,18 @@ func TestApplyTerminalStatuses_CascadesRejectedChildren(t *testing.T) {
 		t.Errorf("expected 2 cascade-rejection rows (child + grandchild), got %d: %v", len(rejected), rejected)
 	}
 	for txid, reason := range rejected {
-		if reason != "parent rejected" {
-			t.Errorf("%s ExtraInfo should be \"parent rejected\", got %q", txid, reason)
+		// The stable "parent rejected" prefix stays for existing consumers;
+		// the suffix must name the rejected ancestor and state the recovery
+		// path so a cascaded child reads as retryable queue state, not a
+		// verdict about its own bytes.
+		if !strings.HasPrefix(reason, "parent rejected") {
+			t.Errorf("%s ExtraInfo should keep the \"parent rejected\" prefix, got %q", txid, reason)
+		}
+		if !strings.Contains(reason, "ancestor parent") {
+			t.Errorf("%s ExtraInfo should name the rejected ancestor, got %q", txid, reason)
+		}
+		if !strings.Contains(reason, "resubmit") {
+			t.Errorf("%s ExtraInfo should state the resubmit recovery path, got %q", txid, reason)
 		}
 	}
 }

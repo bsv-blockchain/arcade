@@ -366,7 +366,7 @@ func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.Tra
 		return nil
 	}
 
-	const colsPerRow = 7 // txid, status, block_hash, block_height, extra_info, merkle_path, timestamp_at, disallowed_prev
+	const colsPerRow = 8 // txid, status, status_code, block_hash, block_height, extra_info, merkle_path, timestamp_at, disallowed_prev
 
 	args := make([]any, 0, len(statuses)*(colsPerRow+1))
 	now := time.Now()
@@ -391,6 +391,7 @@ func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.Tra
 			args,
 			st.TxID,
 			string(st.Status),
+			st.StatusCode,
 			st.BlockHash,
 			int64(st.BlockHeight), /* #nosec G115 */
 			st.ExtraInfo,
@@ -410,8 +411,8 @@ func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.Tra
 		// right types for the VALUES alias columns.
 		fmt.Fprintf(
 			&values,
-			"($%d::text,$%d::text,$%d::text,$%d::bigint,$%d::text,$%d::bytea,$%d::timestamptz,$%d::text[])",
-			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8,
+			"($%d::text,$%d::text,$%d::int,$%d::text,$%d::bigint,$%d::text,$%d::bytea,$%d::timestamptz,$%d::text[])",
+			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9,
 		)
 	}
 
@@ -422,12 +423,13 @@ func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.Tra
 	q := `
 UPDATE transactions t SET
     status       = v.status,
+    status_code  = COALESCE(NULLIF(v.status_code, 0),     t.status_code),
     block_hash   = COALESCE(NULLIF(v.block_hash, ''),     t.block_hash),
     block_height = COALESCE(NULLIF(v.block_height, 0),    t.block_height),
     extra_info   = COALESCE(NULLIF(v.extra_info, ''),     t.extra_info),
     merkle_path  = COALESCE(v.merkle_path,                t.merkle_path),
     timestamp_at = v.timestamp_at
-FROM (VALUES ` + values.String() + `) AS v(txid, status, block_hash, block_height, extra_info, merkle_path, timestamp_at, disallowed_prev)
+FROM (VALUES ` + values.String() + `) AS v(txid, status, status_code, block_hash, block_height, extra_info, merkle_path, timestamp_at, disallowed_prev)
 WHERE t.txid = v.txid AND t.status <> ALL(v.disallowed_prev)`
 
 	if _, err := s.pool.Exec(ctx, q, args...); err != nil {
@@ -467,6 +469,11 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 	if status.ExtraInfo != "" {
 		sets = append(sets, fmt.Sprintf("extra_info = $%d", idx))
 		args = append(args, status.ExtraInfo)
+		idx++
+	}
+	if status.StatusCode != 0 {
+		sets = append(sets, fmt.Sprintf("status_code = $%d", idx))
+		args = append(args, status.StatusCode)
 		idx++
 	}
 	if len(status.MerklePath) > 0 {

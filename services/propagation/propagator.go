@@ -19,6 +19,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/config"
+	arcerrors "github.com/bsv-blockchain/arcade/errors"
 	"github.com/bsv-blockchain/arcade/events"
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/logfields"
@@ -495,20 +496,30 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 	// releases waiters via the dispatcher itself (no caller action
 	// needed — released msgs are appended directly to the
 	// dispatcher's pendingMsgs). REJECTED returns cascaded
-	// descendants we write REJECTED rows for; the cascade reason is
-	// always "parent rejected" regardless of the parent's actual
-	// cause — see persistCascadeRejections.
-	var allCascaded []string
+	// descendants we write REJECTED rows for; the cascade reason names
+	// the rejected ancestor but never its cause — see
+	// persistCascadeRejections.
+	var allCascaded []cascadeRejection
 	for _, txid := range terminalAccepted {
 		p.notifyTerminalToDispatcher(ctx, txid, models.StatusAcceptedByNetwork)
 	}
 	for _, txid := range terminalRejected {
 		r := p.notifyTerminalToDispatcher(ctx, txid, models.StatusRejected)
-		allCascaded = append(allCascaded, r.cascaded...)
+		for _, child := range r.cascaded {
+			allCascaded = append(allCascaded, cascadeRejection{txid: child, ancestor: txid})
+		}
 	}
 	if len(allCascaded) > 0 {
 		p.persistCascadeRejections(ctx, allCascaded, now)
 	}
+}
+
+// cascadeRejection pairs a cascade-rejected tx with the terminal-rejected
+// ancestor whose verdict condemned it, so the persisted reason can name the
+// row a client should look at (and resubmit first).
+type cascadeRejection struct {
+	txid     string
+	ancestor string
 }
 
 // persistCascadeRejections writes terminal REJECTED rows for txs the
@@ -517,31 +528,40 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 // Best-effort: a store write failure is logged but doesn't undo the
 // in-memory cascade state (the dispatcher has already terminalized
 // them; we'd be reconciling at restart via Kafka replay anyway).
-func (p *Propagator) persistCascadeRejections(ctx context.Context, txids []string, now time.Time) {
-	statuses := make([]*models.TransactionStatus, len(txids))
-	for i, txid := range txids {
+func (p *Propagator) persistCascadeRejections(ctx context.Context, cascaded []cascadeRejection, now time.Time) {
+	statuses := make([]*models.TransactionStatus, len(cascaded))
+	txids := make([]string, len(cascaded))
+	for i, cr := range cascaded {
+		txids[i] = cr.txid
+		// "parent rejected" (kept as the stable prefix existing consumers
+		// match on) is the only structural reason that applies to a
+		// cascaded child — it didn't fail for any reason of its own. The
+		// suffix names the rejected ancestor whose row carries the actual
+		// cause, and states the recovery path: this rejection is a
+		// consequence of queue state, not a verdict about this tx's bytes,
+		// so once the ancestor is accepted a resubmission re-runs the
+		// pipeline (intake re-validates and re-broadcasts REJECTED rows).
+		reason := fmt.Sprintf(
+			"parent rejected (ancestor %s): retryable — resubmit after the ancestor is accepted",
+			cr.ancestor,
+		)
 		statuses[i] = &models.TransactionStatus{
-			TxID:      txid,
+			TxID:      cr.txid,
 			Status:    models.StatusRejected,
 			Timestamp: now,
-			// "parent rejected" is the only structural reason that
-			// applies to a cascaded child — it didn't fail for any
-			// reason of its own. The parent's actual cause lives on
-			// the parent's row; downstream consumers can correlate
-			// via the dep graph if they care.
-			ExtraInfo: "parent rejected",
+			ExtraInfo: reason,
 		}
 		p.logger.Info(
 			"transaction rejected",
-			logfields.TxID(txid),
-			zap.String("reason", "parent rejected"),
+			logfields.TxID(cr.txid),
+			zap.String("reason", reason),
 			logfields.Stage(logfields.StageCascade),
 		)
 	}
 	if _, err := p.store.BatchUpdateStatusReturning(ctx, statuses); err != nil {
 		p.logger.Warn(
 			"cascade rejection write failed",
-			zap.Int("count", len(txids)),
+			zap.Int("count", len(cascaded)),
 			zap.Error(err),
 		)
 	}
@@ -936,22 +956,55 @@ type txResult struct {
 	successEndpoint string
 }
 
-// classifyFailureLine maps one Teranode /txs failure line into a dispatcher
-// action bucket. The line is the full UserMessage produced by Teranode,
+// classifyFailureLine maps one Teranode /txs failure line into a client-
+// facing message and a machine-readable ARC status code (errors/errors.go
+// taxonomy; 0 when the line has no confident ARC equivalent). The line is
+// the full UserMessage produced by Teranode,
 // e.g. "PROCESSING (4): [ProcessTransaction][<txid>] failed to validate
 // transaction" or "TX_INVALID (31): [ProcessTransaction][<txid>] ...".
 //
-// Any per-txid line returned by Teranode is treated as terminally rejected.
-// Teranode wraps real validator failures with NewProcessingError (see
-// services/propagation/Server.go:1236), so PROCESSING is the catch-all
+// Any per-txid line returned by Teranode is still treated as terminally
+// rejected. Teranode wraps real validator failures with NewProcessingError
+// (see services/propagation/Server.go:1236), so PROCESSING is the catch-all
 // "this tx is bad" code in practice — we can't distinguish a transient
 // infra issue from a permanent validation failure by code alone. The
 // authoritative requeue signal is a 5xx batch response with no parseable
 // per-tx body (handled separately in broadcastBatchToEndpoints), which
-// reflects a true infra outage rather than a tx-level verdict. errMsg is
-// the line verbatim so wallet rows surface the actual Teranode message.
-func classifyFailureLine(line string) (txResultClass, string) {
-	return txResultClassRejected, line
+// reflects a true infra outage rather than a tx-level verdict.
+//
+// What the leading "NAME (n)" code DOES tell us confidently is mapped onto
+// the ARC taxonomy so consumers can branch on a number instead of prose
+// (issue #254 / external feedback item 2):
+//
+//	TX_LOCK_TIME (35), UTXO_NON_FINAL (71) → 476 StatusNotFinal. The peer's
+//	  view says the tx isn't final yet — a condition of that view, not a
+//	  verdict about the bytes; resubmitting after the lock expires (or the
+//	  peer's tip catches up) is expected to succeed, so the message gains an
+//	  explicit retryable hint. (Intake's finality gate catches most of these
+//	  against arcade's own tip; a line here means the peer's view trails.)
+//	TX_CONFLICTING (36) → 466 StatusConflict (double-spend attempt).
+//	TX_INVALID (31)     → 467 StatusGeneric (wraps fee/script/policy — the
+//	  name alone can't recover which).
+//	PROCESSING (4) and everything else → 0, message verbatim.
+//
+// errMsg preserves the Teranode line verbatim (plus the retryable suffix for
+// the non-final family) so wallet rows surface the actual message.
+func classifyFailureLine(line string) (errMsg string, arcCode int) {
+	name, _, found := strings.Cut(line, " (")
+	if !found {
+		return line, 0
+	}
+	switch name {
+	case "TX_LOCK_TIME", "UTXO_NON_FINAL":
+		return line + " — retryable: the transaction is not final against this peer's chain view; resubmit after the locktime expires",
+			int(arcerrors.StatusNotFinal)
+	case "TX_CONFLICTING":
+		return line, int(arcerrors.StatusConflict)
+	case "TX_INVALID":
+		return line, int(arcerrors.StatusGeneric)
+	default:
+		return line, 0
+	}
 }
 
 // startBroadcastSpan opens one "propagation.broadcast" span per flushed
@@ -1486,15 +1539,16 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 				successEndpoint: successEndpoint,
 			}
 		case rejectionLine[i] != "":
-			_, errMsg := classifyFailureLine(rejectionLine[i])
+			errMsg, arcCode := classifyFailureLine(rejectionLine[i])
 			results[i] = txResult{
 				class:  txResultClassRejected,
 				errMsg: errMsg,
 				status: &models.TransactionStatus{
-					TxID:      msg.TXID,
-					Status:    models.StatusRejected,
-					Timestamp: now,
-					ExtraInfo: errMsg,
+					TxID:       msg.TXID,
+					Status:     models.StatusRejected,
+					StatusCode: arcCode,
+					Timestamp:  now,
+					ExtraInfo:  errMsg,
 				},
 				rawTx: msg.RawTx,
 			}

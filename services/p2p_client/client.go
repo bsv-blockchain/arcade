@@ -240,6 +240,16 @@ func (c *Client) consume(ctx context.Context, msgs <-chan teranodep2p.NodeStatus
 func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatusMessage) {
 	metrics.P2PNodeStatusMessagesTotal.Inc()
 
+	// Surface the peer's advertised tip height as a gauge instead of
+	// discarding it with the debug log below: alongside
+	// arcade_chain_tip_height it is the datahub height-lag signal operators
+	// alert on (issue #254 — peers chain-stalled 50+ blocks while every
+	// reachability probe stayed green). base_url-labelled only, so
+	// restart-churned peer ids can't grow the series set.
+	if msg.BaseURL != "" {
+		metrics.P2PPeerBestHeight.WithLabelValues(msg.BaseURL).Set(float64(msg.BestHeight))
+	}
+
 	if ce := c.logger.Check(zap.DebugLevel, "received node_status"); ce != nil {
 		fields := []zap.Field{
 			zap.String("peer_id", msg.PeerID),

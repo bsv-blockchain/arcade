@@ -650,6 +650,31 @@ var P2PEndpointDiscoveryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "Datahub URL discovery outcomes from peer announcements.",
 }, []string{labelOutcome}) // registered, invalid, blocked, no_url, no_store, error
 
+// P2PPeerBestHeight reports the best block height each datahub peer
+// advertises in its node_status messages. Compared against
+// arcade_chain_tip_height (arcade's own processed tip) this is the
+// height-lag signal that was previously invisible: a reachable-but-stalled
+// peer showed healthy on every existing metric while its chain view froze
+// 50+ blocks behind (issue #254). Labelled by the peer's base_url — the
+// small, stable datahub set — and never by libp2p peer id, whose
+// restart-churn would grow the series set unboundedly; peers announcing no
+// base_url are skipped.
+var P2PPeerBestHeight = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "arcade_p2p_peer_best_height",
+	Help: "Best block height advertised by a datahub peer via p2p node_status, by base_url.",
+}, []string{"base_url"})
+
+// ChainTipHeight reports arcade's own view of the active chain tip — the
+// highest block_processing row marked active. Refreshed by the api-server's
+// /health handler (which also returns it as blockHeight); alert on this
+// flatlining, or on arcade_p2p_peer_best_height pulling ahead of it, to
+// catch stale-chain-view conditions before they surface as non-final
+// rejections (issue #254).
+var ChainTipHeight = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "arcade_chain_tip_height",
+	Help: "Arcade's active processed chain-tip height (max active block_processing row).",
+})
+
 // ---------------------------------------------------------------------------
 // callback path — inbound merkle-service callbacks
 // ---------------------------------------------------------------------------

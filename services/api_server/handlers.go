@@ -181,11 +181,49 @@ func RenderDocs(w io.Writer) error {
 // per-endpoint Datahub health stays in datahub_urls[].healthy. Chaintracks moved
 // out of api-server in the microservice decomposition — its health is now
 // reported by the standalone chaintracks pod's /health endpoint.
+//
+// blockHeight is arcade's own processed active-tip height. It is a freshness
+// signal, not a liveness gate: datahub_urls[].healthy is reachability-only,
+// so this instance can look green while its chain view is stale — clients
+// comparing blockHeight against the real network tip can detect that and
+// route around it (issue #254). Omitted (0) when no store is wired or the
+// height has never been readable.
 type healthResponse struct {
 	Healthy     bool                      `json:"healthy"`
 	Version     string                    `json:"version"`
 	Status      string                    `json:"status"`
+	BlockHeight uint64                    `json:"blockHeight,omitempty"`
 	DatahubURLs []teranode.EndpointStatus `json:"datahub_urls"`
+}
+
+// healthTipTTL bounds how often /health re-reads the store's active tip
+// height. Probes arrive every few seconds per replica (kubelet, LBs, ARC
+// clients); one MAX-scan per TTL keeps the store cost flat regardless of
+// probe fan-in while staying far fresher than block cadence.
+const healthTipTTL = 5 * time.Second
+
+// activeTipHeight returns arcade's processed active-tip height for /health,
+// cached for healthTipTTL. Never fails the probe: on a store error it
+// serves the last known height (a frozen value reads as stale to clients —
+// which is exactly the signal — and the next probe retries the read).
+func (s *Server) activeTipHeight(ctx context.Context) uint64 {
+	if s.store == nil {
+		return 0
+	}
+	s.tipMu.Lock()
+	defer s.tipMu.Unlock()
+	if time.Since(s.tipFetchedAt) < healthTipTTL {
+		return s.tipHeight
+	}
+	h, err := s.store.GetActiveTipBlockHeight(ctx)
+	if err != nil {
+		s.logger.Debug("health tip-height read failed", zap.Error(err))
+		return s.tipHeight
+	}
+	s.tipHeight = h
+	s.tipFetchedAt = time.Now()
+	metrics.ChainTipHeight.Set(float64(h))
+	return h
 }
 
 func (s *Server) handleHealth(c *gin.Context) {
@@ -193,6 +231,7 @@ func (s *Server) handleHealth(c *gin.Context) {
 		Healthy:     true,
 		Version:     version.Version,
 		Status:      "ok",
+		BlockHeight: s.activeTipHeight(c.Request.Context()),
 		DatahubURLs: []teranode.EndpointStatus{},
 	}
 	if s.teranode != nil {
@@ -639,15 +678,13 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// BEEF parents are trusted (arcade doesn't own a chaintracker on the
 	// intake path); script execution against per-input source data still
 	// runs, which catches malformed unlocking scripts, bad signatures,
-	// and underpaid txs. Failures write a terminal REJECTED row and
-	// return 400 so the outcome is both durable and immediate.
+	// and underpaid txs. Failures are a verdict about the transaction
+	// bytes, so they write a terminal REJECTED row and return 400 —
+	// durable and immediate.
 	if s.validator != nil {
 		if err := s.validator.ValidateTransaction(c.Request.Context(), parsedTx, false); err != nil {
-			s.rejectAtIntake(c.Request.Context(), txid, err.Error(), opts)
-			c.JSON(http.StatusBadRequest, gin.H{
-				jsonKeyError: "transaction failed validation",
-				"reason":     err.Error(),
-			})
+			s.rejectAtIntake(c.Request.Context(), txid, err.Error(), arcStatusCodeOf(err), opts)
+			respondSubmitError(c, txid, err)
 			return
 		}
 	}
@@ -657,16 +694,26 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// wraps), so without this a non-final tx is broadcast and bounced by the
 	// network with an opaque generic error (issue #245). Runs after the
 	// validator so its fail-open behavior can never mask a validation error.
-	// The ArcError wrap attaches StatusNotFinal for structured consumers
-	// without changing the reason text (same pattern as mapTeranodeError).
+	//
+	// Unlike a validator failure, a non-final verdict reflects arcade's
+	// CURRENT CHAIN VIEW (which can trail the network's real tip), not the
+	// transaction bytes — a condition, not a verdict. So it is deliberately
+	// NOT persisted: no REJECTED row, no submission record, no status event
+	// (issue #254). The client gets the actionable 400 below; GET /tx keeps
+	// returning its prior state — 404 ("no verdict") for a fresh tx, so
+	// resubmission policies keyed on no-verdict work unchanged — and a
+	// resubmit evaluated against a stale tip can never clobber an existing
+	// in-flight row.
 	if fErr := s.finality.Check(c.Request.Context(), parsedTx); fErr != nil {
 		fErr = arcerrors.NewArcError(fErr, arcerrors.StatusNotFinal)
 		metrics.APIFinalityRejectionsTotal.WithLabelValues("/tx").Inc()
-		s.rejectAtIntake(c.Request.Context(), txid, fErr.Error(), opts)
-		c.JSON(http.StatusBadRequest, gin.H{
-			jsonKeyError: "transaction failed validation",
-			"reason":     fErr.Error(),
-		})
+		s.logger.Info(
+			"transaction not final at intake; no verdict persisted",
+			logfields.TxID(txid),
+			zap.String("reason", fErr.Error()),
+			logfields.Stage(logfields.StageIntake),
+		)
+		respondSubmitError(c, txid, fErr)
 		return
 	}
 
@@ -766,13 +813,51 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	})
 }
 
+// arcStatusCodeOf extracts the numeric ARC status code (460-476 taxonomy,
+// errors/errors.go) from an error chain, or 0 when none is attached.
+func arcStatusCodeOf(err error) int {
+	if arcErr := arcerrors.GetArcError(err); arcErr != nil {
+		return int(arcErr.StatusCode)
+	}
+	return 0
+}
+
+// respondSubmitError writes the 400 for an intake validation or finality
+// failure. The legacy "error"/"reason" fields are unchanged so existing
+// clients keep parsing; "txid" and — when the error carries an ARC status
+// code — the ARC error taxonomy ("status", "title", "detail", "type") are
+// added alongside, so ARC-compatible clients can branch on the code (and
+// judge retryability, e.g. 476 non-final) without matching reason text.
+func respondSubmitError(c *gin.Context, txid string, err error) {
+	body := gin.H{
+		jsonKeyError: "transaction failed validation",
+		"txid":       txid,
+		"reason":     err.Error(),
+	}
+	if arcErr := arcerrors.GetArcError(err); arcErr != nil {
+		f := arcErr.ToErrorFields()
+		body["status"] = f.Status
+		body["title"] = f.Title
+		body["detail"] = f.Detail
+		body["type"] = f.Type
+	}
+	c.JSON(http.StatusBadRequest, body)
+}
+
 // rejectAtIntake is the terminal-rejection counterpart to the intake
-// success sequence. It persists a REJECTED row, records the submission
-// so SSE/webhook can resolve the callback URL+token on delivery, then
-// publishes the REJECTED status to TopicStatusUpdate so live
-// subscribers see the terminal outcome. Every step is best-effort —
+// success sequence, for VALIDATOR failures only — verdicts about the
+// transaction bytes. (Finality failures are conditions of arcade's chain
+// view and deliberately persist nothing; see the finality gate in
+// handleSubmitTransaction.) It persists a REJECTED row, records the
+// submission so SSE/webhook can resolve the callback URL+token on
+// delivery, then publishes the REJECTED status to TopicStatusUpdate so
+// live subscribers see the terminal outcome. Every step is best-effort —
 // the client has already received its 400 by the time this runs, so a
 // store or publish failure does not change the HTTP outcome.
+//
+// statusCode is the numeric ARC code (0 when unclassified) persisted and
+// published alongside the reason so consumers get a machine-readable
+// cause, not just prose.
 //
 // Order matches the success path: persist row, then queue submission,
 // then publish. Queuing the submission before the publish minimizes
@@ -780,23 +865,24 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 // without a matching submission row (the recorder pool is async, so
 // the window can't be eliminated entirely without making the row
 // write synchronous — a trade-off the success path also accepts).
-func (s *Server) rejectAtIntake(ctx context.Context, txid, reason string, opts submitOptions) {
+func (s *Server) rejectAtIntake(ctx context.Context, txid, reason string, statusCode int, opts submitOptions) {
 	s.logger.Info(
 		"transaction rejected",
 		logfields.TxID(txid),
 		zap.String("reason", reason),
 		logfields.Stage(logfields.StageIntake),
 	)
-	s.persistRejectedAtIntake(ctx, txid, reason)
+	s.persistRejectedAtIntake(ctx, txid, reason, statusCode)
 	s.recordSubmission(ctx, txid, opts)
 	if s.publisher == nil {
 		return
 	}
 	status := &models.TransactionStatus{
-		TxID:      txid,
-		Status:    models.StatusRejected,
-		ExtraInfo: reason,
-		Timestamp: time.Now(),
+		TxID:       txid,
+		Status:     models.StatusRejected,
+		StatusCode: statusCode,
+		ExtraInfo:  reason,
+		Timestamp:  time.Now(),
 	}
 	if err := s.publisher.Publish(ctx, status); err != nil {
 		s.logger.Warn(
@@ -812,15 +898,16 @@ func (s *Server) rejectAtIntake(ctx context.Context, txid, reason string, opts s
 // failure is logged but doesn't change the client response (the 400
 // has already told them the tx was rejected). When the store is nil
 // (test setups using struct-literal construction), this is a no-op.
-func (s *Server) persistRejectedAtIntake(ctx context.Context, txid, reason string) {
+func (s *Server) persistRejectedAtIntake(ctx context.Context, txid, reason string, statusCode int) {
 	if s.store == nil {
 		return
 	}
 	row := &models.TransactionStatus{
-		TxID:      txid,
-		Status:    models.StatusRejected,
-		ExtraInfo: reason,
-		Timestamp: time.Now(),
+		TxID:       txid,
+		Status:     models.StatusRejected,
+		StatusCode: statusCode,
+		ExtraInfo:  reason,
+		Timestamp:  time.Now(),
 	}
 	_, inserted, err := s.store.GetOrInsertStatus(ctx, row)
 	if err != nil {
@@ -921,30 +1008,29 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 		ctx := c.Request.Context()
 		for _, p := range parsed {
 			if vErr := s.validator.ValidateTransaction(ctx, p.tx, false); vErr != nil {
-				s.rejectAtIntake(ctx, p.txid, vErr.Error(), opts)
-				c.JSON(http.StatusBadRequest, gin.H{
-					jsonKeyError: "transaction failed validation",
-					"txid":       p.txid,
-					"reason":     vErr.Error(),
-				})
+				s.rejectAtIntake(ctx, p.txid, vErr.Error(), arcStatusCodeOf(vErr), opts)
+				respondSubmitError(c, p.txid, vErr)
 				return
 			}
 		}
 	}
 
 	// nLockTime/BIP113 finality gate per tx; see handleSubmitTransaction for
-	// the rationale. Aborts the whole batch naming the offending txid —
-	// matches the validation contract above.
+	// the rationale — including why a non-final verdict is NOT persisted
+	// (condition of arcade's chain view, not a verdict about the tx; issue
+	// #254). Aborts the whole batch naming the offending txid — matches the
+	// validation contract above.
 	for _, p := range parsed {
 		if fErr := s.finality.Check(c.Request.Context(), p.tx); fErr != nil {
 			fErr = arcerrors.NewArcError(fErr, arcerrors.StatusNotFinal)
 			metrics.APIFinalityRejectionsTotal.WithLabelValues("/txs").Inc()
-			s.rejectAtIntake(c.Request.Context(), p.txid, fErr.Error(), opts)
-			c.JSON(http.StatusBadRequest, gin.H{
-				jsonKeyError: "transaction failed validation",
-				"txid":       p.txid,
-				"reason":     fErr.Error(),
-			})
+			s.logger.Info(
+				"transaction not final at intake; no verdict persisted",
+				logfields.TxID(p.txid),
+				zap.String("reason", fErr.Error()),
+				logfields.Stage(logfields.StageIntake),
+			)
+			respondSubmitError(c, p.txid, fErr)
 			return
 		}
 	}

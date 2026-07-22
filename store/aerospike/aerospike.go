@@ -323,6 +323,14 @@ func (s *Store) GetOrInsertStatus(ctx context.Context, status *models.Transactio
 		"timestamp":  status.Timestamp.UnixMilli(),
 		"created_at": now.UnixMilli(),
 	}
+	// Rows can be born terminal (intake rejection): carry the machine-
+	// readable cause and code on the insert, matching the other backends.
+	if status.StatusCode != 0 {
+		bins["status_code"] = status.StatusCode
+	}
+	if status.ExtraInfo != "" {
+		bins["extra_info"] = status.ExtraInfo
+	}
 
 	policy := s.writePolicy(ctx)
 	policy.RecordExistsAction = aero.CREATE_ONLY
@@ -382,6 +390,9 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 	bins := aero.BinMap{
 		"status":    string(status.Status),
 		"timestamp": status.Timestamp.UnixMilli(),
+	}
+	if status.StatusCode != 0 {
+		bins["status_code"] = status.StatusCode
 	}
 	if status.BlockHash != "" {
 		bins["block_hash"] = status.BlockHash
@@ -2264,6 +2275,11 @@ func recordToStatus(rec *aero.Record, txid string) *models.TransactionStatus {
 	if v, ok := rec.Bins["status"]; ok {
 		if s, ok := v.(string); ok {
 			status.Status = models.Status(s)
+		}
+	}
+	if v, ok := rec.Bins["status_code"]; ok {
+		if n, ok := v.(int); ok {
+			status.StatusCode = n
 		}
 	}
 	if v, ok := rec.Bins["block_hash"]; ok {

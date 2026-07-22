@@ -63,6 +63,11 @@ type mockStore struct {
 	// used directly. Default behavior (nil hook) is the legacy "always
 	// fresh insert" stub: (nil, false, nil).
 	getOrInsertFn func(status *models.TransactionStatus) (*models.TransactionStatus, bool, error)
+	// tipHeight is served by GetActiveTipBlockHeight (the /health
+	// blockHeight source); tipCalls counts reads so tests can assert the
+	// handler's TTL cache actually coalesces probes.
+	tipHeight uint64
+	tipCalls  int
 }
 
 func (m *mockStore) UpdateStatus(_ context.Context, status *models.TransactionStatus) error {
@@ -265,7 +270,12 @@ func (m *mockStore) ListBlockProcessingStatus(context.Context, uint64, int) ([]*
 	return nil, nil
 }
 
-func (m *mockStore) GetActiveTipBlockHeight(context.Context) (uint64, error) { return 0, nil }
+func (m *mockStore) GetActiveTipBlockHeight(context.Context) (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.tipCalls++
+	return m.tipHeight, nil
+}
 
 func (m *mockStore) ListStaleBlockProcessingStatus(context.Context, time.Time, uint64, int) ([]*models.BlockProcessingStatus, error) {
 	return nil, nil

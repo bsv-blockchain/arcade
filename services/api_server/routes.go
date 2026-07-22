@@ -67,9 +67,9 @@ var routeDocs = []RouteDoc{
 		Method:         "GET",
 		Path:           "/health",
 		Summary:        "Liveness probe",
-		Description:    "Reports liveness of the API server process and the upstream Datahub endpoints it depends on. Suitable as a Kubernetes liveness probe.",
+		Description:    "Reports liveness of the API server process and the upstream Datahub endpoints it depends on. Suitable as a Kubernetes liveness probe. blockHeight is this instance's processed chain-tip height — a freshness signal (datahub_urls[].healthy is reachability-only), letting clients detect a stale chain view and route around it.",
 		ResponseStatus: "200 OK",
-		ResponseBody:   "{\n  \"healthy\": true,\n  \"version\": \"v0.8.0\",\n  \"status\": \"ok\",\n  \"datahub_urls\": [\n    { \"url\": \"https://...\", \"healthy\": true }\n  ]\n}",
+		ResponseBody:   "{\n  \"healthy\": true,\n  \"version\": \"v0.8.0\",\n  \"status\": \"ok\",\n  \"blockHeight\": 958779,\n  \"datahub_urls\": [\n    { \"url\": \"https://...\", \"healthy\": true }\n  ]\n}",
 	},
 	{
 		Method:         "GET",
