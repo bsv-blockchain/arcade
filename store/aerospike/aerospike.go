@@ -1677,6 +1677,29 @@ func (s *Store) UpdateDeliveryStatus(ctx context.Context, submissionID string, l
 	return s.client.Put(s.writePolicy(ctx), key, bins)
 }
 
+// RecordDeliveryAttempt implements store.Store. One Operate call: AddOp gives
+// a server-side atomic increment for the lifetime attempts counter (no
+// read-modify-write race across delivery workers); the puts overwrite the
+// last-attempt bookkeeping. Bin names must be <=15 chars ("last_attempt_at"
+// is exactly 15).
+func (s *Store) RecordDeliveryAttempt(ctx context.Context, submissionID string, at time.Time, result string) error {
+	key, err := s.key(setSubmissions, submissionID)
+	if err != nil {
+		return err
+	}
+	policy := s.writePolicy(ctx)
+	policy.RecordExistsAction = aero.UPDATE_ONLY // never create a phantom submission
+	_, err = s.client.Operate(policy, key,
+		aero.AddOp(aero.NewBin("attempts", 1)),
+		aero.PutOp(aero.NewBin("last_attempt_at", at.UnixMilli())),
+		aero.PutOp(aero.NewBin("last_result", result)),
+	)
+	if isKeyNotFound(err) {
+		return nil
+	}
+	return err
+}
+
 // UpdateDeliveryStatusCAS implements store.Store using a generation-match
 // CAS write — the same pattern TryAcquireOrRenew uses for the lease record.
 // Reading then writing with EXPECT_GEN_EQUAL guarantees we lose to any
@@ -2397,6 +2420,22 @@ func recordToSubmission(rec *aero.Record) *models.Submission {
 		if ms, ok := v.(int); ok {
 			t := time.UnixMilli(int64(ms))
 			sub.NextRetryAt = &t
+		}
+	}
+	if v, ok := rec.Bins["attempts"]; ok {
+		if n, ok := v.(int); ok {
+			sub.Attempts = n
+		}
+	}
+	if v, ok := rec.Bins["last_attempt_at"]; ok {
+		if ms, ok := v.(int); ok {
+			t := time.UnixMilli(int64(ms))
+			sub.LastAttemptAt = &t
+		}
+	}
+	if v, ok := rec.Bins["last_result"]; ok {
+		if s, ok := v.(string); ok {
+			sub.LastResult = s
 		}
 	}
 	return sub

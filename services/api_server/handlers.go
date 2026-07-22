@@ -550,7 +550,37 @@ func (s *Server) handleBlockProcessed(c *gin.Context, msg models.CallbackMessage
 	c.Status(http.StatusOK)
 }
 
-// handleGetTransaction retrieves a transaction status by TXID.
+// callbackDelivery is the wire shape of one subscription's webhook delivery
+// state on GET /tx?callbackToken=… — the self-diagnosis surface for receivers
+// whose edge is rejecting arcade's POSTs (issue #249: a WAF 403'd 24k
+// callbacks while the receiver's own logs showed nothing). attempts /
+// lastAttemptAt / lastResult are lifetime bookkeeping stamped on every POST;
+// retry-scheduling state (nextRetryAt) is per-transition and cleared when the
+// next transition is claimed. Deliberately excludes CallbackToken.
+type callbackDelivery struct {
+	CallbackURL         string     `json:"callbackUrl,omitempty"`
+	LastDeliveredStatus string     `json:"lastDeliveredStatus,omitempty"`
+	Attempts            int        `json:"attempts"`
+	LastAttemptAt       *time.Time `json:"lastAttemptAt,omitempty"`
+	LastResult          string     `json:"lastResult,omitempty"`
+	NextRetryAt         *time.Time `json:"nextRetryAt,omitempty"`
+}
+
+// txStatusWithCallbacks embeds the plain status so the base response shape is
+// byte-identical to today's, plus the token-scoped callbacks array.
+type txStatusWithCallbacks struct {
+	*models.TransactionStatus
+
+	Callbacks []callbackDelivery `json:"callbacks,omitempty"`
+}
+
+// handleGetTransaction retrieves a transaction status by TXID. With an
+// optional ?callbackToken=… the response additionally carries the webhook
+// delivery state of the submissions registered under THAT token (capability
+// model — same scoping the SSE stream uses). Without the token, or when no
+// submission matches, the response is unchanged: a txid can carry
+// subscriptions from multiple unrelated clients, and their callback URLs and
+// delivery health are not each other's business.
 func (s *Server) handleGetTransaction(c *gin.Context) {
 	txid := c.Param("txid")
 	if txid == "" {
@@ -570,7 +600,41 @@ func (s *Server) handleGetTransaction(c *gin.Context) {
 		return
 	}
 
+	if callbacks := s.callbackDeliveries(c.Request.Context(), txid, c.Query("callbackToken")); len(callbacks) > 0 {
+		c.JSON(http.StatusOK, txStatusWithCallbacks{TransactionStatus: status, Callbacks: callbacks})
+		return
+	}
 	c.JSON(http.StatusOK, status)
+}
+
+// callbackDeliveries returns the delivery state of the txid's submissions
+// registered under token. Empty token or no match returns nil (never an
+// error to the client — the callbacks view is best-effort diagnostics and
+// must not break the status read).
+func (s *Server) callbackDeliveries(ctx context.Context, txid, token string) []callbackDelivery {
+	if token == "" || s.store == nil {
+		return nil
+	}
+	subs, err := s.store.GetSubmissionsByTxID(ctx, txid)
+	if err != nil {
+		s.logger.Warn("submission lookup for callback state failed", logfields.TxID(txid), zap.Error(err))
+		return nil
+	}
+	var out []callbackDelivery
+	for _, sub := range subs {
+		if sub.CallbackToken != token {
+			continue
+		}
+		out = append(out, callbackDelivery{
+			CallbackURL:         sub.CallbackURL,
+			LastDeliveredStatus: string(sub.LastDeliveredStatus),
+			Attempts:            sub.Attempts,
+			LastAttemptAt:       sub.LastAttemptAt,
+			LastResult:          sub.LastResult,
+			NextRetryAt:         sub.NextRetryAt,
+		})
+	}
+	return out
 }
 
 // Per-request body size caps for the submit endpoints. A BSV transaction can

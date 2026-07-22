@@ -79,6 +79,9 @@ CREATE TABLE IF NOT EXISTS submissions (
     last_delivered_status TEXT,
     retry_count           INT NOT NULL DEFAULT 0,
     next_retry_at         TIMESTAMPTZ,
+    attempts              INT NOT NULL DEFAULT 0,
+    last_attempt_at       TIMESTAMPTZ,
+    last_result           TEXT,
     created_at            TIMESTAMPTZ NOT NULL
 );
 -- Idempotent column adds for stores created before the exactly-once webhook
@@ -89,6 +92,12 @@ CREATE TABLE IF NOT EXISTS submissions (
 ALTER TABLE submissions ADD COLUMN IF NOT EXISTS last_delivered_status TEXT;
 ALTER TABLE submissions ADD COLUMN IF NOT EXISTS retry_count           INT NOT NULL DEFAULT 0;
 ALTER TABLE submissions ADD COLUMN IF NOT EXISTS next_retry_at         TIMESTAMPTZ;
+-- Delivery-attempt bookkeeping (issue #249): lifetime attempt counter plus
+-- the last attempt's time and outcome, surfaced on GET /tx?callbackToken=…
+-- so receivers can self-diagnose callbacks their edge is rejecting.
+ALTER TABLE submissions ADD COLUMN IF NOT EXISTS attempts              INT NOT NULL DEFAULT 0;
+ALTER TABLE submissions ADD COLUMN IF NOT EXISTS last_attempt_at       TIMESTAMPTZ;
+ALTER TABLE submissions ADD COLUMN IF NOT EXISTS last_result           TEXT;
 CREATE INDEX IF NOT EXISTS idx_sub_txid   ON submissions(txid);
 CREATE INDEX IF NOT EXISTS idx_sub_token  ON submissions(callback_token);
 -- Partial index keyed off the webhook reaper's scan predicate; stays

@@ -1174,7 +1174,8 @@ WHERE t.txid IN (SELECT DISTINCT txid FROM submissions WHERE callback_token = $1
 func (s *Store) submissions(ctx context.Context, where string, arg any) ([]*models.Submission, error) {
 	q := `
 SELECT submission_id, txid, callback_url, callback_token, full_status_updates,
-       last_delivered_status, retry_count, next_retry_at, created_at
+       last_delivered_status, retry_count, next_retry_at, attempts,
+       last_attempt_at, last_result, created_at
 FROM submissions WHERE ` + where
 	rows, err := s.pool.Query(ctx, q, arg)
 	if err != nil {
@@ -1184,26 +1185,43 @@ FROM submissions WHERE ` + where
 
 	var out []*models.Submission
 	for rows.Next() {
-		sub := &models.Submission{}
-		var lastStatus *string
-		var nextRetry *time.Time
-		if err := rows.Scan(
-			&sub.SubmissionID, &sub.TxID, &sub.CallbackURL, &sub.CallbackToken,
-			&sub.FullStatusUpdates, &lastStatus, &sub.RetryCount, &nextRetry,
-			&sub.CreatedAt,
-		); err != nil {
+		sub, err := scanSubmission(rows)
+		if err != nil {
 			return out, err
-		}
-		if lastStatus != nil {
-			sub.LastDeliveredStatus = models.Status(*lastStatus)
-		}
-		if nextRetry != nil {
-			t := *nextRetry
-			sub.NextRetryAt = &t
 		}
 		out = append(out, sub)
 	}
 	return out, rows.Err()
+}
+
+// scanSubmission reads one submissions row in the canonical column order
+// (shared by submissions and ListSubmissionsReadyForRetry).
+func scanSubmission(row rowScanner) (*models.Submission, error) {
+	sub := &models.Submission{}
+	var lastStatus, lastResult *string
+	var nextRetry, lastAttempt *time.Time
+	if err := row.Scan(
+		&sub.SubmissionID, &sub.TxID, &sub.CallbackURL, &sub.CallbackToken,
+		&sub.FullStatusUpdates, &lastStatus, &sub.RetryCount, &nextRetry,
+		&sub.Attempts, &lastAttempt, &lastResult, &sub.CreatedAt,
+	); err != nil {
+		return nil, err
+	}
+	if lastStatus != nil {
+		sub.LastDeliveredStatus = models.Status(*lastStatus)
+	}
+	if nextRetry != nil {
+		t := *nextRetry
+		sub.NextRetryAt = &t
+	}
+	if lastAttempt != nil {
+		t := *lastAttempt
+		sub.LastAttemptAt = &t
+	}
+	if lastResult != nil {
+		sub.LastResult = *lastResult
+	}
+	return sub, nil
 }
 
 func (s *Store) UpdateDeliveryStatus(ctx context.Context, submissionID string, lastStatus models.Status, retryCount int, nextRetry *time.Time) error {
@@ -1248,7 +1266,8 @@ func (s *Store) ListSubmissionsReadyForRetry(ctx context.Context, now time.Time,
 	}
 	const q = `
 SELECT submission_id, txid, callback_url, callback_token, full_status_updates,
-       last_delivered_status, retry_count, next_retry_at, created_at
+       last_delivered_status, retry_count, next_retry_at, attempts,
+       last_attempt_at, last_result, created_at
 FROM submissions
 WHERE retry_count > 0
   AND next_retry_at IS NOT NULL
@@ -1263,26 +1282,25 @@ LIMIT $2`
 
 	var out []*models.Submission
 	for rows.Next() {
-		sub := &models.Submission{}
-		var lastStatus *string
-		var nextRetry *time.Time
-		if err := rows.Scan(
-			&sub.SubmissionID, &sub.TxID, &sub.CallbackURL, &sub.CallbackToken,
-			&sub.FullStatusUpdates, &lastStatus, &sub.RetryCount, &nextRetry,
-			&sub.CreatedAt,
-		); err != nil {
+		sub, err := scanSubmission(rows)
+		if err != nil {
 			return out, err
-		}
-		if lastStatus != nil {
-			sub.LastDeliveredStatus = models.Status(*lastStatus)
-		}
-		if nextRetry != nil {
-			t := *nextRetry
-			sub.NextRetryAt = &t
 		}
 		out = append(out, sub)
 	}
 	return out, rows.Err()
+}
+
+// RecordDeliveryAttempt implements store.Store: one atomic in-place update —
+// attempts increments server-side so concurrent workers can't lose counts.
+func (s *Store) RecordDeliveryAttempt(ctx context.Context, submissionID string, at time.Time, result string) error {
+	const q = `
+UPDATE submissions SET attempts = attempts + 1, last_attempt_at=$2, last_result=$3
+WHERE submission_id=$1`
+	if _, err := s.pool.Exec(ctx, q, submissionID, at, result); err != nil {
+		return fmt.Errorf("record delivery attempt: %w", err)
+	}
+	return nil
 }
 
 // --- Leaser ---

@@ -345,6 +345,17 @@ paths:
         prefixed `parent rejected` names the rejected ancestor and is
         retryable: resubmit after the ancestor is accepted (resubmitting a
         `REJECTED` transaction re-validates and re-broadcasts it).
+
+        With `?callbackToken=…` the response additionally carries a
+        `callbacks` array: the webhook delivery state of the submissions
+        registered under that token (and only that token — a txid can carry
+        subscriptions from multiple clients). `attempts`/`lastAttemptAt`/
+        `lastResult` are stamped on every POST arcade makes, so a receiver
+        whose edge is rejecting callbacks (e.g. a WAF answering 403) can
+        self-diagnose: `lastResult: "status 403"` with a climbing `attempts`
+        means arcade is delivering and the receiver's side is refusing. Note
+        the top-level `retryCount`/`nextRetryAt` fields are the transaction's
+        BROADCAST retry state — webhook retry state lives inside `callbacks`.
       parameters:
         - name: txid
           in: path
@@ -353,6 +364,16 @@ paths:
           schema:
             type: string
             example: "<hex>"
+        - name: callbackToken
+          in: query
+          required: false
+          description: >-
+            The X-CallbackToken supplied at submit time. Reveals the webhook
+            delivery state (`callbacks` array) of this token's submissions
+            for the txid. Same capability model as the SSE stream's
+            callbackToken.
+          schema:
+            type: string
       responses:
         "200":
           description: Current transaction status.
@@ -1042,6 +1063,12 @@ components:
         is a TransactionStatus; MINED/IMMUTABLE callbacks include blockHash,
         blockHeight, and merklePath (the tx's BUMP), so the proof arrives on the
         callback without a follow-up GET.
+
+        Every callback POST carries `User-Agent: arcade-webhook/<version>` —
+        allowlist the `arcade-webhook/` prefix at your edge so bot/WAF rules
+        for generic HTTP clients don't silently reject deliveries. Delivery
+        health per submission (attempts, last result) is inspectable via
+        `GET /tx/{txid}?callbackToken=…`.
       schema:
         type: string
         format: uri
@@ -1092,6 +1119,38 @@ components:
         - MINED
         - IMMUTABLE
 
+    CallbackDelivery:
+      type: object
+      description: >-
+        Webhook delivery state of one submission, for delivery
+        self-diagnosis. attempts/lastAttemptAt/lastResult are lifetime
+        bookkeeping stamped on every POST arcade makes (never reset);
+        nextRetryAt/lastDeliveredStatus reflect the current transition's
+        retry scheduling.
+      properties:
+        callbackUrl:
+          type: string
+        lastDeliveredStatus:
+          type: string
+          description: Last status transition claimed for delivery to this URL.
+        attempts:
+          type: integer
+          description: Total POSTs ever attempted for this submission.
+        lastAttemptAt:
+          type: string
+          format: date-time
+        lastResult:
+          type: string
+          description: >-
+            "delivered" on success, otherwise the last failure — an HTTP
+            outcome like "status 403" (the receiver or its edge answered
+            that code) or a transport error.
+          example: status 403
+        nextRetryAt:
+          type: string
+          format: date-time
+          description: When the webhook reaper will retry a failed delivery; absent when not in retry state.
+
     TransactionStatus:
       type: object
       properties:
@@ -1130,6 +1189,14 @@ components:
         extraInfo:
           type: string
           description: Free-form detail (e.g. rejection reason).
+        callbacks:
+          type: array
+          description: >-
+            Webhook delivery state of the requester's submissions. Present
+            only when the request carried a matching ?callbackToken=… —
+            scoped to that token's submissions.
+          items:
+            $ref: "#/components/schemas/CallbackDelivery"
         competingTxs:
           type: array
           items:

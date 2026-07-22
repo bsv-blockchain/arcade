@@ -256,6 +256,16 @@ type Store interface {
 	// UpdateDeliveryStatus updates the delivery tracking for a submission
 	UpdateDeliveryStatus(ctx context.Context, submissionID string, lastStatus models.Status, retryCount int, nextRetry *time.Time) error
 
+	// RecordDeliveryAttempt stamps the outcome of one webhook POST attempt on
+	// the submission row: Attempts is incremented and LastAttemptAt/LastResult
+	// are overwritten (result is "delivered" or the failure reason, e.g.
+	// "status 403"). Deliberately orthogonal to UpdateDeliveryStatus /
+	// UpdateDeliveryStatusCAS: those manage the per-transition retry state the
+	// CAS resets (issue #166), while this is monotonic lifetime bookkeeping
+	// surfaced to clients via GET /tx?callbackToken=… for delivery
+	// self-diagnosis (issue #249).
+	RecordDeliveryAttempt(ctx context.Context, submissionID string, at time.Time, result string) error
+
 	// UpdateDeliveryStatusCAS atomically advances LastDeliveredStatus from
 	// `expected` to `next` for the given submission. Returns true iff a row
 	// was updated; false means another replica has already advanced this
