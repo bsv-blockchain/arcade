@@ -104,11 +104,14 @@ func getTxStatus(rt *arcadeRuntime, txid string) (int, string, error) {
 }
 
 // TestSmoke_NonFinalTxRejectedAtIntake exercises the nLockTime/BIP113
-// finality gate end-to-end through the real boot path (issue #245): arcade
-// boots with chaintracks.mode=remote pointed at a stub chain, a non-final
-// tx is rejected synchronously with an actionable reason (never reaching
-// teranode), the reason is durable on GET /tx/{txid}, and an
-// otherwise-identical final tx broadcasts normally.
+// finality gate end-to-end through the real boot path (issues #245/#254):
+// arcade boots with chaintracks.mode=remote pointed at a stub chain, a
+// non-final tx is answered synchronously with an actionable 400 carrying
+// ARC code 476 (never reaching teranode) — but NO verdict is persisted:
+// non-finality is a condition of arcade's chain view, so GET /tx/{txid}
+// keeps returning 404 ("no verdict") and resubmission policies keyed on
+// no-verdict recover once the locktime expires. An otherwise-identical
+// final tx broadcasts normally.
 func TestSmoke_NonFinalTxRejectedAtIntake(t *testing.T) {
 	recorder := newRecordingTeranode(t)
 	stub := newStubChaintracks(t)
@@ -130,17 +133,18 @@ func TestSmoke_NonFinalTxRejectedAtIntake(t *testing.T) {
 	if !strings.Contains(body, "transaction is not final") {
 		t.Errorf("response %q missing finality reason", body)
 	}
+	if !strings.Contains(body, `"status":476`) {
+		t.Errorf("response %q missing ARC 476 status code", body)
+	}
 
-	// The rejection must be durable and carry the reason for late readers.
+	// Zero-state contract: no verdict is persisted for a non-final tx, so
+	// GET stays 404 — the "no verdict" answer resubmission policies key on.
 	code, body, err = getTxStatus(rt, nonFinal.TxID())
 	if err != nil {
 		t.Fatalf("get non-final tx status: %v", err)
 	}
-	if code != http.StatusOK {
-		t.Fatalf("GET /tx/%s: expected 200, got %d: %s", nonFinal.TxID(), code, body)
-	}
-	if !strings.Contains(body, "REJECTED") || !strings.Contains(body, "transaction is not final") {
-		t.Errorf("status body %q missing REJECTED + finality reason", body)
+	if code != http.StatusNotFound {
+		t.Fatalf("GET /tx/%s: expected 404 (no verdict persisted), got %d: %s", nonFinal.TxID(), code, body)
 	}
 
 	// Final: locktime already below the MTP — must broadcast normally.
