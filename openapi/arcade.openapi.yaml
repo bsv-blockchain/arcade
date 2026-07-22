@@ -556,11 +556,11 @@ paths:
             An event stream of status updates. Every frame carries
             txid/txStatus/timestamp. MINED (and IMMUTABLE) frames additionally
             carry blockHash, blockHeight, and merklePath (the transaction's BUMP,
-            hex-encoded) — the same proof GET /tx/:txid and the webhook callback
+            hex-encoded) — the same proof GET /tx/{txid} and the webhook callback
             return, so push-only clients need not poll. Those three fields are
             omitted from earlier frames. On a Last-Event-ID reconnect, replayed
             MINED frames include merklePath best-effort (bounded per reconnect);
-            when omitted, recover it via GET /tx/:txid.
+            when omitted, recover it via GET /tx/{txid}.
           content:
             text/event-stream:
               schema:
@@ -1082,7 +1082,7 @@ components:
           nullable: true
           description: >-
             BUMP merkle path, hex-encoded. Null/absent until mined. On and after
-            MINED it is returned by GET /tx/:txid, pushed on the webhook callback
+            MINED it is returned by GET /tx/{txid}, pushed on the webhook callback
             body, and included in the SSE MINED frame (best-effort on catchup
             replay).
         extraInfo:
