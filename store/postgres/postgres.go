@@ -366,7 +366,7 @@ func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.Tra
 		return nil
 	}
 
-	const colsPerRow = 7 // txid, status, block_hash, block_height, extra_info, merkle_path, timestamp_at, disallowed_prev
+	const colsPerRow = 8 // txid, status, status_code, block_hash, block_height, extra_info, merkle_path, timestamp_at, disallowed_prev
 
 	args := make([]any, 0, len(statuses)*(colsPerRow+1))
 	now := time.Now()
@@ -391,6 +391,7 @@ func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.Tra
 			args,
 			st.TxID,
 			string(st.Status),
+			st.StatusCode,
 			st.BlockHash,
 			int64(st.BlockHeight), /* #nosec G115 */
 			st.ExtraInfo,
@@ -410,8 +411,8 @@ func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.Tra
 		// right types for the VALUES alias columns.
 		fmt.Fprintf(
 			&values,
-			"($%d::text,$%d::text,$%d::text,$%d::bigint,$%d::text,$%d::bytea,$%d::timestamptz,$%d::text[])",
-			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8,
+			"($%d::text,$%d::text,$%d::int,$%d::text,$%d::bigint,$%d::text,$%d::bytea,$%d::timestamptz,$%d::text[])",
+			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9,
 		)
 	}
 
@@ -422,12 +423,13 @@ func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.Tra
 	q := `
 UPDATE transactions t SET
     status       = v.status,
+    status_code  = COALESCE(NULLIF(v.status_code, 0),     t.status_code),
     block_hash   = COALESCE(NULLIF(v.block_hash, ''),     t.block_hash),
     block_height = COALESCE(NULLIF(v.block_height, 0),    t.block_height),
     extra_info   = COALESCE(NULLIF(v.extra_info, ''),     t.extra_info),
     merkle_path  = COALESCE(v.merkle_path,                t.merkle_path),
     timestamp_at = v.timestamp_at
-FROM (VALUES ` + values.String() + `) AS v(txid, status, block_hash, block_height, extra_info, merkle_path, timestamp_at, disallowed_prev)
+FROM (VALUES ` + values.String() + `) AS v(txid, status, status_code, block_hash, block_height, extra_info, merkle_path, timestamp_at, disallowed_prev)
 WHERE t.txid = v.txid AND t.status <> ALL(v.disallowed_prev)`
 
 	if _, err := s.pool.Exec(ctx, q, args...); err != nil {
@@ -467,6 +469,11 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 	if status.ExtraInfo != "" {
 		sets = append(sets, fmt.Sprintf("extra_info = $%d", idx))
 		args = append(args, status.ExtraInfo)
+		idx++
+	}
+	if status.StatusCode != 0 {
+		sets = append(sets, fmt.Sprintf("status_code = $%d", idx))
+		args = append(args, status.StatusCode)
 		idx++
 	}
 	if len(status.MerklePath) > 0 {
@@ -1167,7 +1174,8 @@ WHERE t.txid IN (SELECT DISTINCT txid FROM submissions WHERE callback_token = $1
 func (s *Store) submissions(ctx context.Context, where string, arg any) ([]*models.Submission, error) {
 	q := `
 SELECT submission_id, txid, callback_url, callback_token, full_status_updates,
-       last_delivered_status, retry_count, next_retry_at, created_at
+       last_delivered_status, retry_count, next_retry_at, attempts,
+       last_attempt_at, last_result, created_at
 FROM submissions WHERE ` + where
 	rows, err := s.pool.Query(ctx, q, arg)
 	if err != nil {
@@ -1177,26 +1185,43 @@ FROM submissions WHERE ` + where
 
 	var out []*models.Submission
 	for rows.Next() {
-		sub := &models.Submission{}
-		var lastStatus *string
-		var nextRetry *time.Time
-		if err := rows.Scan(
-			&sub.SubmissionID, &sub.TxID, &sub.CallbackURL, &sub.CallbackToken,
-			&sub.FullStatusUpdates, &lastStatus, &sub.RetryCount, &nextRetry,
-			&sub.CreatedAt,
-		); err != nil {
+		sub, err := scanSubmission(rows)
+		if err != nil {
 			return out, err
-		}
-		if lastStatus != nil {
-			sub.LastDeliveredStatus = models.Status(*lastStatus)
-		}
-		if nextRetry != nil {
-			t := *nextRetry
-			sub.NextRetryAt = &t
 		}
 		out = append(out, sub)
 	}
 	return out, rows.Err()
+}
+
+// scanSubmission reads one submissions row in the canonical column order
+// (shared by submissions and ListSubmissionsReadyForRetry).
+func scanSubmission(row rowScanner) (*models.Submission, error) {
+	sub := &models.Submission{}
+	var lastStatus, lastResult *string
+	var nextRetry, lastAttempt *time.Time
+	if err := row.Scan(
+		&sub.SubmissionID, &sub.TxID, &sub.CallbackURL, &sub.CallbackToken,
+		&sub.FullStatusUpdates, &lastStatus, &sub.RetryCount, &nextRetry,
+		&sub.Attempts, &lastAttempt, &lastResult, &sub.CreatedAt,
+	); err != nil {
+		return nil, err
+	}
+	if lastStatus != nil {
+		sub.LastDeliveredStatus = models.Status(*lastStatus)
+	}
+	if nextRetry != nil {
+		t := *nextRetry
+		sub.NextRetryAt = &t
+	}
+	if lastAttempt != nil {
+		t := *lastAttempt
+		sub.LastAttemptAt = &t
+	}
+	if lastResult != nil {
+		sub.LastResult = *lastResult
+	}
+	return sub, nil
 }
 
 func (s *Store) UpdateDeliveryStatus(ctx context.Context, submissionID string, lastStatus models.Status, retryCount int, nextRetry *time.Time) error {
@@ -1241,7 +1266,8 @@ func (s *Store) ListSubmissionsReadyForRetry(ctx context.Context, now time.Time,
 	}
 	const q = `
 SELECT submission_id, txid, callback_url, callback_token, full_status_updates,
-       last_delivered_status, retry_count, next_retry_at, created_at
+       last_delivered_status, retry_count, next_retry_at, attempts,
+       last_attempt_at, last_result, created_at
 FROM submissions
 WHERE retry_count > 0
   AND next_retry_at IS NOT NULL
@@ -1256,26 +1282,25 @@ LIMIT $2`
 
 	var out []*models.Submission
 	for rows.Next() {
-		sub := &models.Submission{}
-		var lastStatus *string
-		var nextRetry *time.Time
-		if err := rows.Scan(
-			&sub.SubmissionID, &sub.TxID, &sub.CallbackURL, &sub.CallbackToken,
-			&sub.FullStatusUpdates, &lastStatus, &sub.RetryCount, &nextRetry,
-			&sub.CreatedAt,
-		); err != nil {
+		sub, err := scanSubmission(rows)
+		if err != nil {
 			return out, err
-		}
-		if lastStatus != nil {
-			sub.LastDeliveredStatus = models.Status(*lastStatus)
-		}
-		if nextRetry != nil {
-			t := *nextRetry
-			sub.NextRetryAt = &t
 		}
 		out = append(out, sub)
 	}
 	return out, rows.Err()
+}
+
+// RecordDeliveryAttempt implements store.Store: one atomic in-place update —
+// attempts increments server-side so concurrent workers can't lose counts.
+func (s *Store) RecordDeliveryAttempt(ctx context.Context, submissionID string, at time.Time, result string) error {
+	const q = `
+UPDATE submissions SET attempts = attempts + 1, last_attempt_at=$2, last_result=$3
+WHERE submission_id=$1`
+	if _, err := s.pool.Exec(ctx, q, submissionID, at, result); err != nil {
+		return fmt.Errorf("record delivery attempt: %w", err)
+	}
+	return nil
 }
 
 // --- Leaser ---

@@ -68,6 +68,13 @@ type Server struct {
 	submissionCh   chan submissionRecord
 	submissionStop chan struct{}
 	stopOnce       sync.Once
+
+	// tipMu/tipHeight/tipFetchedAt cache the store's active-tip height for
+	// /health (see activeTipHeight): probes arrive every few seconds and
+	// the underlying read is a store scan we don't want to pay per probe.
+	tipMu        sync.Mutex
+	tipHeight    uint64
+	tipFetchedAt time.Time
 }
 
 // submissionRecord is the in-memory payload the async recorder consumes.

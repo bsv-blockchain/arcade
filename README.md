@@ -351,7 +351,14 @@ When you provide `X-CallbackUrl`, Arcade will POST status updates:
 **Features:**
 - Automatic retries with linear backoff (1min, 2min, 3min, etc.)
 - Configurable max retries via `webhook.max_retries`
-- Delivery tracking
+- Every POST carries `User-Agent: arcade-webhook/<version>` — allowlist the
+  `arcade-webhook/` prefix at your edge so bot/WAF rules don't silently
+  reject deliveries
+- Delivery self-diagnosis: `GET /tx/{txid}?callbackToken=<token>` returns a
+  `callbacks` array with `attempts`, `lastAttemptAt`, and `lastResult`
+  (`"delivered"` or the last failure, e.g. `"status 403"`) for your
+  submissions — if `attempts` climbs while your endpoint sees nothing,
+  something in front of it is rejecting the POSTs
 
 </details>
 

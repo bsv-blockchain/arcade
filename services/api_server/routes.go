@@ -48,7 +48,7 @@ var callbackSubscriptionHeaders = []RouteHeader{
 	{
 		Name:        "X-CallbackUrl",
 		Requirement: "Optional",
-		Description: "Webhook URL Arcade should POST status events to as this transaction progresses through the network. Must be a public HTTPS endpoint; private/loopback hosts are rejected unless the deployment is configured to allow them.",
+		Description: "Webhook URL Arcade should POST status events to as this transaction progresses through the network. Must be a public HTTPS endpoint; private/loopback hosts are rejected unless the deployment is configured to allow them. Every POST carries User-Agent: arcade-webhook/<version> — allowlist the arcade-webhook/ prefix so edge bot rules don't reject deliveries; per-submission delivery health is inspectable via GET /tx/:txid?callbackToken=<token>.",
 	},
 	{
 		Name:        "X-CallbackToken",
@@ -67,9 +67,9 @@ var routeDocs = []RouteDoc{
 		Method:         "GET",
 		Path:           "/health",
 		Summary:        "Liveness probe",
-		Description:    "Reports liveness of the API server process and the upstream Datahub endpoints it depends on. Suitable as a Kubernetes liveness probe.",
+		Description:    "Reports liveness of the API server process and the upstream Datahub endpoints it depends on. Suitable as a Kubernetes liveness probe. blockHeight is this instance's processed chain-tip height — a freshness signal (datahub_urls[].healthy is reachability-only), letting clients detect a stale chain view and route around it.",
 		ResponseStatus: "200 OK",
-		ResponseBody:   "{\n  \"healthy\": true,\n  \"version\": \"v0.8.0\",\n  \"status\": \"ok\",\n  \"datahub_urls\": [\n    { \"url\": \"https://...\", \"healthy\": true }\n  ]\n}",
+		ResponseBody:   "{\n  \"healthy\": true,\n  \"version\": \"v0.8.0\",\n  \"status\": \"ok\",\n  \"blockHeight\": 958779,\n  \"datahub_urls\": [\n    { \"url\": \"https://...\", \"healthy\": true }\n  ]\n}",
 	},
 	{
 		Method:         "GET",
@@ -83,7 +83,7 @@ var routeDocs = []RouteDoc{
 		Method:      "GET",
 		Path:        "/tx/:txid",
 		Summary:     "Look up transaction status by txid",
-		Description: "Returns the current lifecycle state of a previously submitted transaction, including its merkle path once mined.",
+		Description: "Returns the current lifecycle state of a previously submitted transaction, including its merkle path once mined. With ?callbackToken=<token> the response adds a callbacks array: the webhook delivery state (attempts, lastAttemptAt, lastResult, nextRetryAt) of that token's submissions — lastResult \"status 403\" with climbing attempts means arcade is POSTing and the receiver's edge is refusing.",
 		Headers: []RouteHeader{
 			{
 				Name:        "Accept",
@@ -92,8 +92,8 @@ var routeDocs = []RouteDoc{
 			},
 		},
 		ResponseStatus: "200 OK",
-		ResponseBody:   "{\n  \"txid\": \"<hex>\",\n  \"txStatus\": \"SEEN_ON_NETWORK\",\n  \"status\": \"SEEN_ON_NETWORK\",\n  \"timestamp\": \"2026-05-20T12:00:00Z\",\n  \"blockHash\": \"<hex|null>\",\n  \"blockHeight\": 870123,\n  \"merklePath\": \"<BUMP hex|null>\",\n  \"extraInfo\": \"\",\n  \"competingTxs\": []\n}",
-		Notes:          "Returns 404 if the txid has never been submitted to this Arcade instance.",
+		ResponseBody:   "{\n  \"txid\": \"<hex>\",\n  \"txStatus\": \"SEEN_ON_NETWORK\",\n  \"status\": \"SEEN_ON_NETWORK\",\n  \"timestamp\": \"2026-05-20T12:00:00Z\",\n  \"blockHash\": \"<hex|null>\",\n  \"blockHeight\": 870123,\n  \"merklePath\": \"<BUMP hex|null>\",\n  \"extraInfo\": \"\",\n  \"competingTxs\": [],\n  \"callbacks\": [\n    {\n      \"callbackUrl\": \"https://...\",\n      \"lastDeliveredStatus\": \"SEEN_ON_NETWORK\",\n      \"attempts\": 14,\n      \"lastAttemptAt\": \"2026-05-20T12:00:00Z\",\n      \"lastResult\": \"status 403\",\n      \"nextRetryAt\": \"2026-05-20T12:05:00Z\"\n    }\n  ]\n}",
+		Notes:          "Returns 404 if the txid has never been submitted to this Arcade instance. The callbacks array appears only with a matching ?callbackToken= and covers only that token's submissions.",
 	},
 	{
 		Method:      "GET",

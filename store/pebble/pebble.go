@@ -146,6 +146,9 @@ type storedSubmission struct {
 	LastDeliveredStatus string `json:"last_delivered_status,omitempty"`
 	RetryCount          int    `json:"retry_count,omitempty"`
 	NextRetryUnixNs     int64  `json:"next_retry_at,omitempty"`
+	Attempts            int    `json:"attempts,omitempty"`
+	LastAttemptUnixNs   int64  `json:"last_attempt_at,omitempty"`
+	LastResult          string `json:"last_result,omitempty"`
 	CreatedUnixNs       int64  `json:"created_at"`
 }
 
@@ -158,6 +161,8 @@ func (s storedSubmission) toModel() *models.Submission {
 		FullStatusUpdates:   s.FullStatusUpdates,
 		LastDeliveredStatus: models.Status(s.LastDeliveredStatus),
 		RetryCount:          s.RetryCount,
+		Attempts:            s.Attempts,
+		LastResult:          s.LastResult,
 	}
 	if s.CreatedUnixNs != 0 {
 		out.CreatedAt = time.Unix(0, s.CreatedUnixNs)
@@ -165,6 +170,10 @@ func (s storedSubmission) toModel() *models.Submission {
 	if s.NextRetryUnixNs != 0 {
 		t := time.Unix(0, s.NextRetryUnixNs)
 		out.NextRetryAt = &t
+	}
+	if s.LastAttemptUnixNs != 0 {
+		t := time.Unix(0, s.LastAttemptUnixNs)
+		out.LastAttemptAt = &t
 	}
 	return out
 }
@@ -1655,6 +1664,41 @@ func (s *Store) UpdateDeliveryStatus(ctx context.Context, submissionID string, l
 	} else {
 		ss.NextRetryUnixNs = 0
 	}
+
+	payload, err := json.Marshal(ss)
+	if err != nil {
+		return err
+	}
+	return s.db.Set(subKey(submissionID), payload, s.writeOpts)
+}
+
+// RecordDeliveryAttempt implements store.Store. The read-modify-write is
+// serialized via submissionMu so a concurrent CAS or retry-state write can't
+// lose the attempts increment.
+func (s *Store) RecordDeliveryAttempt(ctx context.Context, submissionID string, at time.Time, result string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.submissionMu.Lock()
+	defer s.submissionMu.Unlock()
+
+	v, closer, err := s.db.Get(subKey(submissionID))
+	if errors.Is(err, pebbledb.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var ss storedSubmission
+	if uErr := json.Unmarshal(v, &ss); uErr != nil {
+		_ = closer.Close()
+		return uErr
+	}
+	_ = closer.Close()
+
+	ss.Attempts++
+	ss.LastAttemptUnixNs = at.UnixNano()
+	ss.LastResult = result
 
 	payload, err := json.Marshal(ss)
 	if err != nil {

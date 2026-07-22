@@ -63,6 +63,15 @@ type mockStore struct {
 	// used directly. Default behavior (nil hook) is the legacy "always
 	// fresh insert" stub: (nil, false, nil).
 	getOrInsertFn func(status *models.TransactionStatus) (*models.TransactionStatus, bool, error)
+	// tipHeight is served by GetActiveTipBlockHeight (the /health
+	// blockHeight source); tipCalls counts reads so tests can assert the
+	// handler's TTL cache actually coalesces probes.
+	tipHeight uint64
+	tipCalls  int
+	// subsByTxID feeds GetSubmissionsByTxID and getStatusFn feeds GetStatus
+	// for the GET /tx callback-state tests.
+	subsByTxID  map[string][]*models.Submission
+	getStatusFn func(txid string) *models.TransactionStatus
 }
 
 func (m *mockStore) UpdateStatus(_ context.Context, status *models.TransactionStatus) error {
@@ -131,7 +140,10 @@ func (m *mockStore) BatchUpdateStatusReturning(_ context.Context, statuses []*mo
 	return out, nil
 }
 
-func (m *mockStore) GetStatus(context.Context, string) (*models.TransactionStatus, error) {
+func (m *mockStore) GetStatus(_ context.Context, txid string) (*models.TransactionStatus, error) {
+	if m.getStatusFn != nil {
+		return m.getStatusFn(txid), nil
+	}
 	return nil, nil
 }
 
@@ -165,8 +177,10 @@ func (m *mockStore) InsertSubmission(_ context.Context, sub *models.Submission) 
 	return nil
 }
 
-func (m *mockStore) GetSubmissionsByTxID(context.Context, string) ([]*models.Submission, error) {
-	return nil, nil
+func (m *mockStore) GetSubmissionsByTxID(_ context.Context, txid string) ([]*models.Submission, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.subsByTxID[txid], nil
 }
 
 func (m *mockStore) GetSubmissionsByToken(context.Context, string) ([]*models.Submission, error) {
@@ -182,6 +196,10 @@ func (m *mockStore) TokenHasSubmissionForTx(context.Context, string, string) (bo
 }
 
 func (m *mockStore) UpdateDeliveryStatus(context.Context, string, models.Status, int, *time.Time) error {
+	return nil
+}
+
+func (m *mockStore) RecordDeliveryAttempt(context.Context, string, time.Time, string) error {
 	return nil
 }
 
@@ -265,7 +283,12 @@ func (m *mockStore) ListBlockProcessingStatus(context.Context, uint64, int) ([]*
 	return nil, nil
 }
 
-func (m *mockStore) GetActiveTipBlockHeight(context.Context) (uint64, error) { return 0, nil }
+func (m *mockStore) GetActiveTipBlockHeight(context.Context) (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.tipCalls++
+	return m.tipHeight, nil
+}
 
 func (m *mockStore) ListStaleBlockProcessingStatus(context.Context, time.Time, uint64, int) ([]*models.BlockProcessingStatus, error) {
 	return nil, nil

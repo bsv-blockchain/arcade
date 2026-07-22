@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,6 +26,7 @@ type healthResp struct {
 	Healthy     bool                      `json:"healthy"`
 	Version     string                    `json:"version"`
 	Status      string                    `json:"status"`
+	BlockHeight uint64                    `json:"blockHeight"`
 	DatahubURLs []teranode.EndpointStatus `json:"datahub_urls"`
 }
 
@@ -91,6 +93,48 @@ func TestHandleHealth_StructuredResponse(t *testing.T) {
 		if resp.DatahubURLs[i] != w {
 			t.Errorf("datahub_urls[%d] = %+v, want %+v", i, resp.DatahubURLs[i], w)
 		}
+	}
+}
+
+// TestHandleHealth_IncludesBlockHeight pins the chain-freshness field
+// (issue #254): /health reports arcade's own processed active-tip height so
+// clients can detect a stale chain view — datahub_urls[].healthy is
+// reachability-only and stays green through a chain stall. The store read
+// is TTL-cached (probes arrive every few seconds), and without a store the
+// field is omitted rather than reading as "height 0".
+func TestHandleHealth_IncludesBlockHeight(t *testing.T) {
+	ms := &mockStore{tipHeight: 958_779}
+	srv := &Server{
+		cfg:    &config.Config{},
+		logger: zap.NewNop(),
+		store:  ms,
+	}
+
+	code, resp, body := doHealth(t, srv)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (body=%s)", code, string(body))
+	}
+	if resp.BlockHeight != 958_779 {
+		t.Errorf("expected blockHeight=958779, got %d (body=%s)", resp.BlockHeight, string(body))
+	}
+
+	// A second probe inside the TTL must serve the cached height.
+	_, resp, _ = doHealth(t, srv)
+	if resp.BlockHeight != 958_779 {
+		t.Errorf("cached probe: expected blockHeight=958779, got %d", resp.BlockHeight)
+	}
+	ms.mu.Lock()
+	calls := ms.tipCalls
+	ms.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("expected 1 store tip read across 2 probes (TTL cache), got %d", calls)
+	}
+
+	// No store wired → the field is omitted entirely, not emitted as 0.
+	srvNoStore := &Server{cfg: &config.Config{}, logger: zap.NewNop()}
+	_, _, rawBody := doHealth(t, srvNoStore)
+	if strings.Contains(string(rawBody), "blockHeight") {
+		t.Errorf("expected blockHeight omitted without a store, body=%s", string(rawBody))
 	}
 }
 

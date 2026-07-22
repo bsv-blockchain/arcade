@@ -245,7 +245,10 @@ func (s Status) CanTransitionFrom(prev Status) bool {
 	return true
 }
 
-// Submission represents a client's submission and subscription preferences
+// Submission represents a client's submission and subscription preferences.
+// Deliberately carries no json tags: it is never serialized to clients
+// directly (CallbackToken must not leak) — the api-server maps it to a
+// response DTO where needed.
 type Submission struct {
 	SubmissionID        string
 	TxID                string
@@ -253,9 +256,22 @@ type Submission struct {
 	CallbackToken       string
 	FullStatusUpdates   bool
 	LastDeliveredStatus Status
-	RetryCount          int
-	NextRetryAt         *time.Time
-	CreatedAt           time.Time
+	// RetryCount and NextRetryAt are the webhook retry-scheduling state for
+	// the current transition: bumped by each failed POST, cleared by the CAS
+	// when the next transition is claimed.
+	RetryCount  int
+	NextRetryAt *time.Time
+	// Attempts, LastAttemptAt and LastResult are lifetime delivery
+	// bookkeeping, stamped after every POST regardless of outcome and never
+	// reset: Attempts counts every POST ever made for this submission,
+	// LastResult holds "delivered" or the last failure ("status 403", a
+	// transport error). Surfaced on GET /tx?callbackToken=… so receivers can
+	// self-diagnose delivery problems (issue #249: a WAF 403-ing every
+	// callback is invisible from the receiver's own logs).
+	Attempts      int
+	LastAttemptAt *time.Time
+	LastResult    string
+	CreatedAt     time.Time
 }
 
 // BlockReorg represents a notification that a block was orphaned due to a chain reorganization
