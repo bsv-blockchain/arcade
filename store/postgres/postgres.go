@@ -20,16 +20,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bsv-blockchain/go-sdk/chainhash"
-	"github.com/bsv-blockchain/go-sdk/transaction"
-	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/bsv-blockchain/arcade/bump"
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/arcade/store/bumpcache"
 )
 
 //go:embed schema.sql
@@ -41,29 +38,12 @@ var (
 )
 
 // Store is the Postgres-backed implementation of the store interfaces.
-// bumpCacheSize bounds how many parsed compound BUMPs the store keeps
-// resident for merkle-path enrichment. enrichMerklePath runs on every
-// GetStatus of a mined tx — and, since push-path enrichment was added, once
-// per subscribed tx during a MINED fan-out — and would otherwise re-fetch and
-// re-parse the whole block BUMP on each call, the dominant heap consumer under
-// sustained load. Status lookups and fan-out both cluster on the handful of
-// recently-mined blocks in flight, so a small LRU gives a high hit rate while
-// keeping the resident set bounded to bumpCacheSize sparse compounds (tracked
-// txs only) plus their level-0 offset indexes.
-const bumpCacheSize = 16
-
-// cachedBUMP is one block's parsed compound BUMP plus its level-0 txid→offset
-// index, so per-tx path extraction is a map lookup + ExtractMinimalPath rather
-// than a re-parse and a level-0 hash scan.
-type cachedBUMP struct {
-	compound *transaction.MerklePath
-	offsets  map[chainhash.Hash]uint64
-}
-
 type Store struct {
-	pool      *pgxpool.Pool
-	stopEmb   func() error
-	bumpCache *lru.Cache[string, *cachedBUMP]
+	pool    *pgxpool.Pool
+	stopEmb func() error
+	// bumpCache holds parsed+indexed compound BUMPs for merkle-path
+	// enrichment — sizing, budget, and singleflight live in bumpcache.
+	bumpCache *bumpcache.Cache
 }
 
 // New connects to Postgres (optionally starting the embedded-postgres process
@@ -100,16 +80,7 @@ func New(ctx context.Context, cfg config.Postgres) (*Store, error) {
 		return nil, fmt.Errorf("connect postgres: %w", err)
 	}
 
-	bumpCache, err := lru.New[string, *cachedBUMP](bumpCacheSize)
-	if err != nil {
-		pool.Close()
-		if stopEmbedded != nil {
-			_ = stopEmbedded()
-		}
-		return nil, fmt.Errorf("init bump cache: %w", err)
-	}
-
-	return &Store{pool: pool, stopEmb: stopEmbedded, bumpCache: bumpCache}, nil
+	return &Store{pool: pool, stopEmb: stopEmbedded, bumpCache: bumpcache.New()}, nil
 }
 
 // EnsureIndexes applies the schema. Safe to call repeatedly — every CREATE
@@ -1506,44 +1477,8 @@ func (s *Store) EnrichMerklePath(ctx context.Context, status *models.Transaction
 // enrichMerklePath attaches the per-tx minimal merkle path for mined/immutable
 // rows, extracting it from the block's cached, indexed compound BUMP.
 func (s *Store) enrichMerklePath(ctx context.Context, status *models.TransactionStatus) {
-	if status == nil || len(status.MerklePath) > 0 || status.BlockHash == "" {
-		return
-	}
-	if status.Status != models.StatusMined && status.Status != models.StatusImmutable {
-		return
-	}
-	entry := s.compoundBUMP(ctx, status.BlockHash)
-	if entry == nil {
-		return
-	}
-	txHash, err := chainhash.NewHashFromHex(status.TxID)
-	if err != nil {
-		return
-	}
-	offset, ok := entry.offsets[*txHash]
-	if !ok {
-		return
-	}
-	status.MerklePath = bump.ExtractMinimalPath(entry.compound, offset).Bytes()
-}
-
-// compoundBUMP returns the parsed+indexed compound BUMP for a block, caching it
-// so repeated enrichment for txs in the same block reuses the parse and the
-// level-0 offset index instead of re-fetching, re-parsing, and rescanning the
-// (potentially large) BUMP. The returned value is shared and read-only.
-func (s *Store) compoundBUMP(ctx context.Context, blockHash string) *cachedBUMP {
-	if c, ok := s.bumpCache.Get(blockHash); ok {
-		return c
-	}
-	_, bumpData, err := s.GetBUMP(ctx, blockHash)
-	if err != nil || len(bumpData) == 0 {
-		return nil
-	}
-	compound, offsets, err := bump.IndexCompound(bumpData)
-	if err != nil {
-		return nil
-	}
-	entry := &cachedBUMP{compound: compound, offsets: offsets}
-	s.bumpCache.Add(blockHash, entry)
-	return entry
+	s.bumpCache.Enrich(status, func() ([]byte, error) {
+		_, bumpData, err := s.GetBUMP(ctx, status.BlockHash)
+		return bumpData, err
+	})
 }

@@ -1,16 +1,16 @@
 package synthblock
 
 import (
+	"bytes"
 	"testing"
-
-	"github.com/bsv-blockchain/go-sdk/chainhash"
 
 	"github.com/bsv-blockchain/arcade/bump"
 )
 
 // TestBuild_MinimalPathsVerify is the load-bearing sanity check: for a range of
 // block sizes, every txid's minimal path extracted from the compound (via the
-// SAME bump.ExtractMinimalPath the store uses) must recompute the block root.
+// SAME bump.CompoundIndex walk the store enrichment uses) must recompute the
+// block root and match the unindexed extractor byte-for-byte.
 func TestBuild_MinimalPathsVerify(t *testing.T) {
 	for _, numTxs := range []int{1, 2, 4, 8, 16} {
 		blk, err := Build(numTxs, 870123)
@@ -23,28 +23,27 @@ func TestBuild_MinimalPathsVerify(t *testing.T) {
 
 		// Whole-compound proof for each tx.
 		for _, txid := range blk.Txids {
-			if err := VerifyMerklePath(blk.BumpBytes, txid, blk.Root); err != nil {
-				t.Errorf("compound verify numTxs=%d: %v", numTxs, err)
+			if vErr := VerifyMerklePath(blk.BumpBytes, txid, blk.Root); vErr != nil {
+				t.Errorf("compound verify numTxs=%d: %v", numTxs, vErr)
 			}
 		}
 
 		// Per-tx minimal path, mirroring store enrichment: index once, extract per tx.
-		compound, offsets, err := bump.IndexCompound(blk.BumpBytes)
+		idx, err := bump.IndexCompound(blk.BumpBytes)
 		if err != nil {
 			t.Fatalf("IndexCompound(%d): %v", numTxs, err)
 		}
 		for _, txid := range blk.Txids {
-			th, err := chainhash.NewHashFromHex(txid)
-			if err != nil {
-				t.Fatalf("parse txid %s: %v", txid, err)
+			minimal := idx.MinimalPathBytes(txid)
+			if len(minimal) == 0 {
+				t.Fatalf("numTxs=%d: no minimal path for txid %s", numTxs, txid)
 			}
-			off, ok := offsets[*th]
-			if !ok {
-				t.Fatalf("numTxs=%d: txid %s missing from offset index", numTxs, txid)
+			// The indexed walk must be byte-identical to the unindexed extractor.
+			if legacy := bump.ExtractMinimalPathForTx(blk.BumpBytes, txid); !bytes.Equal(minimal, legacy) {
+				t.Errorf("numTxs=%d txid=%s: indexed path differs from ExtractMinimalPathForTx", numTxs, txid)
 			}
-			minimal := bump.ExtractMinimalPath(compound, off).Bytes()
-			if err := VerifyMerklePath(minimal, txid, blk.Root); err != nil {
-				t.Errorf("minimal verify numTxs=%d txid=%s: %v", numTxs, txid, err)
+			if vErr := VerifyMerklePath(minimal, txid, blk.Root); vErr != nil {
+				t.Errorf("minimal verify numTxs=%d txid=%s: %v", numTxs, txid, vErr)
 			}
 		}
 	}

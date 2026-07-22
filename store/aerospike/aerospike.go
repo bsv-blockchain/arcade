@@ -13,15 +13,12 @@ import (
 
 	aero "github.com/aerospike/aerospike-client-go/v7"
 	"github.com/aerospike/aerospike-client-go/v7/types"
-	"github.com/bsv-blockchain/go-sdk/chainhash"
-	"github.com/bsv-blockchain/go-sdk/transaction"
-	lru "github.com/hashicorp/golang-lru/v2"
 
-	"github.com/bsv-blockchain/arcade/bump"
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/arcade/store/bumpcache"
 )
 
 func isKeyNotFound(err error) bool {
@@ -78,23 +75,6 @@ var (
 )
 
 // Store is the Aerospike-backed implementation of store.Store and store.Leaser.
-// bumpCacheSize bounds how many parsed+indexed compound BUMPs the store keeps
-// resident for merkle-path enrichment. enrichMerklePath runs on every GetStatus
-// of a mined tx and once per subscribed tx during a MINED fan-out; without a
-// cache each call reassembles the chunked BUMP from Aerospike and re-parses it
-// — expensive. Lookups and fan-out cluster on the few recently-mined blocks in
-// flight, so a small LRU gives a high hit rate while bounding the resident set
-// to bumpCacheSize sparse compounds plus their level-0 offset indexes.
-const bumpCacheSize = 16
-
-// cachedBUMP is one block's parsed compound BUMP plus its level-0 txid→offset
-// index, so per-tx path extraction is a map lookup + ExtractMinimalPath rather
-// than a reassemble+re-parse and a level-0 hash scan.
-type cachedBUMP struct {
-	compound *transaction.MerklePath
-	offsets  map[chainhash.Hash]uint64
-}
-
 type Store struct {
 	client        *aero.Client
 	namespace     string
@@ -103,7 +83,11 @@ type Store struct {
 	opTimeout     time.Duration
 	socketTimeout time.Duration
 	bumpChunkSize int
-	bumpCache     *lru.Cache[string, *cachedBUMP]
+	// bumpCache holds parsed+indexed compound BUMPs for merkle-path
+	// enrichment — sizing, budget, and singleflight live in bumpcache.
+	// Especially valuable here: a miss reassembles the chunked BUMP from
+	// Aerospike before parsing.
+	bumpCache *bumpcache.Cache
 }
 
 // New creates an Aerospike-backed Store connected to the configured cluster.
@@ -165,12 +149,6 @@ func New(cfg config.Aero) (*Store, error) {
 		bumpChunkSize = bumpDefaultChunkSizeBytes
 	}
 
-	bumpCache, cacheErr := lru.New[string, *cachedBUMP](bumpCacheSize)
-	if cacheErr != nil {
-		client.Close()
-		return nil, fmt.Errorf("init bump cache: %w", cacheErr)
-	}
-
 	s := &Store{
 		client:        client,
 		namespace:     cfg.Namespace,
@@ -179,7 +157,7 @@ func New(cfg config.Aero) (*Store, error) {
 		opTimeout:     time.Duration(cfg.OpTimeoutMs) * time.Millisecond,
 		socketTimeout: time.Duration(cfg.SocketTimeoutMs) * time.Millisecond,
 		bumpChunkSize: bumpChunkSize,
-		bumpCache:     bumpCache,
+		bumpCache:     bumpcache.New(),
 	}
 
 	if err := s.EnsureIndexes(); err != nil {
@@ -2346,46 +2324,10 @@ func (s *Store) EnrichMerklePath(ctx context.Context, status *models.Transaction
 // and extracts the per-tx minimal merkle path if not already present, reusing
 // the block's cached, indexed compound.
 func (s *Store) enrichMerklePath(ctx context.Context, status *models.TransactionStatus) {
-	if status == nil || len(status.MerklePath) > 0 || status.BlockHash == "" {
-		return
-	}
-	if status.Status != models.StatusMined && status.Status != models.StatusImmutable {
-		return
-	}
-	entry := s.compoundBUMP(ctx, status.BlockHash)
-	if entry == nil {
-		return
-	}
-	txHash, err := chainhash.NewHashFromHex(status.TxID)
-	if err != nil {
-		return
-	}
-	offset, ok := entry.offsets[*txHash]
-	if !ok {
-		return
-	}
-	status.MerklePath = bump.ExtractMinimalPath(entry.compound, offset).Bytes()
-}
-
-// compoundBUMP returns the parsed+indexed compound BUMP for a block, caching it
-// so repeated enrichment for txs in the same block reuses the chunk reassembly,
-// the parse, and the level-0 offset index. The returned value is shared and
-// read-only.
-func (s *Store) compoundBUMP(ctx context.Context, blockHash string) *cachedBUMP {
-	if c, ok := s.bumpCache.Get(blockHash); ok {
-		return c
-	}
-	_, bumpData, err := s.GetBUMP(ctx, blockHash)
-	if err != nil || len(bumpData) == 0 {
-		return nil
-	}
-	compound, offsets, err := bump.IndexCompound(bumpData)
-	if err != nil {
-		return nil
-	}
-	entry := &cachedBUMP{compound: compound, offsets: offsets}
-	s.bumpCache.Add(blockHash, entry)
-	return entry
+	s.bumpCache.Enrich(status, func() ([]byte, error) {
+		_, bumpData, err := s.GetBUMP(ctx, status.BlockHash)
+		return bumpData, err
+	})
 }
 
 func recordToSubmission(rec *aero.Record) *models.Submission {
