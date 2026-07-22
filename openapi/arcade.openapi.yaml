@@ -552,7 +552,15 @@ paths:
             example: "1716205200123456789"
       responses:
         "200":
-          description: An event stream of status updates.
+          description: |
+            An event stream of status updates. Every frame carries
+            txid/txStatus/timestamp. MINED (and IMMUTABLE) frames additionally
+            carry blockHash, blockHeight, and merklePath (the transaction's BUMP,
+            hex-encoded) — the same proof GET /tx/{txid} and the webhook callback
+            return, so push-only clients need not poll. Those three fields are
+            omitted from earlier frames. On a Last-Event-ID reconnect, replayed
+            MINED frames include merklePath best-effort (bounded per reconnect);
+            when omitted, recover it via GET /tx/{txid}.
           content:
             text/event-stream:
               schema:
@@ -564,7 +572,7 @@ paths:
 
                 id: 1716205260987654321
                 event: status
-                data: {"txid":"<hex>","txStatus":"MINED","timestamp":"2026-05-20T12:01:00Z"}
+                data: {"txid":"<hex>","txStatus":"MINED","timestamp":"2026-05-20T12:01:00Z","blockHash":"<hex>","blockHeight":870123,"merklePath":"<BUMP hex>"}
 
                 : keepalive
 
@@ -991,7 +999,10 @@ components:
       description: |
         Webhook URL Arcade should POST status events to as this transaction
         progresses. Must be a public HTTPS endpoint; private/loopback hosts are
-        rejected unless the deployment is configured to allow them.
+        rejected unless the deployment is configured to allow them. The POST body
+        is a TransactionStatus; MINED/IMMUTABLE callbacks include blockHash,
+        blockHeight, and merklePath (the tx's BUMP), so the proof arrives on the
+        callback without a follow-up GET.
       schema:
         type: string
         format: uri
@@ -1069,7 +1080,11 @@ components:
         merklePath:
           type: string
           nullable: true
-          description: BUMP merkle path, hex-encoded. Null/absent until mined.
+          description: >-
+            BUMP merkle path, hex-encoded. Null/absent until mined. On and after
+            MINED it is returned by GET /tx/{txid}, pushed on the webhook callback
+            body, and included in the SSE MINED frame (best-effort on catchup
+            replay).
         extraInfo:
           type: string
           description: Free-form detail (e.g. rejection reason).

@@ -506,6 +506,17 @@ var WebhookCASLostTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "Webhook deliveries skipped because another replica won the LastDeliveredStatus CAS.",
 })
 
+// MinedPushWithoutMerklePathTotal counts MINED (or IMMUTABLE) statuses pushed
+// on a channel ("webhook" | "sse") whose body/frame went out without a
+// merklePath despite enrichment being attempted. Because the compound BUMP is
+// persisted before the MINED event is published, a nonzero value points to a
+// cache-eviction/reorg race or a missing/unparseable BUMP — the proof is still
+// recoverable via GET /tx/:txid, but a sustained rate warrants investigation.
+var MinedPushWithoutMerklePathTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_mined_push_without_merkle_path_total",
+	Help: "MINED/IMMUTABLE statuses pushed without a merklePath after enrichment, by channel.",
+}, []string{"channel"})
+
 // WebhookCASErrorTotal counts CAS attempts that failed with a real infra
 // error rather than a generation mismatch — surfaced separately so a flat
 // WebhookCASLostTotal can't mask a backend that's silently failing every

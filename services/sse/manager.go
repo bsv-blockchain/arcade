@@ -152,6 +152,11 @@ func (m *Manager) fanOut(ctx context.Context, status *models.TransactionStatus) 
 	}
 	m.mu.RUnlock()
 
+	if len(clients) == 0 {
+		return // nobody listening — skip the token probes and enrichment
+	}
+
+	enriched := false
 	for _, c := range clients {
 		if c.Ctx.Err() != nil {
 			metrics.APISSEDroppedTotal.WithLabelValues("client_gone").Inc()
@@ -159,6 +164,17 @@ func (m *Manager) fanOut(ctx context.Context, status *models.TransactionStatus) 
 		}
 		if c.Token != "" && !m.txBelongsToToken(ctx, status.TxID, c.Token) {
 			continue
+		}
+		// This client will receive the frame, so attach the merkle proof — once
+		// per event (the status pointer is shared across the sends below) and
+		// lazily after the token match, so we only pay for txids a connected
+		// client actually wants. Safe on this single fan-out goroutine: the
+		// mutation completes before any c.Ch <- status send establishes
+		// happens-before with the client's read-only writeStatus. No-op for
+		// non-mined statuses.
+		if !enriched {
+			m.enrichMerklePath(ctx, status)
+			enriched = true
 		}
 		select {
 		case c.Ch <- status:
@@ -311,6 +327,17 @@ func (s *Service) handleEvents(c *gin.Context) {
 // of frames used to OOM the whole pod, killing every connected client.
 const catchupMaxFrames = 10_000
 
+// catchupBlockBudget bounds how many DISTINCT blocks a single catchup replay
+// will enrich with merkle paths. Enrichment parses (and caches) a block's
+// compound BUMP; within one replay the LRU keeps recent blocks hot, but a
+// pathological reconnect window spanning many distinct blocks would otherwise
+// re-parse a large BUMP per block. Capping distinct blocks bounds that CPU to
+// at most catchupBlockBudget parses per replay, independent of frame count —
+// the memory ceiling is already the store's bump-cache size. Over-budget MINED
+// frames still ship with blockHash/blockHeight; the proof stays recoverable via
+// GET /tx/:id.
+const catchupBlockBudget = 64
+
 // errCatchupCapped stops the catchup iteration at catchupMaxFrames.
 // Internal sentinel, never surfaced to the client.
 var errCatchupCapped = errors.New("sse catchup frame cap reached")
@@ -327,18 +354,33 @@ var errCatchupCapped = errors.New("sse catchup frame cap reached")
 //
 // The store streams a projection (no raw tx, no merkle-path enrichment) in
 // ascending timestamp order, so replayed event ids stay monotonic for
-// Last-Event-ID resume.
+// Last-Event-ID resume. Merkle-path enrichment is layered on HERE (not inside
+// the iterator, which must stay a pure projection per its contract): terminal
+// frames on a Last-Event-ID reconnect are enriched best-effort, bounded by
+// catchupBlockBudget distinct blocks. Fresh connects replay only non-terminal
+// statuses, so the enrichment branch never fires there.
 func (s *Service) sendCatchup(ctx context.Context, w *sseWriter, token string, since time.Time) {
 	var only []models.Status
 	if since.IsZero() {
 		only = models.NonTerminalStatuses()
 	}
 	frames := 0
+	enrichedBlocks := make(map[string]struct{})
 	err := s.store.IterateStatusesByToken(ctx, token, since, only, func(status *models.TransactionStatus) error {
 		if frames >= catchupMaxFrames {
 			return errCatchupCapped
 		}
 		frames++
+		if status.Status == models.StatusMined || status.Status == models.StatusImmutable {
+			_, seen := enrichedBlocks[status.BlockHash]
+			if status.BlockHash != "" && (seen || len(enrichedBlocks) < catchupBlockBudget) {
+				enrichedBlocks[status.BlockHash] = struct{}{}
+				s.store.EnrichMerklePath(ctx, status)
+				if len(status.MerklePath) == 0 {
+					metrics.MinedPushWithoutMerklePathTotal.WithLabelValues("sse").Inc()
+				}
+			}
+		}
 		return writeStatus(w, status)
 	})
 	if errors.Is(err, errCatchupCapped) {
@@ -348,13 +390,31 @@ func (s *Service) sendCatchup(ctx context.Context, w *sseWriter, token string, s
 	}
 }
 
+// enrichMerklePath attaches the merkle proof to a mined/immutable status before
+// it is framed to clients. No-op for other statuses, when there is no store, or
+// when the block's BUMP isn't retrievable — best-effort, so it never blocks a
+// frame. Records a metric when a mined frame still lacks a proof so operators
+// can spot BUMP-availability gaps.
+func (m *Manager) enrichMerklePath(ctx context.Context, status *models.TransactionStatus) {
+	if m.store == nil {
+		return
+	}
+	m.store.EnrichMerklePath(ctx, status)
+	if (status.Status == models.StatusMined || status.Status == models.StatusImmutable) && len(status.MerklePath) == 0 {
+		metrics.MinedPushWithoutMerklePathTotal.WithLabelValues("sse").Inc()
+	}
+}
+
 // writeStatus emits one status frame. Event id is the timestamp in
 // nanoseconds so clients can use it as Last-Event-ID on reconnect.
 func writeStatus(w *sseWriter, status *models.TransactionStatus) error {
 	data, err := json.Marshal(statusPayload{
-		TxID:      status.TxID,
-		TxStatus:  string(status.Status),
-		Timestamp: status.Timestamp.UTC().Format(time.RFC3339),
+		TxID:        status.TxID,
+		TxStatus:    string(status.Status),
+		Timestamp:   status.Timestamp.UTC().Format(time.RFC3339),
+		BlockHash:   status.BlockHash,
+		BlockHeight: status.BlockHeight,
+		MerklePath:  status.MerklePath,
 	})
 	if err != nil {
 		return err
@@ -363,10 +423,15 @@ func writeStatus(w *sseWriter, status *models.TransactionStatus) error {
 	return w.write(frame)
 }
 
-// statusPayload is the JSON shape inside a `data:` field. Field order
-// and names mirror the legacy wire format: txid, txStatus, timestamp.
+// statusPayload is the JSON shape inside a `data:` field. txid/txStatus/timestamp
+// are the always-present legacy fields; blockHash/blockHeight/merklePath are
+// added for mined/immutable frames (omitempty keeps every other frame at the
+// original three-field shape). merklePath is a BUMP, hex-encoded like GET /tx.
 type statusPayload struct {
-	TxID      string `json:"txid"`
-	TxStatus  string `json:"txStatus"`
-	Timestamp string `json:"timestamp"`
+	TxID        string          `json:"txid"`
+	TxStatus    string          `json:"txStatus"`
+	Timestamp   string          `json:"timestamp"`
+	BlockHash   string          `json:"blockHash,omitempty"`
+	BlockHeight uint64          `json:"blockHeight,omitempty"`
+	MerklePath  models.HexBytes `json:"merklePath,omitempty"`
 }

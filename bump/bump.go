@@ -3,8 +3,10 @@
 package bump
 
 import (
+	"cmp"
 	"fmt"
 	"math"
+	"slices"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
@@ -389,6 +391,111 @@ func ExtractMinimalPathForTx(bumpData []byte, txid string) []byte {
 
 	minimal := ExtractMinimalPath(compound, txOffset)
 	return minimal.Bytes()
+}
+
+// CompoundIndex is a compound BUMP parsed and indexed for repeated per-tx
+// minimal-path extraction: a level-0 txid→offset map plus every level's
+// elements sorted by offset for binary search. Callers that need minimal paths
+// for many txs of the same block (e.g. SSE/webhook fan-out enrichment) build
+// one index via IndexCompound, cache it, and call MinimalPathBytes per tx —
+// O(depth·log level-size) each, instead of a re-parse plus the O(level-size)
+// linear scans that ExtractMinimalPath's findLeafByOffset walk costs.
+//
+// The index shares the parsed PathElements and is read-only after
+// construction, so a cached CompoundIndex is safe for concurrent use.
+type CompoundIndex struct {
+	blockHeight uint32
+	// txOffsets maps each level-0 leaf hash to its offset (duplicate-flag
+	// leaves carry no hash and are reachable only as siblings via levels).
+	txOffsets map[chainhash.Hash]uint64
+	// levels holds every PathElement of the compound per level, sorted by
+	// Offset so leafAt can binary-search. Chosen over per-level maps: ~8B
+	// per element instead of ~50B, and the resident set is what the store's
+	// bump cache has to budget for.
+	levels [][]*transaction.PathElement
+	leaves int
+}
+
+// IndexCompound parses a compound BUMP and indexes it for per-tx extraction.
+// Returns an error if the BUMP cannot be parsed.
+func IndexCompound(bumpData []byte) (*CompoundIndex, error) {
+	compound, err := transaction.NewMerklePathFromBinary(bumpData)
+	if err != nil {
+		return nil, err
+	}
+	ci := &CompoundIndex{
+		blockHeight: compound.BlockHeight,
+		levels:      make([][]*transaction.PathElement, len(compound.Path)),
+	}
+	if len(compound.Path) > 0 {
+		ci.txOffsets = make(map[chainhash.Hash]uint64, len(compound.Path[0]))
+		for _, leaf := range compound.Path[0] {
+			if leaf.Hash != nil {
+				ci.txOffsets[*leaf.Hash] = leaf.Offset
+			}
+		}
+	}
+	for level, elems := range compound.Path {
+		sorted := make([]*transaction.PathElement, len(elems))
+		copy(sorted, elems)
+		slices.SortFunc(sorted, func(a, b *transaction.PathElement) int {
+			return cmp.Compare(a.Offset, b.Offset)
+		})
+		ci.levels[level] = sorted
+		ci.leaves += len(sorted)
+	}
+	return ci, nil
+}
+
+// Leaves reports the total PathElement count across all levels — the size
+// proxy cache implementations use to budget resident memory.
+func (ci *CompoundIndex) Leaves() int { return ci.leaves }
+
+// leafAt returns the element at (level, offset), or nil when absent.
+func (ci *CompoundIndex) leafAt(level int, offset uint64) *transaction.PathElement {
+	if level >= len(ci.levels) {
+		return nil
+	}
+	elems := ci.levels[level]
+	i, ok := slices.BinarySearchFunc(elems, offset, func(e *transaction.PathElement, off uint64) int {
+		return cmp.Compare(e.Offset, off)
+	})
+	if !ok {
+		return nil
+	}
+	return elems[i]
+}
+
+// MinimalPathBytes returns the BRC-74 serialized minimal path for txid, or nil
+// when the txid is unparseable or not a level-0 leaf of the compound. The walk
+// mirrors ExtractMinimalPath (level-0 leaf + sibling, then one sibling per
+// upper level, absent nodes skipped) with indexed lookups in place of scans.
+func (ci *CompoundIndex) MinimalPathBytes(txid string) []byte {
+	txHash, err := chainhash.NewHashFromHex(txid)
+	if err != nil {
+		return nil
+	}
+	txOffset, ok := ci.txOffsets[*txHash]
+	if !ok {
+		return nil
+	}
+	mp := &transaction.MerklePath{
+		BlockHeight: ci.blockHeight,
+		Path:        make([][]*transaction.PathElement, len(ci.levels)),
+	}
+	offset := txOffset
+	for level := range ci.levels {
+		if level == 0 {
+			if leaf := ci.leafAt(0, offset); leaf != nil {
+				addLeaf(mp, 0, leaf)
+			}
+		}
+		if sibling := ci.leafAt(level, offset^1); sibling != nil {
+			addLeaf(mp, level, sibling)
+		}
+		offset >>= 1
+	}
+	return mp.Bytes()
 }
 
 // ExtractLevel0Hashes parses a BRC-74 STUMP binary and returns all level-0 hashes.

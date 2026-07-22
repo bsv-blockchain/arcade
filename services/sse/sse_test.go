@@ -89,6 +89,12 @@ func (s *sseStoreStub) GetStatus(_ context.Context, txid string) (*models.Transa
 	return s.statusByTx[txid], nil
 }
 
+// EnrichMerklePath is a no-op for this stub: these tests don't exercise the
+// compound-BUMP extraction (the dedicated pebble-backed e2e tests do). It must
+// still exist so fan-out/catchup enrichment doesn't dereference the nil
+// embedded store.Store.
+func (s *sseStoreStub) EnrichMerklePath(_ context.Context, _ *models.TransactionStatus) {}
+
 // IterateStatusesByToken mirrors the real backends: distinct txids under
 // the token, current status projection, since/only filters, ascending
 // timestamp order.

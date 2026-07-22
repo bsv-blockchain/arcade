@@ -101,6 +101,20 @@ type Store interface {
 	// GetStatus retrieves the status for a transaction
 	GetStatus(ctx context.Context, txid string) (*models.TransactionStatus, error)
 
+	// EnrichMerklePath populates status.MerklePath in place for a MINED/IMMUTABLE
+	// status that already carries a BlockHash, extracting the transaction's
+	// minimal merkle path from the block's compound BUMP. It is a no-op when the
+	// status is nil, already has a MerklePath, has no BlockHash, is not
+	// MINED/IMMUTABLE, or the block's BUMP cannot be retrieved/parsed — so callers
+	// on push paths can invoke it unconditionally and treat the proof as
+	// best-effort (never a delivery gate). Safe to call repeatedly across all the
+	// txids of one block: implementations share the bounded bumpcache of parsed,
+	// indexed compound BUMPs (see store/bumpcache), so per-tx enrichment is
+	// O(tree depth · log level-size), not a re-parse. Unlike GetStatus this does
+	// not read the full row (no RawTx), which keeps it cheap enough for the
+	// SSE/webhook fan-out hot path.
+	EnrichMerklePath(ctx context.Context, status *models.TransactionStatus)
+
 	// GetStatusesSince retrieves all transactions updated since a given timestamp
 	GetStatusesSince(ctx context.Context, since time.Time) ([]*models.TransactionStatus, error)
 
