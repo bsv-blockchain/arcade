@@ -45,8 +45,24 @@ data: {"txid":"abc...","txStatus":"SEEN_ON_NETWORK","timestamp":"2026-04-28T18:2
 
 - `id` is a Unix nanosecond timestamp. Clients should remember the most recent `id` and send it back as `Last-Event-ID` on reconnect (browser `EventSource` does this automatically).
 - `event: status` is the only event type emitted for transaction updates.
-- `data` is one JSON object per frame with three fields: `txid`, `txStatus`, `timestamp` (RFC 3339).
+- `data` is one JSON object per frame. Every frame carries `txid`, `txStatus`, and `timestamp` (RFC 3339).
 - A blank line terminates each frame.
+
+### Mined frames carry the merkle proof
+
+When `txStatus` is `MINED` (or `IMMUTABLE`), the frame additionally carries the block context and the transaction's merkle proof — the same fields the webhook callback and `GET /tx/:txid` return, so a push-only client never has to poll for the proof:
+
+```
+id: 1745870512987654321
+event: status
+data: {"txid":"abc...","txStatus":"MINED","timestamp":"2026-04-28T18:21:52Z","blockHash":"0000...","blockHeight":870123,"merklePath":"<BUMP hex>"}
+
+```
+
+- `blockHash` / `blockHeight` — the block the transaction was mined into.
+- `merklePath` — the transaction's minimal [BUMP](https://github.com/bitcoin-sv/BRCs/blob/master/transactions/0074.md) (Bitcoin Unified Merkle Path), hex-encoded. Verify it by recomputing the block merkle root from the txid.
+
+These three fields are omitted from non-mined frames, so pre-`MINED` frames keep the original three-field shape. On a `Last-Event-ID` reconnect, replayed `MINED` frames are enriched with `merklePath` best-effort: to keep the replay path bounded, a single reconnect enriches at most a fixed number of distinct blocks, after which replayed `MINED` frames still carry `blockHash`/`blockHeight` but omit `merklePath` — recover it with `GET /tx/:txid`.
 
 Every ~15 seconds the server emits a `: keepalive` comment frame so idle proxies don't kill the connection. Comment frames have no `event:` and should be ignored by clients.
 

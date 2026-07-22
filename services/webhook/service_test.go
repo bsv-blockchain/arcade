@@ -126,6 +126,8 @@ func (s *fakeStore) GetStatus(context.Context, string) (*models.TransactionStatu
 	return nil, nil
 }
 
+func (s *fakeStore) EnrichMerklePath(context.Context, *models.TransactionStatus) {}
+
 func (s *fakeStore) GetStatusesSince(context.Context, time.Time) ([]*models.TransactionStatus, error) {
 	return nil, nil
 }

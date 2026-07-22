@@ -293,12 +293,24 @@ func (s *Service) dispatchOne(ctx context.Context, status *models.TransactionSta
 		)
 		return
 	}
+	enriched := false
 	for _, sub := range subs {
 		if sub.CallbackURL == "" {
 			continue // SSE-only subscription; no webhook to send
 		}
 		if !shouldDeliver(sub, status) {
 			continue
+		}
+		// Attach the merkle proof to MINED/IMMUTABLE deliveries. Done lazily on
+		// the first deliverable subscriber (not for SSE-only txids) and only
+		// once — the status pointer is shared across every deliver() below, so
+		// all subscribers of this txid get the same enriched body. Best-effort:
+		// a no-op for non-mined statuses or when the BUMP isn't retrievable, so
+		// it never blocks delivery. deliver() emits the metric when a MINED body
+		// still lacks a path.
+		if !enriched {
+			s.store.EnrichMerklePath(ctx, status)
+			enriched = true
 		}
 		s.deliver(ctx, sub, status)
 	}
@@ -357,6 +369,10 @@ func (s *Service) deliver(ctx context.Context, sub *models.Submission, status *m
 	if !claimed {
 		metrics.WebhookCASLostTotal.Inc()
 		return
+	}
+
+	if (status.Status == models.StatusMined || status.Status == models.StatusImmutable) && len(status.MerklePath) == 0 {
+		metrics.MinedPushWithoutMerklePathTotal.WithLabelValues("webhook").Inc()
 	}
 
 	body, err := json.Marshal(status)

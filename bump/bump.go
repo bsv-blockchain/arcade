@@ -391,6 +391,30 @@ func ExtractMinimalPathForTx(bumpData []byte, txid string) []byte {
 	return minimal.Bytes()
 }
 
+// IndexCompound parses a compound BUMP and returns it alongside a level-0
+// txid→offset index. Callers that need per-tx minimal paths for many txs of the
+// same block (e.g. SSE/webhook fan-out enrichment) parse+index once via this,
+// cache the result, then call ExtractMinimalPath(compound, offset) per tx —
+// avoiding both a re-parse and the O(level-0) hash scan that finding a tx's
+// offset would otherwise cost on every extraction. Returns an error if the BUMP
+// cannot be parsed.
+func IndexCompound(bumpData []byte) (*transaction.MerklePath, map[chainhash.Hash]uint64, error) {
+	compound, err := transaction.NewMerklePathFromBinary(bumpData)
+	if err != nil {
+		return nil, nil, err
+	}
+	var offsets map[chainhash.Hash]uint64
+	if len(compound.Path) > 0 {
+		offsets = make(map[chainhash.Hash]uint64, len(compound.Path[0]))
+		for _, leaf := range compound.Path[0] {
+			if leaf.Hash != nil {
+				offsets[*leaf.Hash] = leaf.Offset
+			}
+		}
+	}
+	return compound, offsets, nil
+}
+
 // ExtractLevel0Hashes parses a BRC-74 STUMP binary and returns all level-0 hashes.
 func ExtractLevel0Hashes(stumpData []byte) []chainhash.Hash {
 	mp, err := transaction.NewMerklePathFromBinary(stumpData)
