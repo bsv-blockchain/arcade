@@ -107,7 +107,6 @@ func gaugeVal(t *testing.T, vec *prometheus.GaugeVec, label string) float64 {
 // alerting on txs whose SEEN state-transfer never arrived):
 //   - RECEIVED and ACCEPTED_BY_NETWORK rows older than stuckTransientAge are
 //     counted — INCLUDING body-less rows the rebroadcast arm skips;
-//   - ACCEPTED_BY_NETWORK is counted but NOT rebroadcast (no behavior change);
 //   - fresh transient rows and terminal rows are not counted;
 //   - the oldest-age gauge reflects the oldest stuck row per status.
 func TestReapOnce_StuckTransientCensus(t *testing.T) {
@@ -150,13 +149,60 @@ func TestReapOnce_StuckTransientCensus(t *testing.T) {
 	if got := gaugeVal(t, metrics.OldestTransientTxAge, string(models.StatusReceived)); got < 2.5*3600 {
 		t.Errorf("oldest RECEIVED age = %vs, want > 9000s", got)
 	}
-	// ACCEPTED_BY_NETWORK must NOT be rebroadcast (census only).
-	if got := log.count("register:acc-stale"); got != 0 {
-		t.Errorf("ACCEPTED_BY_NETWORK row was rebroadcast; census must not change rebroadcast behavior")
+	// Stale ACCEPTED_BY_NETWORK with a body is now nudged by the rebroadcast
+	// arm (see TestReapOnce_RebroadcastsStaleAccepted); the census still
+	// counts it regardless.
+	if got := log.count("register:acc-stale"); got != 1 {
+		t.Errorf("stale ACCEPTED_BY_NETWORK with body should be rebroadcast; events=%v", log.all())
 	}
 	// Rebroadcast arm unchanged: stale RECEIVED with body + stale SEEN.
 	if got := log.count("register:recv-stale-body"); got != 1 {
 		t.Errorf("stale RECEIVED with body not rebroadcast; events=%v", log.all())
+	}
+}
+
+// TestReapOnce_RebroadcastsStaleAccepted pins the ACCEPTED_BY_NETWORK
+// self-heal arm (the stuck-at-ACCEPTED drain, CASE-26): a validated tx that
+// reached ACCEPTED_BY_NETWORK but never advanced to SEEN past
+// staleAcceptedByNetworkAge is re-registered with merkle-service and
+// re-broadcast. Recent ACCEPTED rows (still in the normal ACCEPTED→SEEN
+// window) and body-less rows are left alone.
+func TestReapOnce_RebroadcastsStaleAccepted(t *testing.T) {
+	now := time.Now()
+	stale := now.Add(-2 * time.Hour)    // > staleAcceptedByNetworkAge, < staleScanLookback
+	recent := now.Add(-1 * time.Minute) // < staleAcceptedByNetworkAge
+
+	log := &eventLog{}
+	ms := newMockStore()
+	ms.replayRows = []*models.TransactionStatus{
+		{TxID: "acc-stale", Status: models.StatusAcceptedByNetwork, RawTx: []byte{0x0a}, Timestamp: stale},
+		{TxID: "acc-recent", Status: models.StatusAcceptedByNetwork, RawTx: []byte{0x0b}, Timestamp: recent},
+		{TxID: "acc-nobody", Status: models.StatusAcceptedByNetwork, Timestamp: stale}, // no RawTx → skip
+	}
+
+	merkleSrv := newMerkleServer(log, http.StatusOK)
+	defer merkleSrv.Close()
+	teranodeSrv := newTeranodeServer(log, http.StatusOK)
+	defer teranodeSrv.Close()
+
+	p := newPropagator(merkleSrv.URL, teranodeSrv.URL, ms)
+	p.reapOnce(context.Background())
+
+	want := map[string]int{
+		"register:acc-stale":  1, // stale ACCEPTED with body → rebroadcast
+		"register:acc-recent": 0, // still in the normal ACCEPTED→SEEN window
+		"register:acc-nobody": 0, // no RawTx to rebroadcast
+	}
+	for prefix, exp := range want {
+		if got := log.count(prefix); got != exp {
+			t.Errorf("%q count = %d, want %d; events=%v", prefix, got, exp, log.all())
+		}
+	}
+	if got := log.count("register:"); got != 1 {
+		t.Errorf("total register count = %d, want 1; events=%v", got, log.all())
+	}
+	if got := log.count("broadcast"); got != 1 {
+		t.Errorf("broadcast count = %d, want 1", got)
 	}
 }
 
