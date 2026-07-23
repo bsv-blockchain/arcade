@@ -149,8 +149,8 @@ func TestInjectExtractTraceContext_RoundTrip(t *testing.T) {
 	// The carrier's Get/Set is an exact []byte<->string conversion — the
 	// traceparent header's on-wire bytes must be exactly the propagator's
 	// string representation, byte for byte.
-	if string(raw) != (headerCarrier(headers)).Get("traceparent") {
-		t.Errorf("traceparent bytes %q do not exactly match carrier.Get %q", raw, (headerCarrier(headers)).Get("traceparent"))
+	if string(raw) != headerCarrier(headers).Get("traceparent") {
+		t.Errorf("traceparent bytes %q do not exactly match carrier.Get %q", raw, headerCarrier(headers).Get("traceparent"))
 	}
 
 	got := trace.SpanContextFromContext(ExtractTraceContext(context.Background(), headers))

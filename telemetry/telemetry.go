@@ -251,7 +251,8 @@ func initTraces(ctx context.Context, cfg config.TelemetryConfig, res *resource.R
 	if cfg.Endpoint == "" && !hasOTLPEndpointEnv("TRACES") {
 		return nil, nil, nil, fmt.Errorf(
 			"traces enabled but no OTLP endpoint configured " +
-				"(set telemetry.endpoint or OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)")
+				"(set telemetry.endpoint or OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)",
+		)
 	}
 
 	var exp *otlptrace.Exporter
@@ -301,7 +302,8 @@ func initMetrics(ctx context.Context, cfg config.TelemetryConfig, res *resource.
 	if cfg.Endpoint == "" && !hasOTLPEndpointEnv("METRICS") {
 		return nil, nil, nil, fmt.Errorf(
 			"metrics enabled but no OTLP endpoint configured " +
-				"(set telemetry.endpoint or OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_EXPORTER_OTLP_METRICS_ENDPOINT)")
+				"(set telemetry.endpoint or OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_EXPORTER_OTLP_METRICS_ENDPOINT)",
+		)
 	}
 
 	var exp sdkmetric.Exporter

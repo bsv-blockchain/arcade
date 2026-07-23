@@ -368,10 +368,7 @@ paths:
           in: query
           required: false
           description: >-
-            The X-CallbackToken supplied at submit time. Reveals the webhook
-            delivery state (`callbacks` array) of this token's submissions
-            for the txid. Same capability model as the SSE stream's
-            callbackToken.
+            The X-CallbackToken supplied at submit time. Reveals the webhook delivery state (`callbacks` array) of this token's submissions for the txid. Same capability model as the SSE stream's callbackToken.
           schema:
             type: string
       responses:
@@ -641,7 +638,7 @@ paths:
       operationId: chaintracksGetNetwork
       tags: [Chaintracks]
       summary: Get the active network
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       responses:
         "200":
           description: The configured network.
@@ -661,7 +658,7 @@ paths:
       operationId: chaintracksGetHeight
       tags: [Chaintracks]
       summary: Get the current chain height
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       responses:
         "200":
           description: Current best-chain height.
@@ -680,7 +677,7 @@ paths:
       operationId: chaintracksGetTip
       tags: [Chaintracks]
       summary: Get the current chain tip header (JSON)
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       responses:
         "200":
           description: The chain tip block header. The `X-Block-Height` response header carries the tip height.
@@ -704,7 +701,7 @@ paths:
       operationId: chaintracksGetTipBinary
       tags: [Chaintracks]
       summary: Get the current chain tip header (binary)
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       responses:
         "200":
           description: The serialized 80-byte block header.
@@ -726,7 +723,7 @@ paths:
       tags: [Chaintracks]
       summary: Get a run of serialized headers (binary)
       description: Returns `count` consecutive serialized headers starting at `height`, concatenated as raw bytes.
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       parameters:
         - name: height
           in: query
@@ -764,7 +761,7 @@ paths:
         Returns the header at the given height. Append `.bin` to the height
         (e.g. `/header/height/870123.bin`) to receive the serialized binary
         header instead of JSON.
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       parameters:
         - name: height
           in: path
@@ -796,7 +793,7 @@ paths:
       description: |
         Returns the header for the given block hash. Append `.bin` to the hash
         to receive the serialized binary header instead of JSON.
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       parameters:
         - name: hash
           in: path
@@ -828,7 +825,7 @@ paths:
         Server-Sent Events stream that emits the current tip immediately on
         connect and then pushes each new tip as blocks arrive. A `: keepalive`
         comment is sent every 15 seconds.
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       responses:
         "200":
           description: An event stream of tip headers.
@@ -842,7 +839,7 @@ paths:
       operationId: chaintracksStreamReorg
       tags: [Chaintracks]
       summary: Stream chain-reorg events (SSE)
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       responses:
         "200":
           description: An event stream of reorg events.
@@ -861,7 +858,7 @@ paths:
         `{ status, value }` envelope (or `{ status, code, description }` on
         error). The `/chaintracks/v1` prefix also serves the full JSON/binary
         surface available under `/chaintracks/v2`.
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       responses:
         "200":
           description: Wrapped network value.
@@ -875,7 +872,7 @@ paths:
       operationId: chaintracksLegacyGetPresentHeight
       tags: [Chaintracks]
       summary: "Legacy: get the current height"
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       responses:
         "200":
           description: Wrapped height value.
@@ -889,7 +886,7 @@ paths:
       operationId: chaintracksLegacyFindChainTipHashHex
       tags: [Chaintracks]
       summary: "Legacy: get the chain tip hash (hex)"
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       responses:
         "200":
           description: Wrapped tip-hash value.
@@ -909,7 +906,7 @@ paths:
       operationId: chaintracksLegacyFindChainTipHeaderHex
       tags: [Chaintracks]
       summary: "Legacy: get the chain tip header"
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       responses:
         "200":
           description: Wrapped tip-header value.
@@ -929,7 +926,7 @@ paths:
       operationId: chaintracksLegacyFindHeaderHexForHeight
       tags: [Chaintracks]
       summary: "Legacy: get a header by height"
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       parameters:
         - name: height
           in: query
@@ -962,7 +959,7 @@ paths:
       operationId: chaintracksLegacyFindHeaderHexForBlockHash
       tags: [Chaintracks]
       summary: "Legacy: get a header by block hash"
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       parameters:
         - name: hash
           in: query
@@ -995,7 +992,7 @@ paths:
       tags: [Chaintracks]
       summary: "Legacy: get a run of headers (hex)"
       description: Returns `count` consecutive headers starting at `height`, concatenated and hex-encoded inside the `value` field.
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       parameters:
         - name: height
           in: query
@@ -1122,11 +1119,7 @@ components:
     CallbackDelivery:
       type: object
       description: >-
-        Webhook delivery state of one submission, for delivery
-        self-diagnosis. attempts/lastAttemptAt/lastResult are lifetime
-        bookkeeping stamped on every POST arcade makes (never reset);
-        nextRetryAt/lastDeliveredStatus reflect the current transition's
-        retry scheduling.
+        Webhook delivery state of one submission, for delivery self-diagnosis. attempts/lastAttemptAt/lastResult are lifetime bookkeeping stamped on every POST arcade makes (never reset); nextRetryAt/lastDeliveredStatus reflect the current transition's retry scheduling.
       properties:
         callbackUrl:
           type: string
@@ -1142,9 +1135,7 @@ components:
         lastResult:
           type: string
           description: >-
-            "delivered" on success, otherwise the last failure — an HTTP
-            outcome like "status 403" (the receiver or its edge answered
-            that code) or a transport error.
+            "delivered" on success, otherwise the last failure — an HTTP outcome like "status 403" (the receiver or its edge answered that code) or a transport error.
           example: status 403
         nextRetryAt:
           type: string
@@ -1162,9 +1153,7 @@ components:
         status:
           type: integer
           description: >-
-            Numeric ARC error code (460-476 taxonomy) recorded with a
-            REJECTED verdict when the failure is classifiable — e.g. 466
-            conflicting tx, 476 not final. Omitted when zero/unclassified.
+            Numeric ARC error code (460-476 taxonomy) recorded with a REJECTED verdict when the failure is classifiable — e.g. 466 conflicting tx, 476 not final. Omitted when zero/unclassified.
         timestamp:
           type: string
           format: date-time
@@ -1182,19 +1171,14 @@ components:
           type: string
           nullable: true
           description: >-
-            BUMP merkle path, hex-encoded. Null/absent until mined. On and after
-            MINED it is returned by GET /tx/{txid}, pushed on the webhook callback
-            body, and included in the SSE MINED frame (best-effort on catchup
-            replay).
+            BUMP merkle path, hex-encoded. Null/absent until mined. On and after MINED it is returned by GET /tx/{txid}, pushed on the webhook callback body, and included in the SSE MINED frame (best-effort on catchup replay).
         extraInfo:
           type: string
           description: Free-form detail (e.g. rejection reason).
         callbacks:
           type: array
           description: >-
-            Webhook delivery state of the requester's submissions. Present
-            only when the request carried a matching ?callbackToken=… —
-            scoped to that token's submissions.
+            Webhook delivery state of the requester's submissions. Present only when the request carried a matching ?callbackToken=… — scoped to that token's submissions.
           items:
             $ref: "#/components/schemas/CallbackDelivery"
         competingTxs:
@@ -1402,9 +1386,7 @@ components:
           type: integer
           format: int64
           description: >-
-            This instance's processed active chain-tip height. A freshness
-            signal (compare against the network tip to detect a stale chain
-            view); omitted when the height has never been readable.
+            This instance's processed active chain-tip height. A freshness signal (compare against the network tip to detect a stale chain view); omitted when the height has never been readable.
           example: 958779
         datahub_urls:
           type: array
@@ -1445,10 +1427,7 @@ components:
         status:
           type: integer
           description: >-
-            Numeric ARC error code (460-476 taxonomy) when the failure maps
-            onto it — e.g. 461 malformed unlocking scripts, 465 fee too low,
-            476 not final (retryable; resubmit after the locktime expires).
-            Absent for failures with no confident classification.
+            Numeric ARC error code (460-476 taxonomy) when the failure maps onto it — e.g. 461 malformed unlocking scripts, 465 fee too low, 476 not final (retryable; resubmit after the locktime expires). Absent for failures with no confident classification.
           example: 476
         title:
           type: string

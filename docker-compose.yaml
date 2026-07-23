@@ -45,7 +45,7 @@ x-arcade-common: &arcade-common
     - arcade-net
   restart: on-failure
   depends_on:
-    <<: *arcade-depends
+    !!merge <<: *arcade-depends
 
 services:
   # --- Infrastructure -------------------------------------------------------
@@ -67,8 +67,8 @@ services:
       - --smp=1
       - --default-log-level=info
     ports:
-      - "19092:19092"   # host tools: rpk -X brokers=localhost:19092
-      - "19644:9644"    # admin API
+      - "19092:19092" # host tools: rpk -X brokers=localhost:19092
+      - "19644:9644" # admin API
     volumes:
       - redpanda-data:/var/lib/redpanda/data:Z
     networks:
@@ -106,7 +106,7 @@ services:
       POSTGRES_PASSWORD: arcade
       PGDATA: /var/lib/postgresql/data/pgdata
     ports:
-      - "15432:5432"    # 5432 left free for a host postgres
+      - "15432:5432" # 5432 left free for a host postgres
     volumes:
       - postgres-data:/var/lib/postgresql/data:Z
     networks:
@@ -167,7 +167,7 @@ services:
       DATAHUB_ALLOW_PRIVATE_IPS: "true"
       BLOB_STORE_URL: "memory:"
     ports:
-      - "18080:8080"    # health/debug from the host (8080 is taken by api-server)
+      - "18080:8080" # health/debug from the host (8080 is taken by api-server)
     networks:
       - arcade-net
     depends_on:
@@ -195,48 +195,48 @@ services:
 
   # http 8080; health/ready/metrics are on 8080 in this mode (not 8081).
   api-server:
-    <<: *arcade-common
+    !!merge <<: *arcade-common
     command: ["--mode", "api-server"]
     environment:
-      <<: *arcade-env
+      !!merge <<: *arcade-env
       OTEL_SERVICE_NAME: arcade-api-server
     ports:
       - "8080:8080"
     depends_on:
-      <<: *arcade-depends
+      !!merge <<: *arcade-depends
       chaintracks:
         condition: service_started
       merkle-service:
         condition: service_started
 
-  propagation:            # health 8081 only (unpublished)
-    <<: *arcade-common
+  propagation: # health 8081 only (unpublished)
+    !!merge <<: *arcade-common
     command: ["--mode", "propagation"]
     environment:
-      <<: *arcade-env
+      !!merge <<: *arcade-env
       OTEL_SERVICE_NAME: arcade-propagation
 
   # Mirrors _base/bump-builder.yaml env: header lookups against the
   # chaintracks service instead of an embedded ChainManager.
-  bump-builder:           # health 8081 (unpublished)
-    <<: *arcade-common
+  bump-builder: # health 8081 (unpublished)
+    !!merge <<: *arcade-common
     command: ["--mode", "bump-builder"]
     environment:
-      <<: *arcade-env
+      !!merge <<: *arcade-env
       OTEL_SERVICE_NAME: arcade-bump-builder
       ARCADE_CHAINTRACKS_MODE: remote
       ARCADE_CHAINTRACKS_URL: http://chaintracks:8083
     depends_on:
-      <<: *arcade-depends
+      !!merge <<: *arcade-depends
       chaintracks:
         condition: service_started
 
   # GOMEMLIMIT mirrors _base/sse.yaml (kafka backlog replay bursts).
-  sse:                    # http 8082 (SSE + /health /ready on same port)
-    <<: *arcade-common
+  sse: # http 8082 (SSE + /health /ready on same port)
+    !!merge <<: *arcade-common
     command: ["--mode", "sse"]
     environment:
-      <<: *arcade-env
+      !!merge <<: *arcade-env
       OTEL_SERVICE_NAME: arcade-sse
       GOMEMLIMIT: 400MiB
     ports:
@@ -247,11 +247,11 @@ services:
   # volume persists synced headers across down/up — deviation from k8s (which
   # re-syncs per pod restart); cheap local QoL. volumes restated because YAML
   # merge keys do not merge lists.
-  chaintracks:            # http 8083 (+8081 health, unpublished)
-    <<: *arcade-common
+  chaintracks: # http 8083 (+8081 health, unpublished)
+    !!merge <<: *arcade-common
     command: ["--mode", "chaintracks"]
     environment:
-      <<: *arcade-env
+      !!merge <<: *arcade-env
       OTEL_SERVICE_NAME: arcade-chaintracks
       ARCADE_CHAINTRACKS_MODE: embedded
     ports:
@@ -260,20 +260,20 @@ services:
       - ./compose/arcade-config.yaml:/etc/arcade/config.yaml:ro,z
       - chaintracks-data:/root/.arcade:Z
 
-  watchdog:               # health 8081 only (unpublished)
-    <<: *arcade-common
+  watchdog: # health 8081 only (unpublished)
+    !!merge <<: *arcade-common
     command: ["--mode", "watchdog"]
     environment:
-      <<: *arcade-env
+      !!merge <<: *arcade-env
       OTEL_SERVICE_NAME: arcade-watchdog
 
   # libp2p 9905 NOT published — k8s exposes no Service for it (outbound-only
   # discovery). Fresh peer key per recreate, same as the no-PVC k8s pod.
   p2p-client:
-    <<: *arcade-common
+    !!merge <<: *arcade-common
     command: ["--mode", "p2p-client"]
     environment:
-      <<: *arcade-env
+      !!merge <<: *arcade-env
       OTEL_SERVICE_NAME: arcade-p2p-client
 
 networks:

@@ -1689,7 +1689,8 @@ func (s *Store) RecordDeliveryAttempt(ctx context.Context, submissionID string, 
 	}
 	policy := s.writePolicy(ctx)
 	policy.RecordExistsAction = aero.UPDATE_ONLY // never create a phantom submission
-	_, err = s.client.Operate(policy, key,
+	_, err = s.client.Operate(
+		policy, key,
 		aero.AddOp(aero.NewBin("attempts", 1)),
 		aero.PutOp(aero.NewBin("last_attempt_at", at.UnixMilli())),
 		aero.PutOp(aero.NewBin("last_result", result)),
