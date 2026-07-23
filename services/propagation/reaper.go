@@ -30,15 +30,27 @@ import (
 // that the normal intake→ACCEPTED path (seconds) and the 2s in-memory requeue
 // are never pre-empted by the reaper.
 //
+// staleAcceptedByNetworkAge: a row at ACCEPTED_BY_NETWORK older than this was
+// accepted into a mempool but never advanced to SEEN — the merkle-service
+// state-transfer that drives SEEN never arrived (the /watch registration was
+// lost, or the tx propagated too narrowly for merkle-service's p2p to observe
+// it). Rebroadcast to nudge it: re-registering gives merkle-service another
+// chance to watch and detect the tx, and re-broadcasting pushes it to more
+// peers so it can propagate wider. Safe to repeat every tick — the lattice
+// forbids ACCEPTED_BY_NETWORK → ACCEPTED_BY_NETWORK
+// (models.Status.DisallowedPreviousStatuses), so a still-accepted rebroadcast
+// result is a store no-op: the stuck gauge drains only when the tx genuinely
+// reaches SEEN/MINED/REJECTED, never via a spurious timestamp refresh.
+//
 // staleScanLookback bounds how far back IterateStatusesSince walks. Rows
 // older than this are assumed permanently stuck and outside the reaper's
-// responsibility — the operator surfaces them with `arcade tools surface
-// stuck` if a deeper sweep is needed.
+// responsibility.
 const (
-	staleSeenOnNetworkAge  = time.Hour
-	staleReceivedAge       = time.Hour
-	staleScanLookback      = 24 * time.Hour
-	reaperRebroadcastBatch = 200
+	staleSeenOnNetworkAge     = time.Hour
+	staleReceivedAge          = time.Hour
+	staleAcceptedByNetworkAge = time.Hour
+	staleScanLookback         = 24 * time.Hour
+	reaperRebroadcastBatch    = 200
 
 	// stuckTransientAge is the threshold for the StuckTransientTxs /
 	// OldestTransientTxAge gauges: a tx sitting in RECEIVED or
@@ -49,9 +61,9 @@ const (
 )
 
 // stuckTransientStatuses are the transient statuses the stuck gauges track.
-// RECEIVED is partially self-healed by the rebroadcast arm below;
-// ACCEPTED_BY_NETWORK has no self-heal path, which is exactly why it needs
-// the visibility.
+// Both are now nudged by the rebroadcast arm below (RECEIVED past
+// staleReceivedAge, ACCEPTED_BY_NETWORK past staleAcceptedByNetworkAge); the
+// gauges stay as the census of what's still stuck after those nudges.
 var stuckTransientStatuses = []models.Status{
 	models.StatusReceived,
 	models.StatusAcceptedByNetwork,
@@ -123,13 +135,15 @@ func (p *Propagator) tryReap(ctx context.Context) {
 
 // reapOnce rebroadcasts rows stuck past their stale-age threshold:
 // SEEN_ON_NETWORK / SEEN_MULTIPLE_NODES past staleSeenOnNetworkAge (peer
-// mempool eviction, dropped BLOCK_PROCESSED callback, fee bump needed), and
+// mempool eviction, dropped BLOCK_PROCESSED callback, fee bump needed),
 // RECEIVED past staleReceivedAge (a no-verdict broadcast whose in-memory
 // requeue was lost, or an intake Kafka-publish failure the submitter never
-// retried). Both carry RawTx and are validated txs we accepted responsibility
-// to propagate, so rebroadcasting self-heals a transient downstream outage.
-// Recent RECEIVED rows (still in the normal intake/requeue path) and body-less
-// rows are left alone.
+// retried), and ACCEPTED_BY_NETWORK past staleAcceptedByNetworkAge (accepted
+// into a mempool but the SEEN state-transfer from merkle-service never
+// arrived — re-register + re-broadcast to nudge it toward SEEN). All carry
+// RawTx and are validated txs we accepted responsibility to propagate, so
+// rebroadcasting self-heals a transient downstream outage. Recent rows (still
+// in the normal intake/requeue path) and body-less rows are left alone.
 //
 // Rebroadcasts go through the same registerBatch + broadcastInChunks +
 // applyTerminalStatuses pipeline as processBatch but bypass the
@@ -144,6 +158,7 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 	since := now.Add(-staleScanLookback)
 	seenDeadline := now.Add(-staleSeenOnNetworkAge)
 	receivedDeadline := now.Add(-staleReceivedAge)
+	acceptedDeadline := now.Add(-staleAcceptedByNetworkAge)
 
 	stuckTransientDeadline := now.Add(-stuckTransientAge)
 	type transientStats struct {
@@ -191,6 +206,19 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 			// retried. Rebroadcast to self-heal. Recent rows are still in
 			// the normal intake/requeue path, so leave them alone.
 			if !st.Timestamp.Before(receivedDeadline) {
+				return nil
+			}
+		case models.StatusAcceptedByNetwork:
+			// Accepted into a mempool but never advanced to SEEN past
+			// staleAcceptedByNetworkAge — the merkle-service SEEN
+			// state-transfer never arrived. Rebroadcast re-registers the tx
+			// with merkle-service (another chance to watch + detect) and
+			// re-broadcasts to more peers (wider propagation). If it stays
+			// ACCEPTED the lattice makes the resulting write a no-op, so this
+			// only ever helps drain the stuck gauge, never masks it. Recent
+			// rows are still in the normal ACCEPTED→SEEN window, so leave
+			// them alone.
+			if !st.Timestamp.Before(acceptedDeadline) {
 				return nil
 			}
 		default:
