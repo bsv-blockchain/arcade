@@ -37,7 +37,7 @@ func (f *fakeReader) GetHeaders(_ context.Context, _, _ uint32) ([]*chaintracks.
 	return f.headers, f.headersErr
 }
 
-func header(height uint32, timestamp uint32) *chaintracks.BlockHeader {
+func header(height, timestamp uint32) *chaintracks.BlockHeader {
 	h := &chaintracks.BlockHeader{
 		Header: &block.Header{Timestamp: timestamp},
 		Height: height,
