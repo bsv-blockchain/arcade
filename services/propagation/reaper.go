@@ -3,6 +3,7 @@ package propagation
 import (
 	"context"
 	"errors"
+	"net/url"
 	"time"
 
 	"go.uber.org/zap"
@@ -69,6 +70,12 @@ var stuckTransientStatuses = []models.Status{
 	models.StatusAcceptedByNetwork,
 }
 
+// stuckAttributionCap bounds how many stuck txs one tick attributes to a
+// callback host. The uncapped totals live on StuckTransientTxs; the per-host
+// breakdown does one submission lookup per attributed tx, so cap it to keep
+// the leader tick cheap even when the stuck set is huge (a real incident).
+const stuckAttributionCap = 500
+
 // zeroStuckTransientGauges resets the leader-computed stuck gauges. Called on
 // non-leader ticks so a pod that lost the lease doesn't keep exporting its
 // last leader-era values (the current leader's values then win under max()).
@@ -77,6 +84,22 @@ func zeroStuckTransientGauges() {
 		metrics.StuckTransientTxs.WithLabelValues(string(st)).Set(0)
 		metrics.OldestTransientTxAge.WithLabelValues(string(st)).Set(0)
 	}
+	// The by-callback vec has dynamic host labels, so Reset (not per-label
+	// Set(0)) is the only way to drop hosts this pod is no longer leader for.
+	metrics.StuckTransientTxsByCallback.Reset()
+}
+
+// callbackHost extracts the hostname from a submission CallbackURL for the
+// per-client stuck breakdown, or "none" when there is no usable URL.
+func callbackHost(rawURL string) string {
+	if rawURL == "" {
+		return "none"
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Hostname() == "" {
+		return "unparsed"
+	}
+	return u.Hostname()
 }
 
 // reaperLeaseName is the well-known key every replica uses to coordinate
@@ -169,6 +192,14 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 	for _, s := range stuckTransientStatuses {
 		stuckTransient[s] = &transientStats{}
 	}
+	// txids of stuck rows to attribute to a callback host after the scan
+	// (bounded by stuckAttributionCap). Collected here — not looked up inline
+	// — so the scan itself stays free of per-row store calls.
+	type stuckRef struct {
+		txid   string
+		status models.Status
+	}
+	attrib := make([]stuckRef, 0, stuckAttributionCap)
 
 	stuck := make([]propagationMsg, 0, reaperRebroadcastBatch)
 	err := p.store.IterateStatusesSince(ctx, since, func(st *models.TransactionStatus) error {
@@ -180,6 +211,9 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 			ts.count++
 			if ts.oldest.IsZero() || st.Timestamp.Before(ts.oldest) {
 				ts.oldest = st.Timestamp
+			}
+			if len(attrib) < stuckAttributionCap {
+				attrib = append(attrib, stuckRef{txid: st.TxID, status: st.Status})
 			}
 		}
 
@@ -257,6 +291,45 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 				zap.Int("count", ts.count),
 				zap.Float64("oldest_age_seconds", age))
 		}
+	}
+
+	// Per-client breakdown of the stuck census: attribute each collected stuck
+	// tx to the callback host(s) of its submission(s), so an operator can see
+	// which client owns the backlog. One submission lookup per attributed tx
+	// (bounded by stuckAttributionCap). Reset the vec first so hosts that
+	// drained since the last tick stop reporting (dynamic host labels).
+	byCallback := make(map[models.Status]map[string]int)
+	for _, ref := range attrib {
+		if err := ctx.Err(); err != nil {
+			break
+		}
+		subs, subErr := p.store.GetSubmissionsByTxID(ctx, ref.txid)
+		if subErr != nil {
+			continue // best-effort: the uncapped totals are already published
+		}
+		hosts := map[string]struct{}{}
+		for _, sub := range subs {
+			hosts[callbackHost(sub.CallbackURL)] = struct{}{}
+		}
+		if len(hosts) == 0 {
+			hosts["none"] = struct{}{} // stuck tx with no registered callback
+		}
+		for h := range hosts {
+			if byCallback[ref.status] == nil {
+				byCallback[ref.status] = map[string]int{}
+			}
+			byCallback[ref.status][h]++
+		}
+	}
+	metrics.StuckTransientTxsByCallback.Reset()
+	for status, hosts := range byCallback {
+		for host, n := range hosts {
+			metrics.StuckTransientTxsByCallback.WithLabelValues(string(status), host).Set(float64(n))
+		}
+	}
+	if len(attrib) >= stuckAttributionCap {
+		p.logger.Warn("reaper: stuck-by-callback attribution capped",
+			zap.Int("cap", stuckAttributionCap))
 	}
 
 	if len(stuck) == 0 {
