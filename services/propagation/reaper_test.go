@@ -103,6 +103,57 @@ func gaugeVal(t *testing.T, vec *prometheus.GaugeVec, label string) float64 {
 	return testutil.ToFloat64(vec.WithLabelValues(label))
 }
 
+// TestReapOnce_StuckByCallbackAttribution pins the per-client breakdown of the
+// stuck census: each stuck tx is attributed to its submission's callback host
+// (or "none" when it has no callback), so an operator can see which client
+// owns the ACCEPTED_BY_NETWORK backlog.
+func TestReapOnce_StuckByCallbackAttribution(t *testing.T) {
+	metrics.StuckTransientTxsByCallback.Reset()
+	stale := time.Now().Add(-2 * time.Hour)
+
+	log := &eventLog{}
+	ms := newMockStore()
+	ms.replayRows = []*models.TransactionStatus{
+		{TxID: "acc-a", Status: models.StatusAcceptedByNetwork, RawTx: []byte{0x01}, Timestamp: stale},
+		{TxID: "acc-b", Status: models.StatusAcceptedByNetwork, RawTx: []byte{0x02}, Timestamp: stale},
+		{TxID: "acc-c", Status: models.StatusAcceptedByNetwork, RawTx: []byte{0x03}, Timestamp: stale},
+		{TxID: "acc-nocb", Status: models.StatusAcceptedByNetwork, RawTx: []byte{0x04}, Timestamp: stale},
+	}
+	// Two txs from one overlay host, one from another, one with no callback.
+	ms.submissionsByTxID = map[string][]*models.Submission{
+		"acc-a": {{TxID: "acc-a", CallbackURL: "https://low-overlay.example/arc-ingest"}},
+		"acc-b": {{TxID: "acc-b", CallbackURL: "https://low-overlay.example/arc-ingest"}},
+		"acc-c": {{TxID: "acc-c", CallbackURL: "https://other-client.example/cb"}},
+		// acc-nocb: no submissions → "none"
+	}
+
+	merkleSrv := newMerkleServer(log, http.StatusOK)
+	defer merkleSrv.Close()
+	teranodeSrv := newTeranodeServer(log, http.StatusOK)
+	defer teranodeSrv.Close()
+
+	p := newPropagator(merkleSrv.URL, teranodeSrv.URL, ms)
+	p.reapOnce(context.Background())
+
+	acc := string(models.StatusAcceptedByNetwork)
+	byHost := func(host string) float64 {
+		return testutil.ToFloat64(metrics.StuckTransientTxsByCallback.WithLabelValues(acc, host))
+	}
+	if got := byHost("low-overlay.example"); got != 2 {
+		t.Errorf("low-overlay.example = %v, want 2", got)
+	}
+	if got := byHost("other-client.example"); got != 1 {
+		t.Errorf("other-client.example = %v, want 1", got)
+	}
+	if got := byHost("none"); got != 1 {
+		t.Errorf("none (no-callback) = %v, want 1", got)
+	}
+	// Aggregate by-callback must equal the uncapped census for ACCEPTED (4).
+	if got := gaugeVal(t, metrics.StuckTransientTxs, acc); got != 4 {
+		t.Errorf("uncapped ACCEPTED census = %v, want 4", got)
+	}
+}
+
 // TestReapOnce_StuckTransientCensus pins the stuck-transient gauges (issue:
 // alerting on txs whose SEEN state-transfer never arrived):
 //   - RECEIVED and ACCEPTED_BY_NETWORK rows older than stuckTransientAge are

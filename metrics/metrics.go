@@ -253,6 +253,21 @@ var OldestTransientTxAge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "Age of the oldest transaction stuck in each transient status (seconds; 0 when none). Leader-computed; aggregate with max().",
 }, []string{"status"})
 
+// StuckTransientTxsByCallback breaks the StuckTransientTxs census down by the
+// callback host of the submission(s) that registered each stuck tx, so an
+// operator can see WHICH client's transactions are stuck (e.g. one overlay
+// service dominating the ACCEPTED_BY_NETWORK backlog) rather than just the
+// aggregate. callback_host is the hostname of the submission's CallbackURL, or
+// "none" for txs submitted without a callback. Leader-computed and fully reset
+// each tick (so a host that drains stops reporting); aggregate with max() and
+// sum by (callback_host). Attribution is capped per tick
+// (stuckAttributionCap) to bound the per-tick submission lookups — the
+// uncapped totals stay on StuckTransientTxs.
+var StuckTransientTxsByCallback = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "arcade_stuck_transient_txs_by_callback",
+	Help: "Stuck transient txs (see arcade_stuck_transient_txs) attributed to the submitting client's callback host. Leader-computed, reset each tick; aggregate with max().",
+}, []string{"status", "callback_host"})
+
 // ---------------------------------------------------------------------------
 // bump_builder
 // ---------------------------------------------------------------------------

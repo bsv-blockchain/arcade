@@ -121,6 +121,10 @@ type mockStore struct {
 	cleared        []clearedCall
 	// replayRows drives IterateStatusesSince for merkle-replay tests.
 	replayRows []*models.TransactionStatus
+	// submissionsByTxID drives GetSubmissionsByTxID, used by the reaper's
+	// stuck-by-callback attribution. Absent txids return no submissions
+	// (attributed to the "none" host).
+	submissionsByTxID map[string][]*models.Submission
 	// merkleMarks records every MarkMerkleRegisteredByTxIDs call as one
 	// slice per call. Lets tests assert how many flushes happened and
 	// which txids landed in each.
@@ -280,6 +284,12 @@ func (m *mockStore) ClearRetryState(_ context.Context, txid string, finalStatus 
 		Timestamp: time.Now(),
 	})
 	return nil
+}
+
+func (m *mockStore) GetSubmissionsByTxID(_ context.Context, txid string) ([]*models.Submission, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.submissionsByTxID[txid], nil
 }
 
 func (m *mockStore) IterateStatusesSince(_ context.Context, since time.Time, fn func(*models.TransactionStatus) error) error {
