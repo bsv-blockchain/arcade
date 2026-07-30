@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -888,14 +889,35 @@ func (p *Propagator) registerBatch(ctx context.Context, batch []propagationMsg) 
 	registered = make([]propagationMsg, 0, len(batch))
 	failed = make([]propagationMsg, 0)
 	successTxIDs := make([]string, 0, len(batch))
-	var sampleErr error
+	var sampleErr, sampleAuthErr error
+	authFailures := 0
 	for i, err := range errs {
 		if err == nil {
 			registered = append(registered, batch[i])
 			successTxIDs = append(successTxIDs, batch[i].TXID)
 			continue
 		}
+		// F-024: a tx we failed to register must NOT be broadcast, so every
+		// failure goes to the requeue subset regardless of cause. Keeping
+		// auth failures in the same requeue path preserves the dispatcher's
+		// offset / in-flight bookkeeping (a diverted tx would strand its Kafka
+		// offset and freeze the commit watermark — see handleAdmit).
 		failed = append(failed, batch[i])
+		// But classify the reason: a 401/403 is an auth rejection
+		// (merkle_service.auth_token missing or wrong — issue #269), not a
+		// transient blip. Surface it under its own metric label + a distinct
+		// WARN below so an operator isn't left staring at a generic
+		// "register_error" while every registration silently fails and self-
+		// heals only once the token is set.
+		var regErr *merkleservice.RegisterError
+		if errors.As(err, &regErr) && (regErr.StatusCode == http.StatusUnauthorized || regErr.StatusCode == http.StatusForbidden) {
+			authFailures++
+			if sampleAuthErr == nil {
+				sampleAuthErr = err
+			}
+			metrics.PropagationMerkleRegisterFailures.WithLabelValues("auth_error").Inc()
+			continue
+		}
 		if sampleErr == nil {
 			sampleErr = err
 		}
@@ -917,6 +939,18 @@ func (p *Propagator) registerBatch(ctx context.Context, batch []propagationMsg) 
 			zap.Int("failed", len(failed)),
 			zap.Int("registered", len(registered)),
 			zap.Error(sampleErr),
+		)
+	}
+	if authFailures > 0 {
+		// Loud, distinct diagnosis (one line per batch, so naturally throttled):
+		// registration is 401/403ing, which blocks broadcast (F-024) until the
+		// operator sets merkle_service.auth_token. Txs are requeued and will
+		// self-heal once configured; nothing is dropped.
+		p.logger.Warn(
+			"merkle-service /watch rejected with 401/403 — merkle_service.auth_token is missing or wrong; registration (and therefore broadcast) is blocked until it is set. Affected txs are requeued and self-heal once configured",
+			zap.Int("auth_failed", authFailures),
+			zap.Int("batch_size", len(batch)),
+			zap.Error(sampleAuthErr),
 		)
 	}
 

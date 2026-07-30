@@ -49,6 +49,21 @@ func (c *Client) SetLogger(logger *zap.Logger) {
 	c.logger = logger
 }
 
+// RegisterError is returned by Register (POST /watch) when merkle-service
+// responds with a non-2xx status. StatusCode carries the HTTP code so callers
+// can distinguish an auth rejection (401/403 — a configuration problem:
+// merkle_service.auth_token missing or wrong, which no amount of retrying
+// fixes) from a transient infrastructure error (5xx / network — retry). This
+// mirrors ReprocessError for the /reprocess path.
+type RegisterError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *RegisterError) Error() string {
+	return fmt.Sprintf("merkle service /watch returned status %d (body: %s)", e.StatusCode, e.Body)
+}
+
 // watchRequest is the payload sent to POST /watch.
 // CallbackToken (when non-empty) tells merkle-service which bearer token to
 // attach as `Authorization: Bearer <token>` on outbound callback delivery to
@@ -98,17 +113,17 @@ func (c *Client) Register(ctx context.Context, txid, callbackURL, callbackToken 
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		err := fmt.Errorf("POST %s: merkle service returned status %d (body: %s)", url, resp.StatusCode, string(body))
+		fail := &RegisterError{StatusCode: resp.StatusCode, Body: string(body)}
 		if c.logger != nil {
 			c.logger.Debug(
 				"merkle service registration failed",
 				zap.String("url", url),
 				logfields.TxID(txid),
 				zap.Int("status_code", resp.StatusCode),
-				zap.String("response_body", string(body)),
+				zap.String("response_body", fail.Body),
 			)
 		}
-		return err
+		return fail
 	}
 
 	return nil
