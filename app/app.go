@@ -165,6 +165,20 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 	if cfg.MerkleService.URL != "" {
 		merkleClient = merkleservice.NewClient(cfg.MerkleService.URL, cfg.MerkleService.AuthToken, 0)
 		merkleClient.SetLogger(logger.Named("merkle-client"))
+		if cfg.MerkleService.AuthToken == "" {
+			// Not fatal: many merkle-service deployments don't enforce auth, and
+			// the standalone/no-auth profile is legitimate. But if the target
+			// DOES enforce it (see merkle-service#204), /watch registration and
+			// /reprocess recovery will 401 at runtime — the watchdog now flags
+			// this loudly (issue #269) rather than misreporting it as a
+			// consensus problem. Warn at startup so the cause is obvious.
+			logger.Warn(
+				"merkle_service.url is set but merkle_service.auth_token is empty; " +
+					"if the target merkle-service enforces auth, tx registration (/watch) " +
+					"and block-processed recovery (/reprocess) will fail with 401 at runtime — " +
+					"set merkle_service.auth_token to authenticate",
+			)
+		}
 	}
 
 	// Build the GoBDK transaction validator only for modes that actually

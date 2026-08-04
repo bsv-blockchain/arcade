@@ -12,9 +12,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/merkleservice"
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
 )
@@ -443,6 +445,52 @@ func TestWatchdog_ParksBlockOlderThanMaxStaleAge(t *testing.T) {
 	}
 	if parked := st.parkedHashes(); len(parked) != 1 {
 		t.Fatalf("parked status should be persisted exactly once: got %v", parked)
+	}
+}
+
+// TestWatchdog_DoesNotParkOnAuthFailure verifies the issue #269 fix: a 401/403
+// from /reprocess is an auth-config problem (merkle_service.auth_token missing
+// or wrong), NOT a permanently un-finalizable block. It must be re-driven at a
+// slow, loud cadence and NEVER parked — even when both park caps are enabled —
+// so it self-heals once the token is set. Contrast with
+// TestWatchdog_CapsReprocessAtMaxAttempts / TestWatchdog_ParksBlockOlderThanMaxStaleAge,
+// which DO park.
+func TestWatchdog_DoesNotParkOnAuthFailure(t *testing.T) {
+	srv := newReprocessServer(t)
+	srv.setResponder(func(string) (int, string) { return http.StatusUnauthorized, "unauthorized" })
+	mc := merkleservice.NewClient(srv.server.URL, "", 5*time.Second)
+
+	now := time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC)
+	st := &watchdogStore{
+		tipHeight: 1000,
+		stale: []*models.BlockProcessingStatus{
+			{BlockHash: "blk-auth", BlockHeight: 1000, HeaderSeenAt: now.Add(-10 * time.Minute), Status: models.BlockStatusActive},
+		},
+	}
+	w := newTestWatchdog(t, st, alwaysLeader(), mc)
+	// Enable BOTH park caps to prove auth failures are exempt from each.
+	w.cfg.MaxReprocessAttempts = 3
+	w.cfg.MaxStaleAge = time.Hour
+
+	before := testutil.ToFloat64(metrics.WatchdogReprocessTotal.WithLabelValues("err_auth"))
+
+	// 40 ticks at +2min each spans 78 min (> MaxStaleAge) and far exceeds
+	// MaxReprocessAttempts. InitialBackoff is 1min, so every 2min tick is
+	// eligible and must re-drive — no park, ever.
+	const ticks = 40
+	for i := 0; i < ticks; i++ {
+		w.now = func() time.Time { return now.Add(time.Duration(i) * 2 * time.Minute) }
+		w.tick(context.Background())
+	}
+
+	if got := srv.callCount(); got != ticks {
+		t.Fatalf("auth-failing block must be re-driven every eligible tick: calls=%d want %d", got, ticks)
+	}
+	if parked := st.parkedHashes(); len(parked) != 0 {
+		t.Fatalf("auth failure must NOT park the block: parked=%v want []", parked)
+	}
+	if delta := testutil.ToFloat64(metrics.WatchdogReprocessTotal.WithLabelValues("err_auth")) - before; int(delta) != ticks {
+		t.Fatalf("err_auth metric delta=%v want %d", delta, ticks)
 	}
 }
 

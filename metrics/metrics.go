@@ -412,7 +412,7 @@ var WatchdogStaleCount = promauto.NewGauge(prometheus.GaugeOpts{
 var WatchdogReprocessTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_watchdog_reprocess_total",
 	Help: "Watchdog /reprocess call outcomes.",
-}, []string{labelOutcome}) // success, err_4xx, err_5xx, err_network
+}, []string{labelOutcome}) // success, err_auth, err_4xx, err_5xx, err_network
 
 // WatchdogBackoffDepth is the size of the in-memory attempts map.
 // Sustained growth implies blocks are persistently failing to recover —

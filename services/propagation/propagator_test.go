@@ -665,6 +665,44 @@ func TestRunMerkleReplay_DisabledByConfig(t *testing.T) {
 	}
 }
 
+// TestRegisterBatch_AuthFailureClassifiedAndRequeued pins the issue #269 fix:
+// a 401/403 from /watch is counted under the distinct "auth_error" metric
+// (not the generic "register_error"), and — because F-024 forbids broadcasting
+// an unregistered tx — every affected tx is returned in the failed (requeue)
+// subset, never in registered.
+func TestRegisterBatch_AuthFailureClassifiedAndRequeued(t *testing.T) {
+	merkleSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("unauthorized"))
+	}))
+	defer merkleSrv.Close()
+
+	ms := newMockStore()
+	cfg := &config.Config{CallbackURL: "http://arcade/cb", CallbackToken: "tok"}
+	cfg.Propagation.MerkleConcurrency = 4
+	mc := merkleservice.NewClient(merkleSrv.URL, "", 5*time.Second)
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, nil, mc)
+
+	authBefore := testutil.ToFloat64(metrics.PropagationMerkleRegisterFailures.WithLabelValues("auth_error"))
+	genBefore := testutil.ToFloat64(metrics.PropagationMerkleRegisterFailures.WithLabelValues("register_error"))
+
+	batch := []propagationMsg{{TXID: "tx1"}, {TXID: "tx2"}, {TXID: "tx3"}}
+	registered, failed := p.registerBatch(context.Background(), batch)
+
+	if len(registered) != 0 {
+		t.Errorf("F-024 violated: %d txs marked registered despite 401", len(registered))
+	}
+	if len(failed) != len(batch) {
+		t.Errorf("all auth-failed txs must be requeued (not dropped): failed=%d want %d", len(failed), len(batch))
+	}
+	if d := testutil.ToFloat64(metrics.PropagationMerkleRegisterFailures.WithLabelValues("auth_error")) - authBefore; int(d) != len(batch) {
+		t.Errorf("auth_error metric delta=%v want %d", d, len(batch))
+	}
+	if d := testutil.ToFloat64(metrics.PropagationMerkleRegisterFailures.WithLabelValues("register_error")) - genBefore; d != 0 {
+		t.Errorf("register_error must not increment on an auth failure: delta=%v", d)
+	}
+}
+
 // replayPropagator builds a Propagator wired to the supplied merkle server,
 // with all the knobs replay tests care about pre-populated. Keeps the
 // per-test setup boilerplate small.

@@ -23,6 +23,7 @@ import (
 	"errors"
 	"math"
 	mrand "math/rand"
+	"net/http"
 	"os"
 	"sync"
 	"time"
@@ -388,6 +389,18 @@ func (w *Watchdog) reprocessOne(ctx context.Context, row *models.BlockProcessing
 
 	var fail *merkleservice.ReprocessError
 	switch {
+	case errors.As(err, &fail) && (fail.StatusCode == http.StatusUnauthorized || fail.StatusCode == http.StatusForbidden):
+		// Auth rejection, NOT a chain-consensus verdict. Almost always a
+		// configuration problem: merkle_service.auth_token is missing or wrong
+		// (see issue #269). Do NOT apply terminal backoff or let this count
+		// toward MaxReprocessAttempts — parking a block on an auth failure
+		// silently abandons its merkle proof for a problem an operator can fix.
+		// recordAuthFailure re-drives at a slow, loud cadence and self-heals
+		// once the token is set.
+		metrics.WatchdogReprocessTotal.WithLabelValues("err_auth").Inc()
+		logger.Warn("watchdog: /reprocess returned 401/403 — merkle_service.auth_token likely missing or wrong; NOT parking, will keep retrying once configured",
+			zap.Int("status_code", fail.StatusCode))
+		w.recordAuthFailure(row.BlockHash, now)
 	case errors.As(err, &fail) && fail.StatusCode >= 400 && fail.StatusCode < 500:
 		// Terminal: block isn't on the consensus chain (or merkle-service
 		// considers the request malformed). Back off heavily — re-trying
@@ -451,6 +464,27 @@ func (w *Watchdog) recordFailure(hash string, now time.Time, delay time.Duration
 	st.failures++
 	st.total++
 	st.nextEligibleAt = now.Add(w.jitter(delay))
+	metrics.WatchdogBackoffDepth.Set(float64(len(w.attempts)))
+}
+
+// recordAuthFailure records a 401/403 from /reprocess. Unlike recordFailure /
+// recordTransientFailure it deliberately does NOT increment st.total, so the
+// block is never parked: parkReason gates both "max_attempts" and "max_age" on
+// attempts (=st.total) > 0, and an auth misconfiguration is a fixable operator
+// problem, not a permanently un-finalizable block. It applies InitialBackoff so
+// the block is re-driven at a slow, loud cadence until the token is configured.
+func (w *Watchdog) recordAuthFailure(hash string, now time.Time) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	st := w.attempts[hash]
+	if st == nil {
+		st = &attemptState{}
+		w.attempts[hash] = st
+	}
+	st.lastTriedAt = now
+	st.failures++
+	// Intentionally do not touch st.total — see doc comment above.
+	st.nextEligibleAt = now.Add(w.jitter(w.cfg.InitialBackoff))
 	metrics.WatchdogBackoffDepth.Set(float64(len(w.attempts)))
 }
 
