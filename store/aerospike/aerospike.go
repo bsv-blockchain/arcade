@@ -43,6 +43,7 @@ const (
 	setBlockProcessing  = "arcade_block_processing"
 	setLeases           = "arcade_leases"
 	setDatahubEndpoints = "arcade_datahub_endpoints"
+	setPeerPolicies     = "arcade_peer_policies"
 )
 
 // BUMP chunking — large compound BUMPs (scaling networks with millions of
@@ -2894,6 +2895,78 @@ loop:
 			}
 			if ep.URL != "" && ep.Network == network {
 				out = append(out, ep)
+			}
+		}
+	}
+	if loopErr != nil {
+		return nil, loopErr
+	}
+	return out, nil
+}
+
+func (s *Store) UpsertPeerPolicy(ctx context.Context, pp store.PeerPolicy) error {
+	if pp.PeerID == "" {
+		return fmt.Errorf("upsert peer policy: empty peer id")
+	}
+	key, err := s.key(setPeerPolicies, pp.PeerID)
+	if err != nil {
+		return err
+	}
+	bins := aero.BinMap{
+		"peer_id":   pp.PeerID,
+		"network":   pp.Network,
+		"fee_sats":  int64(pp.MiningFeeSatoshis), //nolint:gosec // fee in satoshis, non-negative and bounded
+		"fee_bytes": int64(pp.MiningFeeBytes),    //nolint:gosec // fee byte basis, non-negative and bounded
+		"last_seen": pp.LastSeen.UnixMilli(),
+	}
+	return s.client.Put(s.writePolicy(ctx), key, bins)
+}
+
+// ListPeerPolicies scans every recorded peer policy, filtering to entries
+// scoped to the given network. Cardinality tracks the peer count (dozens to
+// low hundreds) — no pagination needed.
+func (s *Store) ListPeerPolicies(ctx context.Context, network string) ([]store.PeerPolicy, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	stmt := aero.NewStatement(s.namespace, setPeerPolicies)
+	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
+	if rs != nil {
+		defer func() { _ = rs.Close() }()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query peer policies: %w", err)
+	}
+
+	var (
+		out     []store.PeerPolicy
+		loopErr error
+	)
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			loopErr = ctx.Err()
+			break loop
+		case rec, ok := <-rs.Results():
+			if !ok {
+				break loop
+			}
+			if rec.Err != nil {
+				loopErr = rec.Err
+				break loop
+			}
+			pp := store.PeerPolicy{
+				PeerID:            getString(rec.Record, "peer_id"),
+				Network:           getString(rec.Record, "network"),
+				MiningFeeSatoshis: uint64(getInt64(rec.Record, "fee_sats")),  //nolint:gosec // stored non-negative
+				MiningFeeBytes:    uint64(getInt64(rec.Record, "fee_bytes")), //nolint:gosec // stored non-negative
+			}
+			if ms := getInt64(rec.Record, "last_seen"); ms > 0 {
+				pp.LastSeen = time.UnixMilli(ms)
+			}
+			if pp.PeerID != "" && pp.Network == network {
+				out = append(out, pp)
 			}
 		}
 	}

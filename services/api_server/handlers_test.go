@@ -72,6 +72,10 @@ type mockStore struct {
 	// for the GET /tx callback-state tests.
 	subsByTxID  map[string][]*models.Submission
 	getStatusFn func(txid string) *models.TransactionStatus
+	// peerPolicies feeds ListPeerPolicies for the GET /policy tests;
+	// listPeerPoliciesErr injects a store failure.
+	peerPolicies        []store.PeerPolicy
+	listPeerPoliciesErr error
 }
 
 func (m *mockStore) UpdateStatus(_ context.Context, status *models.TransactionStatus) error {
@@ -271,6 +275,17 @@ func (m *mockStore) UpsertDatahubEndpoint(context.Context, store.DatahubEndpoint
 
 func (m *mockStore) ListDatahubEndpoints(context.Context, string) ([]store.DatahubEndpoint, error) {
 	return nil, nil
+}
+
+func (m *mockStore) UpsertPeerPolicy(context.Context, store.PeerPolicy) error {
+	return nil
+}
+
+func (m *mockStore) ListPeerPolicies(context.Context, string) ([]store.PeerPolicy, error) {
+	if m.listPeerPoliciesErr != nil {
+		return nil, m.listPeerPoliciesErr
+	}
+	return m.peerPolicies, nil
 }
 
 func (m *mockStore) UpsertBlockHeaderSeen(context.Context, string, uint64, time.Time) error {
