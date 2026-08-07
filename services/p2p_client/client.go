@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"sync"
 	"time"
@@ -56,10 +57,13 @@ type teraClient interface {
 
 // EndpointWriter is the narrow store contract p2p_client needs: persist a
 // discovered datahub URL so other pods (propagation, bump-builder) can pick
-// it up via their teranode.Client refresh loop. Defined as an interface here
-// rather than taking *store.Store directly so tests can pass a fake.
+// it up via their teranode.Client refresh loop, and persist a peer's observed
+// mining fee so api-server pods can serve the network-minimum fee in GET
+// /policy (issue #212). Defined as an interface here rather than taking
+// *store.Store directly so tests can pass a fake.
 type EndpointWriter interface {
 	UpsertDatahubEndpoint(ctx context.Context, ep store.DatahubEndpoint) error
+	UpsertPeerPolicy(ctx context.Context, pp store.PeerPolicy) error
 }
 
 // clientFactory is overridable in tests to avoid starting a real libp2p host.
@@ -282,6 +286,11 @@ func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatu
 		ce.Write(fields...)
 	}
 
+	// Record the peer's advertised mining fee before the datahub-URL gate
+	// below, so a peer that exposes a fee but no datahub URL still counts
+	// toward the GET /policy network-minimum (issue #212).
+	c.recordPeerFee(ctx, msg)
+
 	raw := pickDatahubURL(msg)
 	if raw == "" {
 		metrics.P2PEndpointDiscoveryTotal.WithLabelValues("no_url").Inc()
@@ -332,6 +341,63 @@ func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatu
 		zap.String("peer_id", msg.PeerID),
 		zap.String("url", normalized),
 	)
+}
+
+// recordPeerFee extracts the peer's advertised minimum mining fee from a
+// node_status announcement and persists it to the shared store so api-server
+// pods can compute the network-minimum fee for GET /policy. It prefers the
+// structured FeePolicy.MiningFee (satoshis per Bytes) and falls back to the
+// legacy MinMiningTxFee (*float64 in BSV/kB). Peers advertising neither (older
+// nodes) are skipped.
+func (c *Client) recordPeerFee(ctx context.Context, msg teranodep2p.NodeStatusMessage) {
+	var sats, byts uint64
+	switch {
+	case msg.FeePolicy != nil && msg.FeePolicy.MiningFee.Bytes > 0:
+		sats = msg.FeePolicy.MiningFee.Satoshis
+		byts = msg.FeePolicy.MiningFee.Bytes
+	case msg.MinMiningTxFee != nil:
+		// BSV/kB -> satoshis per 1000 bytes (1 BSV = 1e8 satoshis). Validate the
+		// untrusted float before converting: a malformed/malicious node_status
+		// could carry NaN/Inf/negative or an absurd magnitude, which uint64()
+		// would turn into a wrapped garbage value that pollutes metrics and the
+		// int64-backed store columns. Drop such advertisements.
+		f := *msg.MinMiningTxFee
+		v := math.Round(f * 1e8)
+		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > math.MaxInt64 {
+			c.logger.Debug("ignoring implausible peer MinMiningTxFee",
+				zap.String("peer_id", msg.PeerID),
+				zap.Float64("min_mining_tx_fee", f))
+			return
+		}
+		sats = uint64(v)
+		byts = 1000
+	default:
+		return
+	}
+
+	if msg.BaseURL != "" {
+		// Normalize to satoshis per 1000 bytes for a comparable gauge.
+		metrics.P2PPeerMinMiningFee.WithLabelValues(msg.BaseURL).Set(float64(sats) * 1000 / float64(byts))
+	}
+
+	if c.store == nil || msg.PeerID == "" {
+		return
+	}
+	upsertCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := c.store.UpsertPeerPolicy(upsertCtx, store.PeerPolicy{
+		PeerID:            msg.PeerID,
+		Network:           c.cfg.Network,
+		MiningFeeSatoshis: sats,
+		MiningFeeBytes:    byts,
+		LastSeen:          time.Now(),
+	}); err != nil {
+		c.logger.Warn(
+			"failed to persist peer mining fee",
+			zap.String("peer_id", msg.PeerID),
+			zap.Error(err),
+		)
+	}
 }
 
 // validateDatahubURL runs the full discovered-URL validation (scheme, SSRF

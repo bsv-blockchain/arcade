@@ -224,6 +224,14 @@ jobs:
             echo "⚠️  Nancy scan inconclusive - OSS Index returned 402 Payment Required (not failing CI)."
             echo "    Configure OSSI_USERNAME and OSSI_TOKEN secrets to authenticate against your OSS Index account."
             echo "    Register at https://ossindex.sonatype.org/user/register"
+          elif grep -qiE 'dial tcp|server misbehaving|no such host|connection refused|connection reset|i/o timeout|context deadline exceeded|TLS handshake timeout|network is unreachable|no route to host|component-report":' nancy-output.log; then
+            # OSS Index was unreachable (DNS/TLS/connection error). Nancy exits
+            # before scanning any package, so no vulnerability was detected — this
+            # is an availability problem, not a finding. Treat it as inconclusive
+            # like the rate-limit / 402 cases above (these signatures only appear
+            # in request-failure output, never in a real vulnerability report).
+            echo "nancy-status=unreachable" >> $GITHUB_OUTPUT
+            echo "⚠️  Nancy scan inconclusive - OSS Index was unreachable (network/DNS error); not failing CI."
           else
             echo "nancy-status=failure" >> $GITHUB_OUTPUT
             echo "❌ Nancy scan completed - vulnerabilities detected (exit code: $NANCY_EXIT_CODE)"
@@ -243,6 +251,11 @@ jobs:
         if: always() && steps.run-nancy.outputs.nancy-status == 'payment-required'
         run: |
           echo "::warning title=Nancy Payment Required::OSS Index returned 402 Payment Required; results inconclusive. Add OSSI_USERNAME and OSSI_TOKEN secrets to authenticate against your OSS Index account."
+
+      - name: 📋 Nancy — Annotations (unreachable)
+        if: always() && steps.run-nancy.outputs.nancy-status == 'unreachable'
+        run: |
+          echo "::warning title=Nancy Unreachable::OSS Index was unreachable (network/DNS error); results inconclusive and CI was not failed."
 
       - name: 📊 Nancy — Job Summary
         if: always() && inputs.enable-nancy
@@ -266,6 +279,8 @@ jobs:
             echo "| **Result** | ⚠️ Rate limited by OSS Index — scan inconclusive (CI not failed) |" >> $GITHUB_STEP_SUMMARY
           elif [[ "$NANCY_STATUS" == "payment-required" ]]; then
             echo "| **Result** | ⚠️ OSS Index returned 402 Payment Required — scan inconclusive (CI not failed) |" >> $GITHUB_STEP_SUMMARY
+          elif [[ "$NANCY_STATUS" == "unreachable" ]]; then
+            echo "| **Result** | ⚠️ OSS Index unreachable (network/DNS error) — scan inconclusive (CI not failed) |" >> $GITHUB_STEP_SUMMARY
           else
             echo "| **Result** | ❌ Vulnerabilities detected |" >> $GITHUB_STEP_SUMMARY
           fi

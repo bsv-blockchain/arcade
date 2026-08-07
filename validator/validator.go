@@ -16,6 +16,8 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sync"
+	"sync/atomic"
 
 	chaincfg "github.com/bsv-blockchain/go-chaincfg"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
@@ -67,6 +69,12 @@ const (
 	// max-tx-size setting; the engine rejects construction above it.
 	maxTxSizePolicyConsensusLimit = 1_000_000_000
 
+	// defaultMaxTxSizePolicy and defaultMaxScriptSizePolicy are teranode's
+	// canonical BSV policy defaults, applied when the operator leaves the
+	// corresponding config value unset. Kept in sync with defaultPolicySettings.
+	defaultMaxTxSizePolicy     = 10485760
+	defaultMaxScriptSizePolicy = 500000
+
 	// defaultNetwork is used by NewValidator, which retains the legacy
 	// network-less constructor for tests and callers that do not select one.
 	defaultNetwork = "mainnet"
@@ -80,6 +88,8 @@ var DefaultMinFeePerKB = uint64(100)
 type Policy struct {
 	// MaxTxSizePolicy caps transaction size in bytes (0 => defaultMaxTxSizePolicy).
 	MaxTxSizePolicy int
+	// MaxScriptSizePolicy caps script size in bytes (0 => defaultMaxScriptSizePolicy).
+	MaxScriptSizePolicy int
 	// MaxTxSigopsCountsPolicy caps sigops per transaction (0 => unlimited, the
 	// BSV post-Genesis default).
 	MaxTxSigopsCountsPolicy int64
@@ -93,10 +103,33 @@ type Policy struct {
 // floor and one that does not, so ValidateTransaction can honour skipFees
 // without disabling the script/standardness checks (which SkipPolicyChecks
 // would also turn off).
+//
+// The fee-enforcing validator (tv) is swappable at runtime via SetMinFeePerKB:
+// arcade dynamically tracks the lowest fee the network will accept (observed
+// from peer node_status announcements) and rebuilds tv to enforce it (issue
+// #212). tv is an atomic.Pointer so ValidateTransaction reads it lock-free
+// while the fee refresher swaps it. tvNoFee never enforces a fee, so it is
+// fixed.
 type Validator struct {
-	tv          *tnvalidator.TxValidator
+	tv          atomic.Pointer[tnvalidator.TxValidator]
 	tvNoFee     *tnvalidator.TxValidator
-	minFeePerKB uint64
+	minFeePerKB atomic.Uint64
+
+	// feeMu serializes SetMinFeePerKB so a concurrent burst rebuilds the BDK
+	// engine at most once per distinct value.
+	feeMu sync.Mutex
+
+	// Immutable inputs retained so SetMinFeePerKB can rebuild the fee-enforcing
+	// validator with a new fee floor but the same size/sigop policy.
+	logger ulogger.Logger
+	params *chaincfg.Params
+
+	// Resolved policy values (after applying defaults) surfaced by the
+	// accessors for the ARC-compatible GET /policy endpoint. These reflect
+	// exactly what the BDK validator was built to enforce.
+	maxTxSizePolicy         int
+	maxScriptSizePolicy     int
+	maxTxSigopsCountsPolicy int64
 }
 
 // NewValidator creates a validator for mainnet with the given policy. A nil
@@ -125,14 +158,19 @@ func NewValidatorForNetwork(network string, policy *Policy) (*Validator, error) 
 		minFee = *policy.MinFeePerKB
 	}
 
-	// 0 => keep the canonical default from defaultPolicySettings. An explicit
-	// override is capped at the BDK consensus limit so construction never panics.
-	maxTxSize := 0
+	// 0 => the canonical teranode default. An explicit override is capped at
+	// the BDK consensus limit so construction never panics.
+	maxTxSize := defaultMaxTxSizePolicy
 	if policy != nil && policy.MaxTxSizePolicy > 0 {
 		maxTxSize = policy.MaxTxSizePolicy
 		if maxTxSize > maxTxSizePolicyConsensusLimit {
 			maxTxSize = maxTxSizePolicyConsensusLimit
 		}
+	}
+
+	maxScriptSize := defaultMaxScriptSizePolicy
+	if policy != nil && policy.MaxScriptSizePolicy > 0 {
+		maxScriptSize = policy.MaxScriptSizePolicy
 	}
 
 	var maxSigops int64 // 0 => unlimited (BSV post-Genesis)
@@ -142,16 +180,58 @@ func NewValidatorForNetwork(network string, policy *Policy) (*Validator, error) 
 
 	logger := ulogger.New("arcade-validator")
 
-	return &Validator{
-		tv:          tnvalidator.NewTxValidator(logger, buildSettings(params, maxTxSize, maxSigops, minFee)),
-		tvNoFee:     tnvalidator.NewTxValidator(logger, buildSettings(params, maxTxSize, maxSigops, 0)),
-		minFeePerKB: minFee,
-	}, nil
+	v := &Validator{
+		tvNoFee:                 tnvalidator.NewTxValidator(logger, buildSettings(params, maxTxSize, maxScriptSize, maxSigops, 0)),
+		logger:                  logger,
+		params:                  params,
+		maxTxSizePolicy:         maxTxSize,
+		maxScriptSizePolicy:     maxScriptSize,
+		maxTxSigopsCountsPolicy: maxSigops,
+	}
+	v.tv.Store(tnvalidator.NewTxValidator(logger, buildSettings(params, maxTxSize, maxScriptSize, maxSigops, minFee)))
+	v.minFeePerKB.Store(minFee)
+	return v, nil
 }
 
-// MinFeePerKB returns the configured minimum fee per kB, in satoshis.
+// MinFeePerKB returns the current minimum fee floor per kB, in satoshis. It
+// reflects any runtime update applied via SetMinFeePerKB.
 func (v *Validator) MinFeePerKB() uint64 {
-	return v.minFeePerKB
+	return v.minFeePerKB.Load()
+}
+
+// SetMinFeePerKB updates the intake fee floor at runtime, rebuilding the
+// fee-enforcing BDK validator so subsequent ValidateTransaction calls enforce
+// the new floor. It is a no-op when minFee already equals the current floor, so
+// callers may invoke it on a ticker without churning the cgo engine. Safe for
+// concurrent use with ValidateTransaction. The superseded validator becomes
+// unreachable and the go-bdk finalizer frees its underlying C engine.
+func (v *Validator) SetMinFeePerKB(minFee uint64) {
+	v.feeMu.Lock()
+	defer v.feeMu.Unlock()
+	if v.minFeePerKB.Load() == minFee {
+		return
+	}
+	nv := tnvalidator.NewTxValidator(v.logger, buildSettings(v.params, v.maxTxSizePolicy, v.maxScriptSizePolicy, v.maxTxSigopsCountsPolicy, minFee))
+	v.tv.Store(nv)
+	v.minFeePerKB.Store(minFee)
+}
+
+// MaxTxSizePolicy returns the effective maximum accepted transaction size in
+// bytes, as reported by the ARC-compatible GET /policy endpoint.
+func (v *Validator) MaxTxSizePolicy() int {
+	return v.maxTxSizePolicy
+}
+
+// MaxScriptSizePolicy returns the effective maximum accepted script size in
+// bytes, as reported by GET /policy.
+func (v *Validator) MaxScriptSizePolicy() int {
+	return v.maxScriptSizePolicy
+}
+
+// MaxTxSigopsCountsPolicy returns the effective per-transaction sigop cap
+// (0 = unlimited, the BSV post-Genesis default), as reported by GET /policy.
+func (v *Validator) MaxTxSigopsCountsPolicy() int64 {
+	return v.maxTxSigopsCountsPolicy
 }
 
 // ValidateTransaction validates a transaction against current node consensus
@@ -173,7 +253,7 @@ func (v *Validator) ValidateTransaction(_ context.Context, tx *sdkTx.Transaction
 		utxoHeights[i] = unknownParentHeight
 	}
 
-	tv := v.tv
+	tv := v.tv.Load()
 	if skipFees {
 		tv = v.tvNoFee
 	}
@@ -191,14 +271,14 @@ func (v *Validator) ValidatePolicy(tx *sdkTx.Transaction) error {
 }
 
 // buildSettings assembles a teranode settings.Settings for the BDK validator:
-// canonical BSV policy defaults, with the operator-controlled tx-size, sigop
-// and fee values applied. minFeePerKB is in satoshis/kB and converted to the
-// BSV/kB units teranode's fee check expects (0 => no fee floor).
-func buildSettings(params *chaincfg.Params, maxTxSize int, maxSigops int64, minFeePerKB uint64) *settings.Settings {
+// canonical BSV policy defaults, with the operator-controlled tx-size,
+// script-size, sigop and fee values applied. The size values are already
+// resolved (never zero) by the caller. minFeePerKB is in satoshis/kB and
+// converted to the BSV/kB units teranode's fee check expects (0 => no fee floor).
+func buildSettings(params *chaincfg.Params, maxTxSize, maxScriptSize int, maxSigops int64, minFeePerKB uint64) *settings.Settings {
 	pol := defaultPolicySettings()
-	if maxTxSize > 0 {
-		pol.MaxTxSizePolicy = maxTxSize
-	}
+	pol.MaxTxSizePolicy = maxTxSize
+	pol.MaxScriptSizePolicy = maxScriptSize
 	pol.MaxTxSigopsCountsPolicy = maxSigops
 	pol.MinMiningTxFee = satPerKBToBSVPerKB(minFeePerKB)
 	return &settings.Settings{ChainCfgParams: params, Policy: pol}
@@ -213,10 +293,10 @@ func buildSettings(params *chaincfg.Params, maxTxSize int, maxSigops int64, minF
 func defaultPolicySettings() *settings.PolicySettings {
 	return &settings.PolicySettings{
 		ExcessiveBlockSize:              4294967296,
-		MaxTxSizePolicy:                 10485760,
+		MaxTxSizePolicy:                 defaultMaxTxSizePolicy,
 		MaxOrphanTxSize:                 1000000,
 		DataCarrierSize:                 1000000,
-		MaxScriptSizePolicy:             500000,
+		MaxScriptSizePolicy:             defaultMaxScriptSizePolicy,
 		MaxOpsPerScriptPolicy:           1000000,
 		MaxScriptNumLengthPolicy:        10000,
 		MaxPubKeysPerMultisigPolicy:     0,

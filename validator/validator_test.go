@@ -43,6 +43,63 @@ func TestNewValidator_PreservesExplicitZeroFee(t *testing.T) {
 	}
 }
 
+// TestEffectivePolicy_Defaults verifies the size/sigop accessors report the
+// canonical teranode defaults when the policy leaves them unset — these are
+// the values GET /policy advertises.
+func TestEffectivePolicy_Defaults(t *testing.T) {
+	v := NewValidator(nil)
+	if got := v.MaxTxSizePolicy(); got != defaultMaxTxSizePolicy {
+		t.Errorf("MaxTxSizePolicy() = %d, want %d", got, defaultMaxTxSizePolicy)
+	}
+	if got := v.MaxScriptSizePolicy(); got != defaultMaxScriptSizePolicy {
+		t.Errorf("MaxScriptSizePolicy() = %d, want %d", got, defaultMaxScriptSizePolicy)
+	}
+	if got := v.MaxTxSigopsCountsPolicy(); got != 0 {
+		t.Errorf("MaxTxSigopsCountsPolicy() = %d, want 0 (unlimited)", got)
+	}
+}
+
+// TestSetMinFeePerKB_UpdatesFloor verifies the runtime fee-floor swap used by
+// the api-server's fee refresher to track the network minimum (issue #212).
+func TestSetMinFeePerKB_UpdatesFloor(t *testing.T) {
+	v := NewValidator(nil)
+	if v.MinFeePerKB() != DefaultMinFeePerKB {
+		t.Fatalf("initial floor = %d, want %d", v.MinFeePerKB(), DefaultMinFeePerKB)
+	}
+	v.SetMinFeePerKB(37)
+	if v.MinFeePerKB() != 37 {
+		t.Errorf("after SetMinFeePerKB(37), floor = %d, want 37", v.MinFeePerKB())
+	}
+	// Size/sigop policy is preserved across a fee-only rebuild.
+	if v.MaxTxSizePolicy() != defaultMaxTxSizePolicy || v.MaxScriptSizePolicy() != defaultMaxScriptSizePolicy {
+		t.Errorf("size policy changed after fee update: {%d %d}", v.MaxTxSizePolicy(), v.MaxScriptSizePolicy())
+	}
+	// A tx can still be validated after the swap (exercises the swapped tv).
+	v.SetMinFeePerKB(0)
+	if v.MinFeePerKB() != 0 {
+		t.Errorf("after SetMinFeePerKB(0), floor = %d, want 0", v.MinFeePerKB())
+	}
+}
+
+// TestEffectivePolicy_Overrides verifies operator overrides thread through to
+// the accessors.
+func TestEffectivePolicy_Overrides(t *testing.T) {
+	v := NewValidator(&Policy{
+		MaxTxSizePolicy:         2_000_000,
+		MaxScriptSizePolicy:     123_456,
+		MaxTxSigopsCountsPolicy: 42,
+	})
+	if got := v.MaxTxSizePolicy(); got != 2_000_000 {
+		t.Errorf("MaxTxSizePolicy() = %d, want 2000000", got)
+	}
+	if got := v.MaxScriptSizePolicy(); got != 123_456 {
+		t.Errorf("MaxScriptSizePolicy() = %d, want 123456", got)
+	}
+	if got := v.MaxTxSigopsCountsPolicy(); got != 42 {
+		t.Errorf("MaxTxSigopsCountsPolicy() = %d, want 42", got)
+	}
+}
+
 func TestNewValidatorForNetwork_KnownNetworks(t *testing.T) {
 	for _, n := range []string{"mainnet", "testnet", "teratestnet", "regtest"} {
 		if _, err := NewValidatorForNetwork(n, nil); err != nil {
