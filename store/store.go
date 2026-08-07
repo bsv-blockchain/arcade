@@ -43,6 +43,25 @@ type DatahubEndpoint struct {
 	LastSeen time.Time
 }
 
+// PeerPolicy is a peer's mining fee observed from its node_status gossip
+// announcement, persisted to the shared store so the ARC-compatible
+// GET /policy endpoint (served by api-server pods) can compute the
+// network-wide minimum fee even though only the single p2p-client pod
+// observes node_status (issue #212).
+//
+// Keyed by PeerID and network-scoped for the same reasons as DatahubEndpoint.
+// LastSeen lets readers drop peers not re-heard within a TTL so a departed
+// cheap node cannot pin the advertised fee low forever. The mining fee is
+// stored as satoshis-per-Bytes (the node_status FeePolicy.MiningFee shape),
+// e.g. {Satoshis: 100, Bytes: 1000} == 100 sat/kB.
+type PeerPolicy struct {
+	PeerID            string
+	Network           string
+	MiningFeeSatoshis uint64
+	MiningFeeBytes    uint64
+	LastSeen          time.Time
+}
+
 // BatchInsertResult is one entry in the result slice returned by
 // BatchGetOrInsertStatus. Inserted is true when the row was newly written by
 // this call; false when an existing row was found and Existing carries it.
@@ -341,6 +360,15 @@ type Store interface {
 	// excluded — they will be re-registered with the correct network the next
 	// time their peer announces.
 	ListDatahubEndpoints(ctx context.Context, network string) ([]DatahubEndpoint, error)
+
+	// UpsertPeerPolicy records (or refreshes) a peer's observed mining fee.
+	// Called by p2p_client on each node_status announcement carrying a fee.
+	UpsertPeerPolicy(ctx context.Context, pp PeerPolicy) error
+
+	// ListPeerPolicies returns every recorded peer policy scoped to the given
+	// network. The GET /policy handler filters these by LastSeen and takes the
+	// minimum mining fee. Entries with an empty Network (legacy rows) are excluded.
+	ListPeerPolicies(ctx context.Context, network string) ([]PeerPolicy, error)
 
 	// Close closes the database connection
 	Close() error

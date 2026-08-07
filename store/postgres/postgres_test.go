@@ -91,7 +91,7 @@ func runWithSharedStore(m *testing.M) (int, func()) {
 	return m.Run(), cleanup
 }
 
-const truncateSQL = `TRUNCATE transactions, bumps, stumps, submissions, leases, datahub_endpoints, block_processing`
+const truncateSQL = `TRUNCATE transactions, bumps, stumps, submissions, leases, datahub_endpoints, peer_policies, block_processing`
 
 func newTestStore(t *testing.T) *Store {
 	t.Helper()

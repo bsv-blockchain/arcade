@@ -679,6 +679,17 @@ var P2PPeerBestHeight = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "Best block height advertised by a datahub peer via p2p node_status, by base_url.",
 }, []string{"base_url"})
 
+// P2PPeerMinMiningFee reports the minimum mining fee (satoshis per 1000 bytes)
+// each peer advertises in its node_status FeePolicy. The GET /policy endpoint
+// advertises the network-wide minimum of these (issue #212); this gauge makes
+// the per-peer inputs visible. Labelled by base_url for the same
+// bounded-cardinality reason as P2PPeerBestHeight; peers with no base_url are
+// still persisted for the minimum but not surfaced here.
+var P2PPeerMinMiningFee = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "arcade_p2p_peer_min_mining_fee",
+	Help: "Minimum mining fee (satoshis per 1000 bytes) advertised by a peer via p2p node_status, by base_url.",
+}, []string{"base_url"})
+
 // ChainTipHeight reports arcade's own view of the active chain tip — the
 // highest block_processing row marked active. Refreshed by the api-server's
 // /health handler (which also returns it as blockHeight); alert on this

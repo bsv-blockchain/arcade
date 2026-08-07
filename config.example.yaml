@@ -142,15 +142,37 @@ health:
 #   sample_ratio: 1.0            # ParentBased(TraceIDRatioBased) sampler ratio, 0.0-1.0
 #   export_timeout_ms: 10000
 
-# Intake-time transaction validator. The default rejects txs whose
-# fee rate is below the BSV miner policy minimum of 100 sat/kB.
+# Intake-time transaction validator. Also backs the ARC-compatible
+# GET /policy endpoint (issue #212): the size/sigop limits below are what
+# intake enforces and what /policy advertises.
 # validator:
-#   min_fee_per_kb: 100
+#   # min_fee_per_kb is the intake fee floor in satoshis/kB. Default 0 means
+#   # "not operator-configured": arcade then dynamically tracks the lowest fee
+#   # the network will accept — the minimum advertised across peer node_status
+#   # announcements — and BOTH enforces it at intake and advertises it via
+#   # GET /policy (issue #212). Until a peer is heard it uses the built-in
+#   # 100 sat/kB floor. Set a non-zero value to pin and enforce an exact floor.
+#   min_fee_per_kb: 0
 #   # accept_zero_fee, when true, pins the floor to 0 sat/kB so any tx
-#   # (including fee=0) is accepted at intake. Intended for
-#   # teratestnet/regtest where the upstream Teranode is also configured
-#   # to accept zero-fee txs. Leave false on mainnet and testnet.
+#   # (including fee=0) is accepted at intake, and /policy advertises 0.
+#   # Intended for teratestnet/regtest where the upstream Teranode is also
+#   # configured to accept zero-fee txs. Leave false on mainnet and testnet.
 #   # accept_zero_fee: false
+#   # GET /policy size/format limits. Left unset (or 0), they fall back to
+#   # teranode's canonical policy defaults shown here. max_tx_sigops_counts_policy
+#   # of 0 means unlimited (the BSV post-Genesis default).
+#   # max_tx_size_policy: 10485760
+#   # max_script_size_policy: 500000
+#   # max_tx_sigops_counts_policy: 0
+#   # standard_format_supported: true
+#   # observed_fee_ttl_ms bounds how long a peer's node_status-advertised fee
+#   # stays eligible for the network-minimum (default 15 min). A peer not
+#   # re-heard within this window is dropped from the minimum.
+#   # observed_fee_ttl_ms: 900000
+#   # observed_fee_refresh_ms is how often the api-server recomputes the
+#   # network-minimum fee and updates the intake floor (default 30 s). Only
+#   # active when min_fee_per_kb=0 and accept_zero_fee=false.
+#   # observed_fee_refresh_ms: 30000
 #   # disable_finality_check turns off the nLockTime/BIP113 intake gate
 #   # that rejects provably non-final txs with an actionable reason
 #   # (issue #245). The gate needs a chain source: the embedded

@@ -290,11 +290,28 @@ type SubmitOptions struct {
 	SkipScriptValidation bool   // Skip script validation
 }
 
-// Policy represents the transaction policy configuration
+// FeeAmount is the ARC mining-fee rate expressed as a number of satoshis per
+// a number of bytes, e.g. {Satoshis: 100, Bytes: 1000} == 100 sat/kB.
+type FeeAmount struct {
+	Satoshis uint64 `json:"satoshis"`
+	Bytes    uint64 `json:"bytes"`
+}
+
+// Policy is the ARC-compatible transaction policy document returned by
+// GET /policy (issue #212). Field names and JSON tags match the ARC contract
+// so arcade is a drop-in target for clients that discover fee/size limits
+// before building transactions.
 type Policy struct {
-	MaxScriptSizePolicy     uint64 `json:"maxscriptsizepolicy"`
-	MaxTxSigOpsCountsPolicy uint64 `json:"maxtxsigopscountspolicy"`
-	MaxTxSizePolicy         uint64 `json:"maxtxsizepolicy"`
-	MiningFeeBytes          uint64 `json:"miningFeeBytes"`
-	MiningFeeSatoshis       uint64 `json:"miningFeeSatoshis"`
+	MiningFee               FeeAmount `json:"miningFee"`
+	MaxTxSizePolicy         uint64    `json:"maxtxsizepolicy"`
+	MaxScriptSizePolicy     uint64    `json:"maxscriptsizepolicy"`
+	MaxTxSigopsCountsPolicy int64     `json:"maxtxsigopscountspolicy"`
+	StandardFormatSupported bool      `json:"standardFormatSupported"`
+}
+
+// PolicyResponse wraps Policy in the ARC response envelope with a policy
+// timestamp (RFC 3339).
+type PolicyResponse struct {
+	Policy    Policy    `json:"policy"`
+	Timestamp time.Time `json:"timestamp"`
 }

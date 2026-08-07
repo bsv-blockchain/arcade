@@ -125,3 +125,16 @@ CREATE TABLE IF NOT EXISTS datahub_endpoints (
 ALTER TABLE datahub_endpoints ADD COLUMN IF NOT EXISTS network TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_dh_last_seen ON datahub_endpoints(last_seen);
 CREATE INDEX IF NOT EXISTS idx_dh_network   ON datahub_endpoints(network);
+
+-- Peer mining fees observed from node_status announcements, keyed by peer id
+-- and network-scoped. Read by the GET /policy endpoint to compute the
+-- network-wide minimum fee (issue #212). last_seen drives TTL filtering.
+CREATE TABLE IF NOT EXISTS peer_policies (
+    peer_id              TEXT PRIMARY KEY,
+    network              TEXT NOT NULL DEFAULT '',
+    mining_fee_satoshis  BIGINT NOT NULL,
+    mining_fee_bytes     BIGINT NOT NULL,
+    last_seen            TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pp_network   ON peer_policies(network);
+CREATE INDEX IF NOT EXISTS idx_pp_last_seen ON peer_policies(last_seen);

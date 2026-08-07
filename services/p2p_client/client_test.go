@@ -23,8 +23,9 @@ import (
 // store is now the only sink — the in-process teranode.Client AddEndpoints
 // path was removed when p2p_client was decoupled from the propagation pod.
 type fakeEndpointWriter struct {
-	mu    sync.Mutex
-	calls []store.DatahubEndpoint
+	mu       sync.Mutex
+	calls    []store.DatahubEndpoint
+	feeCalls []store.PeerPolicy
 }
 
 func (f *fakeEndpointWriter) UpsertDatahubEndpoint(_ context.Context, ep store.DatahubEndpoint) error {
@@ -34,11 +35,26 @@ func (f *fakeEndpointWriter) UpsertDatahubEndpoint(_ context.Context, ep store.D
 	return nil
 }
 
+func (f *fakeEndpointWriter) UpsertPeerPolicy(_ context.Context, pp store.PeerPolicy) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.feeCalls = append(f.feeCalls, pp)
+	return nil
+}
+
 func (f *fakeEndpointWriter) snapshot() []store.DatahubEndpoint {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make([]store.DatahubEndpoint, len(f.calls))
 	copy(out, f.calls)
+	return out
+}
+
+func (f *fakeEndpointWriter) feeSnapshot() []store.PeerPolicy {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]store.PeerPolicy, len(f.feeCalls))
+	copy(out, f.feeCalls)
 	return out
 }
 
@@ -406,5 +422,69 @@ func TestClient_ValidationCacheSkipsRepeatLookups(t *testing.T) {
 	waitForUpserts(t, w, 3)
 	if got := lookups.Load(); got != 1 {
 		t.Errorf("expected exactly 1 DNS lookup across 3 announcements, got %d", got)
+	}
+}
+
+// TestRecordPeerFee_FeePolicy verifies the structured FeePolicy.MiningFee is
+// persisted verbatim as the peer's observed fee.
+func TestRecordPeerFee_FeePolicy(t *testing.T) {
+	c, w := newTestClient(t, newFakeTeraClient("sender"))
+	c.recordPeerFee(context.Background(), teranodep2p.NodeStatusMessage{
+		PeerID:    "peer-1",
+		BaseURL:   "https://peer.example",
+		FeePolicy: &teranodep2p.FeePolicy{MiningFee: teranodep2p.FeeAmount{Satoshis: 75, Bytes: 1000}},
+	})
+
+	fees := w.feeSnapshot()
+	if len(fees) != 1 {
+		t.Fatalf("expected 1 fee upsert, got %d: %+v", len(fees), fees)
+	}
+	if fees[0].PeerID != "peer-1" || fees[0].MiningFeeSatoshis != 75 || fees[0].MiningFeeBytes != 1000 {
+		t.Errorf("fee = %+v, want {peer-1 75 1000 ...}", fees[0])
+	}
+	if fees[0].Network != config.NetworkMainnet {
+		t.Errorf("network = %q, want %q", fees[0].Network, config.NetworkMainnet)
+	}
+}
+
+// TestRecordPeerFee_LegacyMinMiningTxFee verifies the BSV/kB fallback is
+// converted to satoshis-per-1000-bytes when no structured FeePolicy is present.
+func TestRecordPeerFee_LegacyMinMiningTxFee(t *testing.T) {
+	c, w := newTestClient(t, newFakeTeraClient("sender"))
+	fee := 0.0000005 // BSV/kB -> 50 sat per 1000 bytes
+	c.recordPeerFee(context.Background(), teranodep2p.NodeStatusMessage{
+		PeerID:         "peer-2",
+		MinMiningTxFee: &fee,
+	})
+
+	fees := w.feeSnapshot()
+	if len(fees) != 1 {
+		t.Fatalf("expected 1 fee upsert, got %d: %+v", len(fees), fees)
+	}
+	if fees[0].MiningFeeSatoshis != 50 || fees[0].MiningFeeBytes != 1000 {
+		t.Errorf("fee = {%d %d}, want {50 1000}", fees[0].MiningFeeSatoshis, fees[0].MiningFeeBytes)
+	}
+}
+
+// TestRecordPeerFee_URLlessPeerStillRecorded verifies a peer that advertises a
+// fee but no datahub URL is still counted toward the /policy network-minimum.
+func TestRecordPeerFee_URLlessPeerStillRecorded(t *testing.T) {
+	c, w := newTestClient(t, newFakeTeraClient("sender"))
+	c.recordPeerFee(context.Background(), teranodep2p.NodeStatusMessage{
+		PeerID:    "peer-3",
+		FeePolicy: &teranodep2p.FeePolicy{MiningFee: teranodep2p.FeeAmount{Satoshis: 10, Bytes: 1000}},
+	})
+	if fees := w.feeSnapshot(); len(fees) != 1 || fees[0].PeerID != "peer-3" {
+		t.Fatalf("expected URL-less peer fee recorded, got %+v", fees)
+	}
+}
+
+// TestRecordPeerFee_NoFeeAdvertised verifies peers advertising no fee (old
+// nodes) are skipped rather than recorded with a zero fee.
+func TestRecordPeerFee_NoFeeAdvertised(t *testing.T) {
+	c, w := newTestClient(t, newFakeTeraClient("sender"))
+	c.recordPeerFee(context.Background(), teranodep2p.NodeStatusMessage{PeerID: "peer-4"})
+	if fees := w.feeSnapshot(); len(fees) != 0 {
+		t.Fatalf("expected no fee upsert for feeless peer, got %+v", fees)
 	}
 }
