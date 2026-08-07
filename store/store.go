@@ -49,11 +49,12 @@ type DatahubEndpoint struct {
 // network-wide minimum fee even though only the single p2p-client pod
 // observes node_status (issue #212).
 //
-// Keyed by PeerID and network-scoped for the same reasons as DatahubEndpoint.
-// LastSeen lets readers drop peers not re-heard within a TTL so a departed
-// cheap node cannot pin the advertised fee low forever. The mining fee is
-// stored as satoshis-per-Bytes (the node_status FeePolicy.MiningFee shape),
-// e.g. {Satoshis: 100, Bytes: 1000} == 100 sat/kB.
+// Keyed by PeerID (a libp2p peer runs on a single network, so PeerID is
+// unique); Network is a filter attribute, not part of the key — matching the
+// DatahubEndpoint pattern. LastSeen lets readers drop peers not re-heard within
+// a TTL so a departed cheap node cannot pin the advertised fee low forever. The
+// mining fee is stored as satoshis-per-Bytes (the node_status FeePolicy.MiningFee
+// shape), e.g. {Satoshis: 100, Bytes: 1000} == 100 sat/kB.
 type PeerPolicy struct {
 	PeerID            string
 	Network           string

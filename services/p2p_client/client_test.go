@@ -2,6 +2,7 @@ package p2p_client
 
 import (
 	"context"
+	"math"
 	"net"
 	"strings"
 	"sync"
@@ -486,5 +487,23 @@ func TestRecordPeerFee_NoFeeAdvertised(t *testing.T) {
 	c.recordPeerFee(context.Background(), teranodep2p.NodeStatusMessage{PeerID: "peer-4"})
 	if fees := w.feeSnapshot(); len(fees) != 0 {
 		t.Fatalf("expected no fee upsert for feeless peer, got %+v", fees)
+	}
+}
+
+// TestRecordPeerFee_RejectsMalformedLegacyFee verifies that a malformed or
+// malicious legacy MinMiningTxFee (NaN, Inf, negative, or absurdly large) is
+// dropped rather than converted into a wrapped uint64 that would pollute the
+// store and metrics.
+func TestRecordPeerFee_RejectsMalformedLegacyFee(t *testing.T) {
+	bad := []float64{math.NaN(), math.Inf(1), -0.0001, 1e30}
+	for _, f := range bad {
+		c, w := newTestClient(t, newFakeTeraClient("sender"))
+		c.recordPeerFee(context.Background(), teranodep2p.NodeStatusMessage{
+			PeerID:         "peer-bad",
+			MinMiningTxFee: &f,
+		})
+		if fees := w.feeSnapshot(); len(fees) != 0 {
+			t.Errorf("fee=%v: expected no upsert for malformed fee, got %+v", f, fees)
+		}
 	}
 }

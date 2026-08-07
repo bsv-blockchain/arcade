@@ -60,8 +60,9 @@ func TestHandlePolicy_ReportsValidatorFloor(t *testing.T) {
 		t.Errorf("size fields = {%d %d}, want validator defaults {10485760 500000}",
 			resp.Policy.MaxTxSizePolicy, resp.Policy.MaxScriptSizePolicy)
 	}
-	if resp.Policy.MaxTxSigopsCountsPolicy != 0 {
-		t.Errorf("maxtxsigopscountspolicy = %d, want 0", resp.Policy.MaxTxSigopsCountsPolicy)
+	// Internal 0 (unlimited) is reported as ARC's unlimited sentinel.
+	if resp.Policy.MaxTxSigopsCountsPolicy != arcUnlimitedSigops {
+		t.Errorf("maxtxsigopscountspolicy = %d, want %d (ARC unlimited)", resp.Policy.MaxTxSigopsCountsPolicy, arcUnlimitedSigops)
 	}
 	if !resp.Policy.StandardFormatSupported {
 		t.Errorf("standardFormatSupported = false, want true")
@@ -119,6 +120,24 @@ func TestHandlePolicy_SizeAndFormatFieldsFromConfig(t *testing.T) {
 	}
 	if !resp.Policy.StandardFormatSupported {
 		t.Errorf("standardFormatSupported = false, want true")
+	}
+}
+
+// TestHandlePolicy_ZeroConfigFallsBackToDefaults covers the no-validator path
+// with an all-zero validator config: size fields must fall back to the
+// canonical teranode defaults rather than emitting a meaningless 0, and sigops
+// must report the ARC unlimited sentinel.
+func TestHandlePolicy_ZeroConfigFallsBackToDefaults(t *testing.T) {
+	_, router := setupPolicyServer(&mockStore{}, config.ValidatorConfig{}, nil)
+	resp := getPolicy(t, router, "/policy")
+	if resp.Policy.MaxTxSizePolicy != config.DefaultValidatorMaxTxSizePolicy {
+		t.Errorf("maxtxsizepolicy = %d, want %d", resp.Policy.MaxTxSizePolicy, config.DefaultValidatorMaxTxSizePolicy)
+	}
+	if resp.Policy.MaxScriptSizePolicy != config.DefaultValidatorMaxScriptSizePolicy {
+		t.Errorf("maxscriptsizepolicy = %d, want %d", resp.Policy.MaxScriptSizePolicy, config.DefaultValidatorMaxScriptSizePolicy)
+	}
+	if resp.Policy.MaxTxSigopsCountsPolicy != arcUnlimitedSigops {
+		t.Errorf("maxtxsigopscountspolicy = %d, want %d", resp.Policy.MaxTxSigopsCountsPolicy, arcUnlimitedSigops)
 	}
 }
 
