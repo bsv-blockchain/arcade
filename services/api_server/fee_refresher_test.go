@@ -65,6 +65,29 @@ func TestLowestObservedFeePerKB(t *testing.T) {
 		}
 	})
 
+	t.Run("rounds up, never below the peer rate", func(t *testing.T) {
+		// 1 sat / 1001 bytes is ~0.999 sat/kB; must round UP to 1, not down to
+		// 0 (which would let arcade accept fee=0 that the peer would reject).
+		peers := []store.PeerPolicy{
+			{PeerID: "p1", MiningFeeSatoshis: 1, MiningFeeBytes: 1001, LastSeen: now},
+		}
+		got, ok := lowestObservedFeePerKB(peers, ttl, now)
+		if !ok || got != 1 {
+			t.Fatalf("got (%d,%v), want (1,true) — ceil, not floor", got, ok)
+		}
+	})
+
+	t.Run("absurd fee saturates and is never the minimum", func(t *testing.T) {
+		peers := []store.PeerPolicy{
+			{PeerID: "huge", MiningFeeSatoshis: 1 << 60, MiningFeeBytes: 1, LastSeen: now},
+			{PeerID: "sane", MiningFeeSatoshis: 20, MiningFeeBytes: 1000, LastSeen: now},
+		}
+		got, ok := lowestObservedFeePerKB(peers, ttl, now)
+		if !ok || got != 20 {
+			t.Fatalf("got (%d,%v), want (20,true) — huge fee must not wrap into the minimum", got, ok)
+		}
+	})
+
 	t.Run("zero-byte row skipped", func(t *testing.T) {
 		peers := []store.PeerPolicy{
 			{PeerID: "bad", MiningFeeSatoshis: 5, MiningFeeBytes: 0, LastSeen: now},

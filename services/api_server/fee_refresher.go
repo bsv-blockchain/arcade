@@ -2,6 +2,7 @@ package api_server
 
 import (
 	"context"
+	"math"
 	"time"
 
 	"go.uber.org/zap"
@@ -83,8 +84,10 @@ func (s *Server) refreshFeeOnce(ctx context.Context) {
 
 // lowestObservedFeePerKB returns the minimum mining fee rate (in satoshis per
 // 1000 bytes) advertised by peers re-heard within ttl. ok is false when no
-// fresh observation exists. A peer's rate is normalized to sat/kB so
-// observations with a non-1000 byte basis compare correctly.
+// fresh observation exists. A peer's rate is normalized to sat/kB using ceil
+// division so a non-1000 byte basis never rounds the enforced floor *below*
+// what the peer requires (e.g. 1 sat / 1001 bytes must map to 1 sat/kB, not 0,
+// or arcade would accept fee=0 that no node would).
 func lowestObservedFeePerKB(peers []store.PeerPolicy, ttl time.Duration, now time.Time) (uint64, bool) {
 	cutoff := now.Add(-ttl)
 	var (
@@ -98,11 +101,35 @@ func lowestObservedFeePerKB(peers []store.PeerPolicy, ttl time.Duration, now tim
 		if !p.LastSeen.IsZero() && p.LastSeen.Before(cutoff) {
 			continue // peer not re-heard within TTL
 		}
-		perKB := p.MiningFeeSatoshis * 1000 / p.MiningFeeBytes
+		perKB := ceilFeePerKB(p.MiningFeeSatoshis, p.MiningFeeBytes)
 		if !found || perKB < best {
 			best = perKB
 			found = true
 		}
 	}
 	return best, found
+}
+
+// ceilFeePerKB computes ceil(satoshis*1000 / bytes), rounding up so the derived
+// sat/kB floor is never lower than the peer's advertised rate. It is
+// overflow-safe for any input: an absurdly large advertised fee saturates to
+// MaxUint64, so it reads as "very high" and can never be wrongly selected as
+// the network minimum. bytes must be non-zero (checked by callers).
+func ceilFeePerKB(satoshis, bytes uint64) uint64 {
+	const scale = 1000
+	whole := satoshis / bytes
+	rem := satoshis % bytes // < bytes
+	if whole > math.MaxUint64/scale || rem > math.MaxUint64/scale {
+		return math.MaxUint64
+	}
+	base := whole * scale
+	remScaled := rem * scale
+	add := remScaled / bytes
+	if remScaled%bytes != 0 {
+		add++ // round up
+	}
+	if base > math.MaxUint64-add {
+		return math.MaxUint64
+	}
+	return base + add
 }

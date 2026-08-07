@@ -356,8 +356,20 @@ func (c *Client) recordPeerFee(ctx context.Context, msg teranodep2p.NodeStatusMe
 		sats = msg.FeePolicy.MiningFee.Satoshis
 		byts = msg.FeePolicy.MiningFee.Bytes
 	case msg.MinMiningTxFee != nil:
-		// BSV/kB -> satoshis per 1000 bytes (1 BSV = 1e8 satoshis).
-		sats = uint64(math.Round(*msg.MinMiningTxFee * 1e8))
+		// BSV/kB -> satoshis per 1000 bytes (1 BSV = 1e8 satoshis). Validate the
+		// untrusted float before converting: a malformed/malicious node_status
+		// could carry NaN/Inf/negative or an absurd magnitude, which uint64()
+		// would turn into a wrapped garbage value that pollutes metrics and the
+		// int64-backed store columns. Drop such advertisements.
+		f := *msg.MinMiningTxFee
+		v := math.Round(f * 1e8)
+		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > math.MaxInt64 {
+			c.logger.Debug("ignoring implausible peer MinMiningTxFee",
+				zap.String("peer_id", msg.PeerID),
+				zap.Float64("min_mining_tx_fee", f))
+			return
+		}
+		sats = uint64(v)
 		byts = 1000
 	default:
 		return
