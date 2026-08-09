@@ -88,6 +88,17 @@ func (t *TxTracker) loadFromStore(ctx context.Context, store statusIterator, cur
 	}
 
 	err := store.IterateStatusesSince(ctx, time.Time{}, func(status *models.TransactionStatus) error {
+		// Skip terminal outcomes that never need tracking. The tracker exists to
+		// recognize in-flight txids that might still land in a mined subtree; a
+		// REJECTED / DOUBLE_SPEND_ATTEMPTED / IMMUTABLE tx never will. Without
+		// this, hydration loaded the entire terminal history into the map —
+		// REJECTED alone was ~44% of a 5M-row store — and OOM-killed the
+		// api-server at startup. MINED is terminal too but is handled below: it
+		// is retained until deeply confirmed so PruneConfirmed can promote it.
+		if status.Status.IsTerminal() && status.Status != models.StatusMined {
+			return nil
+		}
+
 		// Skip transactions that are deeply confirmed — these would only be
 		// pruned moments later, so never let them touch the tracker map.
 		if status.Status == models.StatusMined && status.BlockHeight > 0 {

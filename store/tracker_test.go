@@ -140,6 +140,47 @@ func TestTxTracker_LoadFromStore_DropsDeeplyConfirmed(t *testing.T) {
 	}
 }
 
+func TestTxTracker_LoadFromStore_DropsTerminalStatuses(t *testing.T) {
+	// Regression for the arcade-v2 OOM: hydration loaded terminal rows
+	// (REJECTED was ~44% of a 5M-row store) into the tracker map even though a
+	// terminal tx can never appear in a mined subtree. Only in-flight statuses
+	// and recently-mined rows (needed for PruneConfirmed) belong in the tracker.
+	const currentHeight = uint64(1_000_000)
+	rows := []*models.TransactionStatus{
+		// Terminal, never mined: must be dropped.
+		{TxID: txidHex(0), Status: models.StatusRejected},
+		{TxID: txidHex(1), Status: models.StatusDoubleSpendAttempted},
+		{TxID: txidHex(2), Status: models.StatusImmutable, BlockHeight: currentHeight - 10},
+		// Deeply confirmed mined: dropped (existing behavior).
+		{TxID: txidHex(3), Status: models.StatusMined, BlockHeight: currentHeight - ConfirmationsRequired - 1},
+		// Keep: in-flight + recently mined (still needs pruning tracking).
+		{TxID: txidHex(4), Status: models.StatusSeenOnNetwork},
+		{TxID: txidHex(5), Status: models.StatusReceived},
+		{TxID: txidHex(6), Status: models.StatusMined, BlockHeight: currentHeight - 10},
+	}
+
+	tracker := NewTxTracker()
+	store := &fakeIterStore{rows: rows, tr: tracker}
+
+	got, err := tracker.loadFromStore(context.Background(), store, currentHeight, 100)
+	if err != nil {
+		t.Fatalf("loadFromStore: %v", err)
+	}
+	if got != 3 {
+		t.Fatalf("expected 3 kept rows, got %d", got)
+	}
+	for _, drop := range []int{0, 1, 2, 3} {
+		if tracker.Contains(txidHex(drop)) {
+			t.Errorf("txid %d (%s) should NOT be tracked", drop, rows[drop].Status)
+		}
+	}
+	for _, keep := range []int{4, 5, 6} {
+		if !tracker.Contains(txidHex(keep)) {
+			t.Errorf("txid %d (%s) should be tracked", keep, rows[keep].Status)
+		}
+	}
+}
+
 func TestTxTracker_LoadFromStore_BoundedPeakMemory(t *testing.T) {
 	// Many old rows that will be pruned + a small tail of recent rows. If
 	// LoadFromStore materialized the full history before pruning, the
