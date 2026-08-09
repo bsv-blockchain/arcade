@@ -7,11 +7,14 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"math/big"
+	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/model"
+	teranode "github.com/bsv-blockchain/teranode/services/p2p"
 )
 
 // nonDataScript returns an OP_DROP OP_TRUE locking script. Paired with the
@@ -119,6 +122,21 @@ func TxIDs(txs []*bt.Tx) []chainhash.Hash {
 	for i, tx := range txs {
 		id := tx.TxIDChainHash()
 		out[i] = *id
+	}
+	return out
+}
+
+// TxIDsFromHex converts display-order txid hex strings (as returned by
+// BroadcastTx / GET /tx) into chainhash form for block fabrication.
+func TxIDsFromHex(t *testing.T, ids []string) []chainhash.Hash {
+	t.Helper()
+	out := make([]chainhash.Hash, len(ids))
+	for i, id := range ids {
+		h, err := chainhash.NewHashFromStr(id)
+		if err != nil {
+			t.Fatalf("parse txid %s: %v", id, err)
+		}
+		out[i] = *h
 	}
 	return out
 }
@@ -265,4 +283,235 @@ func EncodeUint32LE(v uint32) []byte {
 	out := make([]byte, 4)
 	binary.LittleEndian.PutUint32(out, v)
 	return out
+}
+
+// coinbasePlaceholder is teranode's subtree-0/leaf-0 coinbase stand-in:
+// 32 bytes of 0xFF (go-subtree's CoinbasePlaceholder). The subtree an
+// announcing node publishes carries this placeholder at leaf 0; the
+// block header's merkle root is computed with the placeholder replaced
+// by the real coinbase txid. merkle-service's coinbase-BUMP builder and
+// arcade's applyCoinbaseToSTUMP both rely on this convention.
+var coinbasePlaceholder = chainhash.Hash{
+	0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+	0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+	0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+	0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+}
+
+// regtestBits is the standard regtest compact difficulty (0x207fffff),
+// little-endian as serialized in the header.
+var regtestBits = [4]byte{0xff, 0xff, 0x7f, 0x20}
+
+// RegtestGenesisHash returns the regtest genesis block hash — the
+// prevHash for a synthetic block at height 1. Matches go-chaincfg's
+// RegressionNetParams (what embedded go-chaintracks initializes from).
+func RegtestGenesisHash() chainhash.Hash {
+	// 0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206
+	// (display order). chainhash bytes are the reverse.
+	h, _ := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
+	return *h
+}
+
+// SyntheticBlock is a fully fabricated single-subtree block: everything
+// a test needs to stage it on a Datahub and announce it over libp2p so
+// that merkle-service, arcade, and embedded chaintracks all accept it.
+//
+// Layout is teranode's: the announced subtree's leaf 0 is the coinbase
+// placeholder; the header merkle root is the same tree with leaf 0
+// replaced by the real coinbase txid (single-subtree block ⇒ the
+// corrected subtree root IS the block root).
+type SyntheticBlock struct {
+	Hash        chainhash.Hash   // block hash (header hash)
+	Height      uint32           //
+	HeaderBin   []byte           // 80-byte serialized header (StageHeader input)
+	HeaderHex   string           // hex(HeaderBin) — BlockMessage.Header
+	CoinbaseHex string           // hex(coinbase bytes) — BlockMessage.Coinbase
+	CoinbaseID  chainhash.Hash   // coinbase txid
+	MerkleRoot  chainhash.Hash   // header merkle root (coinbase-corrected)
+	SubtreeHash chainhash.Hash   // announced subtree id (placeholder-based root)
+	SubtreeBin  []byte           // bytes served at /subtree/<SubtreeHash>
+	BlockBin    []byte           // bytes served at /block/<Hash>
+	TxIDs       []chainhash.Hash // non-coinbase txids, in leaf order 1..n
+}
+
+// SyntheticBlockSpec parameterizes BuildSyntheticBlock. Two same-height
+// competitors are built by calling it twice with the same PrevHash and
+// Height but different TxIDs and/or CBExtra (which varies the coinbase
+// txid the way two different miners' coinbases differ).
+type SyntheticBlockSpec struct {
+	PrevHash  chainhash.Hash
+	Height    uint32
+	Timestamp uint32
+	CBExtra   uint32
+	// TxIDs are the non-coinbase txids in leaf order. len(TxIDs)+1
+	// should ideally be a power of two (e.g. 7 txids → 8 leaves) so no
+	// odd-level duplication rules come into play anywhere in the
+	// pipeline, though go-subtree and this builder share the standard
+	// duplicate-when-odd rule either way.
+	TxIDs []chainhash.Hash
+}
+
+// BuildSyntheticBlock fabricates a single-subtree block per spec. The
+// header nonce is ground so the block hash satisfies the regtest
+// difficulty target (cheap: ~2 attempts expected).
+func BuildSyntheticBlock(spec SyntheticBlockSpec) (*SyntheticBlock, error) {
+	if len(spec.TxIDs) == 0 {
+		return nil, fmt.Errorf("synthetic block needs at least one non-coinbase txid")
+	}
+
+	coinbase := BuildCoinbase(spec.Height)
+	// Vary the coinbase txid between same-height competitors the way two
+	// miners' coinbases naturally differ. Version is otherwise unused by
+	// every consumer in the pipeline (only the txid matters).
+	if spec.CBExtra != 0 {
+		coinbase.Version = spec.CBExtra
+	}
+	cbID := *coinbase.TxIDChainHash()
+
+	// Announced subtree: placeholder at leaf 0.
+	announcedLeaves := append([]chainhash.Hash{coinbasePlaceholder}, spec.TxIDs...)
+	subtreeHash := SubtreeRoot(announcedLeaves)
+	subtreeBin := SubtreeBinary(announcedLeaves)
+
+	// Header root: same tree with the real coinbase txid at leaf 0.
+	correctedLeaves := append([]chainhash.Hash{cbID}, spec.TxIDs...)
+	merkleRoot := SubtreeRoot(correctedLeaves)
+
+	// Grind the nonce against the regtest target so anything that
+	// validates PoW accepts the header.
+	nonce, headerBin, blockHash, err := grindHeaderNonce(spec.PrevHash, merkleRoot, spec.Timestamp)
+	if err != nil {
+		return nil, err
+	}
+
+	bits, err := model.NewNBitFromSlice(regtestBits[:])
+	if err != nil {
+		return nil, fmt.Errorf("regtest nbit: %w", err)
+	}
+	// sizeBytes is advisory — nothing in the pipeline validates it, but
+	// zero looks broken in logs; use a plausible per-tx estimate.
+	sizeBytes := uint64(80 + (len(spec.TxIDs)+1)*256)
+	blockBin, builtHash, err := BuildBlockBinary(
+		spec.PrevHash, merkleRoot, spec.Height, spec.Timestamp, bits, nonce,
+		[]chainhash.Hash{subtreeHash}, coinbase, nil,
+		uint64(len(spec.TxIDs)+1), sizeBytes,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("build block binary: %w", err)
+	}
+	if !builtHash.IsEqual(&blockHash) {
+		return nil, fmt.Errorf("header serialization mismatch: ground %s, model built %s", blockHash, builtHash)
+	}
+
+	return &SyntheticBlock{
+		Hash:        blockHash,
+		Height:      spec.Height,
+		HeaderBin:   headerBin,
+		HeaderHex:   hex.EncodeToString(headerBin),
+		CoinbaseHex: hexEncodeTx(coinbase),
+		CoinbaseID:  cbID,
+		MerkleRoot:  merkleRoot,
+		SubtreeHash: subtreeHash,
+		SubtreeBin:  subtreeBin,
+		BlockBin:    blockBin,
+		TxIDs:       append([]chainhash.Hash(nil), spec.TxIDs...),
+	}, nil
+}
+
+// Stage registers the block, its subtree, and its header on the datahub.
+func (b *SyntheticBlock) Stage(d *Datahub) {
+	d.StageBlock(b.Hash, b.BlockBin)
+	if len(b.SubtreeBin) > 0 {
+		d.StageSubtree(b.SubtreeHash, b.SubtreeBin)
+	}
+	d.StageHeader(b.Hash, b.HeaderBin)
+}
+
+// BlockMessage renders the teranode gossip announcement for this block,
+// pointing consumers at dataHubURL for the block/subtree fetches.
+func (b *SyntheticBlock) BlockMessage(dataHubURL string) teranode.BlockMessage {
+	return teranode.BlockMessage{
+		Hash:       b.Hash.String(),
+		Height:     b.Height,
+		DataHubURL: dataHubURL,
+		Header:     b.HeaderHex,
+		Coinbase:   b.CoinbaseHex,
+	}
+}
+
+// BuildEmptySyntheticBlock fabricates a coinbase-only block (zero
+// subtrees) — the cheapest way to extend a chain by one height in a
+// reorg scenario. Its header merkle root is the coinbase txid, matching
+// Bitcoin's single-tx-block rule; merkle-service takes its coinbase-only
+// BLOCK_PROCESSED path and chaintracks gets a well-formed header.
+func BuildEmptySyntheticBlock(prevHash chainhash.Hash, height, timestamp, cbExtra uint32) (*SyntheticBlock, error) {
+	coinbase := BuildCoinbase(height)
+	if cbExtra != 0 {
+		coinbase.Version = cbExtra
+	}
+	cbID := *coinbase.TxIDChainHash()
+
+	nonce, headerBin, blockHash, err := grindHeaderNonce(prevHash, cbID, timestamp)
+	if err != nil {
+		return nil, err
+	}
+	bits, err := model.NewNBitFromSlice(regtestBits[:])
+	if err != nil {
+		return nil, fmt.Errorf("regtest nbit: %w", err)
+	}
+	blockBin, builtHash, err := BuildBlockBinary(
+		prevHash, cbID, height, timestamp, bits, nonce,
+		nil, coinbase, nil, 1, 320,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("build block binary: %w", err)
+	}
+	if !builtHash.IsEqual(&blockHash) {
+		return nil, fmt.Errorf("header serialization mismatch: ground %s, model built %s", blockHash, builtHash)
+	}
+	return &SyntheticBlock{
+		Hash:        blockHash,
+		Height:      height,
+		HeaderBin:   headerBin,
+		HeaderHex:   hex.EncodeToString(headerBin),
+		CoinbaseHex: hexEncodeTx(coinbase),
+		CoinbaseID:  cbID,
+		MerkleRoot:  cbID,
+		BlockBin:    blockBin,
+	}, nil
+}
+
+func hexEncodeTx(tx *bt.Tx) string {
+	return hex.EncodeToString(tx.Bytes())
+}
+
+// grindHeaderNonce serializes the 80-byte header with increasing nonces
+// until the hash satisfies the regtest compact target 0x207fffff
+// (mantissa 0x7fffff at exponent 0x20 ⇒ target = 0x7fffff << 232; a
+// uniformly random hash passes with p≈1/2). Returns the winning nonce,
+// header bytes, and block hash.
+func grindHeaderNonce(prev, root chainhash.Hash, timestamp uint32) (uint32, []byte, chainhash.Hash, error) {
+	target := new(big.Int).Lsh(big.NewInt(0x7fffff), 232)
+	header := make([]byte, 80)
+	binary.LittleEndian.PutUint32(header[0:4], 1)
+	copy(header[4:36], prev[:])
+	copy(header[36:68], root[:])
+	binary.LittleEndian.PutUint32(header[68:72], timestamp)
+	copy(header[72:76], regtestBits[:])
+	for nonce := uint32(0); nonce < 1<<20; nonce++ {
+		binary.LittleEndian.PutUint32(header[76:80], nonce)
+		hash := chainhash.DoubleHashH(header)
+		// Numeric comparison uses display order (reversed bytes) as a
+		// big-endian integer.
+		rev := make([]byte, 32)
+		for i := range hash {
+			rev[i] = hash[31-i]
+		}
+		if new(big.Int).SetBytes(rev).Cmp(target) <= 0 {
+			out := make([]byte, 80)
+			copy(out, header)
+			return nonce, out, hash, nil
+		}
+	}
+	return 0, nil, chainhash.Hash{}, fmt.Errorf("no nonce satisfied the regtest target in 2^20 attempts")
 }

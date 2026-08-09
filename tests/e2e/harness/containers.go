@@ -5,6 +5,7 @@ package harness
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -92,6 +93,46 @@ type Containers struct {
 	// routable from the container, so we have to thread the real
 	// gateway through explicitly.
 	GatewayIP string
+
+	// HostFromContainer is the hostname/IP containers on this network
+	// should use to reach listeners bound on the TEST HOST (the harness
+	// datahub, the libp2p host, arcade's callback receiver). Prefer this
+	// over GatewayIP: on current rootless podman (pasta) the bridge
+	// gateway no longer maps to the host at all — connections are
+	// refused — while the podman-injected host.containers.internal alias
+	// maps correctly. On Docker this is the GatewayIP recipe as before.
+	HostFromContainer string
+}
+
+// hostFromContainerAddr resolves the address containers use to reach
+// host-bound listeners. Podman injects host.containers.internal into
+// every container's /etc/hosts and maps it through pasta to the host;
+// the bridge-network gateway IP stopped being host-mapped in podman ≥5.8
+// (dials are refused), so the alias is the only reliable route. Docker
+// keeps the gateway recipe (host.docker.internal:host-gateway resolves
+// to it and routes to the host).
+func hostFromContainerAddr(gatewayIP string) string {
+	if isPodmanRuntime() {
+		return "host.containers.internal"
+	}
+	if gatewayIP != "" {
+		return gatewayIP
+	}
+	return "host.docker.internal"
+}
+
+// isPodmanRuntime sniffs whether the container runtime testcontainers
+// resolves to is podman: an explicit podman DOCKER_HOST, or (when unset)
+// the presence of the rootless podman socket.
+func isPodmanRuntime() bool {
+	if host := os.Getenv("DOCKER_HOST"); host != "" {
+		return strings.Contains(host, "podman")
+	}
+	sock := fmt.Sprintf("/run/user/%d/podman/podman.sock", os.Getuid())
+	if _, err := os.Stat(sock); err == nil {
+		return true
+	}
+	return false
 }
 
 // MerkleStartOptions tells StartContainers how to wire merkle-service to
@@ -179,7 +220,7 @@ func startContainersOnNetwork(ctx context.Context, t *testing.T, opts MerkleStar
 		opts.P2PNetwork = "regtest"
 	}
 
-	out := &Containers{Network: nw, GatewayIP: gateway}
+	out := &Containers{Network: nw, GatewayIP: gateway, HostFromContainer: hostFromContainerAddr(gateway)}
 
 	// Postgres ----------------------------------------------------------
 	// BasicWaitStrategies() composes the log-and-port wait the postgres
