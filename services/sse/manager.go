@@ -70,9 +70,23 @@ type Manager struct {
 
 	nextClientID atomic.Int64
 
+	// clientBufferSize is the capacity of each new client's send channel.
+	// Wired from config.SSEConfig.ClientBufferSize by the Service at
+	// startup; when unset (<= 0, e.g. tests that construct via newManager
+	// without threading config) NewClient falls back to
+	// defaultClientBuffer.
+	clientBufferSize int
+
 	mu      sync.RWMutex
 	clients map[int64]*Client
 }
+
+// defaultClientBuffer is the fallback capacity for a client's send channel
+// when Manager.clientBufferSize is unset (<= 0). Mirrors
+// config.DefaultSSEClientBuffer; kept local so newManager callers that don't
+// thread config (tests) still get a burst-tolerant buffer instead of the old
+// silently-dropping 64-slot channel.
+const defaultClientBuffer = 8192
 
 // newManager constructs the manager and starts a single subscriber
 // goroutine that runs for the lifetime of ctx. Returns (nil, nil) only
@@ -249,10 +263,14 @@ func (m *Manager) NewClient(token string) *Client {
 	// cancel is stored on Client and invoked by Manager.Unregister — its
 	// lifetime is the client connection, not this function.
 	ctx, cancel := context.WithCancel(parent)
+	size := m.clientBufferSize
+	if size <= 0 {
+		size = defaultClientBuffer
+	}
 	return &Client{
 		ID:     m.nextClientID.Add(1),
 		Token:  token,
-		Ch:     make(chan *models.TransactionStatus, 64),
+		Ch:     make(chan *models.TransactionStatus, size),
 		Ctx:    ctx,
 		Cancel: cancel,
 	}
@@ -306,10 +324,31 @@ func (s *Service) handleEvents(c *gin.Context) {
 		case <-ctx.Done():
 			return
 		case status := <-client.Ch:
-			if status == nil {
-				continue
+			if status != nil {
+				if err := writeStatusBuffered(writer, status); err != nil {
+					return
+				}
 			}
-			if err := writeStatus(writer, status); err != nil {
+			// Coalesce the rest of this burst: drain everything already
+			// buffered on the channel (the default arm breaks the loop once
+			// the channel is empty, so this only ever writes what's ready and
+			// can't spin) and flush once. A bulk-unfan of one Kafka message
+			// lands ~50 frames here; without coalescing we'd flush per frame.
+		drain:
+			for {
+				select {
+				case s := <-client.Ch:
+					if s == nil {
+						continue
+					}
+					if err := writeStatusBuffered(writer, s); err != nil {
+						return
+					}
+				default:
+					break drain
+				}
+			}
+			if err := writer.flush(); err != nil {
 				return
 			}
 		case <-keepalive.C:
@@ -405,9 +444,10 @@ func (m *Manager) enrichMerklePath(ctx context.Context, status *models.Transacti
 	}
 }
 
-// writeStatus emits one status frame. Event id is the timestamp in
-// nanoseconds so clients can use it as Last-Event-ID on reconnect.
-func writeStatus(w *sseWriter, status *models.TransactionStatus) error {
+// buildStatusFrame renders one status as an SSE frame. Event id is the
+// timestamp in nanoseconds so clients can use it as Last-Event-ID on
+// reconnect.
+func buildStatusFrame(status *models.TransactionStatus) (string, error) {
 	data, err := json.Marshal(statusPayload{
 		TxID:        status.TxID,
 		TxStatus:    string(status.Status),
@@ -417,10 +457,31 @@ func writeStatus(w *sseWriter, status *models.TransactionStatus) error {
 		MerklePath:  status.MerklePath,
 	})
 	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("id: %d\nevent: status\ndata: %s\n\n", status.Timestamp.UnixNano(), data), nil
+}
+
+// writeStatus emits one status frame and flushes it. Used for single frames
+// (keepalive/catchup) where there is no burst to coalesce.
+func writeStatus(w *sseWriter, status *models.TransactionStatus) error {
+	frame, err := buildStatusFrame(status)
+	if err != nil {
 		return err
 	}
-	frame := fmt.Sprintf("id: %d\nevent: status\ndata: %s\n\n", status.Timestamp.UnixNano(), data)
 	return w.write(frame)
+}
+
+// writeStatusBuffered emits one status frame WITHOUT flushing. The live
+// fan-out path writes a whole burst this way and then calls w.flush() once, so
+// a bulk-unfan (~50 frames from one Kafka message) drains with a single flush
+// instead of one flush per frame.
+func writeStatusBuffered(w *sseWriter, status *models.TransactionStatus) error {
+	frame, err := buildStatusFrame(status)
+	if err != nil {
+		return err
+	}
+	return w.writeNoFlush(frame)
 }
 
 // statusPayload is the JSON shape inside a `data:` field. txid/txStatus/timestamp
