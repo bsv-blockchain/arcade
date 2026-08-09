@@ -556,6 +556,14 @@ type SSEConfig struct {
 	// Port the SSE listener binds to. Default 8082. Must differ from
 	// api.port when SSE runs in the same process (mode=all).
 	Port int `mapstructure:"port"`
+	// ClientBufferSize is the per-connection SSE send-channel capacity.
+	// The manager unfans one Kafka message into a burst of per-tx events
+	// (bulk-unfan coalesces ~50 txids per message), so a single burst of
+	// ~50 must fit with headroom; sizing this too small silently drops
+	// events for slow or bursty consumers (the channel send is
+	// non-blocking, so overflow is lost, not backpressured). Default
+	// DefaultSSEClientBuffer. A value <= 0 selects the default.
+	ClientBufferSize int `mapstructure:"client_buffer_size"`
 }
 
 // WebhookConfig tunes the HTTP webhook delivery service. The service
@@ -652,6 +660,14 @@ type EventsConfig struct {
 // non-positive. 4096 is 16× the original 256 — enough headroom for typical
 // status-update bursts without committing significant memory upfront.
 const DefaultEventsSubscriberBuffer = 4096
+
+// DefaultSSEClientBuffer is the fallback per-connection SSE send-channel
+// capacity when SSEConfig.ClientBufferSize is unset or non-positive. The
+// manager unfans one Kafka message into a burst of per-tx events, so the
+// buffer must absorb many such bursts between writer drains; 8192 gives ample
+// headroom over a single ~50-event bulk-unfan while staying a modest
+// per-connection memory cost (channel of *TransactionStatus pointers).
+const DefaultSSEClientBuffer = 8192
 
 // ValidatorConfig controls intake-time transaction validation. It carries the
 // operator-facing fee floor enforced against EF/BEEF submissions; the consensus
@@ -908,6 +924,7 @@ func setDefaults() {
 	viper.SetDefault("sse.enabled", true)
 	viper.SetDefault("sse.host", "0.0.0.0")
 	viper.SetDefault("sse.port", 8082)
+	viper.SetDefault("sse.client_buffer_size", DefaultSSEClientBuffer)
 
 	// chaintracks standalone service: enabled by default. The bind port
 	// must differ from api.port and sse.port in single-binary deployments
