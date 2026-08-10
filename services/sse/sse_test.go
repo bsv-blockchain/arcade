@@ -20,6 +20,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/metrics"
@@ -425,11 +426,14 @@ func TestSSECatchupFrameCap(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	w := &sseWriter{w: rec, f: nopFlusher{rec}}
-	svc.sendCatchup(t.Context(), w, "tok-big", time.Time{})
+	res := svc.sendCatchup(t.Context(), w, "tok-big", time.Time{}, nil, false)
 
 	frames := strings.Count(rec.Body.String(), "\nevent: status\n")
 	if frames != catchupMaxFrames {
 		t.Errorf("catchup frames = %d, want cap %d", frames, catchupMaxFrames)
+	}
+	if !res.capped || res.frames != catchupMaxFrames {
+		t.Errorf("result = %+v, want capped at %d frames", res, catchupMaxFrames)
 	}
 }
 
@@ -599,6 +603,339 @@ func TestSSEFanOutClientGoneDrops(t *testing.T) {
 	after := testutil.ToFloat64(metrics.APISSEDroppedTotal.WithLabelValues("client_gone"))
 	if got := after - before; got < 1 {
 		t.Errorf("client_gone drops = %v, want >= 1", got)
+	}
+}
+
+// TestSSEMidstreamCatchupDeliversDroppedEvents is the end-to-end contract of
+// the mid-stream self-healing path: a token-scoped client whose channel is
+// overflowed by fanOut still receives EVERY status (at-least-once) on the
+// SAME connection, served from the store, and the catchup-round counter
+// increments.
+func TestSSEMidstreamCatchupDeliversDroppedEvents(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	const nTx = 5
+	subs := make([]*models.Submission, 0, nTx)
+	statuses := make([]*models.TransactionStatus, 0, nTx)
+	statusByTx := make(map[string]*models.TransactionStatus, nTx)
+	for i := 0; i < nTx; i++ {
+		txid := fmt.Sprintf("drop-%d", i)
+		st := &models.TransactionStatus{
+			TxID:      txid,
+			Status:    models.StatusMined,
+			Timestamp: now.Add(time.Duration(i) * time.Millisecond),
+		}
+		subs = append(subs, &models.Submission{TxID: txid, CallbackToken: tokA})
+		statuses = append(statuses, st)
+		statusByTx[txid] = st
+	}
+	st := &sseStoreStub{
+		subsByToken: map[string][]*models.Submission{tokA: subs},
+		statusByTx:  statusByTx,
+	}
+	svc, router, _, cancel := setupSSEService(t, st)
+	defer cancel()
+	mgr := svc.manager
+	// A one-slot buffer makes fanOut overflow immediately once the writer
+	// goroutine lags a single frame behind.
+	mgr.clientBufferSize = 1
+
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	catchupsBefore := testutil.ToFloat64(metrics.SSEMidstreamCatchupsTotal)
+	dropsBefore := testutil.ToFloat64(metrics.APISSEDroppedTotal.WithLabelValues("slow_client"))
+
+	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/events?callbackToken="+tokA, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /events: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// Wait for the connection's client to register.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mgr.mu.RLock()
+		n := len(mgr.clients)
+		mgr.mu.RUnlock()
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("client never registered")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Fan the statuses out until at least one is dropped on the full channel.
+	deadline = time.Now().Add(2 * time.Second)
+	for i := 0; testutil.ToFloat64(metrics.APISSEDroppedTotal.WithLabelValues("slow_client")) == dropsBefore; i++ {
+		if time.Now().After(deadline) {
+			t.Fatal("fanOut never dropped despite 1-slot buffer")
+		}
+		mgr.fanOut(t.Context(), statuses[i%nTx])
+	}
+
+	// Nudge the stream while collecting: each delivered frame triggers a
+	// drain cycle whose post-flush check runs the mid-stream catchup (the
+	// 15s keepalive would eventually do it too; nudging keeps the test fast).
+	nudgeDone := make(chan struct{})
+	defer close(nudgeDone)
+	go func() {
+		tick := time.NewTicker(50 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-nudgeDone:
+				return
+			case <-tick.C:
+				mgr.fanOut(context.Background(), statuses[nTx-1])
+			}
+		}
+	}()
+
+	want := make(map[string]bool, nTx)
+	for _, s := range statuses {
+		want[s.TxID] = true
+	}
+	if err := readSSEUntilTxIDs(resp.Body, want, 10*time.Second); err != nil {
+		t.Fatalf("stream did not deliver every status: %v", err)
+	}
+	// The dropped flag is armed, so the writer's next drain cycle (the nudger
+	// keeps producing them) MUST run a catchup round — but it may not have
+	// happened yet when the reader finishes (every status can also arrive
+	// live because the drop-forcing loop cycles them). Poll.
+	deadline = time.Now().Add(5 * time.Second)
+	for testutil.ToFloat64(metrics.SSEMidstreamCatchupsTotal)-catchupsBefore < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("arcade_sse_midstream_catchups_total never incremented after a drop")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestSSEMidstreamCatchupTokenlessKeepsDropOnly verifies the firehose
+// (tokenless) client keeps the historical behavior: drops are counted, but no
+// store-backed catchup runs — the catchup source is token-scoped.
+func TestSSEMidstreamCatchupTokenlessKeepsDropOnly(t *testing.T) {
+	st := &sseStoreStub{
+		subsByToken: map[string][]*models.Submission{},
+		statusByTx:  map[string]*models.TransactionStatus{},
+	}
+	svc, _, _, cancel := setupSSEService(t, st)
+	defer cancel()
+	mgr := svc.manager
+
+	client := mgr.NewClient("")
+	mgr.Register(client)
+	defer mgr.Unregister(client.ID)
+
+	for i := 0; i < cap(client.Ch); i++ {
+		client.Ch <- &models.TransactionStatus{TxID: "filler", Timestamp: time.Now()}
+	}
+	dropsBefore := testutil.ToFloat64(metrics.APISSEDroppedTotal.WithLabelValues("slow_client"))
+	mgr.fanOut(t.Context(), &models.TransactionStatus{TxID: "lost", Status: models.StatusMined, Timestamp: time.Now()})
+	if got := testutil.ToFloat64(metrics.APISSEDroppedTotal.WithLabelValues("slow_client")) - dropsBefore; got != 1 {
+		t.Fatalf("slow_client drops = %v, want 1", got)
+	}
+	if !client.dropped.Load() {
+		t.Fatal("dropped flag not set by fanOut drop arm")
+	}
+
+	catchupsBefore := testutil.ToFloat64(metrics.SSEMidstreamCatchupsTotal)
+	rec := httptest.NewRecorder()
+	w := &sseWriter{w: rec, f: nopFlusher{rec}}
+	if ok := svc.midstreamCatchup(t.Context(), w, client); !ok {
+		t.Fatal("midstreamCatchup reported a dead connection")
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("tokenless client received catchup frames: %q", rec.Body.String())
+	}
+	if got := testutil.ToFloat64(metrics.SSEMidstreamCatchupsTotal) - catchupsBefore; got != 0 {
+		t.Errorf("catchup rounds ran for tokenless client: %v", got)
+	}
+}
+
+// TestSSEFanOutDropLogAggregation verifies the drop Warn is aggregated and
+// rate-limited per client instead of logged once per dropped event.
+func TestSSEFanOutDropLogAggregation(t *testing.T) {
+	st := &sseStoreStub{
+		subsByToken: map[string][]*models.Submission{},
+		statusByTx:  map[string]*models.TransactionStatus{},
+	}
+	core, logs := observer.New(zap.WarnLevel)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	mgr, err := newManager(ctx, &fakePublisher{}, st, zap.New(core))
+	if err != nil {
+		t.Fatalf("newManager: %v", err)
+	}
+
+	client := mgr.NewClient("")
+	mgr.Register(client)
+	defer mgr.Unregister(client.ID)
+	for i := 0; i < cap(client.Ch); i++ {
+		client.Ch <- &models.TransactionStatus{TxID: "filler", Timestamp: time.Now()}
+	}
+
+	const drops = 100
+	for i := 0; i < drops; i++ {
+		mgr.fanOut(ctx, &models.TransactionStatus{TxID: "burst", Status: models.StatusMined, Timestamp: time.Now()})
+	}
+
+	warns := logs.FilterMessage("dropped events for slow SSE client; will catch up mid-stream").Len()
+	// 100 back-to-back drops land inside one dropLogInterval on any sane
+	// machine, so one aggregate line is expected; tolerate a second in case
+	// the loop straddles an interval boundary. The old code logged all 100.
+	if warns < 1 || warns > 2 {
+		t.Errorf("aggregate drop warns = %d, want 1 (2 tolerated), not one per %d drops", warns, drops)
+	}
+}
+
+// TestSSEMidstreamCatchupCappedRoundsProgress verifies the multi-round loop:
+// a replay window larger than catchupMaxFrames is delivered across capped
+// rounds whose `since` watermark strictly advances.
+func TestSSEMidstreamCatchupCappedRoundsProgress(t *testing.T) {
+	n := catchupMaxFrames + 500
+	subs := make([]*models.Submission, 0, n)
+	statusByTx := make(map[string]*models.TransactionStatus, n)
+	base := time.Now().UTC().Add(-time.Hour)
+	for i := 0; i < n; i++ {
+		txid := fmt.Sprintf("prog-%06d", i)
+		subs = append(subs, &models.Submission{TxID: txid, CallbackToken: "tok-prog"})
+		statusByTx[txid] = &models.TransactionStatus{
+			TxID:      txid,
+			Status:    models.StatusMined,
+			Timestamp: base.Add(time.Duration(i) * time.Millisecond),
+		}
+	}
+	st := &sseStoreStub{
+		subsByToken: map[string][]*models.Submission{"tok-prog": subs},
+		statusByTx:  statusByTx,
+	}
+	svc, _, _, cancel := setupSSEService(t, st)
+	defer cancel()
+
+	client := svc.manager.NewClient("tok-prog")
+	// Simulate fanOut having dropped events starting at the first status.
+	client.droppedFloor.Store(base.UnixNano())
+	client.dropped.Store(true)
+
+	catchupsBefore := testutil.ToFloat64(metrics.SSEMidstreamCatchupsTotal)
+	framesBefore := testutil.ToFloat64(metrics.SSEMidstreamCatchupFramesTotal)
+	rec := httptest.NewRecorder()
+	w := &sseWriter{w: rec, f: nopFlusher{rec}}
+	if ok := svc.midstreamCatchup(t.Context(), w, client); !ok {
+		t.Fatal("midstreamCatchup reported a dead connection")
+	}
+
+	if frames := strings.Count(rec.Body.String(), "\nevent: status\n"); frames != n {
+		t.Errorf("frames written = %d, want %d (every status, across rounds)", frames, n)
+	}
+	if got := testutil.ToFloat64(metrics.SSEMidstreamCatchupsTotal) - catchupsBefore; got != 2 {
+		t.Errorf("catchup rounds = %v, want 2 (capped round + resumed round)", got)
+	}
+	if got := testutil.ToFloat64(metrics.SSEMidstreamCatchupFramesTotal) - framesBefore; got != float64(n) {
+		t.Errorf("replayed frames metric delta = %v, want %d", got, n)
+	}
+	wantLast := statusByTx[fmt.Sprintf("prog-%06d", n-1)].Timestamp.UnixNano()
+	if got := client.lastDelivered.Load(); got != wantLast {
+		t.Errorf("lastDelivered = %d, want %d (watermark advanced to the final frame)", got, wantLast)
+	}
+}
+
+// TestSSEMidstreamCatchupSameTimestampGlut verifies the soft frame cap: when
+// an equal-timestamp run (one SetMinedByTxIDs batch) straddles the cap, the
+// round finishes the tie instead of stranding the remainder — a timestamp
+// cursor cannot resume mid-tie because the store filter is strictly-after.
+func TestSSEMidstreamCatchupSameTimestampGlut(t *testing.T) {
+	n := catchupMaxFrames + 500
+	subs := make([]*models.Submission, 0, n)
+	statusByTx := make(map[string]*models.TransactionStatus, n)
+	ts := time.Now().UTC().Add(-time.Hour)
+	for i := 0; i < n; i++ {
+		txid := fmt.Sprintf("glut-%06d", i)
+		subs = append(subs, &models.Submission{TxID: txid, CallbackToken: "tok-glut"})
+		statusByTx[txid] = &models.TransactionStatus{
+			TxID:      txid,
+			Status:    models.StatusMined,
+			Timestamp: ts, // the whole set shares ONE timestamp
+		}
+	}
+	st := &sseStoreStub{
+		subsByToken: map[string][]*models.Submission{"tok-glut": subs},
+		statusByTx:  statusByTx,
+	}
+	svc, _, _, cancel := setupSSEService(t, st)
+	defer cancel()
+
+	client := svc.manager.NewClient("tok-glut")
+	client.droppedFloor.Store(ts.UnixNano())
+	client.dropped.Store(true)
+
+	catchupsBefore := testutil.ToFloat64(metrics.SSEMidstreamCatchupsTotal)
+	rec := httptest.NewRecorder()
+	w := &sseWriter{w: rec, f: nopFlusher{rec}}
+	if ok := svc.midstreamCatchup(t.Context(), w, client); !ok {
+		t.Fatal("midstreamCatchup reported a dead connection")
+	}
+
+	if frames := strings.Count(rec.Body.String(), "\nevent: status\n"); frames != n {
+		t.Errorf("frames written = %d, want %d (tie drained past the cap)", frames, n)
+	}
+	if got := testutil.ToFloat64(metrics.SSEMidstreamCatchupsTotal) - catchupsBefore; got != 1 {
+		t.Errorf("catchup rounds = %v, want 1 (single round drains the tie)", got)
+	}
+}
+
+// readSSEUntilTxIDs consumes SSE frames from r until every txid in want has
+// been seen at least once (duplicates allowed) or the timeout elapses.
+func readSSEUntilTxIDs(r io.Reader, want map[string]bool, timeout time.Duration) error {
+	var mu sync.Mutex
+	seen := make(map[string]bool, len(want))
+	done := make(chan error, 1)
+	go func() {
+		br := bufio.NewReader(r)
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				done <- fmt.Errorf("read: %w", err)
+				return
+			}
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			var payload struct {
+				TxID string `json:"txid"`
+			}
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(strings.TrimSpace(line), "data: ")), &payload); err != nil {
+				continue
+			}
+			mu.Lock()
+			if want[payload.TxID] {
+				seen[payload.TxID] = true
+			}
+			complete := len(seen) == len(want)
+			mu.Unlock()
+			if complete {
+				done <- nil
+				return
+			}
+		}
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		mu.Lock()
+		defer mu.Unlock()
+		missing := make([]string, 0, len(want))
+		for txid := range want {
+			if !seen[txid] {
+				missing = append(missing, txid)
+			}
+		}
+		return fmt.Errorf("timeout; missing txids: %v", missing)
 	}
 }
 

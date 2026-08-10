@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"sync"
@@ -15,7 +16,6 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/events"
-	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
@@ -43,6 +43,31 @@ type Client struct {
 	// long-lived cancellation handles owned by a registry entry.
 	Ctx    context.Context    //nolint:containedctx // see comment above
 	Cancel context.CancelFunc //nolint:containedctx // paired with Ctx above
+
+	// The fields below are the mid-stream catchup delivery state. They are
+	// raced between the manager's fan-out goroutine (recordDrop) and the
+	// per-connection writer goroutine (handleEvents / midstreamCatchup),
+	// hence atomics.
+
+	// lastDelivered is the Timestamp.UnixNano() of the last frame (live or
+	// catchup) the writer goroutine successfully wrote to this client. It is
+	// the resume watermark for capped mid-stream catchup rounds. Written only
+	// by the writer goroutine.
+	lastDelivered atomic.Int64
+	// dropped is set by fanOut's drop arm when this client's channel
+	// overflowed; the writer goroutine clears it and runs a store-backed
+	// catchup. recordDrop writes droppedFloor BEFORE setting this flag, so a
+	// writer that observes the flag also observes the floor.
+	dropped atomic.Bool
+	// droppedFloor is the minimum Timestamp.UnixNano() among events dropped
+	// since the writer last consumed it (math.MaxInt64 = none). It bounds the
+	// mid-stream catchup replay window from below.
+	droppedFloor atomic.Int64
+	// dropsSinceLog and lastDropLog implement the rate-limited aggregate
+	// drop Warn (at most one line per dropLogInterval per client) — a big
+	// block's burst used to emit one Warn PER dropped event.
+	dropsSinceLog atomic.Int64
+	lastDropLog   atomic.Int64
 }
 
 // Manager owns the per-pod registry of SSE clients listening on
@@ -77,6 +102,13 @@ type Manager struct {
 	// defaultClientBuffer.
 	clientBufferSize int
 
+	// catchupOnDrop gates mid-stream store-backed catchup for token-scoped
+	// clients whose channel overflowed. Wired from
+	// config.SSEConfig.CatchupOnDrop by the Service at startup; newManager
+	// initializes it to true so tests constructing the manager directly get
+	// the production default.
+	catchupOnDrop bool
+
 	mu      sync.RWMutex
 	clients map[int64]*Client
 }
@@ -97,11 +129,12 @@ func newManager(ctx context.Context, publisher events.Publisher, st store.Store,
 		return nil, nil //nolint:nilnil // intentional: nil manager means "no fan-out wired"
 	}
 	m := &Manager{
-		publisher: publisher,
-		store:     st,
-		logger:    logger.Named("sse"),
-		parentCtx: ctx,
-		clients:   make(map[int64]*Client),
+		publisher:     publisher,
+		store:         st,
+		logger:        logger.Named("sse"),
+		parentCtx:     ctx,
+		catchupOnDrop: true,
+		clients:       make(map[int64]*Client),
 	}
 	ch, err := publisher.Subscribe(ctx, "sse")
 	if err != nil {
@@ -196,13 +229,48 @@ func (m *Manager) fanOut(ctx context.Context, status *models.TransactionStatus) 
 			metrics.APISSEDroppedTotal.WithLabelValues("client_gone").Inc()
 		default:
 			metrics.APISSEDroppedTotal.WithLabelValues("slow_client").Inc()
-			m.logger.Warn(
-				"dropping update for slow SSE client",
-				zap.Int64("client_id", c.ID),
-				logfields.TxID(status.TxID),
-			)
+			m.recordDrop(c, status)
 		}
 	}
+}
+
+// dropLogInterval rate-limits the aggregate slow-client drop Warn: at most
+// one line per client per interval, carrying the count of drops folded into
+// it. A ≥20k-tx block used to emit ~12-22k per-event Warn lines per slow
+// client.
+const dropLogInterval = time.Second
+
+// recordDrop notes one fan-out drop on a slow client: it arms the mid-stream
+// catchup state read by the client's writer goroutine and folds the event
+// into the rate-limited aggregate Warn. Runs on the manager's single fan-out
+// goroutine; the writer goroutine concurrently consumes the state, hence the
+// atomics.
+func (m *Manager) recordDrop(c *Client, status *models.TransactionStatus) {
+	// Track the earliest dropped timestamp since the writer last consumed the
+	// floor: it lower-bounds the catchup replay window. The floor MUST be
+	// written before the dropped flag so a writer that observes the flag also
+	// observes the floor (it consumes them in the opposite order).
+	ts := status.Timestamp.UnixNano()
+	for {
+		cur := c.droppedFloor.Load()
+		if ts >= cur || c.droppedFloor.CompareAndSwap(cur, ts) {
+			break
+		}
+	}
+	c.dropped.Store(true)
+
+	c.dropsSinceLog.Add(1)
+	now := time.Now().UnixNano()
+	last := c.lastDropLog.Load()
+	if now-last < int64(dropLogInterval) || !c.lastDropLog.CompareAndSwap(last, now) {
+		return
+	}
+	m.logger.Warn(
+		"dropped events for slow SSE client; will catch up mid-stream",
+		zap.Int64("client_id", c.ID),
+		zap.Int64("dropped", c.dropsSinceLog.Swap(0)),
+		zap.Bool("catchup_eligible", m.catchupOnDrop && c.Token != ""),
+	)
 }
 
 // txBelongsToToken reports whether txid was submitted with the given
@@ -267,13 +335,15 @@ func (m *Manager) NewClient(token string) *Client {
 	if size <= 0 {
 		size = defaultClientBuffer
 	}
-	return &Client{
+	c := &Client{
 		ID:     m.nextClientID.Add(1),
 		Token:  token,
 		Ch:     make(chan *models.TransactionStatus, size),
 		Ctx:    ctx,
 		Cancel: cancel,
 	}
+	c.droppedFloor.Store(math.MaxInt64)
+	return c
 }
 
 // handleEvents serves GET /events?callbackToken=<token>. Streams
@@ -313,7 +383,11 @@ func (s *Service) handleEvents(c *gin.Context) {
 				since = time.Unix(0, ns)
 			}
 		}
-		s.sendCatchup(ctx, writer, token, since)
+		// The pre-stream catchup threads the client through so lastDelivered
+		// is initialized from the replayed history — a later mid-stream
+		// catchup then resumes from a fresh watermark instead of replaying
+		// from zero.
+		s.sendCatchup(ctx, writer, token, since, client, false)
 	}
 
 	keepalive := time.NewTicker(15 * time.Second)
@@ -328,6 +402,7 @@ func (s *Service) handleEvents(c *gin.Context) {
 				if err := writeStatusBuffered(writer, status); err != nil {
 					return
 				}
+				client.lastDelivered.Store(status.Timestamp.UnixNano())
 			}
 			// Coalesce the rest of this burst: drain everything already
 			// buffered on the channel (the default arm breaks the loop once
@@ -344,6 +419,7 @@ func (s *Service) handleEvents(c *gin.Context) {
 					if err := writeStatusBuffered(writer, s); err != nil {
 						return
 					}
+					client.lastDelivered.Store(s.Timestamp.UnixNano())
 				default:
 					break drain
 				}
@@ -351,8 +427,18 @@ func (s *Service) handleEvents(c *gin.Context) {
 			if err := writer.flush(); err != nil {
 				return
 			}
+			if !s.midstreamCatchup(ctx, writer, client) {
+				return
+			}
 		case <-keepalive.C:
 			if err := writer.write(": keepalive\n\n"); err != nil {
+				return
+			}
+			// Also heal on the keepalive tick: a drop can land just after the
+			// writer's post-drain check (the flag is set by the concurrent
+			// fan-out goroutine), and if the stream then goes quiet no further
+			// drain cycle would notice it.
+			if !s.midstreamCatchup(ctx, writer, client) {
 				return
 			}
 		}
@@ -381,6 +467,31 @@ const catchupBlockBudget = 64
 // Internal sentinel, never surfaced to the client.
 var errCatchupCapped = errors.New("sse catchup frame cap reached")
 
+// midstreamCatchupSlack widens the mid-stream replay window below the
+// earliest dropped event's timestamp. Bulk MINED events carry the store's
+// timestamp_at verbatim (see setMinedAndPublish), so for the dominant burst
+// source the floor is exact; other publish paths (propagation, api-server)
+// stamp events with a publish-time time.Now() taken shortly AFTER the store
+// row's timestamp_at, and the store filter is strictly-after — the slack
+// covers that skew. Cost of the rewind is only duplicate frames, which the
+// catchup contract already allows.
+const midstreamCatchupSlack = 2 * time.Second
+
+// catchupResult reports one sendCatchup pass.
+type catchupResult struct {
+	// frames is how many status frames were written.
+	frames int
+	// lastTS is the Timestamp.UnixNano() of the last frame written (0 when
+	// frames == 0).
+	lastTS int64
+	// capped is true when the pass stopped at the frame cap with more
+	// matching history remaining beyond lastTS.
+	capped bool
+	// err is any non-cap error: a write error (connection dead) or a store
+	// iteration error.
+	err error
+}
+
 // sendCatchup replays persisted statuses for txids registered under the
 // supplied token. When `since` is non-zero, every status with a timestamp
 // strictly after `since` is emitted (the Last-Event-ID reconnect contract —
@@ -398,18 +509,36 @@ var errCatchupCapped = errors.New("sse catchup frame cap reached")
 // frames on a Last-Event-ID reconnect are enriched best-effort, bounded by
 // catchupBlockBudget distinct blocks. Fresh connects replay only non-terminal
 // statuses, so the enrichment branch never fires there.
-func (s *Service) sendCatchup(ctx context.Context, w *sseWriter, token string, since time.Time) {
+//
+// client, when non-nil, has its lastDelivered watermark advanced per written
+// frame so mid-stream catchup can resume from where any earlier pass ended.
+//
+// midstream=true adapts the pass for the live-loop caller: the frame cap
+// becomes "soft" at a timestamp boundary — once the cap is reached the pass
+// keeps writing while the timestamp stays EQUAL to the last written frame's.
+// The store's since-filter is strictly-after, so a timestamp-cursor cannot
+// resume mid-way through an equal-timestamp run (SetMinedByTxIDs stamps a
+// whole block's rows with one timestamp_at); stopping inside one would
+// strand the remainder forever. Draining the tie bounds the overshoot by the
+// largest same-timestamp batch, and guarantees `capped` passes always end on
+// a boundary the next round can resume from strictly-after.
+func (s *Service) sendCatchup(ctx context.Context, w *sseWriter, token string, since time.Time, client *Client, midstream bool) catchupResult {
 	var only []models.Status
 	if since.IsZero() {
 		only = models.NonTerminalStatuses()
 	}
-	frames := 0
+	var res catchupResult
 	enrichedBlocks := make(map[string]struct{})
 	err := s.store.IterateStatusesByToken(ctx, token, since, only, func(status *models.TransactionStatus) error {
-		if frames >= catchupMaxFrames {
-			return errCatchupCapped
+		ts := status.Timestamp.UnixNano()
+		if res.frames >= catchupMaxFrames {
+			if !midstream || ts != res.lastTS {
+				res.capped = true
+				return errCatchupCapped
+			}
+			// midstream: same-timestamp tie with the frame that hit the cap —
+			// finish the tie (see the function comment).
 		}
-		frames++
 		if status.Status == models.StatusMined || status.Status == models.StatusImmutable {
 			_, seen := enrichedBlocks[status.BlockHash]
 			if status.BlockHash != "" && (seen || len(enrichedBlocks) < catchupBlockBudget) {
@@ -420,13 +549,104 @@ func (s *Service) sendCatchup(ctx context.Context, w *sseWriter, token string, s
 				}
 			}
 		}
-		return writeStatus(w, status)
+		if err := writeStatus(w, status); err != nil {
+			return err
+		}
+		res.frames++
+		res.lastTS = ts
+		if client != nil {
+			client.lastDelivered.Store(ts)
+		}
+		return nil
 	})
-	if errors.Is(err, errCatchupCapped) {
+	switch {
+	case err == nil:
+	case errors.Is(err, errCatchupCapped):
+		if midstream {
+			// Expected multi-round pagination for the live loop, not a
+			// truncation — the caller resumes from lastTS.
+			break
+		}
 		s.logger.Warn("sse catchup truncated at frame cap",
 			zap.Int("cap", catchupMaxFrames),
 			zap.Bool("fresh_connect", since.IsZero()))
+	default:
+		res.err = err
 	}
+	return res
+}
+
+// midstreamCatchup heals a live token-scoped connection after fanOut dropped
+// events on channel overflow: it replays the missed window from the store
+// (the same engine as Last-Event-ID reconnect catchup) without forcing a
+// reconnect. Returns false when the connection is no longer writable and the
+// handler must exit.
+//
+// Replay window: from min(earliest dropped timestamp - slack, resume point of
+// a previous capped round). Frames the client already holds may be replayed
+// again — duplicates across the drop/catchup boundary are the documented
+// catchup semantics (clients dedupe by txid+status). Rounds loop while more
+// drops land or a capped round leaves history unreplayed; each capped round
+// ends on a timestamp boundary strictly above the previous one, so the loop
+// always progresses and terminates once it overtakes the live stream. Under
+// sustained overload the connection degrades to store-paced replay, which is
+// exactly the at-least-once contract.
+//
+// Tokenless (firehose) clients keep the historical drop-only behavior — the
+// catchup source is store.IterateStatusesByToken, which is token-scoped;
+// there is no bounded store query that reconstructs the unfiltered stream.
+// They keep the drop metric and the aggregate Warn.
+func (s *Service) midstreamCatchup(ctx context.Context, w *sseWriter, client *Client) bool {
+	if client.Token == "" || !s.manager.catchupOnDrop {
+		return true
+	}
+	resume := int64(-1) // lastTS of a capped round; -1 = no round pending
+	for client.dropped.Load() || resume >= 0 {
+		// Consume the flag BEFORE the floor: recordDrop writes the floor
+		// before setting the flag, so this order can at worst yield one
+		// spurious extra round, never a missed floor.
+		client.dropped.Store(false)
+		floor := client.droppedFloor.Swap(math.MaxInt64)
+
+		sinceNS := int64(math.MaxInt64)
+		if floor != math.MaxInt64 {
+			sinceNS = floor - int64(midstreamCatchupSlack)
+		}
+		if resume >= 0 && resume < sinceNS {
+			sinceNS = resume
+		}
+		if sinceNS == math.MaxInt64 {
+			// Spurious flag: its floor was consumed (and covered) by the
+			// previous round, and no capped round is pending.
+			break
+		}
+
+		metrics.SSEMidstreamCatchupsTotal.Inc()
+		res := s.sendCatchup(ctx, w, client.Token, time.Unix(0, sinceNS), client, true)
+		metrics.SSEMidstreamCatchupFramesTotal.Add(float64(res.frames))
+		if res.err != nil {
+			// Either the connection is dead (write error) or the store
+			// iteration failed mid-window. Both ways the safe move is to end
+			// the stream: the client reconnects with Last-Event-ID and the
+			// reconnect catchup re-covers the window.
+			s.logger.Warn("sse mid-stream catchup aborted",
+				zap.Int64("client_id", client.ID),
+				zap.Int("frames", res.frames),
+				zap.Error(res.err))
+			return false
+		}
+		s.logger.Info("sse mid-stream catchup round",
+			zap.Int64("client_id", client.ID),
+			zap.Int("frames", res.frames),
+			zap.Bool("capped", res.capped),
+			zap.Time("since", time.Unix(0, sinceNS)))
+		if res.capped {
+			resume = res.lastTS
+		} else {
+			resume = -1
+		}
+	}
+	return true
 }
 
 // enrichMerklePath attaches the merkle proof to a mined/immutable status before

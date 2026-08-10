@@ -670,6 +670,15 @@ type SSEConfig struct {
 	// non-blocking, so overflow is lost, not backpressured). Default
 	// DefaultSSEClientBuffer. A value <= 0 selects the default.
 	ClientBufferSize int `mapstructure:"client_buffer_size"`
+	// CatchupOnDrop enables mid-stream store-backed catchup for token-scoped
+	// clients whose send channel overflowed: instead of losing the dropped
+	// events until the client reconnects with Last-Event-ID, the connection's
+	// writer replays them from the store as soon as it drains its backlog.
+	// Replay may duplicate frames the client already received (clients dedupe
+	// by txid+status). Default true; false restores the previous drop-only
+	// behavior. Tokenless (firehose) clients always keep drop-only behavior —
+	// the store catchup source is token-scoped.
+	CatchupOnDrop bool `mapstructure:"catchup_on_drop"`
 }
 
 // WebhookConfig tunes the HTTP webhook delivery service. The service
@@ -1045,6 +1054,7 @@ func setDefaults() {
 	viper.SetDefault("sse.host", "0.0.0.0")
 	viper.SetDefault("sse.port", 8082)
 	viper.SetDefault("sse.client_buffer_size", DefaultSSEClientBuffer)
+	viper.SetDefault("sse.catchup_on_drop", true)
 
 	// chaintracks standalone service: enabled by default. The bind port
 	// must differ from api.port and sse.port in single-binary deployments

@@ -540,6 +540,27 @@ var APISSEDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "SSE fan-out events dropped without delivery, by reason.",
 }, []string{"reason"}) // slow_client, client_gone
 
+// SSEMidstreamCatchupsTotal counts store-backed catchup rounds run on a LIVE
+// /events connection after fan-out overflowed the client's send channel
+// (reason="slow_client" drops above). One drop episode can take several
+// rounds (each bounded by the per-round frame cap), so this counts rounds,
+// not episodes. A sustained rate means a consumer chronically drains slower
+// than the publish rate and is being served store-paced replay instead of
+// live frames.
+var SSEMidstreamCatchupsTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "arcade_sse_midstream_catchups_total",
+	Help: "Mid-stream SSE catchup rounds run after a client's send buffer overflowed.",
+})
+
+// SSEMidstreamCatchupFramesTotal counts frames replayed from the store by
+// mid-stream catchup rounds. Includes duplicates of frames the client already
+// received live (the replay window is deliberately rewound past the drop
+// boundary; clients dedupe by txid+status).
+var SSEMidstreamCatchupFramesTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "arcade_sse_midstream_catchup_frames_total",
+	Help: "Frames replayed from the store by mid-stream SSE catchup rounds.",
+})
+
 // EventsSubscriberDroppedTotal counts events.Publisher.Subscribe channel
 // drops, labeled by which caller's channel filled. The publisher emits a
 // drop when the per-subscriber buffer is at capacity and the kafka handler

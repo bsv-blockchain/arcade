@@ -72,6 +72,7 @@ func (s *Service) Start(ctx context.Context) error {
 	// treats as "use defaultClientBuffer".
 	if mgr != nil {
 		mgr.clientBufferSize = s.cfg.SSE.ClientBufferSize
+		mgr.catchupOnDrop = s.cfg.SSE.CatchupOnDrop
 	}
 	s.manager = mgr
 
