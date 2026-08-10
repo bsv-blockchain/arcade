@@ -532,12 +532,43 @@ type ReconcilerConfig struct {
 	// SEEN_ON_NETWORK → MINED is lattice-legal and a late canonical
 	// redelivery re-mines via the short-circuit path. Default 10.
 	MaxDeferAttempts int `mapstructure:"max_defer_attempts"`
-	// StartupFullScan runs one pass over the whole block_processing table
-	// after startup, orphan-marking any 'active' row whose height's
-	// canonical header differs — the deep backstop that also heals
-	// incidents that predate this code (like the height-764 block on the
-	// scaling cluster). Default true.
+	// StartupFullScan runs one pass over the block_processing table after
+	// startup, orphan-marking any 'active' row whose height's canonical
+	// header differs — the deep backstop that also heals incidents that
+	// predate this code (like the height-764 block on the scaling cluster).
+	// Bounded by FullScanDepth (or the explicit FullScan{Min,Max}Height
+	// target). Default true.
 	StartupFullScan bool `mapstructure:"startup_full_scan"`
+	// FullScanDepth bounds the STARTUP full-scan to heights within this many
+	// blocks of the active tip (store.GetActiveTipBlockHeight): the sweep
+	// only considers rows with height >= tip-FullScanDepth. This stops the
+	// backstop from becoming a whole-history rewrite on a long chain — the
+	// original scan paged the ENTIRE table oldest-first and re-orphaned
+	// hundreds of historical competition losers, starving the actual recent
+	// incident (issue #282). Default 144 (~1 day on BSV; matches the
+	// watchdog's recency window). <= 0 selects the default; a chain shorter
+	// than the horizon (tip <= depth) scans unbounded, which is cheap. For
+	// deep recovery of an old incident, use the explicit target below.
+	FullScanDepth int `mapstructure:"full_scan_depth"`
+	// FullScanMinHeight / FullScanMaxHeight, when EITHER is > 0, point the
+	// startup scan at an explicit height range [min, max] (max 0 = up to the
+	// tip), OVERRIDING the FullScanDepth horizon — operator-targeted incident
+	// recovery. E.g. min=760 max=770 heals just the height-764 neighborhood
+	// from its already-stored canonical BUMP without touching the rest of the
+	// table. min=1 restores the legacy whole-history sweep as an opt-in.
+	// Both default 0 (use the depth horizon).
+	FullScanMinHeight uint64 `mapstructure:"full_scan_min_height"`
+	FullScanMaxHeight uint64 `mapstructure:"full_scan_max_height"`
+	// RevertWhenUnreconcilable controls the fallback when a block's canonical
+	// BUMP is unavailable and the defer cap is reached. Default false: PARK
+	// the block (issue #282) — leave its txs MINED against the orphan and
+	// stamp reconciled_at so it drops out of the queue (no revert, no
+	// infinite retry). A later stored/rebuilt canonical BUMP re-anchors them
+	// through the normal mine path; un-mining a tx that is almost certainly
+	// in the not-yet-fetched canonical block is a downgrade, not a repair.
+	// true restores the pre-#282 revert-all-to-SEEN_ON_NETWORK fallback as an
+	// opt-in.
+	RevertWhenUnreconcilable bool `mapstructure:"revert_when_unreconcilable"`
 }
 
 // WatchdogConfig tunes the stale-block recovery watchdog. Defaults are
@@ -965,6 +996,10 @@ func setDefaults() {
 	viper.SetDefault("bump_builder.reconciler.neighborhood_depth", 6)
 	viper.SetDefault("bump_builder.reconciler.max_defer_attempts", 10)
 	viper.SetDefault("bump_builder.reconciler.startup_full_scan", true)
+	viper.SetDefault("bump_builder.reconciler.full_scan_depth", 144)
+	viper.SetDefault("bump_builder.reconciler.full_scan_min_height", 0)
+	viper.SetDefault("bump_builder.reconciler.full_scan_max_height", 0)
+	viper.SetDefault("bump_builder.reconciler.revert_when_unreconcilable", false)
 	// Block-processing watchdog (standalone arcade service — mode=watchdog
 	// in production, in-process under mode=all): on by default. The runtime
 	// nil-guards the merkle-service client; an unconfigured deployment

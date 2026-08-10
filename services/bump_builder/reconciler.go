@@ -25,13 +25,24 @@ import (
 // failover window is redundant work, not corruption.
 const ReconcilerLeaseName = "anchor-reconciler"
 
+// defaultFullScanDepth bounds the startup full-scan when
+// Reconciler.FullScanDepth is unset: only rows within this many heights of
+// the active tip are considered. 144 ≈ one day of BSV blocks — the same
+// recency window the watchdog uses — and stops the deep backstop from
+// re-orphaning a long chain's entire history oldest-first (issue #282).
+const defaultFullScanDepth = 144
+
 // Reconciler heals the transactions of orphaned blocks (issue #279): for
 // every block_processing row with status='orphaned' and no reconciled_at,
 // it re-anchors the txs still MINED against the orphan to the active-chain
 // block that contains them (using the canonical block's already-stored
-// compound BUMP — no external calls in the common case), reverts the rest
-// to SEEN_ON_NETWORK, publishes corrected bulk status events, and stamps
-// reconciled_at.
+// compound BUMP — no external calls in the common case), reverts the txs
+// proven to be in no canonical block to SEEN_ON_NETWORK, publishes corrected
+// bulk status events, and stamps reconciled_at. When the canonical block's
+// BUMP is unavailable it PARKS the block instead of reverting (issue #282):
+// the txs stay MINED against the orphan until a later canonical BUMP can
+// re-anchor them — un-mining a tx that is very likely in the not-yet-fetched
+// canonical block would be a downgrade, not a repair.
 //
 // Detection is elsewhere: the chaintracks_server tracker marks blocks
 // orphaned from ReorgEvents and its tie-scan, and bump-builder's anchor
@@ -187,20 +198,33 @@ func (r *Reconciler) tick(ctx context.Context) {
 	}
 }
 
-// fullScan pages the entire block_processing table and orphan-marks every
-// 'active' row whose height is provably held by a different block on the
-// active chain. Unbounded horizon by design: this is what picks up orphans
-// that predate the detection edges (guard, tie-scan, ReorgEvents) — e.g. an
-// incident block far below the current tip. Marked rows are then consumed
-// by the normal tick.
+// fullScan pages the block_processing table and orphan-marks every 'active'
+// row whose height is provably held by a different block on the active
+// chain. It is the deep backstop that picks up orphans predating the
+// detection edges (guard, tie-scan, ReorgEvents).
+//
+// The scan is BOUNDED (issue #282): rather than re-orphaning the entire
+// history oldest-first (which on a long chain grinds through hundreds of
+// historical competition losers, starving the actual recent incident), it
+// considers only heights within FullScanDepth of the active tip — or an
+// explicit FullScan{Min,Max}Height range for operator-targeted recovery.
+// Marked rows are then consumed by the normal tick.
 func (r *Reconciler) fullScan(ctx context.Context) {
 	const page = 1000
+	minHeight, maxHeight, mode := r.fullScanBounds(ctx)
+	r.logger.Info("startup full-scan: scanning",
+		zap.String("bound_mode", mode),
+		zap.Uint64("min_height", minHeight),
+		zap.Uint64("max_height", maxHeight))
 	// A set, not a slice: the boundary-safe pager may visit a row more than
 	// once at page boundaries (see store.ForEachBlockProcessing).
 	markedSet := make(map[string]struct{})
-	err := store.ForEachBlockProcessing(ctx, r.store, 0, page, func(row *models.BlockProcessingStatus) error {
+	err := store.ForEachBlockProcessing(ctx, r.store, minHeight, page, func(row *models.BlockProcessingStatus) error {
 		if row.Status != models.BlockStatusActive || row.BlockHeight == 0 || row.BlockHeight > math.MaxUint32 {
 			return nil
+		}
+		if maxHeight > 0 && row.BlockHeight > maxHeight {
+			return nil // above the targeted range's upper bound
 		}
 		active, hdrErr := r.chainHeader.GetHeaderByHeight(ctx, uint32(row.BlockHeight))
 		if hdrErr != nil || active == nil {
@@ -232,6 +256,34 @@ func (r *Reconciler) fullScan(ctx context.Context) {
 	}
 	r.logger.Info("startup full-scan: marked off-chain blocks orphaned",
 		zap.Strings("block_hashes", marked))
+}
+
+// fullScanBounds resolves the height window the startup full-scan considers.
+// An explicit FullScan{Min,Max}Height target (either > 0) wins — operator-
+// pointed recovery, e.g. a known old incident. Otherwise the scan is bounded
+// to within FullScanDepth of the active tip (store.GetActiveTipBlockHeight).
+// Returns (0, 0) — unbounded, the pre-#282 behavior — when the tip is unknown
+// or the chain is shorter than the horizon (a short table is cheap to sweep
+// whole); this keeps the fail-open contract so a missing tip never hides an
+// incident. maxHeight 0 means "no upper bound".
+func (r *Reconciler) fullScanBounds(ctx context.Context) (minHeight, maxHeight uint64, mode string) {
+	rc := r.cfg.BumpBuilder.Reconciler
+	if rc.FullScanMinHeight > 0 || rc.FullScanMaxHeight > 0 {
+		return rc.FullScanMinHeight, rc.FullScanMaxHeight, "targeted"
+	}
+	depth := rc.FullScanDepth
+	if depth <= 0 {
+		depth = defaultFullScanDepth
+	}
+	tip, err := r.store.GetActiveTipBlockHeight(ctx)
+	if err != nil {
+		r.logger.Warn("startup full-scan: active-tip lookup failed; scanning unbounded", zap.Error(err))
+		return 0, 0, "unbounded"
+	}
+	if tip == 0 || uint64(depth) >= tip {
+		return 0, 0, "unbounded"
+	}
+	return tip - uint64(depth), 0, "horizon"
 }
 
 // reconcileBlock heals one orphaned block O and returns the metric outcome.
@@ -298,14 +350,13 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 		if r.deferForCanonicalBUMP(ctx, logger, orphan, canonicalHash) {
 			return "deferred"
 		}
-		logger.Warn("defer cap reached without a canonical BUMP — falling back to revert-all "+
-			"(SEEN_ON_NETWORK → MINED is lattice-legal; a late canonical redelivery re-mines them)",
-			zap.String("canonical_block_hash", canonicalHash))
 	}
 
 	// Deep-reorg neighborhood: txs re-binned into LATER canonical blocks.
 	// Only the txs still anchored to O are candidates; membership is an
-	// O(1) lookup against each neighbor's stored compound BUMP.
+	// O(1) lookup against each neighbor's stored compound BUMP. This runs
+	// regardless of the height-O canonical BUMP so we still re-anchor every
+	// tx we CAN prove before deciding the remainder's fate.
 	affected, err := r.store.GetTxIDsByBlockHash(ctx, orphan)
 	if err != nil {
 		logger.Warn("failed to read affected txids", zap.Error(err))
@@ -313,10 +364,27 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 	}
 	reanchored += r.reanchorNeighborhood(ctx, logger, affected, height, batchSize)
 
-	// Revert the remainder: everything still anchored to O exists in no
-	// canonical block we can prove — SEEN_ON_NETWORK puts them back in
-	// flight (rebroadcast/propagation owns them from here), and the store
-	// appends O to their orphaned-anchor history.
+	// Park vs revert for whatever is still anchored to O (issue #282). When
+	// the canonical block's BUMP was NOT available (canonicalReady == false),
+	// we have no proof of where these txs belong — the canonical block simply
+	// hasn't been fetched/rebuilt yet. Reverting them to SEEN_ON_NETWORK
+	// would UN-MINE txs that are almost certainly in that not-yet-fetched
+	// block: a downgrade, not a repair. So by default we PARK the block
+	// instead — leave the txs MINED@O and stamp reconciled_at so it drops out
+	// of the queue (bounded — the defer cap already fired; no infinite retry
+	// and no further /reprocess spam). A later stored/rebuilt canonical BUMP
+	// re-anchors them through the normal mine path (MINED@O → MINED@canonical
+	// is lattice-legal). RevertWhenUnreconcilable restores the old revert-all
+	// fallback as an opt-in.
+	if !canonicalReady && !r.cfg.BumpBuilder.Reconciler.RevertWhenUnreconcilable {
+		return r.parkBlock(ctx, logger, orphan, height, canonicalHash, reanchored)
+	}
+
+	// Revert the remainder: the canonical BUMP WAS available and these txs
+	// are provably in no canonical block (or the operator opted into the
+	// legacy fallback) — SEEN_ON_NETWORK puts them back in flight
+	// (rebroadcast/propagation owns them from here), and the store appends O
+	// to their orphaned-anchor history.
 	reverted, err := r.store.SetStatusByBlockHash(ctx, orphan, models.StatusSeenOnNetwork)
 	if err != nil {
 		logger.Warn("failed to revert remaining txs", zap.Error(err))
@@ -358,11 +426,51 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 	}
 }
 
+// parkBlock is the issue-#282 fallback for an orphan whose canonical BUMP is
+// unavailable at the defer cap: it takes the block off the reconcile queue
+// WITHOUT downgrading any transaction. The txs still anchored to O stay
+// MINED@O (not reverted to SEEN_ON_NETWORK) — a later stored or rebuilt
+// canonical BUMP re-anchors them through the normal mine path. STUMPs are
+// pruned and the compound BUMP retained, identical to the healed-terminal
+// path; only reconciled_at is stamped so the row leaves the queue (bounded:
+// no infinite retry, no repeated /reprocess). Returns the "parked" outcome.
+func (r *Reconciler) parkBlock(ctx context.Context, logger *zap.Logger, orphan string, height uint64, canonicalHash string, reanchored int) string {
+	// Count what remains MINED@O purely for the metric/log — the neighborhood
+	// pass already re-anchored everything it could prove, so this is the
+	// still-unresolvable set we are deliberately leaving in place.
+	parked := 0
+	if remaining, err := r.store.GetTxIDsByBlockHash(ctx, orphan); err == nil {
+		parked = len(remaining)
+	}
+
+	if err := r.store.DeleteStumpsByBlockHash(ctx, orphan); err != nil {
+		logger.Warn("failed to clean up orphan STUMPs", zap.Error(err))
+	}
+	if err := r.store.MarkBlockReconciled(ctx, orphan, r.now()); err != nil {
+		logger.Warn("failed to stamp reconciled_at on parked block", zap.Error(err))
+		return "error"
+	}
+	delete(r.defers, orphan)
+
+	metrics.ReconcilerTxsReanchoredTotal.Add(float64(reanchored))
+	metrics.ReconcilerTxsParkedTotal.Add(float64(parked))
+	logger.Warn(
+		"orphaned block parked (unreconcilable): canonical BUMP unavailable at the defer cap — "+
+			"txs left MINED against the orphan, NOT reverted; a later canonical BUMP re-anchors them (issue #282)",
+		logfields.BlockHeight(height),
+		zap.String("canonical_block_hash", canonicalHash),
+		zap.Int("txs_reanchored", reanchored),
+		zap.Int("txs_parked", parked),
+	)
+	return "parked"
+}
+
 // deferForCanonicalBUMP handles the canonical-BUMP-missing branch: while
 // under the defer cap it bumps the orphan's counter, optionally pokes
 // merkle-service /reprocess for the canonical block, and reports true
 // (caller returns "deferred" without stamping reconciled_at). At the cap it
-// reports false so the caller falls back to revert-all.
+// reports false so the caller parks the block (issue #282) — or reverts, if
+// RevertWhenUnreconcilable is set.
 func (r *Reconciler) deferForCanonicalBUMP(ctx context.Context, logger *zap.Logger, orphan, canonicalHash string) bool {
 	maxDefer := r.cfg.BumpBuilder.Reconciler.MaxDeferAttempts
 	if maxDefer <= 0 {
