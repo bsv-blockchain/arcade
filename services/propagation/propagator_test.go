@@ -121,6 +121,10 @@ type mockStore struct {
 	cleared        []clearedCall
 	// replayRows drives IterateStatusesSince for merkle-replay tests.
 	replayRows []*models.TransactionStatus
+	// iterated counts rows visited by IterateStatusesSince — lets a test
+	// assert the reaper walk aborts at the rebroadcast batch (issue #290)
+	// instead of scanning the whole table.
+	iterated int
 	// submissionsByTxID drives GetSubmissionsByTxID, used by the reaper's
 	// stuck-by-callback attribution. Absent txids return no submissions
 	// (attributed to the "none" host).
@@ -303,11 +307,44 @@ func (m *mockStore) IterateStatusesSince(_ context.Context, since time.Time, fn 
 		if !r.Timestamp.IsZero() && r.Timestamp.Before(since) {
 			continue
 		}
+		m.iterated++ // count rows actually visited (issue #290 early-abort test)
 		if err := fn(r); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// CensusStatusesSince mirrors the store-side aggregate the reaper now uses for
+// the stuck census (issue #290): per requested status, the count and oldest
+// timestamp of replayRows in the window [since, stuckDeadline). Zero and
+// pre-since timestamps are excluded to match the Postgres GROUP BY (rows with a
+// NULL/absent timestamp_at can't satisfy timestamp_at >= since).
+func (m *mockStore) CensusStatusesSince(_ context.Context, since, stuckDeadline time.Time, statuses []models.Status) (map[models.Status]store.StatusCensus, error) {
+	m.mu.Lock()
+	rows := append([]*models.TransactionStatus(nil), m.replayRows...)
+	m.mu.Unlock()
+	want := make(map[models.Status]struct{}, len(statuses))
+	out := make(map[models.Status]store.StatusCensus, len(statuses))
+	for _, s := range statuses {
+		want[s] = struct{}{}
+		out[s] = store.StatusCensus{}
+	}
+	for _, r := range rows {
+		if _, ok := want[r.Status]; !ok {
+			continue
+		}
+		if r.Timestamp.Before(since) || !r.Timestamp.Before(stuckDeadline) {
+			continue
+		}
+		c := out[r.Status]
+		c.Count++
+		if c.Oldest.IsZero() || r.Timestamp.Before(c.Oldest) {
+			c.Oldest = r.Timestamp
+		}
+		out[r.Status] = c
+	}
+	return out, nil
 }
 
 func (m *mockStore) updateCount() int {

@@ -43,6 +43,14 @@ type DatahubEndpoint struct {
 	LastSeen time.Time
 }
 
+// StatusCensus is one status's aggregate in a CensusStatusesSince result:
+// how many rows sit at that status inside the census window, and the minimum
+// timestamp among them (zero when Count is 0).
+type StatusCensus struct {
+	Count  int64
+	Oldest time.Time
+}
+
 // BatchInsertResult is one entry in the result slice returned by
 // BatchGetOrInsertStatus. Inserted is true when the row was newly written by
 // this call; false when an existing row was found and Existing carries it.
@@ -125,6 +133,21 @@ type Store interface {
 	// would otherwise pin a large slice during pruning. fn returning a non-nil
 	// error stops iteration and surfaces that error to the caller.
 	IterateStatusesSince(ctx context.Context, since time.Time, fn func(*models.TransactionStatus) error) error
+
+	// CensusStatusesSince aggregates the stuck-transient census store-side:
+	// for each requested status, the number of transaction rows with
+	// timestamp >= since AND timestamp < stuckDeadline, plus the minimum
+	// timestamp among them. The returned map has exactly one entry per
+	// requested status — zero-valued when nothing matched — so callers can
+	// publish gauges without existence checks.
+	//
+	// This exists so the propagation reaper's census over a multi-million-row
+	// table never streams rows: Postgres answers it with one GROUP BY
+	// aggregate, and other backends push the status filter into their
+	// secondary indexes. Counting inside an IterateStatusesSince walk pinned
+	// the reaper's effective cadence to the full-scan time (~4 minutes on a
+	// ~1.6M-row store) instead of reaper_interval_ms — see issue #290.
+	CensusStatusesSince(ctx context.Context, since, stuckDeadline time.Time, statuses []models.Status) (map[models.Status]StatusCensus, error)
 
 	// SetStatusByBlockHash updates all transactions with the given block hash to a new status.
 	// Returns the txids that were updated. For unmined statuses (SEEN_ON_NETWORK),

@@ -170,6 +170,10 @@ func (s *fakeStore) IterateStatusesSince(context.Context, time.Time, func(*model
 	return nil
 }
 
+func (s *fakeStore) CensusStatusesSince(context.Context, time.Time, time.Time, []models.Status) (map[models.Status]store.StatusCensus, error) {
+	return map[models.Status]store.StatusCensus{}, nil
+}
+
 func (s *fakeStore) SetStatusByBlockHash(context.Context, string, models.Status) ([]string, error) {
 	return nil, nil
 }
