@@ -64,6 +64,19 @@ data: {"txid":"abc...","txStatus":"MINED","timestamp":"2026-04-28T18:21:52Z","bl
 
 These three fields are omitted from non-mined frames, so pre-`MINED` frames keep the original three-field shape. On a `Last-Event-ID` reconnect, replayed `MINED` frames are enriched with `merklePath` best-effort: to keep the replay path bounded, a single reconnect enriches at most a fixed number of distinct blocks, after which replayed `MINED` frames still carry `blockHash`/`blockHeight` but omit `merklePath` — recover it with `GET /tx/{txid}`.
 
+### Rejected frames carry the reason
+
+When `txStatus` is `REJECTED`, the frame carries the same rejection detail as `GET /tx/{txid}`:
+
+```
+data: {"txid":"abc...","txStatus":"REJECTED","timestamp":"2026-08-10T09:15:02Z","status":466,"extraInfo":"UTXO_SPENT (70): ... utxo already spent by tx 7dfb...[0]"}
+```
+
+- `extraInfo` — the verbatim Teranode validator line that caused the rejection (best available line when peers disagree).
+- `status` — the ARC status code when the line maps to one (466 conflict/double-spend, 467 generic invalid, 476 not-final); omitted when no confident mapping exists.
+
+Both fields are omitted when empty, so existing consumers see no shape change. Reorg-correction frames (see `MINED`/`SEEN_ON_NETWORK` re-anchoring) reuse `extraInfo` for the `reorg_reanchor` / `reorg_unmined` markers.
+
 Every ~15 seconds the server emits a `: keepalive` comment frame so idle proxies don't kill the connection. Comment frames have no `event:` and should be ignored by clients.
 
 ## Browser (`EventSource`)

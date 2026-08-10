@@ -777,16 +777,32 @@ func (c *Client) SubmitTransaction(ctx context.Context, endpoint string, rawTx [
 //
 //   - HTTP 200: every tx accepted. failures is nil so callers short-circuit
 //     without per-tx inspection.
-//   - HTTP 500 + body starting "Failed to process transactions:" (Teranode
-//     upstream main #879): each subsequent line is one tx's error in the
-//     form "<TERANODE_CODE_NAME> (<num>): <message containing the txid via
+//   - Non-200 + body starting "Failed to process transactions:" (Teranode
+//     upstream main #879): each subsequent line is one tx's error in the form
+//     "<TERANODE_CODE_NAME> (<num>): <message containing the txid via
 //     [ProcessTransaction][<txid>]>". The returned map is keyed by the
 //     extracted txid; the value is the full line verbatim so callers can
-//     surface the Teranode code in wallet-visible rows. Txs not in the map
-//     are assumed to have been accepted.
-//   - Anything else (4xx, 5xx with non-Teranode body, transport error):
-//     failures is nil; the caller treats the batch as a pure infra failure
-//     (whole batch requeued for another attempt).
+//     surface the Teranode code in wallet-visible rows (GET /tx extraInfo,
+//     SSE, webhooks). Txs not in the map are assumed accepted by that peer.
+//   - Non-200 without a parseable Teranode failure-list body (gateway 502/503,
+//     "no available server", echo recover panic, bare 500, transport error,
+//     or an unexpected 2xx-but-not-200): failures is nil; the caller treats
+//     the response as pure infra (no per-tx vote — requeue if no peer
+//     produced a parseable verdict).
+//
+// The failure-list parse is intentionally status-agnostic: the body shape is
+// the contract, not the HTTP code. This is Teranode's own contract, not proxy
+// folklore — since v0.16 the /txs handler derives the aggregate status from
+// the per-tx error class (httpStatusForTxError, services/propagation/
+// Server.go): conflict-family failures (UTXO_SPENT, TX_CONFLICTING,
+// TX_INVALID_DOUBLE_SPEND, TX_LOCKED) return 409, TX_MISSING_PARENT 422,
+// the policy family (TX_INVALID, TX_POLICY, TX_LOCK_TIME, UTXO_NON_FINAL, …)
+// 400, UTXO_FROZEN 403, and only unclassified server faults 500 — all with
+// the identical failure-list body. Restricting parse to 500 silently dropped
+// real validator rejections that arrived as 409/422 (observed in production:
+// UTXO_SPENT / PROCESSING failures visible only in propagation Warn logs
+// while the tx never terminalized — GET /tx stayed RECEIVED/requeued with no
+// reject reason).
 func (c *Client) SubmitTransactions(ctx context.Context, endpoint string, rawTxs [][]byte) (int, map[string]string, error) {
 	start := time.Now()
 	// Calculate total size for pre-allocation
@@ -821,21 +837,29 @@ func (c *Client) SubmitTransactions(ctx context.Context, endpoint string, rawTxs
 	defer drainAndClose(resp.Body)
 	defer observeRequest("submit_txs", resp.StatusCode, start)
 
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, readErr := io.ReadAll(resp.Body)
 
 	if resp.StatusCode == http.StatusOK {
+		// The 200 status line is the whole-batch acceptance verdict; the
+		// body carries no per-tx information, so a read error here doesn't
+		// invalidate the verdict.
 		return resp.StatusCode, nil, nil
 	}
 
-	// HTTP 500 with the Teranode failure-list body (#879) — extract a
-	// per-txid map. Any other 5xx/4xx (echo recover panic, gateway 502/503,
-	// proxy-injected error pages, etc.) falls through to the infra-failure
-	// path with failures==nil.
-	if resp.StatusCode == http.StatusInternalServerError {
-		failures := parseTxsFailures(respBody, c.logger)
-		if failures != nil {
-			return resp.StatusCode, failures, fmt.Errorf("%w %d", errUnexpectedStatusCode, resp.StatusCode)
-		}
+	if readErr != nil {
+		// Truncated or aborted body (connection reset mid-transfer,
+		// unexpected EOF). A PARTIAL failure list must never be parsed:
+		// the map's "absent ⇒ accepted" contract would grant implicit
+		// acceptance to every tx whose failure line was cut off. Treat as
+		// pure infra — no per-tx vote.
+		return resp.StatusCode, nil, fmt.Errorf("%w %d: reading response body: %w", errUnexpectedStatusCode, resp.StatusCode, readErr)
+	}
+
+	// Any non-200 may carry Teranode's failure-list body. Parse first; only
+	// fall through to the opaque infra-failure path when the body is not a
+	// structured per-tx verdict. Status stays on the wire for metrics/logs.
+	if failures := parseTxsFailures(respBody, c.logger); failures != nil {
+		return resp.StatusCode, failures, fmt.Errorf("%w %d", errUnexpectedStatusCode, resp.StatusCode)
 	}
 
 	return resp.StatusCode, nil, fmt.Errorf("%w %d: %s", errUnexpectedStatusCode, resp.StatusCode, string(respBody))
@@ -852,8 +876,18 @@ const txsFailureHeader = "Failed to process transactions:"
 // lowercase but the regex stays defensive.
 var txsTxidPattern = regexp.MustCompile(`[0-9a-fA-F]{64}`)
 
-// parseTxsFailures extracts the per-txid failure list from a /txs HTTP 500
-// response body. The expected format is:
+// txsWrappedTxidPattern extracts the txid from Teranode's
+// "[ProcessTransaction][<txid>]" wrapper. Preferred over the bare 64-hex
+// fallback because conflict-family messages embed OTHER transactions' hashes
+// before any wrapper — e.g. "UTXO_SPENT (70): <outpoint-txid>:<vout> utxo
+// already spent by tx <spender-txid>[0]" names the spent outpoint's tx and
+// the competing spender, not the submitted tx. A bare first-hex match on a
+// wrapped line that also mentions an outpoint would mis-key the failure.
+var txsWrappedTxidPattern = regexp.MustCompile(`\[ProcessTransaction\]\[([0-9a-fA-F]{64})\]`)
+
+// parseTxsFailures extracts the per-txid failure list from a /txs non-2xx
+// response body. The expected format is status-agnostic (HTTP 500, 422, 400,
+// … all accepted — the body shape is the contract):
 //
 //	"Failed to process transactions:
 //	<NAME> (<num>): [ProcessTransaction][<txid>] <message>
@@ -863,7 +897,7 @@ var txsTxidPattern = regexp.MustCompile(`[0-9a-fA-F]{64}`)
 //
 // Returns a txid → full-line map naming every failed tx, or nil if the body
 // doesn't match Teranode's failure-list shape (in which case the caller
-// treats the batch as a pure infra failure). Lines whose txid couldn't be
+// treats the response as a pure infra failure). Lines whose txid couldn't be
 // extracted are dropped — the contract is "if you appear in the map you
 // failed; if you don't you're accepted," so a malformed line with no
 // recognizable txid would otherwise be silently lost. A trailing nil-map
@@ -885,7 +919,20 @@ func parseTxsFailures(body []byte, logger *zap.Logger) map[string]string {
 		if line == "" {
 			continue
 		}
-		txid := txsTxidPattern.FindString(line)
+		// Prefer the [ProcessTransaction][<txid>] wrapper — it names the
+		// submitted tx unambiguously. Wrapper-less lines (Teranode's
+		// UserMessage surfaces the deepest public cause, which for the
+		// conflict family carries no wrapper) fall back to the first bare
+		// 64-hex string; that may be another tx entirely (spent outpoint /
+		// competing spender), so the CALLER must verify each key actually
+		// names a submitted tx before trusting the map's "absent ⇒ accepted"
+		// contract (see broadcastBatchToEndpoints).
+		var txid string
+		if m := txsWrappedTxidPattern.FindStringSubmatch(line); m != nil {
+			txid = m[1]
+		} else {
+			txid = txsTxidPattern.FindString(line)
+		}
 		if txid == "" {
 			// Fail-closed: an orphan line means the response isn't fully
 			// trustworthy (Teranode processOne panic, or a future format

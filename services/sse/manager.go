@@ -675,6 +675,8 @@ func buildStatusFrame(status *models.TransactionStatus) (string, error) {
 		BlockHash:   status.BlockHash,
 		BlockHeight: status.BlockHeight,
 		MerklePath:  status.MerklePath,
+		StatusCode:  status.StatusCode,
+		ExtraInfo:   status.ExtraInfo,
 	})
 	if err != nil {
 		return "", err
@@ -708,6 +710,12 @@ func writeStatusBuffered(w *sseWriter, status *models.TransactionStatus) error {
 // are the always-present legacy fields; blockHash/blockHeight/merklePath are
 // added for mined/immutable frames (omitempty keeps every other frame at the
 // original three-field shape). merklePath is a BUMP, hex-encoded like GET /tx.
+// status/extraInfo mirror the same fields on GET /tx: on REJECTED frames
+// extraInfo carries the verbatim Teranode rejection line (e.g. "UTXO_SPENT
+// (70): … utxo already spent by tx …") and status the ARC code when one maps
+// (466 conflict, 467 generic, 476 non-final) — wallets branching on the
+// reject reason no longer need a follow-up GET /tx. Reorg-correction frames
+// (issue #279) reuse extraInfo for the reorg_reanchor/reorg_unmined markers.
 type statusPayload struct {
 	TxID        string          `json:"txid"`
 	TxStatus    string          `json:"txStatus"`
@@ -715,4 +723,6 @@ type statusPayload struct {
 	BlockHash   string          `json:"blockHash,omitempty"`
 	BlockHeight uint64          `json:"blockHeight,omitempty"`
 	MerklePath  models.HexBytes `json:"merklePath,omitempty"`
+	StatusCode  int             `json:"status,omitempty"`
+	ExtraInfo   string          `json:"extraInfo,omitempty"`
 }
