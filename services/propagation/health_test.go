@@ -453,6 +453,69 @@ func TestBroadcast_PerPeerAggregation_AcceptanceWins(t *testing.T) {
 	}
 }
 
+// TestBroadcast_422RejectionSurfacesExtraInfo pins the production gap where
+// one peer returned HTTP 422 + a parseable Teranode failure list (the real
+// validator verdict for a spent-UTXO / invalid tx) while other peers returned
+// opaque gateway 502/500 with no body. Pre-fix the 422 body was discarded
+// (client only parsed status 500), so the tx either requeued forever or —
+// worse — never carried the PROCESSING/UTXO_SPENT line into GET /tx ExtraInfo.
+// Post-fix: REJECTED with the Teranode line as ExtraInfo.
+func TestBroadcast_422RejectionSurfacesExtraInfo(t *testing.T) {
+	const txid = "d018bc98d7828b7f095e5d616f7ccba607fc228368e82e74b25304e37699f1e9"
+	verdictBody := "Failed to process transactions:\n" +
+		"PROCESSING (4): [ProcessTransaction][" + txid + "] failed to validate transaction\n"
+
+	// Peer A: the only peer that actually validated — 422 + failure list.
+	srvVerdict := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(verdictBody))
+	}))
+	defer srvVerdict.Close()
+	// Peer B/C: gateway noise that must NOT become ExtraInfo and must NOT
+	// silence the 422 verdict.
+	srv502 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte("error code: 502\n"))
+	}))
+	defer srv502.Close()
+	srv503 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("no available server\n"))
+	}))
+	defer srv503.Close()
+
+	ms := newMockStore()
+	cfg := &config.Config{}
+	cfg.Propagation.MerkleConcurrency = 10
+	tc := teranode.NewClient(
+		[]string{srv502.URL, srv503.URL, srvVerdict.URL},
+		"",
+		teranode.HealthConfig{FailureThreshold: 1 << 20},
+	)
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, nil)
+
+	if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg(txid))); err != nil {
+		t.Fatalf("handleMessage: %v", err)
+	}
+	if err := flushSync(t, p); err != nil {
+		t.Fatalf("flush error: %v", err)
+	}
+
+	got := ms.lastUpdateForTxid(txid)
+	if got == nil {
+		t.Fatal("no status update recorded")
+	}
+	if got.Status != models.StatusRejected {
+		t.Fatalf("status=%s want REJECTED (extraInfo=%q)", got.Status, got.ExtraInfo)
+	}
+	if !strings.Contains(got.ExtraInfo, "PROCESSING (4)") {
+		t.Errorf("ExtraInfo=%q want Teranode PROCESSING line (not gateway 502/503 body)", got.ExtraInfo)
+	}
+	if strings.Contains(got.ExtraInfo, "no available server") || strings.Contains(got.ExtraInfo, "502") {
+		t.Errorf("ExtraInfo leaked opaque gateway text: %q", got.ExtraInfo)
+	}
+}
+
 // TestBroadcast_PerPeerAggregation_UnanimousRejection covers the other
 // half: when every peer that gave us a parseable response named the same
 // tx as failed, the tx is REJECTED. Two endpoints both 500 with the

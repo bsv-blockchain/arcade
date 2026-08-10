@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1028,6 +1029,68 @@ type txResult struct {
 	successEndpoint string
 }
 
+// failureLinesForLog returns a stable, capped list of Teranode failure lines
+// for structured logging. Keys are ignored; order is sorted so log output is
+// deterministic across map iteration.
+func failureLinesForLog(failures map[string]string) []string {
+	const maxLines = 8
+	if len(failures) == 0 {
+		return nil
+	}
+	lines := make([]string, 0, len(failures))
+	for _, line := range failures {
+		lines = append(lines, line)
+	}
+	sort.Strings(lines)
+	if len(lines) > maxLines {
+		lines = lines[:maxLines]
+	}
+	return lines
+}
+
+// preferRejectionLine chooses which peer rejection line to keep when several
+// endpoints reject the same tx. Higher score wins; equal score keeps the
+// current (first-writer) line for stability. Ranking prefers concrete
+// Teranode validator codes (UTXO_SPENT, TX_CONFLICTING, TX_INVALID, …) over
+// the PROCESSING catch-all over opaque free text, so wallet-visible ExtraInfo
+// carries the best available reason rather than whichever peer responded first.
+func preferRejectionLine(current, candidate string) string {
+	if candidate == "" {
+		return current
+	}
+	if current == "" {
+		return candidate
+	}
+	if rejectionLineScore(candidate) > rejectionLineScore(current) {
+		return candidate
+	}
+	return current
+}
+
+// rejectionLineScore ranks a Teranode failure line for wallet-facing quality.
+// Higher is better. Unknown free text scores 0.
+func rejectionLineScore(line string) int {
+	name, _, found := strings.Cut(line, " (")
+	if !found {
+		return 0
+	}
+	switch name {
+	case "UTXO_SPENT", "TX_INVALID_DOUBLE_SPEND", "TX_CONFLICTING":
+		return 40
+	case "TX_INVALID", "TX_POLICY", "TX_LOCK_TIME", "TX_MISSING_PARENT",
+		"TX_LOCKED", "TX_COINBASE_IMMATURE", "UTXO_FROZEN", "UTXO_NON_FINAL",
+		"UTXO_INVALID_SIZE", "INVALID_ARGUMENT":
+		return 30
+	case "PROCESSING":
+		// Catch-all "this tx is bad" wrapper — better than opaque infra text,
+		// worse than a specific validator code.
+		return 20
+	default:
+		// Recognizable "<NAME> (n):" shape but not a known code.
+		return 10
+	}
+}
+
 // classifyFailureLine maps one Teranode /txs failure line into a client-
 // facing message and a machine-readable ARC status code (errors/errors.go
 // taxonomy; 0 when the line has no confident ARC equivalent). The line is
@@ -1545,19 +1608,25 @@ func (p *Propagator) submitBroadcastJobs(ctx context.Context, endpoints []string
 //
 //   - HTTP 200 from a peer → that peer accepted the whole batch, so
 //     every tx in the batch gets a sticky acceptance vote.
-//   - HTTP 5xx with a parseable "Failed to process transactions:"
-//     body → that peer rejected the listed txids and accepted the
-//     rest. Each accepted tx gets an acceptance vote; each rejected
-//     tx gets a rejection vote carrying the verbatim error line.
-//   - HTTP 5xx with no parseable body, network error, or no healthy
-//     endpoints → no per-tx information from that peer.
+//   - Non-2xx with a parseable "Failed to process transactions:" body
+//     (HTTP status is NOT part of the contract — Teranode often uses 500,
+//     but some deployments/proxies return 422/4xx with the same body) →
+//     that peer rejected the listed txids and accepted the rest. Each
+//     accepted tx gets an acceptance vote; each rejected tx gets a
+//     rejection vote carrying the verbatim Teranode error line (this is
+//     what lands in the wallet-visible ExtraInfo / SSE payload).
+//   - Non-2xx with no parseable body (gateway 502/503 "no available
+//     server", bare 500, network error), or no healthy endpoints → no
+//     per-tx information from that peer. These must NEVER become the
+//     terminal ExtraInfo on their own — they are infra noise, not a
+//     validator verdict.
 //
 // After all responses are in (or the 15s submitCtx timeout fires), each
 // tx is classified:
 //
 //   - Any acceptance vote → ACCEPTED_BY_NETWORK.
 //   - Otherwise, at least one rejection vote → REJECTED with the
-//     first peer's rejection line.
+//     best (most informative) peer rejection line.
 //   - Otherwise (no information from any peer) → Requeue.
 //
 // We treat any per-tx rejection line as terminal because Teranode wraps
@@ -1631,28 +1700,47 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 			continue
 		}
 
-		p.logger.Warn(
-			"batch broadcast endpoint failed",
-			zap.String("endpoint", result.endpoint),
-			zap.Int("batch_size", len(batch)),
-			zap.Int("status_code", result.statusCode),
-			zap.Error(result.err),
-		)
+		// Always log the human-visible error. When the response carried a
+		// parseable Teranode failure-list, also log the per-txid lines —
+		// otherwise operators only see "unexpected status code 500" and
+		// cannot tell that the peer actually returned UTXO_SPENT /
+		// PROCESSING (the structured body is not on err in that case).
+		// Opaque gateway 502/503 bodies stay on err alone.
+		if n := len(result.failures); n > 0 {
+			p.logger.Warn(
+				"batch broadcast endpoint failed",
+				zap.String("endpoint", result.endpoint),
+				zap.Int("batch_size", len(batch)),
+				zap.Int("status_code", result.statusCode),
+				zap.Error(result.err),
+				zap.Int("failure_count", n),
+				zap.Strings("failure_lines", failureLinesForLog(result.failures)),
+			)
+		} else {
+			p.logger.Warn(
+				"batch broadcast endpoint failed",
+				zap.String("endpoint", result.endpoint),
+				zap.Int("batch_size", len(batch)),
+				zap.Int("status_code", result.statusCode),
+				zap.Error(result.err),
+			)
+		}
 
 		if len(result.failures) == 0 {
 			// Non-parseable failure — this peer carried no per-tx info.
 			continue
 		}
 
-		// Parseable 500: peer accepted every tx not in the failure
-		// map and rejected the listed ones. An acceptance vote from
-		// any peer makes the tx ACCEPTED; a rejection vote only
-		// matters if no peer ever accepts.
+		// Parseable failure-list body (any non-2xx status): peer accepted
+		// every tx not in the failure map and rejected the listed ones. An
+		// acceptance vote from any peer makes the tx ACCEPTED; a rejection
+		// vote only matters if no peer ever accepts. When several peers
+		// reject the same tx with different lines, keep the most
+		// informative one (specific Teranode codes over PROCESSING over
+		// opaque text) so GET /tx ExtraInfo is useful to wallets.
 		for j, lower := range lowerTxids {
 			if line, failed := result.failures[lower]; failed {
-				if rejectionLine[j] == "" {
-					rejectionLine[j] = line
-				}
+				rejectionLine[j] = preferRejectionLine(rejectionLine[j], line)
 			} else {
 				acceptedByAny[j] = true
 			}

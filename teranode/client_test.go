@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -82,6 +83,28 @@ func TestSubmitTransactions_Batch(t *testing.T) {
 // code along with an error so the caller's err != nil branch routes through
 // the per-txid classification path.
 func TestSubmitTransactions_FailureList_500(t *testing.T) {
+	testSubmitTransactionsFailureList(t, http.StatusInternalServerError)
+}
+
+// TestSubmitTransactions_FailureList_422 pins the production bug where
+// Teranode (or a gateway in front of it) returned HTTP 422 with a fully
+// parseable "Failed to process transactions:" body containing
+// PROCESSING / UTXO_SPENT lines. The old client only parsed the body on
+// HTTP 500, so the failure map was nil, the peer contributed no rejection
+// vote, and GET /tx ExtraInfo never saw the Teranode reason (only opaque
+// infra noise from other peers, if anything). Parsing is status-agnostic.
+func TestSubmitTransactions_FailureList_422(t *testing.T) {
+	testSubmitTransactionsFailureList(t, http.StatusUnprocessableEntity)
+}
+
+// TestSubmitTransactions_FailureList_400 covers another remapped status
+// that has been observed carrying the same body shape.
+func TestSubmitTransactions_FailureList_400(t *testing.T) {
+	testSubmitTransactionsFailureList(t, http.StatusBadRequest)
+}
+
+func testSubmitTransactionsFailureList(t *testing.T, status int) {
+	t.Helper()
 	const (
 		txidA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 		txidB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -90,7 +113,7 @@ func TestSubmitTransactions_FailureList_500(t *testing.T) {
 		"TX_INVALID (31): [ProcessTransaction][" + txidA + "] tx is invalid because UTXO_SPENT\n" +
 		"UTXO_SPENT (28): [ProcessTransaction][" + txidB + "] utxo already spent\n"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(status)
 		_, _ = w.Write([]byte(body))
 	}))
 	defer server.Close()
@@ -100,10 +123,10 @@ func TestSubmitTransactions_FailureList_500(t *testing.T) {
 
 	code, failures, err := client.SubmitTransactions(context.Background(), server.URL, rawTxs)
 	if err == nil {
-		t.Fatalf("expected non-nil error for 500 (caller routes off err != nil)")
+		t.Fatalf("expected non-nil error for %d (caller routes off err != nil)", status)
 	}
-	if code != http.StatusInternalServerError {
-		t.Errorf("expected 500, got %d", code)
+	if code != status {
+		t.Errorf("expected %d, got %d", status, code)
 	}
 	if len(failures) != 2 {
 		t.Fatalf("expected 2 failure entries, got %d (%#v)", len(failures), failures)
@@ -113,6 +136,40 @@ func TestSubmitTransactions_FailureList_500(t *testing.T) {
 	}
 	if _, ok := failures[txidB]; !ok {
 		t.Errorf("expected failure for txidB, got %#v", failures)
+	}
+}
+
+// TestSubmitTransactions_422_ProcessingOnly mirrors the exact live shape
+// observed when spending an already-mined UTXO: HTTP 422 with a single
+// PROCESSING catch-all line. Must still yield a one-entry failure map so
+// propagation can terminalize REJECTED with that ExtraInfo.
+func TestSubmitTransactions_422_ProcessingOnly(t *testing.T) {
+	const txid = "d018bc98d7828b7f095e5d616f7ccba607fc228368e82e74b25304e37699f1e9"
+	body := "Failed to process transactions:\n" +
+		"PROCESSING (4): [ProcessTransaction][" + txid + "] failed to validate transaction\n"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer server.Close()
+
+	client := NewClient([]string{server.URL}, "", HealthConfig{})
+	code, failures, err := client.SubmitTransactions(context.Background(), server.URL, [][]byte{{0x01}})
+	if err == nil {
+		t.Fatal("expected non-nil error")
+	}
+	if code != http.StatusUnprocessableEntity {
+		t.Errorf("code=%d want 422", code)
+	}
+	if len(failures) != 1 {
+		t.Fatalf("failures=%#v want 1 entry", failures)
+	}
+	line, ok := failures[txid]
+	if !ok {
+		t.Fatalf("missing failure for %s: %#v", txid, failures)
+	}
+	if !strings.Contains(line, "PROCESSING (4)") {
+		t.Errorf("line=%q want PROCESSING (4)", line)
 	}
 }
 

@@ -68,3 +68,32 @@ func TestClassifyFailureLine(t *testing.T) {
 		})
 	}
 }
+
+// TestPreferRejectionLine ensures multi-peer aggregation keeps the best
+// wallet-facing reason rather than first-writer-wins.
+func TestPreferRejectionLine(t *testing.T) {
+	processing := "PROCESSING (4): [ProcessTransaction][ab] failed to validate transaction"
+	utxoSpent := "UTXO_SPENT (70): [ProcessTransaction][ab] utxo already spent"
+	txInvalid := "TX_INVALID (31): [ProcessTransaction][ab] bad fee"
+	opaque := "malformed peer body"
+	cases := []struct {
+		name      string
+		current   string
+		candidate string
+		want      string
+	}{
+		{name: "empty current takes candidate", current: "", candidate: processing, want: processing},
+		{name: "empty candidate keeps current", current: processing, candidate: "", want: processing},
+		{name: "UTXO_SPENT beats PROCESSING", current: processing, candidate: utxoSpent, want: utxoSpent},
+		{name: "PROCESSING beats opaque", current: opaque, candidate: processing, want: processing},
+		{name: "TX_INVALID beats PROCESSING", current: processing, candidate: txInvalid, want: txInvalid},
+		{name: "equal score keeps current", current: processing + " a", candidate: processing + " b", want: processing + " a"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := preferRejectionLine(tc.current, tc.candidate); got != tc.want {
+				t.Errorf("preferRejectionLine(%q, %q) = %q, want %q", tc.current, tc.candidate, got, tc.want)
+			}
+		})
+	}
+}
