@@ -157,6 +157,10 @@ func (m *mockStore) IterateStatusesSince(context.Context, time.Time, func(*model
 	return nil
 }
 
+func (m *mockStore) CensusStatusesSince(context.Context, time.Time, time.Time, []models.Status) (map[models.Status]store.StatusCensus, error) {
+	return map[models.Status]store.StatusCensus{}, nil
+}
+
 func (m *mockStore) SetStatusByBlockHash(context.Context, string, models.Status) ([]string, error) {
 	return nil, nil
 }

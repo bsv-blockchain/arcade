@@ -665,6 +665,55 @@ func (s *Store) IterateStatusesSince(ctx context.Context, since time.Time, fn fu
 	return nil
 }
 
+// CensusStatusesSince walks the per-status index (idx:tx:status:<status>:*)
+// for each requested status, so rows in other statuses — the overwhelming
+// majority of a mature store — are never visited. Each candidate row is read
+// via readStoredStatus (no merkle enrichment) purely for its timestamp; the
+// count/min aggregation happens in place. This replaces the reaper's in-walk
+// census over the full updated-at index (issue #290).
+func (s *Store) CensusStatusesSince(ctx context.Context, since, stuckDeadline time.Time, statuses []models.Status) (map[models.Status]store.StatusCensus, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	out := make(map[models.Status]store.StatusCensus, len(statuses))
+	sinceNs := since.UnixNano()
+	deadlineNs := stuckDeadline.UnixNano()
+
+	for _, status := range statuses {
+		census := store.StatusCensus{}
+		prefix := idxTxStatusPrefix(string(status))
+		iter, err := s.db.NewIter(&pebbledb.IterOptions{
+			LowerBound: prefix,
+			UpperBound: endOfPrefix(prefix),
+		})
+		if err != nil {
+			return nil, err
+		}
+		for iter.First(); iter.Valid(); iter.Next() {
+			if err := ctx.Err(); err != nil {
+				_ = iter.Close()
+				return nil, err
+			}
+			st, err := s.readStoredStatus(lastSegment(iter.Key()))
+			if err != nil || st == nil {
+				continue
+			}
+			if (!since.IsZero() && st.TimestampUnixNs < sinceNs) || st.TimestampUnixNs >= deadlineNs {
+				continue
+			}
+			census.Count++
+			if census.Oldest.IsZero() || st.TimestampUnixNs < census.Oldest.UnixNano() {
+				census.Oldest = time.Unix(0, st.TimestampUnixNs)
+			}
+		}
+		if err := iter.Close(); err != nil {
+			return nil, err
+		}
+		out[status] = census
+	}
+	return out, nil
+}
+
 // SetStatusByBlockHash walks idx:tx:block:<blockHash>:* and rewrites each
 // referenced row with the new status. For SEEN_ON_NETWORK transitions block
 // fields are cleared and the cleared anchor is appended to the row's

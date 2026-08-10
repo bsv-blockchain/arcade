@@ -67,6 +67,13 @@ const (
 	stuckTransientAge = time.Hour
 )
 
+// errStopReaperWalk stops the IterateStatusesSince scan once the rebroadcast
+// batch is full. It is a control signal, not a failure — reapOnce filters it
+// out of the scan error check. Restoring this early stop (issue #290) is safe
+// because the stuck census no longer rides on the walk; CensusStatusesSince
+// answers it store-side, so the walk only needs a bounded rebroadcast batch.
+var errStopReaperWalk = errors.New("propagation: rebroadcast batch full")
+
 // stuckTransientStatuses are the transient statuses the stuck gauges track.
 // Both are now nudged by the rebroadcast arm below (RECEIVED past
 // staleReceivedAge, ACCEPTED_BY_NETWORK past staleAcceptedByNetworkAge); the
@@ -191,17 +198,20 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 	acceptedDeadline := now.Add(-staleAcceptedByNetworkAge)
 
 	stuckTransientDeadline := now.Add(-stuckTransientAge)
-	type transientStats struct {
-		count  int
-		oldest time.Time
-	}
-	stuckTransient := make(map[models.Status]*transientStats, len(stuckTransientStatuses))
+	// The stuck-transient census (counts + oldest age per status) is resolved
+	// store-side by CensusStatusesSince after the walk, NOT by counting inside
+	// it. Counting in the walk forced it to visit every row so the census
+	// stayed uncapped, which pinned the reaper's cadence to the full-scan time
+	// (~4 min on a ~1.6M-row store) instead of reaper_interval_ms — issue #290.
+	stuckTransientSet := make(map[models.Status]struct{}, len(stuckTransientStatuses))
 	for _, s := range stuckTransientStatuses {
-		stuckTransient[s] = &transientStats{}
+		stuckTransientSet[s] = struct{}{}
 	}
 	// txids of stuck rows to attribute to a callback host after the scan
-	// (bounded by stuckAttributionCap). Collected here — not looked up inline
-	// — so the scan itself stays free of per-row store calls.
+	// (bounded by stuckAttributionCap). Collected in the walk — not looked up
+	// inline — so the scan itself stays free of per-row store calls. Best
+	// effort: the walk stops at the rebroadcast batch, so attribution samples
+	// the leading portion of the backlog.
 	type stuckRef struct {
 		txid   string
 		status models.Status
@@ -210,25 +220,21 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 
 	stuck := make([]propagationMsg, 0, p.rebroadcastBatch)
 	err := p.store.IterateStatusesSince(ctx, since, func(st *models.TransactionStatus) error {
-		// Stuck-transient accounting runs on EVERY row (regardless of RawTx
-		// or the rebroadcast cap): the gauges must be an uncapped census of
-		// txs whose SEEN state-transfer never arrived, including
-		// ACCEPTED_BY_NETWORK rows the rebroadcast arm below never touches.
-		if ts, ok := stuckTransient[st.Status]; ok && st.Timestamp.Before(stuckTransientDeadline) {
-			ts.count++
-			if ts.oldest.IsZero() || st.Timestamp.Before(ts.oldest) {
-				ts.oldest = st.Timestamp
-			}
-			if len(attrib) < stuckAttributionCap {
-				attrib = append(attrib, stuckRef{txid: st.TxID, status: st.Status})
-			}
+		// Best-effort per-callback attribution sample (bounded by
+		// stuckAttributionCap). The census COUNTS come from
+		// CensusStatusesSince below, not from this walk.
+		if _, ok := stuckTransientSet[st.Status]; ok &&
+			st.Timestamp.Before(stuckTransientDeadline) &&
+			len(attrib) < stuckAttributionCap {
+			attrib = append(attrib, stuckRef{txid: st.TxID, status: st.Status})
 		}
 
 		if len(stuck) >= p.rebroadcastBatch {
-			// Rebroadcast batch is full — keep walking for the census, just
-			// stop collecting. (Previously the walk aborted here, which also
-			// capped any counting at the batch size.)
-			return nil
+			// Rebroadcast batch is full — stop the walk (issue #290). The
+			// census no longer needs a full scan (CensusStatusesSince does it
+			// store-side), so a large backlog drains one batch per tick at
+			// reaper_interval_ms cadence instead of a multi-minute full scan.
+			return errStopReaperWalk
 		}
 		if len(st.RawTx) == 0 {
 			// No body to rebroadcast. Pre-reaper-population rows
@@ -271,9 +277,20 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 		stuck = append(stuck, propagationMsg{TXID: st.TxID, RawTx: st.RawTx})
 		return nil
 	})
-	if err != nil && !errors.Is(err, context.Canceled) {
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, errStopReaperWalk) {
 		p.logger.Error("reaper: scan failed", zap.Error(err))
 		return
+	}
+
+	// Resolve the stuck-transient census store-side (one GROUP BY aggregate on
+	// Postgres) so the counts stay uncapped without the walk visiting every
+	// row (issue #290). A census error must not skip the rebroadcast that
+	// follows — the gauges are observability, the drain is the job — so log it
+	// and publish zeroed counts.
+	census, cerr := p.store.CensusStatusesSince(ctx, since, stuckTransientDeadline, stuckTransientStatuses)
+	if cerr != nil {
+		p.logger.Error("reaper: stuck-transient census failed", zap.Error(cerr))
+		census = nil
 	}
 
 	// Publish the post-scan depth on every tick BEFORE the early-return
@@ -298,19 +315,21 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 		zap.Int("reaper_ready_depth", len(stuck)),
 	)
 
-	// Publish the stuck-transient census the same way: every tick, zero
-	// included, so the gauges always reflect the latest completed scan.
-	for status, ts := range stuckTransient {
-		metrics.StuckTransientTxs.WithLabelValues(string(status)).Set(float64(ts.count))
+	// Publish the stuck-transient census every tick, zero included (iterate the
+	// status list, not the result map, so a drained or errored census still
+	// resets the gauges), so they always reflect the latest completed scan.
+	for _, status := range stuckTransientStatuses {
+		c := census[status] // zero value when census is nil or nothing matched
+		metrics.StuckTransientTxs.WithLabelValues(string(status)).Set(float64(c.Count))
 		age := 0.0
-		if !ts.oldest.IsZero() {
-			age = now.Sub(ts.oldest).Seconds()
+		if !c.Oldest.IsZero() {
+			age = now.Sub(c.Oldest).Seconds()
 		}
 		metrics.OldestTransientTxAge.WithLabelValues(string(status)).Set(age)
-		if ts.count > 0 {
+		if c.Count > 0 {
 			p.logger.Warn("reaper: transactions stuck in transient status past threshold",
 				logfields.Status(string(status)),
-				zap.Int("count", ts.count),
+				zap.Int64("count", c.Count),
 				zap.Float64("oldest_age_seconds", age))
 		}
 	}

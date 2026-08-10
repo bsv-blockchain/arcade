@@ -684,6 +684,47 @@ ORDER BY timestamp_at DESC`
 	return rows.Err()
 }
 
+// CensusStatusesSince is one aggregate round-trip: count + min(timestamp_at)
+// per status over the census window, resolved by the idx_tx_status /
+// idx_tx_updated indexes. The reaper's stuck census over a multi-million-row
+// table must never stream rows through the client (issue #290) — this query
+// is the entire point of the method.
+func (s *Store) CensusStatusesSince(ctx context.Context, since, stuckDeadline time.Time, statuses []models.Status) (map[models.Status]store.StatusCensus, error) {
+	out := make(map[models.Status]store.StatusCensus, len(statuses))
+	if len(statuses) == 0 {
+		return out, nil
+	}
+	names := make([]string, len(statuses))
+	for i, st := range statuses {
+		out[st] = store.StatusCensus{}
+		names[i] = string(st)
+	}
+
+	const q = `
+SELECT status, count(*), min(timestamp_at)
+FROM transactions
+WHERE timestamp_at >= $1 AND timestamp_at < $2 AND status = ANY($3)
+GROUP BY status`
+	rows, err := s.pool.Query(ctx, q, since, stuckDeadline, names)
+	if err != nil {
+		return nil, fmt.Errorf("census statuses since: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			name   string
+			count  int64
+			oldest time.Time
+		)
+		if err := rows.Scan(&name, &count, &oldest); err != nil {
+			return nil, err
+		}
+		out[models.Status(name)] = store.StatusCensus{Count: count, Oldest: oldest}
+	}
+	return out, rows.Err()
+}
+
 // SetStatusByBlockHash rewrites every row in the block. Block fields are
 // cleared on SEEN_ON_NETWORK transitions (reorg path) and kept otherwise —
 // matches the Aerospike / Pebble contract. IMMUTABLE rows are never touched,

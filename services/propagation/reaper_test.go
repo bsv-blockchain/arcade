@@ -328,6 +328,50 @@ func TestReapOnce_CensusUncappedByRebroadcastBatch(t *testing.T) {
 	}
 }
 
+// TestReapOnce_WalkAbortsAtBatch_NoFullScan pins the issue #290 fix: with the
+// census resolved store-side (CensusStatusesSince), the IterateStatusesSince
+// walk stops once the rebroadcast batch is full instead of scanning the whole
+// table. It seeds far more eligible rows than the batch and asserts the walk
+// visited only ~one batch of rows — so the reaper's cadence is
+// reaper_interval_ms, not the multi-minute full-scan time it regressed to.
+func TestReapOnce_WalkAbortsAtBatch_NoFullScan(t *testing.T) {
+	now := time.Now()
+	stale := now.Add(-2 * time.Hour)
+
+	log := &eventLog{}
+	ms := newMockStore()
+	total := defaultReaperRebroadcastBatch * 4 // far more eligible rows than one batch
+	for i := 0; i < total; i++ {
+		ms.replayRows = append(ms.replayRows, &models.TransactionStatus{
+			TxID:      fmt.Sprintf("recv-%05d", i),
+			Status:    models.StatusReceived,
+			RawTx:     []byte{0x01},
+			Timestamp: stale,
+		})
+	}
+	merkleSrv := newMerkleServer(log, http.StatusOK)
+	defer merkleSrv.Close()
+	teranodeSrv := newTeranodeServer(log, http.StatusOK)
+	defer teranodeSrv.Close()
+
+	p := newPropagator(merkleSrv.URL, teranodeSrv.URL, ms)
+	p.reapOnce(context.Background())
+
+	// The walk visits one batch of rows, then aborts on the next (that row is
+	// counted before fn returns the stop sentinel) → batch+1 at most.
+	if ms.iterated > defaultReaperRebroadcastBatch+1 {
+		t.Errorf("walk visited %d rows, want <= %d (must abort at the batch, not full-scan %d)",
+			ms.iterated, defaultReaperRebroadcastBatch+1, total)
+	}
+	// Census is still uncapped (store-side aggregate sees every row).
+	if got := gaugeVal(t, metrics.StuckTransientTxs, string(models.StatusReceived)); got != float64(total) {
+		t.Errorf("stuck RECEIVED census = %v, want %d (census must be uncapped via CensusStatusesSince)", got, total)
+	}
+	if got := log.count("register:"); got != defaultReaperRebroadcastBatch {
+		t.Errorf("rebroadcast count = %d, want %d", got, defaultReaperRebroadcastBatch)
+	}
+}
+
 // TestReapOnce_RebroadcastBatchConfigurable pins the configurable per-tick
 // rebroadcast cap (the 2026-08-10 incident fix: ~178k txs stuck at RECEIVED
 // could only drain at the hardcoded 200 per tick). With

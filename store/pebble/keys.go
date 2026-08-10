@@ -55,6 +55,12 @@ func idxTxStatusKey(status, txid string) []byte {
 	return []byte(prefixIdxTxStatus + status + ":" + txid)
 }
 
+// idxTxStatusPrefix returns the prefix used to iterate every row currently at
+// one status — the census path's way of never visiting rows in other statuses.
+func idxTxStatusPrefix(status string) []byte {
+	return []byte(prefixIdxTxStatus + status + ":")
+}
+
 func idxTxBlockKey(blockHash, txid string) []byte {
 	return []byte(prefixIdxTxBlock + blockHash + ":" + txid)
 }

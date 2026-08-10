@@ -554,6 +554,72 @@ func (s *Store) IterateStatusesSince(ctx context.Context, _ time.Time, fn func(*
 	}
 }
 
+// CensusStatusesSince pushes the census as far into Aerospike as the client
+// allows: one secondary-index query per requested status (arcade_idx_tx_status,
+// same index GetReadyRetries uses) projecting ONLY the timestamp bin, with the
+// count/min aggregation done over that stream. No raw_tx or full-record
+// transfer, and rows outside the requested statuses are never visited — the
+// full-namespace IterateStatusesSince walk this replaces is what pinned the
+// reaper's cadence to the scan time (issue #290).
+func (s *Store) CensusStatusesSince(ctx context.Context, since, stuckDeadline time.Time, statuses []models.Status) (map[models.Status]store.StatusCensus, error) {
+	out := make(map[models.Status]store.StatusCensus, len(statuses))
+	for _, st := range statuses {
+		out[st] = store.StatusCensus{}
+	}
+	sinceMs := since.UnixMilli()
+	deadlineMs := stuckDeadline.UnixMilli()
+
+	for _, status := range statuses {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		stmt := aero.NewStatement(s.namespace, setTransactions, "timestamp")
+		_ = stmt.SetFilter(aero.NewEqualFilter("status", string(status)))
+
+		rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
+		if err != nil {
+			if rs != nil {
+				_ = rs.Close()
+			}
+			return nil, fmt.Errorf("census query status %s: %w", status, err)
+		}
+
+		census := out[status]
+		var loopErr error
+	loop:
+		for {
+			select {
+			case <-ctx.Done():
+				loopErr = ctx.Err()
+				break loop
+			case rec, ok := <-rs.Results():
+				if !ok {
+					break loop
+				}
+				if rec.Err != nil {
+					loopErr = rec.Err
+					break loop
+				}
+				tsMs := getInt64(rec.Record, "timestamp")
+				if tsMs < sinceMs || tsMs >= deadlineMs {
+					continue
+				}
+				census.Count++
+				ts := time.UnixMilli(tsMs)
+				if census.Oldest.IsZero() || ts.Before(census.Oldest) {
+					census.Oldest = ts
+				}
+			}
+		}
+		_ = rs.Close()
+		if loopErr != nil {
+			return nil, loopErr
+		}
+		out[status] = census
+	}
+	return out, nil
+}
+
 // binOrphAnchors is the transactions-set bin holding the row's orphaned-anchor
 // history as JSON-encoded []orphanedAnchorRecord (Aerospike bin names are
 // capped at 15 chars, hence the abbreviation). Written by SetMinedByTxIDs
