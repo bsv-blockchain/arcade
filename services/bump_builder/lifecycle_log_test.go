@@ -10,17 +10,20 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 )
 
-// TestMarkMinedAndPublish_LogsTransactionsMinedChunked closes the MINED log
-// gap: markMinedAndPublish must emit an Info "transactions mined" line per
-// maxTxIDsPerLine-sized chunk (from package logfields) so a block larger
-// than one chunk still surfaces every txid somewhere in the log stream —
-// each line also carries block_hash/block_height and the TRUE total
-// txid_count (not the chunk size), plus its position in the chunk sequence.
-func TestMarkMinedAndPublish_LogsTransactionsMinedChunked(t *testing.T) {
+// TestMarkMinedAndPublish_LogsTransactionsMinedLevelSplit pins the MINED log
+// split: markMinedAndPublish must emit exactly ONE Info "transactions mined"
+// line per block — the txid list capped at maxTxIDsPerLine (from package
+// logfields) but txid_count carrying the TRUE total, so Info-level volume
+// stays flat regardless of block size — plus one Debug line per chunk so a
+// block larger than one chunk still surfaces every txid somewhere in the log
+// stream. Each Debug line also carries block_hash/block_height, the TRUE
+// total txid_count (not the chunk size), and its position in the chunk
+// sequence.
+func TestMarkMinedAndPublish_LogsTransactionsMinedLevelSplit(t *testing.T) {
 	ms := newMockStore()
 	b := newTestBuilder(ms, "http://unused.invalid")
 
-	core, recorded := observer.New(zapcore.InfoLevel)
+	core, recorded := observer.New(zapcore.DebugLevel)
 	logger := zap.New(core)
 
 	// 2500 spans logfields.maxTxIDsPerLine (1000) twice over plus a
@@ -34,13 +37,39 @@ func TestMarkMinedAndPublish_LogsTransactionsMinedChunked(t *testing.T) {
 
 	b.markMinedAndPublish(context.Background(), logger, "block-hash-mined-test", 777, txids)
 
-	entries := recorded.FilterMessage("transactions mined").All()
-	if len(entries) != wantChunks {
-		t.Fatalf("expected %d 'transactions mined' log lines, got %d", wantChunks, len(entries))
+	// Info: exactly one bounded line, TRUE total in txid_count, list capped.
+	infoEntries := recorded.FilterMessage("transactions mined").
+		FilterLevelExact(zapcore.InfoLevel).All()
+	if len(infoEntries) != 1 {
+		t.Fatalf("expected exactly 1 Info 'transactions mined' line, got %d", len(infoEntries))
+	}
+	infoFields := infoEntries[0].ContextMap()
+	if got, _ := infoFields["block_hash"].(string); got != "block-hash-mined-test" {
+		t.Errorf("Info: block_hash = %q, want %q", got, "block-hash-mined-test")
+	}
+	if got, _ := infoFields["block_height"].(uint64); got != 777 {
+		t.Errorf("Info: block_height = %v, want 777", infoFields["block_height"])
+	}
+	if got, _ := infoFields["txid_count"].(int64); got != int64(n) {
+		t.Errorf("Info: txid_count = %v, want %d (true total, not the capped list length)", infoFields["txid_count"], n)
+	}
+	infoTxIDs, ok := infoFields["txids"].([]interface{})
+	if !ok {
+		t.Fatalf("Info: txids field missing or wrong type: %#v", infoFields["txids"])
+	}
+	if len(infoTxIDs) != 1000 {
+		t.Errorf("Info: txids list length = %d, want 1000 (capped at maxTxIDsPerLine)", len(infoTxIDs))
+	}
+
+	// Debug: one line per chunk, full coverage across the union.
+	debugEntries := recorded.FilterMessage("transactions mined").
+		FilterLevelExact(zapcore.DebugLevel).All()
+	if len(debugEntries) != wantChunks {
+		t.Fatalf("expected %d Debug 'transactions mined' chunk lines, got %d", wantChunks, len(debugEntries))
 	}
 
 	seen := make(map[string]bool, n)
-	for i, e := range entries {
+	for i, e := range debugEntries {
 		fields := e.ContextMap()
 		if got, _ := fields["block_hash"].(string); got != "block-hash-mined-test" {
 			t.Errorf("entry %d: block_hash = %q, want %q", i, got, "block-hash-mined-test")
@@ -78,27 +107,38 @@ func TestMarkMinedAndPublish_LogsTransactionsMinedChunked(t *testing.T) {
 }
 
 // TestMarkMinedAndPublish_LogsTransactionsMinedSingleChunk pins the common
-// case (a block small enough for one chunk) to exactly one log line, so the
-// chunked path doesn't accidentally fragment small blocks.
+// case (a block small enough for one chunk) to exactly one Info line and one
+// Debug line, so the level split doesn't accidentally fragment or duplicate
+// small blocks.
 func TestMarkMinedAndPublish_LogsTransactionsMinedSingleChunk(t *testing.T) {
 	ms := newMockStore()
 	b := newTestBuilder(ms, "http://unused.invalid")
 
-	core, recorded := observer.New(zapcore.InfoLevel)
+	core, recorded := observer.New(zapcore.DebugLevel)
 	logger := zap.New(core)
 
 	txids := []string{"tx-a", "tx-b", "tx-c"}
 	b.markMinedAndPublish(context.Background(), logger, "block-hash-small", 42, txids)
 
-	entries := recorded.FilterMessage("transactions mined").All()
-	if len(entries) != 1 {
-		t.Fatalf("expected exactly 1 'transactions mined' log line, got %d", len(entries))
+	infoEntries := recorded.FilterMessage("transactions mined").
+		FilterLevelExact(zapcore.InfoLevel).All()
+	if len(infoEntries) != 1 {
+		t.Fatalf("expected exactly 1 Info 'transactions mined' line, got %d", len(infoEntries))
 	}
-	fields := entries[0].ContextMap()
+	fields := infoEntries[0].ContextMap()
 	if got, _ := fields["txid_count"].(int64); got != 3 {
-		t.Errorf("txid_count = %v, want 3", fields["txid_count"])
+		t.Errorf("Info: txid_count = %v, want 3", fields["txid_count"])
 	}
-	if got, _ := fields["chunk_total"].(int64); got != 1 {
-		t.Errorf("chunk_total = %v, want 1", fields["chunk_total"])
+	if got, ok := fields["txids"].([]interface{}); !ok || len(got) != 3 {
+		t.Errorf("Info: txids = %#v, want the full 3-element list (under the cap)", fields["txids"])
+	}
+
+	debugEntries := recorded.FilterMessage("transactions mined").
+		FilterLevelExact(zapcore.DebugLevel).All()
+	if len(debugEntries) != 1 {
+		t.Fatalf("expected exactly 1 Debug 'transactions mined' chunk line, got %d", len(debugEntries))
+	}
+	if got, _ := debugEntries[0].ContextMap()["chunk_total"].(int64); got != 1 {
+		t.Errorf("Debug: chunk_total = %v, want 1", debugEntries[0].ContextMap()["chunk_total"])
 	}
 }
