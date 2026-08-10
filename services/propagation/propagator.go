@@ -95,6 +95,10 @@ type Propagator struct {
 	merkleConcurrency int
 	reaperInterval    time.Duration
 	reaperBatchSize   int
+	// rebroadcastBatch caps stuck-tx rebroadcasts per reaper tick
+	// (propagation.reaper_rebroadcast_batch, default
+	// defaultReaperRebroadcastBatch). See reapOnce.
+	rebroadcastBatch  int
 	teranodeBatchCap  int
 	broadcastWorkers  int
 	maxParallelChunks int
@@ -259,6 +263,10 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 	if reaperBatch <= 0 {
 		reaperBatch = 500
 	}
+	rebroadcastBatch := cfg.Propagation.ReaperRebroadcastBatch
+	if rebroadcastBatch <= 0 {
+		rebroadcastBatch = defaultReaperRebroadcastBatch
+	}
 	leaseTTL := time.Duration(cfg.Propagation.LeaseTTLMs) * time.Millisecond
 	if leaseTTL <= 0 {
 		leaseTTL = 3 * reaperInterval
@@ -296,6 +304,7 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 		merkleConcurrency: merkleConcurrency,
 		reaperInterval:    reaperInterval,
 		reaperBatchSize:   reaperBatch,
+		rebroadcastBatch:  rebroadcastBatch,
 		teranodeBatchCap:  teranodeBatchCap,
 		broadcastWorkers:  broadcastWorkers,
 		maxParallelChunks: maxParallelChunks,

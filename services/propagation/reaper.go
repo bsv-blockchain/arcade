@@ -51,7 +51,13 @@ const (
 	staleReceivedAge          = time.Hour
 	staleAcceptedByNetworkAge = time.Hour
 	staleScanLookback         = 24 * time.Hour
-	reaperRebroadcastBatch    = 200
+
+	// defaultReaperRebroadcastBatch is the per-tick rebroadcast cap applied
+	// when propagation.reaper_rebroadcast_batch is unset or non-positive —
+	// the source of truth for the historical hardcoded 200. See
+	// config.PropagationConfig.ReaperRebroadcastBatch for the incident
+	// rationale behind making it configurable.
+	defaultReaperRebroadcastBatch = 200
 
 	// stuckTransientAge is the threshold for the StuckTransientTxs /
 	// OldestTransientTxAge gauges: a tx sitting in RECEIVED or
@@ -174,7 +180,8 @@ func (p *Propagator) tryReap(ctx context.Context) {
 // resulting terminal status notifies the dispatcher via applyTerminalStatuses
 // only as a no-op for offset bookkeeping.
 //
-// Bounded by reaperRebroadcastBatch per tick so a backlog can't pin the
+// Bounded by p.rebroadcastBatch (propagation.reaper_rebroadcast_batch,
+// default defaultReaperRebroadcastBatch) per tick so a backlog can't pin the
 // reaper into a single multi-minute call.
 func (p *Propagator) reapOnce(ctx context.Context) {
 	now := time.Now()
@@ -201,7 +208,7 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 	}
 	attrib := make([]stuckRef, 0, stuckAttributionCap)
 
-	stuck := make([]propagationMsg, 0, reaperRebroadcastBatch)
+	stuck := make([]propagationMsg, 0, p.rebroadcastBatch)
 	err := p.store.IterateStatusesSince(ctx, since, func(st *models.TransactionStatus) error {
 		// Stuck-transient accounting runs on EVERY row (regardless of RawTx
 		// or the rebroadcast cap): the gauges must be an uncapped census of
@@ -217,7 +224,7 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 			}
 		}
 
-		if len(stuck) >= reaperRebroadcastBatch {
+		if len(stuck) >= p.rebroadcastBatch {
 			// Rebroadcast batch is full — keep walking for the census, just
 			// stop collecting. (Previously the walk aborted here, which also
 			// capped any counting at the batch size.)

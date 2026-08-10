@@ -296,14 +296,14 @@ func TestReapOnce_StuckTransientCensus_ZeroesWhenClear(t *testing.T) {
 
 // TestReapOnce_CensusUncappedByRebroadcastBatch: the census must keep
 // counting past the rebroadcast batch cap (the old walk aborted at
-// reaperRebroadcastBatch, silently truncating any census).
+// the batch cap, silently truncating any census).
 func TestReapOnce_CensusUncappedByRebroadcastBatch(t *testing.T) {
 	now := time.Now()
 	stale := now.Add(-2 * time.Hour)
 
 	log := &eventLog{}
 	ms := newMockStore()
-	total := reaperRebroadcastBatch + 50
+	total := defaultReaperRebroadcastBatch + 50
 	for i := 0; i < total; i++ {
 		ms.replayRows = append(ms.replayRows, &models.TransactionStatus{
 			TxID:      fmt.Sprintf("recv-%04d", i),
@@ -323,8 +323,58 @@ func TestReapOnce_CensusUncappedByRebroadcastBatch(t *testing.T) {
 	if got := gaugeVal(t, metrics.StuckTransientTxs, string(models.StatusReceived)); got != float64(total) {
 		t.Errorf("stuck RECEIVED = %v, want %d (census must not be capped at the rebroadcast batch)", got, total)
 	}
-	if got := log.count("register:"); got != reaperRebroadcastBatch {
-		t.Errorf("rebroadcast count = %d, want %d (batch cap unchanged)", got, reaperRebroadcastBatch)
+	if got := log.count("register:"); got != defaultReaperRebroadcastBatch {
+		t.Errorf("rebroadcast count = %d, want %d (batch cap unchanged)", got, defaultReaperRebroadcastBatch)
+	}
+}
+
+// TestReapOnce_RebroadcastBatchConfigurable pins the configurable per-tick
+// rebroadcast cap (the 2026-08-10 incident fix: ~178k txs stuck at RECEIVED
+// could only drain at the hardcoded 200 per tick). With
+// propagation.reaper_rebroadcast_batch set to 5 and 8 eligible stuck rows
+// seeded, one reapOnce rebroadcasts exactly 5.
+func TestReapOnce_RebroadcastBatchConfigurable(t *testing.T) {
+	stale := time.Now().Add(-2 * time.Hour)
+
+	log := &eventLog{}
+	ms := newMockStore()
+	for i := 0; i < 8; i++ {
+		ms.replayRows = append(ms.replayRows, &models.TransactionStatus{
+			TxID:      fmt.Sprintf("recv-%02d", i),
+			Status:    models.StatusReceived,
+			RawTx:     []byte{0x01},
+			Timestamp: stale,
+		})
+	}
+
+	merkleSrv := newMerkleServer(log, http.StatusOK)
+	defer merkleSrv.Close()
+	teranodeSrv := newTeranodeServer(log, http.StatusOK)
+	defer teranodeSrv.Close()
+
+	cfg := &config.Config{CallbackURL: "http://localhost:8080/callback"}
+	cfg.Propagation.MerkleConcurrency = 10
+	cfg.Propagation.ReaperRebroadcastBatch = 5
+	mc := merkleservice.NewClient(merkleSrv.URL, "", 5*time.Second)
+	tc := teranode.NewClient([]string{teranodeSrv.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, mc)
+
+	p.reapOnce(context.Background())
+
+	if got := log.count("register:"); got != 5 {
+		t.Errorf("rebroadcast count = %d, want 5 (configured reaper_rebroadcast_batch)", got)
+	}
+}
+
+// TestNew_ReaperRebroadcastBatchDefault: leaving
+// propagation.reaper_rebroadcast_batch unset (zero) resolves to the historical
+// hardcoded cap, so behavior at default config is byte-identical to before the
+// knob existed.
+func TestNew_ReaperRebroadcastBatchDefault(t *testing.T) {
+	p := newPropagator("", "http://localhost:0", newMockStore())
+	if p.rebroadcastBatch != defaultReaperRebroadcastBatch {
+		t.Errorf("rebroadcastBatch = %d, want %d (code default when config is unset)",
+			p.rebroadcastBatch, defaultReaperRebroadcastBatch)
 	}
 }
 
