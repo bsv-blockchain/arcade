@@ -15,7 +15,7 @@ import (
 const webhookReaperLeaseName = "webhook-reaper"
 
 // webhookReaperBatch caps how many submissions a single tick re-fires. Same
-// shape as propagation's reaperRebroadcastBatch — bounded so a backlog can't
+// shape as propagation's rebroadcast batch cap — bounded so a backlog can't
 // pin the reaper into a multi-minute call, and so a too-broad scan doesn't
 // hold the worker pool against a sudden burst of new deliveries.
 const webhookReaperBatch = 200

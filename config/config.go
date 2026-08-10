@@ -361,6 +361,17 @@ type PropagationConfig struct {
 	RetryBackoffMs    int `mapstructure:"retry_backoff_ms"`
 	ReaperIntervalMs  int `mapstructure:"reaper_interval_ms"`
 	ReaperBatchSize   int `mapstructure:"reaper_batch_size"`
+	// ReaperRebroadcastBatch caps how many stuck transactions the reaper's
+	// durable-rebroadcast backstop pushes back through the register+broadcast
+	// pipeline per tick (reapOnce collects at most this many stale RECEIVED /
+	// ACCEPTED_BY_NETWORK / SEEN rows). During the 2026-08-10 requeue-spiral
+	// incident ~178k txs were stranded at RECEIVED with the reaper as their
+	// only drain path; the then-hardcoded 200-per-tick cap at the default 30s
+	// interval drained ~6.7 tx/s (~7.4h to clear), forcing operators to crank
+	// reaper_interval_ms down instead. Raise this to drain a large backlog
+	// faster without touching the tick interval. Defaults to 200 (the
+	// historical hardcoded cap) when unset or non-positive.
+	ReaperRebroadcastBatch int `mapstructure:"reaper_rebroadcast_batch"`
 	// LeaseTTLMs bounds how long the reaper lease remains valid without a
 	// renewal. Set to at least 2–3× reaper_interval_ms so a missed tick
 	// doesn't trigger a false-positive failover. Defaults to 3× interval.
@@ -934,6 +945,7 @@ func setDefaults() {
 	viper.SetDefault("propagation.retry_backoff_ms", 500)
 	viper.SetDefault("propagation.reaper_interval_ms", 30000)
 	viper.SetDefault("propagation.reaper_batch_size", 500)
+	viper.SetDefault("propagation.reaper_rebroadcast_batch", 200)
 	// 0 keeps New()'s 3×reaper_interval default, so changing reaper_interval
 	// automatically moves the lease TTL unless the operator opts into a fixed value.
 	viper.SetDefault("propagation.lease_ttl_ms", 0)
