@@ -77,7 +77,7 @@ func runWithSharedStore(m *testing.M) (int, func()) {
 		sharedStoreErr = err
 		return m.Run(), func() { _ = os.RemoveAll(sharedDir) }
 	}
-	if err := s.EnsureIndexes(); err != nil {
+	if err := s.EnsureIndexes(ctx); err != nil {
 		_ = s.Close()
 		sharedStoreErr = err
 		return m.Run(), func() { _ = os.RemoveAll(sharedDir) }

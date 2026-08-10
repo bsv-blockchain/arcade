@@ -82,6 +82,10 @@ store:
 #     embedded_port: 0       # 0 = auto-pick a free port
 #     embedded_data_dir: ""  # defaults to <storage_path>/postgres
 #     embedded_cache_dir: "" # defaults to <storage_path>/postgres-cache
+#     # Ceiling for the boot-time schema apply when it actually has to run
+#     # (fresh database or schema change); restarts with a current schema
+#     # verify a stored checksum and skip DDL entirely. See issue #278.
+#     schema_apply_timeout_ms: 300000
 
 # Statically configured datahub propagation targets. Leave empty to rely
 # entirely on p2p discovery below (requires datahub_discovery: true).

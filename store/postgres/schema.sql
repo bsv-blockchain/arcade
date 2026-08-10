@@ -1,6 +1,18 @@
 -- Schema for the Postgres store backend. Applied idempotently by
 -- Store.EnsureIndexes() via pgx.Exec; safe to run repeatedly.
 
+-- Schema-identity bookkeeping (issue #278). EnsureIndexes stores a SHA-256 of
+-- this entire file after a successful apply; when the stored checksum matches
+-- the binary's, startup skips every statement below — no DDL, no ACCESS
+-- EXCLUSIVE lock requests queueing behind live traffic.
+-- Escape hatch after manual DDL drift (e.g. a hand-dropped index):
+--   DELETE FROM schema_info;  -- forces a full idempotent reapply on next start
+CREATE TABLE IF NOT EXISTS schema_info (
+    id         BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),  -- single-row table
+    checksum   TEXT NOT NULL,
+    applied_at TIMESTAMPTZ NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS transactions (
     txid                 TEXT PRIMARY KEY,
     status               TEXT NOT NULL,

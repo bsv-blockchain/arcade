@@ -322,3 +322,31 @@ func TestValidate_TelemetryRejectsSchemedEndpoint(t *testing.T) {
 		}
 	}
 }
+
+// Issue #278: the schema-apply slow path (fresh DB or schema change) runs
+// under store.postgres.schema_apply_timeout_ms. Zero means "use the built-in
+// default" so an unset YAML block can't foot-gun boot; only negatives are
+// config errors.
+func TestValidate_RejectsNegativeSchemaApplyTimeout(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.Store.Backend = "postgres"
+	cfg.Store.Postgres.Embedded = true
+	cfg.Store.Postgres.SchemaApplyTimeoutMs = -1
+	err := validate(cfg)
+	if err == nil {
+		t.Fatal("negative schema_apply_timeout_ms should be rejected")
+	}
+	if !strings.Contains(err.Error(), "schema_apply_timeout_ms") {
+		t.Errorf("error should mention schema_apply_timeout_ms, got: %v", err)
+	}
+}
+
+func TestValidate_AllowsZeroSchemaApplyTimeout(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.Store.Backend = "postgres"
+	cfg.Store.Postgres.Embedded = true
+	cfg.Store.Postgres.SchemaApplyTimeoutMs = 0
+	if err := validate(cfg); err != nil {
+		t.Fatalf("zero schema_apply_timeout_ms (= use default) should be accepted, got: %v", err)
+	}
+}

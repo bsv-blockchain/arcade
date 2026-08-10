@@ -13,7 +13,6 @@ package postgres
 
 import (
 	"context"
-	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,9 +28,6 @@ import (
 	"github.com/bsv-blockchain/arcade/store/bumpcache"
 )
 
-//go:embed schema.sql
-var schemaSQL string
-
 var (
 	_ store.Store  = (*Store)(nil)
 	_ store.Leaser = (*Store)(nil)
@@ -44,6 +40,9 @@ type Store struct {
 	// bumpCache holds parsed+indexed compound BUMPs for merkle-path
 	// enrichment — sizing, budget, and singleflight live in bumpcache.
 	bumpCache *bumpcache.Cache
+	// schemaApplyTimeout bounds EnsureIndexes' slow path; <=0 means
+	// defaultSchemaApplyTimeout. See schema.go.
+	schemaApplyTimeout time.Duration
 }
 
 // New connects to Postgres (optionally starting the embedded-postgres process
@@ -80,19 +79,12 @@ func New(ctx context.Context, cfg config.Postgres) (*Store, error) {
 		return nil, fmt.Errorf("connect postgres: %w", err)
 	}
 
-	return &Store{pool: pool, stopEmb: stopEmbedded, bumpCache: bumpcache.New()}, nil
-}
-
-// EnsureIndexes applies the schema. Safe to call repeatedly — every CREATE
-// statement in schema.sql is IF NOT EXISTS.
-func (s *Store) EnsureIndexes() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	_, err := s.pool.Exec(ctx, schemaSQL)
-	if err != nil {
-		return fmt.Errorf("apply schema: %w", err)
-	}
-	return nil
+	return &Store{
+		pool:               pool,
+		stopEmb:            stopEmbedded,
+		bumpCache:          bumpcache.New(),
+		schemaApplyTimeout: time.Duration(cfg.SchemaApplyTimeoutMs) * time.Millisecond,
+	}, nil
 }
 
 // Close drains the pool and stops the embedded Postgres process (if any).

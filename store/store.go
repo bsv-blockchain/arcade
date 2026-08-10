@@ -354,8 +354,10 @@ type Store interface {
 	// issue #145.
 	MarkMerkleRegisteredByTxIDs(ctx context.Context, txids []string, ts time.Time) error
 
-	// EnsureIndexes creates any required secondary indexes for query operations.
-	EnsureIndexes() error
+	// EnsureIndexes provisions whatever the backend needs for query operations
+	// (schema, secondary indexes). ctx bounds the whole operation; backends may
+	// layer tighter internal deadlines on top.
+	EnsureIndexes(ctx context.Context) error
 
 	// UpsertDatahubEndpoint registers (or refreshes the LastSeen of) a datahub
 	// URL. Used by p2p_client to publish discovered URLs and by main to seed

@@ -157,7 +157,7 @@ func newMockStore() *mockStore {
 	}
 }
 
-func (m *mockStore) EnsureIndexes() error { return nil }
+func (m *mockStore) EnsureIndexes(context.Context) error { return nil }
 
 func (m *mockStore) UpdateStatus(_ context.Context, status *models.TransactionStatus) error {
 	m.mu.Lock()

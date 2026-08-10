@@ -20,7 +20,7 @@ import (
 
 func integrationStore(t *testing.T) *Store {
 	t.Helper()
-	s, err := New(config.Aero{
+	s, err := New(context.Background(), config.Aero{
 		Hosts:           []string{"localhost:3200"},
 		Namespace:       "arcade",
 		BatchSize:       100,

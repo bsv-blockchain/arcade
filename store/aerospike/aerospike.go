@@ -91,7 +91,7 @@ type Store struct {
 }
 
 // New creates an Aerospike-backed Store connected to the configured cluster.
-func New(cfg config.Aero) (*Store, error) {
+func New(ctx context.Context, cfg config.Aero) (*Store, error) {
 	hosts := make([]*aero.Host, 0, len(cfg.Hosts))
 	for _, h := range cfg.Hosts {
 		hostname, portStr, err := net.SplitHostPort(h)
@@ -160,7 +160,7 @@ func New(cfg config.Aero) (*Store, error) {
 		bumpCache:     bumpcache.New(),
 	}
 
-	if err := s.EnsureIndexes(); err != nil {
+	if err := s.EnsureIndexes(ctx); err != nil {
 		client.Close()
 		return nil, fmt.Errorf("creating indexes: %w", err)
 	}
@@ -177,7 +177,7 @@ func (s *Store) Close() error {
 	return nil
 }
 
-func (s *Store) EnsureIndexes() error {
+func (s *Store) EnsureIndexes(ctx context.Context) error {
 	indexes := []struct {
 		set, bin, name string
 		indexType      aero.IndexType
@@ -213,6 +213,8 @@ func (s *Store) EnsureIndexes() error {
 			if taskErr != nil {
 				return fmt.Errorf("waiting for index %s: %w", idx.name, taskErr)
 			}
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for index %s: %w", idx.name, ctx.Err())
 		case <-time.After(30 * time.Second):
 			return fmt.Errorf("timed out waiting for index %s to build", idx.name)
 		}
