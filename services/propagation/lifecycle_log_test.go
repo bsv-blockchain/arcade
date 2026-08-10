@@ -7,12 +7,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/merkleservice"
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/teranode"
 )
 
@@ -98,6 +100,85 @@ func TestRequeueAfterDelay_LogsRequeueForRetry(t *testing.T) {
 	}
 	if got, _ := fields["txid_count"].(int64); got != 2 {
 		t.Errorf("txid_count = %d, want 2", got)
+	}
+}
+
+// TestRequeueAfterDelay_RevokedClaim_DropsImmediatelyWithoutParking pins the
+// requeueAfterDelay entry fast-path: under an already-dead ctx (claim revoked
+// or shutdown) the requeue must drop NOW — same Debug line as the in-goroutine
+// ctx.Done drop, no "transactions requeued for retry" Info (nothing is being
+// requeued), and no goroutine parked on the PropagationPendingRequeues gauge
+// for the 2s delay it could only ever abandon.
+func TestRequeueAfterDelay_RevokedClaim_DropsImmediatelyWithoutParking(t *testing.T) {
+	core, recorded := observer.New(zapcore.DebugLevel)
+	logger := zap.New(core)
+	cfg := &config.Config{}
+	tc := teranode.NewClient(nil, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
+	p := New(cfg, logger, nil, nil, newMockStore(), nil, tc, nil)
+	defer func() {
+		if p.dispatcherCancel != nil {
+			p.dispatcherCancel()
+			if p.dispatcherDone != nil {
+				<-p.dispatcherDone
+			}
+		}
+	}()
+
+	requeuesBefore := testutil.ToFloat64(metrics.PropagationPendingRequeues)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // claim already revoked when the requeue is scheduled
+
+	p.requeueAfterDelay(ctx, []propagationMsg{{TXID: "dead-1"}, {TXID: "dead-2"}})
+
+	entries := recorded.FilterMessage("requeue dropped before delay elapsed; txs left uncommitted for replay").All()
+	if len(entries) != 1 {
+		t.Fatalf("expected exactly 1 'requeue dropped' log line, got %d", len(entries))
+	}
+	if entries[0].Level != zapcore.DebugLevel {
+		t.Errorf("expected Debug level, got %v", entries[0].Level)
+	}
+	if got, _ := entries[0].ContextMap()["dropped"].(int64); got != 2 {
+		t.Errorf("dropped = %d, want 2", got)
+	}
+	if n := len(recorded.FilterMessage("transactions requeued for retry").All()); n != 0 {
+		t.Errorf("no 'transactions requeued for retry' Info may fire for a dropped requeue; got %d", n)
+	}
+	if d := testutil.ToFloat64(metrics.PropagationPendingRequeues) - requeuesBefore; d != 0 {
+		t.Errorf("no goroutine may park on the pending-requeues gauge; delta = %v", d)
+	}
+}
+
+// TestRegisterBatch_ClaimRevoked_SuppressesPartialFailureWarn: when every
+// registration "failure" in a batch is a context cancellation (claim revoked),
+// the "merkle-service /watch partial/all failure; requeueing failed subset"
+// WARN must not fire — nothing is requeued (processBatch aborts at its
+// post-register checkpoint) and the single "claim revoked mid-batch" Info
+// already covers the event. Pre-fix a rebalance emitted this WARN claiming a
+// 39k-tx requeue that never happened.
+func TestRegisterBatch_ClaimRevoked_SuppressesPartialFailureWarn(t *testing.T) {
+	merkleSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer merkleSrv.Close()
+
+	core, recorded := observer.New(zapcore.WarnLevel)
+	logger := zap.New(core)
+
+	cfg := &config.Config{CallbackURL: "http://arcade/cb", CallbackToken: "tok"}
+	cfg.Propagation.MerkleConcurrency = 4
+	mc := merkleservice.NewClient(merkleSrv.URL, "", 5*time.Second)
+	p := New(cfg, logger, nil, nil, newMockStore(), nil, nil, mc)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, failed := p.registerBatch(ctx, []propagationMsg{{TXID: "w1"}, {TXID: "w2"}})
+	if len(failed) != 2 {
+		t.Fatalf("expected both txs in the failed subset, got %d", len(failed))
+	}
+	if n := len(recorded.FilterMessage("merkle-service /watch partial/all failure; requeueing failed subset").All()); n != 0 {
+		t.Errorf("partial-failure WARN must be suppressed for cancellation-only failures; got %d", n)
 	}
 }
 

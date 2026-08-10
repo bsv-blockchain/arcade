@@ -9,9 +9,15 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
+	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/teranode"
 )
 
 // TestReapOnce_RebroadcastsStaleReceived is the issue #83 / F-025 regression:
@@ -319,5 +325,77 @@ func TestReapOnce_CensusUncappedByRebroadcastBatch(t *testing.T) {
 	}
 	if got := log.count("register:"); got != reaperRebroadcastBatch {
 		t.Errorf("rebroadcast count = %d, want %d (batch cap unchanged)", got, reaperRebroadcastBatch)
+	}
+}
+
+// TestReapOnce_LogsBacklogDepth pins the per-tick backlog snapshot line (the
+// 2026-08-10 load-test gap: a ~466k-tx uncommitted-offset backlog was
+// invisible in logs because the pending gauge is capped at max_pending and
+// the in-flight set was ungauged). reapOnce must emit exactly one Info line
+// per tick carrying the dispatcher's pending depth, its uncapped in-flight
+// depth, and this scan's reaper-ready depth.
+func TestReapOnce_LogsBacklogDepth(t *testing.T) {
+	now := time.Now()
+	stale := now.Add(-2 * time.Hour)
+
+	httpLog := &eventLog{}
+	ms := newMockStore()
+	ms.replayRows = []*models.TransactionStatus{
+		{TxID: "reap-ready", Status: models.StatusReceived, RawTx: []byte{0x01}, Timestamp: stale},
+	}
+
+	merkleSrv := newMerkleServer(httpLog, http.StatusOK)
+	defer merkleSrv.Close()
+	teranodeSrv := newTeranodeServer(httpLog, http.StatusOK)
+	defer teranodeSrv.Close()
+
+	core, recorded := observer.New(zapcore.InfoLevel)
+	cfg := &config.Config{CallbackURL: "http://localhost:8080/callback"}
+	cfg.Propagation.MerkleConcurrency = 10
+	mc := merkleservice.NewClient(merkleSrv.URL, "", 5*time.Second)
+	tc := teranode.NewClient([]string{teranodeSrv.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
+	p := New(cfg, zap.New(core), nil, nil, ms, nil, tc, mc)
+
+	// Seed dispatcher state: two admitted txs, the first drained into a
+	// "mid-broadcast" batch — in-flight counts both, pending only the second.
+	if res := p.admitToDispatcher(propagationMsg{TXID: "inflight-a", RawTx: []byte{0x0a}}, 1); !res.admitted {
+		t.Fatalf("admit inflight-a: %+v", res)
+	}
+	_ = p.drainPending()
+	if res := p.admitToDispatcher(propagationMsg{TXID: "inflight-b", RawTx: []byte{0x0b}}, 2); !res.admitted {
+		t.Fatalf("admit inflight-b: %+v", res)
+	}
+
+	// The dispatcher publishes the depth mirrors at the top of its next
+	// loop iteration — poll briefly rather than assuming scheduling order.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if p.inflightDepth.Load() == 2 && p.pendingDepth.Load() == 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := p.inflightDepth.Load(); got != 2 {
+		t.Fatalf("inflightDepth mirror = %d, want 2 (admitted a + b, neither terminal)", got)
+	}
+	if got := testutil.ToFloat64(metrics.PropagationInflightDepth); got != 2 {
+		t.Fatalf("PropagationInflightDepth gauge = %v, want 2", got)
+	}
+
+	p.reapOnce(context.Background())
+
+	entries := recorded.FilterMessage("reaper: propagation backlog depth").All()
+	if len(entries) != 1 {
+		t.Fatalf("expected exactly 1 backlog-depth line per tick, got %d", len(entries))
+	}
+	fields := entries[0].ContextMap()
+	if got, _ := fields["pending_depth"].(int64); got != 1 {
+		t.Errorf("pending_depth = %d, want 1", got)
+	}
+	if got, _ := fields["inflight_depth"].(int64); got != 2 {
+		t.Errorf("inflight_depth = %d, want 2", got)
+	}
+	if got, _ := fields["reaper_ready_depth"].(int64); got != 1 {
+		t.Errorf("reaper_ready_depth = %d, want 1 (the stale RECEIVED row)", got)
 	}
 }
