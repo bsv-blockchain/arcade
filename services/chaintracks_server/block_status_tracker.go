@@ -156,38 +156,49 @@ func (t *blockStatusTracker) scanRecentActive(ctx context.Context, tipHeight uin
 	if uint64(tipHeight) > uint64(t.scanDepth) {
 		minHeight = uint64(tipHeight) - uint64(t.scanDepth)
 	}
-	// The list is height-DESC; a window of depth heights can hold a few
-	// competitors per height, so over-fetch generously and filter. The
-	// height-0 placeholder rows MarkBlockProcessed creates before any
-	// header arrives are excluded by the height filter.
-	rows, err := t.store.ListBlockProcessingStatus(ctx, 0, t.scanDepth*4)
-	if err != nil {
-		t.logger.Warn("tie-scan: failed to list block_processing rows", zap.Error(err))
-		return
-	}
-
-	var orphaned []string
-	for _, row := range rows {
+	// Walk EVERY row down to minHeight via the boundary-safe pager — a
+	// fixed-size sample could miss active rows when competitors or churn
+	// crowd the top of the height-DESC listing, and a naive height cursor
+	// would skip same-height rows straddling a page boundary (the exact
+	// rows this scan exists to find). The pager may visit a boundary row
+	// twice, so mismatches collect into a set. The height-0 placeholder
+	// rows MarkBlockProcessed creates before any header arrives are
+	// excluded by the height filter.
+	orphanedSet := make(map[string]struct{})
+	err := store.ForEachBlockProcessing(ctx, t.store, minHeight, t.scanDepth*4, func(row *models.BlockProcessingStatus) error {
 		if row.Status != models.BlockStatusActive ||
 			row.BlockHeight < minHeight ||
 			row.BlockHeight > uint64(tipHeight) ||
 			row.BlockHeight > math.MaxUint32 {
-			continue
+			return nil
 		}
-		active, err := t.ct.GetHeaderByHeight(ctx, uint32(row.BlockHeight))
-		if err != nil || active == nil {
-			continue // cannot judge: never orphan on absence of evidence
+		if _, seen := orphanedSet[row.BlockHash]; seen {
+			return nil
+		}
+		active, hdrErr := t.ct.GetHeaderByHeight(ctx, uint32(row.BlockHeight))
+		if hdrErr != nil || active == nil {
+			return nil //nolint:nilerr // fail-open by contract: never orphan on absence of evidence
 		}
 		if active.Hash.String() != row.BlockHash {
-			orphaned = append(orphaned, row.BlockHash)
+			orphanedSet[row.BlockHash] = struct{}{}
 			t.logger.Warn("tie-scan: active row lost its height to a competitor",
 				logfields.BlockHash(row.BlockHash),
 				logfields.BlockHeight(row.BlockHeight),
 				zap.String("active_block_hash", active.Hash.String()))
 		}
+		return nil
+	})
+	if err != nil {
+		t.logger.Warn("tie-scan: incomplete", zap.Error(err))
+		// Fall through: whatever was found still gets marked; the next tip
+		// re-runs the scan and the reconciler full-scan is the backstop.
 	}
-	if len(orphaned) == 0 {
+	if len(orphanedSet) == 0 {
 		return
+	}
+	orphaned := make([]string, 0, len(orphanedSet))
+	for hash := range orphanedSet {
+		orphaned = append(orphaned, hash)
 	}
 	if err := t.store.MarkBlocksOrphaned(ctx, orphaned, time.Now()); err != nil {
 		t.logger.Warn("tie-scan: failed to mark blocks orphaned",

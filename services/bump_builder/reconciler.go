@@ -195,40 +195,36 @@ func (r *Reconciler) tick(ctx context.Context) {
 // by the normal tick.
 func (r *Reconciler) fullScan(ctx context.Context) {
 	const page = 1000
-	var before uint64
-	var marked []string
-	for {
-		if ctx.Err() != nil {
+	// A set, not a slice: the boundary-safe pager may visit a row more than
+	// once at page boundaries (see store.ForEachBlockProcessing).
+	markedSet := make(map[string]struct{})
+	err := store.ForEachBlockProcessing(ctx, r.store, 0, page, func(row *models.BlockProcessingStatus) error {
+		if row.Status != models.BlockStatusActive || row.BlockHeight == 0 || row.BlockHeight > math.MaxUint32 {
+			return nil
+		}
+		active, hdrErr := r.chainHeader.GetHeaderByHeight(ctx, uint32(row.BlockHeight))
+		if hdrErr != nil || active == nil {
+			return nil //nolint:nilerr // fail-open by contract: never orphan on absence of evidence
+		}
+		if active.Hash.String() != row.BlockHash {
+			markedSet[row.BlockHash] = struct{}{}
+		}
+		return nil
+	})
+	if err != nil {
+		r.logger.Warn("startup full-scan: incomplete", zap.Error(err))
+		if len(markedSet) == 0 {
 			return
 		}
-		rows, err := r.store.ListBlockProcessingStatus(ctx, before, page)
-		if err != nil {
-			r.logger.Warn("startup full-scan: list failed", zap.Error(err))
-			return
-		}
-		if len(rows) == 0 {
-			break
-		}
-		for _, row := range rows {
-			if row.Status != models.BlockStatusActive || row.BlockHeight == 0 || row.BlockHeight > math.MaxUint32 {
-				continue
-			}
-			active, err := r.chainHeader.GetHeaderByHeight(ctx, uint32(row.BlockHeight))
-			if err != nil || active == nil {
-				continue
-			}
-			if active.Hash.String() != row.BlockHash {
-				marked = append(marked, row.BlockHash)
-			}
-		}
-		before = rows[len(rows)-1].BlockHeight
-		if len(rows) < page || before == 0 {
-			break
-		}
+		// Whatever was found before the failure still routes into healing.
 	}
-	if len(marked) == 0 {
+	if len(markedSet) == 0 {
 		r.logger.Info("startup full-scan: no stale anchors found")
 		return
+	}
+	marked := make([]string, 0, len(markedSet))
+	for hash := range markedSet {
+		marked = append(marked, hash)
 	}
 	if err := r.store.MarkBlocksOrphaned(ctx, marked, r.now()); err != nil {
 		r.logger.Warn("startup full-scan: failed to mark orphaned", zap.Error(err))

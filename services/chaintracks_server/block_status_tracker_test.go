@@ -2,6 +2,7 @@ package chaintracks_server
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -26,10 +27,25 @@ type trackerStore struct {
 	orphaned [][]string
 }
 
-func (s *trackerStore) ListBlockProcessingStatus(_ context.Context, _ uint64, _ int) ([]*models.BlockProcessingStatus, error) {
+func (s *trackerStore) ListBlockProcessingStatus(_ context.Context, beforeHeight uint64, limit int) ([]*models.BlockProcessingStatus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]*models.BlockProcessingStatus(nil), s.rows...), nil
+	// Honor the real keyset contract (height DESC, block_height < before,
+	// limit) — the tie-scan pages via store.ForEachBlockProcessing, which
+	// depends on it for termination.
+	sorted := append([]*models.BlockProcessingStatus(nil), s.rows...)
+	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].BlockHeight > sorted[j].BlockHeight })
+	var out []*models.BlockProcessingStatus
+	for _, row := range sorted {
+		if beforeHeight > 0 && row.BlockHeight >= beforeHeight {
+			continue
+		}
+		out = append(out, row)
+		if len(out) == limit {
+			break
+		}
+	}
+	return out, nil
 }
 
 func (s *trackerStore) MarkBlocksOrphaned(_ context.Context, hashes []string, _ time.Time) error {
