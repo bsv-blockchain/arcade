@@ -114,7 +114,7 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		_ = producer.Close()
 		return nil, nil, fmt.Errorf("creating store: %w", err)
 	}
-	if idxErr := st.EnsureIndexes(); idxErr != nil {
+	if idxErr := st.EnsureIndexes(ctx); idxErr != nil {
 		_ = st.Close()
 		_ = producer.Close()
 		return nil, nil, fmt.Errorf("ensuring store indexes: %w", idxErr)

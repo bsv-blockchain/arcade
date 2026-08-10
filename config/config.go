@@ -256,6 +256,11 @@ type Postgres struct {
 	EmbeddedDataDir  string `mapstructure:"embedded_data_dir"`
 	EmbeddedCacheDir string `mapstructure:"embedded_cache_dir"`
 	MaxConns         int32  `mapstructure:"max_conns"`
+	// SchemaApplyTimeoutMs bounds the slow path of EnsureIndexes (schema apply
+	// on a fresh DB or after a schema change). The checksum fast path makes
+	// normal restarts skip DDL entirely, so this can be generous. 0 = default
+	// (5 minutes). See issue #278.
+	SchemaApplyTimeoutMs int `mapstructure:"schema_apply_timeout_ms"`
 }
 
 // Pebble configures the embedded Pebble KV backend. Path is the data directory
@@ -859,6 +864,7 @@ func setDefaults() {
 	viper.SetDefault("store.postgres.embedded_data_dir", "~/.arcade/postgres")
 	viper.SetDefault("store.postgres.embedded_cache_dir", "~/.arcade/postgres-cache")
 	viper.SetDefault("store.postgres.max_conns", 16)
+	viper.SetDefault("store.postgres.schema_apply_timeout_ms", 300000)
 	viper.SetDefault("health.port", 8081)
 
 	// OTEL telemetry export: off by default. See TelemetryConfig doc comment
@@ -1027,6 +1033,9 @@ func validate(cfg *Config) error {
 	case "postgres":
 		if !cfg.Store.Postgres.Embedded && cfg.Store.Postgres.DSN == "" {
 			return fmt.Errorf("store.postgres.dsn is required when store.backend=postgres and postgres.embedded=false")
+		}
+		if cfg.Store.Postgres.SchemaApplyTimeoutMs < 0 {
+			return fmt.Errorf("store.postgres.schema_apply_timeout_ms must be >= 0 (0 = default)")
 		}
 	default:
 		return fmt.Errorf("unknown store.backend %q (expected aerospike, pebble, or postgres)", cfg.Store.Backend)
