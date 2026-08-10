@@ -927,7 +927,7 @@ func parseTxsFailures(body []byte, logger *zap.Logger) map[string]string {
 		// competing spender), so the CALLER must verify each key actually
 		// names a submitted tx before trusting the map's "absent ⇒ accepted"
 		// contract (see broadcastBatchToEndpoints).
-		txid := ""
+		var txid string
 		if m := txsWrappedTxidPattern.FindStringSubmatch(line); m != nil {
 			txid = m[1]
 		} else {
