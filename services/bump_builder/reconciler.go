@@ -32,6 +32,14 @@ const ReconcilerLeaseName = "anchor-reconciler"
 // re-orphaning a long chain's entire history oldest-first (issue #282).
 const defaultFullScanDepth = 144
 
+// defaultFullScanChaintracksReadyTimeout bounds the initial wait for the
+// chain-header source to sync up to the store's active tip before the startup
+// full-scan runs, when Reconciler.FullScanChaintracksReadyTimeoutMs is unset.
+// The embedded chaintracks resyncs from genesis on every deploy; two minutes
+// covers a typical catch-up while never blocking startup indefinitely — a
+// slower resync self-heals through the tick loop instead.
+const defaultFullScanChaintracksReadyTimeout = 2 * time.Minute
+
 // Reconciler heals the transactions of orphaned blocks (issue #279): for
 // every block_processing row with status='orphaned' and no reconciled_at,
 // it re-anchors the txs still MINED against the orphan to the active-chain
@@ -65,6 +73,15 @@ type Reconciler struct {
 	// the worst case is a bounded number of duplicate /reprocess calls —
 	// the same trade-off the watchdog makes with its attempt state.
 	defers map[string]int
+
+	// startupScanDone flips true only after a startup full-scan that ran while
+	// the chain-header source was synced to the store's active tip. Until then
+	// the tick loop keeps re-attempting it (lease-gated) so the deep backstop
+	// eventually runs once even if chaintracks was mid-resync at process start
+	// and the initial readiness wait timed out. In-memory by design: a restart
+	// re-arms the one-shot, which is idempotent (fullScan only marks, and marks
+	// are convergent).
+	startupScanDone bool
 
 	now    func() time.Time
 	cancel context.CancelFunc
@@ -113,7 +130,11 @@ func NewReconciler(
 func (r *Reconciler) Name() string { return "anchor-reconciler" }
 
 // Start runs the reconcile loop until ctx is canceled. The optional startup
-// full-scan runs once (lease-gated) before the first tick.
+// full-scan runs once (lease-gated), but only after the chain-header source
+// has synced up to the store's active tip — see waitForChaintracksReady. If it
+// is still catching up when the bounded wait elapses, the scan is deferred to a
+// later tick rather than run against a header source that would fail open on
+// every row (issue #279 follow-up).
 func (r *Reconciler) Start(ctx context.Context) error {
 	ctx, r.cancel = context.WithCancel(ctx)
 	defer close(r.done)
@@ -124,7 +145,14 @@ func (r *Reconciler) Start(ctx context.Context) error {
 	}
 
 	if r.cfg.BumpBuilder.Reconciler.StartupFullScan && r.acquireLease(ctx) {
-		r.fullScan(ctx)
+		if r.waitForChaintracksReady(ctx) {
+			r.fullScan(ctx)
+			r.startupScanDone = true
+		} else {
+			r.logger.Warn("startup full-scan: chain-header source not ready within timeout; "+
+				"deferring to a later tick (self-heals once chaintracks catches up to the active tip)",
+				zap.Int("timeout_ms", r.cfg.BumpBuilder.Reconciler.FullScanChaintracksReadyTimeoutMs))
+		}
 	}
 	r.tick(ctx)
 
@@ -177,6 +205,17 @@ func (r *Reconciler) acquireLease(ctx context.Context) bool {
 func (r *Reconciler) tick(ctx context.Context) {
 	if ctx.Err() != nil || !r.acquireLease(ctx) {
 		return
+	}
+	// Self-heal the startup full-scan: if it was deferred because the embedded
+	// chaintracks was still resyncing from genesis at process start (its
+	// storage is ephemeral, so every deploy wipes headers), run it now that the
+	// lease is held and chaintracks has caught up to the active tip. Guarded by
+	// startupScanDone so it runs at most once successfully; short-circuits
+	// before the readiness probe once done or when the scan is disabled, so
+	// steady-state ticks pay nothing.
+	if r.cfg.BumpBuilder.Reconciler.StartupFullScan && !r.startupScanDone && r.chaintracksReady(ctx) {
+		r.fullScan(ctx)
+		r.startupScanDone = true
 	}
 	blocksPerTick := r.cfg.BumpBuilder.Reconciler.BlocksPerTick
 	if blocksPerTick <= 0 {
@@ -284,6 +323,86 @@ func (r *Reconciler) fullScanBounds(ctx context.Context) (minHeight, maxHeight u
 		return 0, 0, "unbounded"
 	}
 	return tip - uint64(depth), 0, "horizon"
+}
+
+// chaintracksReady reports whether the chain-header source has caught up to the
+// store's active tip — the precondition for a MEANINGFUL startup full-scan. In
+// the bump-builder deployment r.chainHeader is an embedded chaintracks with
+// ephemeral storage that resyncs from genesis on every deploy; until it reaches
+// the tip, GetHeaderByHeight returns nil for every height and the scan would
+// fail open on every row (marking nothing) — silently breaking reorg recovery.
+//
+// Readiness is TRIVIALLY satisfied when the active tip is unknown/zero (nothing
+// to compare against — preserves the pre-gate behavior on an empty table) or
+// when the tip lookup fails (the scan itself still fails open per-row, so a
+// store hiccup never blocks it forever). Otherwise chaintracks is ready exactly
+// when it can return a non-nil, non-error header at the tip height.
+func (r *Reconciler) chaintracksReady(ctx context.Context) bool {
+	tip, err := r.store.GetActiveTipBlockHeight(ctx)
+	if err != nil {
+		// A canceled/expired context is shutdown, not evidence — report
+		// not-ready so a cancellation mid-wait never masquerades as "ready"
+		// and triggers a scan on the way down. A genuine store error still
+		// fails open (treat as ready; the scan itself fails open per-row).
+		if ctx.Err() != nil {
+			return false
+		}
+		r.logger.Warn("chaintracks readiness: active-tip lookup failed; treating as ready", zap.Error(err))
+		return true
+	}
+	if tip == 0 || tip > math.MaxUint32 {
+		return true
+	}
+	hdr, err := r.chainHeader.GetHeaderByHeight(ctx, uint32(tip))
+	return err == nil && hdr != nil
+}
+
+// waitForChaintracksReady blocks — with bounded exponential backoff — until
+// chaintracksReady reports true or the configured timeout elapses, whichever
+// comes first. Returns true if chaintracks became ready, false on timeout or
+// context cancellation. It NEVER blocks indefinitely: a false return is the
+// caller's signal to defer the startup scan to the tick-loop self-heal rather
+// than run it against a not-yet-synced header source.
+func (r *Reconciler) waitForChaintracksReady(ctx context.Context) bool {
+	timeout := time.Duration(r.cfg.BumpBuilder.Reconciler.FullScanChaintracksReadyTimeoutMs) * time.Millisecond
+	if timeout <= 0 {
+		timeout = defaultFullScanChaintracksReadyTimeout
+	}
+	const (
+		initialBackoff = 250 * time.Millisecond
+		maxBackoff     = 5 * time.Second
+	)
+	deadline := time.Now().Add(timeout)
+	backoff := initialBackoff
+	for {
+		if ctx.Err() != nil {
+			return false
+		}
+		if r.chaintracksReady(ctx) {
+			return true
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false
+		}
+		wait := backoff
+		if wait > remaining {
+			wait = remaining
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false
+		case <-timer.C:
+		}
+		if backoff < maxBackoff {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
 }
 
 // reconcileBlock heals one orphaned block O and returns the metric outcome.

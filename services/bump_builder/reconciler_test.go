@@ -456,3 +456,144 @@ func TestReconciler_FullScanRespectsHorizon(t *testing.T) {
 		t.Fatalf("targeted scan must mark height 10 orphaned, got %+v err=%v", rows, err)
 	}
 }
+
+// TestReconciler_StartupScanDeferredUntilChaintracksReady pins the fix: the
+// startup full-scan must not run while the embedded chaintracks is still
+// resyncing from genesis (every GetHeaderByHeight returns nil), because it
+// would fail open on every row and heal nothing. It must instead self-heal on
+// a later tick once chaintracks catches up to the active tip — and run at most
+// once (startupScanDone). Covers (a) unready ⇒ marks nothing, (b) ready ⇒
+// scans + reconciles, (d) one-shot idempotency.
+func TestReconciler_StartupScanDeferredUntilChaintracksReady(t *testing.T) {
+	ctx := context.Background()
+	st := newPebbleForTest(t)
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	stub.setUnready()                                             // resyncing from genesis
+	stub.setHeightHeader(10, headerWithHash(t, recCanonical, 10)) // the real header, revealed once ready
+
+	// Same shape as the plain full-scan test: a stale 'active' row at height 10
+	// whose canonical competitor holds the height, canonical BUMP stored so the
+	// heal can re-anchor. Both rows active ⇒ active tip is 10.
+	seedMined(t, st, recOrphan, 10, recShared1)
+	_ = st.InsertBUMP(ctx, recCanonical, 10, makeCompoundForTest(t, 10, recShared1))
+	_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+	_ = st.UpsertBlockHeaderSeen(ctx, recCanonical, 10, time.Now())
+
+	r := newTestReconciler(st, pub, stub, func(c *config.ReconcilerConfig) {
+		c.StartupFullScan = true
+		c.FullScanChaintracksReadyTimeoutMs = 50
+	})
+
+	// (a) While chaintracks is unready the startup scan marks nothing.
+	r.tick(ctx)
+	if got := statusOf(t, st, recShared1); got.BlockHash != recOrphan {
+		t.Fatalf("unready: stale anchor must be untouched, got %s@%s", got.Status, got.BlockHash)
+	}
+	if rows, _ := st.ListOrphanedBlocksToReconcile(ctx, 10); len(rows) != 0 {
+		t.Fatalf("unready: nothing may be orphaned, got %d queued", len(rows))
+	}
+	if r.startupScanDone {
+		t.Fatal("unready: startupScanDone must stay false")
+	}
+
+	// (b) Once chaintracks catches up, a later tick runs the deferred scan
+	// (marking the off-chain block) and the same tick reconciles it as usual.
+	stub.setReady()
+	r.tick(ctx)
+	if got := statusOf(t, st, recShared1); got.Status != models.StatusMined || got.BlockHash != recCanonical {
+		t.Fatalf("ready: stale anchor must heal to canonical, got %s@%s", got.Status, got.BlockHash)
+	}
+	if !r.startupScanDone {
+		t.Fatal("ready: startupScanDone must be set after a successful scan")
+	}
+	if len(pub.bulkEvents()) == 0 {
+		t.Fatal("ready: expected corrected events from the heal")
+	}
+
+	// (d) One-shot: a NEW stale row introduced afterwards is NOT swept, because
+	// the startup full-scan does not re-run once startupScanDone is set.
+	_ = st.UpsertBlockHeaderSeen(ctx, recNeighbor, 11, time.Now())
+	stub.setHeightHeader(11, headerWithHash(t, recCanonical, 11)) // height 11 held by a DIFFERENT block
+	r.tick(ctx)
+	if bp, err := st.GetBlockProcessingStatus(ctx, recNeighbor); err != nil || bp.Status != models.BlockStatusActive {
+		t.Fatalf("one-shot: post-scan stale row must stay active (scan must not re-run), got %+v err=%v", bp, err)
+	}
+	if !r.startupScanDone {
+		t.Fatal("one-shot: startupScanDone must remain true")
+	}
+}
+
+// TestReconciler_StartupScanReadinessWaitIsBounded covers (c): with chaintracks
+// never becoming ready the readiness wait returns false without hanging, ctx
+// cancellation aborts it, Start logs the timeout path and enters its loop
+// without blocking or marking anything, and the deferred scan still self-heals
+// once chaintracks finally catches up.
+func TestReconciler_StartupScanReadinessWaitIsBounded(t *testing.T) {
+	ctx := context.Background()
+	st := newPebbleForTest(t)
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	stub.setUnready() // never becomes ready during the wait phase
+
+	// Active tip at 10 so readiness is a real comparison (unready ⇒ nil header).
+	seedMined(t, st, recOrphan, 10, recShared1)
+	_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+	stub.setHeightHeader(10, headerWithHash(t, recCanonical, 10))
+
+	r := newTestReconciler(st, pub, stub, func(c *config.ReconcilerConfig) {
+		c.StartupFullScan = true
+		c.FullScanChaintracksReadyTimeoutMs = 100
+	})
+
+	// The wait is bounded: never-ready ⇒ false, and it does not hang.
+	start := time.Now()
+	if r.waitForChaintracksReady(ctx) {
+		t.Fatal("wait must report not-ready when chaintracks never syncs")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("readiness wait must be bounded, took %s", elapsed)
+	}
+
+	// ctx cancellation short-circuits the wait.
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	if r.waitForChaintracksReady(cctx) {
+		t.Fatal("canceled ctx must abort the wait as not-ready")
+	}
+
+	// A timed-out initial wait is NOT fatal: Start logs and enters its loop
+	// without hanging, and marks nothing while chaintracks stays unready.
+	runCtx, runCancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- r.Start(runCtx) }()
+	time.Sleep(300 * time.Millisecond) // well past the 100ms readiness timeout
+	runCancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Start returned error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not return after ctx cancel — the readiness wait hung")
+	}
+	if r.startupScanDone {
+		t.Fatal("scan must not have run while chaintracks stayed unready")
+	}
+	if rows, _ := st.ListOrphanedBlocksToReconcile(ctx, 10); len(rows) != 0 {
+		t.Fatalf("nothing may be orphaned while unready, got %d queued", len(rows))
+	}
+
+	// Self-heal: once chaintracks catches up a later tick runs the deferred
+	// scan exactly once and heals.
+	_ = st.InsertBUMP(ctx, recCanonical, 10, makeCompoundForTest(t, 10, recShared1))
+	_ = st.UpsertBlockHeaderSeen(ctx, recCanonical, 10, time.Now())
+	stub.setReady()
+	r.tick(ctx)
+	if !r.startupScanDone {
+		t.Fatal("self-heal: startupScanDone must be set once the deferred scan runs")
+	}
+	if got := statusOf(t, st, recShared1); got.Status != models.StatusMined || got.BlockHash != recCanonical {
+		t.Fatalf("self-heal: deferred scan must eventually heal, got %s@%s", got.Status, got.BlockHash)
+	}
+}
