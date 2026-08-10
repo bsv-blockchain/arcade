@@ -419,11 +419,25 @@ func setMinedAndPublish(
 		if end > len(publishTxIDs) {
 			end = len(publishTxIDs)
 		}
+		// Stamp the event with the STORE's MINED transition timestamp (mined
+		// is parallel to minedTxIDs, and every row of one SetMinedByTxIDs call
+		// shares it), not a fresh time.Now(). The SSE event id is this
+		// timestamp, and SSE catchup (Last-Event-ID reconnect and mid-stream
+		// drop recovery) queries the store strictly-after timestamp_at — a
+		// publish-time stamp sits seconds AFTER timestamp_at for a big block
+		// (the 40k-row UPDATE + chunked logging run in between), so a client
+		// resuming from a live event id would silently skip the whole block's
+		// rows. Keeping the id in the timestamp_at domain makes the resume
+		// watermark exact.
+		ts := mined[start].Timestamp
+		if ts.IsZero() {
+			ts = time.Now()
+		}
 		template := &models.TransactionStatus{
 			Status:      models.StatusMined,
 			BlockHash:   blockHash,
 			BlockHeight: blockHeight,
-			Timestamp:   time.Now(),
+			Timestamp:   ts,
 			TxIDs:       publishTxIDs[start:end],
 			ExtraInfo:   extraInfo,
 		}
