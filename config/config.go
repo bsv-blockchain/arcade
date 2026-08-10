@@ -574,6 +574,19 @@ type ReconcilerConfig struct {
 	// true restores the pre-#282 revert-all-to-SEEN_ON_NETWORK fallback as an
 	// opt-in.
 	RevertWhenUnreconcilable bool `mapstructure:"revert_when_unreconcilable"`
+	// FullScanChaintracksReadyTimeoutMs bounds how long Start waits, before the
+	// FIRST startup full-scan attempt, for the chain-header source to sync up
+	// to the store's active tip. The bump-builder pod runs an EMBEDDED
+	// chaintracks with ephemeral storage, so every deploy wipes its headers and
+	// it resyncs from genesis (height 0); a scan fired before it catches up
+	// sees GetHeaderByHeight return nil for every height, fails open on every
+	// row, and heals nothing — silently breaking reorg recovery in exactly the
+	// window it is needed (right after a deploy). The wait uses bounded backoff
+	// and respects context cancellation. On timeout the scan is NOT abandoned:
+	// it re-runs on a later tick once chaintracks is ready (self-healing across
+	// the resync), so a slow catch-up is never fatal. Default 120000 (2 min);
+	// <= 0 selects the default.
+	FullScanChaintracksReadyTimeoutMs int `mapstructure:"full_scan_chaintracks_ready_timeout_ms"`
 }
 
 // WatchdogConfig tunes the stale-block recovery watchdog. Defaults are
@@ -1006,6 +1019,7 @@ func setDefaults() {
 	viper.SetDefault("bump_builder.reconciler.full_scan_min_height", 0)
 	viper.SetDefault("bump_builder.reconciler.full_scan_max_height", 0)
 	viper.SetDefault("bump_builder.reconciler.revert_when_unreconcilable", false)
+	viper.SetDefault("bump_builder.reconciler.full_scan_chaintracks_ready_timeout_ms", 120000)
 	// Block-processing watchdog (standalone arcade service — mode=watchdog
 	// in production, in-process under mode=all): on by default. The runtime
 	// nil-guards the merkle-service client; an unconfigured deployment

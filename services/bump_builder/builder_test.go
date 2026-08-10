@@ -1611,6 +1611,11 @@ type stubChaintracks struct {
 	byHeight map[uint32]*chaintrackslib.BlockHeader
 	err      error
 	lookups  int
+	// unready simulates an embedded chaintracks still resyncing from genesis:
+	// every GetHeaderByHeight returns (nil, nil) regardless of what is set,
+	// exactly as the real one does before it reaches the tip. Toggle with
+	// setUnready/setReady. Default false ⇒ existing tests are unaffected.
+	unready bool
 }
 
 func (s *stubChaintracks) GetHeaderByHash(_ context.Context, h *chainhash.Hash) (*chaintrackslib.BlockHeader, error) {
@@ -1631,7 +1636,22 @@ func (s *stubChaintracks) GetHeaderByHeight(_ context.Context, height uint32) (*
 	if s.err != nil {
 		return nil, s.err
 	}
+	if s.unready {
+		return nil, nil //nolint:nilnil // (nil,nil) is the ChainHeaderReader "cannot judge this height" contract
+	}
 	return s.byHeight[height], nil
+}
+
+func (s *stubChaintracks) setUnready() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.unready = true
+}
+
+func (s *stubChaintracks) setReady() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.unready = false
 }
 
 func (s *stubChaintracks) setHeightHeader(height uint32, header *chaintrackslib.BlockHeader) {
