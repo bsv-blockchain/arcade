@@ -394,6 +394,12 @@ func (r *Reconciler) reanchorNeighborhood(ctx context.Context, logger *zap.Logge
 	if len(affected) == 0 {
 		return 0
 	}
+	// A placeholder orphan row with no resolvable height (height==0) has no
+	// meaningful neighborhood above it — walking heights 1..depth is
+	// nonsensical. Skip straight to the caller's revert.
+	if height == 0 {
+		return 0
+	}
 	depth := r.cfg.BumpBuilder.Reconciler.NeighborhoodDepth
 	if depth < 0 {
 		depth = 0

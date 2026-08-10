@@ -629,7 +629,10 @@ func (s *Store) SetStatusByBlockHash(ctx context.Context, blockHash string, newS
 		return nil, fmt.Errorf("query by block hash: %w", err)
 	}
 
-	var candidates []string
+	var (
+		candidates []string
+		loopErr    error
+	)
 loop:
 	for {
 		select {
@@ -640,12 +643,18 @@ loop:
 				break loop
 			}
 			if rec.Err != nil {
-				continue
+				// A partial affected set would silently under-reconcile —
+				// surface the error instead of skipping the record.
+				loopErr = rec.Err
+				break loop
 			}
 			if txid := getString(rec.Record, "txid"); txid != "" {
 				candidates = append(candidates, txid)
 			}
 		}
+	}
+	if loopErr != nil {
+		return nil, loopErr
 	}
 
 	clearBlock := newStatus == models.StatusSeenOnNetwork

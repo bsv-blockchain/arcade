@@ -1334,6 +1334,7 @@ func (s *Store) MarkBlockProcessed(ctx context.Context, blockHash string, blockH
 		cur.BUMPBuiltUnixNs = prev.BUMPBuiltUnixNs
 		cur.Status = prev.Status
 		cur.OrphanedAtUnixNs = prev.OrphanedAtUnixNs
+		cur.ReconciledAtUnixNs = prev.ReconciledAtUnixNs
 	} else {
 		// Row didn't exist — synthesize header_seen_at = processedAt for
 		// observability. The next UpsertBlockHeaderSeen will preserve it.
@@ -1366,6 +1367,7 @@ func (s *Store) MarkBlockBUMPBuilt(ctx context.Context, blockHash string, blockH
 		cur.ProcessedUnixNs = prev.ProcessedUnixNs
 		cur.Status = prev.Status
 		cur.OrphanedAtUnixNs = prev.OrphanedAtUnixNs
+		cur.ReconciledAtUnixNs = prev.ReconciledAtUnixNs
 	} else {
 		cur.HeaderSeenUnixNs = builtAt.UnixNano()
 	}
