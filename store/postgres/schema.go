@@ -117,6 +117,12 @@ func schemaCurrent(ctx context.Context, q rowQuerier) bool {
 // applySchemaSerialized pins one connection, serializes on the advisory lock
 // so only one replica runs DDL at a time, and retries bounded-lock-wait
 // apply attempts until ctx expires.
+//
+// The advisory lock, the apply transaction, and the unlock must all observe
+// the same server session — a transaction-pooling proxy (e.g. pgbouncer in
+// transaction mode) between arcade and Postgres would scatter them across
+// sessions and leak the lock; point the DSN at Postgres (or a session-mode
+// pooler) instead.
 func (s *Store) applySchemaSerialized(ctx context.Context) error {
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
@@ -157,10 +163,15 @@ func (s *Store) applySchemaSerialized(ctx context.Context) error {
 		if err == nil {
 			return nil
 		}
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return fmt.Errorf("timed out after %d attempts waiting for table locks (another session holds a conflicting lock on an arcade table): %w", attempt, ctxErr)
-		}
 		if !hasSQLState(err, sqlstateLockNotAvailable) && !hasSQLState(err, sqlstateDeadlockDetected) {
+			// Not lock contention. Keep the real error — when the deadline
+			// cancelled the attempt mid-statement it includes pgx's
+			// cancellation, and anything else (permissions, disk, bad DDL)
+			// must reach the operator verbatim, not a fabricated lock
+			// diagnosis.
+			if ctx.Err() != nil {
+				return fmt.Errorf("deadline expired on attempt %d (raise store.postgres.schema_apply_timeout_ms if the database is contended): %w", attempt, err)
+			}
 			return err
 		}
 		select {
@@ -190,7 +201,9 @@ func applySchemaAttempt(ctx context.Context, conn *pgxpool.Conn) error {
 		_ = tx.Rollback(rbCtx)
 	}()
 
-	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL lock_timeout = '%dms'", schemaLockTimeout.Milliseconds())); err != nil {
+	// Clamp to >=1ms: Postgres treats lock_timeout = 0 as "wait forever",
+	// the exact opposite of the bounded-wait intent.
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL lock_timeout = '%dms'", max(schemaLockTimeout.Milliseconds(), 1))); err != nil {
 		return fmt.Errorf("set lock_timeout: %w", err)
 	}
 	if _, err := tx.Exec(ctx, schemaSQL); err != nil {

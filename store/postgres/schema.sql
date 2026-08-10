@@ -1,5 +1,11 @@
 -- Schema for the Postgres store backend. Applied idempotently by
 -- Store.EnsureIndexes() via pgx.Exec; safe to run repeatedly.
+--
+-- The whole file runs inside ONE transaction: statements that cannot run in
+-- a transaction block (CREATE INDEX CONCURRENTLY, ALTER TYPE ... ADD VALUE,
+-- VACUUM) must not be added here. Any byte change to this file — comments
+-- included — changes its checksum and triggers one serialized reapply on the
+-- next rollout.
 
 -- Schema-identity bookkeeping (issue #278). EnsureIndexes stores a SHA-256 of
 -- this entire file after a successful apply; when the stored checksum matches

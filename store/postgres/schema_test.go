@@ -5,6 +5,7 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,9 +14,8 @@ import (
 	"github.com/bsv-blockchain/arcade/store/bumpcache"
 )
 
-// isolatedDBSeq numbers throwaway databases. Tests in this package run
-// sequentially (no t.Parallel), so a plain counter is race-free.
-var isolatedDBSeq int
+// isolatedDBSeq numbers throwaway databases.
+var isolatedDBSeq atomic.Int64
 
 // newIsolatedStore creates a throwaway database on the shared postgres
 // instance and returns a Store pointed at it. The schema tests hold table
@@ -29,8 +29,7 @@ func newIsolatedStore(t *testing.T) *Store {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	isolatedDBSeq++
-	name := fmt.Sprintf("arcade_schema_test_%d", isolatedDBSeq)
+	name := fmt.Sprintf("arcade_schema_test_%d", isolatedDBSeq.Add(1))
 	if _, err := sharedStore.pool.Exec(ctx, "CREATE DATABASE "+name); err != nil {
 		t.Skipf("cannot create isolated database (external DSN without CREATEDB?): %v", err)
 	}
@@ -49,6 +48,28 @@ func newIsolatedStore(t *testing.T) *Store {
 	st := &Store{pool: pool, bumpCache: bumpcache.New(), schemaApplyTimeout: 30 * time.Second}
 	t.Cleanup(func() { _ = st.Close() })
 	return st
+}
+
+// waitForLockQueue polls pg_locks until an ungranted lock request is present
+// (wantQueued=true) or absent (wantQueued=false).
+func waitForLockQueue(t *testing.T, st *Store, wantQueued bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	for {
+		var waiting int
+		if err := st.pool.QueryRow(ctx, `SELECT COUNT(*) FROM pg_locks WHERE NOT granted`).Scan(&waiting); err != nil {
+			t.Fatalf("poll pg_locks: %v", err)
+		}
+		if (waiting > 0) == wantQueued {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("pg_locks never reached queued=%v", wantQueued)
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
 }
 
 func mustApplySchema(t *testing.T, st *Store) {
@@ -167,9 +188,13 @@ func TestEnsureIndexes_StaleChecksumRetriesUntilLockReleased(t *testing.T) {
 		done <- st.EnsureIndexes(callCtx)
 	}()
 
-	// Hold the lock long enough for at least one lock_timeout abort, then
-	// release and let the retry succeed.
-	time.Sleep(1 * time.Second)
+	// Deterministically guarantee at least one lock_timeout abort-and-retry
+	// cycle: wait until the apply attempt is queued behind the table lock
+	// (an ungranted request appears in pg_locks), then wait for that queue
+	// entry to vanish again — with the blocker still held, the only way out
+	// of the queue is the 55P03 rollback. Then release and let a retry win.
+	waitForLockQueue(t, st, true)
+	waitForLockQueue(t, st, false)
 	if err := blocker.Rollback(ctx); err != nil {
 		t.Fatalf("release blocking lock: %v", err)
 	}
