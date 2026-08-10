@@ -184,15 +184,18 @@ type broadcastJob struct {
 type broadcastJobResult struct {
 	endpoint   string
 	statusCode int
-	// failures is the per-txid failure map extracted from a /txs HTTP 500
+	// failures is the per-txid failure map extracted from a non-200 /txs
 	// "Failed to process transactions:" body (Teranode upstream main, post
-	// #879). Each entry is keyed by the txid embedded in
-	// "[ProcessTransaction][<txid>]" and the value is the full error line
+	// #879; the HTTP status varies by failure class — 409/422/400/500 all
+	// carry the same shape). Each entry is keyed by the txid embedded in
+	// "[ProcessTransaction][<txid>]" when present, else the first bare
+	// 64-hex string in the line (which for conflict-family verdicts is an
+	// alien hash — see alienFailureLines); the value is the full error line
 	// verbatim (e.g. "TX_INVALID (31): [ProcessTransaction][<txid>] tx is
-	// invalid because..."). Absent here means accepted (after a peer 500).
-	// nil for 200, transport errors, and any 5xx that doesn't match the
-	// Teranode failure-list shape — those cases drive the whole-batch
-	// requeue path.
+	// invalid because..."). Absent here means accepted — but only when no
+	// alien-keyed line voids that contract for the peer. nil for 200,
+	// transport errors, and any non-200 that doesn't match the Teranode
+	// failure-list shape — those cases drive the whole-batch requeue path.
 	failures map[string]string
 	err      error
 }
@@ -1030,8 +1033,10 @@ type txResult struct {
 }
 
 // failureLinesForLog returns a stable, capped list of Teranode failure lines
-// for structured logging. Keys are ignored; order is sorted so log output is
-// deterministic across map iteration.
+// for structured logging. Keys are ignored; lines are ordered most-informative
+// first (rejectionLineScore, ties broken lexicographically) so the cap keeps
+// the concrete validator verdicts (UTXO_SPENT, TX_CONFLICTING, …) and drops
+// PROCESSING catch-alls, not the reverse. Deterministic across map iteration.
 func failureLinesForLog(failures map[string]string) []string {
 	const maxLines = 8
 	if len(failures) == 0 {
@@ -1041,7 +1046,13 @@ func failureLinesForLog(failures map[string]string) []string {
 	for _, line := range failures {
 		lines = append(lines, line)
 	}
-	sort.Strings(lines)
+	sort.Slice(lines, func(i, j int) bool {
+		si, sj := rejectionLineScore(lines[i]), rejectionLineScore(lines[j])
+		if si != sj {
+			return si > sj
+		}
+		return lines[i] < lines[j]
+	})
 	if len(lines) > maxLines {
 		lines = lines[:maxLines]
 	}
@@ -1067,6 +1078,31 @@ func preferRejectionLine(current, candidate string) string {
 	return current
 }
 
+// alienFailureLines scans one peer's parsed failure map for lines whose key
+// does not name any tx in the submitted batch, returning how many such lines
+// exist and the most informative one (preferRejectionLine ordering).
+//
+// Alien keys are expected, not a parser bug: Teranode's conflict-family
+// verdicts (UTXO_SPENT / TX_CONFLICTING / TX_INVALID_DOUBLE_SPEND, HTTP 409)
+// render the deepest public cause, whose message names the spent OUTPOINT's
+// txid and the competing spender — never the submitted txid (no
+// [ProcessTransaction][<txid>] wrapper; see teranode
+// errors/error_data_utxo_spent.go + errors.UserMessage). The parse then keys
+// the line under a hash that isn't in the batch. Any alien line voids the
+// failure map's "absent ⇒ accepted" contract for that peer: exactly one
+// submitted tx DID fail per line, we just can't tell which, so implicit
+// acceptance votes would fabricate an ACCEPTED_BY_NETWORK for the very tx
+// the peer rejected.
+func alienFailureLines(failures map[string]string, inBatch map[string]bool) (count int, best string) {
+	for key, line := range failures {
+		if !inBatch[key] {
+			count++
+			best = preferRejectionLine(best, line)
+		}
+	}
+	return count, best
+}
+
 // rejectionLineScore ranks a Teranode failure line for wallet-facing quality.
 // Higher is better. Unknown free text scores 0.
 func rejectionLineScore(line string) int {
@@ -1083,11 +1119,14 @@ func rejectionLineScore(line string) int {
 		return 30
 	case "PROCESSING":
 		// Catch-all "this tx is bad" wrapper — better than opaque infra text,
-		// worse than a specific validator code.
+		// worse than any concrete validator code.
 		return 20
 	default:
-		// Recognizable "<NAME> (n):" shape but not a known code.
-		return 10
+		// Recognizable "<NAME> (n):" shape but not a code this list knows —
+		// e.g. a Teranode code added after this build. Still a concrete
+		// verdict, so it outranks the PROCESSING catch-all but never a
+		// known code.
+		return 25
 	}
 }
 
@@ -1117,7 +1156,13 @@ func rejectionLineScore(line string) int {
 //	  peer's tip catches up) is expected to succeed, so the message gains an
 //	  explicit retryable hint. (Intake's finality gate catches most of these
 //	  against arcade's own tip; a line here means the peer's view trails.)
-//	TX_CONFLICTING (36) → 466 StatusConflict (double-spend attempt).
+//	TX_CONFLICTING (36), UTXO_SPENT (70), TX_INVALID_DOUBLE_SPEND →
+//	  466 StatusConflict (double-spend attempt / input already spent).
+//	  Teranode's own /txs handler groups exactly these under HTTP 409
+//	  Conflict (httpStatusForTxError, services/propagation/Server.go), so
+//	  the 466 mapping mirrors the upstream classification. Wallets branch
+//	  on 466 to decide "do NOT blind-release these inputs" — the outpoint
+//	  is owned by a competing/confirmed tx, not merely unaccepted.
 //	TX_INVALID (31)     → 467 StatusGeneric (wraps fee/script/policy — the
 //	  name alone can't recover which).
 //	PROCESSING (4) and everything else → 0, message verbatim.
@@ -1133,7 +1178,7 @@ func classifyFailureLine(line string) (errMsg string, arcCode int) {
 	case "TX_LOCK_TIME", "UTXO_NON_FINAL":
 		return line + " — retryable: the transaction is not final against this peer's chain view; resubmit after the locktime expires",
 			int(arcerrors.StatusNotFinal)
-	case "TX_CONFLICTING":
+	case "TX_CONFLICTING", "UTXO_SPENT", "TX_INVALID_DOUBLE_SPEND":
 		return line, int(arcerrors.StatusConflict)
 	case "TX_INVALID":
 		return line, int(arcerrors.StatusGeneric)
@@ -1608,18 +1653,26 @@ func (p *Propagator) submitBroadcastJobs(ctx context.Context, endpoints []string
 //
 //   - HTTP 200 from a peer → that peer accepted the whole batch, so
 //     every tx in the batch gets a sticky acceptance vote.
-//   - Non-2xx with a parseable "Failed to process transactions:" body
-//     (HTTP status is NOT part of the contract — Teranode often uses 500,
-//     but some deployments/proxies return 422/4xx with the same body) →
+//   - Non-200 with a parseable "Failed to process transactions:" body
+//     (HTTP status is NOT part of the contract — Teranode's own /txs
+//     handler returns 409 for the conflict family, 400/422 for policy
+//     failures, and 500 only for unclassified server faults, all with the
+//     same body shape; see httpStatusForTxError in Teranode's
+//     services/propagation/Server.go) →
 //     that peer rejected the listed txids and accepted the rest. Each
 //     accepted tx gets an acceptance vote; each rejected tx gets a
 //     rejection vote carrying the verbatim Teranode error line (this is
 //     what lands in the wallet-visible ExtraInfo / SSE payload).
-//   - Non-2xx with no parseable body (gateway 502/503 "no available
-//     server", bare 500, network error), or no healthy endpoints → no
-//     per-tx information from that peer. These must NEVER become the
-//     terminal ExtraInfo on their own — they are infra noise, not a
-//     validator verdict.
+//     Implicit acceptance is only trusted when every failure line named a
+//     submitted tx; conflict-family lines key under alien hashes (spent
+//     outpoint / competing spender — no [ProcessTransaction] wrapper), in
+//     which case the peer grants no implicit accepts, and a single-tx
+//     batch attributes the alien verdict to its only tx.
+//   - Non-200 with no parseable body (gateway 502/503 "no available
+//     server", bare 500, truncated body, network error, unexpected
+//     2xx-but-not-200), or no healthy endpoints → no per-tx information
+//     from that peer. These must NEVER become the terminal ExtraInfo on
+//     their own — they are infra noise, not a validator verdict.
 //
 // After all responses are in (or the 15s submitCtx timeout fires), each
 // tx is classified:
@@ -1634,11 +1687,16 @@ func (p *Propagator) submitBroadcastJobs(ctx context.Context, endpoints []string
 // so a returned line cannot be reliably distinguished from a transient
 // infra issue by code.
 //
-// Per-endpoint outcomes are recorded into the circuit-breaker regardless
-// of verdict so a peer returning 500 doesn't get sidelined when the
-// 500 was a per-tx verdict, not the peer's fault. The returned
-// successEndpoint is the URL of the first peer that returned HTTP 200
-// (empty when none did).
+// Per-endpoint outcomes are recorded into the circuit-breaker. A peer
+// whose non-2xx carried a per-tx verdict is shielded from sidelining only
+// when NO peer accepted (the unanimous-reject branch of
+// recordBroadcastOutcomes resets its counters); when another peer
+// 2xx-accepts the same batch, a rejecting peer still accrues
+// RecordBroadcastFailure — acceptable, since a healthy peer's next 2xx
+// resets the counter, and a peer that persistently rejects batches its
+// siblings accept is exactly the slow-track breaker's target. The
+// returned successEndpoint is the URL of the first peer that returned
+// HTTP 200 (empty when none did).
 func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]byte, batch []propagationMsg) (results []txResult, successEndpoint string) {
 	start := time.Now()
 	defer func() {
@@ -1661,10 +1719,13 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 
 	// Precompute lowercase txids so failure-map lookups against
 	// Teranode's lower-cased keys don't allocate inside the per-result
-	// loop below.
+	// loop below. inBatch answers the reverse lookup — "does this failure
+	// key name a tx we actually submitted?" — for alien-line detection.
 	lowerTxids := make([]string, len(batch))
+	inBatch := make(map[string]bool, len(batch))
 	for i, msg := range batch {
 		lowerTxids[i] = strings.ToLower(msg.TXID)
+		inBatch[lowerTxids[i]] = true
 	}
 
 	// Per-tx accumulation across every peer response. Acceptance is
@@ -1738,12 +1799,41 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 		// reject the same tx with different lines, keep the most
 		// informative one (specific Teranode codes over PROCESSING over
 		// opaque text) so GET /tx ExtraInfo is useful to wallets.
+		//
+		// The "absent from map ⇒ accepted" half of the contract only holds
+		// when every failure line named a tx we submitted. Conflict-family
+		// lines (UTXO_SPENT et al., HTTP 409) name the spent outpoint / the
+		// competing spender instead of the submitted txid, so they key
+		// under an alien hash — see alienFailureLines. One alien line means
+		// one unidentifiable submitted tx DID fail; granting implicit
+		// accepts would mark that very tx ACCEPTED_BY_NETWORK.
+		alienCount, bestAlien := alienFailureLines(result.failures, inBatch)
+		if alienCount > 0 {
+			p.logger.Warn(
+				"teranode failure lines name no submitted tx; withholding implicit accepts from this peer",
+				zap.String("endpoint", result.endpoint),
+				zap.Int("batch_size", len(batch)),
+				zap.Int("alien_line_count", alienCount),
+				zap.String("best_alien_line", bestAlien),
+			)
+		}
 		for j, lower := range lowerTxids {
 			if line, failed := result.failures[lower]; failed {
 				rejectionLine[j] = preferRejectionLine(rejectionLine[j], line)
-			} else {
+			} else if alienCount == 0 {
 				acceptedByAny[j] = true
 			}
+		}
+		// A single-tx batch has exactly one possible owner for an alien
+		// verdict — the tx itself. Terminalize it with the real reason
+		// (this is the mainnet incident shape: batch_size=1, HTTP 409,
+		// wrapper-less "UTXO_SPENT (70): <outpoint> utxo already spent by
+		// tx <spender>[0]"). Multi-tx batches can't attribute alien lines,
+		// so affected txs simply get no vote from this peer and requeue
+		// unless another peer produces a verdict — the safe pre-fix
+		// behavior, now with the alien reason visible in the Warn log.
+		if alienCount > 0 && len(batch) == 1 {
+			rejectionLine[0] = preferRejectionLine(rejectionLine[0], bestAlien)
 		}
 	}
 	recordBroadcastOutcomes(p.teranodeClient, outcomes)

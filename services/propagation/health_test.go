@@ -516,6 +516,257 @@ func TestBroadcast_422RejectionSurfacesExtraInfo(t *testing.T) {
 	}
 }
 
+// TestBroadcast_422PartialFailureList_ImplicitAccept pins the riskiest
+// semantics the status-agnostic parse enables: a single 422 whose failure
+// list names ONE tx is a whole-batch verdict — the named tx is REJECTED and
+// every unnamed tx is terminally ACCEPTED_BY_NETWORK on that peer's implicit
+// accept. Previously pinned only for HTTP 500.
+func TestBroadcast_422PartialFailureList_ImplicitAccept(t *testing.T) {
+	const (
+		txidRejected = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		txidAccepted = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte("Failed to process transactions:\n" +
+			"TX_INVALID (31): [ProcessTransaction][" + txidRejected + "] bad fee\n"))
+	}))
+	defer srv.Close()
+
+	ms := newMockStore()
+	cfg := &config.Config{}
+	cfg.Propagation.MerkleConcurrency = 10
+	tc := teranode.NewClient([]string{srv.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, nil)
+
+	for _, txid := range []string{txidRejected, txidAccepted} {
+		if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg(txid))); err != nil {
+			t.Fatalf("handleMessage(%s): %v", txid, err)
+		}
+	}
+	if err := flushSync(t, p); err != nil {
+		t.Fatalf("flush error: %v", err)
+	}
+
+	if got := ms.lastUpdateForTxid(txidRejected); got == nil || got.Status != models.StatusRejected {
+		t.Errorf("txidRejected: got %v, want REJECTED", got)
+	}
+	if got := ms.lastUpdateForTxid(txidAccepted); got == nil || got.Status != models.StatusAcceptedByNetwork {
+		t.Errorf("txidAccepted: got %v, want ACCEPTED_BY_NETWORK", got)
+	}
+}
+
+// TestBatchBroadcastFailedLog_IncludesFailureLines pins the operator-
+// visibility half of the fix: the "batch broadcast endpoint failed" warn for
+// a peer whose response parsed into a failure list must carry
+// failure_count/failure_lines (previously the structured verdict was hidden
+// off err once parsed), while an opaque-body peer's warn must NOT grow those
+// fields.
+func TestBatchBroadcastFailedLog_IncludesFailureLines(t *testing.T) {
+	const txid = "d018bc98d7828b7f095e5d616f7ccba607fc228368e82e74b25304e37699f1e9"
+	srvVerdict := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte("Failed to process transactions:\n" +
+			"PROCESSING (4): [ProcessTransaction][" + txid + "] failed to validate transaction\n"))
+	}))
+	defer srvVerdict.Close()
+	srvOpaque := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte("error code: 502\n"))
+	}))
+	defer srvOpaque.Close()
+
+	core, recorded := observer.New(zapcore.WarnLevel)
+	logger := zap.New(core)
+
+	ms := newMockStore()
+	cfg := &config.Config{}
+	cfg.Propagation.MerkleConcurrency = 10
+	tc := teranode.NewClient([]string{srvVerdict.URL, srvOpaque.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
+	p := New(cfg, logger, nil, nil, ms, nil, tc, nil)
+
+	if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg(txid))); err != nil {
+		t.Fatalf("handleMessage: %v", err)
+	}
+	if err := flushSync(t, p); err != nil {
+		t.Fatalf("flush error: %v", err)
+	}
+
+	entries := recorded.FilterMessage("batch broadcast endpoint failed").All()
+	if len(entries) != 2 {
+		t.Fatalf("want 2 'batch broadcast endpoint failed' warns, got %d", len(entries))
+	}
+	for _, e := range entries {
+		fields := make(map[string]interface{}, len(e.Context))
+		for _, f := range e.Context {
+			fields[f.Key] = f
+		}
+		endpoint := ""
+		for _, f := range e.Context {
+			if f.Key == "endpoint" {
+				endpoint = f.String
+			}
+		}
+		_, hasLines := fields["failure_lines"]
+		switch endpoint {
+		case srvVerdict.URL:
+			if !hasLines {
+				t.Errorf("verdict peer warn missing failure_lines: %+v", e.Context)
+			}
+		case srvOpaque.URL:
+			if hasLines {
+				t.Errorf("opaque peer warn must not carry failure_lines: %+v", e.Context)
+			}
+		default:
+			t.Errorf("unexpected endpoint %q in warn", endpoint)
+		}
+	}
+}
+
+// TestBroadcast_422RejectionLosesToAcceptance pins sticky acceptance across
+// the NEW parse path: a peer that 200-accepts the batch must win over a peer
+// that 422-rejects the tx with a parseable failure list. Guards against the
+// status-agnostic parse accidentally making 4xx verdicts override real
+// acceptance (rejection votes only matter when NO peer accepts).
+func TestBroadcast_422RejectionLosesToAcceptance(t *testing.T) {
+	const txid = "d018bc98d7828b7f095e5d616f7ccba607fc228368e82e74b25304e37699f1e9"
+	srvAccept := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srvAccept.Close()
+	srvReject := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte("Failed to process transactions:\n" +
+			"PROCESSING (4): [ProcessTransaction][" + txid + "] failed to validate transaction\n"))
+	}))
+	defer srvReject.Close()
+
+	ms := newMockStore()
+	cfg := &config.Config{}
+	cfg.Propagation.MerkleConcurrency = 10
+	tc := teranode.NewClient([]string{srvReject.URL, srvAccept.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, nil)
+
+	if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg(txid))); err != nil {
+		t.Fatalf("handleMessage: %v", err)
+	}
+	if err := flushSync(t, p); err != nil {
+		t.Fatalf("flush error: %v", err)
+	}
+
+	got := ms.lastUpdateForTxid(txid)
+	if got == nil {
+		t.Fatal("no status update recorded")
+	}
+	if got.Status != models.StatusAcceptedByNetwork {
+		t.Errorf("status=%s want ACCEPTED_BY_NETWORK (acceptance is sticky; extraInfo=%q)", got.Status, got.ExtraInfo)
+	}
+}
+
+// TestBroadcast_409AlienConflict_SingleTxTerminalizes pins the mainnet
+// incident shape end to end: batch_size=1, one peer answers HTTP 409 with a
+// wrapper-less conflict verdict whose hashes name the spent OUTPOINT and the
+// competing spender — NOT the submitted txid ("UTXO_SPENT (70): UTXO_SPENT
+// (70): <outpoint>:2 utxo already spent by tx <spender>[0]"). The failure
+// map therefore keys under an alien hash. A naive "absent from map ⇒
+// accepted" read would mark the submitted tx ACCEPTED_BY_NETWORK off its own
+// rejection; the single-tx attribution rule must instead terminalize it
+// REJECTED with the conflict line as ExtraInfo and ARC 466 (StatusConflict).
+func TestBroadcast_409AlienConflict_SingleTxTerminalizes(t *testing.T) {
+	const (
+		txid     = "e3b7a2c260168429b20ad85f746ae09c2e41f6a1d79877a8810832cdf732e703"
+		outpoint = "256fc7143c6ef5436cd5258ade24b68c43d0f8268c086bd9fa90055dd5a7ae43"
+		spender  = "7dfbe0fcacf630066b23036bc007e73d58a61ab9bcb8e66f6b214f8ef5f28489"
+	)
+	conflictBody := "Failed to process transactions:\n" +
+		"UTXO_SPENT (70): UTXO_SPENT (70): " + outpoint + ":2 utxo already spent by tx " + spender + "[0]\n"
+
+	srvConflict := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(conflictBody))
+	}))
+	defer srvConflict.Close()
+	srv502 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte("error code: 502\n"))
+	}))
+	defer srv502.Close()
+
+	ms := newMockStore()
+	cfg := &config.Config{}
+	cfg.Propagation.MerkleConcurrency = 10
+	tc := teranode.NewClient(
+		[]string{srv502.URL, srvConflict.URL},
+		"",
+		teranode.HealthConfig{FailureThreshold: 1 << 20},
+	)
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, nil)
+
+	if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg(txid))); err != nil {
+		t.Fatalf("handleMessage: %v", err)
+	}
+	if err := flushSync(t, p); err != nil {
+		t.Fatalf("flush error: %v", err)
+	}
+
+	got := ms.lastUpdateForTxid(txid)
+	if got == nil {
+		t.Fatal("no status update recorded")
+	}
+	if got.Status != models.StatusRejected {
+		t.Fatalf("status=%s want REJECTED (extraInfo=%q)", got.Status, got.ExtraInfo)
+	}
+	if got.StatusCode != 466 {
+		t.Errorf("StatusCode=%d want 466 (ARC StatusConflict)", got.StatusCode)
+	}
+	if !strings.Contains(got.ExtraInfo, "UTXO_SPENT") || !strings.Contains(got.ExtraInfo, spender) {
+		t.Errorf("ExtraInfo=%q want the UTXO_SPENT line naming the competing spender", got.ExtraInfo)
+	}
+}
+
+// TestBroadcast_409AlienConflict_MultiTxWithholdsAccepts covers the
+// multi-tx half of the alien-line rule: a 409 failure list whose only line
+// names no submitted tx means SOME tx in the batch was rejected but we can't
+// tell which — so the peer must grant no implicit acceptance votes, and with
+// no other peer voting, both txs requeue rather than either terminalizing
+// (no fabricated ACCEPTED_BY_NETWORK, no misattributed REJECTED).
+func TestBroadcast_409AlienConflict_MultiTxWithholdsAccepts(t *testing.T) {
+	const (
+		txidA    = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		txidB    = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		outpoint = "256fc7143c6ef5436cd5258ade24b68c43d0f8268c086bd9fa90055dd5a7ae43"
+		spender  = "7dfbe0fcacf630066b23036bc007e73d58a61ab9bcb8e66f6b214f8ef5f28489"
+	)
+	srvConflict := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte("Failed to process transactions:\n" +
+			"UTXO_SPENT (70): UTXO_SPENT (70): " + outpoint + ":2 utxo already spent by tx " + spender + "[0]\n"))
+	}))
+	defer srvConflict.Close()
+
+	ms := newMockStore()
+	cfg := &config.Config{}
+	cfg.Propagation.MerkleConcurrency = 10
+	tc := teranode.NewClient([]string{srvConflict.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, nil)
+
+	for _, txid := range []string{txidA, txidB} {
+		if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg(txid))); err != nil {
+			t.Fatalf("handleMessage(%s): %v", txid, err)
+		}
+	}
+	if err := flushSync(t, p); err != nil {
+		t.Fatalf("flush error: %v", err)
+	}
+
+	for _, txid := range []string{txidA, txidB} {
+		if got := ms.lastUpdateForTxid(txid); got != nil &&
+			(got.Status == models.StatusAcceptedByNetwork || got.Status == models.StatusRejected) {
+			t.Errorf("%s: terminalized as %s (extraInfo=%q); alien-keyed 409 must requeue, not vote", txid, got.Status, got.ExtraInfo)
+		}
+	}
+}
+
 // TestBroadcast_PerPeerAggregation_UnanimousRejection covers the other
 // half: when every peer that gave us a parseable response named the same
 // tx as failed, the tx is REJECTED. Two endpoints both 500 with the

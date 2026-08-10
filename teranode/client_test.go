@@ -2,6 +2,7 @@ package teranode
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -97,10 +98,136 @@ func TestSubmitTransactions_FailureList_422(t *testing.T) {
 	testSubmitTransactionsFailureList(t, http.StatusUnprocessableEntity)
 }
 
-// TestSubmitTransactions_FailureList_400 covers another remapped status
-// that has been observed carrying the same body shape.
+// TestSubmitTransactions_FailureList_400 covers Teranode's policy-family
+// aggregate status (TX_INVALID / TX_POLICY / TX_LOCK_TIME / … →
+// httpStatusForTxError → 400).
 func TestSubmitTransactions_FailureList_400(t *testing.T) {
 	testSubmitTransactionsFailureList(t, http.StatusBadRequest)
+}
+
+// TestSubmitTransactions_FailureList_409 covers Teranode's conflict-family
+// aggregate status: since v0.16 the upstream /txs handler returns 409 for
+// UTXO_SPENT / TX_CONFLICTING / TX_INVALID_DOUBLE_SPEND / TX_LOCKED
+// (httpStatusForTxError, services/propagation/Server.go) — the exact status
+// observed on mainnet carrying the UTXO_SPENT verdict that pre-fix Arcade
+// dropped.
+func TestSubmitTransactions_FailureList_409(t *testing.T) {
+	testSubmitTransactionsFailureList(t, http.StatusConflict)
+}
+
+// TestParseTxsFailures_WrapperPreferredOverBareHex pins the txid-extraction
+// order: the [ProcessTransaction][<txid>] wrapper always wins over the first
+// bare 64-hex string in the line. Conflict-family messages embed other
+// transactions' hashes (spent outpoint, competing spender) that can precede
+// any wrapper — keying by first-hex would misattribute the failure to a
+// different tx (possibly another tx in the same batch, e.g. a same-batch
+// parent whose output the failed tx tried to spend).
+func TestParseTxsFailures_WrapperPreferredOverBareHex(t *testing.T) {
+	const (
+		submitted = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+		outpoint  = "256fc7143c6ef5436cd5258ade24b68c43d0f8268c086bd9fa90055dd5a7ae43"
+		spender   = "7dfbe0fcacf630066b23036bc007e73d58a61ab9bcb8e66f6b214f8ef5f28489"
+	)
+	body := []byte("Failed to process transactions:\n" +
+		// Bare hex (the outpoint) appears BEFORE the wrapper — wrapper must win.
+		"TX_INVALID (31): utxo " + outpoint + ":1 already spent [ProcessTransaction][" + submitted + "] tx invalid\n" +
+		// Wrapper-less conflict line — falls back to first bare hex (the
+		// outpoint), which callers must treat as an alien key (it names no
+		// submitted tx); pinned here so the fallback shape is explicit.
+		"UTXO_SPENT (70): UTXO_SPENT (70): " + outpoint + ":2 utxo already spent by tx " + spender + "[0]\n")
+
+	failures := parseTxsFailures(body, nil)
+	if len(failures) != 2 {
+		t.Fatalf("failures=%#v want 2 entries", failures)
+	}
+	if _, ok := failures[submitted]; !ok {
+		t.Errorf("wrapped line must key under the wrapper txid, got %#v", failures)
+	}
+	if _, ok := failures[outpoint]; !ok {
+		t.Errorf("wrapper-less conflict line must fall back to first bare hex, got %#v", failures)
+	}
+}
+
+// TestSubmitTransactions_TruncatedFailureList_NoPartialParse asserts that a
+// failure-list body cut off mid-transfer (Content-Length promises more than
+// arrives) is NOT parsed: a partial list that happens to truncate at a line
+// boundary would silently grant implicit acceptance to every tx whose
+// failure line was lost. The read error must route to the infra path
+// (failures nil → whole-batch requeue).
+func TestSubmitTransactions_TruncatedFailureList_NoPartialParse(t *testing.T) {
+	const (
+		txidA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		txidB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	)
+	full := "Failed to process transactions:\n" +
+		"TX_INVALID (31): [ProcessTransaction][" + txidA + "] tx invalid\n" +
+		"TX_INVALID (31): [ProcessTransaction][" + txidB + "] tx invalid\n"
+	// Truncate exactly at the line boundary after txidA's line — the
+	// dangerous shape: the prefix alone is a well-formed one-entry list.
+	cut := strings.Index(full, txidB) - len("TX_INVALID (31): [ProcessTransaction][")
+	partial := full[:cut]
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(len(full)))
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(partial))
+		// Handler returns with fewer bytes than promised; the server tears
+		// the connection down and the client's io.ReadAll sees an error.
+	}))
+	defer server.Close()
+
+	client := NewClient([]string{server.URL}, "", HealthConfig{})
+	code, failures, err := client.SubmitTransactions(context.Background(), server.URL, [][]byte{{0x01}, {0x02}})
+	if err == nil {
+		t.Fatal("expected non-nil error for truncated body")
+	}
+	if code != http.StatusUnprocessableEntity {
+		t.Errorf("code=%d want 422", code)
+	}
+	if failures != nil {
+		t.Errorf("failures=%#v want nil — a truncated failure list must not be parsed", failures)
+	}
+}
+
+// TestSubmitTransactions_NonParseable4xx_NoFailureList asserts the
+// status-agnostic parse does NOT turn arbitrary 4xx error pages (auth
+// failures, proxy HTML, rate limiting, bare conflict text) into per-tx
+// verdicts. failures must stay nil so the caller treats them as infra
+// noise — otherwise a body-less 4xx would fabricate implicit ACCEPT votes
+// for every tx in the batch.
+func TestSubmitTransactions_NonParseable4xx_NoFailureList(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{name: "401 unauthorized", status: http.StatusUnauthorized, body: "Unauthorized\n"},
+		{name: "404 html error page", status: http.StatusNotFound, body: "<html><body><h1>404 Not Found</h1></body></html>"},
+		{name: "429 rate limited", status: http.StatusTooManyRequests, body: "rate limit exceeded"},
+		{name: "409 without failure-list body", status: http.StatusConflict, body: "Conflict"},
+		{name: "503 no available server", status: http.StatusServiceUnavailable, body: "no available server\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+
+			client := NewClient([]string{server.URL}, "", HealthConfig{})
+			code, failures, err := client.SubmitTransactions(context.Background(), server.URL, [][]byte{{0x01}, {0x02}})
+			if err == nil {
+				t.Fatalf("expected non-nil error for %d", tc.status)
+			}
+			if code != tc.status {
+				t.Errorf("code=%d want %d", code, tc.status)
+			}
+			if failures != nil {
+				t.Errorf("failures=%#v want nil (opaque %d body must not become a per-tx verdict)", failures, tc.status)
+			}
+		})
+	}
 }
 
 func testSubmitTransactionsFailureList(t *testing.T, status int) {
