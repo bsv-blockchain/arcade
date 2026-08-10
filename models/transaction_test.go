@@ -1,6 +1,10 @@
 package models
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+	"time"
+)
 
 // TestStatus_IsTerminal pins the set of statuses that the system treats as
 // terminal — i.e. statuses that callers must not silently overwrite with a
@@ -165,4 +169,63 @@ func TestStatus_CanTransitionFrom_Regressions(t *testing.T) {
 			t.Errorf("%s: %s → %s should be rejected", c.reason, c.prev, c.next)
 		}
 	}
+}
+
+// TestAppendOrphanedAnchor pins the orphaned-anchor history helper (issue
+// #279): empty block hashes are no-ops, consecutive duplicates collapse so
+// idempotent replays cannot grow history, and the history caps at
+// MaxOrphanedAnchors keeping the newest entries.
+func TestAppendOrphanedAnchor(t *testing.T) {
+	now := time.Now()
+
+	t.Run("EmptyHashNoOp", func(t *testing.T) {
+		history := []OrphanedAnchor{{BlockHash: "blk-A", BlockHeight: 1, OrphanedAt: now}}
+		got := AppendOrphanedAnchor(history, OrphanedAnchor{BlockHash: "", BlockHeight: 2, OrphanedAt: now})
+		if len(got) != 1 || got[0].BlockHash != "blk-A" {
+			t.Fatalf("empty hash must be a no-op, got %+v", got)
+		}
+		// Also from a nil history.
+		if got := AppendOrphanedAnchor(nil, OrphanedAnchor{}); got != nil {
+			t.Fatalf("empty hash on nil history must stay nil, got %+v", got)
+		}
+	})
+
+	t.Run("ConsecutiveDupCollapses", func(t *testing.T) {
+		var history []OrphanedAnchor
+		history = AppendOrphanedAnchor(history, OrphanedAnchor{BlockHash: "blk-A", BlockHeight: 1, OrphanedAt: now})
+		history = AppendOrphanedAnchor(history, OrphanedAnchor{BlockHash: "blk-A", BlockHeight: 1, OrphanedAt: now.Add(time.Minute)})
+		if len(history) != 1 {
+			t.Fatalf("consecutive duplicate must collapse, got %+v", history)
+		}
+		// A different hash appends; the SAME hash non-consecutively appends
+		// too (only the tail entry is compared).
+		history = AppendOrphanedAnchor(history, OrphanedAnchor{BlockHash: "blk-B", BlockHeight: 1, OrphanedAt: now})
+		history = AppendOrphanedAnchor(history, OrphanedAnchor{BlockHash: "blk-A", BlockHeight: 1, OrphanedAt: now})
+		if len(history) != 3 ||
+			history[0].BlockHash != "blk-A" || history[1].BlockHash != "blk-B" || history[2].BlockHash != "blk-A" {
+			t.Fatalf("non-consecutive re-append broken: %+v", history)
+		}
+	})
+
+	t.Run("CapKeepsNewest", func(t *testing.T) {
+		var history []OrphanedAnchor
+		for i := 0; i < MaxOrphanedAnchors+2; i++ {
+			history = AppendOrphanedAnchor(history, OrphanedAnchor{
+				BlockHash:   fmt.Sprintf("blk-%d", i),
+				BlockHeight: uint64(i),
+				OrphanedAt:  now.Add(time.Duration(i) * time.Minute),
+			})
+		}
+		if len(history) != MaxOrphanedAnchors {
+			t.Fatalf("history len = %d, want cap %d", len(history), MaxOrphanedAnchors)
+		}
+		// The two oldest entries (blk-0, blk-1) were dropped; the newest
+		// (blk-6) is the tail.
+		if history[0].BlockHash != "blk-2" {
+			t.Errorf("oldest surviving entry = %q, want blk-2", history[0].BlockHash)
+		}
+		if history[len(history)-1].BlockHash != fmt.Sprintf("blk-%d", MaxOrphanedAnchors+1) {
+			t.Errorf("newest entry = %q, want blk-%d", history[len(history)-1].BlockHash, MaxOrphanedAnchors+1)
+		}
+	})
 }

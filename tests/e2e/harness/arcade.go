@@ -233,6 +233,21 @@ func buildArcadeConfig(t *testing.T, port int, opts ArcadeOptions) *config.Confi
 		BumpBuilder: config.BumpBuilderConfig{
 			GraceWindowMs:        500,
 			DataHubMaxBlockBytes: 1024 * 1024 * 16,
+			// The harness builds this struct directly, so the viper
+			// defaults (both true) don't apply — mirror production
+			// behavior explicitly. Reorg tests depend on the guard +
+			// reconciler; the mined-path smoke tests are unaffected
+			// (guard fails open without chaintracks, reconciler skips).
+			AnchorGuardEnabled: true,
+			Reconciler: config.ReconcilerConfig{
+				Enabled:           true,
+				IntervalMs:        2000, // fast ticks: e2e waits on convergence
+				BatchSize:         5000,
+				BlocksPerTick:     8,
+				NeighborhoodDepth: 6,
+				MaxDeferAttempts:  10,
+				StartupFullScan:   true,
+			},
 		},
 		// Datahub discovery off: we seeded a static URL into DatahubURLs,
 		// so arcade's bump-builder + propagation see it without needing
@@ -259,6 +274,10 @@ func buildArcadeConfig(t *testing.T, port int, opts ArcadeOptions) *config.Confi
 			Enabled: true,
 			Host:    "127.0.0.1",
 			Port:    ctPort,
+			// Tight tie-scan cadence: the reorg e2e scenarios wait on the
+			// no-ReorgEvent detection path (issue #279).
+			TieScanDepth:         20,
+			TieScanMinIntervalMs: 500,
 		}
 		// app.initChaintracks threads cfg.Network → Chaintracks.P2P.Network
 		// and cfg.P2P.BootstrapPeers → Chaintracks.P2P.MsgBus.BootstrapPeers,

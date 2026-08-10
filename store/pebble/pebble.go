@@ -65,20 +65,52 @@ type Store struct {
 // unix-nanoseconds to dodge JSON time-zone drift and to keep retry index
 // keys byte-for-byte consistent.
 type storedStatus struct {
-	TxID                   string   `json:"txid"`
-	Status                 string   `json:"status"`
-	StatusCode             int      `json:"status_code,omitempty"`
-	BlockHash              string   `json:"block_hash,omitempty"`
-	BlockHeight            uint64   `json:"block_height,omitempty"`
-	MerklePath             []byte   `json:"merkle_path,omitempty"`
-	ExtraInfo              string   `json:"extra_info,omitempty"`
-	CompetingTxs           []string `json:"competing_txs,omitempty"`
-	RawTx                  []byte   `json:"raw_tx,omitempty"`
-	RetryCount             int      `json:"retry_count,omitempty"`
-	TimestampUnixNs        int64    `json:"ts"`
-	CreatedUnixNs          int64    `json:"created_at,omitempty"`
-	NextRetryUnixNs        int64    `json:"next_retry_at,omitempty"`
-	MerkleRegisteredUnixNs int64    `json:"merkle_registered_at,omitempty"`
+	TxID                   string                 `json:"txid"`
+	Status                 string                 `json:"status"`
+	StatusCode             int                    `json:"status_code,omitempty"`
+	BlockHash              string                 `json:"block_hash,omitempty"`
+	BlockHeight            uint64                 `json:"block_height,omitempty"`
+	MerklePath             []byte                 `json:"merkle_path,omitempty"`
+	ExtraInfo              string                 `json:"extra_info,omitempty"`
+	CompetingTxs           []string               `json:"competing_txs,omitempty"`
+	RawTx                  []byte                 `json:"raw_tx,omitempty"`
+	RetryCount             int                    `json:"retry_count,omitempty"`
+	TimestampUnixNs        int64                  `json:"ts"`
+	CreatedUnixNs          int64                  `json:"created_at,omitempty"`
+	NextRetryUnixNs        int64                  `json:"next_retry_at,omitempty"`
+	MerkleRegisteredUnixNs int64                  `json:"merkle_registered_at,omitempty"`
+	OrphanedAnchors        []storedOrphanedAnchor `json:"orphaned_anchors,omitempty"`
+}
+
+// storedOrphanedAnchor is the persisted form of models.OrphanedAnchor —
+// block identity + when the anchor was superseded. The proof itself is
+// never persisted; it is re-derived from the orphaned block's retained
+// compound BUMP at read time.
+type storedOrphanedAnchor struct {
+	BlockHash      string `json:"block_hash"`
+	BlockHeight    uint64 `json:"block_height,omitempty"`
+	OrphanedUnixNs int64  `json:"orphaned_at"`
+}
+
+// appendOrphanedAnchor records that the row's current anchor is being
+// superseded (re-anchor to a different block, or reorg revert). Collapses
+// consecutive duplicates and caps at models.MaxOrphanedAnchors, mirroring
+// models.AppendOrphanedAnchor.
+func appendOrphanedAnchor(row *storedStatus, now time.Time) {
+	if row.BlockHash == "" {
+		return
+	}
+	if n := len(row.OrphanedAnchors); n > 0 && row.OrphanedAnchors[n-1].BlockHash == row.BlockHash {
+		return
+	}
+	row.OrphanedAnchors = append(row.OrphanedAnchors, storedOrphanedAnchor{
+		BlockHash:      row.BlockHash,
+		BlockHeight:    row.BlockHeight,
+		OrphanedUnixNs: now.UnixNano(),
+	})
+	if len(row.OrphanedAnchors) > models.MaxOrphanedAnchors {
+		row.OrphanedAnchors = row.OrphanedAnchors[len(row.OrphanedAnchors)-models.MaxOrphanedAnchors:]
+	}
 }
 
 func (s storedStatus) toModel() *models.TransactionStatus {
@@ -105,6 +137,13 @@ func (s storedStatus) toModel() *models.TransactionStatus {
 	}
 	if s.MerkleRegisteredUnixNs != 0 {
 		out.MerkleRegisteredAt = time.Unix(0, s.MerkleRegisteredUnixNs)
+	}
+	for _, a := range s.OrphanedAnchors {
+		out.OrphanedProofs = append(out.OrphanedProofs, models.OrphanedAnchor{
+			BlockHash:   a.BlockHash,
+			BlockHeight: a.BlockHeight,
+			OrphanedAt:  time.Unix(0, a.OrphanedUnixNs).UTC(),
+		})
 	}
 	return out
 }
@@ -133,6 +172,13 @@ func fromModel(m *models.TransactionStatus) storedStatus {
 	}
 	if !m.MerkleRegisteredAt.IsZero() {
 		out.MerkleRegisteredUnixNs = m.MerkleRegisteredAt.UnixNano()
+	}
+	for _, a := range m.OrphanedProofs {
+		out.OrphanedAnchors = append(out.OrphanedAnchors, storedOrphanedAnchor{
+			BlockHash:      a.BlockHash,
+			BlockHeight:    a.BlockHeight,
+			OrphanedUnixNs: a.OrphanedAt.UnixNano(),
+		})
 	}
 	return out
 }
@@ -540,6 +586,7 @@ func (s *Store) GetStatus(ctx context.Context, txid string) (*models.Transaction
 		return nil, nil
 	}
 	s.enrichMerklePath(ctx, st)
+	s.enrichOrphanedProofs(ctx, st)
 	return st, nil
 }
 
@@ -620,7 +667,12 @@ func (s *Store) IterateStatusesSince(ctx context.Context, since time.Time, fn fu
 
 // SetStatusByBlockHash walks idx:tx:block:<blockHash>:* and rewrites each
 // referenced row with the new status. For SEEN_ON_NETWORK transitions block
-// fields are cleared (matches Aerospike contract); for IMMUTABLE they're kept.
+// fields are cleared and the cleared anchor is appended to the row's
+// orphaned-anchor history (reorg revert, issue #279); for IMMUTABLE they're
+// kept. The index walk is a snapshot: each row is re-checked under its shard
+// lock and skipped when its block_hash no longer matches (concurrently
+// re-anchored to the canonical block) or it is already IMMUTABLE. Returns
+// only the txids actually rewritten.
 func (s *Store) SetStatusByBlockHash(ctx context.Context, blockHash string, newStatus models.Status) ([]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -634,20 +686,22 @@ func (s *Store) SetStatusByBlockHash(ctx context.Context, blockHash string, newS
 		return nil, err
 	}
 
-	var txids []string
+	var candidates []string
 	for iter.First(); iter.Valid(); iter.Next() {
 		if err := ctx.Err(); err != nil {
 			_ = iter.Close()
-			return txids, err
+			return nil, err
 		}
-		txids = append(txids, lastSegment(iter.Key()))
+		candidates = append(candidates, lastSegment(iter.Key()))
 	}
 	if err := iter.Close(); err != nil {
-		return txids, err
+		return nil, err
 	}
 
 	clearBlock := newStatus == models.StatusSeenOnNetwork
-	for _, txid := range txids {
+	var txids []string
+	now := time.Now()
+	for _, txid := range candidates {
 		mu := s.shardFor(txid)
 		mu.Lock()
 
@@ -656,11 +710,24 @@ func (s *Store) SetStatusByBlockHash(ctx context.Context, blockHash string, newS
 			mu.Unlock()
 			continue
 		}
+		// Stale-index guard: the row moved to a different anchor between the
+		// index snapshot and this write — reverting it now would undo a
+		// concurrent re-anchor to the canonical block.
+		if existing.BlockHash != blockHash {
+			mu.Unlock()
+			continue
+		}
+		// IMMUTABLE rows are never touched by block-scoped rewrites.
+		if existing.Status == string(models.StatusImmutable) {
+			mu.Unlock()
+			continue
+		}
 
 		updated := *existing
 		updated.Status = string(newStatus)
-		updated.TimestampUnixNs = time.Now().UnixNano()
+		updated.TimestampUnixNs = now.UnixNano()
 		if clearBlock {
+			appendOrphanedAnchor(&updated, now)
 			updated.BlockHash = ""
 			updated.BlockHeight = 0
 		}
@@ -685,6 +752,35 @@ func (s *Store) SetStatusByBlockHash(ctx context.Context, blockHash string, newS
 		if err != nil {
 			return txids, err
 		}
+		txids = append(txids, txid)
+	}
+	return txids, nil
+}
+
+// GetTxIDsByBlockHash walks idx:tx:block:<blockHash>:* and returns every
+// txid currently anchored to the block. The reorg reconciler reads this as
+// an orphaned block's affected set; rows already re-anchored or reverted
+// have left the index and no longer appear.
+func (s *Store) GetTxIDsByBlockHash(ctx context.Context, blockHash string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	prefix := idxTxBlockPrefix(blockHash)
+	iter, err := s.db.NewIter(&pebbledb.IterOptions{
+		LowerBound: prefix,
+		UpperBound: endOfPrefix(prefix),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = iter.Close() }()
+
+	var txids []string
+	for iter.First(); iter.Valid(); iter.Next() {
+		if err := ctx.Err(); err != nil {
+			return txids, err
+		}
+		txids = append(txids, lastSegment(iter.Key()))
 	}
 	return txids, nil
 }
@@ -894,9 +990,23 @@ func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeig
 			mu.Unlock()
 			continue
 		}
+		// Respect the status lattice: of all statuses only IMMUTABLE may not
+		// regress to MINED — a future confirmation-depth promotion must never
+		// be pulled back by a replayed BLOCK_PROCESSED (issue #279 hardening).
+		if !models.StatusMined.CanTransitionFrom(models.Status(existing.Status)) {
+			mu.Unlock()
+			continue
+		}
 		prev := existing.toModel()
 
 		updated := *existing
+		// Re-anchor (MINED against a DIFFERENT block): preserve the anchor
+		// being superseded so the orphaned block's proof stays auditable
+		// (issue #279). First-time MINED and idempotent same-block replays
+		// leave history untouched.
+		if existing.Status == string(models.StatusMined) && existing.BlockHash != blockHash {
+			appendOrphanedAnchor(&updated, now)
+		}
 		updated.Status = string(models.StatusMined)
 		updated.BlockHash = blockHash
 		updated.BlockHeight = blockHeight
@@ -1019,6 +1129,19 @@ func (s *Store) GetBUMP(ctx context.Context, blockHash string) (uint64, []byte, 
 	return b.BlockHeight, b.BumpData, nil
 }
 
+// DeleteBUMPByBlockHash removes the stored compound BUMP for a block and
+// drops any cached parse. Idempotent.
+func (s *Store) DeleteBUMPByBlockHash(ctx context.Context, blockHash string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := s.db.Delete(bumpKey(blockHash), s.writeOpts); err != nil {
+		return fmt.Errorf("delete bump %s: %w", blockHash, err)
+	}
+	s.bumpCache.Remove(blockHash)
+	return nil
+}
+
 func (s *Store) InsertStump(ctx context.Context, stump *models.Stump) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -1072,13 +1195,14 @@ func (s *Store) GetStumpsByBlockHash(ctx context.Context, blockHash string) ([]*
 // nanoseconds (0 == "not yet") to match the conventions used by storedStatus
 // and to avoid JSON timezone drift.
 type storedBlockProcessing struct {
-	BlockHash        string `json:"block_hash"`
-	BlockHeight      uint64 `json:"block_height"`
-	HeaderSeenUnixNs int64  `json:"header_seen_at,omitempty"`
-	ProcessedUnixNs  int64  `json:"processed_at,omitempty"`
-	BUMPBuiltUnixNs  int64  `json:"bump_built_at,omitempty"`
-	Status           string `json:"status"`
-	OrphanedAtUnixNs int64  `json:"orphaned_at,omitempty"`
+	BlockHash          string `json:"block_hash"`
+	BlockHeight        uint64 `json:"block_height"`
+	HeaderSeenUnixNs   int64  `json:"header_seen_at,omitempty"`
+	ProcessedUnixNs    int64  `json:"processed_at,omitempty"`
+	BUMPBuiltUnixNs    int64  `json:"bump_built_at,omitempty"`
+	Status             string `json:"status"`
+	OrphanedAtUnixNs   int64  `json:"orphaned_at,omitempty"`
+	ReconciledAtUnixNs int64  `json:"reconciled_at,omitempty"`
 }
 
 func (b storedBlockProcessing) toModel() *models.BlockProcessingStatus {
@@ -1101,6 +1225,10 @@ func (b storedBlockProcessing) toModel() *models.BlockProcessingStatus {
 	if b.OrphanedAtUnixNs != 0 {
 		t := time.Unix(0, b.OrphanedAtUnixNs).UTC()
 		out.OrphanedAt = &t
+	}
+	if b.ReconciledAtUnixNs != 0 {
+		t := time.Unix(0, b.ReconciledAtUnixNs).UTC()
+		out.ReconciledAt = &t
 	}
 	return out
 }
@@ -1270,6 +1398,76 @@ func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, or
 		mu.Unlock()
 	}
 	return nil
+}
+
+// MarkBlockReconciled stamps reconciled_at on an orphaned block's row —
+// the anchor reconciler finished re-anchoring/reverting its transactions.
+// Missing rows are silently skipped.
+func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, at time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	mu := s.shardFor(blockHash)
+	mu.Lock()
+	defer mu.Unlock()
+	prev, err := s.readBlockProc(blockHash)
+	if err != nil {
+		return err
+	}
+	if prev == nil {
+		return nil
+	}
+	cur := *prev
+	cur.ReconciledAtUnixNs = at.UnixNano()
+	return s.writeBlockProc(prev, &cur)
+}
+
+// ListOrphanedBlocksToReconcile scans the block_processing rows for
+// status='orphaned' AND reconciled_at unset, oldest orphaned_at first.
+// The table holds one row per block, so a prefix scan is cheap.
+func (s *Store) ListOrphanedBlocksToReconcile(ctx context.Context, limit int) ([]*models.BlockProcessingStatus, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		return nil, fmt.Errorf("limit must be > 0")
+	}
+	prefix := []byte(prefixBlockProc)
+	iter, err := s.db.NewIter(&pebbledb.IterOptions{
+		LowerBound: prefix,
+		UpperBound: endOfPrefix(prefix),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = iter.Close() }()
+
+	var rows []*storedBlockProcessing
+	for iter.First(); iter.Valid(); iter.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		var b storedBlockProcessing
+		if err := json.Unmarshal(iter.Value(), &b); err != nil {
+			continue
+		}
+		if b.Status != string(models.BlockStatusOrphaned) || b.ReconciledAtUnixNs != 0 {
+			continue
+		}
+		row := b
+		rows = append(rows, &row)
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		return rows[i].OrphanedAtUnixNs < rows[j].OrphanedAtUnixNs
+	})
+	if len(rows) > limit {
+		rows = rows[:limit]
+	}
+	out := make([]*models.BlockProcessingStatus, len(rows))
+	for i, r := range rows {
+		out[i] = r.toModel()
+	}
+	return out, nil
 }
 
 func (s *Store) MarkBlocksParked(ctx context.Context, blockHashes []string) error {
@@ -1951,4 +2149,24 @@ func (s *Store) enrichMerklePath(ctx context.Context, status *models.Transaction
 		_, bumpData, err := s.GetBUMP(ctx, status.BlockHash)
 		return bumpData, err
 	})
+}
+
+// enrichOrphanedProofs resolves each historical anchor's merkle path from
+// the orphaned block's retained compound BUMP (issue #279). Best-effort:
+// an entry whose BUMP is gone or unparseable is served without a path.
+func (s *Store) enrichOrphanedProofs(ctx context.Context, status *models.TransactionStatus) {
+	if status == nil {
+		return
+	}
+	for i := range status.OrphanedProofs {
+		entry := &status.OrphanedProofs[i]
+		if len(entry.MerklePath) > 0 || entry.BlockHash == "" {
+			continue
+		}
+		hash := entry.BlockHash
+		entry.MerklePath = s.bumpCache.MinimalPath(hash, status.TxID, func() ([]byte, error) {
+			_, bumpData, err := s.GetBUMP(ctx, hash)
+			return bumpData, err
+		})
+	}
 }

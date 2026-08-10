@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -35,6 +36,14 @@ import (
 // failing the build outright on a transient chaintracks race.
 type ChainHeaderReader interface {
 	GetHeaderByHash(ctx context.Context, hash *chainhash.Hash) (*chaintrackslib.BlockHeader, error)
+	// GetHeaderByHeight returns the ACTIVE-chain header at height. A
+	// (nil, nil) or error return means "chaintracks cannot judge this
+	// height yet" — callers must fail open, never treat it as evidence.
+	// Unlike GetHeaderByHash, which also resolves same-height alternates
+	// from the header index, this is a main-chain-membership source: the
+	// anchor guard and the reorg reconciler both compare a block hash
+	// against it to decide canonicality (issue #279).
+	GetHeaderByHeight(ctx context.Context, height uint32) (*chaintrackslib.BlockHeader, error)
 }
 
 type Builder struct {
@@ -210,6 +219,75 @@ func (b *Builder) lookupHeaderWithWait(ctx context.Context, hashObj *chainhash.H
 	return header, lookupErr
 }
 
+// anchorVerdict is anchorDecision's outcome.
+type anchorVerdict int
+
+const (
+	// anchorAllow: the block is the active-chain block at its height, or
+	// chaintracks cannot judge (unknown height, lag, guard disabled, no
+	// chainHeader wired). Fail-open by design — a wrong optimistic anchor
+	// is healed by the anchor reconciler, whereas a false denial would
+	// strand the block's txs with no recovery trigger.
+	anchorAllow anchorVerdict = iota
+	// anchorDeny: positive evidence that the active chain has a DIFFERENT
+	// block at this height — anchoring txs to this block would repeat
+	// issue #279's orphan-anchored MINED rows.
+	anchorDeny
+)
+
+// anchorDecision is the write-time anchor guard (issue #279): before txs
+// are marked MINED against blockHash, check that the block is the
+// active-chain block at its height per chaintracks. Denial requires
+// positive evidence — GetHeaderByHeight knows the height AND the hash
+// differs. Everything else (nil reader, guard disabled, height unknown,
+// lookup error) allows: chaintracks' P2P ingestion legitimately races the
+// Kafka path that drives bump-builder, and the tie-scan + reconciler net
+// catches any optimistic anchor the race lets through.
+func (b *Builder) anchorDecision(ctx context.Context, logger *zap.Logger, blockHash string, blockHeight uint64) anchorVerdict {
+	if b.chainHeader == nil || !b.cfg.BumpBuilder.AnchorGuardEnabled {
+		return anchorAllow
+	}
+	if blockHeight == 0 || blockHeight > math.MaxUint32 {
+		return anchorAllow
+	}
+	active, err := b.chainHeader.GetHeaderByHeight(ctx, uint32(blockHeight))
+	if err != nil || active == nil {
+		logger.Debug("anchor guard could not verify canonicality; anchoring optimistically",
+			logfields.BlockHeight(blockHeight),
+			zap.Error(err))
+		return anchorAllow
+	}
+	if active.Hash.String() == blockHash {
+		return anchorAllow
+	}
+	logger.Error("anchor guard: active chain has a different block at this height — refusing to mark MINED",
+		logfields.BlockHash(blockHash),
+		logfields.BlockHeight(blockHeight),
+		zap.String("active_block_hash", active.Hash.String()))
+	return anchorDeny
+}
+
+// handleAnchorDenied finalizes a block the guard refused to anchor: the
+// processing row is stamped (so the watchdog never re-drives it) and marked
+// orphaned — routing it into the anchor reconciler's queue, which heals any
+// txs an EARLIER build anchored to it — and its STUMPs are pruned. The
+// stored compound BUMP is deliberately retained: it is the store-local
+// re-anchor fuel if this block later wins a flip-flop, and the source for
+// historical orphaned-anchor proofs.
+func (b *Builder) handleAnchorDenied(ctx context.Context, logger *zap.Logger, blockHash string, blockHeight uint64, path string) {
+	metrics.BumpBuilderAnchorGuardDeniedTotal.WithLabelValues(path).Inc()
+	// Stamp first: markBlockProcessed upserts the row when missing (a
+	// never-tip block has no chaintracks header-seen row), so the orphan
+	// mark below always has a row to land on.
+	b.markBlockProcessed(ctx, logger, blockHash, blockHeight)
+	if err := b.store.MarkBlocksOrphaned(ctx, []string{blockHash}, time.Now()); err != nil {
+		logger.Warn("anchor guard: failed to mark block orphaned; reconciler full-scan will catch it", zap.Error(err))
+	}
+	if err := b.store.DeleteStumpsByBlockHash(ctx, blockHash); err != nil {
+		logger.Warn("anchor guard: failed to clean up STUMPs", zap.Error(err))
+	}
+}
+
 // markMinedAndPublish moves the txids to MINED and fans the resulting status
 // updates out to the events Publisher. blockHeight is required so each
 // published status carries the block-height anchor that downstream SSE /
@@ -218,15 +296,60 @@ func (b *Builder) lookupHeaderWithWait(ctx context.Context, hashObj *chainhash.H
 // repairs it from the compound BUMP's height before fanning out so a
 // half-applied revert can never reintroduce the original bug.
 func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, blockHash string, blockHeight uint64, txids []string) {
-	prevs, mined, err := b.store.SetMinedByTxIDs(ctx, blockHash, blockHeight, txids)
+	setMinedAndPublish(ctx, logger, b.store, b.publisher, blockHash, blockHeight, txids, "", false)
+}
+
+// setMinedAndPublish is the shared "mark MINED + fan out" core behind the
+// builder's build path and the anchor reconciler's re-anchor path (issue
+// #279). extraInfo, when non-empty, is stamped on the published bulk event
+// templates (e.g. models.ExtraInfoReorgReanchor) so consumers can tell a
+// reorg correction from a plain MINED. onlyChanged filters the fan-out to
+// rows whose anchor actually changed (previous status not MINED, or MINED
+// against a different block) — the reconciler re-mines a canonical block's
+// FULL BUMP set for idempotency, and rows already correctly anchored must
+// not spam duplicate events.
+func setMinedAndPublish(
+	ctx context.Context,
+	logger *zap.Logger,
+	st store.Store,
+	publisher events.Publisher,
+	blockHash string,
+	blockHeight uint64,
+	txids []string,
+	extraInfo string,
+	onlyChanged bool,
+) (changed int) {
+	prevs, mined, err := st.SetMinedByTxIDs(ctx, blockHash, blockHeight, txids)
 	if err != nil {
 		logger.Error("failed to set mined status", zap.Error(err))
-		return
+		return 0
 	}
+	// onlyChanged: keep only actual anchor transitions. prevs and mined are
+	// parallel slices per the SetMinedByTxIDs contract.
+	if onlyChanged {
+		filteredPrevs := prevs[:0]
+		filteredMined := mined[:0]
+		for i, prev := range prevs {
+			if i >= len(mined) {
+				break
+			}
+			if prev != nil && prev.Status == models.StatusMined && prev.BlockHash == blockHash {
+				continue
+			}
+			filteredPrevs = append(filteredPrevs, prev)
+			filteredMined = append(filteredMined, mined[i])
+		}
+		prevs, mined = filteredPrevs, filteredMined
+		if len(mined) == 0 {
+			return 0
+		}
+	}
+
 	logger.Info(
 		"set transactions to MINED",
 		zap.Int("count", len(mined)),
 		logfields.BlockHeight(blockHeight),
+		zap.String("extra_info", extraInfo),
 	)
 	metrics.BumpBuilderTxidsMinedTotal.Add(float64(len(mined)))
 	// Observe the per-tx age of the previous status row so an operator can see
@@ -264,8 +387,8 @@ func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, b
 		)
 	})
 
-	if len(mined) == 0 || b.publisher == nil {
-		return
+	if len(mined) == 0 || publisher == nil {
+		return len(mined)
 	}
 	// Coalesce the N-per-block MINED fan-out into bulk events. Without this, a
 	// single BUMP build for a 14k-tx block produced 14k individual publish
@@ -291,8 +414,9 @@ func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, b
 			BlockHeight: blockHeight,
 			Timestamp:   time.Now(),
 			TxIDs:       publishTxIDs[start:end],
+			ExtraInfo:   extraInfo,
 		}
-		if pubErr := b.publisher.PublishBulk(ctx, template); pubErr != nil {
+		if pubErr := publisher.PublishBulk(ctx, template); pubErr != nil {
 			logger.Warn(
 				"failed to publish bulk MINED",
 				logfields.BlockHash(blockHash),
@@ -303,6 +427,7 @@ func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, b
 			)
 		}
 	}
+	return len(mined)
 }
 
 // maxTxIDsPerBulkEvent caps how many txids ride in a single bulk MINED event.
@@ -584,7 +709,12 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	// and tryShortCircuit re-stamps it on the redelivered BLOCK_PROCESSED.
 	b.markBlockProcessed(ctx, logger, blockHash, blockHeight)
 
-	// 6. Set tracked transactions to MINED.
+	// 6. Set tracked transactions to MINED — unless the anchor guard has
+	// positive evidence the block lost its height to a same-height
+	// competitor (issue #279). The BUMP built above stays stored either
+	// way: it is the store-local re-anchor fuel if the block later wins a
+	// flip-flop, and the source for historical orphaned-anchor proofs.
+	//
 	// blockHeight is threaded through here (and asserted on the returned
 	// statuses below) because downstream SSE/webhook consumers and the
 	// dedup path in BUMP-build rely on the height to anchor each MINED
@@ -597,6 +727,11 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	// previous in-memory pre-filter against TxTracker silently dropped txs
 	// submitted to api-server after bump-builder's per-pod tracker hydration
 	// in microservice mode.
+	if b.anchorDecision(ctx, logger, blockHash, blockHeight) == anchorDeny {
+		outcome = "skipped_inactive_chain"
+		b.handleAnchorDenied(ctx, logger, blockHash, blockHeight, "build")
+		return nil
+	}
 	if len(txids) > 0 {
 		b.markMinedAndPublish(ctx, logger, blockHash, blockHeight, txids)
 	}
@@ -895,6 +1030,14 @@ func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, block
 		zap.Int("level0_count", len(txids)),
 		logfields.BlockHeight(existingHeight),
 	)
+	// The guard runs on the redelivery path too: a replayed BLOCK_PROCESSED
+	// (DLQ redrive, watchdog /reprocess) for a block that lost its height
+	// must not re-anchor txs from its stored BUMP (issue #279). The denied
+	// block is finalized + orphan-marked exactly like the fresh-build path.
+	if b.anchorDecision(ctx, logger, blockHash, existingHeight) == anchorDeny {
+		b.handleAnchorDenied(ctx, logger, blockHash, existingHeight, "short_circuit")
+		return true
+	}
 	if len(txids) > 0 {
 		b.markMinedAndPublish(ctx, logger, blockHash, existingHeight, txids)
 	}

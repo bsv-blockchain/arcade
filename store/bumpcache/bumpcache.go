@@ -89,6 +89,23 @@ func (c *Cache) Enrich(status *models.TransactionStatus, fetch func() ([]byte, e
 	status.MerklePath = idx.MinimalPathBytes(status.TxID)
 }
 
+// MinimalPath returns txid's BRC-74 minimal path from blockHash's compound
+// BUMP, or nil when the BUMP cannot be fetched/parsed or the txid is not a
+// level-0 leaf. Unlike Enrich this is not tied to a status row's CURRENT
+// anchor — it resolves a proof against any retained block, which is how
+// orphaned-anchor proofs are served after a reorg re-anchor (issue #279).
+// fetch is only invoked on a cache miss.
+func (c *Cache) MinimalPath(blockHash, txid string, fetch func() ([]byte, error)) []byte {
+	if blockHash == "" || txid == "" {
+		return nil
+	}
+	idx := c.index(blockHash, fetch)
+	if idx == nil {
+		return nil
+	}
+	return idx.MinimalPathBytes(txid)
+}
+
 // Remove invalidates a block's cached index. Called by InsertBUMP: a rebuild
 // can overwrite the stored compound for an existing block (e.g. late STUMP
 // callbacks), so the next enrichment must re-fetch and re-parse.

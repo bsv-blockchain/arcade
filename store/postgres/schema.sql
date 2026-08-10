@@ -22,6 +22,12 @@ CREATE TABLE IF NOT EXISTS transactions (
 -- introduced. Existing rows keep NULL until the next successful /watch call
 -- repopulates the marker — see issue #145.
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS merkle_registered_at TIMESTAMPTZ;
+-- Orphaned-anchor history (issue #279): every block this tx was once MINED
+-- against before a reorg superseded the anchor, as a JSONB array of
+-- {blockHash, blockHeight, orphanedAt} in models.OrphanedAnchor shape,
+-- capped at 5 entries by the writers. NULL for the overwhelming majority of
+-- rows that never lived through a reorg.
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS orphaned_anchors JSONB;
 
 CREATE INDEX IF NOT EXISTS idx_tx_status        ON transactions(status);
 CREATE INDEX IF NOT EXISTS idx_tx_block_hash    ON transactions(block_hash);
@@ -69,6 +75,15 @@ CREATE INDEX IF NOT EXISTS idx_bp_status_height ON block_processing(status, bloc
 CREATE INDEX IF NOT EXISTS idx_bp_stale_seen
     ON block_processing(header_seen_at)
     WHERE processed_at IS NULL AND status = 'active';
+-- Reorg reconciliation marker (issue #279): stamped by the anchor
+-- reconciler once every tx anchored to this orphaned block has been
+-- re-anchored or reverted; reset to NULL when the block is resurrected.
+ALTER TABLE block_processing ADD COLUMN IF NOT EXISTS reconciled_at TIMESTAMPTZ;
+-- Partial index over the reconciler's work queue — orphaned rows still
+-- awaiting tx reconciliation. Stays proportional to the (tiny) backlog.
+CREATE INDEX IF NOT EXISTS idx_bp_orphaned_unreconciled
+    ON block_processing(orphaned_at)
+    WHERE status = 'orphaned' AND reconciled_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS submissions (
     submission_id         TEXT PRIMARY KEY,

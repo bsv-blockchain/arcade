@@ -494,12 +494,20 @@ func BuildServices(d *Deps) []services.Service {
 	}
 	if shouldRun("bump-builder") {
 		// chainHeader is nil when chaintracks is disabled — bump-builder
-		// nil-guards and falls back to subtree-count-only validation.
+		// nil-guards and falls back to subtree-count-only validation, the
+		// anchor guard fails open, and the reconciler below is skipped.
 		var chainHeader bump_builder.ChainHeaderReader
 		if d.Chaintracks != nil {
 			chainHeader = chaintracksHeaderReader{ct: d.Chaintracks}
 		}
 		svcs = append(svcs, bump_builder.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.TeranodeClient, chainHeader))
+		// The anchor reconciler heals txs anchored to orphaned blocks
+		// (issue #279). Hosted in the bump-builder mode because it shares
+		// the MINED-publish machinery, the store, and the chaintracks
+		// header source; lease-gated for multi-replica deployments.
+		if rec := bump_builder.NewReconciler(cfg, d.Logger, d.Store, d.Publisher, chainHeader, d.MerkleClient, d.Leaser); rec != nil {
+			svcs = append(svcs, rec)
+		}
 	}
 	if shouldRun("watchdog") && cfg.Watchdog.Enabled {
 		if wd := watchdog.NewService(cfg, d.Logger, d.Store, d.Leaser, d.MerkleClient); wd != nil {
@@ -554,6 +562,10 @@ type chaintracksHeaderReader struct {
 
 func (a chaintracksHeaderReader) GetHeaderByHash(ctx context.Context, hash *chainhash.Hash) (*chaintrackslib.BlockHeader, error) {
 	return a.ct.GetHeaderByHash(ctx, hash)
+}
+
+func (a chaintracksHeaderReader) GetHeaderByHeight(ctx context.Context, height uint32) (*chaintrackslib.BlockHeader, error) {
+	return a.ct.GetHeaderByHeight(ctx, height)
 }
 
 // endpointSourceValidationTTL is how long a discovered URL that passed
