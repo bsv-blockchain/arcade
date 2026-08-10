@@ -170,6 +170,15 @@ func (m *mockStore) MarkMerkleRegisteredByTxIDs(context.Context, []string, time.
 	return nil
 }
 
+func (m *mockStore) GetTxIDsByBlockHash(context.Context, string) ([]string, error) {
+	return nil, nil
+}
+func (m *mockStore) DeleteBUMPByBlockHash(context.Context, string) error          { return nil }
+func (m *mockStore) MarkBlockReconciled(context.Context, string, time.Time) error { return nil }
+func (m *mockStore) ListOrphanedBlocksToReconcile(context.Context, int) ([]*models.BlockProcessingStatus, error) {
+	return nil, nil
+}
+
 func (m *mockStore) InsertSubmission(_ context.Context, sub *models.Submission) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

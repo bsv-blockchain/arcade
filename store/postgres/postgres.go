@@ -557,21 +557,84 @@ func disallowedPrevAsStrings(s models.Status) []string {
 }
 
 func (s *Store) GetStatus(ctx context.Context, txid string) (*models.TransactionStatus, error) {
+	// orphaned_anchors rides only on this single-tx read (the GET /tx path
+	// where historical proofs matter) — the scanStatus-shared bulk queries
+	// deliberately skip it.
 	const q = `
 SELECT txid, status, status_code, block_hash, block_height, merkle_path,
        extra_info, competing_txs, raw_tx, retry_count, next_retry_at,
-       timestamp_at, created_at, merkle_registered_at
+       timestamp_at, created_at, merkle_registered_at,
+       COALESCE(orphaned_anchors, 'null'::jsonb)
 FROM transactions WHERE txid = $1`
 	row := s.pool.QueryRow(ctx, q, txid)
-	st, err := scanStatus(row)
+	st, anchorsJSON, err := scanStatusWithAnchors(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
+	if len(anchorsJSON) > 0 && string(anchorsJSON) != "null" {
+		_ = json.Unmarshal(anchorsJSON, &st.OrphanedProofs)
+	}
 	s.enrichMerklePath(ctx, st)
+	s.enrichOrphanedProofs(ctx, st)
 	return st, nil
+}
+
+// scanStatusWithAnchors is scanStatus + the trailing orphaned_anchors JSONB
+// column GetStatus selects.
+func scanStatusWithAnchors(row rowScanner) (*models.TransactionStatus, []byte, error) {
+	var (
+		st                 models.TransactionStatus
+		statusCode         *int
+		blockHash          *string
+		blockHeight        *int64
+		merklePath         []byte
+		extraInfo          *string
+		competingTxs       []byte
+		rawTx              []byte
+		nextRetry          *time.Time
+		merkleRegisteredAt *time.Time
+		anchors            []byte
+	)
+	if err := row.Scan(
+		&st.TxID, &st.Status, &statusCode,
+		&blockHash, &blockHeight, &merklePath,
+		&extraInfo, &competingTxs, &rawTx,
+		&st.RetryCount, &nextRetry,
+		&st.Timestamp, &st.CreatedAt, &merkleRegisteredAt, &anchors,
+	); err != nil {
+		return nil, nil, err
+	}
+	if statusCode != nil {
+		st.StatusCode = *statusCode
+	}
+	if blockHash != nil {
+		st.BlockHash = *blockHash
+	}
+	if blockHeight != nil {
+		st.BlockHeight = uint64(*blockHeight) //nolint:gosec // block height fits in either signed/unsigned 64-bit
+	}
+	if len(merklePath) > 0 {
+		st.MerklePath = merklePath
+	}
+	if extraInfo != nil {
+		st.ExtraInfo = *extraInfo
+	}
+	if len(competingTxs) > 0 {
+		_ = json.Unmarshal(competingTxs, &st.CompetingTxs)
+	}
+	if len(rawTx) > 0 {
+		st.RawTx = rawTx
+	}
+	if nextRetry != nil {
+		st.NextRetryAt = *nextRetry
+	}
+	if merkleRegisteredAt != nil {
+		st.MerkleRegisteredAt = *merkleRegisteredAt
+	}
+	return &st, anchors, nil
 }
 
 func (s *Store) GetStatusesSince(ctx context.Context, since time.Time) ([]*models.TransactionStatus, error) {
@@ -631,22 +694,69 @@ ORDER BY timestamp_at DESC`
 
 // SetStatusByBlockHash rewrites every row in the block. Block fields are
 // cleared on SEEN_ON_NETWORK transitions (reorg path) and kept otherwise —
-// matches the Aerospike / Pebble contract.
+// matches the Aerospike / Pebble contract. IMMUTABLE rows are never touched,
+// and the WHERE block_hash predicate is atomic per row, so a tx concurrently
+// re-anchored to a different block simply falls out of the match (issue
+// #279). Reverts append the cleared anchor to orphaned_anchors so the
+// orphaned block's proof stays auditable.
 func (s *Store) SetStatusByBlockHash(ctx context.Context, blockHash string, newStatus models.Status) ([]string, error) {
 	clearBlock := newStatus == models.StatusSeenOnNetwork
 
 	var q string
 	if clearBlock {
-		q = `UPDATE transactions SET status=$2, block_hash=NULL, block_height=NULL, timestamp_at=NOW()
-             WHERE block_hash=$1 RETURNING txid`
+		q = `UPDATE transactions SET status=$2,
+               orphaned_anchors = CASE
+                 WHEN COALESCE(orphaned_anchors -> -1 ->> 'blockHash', '') <> block_hash
+                 THEN (
+                   SELECT jsonb_agg(elem ORDER BY ord)
+                   FROM (
+                     SELECT elem, ord
+                     FROM jsonb_array_elements(
+                            COALESCE(orphaned_anchors, '[]'::jsonb) ||
+                            jsonb_build_array(jsonb_build_object(
+                              'blockHash',   block_hash,
+                              'blockHeight', COALESCE(block_height, 0),
+                              'orphanedAt',  NOW()
+                            ))
+                          ) WITH ORDINALITY AS x(elem, ord)
+                     ORDER BY ord DESC
+                     LIMIT 5
+                   ) tail
+                 )
+                 ELSE orphaned_anchors
+               END,
+               block_hash=NULL, block_height=NULL, timestamp_at=NOW()
+             WHERE block_hash=$1 AND status <> 'IMMUTABLE' RETURNING txid`
 	} else {
 		q = `UPDATE transactions SET status=$2, timestamp_at=NOW()
-             WHERE block_hash=$1 RETURNING txid`
+             WHERE block_hash=$1 AND status <> 'IMMUTABLE' RETURNING txid`
 	}
 
 	rows, err := s.pool.Query(ctx, q, blockHash, string(newStatus))
 	if err != nil {
 		return nil, fmt.Errorf("update by block hash: %w", err)
+	}
+	defer rows.Close()
+
+	var txids []string
+	for rows.Next() {
+		var txid string
+		if err := rows.Scan(&txid); err != nil {
+			return txids, err
+		}
+		txids = append(txids, txid)
+	}
+	return txids, rows.Err()
+}
+
+// GetTxIDsByBlockHash returns every txid currently anchored to blockHash —
+// the reorg reconciler's affected set for an orphaned block. Resolved via
+// idx_tx_block_hash.
+func (s *Store) GetTxIDsByBlockHash(ctx context.Context, blockHash string) ([]string, error) {
+	const q = `SELECT txid FROM transactions WHERE block_hash = $1`
+	rows, err := s.pool.Query(ctx, q, blockHash)
+	if err != nil {
+		return nil, fmt.Errorf("get txids by block hash: %w", err)
 	}
 	defer rows.Close()
 
@@ -757,16 +867,44 @@ func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeig
 		return nil, nil, nil
 	}
 	now := time.Now()
+	// Lattice hardening + orphaned-anchor history (issue #279):
+	//   - IMMUTABLE rows are excluded from the join — a replayed
+	//     BLOCK_PROCESSED must never demote a confirmation-depth promotion.
+	//   - A MINED row re-anchored to a DIFFERENT block appends its previous
+	//     anchor to orphaned_anchors (models.OrphanedAnchor JSON shape,
+	//     capped at 5 = models.MaxOrphanedAnchors, consecutive duplicates
+	//     collapsed) so the orphaned block's proof stays auditable.
 	const q = `
 WITH prev AS (
-  SELECT txid, status, timestamp_at, block_hash, block_height
+  SELECT txid, status, timestamp_at, block_hash, block_height, orphaned_anchors
   FROM transactions
   WHERE txid = ANY($5)
 )
 UPDATE transactions t
-SET status=$1, block_hash=$2, block_height=$3, timestamp_at=$4
+SET status=$1, block_hash=$2, block_height=$3, timestamp_at=$4,
+    orphaned_anchors = CASE
+      WHEN prev.status = 'MINED' AND prev.block_hash IS NOT NULL AND prev.block_hash <> $2
+           AND COALESCE(prev.orphaned_anchors -> -1 ->> 'blockHash', '') <> prev.block_hash
+      THEN (
+        SELECT jsonb_agg(elem ORDER BY ord)
+        FROM (
+          SELECT elem, ord
+          FROM jsonb_array_elements(
+                 COALESCE(prev.orphaned_anchors, '[]'::jsonb) ||
+                 jsonb_build_array(jsonb_build_object(
+                   'blockHash',   prev.block_hash,
+                   'blockHeight', COALESCE(prev.block_height, 0),
+                   'orphanedAt',  $4::timestamptz
+                 ))
+               ) WITH ORDINALITY AS x(elem, ord)
+          ORDER BY ord DESC
+          LIMIT 5
+        ) tail
+      )
+      ELSE prev.orphaned_anchors
+    END
 FROM prev
-WHERE t.txid = prev.txid
+WHERE t.txid = prev.txid AND t.status <> 'IMMUTABLE'
 RETURNING t.txid, prev.status, prev.timestamp_at, prev.block_hash, prev.block_height`
 	rows, err := s.pool.Query(ctx, q, string(models.StatusMined), blockHash, int64(blockHeight), now, txids) //nolint:gosec // block height fits in int64
 	if err != nil {
@@ -908,9 +1046,10 @@ func (s *Store) UpsertBlockHeaderSeen(ctx context.Context, blockHash string, blo
 INSERT INTO block_processing (block_hash, block_height, header_seen_at, status)
 VALUES ($1, $2, $3, 'active')
 ON CONFLICT (block_hash) DO UPDATE SET
-    block_height = EXCLUDED.block_height,
-    status       = 'active',
-    orphaned_at  = NULL`
+    block_height  = EXCLUDED.block_height,
+    status        = 'active',
+    orphaned_at   = NULL,
+    reconciled_at = NULL`
 	_, err := s.pool.Exec(ctx, q, blockHash, int64(blockHeight), seenAt) //nolint:gosec // block height fits in int64
 	if err != nil {
 		return fmt.Errorf("upsert block header seen %s: %w", blockHash, err)
@@ -959,6 +1098,46 @@ WHERE block_hash = ANY($1)`
 	return nil
 }
 
+// MarkBlockReconciled stamps reconciled_at on an orphaned block's row —
+// the anchor reconciler finished re-anchoring/reverting its transactions.
+// Missing rows are silently skipped.
+func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, at time.Time) error {
+	const q = `UPDATE block_processing SET reconciled_at = $2 WHERE block_hash = $1`
+	if _, err := s.pool.Exec(ctx, q, blockHash, at); err != nil {
+		return fmt.Errorf("mark block reconciled %s: %w", blockHash, err)
+	}
+	return nil
+}
+
+// ListOrphanedBlocksToReconcile returns the reconciler's work queue:
+// orphaned rows not yet reconciled, oldest orphaned_at first. Served by
+// the idx_bp_orphaned_unreconciled partial index.
+func (s *Store) ListOrphanedBlocksToReconcile(ctx context.Context, limit int) ([]*models.BlockProcessingStatus, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("limit must be > 0")
+	}
+	const q = `
+SELECT block_hash, block_height, header_seen_at, processed_at, bump_built_at, status, orphaned_at, reconciled_at
+FROM block_processing
+WHERE status = 'orphaned' AND reconciled_at IS NULL
+ORDER BY orphaned_at ASC NULLS LAST
+LIMIT $1`
+	rows, err := s.pool.Query(ctx, q, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list orphaned blocks to reconcile: %w", err)
+	}
+	defer rows.Close()
+	var out []*models.BlockProcessingStatus
+	for rows.Next() {
+		bp, err := scanBlockProcessing(rows.Scan)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, bp)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) MarkBlocksParked(ctx context.Context, blockHashes []string) error {
 	if len(blockHashes) == 0 {
 		return nil
@@ -978,7 +1157,7 @@ WHERE block_hash = ANY($1) AND status = 'active'`
 
 func (s *Store) GetBlockProcessingStatus(ctx context.Context, blockHash string) (*models.BlockProcessingStatus, error) {
 	const q = `
-SELECT block_hash, block_height, header_seen_at, processed_at, bump_built_at, status, orphaned_at
+SELECT block_hash, block_height, header_seen_at, processed_at, bump_built_at, status, orphaned_at, reconciled_at
 FROM block_processing
 WHERE block_hash = $1`
 	row := s.pool.QueryRow(ctx, q, blockHash)
@@ -997,7 +1176,7 @@ func (s *Store) ListBlockProcessingStatus(ctx context.Context, beforeHeight uint
 		return nil, nil
 	}
 	const q = `
-SELECT block_hash, block_height, header_seen_at, processed_at, bump_built_at, status, orphaned_at
+SELECT block_hash, block_height, header_seen_at, processed_at, bump_built_at, status, orphaned_at, reconciled_at
 FROM block_processing
 WHERE ($1 = 0 OR block_height < $1)
 ORDER BY block_height DESC
@@ -1038,7 +1217,7 @@ func (s *Store) ListStaleBlockProcessingStatus(ctx context.Context, olderThan ti
 		return nil, nil
 	}
 	const q = `
-SELECT block_hash, block_height, header_seen_at, processed_at, bump_built_at, status, orphaned_at
+SELECT block_hash, block_height, header_seen_at, processed_at, bump_built_at, status, orphaned_at, reconciled_at
 FROM block_processing
 WHERE processed_at IS NULL
   AND status = 'active'
@@ -1066,15 +1245,16 @@ LIMIT $3`
 // shape lets us share this between QueryRow.Scan and Rows.Scan.
 func scanBlockProcessing(scan func(...any) error) (*models.BlockProcessingStatus, error) {
 	var (
-		bp         models.BlockProcessingStatus
-		height     int64
-		processed  *time.Time
-		bumpBuilt  *time.Time
-		statusVal  string
-		orphanedAt *time.Time
-		seenAt     time.Time
+		bp           models.BlockProcessingStatus
+		height       int64
+		processed    *time.Time
+		bumpBuilt    *time.Time
+		statusVal    string
+		orphanedAt   *time.Time
+		reconciledAt *time.Time
+		seenAt       time.Time
 	)
-	if err := scan(&bp.BlockHash, &height, &seenAt, &processed, &bumpBuilt, &statusVal, &orphanedAt); err != nil {
+	if err := scan(&bp.BlockHash, &height, &seenAt, &processed, &bumpBuilt, &statusVal, &orphanedAt, &reconciledAt); err != nil {
 		return nil, err
 	}
 	bp.BlockHeight = uint64(height) //nolint:gosec // height non-negative in storage
@@ -1083,6 +1263,7 @@ func scanBlockProcessing(scan func(...any) error) (*models.BlockProcessingStatus
 	bp.BUMPBuiltAt = bumpBuilt
 	bp.Status = models.BlockProcessingStatusValue(statusVal)
 	bp.OrphanedAt = orphanedAt
+	bp.ReconciledAt = reconciledAt
 	return &bp, nil
 }
 
@@ -1506,4 +1687,35 @@ func (s *Store) enrichMerklePath(ctx context.Context, status *models.Transaction
 		_, bumpData, err := s.GetBUMP(ctx, status.BlockHash)
 		return bumpData, err
 	})
+}
+
+// enrichOrphanedProofs resolves each historical anchor's merkle path from
+// the orphaned block's retained compound BUMP (issue #279). Best-effort:
+// an entry whose BUMP is gone or unparseable is served without a path.
+func (s *Store) enrichOrphanedProofs(ctx context.Context, status *models.TransactionStatus) {
+	if status == nil {
+		return
+	}
+	for i := range status.OrphanedProofs {
+		entry := &status.OrphanedProofs[i]
+		if len(entry.MerklePath) > 0 || entry.BlockHash == "" {
+			continue
+		}
+		hash := entry.BlockHash
+		entry.MerklePath = s.bumpCache.MinimalPath(hash, status.TxID, func() ([]byte, error) {
+			_, bumpData, err := s.GetBUMP(ctx, hash)
+			return bumpData, err
+		})
+	}
+}
+
+// DeleteBUMPByBlockHash removes the stored compound BUMP for a block and
+// drops any cached parse. Idempotent.
+func (s *Store) DeleteBUMPByBlockHash(ctx context.Context, blockHash string) error {
+	const q = `DELETE FROM bumps WHERE block_hash = $1`
+	if _, err := s.pool.Exec(ctx, q, blockHash); err != nil {
+		return fmt.Errorf("delete bump %s: %w", blockHash, err)
+	}
+	s.bumpCache.Remove(blockHash)
+	return nil
 }

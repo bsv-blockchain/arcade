@@ -451,6 +451,23 @@ func IndexCompound(bumpData []byte) (*CompoundIndex, error) {
 // proxy cache implementations use to budget resident memory.
 func (ci *CompoundIndex) Leaves() int { return ci.leaves }
 
+// BlockHeight reports the block height the compound BUMP anchors to.
+func (ci *CompoundIndex) BlockHeight() uint64 { return uint64(ci.blockHeight) }
+
+// Contains reports whether txid is a level-0 leaf of the compound — i.e.
+// whether this block provably includes the transaction. Used by the reorg
+// reconciler to decide re-anchor (tx present in the canonical block's
+// BUMP) vs revert. O(1) via the txOffsets map; false for unparseable
+// txids and duplicate-flag leaves (which carry no hash).
+func (ci *CompoundIndex) Contains(txid string) bool {
+	txHash, err := chainhash.NewHashFromHex(txid)
+	if err != nil {
+		return false
+	}
+	_, ok := ci.txOffsets[*txHash]
+	return ok
+}
+
 // leafAt returns the element at (level, offset), or nil when absent.
 func (ci *CompoundIndex) leafAt(level int, offset uint64) *transaction.PathElement {
 	if level >= len(ci.levels) {

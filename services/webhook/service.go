@@ -328,10 +328,14 @@ func (s *Service) dispatchOne(ctx context.Context, status *models.TransactionSta
 //     delivered.
 //   - When FullStatusUpdates is false (the default), only terminal statuses
 //     (MINED, REJECTED, MINED_IN_STALE_BLOCK / IMMUTABLE) are delivered.
-//   - Same status as LastDeliveredStatus is suppressed (idempotent dedup).
+//   - Same status as LastDeliveredStatus is suppressed (idempotent dedup) —
+//     EXCEPT a MINED event flagged as a reorg re-anchor (issue #279): it is
+//     the one same-status transition that carries new information (the
+//     block hash + merkle path changed), and suppressing it would leave the
+//     receiver holding a proof anchored to an orphaned block.
 func shouldDeliver(sub *models.Submission, status *models.TransactionStatus) bool {
 	if sub.LastDeliveredStatus == status.Status {
-		return false
+		return status.Status == models.StatusMined && status.ExtraInfo == models.ExtraInfoReorgReanchor
 	}
 	if sub.FullStatusUpdates {
 		return true

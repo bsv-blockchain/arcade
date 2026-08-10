@@ -1196,10 +1196,50 @@ components:
         merkleRegisteredAt:
           type: string
           format: date-time
+        orphanedProofs:
+          type: array
+          description: >-
+            Historical MINED anchors a chain reorganization superseded, newest
+            last (capped at 5). Present only on transactions that were once
+            anchored to a block that later lost its height to a competitor —
+            e.g. after a same-height reorg the tx re-anchors to the winning
+            block (blockHash/merklePath above) while the losing block's anchor
+            is preserved here, with its proof still resolvable against the
+            orphaned header.
+          items:
+            $ref: "#/components/schemas/OrphanedProof"
       required:
         - txid
         - txStatus
         - timestamp
+
+    OrphanedProof:
+      type: object
+      description: >-
+        One historical anchor a reorg superseded: the orphaned block the
+        transaction was MINED against, when the anchor was replaced, and the
+        transaction's BUMP against that block (best-effort — absent if the
+        orphaned block's compound BUMP is no longer retained).
+      properties:
+        blockHash:
+          type: string
+          description: Hash of the orphaned block.
+        blockHeight:
+          type: integer
+          format: int64
+        orphanedAt:
+          type: string
+          format: date-time
+          description: When the anchor was superseded (re-anchor or revert).
+        merklePath:
+          type: string
+          description: >-
+            BUMP merkle path against the ORPHANED block, hex-encoded. Computes
+            to the orphaned header's merkle root, not the active chain's.
+      required:
+        - blockHash
+        - blockHeight
+        - orphanedAt
 
     SubmitTxJSON:
       type: object

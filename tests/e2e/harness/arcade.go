@@ -10,6 +10,9 @@ import (
 	"testing"
 	"time"
 
+	chaintracksconfig "github.com/bsv-blockchain/go-chaintracks/config"
+	msgbus "github.com/bsv-blockchain/go-p2p-message-bus"
+	teranodep2p "github.com/bsv-blockchain/go-teranode-p2p-client"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
 
@@ -59,6 +62,22 @@ type ArcadeOptions struct {
 	// callback requests. Must match what merkle-service is configured
 	// to send.
 	CallbackToken string
+
+	// EnableChaintracks brings up the embedded go-chaintracks instance
+	// (and the chaintracks_server service with its blockStatusTracker).
+	// Chaintracks joins the same gossipsub mesh as merkle-service and
+	// tracks the headers of blocks the test publishes. Required for
+	// reorg scenarios; off by default because the extra libp2p host
+	// adds ~1s of mesh-formation latency the plain mined-path smoke
+	// tests don't need.
+	EnableChaintracks bool
+
+	// LibP2PLoopback is the harness host's loopback multiaddr
+	// (LibP2PHost.LoopbackMultiaddr()). Required when EnableChaintracks
+	// is set: chaintracks runs on the host, and the announce address in
+	// LibP2PBootstrap (gateway IP / host.docker.internal) is only
+	// dialable from inside containers.
+	LibP2PLoopback string
 }
 
 // StartArcade boots arcade in-process via the same code path the
@@ -90,7 +109,7 @@ func StartArcade(t *testing.T, opts ArcadeOptions) *ArcadeRuntime {
 		Logger:  logger,
 		Port:    port,
 		BaseURL: fmt.Sprintf("http://127.0.0.1:%d", port),
-		HostURL: fmt.Sprintf("http://host.docker.internal:%d", port),
+		HostURL: fmt.Sprintf("http://%s:%d", callbackHost(), port),
 		cancel:  cancel,
 		cleanup: cleanup,
 	}
@@ -139,7 +158,7 @@ func buildArcadeConfig(t *testing.T, port int, opts ArcadeOptions) *config.Confi
 		LogLevel:      "warn",
 		Network:       config.NetworkRegtest,
 		StoragePath:   t.TempDir(),
-		CallbackURL:   fmt.Sprintf("http://host.docker.internal:%d/api/v1/merkle-service/callback", port),
+		CallbackURL:   fmt.Sprintf("http://%s:%d/api/v1/merkle-service/callback", callbackHost(), port),
 		CallbackToken: opts.CallbackToken,
 		APIServer: config.API{
 			Host: "0.0.0.0",
@@ -188,9 +207,11 @@ func buildArcadeConfig(t *testing.T, port int, opts ArcadeOptions) *config.Confi
 		Validator: config.ValidatorConfig{
 			MinFeePerKB: 50,
 		},
-		// Disable chaintracks: regtest has no embedded genesis, and the
-		// smoke test doesn't need header tracking — block announcements
-		// flow direct from harness libp2p host to merkle-service.
+		// Chaintracks default-off: the plain mined-path smoke tests don't
+		// need header tracking — block announcements flow direct from the
+		// harness libp2p host to merkle-service. Reorg tests opt in via
+		// EnableChaintracks (go-chaintracks sources the regtest genesis
+		// from go-chaincfg, so embedded mode works fine on regtest).
 		ChaintracksServer: config.ChaintracksServerConfig{Enabled: false},
 		// Propagation defaults — endpoint health probes off the harness
 		// datahub. Tightened backoff so retries don't slow down tests.
@@ -212,6 +233,21 @@ func buildArcadeConfig(t *testing.T, port int, opts ArcadeOptions) *config.Confi
 		BumpBuilder: config.BumpBuilderConfig{
 			GraceWindowMs:        500,
 			DataHubMaxBlockBytes: 1024 * 1024 * 16,
+			// The harness builds this struct directly, so the viper
+			// defaults (both true) don't apply — mirror production
+			// behavior explicitly. Reorg tests depend on the guard +
+			// reconciler; the mined-path smoke tests are unaffected
+			// (guard fails open without chaintracks, reconciler skips).
+			AnchorGuardEnabled: true,
+			Reconciler: config.ReconcilerConfig{
+				Enabled:           true,
+				IntervalMs:        2000, // fast ticks: e2e waits on convergence
+				BatchSize:         5000,
+				BlocksPerTick:     8,
+				NeighborhoodDepth: 6,
+				MaxDeferAttempts:  10,
+				StartupFullScan:   true,
+			},
 		},
 		// Datahub discovery off: we seeded a static URL into DatahubURLs,
 		// so arcade's bump-builder + propagation see it without needing
@@ -225,7 +261,62 @@ func buildArcadeConfig(t *testing.T, port int, opts ArcadeOptions) *config.Confi
 			AllowPrivateURLs: true,
 		},
 	}
+	if opts.EnableChaintracks {
+		ctPort, err := pickFreeTCPPort()
+		if err != nil {
+			t.Fatalf("pick chaintracks port: %v", err)
+		}
+		if opts.LibP2PLoopback == "" {
+			t.Fatal("EnableChaintracks requires LibP2PLoopback (LibP2PHost.LoopbackMultiaddr()) — " +
+				"the bootstrap announce address is not dialable from the host process")
+		}
+		cfg.ChaintracksServer = config.ChaintracksServerConfig{
+			Enabled: true,
+			Host:    "127.0.0.1",
+			Port:    ctPort,
+			// Tight tie-scan cadence: the reorg e2e scenarios wait on the
+			// no-ReorgEvent detection path (issue #279).
+			TieScanDepth:         20,
+			TieScanMinIntervalMs: 500,
+		}
+		// app.initChaintracks threads cfg.Network → Chaintracks.P2P.Network
+		// and cfg.P2P.BootstrapPeers → Chaintracks.P2P.MsgBus.BootstrapPeers,
+		// BUT go-p2p-message-bus ignores BootstrapPeers entirely when
+		// testing.Testing() is true ("isolated mode") — and arcade runs
+		// in-process here, so its chaintracks p2p client is inside the test
+		// binary. StaticPeers bypass that test-mode gate: they are dialed
+		// unconditionally and kept alive by a maintenance loop, which is
+		// exactly what joins chaintracks to the harness's gossipsub mesh.
+		// The other msgbus fields are the ones p2p.Config.Initialize does
+		// NOT default for us: DHTMode "" is not "off" (it would try to
+		// reach the public DHT).
+		cfg.Chaintracks = chaintracksconfig.Config{
+			Mode:        chaintracksconfig.ModeEmbedded,
+			StoragePath: t.TempDir(),
+			P2P: teranodep2p.Config{
+				StoragePath: t.TempDir(),
+				MsgBus: msgbus.Config{
+					DHTMode:         "off",
+					AllowPrivateIPs: true,
+					StaticPeers:     []string{opts.LibP2PLoopback},
+					PeerCacheFile:   t.TempDir() + "/peer_cache.json",
+				},
+			},
+		}
+	}
 	return cfg
+}
+
+// callbackHost is the hostname the merkle-service container uses to
+// POST callbacks back to the in-process arcade: podman injects (and
+// correctly maps) host.containers.internal; Docker gets
+// host.docker.internal via the ExtraHosts host-gateway entry the
+// container start adds.
+func callbackHost() string {
+	if isPodmanRuntime() {
+		return "host.containers.internal"
+	}
+	return "host.docker.internal"
 }
 
 // waitReady polls /health until arcade's api-server starts answering

@@ -149,6 +149,17 @@ type ChaintracksServerConfig struct {
 	// differ from api.port and sse.port when the standalone service
 	// runs in the same process (mode=all).
 	Port int `mapstructure:"port"`
+	// TieScanDepth is how many heights below the tip the block-status
+	// tracker re-verifies on each tip update: any 'active' block_processing
+	// row in the window whose hash is not the active-chain block at its
+	// height is marked orphaned. This is the detection edge for same-height
+	// competition losers, which never produce a chaintracks ReorgEvent —
+	// an equal-chainwork alternate never becomes tip (issue #279). Default
+	// 20; 0 disables the scan.
+	TieScanDepth int `mapstructure:"tie_scan_depth"`
+	// TieScanMinIntervalMs debounces the scan across tip bursts (regtest
+	// mining, catch-up sync). Default 5000.
+	TieScanMinIntervalMs int `mapstructure:"tie_scan_min_interval_ms"`
 }
 
 type API struct {
@@ -481,6 +492,52 @@ type BumpBuilderConfig struct {
 	// Mitigates F-007 (DataHub block fetch reads unbounded response bodies
 	// into memory).
 	DataHubMaxBlockBytes int64 `mapstructure:"datahub_max_block_bytes"`
+	// AnchorGuardEnabled gates the write-time anchor guard (issue #279):
+	// before marking a block's txs MINED, bump-builder checks that the
+	// block is chaintracks' active-chain block at its height and refuses
+	// when the height is provably held by a same-height competitor. Fail-
+	// open on any uncertainty. Default true (viper); false restores the
+	// legacy last-writer-wins behavior as an instant rollback lever.
+	AnchorGuardEnabled bool `mapstructure:"anchor_guard_enabled"`
+	// Reconciler tunes the anchor reconciler that heals txs anchored to
+	// orphaned blocks (issue #279).
+	Reconciler ReconcilerConfig `mapstructure:"reconciler"`
+}
+
+// ReconcilerConfig tunes the anchor reconciler — the bump-builder-hosted
+// loop that consumes orphaned block_processing rows and re-anchors (or
+// reverts) the transactions still pointing at them. See
+// services/bump_builder/reconciler.go for the algorithm.
+type ReconcilerConfig struct {
+	// Enabled gates the whole loop. Default true (viper); false is the
+	// rollback lever — orphaned rows then queue up (reconciled_at stays
+	// NULL) and are healed when re-enabled.
+	Enabled bool `mapstructure:"enabled"`
+	// IntervalMs is the tick cadence for consuming the orphaned-block
+	// queue. Default 30000.
+	IntervalMs int `mapstructure:"interval_ms"`
+	// BatchSize caps txids per SetMinedByTxIDs call / bulk status event
+	// during re-anchor. Default 5000 (matches maxTxIDsPerBulkEvent).
+	BatchSize int `mapstructure:"batch_size"`
+	// BlocksPerTick bounds how many orphaned blocks one tick reconciles.
+	// Default 4.
+	BlocksPerTick int `mapstructure:"blocks_per_tick"`
+	// NeighborhoodDepth is how many heights ABOVE an orphan's height are
+	// searched for the canonical block containing its txs (a deeper reorg
+	// re-bins txs into later blocks). Default 6.
+	NeighborhoodDepth int `mapstructure:"neighborhood_depth"`
+	// MaxDeferAttempts bounds how many ticks an orphan waits for the
+	// canonical block's BUMP (each defer fires a merkle-service /reprocess
+	// when wired) before falling back to revert-all — safe, because
+	// SEEN_ON_NETWORK → MINED is lattice-legal and a late canonical
+	// redelivery re-mines via the short-circuit path. Default 10.
+	MaxDeferAttempts int `mapstructure:"max_defer_attempts"`
+	// StartupFullScan runs one pass over the whole block_processing table
+	// after startup, orphan-marking any 'active' row whose height's
+	// canonical header differs — the deep backstop that also heals
+	// incidents that predate this code (like the height-764 block on the
+	// scaling cluster). Default true.
+	StartupFullScan bool `mapstructure:"startup_full_scan"`
 }
 
 // WatchdogConfig tunes the stale-block recovery watchdog. Defaults are
@@ -900,6 +957,14 @@ func setDefaults() {
 	// two-plus orders of magnitude of headroom over a realistic payload
 	// while still bounding memory against a hostile DataHub. See F-007.
 	viper.SetDefault("bump_builder.datahub_max_block_bytes", int64(1*1024*1024*1024))
+	viper.SetDefault("bump_builder.anchor_guard_enabled", true)
+	viper.SetDefault("bump_builder.reconciler.enabled", true)
+	viper.SetDefault("bump_builder.reconciler.interval_ms", 30000)
+	viper.SetDefault("bump_builder.reconciler.batch_size", 5000)
+	viper.SetDefault("bump_builder.reconciler.blocks_per_tick", 4)
+	viper.SetDefault("bump_builder.reconciler.neighborhood_depth", 6)
+	viper.SetDefault("bump_builder.reconciler.max_defer_attempts", 10)
+	viper.SetDefault("bump_builder.reconciler.startup_full_scan", true)
 	// Block-processing watchdog (standalone arcade service — mode=watchdog
 	// in production, in-process under mode=all): on by default. The runtime
 	// nil-guards the merkle-service client; an unconfigured deployment
@@ -931,6 +996,8 @@ func setDefaults() {
 	// (mode=all).
 	viper.SetDefault("chaintracks_server.host", "0.0.0.0")
 	viper.SetDefault("chaintracks_server.port", 8083)
+	viper.SetDefault("chaintracks_server.tie_scan_depth", 20)
+	viper.SetDefault("chaintracks_server.tie_scan_min_interval_ms", 5000)
 
 	// Intake validator fee floor in satoshis per KB. Matches the
 	// current BSV miner policy minimum.

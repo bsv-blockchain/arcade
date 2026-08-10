@@ -223,6 +223,26 @@ bump_builder:
   # malfunctioning endpoint. Set <= 0 to use the built-in default.
   # Mitigates F-007.
   # datahub_max_block_bytes: 1073741824
+  #
+  # Write-time anchor guard (issue #279): refuse to mark a block's txs MINED
+  # when chaintracks' active chain provably has a DIFFERENT block at its
+  # height (same-height competition loser). Fails open on any uncertainty.
+  # false restores legacy last-writer-wins behavior as a rollback lever.
+  # anchor_guard_enabled: true
+  #
+  # Anchor reconciler (issue #279): heals transactions anchored to orphaned
+  # blocks — re-anchors them to the active-chain block containing them (via
+  # the canonical block's stored compound BUMP) or reverts them to
+  # SEEN_ON_NETWORK, publishing corrected status events. Runs in the
+  # bump-builder mode, lease-gated across replicas.
+  # reconciler:
+  #   enabled: true
+  #   interval_ms: 30000       # orphan-queue tick cadence
+  #   batch_size: 5000         # txids per store write / bulk event
+  #   blocks_per_tick: 4       # orphaned blocks reconciled per tick
+  #   neighborhood_depth: 6    # heights above an orphan searched for re-binned txs
+  #   max_defer_attempts: 10   # ticks to wait for a missing canonical BUMP
+  #   startup_full_scan: true  # one-off whole-table sweep for stale anchors
 
 # Shared on-disk root for arcade state. Chaintracks headers default to
 # <storage_path>/chaintracks/.
@@ -234,6 +254,13 @@ bump_builder:
 # Set enabled: false in environments without outbound P2P.
 chaintracks_server:
   enabled: true
+  # Tie-scan (issue #279): on each tip update, re-verify the 'active'
+  # block_processing rows within tie_scan_depth of the tip against the
+  # active chain and mark same-height losers orphaned — the case where
+  # chaintracks emits NO ReorgEvent (an equal-chainwork alternate never
+  # becomes tip). 0 disables. Debounced by tie_scan_min_interval_ms.
+  # tie_scan_depth: 20
+  # tie_scan_min_interval_ms: 5000
 
 # go-chaintracks library config. See that library's docs for the full set.
 # Defaults are inherited from the library's SetDefaults — uncomment to override.

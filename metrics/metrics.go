@@ -391,6 +391,51 @@ var BumpBuilderShortCircuitTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "BLOCK_PROCESSED messages skipped because a compound BUMP already exists for the block.",
 })
 
+// BumpBuilderAnchorGuardDeniedTotal counts blocks the anchor guard refused
+// to mark MINED because chaintracks' active chain has a DIFFERENT block at
+// their height (issue #279 — same-height competition loser). path
+// distinguishes the fresh-build path from the short-circuit redelivery
+// path. Each denial routes the block into the anchor reconciler's queue.
+var BumpBuilderAnchorGuardDeniedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_bump_builder_anchor_guard_denied_total",
+	Help: "Blocks refused MINED anchoring because the active chain has a different block at their height.",
+}, []string{"path"})
+
+// ---------------------------------------------------------------------------
+// anchor reconciler (bump-builder-hosted — reorg tx re-anchoring, issue #279)
+
+// ReconcilerBlocksTotal counts orphaned blocks processed by the anchor
+// reconciler, by terminal outcome: reanchored (all affected txs moved to a
+// canonical block), reverted (all reverted to SEEN_ON_NETWORK), mixed,
+// empty (nothing anchored to the orphan anymore), resurrected (the block is
+// active again — stale orphan mark), deferred (waiting on the canonical
+// block's BUMP), error.
+var ReconcilerBlocksTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_reconciler_blocks_total",
+	Help: "Orphaned blocks processed by the anchor reconciler, by outcome.",
+}, []string{"outcome"})
+
+// ReconcilerTxsReanchoredTotal counts transactions the reconciler moved from
+// an orphaned block to the active-chain block containing them.
+var ReconcilerTxsReanchoredTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "arcade_reconciler_txs_reanchored_total",
+	Help: "Transactions re-anchored from an orphaned block to a canonical block.",
+})
+
+// ReconcilerTxsRevertedTotal counts transactions the reconciler reverted to
+// SEEN_ON_NETWORK because no canonical block contains them.
+var ReconcilerTxsRevertedTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "arcade_reconciler_txs_reverted_total",
+	Help: "Transactions reverted to SEEN_ON_NETWORK because their only block was orphaned.",
+})
+
+// ReconcilerBlockDuration observes wall time per reconciled block.
+var ReconcilerBlockDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+	Name:    "arcade_reconciler_block_duration_seconds",
+	Help:    "Wall time spent reconciling one orphaned block's transactions.",
+	Buckets: prometheus.ExponentialBuckets(0.01, 4, 8), // 10ms .. ~11m
+})
+
 // ---------------------------------------------------------------------------
 // watchdog (standalone service — block-processing recovery)
 // ---------------------------------------------------------------------------

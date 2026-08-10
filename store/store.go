@@ -128,14 +128,31 @@ type Store interface {
 
 	// SetStatusByBlockHash updates all transactions with the given block hash to a new status.
 	// Returns the txids that were updated. For unmined statuses (SEEN_ON_NETWORK),
-	// block fields are cleared. For IMMUTABLE, block fields are preserved.
+	// block fields are cleared and the cleared anchor is appended to the row's
+	// orphaned-anchor history (reorg revert). For IMMUTABLE, block fields are
+	// preserved. IMMUTABLE rows are never touched, and rows whose block_hash no
+	// longer matches at write time are skipped — a tx concurrently re-anchored
+	// to the canonical block must not be reverted by a stale index read.
 	SetStatusByBlockHash(ctx context.Context, blockHash string, newStatus models.Status) ([]string, error)
+
+	// GetTxIDsByBlockHash returns the txids of every transaction row currently
+	// anchored to blockHash (MINED or IMMUTABLE). The reorg reconciler reads
+	// this as the affected set of an orphaned block; rows that have already
+	// been re-anchored or reverted no longer appear.
+	GetTxIDsByBlockHash(ctx context.Context, blockHash string) ([]string, error)
 
 	// InsertBUMP stores a compound BUMP for a block.
 	InsertBUMP(ctx context.Context, blockHash string, blockHeight uint64, bumpData []byte) error
 
 	// GetBUMP retrieves the compound BUMP for a block.
 	GetBUMP(ctx context.Context, blockHash string) (blockHeight uint64, bumpData []byte, err error)
+
+	// DeleteBUMPByBlockHash removes the stored compound BUMP for a block and
+	// invalidates any cached parse. Idempotent — deleting a missing BUMP is a
+	// no-op. Operator/cleanup lever; note the reorg reconciler deliberately
+	// RETAINS orphaned blocks' BUMPs so historical orphaned-anchor proofs
+	// stay resolvable (issue #279).
+	DeleteBUMPByBlockHash(ctx context.Context, blockHash string) error
 
 	// --- Block processing status ---
 	//
@@ -168,8 +185,19 @@ type Store interface {
 	// MarkBlocksOrphaned transitions every named block to status='orphaned'
 	// and stamps orphaned_at. Hashes that have no row are silently skipped
 	// (chaintracks may emit OrphanedHashes for blocks observed before the
-	// service started recording).
+	// service started recording). Orphaned rows with reconciled_at IS NULL
+	// form the anchor reconciler's work queue.
 	MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) error
+
+	// MarkBlockReconciled stamps reconciled_at on an orphaned block's row,
+	// recording that tx re-anchor/revert for this orphan completed. A
+	// missing row is a silent no-op.
+	MarkBlockReconciled(ctx context.Context, blockHash string, at time.Time) error
+
+	// ListOrphanedBlocksToReconcile returns up to limit rows with
+	// status='orphaned' AND reconciled_at IS NULL, oldest orphaned_at
+	// first — the anchor reconciler's durable work queue. limit must be > 0.
+	ListOrphanedBlocksToReconcile(ctx context.Context, limit int) ([]*models.BlockProcessingStatus, error)
 
 	// MarkBlocksParked transitions every named block from status='active' to
 	// status='parked' — the watchdog's terminal state for blocks whose

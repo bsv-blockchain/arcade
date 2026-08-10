@@ -55,4 +55,13 @@ type BlockProcessingStatus struct {
 	BUMPBuiltAt  *time.Time                 `json:"bumpBuiltAt,omitempty"`
 	Status       BlockProcessingStatusValue `json:"status"`
 	OrphanedAt   *time.Time                 `json:"orphanedAt,omitempty"`
+	// ReconciledAt is stamped by the anchor reconciler once every
+	// transaction anchored to this orphaned block has been re-anchored to
+	// the canonical block or reverted (issue #279). NULL on active/parked
+	// rows and on orphaned rows still awaiting reconciliation — the
+	// (status='orphaned' AND reconciled_at IS NULL) pair is the
+	// reconciler's durable work queue. Reset to NULL when the block is
+	// resurrected by a later reorg (UpsertBlockHeaderSeen conflict path)
+	// so a re-orphaning reconciles again.
+	ReconciledAt *time.Time `json:"reconciledAt,omitempty"`
 }

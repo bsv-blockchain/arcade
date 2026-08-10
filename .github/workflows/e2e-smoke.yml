@@ -29,7 +29,7 @@ jobs:
   smoke:
     name: smoke
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -57,4 +57,4 @@ jobs:
           # ubuntu runner the docker socket lives at the default path so we
           # leave it unset.
           TESTCONTAINERS_RYUK_DISABLED: "true"
-        run: go test -tags=e2e -timeout=20m -v ./tests/e2e/...
+        run: go test -tags=e2e -timeout=30m -v ./tests/e2e/...

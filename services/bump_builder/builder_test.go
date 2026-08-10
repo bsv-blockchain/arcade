@@ -1606,10 +1606,11 @@ func (h *heightDroppingMockStore) SetMinedByTxIDs(ctx context.Context, blockHash
 // inject a header mid-run (the ingestion race lookupHeaderWithWait rides
 // out), so reads and writes are mutex-guarded.
 type stubChaintracks struct {
-	mu      sync.Mutex
-	headers map[string]*chaintrackslib.BlockHeader
-	err     error
-	lookups int
+	mu       sync.Mutex
+	headers  map[string]*chaintrackslib.BlockHeader
+	byHeight map[uint32]*chaintrackslib.BlockHeader
+	err      error
+	lookups  int
 }
 
 func (s *stubChaintracks) GetHeaderByHash(_ context.Context, h *chainhash.Hash) (*chaintrackslib.BlockHeader, error) {
@@ -1620,6 +1621,26 @@ func (s *stubChaintracks) GetHeaderByHash(_ context.Context, h *chainhash.Hash) 
 		return nil, s.err
 	}
 	return s.headers[h.String()], nil
+}
+
+// byHeight backs GetHeaderByHeight for anchor-guard tests. Unset heights
+// return (nil, nil) — "cannot judge", which the guard treats as allow.
+func (s *stubChaintracks) GetHeaderByHeight(_ context.Context, height uint32) (*chaintrackslib.BlockHeader, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.byHeight[height], nil
+}
+
+func (s *stubChaintracks) setHeightHeader(height uint32, header *chaintrackslib.BlockHeader) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.byHeight == nil {
+		s.byHeight = make(map[uint32]*chaintrackslib.BlockHeader)
+	}
+	s.byHeight[height] = header
 }
 
 func (s *stubChaintracks) setHeader(hash string, header *chaintrackslib.BlockHeader) {

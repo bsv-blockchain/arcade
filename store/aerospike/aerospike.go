@@ -471,6 +471,7 @@ func (s *Store) GetStatus(ctx context.Context, txid string) (*models.Transaction
 
 	status := recordToStatus(rec, txid)
 	s.enrichMerklePath(ctx, status)
+	s.enrichOrphanedProofs(ctx, status)
 	return status, nil
 }
 
@@ -551,11 +552,73 @@ func (s *Store) IterateStatusesSince(ctx context.Context, _ time.Time, fn func(*
 	}
 }
 
+// binOrphAnchors is the transactions-set bin holding the row's orphaned-anchor
+// history as JSON-encoded []orphanedAnchorRecord (Aerospike bin names are
+// capped at 15 chars, hence the abbreviation). Written by SetMinedByTxIDs
+// (re-anchor to a different block) and SetStatusByBlockHash (reorg revert),
+// decoded back into models.TransactionStatus.OrphanedProofs by recordToStatus.
+const binOrphAnchors = "orph_anchors"
+
+// orphanedAnchorRecord is the persisted form of models.OrphanedAnchor — block
+// identity plus when the anchor was superseded, in unix milliseconds like the
+// other transactions-set timestamps. The proof itself is never persisted; it
+// is re-derived from the orphaned block's retained compound BUMP at read time.
+type orphanedAnchorRecord struct {
+	BlockHash    string `json:"block_hash"`
+	BlockHeight  uint64 `json:"block_height,omitempty"`
+	OrphanedAtMs int64  `json:"orphaned_at"`
+}
+
+// orphanedAnchorsFromRecord decodes the orph_anchors bin. A missing or
+// unparseable history reads as empty — the bin is best-effort bookkeeping,
+// never a gate.
+func orphanedAnchorsFromRecord(rec *aero.Record) []orphanedAnchorRecord {
+	var out []orphanedAnchorRecord
+	switch v := rec.Bins[binOrphAnchors].(type) {
+	case []byte:
+		_ = json.Unmarshal(v, &out)
+	case string:
+		_ = json.Unmarshal([]byte(v), &out)
+	}
+	return out
+}
+
+// appendOrphanedAnchor records that the blockHash/blockHeight anchor is being
+// superseded (re-anchor to a different block, or reorg revert). Collapses
+// consecutive duplicates and caps at models.MaxOrphanedAnchors, mirroring
+// models.AppendOrphanedAnchor.
+func appendOrphanedAnchor(history []orphanedAnchorRecord, blockHash string, blockHeight uint64, now time.Time) []orphanedAnchorRecord {
+	if blockHash == "" {
+		return history
+	}
+	if n := len(history); n > 0 && history[n-1].BlockHash == blockHash {
+		return history
+	}
+	history = append(history, orphanedAnchorRecord{
+		BlockHash:    blockHash,
+		BlockHeight:  blockHeight,
+		OrphanedAtMs: now.UnixMilli(),
+	})
+	if len(history) > models.MaxOrphanedAnchors {
+		history = history[len(history)-models.MaxOrphanedAnchors:]
+	}
+	return history
+}
+
+// SetStatusByBlockHash rewrites every transaction currently anchored to
+// blockHash. For SEEN_ON_NETWORK transitions block fields are cleared and the
+// cleared anchor is appended to the row's orph_anchors history (reorg revert,
+// issue #279); for IMMUTABLE they are kept. The secondary-index query is a
+// snapshot: each row is then re-read and CAS-written under a generation match
+// (the same read-check-write UpdateStatus uses for the lattice), so IMMUTABLE
+// rows are never touched and rows whose block_hash no longer matches at write
+// time — concurrently re-anchored to the canonical block — are skipped.
+// Returns only the txids actually rewritten.
 func (s *Store) SetStatusByBlockHash(ctx context.Context, blockHash string, newStatus models.Status) ([]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	stmt := aero.NewStatement(s.namespace, setTransactions)
+	stmt := aero.NewStatement(s.namespace, setTransactions, "txid")
 	_ = stmt.SetFilter(aero.NewEqualFilter("block_hash", blockHash))
 
 	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
@@ -564,6 +627,121 @@ func (s *Store) SetStatusByBlockHash(ctx context.Context, blockHash string, newS
 	}
 	if err != nil {
 		return nil, fmt.Errorf("query by block hash: %w", err)
+	}
+
+	var (
+		candidates []string
+		loopErr    error
+	)
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case rec, ok := <-rs.Results():
+			if !ok {
+				break loop
+			}
+			if rec.Err != nil {
+				// A partial affected set would silently under-reconcile —
+				// surface the error instead of skipping the record.
+				loopErr = rec.Err
+				break loop
+			}
+			if txid := getString(rec.Record, "txid"); txid != "" {
+				candidates = append(candidates, txid)
+			}
+		}
+	}
+	if loopErr != nil {
+		return nil, loopErr
+	}
+
+	clearBlock := newStatus == models.StatusSeenOnNetwork
+	now := time.Now()
+	var txids []string
+	for _, txid := range candidates {
+		if err := ctx.Err(); err != nil {
+			return txids, err
+		}
+		key, err := s.key(setTransactions, txid)
+		if err != nil {
+			continue
+		}
+		for {
+			rec, gerr := s.client.Get(s.readPolicy(ctx), key, "status", "block_hash", "block_height", binOrphAnchors)
+			if gerr != nil || rec == nil {
+				break
+			}
+			// Stale-index guard: the row moved to a different anchor between
+			// the index snapshot and this write — reverting it now would undo
+			// a concurrent re-anchor to the canonical block (issue #279).
+			if getString(rec, "block_hash") != blockHash {
+				break
+			}
+			// IMMUTABLE rows are never touched by block-scoped rewrites.
+			if getString(rec, "status") == string(models.StatusImmutable) {
+				break
+			}
+
+			ops := []*aero.Operation{
+				aero.PutOp(aero.NewBin("status", string(newStatus))),
+				aero.PutOp(aero.NewBin("timestamp", now.UnixMilli())),
+			}
+			if clearBlock {
+				// Preserve the anchor being cleared so the orphaned block's
+				// proof stays auditable (issue #279), then drop the block bins
+				// (Aerospike: writing a nil bin value deletes the bin).
+				height := uint64(getInt(rec, "block_height")) //nolint:gosec // height non-negative
+				history := appendOrphanedAnchor(orphanedAnchorsFromRecord(rec), blockHash, height, now)
+				if payload, mErr := json.Marshal(history); mErr == nil {
+					ops = append(ops, aero.PutOp(aero.NewBin(binOrphAnchors, payload)))
+				}
+				ops = append(ops,
+					aero.PutOp(aero.NewBin("block_hash", nil)),
+					aero.PutOp(aero.NewBin("block_height", nil)),
+				)
+			}
+
+			wp := s.writePolicy(ctx)
+			wp.GenerationPolicy = aero.EXPECT_GEN_EQUAL
+			wp.Generation = rec.Generation
+			wp.RecordExistsAction = aero.UPDATE_ONLY
+			if _, werr := s.client.Operate(wp, key, ops...); werr != nil {
+				// Generation mismatch means another writer landed between our
+				// read and our put — re-read and re-evaluate the guards rather
+				// than clobbering their write. Any other error skips the row,
+				// matching the per-record error tolerance of the old scan loop.
+				if isGenerationErr(werr) {
+					continue
+				}
+				break
+			}
+			txids = append(txids, txid)
+			break
+		}
+	}
+	return txids, nil
+}
+
+// GetTxIDsByBlockHash returns every txid currently anchored to blockHash via
+// the arcade_idx_tx_block_hash secondary index — the reorg reconciler's
+// affected set for an orphaned block. Rows already re-anchored or reverted no
+// longer match the index and don't appear. Only the txid bin is projected;
+// the reconciler wants identities, not rows.
+func (s *Store) GetTxIDsByBlockHash(ctx context.Context, blockHash string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	stmt := aero.NewStatement(s.namespace, setTransactions, "txid")
+	_ = stmt.SetFilter(aero.NewEqualFilter("block_hash", blockHash))
+
+	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
+	if rs != nil {
+		defer func() { _ = rs.Close() }()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query txids by block hash: %w", err)
 	}
 
 	var (
@@ -581,21 +759,14 @@ loop:
 				break loop
 			}
 			if rec.Err != nil {
-				continue
+				// A partial affected set would silently under-reconcile —
+				// surface the error instead of skipping the record.
+				loopErr = rec.Err
+				break loop
 			}
-			txid := getString(rec.Record, "txid")
-			if txid == "" {
-				continue
+			if txid := getString(rec.Record, "txid"); txid != "" {
+				txids = append(txids, txid)
 			}
-			key, err := s.key(setTransactions, txid)
-			if err != nil {
-				continue
-			}
-			bins := aero.BinMap{"status": string(newStatus), "timestamp": time.Now().UnixMilli()}
-			if err := s.client.Put(s.writePolicy(ctx), key, bins); err != nil {
-				continue
-			}
-			txids = append(txids, txid)
 		}
 	}
 	if loopErr != nil {
@@ -737,16 +908,92 @@ func (s *Store) ClearRetryState(ctx context.Context, txid string, finalStatus mo
 	return nil
 }
 
+// minedWrite computes the per-record MINED write from a snapshot of an
+// existing row: the ops to apply, the pre-write model for the prevs slice,
+// and whether the row is eligible. IMMUTABLE rows are ineligible — a replayed
+// BLOCK_PROCESSED must never demote a confirmation-depth promotion (issue
+// #279 hardening). A MINED row re-anchored to a DIFFERENT block appends the
+// anchor being superseded to its orph_anchors history first, so the orphaned
+// block's proof stays auditable; first-time MINED and idempotent same-block
+// replays leave history untouched.
+func minedWrite(rec *aero.Record, txid, blockHash string, blockHeight uint64, now time.Time) (ops []*aero.Operation, prev *models.TransactionStatus, ok bool) {
+	prevStatus := models.Status(getString(rec, "status"))
+	// Respect the status lattice: of all statuses only IMMUTABLE may not
+	// regress to MINED. See models.Status.CanTransitionFrom.
+	if !models.StatusMined.CanTransitionFrom(prevStatus) {
+		return nil, nil, false
+	}
+	prev = recordToStatus(rec, txid)
+	ops = []*aero.Operation{
+		aero.PutOp(aero.NewBin("status", string(models.StatusMined))),
+		aero.PutOp(aero.NewBin("block_hash", blockHash)),
+		aero.PutOp(aero.NewBin("block_height", int(blockHeight))), //nolint:gosec // block height fits in int on 64-bit platforms
+		aero.PutOp(aero.NewBin("timestamp", now.UnixMilli())),
+	}
+	if prevStatus == models.StatusMined && prev.BlockHash != "" && prev.BlockHash != blockHash {
+		history := appendOrphanedAnchor(orphanedAnchorsFromRecord(rec), prev.BlockHash, prev.BlockHeight, now)
+		if payload, err := json.Marshal(history); err == nil {
+			ops = append(ops, aero.PutOp(aero.NewBin(binOrphAnchors, payload)))
+		}
+	}
+	return ops, prev, true
+}
+
+// setMinedCAS is the per-record fallback for a batch MINED write that lost a
+// generation race: re-read, re-run the IMMUTABLE guard and anchor bookkeeping
+// against the fresh snapshot, and CAS-write — the same read-check-write loop
+// UpdateStatus uses for the lattice. Returns the pre-write row and whether
+// the write was applied (false = row missing or ineligible).
+func (s *Store) setMinedCAS(ctx context.Context, txid, blockHash string, blockHeight uint64, now time.Time) (*models.TransactionStatus, bool, error) {
+	key, err := s.key(setTransactions, txid)
+	if err != nil {
+		return nil, false, err
+	}
+	for {
+		rec, gerr := s.client.Get(s.readPolicy(ctx), key)
+		if gerr != nil && !isKeyNotFound(gerr) {
+			return nil, false, fmt.Errorf("read status for set mined %s: %w", txid, gerr)
+		}
+		if rec == nil {
+			return nil, false, nil
+		}
+		ops, prev, ok := minedWrite(rec, txid, blockHash, blockHeight, now)
+		if !ok {
+			return nil, false, nil
+		}
+		wp := s.writePolicy(ctx)
+		wp.GenerationPolicy = aero.EXPECT_GEN_EQUAL
+		wp.Generation = rec.Generation
+		wp.RecordExistsAction = aero.UPDATE_ONLY
+		if _, werr := s.client.Operate(wp, key, ops...); werr != nil {
+			if isGenerationErr(werr) {
+				continue
+			}
+			if isKeyNotFound(werr) {
+				return nil, false, nil
+			}
+			return nil, false, fmt.Errorf("set mined %s: %w", txid, werr)
+		}
+		return prev, true, nil
+	}
+}
+
 // SetMinedByTxIDs writes a MINED status batch keyed by blockHash + blockHeight.
 // blockHeight is persisted as the block_height bin and echoed back on each
 // returned TransactionStatus so SSE/webhook consumers always see the height
 // alongside the hash (issue #87 / F-029).
+//
+// Hardening (issue #279): rows are snapshot via BatchGet first. The snapshot
+// feeds the returned prevs, skips IMMUTABLE rows (never demote a
+// confirmation-depth promotion), and appends the previous anchor to
+// orph_anchors when a MINED row is re-anchored to a DIFFERENT block. Each
+// batch write carries a generation CAS pinned to its snapshot, so a record
+// that moved in between falls back to the per-record read-check-write
+// (setMinedCAS) instead of clobbering the concurrent write with stale
+// bookkeeping.
 func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeight uint64, txids []string) ([]*models.TransactionStatus, []*models.TransactionStatus, error) {
 	now := time.Now()
 	var prevs, statuses []*models.TransactionStatus
-
-	bwp := aero.NewBatchWritePolicy()
-	bwp.RecordExistsAction = aero.UPDATE_ONLY
 
 	for i := 0; i < len(txids); i += s.batchSize {
 		if err := ctx.Err(); err != nil {
@@ -758,11 +1005,9 @@ func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeig
 		}
 		batch := txids[i:end]
 
-		// Snapshot pre-update rows so callers can observe the MINED
-		// transition age. BatchGet is a second round-trip but matches the
-		// access pattern Pebble does atomically via per-shard locks; for
-		// the current production deployment (Pebble) this code path is
-		// unused, so the extra latency is acceptable here.
+		// Snapshot pre-update rows. BatchGet is a second round-trip but
+		// matches the access pattern Pebble does atomically via per-shard
+		// locks; the generation CAS on each write closes the gap in between.
 		keys := make([]*aero.Key, 0, len(batch))
 		keyByTxID := make(map[string]int, len(batch))
 		for _, txid := range batch {
@@ -773,7 +1018,7 @@ func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeig
 			keyByTxID[txid] = len(keys)
 			keys = append(keys, key)
 		}
-		prevByTxID := make(map[string]*models.TransactionStatus, len(batch))
+		recByTxID := make(map[string]*aero.Record, len(batch))
 		if len(keys) > 0 {
 			recs, err := s.client.BatchGet(s.batchPolicy(ctx), keys)
 			if err != nil {
@@ -783,44 +1028,69 @@ func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeig
 				if idx >= len(recs) || recs[idx] == nil {
 					continue
 				}
-				prevByTxID[txid] = recordToStatus(recs[idx], txid)
+				recByTxID[txid] = recs[idx]
 			}
 		}
 
-		records := make([]aero.BatchRecordIfc, len(batch))
-		for j, txid := range batch {
-			key, err := s.key(setTransactions, txid)
-			if err != nil {
+		records := make([]aero.BatchRecordIfc, 0, len(batch))
+		written := make([]string, 0, len(batch))
+		prevForSlot := make([]*models.TransactionStatus, 0, len(batch))
+		for _, txid := range batch {
+			rec := recByTxID[txid]
+			if rec == nil {
+				// Unknown txid — silently skipped, never created.
 				continue
 			}
-			ops := []*aero.Operation{
-				aero.PutOp(aero.NewBin("status", string(models.StatusMined))),
-				aero.PutOp(aero.NewBin("block_hash", blockHash)),
-				aero.PutOp(aero.NewBin("block_height", int(blockHeight))), //nolint:gosec // block height fits in int on 64-bit platforms
-				aero.PutOp(aero.NewBin("timestamp", now.UnixMilli())),
+			ops, prev, ok := minedWrite(rec, txid, blockHash, blockHeight, now)
+			if !ok {
+				// IMMUTABLE — never demoted; no entry in either slice.
+				continue
 			}
-			records[j] = aero.NewBatchWrite(bwp, key, ops...)
+			bwp := aero.NewBatchWritePolicy()
+			bwp.RecordExistsAction = aero.UPDATE_ONLY
+			bwp.GenerationPolicy = aero.EXPECT_GEN_EQUAL
+			bwp.Generation = rec.Generation
+			records = append(records, aero.NewBatchWrite(bwp, keys[keyByTxID[txid]], ops...))
+			written = append(written, txid)
+			prevForSlot = append(prevForSlot, prev)
+		}
+		if len(records) == 0 {
+			continue
 		}
 
 		if err := s.client.BatchOperate(s.batchPolicy(ctx), records); err != nil {
 			return prevs, statuses, fmt.Errorf("batch set mined: %w", err)
 		}
 
-		for j, txid := range batch {
-			if records[j] != nil && records[j].BatchRec().Err == nil {
-				if prev, ok := prevByTxID[txid]; ok {
-					prevs = append(prevs, prev)
-				} else {
-					prevs = append(prevs, nil)
+		for j, txid := range written {
+			switch br := records[j].BatchRec(); {
+			case br.Err == nil:
+				prevs = append(prevs, prevForSlot[j])
+			case isGenerationErr(br.Err):
+				// Another writer landed between snapshot and CAS write —
+				// redo this record alone against a fresh read rather than
+				// silently dropping the MINED transition.
+				prev, applied, err := s.setMinedCAS(ctx, txid, blockHash, blockHeight, now)
+				if err != nil {
+					return prevs, statuses, err
 				}
-				statuses = append(statuses, &models.TransactionStatus{
-					TxID:        txid,
-					Status:      models.StatusMined,
-					BlockHash:   blockHash,
-					BlockHeight: blockHeight,
-					Timestamp:   now,
-				})
+				if !applied {
+					continue
+				}
+				prevs = append(prevs, prev)
+			default:
+				// UPDATE_ONLY on a row deleted since the snapshot, or another
+				// per-record error — skipped, matching the unknown-txid
+				// contract.
+				continue
 			}
+			statuses = append(statuses, &models.TransactionStatus{
+				TxID:        txid,
+				Status:      models.StatusMined,
+				BlockHash:   blockHash,
+				BlockHeight: blockHeight,
+				Timestamp:   now,
+			})
 		}
 	}
 
@@ -1133,6 +1403,39 @@ func (s *Store) deleteBumpChunkRange(ctx context.Context, blockHash string, from
 			return fmt.Errorf("batch delete bump chunks: %w", err)
 		}
 	}
+	return nil
+}
+
+// DeleteBUMPByBlockHash removes the stored compound BUMP — the manifest plus
+// every chunk record it references — and drops any cached parse. Idempotent:
+// a missing manifest is a no-op. The manifest is deleted before its chunks
+// (mirroring DeleteStumpsByBlockHash): a crash mid-delete then leaves only
+// unreferenced orphan chunks (harmless disk waste) rather than a manifest
+// pointing at missing chunks (a hard read error).
+func (s *Store) DeleteBUMPByBlockHash(ctx context.Context, blockHash string) error {
+	manifestKey, err := s.key(setBumps, blockHash)
+	if err != nil {
+		return err
+	}
+	rec, err := s.client.Get(s.readPolicy(ctx), manifestKey, "chunk_count")
+	if err != nil && !isKeyNotFound(err) {
+		return fmt.Errorf("read bump manifest %s: %w", blockHash, err)
+	}
+	if rec == nil {
+		// Nothing stored — still drop any cached parse so a stale in-memory
+		// compound can't outlive the delete.
+		s.bumpCache.Remove(blockHash)
+		return nil
+	}
+	chunkCount, _ := rec.Bins["chunk_count"].(int)
+
+	if _, err := s.client.Delete(s.writePolicy(ctx), manifestKey); err != nil {
+		return fmt.Errorf("delete bump manifest %s: %w", blockHash, err)
+	}
+	if err := s.deleteBumpChunkRange(ctx, blockHash, 0, chunkCount); err != nil {
+		return fmt.Errorf("delete bump chunks %s: %w", blockHash, err)
+	}
+	s.bumpCache.Remove(blockHash)
 	return nil
 }
 
@@ -1831,8 +2134,9 @@ loop:
 //   header_seen_at  int64 (unix nanos; 0 = unset)
 //   processed_at    int64 (unix nanos; 0 = unset)
 //   bump_built_at   int64 (unix nanos; 0 = unset)
-//   status          string ("active" | "orphaned")
+//   status          string ("active" | "orphaned" | "parked")
 //   orphaned_at     int64 (unix nanos; 0 = unset)
+//   reconciled_at   int64 (unix nanos; 0 = unset)
 //
 // Writers must use Operate with per-bin PutOps so concurrent header /
 // processed / bump-built paths only touch their own bins. A full-record
@@ -1846,6 +2150,7 @@ const (
 	binBUMPBuiltAt  = "bump_built_at"
 	binStatus       = "status"
 	binOrphanedAt   = "orphaned_at"
+	binReconciledAt = "reconciled_at"
 )
 
 func (s *Store) UpsertBlockHeaderSeen(ctx context.Context, blockHash string, blockHeight uint64, seenAt time.Time) error {
@@ -1857,12 +2162,14 @@ func (s *Store) UpsertBlockHeaderSeen(ctx context.Context, blockHash string, blo
 	// update we must NOT clobber processed_at or bump_built_at, which is
 	// what per-bin Operate gives us — bins not named here are left alone.
 	// We do overwrite block_height (chaintracks is authoritative) and reset
-	// status/orphaned_at so a returning orphan re-joins active.
+	// status/orphaned_at/reconciled_at so a returning orphan re-joins active
+	// and a later re-orphaning reconciles again (issue #279).
 	ops := []*aero.Operation{
 		aero.PutOp(aero.NewBin(binBlockHash, blockHash)),
 		aero.PutOp(aero.NewBin(binBlockHeight, int(blockHeight))), //nolint:gosec // block height fits in int on 64-bit platforms
 		aero.PutOp(aero.NewBin(binStatus, string(models.BlockStatusActive))),
 		aero.PutOp(aero.NewBin(binOrphanedAt, nil)),
+		aero.PutOp(aero.NewBin(binReconciledAt, nil)),
 		// header_seen_at: only set when the bin is currently absent. Aerospike
 		// has no client-side conditional bin write that's race-free, so we do
 		// a generation-CAS read+write loop to set it on first observation
@@ -1962,6 +2269,83 @@ func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, or
 		}
 	}
 	return nil
+}
+
+// MarkBlockReconciled stamps reconciled_at on an orphaned block's row — the
+// anchor reconciler finished re-anchoring/reverting its transactions. A
+// missing row is a silent no-op (UPDATE_ONLY, the RecordDeliveryAttempt
+// pattern).
+func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, at time.Time) error {
+	key, err := s.key(setBlockProcessing, blockHash)
+	if err != nil {
+		return err
+	}
+	policy := s.writePolicy(ctx)
+	policy.RecordExistsAction = aero.UPDATE_ONLY // never create a phantom block row
+	_, err = s.client.Operate(policy, key,
+		aero.PutOp(aero.NewBin(binReconciledAt, at.UnixNano())))
+	if isKeyNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("mark block reconciled %s: %w", blockHash, err)
+	}
+	return nil
+}
+
+// ListOrphanedBlocksToReconcile narrows by status='orphaned' via the secondary
+// index, then in-memory filters to rows with no reconciled_at, sorts by
+// orphaned_at ascending, and truncates to limit — the anchor reconciler's
+// durable work queue. Cardinality is bounded by unreconciled orphans, which
+// is near-zero in steady state.
+func (s *Store) ListOrphanedBlocksToReconcile(ctx context.Context, limit int) ([]*models.BlockProcessingStatus, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		return nil, fmt.Errorf("limit must be > 0")
+	}
+	stmt := aero.NewStatement(s.namespace, setBlockProcessing)
+	_ = stmt.SetFilter(aero.NewEqualFilter(binStatus, string(models.BlockStatusOrphaned)))
+	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
+	if rs != nil {
+		defer func() { _ = rs.Close() }()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query orphaned block_processing: %w", err)
+	}
+	var (
+		all     []*models.BlockProcessingStatus
+		loopErr error
+	)
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			loopErr = ctx.Err()
+			break loop
+		case rec, ok := <-rs.Results():
+			if !ok {
+				break loop
+			}
+			if rec.Err != nil {
+				continue
+			}
+			// Already reconciled rows are done — not work-queue members.
+			if getInt64(rec.Record, binReconciledAt) != 0 {
+				continue
+			}
+			all = append(all, blockProcessingFromRecord(rec.Record))
+		}
+	}
+	if loopErr != nil {
+		return all, loopErr
+	}
+	sortByOrphanedAtAsc(all)
+	if len(all) > limit {
+		all = all[:limit]
+	}
+	return all, nil
 }
 
 func (s *Store) MarkBlocksParked(ctx context.Context, blockHashes []string) error {
@@ -2089,6 +2473,10 @@ func blockProcessingFromRecord(rec *aero.Record) *models.BlockProcessingStatus {
 		t := time.Unix(0, v).UTC()
 		bp.OrphanedAt = &t
 	}
+	if v := getInt64(rec, binReconciledAt); v != 0 {
+		t := time.Unix(0, v).UTC()
+		bp.ReconciledAt = &t
+	}
 	return bp
 }
 
@@ -2199,6 +2587,29 @@ func sortByHeaderSeenAsc(rows []*models.BlockProcessingStatus) {
 	for i := 1; i < len(rows); i++ {
 		j := i
 		for j > 0 && rows[j-1].HeaderSeenAt.After(rows[j].HeaderSeenAt) {
+			rows[j-1], rows[j] = rows[j], rows[j-1]
+			j--
+		}
+	}
+}
+
+func sortByOrphanedAtAsc(rows []*models.BlockProcessingStatus) {
+	// Insertion sort matches the other block_processing sorts — the orphan
+	// backlog is at most a handful of rows. A nil orphaned_at sorts last,
+	// matching Postgres's ORDER BY orphaned_at ASC NULLS LAST.
+	before := func(a, b *models.BlockProcessingStatus) bool {
+		switch {
+		case a.OrphanedAt == nil:
+			return false
+		case b.OrphanedAt == nil:
+			return true
+		default:
+			return a.OrphanedAt.Before(*b.OrphanedAt)
+		}
+	}
+	for i := 1; i < len(rows); i++ {
+		j := i
+		for j > 0 && before(rows[j], rows[j-1]) {
 			rows[j-1], rows[j] = rows[j], rows[j-1]
 			j--
 		}
@@ -2349,6 +2760,13 @@ func recordToStatus(rec *aero.Record, txid string) *models.TransactionStatus {
 			status.MerkleRegisteredAt = time.UnixMilli(int64(ms))
 		}
 	}
+	for _, a := range orphanedAnchorsFromRecord(rec) {
+		status.OrphanedProofs = append(status.OrphanedProofs, models.OrphanedAnchor{
+			BlockHash:   a.BlockHash,
+			BlockHeight: a.BlockHeight,
+			OrphanedAt:  time.UnixMilli(a.OrphanedAtMs).UTC(),
+		})
+	}
 	return status
 }
 
@@ -2368,6 +2786,26 @@ func (s *Store) enrichMerklePath(ctx context.Context, status *models.Transaction
 		_, bumpData, err := s.GetBUMP(ctx, status.BlockHash)
 		return bumpData, err
 	})
+}
+
+// enrichOrphanedProofs resolves each historical anchor's merkle path from
+// the orphaned block's retained compound BUMP (issue #279). Best-effort:
+// an entry whose BUMP is gone or unparseable is served without a path.
+func (s *Store) enrichOrphanedProofs(ctx context.Context, status *models.TransactionStatus) {
+	if status == nil {
+		return
+	}
+	for i := range status.OrphanedProofs {
+		entry := &status.OrphanedProofs[i]
+		if len(entry.MerklePath) > 0 || entry.BlockHash == "" {
+			continue
+		}
+		hash := entry.BlockHash
+		entry.MerklePath = s.bumpCache.MinimalPath(hash, status.TxID, func() ([]byte, error) {
+			_, bumpData, err := s.GetBUMP(ctx, hash)
+			return bumpData, err
+		})
+	}
 }
 
 func recordToSubmission(rec *aero.Record) *models.Submission {
