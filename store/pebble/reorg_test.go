@@ -447,6 +447,80 @@ func TestMarkBlockReconciled_And_ListOrphanedBlocksToReconcile(t *testing.T) {
 	}
 }
 
+// TestListOrphanedBlocksToReconcile_PrioritizesReanchorable pins the
+// work-queue prioritization: an orphan whose active (canonical) block at the
+// same height already has a stored BUMP — so the reconciler can re-anchor it
+// right now — surfaces AHEAD of orphans whose canonical block has no BUMP,
+// even when it was orphaned more recently. Within the un-re-anchorable group
+// the original oldest-orphaned_at ordering is preserved. A BUMP stored for the
+// ORPHAN's own hash (not the active block) must NOT make it re-anchorable.
+func TestListOrphanedBlocksToReconcile_PrioritizesReanchorable(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	t0 := time.Unix(1700000500, 0).UTC()
+
+	// Three un-re-anchorable competitions: the active block at each height has
+	// NO stored BUMP. Orphaned oldest→newest across heights 100/101/102.
+	for i, h := range []uint64{100, 101, 102} {
+		active := "act-" + string(rune('A'+i))
+		orphan := "orph-" + string(rune('A'+i))
+		if err := s.UpsertBlockHeaderSeen(ctx, active, h, t0); err != nil {
+			t.Fatalf("seed active %s: %v", active, err)
+		}
+		if err := s.UpsertBlockHeaderSeen(ctx, orphan, h, t0); err != nil {
+			t.Fatalf("seed orphan %s: %v", orphan, err)
+		}
+		if err := s.MarkBlocksOrphaned(ctx, []string{orphan}, t0.Add(time.Duration(i+1)*time.Minute)); err != nil {
+			t.Fatalf("orphan %s: %v", orphan, err)
+		}
+	}
+	// A BUMP stored for the ORPHAN's own hash (orph-A) must not count — only
+	// the active block's BUMP makes a height re-anchorable.
+	if err := s.InsertBUMP(ctx, "orph-A", 100, []byte{0x01}); err != nil {
+		t.Fatalf("InsertBUMP orph-A: %v", err)
+	}
+
+	// One re-anchorable competition at height 200: the active block HAS a
+	// stored BUMP, but it was orphaned LAST (newest orphaned_at).
+	if err := s.UpsertBlockHeaderSeen(ctx, "act-canon", 200, t0); err != nil {
+		t.Fatalf("seed act-canon: %v", err)
+	}
+	if err := s.UpsertBlockHeaderSeen(ctx, "orph-canon", 200, t0); err != nil {
+		t.Fatalf("seed orph-canon: %v", err)
+	}
+	if err := s.MarkBlocksOrphaned(ctx, []string{"orph-canon"}, t0.Add(10*time.Minute)); err != nil {
+		t.Fatalf("orphan orph-canon: %v", err)
+	}
+	if err := s.InsertBUMP(ctx, "act-canon", 200, []byte{0xde, 0xad}); err != nil {
+		t.Fatalf("InsertBUMP act-canon: %v", err)
+	}
+
+	rows, err := s.ListOrphanedBlocksToReconcile(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListOrphanedBlocksToReconcile: %v", err)
+	}
+	got := hashesOf(rows)
+	want := []string{"orph-canon", "orph-A", "orph-B", "orph-C"}
+	if len(got) != len(want) {
+		t.Fatalf("queue = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("queue = %v, want %v (re-anchorable first, then oldest orphaned_at)", got, want)
+		}
+	}
+
+	// LIMIT still applies after prioritization: the re-anchorable one wins the
+	// single slot even though it is the newest orphan.
+	rows, err = s.ListOrphanedBlocksToReconcile(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].BlockHash != "orph-canon" {
+		t.Fatalf("limit=1 queue = %v, want [orph-canon]", hashesOf(rows))
+	}
+}
+
 // TestGetStatus_EnrichesOrphanedProofPaths builds a real compound BUMP for
 // the orphaned block so GetStatus can re-derive the historical anchor's
 // minimal path at read time; the extracted path must parse and compute the

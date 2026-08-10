@@ -2296,10 +2296,22 @@ func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, at ti
 }
 
 // ListOrphanedBlocksToReconcile narrows by status='orphaned' via the secondary
-// index, then in-memory filters to rows with no reconciled_at, sorts by
-// orphaned_at ascending, and truncates to limit — the anchor reconciler's
-// durable work queue. Cardinality is bounded by unreconciled orphans, which
-// is near-zero in steady state.
+// index, then in-memory filters to rows with no reconciled_at — the anchor
+// reconciler's durable work queue. Rows that can be re-anchored RIGHT NOW —
+// the active (canonical) block at the same height already has a stored BUMP —
+// sort ahead of rows that cannot, with orphaned_at ascending WITHIN each group,
+// before truncating to limit. This mirrors the Postgres store: the reconciler
+// consumes a small LIMIT per tick, so a large backlog of orphans whose
+// canonical block has no stored BUMP (only parkable, never re-anchorable now)
+// must not starve a genuinely re-anchorable recent incident behind them.
+//
+// The re-anchorable signal mirrors reconcileBlock, which resolves the canonical
+// block at the orphan's height and re-anchors from that block's stored compound
+// BUMP; the active row at a height is the store's record of that canonical
+// block. Checking specifically the ACTIVE block's BUMP (not any BUMP at the
+// height) matters: an orphan retains its own compound BUMP, which must not
+// count. Cardinality is bounded by unreconciled orphans (near-zero in steady
+// state); the re-anchorable probe is memoized per distinct height.
 func (s *Store) ListOrphanedBlocksToReconcile(ctx context.Context, limit int) ([]*models.BlockProcessingStatus, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -2343,11 +2355,111 @@ loop:
 	if loopErr != nil {
 		return all, loopErr
 	}
-	sortByOrphanedAtAsc(all)
+
+	// Memoize the re-anchorable probe per distinct height: a backlog is mostly
+	// same-height competitions, so distinct heights are far fewer than rows.
+	reanchorableAt := make(map[uint64]bool)
+	for _, row := range all {
+		if _, done := reanchorableAt[row.BlockHeight]; done {
+			continue
+		}
+		ok, hErr := s.heightHasActiveBUMP(ctx, row.BlockHeight)
+		if hErr != nil {
+			return all, hErr
+		}
+		reanchorableAt[row.BlockHeight] = ok
+	}
+
+	sortReanchorableThenOrphanedAtAsc(all, reanchorableAt)
 	if len(all) > limit {
 		all = all[:limit]
 	}
 	return all, nil
+}
+
+// heightHasActiveBUMP reports whether the active (canonical) block at height
+// has a stored compound BUMP — the store-expressible proxy for "reconcileBlock
+// can re-anchor this orphan's txs right now". It queries the block_processing
+// rows at the height via the numeric secondary index and returns true on the
+// first active row whose block hash has a BUMP manifest.
+func (s *Store) heightHasActiveBUMP(ctx context.Context, height uint64) (bool, error) {
+	stmt := aero.NewStatement(s.namespace, setBlockProcessing)
+	_ = stmt.SetFilter(aero.NewRangeFilter(binBlockHeight, int64(height), int64(height))) //nolint:gosec // block height fits in int64
+	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
+	if rs != nil {
+		defer func() { _ = rs.Close() }()
+	}
+	if err != nil {
+		return false, fmt.Errorf("query block_processing at height %d: %w", height, err)
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case rec, ok := <-rs.Results():
+			if !ok {
+				return false, nil
+			}
+			if rec.Err != nil {
+				continue
+			}
+			if getString(rec.Record, binStatus) != string(models.BlockStatusActive) {
+				continue
+			}
+			if has, hErr := s.hasBUMP(ctx, getString(rec.Record, binBlockHash)); hErr != nil {
+				return false, hErr
+			} else if has {
+				return true, nil
+			}
+		}
+	}
+}
+
+// hasBUMP reports whether a compound BUMP manifest is stored for blockHash. It
+// reads only the manifest's presence (one bin) — the ordering signal mirrors
+// the Postgres EXISTS(... JOIN bumps ...) check, which is presence, not content.
+func (s *Store) hasBUMP(ctx context.Context, blockHash string) (bool, error) {
+	key, err := s.key(setBumps, blockHash)
+	if err != nil {
+		return false, err
+	}
+	rec, err := s.client.Get(s.readPolicy(ctx), key, "chunk_count")
+	if err != nil {
+		if isKeyNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("probe bump manifest %s: %w", blockHash, err)
+	}
+	return rec != nil, nil
+}
+
+// sortReanchorableThenOrphanedAtAsc orders rows re-anchorable-first (per the
+// reanchorableAt map keyed by height), then oldest orphaned_at within each
+// group, matching the Postgres ORDER BY. A nil orphaned_at sorts last.
+func sortReanchorableThenOrphanedAtAsc(rows []*models.BlockProcessingStatus, reanchorableAt map[uint64]bool) {
+	before := func(a, b *models.BlockProcessingStatus) bool {
+		ra, rb := reanchorableAt[a.BlockHeight], reanchorableAt[b.BlockHeight]
+		if ra != rb {
+			return ra // re-anchorable first
+		}
+		switch {
+		case a.OrphanedAt == nil:
+			return false
+		case b.OrphanedAt == nil:
+			return true
+		default:
+			return a.OrphanedAt.Before(*b.OrphanedAt)
+		}
+	}
+	// Insertion sort matches the other block_processing sorts — the orphan
+	// backlog is at most a handful of rows.
+	for i := 1; i < len(rows); i++ {
+		j := i
+		for j > 0 && before(rows[j], rows[j-1]) {
+			rows[j-1], rows[j] = rows[j], rows[j-1]
+			j--
+		}
+	}
 }
 
 func (s *Store) MarkBlocksParked(ctx context.Context, blockHashes []string) error {
@@ -2589,29 +2701,6 @@ func sortByHeaderSeenAsc(rows []*models.BlockProcessingStatus) {
 	for i := 1; i < len(rows); i++ {
 		j := i
 		for j > 0 && rows[j-1].HeaderSeenAt.After(rows[j].HeaderSeenAt) {
-			rows[j-1], rows[j] = rows[j], rows[j-1]
-			j--
-		}
-	}
-}
-
-func sortByOrphanedAtAsc(rows []*models.BlockProcessingStatus) {
-	// Insertion sort matches the other block_processing sorts — the orphan
-	// backlog is at most a handful of rows. A nil orphaned_at sorts last,
-	// matching Postgres's ORDER BY orphaned_at ASC NULLS LAST.
-	before := func(a, b *models.BlockProcessingStatus) bool {
-		switch {
-		case a.OrphanedAt == nil:
-			return false
-		case b.OrphanedAt == nil:
-			return true
-		default:
-			return a.OrphanedAt.Before(*b.OrphanedAt)
-		}
-	}
-	for i := 1; i < len(rows); i++ {
-		j := i
-		for j > 0 && before(rows[j], rows[j-1]) {
 			rows[j-1], rows[j] = rows[j], rows[j-1]
 			j--
 		}
