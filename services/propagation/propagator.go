@@ -125,6 +125,14 @@ type Propagator struct {
 	// worker pool so an in-flight batch doesn't lose its broadcast
 	// results to a closed jobs channel.
 	inflightBatches sync.WaitGroup
+	// pendingDepth / inflightDepth mirror the PropagationPendingDepth /
+	// PropagationInflightDepth gauges as plain atomics so non-dispatcher
+	// goroutines (the reaper's per-tick backlog log line) can read the
+	// current depths without a Prometheus read API or a round-trip onto the
+	// dispatcher's channels. Written only by the dispatcher loop.
+	pendingDepth  atomic.Int64
+	inflightDepth atomic.Int64
+
 	// backgroundWG tracks the long-running Start-spawned goroutines —
 	// runReaper, runMerkleReplay — so Stop can wait for them to exit
 	// before the surrounding app cleanup closes the store backing them.
@@ -891,6 +899,7 @@ func (p *Propagator) registerBatch(ctx context.Context, batch []propagationMsg) 
 	successTxIDs := make([]string, 0, len(batch))
 	var sampleErr, sampleAuthErr error
 	authFailures := 0
+	canceledFailures := 0
 	for i, err := range errs {
 		if err == nil {
 			registered = append(registered, batch[i])
@@ -903,6 +912,21 @@ func (p *Propagator) registerBatch(ctx context.Context, batch []propagationMsg) 
 		// offset / in-flight bookkeeping (a diverted tx would strand its Kafka
 		// offset and freeze the commit watermark — see handleAdmit).
 		failed = append(failed, batch[i])
+		// Context cancellation isn't a merkle-service failure at all: the
+		// claim was revoked (consumer-group rebalance) or the service is
+		// shutting down, and every in-flight /watch call collapsed at once.
+		// Classify it under the distinct "claim_revoked" label — one
+		// rebalance used to pump tens of thousands of bogus "register_error"
+		// counts into the metric (2026-08-10: 39,189 in one batch) — and
+		// keep it out of sampleErr so the partial-failure WARN below fires
+		// only for real /watch errors. ctx.Err() is checked alongside the
+		// error chain because a call raced by the cancel can surface
+		// transport wrappers that don't unwrap to context.Canceled.
+		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			canceledFailures++
+			metrics.PropagationMerkleRegisterFailures.WithLabelValues("claim_revoked").Inc()
+			continue
+		}
 		// But classify the reason: a 401/403 is an auth rejection
 		// (merkle_service.auth_token missing or wrong — issue #269), not a
 		// transient blip. Surface it under its own metric label + a distinct
@@ -932,7 +956,12 @@ func (p *Propagator) registerBatch(ctx context.Context, batch []propagationMsg) 
 	default:
 		metrics.PropagationMerkleRegisterBatchOutcomeTotal.WithLabelValues("partial").Inc()
 	}
-	if len(failed) > 0 {
+	// Cancellation-only failures don't warn here: nothing will be requeued
+	// (processBatch aborts the batch at its post-register checkpoint) and the
+	// caller's single "claim revoked mid-batch" Info line already covers the
+	// event — a 39k-line-equivalent WARN claiming "requeueing failed subset"
+	// during a rebalance was pure noise.
+	if len(failed) > canceledFailures {
 		p.logger.Warn(
 			"merkle-service /watch partial/all failure; requeueing failed subset",
 			zap.Int("batch_size", len(batch)),
@@ -1083,6 +1112,35 @@ func (p *Propagator) startBroadcastSpan(ctx context.Context, batch []propagation
 	return spanCtx, func() { span.End() }
 }
 
+// abortBatchOnRevokedClaim reports whether the batch's claim context is
+// already dead — the broker revoked the partition claim mid-batch (consumer-
+// group rebalance) or the service is shutting down. When it is, the caller
+// must stop the batch where it stands: every downstream stage (merkle /watch,
+// teranode /txs, the delayed requeue) would run against a born-canceled
+// context, instantly "failing" tens of thousands of txs into requeue
+// goroutines that park 2s and drop. Observed live at >1,900 TPS (2026-08-10):
+// 39,189 of a 53,269-tx batch "failed" registration with context canceled
+// after a claim revocation, then a 14,080-tx retry batch logged "batch
+// propagated" accepted=0 in 12ms because every SubmitTransactions returned
+// instantly under the dead ctx.
+//
+// Stopping IS the durable path: nothing in the batch has been marked on the
+// revoked claim's offsetTracker, so every tx's Kafka offset stays uncommitted
+// and the NEW claim replays the whole batch (at-least-once). One Info line +
+// one counter tick per aborted batch keeps the event visible without the log
+// storm the dead-ctx spiral used to produce.
+func (p *Propagator) abortBatchOnRevokedClaim(ctx context.Context, txCount int) bool {
+	if ctx.Err() == nil {
+		return false
+	}
+	metrics.PropagationClaimRevokedBatchesTotal.Inc()
+	p.logger.Info(
+		"claim revoked mid-batch; leaving txs uncommitted for replay",
+		logfields.TxIDCount(txCount),
+	)
+	return true
+}
+
 // processBatch handles one drained batch:
 //  1. Register every tx with merkle-service. Txs whose /watch failed are
 //     requeued through the dispatcher after a short flat wait.
@@ -1095,10 +1153,28 @@ func (p *Propagator) startBroadcastSpan(ctx context.Context, batch []propagation
 //     reachable, per-slot infra code). The Kafka offset stays pinned via
 //     the existing inFlight entry.
 //
+// The claim context is checked between stages (abortBatchOnRevokedClaim): a
+// batch whose claim was revoked stops immediately and leaves its txs
+// uncommitted for the next claim to replay, rather than dragging a dead ctx
+// through register/broadcast/requeue.
+//
 // Failure paths are absorbed internally — there's no caller that reacts
 // to an aggregate error here, so the function returns void.
 func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) {
+	// The dispatcher detaches this goroutine (see flushBatch / the flush
+	// tick), so the claim can be revoked before the batch even starts.
+	if p.abortBatchOnRevokedClaim(ctx, len(batch)) {
+		return
+	}
 	registered, failedRegister := p.registerBatch(ctx, batch)
+	// A claim revoked DURING registerBatch has already collapsed some or all
+	// /watch calls with context canceled — those "failures" are not merkle-
+	// service verdicts, and broadcasting the survivors under the dead ctx
+	// would only produce born-canceled submits. Stop before touching the
+	// requeue or broadcast stages.
+	if p.abortBatchOnRevokedClaim(ctx, len(batch)) {
+		return
+	}
 	if len(failedRegister) > 0 {
 		p.requeueAfterDelay(ctx, failedRegister)
 	}
@@ -1170,6 +1246,16 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) {
 
 	p.applyTerminalStatuses(ctx, terminalStatuses, accepted, rejected)
 	if len(toRequeue) > 0 {
+		// A claim revoked during broadcast classifies every no-verdict tx
+		// as Requeue (born-canceled submitCtx → instant SubmitTransactions
+		// returns). Requeueing them under the dead ctx would only park a
+		// goroutine that drops them 2s later, and the "batch propagated"
+		// line below would report accepted=0 requeued=N for a batch that
+		// never really broadcast. Stop here instead; any verdicts that DID
+		// land before the revocation were already applied above.
+		if p.abortBatchOnRevokedClaim(ctx, len(toRequeue)) {
+			return
+		}
 		p.requeueAfterDelay(ctx, toRequeue)
 	}
 	metrics.PropagationOutcomeTotal.WithLabelValues("accepted").Add(float64(accepted))
@@ -1207,6 +1293,20 @@ const requeueDelay = 2 * time.Second
 // visible in the operator's logs rather than looking like lost work.
 func (p *Propagator) requeueAfterDelay(ctx context.Context, msgs []propagationMsg) {
 	if len(msgs) == 0 {
+		return
+	}
+	// Already-dead ctx (claim revoked / shutdown): drop NOW rather than park
+	// a goroutine for requeueDelay that can only ever hit the ctx.Done arm
+	// below. Same at-least-once contract and same Debug line as that arm —
+	// the txs' offsets stay uncommitted and the next claim replays them —
+	// minus the 2s of parked goroutines per aborted batch a rebalance used
+	// to accumulate. Also skips the "transactions requeued for retry" Info,
+	// which would be a lie: nothing is being requeued.
+	if ctx.Err() != nil {
+		p.logger.Debug(
+			"requeue dropped before delay elapsed; txs left uncommitted for replay",
+			zap.Int("dropped", len(msgs)),
+		)
 		return
 	}
 	requeueTxIDs := make([]string, len(msgs))

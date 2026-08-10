@@ -369,14 +369,25 @@ func setMinedAndPublish(
 	for i, st := range mined {
 		minedTxIDs[i] = st.TxID
 	}
-	// Full-searchability MINED line(s): every txid appears in the log stream
-	// (chunked, never capped) so a txid or block_hash search in Coralogix
-	// finds the MINED transition regardless of block size. A 14k-tx block
-	// produces ~14 lines at maxTxIDsPerLine=1000 — intended. Independent of
-	// b.publisher wiring below, since this is the lifecycle log, not the
-	// downstream fan-out.
+	// MINED line, split by level. Info gets ONE bounded line per block:
+	// TxIDBatch caps the list at maxTxIDsPerLine but txid_count always
+	// carries the TRUE total, so Info-level volume stays flat regardless of
+	// block size (a 40k-tx block previously chunked into ~41 Info lines,
+	// ~2.7 MB per block). Independent of the publisher wiring below, since
+	// this is the lifecycle log, not the downstream fan-out.
+	logger.Info(
+		"transactions mined",
+		append(
+			[]zap.Field{logfields.BlockHash(blockHash), logfields.BlockHeight(blockHeight)},
+			logfields.TxIDBatch(minedTxIDs)...,
+		)...,
+	)
+	// Debug, not Info, for full searchability: every txid appears in the log
+	// stream (chunked, never capped) so a txid or block_hash search in
+	// Coralogix still finds the MINED transition regardless of block size
+	// when debug logging is enabled, while Info-level volume stays flat.
 	logfields.ForEachTxIDChunk(minedTxIDs, func(chunk []string, chunkIdx, totalChunks int) {
-		logger.Info(
+		logger.Debug(
 			"transactions mined",
 			logfields.BlockHash(blockHash),
 			logfields.BlockHeight(blockHeight),

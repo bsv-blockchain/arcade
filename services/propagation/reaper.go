@@ -276,6 +276,21 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 	// backlog drains, which used to make the metric misleading.
 	metrics.PropagationReaperReadyDepth.Set(float64(len(stuck)))
 
+	// One-line backlog snapshot per tick (~reaperInterval, leader only):
+	// pending is the dispatcher's next-flush accumulator (capped at
+	// max_pending by admission backpressure), inflight is its full
+	// admitted-but-not-terminal census (uncapped — each entry pins an
+	// uncommitted Kafka offset, so this is the log-visible proxy for the
+	// replay backlog), and reaper_ready is this scan's stale-row batch.
+	// During the 2026-08-10 load test a ~466k-tx uncommitted-offset backlog
+	// was invisible without a DB/Kafka query; this line makes growth
+	// visible in plain logs.
+	p.logger.Info("reaper: propagation backlog depth",
+		zap.Int64("pending_depth", p.pendingDepth.Load()),
+		zap.Int64("inflight_depth", p.inflightDepth.Load()),
+		zap.Int("reaper_ready_depth", len(stuck)),
+	)
+
 	// Publish the stuck-transient census the same way: every tick, zero
 	// included, so the gauges always reflect the latest completed scan.
 	for status, ts := range stuckTransient {

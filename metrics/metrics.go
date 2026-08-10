@@ -199,6 +199,32 @@ var PropagationReaperReadyDepth = promauto.NewGauge(prometheus.GaugeOpts{
 	Help: "Number of stale SEEN_ON_NETWORK rows ready for rebroadcast at the last reaper tick.",
 })
 
+// PropagationClaimRevokedBatchesTotal counts processBatch pipelines aborted
+// because their Kafka claim context was already canceled — the broker revoked
+// the partition claim mid-batch (consumer-group rebalance) or the service is
+// shutting down. Aborting is the durable path: nothing in the batch has been
+// marked on the revoked claim's offset tracker, so every tx replays under the
+// next claim. An occasional tick during a rolling restart is normal; a
+// sustained rate means macro-batch cycles are overrunning the consumer-group
+// session timeout and the group is thrashing.
+var PropagationClaimRevokedBatchesTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "arcade_propagation_claim_revoked_batches_total",
+	Help: "Propagation batches aborted mid-pipeline because the Kafka claim was revoked; their txs stay uncommitted for replay.",
+})
+
+// PropagationInflightDepth gauges the dispatcher's full in-flight census:
+// every tx admitted from Kafka that has not yet reached a terminal verdict —
+// pending flush, mid-broadcast, held behind an in-flight parent, or parked in
+// a delayed requeue. Unlike PropagationPendingDepth, which admission
+// backpressure caps at max_pending, this gauge is uncapped, so it is the one
+// that shows a real backlog growing. Each in-flight entry pins its Kafka
+// offset below the commit watermark, so this depth also approximates the
+// uncommitted-offset backlog on the current claim.
+var PropagationInflightDepth = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "arcade_propagation_inflight_depth",
+	Help: "Transactions in the dispatcher's in-flight set (admitted but not yet terminal); each pins an uncommitted Kafka offset.",
+})
+
 // APITxsSubmittedTotal counts individual transactions submitted through the
 // API, by route and dedup result. Unlike the HTTP request histogram (one
 // sample per request), this counts PER TRANSACTION — the /txs batch route
