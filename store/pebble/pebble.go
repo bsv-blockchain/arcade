@@ -279,7 +279,7 @@ func (s *Store) Close() error {
 // EnsureIndexes is a no-op — Pebble's indexes are just prefix key ranges
 // that are written atomically with primary rows. There's nothing to
 // provision at startup.
-func (s *Store) EnsureIndexes() error { return nil }
+func (s *Store) EnsureIndexes(context.Context) error { return nil }
 
 func (s *Store) shardFor(txid string) *sync.Mutex {
 	h := fnv.New32a()

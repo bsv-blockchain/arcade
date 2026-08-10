@@ -260,7 +260,7 @@ func (m *mockStore) GetReadyRetries(context.Context, time.Time, int) ([]*store.P
 func (m *mockStore) ClearRetryState(context.Context, string, models.Status, string) error {
 	return nil
 }
-func (m *mockStore) EnsureIndexes() error { return nil }
+func (m *mockStore) EnsureIndexes(context.Context) error { return nil }
 func (m *mockStore) UpsertDatahubEndpoint(context.Context, store.DatahubEndpoint) error {
 	return nil
 }

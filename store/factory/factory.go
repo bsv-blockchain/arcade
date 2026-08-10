@@ -22,7 +22,7 @@ import (
 func New(ctx context.Context, cfg *config.Config) (store.Store, store.Leaser, error) {
 	switch cfg.Store.Backend {
 	case "", "aerospike":
-		s, err := aerospike.New(cfg.Store.Aerospike)
+		s, err := aerospike.New(ctx, cfg.Store.Aerospike)
 		if err != nil {
 			return nil, nil, err
 		}

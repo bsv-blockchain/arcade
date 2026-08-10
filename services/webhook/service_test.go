@@ -237,7 +237,7 @@ func (s *fakeStore) ListSubmissionsReadyForRetry(_ context.Context, now time.Tim
 func (s *fakeStore) ClearRetryState(context.Context, string, models.Status, string) error {
 	return nil
 }
-func (s *fakeStore) EnsureIndexes() error { return nil }
+func (s *fakeStore) EnsureIndexes(context.Context) error { return nil }
 func (s *fakeStore) UpsertDatahubEndpoint(context.Context, store.DatahubEndpoint) error {
 	return nil
 }

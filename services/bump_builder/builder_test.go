@@ -140,7 +140,7 @@ func (m *mockStore) ListBlockProcessingStatus(_ context.Context, beforeHeight ui
 	return out, nil
 }
 
-func (m *mockStore) EnsureIndexes() error { return nil }
+func (m *mockStore) EnsureIndexes(context.Context) error { return nil }
 
 func (m *mockStore) InsertStump(_ context.Context, stump *models.Stump) error {
 	m.mu.Lock()
