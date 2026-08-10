@@ -1102,17 +1102,44 @@ func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, at ti
 }
 
 // ListOrphanedBlocksToReconcile returns the reconciler's work queue:
-// orphaned rows not yet reconciled, oldest orphaned_at first. Served by
-// the idx_bp_orphaned_unreconciled partial index.
+// orphaned rows not yet reconciled. Rows that can be re-anchored RIGHT NOW —
+// the active (canonical) block at the same height already has a stored BUMP —
+// sort ahead of rows that cannot, with oldest orphaned_at first WITHIN each
+// group. Served by the idx_bp_orphaned_unreconciled partial index for the
+// WHERE, with idx_bp_status_height + the bumps PK serving the re-anchorable
+// probe.
+//
+// Why prioritize: the reconciler processes a small LIMIT per tick. A large
+// backlog of orphans whose canonical block has NO stored BUMP (they can only
+// be parked/deferred, never re-anchored right now) would, under a plain
+// orphaned_at ASC ordering, starve a genuinely re-anchorable recent incident
+// sitting behind them oldest-first. Ordering the re-anchorable ones first
+// guarantees the tick spends its budget on work it can actually complete.
+//
+// The re-anchorable signal mirrors reconcileBlock: it resolves the canonical
+// block at the orphan's height (chaintracks header) and re-anchors from that
+// block's stored compound BUMP. The active block_processing row at a height is
+// the store's record of that canonical block (the tie-scan/tracker keeps the
+// competition winner 'active' and marks losers 'orphaned'), so "an active row
+// at bp.block_height whose block_hash has a bumps row" is the in-SQL proxy for
+// "the canonical block's BUMP is stored". The a.status='active' filter is what
+// makes this correct: an orphan RETAINS its own compound BUMP, so a bare
+// "any bump at this height" test would falsely flag every orphan re-anchorable.
 func (s *Store) ListOrphanedBlocksToReconcile(ctx context.Context, limit int) ([]*models.BlockProcessingStatus, error) {
 	if limit <= 0 {
 		return nil, fmt.Errorf("limit must be > 0")
 	}
 	const q = `
-SELECT block_hash, block_height, header_seen_at, processed_at, bump_built_at, status, orphaned_at, reconciled_at
-FROM block_processing
-WHERE status = 'orphaned' AND reconciled_at IS NULL
-ORDER BY orphaned_at ASC NULLS LAST
+SELECT bp.block_hash, bp.block_height, bp.header_seen_at, bp.processed_at, bp.bump_built_at, bp.status, bp.orphaned_at, bp.reconciled_at
+FROM block_processing bp
+WHERE bp.status = 'orphaned' AND bp.reconciled_at IS NULL
+ORDER BY
+    EXISTS (
+        SELECT 1 FROM block_processing a
+        JOIN bumps b ON b.block_hash = a.block_hash
+        WHERE a.block_height = bp.block_height AND a.status = 'active'
+    ) DESC,
+    bp.orphaned_at ASC NULLS LAST
 LIMIT $1`
 	rows, err := s.pool.Query(ctx, q, limit)
 	if err != nil {

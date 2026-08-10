@@ -1425,8 +1425,22 @@ func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, at ti
 }
 
 // ListOrphanedBlocksToReconcile scans the block_processing rows for
-// status='orphaned' AND reconciled_at unset, oldest orphaned_at first.
-// The table holds one row per block, so a prefix scan is cheap.
+// status='orphaned' AND reconciled_at unset. Rows that can be re-anchored
+// RIGHT NOW — the active (canonical) block at the same height already has a
+// stored BUMP — sort ahead of rows that cannot, oldest orphaned_at first
+// WITHIN each group. This mirrors the Postgres store: the reconciler consumes
+// a small LIMIT per tick, so a large backlog of orphans whose canonical block
+// has no stored BUMP (only parkable, never re-anchorable now) must not starve
+// a genuinely re-anchorable recent incident sitting behind them.
+//
+// The re-anchorable signal mirrors reconcileBlock, which resolves the canonical
+// block at the orphan's height and re-anchors from that block's stored compound
+// BUMP. The active row at a height is the store's record of that canonical
+// block, so "an active row at this height whose hash has a stored BUMP" is the
+// proxy. Checking specifically the ACTIVE block's BUMP (not any BUMP at the
+// height) matters: an orphan retains its own compound BUMP, which must not
+// count. The table holds one row per block, so the single prefix scan that
+// already backs this query also collects the active-by-height map for free.
 func (s *Store) ListOrphanedBlocksToReconcile(ctx context.Context, limit int) ([]*models.BlockProcessingStatus, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -1445,6 +1459,7 @@ func (s *Store) ListOrphanedBlocksToReconcile(ctx context.Context, limit int) ([
 	defer func() { _ = iter.Close() }()
 
 	var rows []*storedBlockProcessing
+	activeByHeight := make(map[uint64][]string)
 	for iter.First(); iter.Valid(); iter.Next() {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -1453,23 +1468,71 @@ func (s *Store) ListOrphanedBlocksToReconcile(ctx context.Context, limit int) ([
 		if err := json.Unmarshal(iter.Value(), &b); err != nil {
 			continue
 		}
-		if b.Status != string(models.BlockStatusOrphaned) || b.ReconciledAtUnixNs != 0 {
-			continue
+		switch {
+		case b.Status == string(models.BlockStatusActive):
+			activeByHeight[b.BlockHeight] = append(activeByHeight[b.BlockHeight], b.BlockHash)
+		case b.Status == string(models.BlockStatusOrphaned) && b.ReconciledAtUnixNs == 0:
+			row := b
+			rows = append(rows, &row)
 		}
-		row := b
-		rows = append(rows, &row)
 	}
-	sort.Slice(rows, func(i, j int) bool {
-		return rows[i].OrphanedAtUnixNs < rows[j].OrphanedAtUnixNs
-	})
-	if len(rows) > limit {
-		rows = rows[:limit]
+
+	// reanchorable[i] tracks whether rows[i]'s canonical block already has a
+	// stored BUMP. Memoized per height because a backlog is mostly same-height
+	// competitions, so distinct heights (and thus BUMP existence probes) are
+	// far fewer than rows.
+	reanchorableAt := make(map[uint64]bool, len(activeByHeight))
+	heightReanchorable := func(height uint64) bool {
+		if v, ok := reanchorableAt[height]; ok {
+			return v
+		}
+		v := false
+		for _, hash := range activeByHeight[height] {
+			if s.hasBUMP(hash) {
+				v = true
+				break
+			}
+		}
+		reanchorableAt[height] = v
+		return v
 	}
-	out := make([]*models.BlockProcessingStatus, len(rows))
+	reanchorable := make([]bool, len(rows))
 	for i, r := range rows {
-		out[i] = r.toModel()
+		reanchorable[i] = heightReanchorable(r.BlockHeight)
+	}
+
+	idx := make([]int, len(rows))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.SliceStable(idx, func(a, b int) bool {
+		ia, ib := idx[a], idx[b]
+		if reanchorable[ia] != reanchorable[ib] {
+			return reanchorable[ia] // re-anchorable first
+		}
+		return rows[ia].OrphanedAtUnixNs < rows[ib].OrphanedAtUnixNs
+	})
+	if len(idx) > limit {
+		idx = idx[:limit]
+	}
+	out := make([]*models.BlockProcessingStatus, len(idx))
+	for i, j := range idx {
+		out[i] = rows[j].toModel()
 	}
 	return out, nil
+}
+
+// hasBUMP reports whether a compound BUMP is stored for blockHash. It only
+// probes for key existence — the ordering signal in
+// ListOrphanedBlocksToReconcile mirrors the Postgres EXISTS(... JOIN bumps ...)
+// check, which is presence, not content.
+func (s *Store) hasBUMP(blockHash string) bool {
+	_, closer, err := s.db.Get(bumpKey(blockHash))
+	if err != nil {
+		return false
+	}
+	_ = closer.Close()
+	return true
 }
 
 func (s *Store) MarkBlocksParked(ctx context.Context, blockHashes []string) error {
