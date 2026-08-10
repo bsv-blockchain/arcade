@@ -24,6 +24,7 @@ import (
 // MarkBlocksOrphaned (the embedded interface would panic).
 type orphanRecordingStore struct {
 	*mockStore
+
 	orphanMu      sync.Mutex
 	orphanedCalls [][]string
 }
@@ -229,12 +230,14 @@ func TestTryShortCircuit_GuardAllowsActiveBlock(t *testing.T) {
 // exercise setMinedAndPublish's onlyChanged filtering.
 type prevSeedingStore struct {
 	*mockStore
+
 	prevByTxid map[string]*models.TransactionStatus
 }
 
 func (s *prevSeedingStore) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeight uint64, txids []string) ([]*models.TransactionStatus, []*models.TransactionStatus, error) {
 	_, _, _ = s.mockStore.SetMinedByTxIDs(ctx, blockHash, blockHeight, txids) // record the call
-	var prevs, mined []*models.TransactionStatus
+	prevs := make([]*models.TransactionStatus, 0, len(txids))
+	mined := make([]*models.TransactionStatus, 0, len(txids))
 	for _, txid := range txids {
 		prev := s.prevByTxid[txid]
 		if prev == nil {

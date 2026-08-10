@@ -47,8 +47,7 @@ func (s *trackerStore) orphanCalls() [][]string {
 
 func headerAt(height uint32, seed byte) *chaintracks.BlockHeader {
 	var h chainhash.Hash
-	h[0] = seed
-	h[1] = byte(height)
+	h[0] = seed // seeds are unique per test row; height needn't feed the hash
 	return &chaintracks.BlockHeader{Height: height, Hash: h}
 }
 

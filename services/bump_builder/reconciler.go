@@ -299,21 +299,7 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 		}
 	}
 	if !canonicalReady && canonicalHash != "" {
-		maxDefer := r.cfg.BumpBuilder.Reconciler.MaxDeferAttempts
-		if maxDefer <= 0 {
-			maxDefer = 10
-		}
-		if r.defers[orphan] < maxDefer {
-			r.defers[orphan]++
-			logger.Info("canonical block's BUMP not stored yet — deferring",
-				zap.String("canonical_block_hash", canonicalHash),
-				zap.Int("defer_attempt", r.defers[orphan]),
-			)
-			if r.merkle != nil && r.cfg.CallbackURL != "" {
-				if err := r.merkle.Reprocess(ctx, canonicalHash, r.cfg.CallbackURL, r.cfg.CallbackToken); err != nil {
-					logger.Warn("merkle-service /reprocess for canonical block failed", zap.Error(err))
-				}
-			}
+		if r.deferForCanonicalBUMP(ctx, logger, orphan, canonicalHash) {
 			return "deferred"
 		}
 		logger.Warn("defer cap reached without a canonical BUMP — falling back to revert-all "+
@@ -329,47 +315,7 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 		logger.Warn("failed to read affected txids", zap.Error(err))
 		return "error"
 	}
-	if len(affected) > 0 {
-		depth := r.cfg.BumpBuilder.Reconciler.NeighborhoodDepth
-		if depth < 0 {
-			depth = 0
-		}
-		for h := height + 1; h <= height+uint64(depth) && len(affected) > 0; h++ {
-			if h > math.MaxUint32 {
-				break
-			}
-			active, err := r.chainHeader.GetHeaderByHeight(ctx, uint32(h))
-			if err != nil || active == nil {
-				break // above the tip — nothing further to check
-			}
-			neighbor := active.Hash.String()
-			_, bumpBytes, err := r.store.GetBUMP(ctx, neighbor)
-			if err != nil || len(bumpBytes) == 0 {
-				continue
-			}
-			idx, err := bump.IndexCompound(bumpBytes)
-			if err != nil {
-				continue
-			}
-			var contained []string
-			var rest []string
-			for _, txid := range affected {
-				if idx.Contains(txid) {
-					contained = append(contained, txid)
-				} else {
-					rest = append(rest, txid)
-				}
-			}
-			if len(contained) > 0 {
-				for start := 0; start < len(contained); start += batchSize {
-					end := min(start+batchSize, len(contained))
-					reanchored += setMinedAndPublish(ctx, logger, r.store, r.publisher,
-						neighbor, h, contained[start:end], models.ExtraInfoReorgReanchor, true)
-				}
-			}
-			affected = rest
-		}
-	}
+	reanchored += r.reanchorNeighborhood(ctx, logger, affected, height, batchSize)
 
 	// Revert the remainder: everything still anchored to O exists in no
 	// canonical block we can prove — SEEN_ON_NETWORK puts them back in
@@ -397,7 +343,8 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 
 	metrics.ReconcilerTxsReanchoredTotal.Add(float64(reanchored))
 	metrics.ReconcilerTxsRevertedTotal.Add(float64(len(reverted)))
-	logger.Info("orphaned block reconciled",
+	logger.Info(
+		"orphaned block reconciled",
 		logfields.BlockHeight(height),
 		zap.String("canonical_block_hash", canonicalHash),
 		zap.Int("txs_reanchored", reanchored),
@@ -413,6 +360,83 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 	default:
 		return "empty"
 	}
+}
+
+// deferForCanonicalBUMP handles the canonical-BUMP-missing branch: while
+// under the defer cap it bumps the orphan's counter, optionally pokes
+// merkle-service /reprocess for the canonical block, and reports true
+// (caller returns "deferred" without stamping reconciled_at). At the cap it
+// reports false so the caller falls back to revert-all.
+func (r *Reconciler) deferForCanonicalBUMP(ctx context.Context, logger *zap.Logger, orphan, canonicalHash string) bool {
+	maxDefer := r.cfg.BumpBuilder.Reconciler.MaxDeferAttempts
+	if maxDefer <= 0 {
+		maxDefer = 10
+	}
+	if r.defers[orphan] >= maxDefer {
+		return false
+	}
+	r.defers[orphan]++
+	logger.Info(
+		"canonical block's BUMP not stored yet — deferring",
+		zap.String("canonical_block_hash", canonicalHash),
+		zap.Int("defer_attempt", r.defers[orphan]),
+	)
+	if r.merkle != nil && r.cfg.CallbackURL != "" {
+		if err := r.merkle.Reprocess(ctx, canonicalHash, r.cfg.CallbackURL, r.cfg.CallbackToken); err != nil {
+			logger.Warn("merkle-service /reprocess for canonical block failed", zap.Error(err))
+		}
+	}
+	return true
+}
+
+// reanchorNeighborhood walks the heights above the orphan looking for
+// canonical blocks whose stored BUMPs contain the still-affected txs (a
+// deep reorg re-bins txs into later blocks) and re-anchors what it finds.
+// Returns the number of rows moved. The affected slice shrinks as txs are
+// claimed; whatever remains falls to the caller's revert.
+func (r *Reconciler) reanchorNeighborhood(ctx context.Context, logger *zap.Logger, affected []string, height uint64, batchSize int) int {
+	if len(affected) == 0 {
+		return 0
+	}
+	depth := r.cfg.BumpBuilder.Reconciler.NeighborhoodDepth
+	if depth < 0 {
+		depth = 0
+	}
+	reanchored := 0
+	for h := height + 1; h <= height+uint64(depth) && len(affected) > 0; h++ {
+		if h > math.MaxUint32 {
+			break
+		}
+		active, hdrErr := r.chainHeader.GetHeaderByHeight(ctx, uint32(h))
+		if hdrErr != nil || active == nil {
+			break // above the tip — nothing further to check
+		}
+		neighbor := active.Hash.String()
+		_, bumpBytes, bumpErr := r.store.GetBUMP(ctx, neighbor)
+		if bumpErr != nil || len(bumpBytes) == 0 {
+			continue
+		}
+		idx, idxErr := bump.IndexCompound(bumpBytes)
+		if idxErr != nil {
+			continue
+		}
+		contained := make([]string, 0, len(affected))
+		rest := make([]string, 0, len(affected))
+		for _, txid := range affected {
+			if idx.Contains(txid) {
+				contained = append(contained, txid)
+			} else {
+				rest = append(rest, txid)
+			}
+		}
+		for start := 0; start < len(contained); start += batchSize {
+			end := min(start+batchSize, len(contained))
+			reanchored += setMinedAndPublish(ctx, logger, r.store, r.publisher,
+				neighbor, h, contained[start:end], models.ExtraInfoReorgReanchor, true)
+		}
+		affected = rest
+	}
+	return reanchored
 }
 
 // remineFromStoredBUMP re-mines every level-0 txid of blockHash's stored

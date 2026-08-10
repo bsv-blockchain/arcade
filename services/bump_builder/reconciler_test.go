@@ -55,7 +55,7 @@ func makeCompoundForTest(t *testing.T, blockHeight uint32, txids ...string) []by
 			t.Fatalf("parse txid %s: %v", id, err)
 		}
 		leaves = append(leaves, &transaction.PathElement{
-			Offset: uint64(i), //nolint:gosec // tiny test values
+			Offset: uint64(i),
 			Hash:   h,
 			Txid:   &isTxid,
 		})

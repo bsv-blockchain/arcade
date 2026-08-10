@@ -12,6 +12,9 @@ import (
 	"github.com/bsv-blockchain/arcade/store"
 )
 
+// testBlockA is the primary anchor block used across these tests.
+const testBlockA = "blk-A"
+
 // Store-layer reorg semantics for issue #279: IMMUTABLE rows are never
 // touched by block-scoped rewrites, superseded MINED anchors are preserved
 // in the row's orphaned-anchor history (capped, dup-collapsed), and the
@@ -29,7 +32,7 @@ func TestSetMinedByTxIDs_SkipsImmutable(t *testing.T) {
 
 	if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
 		TxID: txid, Status: models.StatusImmutable,
-		BlockHash: "blk-A", BlockHeight: 10, Timestamp: time.Now(),
+		BlockHash: testBlockA, BlockHeight: 10, Timestamp: time.Now(),
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -49,7 +52,7 @@ func TestSetMinedByTxIDs_SkipsImmutable(t *testing.T) {
 	if got.Status != models.StatusImmutable {
 		t.Errorf("status = %s, want IMMUTABLE", got.Status)
 	}
-	if got.BlockHash != "blk-A" || got.BlockHeight != 10 {
+	if got.BlockHash != testBlockA || got.BlockHeight != 10 {
 		t.Errorf("anchor moved: hash=%q height=%d, want blk-A/10", got.BlockHash, got.BlockHeight)
 	}
 	if len(got.OrphanedProofs) != 0 {
@@ -68,7 +71,7 @@ func TestSetMinedByTxIDs_ReanchorAppendsOrphanedAnchor(t *testing.T) {
 
 	if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
 		TxID: txid, Status: models.StatusMined,
-		BlockHash: "blk-A", BlockHeight: 10, Timestamp: time.Now(),
+		BlockHash: testBlockA, BlockHeight: 10, Timestamp: time.Now(),
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -93,7 +96,7 @@ func TestSetMinedByTxIDs_ReanchorAppendsOrphanedAnchor(t *testing.T) {
 		t.Fatalf("OrphanedProofs = %+v, want exactly 1 entry", got.OrphanedProofs)
 	}
 	entry := got.OrphanedProofs[0]
-	if entry.BlockHash != "blk-A" || entry.BlockHeight != 10 {
+	if entry.BlockHash != testBlockA || entry.BlockHeight != 10 {
 		t.Errorf("orphaned anchor = {%s %d}, want {blk-A 10}", entry.BlockHash, entry.BlockHeight)
 	}
 	if entry.OrphanedAt.Before(before.Add(-time.Minute)) || entry.OrphanedAt.After(time.Now().Add(time.Minute)) {
@@ -110,15 +113,15 @@ func TestSetMinedByTxIDs_ReanchorAppendsOrphanedAnchor(t *testing.T) {
 	}
 
 	// Re-anchor back to A: the current anchor (B) joins the history.
-	if _, _, err := s.SetMinedByTxIDs(ctx, "blk-A", 10, []string{txid}); err != nil {
+	if _, _, err := s.SetMinedByTxIDs(ctx, testBlockA, 10, []string{txid}); err != nil {
 		t.Fatalf("re-anchor back: %v", err)
 	}
 	got, _ = s.GetStatus(ctx, txid)
-	if got.BlockHash != "blk-A" {
+	if got.BlockHash != testBlockA {
 		t.Errorf("hash after re-anchor back = %q, want blk-A", got.BlockHash)
 	}
 	if len(got.OrphanedProofs) != 2 ||
-		got.OrphanedProofs[0].BlockHash != "blk-A" || got.OrphanedProofs[1].BlockHash != "blk-B" {
+		got.OrphanedProofs[0].BlockHash != testBlockA || got.OrphanedProofs[1].BlockHash != "blk-B" {
 		t.Fatalf("history after flip back = %+v, want [blk-A blk-B]", got.OrphanedProofs)
 	}
 
@@ -205,19 +208,19 @@ func TestSetStatusByBlockHash_RevertAppendsHistoryAndSkipsImmutable(t *testing.T
 	for _, txid := range []string{"rv-1", "rv-2"} {
 		if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
 			TxID: txid, Status: models.StatusMined,
-			BlockHash: "blk-A", BlockHeight: 10, Timestamp: time.Now(),
+			BlockHash: testBlockA, BlockHeight: 10, Timestamp: time.Now(),
 		}); err != nil {
 			t.Fatalf("seed %s: %v", txid, err)
 		}
 	}
 	if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
 		TxID: "rv-imm", Status: models.StatusImmutable,
-		BlockHash: "blk-A", BlockHeight: 10, Timestamp: time.Now(),
+		BlockHash: testBlockA, BlockHeight: 10, Timestamp: time.Now(),
 	}); err != nil {
 		t.Fatalf("seed rv-imm: %v", err)
 	}
 
-	updated, err := s.SetStatusByBlockHash(ctx, "blk-A", models.StatusSeenOnNetwork)
+	updated, err := s.SetStatusByBlockHash(ctx, testBlockA, models.StatusSeenOnNetwork)
 	if err != nil {
 		t.Fatalf("SetStatusByBlockHash: %v", err)
 	}
@@ -227,9 +230,9 @@ func TestSetStatusByBlockHash_RevertAppendsHistoryAndSkipsImmutable(t *testing.T
 	}
 
 	for _, txid := range []string{"rv-1", "rv-2"} {
-		got, err := s.GetStatus(ctx, txid)
-		if err != nil {
-			t.Fatal(err)
+		got, getErr := s.GetStatus(ctx, txid)
+		if getErr != nil {
+			t.Fatal(getErr)
 		}
 		if got.Status != models.StatusSeenOnNetwork {
 			t.Errorf("%s: status = %s, want SEEN_ON_NETWORK", txid, got.Status)
@@ -238,7 +241,7 @@ func TestSetStatusByBlockHash_RevertAppendsHistoryAndSkipsImmutable(t *testing.T
 			t.Errorf("%s: block fields not cleared: hash=%q height=%d", txid, got.BlockHash, got.BlockHeight)
 		}
 		if len(got.OrphanedProofs) != 1 ||
-			got.OrphanedProofs[0].BlockHash != "blk-A" || got.OrphanedProofs[0].BlockHeight != 10 {
+			got.OrphanedProofs[0].BlockHash != testBlockA || got.OrphanedProofs[0].BlockHeight != 10 {
 			t.Errorf("%s: OrphanedProofs = %+v, want [{blk-A 10}]", txid, got.OrphanedProofs)
 		}
 	}
@@ -247,7 +250,7 @@ func TestSetStatusByBlockHash_RevertAppendsHistoryAndSkipsImmutable(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if imm.Status != models.StatusImmutable || imm.BlockHash != "blk-A" || imm.BlockHeight != 10 {
+	if imm.Status != models.StatusImmutable || imm.BlockHash != testBlockA || imm.BlockHeight != 10 {
 		t.Errorf("IMMUTABLE row touched: status=%s hash=%q height=%d", imm.Status, imm.BlockHash, imm.BlockHeight)
 	}
 	if len(imm.OrphanedProofs) != 0 {
@@ -266,7 +269,7 @@ func TestSetStatusByBlockHash_SkipsConcurrentlyReanchoredRow(t *testing.T) {
 
 	if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
 		TxID: txid, Status: models.StatusMined,
-		BlockHash: "blk-A", BlockHeight: 10, Timestamp: time.Now(),
+		BlockHash: testBlockA, BlockHeight: 10, Timestamp: time.Now(),
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -276,11 +279,11 @@ func TestSetStatusByBlockHash_SkipsConcurrentlyReanchoredRow(t *testing.T) {
 	}
 	// Re-inject the now-stale blk-A index entry, as if the revert's index
 	// snapshot had been taken before the re-anchor removed it.
-	if err := s.db.Set(idxTxBlockKey("blk-A", txid), nil, s.writeOpts); err != nil {
+	if err := s.db.Set(idxTxBlockKey(testBlockA, txid), nil, s.writeOpts); err != nil {
 		t.Fatalf("inject stale index: %v", err)
 	}
 
-	updated, err := s.SetStatusByBlockHash(ctx, "blk-A", models.StatusSeenOnNetwork)
+	updated, err := s.SetStatusByBlockHash(ctx, testBlockA, models.StatusSeenOnNetwork)
 	if err != nil {
 		t.Fatalf("SetStatusByBlockHash: %v", err)
 	}
@@ -307,7 +310,7 @@ func TestGetTxIDsByBlockHash(t *testing.T) {
 	for _, txid := range []string{"ba-1", "ba-2", "ba-3"} {
 		if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
 			TxID: txid, Status: models.StatusMined,
-			BlockHash: "blk-A", BlockHeight: 10, Timestamp: time.Now(),
+			BlockHash: testBlockA, BlockHeight: 10, Timestamp: time.Now(),
 		}); err != nil {
 			t.Fatalf("seed %s: %v", txid, err)
 		}
@@ -319,7 +322,7 @@ func TestGetTxIDsByBlockHash(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := s.GetTxIDsByBlockHash(ctx, "blk-A")
+	got, err := s.GetTxIDsByBlockHash(ctx, testBlockA)
 	if err != nil {
 		t.Fatalf("GetTxIDsByBlockHash: %v", err)
 	}
@@ -329,10 +332,10 @@ func TestGetTxIDsByBlockHash(t *testing.T) {
 	}
 
 	// Re-anchor one row to blk-B — it must leave blk-A's set.
-	if _, _, err := s.SetMinedByTxIDs(ctx, "blk-B", 10, []string{"ba-2"}); err != nil {
-		t.Fatalf("re-anchor: %v", err)
+	if _, _, mineErr := s.SetMinedByTxIDs(ctx, "blk-B", 10, []string{"ba-2"}); mineErr != nil {
+		t.Fatalf("re-anchor: %v", mineErr)
 	}
-	got, err = s.GetTxIDsByBlockHash(ctx, "blk-A")
+	got, err = s.GetTxIDsByBlockHash(ctx, testBlockA)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,8 +406,8 @@ func TestMarkBlockReconciled_And_ListOrphanedBlocksToReconcile(t *testing.T) {
 	}
 
 	// Reconcile rb-2 — only rb-1 remains queued.
-	if err := s.MarkBlockReconciled(ctx, "rb-2", t0.Add(3*time.Minute)); err != nil {
-		t.Fatalf("MarkBlockReconciled: %v", err)
+	if mrErr := s.MarkBlockReconciled(ctx, "rb-2", t0.Add(3*time.Minute)); mrErr != nil {
+		t.Fatalf("MarkBlockReconciled: %v", mrErr)
 	}
 	rows, err = s.ListOrphanedBlocksToReconcile(ctx, 10)
 	if err != nil {
@@ -422,14 +425,14 @@ func TestMarkBlockReconciled_And_ListOrphanedBlocksToReconcile(t *testing.T) {
 	}
 
 	// Missing rows are silently skipped.
-	if err := s.MarkBlockReconciled(ctx, "never-seen", t0); err != nil {
-		t.Fatalf("MarkBlockReconciled on missing row: %v", err)
+	if missErr := s.MarkBlockReconciled(ctx, "never-seen", t0); missErr != nil {
+		t.Fatalf("MarkBlockReconciled on missing row: %v", missErr)
 	}
 
 	// Resurrection: the reconciled block re-joins the main chain with both
 	// reorg markers cleared, so a future re-orphaning reconciles again.
-	if err := s.UpsertBlockHeaderSeen(ctx, "rb-2", 601, t0.Add(time.Hour)); err != nil {
-		t.Fatalf("resurrect: %v", err)
+	if upErr := s.UpsertBlockHeaderSeen(ctx, "rb-2", 601, t0.Add(time.Hour)); upErr != nil {
+		t.Fatalf("resurrect: %v", upErr)
 	}
 	got, err = s.GetBlockProcessingStatus(ctx, "rb-2")
 	if err != nil {
@@ -463,21 +466,21 @@ func TestGetStatus_EnrichesOrphanedProofPaths(t *testing.T) {
 	}
 	txid := blk.Txids[0]
 
-	if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+	if _, _, seedErr := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
 		TxID: txid, Status: models.StatusSeenOnNetwork, Timestamp: time.Now(),
-	}); err != nil {
-		t.Fatalf("seed: %v", err)
+	}); seedErr != nil {
+		t.Fatalf("seed: %v", seedErr)
 	}
 	// Mine into blockA (whose compound BUMP is retained), then re-anchor to
 	// blockB so blockA lands in the orphaned-anchor history.
-	if _, _, err := s.SetMinedByTxIDs(ctx, blockA, 900010, []string{txid}); err != nil {
-		t.Fatalf("mine @A: %v", err)
+	if _, _, mineErr := s.SetMinedByTxIDs(ctx, blockA, 900010, []string{txid}); mineErr != nil {
+		t.Fatalf("mine @A: %v", mineErr)
 	}
-	if err := s.InsertBUMP(ctx, blockA, 900010, blk.BumpBytes); err != nil {
-		t.Fatalf("InsertBUMP: %v", err)
+	if insErr := s.InsertBUMP(ctx, blockA, 900010, blk.BumpBytes); insErr != nil {
+		t.Fatalf("InsertBUMP: %v", insErr)
 	}
-	if _, _, err := s.SetMinedByTxIDs(ctx, blockB, 900010, []string{txid}); err != nil {
-		t.Fatalf("re-anchor @B: %v", err)
+	if _, _, mineBErr := s.SetMinedByTxIDs(ctx, blockB, 900010, []string{txid}); mineBErr != nil {
+		t.Fatalf("re-anchor @B: %v", mineBErr)
 	}
 
 	got, err := s.GetStatus(ctx, txid)
@@ -493,14 +496,14 @@ func TestGetStatus_EnrichesOrphanedProofPaths(t *testing.T) {
 	}
 	// The path must parse (NewMerklePathFromBinary) and compute the orphaned
 	// block's merkle root for this txid.
-	if err := synthblock.VerifyMerklePath(path, txid, blk.Root); err != nil {
-		t.Fatalf("orphaned proof does not verify: %v", err)
+	if verErr := synthblock.VerifyMerklePath(path, txid, blk.Root); verErr != nil {
+		t.Fatalf("orphaned proof does not verify: %v", verErr)
 	}
 
 	// Best-effort: once blockA's BUMP is gone the entry is served without a
 	// path rather than failing the read.
-	if err := s.DeleteBUMPByBlockHash(ctx, blockA); err != nil {
-		t.Fatalf("DeleteBUMPByBlockHash: %v", err)
+	if delErr := s.DeleteBUMPByBlockHash(ctx, blockA); delErr != nil {
+		t.Fatalf("DeleteBUMPByBlockHash: %v", delErr)
 	}
 	got, err = s.GetStatus(ctx, txid)
 	if err != nil {

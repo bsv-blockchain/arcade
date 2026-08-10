@@ -169,6 +169,7 @@ func (m *mockStore) SetMinedByTxIDs(context.Context, string, uint64, []string) (
 func (m *mockStore) MarkMerkleRegisteredByTxIDs(context.Context, []string, time.Time) error {
 	return nil
 }
+
 func (m *mockStore) GetTxIDsByBlockHash(context.Context, string) ([]string, error) {
 	return nil, nil
 }
