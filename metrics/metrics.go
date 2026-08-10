@@ -409,7 +409,9 @@ var BumpBuilderAnchorGuardDeniedTotal = promauto.NewCounterVec(prometheus.Counte
 // canonical block), reverted (all reverted to SEEN_ON_NETWORK), mixed,
 // empty (nothing anchored to the orphan anymore), resurrected (the block is
 // active again — stale orphan mark), deferred (waiting on the canonical
-// block's BUMP), error.
+// block's BUMP), parked (canonical BUMP unavailable at the defer cap — txs
+// left MINED, NOT reverted, awaiting a later canonical BUMP; issue #282),
+// error.
 var ReconcilerBlocksTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_reconciler_blocks_total",
 	Help: "Orphaned blocks processed by the anchor reconciler, by outcome.",
@@ -427,6 +429,17 @@ var ReconcilerTxsReanchoredTotal = promauto.NewCounter(prometheus.CounterOpts{
 var ReconcilerTxsRevertedTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "arcade_reconciler_txs_reverted_total",
 	Help: "Transactions reverted to SEEN_ON_NETWORK because their only block was orphaned.",
+})
+
+// ReconcilerTxsParkedTotal counts transactions left MINED against an
+// orphaned block because its canonical BUMP was unavailable at the defer cap
+// (issue #282). Parked txs are NOT reverted to SEEN_ON_NETWORK — a later
+// stored/rebuilt canonical BUMP re-anchors them through the normal mine
+// path. A steady climb here means canonical BUMPs are not arriving (see the
+// merkle-service /reprocess dependency, bsv-blockchain/merkle-service#208).
+var ReconcilerTxsParkedTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "arcade_reconciler_txs_parked_total",
+	Help: "Transactions left MINED against an orphan because no canonical BUMP was available (not reverted).",
 })
 
 // ReconcilerBlockDuration observes wall time per reconciled block.

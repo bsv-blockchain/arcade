@@ -278,9 +278,10 @@ func TestReconciler_DefersUntilCanonicalBUMPArrives(t *testing.T) {
 	}
 }
 
-// TestReconciler_DeferCapFallsBackToRevert: when the canonical BUMP never
-// arrives, the defer cap converts the orphan to revert-all — safe because
-// SEEN_ON_NETWORK → MINED is lattice-legal on a later redelivery.
+// TestReconciler_DeferCapFallsBackToRevert: the OPT-IN legacy fallback
+// (RevertWhenUnreconcilable) — when the canonical BUMP never arrives, the
+// defer cap converts the orphan to revert-all. Default behavior is now to
+// park instead (see TestReconciler_DeferCapParksByDefault, issue #282).
 func TestReconciler_DeferCapFallsBackToRevert(t *testing.T) {
 	ctx := context.Background()
 	st := newPebbleForTest(t)
@@ -292,7 +293,10 @@ func TestReconciler_DeferCapFallsBackToRevert(t *testing.T) {
 	_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
 	_ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
 
-	r := newTestReconciler(st, pub, stub, func(c *config.ReconcilerConfig) { c.MaxDeferAttempts = 1 })
+	r := newTestReconciler(st, pub, stub, func(c *config.ReconcilerConfig) {
+		c.MaxDeferAttempts = 1
+		c.RevertWhenUnreconcilable = true // opt into the legacy revert-all fallback
+	})
 	r.tick(ctx) // defer 1/1
 	r.tick(ctx) // cap reached → revert-all
 
@@ -301,6 +305,58 @@ func TestReconciler_DeferCapFallsBackToRevert(t *testing.T) {
 	}
 	if rows, _ := st.ListOrphanedBlocksToReconcile(ctx, 10); len(rows) != 0 {
 		t.Fatalf("orphan must be reconciled after the fallback, got %d rows", len(rows))
+	}
+}
+
+// TestReconciler_DeferCapParksByDefault: when the canonical BUMP never
+// arrives, the DEFAULT fallback is to PARK the block (issue #282) — the txs
+// stay MINED against the orphan (NOT reverted to SEEN_ON_NETWORK), no revert
+// event is published, and the block leaves the queue (bounded, no infinite
+// retry). Because the txs are left in place, a later stored/rebuilt canonical
+// BUMP re-anchors them through the normal mine path.
+func TestReconciler_DeferCapParksByDefault(t *testing.T) {
+	ctx := context.Background()
+	st := newPebbleForTest(t)
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	// The canonical block at height 10 exists on-chain, but its BUMP is NOT
+	// stored — the reconciler cannot prove where the txs belong.
+	stub.setHeightHeader(10, headerWithHash(t, recCanonical, 10))
+
+	seedMined(t, st, recOrphan, 10, recShared1)
+	_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+	_ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+
+	r := newTestReconciler(st, pub, stub, func(c *config.ReconcilerConfig) { c.MaxDeferAttempts = 1 })
+	r.tick(ctx) // defer 1/1
+	r.tick(ctx) // cap reached → PARK (default)
+
+	// The tx stays MINED against the orphan — the #282 invariant: no un-mine.
+	if got := statusOf(t, st, recShared1); got.Status != models.StatusMined || got.BlockHash != recOrphan {
+		t.Fatalf("parked orphan's tx must stay MINED@orphan, got %s@%s", got.Status, got.BlockHash)
+	}
+	// No revert event published.
+	for _, ev := range pub.bulkEvents() {
+		if ev.ExtraInfo == models.ExtraInfoReorgUnmined {
+			t.Fatalf("park must not publish a revert event, got %+v", ev)
+		}
+	}
+	// Block off the queue (bounded — no infinite retry) and stamped.
+	if rows, _ := st.ListOrphanedBlocksToReconcile(ctx, 10); len(rows) != 0 {
+		t.Fatalf("parked block must leave the reconcile queue, got %d rows", len(rows))
+	}
+	bp, err := st.GetBlockProcessingStatus(ctx, recOrphan)
+	if err != nil || bp.ReconciledAt == nil {
+		t.Fatalf("parked block must be stamped reconciled_at, got %+v err=%v", bp, err)
+	}
+
+	// The txs were left in place, so once the canonical block IS processed
+	// (its BUMP stored → normal mine path), they re-anchor to canonical.
+	if _, _, err := st.SetMinedByTxIDs(ctx, recCanonical, 10, []string{recShared1}); err != nil {
+		t.Fatalf("SetMinedByTxIDs (build-path re-anchor): %v", err)
+	}
+	if got := statusOf(t, st, recShared1); got.Status != models.StatusMined || got.BlockHash != recCanonical {
+		t.Fatalf("a later canonical BUMP must re-anchor the parked tx, got %s@%s", got.Status, got.BlockHash)
 	}
 }
 
@@ -354,5 +410,49 @@ func TestReconciler_FullScanDetectsStaleAnchors(t *testing.T) {
 	}
 	if len(pub.bulkEvents()) == 0 {
 		t.Fatal("expected corrected events from the full-scan heal")
+	}
+}
+
+// TestReconciler_FullScanRespectsHorizon: the startup sweep is bounded to
+// within FullScanDepth of the active tip (issue #282) — a stale off-chain
+// row far below the tip is NOT re-orphaned by the default depth, but an
+// explicit target range picks it up. This is what stops the deep backstop
+// from grinding a long chain's whole history oldest-first and starving the
+// actual recent incident.
+func TestReconciler_FullScanRespectsHorizon(t *testing.T) {
+	ctx := context.Background()
+	st := newPebbleForTest(t)
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+
+	// Active tip at height 200 (on-chain → never flagged; sets GetActiveTip).
+	stub.setHeightHeader(200, headerWithHash(t, recCanonical, 200))
+	_ = st.UpsertBlockHeaderSeen(ctx, recCanonical, 200, time.Now())
+	// A stale off-chain 'active' row far below the tip: the active chain
+	// holds a DIFFERENT block at height 10.
+	stub.setHeightHeader(10, headerWithHash(t, recNeighbor, 10))
+	_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+
+	// Default depth (144): height 10 < tip-144 (=56) ⇒ out of horizon, so it
+	// must NOT be marked.
+	r := newTestReconciler(st, pub, stub, nil)
+	r.fullScan(ctx)
+	if rows, _ := st.ListOrphanedBlocksToReconcile(ctx, 10); len(rows) != 0 {
+		t.Fatalf("horizon must skip height 10 (tip 200, depth 144), got %d queued", len(rows))
+	}
+	if bp, err := st.GetBlockProcessingStatus(ctx, recOrphan); err != nil || bp.Status != models.BlockStatusActive {
+		t.Fatalf("out-of-horizon row must stay active, got %+v err=%v", bp, err)
+	}
+
+	// An explicit target range covering height 10 overrides the depth horizon
+	// ⇒ the stale anchor is now marked orphaned and queued.
+	r2 := newTestReconciler(st, pub, stub, func(c *config.ReconcilerConfig) {
+		c.FullScanMinHeight = 1
+		c.FullScanMaxHeight = 50
+	})
+	r2.fullScan(ctx)
+	rows, err := st.ListOrphanedBlocksToReconcile(ctx, 10)
+	if err != nil || len(rows) != 1 || rows[0].BlockHash != recOrphan {
+		t.Fatalf("targeted scan must mark height 10 orphaned, got %+v err=%v", rows, err)
 	}
 }

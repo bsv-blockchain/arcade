@@ -241,9 +241,8 @@ bump_builder:
   #
   # Anchor reconciler (issue #279): heals transactions anchored to orphaned
   # blocks — re-anchors them to the active-chain block containing them (via
-  # the canonical block's stored compound BUMP) or reverts them to
-  # SEEN_ON_NETWORK, publishing corrected status events. Runs in the
-  # bump-builder mode, lease-gated across replicas.
+  # the canonical block's stored compound BUMP). Runs in the bump-builder
+  # mode, lease-gated across replicas.
   # reconciler:
   #   enabled: true
   #   interval_ms: 30000       # orphan-queue tick cadence
@@ -251,7 +250,27 @@ bump_builder:
   #   blocks_per_tick: 4       # orphaned blocks reconciled per tick
   #   neighborhood_depth: 6    # heights above an orphan searched for re-binned txs
   #   max_defer_attempts: 10   # ticks to wait for a missing canonical BUMP
-  #   startup_full_scan: true  # one-off whole-table sweep for stale anchors
+  #   startup_full_scan: true  # one-off sweep for stale anchors (bounded, see below)
+  #
+  #   # Startup full-scan horizon (issue #282). The sweep is BOUNDED so it does
+  #   # not re-orphan a long chain's entire history oldest-first (which starves
+  #   # the actual recent incident). It considers only heights within
+  #   # full_scan_depth of the active tip. Default 144 (~1 day of BSV blocks);
+  #   # a chain shorter than the horizon is swept whole (cheap).
+  #   full_scan_depth: 144
+  #   # Operator-targeted recovery: when either bound is > 0 the startup scan
+  #   # runs over the explicit [min, max] height range instead of the depth
+  #   # horizon (max 0 = up to the tip). E.g. min=760 max=770 heals just the
+  #   # height-764 incident from its already-stored canonical BUMP; min=1
+  #   # restores the legacy whole-history sweep. Both default 0.
+  #   full_scan_min_height: 0
+  #   full_scan_max_height: 0
+  #
+  #   # Fallback when a block's canonical BUMP is unavailable at the defer cap
+  #   # (issue #282). Default false: PARK the block — leave its txs MINED
+  #   # against the orphan (a later canonical BUMP re-anchors them) rather than
+  #   # un-mining them. true restores the pre-#282 revert-all-to-SEEN fallback.
+  #   revert_when_unreconcilable: false
 
 # Shared on-disk root for arcade state. Chaintracks headers default to
 # <storage_path>/chaintracks/.
