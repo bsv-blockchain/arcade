@@ -703,6 +703,47 @@ func TestRegisterBatch_AuthFailureClassifiedAndRequeued(t *testing.T) {
 	}
 }
 
+// TestRegisterBatch_ClaimRevokedClassifiedDistinctly pins the rebalance-noise
+// fix from the 2026-08-10 load test: when the claim ctx is dead, every /watch
+// "failure" is a context cancellation, not a merkle-service verdict. Those
+// must count under the distinct "claim_revoked" label — a single revocation
+// used to pump 39,189 bogus register_error counts into the metric — while
+// F-024 still routes every tx to the failed subset (the caller's post-register
+// checkpoint aborts the batch; nothing is broadcast).
+func TestRegisterBatch_ClaimRevokedClassifiedDistinctly(t *testing.T) {
+	httpLog := &eventLog{}
+	merkleSrv := newMerkleServer(httpLog, http.StatusOK)
+	defer merkleSrv.Close()
+
+	ms := newMockStore()
+	cfg := &config.Config{CallbackURL: "http://arcade/cb", CallbackToken: "tok"}
+	cfg.Propagation.MerkleConcurrency = 4
+	mc := merkleservice.NewClient(merkleSrv.URL, "", 5*time.Second)
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, nil, mc)
+
+	revokedBefore := testutil.ToFloat64(metrics.PropagationMerkleRegisterFailures.WithLabelValues("claim_revoked"))
+	genBefore := testutil.ToFloat64(metrics.PropagationMerkleRegisterFailures.WithLabelValues("register_error"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // claim revoked before the register fan-out runs
+
+	batch := []propagationMsg{{TXID: "tx1"}, {TXID: "tx2"}, {TXID: "tx3"}}
+	registered, failed := p.registerBatch(ctx, batch)
+
+	if len(registered) != 0 {
+		t.Errorf("F-024 violated: %d txs marked registered under a revoked claim", len(registered))
+	}
+	if len(failed) != len(batch) {
+		t.Errorf("every tx must stay in the failed subset (offset bookkeeping): failed=%d want %d", len(failed), len(batch))
+	}
+	if d := testutil.ToFloat64(metrics.PropagationMerkleRegisterFailures.WithLabelValues("claim_revoked")) - revokedBefore; int(d) != len(batch) {
+		t.Errorf("claim_revoked metric delta=%v want %d", d, len(batch))
+	}
+	if d := testutil.ToFloat64(metrics.PropagationMerkleRegisterFailures.WithLabelValues("register_error")) - genBefore; d != 0 {
+		t.Errorf("register_error must not increment on a claim revocation: delta=%v", d)
+	}
+}
+
 // replayPropagator builds a Propagator wired to the supplied merkle server,
 // with all the knobs replay tests care about pre-populated. Keeps the
 // per-test setup boilerplate small.

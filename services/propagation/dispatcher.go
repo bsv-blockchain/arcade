@@ -148,13 +148,26 @@ func (p *Propagator) runDispatcher(ctx context.Context, claim kafka.Claim, cfg d
 	}
 
 	for {
-		// Keep the pending-depth gauge in sync at the top of every
-		// iteration. Every branch below that mutates pendingMsgs
+		// Keep the depth gauges in sync at the top of every iteration.
+		// Every branch below that mutates pendingMsgs or inFlight
 		// (handleAdmit, handleRequeue, handleTerminal, drain, flush)
 		// is observed exactly once before the next select fires.
-		// One atomic write per iteration is negligible vs the throughput
-		// the dispatcher handles.
+		// A few atomic writes per iteration are negligible vs the
+		// throughput the dispatcher handles.
+		//
+		// inFlight is the REAL backlog: every admitted-or-held tx whose
+		// Kafka offset is pinned below the commit watermark but which
+		// hasn't reached a terminal verdict. The pending gauge alone is
+		// misleading under load — admission backpressure caps it at
+		// maxPending, so during the 2026-08-10 load test a ~466k-tx
+		// uncommitted-offset backlog was invisible behind a flat pending
+		// depth. The Propagator-level atomics mirror the gauges so the
+		// reaper's per-tick backlog log line can read them without a
+		// Prometheus read API.
 		metrics.PropagationPendingDepth.Set(float64(len(pendingMsgs)))
+		p.pendingDepth.Store(int64(len(pendingMsgs)))
+		metrics.PropagationInflightDepth.Set(float64(len(inFlight)))
+		p.inflightDepth.Store(int64(len(inFlight)))
 
 		// Backpressure: nil-channel trick excludes incoming-message
 		// sources from the select when pendingMsgs is at cap. Both
