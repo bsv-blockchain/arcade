@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -325,6 +326,17 @@ func (m *mockStore) IterateStatusesSince(_ context.Context, since time.Time, fn 
 	m.mu.Lock()
 	rows := append([]*models.TransactionStatus(nil), m.replayRows...)
 	m.mu.Unlock()
+	// Match the real query's ordering. Postgres serves this as
+	// "ORDER BY timestamp_at DESC" (store/postgres.IterateStatusesSince), so
+	// the reaper walks NEWEST first and its rebroadcast cap is spent on the
+	// most recent eligible rows. Returning insertion order here made the
+	// walk order an accident of test setup and hid every starvation bug the
+	// cap can produce — see TestReapOnce_PendingRetry_StarvedByNewerBacklog.
+	// Stable sort so equal timestamps keep insertion order, mirroring a
+	// stable index scan over rows written with a single batch timestamp.
+	sort.SliceStable(rows, func(i, j int) bool {
+		return rows[i].Timestamp.After(rows[j].Timestamp)
+	})
 	for _, r := range rows {
 		// Honor the lookback filter so replay tests can pin behavior that
 		// depends on it. Rows with a zero Timestamp are always returned —
