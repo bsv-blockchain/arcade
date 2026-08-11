@@ -268,8 +268,8 @@ var PropagationConflictAttributionTotal = promauto.NewCounterVec(prometheus.Coun
 // dispatcher's same-partition cascade.
 var PropagationMissingParentTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_propagation_missing_parent_total",
-	Help: "Teranode missing-parent responses by resolution (requeued vs rejected via a REJECTED ancestor in arcade's store).",
-}, []string{"outcome"}) // requeued, rejected_ancestor
+	Help: "Teranode missing-parent responses by resolution (requeued vs durable reaper retry vs rejected via a REJECTED ancestor in arcade's store).",
+}, []string{"outcome"}) // requeued, reaper_retry, rejected_ancestor
 
 // PropagationRequeueExhaustedTotal counts transactions parked at PENDING_RETRY
 // because they burned their whole in-memory requeue budget
