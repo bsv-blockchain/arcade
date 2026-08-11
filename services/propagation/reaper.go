@@ -43,6 +43,16 @@ import (
 // result is a store no-op: the stuck gauge drains only when the tx genuinely
 // reaches SEEN/MINED/REJECTED, never via a spurious timestamp refresh.
 //
+// stalePendingRetryAge: a row parked at PENDING_RETRY by the propagation
+// requeue-budget escape (parkExhaustedRequeues) got no verdict from any peer
+// across its whole fast-path budget, so its dispatcher in-flight entry was
+// released to free the Kafka commit watermark and the reaper inherited the
+// retry. Much shorter than the other thresholds — the row is not "stuck", it
+// is explicitly queued for another attempt, and the failure that parked it
+// (a peer outage, a conflict line arcade could not attribute) typically
+// clears in minutes. Long enough that a tx cannot bounce between the
+// fast path and the reaper faster than the fast path's own budget.
+//
 // staleScanLookback bounds how far back IterateStatusesSince walks. Rows
 // older than this are assumed permanently stuck and outside the reaper's
 // responsibility.
@@ -50,6 +60,7 @@ const (
 	staleSeenOnNetworkAge     = time.Hour
 	staleReceivedAge          = time.Hour
 	staleAcceptedByNetworkAge = time.Hour
+	stalePendingRetryAge      = 5 * time.Minute
 	staleScanLookback         = 24 * time.Hour
 
 	// defaultReaperRebroadcastBatch is the per-tick rebroadcast cap applied
@@ -176,10 +187,13 @@ func (p *Propagator) tryReap(ctx context.Context) {
 // requeue was lost, or an intake Kafka-publish failure the submitter never
 // retried), and ACCEPTED_BY_NETWORK past staleAcceptedByNetworkAge (accepted
 // into a mempool but the SEEN state-transfer from merkle-service never
-// arrived — re-register + re-broadcast to nudge it toward SEEN). All carry
-// RawTx and are validated txs we accepted responsibility to propagate, so
-// rebroadcasting self-heals a transient downstream outage. Recent rows (still
-// in the normal intake/requeue path) and body-less rows are left alone.
+// arrived — re-register + re-broadcast to nudge it toward SEEN), and
+// PENDING_RETRY past stalePendingRetryAge (parked by the propagation
+// requeue-budget escape after getting no verdict from any peer; the reaper is
+// its only remaining retry path). All carry RawTx and are validated txs we
+// accepted responsibility to propagate, so rebroadcasting self-heals a
+// transient downstream outage. Recent rows (still in the normal intake/requeue
+// path) and body-less rows are left alone.
 //
 // Rebroadcasts go through the same registerBatch + broadcastInChunks +
 // applyTerminalStatuses pipeline as processBatch but bypass the
@@ -196,6 +210,7 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 	seenDeadline := now.Add(-staleSeenOnNetworkAge)
 	receivedDeadline := now.Add(-staleReceivedAge)
 	acceptedDeadline := now.Add(-staleAcceptedByNetworkAge)
+	pendingRetryDeadline := now.Add(-stalePendingRetryAge)
 
 	stuckTransientDeadline := now.Add(-stuckTransientAge)
 	// The stuck-transient census (counts + oldest age per status) is resolved
@@ -268,10 +283,22 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 			if !st.Timestamp.Before(acceptedDeadline) {
 				return nil
 			}
+		case models.StatusPendingRetry:
+			// Parked by parkExhaustedRequeues: the fast path spent its whole
+			// requeue budget without a verdict and released the tx's Kafka
+			// offset so the consumer could keep moving. The reaper is now the
+			// ONLY thing that will retry it, so this arm is what makes the
+			// poison-batch escape a park rather than a drop. A successful
+			// rebroadcast lifts the row straight to ACCEPTED_BY_NETWORK /
+			// REJECTED (the lattice permits both from PENDING_RETRY); another
+			// no-verdict result leaves it here for the next tick.
+			if !st.Timestamp.Before(pendingRetryDeadline) {
+				return nil
+			}
 		default:
 			// Terminal statuses (REJECTED, DOUBLE_SPEND_ATTEMPTED, MINED,
-			// IMMUTABLE) and transient in-between states are not the
-			// reaper's job to rebroadcast.
+			// IMMUTABLE) and the remaining transient in-between states are
+			// not the reaper's job to rebroadcast.
 			return nil
 		}
 		stuck = append(stuck, propagationMsg{TXID: st.TxID, RawTx: st.RawTx})

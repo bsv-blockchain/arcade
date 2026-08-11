@@ -225,6 +225,50 @@ var PropagationInflightDepth = promauto.NewGauge(prometheus.GaugeOpts{
 	Help: "Transactions in the dispatcher's in-flight set (admitted but not yet terminal); each pins an uncommitted Kafka offset.",
 })
 
+// PropagationConflictAttributionTotal counts conflict-family ("alien") Teranode
+// failure lines by whether arcade could resolve them back to a submitted tx.
+//
+// Teranode renders the conflict family (UTXO_SPENT / TX_CONFLICTING /
+// TX_INVALID_DOUBLE_SPEND, HTTP 409) as the deepest public cause, which names
+// the SPENT OUTPOINT and the competing spender — never the submitted txid — so
+// the line keys under a hash that is not in the batch. arcade holds the
+// submitted raw transactions, so it can usually match "<outpoint>:<vout>"
+// against a submitted tx's inputs and attribute the verdict (result=attributed
+// → terminal REJECTED). result=unattributable means the outpoint matched no
+// submitted input, or matched more than one (an intra-batch double spend), so
+// the verdict is deliberately NOT guessed: implicit accepts stay withheld and
+// the affected txs fall to the bounded requeue.
+//
+// A sustained unattributable rate is the signal that Teranode changed the
+// conflict-line format (or is reporting on outpoints arcade never submitted) —
+// exactly the shape that wedged the dev-ovh-1 propagation consumer on
+// 2026-08-11 at 337,247 frozen messages of Kafka lag.
+var PropagationConflictAttributionTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_propagation_conflict_attribution_total",
+	Help: "Conflict-family Teranode failure lines by whether the spent outpoint resolved to a submitted transaction.",
+}, []string{"result"}) // attributed, unattributable
+
+// PropagationRequeueExhaustedTotal counts transactions parked at PENDING_RETRY
+// because they burned their whole in-memory requeue budget
+// (propagation.retry_max_attempts) without ever producing a network verdict.
+//
+// This is the poison-batch escape hatch. Before it existed a batch that
+// permanently failed with no attributable per-tx verdict requeued forever:
+// every tx stayed in the dispatcher's inFlight map, so its Kafka offset kept
+// pinning LowestUnfinished() and the single-partition arcade.propagation topic
+// could not commit. Observed live on dev-ovh-1 (2026-08-11, arcade v0.11.5):
+// 337,247 messages of lag frozen for minutes, 4,679 txs in-flight, ~2,410
+// UTXO_SPENT 409s in two minutes across 43 batches of which 42 requeued, while
+// the leader pod burned 4.2 cores achieving nothing.
+//
+// Any non-zero rate here is worth an alert: it means transactions are getting
+// no verdict from any peer. They are NOT lost — the row keeps its raw bytes and
+// the reaper rebroadcasts PENDING_RETRY rows — but the fast path has given up.
+var PropagationRequeueExhaustedTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "arcade_propagation_requeue_exhausted_total",
+	Help: "Transactions parked at PENDING_RETRY after exhausting the in-memory requeue budget with no network verdict.",
+})
+
 // APITxsSubmittedTotal counts individual transactions submitted through the
 // API, by route and dedup result. Unlike the HTTP request histogram (one
 // sample per request), this counts PER TRANSACTION — the /txs batch route
