@@ -154,6 +154,10 @@ type mockStore struct {
 	// rawByTxID carries raw_tx alongside statusByTxID so GetStatus returns
 	// rows shaped like the real backends'. See setStatusRow.
 	rawByTxID map[string][]byte
+	// retrySeq records the order rows entered the durable retry queue, so
+	// GetReadyRetries can break next_retry_at ties the way an index scan does.
+	retrySeq     map[string]int
+	retrySeqNext int
 }
 
 // setStatus seeds the row GetStatus returns for txid.
@@ -201,6 +205,7 @@ func newMockStore() *mockStore {
 	return &mockStore{
 		retryCounts:    make(map[string]int),
 		pendingRetries: make(map[string]*store.PendingRetry),
+		retrySeq:       make(map[string]int),
 	}
 }
 
@@ -250,6 +255,10 @@ func (m *mockStore) BumpRetryCount(_ context.Context, txid string) (int, error) 
 func (m *mockStore) SetPendingRetryFields(_ context.Context, txid string, rawTx []byte, nextRetryAt time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if _, ok := m.retrySeq[txid]; !ok {
+		m.retrySeq[txid] = m.retrySeqNext
+		m.retrySeqNext++
+	}
 	m.pendingRetries[txid] = &store.PendingRetry{
 		TxID:        txid,
 		RawTx:       append([]byte(nil), rawTx...),
@@ -295,7 +304,11 @@ func (m *mockStore) SetPendingRetryFields(_ context.Context, txid string, rawTx 
 func (m *mockStore) GetReadyRetries(_ context.Context, now time.Time, limit int) ([]*store.PendingRetry, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := make([]*store.PendingRetry, 0, len(m.pendingRetries))
+	type entry struct {
+		pr  *store.PendingRetry
+		seq int
+	}
+	pending := make([]entry, 0, len(m.pendingRetries))
 	for txid, pr := range m.pendingRetries {
 		if pr.NextRetryAt.After(now) {
 			continue
@@ -303,12 +316,30 @@ func (m *mockStore) GetReadyRetries(_ context.Context, now time.Time, limit int)
 		if st, ok := m.latestStatusLocked(txid); ok && st != models.StatusPendingRetry {
 			continue
 		}
-		cp := *pr
-		out = append(out, &cp)
+		pending = append(pending, entry{pr: pr, seq: m.retrySeq[txid]})
 	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].NextRetryAt.Before(out[j].NextRetryAt) })
-	if limit > 0 && len(out) > limit {
-		out = out[:limit]
+	// Order by next_retry_at, breaking ties by insertion sequence.
+	//
+	// The tie-break is not cosmetic. Rows parked by one call all share a
+	// single timestamp (parkExhaustedRequeues stamps one now for the whole
+	// slice), so ties are the common case, and Postgres serves
+	// "ORDER BY next_retry_at LIMIT n" from idx_tx_retry_ready — equal keys
+	// come back in index/heap order, which tracks insertion. Ranging over a
+	// Go map instead would hand back a random subset each call, which is both
+	// unfaithful and non-deterministic across runs.
+	sort.SliceStable(pending, func(i, j int) bool {
+		if pending[i].pr.NextRetryAt.Equal(pending[j].pr.NextRetryAt) {
+			return pending[i].seq < pending[j].seq
+		}
+		return pending[i].pr.NextRetryAt.Before(pending[j].pr.NextRetryAt)
+	})
+	if limit > 0 && len(pending) > limit {
+		pending = pending[:limit]
+	}
+	out := make([]*store.PendingRetry, 0, len(pending))
+	for _, e := range pending {
+		cp := *e.pr
+		out = append(out, &cp)
 	}
 	return out, nil
 }
@@ -342,6 +373,10 @@ func (m *mockStore) parkTx(txid string, rawTx []byte, parkedAt, nextRetryAt time
 		Timestamp: parkedAt,
 	})
 	m.retryCounts[txid]++
+	if _, ok := m.retrySeq[txid]; !ok {
+		m.retrySeq[txid] = m.retrySeqNext
+		m.retrySeqNext++
+	}
 	m.pendingRetries[txid] = &store.PendingRetry{
 		TxID:        txid,
 		RawTx:       append([]byte(nil), rawTx...),
