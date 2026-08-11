@@ -34,6 +34,12 @@ type Publisher interface {
 	// to coalesce per-block MINED bursts (N=14k+) into one event so the
 	// webhook service's bounded work queue can't saturate on BUMP fan-out.
 	// template.TxID is ignored; template.TxIDs must be non-empty.
+	//
+	// The template's WHOLE payload applies to every txid it carries — the
+	// unfan copies the struct per txid. A caller holding a per-transaction
+	// payload (a rejection reason, say) must therefore split its txids into
+	// one call per distinct payload rather than send one event whose fields
+	// fit only some of them; see propagation.publishRejections.
 	PublishBulk(ctx context.Context, template *models.TransactionStatus) error
 	Subscribe(ctx context.Context, caller string) (<-chan *models.TransactionStatus, error)
 	Close() error
