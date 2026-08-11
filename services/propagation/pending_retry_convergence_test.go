@@ -270,6 +270,15 @@ func TestReapOnce_PendingRetryChain_ConvergesInOneTick(t *testing.T) {
 			len(accepted), depth, strings.Join(stuck, ", "),
 			depth, depth, time.Duration(depth)*30*time.Second)
 	}
+
+	// And it must get there by submitting one layer at a time. A single /txs
+	// call carrying the whole chain would put parents and children in one
+	// batch, which is exactly the shape teranode's contract forbids and the
+	// reason a dep-blind batch could only ever advance one level.
+	if got := tn.requestCount(); got < depth {
+		t.Errorf("teranode saw %d /txs requests for a depth-%d chain, want one per "+
+			"dependency layer; the batch is not being layered", got, depth)
+	}
 }
 
 // TestReapOnce_PendingRetry_StarvedByNewerBacklog pins the fairness property.
