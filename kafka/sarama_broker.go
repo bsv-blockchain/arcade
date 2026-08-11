@@ -51,13 +51,7 @@ func NewSaramaBroker(brokers []string, consumerGroup string) (Broker, error) {
 // zap logger for async-producer error logging. A nil logger falls back to
 // zap.NewNop() so the broker is always safe to construct.
 func NewSaramaBrokerWithLogger(brokers []string, consumerGroup string, logger *zap.Logger) (Broker, error) {
-	syncCfg := sarama.NewConfig()
-	syncCfg.Producer.RequiredAcks = sarama.WaitForAll
-	syncCfg.Producer.Retry.Max = 5
-	syncCfg.Producer.Return.Successes = true
-	syncCfg.Producer.Return.Errors = true
-
-	syncProducer, err := sarama.NewSyncProducer(brokers, syncCfg)
+	syncProducer, err := sarama.NewSyncProducer(brokers, newSyncProducerConfig())
 	if err != nil {
 		return nil, fmt.Errorf("creating sync producer: %w", err)
 	}
@@ -75,6 +69,28 @@ func NewSaramaBrokerWithLogger(brokers []string, consumerGroup string, logger *z
 	}
 
 	return newSaramaBrokerFromProducers(syncProducer, asyncProducer, brokers, consumerGroup, logger), nil
+}
+
+// newSyncProducerConfig builds the sync-producer config used for Send /
+// SendBatch — the path every ordering-sensitive topic goes through
+// (TopicPropagation most of all). Idempotent + MaxOpenRequests=1 makes
+// per-partition order survive broker-side retries: without it a failed
+// produce can be retried behind a newer in-flight batch, reordering a
+// dependency family's parent behind its child on the same partition
+// (#295 family keying makes that order load-bearing). Idempotence
+// requires WaitForAll acks (already the sync default here) and protocol
+// >= 0.11; 2.6.0 is safely below anything Redpanda or a maintained
+// Kafka speaks. Extracted so tests can pin these invariants.
+func newSyncProducerConfig() *sarama.Config {
+	syncCfg := sarama.NewConfig()
+	syncCfg.Version = sarama.V2_6_0_0
+	syncCfg.Producer.RequiredAcks = sarama.WaitForAll
+	syncCfg.Producer.Retry.Max = 5
+	syncCfg.Producer.Return.Successes = true
+	syncCfg.Producer.Return.Errors = true
+	syncCfg.Producer.Idempotent = true
+	syncCfg.Net.MaxOpenRequests = 1
+	return syncCfg
 }
 
 // newSaramaBrokerFromProducers wires the broker around already-constructed

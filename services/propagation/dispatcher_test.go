@@ -260,9 +260,11 @@ var _ kafka.Claim = (*fakeClaim)(nil)
 // commit watermark. Returns the claim and a stop func.
 func runDispatcherWithClaim(t *testing.T, p *Propagator) (*fakeClaim, func()) {
 	t.Helper()
-	// The test-mode and production dispatcher loops share p.terminalCh
-	// et al. and must never run concurrently — cancel the test-mode one
-	// New() spawned and wait for it to exit first.
+	// The test-mode and production dispatcher loops share p.defaultIO
+	// and must never run concurrently — cancel the test-mode one
+	// New() spawned and wait for it to exit first. The production loop
+	// reuses defaultIO so the batch-pipeline helpers tests reach through
+	// the Propagator keep routing to this dispatcher.
 	p.dispatcherCancel()
 	<-p.dispatcherDone
 	p.dispatcherCancel = nil
@@ -272,7 +274,7 @@ func runDispatcherWithClaim(t *testing.T, p *Propagator) (*fakeClaim, func()) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = p.runDispatcher(claimCtx, claim, dispatcherConfig{maxPending: 1000})
+		_ = p.runDispatcher(claimCtx, claim, dispatcherConfig{maxPending: 1000}, p.defaultIO)
 	}()
 	return claim, func() {
 		cancel()
@@ -470,7 +472,7 @@ func TestProcessBatch_ClaimRevokedBeforeStart_NoSideEffects(t *testing.T) {
 	p.processBatch(ctx, []propagationMsg{
 		{TXID: "revoked-1", RawTx: []byte{0x01}},
 		{TXID: "revoked-2", RawTx: []byte{0x02}},
-	})
+	}, p.defaultIO)
 
 	if got := httpLog.count("register:"); got != 0 {
 		t.Errorf("no merkle /watch call may run under a revoked claim; got %d", got)
@@ -516,7 +518,7 @@ func TestApplyTerminalStatuses_StoreError_DoesNotReleaseOffset(t *testing.T) {
 	// Terminalize it — but the store write fails.
 	p.applyTerminalStatuses(context.Background(), []*models.TransactionStatus{
 		{TxID: "x", Status: models.StatusAcceptedByNetwork, Timestamp: time.Now()},
-	}, 1, 0)
+	}, 1, 0, p.defaultIO)
 
 	// The dispatcher must NOT have been notified: "x" is still in flight,
 	// so a re-admission is detected as a duplicate (offset bookkept, not a
@@ -542,7 +544,7 @@ func TestApplyTerminalStatuses_StoreOK_ReleasesOffset(t *testing.T) {
 
 	p.applyTerminalStatuses(context.Background(), []*models.TransactionStatus{
 		{TxID: "y", Status: models.StatusAcceptedByNetwork, Timestamp: time.Now()},
-	}, 1, 0)
+	}, 1, 0, p.defaultIO)
 
 	if res := p.admitToDispatcher(propagationMsg{TXID: "y", RawTx: []byte{0x01}}, 6); !res.admitted {
 		t.Fatalf("after a successful terminal write the tx must be released from in-flight; re-admit got %+v, want admitted", res)

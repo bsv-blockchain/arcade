@@ -178,10 +178,8 @@ type Kafka struct {
 	BufferSize    int      `mapstructure:"buffer_size"`
 	// MinPartitions is a soft minimum-partition hint for horizontally-scaled
 	// topics; arcade fails fast at startup when an existing topic has fewer.
-	// Independent of this knob, TopicPropagation is ALWAYS checked for an
-	// exact partition count of 1 — the dep-aware dispatcher's single-goroutine
-	// state ownership requires total order at the topic level, so multiple
-	// partitions would reintroduce the cross-batch "missing inputs" race.
+	// TopicPropagation has its own dedicated knob (propagation.partitions)
+	// with a fail-closed startup check — see PropagationConfig.Partitions.
 	// Leave at 0 or 1 in standalone/single-replica deployments.
 	MinPartitions int `mapstructure:"min_partitions"`
 	// SendTimeoutMs bounds how long the in-process memory broker waits for a
@@ -356,6 +354,23 @@ type TelemetryConfig struct {
 }
 
 type PropagationConfig struct {
+	// Partitions is the minimum partition count arcade requires on
+	// arcade.propagation at startup (fail-closed: missing topic or fewer
+	// partitions aborts boot; more is fine — extra partitions only cost
+	// idle dispatchers). Set it to at least the propagation replica count
+	// when scaling horizontally, and widen the topic BEFORE rolling the
+	// config (a pod configured above the broker's actual count crash-loops
+	// by design).
+	//
+	// Ordering model (#295, replacing the #151 exact-1 rule): the api
+	// server keys every propagation message by its dependency family —
+	// all txs of one submission connected through in-batch spends share a
+	// partition key — so per-partition Kafka order still delivers parents
+	// to a dispatcher before their children. Cross-submission chains that
+	// land on different partitions are absorbed by the missing-parent
+	// safety net (TX_MISSING_PARENT is a retryable condition, never a
+	// terminal verdict on its own). Default 1.
+	Partitions        int `mapstructure:"partitions"`
 	MerkleConcurrency int `mapstructure:"merkle_concurrency"`
 	// RetryMaxAttempts bounds how many times the propagator will push a
 	// transaction back through the in-memory requeue loop when a broadcast
@@ -382,7 +397,16 @@ type PropagationConfig struct {
 	// fall back to the default rather than disabling the bound — an unbounded
 	// requeue is the failure mode this exists to prevent.
 	RetryMaxAttempts int `mapstructure:"retry_max_attempts"`
-	RetryBackoffMs   int `mapstructure:"retry_backoff_ms"`
+	// RetryBackoffMs is the flat wait (milliseconds) before a requeued tx
+	// lands back on the dispatcher for another broadcast attempt. Flat by
+	// design, not exponential: the budget above bounds total attempts, so
+	// a predictable wall-clock window (attempts × backoff ≈ 10s at the
+	// defaults) is what matters; the reaper's cadence dominates anything
+	// slower. Non-positive falls back to 2000ms. NOTE: this knob was
+	// declared but unread before #295 — deployments that explicitly set
+	// it (e.g. to the old default 500) start feeling their configured
+	// value on upgrade.
+	RetryBackoffMs int `mapstructure:"retry_backoff_ms"`
 	ReaperIntervalMs int `mapstructure:"reaper_interval_ms"`
 	ReaperBatchSize  int `mapstructure:"reaper_batch_size"`
 	// ReaperRebroadcastBatch caps how many stuck transactions the reaper's
@@ -973,9 +997,10 @@ func setDefaults() {
 	viper.SetDefault("telemetry.logs", false)
 	viper.SetDefault("telemetry.sample_ratio", 1.0)
 	viper.SetDefault("telemetry.export_timeout_ms", 10000)
+	viper.SetDefault("propagation.partitions", 1)
 	viper.SetDefault("propagation.merkle_concurrency", 10)
 	viper.SetDefault("propagation.retry_max_attempts", 5)
-	viper.SetDefault("propagation.retry_backoff_ms", 500)
+	viper.SetDefault("propagation.retry_backoff_ms", 2000)
 	viper.SetDefault("propagation.reaper_interval_ms", 30000)
 	viper.SetDefault("propagation.reaper_batch_size", 500)
 	viper.SetDefault("propagation.reaper_rebroadcast_batch", 200)

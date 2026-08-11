@@ -34,10 +34,10 @@ api:
 
 # Arcade does not create Kafka topics; the broker must already have them
 # (auto-create on first publish is typically disabled in production, and
-# arcade.propagation has a hard exactly-1-partition correctness constraint
-# that arcade enforces at startup). See docs/production-kafka.md for the
-# full topic list, partition guidance, and ready-to-paste rpk /
-# kafka-topics.sh commands.
+# arcade.propagation must exist with at least propagation.partitions
+# partitions — arcade fails closed at startup otherwise). See
+# docs/production-kafka.md for the full topic list, partition guidance,
+# and ready-to-paste rpk / kafka-topics.sh commands.
 kafka:
   brokers:
     - localhost:9092

@@ -424,7 +424,7 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 
 	var accepted, rejected int
 	terminalStatuses := make([]*models.TransactionStatus, 0, len(results))
-	for _, res := range results {
+	for i, res := range results {
 		switch res.class {
 		case txResultClassAccepted:
 			accepted++
@@ -436,6 +436,18 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 			if res.status != nil {
 				terminalStatuses = append(terminalStatuses, res.status)
 			}
+		case txResultClassMissingParent:
+			// The reaper's dep-blind rebroadcast can resurface a child
+			// before its parent (both parked, or the parent wedged on
+			// another pod). Pre-#295 this drew TX_MISSING_PARENT and
+			// falsely terminalized the child REJECTED. Condition, not
+			// verdict: only a REJECTED ancestor in arcade's own store
+			// condemns the child; otherwise the row stays as-is and the
+			// next tick retries after the parent lands.
+			if cascaded, _ := p.resolveMissingParents(ctx, []propagationMsg{registered[i]}, []string{res.errMsg}); len(cascaded) > 0 {
+				rejected += len(cascaded)
+				terminalStatuses = append(terminalStatuses, cascaded...)
+			}
 		case txResultClassUnknown, txResultClassRequeue:
 			// Requeue / Unknown from the reaper's rebroadcast path:
 			// leave the row alone so the next reaper tick picks it up.
@@ -444,5 +456,8 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 			// tick.
 		}
 	}
-	p.applyTerminalStatuses(ctx, terminalStatuses, accepted, rejected)
+	// nil io: the reaper runs off any claim's pipeline, so terminal
+	// notifications fan out to every live dispatcher — whichever one
+	// holds a tx in flight releases its offset, the rest no-op.
+	p.applyTerminalStatuses(ctx, terminalStatuses, accepted, rejected, nil)
 }

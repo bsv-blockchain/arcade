@@ -11,9 +11,16 @@ import (
 //   - "sarama" (default): real Kafka via IBM Sarama. Requires cfg.Brokers.
 //   - "memory": in-process broker. Zero external dependencies.
 //
+// topicPartitions widens selected topics on the memory backend (absent = 1
+// partition), so standalone mode reproduces the multi-partition
+// key→partition→dispatcher topology of a real deployment (#295 — the
+// caller passes propagation.partitions for TopicPropagation). The sarama
+// backend ignores it: real topics are provisioned broker-side and
+// validated at startup via CheckMinPartitions.
+//
 // The returned Broker is shared across all services in the process — main.go
 // constructs it once and hands it to Producer + every ConsumerGroup.
-func NewBroker(cfg config.Kafka) (Broker, error) {
+func NewBroker(cfg config.Kafka, topicPartitions map[string]int) (Broker, error) {
 	backend := cfg.Backend
 	if backend == "" {
 		backend = "sarama"
@@ -25,7 +32,7 @@ func NewBroker(cfg config.Kafka) (Broker, error) {
 		}
 		return NewSaramaBroker(cfg.Brokers, cfg.ConsumerGroup)
 	case "memory":
-		return NewMemoryBrokerWithTimeout(cfg.BufferSize, time.Duration(cfg.SendTimeoutMs)*time.Millisecond), nil
+		return NewMemoryBrokerWithPartitions(cfg.BufferSize, time.Duration(cfg.SendTimeoutMs)*time.Millisecond, topicPartitions), nil
 	default:
 		return nil, fmt.Errorf("unknown kafka backend %q", backend)
 	}

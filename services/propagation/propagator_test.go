@@ -146,6 +146,31 @@ type mockStore struct {
 	// returns — simulating a store write failure so tests can exercise the
 	// at-least-once guard that skips dispatcher notification on error.
 	returningErr error
+	// statusByTxID drives GetStatus, used by the missing-parent safety
+	// net's store consult (rejectedAncestor). Absent txids return
+	// store.ErrNotFound.
+	statusByTxID map[string]models.Status
+}
+
+// setStatus seeds the row GetStatus returns for txid.
+func (m *mockStore) setStatus(txid string, status models.Status) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.statusByTxID == nil {
+		m.statusByTxID = make(map[string]models.Status)
+	}
+	m.statusByTxID[txid] = status
+}
+
+// GetStatus serves the seeded statusByTxID map; unknown txids return
+// store.ErrNotFound, matching the real backends' contract.
+func (m *mockStore) GetStatus(_ context.Context, txid string) (*models.TransactionStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if st, ok := m.statusByTxID[txid]; ok {
+		return &models.TransactionStatus{TxID: txid, Status: st}, nil
+	}
+	return nil, store.ErrNotFound
 }
 
 type clearedCall struct {

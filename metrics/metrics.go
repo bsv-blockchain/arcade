@@ -86,14 +86,15 @@ var PropagationBroadcastConsensus = promauto.NewCounterVec(prometheus.CounterOpt
 }, []string{"verdict"}) // accepted, unanimous_reject, mixed, unreachable
 
 // PropagationPendingDepth gauges how many propagationMsgs the dep-aware
-// dispatcher is currently holding in its pendingMsgs accumulator awaiting
-// the next flush. The dispatcher owns the slice on a single goroutine,
-// so the gauge tracks its length at every mutation point. Sustained
-// growth indicates downstream (teranode broadcast or merkle-service
-// register) is not keeping up with ingest.
+// dispatchers are currently holding in their pendingMsgs accumulators
+// awaiting the next flush, summed across this pod's partition
+// dispatchers (#295: one dispatcher per assigned partition claim; each
+// delta-adds its own contribution and removes it on claim teardown).
+// Sustained growth indicates downstream (teranode broadcast or
+// merkle-service register) is not keeping up with ingest.
 var PropagationPendingDepth = promauto.NewGauge(prometheus.GaugeOpts{
 	Name: "arcade_propagation_pending_depth",
-	Help: "Number of propagation messages buffered in the dispatcher awaiting flush.",
+	Help: "Propagation messages buffered awaiting flush, summed across this pod's partition dispatchers.",
 })
 
 // PropagationPendingRequeues gauges how many delayed-requeue goroutines
@@ -212,17 +213,19 @@ var PropagationClaimRevokedBatchesTotal = promauto.NewCounter(prometheus.Counter
 	Help: "Propagation batches aborted mid-pipeline because the Kafka claim was revoked; their txs stay uncommitted for replay.",
 })
 
-// PropagationInflightDepth gauges the dispatcher's full in-flight census:
+// PropagationInflightDepth gauges the dispatchers' full in-flight census:
 // every tx admitted from Kafka that has not yet reached a terminal verdict —
 // pending flush, mid-broadcast, held behind an in-flight parent, or parked in
-// a delayed requeue. Unlike PropagationPendingDepth, which admission
-// backpressure caps at max_pending, this gauge is uncapped, so it is the one
+// a delayed requeue — summed across this pod's partition dispatchers
+// (#295 delta accounting, same as PropagationPendingDepth). Unlike
+// PropagationPendingDepth, which admission backpressure caps at
+// max_pending per dispatcher, this gauge is uncapped, so it is the one
 // that shows a real backlog growing. Each in-flight entry pins its Kafka
-// offset below the commit watermark, so this depth also approximates the
-// uncommitted-offset backlog on the current claim.
+// offset below its partition's commit watermark, so this depth also
+// approximates the pod's uncommitted-offset backlog.
 var PropagationInflightDepth = promauto.NewGauge(prometheus.GaugeOpts{
 	Name: "arcade_propagation_inflight_depth",
-	Help: "Transactions in the dispatcher's in-flight set (admitted but not yet terminal); each pins an uncommitted Kafka offset.",
+	Help: "Transactions in the in-flight set (admitted but not yet terminal), summed across this pod's partition dispatchers; each pins an uncommitted Kafka offset.",
 })
 
 // PropagationConflictAttributionTotal counts conflict-family ("alien") Teranode
@@ -247,6 +250,26 @@ var PropagationConflictAttributionTotal = promauto.NewCounterVec(prometheus.Coun
 	Name: "arcade_propagation_conflict_attribution_total",
 	Help: "Conflict-family Teranode failure lines by whether the spent outpoint resolved to a submitted transaction.",
 }, []string{"result"}) // attributed, unattributable
+
+// PropagationMissingParentTotal counts Teranode missing-parent responses
+// (TX_MISSING_PARENT / TX_NOT_FOUND) by how arcade resolved them. With a
+// multi-partition arcade.propagation topic (#295) a child submitted in a
+// later request than its parent can reach Teranode first; that condition is
+// retryable, never a verdict on its own (#254).
+//
+// outcome="requeued": the parent wasn't terminally REJECTED in arcade's own
+// store, so the child went back through the bounded requeue (and, on budget
+// exhaustion, PENDING_RETRY + reaper). A short burst is expected during a
+// partition-count change (key remap window); a sustained rate at steady
+// state means family keying is not co-locating same-submission chains —
+// check the intake path. outcome="rejected_ancestor": arcade's store showed
+// a parent terminally REJECTED, so the child inherited REJECTED via the
+// standard cascade reason — the cross-partition analogue of the
+// dispatcher's same-partition cascade.
+var PropagationMissingParentTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_propagation_missing_parent_total",
+	Help: "Teranode missing-parent responses by resolution (requeued vs rejected via a REJECTED ancestor in arcade's store).",
+}, []string{"outcome"}) // requeued, rejected_ancestor
 
 // PropagationRequeueExhaustedTotal counts transactions parked at PENDING_RETRY
 // because they burned their whole in-memory requeue budget

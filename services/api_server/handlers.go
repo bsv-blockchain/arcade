@@ -1176,15 +1176,27 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	// Phase 4: build propagation envelopes and publish as one batch.
 	// input_txids drives the dispatcher's dep-aware admission — children
 	// of any in-flight parent are held until the parent terminalizes.
+	// Messages are keyed by dependency family (#295): txs of this
+	// submission connected through in-batch spends share a key, so on a
+	// multi-partition topic a whole family lands on one partition and
+	// per-partition order still delivers parents before children.
 	if len(toPublish) > 0 {
+		txids := make([]string, len(toPublish))
+		inputs := make([][]string, len(toPublish))
+		for i, p := range toPublish {
+			txids[i] = p.txid
+			inputs[i] = collectInputTXIDs(p.tx)
+		}
+		keys := familyPartitionKeys(txids, inputs)
+
 		msgs := make([]kafka.KeyValue, 0, len(toPublish))
-		for _, p := range toPublish {
+		for i, p := range toPublish {
 			msgs = append(msgs, kafka.KeyValue{
-				Key: p.txid,
+				Key: keys[i],
 				Value: map[string]interface{}{
 					"txid":        p.txid,
 					"raw_tx":      p.raw,
-					"input_txids": collectInputTXIDs(p.tx),
+					"input_txids": inputs[i],
 				},
 			})
 		}

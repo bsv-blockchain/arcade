@@ -82,19 +82,27 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		zap.String("store_backend", cfg.Store.Backend),
 	)
 
-	broker, err := kafka.NewBroker(cfg.Kafka)
+	// The memory backend provisions its own topics, so it takes the
+	// propagation partition count directly; the sarama backend ignores the
+	// map (real topics are broker-provisioned and checked below).
+	broker, err := kafka.NewBroker(cfg.Kafka, map[string]int{
+		kafka.TopicPropagation: cfg.Propagation.Partitions,
+	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("creating kafka broker: %w", err)
 	}
 	producer := kafka.NewProducer(broker)
 
-	// Hard requirement: TopicPropagation MUST be single-partition. The
-	// dep-aware dispatcher's single-goroutine state ownership relies on
-	// total order at the topic level — parent/child txids on different
-	// partitions would bypass the in-memory dep index and reintroduce
-	// the cross-batch "missing inputs" race we just removed. Check this
-	// on every startup regardless of MinPartitions.
-	if pErr := kafka.CheckExactPartitions(broker, kafka.TopicPropagation, 1, logger); pErr != nil {
+	// TopicPropagation must exist with at least propagation.partitions
+	// partitions (fail-closed on a missing topic — auto-creation would let
+	// the broker default decide the key→partition mapping). Since #295 the
+	// topic may have any partition count: the api server keys messages by
+	// dependency family, so per-partition order still delivers a parent's
+	// admit to its dispatcher before its children's, and cross-partition
+	// stragglers are absorbed by the missing-parent safety net instead of
+	// being terminally REJECTED. `>=` rather than `==` because extra
+	// partitions only cost idle dispatchers.
+	if pErr := kafka.CheckMinPartitions(broker, kafka.TopicPropagation, cfg.Propagation.Partitions, logger); pErr != nil {
 		_ = producer.Close()
 		return nil, nil, fmt.Errorf("kafka partition check: %w", pErr)
 	}
@@ -103,7 +111,8 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 	// was retired with tx_validator) but the knob is retained so a future
 	// fan-out topic can opt into the check without re-introducing config.
 	if cfg.Kafka.MinPartitions > 1 {
-		if pErr := kafka.CheckPartitions(broker, nil, cfg.Kafka.MinPartitions, logger); pErr != nil {
+		topics := []string{kafka.TopicStatusUpdate, kafka.TopicBlockProcessed}
+		if pErr := kafka.CheckPartitions(broker, topics, cfg.Kafka.MinPartitions, logger); pErr != nil {
 			_ = producer.Close()
 			return nil, nil, fmt.Errorf("kafka partition check: %w", pErr)
 		}
