@@ -3,6 +3,8 @@ package kafka
 import (
 	"context"
 	"errors"
+	"fmt"
+	"hash/fnv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,13 +14,19 @@ import (
 // to saramaBroker — zero external dependencies, same interface.
 //
 // Semantics:
-//   - Each (groupID, topic) has a buffered channel. Publishing to a topic fans
-//     the message out to every groupID currently subscribed to it. Within a
-//     group, a single consumer drains the channel (mirrors Kafka consumer-group
-//     semantics for the common case where standalone mode runs one consumer
-//     per group).
-//   - Offsets are monotonically assigned per topic so DLQ envelopes and logs
-//     carry sensible values. Partition is always 0.
+//   - Each (groupID, topic, partition) has a buffered channel. Publishing to
+//     a topic routes the message to one partition by key (Sarama-compatible
+//     FNV-1a hash, #295 — so a smoke test observes the same family placement
+//     a production topic would) and fans it out to every groupID currently
+//     subscribed. Within a group, whichever consumer drains the partition
+//     mailbox wins the next message (mirrors Kafka consumer-group semantics).
+//   - Topics default to 1 partition; NewMemoryBrokerWithPartitions widens
+//     selected topics. Consume invokes the handler once per (topic,
+//     partition) — the same per-partition claim shape Sarama produces — so
+//     services like the dep-aware propagator get one dispatcher per
+//     partition in standalone mode too.
+//   - Offsets are monotonically assigned per (topic, partition) so DLQ
+//     envelopes and logs carry sensible values.
 //   - MarkMessage is a no-op; at-most-once on crash is acceptable for a
 //     single-binary deployment.
 //   - Close signals every subscriber's done channel and prevents further
@@ -33,8 +41,9 @@ import (
 type memoryBroker struct {
 	mu          sync.Mutex
 	closed      bool
-	groups      map[string]map[string]*memoryMailbox // [groupID][topic] = mailbox
-	offsets     map[string]*int64                    // per-topic monotonic offsets
+	groups      map[string]map[string][]*memoryMailbox // [groupID][topic][partition] = mailbox
+	offsets     map[string]*int64                      // per (topic,partition) monotonic offsets
+	partitions  map[string]int                         // per-topic partition count; absent = 1
 	buffer      int
 	sendTimeout time.Duration
 }
@@ -52,33 +61,41 @@ var ErrBrokerBackpressure = errors.New("broker mailbox full (backpressure)")
 // deadline.
 const defaultSendTimeout = 2 * time.Second
 
-// memoryMailbox is a per-(group, topic) delivery queue. Subscriptions joined
-// to the same group share it so either concurrent consumer wins the next
-// message (standard consumer-group semantics).
+// memoryMailbox is a per-(group, topic, partition) delivery queue.
+// Subscriptions joined to the same group share it so either concurrent
+// consumer wins the next message (standard consumer-group semantics).
 //
-// done is closed when the mailbox is being torn down (broker Close, or its
-// last subscription unwinding). Publishers select on it so a concurrent
-// teardown turns a would-be send-on-closed-channel into a clean drop. The
-// mailbox channel itself is intentionally never closed — the forward
-// goroutine exits via done instead, and the unreferenced channel is left to
-// the GC. See F-012.
+// done is closed when the mailbox is being torn down (broker Close).
+// Publishers select on it so a concurrent teardown turns a would-be
+// send-on-closed-channel into a clean drop. The mailbox channel itself is
+// intentionally never closed — consumers exit via done instead, and the
+// unreferenced channel is left to the GC. See F-012.
 type memoryMailbox struct {
-	ch       chan *Message
-	done     chan struct{}
-	refCount int
+	ch   chan *Message
+	done chan struct{}
 }
 
 // NewMemoryBroker constructs an in-process broker. buffer is the per-mailbox
 // channel capacity — larger values smooth out bursts at the cost of memory.
-// sendTimeout, when > 0, bounds how long Send blocks on a full mailbox before
-// returning ErrBrokerBackpressure; zero falls back to defaultSendTimeout.
 func NewMemoryBroker(buffer int) Broker {
 	return NewMemoryBrokerWithTimeout(buffer, 0)
 }
 
 // NewMemoryBrokerWithTimeout exposes the sendTimeout knob for tests and
 // callers that want to deliberately tighten or loosen backpressure handling.
+// sendTimeout, when > 0, bounds how long Send blocks on a full mailbox before
+// returning ErrBrokerBackpressure; zero falls back to defaultSendTimeout.
 func NewMemoryBrokerWithTimeout(buffer int, sendTimeout time.Duration) Broker {
+	return NewMemoryBrokerWithPartitions(buffer, sendTimeout, nil)
+}
+
+// NewMemoryBrokerWithPartitions additionally widens the named topics to the
+// given partition counts (absent or non-positive = 1). Keyed publishes route
+// with Sarama's default hash partitioner arithmetic so standalone-mode
+// placement matches what the same keys would do on a real topic (#295:
+// dependency families share a key, therefore a partition, therefore a
+// dispatcher).
+func NewMemoryBrokerWithPartitions(buffer int, sendTimeout time.Duration, partitions map[string]int) Broker {
 	if buffer <= 0 {
 		buffer = 10000
 	}
@@ -86,11 +103,40 @@ func NewMemoryBrokerWithTimeout(buffer int, sendTimeout time.Duration) Broker {
 		sendTimeout = defaultSendTimeout
 	}
 	return &memoryBroker{
-		groups:      make(map[string]map[string]*memoryMailbox),
+		groups:      make(map[string]map[string][]*memoryMailbox),
 		offsets:     make(map[string]*int64),
+		partitions:  partitions,
 		buffer:      buffer,
 		sendTimeout: sendTimeout,
 	}
+}
+
+// partitionsFor returns the topic's configured partition count (min 1).
+func (b *memoryBroker) partitionsFor(topic string) int {
+	if n, ok := b.partitions[topic]; ok && n > 0 {
+		return n
+	}
+	return 1
+}
+
+// partitionForKey mirrors sarama.NewHashPartitioner: FNV-1a 32-bit of the
+// key, cast to int32, mod partition count, absolute value. An empty key is
+// routed to partition 0 (deterministic; the real Sarama randomizes keyless
+// messages, but no arcade producer publishes keyless to a widened topic and
+// determinism is worth more to tests than fidelity here).
+func partitionForKey(key string, n int) int32 {
+	if n <= 1 || key == "" {
+		return 0
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	// The uint32→int32 wrap is deliberate: it reproduces Sarama's hash
+	// partitioner bit-for-bit, and the abs below handles the negative half.
+	p := int32(h.Sum32()) % int32(n) // #nosec G115 -- sarama-compatible arithmetic
+	if p < 0 {
+		p = -p
+	}
+	return p
 }
 
 func (b *memoryBroker) Send(ctx context.Context, topic, key string, value []byte) error {
@@ -121,26 +167,30 @@ func (b *memoryBroker) publish(ctx context.Context, topic, key string, value []b
 		return errors.New("memory broker closed")
 	}
 
-	offsetPtr, ok := b.offsets[topic]
+	partition := partitionForKey(key, b.partitionsFor(topic))
+	offsetKey := fmt.Sprintf("%s#%d", topic, partition)
+	offsetPtr, ok := b.offsets[offsetKey]
 	if !ok {
 		var o int64
 		offsetPtr = &o
-		b.offsets[topic] = offsetPtr
+		b.offsets[offsetKey] = offsetPtr
 	}
 	offset := atomic.AddInt64(offsetPtr, 1) - 1
 
-	// Snapshot the mailboxes that currently care about this topic. Snapshot
-	// under the lock, then release before sending so a blocked receiver
-	// doesn't stall other publishers. Each mailbox's done channel rides
-	// along so a concurrent Close that tears down the mailbox between the
-	// snapshot and the send is observed as a drop rather than a panic.
+	// Snapshot the partition mailboxes that currently care about this
+	// topic. Snapshot under the lock, then release before sending so a
+	// blocked receiver doesn't stall other publishers. Each mailbox's done
+	// channel rides along so a concurrent Close that tears down the mailbox
+	// between the snapshot and the send is observed as a drop rather than a
+	// panic.
 	type target struct {
 		ch   chan *Message
 		done chan struct{}
 	}
 	var targets []target
 	for _, topics := range b.groups {
-		if mb, ok := topics[topic]; ok {
+		if mbs, ok := topics[topic]; ok && int(partition) < len(mbs) {
+			mb := mbs[partition]
 			targets = append(targets, target{ch: mb.ch, done: mb.done})
 		}
 	}
@@ -150,7 +200,7 @@ func (b *memoryBroker) publish(ctx context.Context, topic, key string, value []b
 		Topic:     topic,
 		Key:       []byte(key),
 		Value:     value,
-		Partition: 0,
+		Partition: partition,
 		Offset:    offset,
 		Timestamp: time.Now(),
 		// Injects the producer's trace context (nil on the disabled/no-span
@@ -215,64 +265,37 @@ func (b *memoryBroker) Subscribe(groupID string, topics []string, _ StartOffset)
 
 	topicMailboxes, ok := b.groups[groupID]
 	if !ok {
-		topicMailboxes = make(map[string]*memoryMailbox)
+		topicMailboxes = make(map[string][]*memoryMailbox)
 		b.groups[groupID] = topicMailboxes
 	}
 
-	// Merge all subscribed topics into a single delivery channel. Because all
-	// shared a groupID, round-robin across concurrent consumers in the same
-	// group happens naturally via Go channel receive semantics.
-	merged := make(chan *Message, b.buffer)
+	var claims []*memoryMailbox
 	for _, t := range topics {
-		mb, ok := topicMailboxes[t]
+		mbs, ok := topicMailboxes[t]
 		if !ok {
-			mb = &memoryMailbox{
-				ch:   make(chan *Message, b.buffer),
-				done: make(chan struct{}),
+			n := b.partitionsFor(t)
+			mbs = make([]*memoryMailbox, n)
+			for i := range mbs {
+				mbs[i] = &memoryMailbox{
+					ch:   make(chan *Message, b.buffer),
+					done: make(chan struct{}),
+				}
 			}
-			topicMailboxes[t] = mb
+			topicMailboxes[t] = mbs
 		}
-		mb.refCount++
-		go forward(mb.ch, merged, mb.done)
+		claims = append(claims, mbs...)
 	}
 
 	return &memorySubscription{
-		broker:  b,
-		groupID: groupID,
-		topics:  topics,
-		out:     merged,
+		broker:    b,
+		groupID:   groupID,
+		topics:    topics,
+		mailboxes: claims,
 	}, nil
 }
 
-// forward pipes messages from a per-topic mailbox into the merged per-
-// subscription channel until the mailbox is torn down. The mailbox channel
-// is never closed (see F-012), so we exit via done instead of relying on
-// channel-close detection. Any messages still buffered in the mailbox at
-// teardown are abandoned; publishers may have already raced past Close and
-// landed values that no consumer will see — this matches the at-most-once
-// semantics documented on the broker.
-func forward(in <-chan *Message, out chan<- *Message, done <-chan struct{}) {
-	for {
-		select {
-		case <-done:
-			return
-		case msg, ok := <-in:
-			if !ok {
-				return
-			}
-			select {
-			case out <- msg:
-			case <-done:
-				return
-			}
-		}
-	}
-}
-
-func (b *memoryBroker) PartitionCount(_ string) (int, error) {
-	// Memory broker has no concept of partitions — treat every topic as a
-	// single-partition topic so callers can compute concurrency uniformly.
-	return 1, nil
+func (b *memoryBroker) PartitionCount(topic string) (int, error) {
+	return b.partitionsFor(topic), nil
 }
 
 func (b *memoryBroker) Close() error {
@@ -286,43 +309,71 @@ func (b *memoryBroker) Close() error {
 	// close mb.ch: a publisher may have snapshotted the channel under the
 	// lock and released the lock before sending (see publish), so closing
 	// it here would race that send and panic. Closing done is enough —
-	// publishers select on it to drop, and forward goroutines select on it
-	// to exit. The unreferenced channel is reclaimed by the GC. (F-012)
+	// publishers select on it to drop, and consumers select on it to
+	// exit. The unreferenced channel is reclaimed by the GC. (F-012)
 	for _, topics := range b.groups {
-		for _, mb := range topics {
-			close(mb.done)
+		for _, mbs := range topics {
+			for _, mb := range mbs {
+				close(mb.done)
+			}
 		}
 	}
 	b.groups = nil
 	return nil
 }
 
-// memorySubscription is a single consumer's view of the broker. Because
-// standalone mode has no rebalances, Consume emits exactly one synthetic
-// claim whose lifetime matches the subscription.
+// memorySubscription is a single consumer's view of the broker. Standalone
+// mode has no rebalances, so Consume emits one synthetic claim per (topic,
+// partition) mailbox, each with the subscription's lifetime — the same
+// shape Sarama gives a consumer that owns every partition.
 type memorySubscription struct {
-	broker  *memoryBroker
-	groupID string
-	topics  []string
-	out     chan *Message
-	closed  atomic.Bool
+	broker    *memoryBroker
+	groupID   string
+	topics    []string
+	mailboxes []*memoryMailbox
+	closed    atomic.Bool
 }
 
+// Consume runs handler once per claim. A single mailbox (the pre-#295
+// common case: one topic, one partition) is served inline; multiple
+// mailboxes run concurrently — matching Sarama, which invokes ConsumeClaim
+// on its own goroutine per assigned partition. Returns the first handler
+// error, if any.
 func (s *memorySubscription) Consume(ctx context.Context, handler func(Claim) error) error {
 	claimCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	claim := &memoryClaim{ctx: claimCtx, ch: s.out}
-	return handler(claim)
+
+	if len(s.mailboxes) == 1 {
+		return handler(&memoryClaim{ctx: claimCtx, ch: s.mailboxes[0].ch})
+	}
+
+	errCh := make(chan error, len(s.mailboxes))
+	var wg sync.WaitGroup
+	wg.Add(len(s.mailboxes))
+	for _, mb := range s.mailboxes {
+		go func(mb *memoryMailbox) {
+			defer wg.Done()
+			if err := handler(&memoryClaim{ctx: claimCtx, ch: mb.ch}); err != nil {
+				errCh <- err
+			}
+		}(mb)
+	}
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		return err
+	default:
+		return nil
+	}
 }
 
 func (s *memorySubscription) Close() error {
 	if !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	// We don't close s.out here — the broker owns the underlying mailboxes
-	// and their done channels, and will signal them on broker Close().
-	// Closing out would risk a send on a closed channel from the still-
-	// running forward goroutines.
+	// The broker owns the underlying mailboxes and their done channels, and
+	// will signal them on broker Close(). Closing channels here would risk a
+	// send on a closed channel from concurrent publishers.
 	return nil
 }
 

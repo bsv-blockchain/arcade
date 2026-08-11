@@ -450,6 +450,13 @@ func TestReapOnce_LogsBacklogDepth(t *testing.T) {
 	tc := teranode.NewClient([]string{teranodeSrv.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
 	p := New(cfg, zap.New(core), nil, nil, ms, nil, tc, mc)
 
+	// The depth gauges are delta-accounted pod totals (#295): every live
+	// dispatcher adds its own contribution, and test-mode dispatchers
+	// from other tests in this process may still hold theirs. Assert the
+	// gauge's CHANGE from this propagator's two admissions, not an
+	// absolute value.
+	gaugeBefore := testutil.ToFloat64(metrics.PropagationInflightDepth)
+
 	// Seed dispatcher state: two admitted txs, the first drained into a
 	// "mid-broadcast" batch — in-flight counts both, pending only the second.
 	if res := p.admitToDispatcher(propagationMsg{TXID: "inflight-a", RawTx: []byte{0x0a}}, 1); !res.admitted {
@@ -472,8 +479,8 @@ func TestReapOnce_LogsBacklogDepth(t *testing.T) {
 	if got := p.inflightDepth.Load(); got != 2 {
 		t.Fatalf("inflightDepth mirror = %d, want 2 (admitted a + b, neither terminal)", got)
 	}
-	if got := testutil.ToFloat64(metrics.PropagationInflightDepth); got != 2 {
-		t.Fatalf("PropagationInflightDepth gauge = %v, want 2", got)
+	if got := testutil.ToFloat64(metrics.PropagationInflightDepth); got != gaugeBefore+2 {
+		t.Fatalf("PropagationInflightDepth gauge = %v, want %v (before + this dispatcher's 2)", got, gaugeBefore+2)
 	}
 
 	p.reapOnce(context.Background())

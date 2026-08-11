@@ -68,3 +68,20 @@ func PreRegisterBumpOutcomes() {
 		BumpBuilderBuildDuration.WithLabelValues(outcome)
 	}
 }
+
+// PreRegisterPropagationRetryOutcomes instantiates every outcome child of the
+// missing-parent and durable-retry counters. The propagation service calls
+// this at construction time.
+//
+// These matter more than most: the interesting series are the ones that stay
+// at zero in a healthy deployment (rejected_ancestor, exhausted), and an alert
+// on a series that was never born returns no-data rather than 0 — which most
+// alerting rules treat as "nothing to see" instead of "healthy".
+func PreRegisterPropagationRetryOutcomes() {
+	for _, outcome := range []string{"requeued", "reaper_retry", "rejected_ancestor"} {
+		PropagationMissingParentTotal.WithLabelValues(outcome)
+	}
+	for _, outcome := range []string{"scheduled", "exhausted"} {
+		PropagationPendingRetryTotal.WithLabelValues(outcome)
+	}
+}

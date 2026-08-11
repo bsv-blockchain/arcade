@@ -357,10 +357,10 @@ func TestMemoryBroker_SendTimeoutBackpressure(t *testing.T) {
 	b := NewMemoryBrokerWithTimeout(buffer, 50*time.Millisecond)
 	defer func() { _ = b.Close() }()
 
-	// Subscribe without consuming. The subscription's forward goroutine
-	// drains the per-(group, topic) mailbox into a merged channel of equal
-	// capacity, so the total slack between the producer's Send and a stuck
-	// consumer is 2 * buffer + 1 (one in-flight in forward).
+	// Subscribe without consuming. Claims read the per-(group, topic,
+	// partition) mailbox directly (#295 removed the merged-channel
+	// forward goroutine), so the total slack between the producer's Send
+	// and a stuck consumer is exactly the mailbox buffer.
 	sub, err := b.Subscribe("group-stall", []string{"topic-stall"}, StartOldest)
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
@@ -370,7 +370,7 @@ func TestMemoryBroker_SendTimeoutBackpressure(t *testing.T) {
 	ctx := context.Background()
 	// Fill every slot the consumer pipeline can absorb without an active
 	// receiver. After this loop the next Send must time out.
-	for i := 0; i < 2*buffer+1; i++ {
+	for i := 0; i < buffer; i++ {
 		if sendErr := b.Send(ctx, "topic-stall", "k", []byte("pad")); sendErr != nil {
 			t.Fatalf("pad send %d: %v", i, sendErr)
 		}

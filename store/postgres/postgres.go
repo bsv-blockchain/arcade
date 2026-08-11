@@ -820,12 +820,25 @@ func (s *Store) BumpRetryCount(ctx context.Context, txid string) (int, error) {
 	return n, nil
 }
 
+// SetPendingRetryFields records the durable-retry bins for a parked tx.
+//
+// The lattice guard in the WHERE clause is load-bearing, not decorative. The
+// park path writes twice — a lattice-guarded BatchUpdateStatusReturning,
+// then this — so without it the second write would silently undo the first
+// one's protection and force a MINED / IMMUTABLE / SEEN / REJECTED row back
+// to PENDING_RETRY, where the reaper would then rebroadcast it. Rows whose
+// current status forbids PENDING_RETRY are skipped, matching
+// BatchUpdateStatusReturning's silent-skip semantics.
 func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time) error {
 	const q = `
 UPDATE transactions
 SET status=$2, raw_tx=$3, next_retry_at=$4, timestamp_at=NOW()
-WHERE txid=$1`
-	_, err := s.pool.Exec(ctx, q, txid, string(models.StatusPendingRetry), rawTx, nextRetryAt)
+WHERE txid=$1 AND status <> ALL($5)`
+	disallowed := disallowedPrevAsStrings(models.StatusPendingRetry)
+	if disallowed == nil {
+		disallowed = []string{}
+	}
+	_, err := s.pool.Exec(ctx, q, txid, string(models.StatusPendingRetry), rawTx, nextRetryAt, disallowed)
 	if err != nil {
 		return fmt.Errorf("set pending retry fields %s: %w", txid, err)
 	}

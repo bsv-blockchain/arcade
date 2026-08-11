@@ -77,6 +77,12 @@ type propagationMsg struct {
 	// commit watermark (the 2026-08-11 dev-ovh-1 wedge: 337,247 messages of
 	// lag stationary behind 4,679 in-flight txs).
 	retryCount int
+	// retryReason, when non-empty, names the condition that sent this tx
+	// through the requeue loop (currently only the missing-parent line
+	// from Teranode) so parkExhaustedRequeues can write a specific
+	// PENDING_RETRY reason instead of the generic no-verdict text.
+	// Process-local like retryCount; never serialized.
+	retryReason string
 }
 
 type Propagator struct {
@@ -95,16 +101,18 @@ type Propagator struct {
 	consumer atomic.Pointer[kafka.ConsumerGroup]
 
 	maxPending int
-	// admitCh, requeueCh, terminalCh, and drainCh feed runDispatcher's
-	// single state-owning loop. The loop selects on these channels (and,
-	// in production, claim.Messages()) and runs ALL dep-aware state
-	// mutations — inFlight, waiters, heldMsgs, pendingMsgs, the
-	// offsetTracker, and the pendingMarks map — inside the goroutine
-	// that owns the loop. No locks, no atomics. See dispatcher.go.
-	admitCh           chan admitRequest
-	requeueCh         chan requeueRequest
-	terminalCh        chan terminalEvent
-	drainCh           chan drainRequest
+	// defaultIO is the dispatcherIO of the New()-spawned test-mode
+	// dispatcher; its channels feed that loop's dep-aware state machine
+	// exactly as each per-claim io feeds a production loop. Production
+	// claims each build their own io in handleClaim (#295: one dispatcher
+	// per partition claim; a shared channel set would mis-route events
+	// across partitions). See dispatcherIO in dispatcher.go.
+	defaultIO *dispatcherIO
+	// dispatchers is the live-dispatcher registry behind the reaper's
+	// nil-io terminal fan-out. Guarded by dispatchersMu; every other
+	// piece of dispatcher state stays goroutine-local.
+	dispatchersMu     sync.RWMutex
+	dispatchers       map[*dispatcherIO]struct{}
 	dispatcherCancel  context.CancelFunc
 	dispatcherDone    chan struct{}
 	merkleConcurrency int
@@ -131,6 +139,13 @@ type Propagator struct {
 	// retry loop to milliseconds instead of spending
 	// retryMaxAttempts × 2s of wall time per case.
 	requeueDelay time.Duration
+	// pendingRetryBackoff / pendingRetryMaxBackoff / pendingRetryMaxAttempts
+	// govern the DURABLE retry schedule a parked tx follows once the
+	// in-memory budget above is spent and the reaper owns it. See
+	// schedulePendingRetry.
+	pendingRetryBackoff     time.Duration
+	pendingRetryMaxBackoff  time.Duration
+	pendingRetryMaxAttempts int
 
 	// broadcastJobs feeds the persistent worker pool that runs every
 	// per-endpoint POST /txs call. Replaces the previous per-broadcast
@@ -251,6 +266,18 @@ const (
 	// row stays at RECEIVED in the DB; the dispatcher inFlight entry and
 	// pinned Kafka offset both persist across the requeue.
 	txResultClassRequeue
+	// txResultClassMissingParent: Teranode explicitly answered
+	// TX_MISSING_PARENT / TX_NOT_FOUND — the tx's parent isn't in the
+	// node's store YET. With multi-partition propagation (#295) this is
+	// the expected signature of a child broadcast before its
+	// cross-submission parent, so per the #254 principle it is a
+	// CONDITION, not a verdict: never terminalize REJECTED on it alone.
+	// processBatch consults arcade's own store first — a parent
+	// terminally REJECTED cascades the child REJECTED (that's a real
+	// verdict); anything else requeues, and budget exhaustion parks at
+	// PENDING_RETRY for the reaper's durable retry. errMsg carries the
+	// Teranode line for the park reason.
+	txResultClassMissingParent
 )
 
 // broadcastJobBuffer sizes the job channel between broadcast helpers and the
@@ -339,6 +366,29 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 	if retryMaxAttempts <= 0 {
 		retryMaxAttempts = defaultRetryMaxAttempts
 	}
+	// retry_backoff_ms drives the flat requeue delay. It existed as a
+	// declared-but-unread field long before #295 wired it up, so the viper
+	// default was bumped 500 → 2000 in the same change to keep the shipped
+	// cadence identical to the old hardcoded defaultRequeueDelay.
+	requeueDelay := defaultRequeueDelay
+	if cfg.Propagation.RetryBackoffMs > 0 {
+		requeueDelay = time.Duration(cfg.Propagation.RetryBackoffMs) * time.Millisecond
+	}
+	pendingRetryBackoff := defaultPendingRetryBackoff
+	if cfg.Propagation.PendingRetryBackoffMs > 0 {
+		pendingRetryBackoff = time.Duration(cfg.Propagation.PendingRetryBackoffMs) * time.Millisecond
+	}
+	pendingRetryMaxBackoff := defaultPendingRetryMaxBackoff
+	if cfg.Propagation.PendingRetryMaxBackoffMs > 0 {
+		pendingRetryMaxBackoff = time.Duration(cfg.Propagation.PendingRetryMaxBackoffMs) * time.Millisecond
+	}
+	if pendingRetryMaxBackoff < pendingRetryBackoff {
+		pendingRetryMaxBackoff = pendingRetryBackoff
+	}
+	pendingRetryMaxAttempts := defaultPendingRetryMaxAttempts
+	if cfg.Propagation.PendingRetryMaxAttempts > 0 {
+		pendingRetryMaxAttempts = cfg.Propagation.PendingRetryMaxAttempts
+	}
 	p := &Propagator{
 		cfg:               cfg,
 		logger:            logger.Named("propagation"),
@@ -359,15 +409,19 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 		holderID:          newHolderID(),
 		leaseTTL:          leaseTTL,
 		retryMaxAttempts:  retryMaxAttempts,
-		requeueDelay:      defaultRequeueDelay,
-		broadcastJobs:     make(chan broadcastJob, broadcastJobBuffer),
-		processBatchSem:   make(chan struct{}, maxConcurrentBatches),
-		admitCh:           make(chan admitRequest, dispatcherChannelBuffer),
-		requeueCh:         make(chan requeueRequest, dispatcherChannelBuffer),
-		terminalCh:        make(chan terminalEvent, dispatcherChannelBuffer),
-		drainCh:           make(chan drainRequest),
-		initDone:          make(chan struct{}),
+		requeueDelay:      requeueDelay,
+
+		pendingRetryBackoff:     pendingRetryBackoff,
+		pendingRetryMaxBackoff:  pendingRetryMaxBackoff,
+		pendingRetryMaxAttempts: pendingRetryMaxAttempts,
+
+		broadcastJobs:   make(chan broadcastJob, broadcastJobBuffer),
+		processBatchSem: make(chan struct{}, maxConcurrentBatches),
+		defaultIO:       newDispatcherIO(),
+		dispatchers:     make(map[*dispatcherIO]struct{}),
+		initDone:        make(chan struct{}),
 	}
+	metrics.PreRegisterPropagationRetryOutcomes()
 	// Start a dispatcher goroutine with a nil claim so tests that
 	// construct via New and drive via admitCh / drainCh have a running
 	// state machine without needing to invoke Start. In production
@@ -381,7 +435,7 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 	p.dispatcherDone = make(chan struct{})
 	go func() {
 		defer close(p.dispatcherDone)
-		if err := p.runDispatcher(dispatcherCtx, nil, dispatcherConfig{maxPending: maxPending}); err != nil {
+		if err := p.runDispatcher(dispatcherCtx, nil, dispatcherConfig{maxPending: maxPending}, p.defaultIO); err != nil {
 			p.logger.Error("test-mode dispatcher exited with error", zap.Error(err))
 		}
 	}()
@@ -460,7 +514,9 @@ func (p *Propagator) Name() string { return "propagation" }
 //
 // Split out of processBatch so the surrounding flush loop stays under
 // nesting-complexity limits.
-func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses []*models.TransactionStatus, accepted, rejected int) {
+// io names the dispatcher whose pipeline produced these terminals; nil
+// (reaper path) fans the notifications out to every live dispatcher.
+func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses []*models.TransactionStatus, accepted, rejected int, io *dispatcherIO) {
 	if len(terminalStatuses) == 0 {
 		return
 	}
@@ -591,18 +647,18 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 	// ancestor.
 	var allRejectCascaded, allParkCascaded []cascadeRejection
 	for _, txid := range terminalAccepted {
-		p.notifyTerminalToDispatcher(ctx, txid, models.StatusAcceptedByNetwork)
+		p.notifyTerminalToDispatcher(ctx, io, txid, models.StatusAcceptedByNetwork)
 	}
 	for _, txid := range terminalRejected {
-		r := p.notifyTerminalToDispatcher(ctx, txid, models.StatusRejected)
+		r := p.notifyTerminalToDispatcher(ctx, io, txid, models.StatusRejected)
 		for _, child := range r.cascaded {
-			allRejectCascaded = append(allRejectCascaded, cascadeRejection{txid: child, ancestor: txid})
+			allRejectCascaded = append(allRejectCascaded, cascadeRejection{txid: child.txid, rawTx: child.rawTx, ancestor: txid})
 		}
 	}
 	for _, txid := range terminalParked {
-		r := p.notifyTerminalToDispatcher(ctx, txid, models.StatusPendingRetry)
+		r := p.notifyTerminalToDispatcher(ctx, io, txid, models.StatusPendingRetry)
 		for _, child := range r.cascaded {
-			allParkCascaded = append(allParkCascaded, cascadeRejection{txid: child, ancestor: txid})
+			allParkCascaded = append(allParkCascaded, cascadeRejection{txid: child.txid, rawTx: child.rawTx, ancestor: txid})
 		}
 	}
 	if len(allRejectCascaded) > 0 {
@@ -618,6 +674,7 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 // reason can name the row a client should look at (and resubmit first).
 type cascadeRejection struct {
 	txid     string
+	rawTx    []byte
 	ancestor string
 }
 
@@ -640,6 +697,146 @@ func cascadeReason(status models.Status, ancestor string) string {
 		"parent rejected (ancestor %s): retryable — resubmit after the ancestor is accepted",
 		ancestor,
 	)
+}
+
+// parentTxIDsOf returns msg's parent txids: InputTXIDs when the intake
+// envelope populated them, else parsed from the raw bytes (reaper
+// rebroadcast rows carry no InputTXIDs). Unparseable bytes yield nil —
+// the caller then just requeues/parks, which is always safe.
+func parentTxIDsOf(msg propagationMsg) []string {
+	if len(msg.InputTXIDs) > 0 {
+		return msg.InputTXIDs
+	}
+	tx, err := sdkTx.NewTransactionFromBytes(msg.RawTx)
+	if err != nil || tx == nil {
+		return nil
+	}
+	parents := make([]string, 0, len(tx.Inputs))
+	for _, in := range tx.Inputs {
+		if in == nil || in.SourceTXID == nil {
+			continue
+		}
+		parents = append(parents, in.SourceTXID.String())
+	}
+	return parents
+}
+
+// rejectedAncestor consults arcade's own status store for msg's parents
+// and returns the first that is terminally REJECTED. This is the ONLY
+// path from a Teranode missing-parent condition to a REJECTED child: the
+// ancestor's rejection is a real verdict, so inheriting it mirrors the
+// dispatcher's same-partition cascade for parents that live on another
+// partition (or terminalized before this pod ever saw them).
+//
+// Deliberately conservative: store.ErrNotFound, read errors, and every
+// non-REJECTED status (RECEIVED, PENDING_RETRY, DOUBLE_SPEND_ATTEMPTED,
+// …) return false — anything else would invent a verdict. Runs on
+// processBatch / reaper worker goroutines only, never the dispatcher.
+//
+// The walk is transitive, bounded by maxAncestorWalkDepth and a visited set.
+// A single hop was not enough to match the behavior this is documented as
+// mirroring: cascadeReject is a recursive BFS over the waiter graph, so a
+// REJECTED grandparent condemns a grandchild immediately on the same
+// partition. Consulting direct parents only meant the cross-partition case
+// needed the parent to cascade first, costing one durable retry cycle per
+// generation before a doomed chain could be condemned.
+func (p *Propagator) rejectedAncestor(ctx context.Context, msg propagationMsg) (string, bool) {
+	if p.store == nil {
+		return "", false
+	}
+	visited := map[string]struct{}{msg.TXID: {}}
+	frontier := parentTxIDsOf(msg)
+
+	for depth := 0; depth < maxAncestorWalkDepth && len(frontier) > 0; depth++ {
+		var next []string
+		for _, ancestor := range frontier {
+			if ancestor == "" {
+				continue
+			}
+			if _, seen := visited[ancestor]; seen {
+				continue
+			}
+			visited[ancestor] = struct{}{}
+
+			row, err := p.store.GetStatus(ctx, ancestor)
+			if err != nil || row == nil {
+				// Not arcade's tx, or a transient read failure. Either way we
+				// know nothing about it, and inventing a verdict from silence
+				// is exactly what this function exists to avoid.
+				continue
+			}
+			if row.Status == models.StatusRejected {
+				return ancestor, true
+			}
+			// Keep climbing only through ancestors that are themselves still
+			// unresolved. A tx that is ACCEPTED/SEEN/MINED is settled — its
+			// own parents cannot retroactively condemn this child.
+			if row.Status != models.StatusPendingRetry && row.Status != models.StatusReceived {
+				continue
+			}
+			if len(row.RawTx) == 0 {
+				continue
+			}
+			next = append(next, parentTxIDsOf(propagationMsg{TXID: ancestor, RawTx: row.RawTx})...)
+		}
+		frontier = next
+	}
+	return "", false
+}
+
+// maxAncestorWalkDepth bounds the transitive rejectedAncestor climb. Each
+// level costs one GetStatus per unresolved ancestor, on a broadcast worker
+// goroutine, so this trades a deeper cascade against per-event store load.
+// Chains this long are already parked and draining a layer at a time; the
+// bound only decides how many generations one pass can condemn at once.
+const maxAncestorWalkDepth = 8
+
+// Labels for the requeue side of PropagationMissingParentTotal. The fast path
+// really does requeue; the reaper books a durable retry instead. Reporting
+// both as "requeued" meant a constant population of unresolvable orphans
+// pinned that counter at a steady rate forever, which reads exactly like the
+// sustained family-keying regression #295's dashboard note tells operators to
+// look for.
+const (
+	missingParentOutcomeRequeued    = "requeued"
+	missingParentOutcomeReaperRetry = "reaper_retry"
+)
+
+// resolveMissingParents settles every txResultClassMissingParent result:
+// a REJECTED ancestor in the store cascades the child REJECTED (returned
+// as extra terminal statuses); everything else requeues with the
+// Teranode line as its retry reason. Shared by processBatch and the
+// reaper (which passes collect=false semantics via its own loop).
+//
+// outcome reports which caller this is, because the two do different things
+// with the returned requeue slice: processBatch actually requeues, while the
+// reaper discards it and books a durable retry instead. Labelling both
+// "requeued" made a steady population of unresolvable orphans pin that
+// counter at a constant rate forever — poisoning the exact signal #295's
+// dashboard guidance says to watch for family-keying regressions.
+func (p *Propagator) resolveMissingParents(ctx context.Context, msgs []propagationMsg, lines []string, outcome string) (cascaded []*models.TransactionStatus, requeue []propagationMsg) {
+	now := time.Now()
+	for i, msg := range msgs {
+		if ancestor, ok := p.rejectedAncestor(ctx, msg); ok {
+			metrics.PropagationMissingParentTotal.WithLabelValues("rejected_ancestor").Inc()
+			p.logger.Info(
+				"missing-parent child cascaded to REJECTED via store consult",
+				logfields.TxID(msg.TXID),
+				zap.String("ancestor", ancestor),
+			)
+			cascaded = append(cascaded, &models.TransactionStatus{
+				TxID:      msg.TXID,
+				Status:    models.StatusRejected,
+				Timestamp: now,
+				ExtraInfo: cascadeReason(models.StatusRejected, ancestor),
+			})
+			continue
+		}
+		metrics.PropagationMissingParentTotal.WithLabelValues(outcome).Inc()
+		msg.retryReason = lines[i]
+		requeue = append(requeue, msg)
+	}
+	return cascaded, requeue
 }
 
 // persistCascade writes rows for txs the dep cascade terminalized without ever
@@ -690,6 +887,17 @@ func (p *Propagator) persistCascade(ctx context.Context, cascaded []cascadeRejec
 			zap.Int("count", len(cascaded)),
 			zap.Error(err),
 		)
+	}
+	// A cascade-parked descendant has to enter the durable retry queue too.
+	// It reaches PENDING_RETRY without ever being broadcast — its ancestor
+	// got no verdict, so it was never charged a requeue budget and never went
+	// through parkExhaustedRequeues. Writing only the status row would leave
+	// it with a NULL next_retry_at, which GetReadyRetries cannot see: the row
+	// would sit at PENDING_RETRY forever with nothing scheduled to retry it.
+	if status == models.StatusPendingRetry {
+		for _, cr := range cascaded {
+			p.schedulePendingRetry(ctx, cr.txid, cr.rawTx)
+		}
 	}
 	p.publishBulkStatus(ctx, status, txids, now)
 }
@@ -827,7 +1035,10 @@ func (p *Propagator) handleClaim(ctx context.Context) kafka.ClaimHandler {
 			case <-claimCtx.Done():
 			}
 		}()
-		return p.runDispatcher(claimCtx, claim, cfg)
+		// One dispatcherIO per claim: Sarama runs one ConsumeClaim per
+		// assigned partition, and each loop's events must be unreachable
+		// by its siblings (#295 — see dispatcherIO).
+		return p.runDispatcher(claimCtx, claim, cfg, newDispatcherIO())
 	}
 }
 
@@ -960,7 +1171,6 @@ func (p *Propagator) flushBatch(ctx context.Context) error {
 	// drainCh request/reply. The dispatcher owns the slice; we
 	// receive a snapshot and own it from here on.
 	batch := p.drainPending()
-	metrics.PropagationPendingDepth.Set(0)
 
 	if len(batch) == 0 {
 		return nil
@@ -979,7 +1189,7 @@ func (p *Propagator) flushBatch(ctx context.Context) error {
 			p.inflightBatches.Done()
 			metrics.PropagationInflightBatches.Set(float64(len(p.processBatchSem)))
 		}()
-		p.processBatch(ctx, batch)
+		p.processBatch(ctx, batch, p.defaultIO)
 	}()
 	return nil
 }
@@ -1338,6 +1548,22 @@ func attributeOneConflictLine(line string, owners map[string]int) (int, bool) {
 
 // rejectionLineScore ranks a Teranode failure line for wallet-facing quality.
 // Higher is better. Unknown free text scores 0.
+// lineIsMissingParentCondition reports whether a Teranode failure line is
+// the missing-parent condition family: TX_MISSING_PARENT (34), or its
+// un-wrapped store-layer form TX_NOT_FOUND (30) — both produced when a
+// tx's parent isn't in the node's UTXO store yet, which on a
+// multi-partition propagation topic is the signature of an out-of-order
+// child rather than a verdict about the bytes. Substring match, not a
+// prefix: Teranode nests codes ("PROCESSING (4): … TX_MISSING_PARENT
+// (34): …") and doubles prefixes. Over-matching only routes a tx to the
+// bounded requeue (safe, self-correcting); under-matching risks a false
+// terminal REJECTED — so err on matching. The "(" suffix keeps free-text
+// mentions of parents from matching.
+func lineIsMissingParentCondition(line string) bool {
+	return strings.Contains(line, "TX_MISSING_PARENT (") ||
+		strings.Contains(line, "TX_NOT_FOUND (")
+}
+
 func rejectionLineScore(line string) int {
 	name, _, found := strings.Cut(line, " (")
 	if !found {
@@ -1510,7 +1736,9 @@ func (p *Propagator) abortBatchOnRevokedClaim(ctx context.Context, txCount int) 
 //
 // Failure paths are absorbed internally — there's no caller that reacts
 // to an aggregate error here, so the function returns void.
-func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) {
+// io is the channel set of the dispatcher that flushed this batch; every
+// downstream requeue and terminal notification routes back through it.
+func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg, io *dispatcherIO) {
 	// The dispatcher detaches this goroutine (see flushBatch / the flush
 	// tick), so the claim can be revoked before the batch even starts.
 	if p.abortBatchOnRevokedClaim(ctx, len(batch)) {
@@ -1526,7 +1754,7 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) {
 		return
 	}
 	if len(failedRegister) > 0 {
-		p.requeueAfterDelay(ctx, failedRegister)
+		p.requeueAfterDelay(ctx, failedRegister, io)
 	}
 	if len(registered) == 0 {
 		return
@@ -1567,6 +1795,8 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) {
 	var accepted, rejected int
 	terminalStatuses := make([]*models.TransactionStatus, 0, len(results))
 	var toRequeue []propagationMsg
+	var missingParentMsgs []propagationMsg
+	var missingParentLines []string
 	for i, res := range results {
 		if res.successEndpoint != "" {
 			if _, ok := seenEndpoints[res.successEndpoint]; !ok {
@@ -1585,6 +1815,11 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) {
 			if res.status != nil {
 				terminalStatuses = append(terminalStatuses, res.status)
 			}
+		case txResultClassMissingParent:
+			// Condition, not verdict (#254/#295): resolved below against
+			// arcade's own store before anything terminalizes.
+			missingParentMsgs = append(missingParentMsgs, batch[i])
+			missingParentLines = append(missingParentLines, res.errMsg)
 		default:
 			// Requeue / Unknown: transient infra failure. Collect for
 			// requeue after a short flat wait so the dispatcher re-runs
@@ -1594,7 +1829,23 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) {
 		}
 	}
 
-	p.applyTerminalStatuses(ctx, terminalStatuses, accepted, rejected)
+	if len(missingParentMsgs) > 0 {
+		mpTxids := make([]string, len(missingParentMsgs))
+		for i, m := range missingParentMsgs {
+			mpTxids[i] = m.TXID
+		}
+		mpFields := append([]zap.Field{logfields.Stage(logfields.StageNetwork)}, logfields.TxIDBatch(mpTxids)...)
+		p.logger.Warn(
+			"teranode reported missing parents; treating as retryable condition, not verdict",
+			mpFields...,
+		)
+		cascaded, requeue := p.resolveMissingParents(ctx, missingParentMsgs, missingParentLines, missingParentOutcomeRequeued)
+		rejected += len(cascaded)
+		terminalStatuses = append(terminalStatuses, cascaded...)
+		toRequeue = append(toRequeue, requeue...)
+	}
+
+	p.applyTerminalStatuses(ctx, terminalStatuses, accepted, rejected, io)
 	if len(toRequeue) > 0 {
 		// A claim revoked during broadcast classifies every no-verdict tx
 		// as Requeue (born-canceled submitCtx → instant SubmitTransactions
@@ -1606,7 +1857,7 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) {
 		if p.abortBatchOnRevokedClaim(ctx, len(toRequeue)) {
 			return
 		}
-		p.requeueAfterDelay(ctx, toRequeue)
+		p.requeueAfterDelay(ctx, toRequeue, io)
 	}
 	metrics.PropagationOutcomeTotal.WithLabelValues("accepted").Add(float64(accepted))
 	metrics.PropagationOutcomeTotal.WithLabelValues("rejected").Add(float64(rejected))
@@ -1649,7 +1900,7 @@ const defaultRequeueDelay = 2 * time.Second
 // uncommitted offset IS the retry. The drop must not be silent though:
 // it's logged so a teardown that strands a large requeue batch is
 // visible in the operator's logs rather than looking like lost work.
-func (p *Propagator) requeueAfterDelay(ctx context.Context, msgs []propagationMsg) {
+func (p *Propagator) requeueAfterDelay(ctx context.Context, msgs []propagationMsg, io *dispatcherIO) {
 	if len(msgs) == 0 {
 		return
 	}
@@ -1674,7 +1925,7 @@ func (p *Propagator) requeueAfterDelay(ctx context.Context, msgs []propagationMs
 
 	msgs, exhausted := p.chargeRetryBudget(msgs)
 	if len(exhausted) > 0 {
-		p.parkExhaustedRequeues(ctx, exhausted)
+		p.parkExhaustedRequeues(ctx, exhausted, io)
 	}
 	if len(msgs) == 0 {
 		return
@@ -1713,7 +1964,7 @@ func (p *Propagator) requeueAfterDelay(ctx context.Context, msgs []propagationMs
 			// requeueToDispatcher selects on ctx, so a teardown mid-loop
 			// unblocks the send instead of leaking this goroutine on a
 			// requeueCh whose dispatcher has already exited.
-			if !p.requeueToDispatcher(ctx, m) {
+			if !p.requeueToDispatcher(ctx, io, m) {
 				p.logger.Debug(
 					"requeue dropped mid-batch; txs left uncommitted for replay",
 					zap.Int("dropped", len(msgs)-i),
@@ -1774,16 +2025,27 @@ func (p *Propagator) chargeRetryBudget(msgs []propagationMsg) (retry, exhausted 
 // one path that both persists the status AND notifies the dispatcher. A park
 // that skipped the notify would leave the in-flight entry — and therefore the
 // wedge — exactly as it was.
-func (p *Propagator) parkExhaustedRequeues(ctx context.Context, msgs []propagationMsg) {
+func (p *Propagator) parkExhaustedRequeues(ctx context.Context, msgs []propagationMsg, io *dispatcherIO) {
 	now := time.Now()
 	txids := make([]string, len(msgs))
 	statuses := make([]*models.TransactionStatus, len(msgs))
-	reason := fmt.Sprintf(
+	genericReason := fmt.Sprintf(
 		"no network verdict after %d propagation attempts: retryable — parked for durable rebroadcast by the propagation reaper",
 		p.retryMaxAttempts,
 	)
 	for i, m := range msgs {
 		txids[i] = m.TXID
+		// A tx that cycled here on a named condition (missing parent)
+		// gets a reason stating it, so GET /tx explains WHY the fast
+		// path gave up instead of the generic no-verdict text.
+		reason := genericReason
+		if m.retryReason != "" {
+			reason = fmt.Sprintf(
+				"parent not yet accepted by the network after %d propagation attempts: retryable — parked for durable rebroadcast by the propagation reaper; last error: %s",
+				p.retryMaxAttempts,
+				m.retryReason,
+			)
+		}
 		statuses[i] = &models.TransactionStatus{
 			TxID:      m.TXID,
 			Status:    models.StatusPendingRetry,
@@ -1809,7 +2071,117 @@ func (p *Propagator) parkExhaustedRequeues(ctx context.Context, msgs []propagati
 		parkFields...,
 	)
 
-	p.applyTerminalStatuses(ctx, statuses, 0, 0)
+	p.applyTerminalStatuses(ctx, statuses, 0, 0, io)
+
+	// Hand the txs to the durable retry queue. applyTerminalStatuses above
+	// wrote status=PENDING_RETRY and released the offset; this records the
+	// per-row retry bins (retry_count, next_retry_at) the reaper drains by.
+	//
+	// Without this the reaper can only find a parked row by scanning
+	// timestamp_at, which Postgres serves newest-first — and because a
+	// failed rebroadcast never rewrote the row, its timestamp stayed frozen
+	// at park time and it sank below every newer eligible row until it fell
+	// out of the 24h scan window entirely.
+	for _, m := range msgs {
+		p.schedulePendingRetry(ctx, m.TXID, m.RawTx)
+	}
+}
+
+// defaultPendingRetryBackoff / defaultPendingRetryMaxBackoff /
+// defaultPendingRetryMaxAttempts back the propagation.pending_retry_* knobs.
+// The max backoff equals the flat eligibility age the reaper used before
+// #299, so the slowest cadence is unchanged while early attempts are much
+// faster; the attempt bound is 24h at that cap, which is when a parked row
+// used to silently fall out of the scan window.
+const (
+	defaultPendingRetryBackoff     = 5 * time.Second
+	defaultPendingRetryMaxBackoff  = 5 * time.Minute
+	defaultPendingRetryMaxAttempts = 288
+)
+
+// nextPendingRetryDelay is the wait before attempt n+1 of a parked tx:
+// exponential in the attempt count, capped at pendingRetryMaxBackoff, with
+// ±20% jitter.
+//
+// Jitter matters more here than it looks. Every child of one late parent
+// parks in the same batch with the same attempt count, so an unjittered
+// schedule re-broadcasts them in lockstep — a synchronized burst at teranode
+// and merkle-service every cycle, forever, for as long as the parent is
+// missing.
+func (p *Propagator) nextPendingRetryDelay(retryCount int) time.Duration {
+	base := p.pendingRetryBackoff
+	if base <= 0 {
+		base = defaultPendingRetryBackoff
+	}
+	maxBackoff := p.pendingRetryMaxBackoff
+	if maxBackoff < base {
+		maxBackoff = base
+	}
+	delay := base
+	for i := 1; i < retryCount && delay < maxBackoff; i++ {
+		delay *= 2
+	}
+	if delay > maxBackoff {
+		delay = maxBackoff
+	}
+	// ±20% jitter. Sourced from crypto/rand only because it is already the
+	// package's rand import; nothing here is a security decision.
+	var b [2]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		frac := float64(uint16(b[0])<<8|uint16(b[1])) / 65535.0
+		delay += time.Duration((frac*0.4 - 0.2) * float64(delay))
+	}
+	if delay < time.Millisecond {
+		delay = time.Millisecond
+	}
+	return delay
+}
+
+// schedulePendingRetry books a parked tx's next durable attempt, or gives up
+// on it.
+//
+// Give-up is the property the PENDING_RETRY path was missing entirely. A tx
+// spending an outpoint that does not exist — the most common client mistake
+// there is — draws TX_MISSING_PARENT forever: rejectedAncestor finds no
+// REJECTED ancestor because arcade has never seen the parent at all, so the
+// row can never be condemned and can never succeed. Before #299 those rows
+// accumulated without bound, monopolized the reaper's per-tick batch, and
+// were finally abandoned at 24h in a non-terminal state with no signal of
+// any kind. Now they terminate with a verdict the submitter can read.
+func (p *Propagator) schedulePendingRetry(ctx context.Context, txid string, rawTx []byte) {
+	if p.store == nil || len(rawTx) == 0 {
+		return
+	}
+	count, err := p.store.BumpRetryCount(ctx, txid)
+	if err != nil {
+		// The row may not exist yet on the intake path; the next reaper tick
+		// re-derives everything it needs, so this is not fatal.
+		p.logger.Warn("bump retry count failed; tx keeps its previous retry schedule",
+			logfields.TxID(txid), zap.Error(err))
+		return
+	}
+	if count > p.pendingRetryMaxAttempts {
+		reason := fmt.Sprintf(
+			"no network verdict after %d durable retry attempts: giving up — a parent this transaction spends has never reached the network",
+			p.pendingRetryMaxAttempts,
+		)
+		metrics.PropagationPendingRetryTotal.WithLabelValues("exhausted").Inc()
+		p.logger.Warn("durable retry budget exhausted; terminalizing parked tx as REJECTED",
+			logfields.TxID(txid), zap.Int("attempts", count))
+		if err := p.store.ClearRetryState(ctx, txid, models.StatusRejected, reason); err != nil {
+			p.logger.Error("clear retry state failed", logfields.TxID(txid), zap.Error(err))
+			return
+		}
+		p.publishBulkStatus(ctx, models.StatusRejected, []string{txid}, time.Now())
+		return
+	}
+	next := time.Now().Add(p.nextPendingRetryDelay(count))
+	if err := p.store.SetPendingRetryFields(ctx, txid, rawTx, next); err != nil {
+		p.logger.Error("set pending retry fields failed; tx may not be re-broadcast",
+			logfields.TxID(txid), zap.Error(err))
+		return
+	}
+	metrics.PropagationPendingRetryTotal.WithLabelValues("scheduled").Inc()
 }
 
 // Per-batch chunk parallelism is now config-driven via
@@ -2082,6 +2454,12 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 	outcomes := make([]endpointOutcome, 0, submitted)
 	acceptedByAny := make([]bool, len(batch))
 	rejectionLine := make([]string, len(batch))
+	// missingParentLine collects TX_MISSING_PARENT / TX_NOT_FOUND lines
+	// separately from real verdicts: they are conditions (#254), not
+	// rejections, and rank below any genuine verdict in the final
+	// classification. See lineIsMissingParentCondition and
+	// txResultClassMissingParent.
+	missingParentLine := make([]string, len(batch))
 	// outpointOwners is the batch's spent-outpoint → tx index map used to
 	// attribute conflict-family lines back to submitted txs. Built lazily and
 	// at most once: it costs a full parse of every raw tx in the batch, which
@@ -2191,13 +2569,29 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 		}
 		for j, lower := range lowerTxids {
 			if line, failed := result.failures[lower]; failed {
-				rejectionLine[j] = preferRejectionLine(rejectionLine[j], line)
+				// A missing-parent line keyed to a submitted tx is NOT a
+				// verdict about its bytes — the peer processed the batch
+				// and told us the parent isn't there yet. Route it to the
+				// condition bucket; the siblings' implicit accepts above
+				// are untouched (the line is in-batch-keyed, not alien).
+				if lineIsMissingParentCondition(line) {
+					missingParentLine[j] = preferRejectionLine(missingParentLine[j], line)
+				} else {
+					rejectionLine[j] = preferRejectionLine(rejectionLine[j], line)
+				}
 			} else if alienCount == 0 {
 				acceptedByAny[j] = true
 			}
 		}
 		for idx, line := range attributed {
-			rejectionLine[idx] = preferRejectionLine(rejectionLine[idx], line)
+			// Attributed lines are conflict-family by construction, but the
+			// condition check is kept for defense: a mis-shaped line must
+			// never become a terminal verdict via the attribution path.
+			if lineIsMissingParentCondition(line) {
+				missingParentLine[idx] = preferRejectionLine(missingParentLine[idx], line)
+			} else {
+				rejectionLine[idx] = preferRejectionLine(rejectionLine[idx], line)
+			}
 		}
 		// A single-tx batch has exactly one possible owner for an alien
 		// verdict — the tx itself. Terminalize it with the real reason
@@ -2207,7 +2601,11 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 		// attribution can't cover — a conflict line about an outpoint the tx
 		// doesn't visibly spend, or raw bytes we failed to parse.
 		if alienCount > 0 && len(batch) == 1 {
-			rejectionLine[0] = preferRejectionLine(rejectionLine[0], bestAlien)
+			if lineIsMissingParentCondition(bestAlien) {
+				missingParentLine[0] = preferRejectionLine(missingParentLine[0], bestAlien)
+			} else {
+				rejectionLine[0] = preferRejectionLine(rejectionLine[0], bestAlien)
+			}
 		}
 	}
 	recordBroadcastOutcomes(p.teranodeClient, outcomes)
@@ -2246,6 +2644,15 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 					ExtraInfo:  errMsg,
 				},
 				rawTx: msg.RawTx,
+			}
+		case missingParentLine[i] != "":
+			// Condition, not verdict: no status write here. processBatch
+			// consults the store (rejected ancestor → cascade REJECTED)
+			// and otherwise requeues with this line as the retry reason.
+			results[i] = txResult{
+				class:  txResultClassMissingParent,
+				errMsg: missingParentLine[i],
+				rawTx:  msg.RawTx,
 			}
 		default:
 			results[i] = txResult{

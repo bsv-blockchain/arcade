@@ -76,7 +76,7 @@ type terminalEvent struct {
 // re-enters them into pendingMsgs directly, so the next flushBatch
 // picks them up without any caller action.
 type terminalResult struct {
-	cascaded []string
+	cascaded []cascadedTx
 }
 
 // drainRequest is the protocol between flushBatch and the dispatcher.
@@ -102,6 +102,38 @@ type dispatcherConfig struct {
 	maxPending int
 }
 
+// dispatcherIO is one dispatcher instance's channel set. Pre-#295 these
+// channels lived directly on the Propagator; with a multi-partition
+// topic Sarama runs one runDispatcher per assigned partition claim, and
+// a SHARED channel set would let partition B's loop consume partition
+// A's terminal event — B's handleTerminal would no-op the unknown txid,
+// A's offset would never be Done'd, and A's commit watermark would
+// freeze permanently. Every claim therefore gets its own dispatcherIO;
+// the batch pipeline spawned by a dispatcher carries its io along so
+// replies route back to the loop whose inFlight map owns the tx.
+//
+// The reaper terminalizes txs off any claim's Kafka path — it passes a
+// nil io to applyTerminalStatuses, which fans the event out to every
+// registered dispatcher (at most one owns the tx; the rest no-op).
+type dispatcherIO struct {
+	admitCh    chan admitRequest
+	requeueCh  chan requeueRequest
+	terminalCh chan terminalEvent
+	drainCh    chan drainRequest
+}
+
+// newDispatcherIO builds a channel set for one dispatcher instance.
+// drainCh is unbuffered (request/reply handshake); the rest use
+// dispatcherChannelBuffer to absorb bursts.
+func newDispatcherIO() *dispatcherIO {
+	return &dispatcherIO{
+		admitCh:    make(chan admitRequest, dispatcherChannelBuffer),
+		requeueCh:  make(chan requeueRequest, dispatcherChannelBuffer),
+		terminalCh: make(chan terminalEvent, dispatcherChannelBuffer),
+		drainCh:    make(chan drainRequest),
+	}
+}
+
 // runDispatcher is the single state-owning loop. ALL dep-aware state
 // (inFlight, waiters, heldMsgs, pendingMsgs, the offsetTracker, and the
 // per-offset *kafka.Message references used for marking) lives in this
@@ -117,18 +149,27 @@ type dispatcherConfig struct {
 //   - Test: invoked with a nil claim from a goroutine started by tests.
 //     admitCh is the message source; no MarkMessage calls.
 //
-// One goroutine, no locks, no atomics.
-func (p *Propagator) runDispatcher(ctx context.Context, claim kafka.Claim, cfg dispatcherConfig) error {
+// One goroutine, no locks, no atomics (the registry and depth mirrors on
+// the Propagator are the deliberate exceptions — see registerDispatcher
+// and the delta accounting below).
+func (p *Propagator) runDispatcher(ctx context.Context, claim kafka.Claim, cfg dispatcherConfig, io *dispatcherIO) error {
+	// Registration makes this loop reachable by the reaper's nil-io
+	// fan-out; deregistering on exit keeps a dead loop's channels from
+	// absorbing (and eventually blocking) fan-out sends.
+	p.registerDispatcher(io)
+	defer p.deregisterDispatcher(io)
+
 	inFlight := make(map[string]int64)
 	waiters := make(map[string]map[string]struct{})
 	heldMsgs := make(map[string]propagationMsg)
 	var pendingMsgs []propagationMsg
 	tracker := newOffsetTracker()
-	// pendingMarks is the per-offset Kafka-message reference we hand back
-	// to claim.MarkMessage when its offset terminalizes. Only populated
-	// when claim != nil; in test mode admitRequests carry no Kafka
-	// message and pendingMarks stays empty.
-	pendingMarks := make(map[int64]*kafka.Message)
+	// marks queues consumed Kafka messages until the commit watermark
+	// passes their offset; the 50ms flush tick (and the exit paths)
+	// advance it. Only populated when claim != nil; in test mode
+	// admitRequests carry no Kafka message and the queue stays empty.
+	// See markQueue for why this is a queue, not a map (#295).
+	marks := &markQueue{}
 
 	var claimMsgCh <-chan *kafka.Message
 	if claim != nil {
@@ -147,27 +188,40 @@ func (p *Propagator) runDispatcher(ctx context.Context, claim kafka.Claim, cfg d
 		flushTickC = t.C
 	}
 
+	// Depth accounting is delta-based (#295): with one dispatcher per
+	// partition claim, absolute Set()s from several loops would fight
+	// last-writer-wins. Each loop Adds only its own change, so the gauge
+	// and the Propagator-level atomic mirrors read as the POD TOTAL
+	// across owned partitions — which is what dashboards and the
+	// reaper's backlog log line want. The deferred removal zeroes this
+	// loop's contribution on exit so a rebalanced-away partition doesn't
+	// leave phantom depth behind.
+	//
+	// inFlight is the REAL backlog: every admitted-or-held tx whose
+	// Kafka offset is pinned below the commit watermark but which
+	// hasn't reached a terminal verdict. The pending gauge alone is
+	// misleading under load — admission backpressure caps it at
+	// maxPending, so during the 2026-08-10 load test a ~466k-tx
+	// uncommitted-offset backlog was invisible behind a flat pending
+	// depth.
+	var prevPending, prevInflight int
+	defer func() {
+		metrics.PropagationPendingDepth.Sub(float64(prevPending))
+		p.pendingDepth.Add(int64(-prevPending))
+		metrics.PropagationInflightDepth.Sub(float64(prevInflight))
+		p.inflightDepth.Add(int64(-prevInflight))
+	}()
+
 	for {
-		// Keep the depth gauges in sync at the top of every iteration.
-		// Every branch below that mutates pendingMsgs or inFlight
-		// (handleAdmit, handleRequeue, handleTerminal, drain, flush)
-		// is observed exactly once before the next select fires.
-		// A few atomic writes per iteration are negligible vs the
-		// throughput the dispatcher handles.
-		//
-		// inFlight is the REAL backlog: every admitted-or-held tx whose
-		// Kafka offset is pinned below the commit watermark but which
-		// hasn't reached a terminal verdict. The pending gauge alone is
-		// misleading under load — admission backpressure caps it at
-		// maxPending, so during the 2026-08-10 load test a ~466k-tx
-		// uncommitted-offset backlog was invisible behind a flat pending
-		// depth. The Propagator-level atomics mirror the gauges so the
-		// reaper's per-tick backlog log line can read them without a
-		// Prometheus read API.
-		metrics.PropagationPendingDepth.Set(float64(len(pendingMsgs)))
-		p.pendingDepth.Store(int64(len(pendingMsgs)))
-		metrics.PropagationInflightDepth.Set(float64(len(inFlight)))
-		p.inflightDepth.Store(int64(len(inFlight)))
+		// Observe depth changes at the top of every iteration: every
+		// branch below that mutates pendingMsgs or inFlight is seen
+		// exactly once before the next select fires.
+		metrics.PropagationPendingDepth.Add(float64(len(pendingMsgs) - prevPending))
+		p.pendingDepth.Add(int64(len(pendingMsgs) - prevPending))
+		prevPending = len(pendingMsgs)
+		metrics.PropagationInflightDepth.Add(float64(len(inFlight) - prevInflight))
+		p.inflightDepth.Add(int64(len(inFlight) - prevInflight))
+		prevInflight = len(inFlight)
 
 		// Backpressure: nil-channel trick excludes incoming-message
 		// sources from the select when pendingMsgs is at cap. Both
@@ -176,18 +230,25 @@ func (p *Propagator) runDispatcher(ctx context.Context, claim kafka.Claim, cfg d
 		var admitChIfRoom <-chan admitRequest
 		var claimChIfRoom <-chan *kafka.Message
 		if cfg.maxPending <= 0 || len(pendingMsgs) < cfg.maxPending {
-			admitChIfRoom = p.admitCh
+			admitChIfRoom = io.admitCh
 			claimChIfRoom = claimMsgCh
 		}
 
 		select {
 		case <-ctx.Done():
+			// Final drain: commit anything the watermark already passed
+			// so a clean teardown doesn't strand up to one tick's worth
+			// of finished work for replay. Still-unfinished offsets are
+			// never marked, so a revoked claim's in-flight work replays
+			// exactly as before.
+			marks.advance(claim, tracker)
 			return nil
 
 		case msg, ok := <-claimChIfRoom:
 			if !ok {
 				// Claim channel closed → claim ended; exit cleanly so
-				// Sarama can move on.
+				// Sarama can move on. Same final drain as ctx.Done.
+				marks.advance(claim, tracker)
 				return nil
 			}
 			var propMsg propagationMsg
@@ -225,26 +286,34 @@ func (p *Propagator) runDispatcher(ctx context.Context, claim kafka.Claim, cfg d
 			// safe to use here.
 			propMsg.spanCtx = trace.SpanContextFromContext(kafka.ExtractTraceContext(ctx, msg.Headers))
 			handleAdmit(propMsg, msg.Offset, inFlight, waiters, heldMsgs, &pendingMsgs, tracker)
-			pendingMarks[msg.Offset] = msg
+			marks.push(msg)
 
 		case req := <-admitChIfRoom:
 			res := handleAdmit(req.msg, req.offset, inFlight, waiters, heldMsgs, &pendingMsgs, tracker)
 			req.reply <- res
 
-		case req := <-p.requeueCh:
+		case req := <-io.requeueCh:
 			handleRequeue(req.msg, inFlight, waiters, heldMsgs, &pendingMsgs)
 
-		case ev := <-p.terminalCh:
+		case ev := <-io.terminalCh:
 			result := handleTerminal(ev, inFlight, waiters, heldMsgs, &pendingMsgs, tracker)
 			ev.reply <- result
-			advanceMarks(claim, tracker, pendingMarks)
+			// Marking moved to the flush tick: running the queue advance
+			// here per terminal event was the O(terminals × in-flight)
+			// serial hot spot of issue #295. The 50ms tick amortizes it
+			// (and the queue makes each advance O(newly-markable)).
 
-		case req := <-p.drainCh:
+		case req := <-io.drainCh:
 			batch := pendingMsgs
 			pendingMsgs = nil
 			req.reply <- batch
 
 		case <-flushTickC:
+			// Commit-watermark maintenance rides the existing production
+			// ticker: no extra timer, stays on the dispatcher goroutine
+			// (no-locks invariant), and runs whether or not there is a
+			// batch to flush.
+			marks.advance(claim, tracker)
 			if len(pendingMsgs) == 0 {
 				continue
 			}
@@ -268,27 +337,9 @@ func (p *Propagator) runDispatcher(ctx context.Context, claim kafka.Claim, cfg d
 					p.inflightBatches.Done()
 					metrics.PropagationInflightBatches.Set(float64(len(p.processBatchSem)))
 				}()
-				p.processBatch(ctx, batch)
+				p.processBatch(ctx, batch, io)
 			}()
 		}
-	}
-}
-
-// advanceMarks walks pendingMarks and calls claim.MarkMessage on every
-// offset that is strictly below the dispatcher's current lowest in-flight
-// offset. Idempotent and cheap when nothing has advanced. No-op when
-// claim is nil (test mode).
-func advanceMarks(claim kafka.Claim, tracker *offsetTracker, pendingMarks map[int64]*kafka.Message) {
-	if claim == nil {
-		return
-	}
-	lowest, hasUnfinished := tracker.LowestUnfinished()
-	for offset, msg := range pendingMarks {
-		if hasUnfinished && offset >= lowest {
-			continue
-		}
-		claim.MarkMessage(msg)
-		delete(pendingMarks, offset)
 	}
 }
 
@@ -328,6 +379,18 @@ func handleAdmit(
 	// new offset and immediately mark it done so advanceMarks can
 	// flush it once the original terminalizes, and return without
 	// touching pendingMsgs.
+	//
+	// Scope, since #295: inFlight is per-claim, so this suppresses
+	// duplicates only on the SAME partition. It is no longer a process-wide
+	// guard and never was a fleet-wide one. Two intake branches can still
+	// publish a txid that is in flight elsewhere — the store-error branch
+	// (which publishes rather than risk dropping a genuinely new tx) and the
+	// REJECTED-resubmit branch. Family keys are computed over the whole
+	// submitted batch, so batch composition no longer moves a txid between
+	// partitions, but a resubmission whose family genuinely differs still
+	// can. The consequence is a duplicate broadcast and racing terminal
+	// writes, which the status lattice absorbs — not something this function
+	// guarantees against.
 	if _, exists := inFlight[msg.TXID]; exists {
 		tracker.Add(offset)
 		tracker.Done(offset)
@@ -549,14 +612,22 @@ func canRelease(
 // their own, only because an ancestor did. Every cascaded descendant's
 // Kafka offset is marked Done on the tracker so the commit watermark
 // can advance past them once the caller writes the REJECTED rows.
+// cascadedTx is one descendant terminalized by a cascade, carrying the raw
+// bytes captured from its held message so a parked descendant can be booked
+// into the durable retry queue.
+type cascadedTx struct {
+	txid  string
+	rawTx []byte
+}
+
 func cascadeReject(
 	rejectedTxID string,
 	inFlight map[string]int64,
 	waiters map[string]map[string]struct{},
 	heldMsgs map[string]propagationMsg,
 	tracker *offsetTracker,
-) []string {
-	var cascaded []string
+) []cascadedTx {
+	var cascaded []cascadedTx
 	queue := []string{rejectedTxID}
 	for len(queue) > 0 {
 		parent := queue[0]
@@ -568,12 +639,18 @@ func cascadeReject(
 		delete(waiters, parent)
 		for child := range children {
 			cleanupWaiterEntries(child, parent, waiters, heldMsgs)
+			// Capture the raw bytes BEFORE dropping the held message. A
+			// descendant parked by this cascade has to enter the durable
+			// retry queue, and that needs a body to rebroadcast — without it
+			// the row would sit at PENDING_RETRY with no next_retry_at, which
+			// GetReadyRetries cannot see.
+			rawTx := heldMsgs[child].RawTx
 			delete(heldMsgs, child)
 			if offset, ok := inFlight[child]; ok {
 				tracker.Done(offset)
 			}
 			delete(inFlight, child)
-			cascaded = append(cascaded, child)
+			cascaded = append(cascaded, cascadedTx{txid: child, rawTx: rawTx})
 			queue = append(queue, child)
 		}
 	}
@@ -618,17 +695,58 @@ func cleanupWaiterEntries(
 // workers.
 const dispatcherChannelBuffer = 256
 
+// registerDispatcher / deregisterDispatcher maintain the set of live
+// dispatcher loops. The registry exists for exactly one caller: the
+// reaper's nil-io fan-out in notifyTerminalToDispatcher. Everything on
+// a claim's own pipeline carries its dispatcherIO explicitly.
+func (p *Propagator) registerDispatcher(io *dispatcherIO) {
+	p.dispatchersMu.Lock()
+	p.dispatchers[io] = struct{}{}
+	p.dispatchersMu.Unlock()
+}
+
+func (p *Propagator) deregisterDispatcher(io *dispatcherIO) {
+	p.dispatchersMu.Lock()
+	delete(p.dispatchers, io)
+	p.dispatchersMu.Unlock()
+}
+
+// dispatcherTargets resolves which dispatcher(s) an event should reach:
+// the explicit io when the caller runs on a claim's pipeline, or a
+// snapshot of every live dispatcher for io == nil (reaper path — the
+// owning dispatcher, if any, releases the tx; the rest no-op).
+func (p *Propagator) dispatcherTargets(io *dispatcherIO) []*dispatcherIO {
+	if io != nil {
+		return []*dispatcherIO{io}
+	}
+	p.dispatchersMu.RLock()
+	defer p.dispatchersMu.RUnlock()
+	targets := make([]*dispatcherIO, 0, len(p.dispatchers))
+	for d := range p.dispatchers {
+		targets = append(targets, d)
+	}
+	return targets
+}
+
 // admitToDispatcher is the consumer-side helper. Sends the tx and its
-// Kafka offset, waits for the dispatcher's verdict, returns it.
+// Kafka offset, waits for the dispatcher's verdict, returns it. Only
+// used by the test-mode message path, so it always targets the default
+// dispatcher.
 func (p *Propagator) admitToDispatcher(msg propagationMsg, offset int64) admitResult {
 	reply := make(chan admitResult, 1)
-	p.admitCh <- admitRequest{msg: msg, offset: offset, reply: reply}
+	p.defaultIO.admitCh <- admitRequest{msg: msg, offset: offset, reply: reply}
 	return <-reply
 }
 
 // notifyTerminalToDispatcher is the post-broadcast helper. Tells the
 // dispatcher the txid reached terminal status, returns the cascaded
 // descendants (caller writes REJECTED rows for them).
+//
+// io names the dispatcher whose pipeline produced this terminal; a nil
+// io (reaper path — no claim of its own) fans the event out to every
+// registered dispatcher and merges the cascades: at most one dispatcher
+// owns the tx, the rest no-op, preserving the pre-#295 behavior where a
+// reaper verdict could release a tx wedged in a live dispatcher.
 //
 // Both the send and the reply receive are guarded by ctx. processBatch
 // goroutines outlive the dispatcher on a claim teardown (rebalance /
@@ -639,16 +757,33 @@ func (p *Propagator) admitToDispatcher(msg propagationMsg, offset int64) admitRe
 // offset is simply left un-Done and uncommitted, and the next claim
 // replays it (at-least-once). reply is buffered so a late dispatcher
 // answer after we've stopped waiting never blocks the dispatcher.
-func (p *Propagator) notifyTerminalToDispatcher(ctx context.Context, txid string, status models.Status) terminalResult {
+func (p *Propagator) notifyTerminalToDispatcher(ctx context.Context, io *dispatcherIO, txid string, status models.Status) terminalResult {
+	var merged terminalResult
+	for _, target := range p.dispatcherTargets(io) {
+		r, ok := p.notifyTerminalToOne(ctx, target, txid, status)
+		if !ok {
+			// ctx died mid-fan-out; whatever we already collected is
+			// still valid cascade output.
+			break
+		}
+		merged.cascaded = append(merged.cascaded, r.cascaded...)
+	}
+	return merged
+}
+
+// notifyTerminalToOne performs the single-dispatcher send/reply
+// round-trip described on notifyTerminalToDispatcher. The bool is false
+// when ctx was canceled before a reply was obtained.
+func (p *Propagator) notifyTerminalToOne(ctx context.Context, io *dispatcherIO, txid string, status models.Status) (terminalResult, bool) {
 	reply := make(chan terminalResult, 1)
 	select {
-	case p.terminalCh <- terminalEvent{txid: txid, status: status, reply: reply}:
+	case io.terminalCh <- terminalEvent{txid: txid, status: status, reply: reply}:
 	case <-ctx.Done():
-		return terminalResult{}
+		return terminalResult{}, false
 	}
 	select {
 	case r := <-reply:
-		return r
+		return r, true
 	case <-ctx.Done():
 		// ctx and reply can both be ready at once, and select picks a
 		// ready case at random — so a teardown could win even though the
@@ -659,20 +794,21 @@ func (p *Propagator) notifyTerminalToDispatcher(ctx context.Context, txid string
 		// cancellation with a final non-blocking read.
 		select {
 		case r := <-reply:
-			return r
+			return r, true
 		default:
-			return terminalResult{}
+			return terminalResult{}, false
 		}
 	}
 }
 
-// drainPending asks the dispatcher for the current pendingMsgs as a
-// batch. The dispatcher clears its slice and hands the snapshot to
-// the caller; the caller owns it fully and processBatch can mutate
-// it as needed.
+// drainPending asks the default dispatcher for the current pendingMsgs
+// as a batch (test-mode path only — production flushes happen inside
+// runDispatcher's own tick). The dispatcher clears its slice and hands
+// the snapshot to the caller; the caller owns it fully and processBatch
+// can mutate it as needed.
 func (p *Propagator) drainPending() []propagationMsg {
 	reply := make(chan []propagationMsg, 1)
-	p.drainCh <- drainRequest{reply: reply}
+	p.defaultIO.drainCh <- drainRequest{reply: reply}
 	return <-reply
 }
 
@@ -688,9 +824,9 @@ func (p *Propagator) drainPending() []propagationMsg {
 // if the requeue was handed to the dispatcher, false if ctx was
 // canceled first — in which case the tx is left uncommitted for the
 // next claim to replay.
-func (p *Propagator) requeueToDispatcher(ctx context.Context, msg propagationMsg) bool {
+func (p *Propagator) requeueToDispatcher(ctx context.Context, io *dispatcherIO, msg propagationMsg) bool {
 	select {
-	case p.requeueCh <- requeueRequest{msg: msg}:
+	case io.requeueCh <- requeueRequest{msg: msg}:
 		return true
 	case <-ctx.Done():
 		return false

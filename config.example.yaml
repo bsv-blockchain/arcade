@@ -34,10 +34,10 @@ api:
 
 # Arcade does not create Kafka topics; the broker must already have them
 # (auto-create on first publish is typically disabled in production, and
-# arcade.propagation has a hard exactly-1-partition correctness constraint
-# that arcade enforces at startup). See docs/production-kafka.md for the
-# full topic list, partition guidance, and ready-to-paste rpk /
-# kafka-topics.sh commands.
+# arcade.propagation must exist with at least propagation.partitions
+# partitions — arcade fails closed at startup otherwise). See
+# docs/production-kafka.md for the full topic list, partition guidance,
+# and ready-to-paste rpk / kafka-topics.sh commands.
 kafka:
   brokers:
     - localhost:9092
@@ -202,6 +202,33 @@ health:
 #   subscriber_buffer: 4096
 
 # propagation:
+#   # Number of partitions arcade requires on arcade.propagation, and the
+#   # number of propagation replicas that can do work (one dep-aware
+#   # dispatcher per partition claim; extra replicas idle as standbys).
+#   # Checked fail-closed at startup: a topic with FEWER partitions than this
+#   # aborts the boot. More is allowed — the producer hashes over the topic's
+#   # actual partition count, so extra partitions carry real traffic and get
+#   # their own dispatchers. Widen the topic BEFORE raising this; see
+#   # docs/production-kafka.md "Widening an existing deployment".
+#   partitions: 1
+#
+#   # Fast-path requeue: a tx with no network verdict is retried in-memory up
+#   # to retry_max_attempts times, retry_backoff_ms apart, before parking at
+#   # PENDING_RETRY. At the defaults that is a ~10s window.
+#   retry_max_attempts: 5
+#   retry_backoff_ms: 2000
+#
+#   # Durable retry: once parked, a tx is drained by the reaper in
+#   # next_retry_at order with exponential backoff from
+#   # pending_retry_backoff_ms, doubling to pending_retry_max_backoff_ms.
+#   # After pending_retry_max_attempts it is terminalized REJECTED — the
+#   # give-up case is a tx spending an outpoint that never reaches the
+#   # network, which can neither succeed nor be condemned by an ancestor.
+#   # The default 288 attempts is ~24h at the 5-minute cap.
+#   pending_retry_backoff_ms: 5000
+#   pending_retry_max_backoff_ms: 300000
+#   pending_retry_max_attempts: 288
+#
 #   # Per-endpoint circuit-breaker for the datahub URL list. Endpoints that
 #   # accumulate `failure_threshold` consecutive failures are marked unhealthy
 #   # and excluded from broadcasts; a background probe hits GET /health on

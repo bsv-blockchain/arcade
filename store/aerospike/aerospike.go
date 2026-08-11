@@ -876,6 +876,20 @@ func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []
 	if err != nil {
 		return err
 	}
+	// Lattice guard: the park path writes twice (a guarded status update, then
+	// this), so skipping it here would silently undo the first write's
+	// protection and drag a MINED / IMMUTABLE / SEEN / REJECTED row back to
+	// PENDING_RETRY. Silent skip matches the guarded update's semantics.
+	rec, gerr := s.client.Get(s.readPolicy(ctx), key, "status")
+	if gerr != nil && !isKeyNotFound(gerr) {
+		return fmt.Errorf("read status for lattice check %s: %w", txid, gerr)
+	}
+	if rec == nil {
+		return fmt.Errorf("set pending retry fields %s: %w", txid, store.ErrNotFound)
+	}
+	if !models.StatusPendingRetry.CanTransitionFrom(models.Status(getString(rec, "status"))) {
+		return nil
+	}
 	ops := []*aero.Operation{
 		aero.PutOp(aero.NewBin("status", string(models.StatusPendingRetry))),
 		aero.PutOp(aero.NewBin("raw_tx", rawTx)),

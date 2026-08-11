@@ -3,8 +3,8 @@
 Arcade does **not** create Kafka topics itself — it relies on broker-side
 auto-creation on first publish, which is typically disabled in production
 clusters. One topic also has a hard correctness constraint (`arcade.propagation`
-must be **exactly 1 partition**) that arcade enforces at startup with a
-fail-closed check. This guide lists every topic an operator needs to
+must have **at least `propagation.partitions`**) that arcade enforces at startup
+with a fail-closed check. This guide lists every topic an operator needs to
 pre-create, with partition, replication, and retention guidance.
 
 This guide assumes a production deployment with `kafka.backend: sarama` pointed
@@ -15,7 +15,7 @@ don't need any of this — see [`getting-started.md`](getting-started.md).
 
 | Topic                          | Partitions                | Consumer group(s)                  | Purpose                                                              |
 | ------------------------------ | ------------------------- | ---------------------------------- | -------------------------------------------------------------------- |
-| `arcade.propagation`           | **exactly 1** (mandatory) | `<consumer_group>-propagation`     | API server → propagation: txs to broadcast to datahubs.              |
+| `arcade.propagation`           | **≥ `propagation.partitions`** (default 1) | `<consumer_group>-propagation`     | API server → propagation: txs to broadcast to datahubs.              |
 | `arcade.block_processed`       | ≥ N (N = bump-builder replicas) | `<consumer_group>-bump-builder` | API server → bump-builder: BLOCK_PROCESSED signals from Merkle Service. |
 | `arcade.tx_status`             | ≥ N (N = max concurrent SSE/webhook fan-outs) | ephemeral per-subscriber groups | All services → SSE/webhook: tx status mutations.                     |
 | `arcade.transaction`           | 1 (currently unused)      | none                               | Defined in `AllTopics()` but retired with `tx_validator`. Create or skip. |
@@ -30,14 +30,74 @@ applied automatically — operators only configure the base name.
 
 ## Partition counts
 
-### `arcade.propagation` — exactly 1 (mandatory)
+### `arcade.propagation` — at least `propagation.partitions`
 
-The propagation service uses a dep-aware dispatcher whose single-goroutine
-state ownership relies on **total order at the topic level**. Parent/child
-txids landing on different partitions would bypass the in-memory dependency
-index and reintroduce a "missing inputs" race. Arcade enforces this with a
-hard check at startup (`kafka.CheckExactPartitions`); a missing topic or any
-partition count other than 1 aborts startup.
+The propagation service runs one dep-aware dispatcher per partition claim.
+Each dispatcher owns its own in-memory dependency index, so a parent and its
+child must land on the **same** partition for the child to be held behind its
+parent.
+
+Intake guarantees that for transactions submitted together: `POST /txs`
+computes a partition key per **dependency family** — every tx in the request
+connected through in-batch spends shares one key (the lexicographically
+smallest member txid, so a shuffled resubmission maps to the same partition).
+A whole family therefore lands on one partition, and per-partition order
+delivers parents before children.
+
+Chains that span requests have no such guarantee, and that is by design rather
+than an oversight: a child can reach a datahub before its parent and draw
+`TX_MISSING_PARENT`. That is treated as a **condition, not a verdict** — the tx
+rides the bounded requeue, then parks at `PENDING_RETRY` for the reaper's
+durable retry queue. The only path to `REJECTED` is arcade's own store showing
+an ancestor terminally rejected. Note this means single-transaction `POST /tx`
+submissions get no cross-request ordering help: they are keyed by their own
+txid.
+
+Arcade enforces the floor at startup with `kafka.CheckMinPartitions`. A missing
+topic, or a topic with fewer partitions than `propagation.partitions`, aborts
+startup. More partitions than configured is allowed — but note the producer
+hashes over the topic's **actual** partition count, so extra partitions carry
+real traffic and get their own dispatchers. `propagation.partitions` is a
+fail-closed assertion, not a placement control.
+
+Sizing: run at most `propagation.partitions` propagation replicas. Extra
+replicas idle as standbys for failover. A single request whose transactions
+are all one dependency family lands entirely on one partition, so batches that
+are one long chain — or that contain a consolidation tx spending many
+in-request outputs — serialize regardless of partition count.
+
+### Widening an existing deployment
+
+Partition counts can be increased in place. Do it **topic first**, so arcade is
+never configured for more partitions than the topic has (that combination is a
+boot-time hard fail):
+
+```bash
+# 1. Widen the topic.
+rpk topic add-partitions arcade.propagation --num 3   # 1 -> 4 total
+
+# 2. Raise propagation.partitions to the new count (config or
+#    ARCADE_PROPAGATION_PARTITIONS), then roll the propagation pods.
+
+# 3. Scale replicas up to at most the partition count.
+kubectl scale deploy/propagation --replicas=4
+```
+
+Between steps 1 and 2 the producer already hashes over the wider topic, so a
+family submitted before the widen and its continuation submitted after can map
+to different partitions. That window is what the missing-parent safety net
+exists for. During it, watch:
+
+- `arcade_propagation_missing_parent_total{outcome="requeued"}` — a burst is
+  expected; it should return to baseline once the remap window passes.
+- `arcade_propagation_parked_depth` — a transient rise is normal; sustained
+  growth means chains are not converging.
+- `arcade_propagation_outcome_total{outcome="rejected"}` — should **not**
+  move. A spike would mean ordering artifacts reached a verdict, which the
+  condition-not-verdict rule is designed to make impossible.
+
+For a zero-race alternative, drain the topic and recreate it at the target
+width before rolling pods.
 
 ### `arcade.block_processed` and `arcade.tx_status` — match consumer scale
 
@@ -90,6 +150,8 @@ none of them are log-compacted.
 
 ```bash
 # Hot path
+# --partitions must be >= propagation.partitions (default 1). To go wider
+# later, see "Widening an existing deployment" above.
 rpk topic create arcade.propagation \
   --partitions 1 \
   --replicas 3 \
@@ -172,8 +234,8 @@ multiple deployments share a Kafka cluster.
 
 ## What arcade checks at startup
 
-- `kafka.CheckExactPartitions(arcade.propagation, 1)` — **hard fail** if
-  the topic is missing or has any partition count other than 1.
+- `kafka.CheckMinPartitions(arcade.propagation, propagation.partitions)` — **hard fail** if
+  the topic is missing or has fewer partitions than `propagation.partitions`.
 - `kafka.CheckPartitions(...)` — soft warning path used when
   `kafka.min_partitions > 1`. Existing topics with fewer partitions cause a
   startup error; missing topics only log a warning ("will be auto-created

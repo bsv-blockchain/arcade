@@ -46,6 +46,17 @@ type smokeOptions struct {
 	// disabled — the suite's baseline, proving the gate fails open when no
 	// chain source exists.
 	ChaintracksRemoteURL string
+	// PropagationPartitions widens arcade.propagation on the in-process
+	// memory broker (#295): family-keyed publishes shard across this many
+	// partitions and the propagator runs one dep-aware dispatcher per
+	// partition — the production multi-partition topology, in-process.
+	// Zero means 1 (the pre-#295 shape).
+	PropagationPartitions int
+	// MutateConfig, when set, gets the fully-built smoke config last so a
+	// test can override individual knobs (e.g. a larger retry budget for
+	// the missing-parent recovery window) without the harness growing a
+	// field per knob.
+	MutateConfig func(*config.Config)
 }
 
 // startArcadeSmoke boots arcade in-process via app.Bootstrap +
@@ -179,6 +190,7 @@ func buildSmokeConfig(t *testing.T, port int, opts smokeOptions) *config.Config 
 		ChaintracksServer: config.ChaintracksServerConfig{Enabled: false},
 		Chaintracks:       chaintracksRemoteConfig(opts.ChaintracksRemoteURL),
 		Propagation: config.PropagationConfig{
+			Partitions:        opts.PropagationPartitions,
 			MerkleConcurrency: 2,
 			RetryMaxAttempts:  1,
 			RetryBackoffMs:    50,
@@ -209,6 +221,9 @@ func buildSmokeConfig(t *testing.T, port int, opts smokeOptions) *config.Config 
 			StoragePath:      t.TempDir(),
 			AllowPrivateURLs: true,
 		},
+	}
+	if opts.MutateConfig != nil {
+		opts.MutateConfig(cfg)
 	}
 	return cfg
 }

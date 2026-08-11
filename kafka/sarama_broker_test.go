@@ -206,3 +206,29 @@ func TestNewSaramaConsumerConfig_StartOffset(t *testing.T) {
 		})
 	}
 }
+
+// TestNewSyncProducerConfig_OrderingInvariants pins the produce-side
+// ordering contract that family partition keying (#295) relies on: with
+// idempotence on and one open request, a retried produce cannot be
+// reordered behind a newer message on the same partition, so a family's
+// parent-before-child submission order survives broker hiccups. Version
+// must be >= 0.11 for idempotent produce; WaitForAll is required by
+// idempotence (and was already the sync default here).
+func TestNewSyncProducerConfig_OrderingInvariants(t *testing.T) {
+	cfg := newSyncProducerConfig()
+	if !cfg.Producer.Idempotent {
+		t.Error("sync producer must be idempotent — retries may otherwise reorder a family's messages within a partition")
+	}
+	if cfg.Net.MaxOpenRequests != 1 {
+		t.Errorf("Net.MaxOpenRequests = %d, want 1 (required by idempotent produce, guarantees per-partition order)", cfg.Net.MaxOpenRequests)
+	}
+	if cfg.Producer.RequiredAcks != sarama.WaitForAll {
+		t.Errorf("RequiredAcks = %v, want WaitForAll", cfg.Producer.RequiredAcks)
+	}
+	if !cfg.Version.IsAtLeast(sarama.V0_11_0_0) {
+		t.Errorf("Version = %v, want >= 0.11.0.0 for idempotent produce", cfg.Version)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("sarama config invalid: %v", err)
+	}
+}

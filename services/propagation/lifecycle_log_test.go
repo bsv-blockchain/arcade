@@ -88,7 +88,7 @@ func TestRequeueAfterDelay_LogsRequeueForRetry(t *testing.T) {
 	defer cancel()
 
 	msgs := []propagationMsg{{TXID: "retry-tx-1"}, {TXID: "retry-tx-2"}}
-	p.requeueAfterDelay(ctx, msgs)
+	p.requeueAfterDelay(ctx, msgs, p.defaultIO)
 
 	entries := recorded.FilterMessage("transactions requeued for retry").All()
 	if len(entries) != 1 {
@@ -129,7 +129,7 @@ func TestRequeueAfterDelay_RevokedClaim_DropsImmediatelyWithoutParking(t *testin
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // claim already revoked when the requeue is scheduled
 
-	p.requeueAfterDelay(ctx, []propagationMsg{{TXID: "dead-1"}, {TXID: "dead-2"}})
+	p.requeueAfterDelay(ctx, []propagationMsg{{TXID: "dead-1"}, {TXID: "dead-2"}}, p.defaultIO)
 
 	entries := recorded.FilterMessage("requeue dropped before delay elapsed; txs left uncommitted for replay").All()
 	if len(entries) != 1 {

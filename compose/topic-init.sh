@@ -7,14 +7,18 @@
 # Idempotent: safe across `podman-compose up` re-runs and container restarts.
 #
 # Partition counts are load-bearing:
-#   - arcade.propagation MUST have exactly 1 partition. arcade enforces this
-#     fail-closed at startup in EVERY mode (kafka.CheckExactPartitions);
-#     parent/child tx ordering relies on total order at the topic level.
+#   - arcade.propagation needs at least PROPAGATION_PARTITIONS partitions
+#     (default 1). arcade enforces the same minimum fail-closed at startup
+#     (kafka.CheckMinPartitions). Any count preserves ordering: producers key
+#     messages by dependency family, so parent/child txs of one submission
+#     share a partition (#295).
 #   - block_processed(8) / tx_status(16) mirror production consumer fan-out.
 # See docs/production-kafka.md.
 set -euo pipefail
 
 RPK=(rpk -X brokers=redpanda:9092 -X admin.hosts=redpanda:9644)
+
+PROPAGATION_PARTITIONS="${PROPAGATION_PARTITIONS:-1}"
 
 # merkle-service (all-in-one) provisions its own topics (subtree, block,
 # stumps, ...) via client auto-creation; keep broker-side auto-create on for
@@ -26,8 +30,8 @@ RPK=(rpk -X brokers=redpanda:9092 -X admin.hosts=redpanda:9644)
 declare -A TOPICS=(
   [arcade.block_processed]=8
   [arcade.block_processed.dlq]=8
-  [arcade.propagation]=1
-  [arcade.propagation.dlq]=1
+  [arcade.propagation]="$PROPAGATION_PARTITIONS"
+  [arcade.propagation.dlq]="$PROPAGATION_PARTITIONS"
   [arcade.tx_status]=16
   [arcade.tx_status.dlq]=16
 )
@@ -42,11 +46,14 @@ for topic in "${!TOPICS[@]}"; do
   fi
 done
 
+# Grow an existing propagation topic in place when the target minimum rose
+# between runs. Partitions can only be added, never removed — a topic wider
+# than the target is fine (arcade's startup check is >=, and family keying
+# keeps ordering correct at any width).
 count="$("${RPK[@]}" topic list | awk '$1 == "arcade.propagation" { print $2 }')"
-if [[ "$count" != "1" ]]; then
-  echo "topic-init: FATAL: arcade.propagation has partitions=$count, expected exactly 1" >&2
-  echo "topic-init: delete the topic (rpk topic delete arcade.propagation) or wipe the redpanda-data volume" >&2
-  exit 1
+if [[ "$count" -lt "$PROPAGATION_PARTITIONS" ]]; then
+  "${RPK[@]}" topic add-partitions arcade.propagation --num "$((PROPAGATION_PARTITIONS - count))"
+  echo "topic-init: widened arcade.propagation ${count} -> ${PROPAGATION_PARTITIONS} partitions"
 fi
 
-echo "topic-init: all arcade topics present; arcade.propagation partition invariant OK"
+echo "topic-init: all arcade topics present; arcade.propagation has >= ${PROPAGATION_PARTITIONS} partition(s)"

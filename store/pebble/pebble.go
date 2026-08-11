@@ -879,6 +879,14 @@ func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []
 		return fmt.Errorf("set pending retry fields %s: %w", txid, store.ErrNotFound)
 	}
 
+	// Lattice guard: the park path writes twice (a guarded status update, then
+	// this), so skipping it here would silently undo the first write's
+	// protection and drag a MINED / IMMUTABLE / SEEN / REJECTED row back to
+	// PENDING_RETRY. Silent skip matches the guarded update's semantics.
+	if !models.StatusPendingRetry.CanTransitionFrom(models.Status(existing.Status)) {
+		return nil
+	}
+
 	updated := *existing
 	updated.Status = string(models.StatusPendingRetry)
 	updated.RawTx = rawTx

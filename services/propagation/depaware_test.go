@@ -141,7 +141,7 @@ func TestApplyTerminalStatuses_ReleasesWaitersOnAccepted(t *testing.T) {
 
 	p.applyTerminalStatuses(context.Background(), []*models.TransactionStatus{
 		{TxID: "parent", Status: models.StatusAcceptedByNetwork, Timestamp: time.Now()},
-	}, 1, 0)
+	}, 1, 0, p.defaultIO)
 
 	if got := drainSet(p); !got["child"] {
 		t.Errorf("child should be released into pending batch after parent ACCEPTED; got %v", got)
@@ -174,7 +174,7 @@ func TestApplyTerminalStatuses_CascadesRejectedChildren(t *testing.T) {
 
 	p.applyTerminalStatuses(context.Background(), []*models.TransactionStatus{
 		{TxID: "parent", Status: models.StatusRejected, Timestamp: time.Now(), ExtraInfo: "bad parent"},
-	}, 0, 1)
+	}, 0, 1, p.defaultIO)
 
 	if got := drainSet(p); got["child"] || got["grandchild"] {
 		t.Errorf("cascaded descendants should NOT enter pending batch; got %v", got)
@@ -237,7 +237,7 @@ func TestSequentialReleaseDeepChain(t *testing.T) {
 	// because parent is still in-flight (just queued for broadcast).
 	p.applyTerminalStatuses(context.Background(), []*models.TransactionStatus{
 		{TxID: "grandparent", Status: models.StatusAcceptedByNetwork, Timestamp: time.Now()},
-	}, 1, 0)
+	}, 1, 0, p.defaultIO)
 
 	got := drainSet(p)
 	if !got["parent"] {
@@ -250,7 +250,7 @@ func TestSequentialReleaseDeepChain(t *testing.T) {
 	// parent ACCEPTED in its own batch — now child can release.
 	p.applyTerminalStatuses(context.Background(), []*models.TransactionStatus{
 		{TxID: "parent", Status: models.StatusAcceptedByNetwork, Timestamp: time.Now()},
-	}, 1, 0)
+	}, 1, 0, p.defaultIO)
 
 	got = drainSet(p)
 	if !got["child"] {
@@ -411,7 +411,7 @@ func TestRequeueAfterDelay_PendingRequeuesGauge(t *testing.T) {
 	t.Cleanup(cancel)
 
 	msgs := []propagationMsg{{TXID: "a", RawTx: []byte{0x01}}}
-	p.requeueAfterDelay(ctx, msgs)
+	p.requeueAfterDelay(ctx, msgs, p.defaultIO)
 
 	if got := testutil.ToFloat64(metrics.PropagationPendingRequeues); got != startVal+1 {
 		t.Fatalf("after requeueAfterDelay gauge = %v, want %v (inc by 1)", got, startVal+1)
@@ -442,7 +442,7 @@ func TestRequeueAfterDelay_EmptyMsgs_NoGaugeChange(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	startVal := testutil.ToFloat64(metrics.PropagationPendingRequeues)
-	p.requeueAfterDelay(t.Context(), nil)
+	p.requeueAfterDelay(t.Context(), nil, p.defaultIO)
 	if got := testutil.ToFloat64(metrics.PropagationPendingRequeues); got != startVal {
 		t.Fatalf("empty-msgs early-return mutated gauge: got %v, want %v", got, startVal)
 	}

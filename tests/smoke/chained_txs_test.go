@@ -36,6 +36,22 @@ import (
 // also catch interesting regressions: an ordering inversion would
 // surface in (2), a requeue bug in (3), a chunking bug in (4).
 func TestSmoke_ChainedTxBatchOrdering(t *testing.T) {
+	runChainedTxBatchOrdering(t, 1)
+}
+
+// TestSmoke_ChainedTxBatchOrdering_MultiPartition is the #295 variant: the
+// same forest, the same four invariants, but arcade.propagation runs 4
+// partitions with one dep-aware dispatcher each. The invariants only hold
+// because intake keys every submission's dependency family to one
+// partition (familyPartitionKeys) — key by txid instead (the pre-#295
+// producer behavior) and parents and children shard apart, children
+// broadcast before parents, and assertParentPrecedesChild goes red.
+func TestSmoke_ChainedTxBatchOrdering_MultiPartition(t *testing.T) {
+	runChainedTxBatchOrdering(t, 4)
+}
+
+func runChainedTxBatchOrdering(t *testing.T, partitions int) {
+	t.Helper()
 	const (
 		totalTxs             = 10_000
 		minDepth             = 2
@@ -48,7 +64,10 @@ func TestSmoke_ChainedTxBatchOrdering(t *testing.T) {
 	)
 
 	recorder := newRecordingTeranode(t)
-	rt := startArcadeSmoke(t, smokeOptions{TeranodeURL: recorder.URL()})
+	rt := startArcadeSmoke(t, smokeOptions{
+		TeranodeURL:           recorder.URL(),
+		PropagationPartitions: partitions,
+	})
 
 	chains := BuildChains(ChainOpts{
 		TotalTxs: totalTxs,
@@ -60,12 +79,14 @@ func TestSmoke_ChainedTxBatchOrdering(t *testing.T) {
 
 	// Flatten into submission batches. Each chain lives entirely
 	// inside one submission so the dispatcher's ordering guarantee
-	// holds: a single SendBatch on a single-partition Kafka topic
-	// preserves order within the batch, so parent always reaches the
-	// dispatcher before child. Concurrent submitters race the
-	// submissions themselves, but since chains don't span submissions
-	// and different chains share no edges, no cross-submission race
-	// can produce a child-before-parent on the wire.
+	// holds: intake keys every same-submission dependency family to one
+	// partition (#295 familyPartitionKeys), and Kafka preserves order
+	// within a partition, so parent always reaches its dispatcher
+	// before child — at any partition count. Concurrent submitters race
+	// the submissions themselves, but since chains don't span
+	// submissions and different chains share no edges, no
+	// cross-submission race can produce a child-before-parent on the
+	// wire.
 	submissions := buildSubmissionBatches(chains, submissionBatchSize)
 
 	start := time.Now()
@@ -108,12 +129,13 @@ func TestSmoke_ChainedTxBatchOrdering(t *testing.T) {
 
 // buildSubmissionBatches groups chains into HTTP submission batches such
 // that each chain lives entirely inside one submission. This is the
-// crucial invariant for the test: a SendBatch on the single-partition
-// Kafka topic preserves order, so parent reaches the dispatcher before
-// child for txs in the same submission. Different chains share no
-// edges, so the order in which submissions arrive at Kafka doesn't
-// matter — there's no cross-submission race that can produce a
-// child-before-parent on the wire.
+// crucial invariant for the test: a same-submission family shares a
+// partition key (#295), and Kafka preserves per-partition order, so
+// parent reaches its dispatcher before child for txs in the same
+// submission. Different chains share no edges, so the order in which
+// submissions arrive at Kafka doesn't matter — there's no
+// cross-submission race that can produce a child-before-parent on the
+// wire.
 //
 // Chain order across submissions is shuffled (deterministically by
 // seed) so concurrent submitters still stress the dispatcher with txs

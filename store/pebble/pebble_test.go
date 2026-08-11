@@ -1296,3 +1296,46 @@ func TestTokensForTxIDs(t *testing.T) {
 		t.Errorf("TokensForTxIDs(nil) = %v, want empty", empty)
 	}
 }
+
+// TestSetPendingRetryFields_RespectsStatusLattice is the pebble half of the
+// backend-parity guard; see the postgres test of the same name for why the
+// second write of the park path must not bypass the lattice.
+func TestSetPendingRetryFields_RespectsStatusLattice(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	for _, prev := range models.StatusPendingRetry.DisallowedPreviousStatuses() {
+		t.Run(string(prev), func(t *testing.T) {
+			txid := "lattice-" + string(prev)
+			if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+				TxID: txid, Status: models.StatusReceived,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.UpdateStatus(ctx, &models.TransactionStatus{TxID: txid, Status: prev}); err != nil {
+				t.Fatalf("seed %s: %v", prev, err)
+			}
+
+			if err := s.SetPendingRetryFields(ctx, txid, []byte{0xaa}, time.Now().Add(-time.Second)); err != nil {
+				t.Fatalf("SetPendingRetryFields: %v", err)
+			}
+
+			got, err := s.GetStatus(ctx, txid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Status != prev {
+				t.Errorf("status = %s, want %s left untouched", got.Status, prev)
+			}
+			ready, err := s.GetReadyRetries(ctx, time.Now(), 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, r := range ready {
+				if r.TxID == txid {
+					t.Errorf("%s row entered the durable retry queue", prev)
+				}
+			}
+		})
+	}
+}

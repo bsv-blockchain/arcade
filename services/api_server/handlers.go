@@ -1028,11 +1028,6 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	// Phase 1: parse the whole stream. Use the canonical TxID() (not a
 	// hash of the wire bytes) so Extended Format submissions key the
 	// same as the canonical txid the propagator broadcasts.
-	type parsedItem struct {
-		tx   *sdkTx.Transaction
-		raw  []byte
-		txid string
-	}
 	var parsed []parsedItem
 	offset := 0
 	for offset < len(body) {
@@ -1176,18 +1171,13 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	// Phase 4: build propagation envelopes and publish as one batch.
 	// input_txids drives the dispatcher's dep-aware admission — children
 	// of any in-flight parent are held until the parent terminalizes.
+	// Messages are keyed by dependency family (#295): txs of this
+	// submission connected through in-batch spends share a key, so on a
+	// multi-partition topic a whole family lands on one partition and
+	// per-partition order still delivers parents before children.
 	if len(toPublish) > 0 {
-		msgs := make([]kafka.KeyValue, 0, len(toPublish))
-		for _, p := range toPublish {
-			msgs = append(msgs, kafka.KeyValue{
-				Key: p.txid,
-				Value: map[string]interface{}{
-					"txid":        p.txid,
-					"raw_tx":      p.raw,
-					"input_txids": collectInputTXIDs(p.tx),
-				},
-			})
-		}
+		keyByTxid, inputsByTxid := familyKeysBySubmittedTxid(parsed)
+		msgs := propagationMessages(toPublish, keyByTxid, inputsByTxid)
 		if err := s.producer.SendBatch(ctx, kafka.TopicPropagation, msgs); err != nil {
 			if errors.Is(err, kafka.ErrBrokerBackpressure) {
 				s.logger.Warn("batch submit rejected: kafka backpressure", zap.Int("count", len(msgs)))
