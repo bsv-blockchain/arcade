@@ -235,7 +235,7 @@ multiple deployments share a Kafka cluster.
 ## What arcade checks at startup
 
 - `kafka.CheckMinPartitions(arcade.propagation, propagation.partitions)` — **hard fail** if
-  the topic is missing or has any partition count other than 1.
+  the topic is missing or has fewer partitions than `propagation.partitions`.
 - `kafka.CheckPartitions(...)` — soft warning path used when
   `kafka.min_partitions > 1`. Existing topics with fewer partitions cause a
   startup error; missing topics only log a warning ("will be auto-created
