@@ -85,6 +85,11 @@ services:
   topic-init:
     image: docker.io/redpandadata/redpanda:v26.1.9
     entrypoint: ["/bin/bash", "/topic-init.sh"]
+    # Keep in step with propagation.partitions in compose/arcade-config.yaml:
+    # arcade hard-fails at boot if the topic has fewer partitions than the
+    # service is configured for.
+    environment:
+      PROPAGATION_PARTITIONS: "${PROPAGATION_PARTITIONS:-1}"
     volumes:
       - ./compose/topic-init.sh:/topic-init.sh:ro,Z
     networks:

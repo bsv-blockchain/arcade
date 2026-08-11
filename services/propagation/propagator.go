@@ -421,6 +421,7 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 		dispatchers:     make(map[*dispatcherIO]struct{}),
 		initDone:        make(chan struct{}),
 	}
+	metrics.PreRegisterPropagationRetryOutcomes()
 	// Start a dispatcher goroutine with a nil claim so tests that
 	// construct via New and drive via admitCh / drainCh have a running
 	// state machine without needing to invoke Start. In production
@@ -789,12 +790,30 @@ func (p *Propagator) rejectedAncestor(ctx context.Context, msg propagationMsg) (
 // bound only decides how many generations one pass can condemn at once.
 const maxAncestorWalkDepth = 8
 
+// Labels for the requeue side of PropagationMissingParentTotal. The fast path
+// really does requeue; the reaper books a durable retry instead. Reporting
+// both as "requeued" meant a constant population of unresolvable orphans
+// pinned that counter at a steady rate forever, which reads exactly like the
+// sustained family-keying regression #295's dashboard note tells operators to
+// look for.
+const (
+	missingParentOutcomeRequeued    = "requeued"
+	missingParentOutcomeReaperRetry = "reaper_retry"
+)
+
 // resolveMissingParents settles every txResultClassMissingParent result:
 // a REJECTED ancestor in the store cascades the child REJECTED (returned
 // as extra terminal statuses); everything else requeues with the
 // Teranode line as its retry reason. Shared by processBatch and the
 // reaper (which passes collect=false semantics via its own loop).
-func (p *Propagator) resolveMissingParents(ctx context.Context, msgs []propagationMsg, lines []string) (cascaded []*models.TransactionStatus, requeue []propagationMsg) {
+//
+// outcome reports which caller this is, because the two do different things
+// with the returned requeue slice: processBatch actually requeues, while the
+// reaper discards it and books a durable retry instead. Labelling both
+// "requeued" made a steady population of unresolvable orphans pin that
+// counter at a constant rate forever — poisoning the exact signal #295's
+// dashboard guidance says to watch for family-keying regressions.
+func (p *Propagator) resolveMissingParents(ctx context.Context, msgs []propagationMsg, lines []string, outcome string) (cascaded []*models.TransactionStatus, requeue []propagationMsg) {
 	now := time.Now()
 	for i, msg := range msgs {
 		if ancestor, ok := p.rejectedAncestor(ctx, msg); ok {
@@ -812,7 +831,7 @@ func (p *Propagator) resolveMissingParents(ctx context.Context, msgs []propagati
 			})
 			continue
 		}
-		metrics.PropagationMissingParentTotal.WithLabelValues("requeued").Inc()
+		metrics.PropagationMissingParentTotal.WithLabelValues(outcome).Inc()
 		msg.retryReason = lines[i]
 		requeue = append(requeue, msg)
 	}
@@ -1808,7 +1827,7 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg, i
 			"teranode reported missing parents; treating as retryable condition, not verdict",
 			mpFields...,
 		)
-		cascaded, requeue := p.resolveMissingParents(ctx, missingParentMsgs, missingParentLines)
+		cascaded, requeue := p.resolveMissingParents(ctx, missingParentMsgs, missingParentLines, missingParentOutcomeRequeued)
 		rejected += len(cascaded)
 		terminalStatuses = append(terminalStatuses, cascaded...)
 		toRequeue = append(toRequeue, requeue...)

@@ -1181,22 +1181,54 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	// multi-partition topic a whole family lands on one partition and
 	// per-partition order still delivers parents before children.
 	if len(toPublish) > 0 {
-		txids := make([]string, len(toPublish))
-		inputs := make([][]string, len(toPublish))
-		for i, p := range toPublish {
-			txids[i] = p.txid
-			inputs[i] = collectInputTXIDs(p.tx)
+		// Keys are computed over `parsed` — the FULL submitted batch — not
+		// over toPublish. The distinction is the difference between a stable
+		// family key and a moving one.
+		//
+		// The key is min(family), so it moves whenever a member leaves the
+		// set. Members leave constantly: the Phase 3 dedup CAS drops every tx
+		// already known at a non-REJECTED status. The standard wallet pattern
+		// POST {P} then POST {P, C} therefore dedups P out, leaving the child
+		// with no in-batch parent and keying it by its own txid — onto a
+		// partition its still-in-flight parent is not on, where the
+		// dispatcher cannot hold it behind that parent. It draws
+		// TX_MISSING_PARENT and parks, where before #295's multi-partition
+		// topic it was admitted in milliseconds. The partial-produce retry
+		// path has the same shape: the members that already landed dedup out
+		// and the remainder recomputes onto a different partition.
+		//
+		// A deduped-out member can remain the family representative because
+		// the key is only a hash input; it does not have to be a txid that
+		// this request publishes.
+		allTxids := make([]string, len(parsed))
+		allInputs := make([][]string, len(parsed))
+		for i, p := range parsed {
+			allTxids[i] = p.txid
+			allInputs[i] = collectInputTXIDs(p.tx)
 		}
-		keys := familyPartitionKeys(txids, inputs)
+		allKeys := familyPartitionKeys(allTxids, allInputs)
+		keyByTxid := make(map[string]string, len(parsed))
+		inputsByTxid := make(map[string][]string, len(parsed))
+		for i, p := range parsed {
+			if _, ok := keyByTxid[p.txid]; ok {
+				continue // duplicate txid in one body: first occurrence wins
+			}
+			keyByTxid[p.txid] = allKeys[i]
+			inputsByTxid[p.txid] = allInputs[i]
+		}
 
 		msgs := make([]kafka.KeyValue, 0, len(toPublish))
-		for i, p := range toPublish {
+		for _, p := range toPublish {
+			key, ok := keyByTxid[p.txid]
+			if !ok {
+				key = p.txid
+			}
 			msgs = append(msgs, kafka.KeyValue{
-				Key: keys[i],
+				Key: key,
 				Value: map[string]interface{}{
 					"txid":        p.txid,
 					"raw_tx":      p.raw,
-					"input_txids": inputs[i],
+					"input_txids": inputsByTxid[p.txid],
 				},
 			})
 		}

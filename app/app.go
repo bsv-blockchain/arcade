@@ -100,8 +100,14 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 	// dependency family, so per-partition order still delivers a parent's
 	// admit to its dispatcher before its children's, and cross-partition
 	// stragglers are absorbed by the missing-parent safety net instead of
-	// being terminally REJECTED. `>=` rather than `==` because extra
-	// partitions only cost idle dispatchers.
+	// being terminally REJECTED.
+	//
+	// `>=` rather than `==` because a wider topic is safe to run against —
+	// not because the extra partitions are inert. Nothing passes this value
+	// to a partitioner, so the producer hashes over the topic's ACTUAL
+	// partition count: every partition carries real traffic and gets its own
+	// dispatcher. This knob is a fail-closed assertion, not a placement
+	// control; lowering it does not narrow the producer's hash space.
 	if pErr := kafka.CheckMinPartitions(broker, kafka.TopicPropagation, cfg.Propagation.Partitions, logger); pErr != nil {
 		_ = producer.Close()
 		return nil, nil, fmt.Errorf("kafka partition check: %w", pErr)
@@ -110,9 +116,16 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 	// are currently no other hot-path topics that need it (TopicTransaction
 	// was retired with tx_validator) but the knob is retained so a future
 	// fan-out topic can opt into the check without re-introducing config.
+	//
+	// Deliberately still passed a nil topic list, which makes CheckPartitions
+	// a no-op. Handing it the real fan-out topics turns a check that has been
+	// dead since TopicTransaction was retired into a live boot-blocking one:
+	// any deployment carrying a leftover kafka.min_partitions greater than
+	// its actual arcade.tx_status / arcade.block_processed width would
+	// crash-loop on upgrade, for a reason unrelated to multi-partition
+	// propagation. Enabling it is its own change, with its own release note.
 	if cfg.Kafka.MinPartitions > 1 {
-		topics := []string{kafka.TopicStatusUpdate, kafka.TopicBlockProcessed}
-		if pErr := kafka.CheckPartitions(broker, topics, cfg.Kafka.MinPartitions, logger); pErr != nil {
+		if pErr := kafka.CheckPartitions(broker, nil, cfg.Kafka.MinPartitions, logger); pErr != nil {
 			_ = producer.Close()
 			return nil, nil, fmt.Errorf("kafka partition check: %w", pErr)
 		}

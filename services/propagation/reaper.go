@@ -43,15 +43,13 @@ import (
 // result is a store no-op: the stuck gauge drains only when the tx genuinely
 // reaches SEEN/MINED/REJECTED, never via a spurious timestamp refresh.
 //
-// stalePendingRetryAge: a row parked at PENDING_RETRY by the propagation
-// requeue-budget escape (parkExhaustedRequeues) got no verdict from any peer
-// across its whole fast-path budget, so its dispatcher in-flight entry was
-// released to free the Kafka commit watermark and the reaper inherited the
-// retry. Much shorter than the other thresholds — the row is not "stuck", it
-// is explicitly queued for another attempt, and the failure that parked it
-// (a peer outage, a conflict line arcade could not attribute) typically
-// clears in minutes. Long enough that a tx cannot bounce between the
-// fast path and the reaper faster than the fast path's own budget.
+// Parked PENDING_RETRY rows are NOT age-selected here: they carry a per-row
+// next_retry_at and are drained by drainParkedRetries via store.GetReadyRetries.
+// A flat eligibility age meant every parked tx waited the same 5 minutes no
+// matter how many times it had already failed, and — because a failed
+// rebroadcast never rewrote the row — that a row which kept failing was
+// retried on every single tick while its frozen timestamp_at sank it out of
+// the selection window entirely.
 //
 // staleScanLookback bounds how far back IterateStatusesSince walks. Rows
 // older than this are assumed permanently stuck and outside the reaper's
@@ -60,7 +58,6 @@ const (
 	staleSeenOnNetworkAge     = time.Hour
 	staleReceivedAge          = time.Hour
 	staleAcceptedByNetworkAge = time.Hour
-	stalePendingRetryAge      = 5 * time.Minute
 	staleScanLookback         = 24 * time.Hour
 
 	// defaultReaperRebroadcastBatch is the per-tick rebroadcast cap applied
@@ -187,13 +184,14 @@ func (p *Propagator) tryReap(ctx context.Context) {
 // requeue was lost, or an intake Kafka-publish failure the submitter never
 // retried), and ACCEPTED_BY_NETWORK past staleAcceptedByNetworkAge (accepted
 // into a mempool but the SEEN state-transfer from merkle-service never
-// arrived — re-register + re-broadcast to nudge it toward SEEN), and
-// PENDING_RETRY past stalePendingRetryAge (parked by the propagation
-// requeue-budget escape after getting no verdict from any peer; the reaper is
-// its only remaining retry path). All carry RawTx and are validated txs we
-// accepted responsibility to propagate, so rebroadcasting self-heals a
-// transient downstream outage. Recent rows (still in the normal intake/requeue
-// path) and body-less rows are left alone.
+// arrived — re-register + re-broadcast to nudge it toward SEEN). All carry
+// RawTx and are validated txs we accepted responsibility to propagate, so
+// rebroadcasting self-heals a transient downstream outage. Recent rows (still
+// in the normal intake/requeue path) and body-less rows are left alone.
+//
+// Rows parked at PENDING_RETRY are NOT selected by this age walk. They have a
+// per-row schedule and are drained by drainParkedRetries in next_retry_at
+// order — see there for why age selection starved them.
 //
 // Rebroadcasts go through the same registerBatch + broadcastInChunks +
 // applyTerminalStatuses pipeline as processBatch but bypass the
@@ -521,7 +519,7 @@ func (p *Propagator) rebroadcastStuck(ctx context.Context, msgs []propagationMsg
 				// Condition, not verdict (#254/#295): only a REJECTED
 				// ancestor in arcade's own store condemns the child. A
 				// missing parent that is merely late must never terminalize.
-				cascaded, _ := p.resolveMissingParents(ctx, []propagationMsg{layer[i]}, []string{res.errMsg})
+				cascaded, _ := p.resolveMissingParents(ctx, []propagationMsg{layer[i]}, []string{res.errMsg}, missingParentOutcomeReaperRetry)
 				if len(cascaded) > 0 {
 					rejected += len(cascaded)
 					terminalStatuses = append(terminalStatuses, cascaded...)

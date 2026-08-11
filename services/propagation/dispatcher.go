@@ -379,6 +379,18 @@ func handleAdmit(
 	// new offset and immediately mark it done so advanceMarks can
 	// flush it once the original terminalizes, and return without
 	// touching pendingMsgs.
+	//
+	// Scope, since #295: inFlight is per-claim, so this suppresses
+	// duplicates only on the SAME partition. It is no longer a process-wide
+	// guard and never was a fleet-wide one. Two intake branches can still
+	// publish a txid that is in flight elsewhere — the store-error branch
+	// (which publishes rather than risk dropping a genuinely new tx) and the
+	// REJECTED-resubmit branch. Family keys are computed over the whole
+	// submitted batch, so batch composition no longer moves a txid between
+	// partitions, but a resubmission whose family genuinely differs still
+	// can. The consequence is a duplicate broadcast and racing terminal
+	// writes, which the status lattice absorbs — not something this function
+	// guarantees against.
 	if _, exists := inFlight[msg.TXID]; exists {
 		tracker.Add(offset)
 		tracker.Done(offset)
