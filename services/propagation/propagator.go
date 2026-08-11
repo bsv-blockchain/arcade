@@ -139,6 +139,13 @@ type Propagator struct {
 	// retry loop to milliseconds instead of spending
 	// retryMaxAttempts × 2s of wall time per case.
 	requeueDelay time.Duration
+	// pendingRetryBackoff / pendingRetryMaxBackoff / pendingRetryMaxAttempts
+	// govern the DURABLE retry schedule a parked tx follows once the
+	// in-memory budget above is spent and the reaper owns it. See
+	// schedulePendingRetry.
+	pendingRetryBackoff     time.Duration
+	pendingRetryMaxBackoff  time.Duration
+	pendingRetryMaxAttempts int
 
 	// broadcastJobs feeds the persistent worker pool that runs every
 	// per-endpoint POST /txs call. Replaces the previous per-broadcast
@@ -367,6 +374,21 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 	if cfg.Propagation.RetryBackoffMs > 0 {
 		requeueDelay = time.Duration(cfg.Propagation.RetryBackoffMs) * time.Millisecond
 	}
+	pendingRetryBackoff := defaultPendingRetryBackoff
+	if cfg.Propagation.PendingRetryBackoffMs > 0 {
+		pendingRetryBackoff = time.Duration(cfg.Propagation.PendingRetryBackoffMs) * time.Millisecond
+	}
+	pendingRetryMaxBackoff := defaultPendingRetryMaxBackoff
+	if cfg.Propagation.PendingRetryMaxBackoffMs > 0 {
+		pendingRetryMaxBackoff = time.Duration(cfg.Propagation.PendingRetryMaxBackoffMs) * time.Millisecond
+	}
+	if pendingRetryMaxBackoff < pendingRetryBackoff {
+		pendingRetryMaxBackoff = pendingRetryBackoff
+	}
+	pendingRetryMaxAttempts := defaultPendingRetryMaxAttempts
+	if cfg.Propagation.PendingRetryMaxAttempts > 0 {
+		pendingRetryMaxAttempts = cfg.Propagation.PendingRetryMaxAttempts
+	}
 	p := &Propagator{
 		cfg:               cfg,
 		logger:            logger.Named("propagation"),
@@ -388,11 +410,16 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 		leaseTTL:          leaseTTL,
 		retryMaxAttempts:  retryMaxAttempts,
 		requeueDelay:      requeueDelay,
-		broadcastJobs:     make(chan broadcastJob, broadcastJobBuffer),
-		processBatchSem:   make(chan struct{}, maxConcurrentBatches),
-		defaultIO:         newDispatcherIO(),
-		dispatchers:       make(map[*dispatcherIO]struct{}),
-		initDone:          make(chan struct{}),
+
+		pendingRetryBackoff:     pendingRetryBackoff,
+		pendingRetryMaxBackoff:  pendingRetryMaxBackoff,
+		pendingRetryMaxAttempts: pendingRetryMaxAttempts,
+
+		broadcastJobs:   make(chan broadcastJob, broadcastJobBuffer),
+		processBatchSem: make(chan struct{}, maxConcurrentBatches),
+		defaultIO:       newDispatcherIO(),
+		dispatchers:     make(map[*dispatcherIO]struct{}),
+		initDone:        make(chan struct{}),
 	}
 	// Start a dispatcher goroutine with a nil claim so tests that
 	// construct via New and drive via admitCh / drainCh have a running
@@ -703,24 +730,64 @@ func parentTxIDsOf(msg propagationMsg) []string {
 // non-REJECTED status (RECEIVED, PENDING_RETRY, DOUBLE_SPEND_ATTEMPTED,
 // …) return false — anything else would invent a verdict. Runs on
 // processBatch / reaper worker goroutines only, never the dispatcher.
+//
+// The walk is transitive, bounded by maxAncestorWalkDepth and a visited set.
+// A single hop was not enough to match the behavior this is documented as
+// mirroring: cascadeReject is a recursive BFS over the waiter graph, so a
+// REJECTED grandparent condemns a grandchild immediately on the same
+// partition. Consulting direct parents only meant the cross-partition case
+// needed the parent to cascade first, costing one durable retry cycle per
+// generation before a doomed chain could be condemned.
 func (p *Propagator) rejectedAncestor(ctx context.Context, msg propagationMsg) (string, bool) {
 	if p.store == nil {
 		return "", false
 	}
-	for _, parent := range parentTxIDsOf(msg) {
-		if parent == "" || parent == msg.TXID {
-			continue
+	visited := map[string]struct{}{msg.TXID: {}}
+	frontier := parentTxIDsOf(msg)
+
+	for depth := 0; depth < maxAncestorWalkDepth && len(frontier) > 0; depth++ {
+		var next []string
+		for _, ancestor := range frontier {
+			if ancestor == "" {
+				continue
+			}
+			if _, seen := visited[ancestor]; seen {
+				continue
+			}
+			visited[ancestor] = struct{}{}
+
+			row, err := p.store.GetStatus(ctx, ancestor)
+			if err != nil || row == nil {
+				// Not arcade's tx, or a transient read failure. Either way we
+				// know nothing about it, and inventing a verdict from silence
+				// is exactly what this function exists to avoid.
+				continue
+			}
+			if row.Status == models.StatusRejected {
+				return ancestor, true
+			}
+			// Keep climbing only through ancestors that are themselves still
+			// unresolved. A tx that is ACCEPTED/SEEN/MINED is settled — its
+			// own parents cannot retroactively condemn this child.
+			if row.Status != models.StatusPendingRetry && row.Status != models.StatusReceived {
+				continue
+			}
+			if len(row.RawTx) == 0 {
+				continue
+			}
+			next = append(next, parentTxIDsOf(propagationMsg{TXID: ancestor, RawTx: row.RawTx})...)
 		}
-		row, err := p.store.GetStatus(ctx, parent)
-		if err != nil || row == nil {
-			continue
-		}
-		if row.Status == models.StatusRejected {
-			return parent, true
-		}
+		frontier = next
 	}
 	return "", false
 }
+
+// maxAncestorWalkDepth bounds the transitive rejectedAncestor climb. Each
+// level costs one GetStatus per unresolved ancestor, on a broadcast worker
+// goroutine, so this trades a deeper cascade against per-event store load.
+// Chains this long are already parked and draining a layer at a time; the
+// bound only decides how many generations one pass can condemn at once.
+const maxAncestorWalkDepth = 8
 
 // resolveMissingParents settles every txResultClassMissingParent result:
 // a REJECTED ancestor in the store cascades the child REJECTED (returned
@@ -1974,6 +2041,116 @@ func (p *Propagator) parkExhaustedRequeues(ctx context.Context, msgs []propagati
 	)
 
 	p.applyTerminalStatuses(ctx, statuses, 0, 0, io)
+
+	// Hand the txs to the durable retry queue. applyTerminalStatuses above
+	// wrote status=PENDING_RETRY and released the offset; this records the
+	// per-row retry bins (retry_count, next_retry_at) the reaper drains by.
+	//
+	// Without this the reaper can only find a parked row by scanning
+	// timestamp_at, which Postgres serves newest-first — and because a
+	// failed rebroadcast never rewrote the row, its timestamp stayed frozen
+	// at park time and it sank below every newer eligible row until it fell
+	// out of the 24h scan window entirely.
+	for _, m := range msgs {
+		p.schedulePendingRetry(ctx, m.TXID, m.RawTx)
+	}
+}
+
+// defaultPendingRetryBackoff / defaultPendingRetryMaxBackoff /
+// defaultPendingRetryMaxAttempts back the propagation.pending_retry_* knobs.
+// The max backoff equals the flat eligibility age the reaper used before
+// #299, so the slowest cadence is unchanged while early attempts are much
+// faster; the attempt bound is 24h at that cap, which is when a parked row
+// used to silently fall out of the scan window.
+const (
+	defaultPendingRetryBackoff     = 5 * time.Second
+	defaultPendingRetryMaxBackoff  = 5 * time.Minute
+	defaultPendingRetryMaxAttempts = 288
+)
+
+// nextPendingRetryDelay is the wait before attempt n+1 of a parked tx:
+// exponential in the attempt count, capped at pendingRetryMaxBackoff, with
+// ±20% jitter.
+//
+// Jitter matters more here than it looks. Every child of one late parent
+// parks in the same batch with the same attempt count, so an unjittered
+// schedule re-broadcasts them in lockstep — a synchronized burst at teranode
+// and merkle-service every cycle, forever, for as long as the parent is
+// missing.
+func (p *Propagator) nextPendingRetryDelay(retryCount int) time.Duration {
+	base := p.pendingRetryBackoff
+	if base <= 0 {
+		base = defaultPendingRetryBackoff
+	}
+	maxBackoff := p.pendingRetryMaxBackoff
+	if maxBackoff < base {
+		maxBackoff = base
+	}
+	delay := base
+	for i := 1; i < retryCount && delay < maxBackoff; i++ {
+		delay *= 2
+	}
+	if delay > maxBackoff {
+		delay = maxBackoff
+	}
+	// ±20% jitter. Sourced from crypto/rand only because it is already the
+	// package's rand import; nothing here is a security decision.
+	var b [2]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		frac := float64(uint16(b[0])<<8|uint16(b[1])) / 65535.0
+		delay += time.Duration((frac*0.4 - 0.2) * float64(delay))
+	}
+	if delay < time.Millisecond {
+		delay = time.Millisecond
+	}
+	return delay
+}
+
+// schedulePendingRetry books a parked tx's next durable attempt, or gives up
+// on it.
+//
+// Give-up is the property the PENDING_RETRY path was missing entirely. A tx
+// spending an outpoint that does not exist — the most common client mistake
+// there is — draws TX_MISSING_PARENT forever: rejectedAncestor finds no
+// REJECTED ancestor because arcade has never seen the parent at all, so the
+// row can never be condemned and can never succeed. Before #299 those rows
+// accumulated without bound, monopolized the reaper's per-tick batch, and
+// were finally abandoned at 24h in a non-terminal state with no signal of
+// any kind. Now they terminate with a verdict the submitter can read.
+func (p *Propagator) schedulePendingRetry(ctx context.Context, txid string, rawTx []byte) {
+	if p.store == nil || len(rawTx) == 0 {
+		return
+	}
+	count, err := p.store.BumpRetryCount(ctx, txid)
+	if err != nil {
+		// The row may not exist yet on the intake path; the next reaper tick
+		// re-derives everything it needs, so this is not fatal.
+		p.logger.Warn("bump retry count failed; tx keeps its previous retry schedule",
+			logfields.TxID(txid), zap.Error(err))
+		return
+	}
+	if count > p.pendingRetryMaxAttempts {
+		reason := fmt.Sprintf(
+			"no network verdict after %d durable retry attempts: giving up — a parent this transaction spends has never reached the network",
+			p.pendingRetryMaxAttempts,
+		)
+		metrics.PropagationPendingRetryTotal.WithLabelValues("exhausted").Inc()
+		p.logger.Warn("durable retry budget exhausted; terminalizing parked tx as REJECTED",
+			logfields.TxID(txid), zap.Int("attempts", count))
+		if err := p.store.ClearRetryState(ctx, txid, models.StatusRejected, reason); err != nil {
+			p.logger.Error("clear retry state failed", logfields.TxID(txid), zap.Error(err))
+			return
+		}
+		p.publishBulkStatus(ctx, models.StatusRejected, []string{txid}, time.Now())
+		return
+	}
+	next := time.Now().Add(p.nextPendingRetryDelay(count))
+	if err := p.store.SetPendingRetryFields(ctx, txid, rawTx, next); err != nil {
+		p.logger.Error("set pending retry fields failed; tx may not be re-broadcast",
+			logfields.TxID(txid), zap.Error(err))
+		return
+	}
+	metrics.PropagationPendingRetryTotal.WithLabelValues("scheduled").Inc()
 }
 
 // Per-batch chunk parallelism is now config-driven via

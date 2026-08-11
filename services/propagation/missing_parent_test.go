@@ -328,17 +328,18 @@ func TestRunDispatcher_MissingParentExhaustsBudget_ParksPendingRetry(t *testing.
 
 // --- reaper path ---------------------------------------------------------
 
-// reaperChild seeds ms with a stale PENDING_RETRY child row (real bytes so
+// reaperChild seeds ms with a due PENDING_RETRY child row (real bytes so
 // rejectedAncestor can parse the parent) and returns the child's txid.
+//
+// Parked rows now live in the durable retry queue (retry_count /
+// next_retry_at, drained by store.GetReadyRetries in next_retry_at order)
+// rather than being fished out of the timestamp_at walk, so the fixture
+// writes both halves — exactly what parkExhaustedRequeues produces.
 func reaperChild(t *testing.T, ms *mockStore, parentTxid string) (childTxid string) {
 	t.Helper()
 	childTxid, childRaw := spendingTx(t, parentTxid, 0, 1)
-	ms.replayRows = []*models.TransactionStatus{{
-		TxID:      childTxid,
-		Status:    models.StatusPendingRetry,
-		RawTx:     childRaw,
-		Timestamp: time.Now().Add(-2 * time.Hour),
-	}}
+	parkedAt := time.Now().Add(-2 * time.Hour)
+	ms.parkTx(childTxid, childRaw, parkedAt, parkedAt)
 	return childTxid
 }
 
@@ -368,8 +369,24 @@ func TestReapOnce_MissingParent_LeavesRowForNextTick(t *testing.T) {
 	if got := rejectedUpdates(ms); len(got) != 0 {
 		t.Fatalf("reaper missing-parent must leave the row for the next tick, got REJECTED %+v", got[0])
 	}
-	if got := ms.lastUpdateForTxid(childTxid); got != nil {
-		t.Fatalf("no status write expected for the child, got %+v", got)
+	// The row must survive as PENDING_RETRY — and must be RESCHEDULED, not
+	// left untouched. Leaving it alone was the original behavior and the
+	// direct cause of the starvation bug: a failed rebroadcast never rewrote
+	// the row, so its timestamp_at stayed frozen at park time, it sank below
+	// every newer eligible row in the newest-first scan, and at 24h it fell
+	// out of the lookback window and was abandoned in a non-terminal state.
+	if got := ms.lastUpdateForTxid(childTxid); got == nil || got.Status != models.StatusPendingRetry {
+		t.Fatalf("child should remain PENDING_RETRY, got %+v", got)
+	}
+	ms.mu.Lock()
+	pr := ms.pendingRetries[childTxid]
+	ms.mu.Unlock()
+	if pr == nil {
+		t.Fatal("child dropped out of the durable retry queue after a no-verdict rebroadcast")
+	}
+	if !pr.NextRetryAt.After(time.Now()) {
+		t.Errorf("next_retry_at = %v is not in the future; an unresolved row must back off "+
+			"rather than be re-broadcast on every tick forever", pr.NextRetryAt)
 	}
 }
 

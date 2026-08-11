@@ -406,9 +406,39 @@ type PropagationConfig struct {
 	// declared but unread before #295 — deployments that explicitly set
 	// it (e.g. to the old default 500) start feeling their configured
 	// value on upgrade.
-	RetryBackoffMs   int `mapstructure:"retry_backoff_ms"`
-	ReaperIntervalMs int `mapstructure:"reaper_interval_ms"`
-	ReaperBatchSize  int `mapstructure:"reaper_batch_size"`
+	RetryBackoffMs int `mapstructure:"retry_backoff_ms"`
+	// PendingRetryBackoffMs is the base delay before a PENDING_RETRY row's
+	// first reaper attempt. Each subsequent attempt doubles it, capped at
+	// PendingRetryMaxBackoffMs, with ±20% jitter so a batch parked together
+	// doesn't re-broadcast in lockstep.
+	//
+	// Before #299 there was no per-row schedule at all: eligibility was
+	// "parked more than a hardcoded 5 minutes ago", so every parked tx —
+	// including a child whose parent lands a second later — waited the full
+	// 5 minutes, and a row that kept failing was retried every tick forever.
+	// Defaults to 5000ms; non-positive falls back to the default.
+	PendingRetryBackoffMs int `mapstructure:"pending_retry_backoff_ms"`
+	// PendingRetryMaxBackoffMs caps the exponential above. Defaults to
+	// 300000ms (5 minutes) — the old flat eligibility age, so the slowest
+	// this ever retries matches the previous behavior while early attempts
+	// are far faster.
+	PendingRetryMaxBackoffMs int `mapstructure:"pending_retry_max_backoff_ms"`
+	// PendingRetryMaxAttempts bounds how many times the reaper rebroadcasts
+	// a PENDING_RETRY row before giving up and writing REJECTED.
+	//
+	// Without a bound a tx whose parent never arrives — the single most
+	// common client mistake, spending an outpoint that does not exist — is
+	// retried forever. Before #299 such rows were not retried forever so
+	// much as silently abandoned: their timestamp_at never moved, so at
+	// staleScanLookback (24h) they fell out of the reaper's scan window and
+	// stayed PENDING_RETRY with no terminal status, no log and no metric.
+	//
+	// The default 288 is 24h at the 5-minute backoff cap, so give-up happens
+	// about when abandonment used to — except it is now an observable
+	// verdict the submitter can read. Non-positive falls back to the default.
+	PendingRetryMaxAttempts int `mapstructure:"pending_retry_max_attempts"`
+	ReaperIntervalMs        int `mapstructure:"reaper_interval_ms"`
+	ReaperBatchSize         int `mapstructure:"reaper_batch_size"`
 	// ReaperRebroadcastBatch caps how many stuck transactions the reaper's
 	// durable-rebroadcast backstop pushes back through the register+broadcast
 	// pipeline per tick (reapOnce collects at most this many stale RECEIVED /
@@ -1001,6 +1031,9 @@ func setDefaults() {
 	viper.SetDefault("propagation.merkle_concurrency", 10)
 	viper.SetDefault("propagation.retry_max_attempts", 5)
 	viper.SetDefault("propagation.retry_backoff_ms", 2000)
+	viper.SetDefault("propagation.pending_retry_backoff_ms", 5000)
+	viper.SetDefault("propagation.pending_retry_max_backoff_ms", 300000)
+	viper.SetDefault("propagation.pending_retry_max_attempts", 288)
 	viper.SetDefault("propagation.reaper_interval_ms", 30000)
 	viper.SetDefault("propagation.reaper_batch_size", 500)
 	viper.SetDefault("propagation.reaper_rebroadcast_batch", 200)

@@ -182,15 +182,12 @@ func buildChain(t *testing.T, rootTxID string, depth int) []chainLink {
 	return links
 }
 
-// parkedRow renders a chain link as the store row parkExhaustedRequeues
-// leaves behind: PENDING_RETRY, carrying RawTx, stamped when it parked.
-func parkedRow(link chainLink, parkedAt time.Time) *models.TransactionStatus {
-	return &models.TransactionStatus{
-		TxID:      link.txid,
-		Status:    models.StatusPendingRetry,
-		RawTx:     link.raw,
-		Timestamp: parkedAt,
-	}
+// park seeds a chain link in the state parkExhaustedRequeues leaves behind.
+// parkedAt doubles as the next-attempt time so the row is immediately due —
+// these tests are about what the reaper does with a due row, not about the
+// backoff schedule (nextPendingRetryDelay has its own coverage).
+func park(ms *mockStore, link chainLink, parkedAt time.Time) {
+	ms.parkTx(link.txid, link.raw, parkedAt, parkedAt)
 }
 
 // newReaperPropagator builds a propagator with a configurable rebroadcast cap
@@ -247,10 +244,10 @@ func TestReapOnce_PendingRetryChain_ConvergesInOneTick(t *testing.T) {
 	root := strings.Repeat("11", 32)
 	chain := buildChain(t, root, depth)
 
-	parkedAt := time.Now().Add(-10 * time.Minute) // older than stalePendingRetryAge
+	parkedAt := time.Now().Add(-10 * time.Minute)
 	ms := newMockStore()
 	for _, link := range chain {
-		ms.replayRows = append(ms.replayRows, parkedRow(link, parkedAt))
+		park(ms, link, parkedAt)
 	}
 
 	tn := newDepAwareTeranode(t, root)
@@ -300,9 +297,9 @@ func TestReapOnce_PendingRetry_StarvedByNewerBacklog(t *testing.T) {
 
 	now := time.Now()
 	ms := newMockStore()
-	ms.replayRows = append(ms.replayRows, parkedRow(old, now.Add(-6*time.Hour)))
+	park(ms, old, now.Add(-6*time.Hour))
 	for i, link := range newer {
-		ms.replayRows = append(ms.replayRows, parkedRow(link, now.Add(-time.Duration(10+i)*time.Minute)))
+		park(ms, link, now.Add(-time.Duration(10+i)*time.Minute))
 	}
 
 	// Root of the newer rows is NOT accepted, so they never resolve and never
@@ -338,9 +335,7 @@ func TestReapOnce_PendingRetry_NeverSilentlyAbandoned(t *testing.T) {
 	orphan := buildChain(t, root, 1)[0]
 
 	ms := newMockStore()
-	ms.replayRows = []*models.TransactionStatus{
-		parkedRow(orphan, time.Now().Add(-25*time.Hour)), // past staleScanLookback
-	}
+	park(ms, orphan, time.Now().Add(-25*time.Hour)) // past staleScanLookback
 
 	// Parent is on-chain, so a retry would succeed immediately.
 	tn := newDepAwareTeranode(t, root)
@@ -427,7 +422,7 @@ func TestReapOnce_PendingRetry_RecoversWhenParentAccepted(t *testing.T) {
 	child := chain[0]
 
 	ms := newMockStore()
-	ms.replayRows = []*models.TransactionStatus{parkedRow(child, time.Now().Add(-10*time.Minute))}
+	park(ms, child, time.Now().Add(-10*time.Minute))
 
 	tn := newDepAwareTeranode(t, root) // parent already on-chain
 	p := newReaperPropagator(t, tn.URL(), ms, 0)
@@ -437,12 +432,22 @@ func TestReapOnce_PendingRetry_RecoversWhenParentAccepted(t *testing.T) {
 	if !acceptedTxIDs(ms)[child.txid] {
 		t.Fatalf("parked child was not lifted to ACCEPTED_BY_NETWORK after its parent landed")
 	}
-	ms.mu.Lock()
-	cleared := len(ms.cleared)
-	ms.mu.Unlock()
-	if cleared == 0 {
-		t.Errorf("ClearRetryState was never called: the row keeps its PENDING_RETRY retry " +
-			"bins after resolving, so it stays visible to a next_retry_at-ordered drain")
+
+	// And it must leave the retry queue. Asserted behaviorally rather than by
+	// watching for a ClearRetryState call: the resolving write goes through
+	// BatchUpdateStatusReturning, and GetReadyRetries filters on
+	// status='PENDING_RETRY', so a resolved row drops out on its own. Pinning
+	// the method would pin an implementation detail; pinning the query result
+	// pins the property that actually matters.
+	ready, err := ms.GetReadyRetries(context.Background(), time.Now(), 100)
+	if err != nil {
+		t.Fatalf("GetReadyRetries: %v", err)
+	}
+	for _, r := range ready {
+		if r.TxID == child.txid {
+			t.Fatalf("resolved child %s is still served by the durable retry drain; "+
+				"it would be rebroadcast to teranode every tick forever", child.txid[:12])
+		}
 	}
 }
 
@@ -466,9 +471,10 @@ func TestRejectedAncestor_GrandparentRejected_Cascades(t *testing.T) {
 
 	ms := newMockStore()
 	// Grandparent (the chain root) is terminally REJECTED; the parent between
-	// it and the child is merely parked.
+	// it and the child is merely parked. The parent's row carries its raw
+	// bytes, which is how the walk discovers the grandparent.
 	ms.setStatus(root, models.StatusRejected)
-	ms.setStatus(parent.txid, models.StatusPendingRetry)
+	ms.setStatusRow(parent.txid, models.StatusPendingRetry, parent.raw)
 
 	p := newReaperPropagator(t, "http://127.0.0.1:0", ms, 0)
 

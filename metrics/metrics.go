@@ -292,6 +292,43 @@ var PropagationRequeueExhaustedTotal = promauto.NewCounter(prometheus.CounterOpt
 	Help: "Transactions parked at PENDING_RETRY after exhausting the in-memory requeue budget with no network verdict.",
 })
 
+// PropagationPendingRetryTotal counts durable-retry lifecycle events for
+// transactions parked at PENDING_RETRY.
+//
+// outcome="scheduled": a parked tx was booked for another reaper attempt with
+// an exponential-backoff next_retry_at. outcome="exhausted": it burned
+// propagation.pending_retry_max_attempts and was terminalized REJECTED
+// because a parent it spends never reached the network.
+//
+// A rising "exhausted" rate means clients are submitting transactions whose
+// parents arcade never sees — before #299 those rows were not terminalized at
+// all: their timestamp_at never moved, so at 24h they fell out of the reaper's
+// scan window and stayed PENDING_RETRY permanently, invisible to every gauge.
+var PropagationPendingRetryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_propagation_pending_retry_total",
+	Help: "Durable-retry lifecycle events for PENDING_RETRY transactions (scheduled for another attempt vs terminalized after exhausting the budget).",
+}, []string{"outcome"}) // scheduled, exhausted
+
+// PropagationParkedDepth is the number of transactions currently parked at
+// PENDING_RETRY, and PropagationParkedOldestAgeSeconds the age of the oldest.
+//
+// PENDING_RETRY is deliberately absent from the stuck-transient census
+// (reaper.go stuckTransientStatuses tracks RECEIVED and ACCEPTED_BY_NETWORK
+// only), and reaper_ready_depth saturates at the per-tick rebroadcast cap, so
+// before these existed the parked set was both unbounded and unmeasurable —
+// while #299 makes parking an expected steady state for cross-submission
+// chains rather than a poison-batch rarity.
+var (
+	PropagationParkedDepth = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "arcade_propagation_parked_depth",
+		Help: "Transactions currently parked at PENDING_RETRY awaiting durable reaper rebroadcast.",
+	})
+	PropagationParkedOldestAgeSeconds = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "arcade_propagation_parked_oldest_age_seconds",
+		Help: "Age of the oldest transaction parked at PENDING_RETRY.",
+	})
+)
+
 // APITxsSubmittedTotal counts individual transactions submitted through the
 // API, by route and dedup result. Unlike the HTTP request histogram (one
 // sample per request), this counts PER TRANSACTION — the /txs batch route

@@ -210,7 +210,6 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 	seenDeadline := now.Add(-staleSeenOnNetworkAge)
 	receivedDeadline := now.Add(-staleReceivedAge)
 	acceptedDeadline := now.Add(-staleAcceptedByNetworkAge)
-	pendingRetryDeadline := now.Add(-stalePendingRetryAge)
 
 	stuckTransientDeadline := now.Add(-stuckTransientAge)
 	// The stuck-transient census (counts + oldest age per status) is resolved
@@ -284,17 +283,18 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 				return nil
 			}
 		case models.StatusPendingRetry:
-			// Parked by parkExhaustedRequeues: the fast path spent its whole
-			// requeue budget without a verdict and released the tx's Kafka
-			// offset so the consumer could keep moving. The reaper is now the
-			// ONLY thing that will retry it, so this arm is what makes the
-			// poison-batch escape a park rather than a drop. A successful
-			// rebroadcast lifts the row straight to ACCEPTED_BY_NETWORK /
-			// REJECTED (the lattice permits both from PENDING_RETRY); another
-			// no-verdict result leaves it here for the next tick.
-			if !st.Timestamp.Before(pendingRetryDeadline) {
-				return nil
-			}
+			// Parked rows are NOT selected by this walk any more — they are
+			// drained by next_retry_at via store.GetReadyRetries below.
+			//
+			// Selecting them here meant selecting by timestamp_at, which
+			// Postgres serves newest-first and Pebble oldest-first, capped at
+			// rebroadcastBatch. Since a failed rebroadcast never rewrote the
+			// row, its timestamp stayed frozen at park time: on Postgres it
+			// sank below every newer eligible row and was never retried
+			// again, and on Pebble a block of unresolvable orphans sat at the
+			// head of the queue and starved every other arm of this walk.
+			// Either way the row silently left the 24h scan window for good.
+			return nil
 		default:
 			// Terminal statuses (REJECTED, DOUBLE_SPEND_ATTEMPTED, MINED,
 			// IMMUTABLE) and the remaining transient in-between states are
@@ -401,64 +401,206 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 			zap.Int("cap", stuckAttributionCap))
 	}
 
-	if len(stuck) == 0 {
+	if len(stuck) > 0 {
+		p.logger.Info("reaper: rebroadcasting stuck txs", zap.Int("count", len(stuck)))
+		p.rebroadcastStuck(ctx, stuck, false)
+	}
+
+	// Parked rows are a separate, next_retry_at-ordered drain.
+	p.drainParkedRetries(ctx, now, since)
+}
+
+// drainParkedRetries rebroadcasts PENDING_RETRY rows whose next_retry_at is
+// due, oldest schedule first.
+//
+// This replaces selecting parked rows in the timestamp_at walk above. The
+// store already had everything needed for a proper durable retry queue —
+// retry_count, next_retry_at, idx_tx_retry_ready(next_retry_at) WHERE
+// status='PENDING_RETRY', and GetReadyRetries' "ORDER BY next_retry_at LIMIT n
+// FOR UPDATE SKIP LOCKED" — implemented on every backend and wired to nothing.
+// Using it buys FIFO drain, per-row backoff, a per-row attempt count to give
+// up on, and multi-process safety, all at once.
+func (p *Propagator) drainParkedRetries(ctx context.Context, now, since time.Time) {
+	if p.store == nil {
 		return
 	}
 
-	p.logger.Info("reaper: rebroadcasting stuck txs", zap.Int("count", len(stuck)))
+	// Parked-set gauges. PENDING_RETRY is deliberately absent from
+	// stuckTransientStatuses, and reaper_ready_depth saturates at the
+	// per-tick cap, so without these the parked set is invisible — and #299
+	// makes parking an expected steady state, not a rarity. Safe to bound by
+	// `since`: every reschedule rewrites timestamp_at, so a live parked row
+	// is always inside the window.
+	if census, err := p.store.CensusStatusesSince(ctx, since, now, []models.Status{models.StatusPendingRetry}); err == nil {
+		c := census[models.StatusPendingRetry]
+		metrics.PropagationParkedDepth.Set(float64(c.Count))
+		age := 0.0
+		if !c.Oldest.IsZero() {
+			age = now.Sub(c.Oldest).Seconds()
+		}
+		metrics.PropagationParkedOldestAgeSeconds.Set(age)
+	} else {
+		p.logger.Error("reaper: parked census failed", zap.Error(err))
+	}
 
+	ready, err := p.store.GetReadyRetries(ctx, now, p.rebroadcastBatch)
+	if err != nil {
+		p.logger.Error("reaper: parked retry scan failed", zap.Error(err))
+		return
+	}
+	if len(ready) == 0 {
+		return
+	}
+
+	msgs := make([]propagationMsg, 0, len(ready))
+	for _, r := range ready {
+		// Carry InputTXIDs so the dependency layering below — and
+		// rejectedAncestor's store consult — don't have to re-parse RawTx
+		// once per tx per tick, forever, for rows that never resolve.
+		msgs = append(msgs, propagationMsg{
+			TXID:       r.TxID,
+			RawTx:      r.RawTx,
+			InputTXIDs: parentTxIDsOf(propagationMsg{TXID: r.TxID, RawTx: r.RawTx}),
+		})
+	}
+	p.logger.Info("reaper: rebroadcasting parked txs", zap.Int("count", len(msgs)))
+	p.rebroadcastStuck(ctx, msgs, true)
+}
+
+// rebroadcastStuck pushes msgs back through the register+broadcast pipeline
+// and settles each result.
+//
+// parked marks the durable-retry path: a msg that still has no verdict gets
+// its next attempt booked (or is given up on) rather than being left for an
+// unconditional retry on the next tick.
+func (p *Propagator) rebroadcastStuck(ctx context.Context, msgs []propagationMsg, parked bool) {
 	// Use the same broadcast pipeline as processBatch so the per-tx
 	// classification (Accepted / Rejected / Requeue) applies uniformly.
 	// applyTerminalStatuses writes terminal rows AND notifies the
 	// dispatcher — txids the dispatcher doesn't know about (because the
 	// original Kafka message terminated long ago) get a no-op notify,
 	// which is fine.
-	registered, _ := p.registerBatch(ctx, stuck)
+	registered, _ := p.registerBatch(ctx, msgs)
 	if len(registered) == 0 {
 		return
 	}
-	rawTxs := make([][]byte, len(registered))
-	for i, m := range registered {
-		rawTxs[i] = m.RawTx
-	}
-	results := p.broadcastInChunks(ctx, registered, rawTxs)
 
 	var accepted, rejected int
-	terminalStatuses := make([]*models.TransactionStatus, 0, len(results))
-	for i, res := range results {
-		switch res.class {
-		case txResultClassAccepted:
-			accepted++
-			if res.status != nil {
-				terminalStatuses = append(terminalStatuses, res.status)
+	terminalStatuses := make([]*models.TransactionStatus, 0, len(registered))
+	// unresolved collects msgs that produced no verdict this pass.
+	var unresolved []propagationMsg
+
+	// Broadcast one dependency layer at a time. Within a layer no tx spends
+	// another, so teranode's parallel bulk processing can accept them all;
+	// each layer's accepts are visible to the next.
+	//
+	// Before this the whole selected batch went out as a single /txs call —
+	// which both violated the "no parent and child in one batch" contract the
+	// design relies on, and meant a parked chain could only advance ONE level
+	// per tick. At reaper_interval_ms=30000 a depth-100 chain took ~52
+	// minutes; it now drains in a single tick.
+	for _, layer := range layerByDependency(registered) {
+		rawTxs := make([][]byte, len(layer))
+		for i, m := range layer {
+			rawTxs[i] = m.RawTx
+		}
+		results := p.broadcastInChunks(ctx, layer, rawTxs)
+		for i, res := range results {
+			switch res.class {
+			case txResultClassAccepted:
+				accepted++
+				if res.status != nil {
+					terminalStatuses = append(terminalStatuses, res.status)
+				}
+			case txResultClassRejected:
+				rejected++
+				if res.status != nil {
+					terminalStatuses = append(terminalStatuses, res.status)
+				}
+			case txResultClassMissingParent:
+				// Condition, not verdict (#254/#295): only a REJECTED
+				// ancestor in arcade's own store condemns the child. A
+				// missing parent that is merely late must never terminalize.
+				cascaded, _ := p.resolveMissingParents(ctx, []propagationMsg{layer[i]}, []string{res.errMsg})
+				if len(cascaded) > 0 {
+					rejected += len(cascaded)
+					terminalStatuses = append(terminalStatuses, cascaded...)
+					continue
+				}
+				unresolved = append(unresolved, layer[i])
+			case txResultClassUnknown, txResultClassRequeue:
+				// No verdict from any peer. The reaper bypasses the
+				// dispatcher, so there is no inFlight entry to requeue
+				// against — the retry is the next scheduled attempt.
+				unresolved = append(unresolved, layer[i])
 			}
-		case txResultClassRejected:
-			rejected++
-			if res.status != nil {
-				terminalStatuses = append(terminalStatuses, res.status)
-			}
-		case txResultClassMissingParent:
-			// The reaper's dep-blind rebroadcast can resurface a child
-			// before its parent (both parked, or the parent wedged on
-			// another pod). Pre-#295 this drew TX_MISSING_PARENT and
-			// falsely terminalized the child REJECTED. Condition, not
-			// verdict: only a REJECTED ancestor in arcade's own store
-			// condemns the child; otherwise the row stays as-is and the
-			// next tick retries after the parent lands.
-			if cascaded, _ := p.resolveMissingParents(ctx, []propagationMsg{registered[i]}, []string{res.errMsg}); len(cascaded) > 0 {
-				rejected += len(cascaded)
-				terminalStatuses = append(terminalStatuses, cascaded...)
-			}
-		case txResultClassUnknown, txResultClassRequeue:
-			// Requeue / Unknown from the reaper's rebroadcast path:
-			// leave the row alone so the next reaper tick picks it up.
-			// The reaper bypasses the dispatcher, so there's no inFlight
-			// entry to requeue against — natural retry is just the next
-			// tick.
 		}
 	}
+
 	// nil io: the reaper runs off any claim's pipeline, so terminal
 	// notifications fan out to every live dispatcher — whichever one
 	// holds a tx in flight releases its offset, the rest no-op.
 	p.applyTerminalStatuses(ctx, terminalStatuses, accepted, rejected, nil)
+
+	if parked {
+		for _, m := range unresolved {
+			p.schedulePendingRetry(ctx, m.TXID, m.RawTx)
+		}
+	}
+}
+
+// layerByDependency splits msgs into dependency layers: layer 0 has no parent
+// inside msgs, layer N's parents all live in layers < N. Order within a layer
+// is the input order.
+//
+// Any msg left in a cycle (impossible for real transactions, but cheap to
+// guard) is appended as a final layer so nothing is silently dropped.
+func layerByDependency(msgs []propagationMsg) [][]propagationMsg {
+	if len(msgs) < 2 {
+		return [][]propagationMsg{msgs}
+	}
+	index := make(map[string]int, len(msgs))
+	for i, m := range msgs {
+		if _, ok := index[m.TXID]; !ok {
+			index[m.TXID] = i
+		}
+	}
+	// depth[i] = 1 + max(depth of in-batch parents), memoized.
+	depth := make([]int, len(msgs))
+	state := make([]int8, len(msgs)) // 0 unvisited, 1 in progress, 2 done
+	var resolve func(i int) int
+	resolve = func(i int) int {
+		switch state[i] {
+		case 2:
+			return depth[i]
+		case 1:
+			return 0 // cycle guard
+		}
+		state[i] = 1
+		best := 0
+		for _, parent := range msgs[i].InputTXIDs {
+			j, ok := index[parent]
+			if !ok || j == i {
+				continue
+			}
+			if d := resolve(j) + 1; d > best {
+				best = d
+			}
+		}
+		depth[i] = best
+		state[i] = 2
+		return best
+	}
+
+	maxDepth := 0
+	for i := range msgs {
+		if d := resolve(i); d > maxDepth {
+			maxDepth = d
+		}
+	}
+	layers := make([][]propagationMsg, maxDepth+1)
+	for i, m := range msgs {
+		layers[depth[i]] = append(layers[depth[i]], m)
+	}
+	return layers
 }

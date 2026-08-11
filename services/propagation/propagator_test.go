@@ -151,6 +151,9 @@ type mockStore struct {
 	// net's store consult (rejectedAncestor). Absent txids return
 	// store.ErrNotFound.
 	statusByTxID map[string]models.Status
+	// rawByTxID carries raw_tx alongside statusByTxID so GetStatus returns
+	// rows shaped like the real backends'. See setStatusRow.
+	rawByTxID map[string][]byte
 }
 
 // setStatus seeds the row GetStatus returns for txid.
@@ -163,13 +166,27 @@ func (m *mockStore) setStatus(txid string, status models.Status) {
 	m.statusByTxID[txid] = status
 }
 
+// setStatusRow seeds status AND raw bytes for txid. The raw bytes matter to
+// rejectedAncestor's transitive walk: climbing from a parent to a grandparent
+// means re-deriving the parent's own inputs, which real store rows carry in
+// raw_tx.
+func (m *mockStore) setStatusRow(txid string, status models.Status, rawTx []byte) {
+	m.setStatus(txid, status)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.rawByTxID == nil {
+		m.rawByTxID = make(map[string][]byte)
+	}
+	m.rawByTxID[txid] = append([]byte(nil), rawTx...)
+}
+
 // GetStatus serves the seeded statusByTxID map; unknown txids return
 // store.ErrNotFound, matching the real backends' contract.
 func (m *mockStore) GetStatus(_ context.Context, txid string) (*models.TransactionStatus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if st, ok := m.statusByTxID[txid]; ok {
-		return &models.TransactionStatus{TxID: txid, Status: st}, nil
+		return &models.TransactionStatus{TxID: txid, Status: st, RawTx: m.rawByTxID[txid]}, nil
 	}
 	return nil, store.ErrNotFound
 }
@@ -241,28 +258,96 @@ func (m *mockStore) SetPendingRetryFields(_ context.Context, txid string, rawTx 
 	}
 	// Reflect PENDING_RETRY status in the updates stream so existing tests that
 	// inspect status updates continue to observe the transition.
+	//
+	// Carry the row's current ExtraInfo forward. The real statement is
+	// "UPDATE transactions SET status=$2, raw_tx=$3, next_retry_at=$4,
+	// timestamp_at=NOW()" — it does not touch extra_info, so the park reason
+	// written moments earlier by applyTerminalStatuses survives. A mock that
+	// appended a reason-less row would make GET /tx look like it lost the
+	// explanation when it hadn't.
+	var extra string
+	for i := len(m.updates) - 1; i >= 0; i-- {
+		if m.updates[i].TxID == txid {
+			extra = m.updates[i].ExtraInfo
+			break
+		}
+	}
 	m.updates = append(m.updates, &models.TransactionStatus{
 		TxID:      txid,
 		Status:    models.StatusPendingRetry,
 		Timestamp: time.Now(),
+		ExtraInfo: extra,
 	})
 	return nil
 }
 
+// GetReadyRetries mirrors the real query's contract:
+//
+//	WHERE status = 'PENDING_RETRY' AND next_retry_at <= now
+//	ORDER BY next_retry_at LIMIT n
+//
+// Both halves matter. The status filter is how a row leaves the retry queue
+// when it resolves — the resolving write goes through BatchUpdateStatusReturning,
+// not through ClearRetryState, so a mock that ignored status would keep serving
+// rows that are already ACCEPTED. And the ordering is the whole point of using
+// this queue rather than a timestamp scan: oldest schedule first, so no row can
+// be starved by newer arrivals.
 func (m *mockStore) GetReadyRetries(_ context.Context, now time.Time, limit int) ([]*store.PendingRetry, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := make([]*store.PendingRetry, 0, len(m.pendingRetries))
-	for _, pr := range m.pendingRetries {
-		if !pr.NextRetryAt.After(now) {
-			cp := *pr
-			out = append(out, &cp)
-			if len(out) >= limit {
-				break
-			}
+	for txid, pr := range m.pendingRetries {
+		if pr.NextRetryAt.After(now) {
+			continue
 		}
+		if st, ok := m.latestStatusLocked(txid); ok && st != models.StatusPendingRetry {
+			continue
+		}
+		cp := *pr
+		out = append(out, &cp)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].NextRetryAt.Before(out[j].NextRetryAt) })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
 	}
 	return out, nil
+}
+
+// latestStatusLocked returns the most recent status written for txid, falling
+// back to its seeded replay row. Caller holds m.mu.
+func (m *mockStore) latestStatusLocked(txid string) (models.Status, bool) {
+	for i := len(m.updates) - 1; i >= 0; i-- {
+		if m.updates[i].TxID == txid {
+			return m.updates[i].Status, true
+		}
+	}
+	for _, r := range m.replayRows {
+		if r.TxID == txid {
+			return r.Status, true
+		}
+	}
+	return "", false
+}
+
+// parkTx seeds a transaction in the state parkExhaustedRequeues leaves behind:
+// a PENDING_RETRY status row carrying the raw bytes, plus the durable retry
+// bins the reaper drains by.
+func (m *mockStore) parkTx(txid string, rawTx []byte, parkedAt, nextRetryAt time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.replayRows = append(m.replayRows, &models.TransactionStatus{
+		TxID:      txid,
+		Status:    models.StatusPendingRetry,
+		RawTx:     rawTx,
+		Timestamp: parkedAt,
+	})
+	m.retryCounts[txid]++
+	m.pendingRetries[txid] = &store.PendingRetry{
+		TxID:        txid,
+		RawTx:       append([]byte(nil), rawTx...),
+		RetryCount:  m.retryCounts[txid],
+		NextRetryAt: nextRetryAt,
+	}
 }
 
 func (m *mockStore) MarkMerkleRegisteredByTxIDs(_ context.Context, txids []string, ts time.Time) error {
