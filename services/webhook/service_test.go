@@ -28,6 +28,7 @@ type fakeStore struct {
 	subs map[string][]*models.Submission
 
 	deliveries []deliveryRecord
+	attempts   []attemptRecord
 }
 
 type deliveryRecord struct {
@@ -35,6 +36,11 @@ type deliveryRecord struct {
 	LastStatus   models.Status
 	RetryCount   int
 	NextRetryAt  *time.Time
+}
+
+type attemptRecord struct {
+	SubmissionID string
+	Result       string
 }
 
 func (s *fakeStore) GetSubmissionsByTxID(_ context.Context, txid string) ([]*models.Submission, error) {
@@ -70,6 +76,25 @@ func (s *fakeStore) UpdateDeliveryStatus(_ context.Context, id string, last mode
 				sub.LastDeliveredStatus = last
 				sub.RetryCount = retry
 				sub.NextRetryAt = nextRetry
+			}
+		}
+	}
+	return nil
+}
+
+// RecordDeliveryAttempt mirrors the real stores: attempts increments and the
+// last-attempt bookkeeping is overwritten, on every POST regardless of outcome.
+func (s *fakeStore) RecordDeliveryAttempt(_ context.Context, id string, at time.Time, result string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.attempts = append(s.attempts, attemptRecord{SubmissionID: id, Result: result})
+	for _, list := range s.subs {
+		for _, sub := range list {
+			if sub.SubmissionID == id {
+				sub.Attempts++
+				t := at
+				sub.LastAttemptAt = &t
+				sub.LastResult = result
 			}
 		}
 	}
@@ -112,6 +137,15 @@ func (s *fakeStore) GetOrInsertStatus(context.Context, *models.TransactionStatus
 func (s *fakeStore) BatchGetOrInsertStatus(context.Context, []*models.TransactionStatus) ([]store.BatchInsertResult, error) {
 	return nil, nil
 }
+
+func (s *fakeStore) GetTxIDsByBlockHash(context.Context, string) ([]string, error) {
+	return nil, nil
+}
+func (s *fakeStore) DeleteBUMPByBlockHash(context.Context, string) error          { return nil }
+func (s *fakeStore) MarkBlockReconciled(context.Context, string, time.Time) error { return nil }
+func (s *fakeStore) ListOrphanedBlocksToReconcile(context.Context, int) ([]*models.BlockProcessingStatus, error) {
+	return nil, nil
+}
 func (s *fakeStore) UpdateStatus(context.Context, *models.TransactionStatus) error { return nil }
 func (s *fakeStore) BatchUpdateStatus(context.Context, []*models.TransactionStatus) error {
 	return nil
@@ -126,12 +160,18 @@ func (s *fakeStore) GetStatus(context.Context, string) (*models.TransactionStatu
 	return nil, nil
 }
 
+func (s *fakeStore) EnrichMerklePath(context.Context, *models.TransactionStatus) {}
+
 func (s *fakeStore) GetStatusesSince(context.Context, time.Time) ([]*models.TransactionStatus, error) {
 	return nil, nil
 }
 
 func (s *fakeStore) IterateStatusesSince(context.Context, time.Time, func(*models.TransactionStatus) error) error {
 	return nil
+}
+
+func (s *fakeStore) CensusStatusesSince(context.Context, time.Time, time.Time, []models.Status) (map[models.Status]store.StatusCensus, error) {
+	return map[models.Status]store.StatusCensus{}, nil
 }
 
 func (s *fakeStore) SetStatusByBlockHash(context.Context, string, models.Status) ([]string, error) {
@@ -149,6 +189,14 @@ func (s *fakeStore) MarkMerkleRegisteredByTxIDs(context.Context, []string, time.
 func (s *fakeStore) InsertSubmission(context.Context, *models.Submission) error { return nil }
 func (s *fakeStore) GetSubmissionsByToken(context.Context, string) ([]*models.Submission, error) {
 	return nil, nil
+}
+
+func (s *fakeStore) IterateStatusesByToken(context.Context, string, time.Time, []models.Status, func(*models.TransactionStatus) error) error {
+	return nil
+}
+
+func (s *fakeStore) TokensForTxIDs(context.Context, []string) (map[string][]string, error) {
+	return map[string][]string{}, nil
 }
 func (s *fakeStore) InsertStump(context.Context, *models.Stump) error { return nil }
 func (s *fakeStore) GetStumpsByBlockHash(context.Context, string) ([]*models.Stump, error) {
@@ -193,7 +241,7 @@ func (s *fakeStore) ListSubmissionsReadyForRetry(_ context.Context, now time.Tim
 func (s *fakeStore) ClearRetryState(context.Context, string, models.Status, string) error {
 	return nil
 }
-func (s *fakeStore) EnsureIndexes() error { return nil }
+func (s *fakeStore) EnsureIndexes(context.Context) error { return nil }
 func (s *fakeStore) UpsertDatahubEndpoint(context.Context, store.DatahubEndpoint) error {
 	return nil
 }
@@ -214,6 +262,7 @@ func (s *fakeStore) MarkBlockBUMPBuilt(context.Context, string, uint64, time.Tim
 	return nil
 }
 func (s *fakeStore) MarkBlocksOrphaned(context.Context, []string, time.Time) error { return nil }
+func (s *fakeStore) MarkBlocksParked(context.Context, []string) error              { return nil }
 
 //nolint:nilnil // unused stub.
 func (s *fakeStore) GetBlockProcessingStatus(context.Context, string) (*models.BlockProcessingStatus, error) {
@@ -258,12 +307,14 @@ func (p *scriptedPub) Close() error { return nil }
 // status, callback URL gets POSTed with the bearer token, store records
 // LastDeliveredStatus.
 func TestDeliverSuccess(t *testing.T) {
-	var receivedAuth string
+	var receivedAuth, receivedUA, receivedCT string
 	var receivedBody []byte
 	var hits atomic.Int32
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedAuth = r.Header.Get("Authorization")
+		receivedUA = r.Header.Get("User-Agent")
+		receivedCT = r.Header.Get("Content-Type")
 		body, _ := io.ReadAll(r.Body)
 		receivedBody = body
 		hits.Add(1)
@@ -301,6 +352,15 @@ func TestDeliverSuccess(t *testing.T) {
 	if receivedAuth != "Bearer tok-A" {
 		t.Errorf("Authorization = %q, want %q", receivedAuth, "Bearer tok-A")
 	}
+	// The documented allowlistable UA (issue #249) — receivers key WAF rules
+	// on the "arcade-webhook/" prefix, so it must never regress to Go's
+	// default UA. version.Version is "dev" outside ldflags builds.
+	if receivedUA != "arcade-webhook/dev" {
+		t.Errorf("User-Agent = %q, want %q", receivedUA, "arcade-webhook/dev")
+	}
+	if receivedCT != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", receivedCT)
+	}
 	var payload map[string]any
 	if err := json.Unmarshal(receivedBody, &payload); err != nil {
 		t.Fatalf("decoding callback body: %v", err)
@@ -310,6 +370,13 @@ func TestDeliverSuccess(t *testing.T) {
 	}
 	if len(st.deliveries) != 1 || st.deliveries[0].LastStatus != models.StatusMined {
 		t.Errorf("expected one MINED delivery record, got %+v", st.deliveries)
+	}
+	// Successful POST stamps the lifetime attempt bookkeeping.
+	if len(st.attempts) != 1 || st.attempts[0].Result != "delivered" {
+		t.Errorf("expected one delivered attempt record, got %+v", st.attempts)
+	}
+	if sub := st.subs[txA][0]; sub.Attempts != 1 || sub.LastResult != "delivered" || sub.LastAttemptAt == nil {
+		t.Errorf("submission attempt state not stamped: %+v", sub)
 	}
 }
 
@@ -389,6 +456,15 @@ func TestRetryOnFailure(t *testing.T) {
 	}
 	if d.NextRetryAt == nil || !d.NextRetryAt.After(before) {
 		t.Errorf("NextRetryAt = %v, expected after %v", d.NextRetryAt, before)
+	}
+	// The failed POST stamps the lifetime attempt bookkeeping with the same
+	// reason string the failure log carries — this is what GET /tx's
+	// callbacks[].lastResult surfaces for receiver self-diagnosis (#249).
+	if len(st.attempts) != 1 || st.attempts[0].Result != "status 500" {
+		t.Errorf("expected one 'status 500' attempt record, got %+v", st.attempts)
+	}
+	if sub := st.subs[txA][0]; sub.Attempts != 1 || sub.LastResult != "status 500" {
+		t.Errorf("submission attempt state not stamped on failure: %+v", sub)
 	}
 }
 

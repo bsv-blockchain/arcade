@@ -3,8 +3,10 @@
 package bump
 
 import (
+	"cmp"
 	"fmt"
 	"math"
+	"slices"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
@@ -391,6 +393,128 @@ func ExtractMinimalPathForTx(bumpData []byte, txid string) []byte {
 	return minimal.Bytes()
 }
 
+// CompoundIndex is a compound BUMP parsed and indexed for repeated per-tx
+// minimal-path extraction: a level-0 txid→offset map plus every level's
+// elements sorted by offset for binary search. Callers that need minimal paths
+// for many txs of the same block (e.g. SSE/webhook fan-out enrichment) build
+// one index via IndexCompound, cache it, and call MinimalPathBytes per tx —
+// O(depth·log level-size) each, instead of a re-parse plus the O(level-size)
+// linear scans that ExtractMinimalPath's findLeafByOffset walk costs.
+//
+// The index shares the parsed PathElements and is read-only after
+// construction, so a cached CompoundIndex is safe for concurrent use.
+type CompoundIndex struct {
+	blockHeight uint32
+	// txOffsets maps each level-0 leaf hash to its offset (duplicate-flag
+	// leaves carry no hash and are reachable only as siblings via levels).
+	txOffsets map[chainhash.Hash]uint64
+	// levels holds every PathElement of the compound per level, sorted by
+	// Offset so leafAt can binary-search. Chosen over per-level maps: ~8B
+	// per element instead of ~50B, and the resident set is what the store's
+	// bump cache has to budget for.
+	levels [][]*transaction.PathElement
+	leaves int
+}
+
+// IndexCompound parses a compound BUMP and indexes it for per-tx extraction.
+// Returns an error if the BUMP cannot be parsed.
+func IndexCompound(bumpData []byte) (*CompoundIndex, error) {
+	compound, err := transaction.NewMerklePathFromBinary(bumpData)
+	if err != nil {
+		return nil, err
+	}
+	ci := &CompoundIndex{
+		blockHeight: compound.BlockHeight,
+		levels:      make([][]*transaction.PathElement, len(compound.Path)),
+	}
+	if len(compound.Path) > 0 {
+		ci.txOffsets = make(map[chainhash.Hash]uint64, len(compound.Path[0]))
+		for _, leaf := range compound.Path[0] {
+			if leaf.Hash != nil {
+				ci.txOffsets[*leaf.Hash] = leaf.Offset
+			}
+		}
+	}
+	for level, elems := range compound.Path {
+		sorted := make([]*transaction.PathElement, len(elems))
+		copy(sorted, elems)
+		slices.SortFunc(sorted, func(a, b *transaction.PathElement) int {
+			return cmp.Compare(a.Offset, b.Offset)
+		})
+		ci.levels[level] = sorted
+		ci.leaves += len(sorted)
+	}
+	return ci, nil
+}
+
+// Leaves reports the total PathElement count across all levels — the size
+// proxy cache implementations use to budget resident memory.
+func (ci *CompoundIndex) Leaves() int { return ci.leaves }
+
+// BlockHeight reports the block height the compound BUMP anchors to.
+func (ci *CompoundIndex) BlockHeight() uint64 { return uint64(ci.blockHeight) }
+
+// Contains reports whether txid is a level-0 leaf of the compound — i.e.
+// whether this block provably includes the transaction. Used by the reorg
+// reconciler to decide re-anchor (tx present in the canonical block's
+// BUMP) vs revert. O(1) via the txOffsets map; false for unparseable
+// txids and duplicate-flag leaves (which carry no hash).
+func (ci *CompoundIndex) Contains(txid string) bool {
+	txHash, err := chainhash.NewHashFromHex(txid)
+	if err != nil {
+		return false
+	}
+	_, ok := ci.txOffsets[*txHash]
+	return ok
+}
+
+// leafAt returns the element at (level, offset), or nil when absent.
+func (ci *CompoundIndex) leafAt(level int, offset uint64) *transaction.PathElement {
+	if level >= len(ci.levels) {
+		return nil
+	}
+	elems := ci.levels[level]
+	i, ok := slices.BinarySearchFunc(elems, offset, func(e *transaction.PathElement, off uint64) int {
+		return cmp.Compare(e.Offset, off)
+	})
+	if !ok {
+		return nil
+	}
+	return elems[i]
+}
+
+// MinimalPathBytes returns the BRC-74 serialized minimal path for txid, or nil
+// when the txid is unparseable or not a level-0 leaf of the compound. The walk
+// mirrors ExtractMinimalPath (level-0 leaf + sibling, then one sibling per
+// upper level, absent nodes skipped) with indexed lookups in place of scans.
+func (ci *CompoundIndex) MinimalPathBytes(txid string) []byte {
+	txHash, err := chainhash.NewHashFromHex(txid)
+	if err != nil {
+		return nil
+	}
+	txOffset, ok := ci.txOffsets[*txHash]
+	if !ok {
+		return nil
+	}
+	mp := &transaction.MerklePath{
+		BlockHeight: ci.blockHeight,
+		Path:        make([][]*transaction.PathElement, len(ci.levels)),
+	}
+	offset := txOffset
+	for level := range ci.levels {
+		if level == 0 {
+			if leaf := ci.leafAt(0, offset); leaf != nil {
+				addLeaf(mp, 0, leaf)
+			}
+		}
+		if sibling := ci.leafAt(level, offset^1); sibling != nil {
+			addLeaf(mp, level, sibling)
+		}
+		offset >>= 1
+	}
+	return mp.Bytes()
+}
+
 // ExtractLevel0Hashes parses a BRC-74 STUMP binary and returns all level-0 hashes.
 func ExtractLevel0Hashes(stumpData []byte) []chainhash.Hash {
 	mp, err := transaction.NewMerklePathFromBinary(stumpData)
@@ -491,7 +615,20 @@ func correctedSubtree0Root(coinbaseBUMP []byte, numSubtrees int) *chainhash.Hash
 // Output is structurally equivalent to the old algorithm — same merkle root,
 // same extracted minimal paths for tracked txs — and the nine existing
 // BuildCompoundBUMP tests pass unchanged.
-func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, coinbaseBUMP []byte) (*transaction.MerklePath, []string, error) {
+//
+// headerMerkleRoot (optional, nil to skip) enables lifted-final-subtree
+// support: teranode allows only the FINAL subtree to be incomplete and, when
+// it is shorter than the first subtree's capacity, LIFTS its root to the
+// common height (one self-hash per missing level) before composing the block
+// merkle root. The lift amount is derived here by matching candidate
+// top-tree roots against headerMerkleRoot; the final subtree's STUMP is then
+// accepted at its natural (shorter) height, the lift levels are represented
+// as duplicate-flag elements, and a no-STUMP final slot is seeded with the
+// lifted root. Without this, any block whose final subtree holds at most
+// half the first subtree's capacity builds a compound the canonical chain
+// rejects (issue #234; sibling of merkle-service#179). Passing nil preserves
+// the legacy uniform-height behavior.
+func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, coinbaseBUMP []byte, headerMerkleRoot *chainhash.Hash) (*transaction.MerklePath, []string, error) {
 	if len(stumps) == 0 {
 		return nil, nil, fmt.Errorf("no stumps to build compound BUMP")
 	}
@@ -548,6 +685,16 @@ func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, c
 
 	totalHeight := internalHeight + subtreeRootLayer
 
+	// Lifted final subtree (teranode: only the final subtree may be
+	// incomplete; when shorter than the first subtree's capacity its root is
+	// self-hashed up to the common height before top-tree composition).
+	// Derive how many lift levels this block uses by matching candidate
+	// top-tree roots against the canonical header root. 0 for uniform blocks
+	// and when headerMerkleRoot is nil (legacy behavior preserved).
+	liftLevels := deriveFinalSubtreeLift(subtreeHashes, internalHeight, headerMerkleRoot)
+	finalIdx := numSubtrees - 1
+	finalNaturalHeight := internalHeight - liftLevels
+
 	compound := &transaction.MerklePath{
 		BlockHeight: blockHeight,
 		Path:        make([][]*transaction.PathElement, totalHeight),
@@ -570,19 +717,26 @@ func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, c
 		if err != nil {
 			return nil, nil, fmt.Errorf("parse STUMP for subtree %d: %w", stump.SubtreeIndex, err)
 		}
-		// A STUMP taller than internalHeight is tolerated: merkle-service
+		// The lifted final subtree's STUMP is legitimately shorter: its
+		// natural height is internalHeight - liftLevels. Every other subtree
+		// is complete and must cover internalHeight levels.
+		requiredHeight := internalHeight
+		if stump.SubtreeIndex == finalIdx {
+			requiredHeight = finalNaturalHeight
+		}
+		// A STUMP taller than requiredHeight is tolerated: merkle-service
 		// sometimes delivers a STUMP at full block height, and only its first
-		// internalHeight levels are the subtree-internal path — the placement
-		// loop below reads exactly those. A STUMP SHORTER than internalHeight
+		// requiredHeight levels are the subtree-internal path — the placement
+		// loop below reads exactly those. A STUMP SHORTER than requiredHeight
 		// cannot cover its subtree and is rejected.
-		if len(path.Path) < internalHeight {
-			return nil, nil, fmt.Errorf("subtree %d STUMP has internal height %d, expected at least %d", stump.SubtreeIndex, len(path.Path), internalHeight)
+		if len(path.Path) < requiredHeight {
+			return nil, nil, fmt.Errorf("subtree %d STUMP has internal height %d, expected at least %d", stump.SubtreeIndex, len(path.Path), requiredHeight)
 		}
 		if stump.SubtreeIndex == 0 && coinbaseTxID != nil {
 			applyCoinbaseToSTUMP(path, coinbaseTxID, coinbaseBUMP)
 		}
 
-		for level := 0; level < internalHeight; level++ {
+		for level := 0; level < requiredHeight; level++ {
 			shift := uint64(stump.SubtreeIndex) << uint(internalHeight-level) //nolint:gosec // subtreeIndex is bounded by numSubtrees; height is small
 			for _, elem := range path.Path[level] {
 				elem.Offset += shift
@@ -595,15 +749,37 @@ func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, c
 		}
 	}
 
+	// Represent the final subtree's lift levels: from its natural height up
+	// to internalHeight the node self-hashes, which BRC-74 encodes as a
+	// duplicate-flag sibling. Only needed when its own leaves are present
+	// (STUMP placed above); a no-STUMP final slot is seeded pre-lifted below.
+	if liftLevels > 0 && haveSTUMP[finalIdx] {
+		dupTrue := true
+		for level := finalNaturalHeight; level < internalHeight; level++ {
+			nodeOffset := uint64(finalIdx) << uint(internalHeight-level)
+			addLeaf(compound, level, &transaction.PathElement{
+				Offset:    nodeOffset + 1,
+				Duplicate: &dupTrue,
+			})
+		}
+	}
+
 	// Seed the subtree-root layer with hashes for slots that have NO STUMP;
 	// slots that do will have their subtree root computed up from their
 	// level-0 leaves in the top-down pass below. The corrected
-	// subtreeHashes[0] flows through here when subtree 0 lacks a STUMP.
+	// subtreeHashes[0] flows through here when subtree 0 lacks a STUMP. The
+	// final slot is seeded with its LIFTED root so the top tree matches the
+	// canonical composition.
 	for i, subHash := range subtreeHashes {
 		if haveSTUMP[i] {
 			continue
 		}
 		hashCopy := subHash
+		if i == finalIdx {
+			for k := 0; k < liftLevels; k++ {
+				hashCopy = *merkleTreeParent(&hashCopy, &hashCopy)
+			}
+		}
 		addLeaf(compound, internalHeight, &transaction.PathElement{
 			Offset: uint64(i),
 			Hash:   &hashCopy,
@@ -613,6 +789,55 @@ func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, c
 	computeAndPadCompound(compound, internalHeight, numSubtrees)
 
 	return compound, txids, nil
+}
+
+// topTreeRoot folds subtree-root-layer hashes to the block merkle root using
+// Bitcoin-canonical duplicate-last-on-odd padding — the same rule
+// computeAndPadCompound applies at and above the subtree-root layer.
+func topTreeRoot(hs []chainhash.Hash) chainhash.Hash {
+	level := append([]chainhash.Hash(nil), hs...)
+	for len(level) > 1 {
+		if len(level)%2 == 1 {
+			level = append(level, level[len(level)-1])
+		}
+		next := make([]chainhash.Hash, len(level)/2)
+		for i := range next {
+			next[i] = *merkleTreeParent(&level[2*i], &level[2*i+1])
+		}
+		level = next
+	}
+	return level[0]
+}
+
+// deriveFinalSubtreeLift returns how many levels the block lifts its final
+// subtree's root before top-tree composition (0 = uniform block). teranode
+// lifts a final subtree that is shorter than the first subtree's capacity by
+// self-hashing its root once per missing level (model.Block CheckMerkleRoot
+// → RootHashPadded); a compound composed from the raw root disagrees with
+// the canonical header root for every such block.
+//
+// The lift amount is not carried in any input, so it is derived by matching:
+// candidate top-tree roots (final root lifted k = 0,1,2,… levels) are folded
+// and compared against the canonical headerMerkleRoot. subtreeHashes[0] must
+// already be coinbase-corrected. k=0 matches immediately for uniform blocks,
+// so the common case costs a single top-tree fold. Returns 0 when
+// headerMerkleRoot is nil or no candidate matches (legacy behavior — the
+// caller's ValidateCompoundRoot remains the final guard).
+func deriveFinalSubtreeLift(subtreeHashes []chainhash.Hash, internalHeight int, headerMerkleRoot *chainhash.Hash) int {
+	n := len(subtreeHashes)
+	if n < 2 || headerMerkleRoot == nil {
+		return 0
+	}
+	tops := append([]chainhash.Hash(nil), subtreeHashes...)
+	lifted := subtreeHashes[n-1]
+	for k := 0; k <= internalHeight; k++ {
+		tops[n-1] = lifted
+		if root := topTreeRoot(tops); root.IsEqual(headerMerkleRoot) {
+			return k
+		}
+		lifted = *merkleTreeParent(&lifted, &lifted)
+	}
+	return 0
 }
 
 // computeAndPadCompound fills in every missing intermediate node of a

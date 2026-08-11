@@ -32,6 +32,58 @@ func TestModeNeedsChaintracks(t *testing.T) {
 	}
 }
 
+func TestModeNeedsTxTracker(t *testing.T) {
+	cases := []struct {
+		mode string
+		want bool
+	}{
+		{"all", true},
+		{"api-server", true},
+		{"bump-builder", false},
+		{"sse", false},
+		{"watchdog", false},
+		{"propagation", false},
+		{"p2p-client", false},
+		{"chaintracks", false},
+		{"webhook", false},
+		{"", false},
+		{"unknown-mode", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.mode, func(t *testing.T) {
+			if got := modeNeedsTxTracker(tc.mode); got != tc.want {
+				t.Errorf("modeNeedsTxTracker(%q) = %v, want %v", tc.mode, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestModeNeedsValidator(t *testing.T) {
+	cases := []struct {
+		mode string
+		want bool
+	}{
+		{"all", true},
+		{"api-server", true},
+		{"bump-builder", false},
+		{"sse", false},
+		{"watchdog", false},
+		{"propagation", false},
+		{"p2p-client", false},
+		{"chaintracks", false},
+		{"webhook", false},
+		{"", false},
+		{"unknown-mode", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.mode, func(t *testing.T) {
+			if got := modeNeedsValidator(tc.mode); got != tc.want {
+				t.Errorf("modeNeedsValidator(%q) = %v, want %v", tc.mode, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestValidatorPolicyFromConfig(t *testing.T) {
 	cases := []struct {
 		name        string

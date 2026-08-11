@@ -1,5 +1,23 @@
 -- Schema for the Postgres store backend. Applied idempotently by
 -- Store.EnsureIndexes() via pgx.Exec; safe to run repeatedly.
+--
+-- The whole file runs inside ONE transaction: statements that cannot run in
+-- a transaction block (CREATE INDEX CONCURRENTLY, ALTER TYPE ... ADD VALUE,
+-- VACUUM) must not be added here. Any byte change to this file — comments
+-- included — changes its checksum and triggers one serialized reapply on the
+-- next rollout.
+
+-- Schema-identity bookkeeping (issue #278). EnsureIndexes stores a SHA-256 of
+-- this entire file after a successful apply; when the stored checksum matches
+-- the binary's, startup skips every statement below — no DDL, no ACCESS
+-- EXCLUSIVE lock requests queueing behind live traffic.
+-- Escape hatch after manual DDL drift (e.g. a hand-dropped index):
+--   DELETE FROM schema_info;  -- forces a full idempotent reapply on next start
+CREATE TABLE IF NOT EXISTS schema_info (
+    id         BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),  -- single-row table
+    checksum   TEXT NOT NULL,
+    applied_at TIMESTAMPTZ NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS transactions (
     txid                 TEXT PRIMARY KEY,
@@ -22,6 +40,12 @@ CREATE TABLE IF NOT EXISTS transactions (
 -- introduced. Existing rows keep NULL until the next successful /watch call
 -- repopulates the marker — see issue #145.
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS merkle_registered_at TIMESTAMPTZ;
+-- Orphaned-anchor history (issue #279): every block this tx was once MINED
+-- against before a reorg superseded the anchor, as a JSONB array of
+-- {blockHash, blockHeight, orphanedAt} in models.OrphanedAnchor shape,
+-- capped at 5 entries by the writers. NULL for the overwhelming majority of
+-- rows that never lived through a reorg.
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS orphaned_anchors JSONB;
 
 CREATE INDEX IF NOT EXISTS idx_tx_status        ON transactions(status);
 CREATE INDEX IF NOT EXISTS idx_tx_block_hash    ON transactions(block_hash);
@@ -69,6 +93,15 @@ CREATE INDEX IF NOT EXISTS idx_bp_status_height ON block_processing(status, bloc
 CREATE INDEX IF NOT EXISTS idx_bp_stale_seen
     ON block_processing(header_seen_at)
     WHERE processed_at IS NULL AND status = 'active';
+-- Reorg reconciliation marker (issue #279): stamped by the anchor
+-- reconciler once every tx anchored to this orphaned block has been
+-- re-anchored or reverted; reset to NULL when the block is resurrected.
+ALTER TABLE block_processing ADD COLUMN IF NOT EXISTS reconciled_at TIMESTAMPTZ;
+-- Partial index over the reconciler's work queue — orphaned rows still
+-- awaiting tx reconciliation. Stays proportional to the (tiny) backlog.
+CREATE INDEX IF NOT EXISTS idx_bp_orphaned_unreconciled
+    ON block_processing(orphaned_at)
+    WHERE status = 'orphaned' AND reconciled_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS submissions (
     submission_id         TEXT PRIMARY KEY,
@@ -79,6 +112,9 @@ CREATE TABLE IF NOT EXISTS submissions (
     last_delivered_status TEXT,
     retry_count           INT NOT NULL DEFAULT 0,
     next_retry_at         TIMESTAMPTZ,
+    attempts              INT NOT NULL DEFAULT 0,
+    last_attempt_at       TIMESTAMPTZ,
+    last_result           TEXT,
     created_at            TIMESTAMPTZ NOT NULL
 );
 -- Idempotent column adds for stores created before the exactly-once webhook
@@ -89,8 +125,27 @@ CREATE TABLE IF NOT EXISTS submissions (
 ALTER TABLE submissions ADD COLUMN IF NOT EXISTS last_delivered_status TEXT;
 ALTER TABLE submissions ADD COLUMN IF NOT EXISTS retry_count           INT NOT NULL DEFAULT 0;
 ALTER TABLE submissions ADD COLUMN IF NOT EXISTS next_retry_at         TIMESTAMPTZ;
-CREATE INDEX IF NOT EXISTS idx_sub_txid   ON submissions(txid);
+-- Delivery-attempt bookkeeping (issue #249): lifetime attempt counter plus
+-- the last attempt's time and outcome, surfaced on GET /tx?callbackToken=…
+-- so receivers can self-diagnose callbacks their edge is rejecting.
+ALTER TABLE submissions ADD COLUMN IF NOT EXISTS attempts              INT NOT NULL DEFAULT 0;
+ALTER TABLE submissions ADD COLUMN IF NOT EXISTS last_attempt_at       TIMESTAMPTZ;
+ALTER TABLE submissions ADD COLUMN IF NOT EXISTS last_result           TEXT;
 CREATE INDEX IF NOT EXISTS idx_sub_token  ON submissions(callback_token);
+-- Covering index for the txid-side access path: GetSubmissionsByTxID (webhook
+-- dispatch) and TokensForTxIDs (SSE fan-out membership). Carrying
+-- callback_token in the index turns the fan-out's batch resolution into an
+-- Index Only Scan — measured on 200k rows: Heap Fetches 0 and 97 shared
+-- buffers, against 217 with the heap fetch.
+CREATE INDEX IF NOT EXISTS idx_sub_txid_token ON submissions(txid, callback_token);
+-- idx_sub_txid is a strict prefix of idx_sub_txid_token, so it answers nothing
+-- the composite cannot. It must be DROPPED rather than merely left alone: while
+-- it exists the planner costs the narrower index lower, picks it, and pays the
+-- heap fetch anyway — verified by EXPLAIN, the composite is simply never
+-- chosen. Dropping it also removes one index write per submission INSERT on a
+-- 1000+/s ingest path. A downgrade to a release whose schema still creates it
+-- self-heals: that script's CREATE INDEX IF NOT EXISTS puts it back.
+DROP INDEX IF EXISTS idx_sub_txid;
 -- Partial index keyed off the webhook reaper's scan predicate; stays
 -- proportional to the in-retry backlog, not the full submissions table.
 CREATE INDEX IF NOT EXISTS idx_sub_retry_ready

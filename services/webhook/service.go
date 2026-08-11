@@ -20,15 +20,24 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/callbackurl"
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/events"
+	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/arcade/version"
 )
+
+// webhookUserAgent identifies arcade's callback POSTs. The "arcade-webhook/"
+// prefix is a documented, stable string receivers can allowlist at their
+// edge — Go's default Go-http-client UA is a common bot-rule target and got
+// every callback to one production receiver silently 403'd (issue #249).
+var webhookUserAgent = "arcade-webhook/" + version.Version
 
 // defaultMaxConcurrentDeliveries is the fallback pool size when
 // WebhookConfig.MaxConcurrentDeliveries is unset or non-positive.
@@ -126,22 +135,27 @@ func newHolderID() string {
 // an error from the callbackurl package — the request never leaves the
 // machine. Pulled out of New so tests can construct an equivalent client
 // without instantiating the whole Service.
+//
+// The SSRF-guarding *http.Transport is wrapped by otelhttp so outbound spans
+// and traceparent propagation are added on top — the guard remains the inner
+// RoundTripper and still runs on every dial, unaffected by the wrapping.
 func newCallbackClient(timeout time.Duration, allowPrivate bool) *http.Client {
 	dialer := &net.Dialer{
 		Timeout:   timeout,
 		KeepAlive: 30 * time.Second,
 		Control:   callbackurl.DialControl(allowPrivate),
 	}
+	guardedTransport := &http.Transport{
+		DialContext:           dialer.DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: timeout,
+		ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2:     true,
+		IdleConnTimeout:       90 * time.Second,
+	}
 	return &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			DialContext:           dialer.DialContext,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: timeout,
-			ExpectContinueTimeout: 1 * time.Second,
-			ForceAttemptHTTP2:     true,
-			IdleConnTimeout:       90 * time.Second,
-		},
+		Timeout:   timeout,
+		Transport: otelhttp.NewTransport(guardedTransport),
 	}
 }
 
@@ -227,16 +241,18 @@ func (s *Service) Start(ctx context.Context) error {
 			default:
 				// Pool saturated — every worker is blocked on a slow
 				// callback and the work queue is full. Drop with metric;
-				// the lost update is recoverable via the durable Kafka
-				// offset on reconnect, and we'd rather drop here than
-				// back-pressure the upstream subscriber channel (which
-				// would multiply the impact across this and other
-				// subscribers in the same publisher).
+				// recovery is store-backed (failed-POST retries via
+				// NextRetryAt swept by the reaper, plus CAS dedup gating on
+				// the next transition), NOT Kafka replay — the subscription
+				// is an ephemeral random group with no durable offsets. We'd
+				// rather drop here than back-pressure the upstream subscriber
+				// channel (which would multiply the impact across this and
+				// other subscribers in the same publisher).
 				metrics.WebhookPoolSaturatedTotal.Inc()
 				s.logger.Warn(
 					"webhook delivery pool saturated, dropping status",
-					zap.String("txid", status.TxID),
-					zap.String("status", string(status.Status)),
+					logfields.TxID(status.TxID),
+					logfields.Status(string(status.Status)),
 				)
 			}
 		}
@@ -279,17 +295,29 @@ func (s *Service) dispatchOne(ctx context.Context, status *models.TransactionSta
 	if err != nil {
 		s.logger.Warn(
 			"submission lookup failed",
-			zap.String("txid", status.TxID),
+			logfields.TxID(status.TxID),
 			zap.Error(err),
 		)
 		return
 	}
+	enriched := false
 	for _, sub := range subs {
 		if sub.CallbackURL == "" {
 			continue // SSE-only subscription; no webhook to send
 		}
 		if !shouldDeliver(sub, status) {
 			continue
+		}
+		// Attach the merkle proof to MINED/IMMUTABLE deliveries. Done lazily on
+		// the first deliverable subscriber (not for SSE-only txids) and only
+		// once — the status pointer is shared across every deliver() below, so
+		// all subscribers of this txid get the same enriched body. Best-effort:
+		// a no-op for non-mined statuses or when the BUMP isn't retrievable, so
+		// it never blocks delivery. deliver() emits the metric when a MINED body
+		// still lacks a path.
+		if !enriched {
+			s.store.EnrichMerklePath(ctx, status)
+			enriched = true
 		}
 		s.deliver(ctx, sub, status)
 	}
@@ -300,10 +328,14 @@ func (s *Service) dispatchOne(ctx context.Context, status *models.TransactionSta
 //     delivered.
 //   - When FullStatusUpdates is false (the default), only terminal statuses
 //     (MINED, REJECTED, MINED_IN_STALE_BLOCK / IMMUTABLE) are delivered.
-//   - Same status as LastDeliveredStatus is suppressed (idempotent dedup).
+//   - Same status as LastDeliveredStatus is suppressed (idempotent dedup) —
+//     EXCEPT a MINED event flagged as a reorg re-anchor (issue #279): it is
+//     the one same-status transition that carries new information (the
+//     block hash + merkle path changed), and suppressing it would leave the
+//     receiver holding a proof anchored to an orphaned block.
 func shouldDeliver(sub *models.Submission, status *models.TransactionStatus) bool {
 	if sub.LastDeliveredStatus == status.Status {
-		return false
+		return status.Status == models.StatusMined && status.ExtraInfo == models.ExtraInfoReorgReanchor
 	}
 	if sub.FullStatusUpdates {
 		return true
@@ -335,9 +367,9 @@ func shouldDeliver(sub *models.Submission, status *models.TransactionStatus) boo
 // 5xx no longer translates into permanent loss.
 func (s *Service) deliver(ctx context.Context, sub *models.Submission, status *models.TransactionStatus) {
 	logger := s.logger.With(
-		zap.String("txid", status.TxID),
-		zap.String("callback_url", sub.CallbackURL),
-		zap.String("status", string(status.Status)),
+		logfields.TxID(status.TxID),
+		logfields.CallbackURL(sub.CallbackURL),
+		logfields.Status(string(status.Status)),
 	)
 
 	claimed, err := s.store.UpdateDeliveryStatusCAS(ctx, sub.SubmissionID, sub.LastDeliveredStatus, status.Status)
@@ -348,6 +380,10 @@ func (s *Service) deliver(ctx context.Context, sub *models.Submission, status *m
 	if !claimed {
 		metrics.WebhookCASLostTotal.Inc()
 		return
+	}
+
+	if (status.Status == models.StatusMined || status.Status == models.StatusImmutable) && len(status.MerklePath) == 0 {
+		metrics.MinedPushWithoutMerklePathTotal.WithLabelValues("webhook").Inc()
 	}
 
 	body, err := json.Marshal(status)
@@ -361,26 +397,58 @@ func (s *Service) deliver(ctx context.Context, sub *models.Submission, status *m
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// A distinctive UA (instead of Go's default Go-http-client/…) lets
+	// receivers allowlist arcade's callbacks explicitly — generic-Go-UA
+	// bot/WAF rules silently 403'd every POST to one production receiver
+	// while its origin saw nothing (issue #249).
+	req.Header.Set("User-Agent", webhookUserAgent)
 	if sub.CallbackToken != "" {
 		req.Header.Set("Authorization", "Bearer "+sub.CallbackToken)
 	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {
+		s.recordAttempt(ctx, sub, logger, err.Error())
 		s.recordFailure(ctx, sub, status, logger, err.Error())
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		s.recordFailure(ctx, sub, status, logger, fmt.Sprintf("status %d", resp.StatusCode))
+		reason := fmt.Sprintf("status %d", resp.StatusCode)
+		s.recordAttempt(ctx, sub, logger, reason)
+		s.recordFailure(ctx, sub, status, logger, reason)
 		return
 	}
 
-	// CAS already advanced LastDeliveredStatus and cleared retry state, so
-	// there's no second store write on success. recordFailure remains the
-	// only post-claim writer.
-	logger.Debug("callback delivered")
+	s.recordAttempt(ctx, sub, logger, deliveryResultDelivered)
+
+	// The CAS already advanced LastDeliveredStatus and cleared retry state,
+	// and recordAttempt above stamped the attempt bookkeeping — recordFailure
+	// remains the only retry-state writer. Info (not Debug): only subscribed
+	// txs reach here, so volume is bounded by callback subscriptions, not raw
+	// TPS — and this is the terminal-delivery lifecycle line for the
+	// txid/callback_url/status search story. No telemetry.LoggerWith here:
+	// deliver runs on the delivery worker pool from a Kafka-fed status
+	// event, not an HTTP request, so no per-request span ctx is plumbed in.
+	logger.Info("callback delivered")
+}
+
+// deliveryResultDelivered is the LastResult value recorded for a successful
+// POST; failures record the transport error or "status <code>" instead. The
+// exact string is part of the GET /tx `callbacks[].lastResult` surface.
+const deliveryResultDelivered = "delivered"
+
+// recordAttempt stamps the outcome of one POST attempt on the submission row
+// (attempts+1, lastAttemptAt, lastResult) so a client can self-diagnose
+// delivery problems from GET /tx?callbackToken=… — e.g. a WAF 403-ing every
+// callback looks like "arcade never called" from the receiver's side (issue
+// #249). Orthogonal to retry-state bookkeeping (CAS/recordFailure), and
+// best-effort: a write failure never changes the delivery outcome.
+func (s *Service) recordAttempt(ctx context.Context, sub *models.Submission, logger *zap.Logger, result string) {
+	if err := s.store.RecordDeliveryAttempt(ctx, sub.SubmissionID, time.Now(), result); err != nil {
+		logger.Warn("recording delivery attempt failed", zap.Error(err))
+	}
 }
 
 // recordFailure increments the submission's retry counter and computes the

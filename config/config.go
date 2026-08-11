@@ -116,6 +116,7 @@ type Config struct {
 	MerkleService MerkleServiceConfig `mapstructure:"merkle_service"`
 	P2P           P2PConfig           `mapstructure:"p2p"`
 	Health        HealthConfig        `mapstructure:"health"`
+	Telemetry     TelemetryConfig     `mapstructure:"telemetry"`
 	Propagation   PropagationConfig   `mapstructure:"propagation"`
 	BumpBuilder   BumpBuilderConfig   `mapstructure:"bump_builder"`
 	Watchdog      WatchdogConfig      `mapstructure:"watchdog"`
@@ -148,6 +149,17 @@ type ChaintracksServerConfig struct {
 	// differ from api.port and sse.port when the standalone service
 	// runs in the same process (mode=all).
 	Port int `mapstructure:"port"`
+	// TieScanDepth is how many heights below the tip the block-status
+	// tracker re-verifies on each tip update: any 'active' block_processing
+	// row in the window whose hash is not the active-chain block at its
+	// height is marked orphaned. This is the detection edge for same-height
+	// competition losers, which never produce a chaintracks ReorgEvent —
+	// an equal-chainwork alternate never becomes tip (issue #279). Default
+	// 20; 0 disables the scan.
+	TieScanDepth int `mapstructure:"tie_scan_depth"`
+	// TieScanMinIntervalMs debounces the scan across tip bursts (regtest
+	// mining, catch-up sync). Default 5000.
+	TieScanMinIntervalMs int `mapstructure:"tie_scan_min_interval_ms"`
 }
 
 type API struct {
@@ -166,10 +178,8 @@ type Kafka struct {
 	BufferSize    int      `mapstructure:"buffer_size"`
 	// MinPartitions is a soft minimum-partition hint for horizontally-scaled
 	// topics; arcade fails fast at startup when an existing topic has fewer.
-	// Independent of this knob, TopicPropagation is ALWAYS checked for an
-	// exact partition count of 1 — the dep-aware dispatcher's single-goroutine
-	// state ownership requires total order at the topic level, so multiple
-	// partitions would reintroduce the cross-batch "missing inputs" race.
+	// TopicPropagation has its own dedicated knob (propagation.partitions)
+	// with a fail-closed startup check — see PropagationConfig.Partitions.
 	// Leave at 0 or 1 in standalone/single-replica deployments.
 	MinPartitions int `mapstructure:"min_partitions"`
 	// SendTimeoutMs bounds how long the in-process memory broker waits for a
@@ -244,6 +254,11 @@ type Postgres struct {
 	EmbeddedDataDir  string `mapstructure:"embedded_data_dir"`
 	EmbeddedCacheDir string `mapstructure:"embedded_cache_dir"`
 	MaxConns         int32  `mapstructure:"max_conns"`
+	// SchemaApplyTimeoutMs bounds the slow path of EnsureIndexes (schema apply
+	// on a fresh DB or after a schema change). The checksum fast path makes
+	// normal restarts skip DDL entirely, so this can be generous. 0 = default
+	// (5 minutes). See issue #278.
+	SchemaApplyTimeoutMs int `mapstructure:"schema_apply_timeout_ms"`
 }
 
 // Pebble configures the embedded Pebble KV backend. Path is the data directory
@@ -299,12 +314,142 @@ type HealthConfig struct {
 	PprofEnabled bool `mapstructure:"pprof_enabled"`
 }
 
+// TelemetryConfig configures OpenTelemetry export to an external OTLP
+// collector (see docs/plans/otel-integration.md). Disabled by default:
+// with Enabled=false, telemetry.Init installs no-op providers and opens
+// no network connections, so runtime behaviour matches the pre-OTEL build
+// exactly. When Enabled, Endpoint may be left empty to fall back to the
+// standard OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_EXPORTER_OTLP_*_ENDPOINT
+// environment variables (resolved inside telemetry.Init, not here).
+type TelemetryConfig struct {
+	Enabled bool `mapstructure:"enabled"`
+	// Endpoint is the host:port of the OTLP collector. May be left empty
+	// when Enabled=true — the exporter then falls back to the standard
+	// OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_EXPORTER_OTLP_{TRACES,METRICS}_ENDPOINT
+	// env vars.
+	Endpoint string `mapstructure:"endpoint"`
+	// Protocol selects the OTLP transport: "grpc" (default) or "http".
+	Protocol string `mapstructure:"protocol"`
+	// Insecure skips TLS when dialing the collector (e.g. an in-cluster
+	// collector reachable without TLS).
+	Insecure bool `mapstructure:"insecure"`
+	// ServiceName sets the resource's service.name attribute. Default "arcade".
+	ServiceName string `mapstructure:"service_name"`
+	// Namespace sets the resource's service.namespace attribute (e.g. the
+	// downstream solution's name). Omitted from the resource when empty.
+	Namespace string `mapstructure:"namespace"`
+	// Traces enables the OTLP trace pipeline. Default true.
+	Traces bool `mapstructure:"traces"`
+	// Metrics enables the OTLP metric pipeline (Prometheus bridge). Default true.
+	Metrics bool `mapstructure:"metrics"`
+	// Logs, when true, only logs a warning that OTLP log export is not
+	// implemented; logs continue to ship via stdout JSON. Default false.
+	Logs bool `mapstructure:"logs"`
+	// SampleRatio is the ratio (0.0-1.0) fed to a ParentBased(TraceIDRatioBased)
+	// sampler. Default 1.0 (sample everything).
+	SampleRatio float64 `mapstructure:"sample_ratio"`
+	// ExportTimeoutMs bounds Shutdown's ForceFlush+Shutdown of every
+	// provider. Default 10000 (10s).
+	ExportTimeoutMs int `mapstructure:"export_timeout_ms"`
+}
+
 type PropagationConfig struct {
+	// Partitions is the minimum partition count arcade requires on
+	// arcade.propagation at startup (fail-closed: missing topic or fewer
+	// partitions aborts boot; more is fine — extra partitions only cost
+	// idle dispatchers). Set it to at least the propagation replica count
+	// when scaling horizontally, and widen the topic BEFORE rolling the
+	// config (a pod configured above the broker's actual count crash-loops
+	// by design).
+	//
+	// Ordering model (#295, replacing the #151 exact-1 rule): the api
+	// server keys every propagation message by its dependency family —
+	// all txs of one submission connected through in-batch spends share a
+	// partition key — so per-partition Kafka order still delivers parents
+	// to a dispatcher before their children. Cross-submission chains that
+	// land on different partitions are absorbed by the missing-parent
+	// safety net (TX_MISSING_PARENT is a retryable condition, never a
+	// terminal verdict on its own). Default 1.
+	Partitions        int `mapstructure:"partitions"`
 	MerkleConcurrency int `mapstructure:"merkle_concurrency"`
-	RetryMaxAttempts  int `mapstructure:"retry_max_attempts"`
-	RetryBackoffMs    int `mapstructure:"retry_backoff_ms"`
-	ReaperIntervalMs  int `mapstructure:"reaper_interval_ms"`
-	ReaperBatchSize   int `mapstructure:"reaper_batch_size"`
+	// RetryMaxAttempts bounds how many times the propagator will push a
+	// transaction back through the in-memory requeue loop when a broadcast
+	// produced no per-tx verdict (no healthy peer, body-less 5xx, merkle
+	// /watch blip, or a conflict-family 409 whose lines could not be
+	// attributed to any submitted tx). After the budget is spent the tx is
+	// parked at PENDING_RETRY, which releases the dispatcher's in-flight
+	// entry so the Kafka commit watermark can advance; the reaper then owns
+	// the durable retry.
+	//
+	// The bound is not a nicety. On 2026-08-11 (dev-ovh-1, arcade v0.11.5) a
+	// 21-tx batch of stale transactions drew a permanent HTTP 409 from
+	// Teranode — 21 "UTXO_SPENT (70): <outpoint>:<vout> utxo already spent by
+	// tx <spender>[n]" lines, all keyed by the spent outpoint rather than by
+	// any submitted txid. With no attributable verdict every tx fell to the
+	// requeue arm and looped forever: ~2,410 409s in two minutes, 42 of 43
+	// batches requeued, 4,679 transactions pinned in the dispatcher's
+	// inFlight map and therefore 337,247 messages of Kafka lag frozen on the
+	// single-partition arcade.propagation topic while the leader burned 4.2
+	// cores. Nothing new could propagate until operators seeked the consumer
+	// group past the backlog by hand.
+	//
+	// Defaults to 5 (matching the shipped viper default). Non-positive values
+	// fall back to the default rather than disabling the bound — an unbounded
+	// requeue is the failure mode this exists to prevent.
+	RetryMaxAttempts int `mapstructure:"retry_max_attempts"`
+	// RetryBackoffMs is the flat wait (milliseconds) before a requeued tx
+	// lands back on the dispatcher for another broadcast attempt. Flat by
+	// design, not exponential: the budget above bounds total attempts, so
+	// a predictable wall-clock window (attempts × backoff ≈ 10s at the
+	// defaults) is what matters; the reaper's cadence dominates anything
+	// slower. Non-positive falls back to 2000ms. NOTE: this knob was
+	// declared but unread before #295 — deployments that explicitly set
+	// it (e.g. to the old default 500) start feeling their configured
+	// value on upgrade.
+	RetryBackoffMs int `mapstructure:"retry_backoff_ms"`
+	// PendingRetryBackoffMs is the base delay before a PENDING_RETRY row's
+	// first reaper attempt. Each subsequent attempt doubles it, capped at
+	// PendingRetryMaxBackoffMs, with ±20% jitter so a batch parked together
+	// doesn't re-broadcast in lockstep.
+	//
+	// Before #299 there was no per-row schedule at all: eligibility was
+	// "parked more than a hardcoded 5 minutes ago", so every parked tx —
+	// including a child whose parent lands a second later — waited the full
+	// 5 minutes, and a row that kept failing was retried every tick forever.
+	// Defaults to 5000ms; non-positive falls back to the default.
+	PendingRetryBackoffMs int `mapstructure:"pending_retry_backoff_ms"`
+	// PendingRetryMaxBackoffMs caps the exponential above. Defaults to
+	// 300000ms (5 minutes) — the old flat eligibility age, so the slowest
+	// this ever retries matches the previous behavior while early attempts
+	// are far faster.
+	PendingRetryMaxBackoffMs int `mapstructure:"pending_retry_max_backoff_ms"`
+	// PendingRetryMaxAttempts bounds how many times the reaper rebroadcasts
+	// a PENDING_RETRY row before giving up and writing REJECTED.
+	//
+	// Without a bound a tx whose parent never arrives — the single most
+	// common client mistake, spending an outpoint that does not exist — is
+	// retried forever. Before #299 such rows were not retried forever so
+	// much as silently abandoned: their timestamp_at never moved, so at
+	// staleScanLookback (24h) they fell out of the reaper's scan window and
+	// stayed PENDING_RETRY with no terminal status, no log and no metric.
+	//
+	// The default 288 is 24h at the 5-minute backoff cap, so give-up happens
+	// about when abandonment used to — except it is now an observable
+	// verdict the submitter can read. Non-positive falls back to the default.
+	PendingRetryMaxAttempts int `mapstructure:"pending_retry_max_attempts"`
+	ReaperIntervalMs        int `mapstructure:"reaper_interval_ms"`
+	ReaperBatchSize         int `mapstructure:"reaper_batch_size"`
+	// ReaperRebroadcastBatch caps how many stuck transactions the reaper's
+	// durable-rebroadcast backstop pushes back through the register+broadcast
+	// pipeline per tick (reapOnce collects at most this many stale RECEIVED /
+	// ACCEPTED_BY_NETWORK / SEEN rows). During the 2026-08-10 requeue-spiral
+	// incident ~178k txs were stranded at RECEIVED with the reaper as their
+	// only drain path; the then-hardcoded 200-per-tick cap at the default 30s
+	// interval drained ~6.7 tx/s (~7.4h to clear), forcing operators to crank
+	// reaper_interval_ms down instead. Raise this to drain a large backlog
+	// faster without touching the tick interval. Defaults to 200 (the
+	// historical hardcoded cap) when unset or non-positive.
+	ReaperRebroadcastBatch int `mapstructure:"reaper_rebroadcast_batch"`
 	// LeaseTTLMs bounds how long the reaper lease remains valid without a
 	// renewal. Set to at least 2–3× reaper_interval_ms so a missed tick
 	// doesn't trigger a false-positive failover. Defaults to 3× interval.
@@ -422,6 +567,16 @@ type EndpointHealthConfig struct {
 // giving merkle-service retries time to land for any STUMPs that initially got a 5xx.
 type BumpBuilderConfig struct {
 	GraceWindowMs int `mapstructure:"grace_window_ms"`
+	// HeaderWaitMs bounds how long the DataHub-fetch canonical-root
+	// validator waits for chaintracks to learn a freshly-mined block's
+	// header before giving up and skipping the cross-check. bump-builder is
+	// driven by the BLOCK_PROCESSED Kafka message while chaintracks ingests
+	// headers over an independent teranode P2P subscription; for a block
+	// mined seconds earlier the Kafka path usually wins that race, and
+	// without a wait the validator silently skipped its only independent
+	// canonicality check. <= 0 disables the wait (single lookup, legacy
+	// behavior).
+	HeaderWaitMs int `mapstructure:"header_wait_ms"`
 	// DataHubMaxBlockBytes caps a single /block/<hash> response body fetched
 	// from a DataHub endpoint, in bytes. The DataHub serves block metadata
 	// (header + subtree-hash list + coinbase tx + coinbase BUMP), so the
@@ -431,6 +586,96 @@ type BumpBuilderConfig struct {
 	// Mitigates F-007 (DataHub block fetch reads unbounded response bodies
 	// into memory).
 	DataHubMaxBlockBytes int64 `mapstructure:"datahub_max_block_bytes"`
+	// AnchorGuardEnabled gates the write-time anchor guard (issue #279):
+	// before marking a block's txs MINED, bump-builder checks that the
+	// block is chaintracks' active-chain block at its height and refuses
+	// when the height is provably held by a same-height competitor. Fail-
+	// open on any uncertainty. Default true (viper); false restores the
+	// legacy last-writer-wins behavior as an instant rollback lever.
+	AnchorGuardEnabled bool `mapstructure:"anchor_guard_enabled"`
+	// Reconciler tunes the anchor reconciler that heals txs anchored to
+	// orphaned blocks (issue #279).
+	Reconciler ReconcilerConfig `mapstructure:"reconciler"`
+}
+
+// ReconcilerConfig tunes the anchor reconciler — the bump-builder-hosted
+// loop that consumes orphaned block_processing rows and re-anchors (or
+// reverts) the transactions still pointing at them. See
+// services/bump_builder/reconciler.go for the algorithm.
+type ReconcilerConfig struct {
+	// Enabled gates the whole loop. Default true (viper); false is the
+	// rollback lever — orphaned rows then queue up (reconciled_at stays
+	// NULL) and are healed when re-enabled.
+	Enabled bool `mapstructure:"enabled"`
+	// IntervalMs is the tick cadence for consuming the orphaned-block
+	// queue. Default 30000.
+	IntervalMs int `mapstructure:"interval_ms"`
+	// BatchSize caps txids per SetMinedByTxIDs call / bulk status event
+	// during re-anchor. Default 5000 (matches maxTxIDsPerBulkEvent).
+	BatchSize int `mapstructure:"batch_size"`
+	// BlocksPerTick bounds how many orphaned blocks one tick reconciles.
+	// Default 4.
+	BlocksPerTick int `mapstructure:"blocks_per_tick"`
+	// NeighborhoodDepth is how many heights ABOVE an orphan's height are
+	// searched for the canonical block containing its txs (a deeper reorg
+	// re-bins txs into later blocks). Default 6.
+	NeighborhoodDepth int `mapstructure:"neighborhood_depth"`
+	// MaxDeferAttempts bounds how many ticks an orphan waits for the
+	// canonical block's BUMP (each defer fires a merkle-service /reprocess
+	// when wired) before falling back to revert-all — safe, because
+	// SEEN_ON_NETWORK → MINED is lattice-legal and a late canonical
+	// redelivery re-mines via the short-circuit path. Default 10.
+	MaxDeferAttempts int `mapstructure:"max_defer_attempts"`
+	// StartupFullScan runs one pass over the block_processing table after
+	// startup, orphan-marking any 'active' row whose height's canonical
+	// header differs — the deep backstop that also heals incidents that
+	// predate this code (like the height-764 block on the scaling cluster).
+	// Bounded by FullScanDepth (or the explicit FullScan{Min,Max}Height
+	// target). Default true.
+	StartupFullScan bool `mapstructure:"startup_full_scan"`
+	// FullScanDepth bounds the STARTUP full-scan to heights within this many
+	// blocks of the active tip (store.GetActiveTipBlockHeight): the sweep
+	// only considers rows with height >= tip-FullScanDepth. This stops the
+	// backstop from becoming a whole-history rewrite on a long chain — the
+	// original scan paged the ENTIRE table oldest-first and re-orphaned
+	// hundreds of historical competition losers, starving the actual recent
+	// incident (issue #282). Default 144 (~1 day on BSV; matches the
+	// watchdog's recency window). <= 0 selects the default; a chain shorter
+	// than the horizon (tip <= depth) scans unbounded, which is cheap. For
+	// deep recovery of an old incident, use the explicit target below.
+	FullScanDepth int `mapstructure:"full_scan_depth"`
+	// FullScanMinHeight / FullScanMaxHeight, when EITHER is > 0, point the
+	// startup scan at an explicit height range [min, max] (max 0 = up to the
+	// tip), OVERRIDING the FullScanDepth horizon — operator-targeted incident
+	// recovery. E.g. min=760 max=770 heals just the height-764 neighborhood
+	// from its already-stored canonical BUMP without touching the rest of the
+	// table. min=1 restores the legacy whole-history sweep as an opt-in.
+	// Both default 0 (use the depth horizon).
+	FullScanMinHeight uint64 `mapstructure:"full_scan_min_height"`
+	FullScanMaxHeight uint64 `mapstructure:"full_scan_max_height"`
+	// RevertWhenUnreconcilable controls the fallback when a block's canonical
+	// BUMP is unavailable and the defer cap is reached. Default false: PARK
+	// the block (issue #282) — leave its txs MINED against the orphan and
+	// stamp reconciled_at so it drops out of the queue (no revert, no
+	// infinite retry). A later stored/rebuilt canonical BUMP re-anchors them
+	// through the normal mine path; un-mining a tx that is almost certainly
+	// in the not-yet-fetched canonical block is a downgrade, not a repair.
+	// true restores the pre-#282 revert-all-to-SEEN_ON_NETWORK fallback as an
+	// opt-in.
+	RevertWhenUnreconcilable bool `mapstructure:"revert_when_unreconcilable"`
+	// FullScanChaintracksReadyTimeoutMs bounds how long Start waits, before the
+	// FIRST startup full-scan attempt, for the chain-header source to sync up
+	// to the store's active tip. The bump-builder pod runs an EMBEDDED
+	// chaintracks with ephemeral storage, so every deploy wipes its headers and
+	// it resyncs from genesis (height 0); a scan fired before it catches up
+	// sees GetHeaderByHeight return nil for every height, fails open on every
+	// row, and heals nothing — silently breaking reorg recovery in exactly the
+	// window it is needed (right after a deploy). The wait uses bounded backoff
+	// and respects context cancellation. On timeout the scan is NOT abandoned:
+	// it re-runs on a later tick once chaintracks is ready (self-healing across
+	// the resync), so a slow catch-up is never fatal. Default 120000 (2 min);
+	// <= 0 selects the default.
+	FullScanChaintracksReadyTimeoutMs int `mapstructure:"full_scan_chaintracks_ready_timeout_ms"`
 }
 
 // WatchdogConfig tunes the stale-block recovery watchdog. Defaults are
@@ -474,6 +719,15 @@ type WatchdogConfig struct {
 	// block likely isn't on the consensus chain, so retrying soon would
 	// produce the same disagreement. Default 4 h.
 	TerminalBackoffMs int `mapstructure:"terminal_backoff_ms"`
+	// MaxReprocessAttempts caps total /reprocess dispatches per block; once a
+	// block is re-driven this many times it is parked (reprocessing stops) so a
+	// permanently un-finalizable block can't flood arcade.block_processed and
+	// starve the bump-builder consumer. Default 10; <= 0 disables the cap.
+	MaxReprocessAttempts int `mapstructure:"max_reprocess_attempts"`
+	// MaxStaleAgeMs parks a block whose header_seen_at is older than this,
+	// regardless of attempt count — a restart-proof backstop (the in-memory
+	// attempt counter resets on redeploy). Default 6 h; <= 0 disables it.
+	MaxStaleAgeMs int `mapstructure:"max_stale_age_ms"`
 }
 
 // SSEConfig governs the standalone SSE (server-sent events) service.
@@ -497,6 +751,23 @@ type SSEConfig struct {
 	// Port the SSE listener binds to. Default 8082. Must differ from
 	// api.port when SSE runs in the same process (mode=all).
 	Port int `mapstructure:"port"`
+	// ClientBufferSize is the per-connection SSE send-channel capacity.
+	// The manager unfans one Kafka message into a burst of per-tx events
+	// (bulk-unfan coalesces ~50 txids per message), so a single burst of
+	// ~50 must fit with headroom; sizing this too small silently drops
+	// events for slow or bursty consumers (the channel send is
+	// non-blocking, so overflow is lost, not backpressured). Default
+	// DefaultSSEClientBuffer. A value <= 0 selects the default.
+	ClientBufferSize int `mapstructure:"client_buffer_size"`
+	// CatchupOnDrop enables mid-stream store-backed catchup for token-scoped
+	// clients whose send channel overflowed: instead of losing the dropped
+	// events until the client reconnects with Last-Event-ID, the connection's
+	// writer replays them from the store as soon as it drains its backlog.
+	// Replay may duplicate frames the client already received (clients dedupe
+	// by txid+status). Default true; false restores the previous drop-only
+	// behavior. Tokenless (firehose) clients always keep drop-only behavior —
+	// the store catchup source is token-scoped.
+	CatchupOnDrop bool `mapstructure:"catchup_on_drop"`
 }
 
 // WebhookConfig tunes the HTTP webhook delivery service. The service
@@ -594,6 +865,14 @@ type EventsConfig struct {
 // status-update bursts without committing significant memory upfront.
 const DefaultEventsSubscriberBuffer = 4096
 
+// DefaultSSEClientBuffer is the fallback per-connection SSE send-channel
+// capacity when SSEConfig.ClientBufferSize is unset or non-positive. The
+// manager unfans one Kafka message into a burst of per-tx events, so the
+// buffer must absorb many such bursts between writer drains; 8192 gives ample
+// headroom over a single ~50-event bulk-unfan while staying a modest
+// per-connection memory cost (channel of *TransactionStatus pointers).
+const DefaultSSEClientBuffer = 8192
+
 // ValidatorConfig controls intake-time transaction validation. It carries the
 // operator-facing fee floor enforced against EF/BEEF submissions; the consensus
 // and policy script rules come from teranode's BDK-backed validator (keyed by
@@ -613,6 +892,12 @@ type ValidatorConfig struct {
 	// false (default) on mainnet and any environment that should enforce
 	// the production fee floor. Takes precedence over MinFeePerKB.
 	AcceptZeroFee bool `mapstructure:"accept_zero_fee"`
+
+	// DisableFinalityCheck turns off the api-server's nLockTime/BIP113
+	// intake gate (issue #245). The gate is UX-only — teranode remains
+	// authoritative and the check fails open when chain state is
+	// unavailable — so this exists purely as an emergency escape hatch.
+	DisableFinalityCheck bool `mapstructure:"disable_finality_check"`
 }
 
 // DefaultValidatorMinFeePerKB is the production fee floor in satoshis
@@ -721,12 +1006,37 @@ func setDefaults() {
 	viper.SetDefault("store.postgres.embedded_data_dir", "~/.arcade/postgres")
 	viper.SetDefault("store.postgres.embedded_cache_dir", "~/.arcade/postgres-cache")
 	viper.SetDefault("store.postgres.max_conns", 16)
+	viper.SetDefault("store.postgres.schema_apply_timeout_ms", 300000)
 	viper.SetDefault("health.port", 8081)
+
+	// OTEL telemetry export: off by default. See TelemetryConfig doc comment
+	// and docs/plans/otel-integration.md. Every field gets an explicit
+	// SetDefault — including the zero-valued ones — because viper's
+	// AutomaticEnv only recognizes ARCADE_TELEMETRY_* overrides for keys it
+	// already knows about (same reasoning as the chaintracks.url default
+	// below); without these, ARCADE_TELEMETRY_ENDPOINT/NAMESPACE/INSECURE
+	// would silently be ignored.
+	viper.SetDefault("telemetry.enabled", false)
+	viper.SetDefault("telemetry.endpoint", "")
+	viper.SetDefault("telemetry.protocol", "grpc")
+	viper.SetDefault("telemetry.insecure", false)
+	viper.SetDefault("telemetry.service_name", "arcade")
+	viper.SetDefault("telemetry.namespace", "")
+	viper.SetDefault("telemetry.traces", true)
+	viper.SetDefault("telemetry.metrics", true)
+	viper.SetDefault("telemetry.logs", false)
+	viper.SetDefault("telemetry.sample_ratio", 1.0)
+	viper.SetDefault("telemetry.export_timeout_ms", 10000)
+	viper.SetDefault("propagation.partitions", 1)
 	viper.SetDefault("propagation.merkle_concurrency", 10)
 	viper.SetDefault("propagation.retry_max_attempts", 5)
-	viper.SetDefault("propagation.retry_backoff_ms", 500)
+	viper.SetDefault("propagation.retry_backoff_ms", 2000)
+	viper.SetDefault("propagation.pending_retry_backoff_ms", 5000)
+	viper.SetDefault("propagation.pending_retry_max_backoff_ms", 300000)
+	viper.SetDefault("propagation.pending_retry_max_attempts", 288)
 	viper.SetDefault("propagation.reaper_interval_ms", 30000)
 	viper.SetDefault("propagation.reaper_batch_size", 500)
+	viper.SetDefault("propagation.reaper_rebroadcast_batch", 200)
 	// 0 keeps New()'s 3×reaper_interval default, so changing reaper_interval
 	// automatically moves the lease TTL unless the operator opts into a fixed value.
 	viper.SetDefault("propagation.lease_ttl_ms", 0)
@@ -790,11 +1100,29 @@ func setDefaults() {
 	// can't see ARCADE_CHAINTRACKS_URL — register the key explicitly here.
 	viper.SetDefault("chaintracks.url", "")
 	viper.SetDefault("bump_builder.grace_window_ms", 30000)
+	// 10s covers the observed chaintracks P2P-ingestion lag for a
+	// freshly-mined block (typically < 2s) with margin, while bounding how
+	// long a DataHub fetch can stall when chaintracks genuinely never
+	// learns the header (e.g. it is down).
+	viper.SetDefault("bump_builder.header_wait_ms", 10000)
 	// 1 GiB — DataHub /block/<hash> responses contain block metadata
 	// (header + subtree hashes + coinbase tx + coinbase BUMP). 1 GiB is
 	// two-plus orders of magnitude of headroom over a realistic payload
 	// while still bounding memory against a hostile DataHub. See F-007.
 	viper.SetDefault("bump_builder.datahub_max_block_bytes", int64(1*1024*1024*1024))
+	viper.SetDefault("bump_builder.anchor_guard_enabled", true)
+	viper.SetDefault("bump_builder.reconciler.enabled", true)
+	viper.SetDefault("bump_builder.reconciler.interval_ms", 30000)
+	viper.SetDefault("bump_builder.reconciler.batch_size", 5000)
+	viper.SetDefault("bump_builder.reconciler.blocks_per_tick", 4)
+	viper.SetDefault("bump_builder.reconciler.neighborhood_depth", 6)
+	viper.SetDefault("bump_builder.reconciler.max_defer_attempts", 10)
+	viper.SetDefault("bump_builder.reconciler.startup_full_scan", true)
+	viper.SetDefault("bump_builder.reconciler.full_scan_depth", 144)
+	viper.SetDefault("bump_builder.reconciler.full_scan_min_height", 0)
+	viper.SetDefault("bump_builder.reconciler.full_scan_max_height", 0)
+	viper.SetDefault("bump_builder.reconciler.revert_when_unreconcilable", false)
+	viper.SetDefault("bump_builder.reconciler.full_scan_chaintracks_ready_timeout_ms", 120000)
 	// Block-processing watchdog (standalone arcade service — mode=watchdog
 	// in production, in-process under mode=all): on by default. The runtime
 	// nil-guards the merkle-service client; an unconfigured deployment
@@ -810,6 +1138,8 @@ func setDefaults() {
 	viper.SetDefault("watchdog.initial_backoff_ms", 60000)
 	viper.SetDefault("watchdog.max_backoff_ms", 1800000)
 	viper.SetDefault("watchdog.terminal_backoff_ms", 14400000)
+	viper.SetDefault("watchdog.max_reprocess_attempts", 10)
+	viper.SetDefault("watchdog.max_stale_age_ms", 21600000) // 6h
 
 	// SSE standalone service (mode=sse, or in-process under mode=all):
 	// enabled by default. Distinct port from api.port avoids the bind
@@ -817,12 +1147,16 @@ func setDefaults() {
 	viper.SetDefault("sse.enabled", true)
 	viper.SetDefault("sse.host", "0.0.0.0")
 	viper.SetDefault("sse.port", 8082)
+	viper.SetDefault("sse.client_buffer_size", DefaultSSEClientBuffer)
+	viper.SetDefault("sse.catchup_on_drop", true)
 
 	// chaintracks standalone service: enabled by default. The bind port
 	// must differ from api.port and sse.port in single-binary deployments
 	// (mode=all).
 	viper.SetDefault("chaintracks_server.host", "0.0.0.0")
 	viper.SetDefault("chaintracks_server.port", 8083)
+	viper.SetDefault("chaintracks_server.tie_scan_depth", 20)
+	viper.SetDefault("chaintracks_server.tie_scan_min_interval_ms", 5000)
 
 	// Intake validator fee floor in satoshis per KB. Matches the
 	// current BSV miner policy minimum.
@@ -852,6 +1186,9 @@ func validate(cfg *Config) error {
 	case "postgres":
 		if !cfg.Store.Postgres.Embedded && cfg.Store.Postgres.DSN == "" {
 			return fmt.Errorf("store.postgres.dsn is required when store.backend=postgres and postgres.embedded=false")
+		}
+		if cfg.Store.Postgres.SchemaApplyTimeoutMs < 0 {
+			return fmt.Errorf("store.postgres.schema_apply_timeout_ms must be >= 0 (0 = default)")
 		}
 	default:
 		return fmt.Errorf("unknown store.backend %q (expected aerospike, pebble, or postgres)", cfg.Store.Backend)
@@ -910,6 +1247,31 @@ func validate(cfg *Config) error {
 		}
 		if cfg.Watchdog.RecencyDepth <= 0 {
 			return fmt.Errorf("watchdog.recency_depth must be > 0 when watchdog.enabled")
+		}
+	}
+	if cfg.Telemetry.Enabled {
+		switch cfg.Telemetry.Protocol {
+		case "grpc", "http":
+		default:
+			return fmt.Errorf("invalid telemetry.protocol %q (expected grpc or http)", cfg.Telemetry.Protocol)
+		}
+		// Both the gRPC and HTTP exporters' WithEndpoint dial the value
+		// verbatim as host:port; a scheme prefix makes the dial fail silently
+		// in the background exporter goroutine (for HTTP the scheme is instead
+		// controlled by telemetry.insecure), so fail fast here for either
+		// protocol. Only the OTEL_EXPORTER_OTLP_ENDPOINT env var understands a
+		// scheme-prefixed URL.
+		if strings.HasPrefix(cfg.Telemetry.Endpoint, "http://") || strings.HasPrefix(cfg.Telemetry.Endpoint, "https://") {
+			return fmt.Errorf("telemetry.endpoint %q must be host:port without a scheme "+
+				"(e.g. \"collector:4317\"); scheme-prefixed URLs are only understood by the OTEL_EXPORTER_OTLP_ENDPOINT env var",
+				cfg.Telemetry.Endpoint)
+		}
+		// telemetry.endpoint is intentionally not required here: an empty
+		// value falls back to the standard OTEL_EXPORTER_OTLP_ENDPOINT /
+		// OTEL_EXPORTER_OTLP_{TRACES,METRICS}_ENDPOINT env vars, resolved
+		// inside telemetry.Init (which errors if neither is set).
+		if cfg.Telemetry.SampleRatio < 0 || cfg.Telemetry.SampleRatio > 1 {
+			return fmt.Errorf("telemetry.sample_ratio must be between 0 and 1, got %v", cfg.Telemetry.SampleRatio)
 		}
 	}
 	return nil

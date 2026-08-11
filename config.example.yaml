@@ -34,10 +34,10 @@ api:
 
 # Arcade does not create Kafka topics; the broker must already have them
 # (auto-create on first publish is typically disabled in production, and
-# arcade.propagation has a hard exactly-1-partition correctness constraint
-# that arcade enforces at startup). See docs/production-kafka.md for the
-# full topic list, partition guidance, and ready-to-paste rpk /
-# kafka-topics.sh commands.
+# arcade.propagation must exist with at least propagation.partitions
+# partitions — arcade fails closed at startup otherwise). See
+# docs/production-kafka.md for the full topic list, partition guidance,
+# and ready-to-paste rpk / kafka-topics.sh commands.
 kafka:
   brokers:
     - localhost:9092
@@ -76,6 +76,15 @@ store:
     # Per-attempt socket timeout. Should be <= op_timeout_ms; the client
     # may retry on socket timeout up to the op deadline.
     socket_timeout_ms: 5000
+  # Alternative: external PostgreSQL. Only read when backend: postgres.
+  # postgres:
+  #   dsn: postgres://user:pass@host:5432/arcade
+  #   max_conns: 16
+  #   # Ceiling for the boot-time schema apply when it actually has to run
+  #   # (fresh database or schema change). Restarts with a current schema
+  #   # verify a stored checksum and skip DDL entirely, so they boot
+  #   # instantly even under heavy DB load. See issue #278.
+  #   schema_apply_timeout_ms: 300000
 
 # datahub_urls:
 #   - "https://datahub1.example.com"
@@ -109,10 +118,38 @@ p2p:
   # bootstrap_peers: []        # override the built-in defaults; also feeds chaintracks
   # (unless chaintracks.p2p.msgbus.bootstrappeers is set explicitly)
   # enable_mdns: false
-  # allow_private_urls: false  # accept loopback/RFC1918/link-local URLs from peers
+  # allow_private_urls: false  # accept discovered URLs on loopback/RFC1918/link-local/CGNAT
+  # addresses, including DNS names that RESOLVE to those ranges. Unresolvable
+  # hostnames (e.g. a peer announcing its cluster-internal service name) are
+  # rejected regardless. Statically configured datahub_urls are never validated.
 
 health:
   port: 8081
+
+# OpenTelemetry export to an external OTLP collector (traces + metrics; the
+# existing Prometheus /metrics scrape keeps working unchanged either way).
+# Disabled by default: with enabled=false, no OTEL providers are created and
+# no network connections are opened, so runtime behaviour is identical to a
+# build with no OTEL support at all.
+#
+# endpoint may be left blank when enabled=true: the exporters then fall back
+# to the standard OTEL_EXPORTER_OTLP_ENDPOINT (or the more specific
+# OTEL_EXPORTER_OTLP_TRACES_ENDPOINT / OTEL_EXPORTER_OTLP_METRICS_ENDPOINT)
+# environment variables, e.g. for a node-local collector reached via the
+# Kubernetes downward API host IP:
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://$(HOST_IP):4317
+# telemetry:
+#   enabled: false
+#   endpoint: ""                # host:port of the OTLP collector; see env fallback above
+#   protocol: grpc              # "grpc" (default, port 4317) or "http" (port 4318)
+#   insecure: false             # skip TLS; typically true for an in-cluster/local collector
+#   service_name: arcade
+#   namespace: ""                # service.namespace resource attribute (e.g. downstream solution name)
+#   traces: true
+#   metrics: true
+#   logs: false                  # OTLP log export is not implemented; logs always ship via stdout JSON
+#   sample_ratio: 1.0            # ParentBased(TraceIDRatioBased) sampler ratio, 0.0-1.0
+#   export_timeout_ms: 10000
 
 # Intake-time transaction validator. The default rejects txs whose
 # fee rate is below the BSV miner policy minimum of 100 sat/kB.
@@ -123,6 +160,14 @@ health:
 #   # teratestnet/regtest where the upstream Teranode is also configured
 #   # to accept zero-fee txs. Leave false on mainnet and testnet.
 #   # accept_zero_fee: false
+#   # disable_finality_check turns off the nLockTime/BIP113 intake gate
+#   # that rejects provably non-final txs with an actionable reason
+#   # (issue #245). The gate needs a chain source: the embedded
+#   # chaintracks (mode=all) or chaintracks.mode=remote pointed at the
+#   # chaintracks pod (note: the URL must include the /chaintracks path
+#   # prefix). Without one it silently fails open, so this switch is only
+#   # an emergency escape hatch.
+#   # disable_finality_check: false
 
 # SSRF guard for client-supplied callback URLs. The api-server rejects
 # X-CallbackUrl values whose host is loopback / link-local / RFC1918 /
@@ -150,10 +195,40 @@ health:
 # Going beyond ~65536 just delays the drop rather than addressing the
 # slow-consumer root cause. Memory cost is roughly
 # subscribers × subscriber_buffer × ~500 bytes per slot.
+# Subscribers are live-only: their consumer groups start at the topic head,
+# and history missed while a pod was down recovers via store-backed paths
+# (SSE Last-Event-ID catchup, webhook retry reaper), not Kafka replay.
 # events:
 #   subscriber_buffer: 4096
 
 # propagation:
+#   # Number of partitions arcade requires on arcade.propagation, and the
+#   # number of propagation replicas that can do work (one dep-aware
+#   # dispatcher per partition claim; extra replicas idle as standbys).
+#   # Checked fail-closed at startup: a topic with FEWER partitions than this
+#   # aborts the boot. More is allowed — the producer hashes over the topic's
+#   # actual partition count, so extra partitions carry real traffic and get
+#   # their own dispatchers. Widen the topic BEFORE raising this; see
+#   # docs/production-kafka.md "Widening an existing deployment".
+#   partitions: 1
+#
+#   # Fast-path requeue: a tx with no network verdict is retried in-memory up
+#   # to retry_max_attempts times, retry_backoff_ms apart, before parking at
+#   # PENDING_RETRY. At the defaults that is a ~10s window.
+#   retry_max_attempts: 5
+#   retry_backoff_ms: 2000
+#
+#   # Durable retry: once parked, a tx is drained by the reaper in
+#   # next_retry_at order with exponential backoff from
+#   # pending_retry_backoff_ms, doubling to pending_retry_max_backoff_ms.
+#   # After pending_retry_max_attempts it is terminalized REJECTED — the
+#   # give-up case is a tx spending an outpoint that never reaches the
+#   # network, which can neither succeed nor be condemned by an ancestor.
+#   # The default 288 attempts is ~24h at the 5-minute cap.
+#   pending_retry_backoff_ms: 5000
+#   pending_retry_max_backoff_ms: 300000
+#   pending_retry_max_attempts: 288
+#
 #   # Per-endpoint circuit-breaker for the datahub URL list. Endpoints that
 #   # accumulate `failure_threshold` consecutive failures are marked unhealthy
 #   # and excluded from broadcasts; a background probe hits GET /health on
@@ -184,6 +259,45 @@ bump_builder:
   # malfunctioning endpoint. Set <= 0 to use the built-in default.
   # Mitigates F-007.
   # datahub_max_block_bytes: 1073741824
+  #
+  # Write-time anchor guard (issue #279): refuse to mark a block's txs MINED
+  # when chaintracks' active chain provably has a DIFFERENT block at its
+  # height (same-height competition loser). Fails open on any uncertainty.
+  # false restores legacy last-writer-wins behavior as a rollback lever.
+  # anchor_guard_enabled: true
+  #
+  # Anchor reconciler (issue #279): heals transactions anchored to orphaned
+  # blocks — re-anchors them to the active-chain block containing them (via
+  # the canonical block's stored compound BUMP). Runs in the bump-builder
+  # mode, lease-gated across replicas.
+  # reconciler:
+  #   enabled: true
+  #   interval_ms: 30000       # orphan-queue tick cadence
+  #   batch_size: 5000         # txids per store write / bulk event
+  #   blocks_per_tick: 4       # orphaned blocks reconciled per tick
+  #   neighborhood_depth: 6    # heights above an orphan searched for re-binned txs
+  #   max_defer_attempts: 10   # ticks to wait for a missing canonical BUMP
+  #   startup_full_scan: true  # one-off sweep for stale anchors (bounded, see below)
+  #
+  #   # Startup full-scan horizon (issue #282). The sweep is BOUNDED so it does
+  #   # not re-orphan a long chain's entire history oldest-first (which starves
+  #   # the actual recent incident). It considers only heights within
+  #   # full_scan_depth of the active tip. Default 144 (~1 day of BSV blocks);
+  #   # a chain shorter than the horizon is swept whole (cheap).
+  #   full_scan_depth: 144
+  #   # Operator-targeted recovery: when either bound is > 0 the startup scan
+  #   # runs over the explicit [min, max] height range instead of the depth
+  #   # horizon (max 0 = up to the tip). E.g. min=760 max=770 heals just the
+  #   # height-764 incident from its already-stored canonical BUMP; min=1
+  #   # restores the legacy whole-history sweep. Both default 0.
+  #   full_scan_min_height: 0
+  #   full_scan_max_height: 0
+  #
+  #   # Fallback when a block's canonical BUMP is unavailable at the defer cap
+  #   # (issue #282). Default false: PARK the block — leave its txs MINED
+  #   # against the orphan (a later canonical BUMP re-anchors them) rather than
+  #   # un-mining them. true restores the pre-#282 revert-all-to-SEEN fallback.
+  #   revert_when_unreconcilable: false
 
 # Shared on-disk root for arcade state. Chaintracks headers default to
 # <storage_path>/chaintracks/.
@@ -195,6 +309,13 @@ bump_builder:
 # Set enabled: false in environments without outbound P2P.
 chaintracks_server:
   enabled: true
+  # Tie-scan (issue #279): on each tip update, re-verify the 'active'
+  # block_processing rows within tie_scan_depth of the tip against the
+  # active chain and mark same-height losers orphaned — the case where
+  # chaintracks emits NO ReorgEvent (an equal-chainwork alternate never
+  # becomes tip). 0 disables. Debounced by tie_scan_min_interval_ms.
+  # tie_scan_depth: 20
+  # tie_scan_min_interval_ms: 5000
 
 # go-chaintracks library config. See that library's docs for the full set.
 # Defaults are inherited from the library's SetDefaults — uncomment to override.

@@ -9,6 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
 )
@@ -123,7 +124,7 @@ func (s *Server) handleGetBlockProcessingStatus(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		s.logger.Error("get block_processing", zap.String("block_hash", hash), zap.Error(err))
+		s.logger.Error("get block_processing", logfields.BlockHash(hash), zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to fetch block processing status"})
 		return
 	}

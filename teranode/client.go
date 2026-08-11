@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/metrics"
@@ -59,11 +60,11 @@ const (
 // guarded by the enclosing Client's RWMutex — the struct itself is not
 // independently thread-safe.
 //
-// Two parallel failure counters drive the same `state` field:
+// Three parallel failure counters drive the same `state` field:
 //
 //   - consecutiveFailures: fast track for reachability failures (no HTTP
-//     response received — DNS, transport, timeout). Trips at
-//     failureThreshold (default 3).
+//     response received — DNS, transport, timeout) observed on the
+//     broadcast path. Trips at failureThreshold (default 3).
 //   - consecutiveBroadcastFailures: slow track for non-2xx responses. Trips
 //     at broadcastFailureThreshold (default 10). Catches the case where an
 //     endpoint is responding but consistently rejecting our payload —
@@ -71,12 +72,24 @@ const (
 //     peers whose validation rules disagree with ours, are alive but
 //     useless to us. Without this, every broadcast wasted a worker slot on
 //     them.
+//   - consecutiveProbeFailures: reachability failures observed by the
+//     background probe loop, which probes EVERY endpoint (not just
+//     unhealthy ones). Trips at failureThreshold. This is what lets pods
+//     that never broadcast (api-server, sse, watchdog) demote a dead
+//     endpoint so their /health output reflects reality. It is deliberately
+//     a separate counter: a probe success on a healthy endpoint must NOT
+//     reset the broadcast-path counters, otherwise a 30s probe cadence
+//     against an endpoint whose /health answers — but whose POST /txs
+//     always fails — would keep resetting the slow track and the breaker
+//     could never trip.
 //
-// Either counter tripping marks the endpoint unhealthy; a single 2xx
-// response resets both.
+// Any counter tripping marks the endpoint unhealthy; a single 2xx broadcast
+// response (RecordSuccess) or a probe success on an unhealthy endpoint
+// resets all three.
 type endpointHealth struct {
 	consecutiveFailures          int
 	consecutiveBroadcastFailures int
+	consecutiveProbeFailures     int
 	lastFailure                  time.Time
 	state                        healthState
 	source                       healthSource
@@ -203,7 +216,7 @@ func NewClient(endpoints []string, authToken string, hc HealthConfig) *Client {
 		authToken: authToken,
 		httpClient: &http.Client{
 			Timeout:   defaultTimeout,
-			Transport: newBroadcastTransport(),
+			Transport: otelhttp.NewTransport(newBroadcastTransport()),
 		},
 		failureThreshold:          hc.FailureThreshold,
 		broadcastFailureThreshold: hc.BroadcastFailureThreshold,
@@ -363,7 +376,7 @@ func (c *Client) AddEndpoints(urls []string) int {
 	return added
 }
 
-// RecordSuccess resets both failure counters to zero (a successful 2xx
+// RecordSuccess resets all failure counters to zero (a successful 2xx
 // response is the canonical signal of full endpoint health) and, if the
 // endpoint was previously unhealthy, transitions it back to healthy.
 // Unknown URLs are silently ignored so callers don't need to pre-check.
@@ -378,6 +391,7 @@ func (c *Client) RecordSuccess(url string) {
 	transitioned := h.state == stateUnhealthy
 	h.consecutiveFailures = 0
 	h.consecutiveBroadcastFailures = 0
+	h.consecutiveProbeFailures = 0
 	h.state = stateHealthy
 	source := h.source
 	c.recomputeBelowThresholdLocked()
@@ -470,6 +484,83 @@ func (c *Client) RecordBroadcastFailure(url string) {
 			zap.String("reason", "persistent_non_2xx"),
 		)
 	}
+}
+
+// recordProbeFailure increments the probe-failure counter for an endpoint
+// and transitions it to unhealthy once the counter reaches failureThreshold.
+// Kept separate from RecordFailure so probe outcomes and broadcast outcomes
+// can't mask each other (see the endpointHealth doc comment).
+func (c *Client) recordProbeFailure(url string) {
+	n := normalizeURL(url)
+	c.mu.Lock()
+	h, ok := c.health[n]
+	if !ok {
+		c.mu.Unlock()
+		return
+	}
+	h.consecutiveProbeFailures++
+	h.lastFailure = time.Now()
+	transitioned := false
+	if h.state == stateHealthy && h.consecutiveProbeFailures >= c.failureThreshold {
+		h.state = stateUnhealthy
+		transitioned = true
+	}
+	source := h.source
+	consecutive := h.consecutiveProbeFailures
+	c.recomputeBelowThresholdLocked()
+	c.mu.Unlock()
+	if transitioned {
+		metrics.TeranodeEndpointHealth.WithLabelValues(n, sourceLabel(source)).Set(0)
+		c.logger.Warn(
+			"endpoint unhealthy",
+			zap.String("endpoint", n),
+			zap.Int("consecutive_probe_failures", consecutive),
+			zap.String("from", "healthy"),
+			zap.String("to", "unhealthy"),
+			zap.String("reason", "probe"),
+		)
+	}
+}
+
+// recordProbeSuccess handles a successful probe (any HTTP response).
+//
+// For an unhealthy endpoint this is the recovery signal and behaves exactly
+// like RecordSuccess: all counters reset, state flips back to healthy —
+// preserving the long-standing probe-recovery contract (any response, even
+// 4xx/5xx, proves reachability; usefulness is re-judged by the slow track
+// once broadcasts resume).
+//
+// For a healthy endpoint it resets ONLY the probe counter. The broadcast
+// counters are deliberately untouched: /health answering says nothing about
+// whether POST /txs works, and zeroing them here would neuter both
+// broadcast-path breakers for any pod running probes (i.e. all of them).
+func (c *Client) recordProbeSuccess(url string) {
+	n := normalizeURL(url)
+	c.mu.Lock()
+	h, ok := c.health[n]
+	if !ok {
+		c.mu.Unlock()
+		return
+	}
+	if h.state == stateUnhealthy {
+		h.consecutiveFailures = 0
+		h.consecutiveBroadcastFailures = 0
+		h.consecutiveProbeFailures = 0
+		h.state = stateHealthy
+		source := h.source
+		c.recomputeBelowThresholdLocked()
+		c.mu.Unlock()
+		metrics.TeranodeEndpointHealth.WithLabelValues(n, sourceLabel(source)).Set(1)
+		c.logger.Info(
+			"endpoint healthy",
+			zap.String("endpoint", n),
+			zap.String("from", "unhealthy"),
+			zap.String("to", "healthy"),
+		)
+		return
+	}
+	h.consecutiveProbeFailures = 0
+	c.mu.Unlock()
 }
 
 // sourceLabel converts the internal healthSource enum to the metric label value.
@@ -581,16 +672,19 @@ func (c *Client) probeLoop(ctx context.Context) {
 	}
 }
 
-// probeOnce collects the current unhealthy set under an RLock, then probes
+// probeOnce snapshots the full endpoint list under an RLock, then probes
 // each endpoint concurrently so one slow probe doesn't block the others.
+//
+// Healthy endpoints are probed too — not just unhealthy ones. Pods that
+// never broadcast (api-server, sse, watchdog) have no other signal that a
+// registered endpoint went dark, so without this their health map (and the
+// public /health datahub_urls output) reported dead endpoints healthy
+// forever. Probe outcomes feed the dedicated probe counter, never the
+// broadcast counters (see recordProbeSuccess).
 func (c *Client) probeOnce(ctx context.Context) {
 	c.mu.RLock()
-	var targets []string
-	for _, ep := range c.endpoints {
-		if h, ok := c.health[ep]; ok && h.state == stateUnhealthy {
-			targets = append(targets, ep)
-		}
-	}
+	targets := make([]string, len(c.endpoints))
+	copy(targets, c.endpoints)
 	c.mu.RUnlock()
 	if len(targets) == 0 {
 		return
@@ -609,7 +703,9 @@ func (c *Client) probeOnce(ctx context.Context) {
 
 // probeEndpoint issues a single GET /health. A non-nil HTTP response counts
 // as reachable regardless of status code; a transport error or context
-// timeout counts as a failure.
+// timeout counts as a failure. Outcomes are recorded on the probe-specific
+// counter so probes can demote unreachable endpoints (and recover unhealthy
+// ones) without touching the broadcast-path breaker counters.
 func (c *Client) probeEndpoint(ctx context.Context, endpoint string) {
 	start := time.Now()
 	probeCtx, cancel := context.WithTimeout(ctx, c.probeTimeout)
@@ -617,18 +713,18 @@ func (c *Client) probeEndpoint(ctx context.Context, endpoint string) {
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, endpoint+"/health", nil)
 	if err != nil {
 		observeRequest("probe", 0, start)
-		c.RecordFailure(endpoint)
+		c.recordProbeFailure(endpoint)
 		return
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		observeRequest("probe", 0, start)
-		c.RecordFailure(endpoint)
+		c.recordProbeFailure(endpoint)
 		return
 	}
 	observeRequest("probe", resp.StatusCode, start)
 	drainAndClose(resp.Body)
-	c.RecordSuccess(endpoint)
+	c.recordProbeSuccess(endpoint)
 }
 
 // observeRequest records latency + status class for an outbound HTTP request.
@@ -681,16 +777,32 @@ func (c *Client) SubmitTransaction(ctx context.Context, endpoint string, rawTx [
 //
 //   - HTTP 200: every tx accepted. failures is nil so callers short-circuit
 //     without per-tx inspection.
-//   - HTTP 500 + body starting "Failed to process transactions:" (Teranode
-//     upstream main #879): each subsequent line is one tx's error in the
-//     form "<TERANODE_CODE_NAME> (<num>): <message containing the txid via
+//   - Non-200 + body starting "Failed to process transactions:" (Teranode
+//     upstream main #879): each subsequent line is one tx's error in the form
+//     "<TERANODE_CODE_NAME> (<num>): <message containing the txid via
 //     [ProcessTransaction][<txid>]>". The returned map is keyed by the
 //     extracted txid; the value is the full line verbatim so callers can
-//     surface the Teranode code in wallet-visible rows. Txs not in the map
-//     are assumed to have been accepted.
-//   - Anything else (4xx, 5xx with non-Teranode body, transport error):
-//     failures is nil; the caller treats the batch as a pure infra failure
-//     (whole batch requeued for another attempt).
+//     surface the Teranode code in wallet-visible rows (GET /tx extraInfo,
+//     SSE, webhooks). Txs not in the map are assumed accepted by that peer.
+//   - Non-200 without a parseable Teranode failure-list body (gateway 502/503,
+//     "no available server", echo recover panic, bare 500, transport error,
+//     or an unexpected 2xx-but-not-200): failures is nil; the caller treats
+//     the response as pure infra (no per-tx vote — requeue if no peer
+//     produced a parseable verdict).
+//
+// The failure-list parse is intentionally status-agnostic: the body shape is
+// the contract, not the HTTP code. This is Teranode's own contract, not proxy
+// folklore — since v0.16 the /txs handler derives the aggregate status from
+// the per-tx error class (httpStatusForTxError, services/propagation/
+// Server.go): conflict-family failures (UTXO_SPENT, TX_CONFLICTING,
+// TX_INVALID_DOUBLE_SPEND, TX_LOCKED) return 409, TX_MISSING_PARENT 422,
+// the policy family (TX_INVALID, TX_POLICY, TX_LOCK_TIME, UTXO_NON_FINAL, …)
+// 400, UTXO_FROZEN 403, and only unclassified server faults 500 — all with
+// the identical failure-list body. Restricting parse to 500 silently dropped
+// real validator rejections that arrived as 409/422 (observed in production:
+// UTXO_SPENT / PROCESSING failures visible only in propagation Warn logs
+// while the tx never terminalized — GET /tx stayed RECEIVED/requeued with no
+// reject reason).
 func (c *Client) SubmitTransactions(ctx context.Context, endpoint string, rawTxs [][]byte) (int, map[string]string, error) {
 	start := time.Now()
 	// Calculate total size for pre-allocation
@@ -725,21 +837,29 @@ func (c *Client) SubmitTransactions(ctx context.Context, endpoint string, rawTxs
 	defer drainAndClose(resp.Body)
 	defer observeRequest("submit_txs", resp.StatusCode, start)
 
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, readErr := io.ReadAll(resp.Body)
 
 	if resp.StatusCode == http.StatusOK {
+		// The 200 status line is the whole-batch acceptance verdict; the
+		// body carries no per-tx information, so a read error here doesn't
+		// invalidate the verdict.
 		return resp.StatusCode, nil, nil
 	}
 
-	// HTTP 500 with the Teranode failure-list body (#879) — extract a
-	// per-txid map. Any other 5xx/4xx (echo recover panic, gateway 502/503,
-	// proxy-injected error pages, etc.) falls through to the infra-failure
-	// path with failures==nil.
-	if resp.StatusCode == http.StatusInternalServerError {
-		failures := parseTxsFailures(respBody, c.logger)
-		if failures != nil {
-			return resp.StatusCode, failures, fmt.Errorf("%w %d", errUnexpectedStatusCode, resp.StatusCode)
-		}
+	if readErr != nil {
+		// Truncated or aborted body (connection reset mid-transfer,
+		// unexpected EOF). A PARTIAL failure list must never be parsed:
+		// the map's "absent ⇒ accepted" contract would grant implicit
+		// acceptance to every tx whose failure line was cut off. Treat as
+		// pure infra — no per-tx vote.
+		return resp.StatusCode, nil, fmt.Errorf("%w %d: reading response body: %w", errUnexpectedStatusCode, resp.StatusCode, readErr)
+	}
+
+	// Any non-200 may carry Teranode's failure-list body. Parse first; only
+	// fall through to the opaque infra-failure path when the body is not a
+	// structured per-tx verdict. Status stays on the wire for metrics/logs.
+	if failures := parseTxsFailures(respBody, c.logger); failures != nil {
+		return resp.StatusCode, failures, fmt.Errorf("%w %d", errUnexpectedStatusCode, resp.StatusCode)
 	}
 
 	return resp.StatusCode, nil, fmt.Errorf("%w %d: %s", errUnexpectedStatusCode, resp.StatusCode, string(respBody))
@@ -756,8 +876,18 @@ const txsFailureHeader = "Failed to process transactions:"
 // lowercase but the regex stays defensive.
 var txsTxidPattern = regexp.MustCompile(`[0-9a-fA-F]{64}`)
 
-// parseTxsFailures extracts the per-txid failure list from a /txs HTTP 500
-// response body. The expected format is:
+// txsWrappedTxidPattern extracts the txid from Teranode's
+// "[ProcessTransaction][<txid>]" wrapper. Preferred over the bare 64-hex
+// fallback because conflict-family messages embed OTHER transactions' hashes
+// before any wrapper — e.g. "UTXO_SPENT (70): <outpoint-txid>:<vout> utxo
+// already spent by tx <spender-txid>[0]" names the spent outpoint's tx and
+// the competing spender, not the submitted tx. A bare first-hex match on a
+// wrapped line that also mentions an outpoint would mis-key the failure.
+var txsWrappedTxidPattern = regexp.MustCompile(`\[ProcessTransaction\]\[([0-9a-fA-F]{64})\]`)
+
+// parseTxsFailures extracts the per-txid failure list from a /txs non-2xx
+// response body. The expected format is status-agnostic (HTTP 500, 422, 400,
+// … all accepted — the body shape is the contract):
 //
 //	"Failed to process transactions:
 //	<NAME> (<num>): [ProcessTransaction][<txid>] <message>
@@ -767,7 +897,7 @@ var txsTxidPattern = regexp.MustCompile(`[0-9a-fA-F]{64}`)
 //
 // Returns a txid → full-line map naming every failed tx, or nil if the body
 // doesn't match Teranode's failure-list shape (in which case the caller
-// treats the batch as a pure infra failure). Lines whose txid couldn't be
+// treats the response as a pure infra failure). Lines whose txid couldn't be
 // extracted are dropped — the contract is "if you appear in the map you
 // failed; if you don't you're accepted," so a malformed line with no
 // recognizable txid would otherwise be silently lost. A trailing nil-map
@@ -789,7 +919,20 @@ func parseTxsFailures(body []byte, logger *zap.Logger) map[string]string {
 		if line == "" {
 			continue
 		}
-		txid := txsTxidPattern.FindString(line)
+		// Prefer the [ProcessTransaction][<txid>] wrapper — it names the
+		// submitted tx unambiguously. Wrapper-less lines (Teranode's
+		// UserMessage surfaces the deepest public cause, which for the
+		// conflict family carries no wrapper) fall back to the first bare
+		// 64-hex string; that may be another tx entirely (spent outpoint /
+		// competing spender), so the CALLER must verify each key actually
+		// names a submitted tx before trusting the map's "absent ⇒ accepted"
+		// contract (see broadcastBatchToEndpoints).
+		var txid string
+		if m := txsWrappedTxidPattern.FindStringSubmatch(line); m != nil {
+			txid = m[1]
+		} else {
+			txid = txsTxidPattern.FindString(line)
+		}
 		if txid == "" {
 			// Fail-closed: an orphan line means the response isn't fully
 			// trustworthy (Teranode processOne panic, or a future format

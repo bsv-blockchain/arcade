@@ -23,6 +23,7 @@ import (
 	"errors"
 	"math"
 	mrand "math/rand"
+	"net/http"
 	"os"
 	"sync"
 	"time"
@@ -30,6 +31,7 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
@@ -69,6 +71,14 @@ type attemptState struct {
 	// Compared against time.Now in the tick loop; if it's in the future
 	// the candidate is skipped without an HTTP call.
 	nextEligibleAt time.Time
+	// total counts every /reprocess dispatch for this block regardless of
+	// outcome (success OR failure). Unlike failures it is never reset — it
+	// drives the MaxReprocessAttempts cap so an accepted-but-never-finalized
+	// block (which resets failures to 0 each stale window) still gets parked.
+	total int
+	// parked is set once when the block crosses a cap (attempts or age) so the
+	// WARN + metric fire exactly once, not every tick thereafter.
+	parked bool
 }
 
 // Config is the resolved knob bundle the run loop consumes. Construct
@@ -84,6 +94,12 @@ type Config struct {
 	InitialBackoff  time.Duration
 	MaxBackoff      time.Duration
 	TerminalBackoff time.Duration
+	// MaxReprocessAttempts caps total /reprocess dispatches per block; once a
+	// block hits this it is parked (reprocessing stops). <= 0 disables the cap.
+	MaxReprocessAttempts int
+	// MaxStaleAge parks a block whose header_seen_at is older than this,
+	// regardless of attempt count. Restart-proof backstop. <= 0 disables it.
+	MaxStaleAge time.Duration
 }
 
 // Watchdog is the background actor. Construction is via New so callers
@@ -249,7 +265,18 @@ func (w *Watchdog) runOnce(ctx context.Context) {
 		return
 	}
 
-	eligible := w.filterEligible(candidates, now)
+	eligible, newlyParked := w.filterEligible(candidates, now)
+	if len(newlyParked) > 0 {
+		// Persist the park as a terminal status so the rows leave the stale
+		// scan (status='active' predicate) and read as an explicit triage
+		// backlog instead of perpetual processed_at=NULL churn. Best-effort:
+		// the in-memory parked flag already stops reprocessing this run, and
+		// a redeploy would re-try once then re-park (rewriting the status).
+		if err := w.store.MarkBlocksParked(ctx, newlyParked); err != nil {
+			w.logger.Warn("watchdog: failed to persist parked status",
+				zap.Int("blocks", len(newlyParked)), zap.Error(err))
+		}
+	}
 	if len(eligible) == 0 {
 		w.gc(now)
 		return
@@ -260,20 +287,71 @@ func (w *Watchdog) runOnce(ctx context.Context) {
 }
 
 // filterEligible drops candidates whose in-memory backoff hasn't expired.
-// Returns the rows that should actually trigger a /reprocess this tick.
-func (w *Watchdog) filterEligible(rows []*models.BlockProcessingStatus, now time.Time) []*models.BlockProcessingStatus {
+// Returns the rows that should actually trigger a /reprocess this tick, plus
+// the block hashes that crossed a park cap on THIS pass (first time only) so
+// the caller can persist their terminal status.
+func (w *Watchdog) filterEligible(rows []*models.BlockProcessingStatus, now time.Time) (eligible []*models.BlockProcessingStatus, newlyParked []string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	out := rows[:0:cap(rows)]
 	for _, r := range rows {
 		st := w.attempts[r.BlockHash]
+		// Cap reprocessing: a block re-driven MaxReprocessAttempts times (or
+		// stale longer than MaxStaleAge, after at least one attempt) is
+		// parked — we stop issuing /reprocess so a permanently un-finalizable
+		// block can't soak the arcade.block_processed topic indefinitely (the
+		// reprocess storm that saturates the single bump-builder consumer).
+		// The park is persisted as status='parked' by the caller, so the row
+		// stops surfacing here at all; a redeploy re-tries once then re-parks.
+		if reason := w.parkReason(r, st, now); reason != "" {
+			if st == nil {
+				st = &attemptState{lastTriedAt: now}
+				w.attempts[r.BlockHash] = st
+			}
+			if !st.parked {
+				st.parked = true
+				newlyParked = append(newlyParked, r.BlockHash)
+				metrics.WatchdogParkedTotal.WithLabelValues(reason).Inc()
+				w.logger.Warn("watchdog: parking block; stopping reprocess",
+					logfields.BlockHash(r.BlockHash),
+					logfields.BlockHeight(r.BlockHeight),
+					zap.String("reason", reason),
+					zap.Int("attempts", st.total))
+			}
+			continue
+		}
 		if st != nil && st.nextEligibleAt.After(now) {
 			continue
 		}
 		out = append(out, r)
 	}
-	return out
+	return out, newlyParked
+}
+
+// parkReason returns a non-empty reason ("max_age" | "max_attempts") when the
+// block should be parked (reprocessing stopped), or "" to keep re-driving.
+// Each bound is disabled when its config value is <= 0.
+//
+// The max-age bound only fires after at least one dispatch for the block: a
+// block ALREADY past MaxStaleAge when first seen (an incident backlog
+// surfacing late, or a redeploy resetting the in-memory counters) gets
+// exactly one recovery attempt instead of being abandoned with zero —
+// age-parking at attempts:0 silently strands recoverable blocks forever.
+// The next tick re-consults parkReason with total >= 1, so the park still
+// lands promptly after that single attempt.
+func (w *Watchdog) parkReason(r *models.BlockProcessingStatus, st *attemptState, now time.Time) string {
+	attempts := 0
+	if st != nil {
+		attempts = st.total
+	}
+	if w.cfg.MaxStaleAge > 0 && attempts > 0 && now.Sub(r.HeaderSeenAt) > w.cfg.MaxStaleAge {
+		return "max_age"
+	}
+	if w.cfg.MaxReprocessAttempts > 0 && attempts >= w.cfg.MaxReprocessAttempts {
+		return "max_attempts"
+	}
+	return ""
 }
 
 // dispatch fires /reprocess calls in parallel, bounded by MaxConcurrent.
@@ -296,8 +374,8 @@ func (w *Watchdog) dispatch(ctx context.Context, rows []*models.BlockProcessingS
 // state based on the outcome.
 func (w *Watchdog) reprocessOne(ctx context.Context, row *models.BlockProcessingStatus) {
 	logger := w.logger.With(
-		zap.String("block_hash", row.BlockHash),
-		zap.Uint64("block_height", row.BlockHeight),
+		logfields.BlockHash(row.BlockHash),
+		logfields.BlockHeight(row.BlockHeight),
 	)
 	logger.Info("watchdog: requesting /reprocess for stale block")
 
@@ -311,6 +389,18 @@ func (w *Watchdog) reprocessOne(ctx context.Context, row *models.BlockProcessing
 
 	var fail *merkleservice.ReprocessError
 	switch {
+	case errors.As(err, &fail) && (fail.StatusCode == http.StatusUnauthorized || fail.StatusCode == http.StatusForbidden):
+		// Auth rejection, NOT a chain-consensus verdict. Almost always a
+		// configuration problem: merkle_service.auth_token is missing or wrong
+		// (see issue #269). Do NOT apply terminal backoff or let this count
+		// toward MaxReprocessAttempts — parking a block on an auth failure
+		// silently abandons its merkle proof for a problem an operator can fix.
+		// recordAuthFailure re-drives at a slow, loud cadence and self-heals
+		// once the token is set.
+		metrics.WatchdogReprocessTotal.WithLabelValues("err_auth").Inc()
+		logger.Warn("watchdog: /reprocess returned 401/403 — merkle_service.auth_token likely missing or wrong; NOT parking, will keep retrying once configured",
+			zap.Int("status_code", fail.StatusCode))
+		w.recordAuthFailure(row.BlockHash, now)
 	case errors.As(err, &fail) && fail.StatusCode >= 400 && fail.StatusCode < 500:
 		// Terminal: block isn't on the consensus chain (or merkle-service
 		// considers the request malformed). Back off heavily — re-trying
@@ -346,11 +436,19 @@ func (w *Watchdog) reprocessOne(ctx context.Context, row *models.BlockProcessing
 func (w *Watchdog) recordSuccess(hash string, now time.Time) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.attempts[hash] = &attemptState{
-		lastTriedAt:    now,
-		failures:       0,
-		nextEligibleAt: now.Add(w.cfg.StaleThreshold),
+	// Fetch-or-increment rather than replace: a 2xx ack does NOT mean the block
+	// finalized (only that merkle accepted the request). Preserving the total
+	// counter across re-drives is what lets MaxReprocessAttempts eventually park
+	// an accepted-but-never-finalized block instead of re-driving it forever.
+	st := w.attempts[hash]
+	if st == nil {
+		st = &attemptState{}
+		w.attempts[hash] = st
 	}
+	st.lastTriedAt = now
+	st.failures = 0
+	st.total++
+	st.nextEligibleAt = now.Add(w.cfg.StaleThreshold)
 	metrics.WatchdogBackoffDepth.Set(float64(len(w.attempts)))
 }
 
@@ -364,7 +462,29 @@ func (w *Watchdog) recordFailure(hash string, now time.Time, delay time.Duration
 	}
 	st.lastTriedAt = now
 	st.failures++
+	st.total++
 	st.nextEligibleAt = now.Add(w.jitter(delay))
+	metrics.WatchdogBackoffDepth.Set(float64(len(w.attempts)))
+}
+
+// recordAuthFailure records a 401/403 from /reprocess. Unlike recordFailure /
+// recordTransientFailure it deliberately does NOT increment st.total, so the
+// block is never parked: parkReason gates both "max_attempts" and "max_age" on
+// attempts (=st.total) > 0, and an auth misconfiguration is a fixable operator
+// problem, not a permanently un-finalizable block. It applies InitialBackoff so
+// the block is re-driven at a slow, loud cadence until the token is configured.
+func (w *Watchdog) recordAuthFailure(hash string, now time.Time) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	st := w.attempts[hash]
+	if st == nil {
+		st = &attemptState{}
+		w.attempts[hash] = st
+	}
+	st.lastTriedAt = now
+	st.failures++
+	// Intentionally do not touch st.total — see doc comment above.
+	st.nextEligibleAt = now.Add(w.jitter(w.cfg.InitialBackoff))
 	metrics.WatchdogBackoffDepth.Set(float64(len(w.attempts)))
 }
 
@@ -378,6 +498,7 @@ func (w *Watchdog) recordTransientFailure(hash string, now time.Time) {
 	}
 	st.lastTriedAt = now
 	st.failures++
+	st.total++
 	delay := transientBackoff(w.cfg.InitialBackoff, w.cfg.MaxBackoff, st.failures)
 	st.nextEligibleAt = now.Add(w.jitter(delay))
 	metrics.WatchdogBackoffDepth.Set(float64(len(w.attempts)))

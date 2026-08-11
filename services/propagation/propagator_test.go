@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -121,6 +122,14 @@ type mockStore struct {
 	cleared        []clearedCall
 	// replayRows drives IterateStatusesSince for merkle-replay tests.
 	replayRows []*models.TransactionStatus
+	// iterated counts rows visited by IterateStatusesSince — lets a test
+	// assert the reaper walk aborts at the rebroadcast batch (issue #290)
+	// instead of scanning the whole table.
+	iterated int
+	// submissionsByTxID drives GetSubmissionsByTxID, used by the reaper's
+	// stuck-by-callback attribution. Absent txids return no submissions
+	// (attributed to the "none" host).
+	submissionsByTxID map[string][]*models.Submission
 	// merkleMarks records every MarkMerkleRegisteredByTxIDs call as one
 	// slice per call. Lets tests assert how many flushes happened and
 	// which txids landed in each.
@@ -138,6 +147,52 @@ type mockStore struct {
 	// returns — simulating a store write failure so tests can exercise the
 	// at-least-once guard that skips dispatcher notification on error.
 	returningErr error
+	// statusByTxID drives GetStatus, used by the missing-parent safety
+	// net's store consult (rejectedAncestor). Absent txids return
+	// store.ErrNotFound.
+	statusByTxID map[string]models.Status
+	// rawByTxID carries raw_tx alongside statusByTxID so GetStatus returns
+	// rows shaped like the real backends'. See setStatusRow.
+	rawByTxID map[string][]byte
+	// retrySeq records the order rows entered the durable retry queue, so
+	// GetReadyRetries can break next_retry_at ties the way an index scan does.
+	retrySeq     map[string]int
+	retrySeqNext int
+}
+
+// setStatus seeds the row GetStatus returns for txid.
+func (m *mockStore) setStatus(txid string, status models.Status) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.statusByTxID == nil {
+		m.statusByTxID = make(map[string]models.Status)
+	}
+	m.statusByTxID[txid] = status
+}
+
+// setStatusRow seeds status AND raw bytes for txid. The raw bytes matter to
+// rejectedAncestor's transitive walk: climbing from a parent to a grandparent
+// means re-deriving the parent's own inputs, which real store rows carry in
+// raw_tx.
+func (m *mockStore) setStatusRow(txid string, status models.Status, rawTx []byte) {
+	m.setStatus(txid, status)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.rawByTxID == nil {
+		m.rawByTxID = make(map[string][]byte)
+	}
+	m.rawByTxID[txid] = append([]byte(nil), rawTx...)
+}
+
+// GetStatus serves the seeded statusByTxID map; unknown txids return
+// store.ErrNotFound, matching the real backends' contract.
+func (m *mockStore) GetStatus(_ context.Context, txid string) (*models.TransactionStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if st, ok := m.statusByTxID[txid]; ok {
+		return &models.TransactionStatus{TxID: txid, Status: st, RawTx: m.rawByTxID[txid]}, nil
+	}
+	return nil, store.ErrNotFound
 }
 
 type clearedCall struct {
@@ -150,10 +205,11 @@ func newMockStore() *mockStore {
 	return &mockStore{
 		retryCounts:    make(map[string]int),
 		pendingRetries: make(map[string]*store.PendingRetry),
+		retrySeq:       make(map[string]int),
 	}
 }
 
-func (m *mockStore) EnsureIndexes() error { return nil }
+func (m *mockStore) EnsureIndexes(context.Context) error { return nil }
 
 func (m *mockStore) UpdateStatus(_ context.Context, status *models.TransactionStatus) error {
 	m.mu.Lock()
@@ -199,36 +255,152 @@ func (m *mockStore) BumpRetryCount(_ context.Context, txid string) (int, error) 
 func (m *mockStore) SetPendingRetryFields(_ context.Context, txid string, rawTx []byte, nextRetryAt time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if _, ok := m.retrySeq[txid]; !ok {
+		m.retrySeq[txid] = m.retrySeqNext
+		m.retrySeqNext++
+	}
 	m.pendingRetries[txid] = &store.PendingRetry{
 		TxID:        txid,
 		RawTx:       append([]byte(nil), rawTx...),
 		RetryCount:  m.retryCounts[txid],
 		NextRetryAt: nextRetryAt,
 	}
+	// Mirror the write onto the row the scan walk sees. The real statement
+	// updates the transactions row itself, so a later IterateStatusesSince
+	// observes the new next_retry_at — which is what stops the reaper's
+	// legacy-row adoption from re-firing on every tick.
+	for _, r := range m.replayRows {
+		if r.TxID == txid {
+			r.Status = models.StatusPendingRetry
+			r.NextRetryAt = nextRetryAt
+			r.RetryCount = m.retryCounts[txid]
+			r.Timestamp = time.Now()
+		}
+	}
 	// Reflect PENDING_RETRY status in the updates stream so existing tests that
 	// inspect status updates continue to observe the transition.
+	//
+	// Carry the row's current ExtraInfo forward. The real statement is
+	// "UPDATE transactions SET status=$2, raw_tx=$3, next_retry_at=$4,
+	// timestamp_at=NOW()" — it does not touch extra_info, so the park reason
+	// written moments earlier by applyTerminalStatuses survives. A mock that
+	// appended a reason-less row would make GET /tx look like it lost the
+	// explanation when it hadn't.
+	var extra string
+	for i := len(m.updates) - 1; i >= 0; i-- {
+		if m.updates[i].TxID == txid {
+			extra = m.updates[i].ExtraInfo
+			break
+		}
+	}
 	m.updates = append(m.updates, &models.TransactionStatus{
 		TxID:      txid,
 		Status:    models.StatusPendingRetry,
 		Timestamp: time.Now(),
+		ExtraInfo: extra,
 	})
 	return nil
 }
 
+// GetReadyRetries mirrors the real query's contract:
+//
+//	WHERE status = 'PENDING_RETRY' AND next_retry_at <= now
+//	ORDER BY next_retry_at LIMIT n
+//
+// Both halves matter. The status filter is how a row leaves the retry queue
+// when it resolves — the resolving write goes through BatchUpdateStatusReturning,
+// not through ClearRetryState, so a mock that ignored status would keep serving
+// rows that are already ACCEPTED. And the ordering is the whole point of using
+// this queue rather than a timestamp scan: oldest schedule first, so no row can
+// be starved by newer arrivals.
 func (m *mockStore) GetReadyRetries(_ context.Context, now time.Time, limit int) ([]*store.PendingRetry, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := make([]*store.PendingRetry, 0, len(m.pendingRetries))
-	for _, pr := range m.pendingRetries {
-		if !pr.NextRetryAt.After(now) {
-			cp := *pr
-			out = append(out, &cp)
-			if len(out) >= limit {
-				break
-			}
+	type entry struct {
+		pr  *store.PendingRetry
+		seq int
+	}
+	pending := make([]entry, 0, len(m.pendingRetries))
+	for txid, pr := range m.pendingRetries {
+		if pr.NextRetryAt.After(now) {
+			continue
 		}
+		if st, ok := m.latestStatusLocked(txid); ok && st != models.StatusPendingRetry {
+			continue
+		}
+		pending = append(pending, entry{pr: pr, seq: m.retrySeq[txid]})
+	}
+	// Order by next_retry_at, breaking ties by insertion sequence.
+	//
+	// The tie-break is not cosmetic. Rows parked by one call all share a
+	// single timestamp (parkExhaustedRequeues stamps one now for the whole
+	// slice), so ties are the common case, and Postgres serves
+	// "ORDER BY next_retry_at LIMIT n" from idx_tx_retry_ready — equal keys
+	// come back in index/heap order, which tracks insertion. Ranging over a
+	// Go map instead would hand back a random subset each call, which is both
+	// unfaithful and non-deterministic across runs.
+	sort.SliceStable(pending, func(i, j int) bool {
+		if pending[i].pr.NextRetryAt.Equal(pending[j].pr.NextRetryAt) {
+			return pending[i].seq < pending[j].seq
+		}
+		return pending[i].pr.NextRetryAt.Before(pending[j].pr.NextRetryAt)
+	})
+	if limit > 0 && len(pending) > limit {
+		pending = pending[:limit]
+	}
+	out := make([]*store.PendingRetry, 0, len(pending))
+	for _, e := range pending {
+		cp := *e.pr
+		out = append(out, &cp)
 	}
 	return out, nil
+}
+
+// latestStatusLocked returns the most recent status written for txid, falling
+// back to its seeded replay row. Caller holds m.mu.
+func (m *mockStore) latestStatusLocked(txid string) (models.Status, bool) {
+	for i := len(m.updates) - 1; i >= 0; i-- {
+		if m.updates[i].TxID == txid {
+			return m.updates[i].Status, true
+		}
+	}
+	for _, r := range m.replayRows {
+		if r.TxID == txid {
+			return r.Status, true
+		}
+	}
+	return "", false
+}
+
+// parkTx seeds a transaction in the state parkExhaustedRequeues leaves behind:
+// a PENDING_RETRY status row carrying the raw bytes, plus the durable retry
+// bins the reaper drains by.
+func (m *mockStore) parkTx(txid string, rawTx []byte, parkedAt, nextRetryAt time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.retryCounts[txid]++
+	// The status row carries the retry bins too, because the real park writes
+	// them with SetPendingRetryFields. A row without next_retry_at is a LEGACY
+	// park (pre-durable-scheduling) and the reaper deliberately treats it
+	// differently — see TestReapOnce_AdoptsLegacyParkedRows.
+	m.replayRows = append(m.replayRows, &models.TransactionStatus{
+		TxID:        txid,
+		Status:      models.StatusPendingRetry,
+		RawTx:       rawTx,
+		Timestamp:   parkedAt,
+		RetryCount:  m.retryCounts[txid],
+		NextRetryAt: nextRetryAt,
+	})
+	if _, ok := m.retrySeq[txid]; !ok {
+		m.retrySeq[txid] = m.retrySeqNext
+		m.retrySeqNext++
+	}
+	m.pendingRetries[txid] = &store.PendingRetry{
+		TxID:        txid,
+		RawTx:       append([]byte(nil), rawTx...),
+		RetryCount:  m.retryCounts[txid],
+		NextRetryAt: nextRetryAt,
+	}
 }
 
 func (m *mockStore) MarkMerkleRegisteredByTxIDs(_ context.Context, txids []string, ts time.Time) error {
@@ -282,10 +454,27 @@ func (m *mockStore) ClearRetryState(_ context.Context, txid string, finalStatus 
 	return nil
 }
 
+func (m *mockStore) GetSubmissionsByTxID(_ context.Context, txid string) ([]*models.Submission, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.submissionsByTxID[txid], nil
+}
+
 func (m *mockStore) IterateStatusesSince(_ context.Context, since time.Time, fn func(*models.TransactionStatus) error) error {
 	m.mu.Lock()
 	rows := append([]*models.TransactionStatus(nil), m.replayRows...)
 	m.mu.Unlock()
+	// Match the real query's ordering. Postgres serves this as
+	// "ORDER BY timestamp_at DESC" (store/postgres.IterateStatusesSince), so
+	// the reaper walks NEWEST first and its rebroadcast cap is spent on the
+	// most recent eligible rows. Returning insertion order here made the
+	// walk order an accident of test setup and hid every starvation bug the
+	// cap can produce — see TestReapOnce_PendingRetry_StarvedByNewerBacklog.
+	// Stable sort so equal timestamps keep insertion order, mirroring a
+	// stable index scan over rows written with a single batch timestamp.
+	sort.SliceStable(rows, func(i, j int) bool {
+		return rows[i].Timestamp.After(rows[j].Timestamp)
+	})
 	for _, r := range rows {
 		// Honor the lookback filter so replay tests can pin behavior that
 		// depends on it. Rows with a zero Timestamp are always returned —
@@ -293,11 +482,44 @@ func (m *mockStore) IterateStatusesSince(_ context.Context, since time.Time, fn 
 		if !r.Timestamp.IsZero() && r.Timestamp.Before(since) {
 			continue
 		}
+		m.iterated++ // count rows actually visited (issue #290 early-abort test)
 		if err := fn(r); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// CensusStatusesSince mirrors the store-side aggregate the reaper now uses for
+// the stuck census (issue #290): per requested status, the count and oldest
+// timestamp of replayRows in the window [since, stuckDeadline). Zero and
+// pre-since timestamps are excluded to match the Postgres GROUP BY (rows with a
+// NULL/absent timestamp_at can't satisfy timestamp_at >= since).
+func (m *mockStore) CensusStatusesSince(_ context.Context, since, stuckDeadline time.Time, statuses []models.Status) (map[models.Status]store.StatusCensus, error) {
+	m.mu.Lock()
+	rows := append([]*models.TransactionStatus(nil), m.replayRows...)
+	m.mu.Unlock()
+	want := make(map[models.Status]struct{}, len(statuses))
+	out := make(map[models.Status]store.StatusCensus, len(statuses))
+	for _, s := range statuses {
+		want[s] = struct{}{}
+		out[s] = store.StatusCensus{}
+	}
+	for _, r := range rows {
+		if _, ok := want[r.Status]; !ok {
+			continue
+		}
+		if r.Timestamp.Before(since) || !r.Timestamp.Before(stuckDeadline) {
+			continue
+		}
+		c := out[r.Status]
+		c.Count++
+		if c.Oldest.IsZero() || r.Timestamp.Before(c.Oldest) {
+			c.Oldest = r.Timestamp
+		}
+		out[r.Status] = c
+	}
+	return out, nil
 }
 
 func (m *mockStore) updateCount() int {
@@ -652,6 +874,85 @@ func TestRunMerkleReplay_DisabledByConfig(t *testing.T) {
 
 	if log.count("register:") != 0 {
 		t.Errorf("registered=%d want 0 (replay disabled)", log.count("register:"))
+	}
+}
+
+// TestRegisterBatch_AuthFailureClassifiedAndRequeued pins the issue #269 fix:
+// a 401/403 from /watch is counted under the distinct "auth_error" metric
+// (not the generic "register_error"), and — because F-024 forbids broadcasting
+// an unregistered tx — every affected tx is returned in the failed (requeue)
+// subset, never in registered.
+func TestRegisterBatch_AuthFailureClassifiedAndRequeued(t *testing.T) {
+	merkleSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("unauthorized"))
+	}))
+	defer merkleSrv.Close()
+
+	ms := newMockStore()
+	cfg := &config.Config{CallbackURL: "http://arcade/cb", CallbackToken: "tok"}
+	cfg.Propagation.MerkleConcurrency = 4
+	mc := merkleservice.NewClient(merkleSrv.URL, "", 5*time.Second)
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, nil, mc)
+
+	authBefore := testutil.ToFloat64(metrics.PropagationMerkleRegisterFailures.WithLabelValues("auth_error"))
+	genBefore := testutil.ToFloat64(metrics.PropagationMerkleRegisterFailures.WithLabelValues("register_error"))
+
+	batch := []propagationMsg{{TXID: "tx1"}, {TXID: "tx2"}, {TXID: "tx3"}}
+	registered, failed := p.registerBatch(context.Background(), batch)
+
+	if len(registered) != 0 {
+		t.Errorf("F-024 violated: %d txs marked registered despite 401", len(registered))
+	}
+	if len(failed) != len(batch) {
+		t.Errorf("all auth-failed txs must be requeued (not dropped): failed=%d want %d", len(failed), len(batch))
+	}
+	if d := testutil.ToFloat64(metrics.PropagationMerkleRegisterFailures.WithLabelValues("auth_error")) - authBefore; int(d) != len(batch) {
+		t.Errorf("auth_error metric delta=%v want %d", d, len(batch))
+	}
+	if d := testutil.ToFloat64(metrics.PropagationMerkleRegisterFailures.WithLabelValues("register_error")) - genBefore; d != 0 {
+		t.Errorf("register_error must not increment on an auth failure: delta=%v", d)
+	}
+}
+
+// TestRegisterBatch_ClaimRevokedClassifiedDistinctly pins the rebalance-noise
+// fix from the 2026-08-10 load test: when the claim ctx is dead, every /watch
+// "failure" is a context cancellation, not a merkle-service verdict. Those
+// must count under the distinct "claim_revoked" label — a single revocation
+// used to pump 39,189 bogus register_error counts into the metric — while
+// F-024 still routes every tx to the failed subset (the caller's post-register
+// checkpoint aborts the batch; nothing is broadcast).
+func TestRegisterBatch_ClaimRevokedClassifiedDistinctly(t *testing.T) {
+	httpLog := &eventLog{}
+	merkleSrv := newMerkleServer(httpLog, http.StatusOK)
+	defer merkleSrv.Close()
+
+	ms := newMockStore()
+	cfg := &config.Config{CallbackURL: "http://arcade/cb", CallbackToken: "tok"}
+	cfg.Propagation.MerkleConcurrency = 4
+	mc := merkleservice.NewClient(merkleSrv.URL, "", 5*time.Second)
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, nil, mc)
+
+	revokedBefore := testutil.ToFloat64(metrics.PropagationMerkleRegisterFailures.WithLabelValues("claim_revoked"))
+	genBefore := testutil.ToFloat64(metrics.PropagationMerkleRegisterFailures.WithLabelValues("register_error"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // claim revoked before the register fan-out runs
+
+	batch := []propagationMsg{{TXID: "tx1"}, {TXID: "tx2"}, {TXID: "tx3"}}
+	registered, failed := p.registerBatch(ctx, batch)
+
+	if len(registered) != 0 {
+		t.Errorf("F-024 violated: %d txs marked registered under a revoked claim", len(registered))
+	}
+	if len(failed) != len(batch) {
+		t.Errorf("every tx must stay in the failed subset (offset bookkeeping): failed=%d want %d", len(failed), len(batch))
+	}
+	if d := testutil.ToFloat64(metrics.PropagationMerkleRegisterFailures.WithLabelValues("claim_revoked")) - revokedBefore; int(d) != len(batch) {
+		t.Errorf("claim_revoked metric delta=%v want %d", d, len(batch))
+	}
+	if d := testutil.ToFloat64(metrics.PropagationMerkleRegisterFailures.WithLabelValues("register_error")) - genBefore; d != 0 {
+		t.Errorf("register_error must not increment on a claim revocation: delta=%v", d)
 	}
 }
 

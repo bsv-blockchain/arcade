@@ -19,9 +19,12 @@ import (
 
 	"github.com/bsv-blockchain/arcade/callbackurl"
 	"github.com/bsv-blockchain/arcade/config"
+	arcerrors "github.com/bsv-blockchain/arcade/errors"
 	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/telemetry"
 	"github.com/bsv-blockchain/arcade/teranode"
 	"github.com/bsv-blockchain/arcade/version"
 )
@@ -130,7 +133,7 @@ func (s *Server) recordSubmission(_ context.Context, txid string, opts submitOpt
 		metrics.APISubmissionRecorderDropTotal.Inc()
 		s.logger.Warn(
 			"submission recorder queue full; dropping (best-effort)",
-			zap.String("txid", txid),
+			logfields.TxID(txid),
 		)
 	}
 }
@@ -178,11 +181,49 @@ func RenderDocs(w io.Writer) error {
 // per-endpoint Datahub health stays in datahub_urls[].healthy. Chaintracks moved
 // out of api-server in the microservice decomposition — its health is now
 // reported by the standalone chaintracks pod's /health endpoint.
+//
+// blockHeight is arcade's own processed active-tip height. It is a freshness
+// signal, not a liveness gate: datahub_urls[].healthy is reachability-only,
+// so this instance can look green while its chain view is stale — clients
+// comparing blockHeight against the real network tip can detect that and
+// route around it (issue #254). Omitted (0) when no store is wired or the
+// height has never been readable.
 type healthResponse struct {
 	Healthy     bool                      `json:"healthy"`
 	Version     string                    `json:"version"`
 	Status      string                    `json:"status"`
+	BlockHeight uint64                    `json:"blockHeight,omitempty"`
 	DatahubURLs []teranode.EndpointStatus `json:"datahub_urls"`
+}
+
+// healthTipTTL bounds how often /health re-reads the store's active tip
+// height. Probes arrive every few seconds per replica (kubelet, LBs, ARC
+// clients); one MAX-scan per TTL keeps the store cost flat regardless of
+// probe fan-in while staying far fresher than block cadence.
+const healthTipTTL = 5 * time.Second
+
+// activeTipHeight returns arcade's processed active-tip height for /health,
+// cached for healthTipTTL. Never fails the probe: on a store error it
+// serves the last known height (a frozen value reads as stale to clients —
+// which is exactly the signal — and the next probe retries the read).
+func (s *Server) activeTipHeight(ctx context.Context) uint64 {
+	if s.store == nil {
+		return 0
+	}
+	s.tipMu.Lock()
+	defer s.tipMu.Unlock()
+	if time.Since(s.tipFetchedAt) < healthTipTTL {
+		return s.tipHeight
+	}
+	h, err := s.store.GetActiveTipBlockHeight(ctx)
+	if err != nil {
+		s.logger.Debug("health tip-height read failed", zap.Error(err))
+		return s.tipHeight
+	}
+	s.tipHeight = h
+	s.tipFetchedAt = time.Now()
+	metrics.ChainTipHeight.Set(float64(h))
+	return h
 }
 
 func (s *Server) handleHealth(c *gin.Context) {
@@ -190,6 +231,7 @@ func (s *Server) handleHealth(c *gin.Context) {
 		Healthy:     true,
 		Version:     version.Version,
 		Status:      "ok",
+		BlockHeight: s.activeTipHeight(c.Request.Context()),
 		DatahubURLs: []teranode.EndpointStatus{},
 	}
 	if s.teranode != nil {
@@ -262,12 +304,12 @@ func (s *Server) handleCallback(c *gin.Context) {
 		return
 	}
 
-	logger := s.logger.With(
+	logger := telemetry.LoggerWith(c.Request.Context(), s.logger.With(
 		zap.String("type", string(msg.Type)),
-		zap.String("txid", msg.TxID),
-		zap.Strings("txids", msg.TxIDs),
-		zap.String("blockHash", msg.BlockHash),
-	)
+		logfields.TxID(msg.TxID),
+		logfields.TxIDs(msg.TxIDs),
+		logfields.BlockHash(msg.BlockHash),
+	))
 
 	switch msg.Type {
 	case models.CallbackSeenOnNetwork:
@@ -381,7 +423,7 @@ func (s *Server) applySeenCallback(c *gin.Context, msg models.CallbackMessage, l
 			metrics.CallbackUnknownTxIDTotal.WithLabelValues(metricLabel).Inc()
 			logger.Warn("dropping callback for unknown txid",
 				zap.String("type", metricLabel),
-				zap.String("txid", keptTxIDs[i]))
+				logfields.TxID(keptTxIDs[i]))
 			continue
 		}
 		// Observe transition age — the headline metric the user asked for.
@@ -408,6 +450,21 @@ func (s *Server) applySeenCallback(c *gin.Context, msg models.CallbackMessage, l
 			s.txTracker.UpdateStatus(keptTxIDs[i], targetStatus)
 		}
 	}
+
+	// Full-coverage SEEN line(s): this callback path is driven by
+	// merkle-service (not the client submit request), so it's off the
+	// synchronous hot path — emit every seen txid, chunked and never capped,
+	// matching MINED, so a txid search finds the SEEN transition.
+	logfields.ForEachTxIDChunk(successful, func(chunk []string, chunkIdx, totalChunks int) {
+		logger.Info(
+			"transactions seen",
+			logfields.Status(string(targetStatus)),
+			logfields.TxIDCount(len(successful)),
+			logfields.TxIDs(chunk),
+			zap.Int("chunk_index", chunkIdx),
+			zap.Int("chunk_total", totalChunks),
+		)
+	})
 
 	// Single PublishBulk for the whole batch — drops the per-txid Kafka send
 	// down to one event regardless of N. Subscribers (SSE, webhook) unfan in
@@ -452,6 +509,11 @@ func (s *Server) handleStump(c *gin.Context, msg models.CallbackMessage, logger 
 		return
 	}
 
+	logger.Info(
+		"stump stored",
+		logfields.BlockHash(msg.BlockHash),
+		zap.Int("subtree_index", msg.SubtreeIndex),
+	)
 	c.Status(http.StatusOK)
 }
 
@@ -479,15 +541,46 @@ func (s *Server) handleBlockProcessed(c *gin.Context, msg models.CallbackMessage
 	// the height-0 placeholder this handler used to write was never recoverable
 	// anyway). That chaintracks dependency is pre-existing and unchanged here;
 	// see services/watchdog.
-	if err := s.producer.Send(kafka.TopicBlockProcessed, msg.BlockHash, msg); err != nil {
+	if err := s.producer.Send(c.Request.Context(), kafka.TopicBlockProcessed, msg.BlockHash, msg); err != nil {
 		logger.Error("failed to publish block_processed", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to enqueue"})
 		return
 	}
+	logger.Info("block_processed enqueued", logfields.BlockHash(msg.BlockHash))
 	c.Status(http.StatusOK)
 }
 
-// handleGetTransaction retrieves a transaction status by TXID.
+// callbackDelivery is the wire shape of one subscription's webhook delivery
+// state on GET /tx?callbackToken=… — the self-diagnosis surface for receivers
+// whose edge is rejecting arcade's POSTs (issue #249: a WAF 403'd 24k
+// callbacks while the receiver's own logs showed nothing). attempts /
+// lastAttemptAt / lastResult are lifetime bookkeeping stamped on every POST;
+// retry-scheduling state (nextRetryAt) is per-transition and cleared when the
+// next transition is claimed. Deliberately excludes CallbackToken.
+type callbackDelivery struct {
+	CallbackURL         string     `json:"callbackUrl,omitempty"`
+	LastDeliveredStatus string     `json:"lastDeliveredStatus,omitempty"`
+	Attempts            int        `json:"attempts"`
+	LastAttemptAt       *time.Time `json:"lastAttemptAt,omitempty"`
+	LastResult          string     `json:"lastResult,omitempty"`
+	NextRetryAt         *time.Time `json:"nextRetryAt,omitempty"`
+}
+
+// txStatusWithCallbacks embeds the plain status so the base response shape is
+// byte-identical to today's, plus the token-scoped callbacks array.
+type txStatusWithCallbacks struct {
+	*models.TransactionStatus
+
+	Callbacks []callbackDelivery `json:"callbacks,omitempty"`
+}
+
+// handleGetTransaction retrieves a transaction status by TXID. With an
+// optional ?callbackToken=… the response additionally carries the webhook
+// delivery state of the submissions registered under THAT token (capability
+// model — same scoping the SSE stream uses). Without the token, or when no
+// submission matches, the response is unchanged: a txid can carry
+// subscriptions from multiple unrelated clients, and their callback URLs and
+// delivery health are not each other's business.
 func (s *Server) handleGetTransaction(c *gin.Context) {
 	txid := c.Param("txid")
 	if txid == "" {
@@ -497,7 +590,7 @@ func (s *Server) handleGetTransaction(c *gin.Context) {
 
 	status, err := s.store.GetStatus(c.Request.Context(), txid)
 	if err != nil {
-		s.logger.Error("failed to get status", zap.String("txid", txid), zap.Error(err))
+		s.logger.Error("failed to get status", logfields.TxID(txid), zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "internal error"})
 		return
 	}
@@ -507,7 +600,41 @@ func (s *Server) handleGetTransaction(c *gin.Context) {
 		return
 	}
 
+	if callbacks := s.callbackDeliveries(c.Request.Context(), txid, c.Query("callbackToken")); len(callbacks) > 0 {
+		c.JSON(http.StatusOK, txStatusWithCallbacks{TransactionStatus: status, Callbacks: callbacks})
+		return
+	}
 	c.JSON(http.StatusOK, status)
+}
+
+// callbackDeliveries returns the delivery state of the txid's submissions
+// registered under token. Empty token or no match returns nil (never an
+// error to the client — the callbacks view is best-effort diagnostics and
+// must not break the status read).
+func (s *Server) callbackDeliveries(ctx context.Context, txid, token string) []callbackDelivery {
+	if token == "" || s.store == nil {
+		return nil
+	}
+	subs, err := s.store.GetSubmissionsByTxID(ctx, txid)
+	if err != nil {
+		s.logger.Warn("submission lookup for callback state failed", logfields.TxID(txid), zap.Error(err))
+		return nil
+	}
+	var out []callbackDelivery
+	for _, sub := range subs {
+		if sub.CallbackToken != token {
+			continue
+		}
+		out = append(out, callbackDelivery{
+			CallbackURL:         sub.CallbackURL,
+			LastDeliveredStatus: string(sub.LastDeliveredStatus),
+			Attempts:            sub.Attempts,
+			LastAttemptAt:       sub.LastAttemptAt,
+			LastResult:          sub.LastResult,
+			NextRetryAt:         sub.NextRetryAt,
+		})
+	}
+	return out
 }
 
 // Per-request body size caps for the submit endpoints. A BSV transaction can
@@ -615,22 +742,49 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// BEEF parents are trusted (arcade doesn't own a chaintracker on the
 	// intake path); script execution against per-input source data still
 	// runs, which catches malformed unlocking scripts, bad signatures,
-	// and underpaid txs. Failures write a terminal REJECTED row and
-	// return 400 so the outcome is both durable and immediate.
+	// and underpaid txs. Failures are a verdict about the transaction
+	// bytes, so they write a terminal REJECTED row and return 400 —
+	// durable and immediate.
 	if s.validator != nil {
 		if err := s.validator.ValidateTransaction(c.Request.Context(), parsedTx, false); err != nil {
-			s.rejectAtIntake(c.Request.Context(), txid, err.Error(), opts)
-			c.JSON(http.StatusBadRequest, gin.H{
-				jsonKeyError: "transaction failed validation",
-				"reason":     err.Error(),
-			})
+			s.rejectAtIntake(c.Request.Context(), txid, err.Error(), arcStatusCodeOf(err), opts)
+			respondSubmitError(c, txid, err)
 			return
 		}
+	}
+
+	// nLockTime/BIP113 finality gate. The embedded validator above does not
+	// check finality (teranode enforces it a layer above the TxValidator it
+	// wraps), so without this a non-final tx is broadcast and bounced by the
+	// network with an opaque generic error (issue #245). Runs after the
+	// validator so its fail-open behavior can never mask a validation error.
+	//
+	// Unlike a validator failure, a non-final verdict reflects arcade's
+	// CURRENT CHAIN VIEW (which can trail the network's real tip), not the
+	// transaction bytes — a condition, not a verdict. So it is deliberately
+	// NOT persisted: no REJECTED row, no submission record, no status event
+	// (issue #254). The client gets the actionable 400 below; GET /tx keeps
+	// returning its prior state — 404 ("no verdict") for a fresh tx, so
+	// resubmission policies keyed on no-verdict work unchanged — and a
+	// resubmit evaluated against a stale tip can never clobber an existing
+	// in-flight row.
+	if fErr := s.finality.Check(c.Request.Context(), parsedTx); fErr != nil {
+		fErr = arcerrors.NewArcError(fErr, arcerrors.StatusNotFinal)
+		metrics.APIFinalityRejectionsTotal.WithLabelValues("/tx").Inc()
+		s.logger.Info(
+			"transaction not final at intake; no verdict persisted",
+			logfields.TxID(txid),
+			zap.String("reason", fErr.Error()),
+			logfields.Stage(logfields.StageIntake),
+		)
+		respondSubmitError(c, txid, fErr)
+		return
 	}
 
 	// Dedup CAS via GetOrInsertStatus. Two submitters racing on the
 	// same txid both attempt the insert; the loser sees inserted=false
 	// and returns 202 idempotently without re-publishing.
+	submitResult := "new"
 	if s.store != nil {
 		row := &models.TransactionStatus{
 			TxID:      txid,
@@ -644,7 +798,7 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		existing, inserted, dedupErr := s.store.GetOrInsertStatus(c.Request.Context(), row)
 		switch {
 		case dedupErr != nil:
-			s.logger.Error("dedup CAS failed", zap.String("txid", txid), zap.Error(dedupErr))
+			s.logger.Error("dedup CAS failed", logfields.TxID(txid), zap.Error(dedupErr))
 			// Best-effort: continue with publish. The propagator's
 			// in-flight set catches duplicates that slip past.
 		case !inserted && existing != nil && existing.Status == models.StatusRejected:
@@ -658,6 +812,7 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 			// both RECEIVED and REJECTED produce the same callback
 			// prefilter behavior because every forward status allows
 			// transitioning from either.
+			submitResult = "retry_rejected"
 		case !inserted && existing != nil:
 			// Idempotent re-submit: row already exists at a non-REJECTED
 			// status. Register the txid with the in-process TxTracker so
@@ -667,6 +822,7 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 			if s.txTracker != nil {
 				s.txTracker.Add(txid, existing.Status)
 			}
+			metrics.APITxsSubmittedTotal.WithLabelValues("/tx", "duplicate").Inc()
 			s.recordSubmission(c.Request.Context(), txid, opts)
 			c.JSON(http.StatusAccepted, submitResponse{
 				TxID:     txid,
@@ -676,6 +832,8 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 			return
 		}
 	}
+
+	metrics.APITxsSubmittedTotal.WithLabelValues("/tx", submitResult).Inc()
 
 	// Register the tx with the in-process TxTracker so the bump-builder
 	// recognizes it when its block is processed.
@@ -692,11 +850,11 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		"raw_tx":      rawTx,
 		"input_txids": collectInputTXIDs(parsedTx),
 	}
-	if err := s.producer.Send(kafka.TopicPropagation, txid, msg); err != nil {
+	if err := s.producer.Send(c.Request.Context(), kafka.TopicPropagation, txid, msg); err != nil {
 		if errors.Is(err, kafka.ErrBrokerBackpressure) {
 			// Backpressure → shed load to the client. The tx was never queued,
 			// so a retry is safe and is the contract the 503 expresses.
-			s.logger.Warn("submit rejected: kafka backpressure", zap.String("txid", txid))
+			s.logger.Warn("submit rejected: kafka backpressure", logfields.TxID(txid))
 			c.Header("Retry-After", "1")
 			c.JSON(http.StatusServiceUnavailable, gin.H{jsonKeyError: "service overloaded, retry shortly"})
 			return
@@ -706,6 +864,12 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		return
 	}
 
+	telemetry.LoggerWith(c.Request.Context(), s.logger).Info(
+		"transaction received",
+		logfields.TxID(txid),
+		logfields.Status(string(models.StatusReceived)),
+	)
+
 	c.JSON(http.StatusAccepted, submitResponse{
 		TxID:     txid,
 		Status:   http.StatusAccepted,
@@ -713,13 +877,51 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	})
 }
 
+// arcStatusCodeOf extracts the numeric ARC status code (460-476 taxonomy,
+// errors/errors.go) from an error chain, or 0 when none is attached.
+func arcStatusCodeOf(err error) int {
+	if arcErr := arcerrors.GetArcError(err); arcErr != nil {
+		return int(arcErr.StatusCode)
+	}
+	return 0
+}
+
+// respondSubmitError writes the 400 for an intake validation or finality
+// failure. The legacy "error"/"reason" fields are unchanged so existing
+// clients keep parsing; "txid" and — when the error carries an ARC status
+// code — the ARC error taxonomy ("status", "title", "detail", "type") are
+// added alongside, so ARC-compatible clients can branch on the code (and
+// judge retryability, e.g. 476 non-final) without matching reason text.
+func respondSubmitError(c *gin.Context, txid string, err error) {
+	body := gin.H{
+		jsonKeyError: "transaction failed validation",
+		"txid":       txid,
+		"reason":     err.Error(),
+	}
+	if arcErr := arcerrors.GetArcError(err); arcErr != nil {
+		f := arcErr.ToErrorFields()
+		body["status"] = f.Status
+		body["title"] = f.Title
+		body["detail"] = f.Detail
+		body["type"] = f.Type
+	}
+	c.JSON(http.StatusBadRequest, body)
+}
+
 // rejectAtIntake is the terminal-rejection counterpart to the intake
-// success sequence. It persists a REJECTED row, records the submission
-// so SSE/webhook can resolve the callback URL+token on delivery, then
-// publishes the REJECTED status to TopicStatusUpdate so live
-// subscribers see the terminal outcome. Every step is best-effort —
+// success sequence, for VALIDATOR failures only — verdicts about the
+// transaction bytes. (Finality failures are conditions of arcade's chain
+// view and deliberately persist nothing; see the finality gate in
+// handleSubmitTransaction.) It persists a REJECTED row, records the
+// submission so SSE/webhook can resolve the callback URL+token on
+// delivery, then publishes the REJECTED status to TopicStatusUpdate so
+// live subscribers see the terminal outcome. Every step is best-effort —
 // the client has already received its 400 by the time this runs, so a
 // store or publish failure does not change the HTTP outcome.
+//
+// statusCode is the numeric ARC code (0 when unclassified) persisted and
+// published alongside the reason so consumers get a machine-readable
+// cause, not just prose.
 //
 // Order matches the success path: persist row, then queue submission,
 // then publish. Queuing the submission before the publish minimizes
@@ -727,28 +929,29 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 // without a matching submission row (the recorder pool is async, so
 // the window can't be eliminated entirely without making the row
 // write synchronous — a trade-off the success path also accepts).
-func (s *Server) rejectAtIntake(ctx context.Context, txid, reason string, opts submitOptions) {
+func (s *Server) rejectAtIntake(ctx context.Context, txid, reason string, statusCode int, opts submitOptions) {
 	s.logger.Info(
 		"transaction rejected",
-		zap.String("txid", txid),
+		logfields.TxID(txid),
 		zap.String("reason", reason),
-		zap.String("stage", "intake"),
+		logfields.Stage(logfields.StageIntake),
 	)
-	s.persistRejectedAtIntake(ctx, txid, reason)
+	s.persistRejectedAtIntake(ctx, txid, reason, statusCode)
 	s.recordSubmission(ctx, txid, opts)
 	if s.publisher == nil {
 		return
 	}
 	status := &models.TransactionStatus{
-		TxID:      txid,
-		Status:    models.StatusRejected,
-		ExtraInfo: reason,
-		Timestamp: time.Now(),
+		TxID:       txid,
+		Status:     models.StatusRejected,
+		StatusCode: statusCode,
+		ExtraInfo:  reason,
+		Timestamp:  time.Now(),
 	}
 	if err := s.publisher.Publish(ctx, status); err != nil {
 		s.logger.Warn(
 			"intake rejection publish failed",
-			zap.String("txid", txid),
+			logfields.TxID(txid),
 			zap.Error(err),
 		)
 	}
@@ -759,21 +962,22 @@ func (s *Server) rejectAtIntake(ctx context.Context, txid, reason string, opts s
 // failure is logged but doesn't change the client response (the 400
 // has already told them the tx was rejected). When the store is nil
 // (test setups using struct-literal construction), this is a no-op.
-func (s *Server) persistRejectedAtIntake(ctx context.Context, txid, reason string) {
+func (s *Server) persistRejectedAtIntake(ctx context.Context, txid, reason string, statusCode int) {
 	if s.store == nil {
 		return
 	}
 	row := &models.TransactionStatus{
-		TxID:      txid,
-		Status:    models.StatusRejected,
-		ExtraInfo: reason,
-		Timestamp: time.Now(),
+		TxID:       txid,
+		Status:     models.StatusRejected,
+		StatusCode: statusCode,
+		ExtraInfo:  reason,
+		Timestamp:  time.Now(),
 	}
 	_, inserted, err := s.store.GetOrInsertStatus(ctx, row)
 	if err != nil {
 		s.logger.Warn(
 			"intake rejection persist failed",
-			zap.String("txid", txid),
+			logfields.TxID(txid),
 			zap.Error(err),
 		)
 		return
@@ -782,7 +986,7 @@ func (s *Server) persistRejectedAtIntake(ctx context.Context, txid, reason strin
 		if err := s.store.UpdateStatus(ctx, row); err != nil {
 			s.logger.Warn(
 				"intake rejection status update failed",
-				zap.String("txid", txid),
+				logfields.TxID(txid),
 				zap.Error(err),
 			)
 		}
@@ -824,11 +1028,6 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	// Phase 1: parse the whole stream. Use the canonical TxID() (not a
 	// hash of the wire bytes) so Extended Format submissions key the
 	// same as the canonical txid the propagator broadcasts.
-	type parsedItem struct {
-		tx   *sdkTx.Transaction
-		raw  []byte
-		txid string
-	}
 	var parsed []parsedItem
 	offset := 0
 	for offset < len(body) {
@@ -868,14 +1067,30 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 		ctx := c.Request.Context()
 		for _, p := range parsed {
 			if vErr := s.validator.ValidateTransaction(ctx, p.tx, false); vErr != nil {
-				s.rejectAtIntake(ctx, p.txid, vErr.Error(), opts)
-				c.JSON(http.StatusBadRequest, gin.H{
-					jsonKeyError: "transaction failed validation",
-					"txid":       p.txid,
-					"reason":     vErr.Error(),
-				})
+				s.rejectAtIntake(ctx, p.txid, vErr.Error(), arcStatusCodeOf(vErr), opts)
+				respondSubmitError(c, p.txid, vErr)
 				return
 			}
+		}
+	}
+
+	// nLockTime/BIP113 finality gate per tx; see handleSubmitTransaction for
+	// the rationale — including why a non-final verdict is NOT persisted
+	// (condition of arcade's chain view, not a verdict about the tx; issue
+	// #254). Aborts the whole batch naming the offending txid — matches the
+	// validation contract above.
+	for _, p := range parsed {
+		if fErr := s.finality.Check(c.Request.Context(), p.tx); fErr != nil {
+			fErr = arcerrors.NewArcError(fErr, arcerrors.StatusNotFinal)
+			metrics.APIFinalityRejectionsTotal.WithLabelValues("/txs").Inc()
+			s.logger.Info(
+				"transaction not final at intake; no verdict persisted",
+				logfields.TxID(p.txid),
+				zap.String("reason", fErr.Error()),
+				logfields.Stage(logfields.StageIntake),
+			)
+			respondSubmitError(c, p.txid, fErr)
+			return
 		}
 	}
 
@@ -885,6 +1100,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	// best-effort behavior.
 	toPublish := make([]parsedItem, 0, len(parsed))
 	duplicates := 0
+	newSubmits, retryRejected := 0, 0
 	if s.store != nil {
 		ctx := c.Request.Context()
 		for _, p := range parsed {
@@ -899,7 +1115,8 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 			existing, inserted, dedupErr := s.store.GetOrInsertStatus(ctx, row)
 			switch {
 			case dedupErr != nil:
-				s.logger.Error("dedup CAS failed", zap.String("txid", p.txid), zap.Error(dedupErr))
+				s.logger.Error("dedup CAS failed", logfields.TxID(p.txid), zap.Error(dedupErr))
+				newSubmits++
 				toPublish = append(toPublish, p)
 			case !inserted && existing != nil && existing.Status == models.StatusRejected:
 				// Resubmission of a previously-rejected tx: add to
@@ -909,6 +1126,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				// pipeline. The status row stays at REJECTED until the
 				// new broadcast produces a verdict. Mirrors
 				// handleSubmitTransaction.
+				retryRejected++
 				toPublish = append(toPublish, p)
 			case !inserted && existing != nil:
 				duplicates++
@@ -921,12 +1139,17 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				}
 				s.recordSubmission(ctx, p.txid, opts)
 			default:
+				newSubmits++
 				toPublish = append(toPublish, p)
 			}
 		}
 	} else {
 		toPublish = parsed
+		newSubmits = len(parsed)
 	}
+	metrics.APITxsSubmittedTotal.WithLabelValues("/txs", "new").Add(float64(newSubmits))
+	metrics.APITxsSubmittedTotal.WithLabelValues("/txs", "duplicate").Add(float64(duplicates))
+	metrics.APITxsSubmittedTotal.WithLabelValues("/txs", "retry_rejected").Add(float64(retryRejected))
 
 	// Register every accepted tx with the in-process TxTracker so the
 	// bump-builder's filterTrackedTxids recognizes them when their block
@@ -948,19 +1171,14 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	// Phase 4: build propagation envelopes and publish as one batch.
 	// input_txids drives the dispatcher's dep-aware admission — children
 	// of any in-flight parent are held until the parent terminalizes.
+	// Messages are keyed by dependency family (#295): txs of this
+	// submission connected through in-batch spends share a key, so on a
+	// multi-partition topic a whole family lands on one partition and
+	// per-partition order still delivers parents before children.
 	if len(toPublish) > 0 {
-		msgs := make([]kafka.KeyValue, 0, len(toPublish))
-		for _, p := range toPublish {
-			msgs = append(msgs, kafka.KeyValue{
-				Key: p.txid,
-				Value: map[string]interface{}{
-					"txid":        p.txid,
-					"raw_tx":      p.raw,
-					"input_txids": collectInputTXIDs(p.tx),
-				},
-			})
-		}
-		if err := s.producer.SendBatch(kafka.TopicPropagation, msgs); err != nil {
+		keyByTxid, inputsByTxid := familyKeysBySubmittedTxid(parsed)
+		msgs := propagationMessages(toPublish, keyByTxid, inputsByTxid)
+		if err := s.producer.SendBatch(ctx, kafka.TopicPropagation, msgs); err != nil {
 			if errors.Is(err, kafka.ErrBrokerBackpressure) {
 				s.logger.Warn("batch submit rejected: kafka backpressure", zap.Int("count", len(msgs)))
 				c.Header("Retry-After", "1")
@@ -971,6 +1189,19 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to submit"})
 			return
 		}
+
+		publishedTxIDs := make([]string, len(toPublish))
+		for i, p := range toPublish {
+			publishedTxIDs[i] = p.txid
+		}
+		// Bounded (TxIDBatch: true count + capped list), NOT chunked: this
+		// runs synchronously before the HTTP response and /txs accepts up to
+		// 256 MiB, so unbounded sequential chunk writes would land in the
+		// client's request latency. Full per-txid coverage arrives shortly
+		// after on the async "transactions accepted by network" line; a tx
+		// rejected at intake is covered by the existing REJECTED line.
+		receivedFields := append([]zap.Field{logfields.Status(string(models.StatusReceived))}, logfields.TxIDBatch(publishedTxIDs)...)
+		telemetry.LoggerWith(ctx, s.logger).Info("transactions received", receivedFields...)
 	}
 
 	c.JSON(http.StatusAccepted, gin.H{

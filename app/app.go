@@ -10,19 +10,25 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path"
+	"sync"
 	"time"
 
 	chaintrackslib "github.com/bsv-blockchain/go-chaintracks/chaintracks"
+	chaintracksconfig "github.com/bsv-blockchain/go-chaintracks/config"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/events"
+	"github.com/bsv-blockchain/arcade/finality"
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/merkleservice"
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/services"
 	"github.com/bsv-blockchain/arcade/services/api_server"
 	"github.com/bsv-blockchain/arcade/services/bump_builder"
@@ -32,6 +38,7 @@ import (
 	"github.com/bsv-blockchain/arcade/services/sse"
 	"github.com/bsv-blockchain/arcade/services/watchdog"
 	"github.com/bsv-blockchain/arcade/services/webhook"
+	"github.com/bsv-blockchain/arcade/ssrfguard"
 	"github.com/bsv-blockchain/arcade/store"
 	storefactory "github.com/bsv-blockchain/arcade/store/factory"
 	"github.com/bsv-blockchain/arcade/teranode"
@@ -57,6 +64,10 @@ type Deps struct {
 	// that consume it (chaintracks_server, bump-builder canonical-root
 	// validation) must nil-guard.
 	Chaintracks chaintrackslib.Chaintracks
+	// FinalityChecker runs the api-server's nLockTime/BIP113 intake gate.
+	// nil (no chain source, or validator.disable_finality_check) disables
+	// the gate; the checker itself is nil-receiver-safe.
+	FinalityChecker *finality.Checker
 }
 
 // Bootstrap creates every shared dependency the services rely on, in the
@@ -71,19 +82,33 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		zap.String("store_backend", cfg.Store.Backend),
 	)
 
-	broker, err := kafka.NewBroker(cfg.Kafka)
+	// The memory backend provisions its own topics, so it takes the
+	// propagation partition count directly; the sarama backend ignores the
+	// map (real topics are broker-provisioned and checked below).
+	broker, err := kafka.NewBroker(cfg.Kafka, map[string]int{
+		kafka.TopicPropagation: cfg.Propagation.Partitions,
+	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("creating kafka broker: %w", err)
 	}
 	producer := kafka.NewProducer(broker)
 
-	// Hard requirement: TopicPropagation MUST be single-partition. The
-	// dep-aware dispatcher's single-goroutine state ownership relies on
-	// total order at the topic level — parent/child txids on different
-	// partitions would bypass the in-memory dep index and reintroduce
-	// the cross-batch "missing inputs" race we just removed. Check this
-	// on every startup regardless of MinPartitions.
-	if pErr := kafka.CheckExactPartitions(broker, kafka.TopicPropagation, 1, logger); pErr != nil {
+	// TopicPropagation must exist with at least propagation.partitions
+	// partitions (fail-closed on a missing topic — auto-creation would let
+	// the broker default decide the key→partition mapping). Since #295 the
+	// topic may have any partition count: the api server keys messages by
+	// dependency family, so per-partition order still delivers a parent's
+	// admit to its dispatcher before its children's, and cross-partition
+	// stragglers are absorbed by the missing-parent safety net instead of
+	// being terminally REJECTED.
+	//
+	// `>=` rather than `==` because a wider topic is safe to run against —
+	// not because the extra partitions are inert. Nothing passes this value
+	// to a partitioner, so the producer hashes over the topic's ACTUAL
+	// partition count: every partition carries real traffic and gets its own
+	// dispatcher. This knob is a fail-closed assertion, not a placement
+	// control; lowering it does not narrow the producer's hash space.
+	if pErr := kafka.CheckMinPartitions(broker, kafka.TopicPropagation, cfg.Propagation.Partitions, logger); pErr != nil {
 		_ = producer.Close()
 		return nil, nil, fmt.Errorf("kafka partition check: %w", pErr)
 	}
@@ -91,6 +116,14 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 	// are currently no other hot-path topics that need it (TopicTransaction
 	// was retired with tx_validator) but the knob is retained so a future
 	// fan-out topic can opt into the check without re-introducing config.
+	//
+	// Deliberately still passed a nil topic list, which makes CheckPartitions
+	// a no-op. Handing it the real fan-out topics turns a check that has been
+	// dead since TopicTransaction was retired into a live boot-blocking one:
+	// any deployment carrying a leftover kafka.min_partitions greater than
+	// its actual arcade.tx_status / arcade.block_processed width would
+	// crash-loop on upgrade, for a reason unrelated to multi-partition
+	// propagation. Enabling it is its own change, with its own release note.
 	if cfg.Kafka.MinPartitions > 1 {
 		if pErr := kafka.CheckPartitions(broker, nil, cfg.Kafka.MinPartitions, logger); pErr != nil {
 			_ = producer.Close()
@@ -103,7 +136,7 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		_ = producer.Close()
 		return nil, nil, fmt.Errorf("creating store: %w", err)
 	}
-	if idxErr := st.EnsureIndexes(); idxErr != nil {
+	if idxErr := st.EnsureIndexes(ctx); idxErr != nil {
 		_ = st.Close()
 		_ = producer.Close()
 		return nil, nil, fmt.Errorf("ensuring store indexes: %w", idxErr)
@@ -123,7 +156,7 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		ProbeTimeout:              time.Duration(cfg.Propagation.EndpointHealth.ProbeTimeoutMs) * time.Millisecond,
 		MinHealthyEndpoints:       cfg.Propagation.EndpointHealth.MinHealthyEndpoints,
 		RefreshInterval:           time.Duration(cfg.Propagation.EndpointHealth.RefreshIntervalMs) * time.Millisecond,
-		Source:                    endpointSource{st: st, network: cfg.Network, includeDiscovered: cfg.P2P.DatahubDiscovery},
+		Source:                    newEndpointSource(st, cfg.Network, cfg.P2P.DatahubDiscovery, cfg.P2P.AllowPrivateURLs, logger),
 		Logger:                    logger,
 	})
 
@@ -154,13 +187,37 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 	if cfg.MerkleService.URL != "" {
 		merkleClient = merkleservice.NewClient(cfg.MerkleService.URL, cfg.MerkleService.AuthToken, 0)
 		merkleClient.SetLogger(logger.Named("merkle-client"))
+		if cfg.MerkleService.AuthToken == "" {
+			// Not fatal: many merkle-service deployments don't enforce auth, and
+			// the standalone/no-auth profile is legitimate. But if the target
+			// DOES enforce it (see merkle-service#204), /watch registration and
+			// /reprocess recovery will 401 at runtime — the watchdog now flags
+			// this loudly (issue #269) rather than misreporting it as a
+			// consensus problem. Warn at startup so the cause is obvious.
+			logger.Warn(
+				"merkle_service.url is set but merkle_service.auth_token is empty; " +
+					"if the target merkle-service enforces auth, tx registration (/watch) " +
+					"and block-processed recovery (/reprocess) will fail with 401 at runtime — " +
+					"set merkle_service.auth_token to authenticate",
+			)
+		}
 	}
 
-	txVal, err := validator.NewValidatorForNetwork(cfg.Network, validatorPolicyFromConfig(cfg))
-	if err != nil {
-		_ = st.Close()
-		_ = producer.Close()
-		return nil, nil, fmt.Errorf("creating validator: %w", err)
+	// Build the GoBDK transaction validator only for modes that actually
+	// validate submissions (api-server). NewValidatorForNetwork constructs
+	// two cgo/BDK script-verification engines; standing them up in modes that
+	// never call Validator.ValidateTransaction (sse, watchdog, propagation,
+	// p2p-client, bump-builder, chaintracks) is pure per-pod memory overhead.
+	// Keep in sync with BuildServices / modeNeedsValidator.
+	var txVal *validator.Validator
+	if modeNeedsValidator(cfg.Mode) {
+		v, verr := validator.NewValidatorForNetwork(cfg.Network, validatorPolicyFromConfig(cfg))
+		if verr != nil {
+			_ = st.Close()
+			_ = producer.Close()
+			return nil, nil, fmt.Errorf("creating validator: %w", verr)
+		}
+		txVal = v
 	}
 
 	publisher := events.NewKafkaPublisher(producer, logger, cfg.Events.SubscriberBuffer)
@@ -189,50 +246,58 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		chainTracks = ct
 	}
 
-	// Hydrate the TxTracker from the store BEFORE handing it to services.
-	// Without this, a process restart leaves the in-memory tracker empty
-	// and bump-builder's tracked-only filtering silently drops MINED /
-	// IMMUTABLE transitions for any tx that was already in-flight at the
-	// previous shutdown. Chain height is used to skip deeply-confirmed
-	// rows; when chaintracks is disabled we pass 0, which preserves every
-	// MINED row in the tracker — safe (loads a bit more) and the operator
-	// can prune later.
-	var hydrateHeight uint64
-	if chainTracks != nil {
-		hydrateHeight = uint64(chainTracks.GetHeight(ctx))
-	}
-	hydrateStart := time.Now()
-	loaded, hydrateErr := txTracker.LoadFromStore(ctx, st, hydrateHeight)
-	if hydrateErr != nil {
-		logger.Warn(
-			"tx tracker hydration partial",
-			zap.Int("loaded", loaded),
-			zap.Uint64("current_height", hydrateHeight),
-			zap.Duration("elapsed", time.Since(hydrateStart)),
-			zap.Error(hydrateErr),
-		)
-	} else {
-		logger.Info(
-			"tx tracker hydrated",
-			zap.Int("loaded", loaded),
-			zap.Uint64("current_height", hydrateHeight),
-			zap.Duration("elapsed", time.Since(hydrateStart)),
-		)
+	finalityChecker := buildFinalityChecker(ctx, cfg, chainTracks, st, logger)
+
+	// Hydrate the TxTracker from the store BEFORE handing it to api-server.
+	// Gated to modes that actually consume it: only api-server reads
+	// deps.TxTracker (see BuildServices). Without hydration a restart leaves the
+	// tracker empty and in-flight transitions can be dropped until re-observed.
+	// LoadFromStore streams the full transactions history into an in-memory map,
+	// a cost that scales with tx volume; running it in modes that never read the
+	// tracker (sse, watchdog, propagation, p2p-client, bump-builder, chaintracks)
+	// is what OOMKilled every 512Mi arcade-v2 component after the v0.9.0 rollout.
+	// Chain height skips deeply-confirmed rows; when chaintracks is disabled we
+	// pass 0 (preserves every MINED row — safe, prunable later).
+	// Keep in sync with BuildServices / modeNeedsTxTracker.
+	if modeNeedsTxTracker(cfg.Mode) {
+		var hydrateHeight uint64
+		if chainTracks != nil {
+			hydrateHeight = uint64(chainTracks.GetHeight(ctx))
+		}
+		hydrateStart := time.Now()
+		loaded, hydrateErr := txTracker.LoadFromStore(ctx, st, hydrateHeight)
+		if hydrateErr != nil {
+			logger.Warn(
+				"tx tracker hydration partial",
+				zap.Int("loaded", loaded),
+				zap.Uint64("current_height", hydrateHeight),
+				zap.Duration("elapsed", time.Since(hydrateStart)),
+				zap.Error(hydrateErr),
+			)
+		} else {
+			logger.Info(
+				"tx tracker hydrated",
+				zap.Int("loaded", loaded),
+				zap.Uint64("current_height", hydrateHeight),
+				zap.Duration("elapsed", time.Since(hydrateStart)),
+			)
+		}
 	}
 
 	deps := &Deps{
-		Cfg:            cfg,
-		Logger:         logger,
-		Broker:         broker,
-		Producer:       producer,
-		Publisher:      publisher,
-		Store:          st,
-		Leaser:         leaser,
-		TxTracker:      txTracker,
-		TeranodeClient: teranodeClient,
-		MerkleClient:   merkleClient,
-		Validator:      txVal,
-		Chaintracks:    chainTracks,
+		Cfg:             cfg,
+		Logger:          logger,
+		Broker:          broker,
+		Producer:        producer,
+		Publisher:       publisher,
+		Store:           st,
+		Leaser:          leaser,
+		TxTracker:       txTracker,
+		TeranodeClient:  teranodeClient,
+		MerkleClient:    merkleClient,
+		Validator:       txVal,
+		Chaintracks:     chainTracks,
+		FinalityChecker: finalityChecker,
 	}
 
 	cleanup := func() {
@@ -276,6 +341,92 @@ func validatorPolicyFromConfig(cfg *config.Config) *validator.Policy {
 func modeNeedsChaintracks(mode string) bool {
 	switch mode {
 	case "all", "chaintracks", "bump-builder":
+		return true
+	default:
+		return false
+	}
+}
+
+// modeNeedsFinality reports whether the configured mode constructs a service
+// that consumes Deps.FinalityChecker — only api-server does (the intake
+// finality gate). Deliberately NOT part of modeNeedsChaintracks: the gate
+// uses the remote chaintracks client in microservice deployments precisely
+// so api-server pods never spin up an embedded ChainManager.
+func modeNeedsFinality(mode string) bool {
+	return mode == "all" || mode == "api-server"
+}
+
+// buildFinalityChecker wires the chain sources for the api-server's
+// nLockTime/BIP113 finality gate (issue #245). In mode=all the embedded
+// chaintracks is reused; in microservice deployments the api-server pod runs
+// with chaintracks disabled (see modeNeedsChaintracks), so when the operator
+// points chaintracks.mode=remote at the chaintracks pod the cheap HTTP
+// client is constructed here — no P2P, no storage, no ChainManager. The
+// store always backs a height-only fallback (adopted from PR #181): without
+// any chaintracks source, height-based locktimes are still gated while
+// timestamp locktimes fail open (they need MTP). Teranode stays the
+// authority in every degraded mode.
+func buildFinalityChecker(ctx context.Context, cfg *config.Config, chainTracks chaintrackslib.Chaintracks, st store.Store, logger *zap.Logger) *finality.Checker {
+	if cfg.Validator.DisableFinalityCheck || !modeNeedsFinality(cfg.Mode) {
+		return nil
+	}
+
+	reader := finalityChainReader(ctx, cfg, chainTracks, logger)
+	if reader == nil {
+		logger.Info("finality pre-check degraded to height-only: no MTP source (enable chaintracks_server or set chaintracks.mode=remote with a URL)")
+	}
+
+	return finality.NewChecker(reader, logger,
+		finality.WithHeightFallback(st),
+		finality.WithUnavailableHook(metrics.APIFinalityPrecheckUnavailableTotal.Inc))
+}
+
+// finalityChainReader picks the finality gate's chain source: the shared
+// embedded chaintracks when it exists, else a remote go-chaintracks client
+// when configured, else nil.
+func finalityChainReader(ctx context.Context, cfg *config.Config, chainTracks chaintrackslib.Chaintracks, logger *zap.Logger) finality.ChainReader {
+	if chainTracks != nil {
+		return chainTracks
+	}
+	if cfg.Chaintracks.Mode != chaintracksconfig.ModeRemote || cfg.Chaintracks.URL == "" {
+		return nil
+	}
+	remote, err := cfg.Chaintracks.Initialize(ctx, "arcade-finality", nil)
+	if err != nil {
+		logger.Warn("finality pre-check disabled: remote chaintracks init failed", zap.Error(err))
+		return nil
+	}
+	return remote
+}
+
+// modeNeedsTxTracker reports whether the configured mode constructs a service
+// that reads deps.TxTracker. Only api-server does (see BuildServices). Other
+// modes must not hydrate it: TxTracker.LoadFromStore streams the entire
+// transactions history into an in-memory map, a cost that scales with tx volume
+// and OOMKilled the 512Mi arcade-v2 components (sse, watchdog, p2p-client,
+// bump-builder) after the v0.9.0 rollout.
+//
+// Keep this list in sync with BuildServices: any new mode that wires
+// deps.TxTracker into a service must be added here.
+func modeNeedsTxTracker(mode string) bool {
+	switch mode {
+	case "all", "api-server":
+		return true
+	default:
+		return false
+	}
+}
+
+// modeNeedsValidator reports whether the configured mode constructs a service
+// that calls deps.Validator.ValidateTransaction. Only api-server does (see
+// BuildServices). NewValidatorForNetwork builds two cgo/BDK script-verification
+// engines, so constructing it in other modes is pure per-pod memory overhead.
+//
+// Keep this list in sync with BuildServices: any new mode that wires
+// deps.Validator into a service must be added here.
+func modeNeedsValidator(mode string) bool {
+	switch mode {
+	case "all", "api-server":
 		return true
 	default:
 		return false
@@ -361,16 +512,24 @@ func BuildServices(d *Deps) []services.Service {
 	}
 
 	if shouldRun("api-server") {
-		svcs = append(svcs, api_server.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.TxTracker, d.TeranodeClient, d.MerkleClient, d.Validator))
+		svcs = append(svcs, api_server.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.TxTracker, d.TeranodeClient, d.MerkleClient, d.Validator, d.FinalityChecker))
 	}
 	if shouldRun("bump-builder") {
 		// chainHeader is nil when chaintracks is disabled — bump-builder
-		// nil-guards and falls back to subtree-count-only validation.
+		// nil-guards and falls back to subtree-count-only validation, the
+		// anchor guard fails open, and the reconciler below is skipped.
 		var chainHeader bump_builder.ChainHeaderReader
 		if d.Chaintracks != nil {
 			chainHeader = chaintracksHeaderReader{ct: d.Chaintracks}
 		}
 		svcs = append(svcs, bump_builder.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.TeranodeClient, chainHeader))
+		// The anchor reconciler heals txs anchored to orphaned blocks
+		// (issue #279). Hosted in the bump-builder mode because it shares
+		// the MINED-publish machinery, the store, and the chaintracks
+		// header source; lease-gated for multi-replica deployments.
+		if rec := bump_builder.NewReconciler(cfg, d.Logger, d.Store, d.Publisher, chainHeader, d.MerkleClient, d.Leaser); rec != nil {
+			svcs = append(svcs, rec)
+		}
 	}
 	if shouldRun("watchdog") && cfg.Watchdog.Enabled {
 		if wd := watchdog.NewService(cfg, d.Logger, d.Store, d.Leaser, d.MerkleClient); wd != nil {
@@ -427,30 +586,165 @@ func (a chaintracksHeaderReader) GetHeaderByHash(ctx context.Context, hash *chai
 	return a.ct.GetHeaderByHash(ctx, hash)
 }
 
-// endpointSource adapts store.Store to teranode.EndpointSource by extracting
-// just the URL list. network scopes the listing to the configured Bitcoin
-// network so a store shared across pods (or reused after a network change)
-// never replays peers from a different network. When includeDiscovered is
-// false (operator disabled p2p.datahub_discovery), rows persisted as
-// source=discovered by prior runs are filtered out — the toggle now means
-// "ignore discovered URLs" end-to-end, not just "stop discovering new ones."
-type endpointSource struct {
-	st                store.Store
-	network           string
-	includeDiscovered bool
+func (a chaintracksHeaderReader) GetHeaderByHeight(ctx context.Context, height uint32) (*chaintrackslib.BlockHeader, error) {
+	return a.ct.GetHeaderByHeight(ctx, height)
 }
 
-func (a endpointSource) ListEndpointURLs(ctx context.Context) ([]string, error) {
+// endpointSourceValidationTTL is how long a discovered URL that passed
+// validation skips re-validation (including its DNS round-trip) on
+// subsequent refresh ticks. Success-only: rejected URLs are re-checked
+// every tick so a row whose DNS recovers is admitted within one interval.
+const endpointSourceValidationTTL = 5 * time.Minute
+
+// endpointSourceValidationCacheMax bounds the validation cache. Discovered
+// registry rows originate from untrusted p2p announcements; the cap keeps a
+// registry flooded with unique URLs from growing process memory without
+// bound. Far above the size of any real datahub fleet.
+const endpointSourceValidationCacheMax = 512
+
+// endpointSourceLookupTimeout bounds each DNS lookup during refresh so a
+// dead resolver cannot wedge the refresh tick (the synchronous first
+// refresh in teranode.Client.Start is separately capped, and lookups
+// derive from the tick's ctx).
+const endpointSourceLookupTimeout = 2 * time.Second
+
+// datahubLister is the narrow store contract endpointSource needs;
+// extracted so tests can fake the registry without a real store.
+type datahubLister interface {
+	ListDatahubEndpoints(ctx context.Context, network string) ([]store.DatahubEndpoint, error)
+}
+
+// endpointSource adapts the store's DatahubEndpoint registry to
+// teranode.EndpointSource. network scopes the listing to the configured
+// Bitcoin network so a store shared across pods (or reused after a network
+// change) never replays peers from a different network. When
+// includeDiscovered is false (operator disabled p2p.datahub_discovery),
+// rows persisted as source=discovered by prior runs are filtered out — the
+// toggle means "ignore discovered URLs" end-to-end, not just "stop
+// discovering new ones."
+//
+// Discovered rows are additionally re-validated with ssrfguard on every
+// listing (behind a success-only TTL cache): the p2p_client validates at
+// announcement intake, but rows persisted before that guard existed — or by
+// older builds — would otherwise flow straight into every pod's endpoint
+// set forever, since the registry has no eviction. Operator-configured rows
+// are exempt: static datahub_urls may legitimately point at
+// cluster-internal names.
+type endpointSource struct {
+	st                datahubLister
+	network           string
+	includeDiscovered bool
+	allowPrivate      bool
+
+	// lookupIP is the DNS seam; nil is never stored — newEndpointSource
+	// installs the bounded default.
+	lookupIP func(ctx context.Context, host string) ([]net.IP, error)
+	// validated caches URLs that passed validation. Bounded — see
+	// endpointSourceValidationCacheMax.
+	validated *ssrfguard.SuccessCache
+	// warned tracks URLs already logged at WARN so each rejected row logs
+	// loudly once per process and quietly (DEBUG) on the ~30s re-checks.
+	// Pruned against every listing, so it is bounded by the registry's
+	// current row count rather than by everything ever seen.
+	warnedMu sync.Mutex
+	warned   map[string]struct{}
+	logger   *zap.Logger
+}
+
+func newEndpointSource(st datahubLister, network string, includeDiscovered, allowPrivate bool, logger *zap.Logger) *endpointSource {
+	return &endpointSource{
+		st:                st,
+		network:           network,
+		includeDiscovered: includeDiscovered,
+		allowPrivate:      allowPrivate,
+		validated:         ssrfguard.NewSuccessCache(endpointSourceValidationTTL, endpointSourceValidationCacheMax),
+		warned:            map[string]struct{}{},
+		logger:            logger,
+		lookupIP: func(ctx context.Context, host string) ([]net.IP, error) {
+			lctx, cancel := context.WithTimeout(ctx, endpointSourceLookupTimeout)
+			defer cancel()
+			return net.DefaultResolver.LookupIP(lctx, "ip", host)
+		},
+	}
+}
+
+func (a *endpointSource) ListEndpointURLs(ctx context.Context) ([]string, error) {
 	eps, err := a.st.ListDatahubEndpoints(ctx, a.network)
 	if err != nil {
 		return nil, err
 	}
+	current := make(map[string]struct{}, len(eps))
 	out := make([]string, 0, len(eps))
 	for _, ep := range eps {
-		if !a.includeDiscovered && ep.Source == store.DatahubEndpointSourceDiscovered {
-			continue
+		current[ep.URL] = struct{}{}
+		if ep.Source == store.DatahubEndpointSourceDiscovered {
+			if !a.includeDiscovered {
+				continue
+			}
+			if !a.validDiscoveredURL(ctx, ep.URL) {
+				continue
+			}
 		}
 		out = append(out, ep.URL)
 	}
+	a.pruneWarned(current)
 	return out, nil
+}
+
+// pruneWarned drops warn-dampening entries for URLs no longer present in
+// the registry listing, keeping the map bounded by the registry's current
+// size. A row that later reappears simply WARNs once more.
+func (a *endpointSource) pruneWarned(current map[string]struct{}) {
+	a.warnedMu.Lock()
+	defer a.warnedMu.Unlock()
+	for url := range a.warned {
+		if _, ok := current[url]; !ok {
+			delete(a.warned, url)
+		}
+	}
+}
+
+// validDiscoveredURL runs ssrfguard validation behind the success-only TTL
+// cache and handles rejection metering/log dampening.
+func (a *endpointSource) validDiscoveredURL(ctx context.Context, url string) bool {
+	if _, ok := a.validated.Get(url); ok {
+		return true
+	}
+
+	err := ssrfguard.ValidateURL(url, a.allowPrivate, func(host string) ([]net.IP, error) {
+		return a.lookupIP(ctx, host)
+	})
+	if err != nil {
+		outcome := "invalid"
+		if errors.Is(err, ssrfguard.ErrBlockedAddress) {
+			outcome = "blocked"
+		}
+		metrics.TeranodeEndpointRefreshRejectedTotal.WithLabelValues(outcome).Inc()
+		a.logRejection(url, err)
+		return false
+	}
+
+	a.validated.Put(url, "")
+	a.warnedMu.Lock()
+	delete(a.warned, url) // if it later goes bad again, WARN once more
+	a.warnedMu.Unlock()
+	return true
+}
+
+// logRejection logs a rejected registry row at WARN the first time a URL is
+// seen and DEBUG thereafter. A bad row is re-listed every refresh tick in
+// every pod; an unconditional WARN would drip permanently from a registry
+// row nobody has pruned yet.
+func (a *endpointSource) logRejection(url string, err error) {
+	a.warnedMu.Lock()
+	_, already := a.warned[url]
+	if !already {
+		a.warned[url] = struct{}{}
+	}
+	a.warnedMu.Unlock()
+	if already {
+		a.logger.Debug("skipping invalid discovered datahub url", zap.String("url", url), zap.Error(err))
+		return
+	}
+	a.logger.Warn("skipping invalid discovered datahub url", zap.String("url", url), zap.Error(err))
 }

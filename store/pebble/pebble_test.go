@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -1085,4 +1087,255 @@ func hashesOf(rows []*models.BlockProcessingStatus) []string {
 		out[i] = r.BlockHash
 	}
 	return out
+}
+
+func TestBlockProcessing_MarkParked(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	t0 := time.Now().Add(-time.Hour).UTC().Truncate(time.Millisecond)
+
+	if err := s.UpsertBlockHeaderSeen(ctx, "parkme", 500, t0); err != nil {
+		t.Fatalf("seen: %v", err)
+	}
+	if err := s.MarkBlocksParked(ctx, []string{"parkme"}); err != nil {
+		t.Fatalf("park: %v", err)
+	}
+	got, err := s.GetBlockProcessingStatus(ctx, "parkme")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status != models.BlockStatusParked {
+		t.Errorf("Status=%q, want parked", got.Status)
+	}
+
+	// Parked rows leave the stale scan (status='active' predicate).
+	stale, err := s.ListStaleBlockProcessingStatus(ctx, time.Now(), 0, 10)
+	if err != nil {
+		t.Fatalf("list stale: %v", err)
+	}
+	for _, r := range stale {
+		if r.BlockHash == "parkme" {
+			t.Error("parked row must not surface in the stale scan")
+		}
+	}
+
+	// A fresh header arrival revives the row to active (recovery resumes).
+	if err := s.UpsertBlockHeaderSeen(ctx, "parkme", 500, t0.Add(time.Minute)); err != nil {
+		t.Fatalf("re-seen: %v", err)
+	}
+	got, _ = s.GetBlockProcessingStatus(ctx, "parkme")
+	if got.Status != models.BlockStatusActive {
+		t.Errorf("Status after re-seen=%q, want active", got.Status)
+	}
+}
+
+func TestBlockProcessing_MarkParked_SkipsOrphanedAndMissing(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	t0 := time.Now().Add(-time.Hour)
+
+	if err := s.UpsertBlockHeaderSeen(ctx, "reorged", 501, t0); err != nil {
+		t.Fatalf("seen: %v", err)
+	}
+	if err := s.MarkBlocksOrphaned(ctx, []string{"reorged"}, t0.Add(time.Minute)); err != nil {
+		t.Fatalf("orphan: %v", err)
+	}
+	// Parking must not relabel an orphaned (off-chain) row, and a missing
+	// row is a silent no-op.
+	if err := s.MarkBlocksParked(ctx, []string{"reorged", "never-seen"}); err != nil {
+		t.Fatalf("park: %v", err)
+	}
+	got, _ := s.GetBlockProcessingStatus(ctx, "reorged")
+	if got.Status != models.BlockStatusOrphaned {
+		t.Errorf("Status=%q, want orphaned (park must not override)", got.Status)
+	}
+}
+
+// TestIterateStatusesByToken covers the SSE-catchup hot path: distinct
+// txids, since/only filters, ascending order, and the no-heavy-fields
+// projection (raw tx / merkle path stripped).
+func TestIterateStatusesByToken(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	base := time.Now().Add(-time.Hour).UTC().Truncate(time.Millisecond)
+	rows := []*models.TransactionStatus{
+		{TxID: "tx-mined", Status: models.StatusMined, Timestamp: base, RawTx: []byte{0xde, 0xad}, MerklePath: []byte{0xbe, 0xef}},
+		{TxID: "tx-pending", Status: models.StatusSeenOnNetwork, Timestamp: base.Add(time.Minute)},
+		{TxID: "tx-received", Status: models.StatusReceived, Timestamp: base.Add(2 * time.Minute)},
+		{TxID: "tx-other", Status: models.StatusReceived, Timestamp: base.Add(3 * time.Minute)},
+	}
+	for _, r := range rows {
+		if _, _, err := s.GetOrInsertStatus(ctx, r); err != nil {
+			t.Fatalf("insert %s: %v", r.TxID, err)
+		}
+	}
+	subs := []*models.Submission{
+		{SubmissionID: "s1", TxID: "tx-mined", CallbackToken: "tok-1", CreatedAt: base},
+		{SubmissionID: "s2", TxID: "tx-pending", CallbackToken: "tok-1", CreatedAt: base},
+		// Duplicate submission for the same txid — must not double-emit.
+		{SubmissionID: "s3", TxID: "tx-pending", CallbackToken: "tok-1", CreatedAt: base},
+		{SubmissionID: "s4", TxID: "tx-received", CallbackToken: "tok-1", CreatedAt: base},
+		{SubmissionID: "s5", TxID: "tx-other", CallbackToken: "tok-2", CreatedAt: base},
+	}
+	for _, sub := range subs {
+		if err := s.InsertSubmission(ctx, sub); err != nil {
+			t.Fatalf("insert submission %s: %v", sub.SubmissionID, err)
+		}
+	}
+
+	collect := func(since time.Time, only []models.Status) []*models.TransactionStatus {
+		t.Helper()
+		var got []*models.TransactionStatus
+		if err := s.IterateStatusesByToken(ctx, "tok-1", since, only, func(st *models.TransactionStatus) error {
+			got = append(got, st)
+			return nil
+		}); err != nil {
+			t.Fatalf("IterateStatusesByToken: %v", err)
+		}
+		return got
+	}
+
+	// Unfiltered: 3 distinct txids in ascending timestamp order, projected.
+	got := collect(time.Time{}, nil)
+	if len(got) != 3 {
+		t.Fatalf("unfiltered rows = %d, want 3 (%+v)", len(got), got)
+	}
+	wantOrder := []string{"tx-mined", "tx-pending", "tx-received"}
+	for i, want := range wantOrder {
+		if got[i].TxID != want {
+			t.Errorf("row %d = %s, want %s", i, got[i].TxID, want)
+		}
+	}
+	if len(got[0].RawTx) != 0 || len(got[0].MerklePath) != 0 {
+		t.Errorf("projection leaked heavy fields: rawTx=%d merklePath=%d bytes", len(got[0].RawTx), len(got[0].MerklePath))
+	}
+
+	// onlyStatuses filter: non-terminal only drops the MINED row.
+	got = collect(time.Time{}, models.NonTerminalStatuses())
+	if len(got) != 2 || got[0].TxID != "tx-pending" || got[1].TxID != "tx-received" {
+		t.Fatalf("non-terminal rows = %+v, want [tx-pending tx-received]", got)
+	}
+
+	// since filter is strictly-after: cutting at tx-pending's timestamp
+	// leaves only tx-received.
+	got = collect(base.Add(time.Minute), nil)
+	if len(got) != 1 || got[0].TxID != "tx-received" {
+		t.Fatalf("since rows = %+v, want [tx-received]", got)
+	}
+
+	// fn error stops iteration and propagates.
+	sentinel := errors.New("stop")
+	calls := 0
+	err := s.IterateStatusesByToken(ctx, "tok-1", time.Time{}, nil, func(*models.TransactionStatus) error {
+		calls++
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Errorf("fn error not propagated: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("iteration continued after fn error: %d calls", calls)
+	}
+}
+
+// TestTokensForTxIDs covers the SSE fan-out membership resolution: multiple
+// tokens on one txid, a txid with a single token, unknown txids, duplicate
+// inputs, submissions without a token, and the empty batch.
+func TestTokensForTxIDs(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	subs := []*models.Submission{
+		{SubmissionID: "p1", TxID: "tx-probe", CallbackToken: "tok-1", CreatedAt: time.Now()},
+		{SubmissionID: "p2", TxID: "tx-probe", CallbackToken: "tok-2", CreatedAt: time.Now()},
+		// Same (txid, token) twice: the result must be de-duplicated.
+		{SubmissionID: "p2b", TxID: "tx-probe", CallbackToken: "tok-2", CreatedAt: time.Now()},
+		{SubmissionID: "p3", TxID: "tx-solo", CallbackToken: "tok-1", CreatedAt: time.Now()},
+		// SSE-less submission: no callback token, so it contributes nothing.
+		{SubmissionID: "p4", TxID: "tx-notoken", CreatedAt: time.Now()},
+	}
+	for _, sub := range subs {
+		if err := s.InsertSubmission(ctx, sub); err != nil {
+			t.Fatalf("insert %s: %v", sub.SubmissionID, err)
+		}
+	}
+
+	// One batch resolves every txid, duplicates included.
+	got, err := s.TokensForTxIDs(ctx, []string{"tx-probe", "tx-probe", "tx-solo", "tx-notoken", "tx-ghost"})
+	if err != nil {
+		t.Fatalf("TokensForTxIDs: %v", err)
+	}
+	want := map[string][]string{
+		"tx-probe": {"tok-1", "tok-2"},
+		"tx-solo":  {"tok-1"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("TokensForTxIDs returned %d txids (%v), want %d", len(got), got, len(want))
+	}
+	for txid, wantTokens := range want {
+		gotTokens := append([]string(nil), got[txid]...)
+		sort.Strings(gotTokens)
+		if !slices.Equal(gotTokens, wantTokens) {
+			t.Errorf("tokens for %s = %v, want %v", txid, gotTokens, wantTokens)
+		}
+	}
+	// Absent, never present-but-empty: fan-out treats a missing key as
+	// "nobody subscribed".
+	for _, txid := range []string{"tx-ghost", "tx-notoken"} {
+		if _, ok := got[txid]; ok {
+			t.Errorf("%s must be absent from the result, got %v", txid, got[txid])
+		}
+	}
+
+	empty, err := s.TokensForTxIDs(ctx, nil)
+	if err != nil {
+		t.Fatalf("TokensForTxIDs(nil): %v", err)
+	}
+	if len(empty) != 0 {
+		t.Errorf("TokensForTxIDs(nil) = %v, want empty", empty)
+	}
+}
+
+// TestSetPendingRetryFields_RespectsStatusLattice is the pebble half of the
+// backend-parity guard; see the postgres test of the same name for why the
+// second write of the park path must not bypass the lattice.
+func TestSetPendingRetryFields_RespectsStatusLattice(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	for _, prev := range models.StatusPendingRetry.DisallowedPreviousStatuses() {
+		t.Run(string(prev), func(t *testing.T) {
+			txid := "lattice-" + string(prev)
+			if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+				TxID: txid, Status: models.StatusReceived,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.UpdateStatus(ctx, &models.TransactionStatus{TxID: txid, Status: prev}); err != nil {
+				t.Fatalf("seed %s: %v", prev, err)
+			}
+
+			if err := s.SetPendingRetryFields(ctx, txid, []byte{0xaa}, time.Now().Add(-time.Second)); err != nil {
+				t.Fatalf("SetPendingRetryFields: %v", err)
+			}
+
+			got, err := s.GetStatus(ctx, txid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Status != prev {
+				t.Errorf("status = %s, want %s left untouched", got.Status, prev)
+			}
+			ready, err := s.GetReadyRetries(ctx, time.Now(), 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, r := range ready {
+				if r.TxID == txid {
+					t.Errorf("%s row entered the durable retry queue", prev)
+				}
+			}
+		})
+	}
 }

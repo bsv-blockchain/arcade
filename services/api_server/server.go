@@ -9,16 +9,20 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/events"
+	"github.com/bsv-blockchain/arcade/finality"
 	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/services/httpmiddleware"
 	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/arcade/telemetry"
 	"github.com/bsv-blockchain/arcade/teranode"
 	"github.com/bsv-blockchain/arcade/validator"
 )
@@ -49,7 +53,12 @@ type Server struct {
 	// unset, in which case the handler skips validation. Production
 	// wiring through New requires it.
 	validator *validator.Validator
-	server    *http.Server
+	// finality runs the nLockTime/BIP113 pre-check in the submit handler,
+	// rejecting provably non-final txs with an actionable reason instead of
+	// letting teranode bounce them with a generic error (issue #245).
+	// Nil-safe: nil (no chain source configured, or disabled) skips the gate.
+	finality *finality.Checker
+	server   *http.Server
 
 	// submissionCh decouples the InsertSubmission Pebble write from the HTTP
 	// handler tail latency. recordSubmission enqueues onto it via a non-
@@ -59,6 +68,13 @@ type Server struct {
 	submissionCh   chan submissionRecord
 	submissionStop chan struct{}
 	stopOnce       sync.Once
+
+	// tipMu/tipHeight/tipFetchedAt cache the store's active-tip height for
+	// /health (see activeTipHeight): probes arrive every few seconds and
+	// the underlying read is a store scan we don't want to pay per probe.
+	tipMu        sync.Mutex
+	tipHeight    uint64
+	tipFetchedAt time.Time
 }
 
 // submissionRecord is the in-memory payload the async recorder consumes.
@@ -70,7 +86,12 @@ type submissionRecord struct {
 	sub *models.Submission
 }
 
-func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publisher events.Publisher, st store.Store, tracker *store.TxTracker, tc *teranode.Client, mc *merkleservice.Client, val *validator.Validator) *Server {
+func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publisher events.Publisher, st store.Store, tracker *store.TxTracker, tc *teranode.Client, mc *merkleservice.Client, val *validator.Validator, fin *finality.Checker) *Server {
+	// Export every series this service can emit at 0 from the first scrape —
+	// a series born mid-burst is invisible to increase() until its second
+	// sample, which undercounted submissions after every rollout.
+	metrics.PreRegisterTxSubmissions()
+	metrics.PreRegisterStatusTransitions(models.StatusSeenOnNetwork, models.StatusSeenMultipleNodes)
 	return &Server{
 		cfg:            cfg,
 		logger:         logger.Named("api-server"),
@@ -81,6 +102,7 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 		teranode:       tc,
 		merkleClient:   mc,
 		validator:      val,
+		finality:       fin,
 		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
 		submissionStop: make(chan struct{}),
 	}
@@ -88,13 +110,50 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 
 func (s *Server) Name() string { return "api-server" }
 
-func (s *Server) Start(ctx context.Context) error {
-	gin.SetMode(gin.ReleaseMode)
+// newRouter assembles the gin engine and its middleware stack: inbound OTEL
+// tracing (outermost), then panic recovery, then the request logger/metrics
+// middleware, followed by every registered route. Factored out of Start so
+// tests can exercise the full middleware stack (span creation, trace-id log
+// correlation) through httptest without binding a real listener.
+//
+// otelgin must be OUTSIDE CustomRecovery: otelgin restores the pre-span
+// request context in a defer, and deferred funcs run innermost-first during
+// a panic unwind — were recovery outermost, the span would already be gone
+// from c.Request.Context() by the time recoverPanic runs, and panic logs
+// would lose their trace_id/span_id. With otelgin outermost the panic is
+// recovered while the span is still live (fields attach) and otelgin's own
+// post-processing then ends the span with the 500 recovery wrote, so panics
+// show up on traces too. The cost — a panic inside otelgin itself has no
+// recovery above it — is acceptable: otelgin is thin and widely deployed,
+// and net/http still contains per-request panics at the server level.
+//
+// otelgin.Middleware is installed unconditionally so tracing can be turned
+// on via env at runtime without a redeploy. It is NOT free when telemetry is
+// disabled: on every non-filtered request otelgin still runs the propagator
+// Extract, builds the full semconv attribute slice, copies the request
+// context, and assembles the metric attributes (~15+ allocations) — it just
+// never exports or touches the network (the no-op provider drops it all).
+// That per-request overhead is negligible next to the JSON (de)serialisation
+// each handler already does, so gating on Enabled isn't worth losing the
+// zero-redeploy toggle. /health, /ready, and /metrics are filtered out —
+// they're polled far more often than real traffic and carry no useful trace
+// information.
+func (s *Server) newRouter() *gin.Engine {
 	router := gin.New()
+	router.Use(otelgin.Middleware(s.cfg.Telemetry.ServiceName, otelgin.WithGinFilter(func(c *gin.Context) bool {
+		p := c.FullPath()
+		return p != "/health" && p != "/ready" && p != "/metrics"
+	})))
 	router.Use(gin.CustomRecovery(s.recoverPanic))
 	router.Use(s.requestLogger())
 
 	s.registerRoutes(router)
+	return router
+}
+
+func (s *Server) Start(ctx context.Context) error {
+	gin.SetMode(gin.ReleaseMode)
+	router := s.newRouter() //nolint:contextcheck // false positive: requestLogger's telemetry.Fields(c.Request.Context()) already uses the correct per-request context; requestLogger is a gin middleware factory with no ctx parameter of its own for the linter to compare against.
 
 	// Spin up the submission recorder pool. Workers exit on submissionStop
 	// (Stop()) which is signaled before the HTTP server is closed. The
@@ -151,7 +210,7 @@ func (s *Server) runSubmissionRecorder(parentCtx context.Context, wg *sync.WaitG
 			if err := s.store.InsertSubmission(ctx, rec.sub); err != nil {
 				s.logger.Warn(
 					"failed to insert submission (async)",
-					zap.String("txid", rec.sub.TxID),
+					logfields.TxID(rec.sub.TxID),
 					zap.Error(err),
 				)
 			}
@@ -189,13 +248,17 @@ func (s *Server) requestLogger() gin.HandlerFunc {
 			metrics.APIRequestBytes.WithLabelValues(route).Observe(float64(reqLen))
 		}
 
-		fields := []zap.Field{
+		fields := append([]zap.Field{
 			zap.String("method", c.Request.Method),
 			zap.String("path", c.Request.URL.Path),
-			zap.Int("status", status),
+			// status_code (HTTP), not "status": the canonical "status" field is
+			// reserved for the transaction-status string (logfields.Status), so
+			// an HTTP status int must use a distinct key to avoid a mixed-type
+			// collision in the shared log-field namespace.
+			zap.Int("status_code", status),
 			zap.Duration("latency", time.Since(start)),
 			zap.String("client_ip", c.ClientIP()),
-		}
+		}, telemetry.Fields(c.Request.Context())...)
 		switch {
 		case status >= 500:
 			s.logger.Error("request", fields...)
@@ -208,18 +271,19 @@ func (s *Server) requestLogger() gin.HandlerFunc {
 }
 
 // recoverPanic is wired into gin.CustomRecovery so handler panics are logged
-// through zap (structured) rather than gin's default stderr text writer. The
-// requestLogger middleware still runs after this and emits the request line
-// at Error level for the recovered 500.
+// through zap (structured) rather than gin's default stderr text writer.
+// Because recovery sits inside otelgin (see newRouter), the request context
+// still carries the live span here, so the panic line gets trace_id/span_id
+// and the span is subsequently ended with the 500 written below.
 func (s *Server) recoverPanic(c *gin.Context, recovered any) {
-	s.logger.Error(
-		"panic in handler",
+	fields := append([]zap.Field{
 		zap.Any("panic", recovered),
 		zap.String("method", c.Request.Method),
 		zap.String("path", c.Request.URL.Path),
 		zap.String("client_ip", c.ClientIP()),
 		zap.Stack("stack"),
-	)
+	}, telemetry.Fields(c.Request.Context())...)
+	s.logger.Error("panic in handler", fields...)
 	c.AbortWithStatus(http.StatusInternalServerError)
 }
 

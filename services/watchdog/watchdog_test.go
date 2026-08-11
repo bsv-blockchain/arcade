@@ -12,9 +12,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/merkleservice"
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
 )
@@ -31,7 +33,8 @@ type watchdogStore struct {
 	stale     []*models.BlockProcessingStatus
 	staleErr  error
 
-	listCalls []listStaleCall
+	listCalls   []listStaleCall
+	parkedCalls [][]string
 }
 
 type listStaleCall struct {
@@ -92,6 +95,33 @@ func (s *watchdogStore) captureListCalls() []listStaleCall {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]listStaleCall(nil), s.listCalls...)
+}
+
+// MarkBlocksParked mirrors the real backends: records the call and flips
+// active rows to parked, so subsequent ListStaleBlockProcessingStatus calls
+// exclude them (the status filter above).
+func (s *watchdogStore) MarkBlocksParked(_ context.Context, hashes []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.parkedCalls = append(s.parkedCalls, append([]string(nil), hashes...))
+	for _, h := range hashes {
+		for _, r := range s.stale {
+			if r.BlockHash == h && (r.Status == "" || r.Status == models.BlockStatusActive) {
+				r.Status = models.BlockStatusParked
+			}
+		}
+	}
+	return nil
+}
+
+func (s *watchdogStore) parkedHashes() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []string
+	for _, call := range s.parkedCalls {
+		out = append(out, call...)
+	}
+	return out
 }
 
 type watchdogLeaser struct {
@@ -327,6 +357,140 @@ func TestWatchdog_BacksOffHeavilyOn4xx(t *testing.T) {
 	w.tick(context.Background())
 	if srv.callCount() != 2 {
 		t.Fatalf("after terminal backoff calls=%d want 2", srv.callCount())
+	}
+}
+
+// TestWatchdog_CapsReprocessAtMaxAttempts reproduces the reprocess-storm:
+// merkle keeps ACCEPTING /reprocess (202) but the block never finalizes
+// (processed_at stays NULL), so the row is re-listed every stale window. With
+// MaxReprocessAttempts the watchdog must stop re-driving after N dispatches
+// instead of forever (the old recordSuccess reset the counter each time).
+func TestWatchdog_CapsReprocessAtMaxAttempts(t *testing.T) {
+	srv := newReprocessServer(t) // default responder returns 202 Accepted
+	mc := merkleservice.NewClient(srv.server.URL, "auth", 5*time.Second)
+
+	now := time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC)
+	st := &watchdogStore{
+		tipHeight: 1000,
+		stale: []*models.BlockProcessingStatus{
+			{BlockHash: "blk-1", BlockHeight: 1000, HeaderSeenAt: now.Add(-10 * time.Minute), Status: models.BlockStatusActive},
+		},
+	}
+	w := newTestWatchdog(t, st, alwaysLeader(), mc)
+	w.cfg.MaxReprocessAttempts = 3
+	w.cfg.MaxStaleAge = 0 // isolate the attempt cap
+
+	// Tick well past the cap, advancing > StaleThreshold each time so backoff
+	// never gates (only the cap should).
+	for i := 0; i < 6; i++ {
+		w.now = func() time.Time { return now.Add(time.Duration(i) * 3 * time.Minute) }
+		w.tick(context.Background())
+	}
+
+	if got := srv.callCount(); got != 3 {
+		t.Fatalf("reprocess not capped: calls=%d want 3 (MaxReprocessAttempts)", got)
+	}
+	if parked := st.parkedHashes(); len(parked) != 1 || parked[0] != "blk-1" {
+		t.Fatalf("attempt-cap park must be persisted via MarkBlocksParked: got %v want [blk-1]", parked)
+	}
+}
+
+// TestWatchdog_ParksBlockOlderThanMaxStaleAge verifies the age backstop AND
+// its one-attempt guarantee: a block already older than MaxStaleAge when
+// first seen (incident backlog, or a redeploy reset the in-memory counters)
+// gets exactly ONE recovery dispatch, then parks — and the park is persisted
+// as a terminal status so the row leaves the stale scan entirely.
+func TestWatchdog_ParksBlockOlderThanMaxStaleAge(t *testing.T) {
+	srv := newReprocessServer(t)
+	mc := merkleservice.NewClient(srv.server.URL, "auth", 5*time.Second)
+
+	now := time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC)
+	st := &watchdogStore{
+		tipHeight: 1000,
+		stale: []*models.BlockProcessingStatus{
+			// height-recent (within RecencyDepth) but stuck for 2h.
+			{BlockHash: "blk-old", BlockHeight: 1000, HeaderSeenAt: now.Add(-2 * time.Hour), Status: models.BlockStatusActive},
+		},
+	}
+	w := newTestWatchdog(t, st, alwaysLeader(), mc)
+	w.cfg.MaxReprocessAttempts = 0 // disable attempt cap; isolate the age cap
+	w.cfg.MaxStaleAge = time.Hour
+
+	// Tick 1: aged block with zero attempts must be dispatched once, not
+	// silently abandoned.
+	w.now = func() time.Time { return now }
+	w.tick(context.Background())
+	if got := srv.callCount(); got != 1 {
+		t.Fatalf("aged block must get one recovery attempt before parking: calls=%d want 1", got)
+	}
+
+	// Tick 2 (past the post-success nextEligibleAt gate): the block now has
+	// one attempt recorded, so the age cap parks it — no further dispatch,
+	// and the terminal status is persisted.
+	w.now = func() time.Time { return now.Add(3 * time.Minute) }
+	w.tick(context.Background())
+	if got := srv.callCount(); got != 1 {
+		t.Fatalf("block older than MaxStaleAge should park after its single attempt: calls=%d want 1", got)
+	}
+	if parked := st.parkedHashes(); len(parked) != 1 || parked[0] != "blk-old" {
+		t.Fatalf("park must be persisted via MarkBlocksParked: got %v want [blk-old]", parked)
+	}
+
+	// Tick 3: the persisted status removes the row from the stale scan — the
+	// watchdog no longer even sees it (no re-park, no dispatch).
+	w.now = func() time.Time { return now.Add(6 * time.Minute) }
+	w.tick(context.Background())
+	if got := srv.callCount(); got != 1 {
+		t.Fatalf("parked block resurfaced: calls=%d want 1", got)
+	}
+	if parked := st.parkedHashes(); len(parked) != 1 {
+		t.Fatalf("parked status should be persisted exactly once: got %v", parked)
+	}
+}
+
+// TestWatchdog_DoesNotParkOnAuthFailure verifies the issue #269 fix: a 401/403
+// from /reprocess is an auth-config problem (merkle_service.auth_token missing
+// or wrong), NOT a permanently un-finalizable block. It must be re-driven at a
+// slow, loud cadence and NEVER parked — even when both park caps are enabled —
+// so it self-heals once the token is set. Contrast with
+// TestWatchdog_CapsReprocessAtMaxAttempts / TestWatchdog_ParksBlockOlderThanMaxStaleAge,
+// which DO park.
+func TestWatchdog_DoesNotParkOnAuthFailure(t *testing.T) {
+	srv := newReprocessServer(t)
+	srv.setResponder(func(string) (int, string) { return http.StatusUnauthorized, "unauthorized" })
+	mc := merkleservice.NewClient(srv.server.URL, "", 5*time.Second)
+
+	now := time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC)
+	st := &watchdogStore{
+		tipHeight: 1000,
+		stale: []*models.BlockProcessingStatus{
+			{BlockHash: "blk-auth", BlockHeight: 1000, HeaderSeenAt: now.Add(-10 * time.Minute), Status: models.BlockStatusActive},
+		},
+	}
+	w := newTestWatchdog(t, st, alwaysLeader(), mc)
+	// Enable BOTH park caps to prove auth failures are exempt from each.
+	w.cfg.MaxReprocessAttempts = 3
+	w.cfg.MaxStaleAge = time.Hour
+
+	before := testutil.ToFloat64(metrics.WatchdogReprocessTotal.WithLabelValues("err_auth"))
+
+	// 40 ticks at +2min each spans 78 min (> MaxStaleAge) and far exceeds
+	// MaxReprocessAttempts. InitialBackoff is 1min, so every 2min tick is
+	// eligible and must re-drive — no park, ever.
+	const ticks = 40
+	for i := 0; i < ticks; i++ {
+		w.now = func() time.Time { return now.Add(time.Duration(i) * 2 * time.Minute) }
+		w.tick(context.Background())
+	}
+
+	if got := srv.callCount(); got != ticks {
+		t.Fatalf("auth-failing block must be re-driven every eligible tick: calls=%d want %d", got, ticks)
+	}
+	if parked := st.parkedHashes(); len(parked) != 0 {
+		t.Fatalf("auth failure must NOT park the block: parked=%v want []", parked)
+	}
+	if delta := testutil.ToFloat64(metrics.WatchdogReprocessTotal.WithLabelValues("err_auth")) - before; int(delta) != ticks {
+		t.Fatalf("err_auth metric delta=%v want %d", delta, ticks)
 	}
 }
 

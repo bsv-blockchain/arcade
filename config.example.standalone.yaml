@@ -28,6 +28,31 @@ api:
 health:
   port: 8081
 
+# OpenTelemetry export to an external OTLP collector (traces + metrics; the
+# existing Prometheus /metrics scrape keeps working unchanged either way).
+# Disabled by default: with enabled=false, no OTEL providers are created and
+# no network connections are opened, so runtime behaviour is identical to a
+# build with no OTEL support at all.
+#
+# endpoint may be left blank when enabled=true: the exporters then fall back
+# to the standard OTEL_EXPORTER_OTLP_ENDPOINT (or the more specific
+# OTEL_EXPORTER_OTLP_TRACES_ENDPOINT / OTEL_EXPORTER_OTLP_METRICS_ENDPOINT)
+# environment variables, e.g. for a node-local collector reached via the
+# Kubernetes downward API host IP:
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://$(HOST_IP):4317
+# telemetry:
+#   enabled: false
+#   endpoint: ""                # host:port of the OTLP collector; see env fallback above
+#   protocol: grpc              # "grpc" (default, port 4317) or "http" (port 4318)
+#   insecure: false             # skip TLS; typically true for an in-cluster/local collector
+#   service_name: arcade
+#   namespace: ""                # service.namespace resource attribute (e.g. downstream solution name)
+#   traces: true
+#   metrics: true
+#   logs: false                  # OTLP log export is not implemented; logs always ship via stdout JSON
+#   sample_ratio: 1.0            # ParentBased(TraceIDRatioBased) sampler ratio, 0.0-1.0
+#   export_timeout_ms: 10000
+
 # In-memory broker: publishes and consumes stay inside the process. No
 # Kafka/Sarama connection is attempted. Messages are at-most-once on crash,
 # which is fine for single-node evaluation and local development.
@@ -57,6 +82,10 @@ store:
 #     embedded_port: 0       # 0 = auto-pick a free port
 #     embedded_data_dir: ""  # defaults to <storage_path>/postgres
 #     embedded_cache_dir: "" # defaults to <storage_path>/postgres-cache
+#     # Ceiling for the boot-time schema apply when it actually has to run
+#     # (fresh database or schema change); restarts with a current schema
+#     # verify a stored checksum and skip DDL entirely. See issue #278.
+#     schema_apply_timeout_ms: 300000
 
 # Statically configured datahub propagation targets. Leave empty to rely
 # entirely on p2p discovery below (requires datahub_discovery: true).
@@ -83,7 +112,9 @@ p2p:
   # storage_path: ""           # defaults to <storage_path>/p2p; stores p2p_key.hex
   # bootstrap_peers: []        # override/extend the built-in defaults for the selected network
   # enable_mdns: false
-  # allow_private_urls: false  # accept loopback/RFC1918 URLs from peers
+  # allow_private_urls: false  # accept discovered URLs on loopback/RFC1918/link-local/CGNAT
+  # addresses, including DNS names that RESOLVE to those ranges. Unresolvable
+  # hostnames are rejected regardless. Configured datahub_urls are never validated.
 
 # Embedded block-header tracker. Serves /chaintracks/v1/* and /chaintracks/v2/*
 # on the api-server. Default storage is <storage_path>/chaintracks.

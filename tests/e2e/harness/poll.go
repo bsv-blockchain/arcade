@@ -17,6 +17,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
+	teranode "github.com/bsv-blockchain/teranode/services/p2p"
 )
 
 // BroadcastTx submits a single transaction to arcade via POST /tx in
@@ -64,6 +65,29 @@ type txStatusResponse struct {
 	BlockHeight uint64 `json:"blockHeight,omitempty"`
 	MerklePath  string `json:"merklePath,omitempty"`
 	ExtraInfo   string `json:"extraInfo,omitempty"`
+	// OrphanedProofs carries the historical anchors a reorg superseded
+	// (issue #279): every block this tx was once MINED against, with the
+	// proof still resolvable from the retained compound BUMP.
+	OrphanedProofs []OrphanedProof `json:"orphanedProofs,omitempty"`
+}
+
+// OrphanedProof is one historical (superseded) anchor on GET /tx.
+type OrphanedProof struct {
+	BlockHash   string `json:"blockHash"`
+	BlockHeight uint64 `json:"blockHeight"`
+	OrphanedAt  string `json:"orphanedAt"`
+	MerklePath  string `json:"merklePath,omitempty"`
+}
+
+// GetOrphanedProof returns the orphaned-proof entry for wantBlock, if
+// the tx's status carries one.
+func (r txStatusResponse) GetOrphanedProof(wantBlock string) (OrphanedProof, bool) {
+	for _, p := range r.OrphanedProofs {
+		if p.BlockHash == wantBlock {
+			return p, true
+		}
+	}
+	return OrphanedProof{}, false
 }
 
 // GetTxStatus fetches a single tx's status from arcade. Returns
@@ -269,6 +293,225 @@ func AssertMerklePathsMatchHeaderRoot(t *testing.T, rt *ArcadeRuntime, expectedH
 			t.Errorf("merkle root mismatch for %s: got %x want %x", id, root[:], wantInternal)
 		}
 	}
+}
+
+// WaitForMinedInBlock polls /tx/:txid for every txid until each reports
+// MINED (or IMMUTABLE) with a non-empty merklePath AND blockHash equal to
+// wantBlockHash. Use in reorg scenarios where plain WaitForMined would
+// accept an anchor to either competing block.
+func WaitForMinedInBlock(ctx context.Context, t *testing.T, rt *ArcadeRuntime, txids []string, wantBlockHash string, timeout time.Duration) error {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	pending := make(map[string]struct{}, len(txids))
+	for _, id := range txids {
+		pending[id] = struct{}{}
+	}
+	last := txStatusResponse{}
+	lastSeen := ""
+	for len(pending) > 0 {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for MINED@%s: %d/%d pending; last seen txid=%s status=%s block=%s",
+				wantBlockHash, len(pending), len(txids), lastSeen, last.TxStatus, last.BlockHash)
+		}
+		for id := range pending {
+			st, ok, err := GetTxStatus(ctx, rt, id)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				continue
+			}
+			last, lastSeen = st, id
+			if st.TxStatus == "REJECTED" || st.TxStatus == "DOUBLE_SPEND_ATTEMPTED" {
+				return fmt.Errorf("tx %s rejected with status %s extra=%s", id, st.TxStatus, st.ExtraInfo)
+			}
+			if (st.TxStatus == "MINED" || st.TxStatus == "IMMUTABLE") && st.MerklePath != "" && st.BlockHash == wantBlockHash {
+				delete(pending, id)
+			}
+		}
+		if len(pending) == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	return nil
+}
+
+// WaitForStatus polls /tx/:txid until it reports wantStatus (e.g.
+// SEEN_ON_NETWORK after a reorg revert) or the timeout elapses.
+func WaitForStatus(ctx context.Context, rt *ArcadeRuntime, txid, wantStatus string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	last := ""
+	for {
+		st, ok, err := GetTxStatus(ctx, rt, txid)
+		if err != nil {
+			return err
+		}
+		if ok {
+			if st.TxStatus == wantStatus {
+				return nil
+			}
+			last = st.TxStatus
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for %s on %s (last %q)", wantStatus, txid, last)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+// WaitForBUMPStored polls arcade's store until the compound BUMP for
+// blockHash exists. In reorg scenarios this is the gate between
+// announcing competing blocks: the losing block's BUMP being persisted
+// proves bump-builder fully processed its BLOCK_PROCESSED before the
+// test moves on.
+func WaitForBUMPStored(ctx context.Context, rt *ArcadeRuntime, blockHash string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		_, data, err := rt.Deps.Store.GetBUMP(ctx, blockHash)
+		if err == nil && len(data) > 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for BUMP of %s (last err: %v)", blockHash, err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+// AssertAnchorsStable polls every txid for the given window and fails
+// the test the moment any reports blockHash == forbiddenBlock. Use after
+// announcing a same-height competitor: on buggy code the competitor's
+// STUMPs re-anchor already-MINED txs to it within a second or two, so a
+// short window catches the flip with a crisp message; on fixed code the
+// window passes quietly.
+func AssertAnchorsStable(ctx context.Context, t *testing.T, rt *ArcadeRuntime, txids []string, forbiddenBlock string, window time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(window)
+	for time.Now().Before(deadline) {
+		for _, id := range txids {
+			st, ok, err := GetTxStatus(ctx, rt, id)
+			if err != nil {
+				t.Fatalf("status %s: %v", id, err)
+			}
+			if ok && st.BlockHash == forbiddenBlock {
+				t.Fatalf("tx %s re-anchored to the losing same-height block %s (status=%s) — "+
+					"MINED anchors must never move to a block off the active chain (issue #279)",
+					id, forbiddenBlock, st.TxStatus)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("context done during stability window: %v", ctx.Err())
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+}
+
+// publishBlockUntil republishes every msg variant on the block topic
+// every 2s until done() reports true. Gossipsub publishes into a mesh
+// that takes 1-3s to form, so a single early publish can be silently
+// lost; republishing until the observable effect lands is the
+// idempotent fix (chaintracks and merkle-service both dedup by block
+// hash). Multiple variants of the same block (differing DataHubURL) let
+// host-side chaintracks and the containerized merkle-service each find
+// a URL they can actually reach.
+func publishBlockUntil(ctx context.Context, lp *LibP2PHost, msgs []teranode.BlockMessage, timeout time.Duration, done func() bool) error {
+	if len(msgs) == 0 {
+		return fmt.Errorf("no block message variants to publish")
+	}
+	publishAll := func() error {
+		for _, msg := range msgs {
+			if err := lp.PublishBlock(ctx, msg); err != nil {
+				return fmt.Errorf("publish block %s: %w", msg.Hash, err)
+			}
+		}
+		return nil
+	}
+	deadline := time.Now().Add(timeout)
+	if err := publishAll(); err != nil {
+		return err
+	}
+	next := time.Now().Add(2 * time.Second)
+	for {
+		if done() {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out publishing block %s until condition", msgs[0].Hash)
+		}
+		if time.Now().After(next) {
+			if err := publishAll(); err != nil {
+				return err
+			}
+			next = time.Now().Add(2 * time.Second)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
+}
+
+// PublishBlockUntilTracked publishes msg until arcade's embedded
+// chaintracks knows the header (by hash) — regardless of whether it
+// became tip. Use for the same-height alternate in reorg scenarios.
+func PublishBlockUntilTracked(ctx context.Context, rt *ArcadeRuntime, lp *LibP2PHost, msg teranode.BlockMessage, timeout time.Duration) error {
+	if rt.Deps.Chaintracks == nil {
+		return fmt.Errorf("chaintracks not enabled on this arcade runtime (set ArcadeOptions.EnableChaintracks)")
+	}
+	want, err := chainhash.NewHashFromHex(msg.Hash)
+	if err != nil {
+		return fmt.Errorf("parse block hash %s: %w", msg.Hash, err)
+	}
+	return publishBlockUntil(ctx, lp, []teranode.BlockMessage{msg}, timeout, func() bool {
+		h, err := rt.Deps.Chaintracks.GetHeaderByHash(ctx, want)
+		return err == nil && h != nil
+	})
+}
+
+// PublishBlockUntilTip publishes msg until arcade's embedded chaintracks
+// reports it as the chain tip.
+func PublishBlockUntilTip(ctx context.Context, rt *ArcadeRuntime, lp *LibP2PHost, msg teranode.BlockMessage, timeout time.Duration) error {
+	return PublishBlockVariantsUntilTip(ctx, rt, lp, []teranode.BlockMessage{msg}, timeout)
+}
+
+// PublishBlockVariantsUntilTip publishes every variant of the same
+// block (identical hash, different DataHubURL) until chaintracks
+// reports it as tip. Use when the announcement must carry a
+// container-reachable URL for merkle-service AND a host-reachable URL
+// for chaintracks' backward header crawl (the reorg-trigger path
+// C-on-orphaned-parent, where chaintracks HTTP-GETs /headers/<hash>).
+func PublishBlockVariantsUntilTip(ctx context.Context, rt *ArcadeRuntime, lp *LibP2PHost, msgs []teranode.BlockMessage, timeout time.Duration) error {
+	if rt.Deps.Chaintracks == nil {
+		return fmt.Errorf("chaintracks not enabled on this arcade runtime (set ArcadeOptions.EnableChaintracks)")
+	}
+	if len(msgs) == 0 {
+		return fmt.Errorf("no block message variants")
+	}
+	wantHash := msgs[0].Hash
+	for _, m := range msgs {
+		if m.Hash != wantHash {
+			return fmt.Errorf("variants must announce the same block: %s vs %s", wantHash, m.Hash)
+		}
+	}
+	return publishBlockUntil(ctx, lp, msgs, timeout, func() bool {
+		tip := rt.Deps.Chaintracks.GetTip(ctx)
+		return tip != nil && tip.Hash.String() == wantHash
+	})
 }
 
 // WaitForMined polls /tx/:txid for every txid in the slice until each

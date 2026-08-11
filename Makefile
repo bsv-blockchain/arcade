@@ -19,6 +19,9 @@ test:
 lint:
 	golangci-lint run
 
+# Full microservices stack (see docker-compose.yaml). Runs the published
+# image by default; ARCADE_IMAGE=arcade:local make docker-up runs a working
+# tree build produced by `make docker-build`.
 docker-up:
 	podman-compose up -d
 

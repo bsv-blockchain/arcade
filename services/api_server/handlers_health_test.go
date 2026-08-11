@@ -1,10 +1,13 @@
 package api_server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -23,6 +26,7 @@ type healthResp struct {
 	Healthy     bool                      `json:"healthy"`
 	Version     string                    `json:"version"`
 	Status      string                    `json:"status"`
+	BlockHeight uint64                    `json:"blockHeight"`
 	DatahubURLs []teranode.EndpointStatus `json:"datahub_urls"`
 }
 
@@ -92,6 +96,48 @@ func TestHandleHealth_StructuredResponse(t *testing.T) {
 	}
 }
 
+// TestHandleHealth_IncludesBlockHeight pins the chain-freshness field
+// (issue #254): /health reports arcade's own processed active-tip height so
+// clients can detect a stale chain view — datahub_urls[].healthy is
+// reachability-only and stays green through a chain stall. The store read
+// is TTL-cached (probes arrive every few seconds), and without a store the
+// field is omitted rather than reading as "height 0".
+func TestHandleHealth_IncludesBlockHeight(t *testing.T) {
+	ms := &mockStore{tipHeight: 958_779}
+	srv := &Server{
+		cfg:    &config.Config{},
+		logger: zap.NewNop(),
+		store:  ms,
+	}
+
+	code, resp, body := doHealth(t, srv)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (body=%s)", code, string(body))
+	}
+	if resp.BlockHeight != 958_779 {
+		t.Errorf("expected blockHeight=958779, got %d (body=%s)", resp.BlockHeight, string(body))
+	}
+
+	// A second probe inside the TTL must serve the cached height.
+	_, resp, _ = doHealth(t, srv)
+	if resp.BlockHeight != 958_779 {
+		t.Errorf("cached probe: expected blockHeight=958779, got %d", resp.BlockHeight)
+	}
+	ms.mu.Lock()
+	calls := ms.tipCalls
+	ms.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("expected 1 store tip read across 2 probes (TTL cache), got %d", calls)
+	}
+
+	// No store wired → the field is omitted entirely, not emitted as 0.
+	srvNoStore := &Server{cfg: &config.Config{}, logger: zap.NewNop()}
+	_, _, rawBody := doHealth(t, srvNoStore)
+	if strings.Contains(string(rawBody), "blockHeight") {
+		t.Errorf("expected blockHeight omitted without a store, body=%s", string(rawBody))
+	}
+}
+
 func TestHandleHealth_NilTeranode_ReturnsEmptyArray(t *testing.T) {
 	srv := &Server{
 		cfg:    &config.Config{},
@@ -120,4 +166,44 @@ func TestHandleHealth_NilTeranode_ReturnsEmptyArray(t *testing.T) {
 	if string(raw["healthy"]) != "true" {
 		t.Errorf("expected healthy to be `true` in JSON, got %s", string(raw["healthy"]))
 	}
+}
+
+// TestHandleHealth_UnreachableEndpointFlipsUnhealthy is the end-to-end proof
+// for the production complaint: /health reported a registered-but-dead
+// endpoint as healthy:true forever, because the api-server pod never
+// broadcasts and the probe loop only targeted already-unhealthy endpoints.
+// With probe-all, the endpoint flips to healthy:false with zero broadcast
+// traffic — driven purely by the background probe loop.
+func TestHandleHealth_UnreachableEndpointFlipsUnhealthy(t *testing.T) {
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	deadURL := dead.URL
+	dead.Close() // port now refuses connections
+
+	tc := teranode.NewClient([]string{deadURL}, "", teranode.HealthConfig{
+		FailureThreshold: 3,
+		ProbeInterval:    10 * time.Millisecond,
+		ProbeTimeout:     200 * time.Millisecond,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tc.Start(ctx)
+	defer tc.Close()
+
+	srv := &Server{
+		cfg:      &config.Config{},
+		logger:   zap.NewNop(),
+		teranode: tc,
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		_, resp, _ := doHealth(t, srv)
+		if len(resp.DatahubURLs) == 1 && !resp.DatahubURLs[0].Healthy {
+			return // /health now tells the truth
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("/health kept reporting an unreachable endpoint as healthy for 2s")
 }

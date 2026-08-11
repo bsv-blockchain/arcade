@@ -3,6 +3,7 @@ package propagation
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -140,7 +141,7 @@ func TestApplyTerminalStatuses_ReleasesWaitersOnAccepted(t *testing.T) {
 
 	p.applyTerminalStatuses(context.Background(), []*models.TransactionStatus{
 		{TxID: "parent", Status: models.StatusAcceptedByNetwork, Timestamp: time.Now()},
-	}, 1, 0)
+	}, 1, 0, p.defaultIO)
 
 	if got := drainSet(p); !got["child"] {
 		t.Errorf("child should be released into pending batch after parent ACCEPTED; got %v", got)
@@ -173,7 +174,7 @@ func TestApplyTerminalStatuses_CascadesRejectedChildren(t *testing.T) {
 
 	p.applyTerminalStatuses(context.Background(), []*models.TransactionStatus{
 		{TxID: "parent", Status: models.StatusRejected, Timestamp: time.Now(), ExtraInfo: "bad parent"},
-	}, 0, 1)
+	}, 0, 1, p.defaultIO)
 
 	if got := drainSet(p); got["child"] || got["grandchild"] {
 		t.Errorf("cascaded descendants should NOT enter pending batch; got %v", got)
@@ -191,8 +192,18 @@ func TestApplyTerminalStatuses_CascadesRejectedChildren(t *testing.T) {
 		t.Errorf("expected 2 cascade-rejection rows (child + grandchild), got %d: %v", len(rejected), rejected)
 	}
 	for txid, reason := range rejected {
-		if reason != "parent rejected" {
-			t.Errorf("%s ExtraInfo should be \"parent rejected\", got %q", txid, reason)
+		// The stable "parent rejected" prefix stays for existing consumers;
+		// the suffix must name the rejected ancestor and state the recovery
+		// path so a cascaded child reads as retryable queue state, not a
+		// verdict about its own bytes.
+		if !strings.HasPrefix(reason, "parent rejected") {
+			t.Errorf("%s ExtraInfo should keep the \"parent rejected\" prefix, got %q", txid, reason)
+		}
+		if !strings.Contains(reason, "ancestor parent") {
+			t.Errorf("%s ExtraInfo should name the rejected ancestor, got %q", txid, reason)
+		}
+		if !strings.Contains(reason, "resubmit") {
+			t.Errorf("%s ExtraInfo should state the resubmit recovery path, got %q", txid, reason)
 		}
 	}
 }
@@ -226,7 +237,7 @@ func TestSequentialReleaseDeepChain(t *testing.T) {
 	// because parent is still in-flight (just queued for broadcast).
 	p.applyTerminalStatuses(context.Background(), []*models.TransactionStatus{
 		{TxID: "grandparent", Status: models.StatusAcceptedByNetwork, Timestamp: time.Now()},
-	}, 1, 0)
+	}, 1, 0, p.defaultIO)
 
 	got := drainSet(p)
 	if !got["parent"] {
@@ -239,7 +250,7 @@ func TestSequentialReleaseDeepChain(t *testing.T) {
 	// parent ACCEPTED in its own batch — now child can release.
 	p.applyTerminalStatuses(context.Background(), []*models.TransactionStatus{
 		{TxID: "parent", Status: models.StatusAcceptedByNetwork, Timestamp: time.Now()},
-	}, 1, 0)
+	}, 1, 0, p.defaultIO)
 
 	got = drainSet(p)
 	if !got["child"] {
@@ -400,7 +411,7 @@ func TestRequeueAfterDelay_PendingRequeuesGauge(t *testing.T) {
 	t.Cleanup(cancel)
 
 	msgs := []propagationMsg{{TXID: "a", RawTx: []byte{0x01}}}
-	p.requeueAfterDelay(ctx, msgs)
+	p.requeueAfterDelay(ctx, msgs, p.defaultIO)
 
 	if got := testutil.ToFloat64(metrics.PropagationPendingRequeues); got != startVal+1 {
 		t.Fatalf("after requeueAfterDelay gauge = %v, want %v (inc by 1)", got, startVal+1)
@@ -431,7 +442,7 @@ func TestRequeueAfterDelay_EmptyMsgs_NoGaugeChange(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	startVal := testutil.ToFloat64(metrics.PropagationPendingRequeues)
-	p.requeueAfterDelay(t.Context(), nil)
+	p.requeueAfterDelay(t.Context(), nil, p.defaultIO)
 	if got := testutil.ToFloat64(metrics.PropagationPendingRequeues); got != startVal {
 		t.Fatalf("empty-msgs early-return mutated gauge: got %v, want %v", got, startVal)
 	}

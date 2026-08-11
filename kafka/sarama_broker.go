@@ -7,6 +7,10 @@ import (
 	"sync"
 
 	"github.com/IBM/sarama"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/metrics"
@@ -47,13 +51,7 @@ func NewSaramaBroker(brokers []string, consumerGroup string) (Broker, error) {
 // zap logger for async-producer error logging. A nil logger falls back to
 // zap.NewNop() so the broker is always safe to construct.
 func NewSaramaBrokerWithLogger(brokers []string, consumerGroup string, logger *zap.Logger) (Broker, error) {
-	syncCfg := sarama.NewConfig()
-	syncCfg.Producer.RequiredAcks = sarama.WaitForAll
-	syncCfg.Producer.Retry.Max = 5
-	syncCfg.Producer.Return.Successes = true
-	syncCfg.Producer.Return.Errors = true
-
-	syncProducer, err := sarama.NewSyncProducer(brokers, syncCfg)
+	syncProducer, err := sarama.NewSyncProducer(brokers, newSyncProducerConfig())
 	if err != nil {
 		return nil, fmt.Errorf("creating sync producer: %w", err)
 	}
@@ -71,6 +69,28 @@ func NewSaramaBrokerWithLogger(brokers []string, consumerGroup string, logger *z
 	}
 
 	return newSaramaBrokerFromProducers(syncProducer, asyncProducer, brokers, consumerGroup, logger), nil
+}
+
+// newSyncProducerConfig builds the sync-producer config used for Send /
+// SendBatch — the path every ordering-sensitive topic goes through
+// (TopicPropagation most of all). Idempotent + MaxOpenRequests=1 makes
+// per-partition order survive broker-side retries: without it a failed
+// produce can be retried behind a newer in-flight batch, reordering a
+// dependency family's parent behind its child on the same partition
+// (#295 family keying makes that order load-bearing). Idempotence
+// requires WaitForAll acks (already the sync default here) and protocol
+// >= 0.11; 2.6.0 is safely below anything Redpanda or a maintained
+// Kafka speaks. Extracted so tests can pin these invariants.
+func newSyncProducerConfig() *sarama.Config {
+	syncCfg := sarama.NewConfig()
+	syncCfg.Version = sarama.V2_6_0_0
+	syncCfg.Producer.RequiredAcks = sarama.WaitForAll
+	syncCfg.Producer.Retry.Max = 5
+	syncCfg.Producer.Return.Successes = true
+	syncCfg.Producer.Return.Errors = true
+	syncCfg.Producer.Idempotent = true
+	syncCfg.Net.MaxOpenRequests = 1
+	return syncCfg
 }
 
 // newSaramaBrokerFromProducers wires the broker around already-constructed
@@ -136,7 +156,10 @@ func (b *saramaBroker) startAsyncDrainers() {
 	}()
 }
 
-func (b *saramaBroker) Send(_ context.Context, topic, key string, value []byte) error {
+func (b *saramaBroker) Send(ctx context.Context, topic, key string, value []byte) error {
+	ctx, span := startProduceSpan(ctx, topic)
+	defer span.End()
+
 	msg := &sarama.ProducerMessage{
 		Topic: topic,
 		Value: sarama.ByteEncoder(value),
@@ -144,13 +167,25 @@ func (b *saramaBroker) Send(_ context.Context, topic, key string, value []byte) 
 	if key != "" {
 		msg.Key = sarama.StringEncoder(key)
 	}
+	msg.Headers = buildRecordHeaders(InjectTraceContext(ctx))
 	if _, _, err := b.syncProducer.SendMessage(msg); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "sync produce failed")
 		return fmt.Errorf("sending message to %s: %w", topic, err)
 	}
 	return nil
 }
 
-func (b *saramaBroker) SendAsync(_ context.Context, topic, key string, value []byte) error {
+func (b *saramaBroker) SendAsync(ctx context.Context, topic, key string, value []byte) error {
+	ctx, span := startProduceSpan(ctx, topic)
+	// Fire-and-forget: the span ends at enqueue time (Input() <- msg), which
+	// only hands the message to Sarama's async producer. A later delivery
+	// failure therefore does NOT surface on this span — it arrives on the
+	// producer's Errors() channel and is logged/counted by the error drainer
+	// (see startAsyncDrainers). The span records only that the enqueue
+	// happened; the enqueue itself cannot fail here.
+	defer span.End()
+
 	msg := &sarama.ProducerMessage{
 		Topic: topic,
 		Value: sarama.ByteEncoder(value),
@@ -158,23 +193,37 @@ func (b *saramaBroker) SendAsync(_ context.Context, topic, key string, value []b
 	if key != "" {
 		msg.Key = sarama.StringEncoder(key)
 	}
+	msg.Headers = buildRecordHeaders(InjectTraceContext(ctx))
 	b.asyncProducer.Input() <- msg
 	return nil
 }
 
-func (b *saramaBroker) SendBatch(_ context.Context, topic string, msgs []KeyValue) error {
+func (b *saramaBroker) SendBatch(ctx context.Context, topic string, msgs []KeyValue) error {
 	if len(msgs) == 0 {
 		return nil
 	}
+	ctx, span := startProduceSpan(ctx, topic)
+	defer span.End()
+
+	// Injected once and shared by reference across every message in the
+	// batch — SendBatch propagates the same parent trace context to every
+	// message, and Sarama only reads Headers to encode the wire record (it
+	// never mutates the slice), so sharing is safe and avoids re-running
+	// the propagator for every message in a large batch.
+	headers := buildRecordHeaders(InjectTraceContext(ctx))
+
 	saramaMsgs := make([]*sarama.ProducerMessage, 0, len(msgs))
 	for _, m := range msgs {
 		data, err := marshalValue(m.Value)
 		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "marshaling batch message failed")
 			return fmt.Errorf("marshaling batch message: %w", err)
 		}
 		pm := &sarama.ProducerMessage{
-			Topic: topic,
-			Value: sarama.ByteEncoder(data),
+			Topic:   topic,
+			Value:   sarama.ByteEncoder(data),
+			Headers: headers,
 		}
 		if m.Key != "" {
 			pm.Key = sarama.StringEncoder(m.Key)
@@ -182,21 +231,83 @@ func (b *saramaBroker) SendBatch(_ context.Context, topic string, msgs []KeyValu
 		saramaMsgs = append(saramaMsgs, pm)
 	}
 	if err := b.syncProducer.SendMessages(saramaMsgs); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "sync batch produce failed")
 		return fmt.Errorf("sending batch to %s: %w", topic, err)
 	}
 	return nil
 }
 
-func (b *saramaBroker) Subscribe(groupID string, topics []string) (Subscription, error) {
-	saramaCfg := sarama.NewConfig()
-	saramaCfg.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{sarama.NewBalanceStrategyRoundRobin()}
-	saramaCfg.Consumer.Offsets.Initial = sarama.OffsetOldest
+// startProduceSpan starts a Kafka producer span for topic, parented on
+// ctx's existing span. The span name and messaging.* attributes are
+// low-cardinality (topic only — never a txid or key) per the metrics-package
+// rule.
+//
+// When ctx carries no valid span (telemetry disabled end-to-end, or simply
+// no active span at this call site), span creation is skipped entirely —
+// there is no useful parent to attach to, InjectTraceContext would no-op on
+// the result anyway, and the internal/global placeholder tracer's Start
+// still costs a context.WithValue + interface allocation for a span nobody
+// will ever query. Returning ctx unchanged with trace.SpanFromContext(ctx)
+// (a shared no-op singleton — zero allocation) keeps this path exactly as
+// cheap as InjectTraceContext's own guard.
+//
+// When ctx does carry a valid parent span, the per-topic name string and
+// attribute values are still only built once span.IsRecording() is true —
+// covering the case where a real span exists but this trace wasn't sampled.
+func startProduceSpan(ctx context.Context, topic string) (context.Context, trace.Span) {
+	if !trace.SpanContextFromContext(ctx).IsValid() {
+		return ctx, trace.SpanFromContext(ctx)
+	}
+	ctx, span := otel.Tracer(tracerName).Start(ctx, "kafka.produce")
+	if span.IsRecording() {
+		span.SetName("kafka.produce " + topic)
+		span.SetAttributes(
+			semconv.MessagingSystemKafka,
+			semconv.MessagingDestinationName(topic),
+		)
+	}
+	return ctx, span
+}
 
-	group, err := sarama.NewConsumerGroup(b.brokers, groupID, saramaCfg)
+// buildRecordHeaders converts an injected trace-context header map into
+// Sarama's []RecordHeader representation. Returns nil when hdrs is empty
+// (InjectTraceContext already returned nil on the disabled/no-span path) so
+// callers can assign it straight to ProducerMessage.Headers without an extra
+// nil check.
+func buildRecordHeaders(hdrs map[string][]byte) []sarama.RecordHeader {
+	if len(hdrs) == 0 {
+		return nil
+	}
+	rh := make([]sarama.RecordHeader, 0, len(hdrs))
+	for k, v := range hdrs {
+		rh = append(rh, sarama.RecordHeader{Key: []byte(k), Value: v})
+	}
+	return rh
+}
+
+func (b *saramaBroker) Subscribe(groupID string, topics []string, start StartOffset) (Subscription, error) {
+	group, err := sarama.NewConsumerGroup(b.brokers, groupID, newSaramaConsumerConfig(start))
 	if err != nil {
 		return nil, fmt.Errorf("creating consumer group %s: %w", groupID, err)
 	}
 	return &saramaSubscription{group: group, topics: topics}, nil
+}
+
+// newSaramaConsumerConfig maps the broker-neutral StartOffset onto Sarama's
+// Consumer.Offsets.Initial. Initial is only consulted when the group has no
+// committed offsets, so durable stable-group consumers are unaffected by it
+// after their first commit; for fresh random groups it decides between
+// replaying the topic's entire retained backlog (OffsetOldest) and starting
+// at the head (OffsetNewest).
+func newSaramaConsumerConfig(start StartOffset) *sarama.Config {
+	saramaCfg := sarama.NewConfig()
+	saramaCfg.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{sarama.NewBalanceStrategyRoundRobin()}
+	saramaCfg.Consumer.Offsets.Initial = sarama.OffsetOldest
+	if start == StartLatest {
+		saramaCfg.Consumer.Offsets.Initial = sarama.OffsetNewest
+	}
+	return saramaCfg
 }
 
 func (b *saramaBroker) PartitionCount(topic string) (int, error) {

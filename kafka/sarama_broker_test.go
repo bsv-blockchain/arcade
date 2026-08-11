@@ -62,7 +62,7 @@ func (f *fakeSyncProducer) TxnAddOffsetsToTxn(map[string][]*sarama.PartitionOffs
 // Return.Successes/Return.Errors flags the production broker uses, so the
 // drainer goroutines see the same channel behavior they would in a real
 // deployment.
-func newAsyncProducerMock(t *testing.T) *mocks.AsyncProducer {
+func newAsyncProducerMock(t testing.TB) *mocks.AsyncProducer {
 	t.Helper()
 	cfg := sarama.NewConfig()
 	cfg.Producer.Return.Successes = true
@@ -178,5 +178,57 @@ func TestSaramaBroker_Close_WaitsForDrainers(t *testing.T) {
 	case <-waitDone:
 	case <-time.After(time.Second):
 		t.Fatal("drainer goroutines leaked past Close()")
+	}
+}
+
+// TestNewSaramaConsumerConfig_StartOffset pins the StartOffset →
+// Consumer.Offsets.Initial mapping. This is the primary guard for the
+// live-only events-subscriber contract: sarama consumer groups aren't
+// mockable, so the config seam is the closest unit-testable point. A
+// regression back to OffsetOldest for StartLatest callers silently
+// reintroduces the full-backlog replay that OOM-crashlooped the sse pods.
+func TestNewSaramaConsumerConfig_StartOffset(t *testing.T) {
+	tests := []struct {
+		name  string
+		start StartOffset
+		want  int64
+	}{
+		{name: "zero value defaults to oldest", start: StartOldest, want: sarama.OffsetOldest},
+		{name: "latest maps to newest", start: StartLatest, want: sarama.OffsetNewest},
+		{name: "out-of-range values fall back to oldest", start: StartOffset(42), want: sarama.OffsetOldest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := newSaramaConsumerConfig(tt.start)
+			if got := cfg.Consumer.Offsets.Initial; got != tt.want {
+				t.Errorf("Consumer.Offsets.Initial = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestNewSyncProducerConfig_OrderingInvariants pins the produce-side
+// ordering contract that family partition keying (#295) relies on: with
+// idempotence on and one open request, a retried produce cannot be
+// reordered behind a newer message on the same partition, so a family's
+// parent-before-child submission order survives broker hiccups. Version
+// must be >= 0.11 for idempotent produce; WaitForAll is required by
+// idempotence (and was already the sync default here).
+func TestNewSyncProducerConfig_OrderingInvariants(t *testing.T) {
+	cfg := newSyncProducerConfig()
+	if !cfg.Producer.Idempotent {
+		t.Error("sync producer must be idempotent — retries may otherwise reorder a family's messages within a partition")
+	}
+	if cfg.Net.MaxOpenRequests != 1 {
+		t.Errorf("Net.MaxOpenRequests = %d, want 1 (required by idempotent produce, guarantees per-partition order)", cfg.Net.MaxOpenRequests)
+	}
+	if cfg.Producer.RequiredAcks != sarama.WaitForAll {
+		t.Errorf("RequiredAcks = %v, want WaitForAll", cfg.Producer.RequiredAcks)
+	}
+	if !cfg.Version.IsAtLeast(sarama.V0_11_0_0) {
+		t.Errorf("Version = %v, want >= 0.11.0.0 for idempotent produce", cfg.Version)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("sarama config invalid: %v", err)
 	}
 }

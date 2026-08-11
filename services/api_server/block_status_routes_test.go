@@ -117,6 +117,17 @@ func (s *blockProcStore) MarkBlocksOrphaned(_ context.Context, hashes []string, 
 	return nil
 }
 
+func (s *blockProcStore) MarkBlocksParked(_ context.Context, hashes []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, h := range hashes {
+		if row, ok := s.rows[h]; ok && row.Status == models.BlockStatusActive {
+			row.Status = models.BlockStatusParked
+		}
+	}
+	return nil
+}
+
 func (s *blockProcStore) GetBlockProcessingStatus(_ context.Context, hash string) (*models.BlockProcessingStatus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

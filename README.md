@@ -25,7 +25,6 @@
        &nbsp;&nbsp;&nbsp;&nbsp; <code>Quality</code> &nbsp;&nbsp;
     </td>
     <td align="left">
-       <a href="https://goreportcard.com/report/github.com/bsv-blockchain/arcade"><img src="https://goreportcard.com/badge/github.com/bsv-blockchain/arcade?style=flat-square&v=1" alt="Go Report"></a>
        <a href="https://codecov.io/gh/bsv-blockchain/arcade"><img src="https://codecov.io/gh/bsv-blockchain/arcade/branch/main/graph/badge.svg?style=flat-square" alt="Coverage"></a>
     </td>
   </tr>
@@ -351,7 +350,14 @@ When you provide `X-CallbackUrl`, Arcade will POST status updates:
 **Features:**
 - Automatic retries with linear backoff (1min, 2min, 3min, etc.)
 - Configurable max retries via `webhook.max_retries`
-- Delivery tracking
+- Every POST carries `User-Agent: arcade-webhook/<version>` — allowlist the
+  `arcade-webhook/` prefix at your edge so bot/WAF rules don't silently
+  reject deliveries
+- Delivery self-diagnosis: `GET /tx/{txid}?callbackToken=<token>` returns a
+  `callbacks` array with `attempts`, `lastAttemptAt`, and `lastResult`
+  (`"delivered"` or the last failure, e.g. `"status 403"`) for your
+  submissions — if `attempts` climbs while your endpoint sees nothing,
+  something in front of it is rejecting the POSTs
 
 </details>
 
@@ -569,6 +575,7 @@ Read the [AI Usage & Assistant Guidelines](.github/tech-conventions/ai-complianc
 ## 📚 Resources
 
 - [Architecture Documentation](docs/ARCHITECTURE.md)
+- [Observability](docs/observability.md) — OTLP traces/metrics, structured log field canon, and transaction-lifecycle logging
 - [Teranode Documentation](https://docs.bsvblockchain.org/)
 - [Arc API Reference](https://github.com/bitcoin-sv/arc)
 

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	chaintracksconfig "github.com/bsv-blockchain/go-chaintracks/config"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
 
@@ -39,6 +40,23 @@ type smokeOptions struct {
 	// TeranodeURL is the single fake-teranode endpoint arcade sees via
 	// DatahubURLs. Required.
 	TeranodeURL string
+	// ChaintracksRemoteURL, when set, points chaintracks.mode=remote at a
+	// stub chaintracks HTTP server, which arms the api-server's
+	// nLockTime/BIP113 finality gate. Empty (the default) leaves the gate
+	// disabled — the suite's baseline, proving the gate fails open when no
+	// chain source exists.
+	ChaintracksRemoteURL string
+	// PropagationPartitions widens arcade.propagation on the in-process
+	// memory broker (#295): family-keyed publishes shard across this many
+	// partitions and the propagator runs one dep-aware dispatcher per
+	// partition — the production multi-partition topology, in-process.
+	// Zero means 1 (the pre-#295 shape).
+	PropagationPartitions int
+	// MutateConfig, when set, gets the fully-built smoke config last so a
+	// test can override individual knobs (e.g. a larger retry budget for
+	// the missing-parent recovery window) without the harness growing a
+	// field per knob.
+	MutateConfig func(*config.Config)
 }
 
 // startArcadeSmoke boots arcade in-process via app.Bootstrap +
@@ -170,7 +188,9 @@ func buildSmokeConfig(t *testing.T, port int, opts smokeOptions) *config.Config 
 			SubscriberBuffer: config.DefaultEventsSubscriberBuffer,
 		},
 		ChaintracksServer: config.ChaintracksServerConfig{Enabled: false},
+		Chaintracks:       chaintracksRemoteConfig(opts.ChaintracksRemoteURL),
 		Propagation: config.PropagationConfig{
+			Partitions:        opts.PropagationPartitions,
 			MerkleConcurrency: 2,
 			RetryMaxAttempts:  1,
 			RetryBackoffMs:    50,
@@ -202,7 +222,20 @@ func buildSmokeConfig(t *testing.T, port int, opts smokeOptions) *config.Config 
 			AllowPrivateURLs: true,
 		},
 	}
+	if opts.MutateConfig != nil {
+		opts.MutateConfig(cfg)
+	}
 	return cfg
+}
+
+// chaintracksRemoteConfig returns a remote-mode chaintracks config pointed
+// at url, or the zero config (mode unset → no chain source, finality gate
+// off) when url is empty.
+func chaintracksRemoteConfig(url string) chaintracksconfig.Config {
+	if url == "" {
+		return chaintracksconfig.Config{}
+	}
+	return chaintracksconfig.Config{Mode: chaintracksconfig.ModeRemote, URL: url}
 }
 
 // waitReady polls the configured api-server port until it accepts a TCP

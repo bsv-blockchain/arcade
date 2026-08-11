@@ -48,15 +48,15 @@ func TestFetchBlockDataForBUMP_PerAttemptDebugLog(t *testing.T) {
 		t.Fatalf("expected 2 per-attempt log entries, got %d", len(entries))
 	}
 
-	// Each entry should carry idx, url, status, error.
+	// Each entry should carry idx, url, status_code, error.
 	statuses := []int{http.StatusInternalServerError, http.StatusServiceUnavailable}
 	for i, e := range entries {
 		fields := e.ContextMap()
 		if got := fields["idx"]; got != int64(i) {
 			t.Errorf("entry[%d] idx: got %v want %d", i, got, i)
 		}
-		if got := fields["status"]; got != int64(statuses[i]) {
-			t.Errorf("entry[%d] status: got %v want %d", i, got, statuses[i])
+		if got := fields["status_code"]; got != int64(statuses[i]) {
+			t.Errorf("entry[%d] status_code: got %v want %d", i, got, statuses[i])
 		}
 		urlStr, _ := fields["url"].(string)
 		if urlStr == "" {

@@ -62,6 +62,15 @@ type TransactionStatus struct {
 	RetryCount   int       `json:"retryCount,omitempty"`
 	NextRetryAt  time.Time `json:"nextRetryAt,omitempty"`
 	CreatedAt    time.Time `json:"-"`
+	// OrphanedProofs preserves every block this tx was once MINED against
+	// before a reorg superseded the anchor (issue #279). Stores append an
+	// entry whenever an existing MINED anchor is overwritten with a
+	// different block (re-anchor) or cleared by a reorg revert, capped at
+	// MaxOrphanedAnchors. Each entry's MerklePath is enriched at read time
+	// from the orphaned block's retained compound BUMP — never persisted —
+	// so clients can still verify the historical proof against the
+	// orphaned header.
+	OrphanedProofs []OrphanedAnchor `json:"orphanedProofs,omitempty"`
 	// MerkleRegisteredAt is the wall-clock time of the most recent
 	// successful merkle-service /watch registration for this txid. Zero
 	// value means "never registered" (or registered before this field was
@@ -100,6 +109,18 @@ const (
 	StatusImmutable = Status("IMMUTABLE")
 )
 
+// AllStatuses returns every defined Status, in lifecycle order. Callers that
+// enumerate the status domain (metric pre-registration, exhaustive lattice
+// checks) use this instead of maintaining their own copy of the const block.
+func AllStatuses() []Status {
+	return []Status{
+		StatusUnknown, StatusReceived, StatusSentToNetwork,
+		StatusAcceptedByNetwork, StatusSeenOnNetwork, StatusSeenMultipleNodes,
+		StatusDoubleSpendAttempted, StatusRejected, StatusPendingRetry,
+		StatusStumpProcessing, StatusMined, StatusImmutable,
+	}
+}
+
 // terminalStatuses lists statuses that represent a final outcome for a
 // transaction. A row already in one of these states must never be overwritten
 // by a lower-priority update (e.g. a late SEEN_ON_NETWORK callback arriving
@@ -117,6 +138,19 @@ var terminalStatuses = map[Status]struct{}{
 func (s Status) IsTerminal() bool {
 	_, ok := terminalStatuses[s]
 	return ok
+}
+
+// NonTerminalStatuses returns the statuses a transaction can still move on
+// from — the "pending" set a reconnecting client needs replayed. Everything
+// terminal (MINED, IMMUTABLE, REJECTED, DOUBLE_SPEND_ATTEMPTED) is excluded:
+// terminal history is queryable via the REST API and replaying it wholesale
+// is what made SSE catchup unbounded.
+func NonTerminalStatuses() []Status {
+	return []Status{
+		StatusReceived, StatusSentToNetwork, StatusAcceptedByNetwork,
+		StatusSeenOnNetwork, StatusSeenMultipleNodes,
+		StatusPendingRetry, StatusStumpProcessing,
+	}
 }
 
 // DisallowedPreviousStatuses returns statuses that CANNOT transition to this status.
@@ -220,7 +254,10 @@ func (s Status) CanTransitionFrom(prev Status) bool {
 	return true
 }
 
-// Submission represents a client's submission and subscription preferences
+// Submission represents a client's submission and subscription preferences.
+// Deliberately carries no json tags: it is never serialized to clients
+// directly (CallbackToken must not leak) — the api-server maps it to a
+// response DTO where needed.
 type Submission struct {
 	SubmissionID        string
 	TxID                string
@@ -228,9 +265,73 @@ type Submission struct {
 	CallbackToken       string
 	FullStatusUpdates   bool
 	LastDeliveredStatus Status
-	RetryCount          int
-	NextRetryAt         *time.Time
-	CreatedAt           time.Time
+	// RetryCount and NextRetryAt are the webhook retry-scheduling state for
+	// the current transition: bumped by each failed POST, cleared by the CAS
+	// when the next transition is claimed.
+	RetryCount  int
+	NextRetryAt *time.Time
+	// Attempts, LastAttemptAt and LastResult are lifetime delivery
+	// bookkeeping, stamped after every POST regardless of outcome and never
+	// reset: Attempts counts every POST ever made for this submission,
+	// LastResult holds "delivered" or the last failure ("status 403", a
+	// transport error). Surfaced on GET /tx?callbackToken=… so receivers can
+	// self-diagnose delivery problems (issue #249: a WAF 403-ing every
+	// callback is invisible from the receiver's own logs).
+	Attempts      int
+	LastAttemptAt *time.Time
+	LastResult    string
+	CreatedAt     time.Time
+}
+
+// OrphanedAnchor is one historical MINED anchor a reorg superseded: the
+// block the tx was anchored to, and when the anchor was replaced. Kept on
+// the transaction row (capped at MaxOrphanedAnchors) so the orphaned
+// block's proof remains auditable after re-anchoring — see issue #279.
+type OrphanedAnchor struct {
+	BlockHash   string    `json:"blockHash"`
+	BlockHeight uint64    `json:"blockHeight"`
+	OrphanedAt  time.Time `json:"orphanedAt"`
+	// MerklePath is the tx's proof against the orphaned block, resolved at
+	// read time from that block's retained compound BUMP. Empty when the
+	// BUMP is no longer available. Never persisted.
+	MerklePath HexBytes `json:"merklePath,omitempty"`
+}
+
+// MaxOrphanedAnchors caps the orphaned-anchor history kept per transaction.
+// A flip-flopping competition rewrites the same two anchors, so a small cap
+// bounds row growth without losing real history.
+const MaxOrphanedAnchors = 5
+
+// ExtraInfo markers carried on reorg-correction status events (issue #279).
+// They ride the bulk event templates on arcade.tx_status so downstream
+// consumers (webhook, SSE) can distinguish a reorg correction from a plain
+// transition — in particular, the webhook's same-status dedup makes an
+// exception for a MINED event flagged as a re-anchor, since it carries a
+// new block hash + merkle path.
+const (
+	// ExtraInfoReorgReanchor marks a MINED event whose txs were re-anchored
+	// from an orphaned block to the active-chain block at its height.
+	ExtraInfoReorgReanchor = "reorg_reanchor"
+	// ExtraInfoReorgUnmined marks a SEEN_ON_NETWORK event whose txs were
+	// reverted out of an orphaned block they do not exist outside of.
+	ExtraInfoReorgUnmined = "reorg_unmined"
+)
+
+// AppendOrphanedAnchor appends anchor to history, dropping the oldest
+// entries beyond MaxOrphanedAnchors. Duplicate consecutive anchors for the
+// same block hash are collapsed (idempotent replays must not grow history).
+func AppendOrphanedAnchor(history []OrphanedAnchor, anchor OrphanedAnchor) []OrphanedAnchor {
+	if anchor.BlockHash == "" {
+		return history
+	}
+	if n := len(history); n > 0 && history[n-1].BlockHash == anchor.BlockHash {
+		return history
+	}
+	history = append(history, anchor)
+	if len(history) > MaxOrphanedAnchors {
+		history = history[len(history)-MaxOrphanedAnchors:]
+	}
+	return history
 }
 
 // BlockReorg represents a notification that a block was orphaned due to a chain reorganization

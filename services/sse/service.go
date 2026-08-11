@@ -66,6 +66,14 @@ func (s *Service) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("initializing SSE manager: %w", err)
 	}
+	// Thread the configured per-connection buffer capacity through to the
+	// manager so NewClient sizes each client's send channel accordingly.
+	// A non-positive value leaves clientBufferSize at 0, which NewClient
+	// treats as "use defaultClientBuffer".
+	if mgr != nil {
+		mgr.clientBufferSize = s.cfg.SSE.ClientBufferSize
+		mgr.catchupOnDrop = s.cfg.SSE.CatchupOnDrop
+	}
 	s.manager = mgr
 
 	gin.SetMode(gin.ReleaseMode)

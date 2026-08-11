@@ -84,9 +84,11 @@ func (s *Service) Start(ctx context.Context) error {
 	)
 
 	// Bridge chaintracks tip + reorg → block_processing store. Downstream
-	// services (watchdog, api-server) read from the shared table, so this
-	// service is responsible for keeping it fresh.
-	s.tracker = newBlockStatusTracker(ctx, s.ct, s.store, s.logger)
+	// services (watchdog, api-server, the anchor reconciler) read from the
+	// shared table, so this service is responsible for keeping it fresh —
+	// including the tie-scan that detects same-height competition losers
+	// chaintracks never emits a ReorgEvent for (issue #279).
+	s.tracker = newBlockStatusTracker(ctx, s.cfg, s.ct, s.store, s.logger)
 
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()

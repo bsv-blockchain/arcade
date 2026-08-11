@@ -371,3 +371,143 @@ func TestProbe_StopsOnClose(t *testing.T) {
 		t.Fatal("Close did not return within 2s")
 	}
 }
+
+// TestProbe_TripsUnreachableHealthyEndpoint is the truthful-health
+// regression test: a registered-but-unreachable endpoint must be demoted by
+// the probe loop alone — no broadcast traffic — so pods that never
+// broadcast (api-server serving /health) stop reporting dead endpoints as
+// healthy.
+func TestProbe_TripsUnreachableHealthyEndpoint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	deadURL := srv.URL
+	srv.Close() // port now refuses connections
+
+	c := NewClient([]string{deadURL}, "", HealthConfig{
+		FailureThreshold: 3,
+		ProbeInterval:    10 * time.Millisecond,
+		ProbeTimeout:     200 * time.Millisecond,
+	})
+	if len(c.GetHealthyEndpoints()) != 1 {
+		t.Fatal("endpoint should start healthy")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.Start(ctx)
+	defer c.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		statuses := c.GetEndpointStatuses()
+		if len(statuses) == 1 && !statuses[0].Healthy {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("probe loop did not demote an unreachable healthy endpoint within 2s")
+}
+
+// TestProbe_HealthySuccess_DoesNotResetBroadcastCounter guards the reason
+// probe outcomes use a dedicated counter: an endpoint whose /health answers
+// 200 but whose broadcasts persistently fail non-2xx must still trip the
+// slow track, even with fast probes succeeding between every failure.
+func TestProbe_HealthySuccess_DoesNotResetBroadcastCounter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := NewClient([]string{srv.URL}, "", HealthConfig{
+		FailureThreshold:          3,
+		BroadcastFailureThreshold: 5,
+		ProbeInterval:             5 * time.Millisecond,
+		ProbeTimeout:              200 * time.Millisecond,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.Start(ctx)
+	defer c.Close()
+
+	for i := 0; i < 5; i++ {
+		// Several probe intervals pass between failures; each probe succeeds
+		// against the live server. If probe success reset the broadcast
+		// counter, the threshold could never be reached.
+		time.Sleep(15 * time.Millisecond)
+		c.RecordBroadcastFailure(srv.URL)
+	}
+	if got := len(c.GetHealthyEndpoints()); got != 0 {
+		t.Fatal("slow-track breaker did not trip: probe successes must not reset consecutiveBroadcastFailures")
+	}
+}
+
+// TestProbe_HealthySuccess_DoesNotResetReachabilityCounter is the fast-track
+// sibling: broadcast-path transport failures must accumulate to the
+// threshold regardless of interleaved probe successes.
+func TestProbe_HealthySuccess_DoesNotResetReachabilityCounter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := NewClient([]string{srv.URL}, "", HealthConfig{
+		FailureThreshold: 3,
+		ProbeInterval:    5 * time.Millisecond,
+		ProbeTimeout:     200 * time.Millisecond,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.Start(ctx)
+	defer c.Close()
+
+	for i := 0; i < 3; i++ {
+		time.Sleep(15 * time.Millisecond)
+		c.RecordFailure(srv.URL)
+	}
+	if got := len(c.GetHealthyEndpoints()); got != 0 {
+		t.Fatal("fast-track breaker did not trip: probe successes must not reset consecutiveFailures")
+	}
+}
+
+// TestRecordProbeCounters_UnitSemantics pins the probe counter's consecutive
+// semantics and the full-recovery contract without any HTTP traffic.
+func TestRecordProbeCounters_UnitSemantics(t *testing.T) {
+	c := NewClient([]string{testEndpointA}, "", HealthConfig{FailureThreshold: 3})
+
+	// Two failures + a success: counter resets, still healthy.
+	c.recordProbeFailure(testEndpointA)
+	c.recordProbeFailure(testEndpointA)
+	c.recordProbeSuccess(testEndpointA)
+	c.recordProbeFailure(testEndpointA)
+	c.recordProbeFailure(testEndpointA)
+	if len(c.GetHealthyEndpoints()) != 1 {
+		t.Fatal("non-consecutive probe failures must not trip the breaker")
+	}
+
+	// Third consecutive failure trips.
+	c.recordProbeFailure(testEndpointA)
+	if len(c.GetHealthyEndpoints()) != 0 {
+		t.Fatal("3rd consecutive probe failure should trip the breaker")
+	}
+
+	// Probe success on an unhealthy endpoint = full recovery: all counters
+	// reset, so the slow track needs its full threshold again afterwards.
+	c.RecordBroadcastFailure(testEndpointA) // accumulate some pre-recovery state
+	c.recordProbeSuccess(testEndpointA)
+	if len(c.GetHealthyEndpoints()) != 1 {
+		t.Fatal("probe success should recover an unhealthy endpoint")
+	}
+	// 9 more broadcast failures shouldn't trip a threshold of 10 if the
+	// pre-recovery failure was wiped.
+	for i := 0; i < 9; i++ {
+		c.RecordBroadcastFailure(testEndpointA)
+	}
+	if len(c.GetHealthyEndpoints()) != 1 {
+		t.Fatal("recovery must reset consecutiveBroadcastFailures (9 < threshold 10)")
+	}
+	c.RecordBroadcastFailure(testEndpointA)
+	if len(c.GetHealthyEndpoints()) != 0 {
+		t.Fatal("10th consecutive broadcast failure should trip")
+	}
+}

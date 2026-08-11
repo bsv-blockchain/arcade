@@ -2,8 +2,10 @@ package p2p_client
 
 import (
 	"context"
+	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -81,6 +83,11 @@ func newTestClient(t *testing.T, fc *fakeTeraClient) (*Client, *fakeEndpointWrit
 	w := &fakeEndpointWriter{}
 	c := New(cfg, zaptest.NewLogger(t), nil, w)
 	c.clientFactory = func(_ context.Context, _ p2pclient.Config) (teraClient, error) { return fc, nil }
+	// Existing tests announce hostnames like https://peer.example — resolve
+	// everything to a public IP so validation never touches real DNS.
+	c.lookupIP = func(_ context.Context, _ string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("93.184.216.34")}, nil
+	}
 	return c, w
 }
 
@@ -352,5 +359,52 @@ func TestClient_DisabledDiscoveryOpensNoBus(t *testing.T) {
 	}
 	if err := c.Stop(); err != nil {
 		t.Errorf("Stop returned: %v", err)
+	}
+}
+
+// TestClient_UnresolvableURLNotPersisted is the production regression case:
+// a peer announcing its own cluster-internal service name (unresolvable from
+// this cluster) must never enter the shared endpoint registry.
+func TestClient_UnresolvableURLNotPersisted(t *testing.T) {
+	fc := newFakeTeraClient("sender")
+	c, w := newTestClient(t, fc)
+	c.lookupIP = func(_ context.Context, host string) ([]net.IP, error) {
+		return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+	}
+	_, stop := runStart(t, c)
+	defer stop()
+
+	fc.ch <- teranodep2p.NodeStatusMessage{
+		PeerID:  "sender",
+		BaseURL: "http://asset:8090/api/v1",
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	if calls := w.snapshot(); len(calls) != 0 {
+		t.Errorf("unresolvable URL reached the store: %+v", calls)
+	}
+}
+
+// TestClient_ValidationCacheSkipsRepeatLookups confirms the success-only TTL
+// cache: three announcements of one URL cost exactly one DNS lookup, while
+// the upsert-per-announcement contract (LastSeen advancing) is preserved.
+func TestClient_ValidationCacheSkipsRepeatLookups(t *testing.T) {
+	fc := newFakeTeraClient("sender")
+	c, w := newTestClient(t, fc)
+	var lookups atomic.Int64
+	c.lookupIP = func(_ context.Context, _ string) ([]net.IP, error) {
+		lookups.Add(1)
+		return []net.IP{net.ParseIP("93.184.216.34")}, nil
+	}
+	_, stop := runStart(t, c)
+	defer stop()
+
+	for i := 0; i < 3; i++ {
+		fc.ch <- teranodep2p.NodeStatusMessage{PeerID: "sender", BaseURL: "https://peer.example"}
+	}
+
+	waitForUpserts(t, w, 3)
+	if got := lookups.Load(); got != 1 {
+		t.Errorf("expected exactly 1 DNS lookup across 3 announcements, got %d", got)
 	}
 }

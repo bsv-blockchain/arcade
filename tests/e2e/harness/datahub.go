@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,6 +36,7 @@ type Datahub struct {
 	mu       sync.RWMutex
 	blocks   map[string][]byte
 	subtrees map[string][]byte
+	headers  map[string][]byte
 
 	// Per-path fetch counters. blockFetches is load-bearing for the issue
 	// #195 datahub-independence assertion: when merkle-service enriches
@@ -90,6 +92,7 @@ func NewDatahubOnPort(t *testing.T, opts DatahubOptions, port int) (*Datahub, er
 	d := &Datahub{
 		blocks:   make(map[string][]byte),
 		subtrees: make(map[string][]byte),
+		headers:  make(map[string][]byte),
 	}
 
 	// Bind on 0.0.0.0 so the merkle-service container can reach us via
@@ -150,6 +153,22 @@ func (d *Datahub) StageSubtree(hash chainhash.Hash, payload []byte) {
 	d.subtrees[hash.String()] = append([]byte(nil), payload...)
 }
 
+// StageHeader registers an 80-byte block header keyed by its block hash.
+// Headers feed GET /headers/<hash>?n=N — go-chaintracks' backward crawl
+// (SyncFromRemoteTip) walks child→parent through these when it receives
+// a block whose parent is off its main chain (the reorg-trigger path).
+// Stage every header on the branch you want chaintracks able to crawl,
+// including the fork point's ancestors it already knows — the walk stops
+// at the first header chaintracks recognizes as main-chain.
+func (d *Datahub) StageHeader(hash chainhash.Hash, header []byte) {
+	if len(header) != 80 {
+		panic(fmt.Sprintf("StageHeader %s: header must be 80 bytes, got %d", hash, len(header)))
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.headers[hash.String()] = append([]byte(nil), header...)
+}
+
 // StageFixture stages every binary a RealBlockFixture carries: the
 // block.bin under /block/<hash> and each subtree under /subtree/<hash>.
 // One call per fixture is enough to make merkle-service's block-fetch
@@ -170,6 +189,31 @@ func (d *Datahub) Close() {
 	d.server.Close()
 }
 
+// headersBackward walks the staged headers child→parent starting at
+// startHash, concatenating up to n 80-byte headers (newest first) — the
+// wire format go-chaintracks' fetchHeadersBackward expects. The walk
+// stops when a parent isn't staged; ok is false when even startHash is
+// unknown (→ 404, matching a real datahub asked for a foreign hash).
+func (d *Datahub) headersBackward(startHash string, n int) ([]byte, bool) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	var out []byte
+	cur := startHash
+	for i := 0; i < n; i++ {
+		h, ok := d.headers[cur]
+		if !ok {
+			break
+		}
+		out = append(out, h...)
+		// prevHash is bytes 4:36 of the serialized header.
+		var prev chainhash.Hash
+		copy(prev[:], h[4:36])
+		cur = prev.String()
+	}
+	return out, len(out) > 0
+}
+
 func (d *Datahub) handle(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/block/"):
@@ -180,6 +224,21 @@ func (d *Datahub) handle(w http.ResponseWriter, r *http.Request) {
 		d.mu.RUnlock()
 		if !ok {
 			http.Error(w, "block not staged", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write(payload)
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/headers/"):
+		hash := strings.TrimPrefix(r.URL.Path, "/headers/")
+		n := 1000
+		if q := r.URL.Query().Get("n"); q != "" {
+			if parsed, err := strconv.Atoi(q); err == nil && parsed > 0 {
+				n = parsed
+			}
+		}
+		payload, ok := d.headersBackward(hash, n)
+		if !ok {
+			http.Error(w, "header not staged", http.StatusNotFound)
 			return
 		}
 		w.Header().Set("Content-Type", "application/octet-stream")

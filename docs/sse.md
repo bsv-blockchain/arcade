@@ -39,14 +39,43 @@ You may also set `X-CallbackUrl` to additionally receive status updates as outbo
 ```
 id: 1745870456123456789
 event: status
-data: {"txid":"abc...","txStatus":"SEEN_ON_NETWORK","timestamp":"2026-04-28T18:20:56Z"}
+data: {"txid":"abc...","txStatus":"SEEN_ON_NETWORK","timestamp":"2026-04-28T18:20:56.123456789Z"}
 
 ```
 
 - `id` is a Unix nanosecond timestamp. Clients should remember the most recent `id` and send it back as `Last-Event-ID` on reconnect (browser `EventSource` does this automatically).
 - `event: status` is the only event type emitted for transaction updates.
-- `data` is one JSON object per frame with three fields: `txid`, `txStatus`, `timestamp` (RFC 3339).
+- `data` is one JSON object per frame. Every frame carries `txid`, `txStatus`, and `timestamp` (RFC 3339, with fractional seconds when the event has sub-second precision — the same instant as `id`, so latency can be measured from the payload alone). Fractional seconds are optional in RFC 3339; a whole-second timestamp is still rendered as `2026-04-28T18:20:56Z`.
 - A blank line terminates each frame.
+
+### Mined frames carry the merkle proof
+
+When `txStatus` is `MINED` (or `IMMUTABLE`), the frame additionally carries the block context and the transaction's merkle proof — the same fields the webhook callback and `GET /tx/{txid}` return, so a push-only client never has to poll for the proof:
+
+```
+id: 1745870512987654321
+event: status
+data: {"txid":"abc...","txStatus":"MINED","timestamp":"2026-04-28T18:21:52.987654321Z","blockHash":"0000...","blockHeight":870123,"merklePath":"<BUMP hex>"}
+
+```
+
+- `blockHash` / `blockHeight` — the block the transaction was mined into.
+- `merklePath` — the transaction's minimal [BUMP](https://github.com/bitcoin-sv/BRCs/blob/master/transactions/0074.md) (Bitcoin Unified Merkle Path), hex-encoded. Verify it by recomputing the block merkle root from the txid.
+
+These three fields are omitted from non-mined frames, so pre-`MINED` frames keep the original three-field shape. On a `Last-Event-ID` reconnect, replayed `MINED` frames are enriched with `merklePath` best-effort: to keep the replay path bounded, a single reconnect enriches at most a fixed number of distinct blocks, after which replayed `MINED` frames still carry `blockHash`/`blockHeight` but omit `merklePath` — recover it with `GET /tx/{txid}`.
+
+### Rejected frames carry the reason
+
+When `txStatus` is `REJECTED`, the frame carries the same rejection detail as `GET /tx/{txid}`:
+
+```
+data: {"txid":"abc...","txStatus":"REJECTED","timestamp":"2026-08-10T09:15:02Z","status":466,"extraInfo":"UTXO_SPENT (70): ... utxo already spent by tx 7dfb...[0]"}
+```
+
+- `extraInfo` — the verbatim Teranode validator line that caused the rejection (best available line when peers disagree).
+- `status` — the ARC status code when the line maps to one (466 conflict/double-spend, 467 generic invalid, 476 not-final); omitted when no confident mapping exists.
+
+Both fields are omitted when empty, so existing consumers see no shape change. Reorg-correction frames (see `MINED`/`SEEN_ON_NETWORK` re-anchoring) reuse `extraInfo` for the `reorg_reanchor` / `reorg_unmined` markers.
 
 Every ~15 seconds the server emits a `: keepalive` comment frame so idle proxies don't kill the connection. Comment frames have no `event:` and should be ignored by clients.
 

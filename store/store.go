@@ -43,6 +43,14 @@ type DatahubEndpoint struct {
 	LastSeen time.Time
 }
 
+// StatusCensus is one status's aggregate in a CensusStatusesSince result:
+// how many rows sit at that status inside the census window, and the minimum
+// timestamp among them (zero when Count is 0).
+type StatusCensus struct {
+	Count  int64
+	Oldest time.Time
+}
+
 // BatchInsertResult is one entry in the result slice returned by
 // BatchGetOrInsertStatus. Inserted is true when the row was newly written by
 // this call; false when an existing row was found and Existing carries it.
@@ -101,6 +109,20 @@ type Store interface {
 	// GetStatus retrieves the status for a transaction
 	GetStatus(ctx context.Context, txid string) (*models.TransactionStatus, error)
 
+	// EnrichMerklePath populates status.MerklePath in place for a MINED/IMMUTABLE
+	// status that already carries a BlockHash, extracting the transaction's
+	// minimal merkle path from the block's compound BUMP. It is a no-op when the
+	// status is nil, already has a MerklePath, has no BlockHash, is not
+	// MINED/IMMUTABLE, or the block's BUMP cannot be retrieved/parsed — so callers
+	// on push paths can invoke it unconditionally and treat the proof as
+	// best-effort (never a delivery gate). Safe to call repeatedly across all the
+	// txids of one block: implementations share the bounded bumpcache of parsed,
+	// indexed compound BUMPs (see store/bumpcache), so per-tx enrichment is
+	// O(tree depth · log level-size), not a re-parse. Unlike GetStatus this does
+	// not read the full row (no RawTx), which keeps it cheap enough for the
+	// SSE/webhook fan-out hot path.
+	EnrichMerklePath(ctx context.Context, status *models.TransactionStatus)
+
 	// GetStatusesSince retrieves all transactions updated since a given timestamp
 	GetStatusesSince(ctx context.Context, since time.Time) ([]*models.TransactionStatus, error)
 
@@ -112,16 +134,48 @@ type Store interface {
 	// error stops iteration and surfaces that error to the caller.
 	IterateStatusesSince(ctx context.Context, since time.Time, fn func(*models.TransactionStatus) error) error
 
+	// CensusStatusesSince aggregates the stuck-transient census store-side:
+	// for each requested status, the number of transaction rows with
+	// timestamp >= since AND timestamp < stuckDeadline, plus the minimum
+	// timestamp among them. The returned map has exactly one entry per
+	// requested status — zero-valued when nothing matched — so callers can
+	// publish gauges without existence checks.
+	//
+	// This exists so the propagation reaper's census over a multi-million-row
+	// table never streams rows: Postgres answers it with one GROUP BY
+	// aggregate, and other backends push the status filter into their
+	// secondary indexes. Counting inside an IterateStatusesSince walk pinned
+	// the reaper's effective cadence to the full-scan time (~4 minutes on a
+	// ~1.6M-row store) instead of reaper_interval_ms — see issue #290.
+	CensusStatusesSince(ctx context.Context, since, stuckDeadline time.Time, statuses []models.Status) (map[models.Status]StatusCensus, error)
+
 	// SetStatusByBlockHash updates all transactions with the given block hash to a new status.
 	// Returns the txids that were updated. For unmined statuses (SEEN_ON_NETWORK),
-	// block fields are cleared. For IMMUTABLE, block fields are preserved.
+	// block fields are cleared and the cleared anchor is appended to the row's
+	// orphaned-anchor history (reorg revert). For IMMUTABLE, block fields are
+	// preserved. IMMUTABLE rows are never touched, and rows whose block_hash no
+	// longer matches at write time are skipped — a tx concurrently re-anchored
+	// to the canonical block must not be reverted by a stale index read.
 	SetStatusByBlockHash(ctx context.Context, blockHash string, newStatus models.Status) ([]string, error)
+
+	// GetTxIDsByBlockHash returns the txids of every transaction row currently
+	// anchored to blockHash (MINED or IMMUTABLE). The reorg reconciler reads
+	// this as the affected set of an orphaned block; rows that have already
+	// been re-anchored or reverted no longer appear.
+	GetTxIDsByBlockHash(ctx context.Context, blockHash string) ([]string, error)
 
 	// InsertBUMP stores a compound BUMP for a block.
 	InsertBUMP(ctx context.Context, blockHash string, blockHeight uint64, bumpData []byte) error
 
 	// GetBUMP retrieves the compound BUMP for a block.
 	GetBUMP(ctx context.Context, blockHash string) (blockHeight uint64, bumpData []byte, err error)
+
+	// DeleteBUMPByBlockHash removes the stored compound BUMP for a block and
+	// invalidates any cached parse. Idempotent — deleting a missing BUMP is a
+	// no-op. Operator/cleanup lever; note the reorg reconciler deliberately
+	// RETAINS orphaned blocks' BUMPs so historical orphaned-anchor proofs
+	// stay resolvable (issue #279).
+	DeleteBUMPByBlockHash(ctx context.Context, blockHash string) error
 
 	// --- Block processing status ---
 	//
@@ -154,8 +208,28 @@ type Store interface {
 	// MarkBlocksOrphaned transitions every named block to status='orphaned'
 	// and stamps orphaned_at. Hashes that have no row are silently skipped
 	// (chaintracks may emit OrphanedHashes for blocks observed before the
-	// service started recording).
+	// service started recording). Orphaned rows with reconciled_at IS NULL
+	// form the anchor reconciler's work queue.
 	MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) error
+
+	// MarkBlockReconciled stamps reconciled_at on an orphaned block's row,
+	// recording that tx re-anchor/revert for this orphan completed. A
+	// missing row is a silent no-op.
+	MarkBlockReconciled(ctx context.Context, blockHash string, at time.Time) error
+
+	// ListOrphanedBlocksToReconcile returns up to limit rows with
+	// status='orphaned' AND reconciled_at IS NULL, oldest orphaned_at
+	// first — the anchor reconciler's durable work queue. limit must be > 0.
+	ListOrphanedBlocksToReconcile(ctx context.Context, limit int) ([]*models.BlockProcessingStatus, error)
+
+	// MarkBlocksParked transitions every named block from status='active' to
+	// status='parked' — the watchdog's terminal state for blocks whose
+	// reprocess caps (attempts/age) are exhausted. Rows that are missing or
+	// not 'active' (orphaned rows stay orphaned) are silently skipped. Parked
+	// rows drop out of ListStaleBlockProcessingStatus so they read as an
+	// explicit triage backlog rather than perpetual stale churn; a later
+	// UpsertBlockHeaderSeen for the same hash resets them to 'active'.
+	MarkBlocksParked(ctx context.Context, blockHashes []string) error
 
 	// GetBlockProcessingStatus returns the row keyed by blockHash. Returns
 	// ErrNotFound if no row exists.
@@ -208,8 +282,48 @@ type Store interface {
 	// GetSubmissionsByToken retrieves all submissions for a callback token
 	GetSubmissionsByToken(ctx context.Context, callbackToken string) ([]*models.Submission, error)
 
+	// TokensForTxIDs returns the DISTINCT non-empty callback tokens registered
+	// against each of the supplied txids, keyed by txid. A txid with no
+	// submission — or none carrying a token — is ABSENT from the result map
+	// (never present with an empty slice), so an absent key means "nobody is
+	// subscribed". Duplicate txids in the input are collapsed.
+	//
+	// This is the SSE fan-out hot path. It replaced a per-(event, client)
+	// existence probe: fan-out now resolves a txid's token set ONCE and
+	// answers every connected client from that set in memory, and resolves a
+	// whole bulk event's txid list in one batch. Implementations MUST resolve
+	// from the txid side only (a txid has a handful of submissions) and MUST
+	// NOT materialize a token's submission list: a single token can hold
+	// millions of submissions, and loading one per event is what OOM-killed
+	// the SSE service (#237/#238). Implementations that cannot issue an
+	// unbounded batch must chunk internally rather than reject the call.
+	TokensForTxIDs(ctx context.Context, txids []string) (map[string][]string, error)
+
+	// IterateStatusesByToken streams the current status of every DISTINCT
+	// txid registered under callbackToken through fn, in ascending
+	// status-timestamp order. Rows are PROJECTED for streaming delivery —
+	// txid, status, timestamp, block hash/height only. Implementations MUST
+	// NOT load raw_tx or enrich the merkle path: this is the SSE catchup hot
+	// path, called for tokens with millions of submissions, and per-row
+	// compound-BUMP parsing is what OOMed the SSE service. Filters: when
+	// since is non-zero, only statuses with Timestamp strictly after since
+	// are emitted; when onlyStatuses is non-empty, only rows in one of those
+	// statuses are emitted. fn returning a non-nil error stops the iteration
+	// and surfaces that error to the caller.
+	IterateStatusesByToken(ctx context.Context, callbackToken string, since time.Time, onlyStatuses []models.Status, fn func(*models.TransactionStatus) error) error
+
 	// UpdateDeliveryStatus updates the delivery tracking for a submission
 	UpdateDeliveryStatus(ctx context.Context, submissionID string, lastStatus models.Status, retryCount int, nextRetry *time.Time) error
+
+	// RecordDeliveryAttempt stamps the outcome of one webhook POST attempt on
+	// the submission row: Attempts is incremented and LastAttemptAt/LastResult
+	// are overwritten (result is "delivered" or the failure reason, e.g.
+	// "status 403"). Deliberately orthogonal to UpdateDeliveryStatus /
+	// UpdateDeliveryStatusCAS: those manage the per-transition retry state the
+	// CAS resets (issue #166), while this is monotonic lifetime bookkeeping
+	// surfaced to clients via GET /tx?callbackToken=… for delivery
+	// self-diagnosis (issue #249).
+	RecordDeliveryAttempt(ctx context.Context, submissionID string, at time.Time, result string) error
 
 	// UpdateDeliveryStatusCAS atomically advances LastDeliveredStatus from
 	// `expected` to `next` for the given submission. Returns true iff a row
@@ -271,8 +385,10 @@ type Store interface {
 	// issue #145.
 	MarkMerkleRegisteredByTxIDs(ctx context.Context, txids []string, ts time.Time) error
 
-	// EnsureIndexes creates any required secondary indexes for query operations.
-	EnsureIndexes() error
+	// EnsureIndexes provisions whatever the backend needs for query operations
+	// (schema, secondary indexes). ctx bounds the whole operation; backends may
+	// layer tighter internal deadlines on top.
+	EnsureIndexes(ctx context.Context) error
 
 	// UpsertDatahubEndpoint registers (or refreshes the LastSeen of) a datahub
 	// URL. Used by p2p_client to publish discovered URLs and by main to seed

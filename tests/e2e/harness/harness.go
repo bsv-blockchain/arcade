@@ -76,15 +76,17 @@ func New(t *testing.T, opts ...Option) *Harness {
 		_ = nw.Remove(closeCtx)
 	})
 
-	// Step 3: libp2p host with the gateway IP baked into its announce
-	// multiaddr. Skipped when the caller explicitly passed a bootstrap
-	// peer string — that mode is for tests that want to wire their own
-	// libp2p configuration.
+	// Step 3: libp2p host with the container-reachable host address baked
+	// into its announce multiaddr (host.containers.internal on podman,
+	// the gateway IP on Docker — see hostFromContainerAddr). Skipped when
+	// the caller explicitly passed a bootstrap peer string — that mode is
+	// for tests that want to wire their own libp2p configuration.
+	hostAddr := hostFromContainerAddr(gateway)
 	var libp2p *LibP2PHost
 	if cfg.merkleStart.BootstrapPeers == "" {
 		libp2p, err = NewLibP2PHostWith(t, LibP2PHostOptions{
 			Network:      cfg.merkleStart.P2PNetwork,
-			AnnounceHost: gateway,
+			AnnounceHost: hostAddr,
 		})
 		if err != nil {
 			t.Fatalf("build libp2p host: %v", err)
@@ -108,7 +110,7 @@ func New(t *testing.T, opts ...Option) *Harness {
 		if cfg.merkleStart.ExtraEnv == nil {
 			cfg.merkleStart.ExtraEnv = make(map[string]string)
 		}
-		cfg.merkleStart.ExtraEnv["DATAHUB_FALLBACK_URLS"] = fmt.Sprintf("http://%s:%d", gateway, datahubPort)
+		cfg.merkleStart.ExtraEnv["DATAHUB_FALLBACK_URLS"] = fmt.Sprintf("http://%s:%d", hostAddr, datahubPort)
 	}
 
 	// Step 4: Postgres + Redpanda + merkle-service on the prepared
@@ -125,7 +127,7 @@ func New(t *testing.T, opts ...Option) *Harness {
 	// dead listener).
 	var datahub *Datahub
 	if cfg.reprocessReady {
-		datahub, err = NewDatahubOnPort(t, DatahubOptions{AnnounceHost: gateway}, datahubPort)
+		datahub, err = NewDatahubOnPort(t, DatahubOptions{AnnounceHost: hostAddr}, datahubPort)
 		if err != nil {
 			t.Fatalf("bind pre-registered datahub: %v", err)
 		}
@@ -156,16 +158,17 @@ func New(t *testing.T, opts ...Option) *Harness {
 }
 
 // NewDatahub spins up an in-process datahub HTTP server announcing on
-// the docker-network gateway IP discovered when the harness's network
-// was created. The returned datahub is reachable from the merkle-service
-// container regardless of whether host.docker.internal is routable on
-// the runtime — same fix as the libp2p host.
+// the container-reachable host address resolved when the harness's
+// network was created (host.containers.internal on podman, the gateway
+// IP on Docker). The returned datahub is reachable from the
+// merkle-service container regardless of whether host.docker.internal
+// is routable on the runtime — same fix as the libp2p host.
 //
 // Lifetime is tied to t via t.Cleanup. Tests call this from within a
 // scenario after harness.New(t) has run.
 func (h *Harness) NewDatahub(t *testing.T) *Datahub {
 	t.Helper()
-	d, err := NewDatahubWith(t, DatahubOptions{AnnounceHost: h.Containers.GatewayIP})
+	d, err := NewDatahubWith(t, DatahubOptions{AnnounceHost: h.Containers.HostFromContainer})
 	if err != nil {
 		t.Fatalf("new datahub: %v", err)
 	}

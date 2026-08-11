@@ -4,11 +4,15 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 )
 
@@ -256,9 +260,11 @@ var _ kafka.Claim = (*fakeClaim)(nil)
 // commit watermark. Returns the claim and a stop func.
 func runDispatcherWithClaim(t *testing.T, p *Propagator) (*fakeClaim, func()) {
 	t.Helper()
-	// The test-mode and production dispatcher loops share p.terminalCh
-	// et al. and must never run concurrently — cancel the test-mode one
-	// New() spawned and wait for it to exit first.
+	// The test-mode and production dispatcher loops share p.defaultIO
+	// and must never run concurrently — cancel the test-mode one
+	// New() spawned and wait for it to exit first. The production loop
+	// reuses defaultIO so the batch-pipeline helpers tests reach through
+	// the Propagator keep routing to this dispatcher.
 	p.dispatcherCancel()
 	<-p.dispatcherDone
 	p.dispatcherCancel = nil
@@ -268,7 +274,7 @@ func runDispatcherWithClaim(t *testing.T, p *Propagator) (*fakeClaim, func()) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = p.runDispatcher(claimCtx, claim, dispatcherConfig{maxPending: 1000})
+		_ = p.runDispatcher(claimCtx, claim, dispatcherConfig{maxPending: 1000}, p.defaultIO)
 	}()
 	return claim, func() {
 		cancel()
@@ -359,6 +365,135 @@ func TestRunDispatcher_ReapedRowTerminal_AdvancesCommitWatermark(t *testing.T) {
 		"a terminal for a reaped (nil-prev) row must still notify the dispatcher")
 }
 
+// --- claim revocation: fail fast, leave the batch uncommitted ------------
+
+// TestRunDispatcher_ClaimRevokedMidBatch_FailsFastAndLeavesUncommitted pins
+// the fail-fast contract from the 2026-08-10 load test (>1,900 TPS macro-
+// batch cycles overran the consumer-group session and the broker revoked the
+// claim mid-batch): when the claim ctx dies while a batch is mid-pipeline,
+// the batch must stop where it stands — no teranode submit under the dead
+// ctx, no 2s-parked requeue goroutine, no store writes — and the tx's Kafka
+// offset must stay unmarked so the next claim replays it. Pre-fix the batch
+// dragged the dead ctx through register → requeue → broadcast: every /watch
+// "failure" counted as register_error (39,189 in one observed batch), the
+// requeue parked 2s and dropped, and retry batches logged a misleading
+// "batch propagated" accepted=0.
+func TestRunDispatcher_ClaimRevokedMidBatch_FailsFastAndLeavesUncommitted(t *testing.T) {
+	// A merkle server that parks the first /watch call until released lets
+	// the test revoke the claim while the batch is provably mid-
+	// registerBatch. The cancel aborts the ctx-bound client call with
+	// context.Canceled even though the handler stays parked.
+	registerStarted := make(chan struct{})
+	var startedOnce sync.Once
+	release := make(chan struct{})
+	merkleSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		startedOnce.Do(func() { close(registerStarted) })
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer merkleSrv.Close()
+
+	teranodeLog := &eventLog{}
+	teranodeSrv := newTeranodeServer(teranodeLog, http.StatusOK)
+	defer teranodeSrv.Close()
+
+	ms := newMockStore()
+	p := newPropagator(merkleSrv.URL, teranodeSrv.URL, ms)
+
+	revokedBefore := testutil.ToFloat64(metrics.PropagationClaimRevokedBatchesTotal)
+	requeuesBefore := testutil.ToFloat64(metrics.PropagationPendingRequeues)
+	claimRevokedBefore := testutil.ToFloat64(metrics.PropagationMerkleRegisterFailures.WithLabelValues("claim_revoked"))
+	registerErrBefore := testutil.ToFloat64(metrics.PropagationMerkleRegisterFailures.WithLabelValues("register_error"))
+
+	claim, stop := runDispatcherWithClaim(t, p)
+	claim.ch <- &kafka.Message{Offset: 21, Value: makePropMsg("revoked-mid-batch-tx")}
+
+	select {
+	case <-registerStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("batch never reached merkle /watch")
+	}
+
+	// Revoke the claim while /watch is in flight. stop() cancels claimCtx,
+	// waits for the dispatcher loop to exit AND for the processBatch
+	// goroutine to unwind (WaitForBatches), so every assertion below runs
+	// against a fully-settled aborted batch.
+	stop()
+	close(release) // unpark the handler so merkleSrv.Close() doesn't hang
+
+	if got := teranodeLog.count("broadcast"); got != 0 {
+		t.Errorf("no teranode submit may run under a revoked claim; got %d", got)
+	}
+	if claim.isMarked(21) {
+		t.Error("the tx's offset must stay unmarked so the next claim replays it")
+	}
+	if got := ms.updateCount(); got != 0 {
+		t.Errorf("no status writes may land for an aborted batch; got %d", got)
+	}
+	if got := ms.markCount(); got != 0 {
+		t.Errorf("no merkle-registered marks may be written for an aborted batch; got %d", got)
+	}
+	if d := testutil.ToFloat64(metrics.PropagationClaimRevokedBatchesTotal) - revokedBefore; d != 1 {
+		t.Errorf("claim-revoked batch counter delta = %v, want 1", d)
+	}
+	if d := testutil.ToFloat64(metrics.PropagationMerkleRegisterFailures.WithLabelValues("claim_revoked")) - claimRevokedBefore; d != 1 {
+		t.Errorf("claim_revoked register-failure delta = %v, want 1 (the parked /watch collapsed with context canceled)", d)
+	}
+	if d := testutil.ToFloat64(metrics.PropagationMerkleRegisterFailures.WithLabelValues("register_error")) - registerErrBefore; d != 0 {
+		t.Errorf("a rebalance must not pollute register_error; delta = %v", d)
+	}
+	if d := testutil.ToFloat64(metrics.PropagationPendingRequeues) - requeuesBefore; d != 0 {
+		t.Errorf("no delayed-requeue goroutine may park under a revoked claim; gauge delta = %v", d)
+	}
+}
+
+// TestProcessBatch_ClaimRevokedBeforeStart_NoSideEffects covers the other
+// revocation window: the dispatcher's flush tick detaches the processBatch
+// goroutine, so the claim can already be dead before the batch STARTS. The
+// entry checkpoint must stop it before any merkle /watch or teranode submit
+// is even attempted, leaving the store untouched and the offsets uncommitted
+// for replay.
+func TestProcessBatch_ClaimRevokedBeforeStart_NoSideEffects(t *testing.T) {
+	httpLog := &eventLog{}
+	merkleSrv := newMerkleServer(httpLog, http.StatusOK)
+	defer merkleSrv.Close()
+	teranodeSrv := newTeranodeServer(httpLog, http.StatusOK)
+	defer teranodeSrv.Close()
+
+	ms := newMockStore()
+	p := newPropagator(merkleSrv.URL, teranodeSrv.URL, ms)
+
+	revokedBefore := testutil.ToFloat64(metrics.PropagationClaimRevokedBatchesTotal)
+	requeuesBefore := testutil.ToFloat64(metrics.PropagationPendingRequeues)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the claim died before the detached batch goroutine ran
+
+	p.processBatch(ctx, []propagationMsg{
+		{TXID: "revoked-1", RawTx: []byte{0x01}},
+		{TXID: "revoked-2", RawTx: []byte{0x02}},
+	}, p.defaultIO)
+
+	if got := httpLog.count("register:"); got != 0 {
+		t.Errorf("no merkle /watch call may run under a revoked claim; got %d", got)
+	}
+	if got := httpLog.count("broadcast"); got != 0 {
+		t.Errorf("no teranode submit may run under a revoked claim; got %d", got)
+	}
+	if got := ms.updateCount(); got != 0 {
+		t.Errorf("store must stay untouched (txs left for replay); got %d status writes", got)
+	}
+	if got := ms.markCount(); got != 0 {
+		t.Errorf("no merkle-registered marks may be written; got %d", got)
+	}
+	if d := testutil.ToFloat64(metrics.PropagationClaimRevokedBatchesTotal) - revokedBefore; d != 1 {
+		t.Errorf("claim-revoked batch counter delta = %v, want 1", d)
+	}
+	if d := testutil.ToFloat64(metrics.PropagationPendingRequeues) - requeuesBefore; d != 0 {
+		t.Errorf("no delayed-requeue goroutine may park; gauge delta = %v", d)
+	}
+}
+
 // --- store-error guard: offsets must not release on a failed write ------
 
 // TestApplyTerminalStatuses_StoreError_DoesNotReleaseOffset is the
@@ -383,7 +518,7 @@ func TestApplyTerminalStatuses_StoreError_DoesNotReleaseOffset(t *testing.T) {
 	// Terminalize it — but the store write fails.
 	p.applyTerminalStatuses(context.Background(), []*models.TransactionStatus{
 		{TxID: "x", Status: models.StatusAcceptedByNetwork, Timestamp: time.Now()},
-	}, 1, 0)
+	}, 1, 0, p.defaultIO)
 
 	// The dispatcher must NOT have been notified: "x" is still in flight,
 	// so a re-admission is detected as a duplicate (offset bookkept, not a
@@ -409,7 +544,7 @@ func TestApplyTerminalStatuses_StoreOK_ReleasesOffset(t *testing.T) {
 
 	p.applyTerminalStatuses(context.Background(), []*models.TransactionStatus{
 		{TxID: "y", Status: models.StatusAcceptedByNetwork, Timestamp: time.Now()},
-	}, 1, 0)
+	}, 1, 0, p.defaultIO)
 
 	if res := p.admitToDispatcher(propagationMsg{TXID: "y", RawTx: []byte{0x01}}, 6); !res.admitted {
 		t.Fatalf("after a successful terminal write the tx must be released from in-flight; re-admit got %+v, want admitted", res)

@@ -62,8 +62,9 @@ jobs:
       # Checkout code and set up Go environment
       # --------------------------------------------------------------------
       - name: 📥 Checkout code
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false # checkout v7 breaks auth with persisted creds; goreleaser uses env GITHUB_TOKEN
           fetch-depth: 0 # Required for changelog generation
           token: ${{ secrets.github-token }}
 
@@ -175,7 +176,7 @@ jobs:
       # --------------------------------------------------------------------
       - name: 💾 Cache golangci-lint analysis
         id: cache-golangci-lint
-        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.GOLANGCI_LINT_CACHE }}
           key: ${{ inputs.primary-runner }}-golangci-lint-analysis-${{ hashFiles('.golangci.json', env.GO_SUM_FILE) }}-${{ inputs.golangci-lint-version }}

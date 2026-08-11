@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -18,9 +19,11 @@ import (
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/events"
 	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/arcade/telemetry"
 	"github.com/bsv-blockchain/arcade/teranode"
 )
 
@@ -33,6 +36,14 @@ import (
 // failing the build outright on a transient chaintracks race.
 type ChainHeaderReader interface {
 	GetHeaderByHash(ctx context.Context, hash *chainhash.Hash) (*chaintrackslib.BlockHeader, error)
+	// GetHeaderByHeight returns the ACTIVE-chain header at height. A
+	// (nil, nil) or error return means "chaintracks cannot judge this
+	// height yet" — callers must fail open, never treat it as evidence.
+	// Unlike GetHeaderByHash, which also resolves same-height alternates
+	// from the header index, this is a main-chain-membership source: the
+	// anchor guard and the reorg reconciler both compare a block hash
+	// against it to decide canonicality (issue #279).
+	GetHeaderByHeight(ctx context.Context, height uint32) (*chaintrackslib.BlockHeader, error)
 }
 
 type Builder struct {
@@ -70,6 +81,13 @@ func New(
 	teranodeClient *teranode.Client,
 	chainHeader ChainHeaderReader,
 ) *Builder {
+	// Export every series this service can emit at 0 from the first scrape —
+	// a series born mid-burst is invisible to increase() until its second
+	// sample, which made a whole block's MINED transitions vanish from
+	// dashboards after every rollout. The build-outcome children matter most:
+	// a first-occurrence build failure must not be swallowed by increase().
+	metrics.PreRegisterStatusTransitions(models.StatusMined)
+	metrics.PreRegisterBumpOutcomes()
 	return &Builder{
 		cfg:         cfg,
 		logger:      logger.Named("bump-builder"),
@@ -99,17 +117,27 @@ func combineValidators(a, b bump.BlockDataValidator) bump.BlockDataValidator {
 	}
 }
 
+// headerWaitPollInterval is the pause between chaintracks header lookups
+// while chainHeaderRootValidator waits out the ingestion race (see below).
+// 1s keeps the wait responsive without hammering the chaintracks API.
+const headerWaitPollInterval = time.Second
+
 // chainHeaderRootValidator returns a validator that compares the datahub's
 // header merkle root against the canonical merkle root from chaintracks. A
 // mismatch means the datahub returned a block representation that doesn't
 // belong to the canonical chain (pruned peer, stale cache, malicious peer),
 // so the fetch loop should fall through to the next URL.
 //
-// Soft-fails to "no validation" when chaintracks doesn't know the header
-// yet — this is a real race in mode=all where chaintracks's P2P subscription
-// is independent of the BLOCK_PROCESSED message that drives bump-builder.
-// The post-build ValidateCompoundRoot at builder.go still runs and catches
-// any compound that doesn't reconcile.
+// chaintracks not knowing the header yet is a real race: its teranode P2P
+// subscription is independent of the Kafka BLOCK_PROCESSED message that
+// drives bump-builder, and for a block mined seconds earlier the Kafka path
+// usually wins. The validator retries the lookup for up to
+// bump_builder.header_wait_ms so the race resolves into a real cross-check
+// instead of a silent skip; only when chaintracks still doesn't know the
+// header after the wait does it soft-fail to "no validation" (post-build
+// ValidateCompoundRoot still runs and catches any compound that doesn't
+// reconcile — but that check uses the datahub's own root, so it cannot
+// prove canonicality the way this one does).
 func (b *Builder) chainHeaderRootValidator(ctx context.Context, blockHash string, logger *zap.Logger) bump.BlockDataValidator {
 	if b.chainHeader == nil {
 		return nil
@@ -119,15 +147,25 @@ func (b *Builder) chainHeaderRootValidator(ctx context.Context, blockHash string
 		logger.Warn("skipping canonical-root validation: invalid block hash", zap.Error(err))
 		return nil
 	}
+	// One wall-clock budget for the whole block, shared by every per-URL
+	// invocation of the validator: the race being waited out is chaintracks
+	// ingesting THIS block, so the clock starts once. If chaintracks is
+	// genuinely down, only the first fetch attempt pays the wait — later
+	// URLs find the budget spent and degrade to a single lookup each.
+	var headerWaitDeadline time.Time
+	if wait := time.Duration(b.cfg.BumpBuilder.HeaderWaitMs) * time.Millisecond; wait > 0 {
+		headerWaitDeadline = time.Now().Add(wait)
+	}
 	return func(_ []chainhash.Hash, fetchedRoot *chainhash.Hash) error {
-		header, lookupErr := b.chainHeader.GetHeaderByHash(ctx, hashObj)
+		header, lookupErr := b.lookupHeaderWithWait(ctx, hashObj, headerWaitDeadline, logger)
 		if lookupErr != nil || header == nil {
 			// Soft-fail: log and accept the response. Post-build
 			// ValidateCompoundRoot is still the final guard.
 			if lookupErr != nil && !errors.Is(lookupErr, context.Canceled) {
-				logger.Debug(
-					"chaintracks header lookup failed; skipping canonical-root validation",
-					zap.String("block_hash", blockHash),
+				logger.Warn(
+					"chaintracks header still unknown after wait; skipping canonical-root validation",
+					logfields.BlockHash(blockHash),
+					zap.Int("header_wait_ms", b.cfg.BumpBuilder.HeaderWaitMs),
 					zap.Error(lookupErr),
 				)
 			}
@@ -148,6 +186,108 @@ func (b *Builder) chainHeaderRootValidator(ctx context.Context, blockHash string
 	}
 }
 
+// lookupHeaderWithWait fetches the block header from chaintracks, retrying
+// until deadline while chaintracks catches up on a freshly-mined block (its
+// P2P ingestion races the Kafka path that drives bump-builder). Returns the
+// last lookup outcome once the deadline passes; a zero/past deadline
+// degrades to a single lookup. Context cancellation aborts the wait
+// immediately.
+func (b *Builder) lookupHeaderWithWait(ctx context.Context, hashObj *chainhash.Hash, deadline time.Time, logger *zap.Logger) (*chaintrackslib.BlockHeader, error) {
+	header, lookupErr := b.chainHeader.GetHeaderByHash(ctx, hashObj)
+	if (lookupErr == nil && header != nil) || errors.Is(lookupErr, context.Canceled) {
+		return header, lookupErr
+	}
+	if !time.Now().Before(deadline) {
+		return header, lookupErr
+	}
+
+	logger.Debug("chaintracks header not yet known; waiting for ingestion",
+		zap.Duration("budget", time.Until(deadline)))
+	ticker := time.NewTicker(headerWaitPollInterval)
+	defer ticker.Stop()
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
+		header, lookupErr = b.chainHeader.GetHeaderByHash(ctx, hashObj)
+		if (lookupErr == nil && header != nil) || errors.Is(lookupErr, context.Canceled) {
+			return header, lookupErr
+		}
+	}
+	return header, lookupErr
+}
+
+// anchorVerdict is anchorDecision's outcome.
+type anchorVerdict int
+
+const (
+	// anchorAllow: the block is the active-chain block at its height, or
+	// chaintracks cannot judge (unknown height, lag, guard disabled, no
+	// chainHeader wired). Fail-open by design — a wrong optimistic anchor
+	// is healed by the anchor reconciler, whereas a false denial would
+	// strand the block's txs with no recovery trigger.
+	anchorAllow anchorVerdict = iota
+	// anchorDeny: positive evidence that the active chain has a DIFFERENT
+	// block at this height — anchoring txs to this block would repeat
+	// issue #279's orphan-anchored MINED rows.
+	anchorDeny
+)
+
+// anchorDecision is the write-time anchor guard (issue #279): before txs
+// are marked MINED against blockHash, check that the block is the
+// active-chain block at its height per chaintracks. Denial requires
+// positive evidence — GetHeaderByHeight knows the height AND the hash
+// differs. Everything else (nil reader, guard disabled, height unknown,
+// lookup error) allows: chaintracks' P2P ingestion legitimately races the
+// Kafka path that drives bump-builder, and the tie-scan + reconciler net
+// catches any optimistic anchor the race lets through.
+func (b *Builder) anchorDecision(ctx context.Context, logger *zap.Logger, blockHash string, blockHeight uint64) anchorVerdict {
+	if b.chainHeader == nil || !b.cfg.BumpBuilder.AnchorGuardEnabled {
+		return anchorAllow
+	}
+	if blockHeight == 0 || blockHeight > math.MaxUint32 {
+		return anchorAllow
+	}
+	active, err := b.chainHeader.GetHeaderByHeight(ctx, uint32(blockHeight))
+	if err != nil || active == nil {
+		logger.Debug("anchor guard could not verify canonicality; anchoring optimistically",
+			logfields.BlockHeight(blockHeight),
+			zap.Error(err))
+		return anchorAllow
+	}
+	if active.Hash.String() == blockHash {
+		return anchorAllow
+	}
+	logger.Error("anchor guard: active chain has a different block at this height — refusing to mark MINED",
+		logfields.BlockHash(blockHash),
+		logfields.BlockHeight(blockHeight),
+		zap.String("active_block_hash", active.Hash.String()))
+	return anchorDeny
+}
+
+// handleAnchorDenied finalizes a block the guard refused to anchor: the
+// processing row is stamped (so the watchdog never re-drives it) and marked
+// orphaned — routing it into the anchor reconciler's queue, which heals any
+// txs an EARLIER build anchored to it — and its STUMPs are pruned. The
+// stored compound BUMP is deliberately retained: it is the store-local
+// re-anchor fuel if this block later wins a flip-flop, and the source for
+// historical orphaned-anchor proofs.
+func (b *Builder) handleAnchorDenied(ctx context.Context, logger *zap.Logger, blockHash string, blockHeight uint64, path string) {
+	metrics.BumpBuilderAnchorGuardDeniedTotal.WithLabelValues(path).Inc()
+	// Stamp first: markBlockProcessed upserts the row when missing (a
+	// never-tip block has no chaintracks header-seen row), so the orphan
+	// mark below always has a row to land on.
+	b.markBlockProcessed(ctx, logger, blockHash, blockHeight)
+	if err := b.store.MarkBlocksOrphaned(ctx, []string{blockHash}, time.Now()); err != nil {
+		logger.Warn("anchor guard: failed to mark block orphaned; reconciler full-scan will catch it", zap.Error(err))
+	}
+	if err := b.store.DeleteStumpsByBlockHash(ctx, blockHash); err != nil {
+		logger.Warn("anchor guard: failed to clean up STUMPs", zap.Error(err))
+	}
+}
+
 // markMinedAndPublish moves the txids to MINED and fans the resulting status
 // updates out to the events Publisher. blockHeight is required so each
 // published status carries the block-height anchor that downstream SSE /
@@ -156,15 +296,60 @@ func (b *Builder) chainHeaderRootValidator(ctx context.Context, blockHash string
 // repairs it from the compound BUMP's height before fanning out so a
 // half-applied revert can never reintroduce the original bug.
 func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, blockHash string, blockHeight uint64, txids []string) {
-	prevs, mined, err := b.store.SetMinedByTxIDs(ctx, blockHash, blockHeight, txids)
+	setMinedAndPublish(ctx, logger, b.store, b.publisher, blockHash, blockHeight, txids, "", false)
+}
+
+// setMinedAndPublish is the shared "mark MINED + fan out" core behind the
+// builder's build path and the anchor reconciler's re-anchor path (issue
+// #279). extraInfo, when non-empty, is stamped on the published bulk event
+// templates (e.g. models.ExtraInfoReorgReanchor) so consumers can tell a
+// reorg correction from a plain MINED. onlyChanged filters the fan-out to
+// rows whose anchor actually changed (previous status not MINED, or MINED
+// against a different block) — the reconciler re-mines a canonical block's
+// FULL BUMP set for idempotency, and rows already correctly anchored must
+// not spam duplicate events.
+func setMinedAndPublish(
+	ctx context.Context,
+	logger *zap.Logger,
+	st store.Store,
+	publisher events.Publisher,
+	blockHash string,
+	blockHeight uint64,
+	txids []string,
+	extraInfo string,
+	onlyChanged bool,
+) (changed int) {
+	prevs, mined, err := st.SetMinedByTxIDs(ctx, blockHash, blockHeight, txids)
 	if err != nil {
 		logger.Error("failed to set mined status", zap.Error(err))
-		return
+		return 0
 	}
+	// onlyChanged: keep only actual anchor transitions. prevs and mined are
+	// parallel slices per the SetMinedByTxIDs contract.
+	if onlyChanged {
+		filteredPrevs := prevs[:0]
+		filteredMined := mined[:0]
+		for i, prev := range prevs {
+			if i >= len(mined) {
+				break
+			}
+			if prev != nil && prev.Status == models.StatusMined && prev.BlockHash == blockHash {
+				continue
+			}
+			filteredPrevs = append(filteredPrevs, prev)
+			filteredMined = append(filteredMined, mined[i])
+		}
+		prevs, mined = filteredPrevs, filteredMined
+		if len(mined) == 0 {
+			return 0
+		}
+	}
+
 	logger.Info(
 		"set transactions to MINED",
 		zap.Int("count", len(mined)),
-		zap.Uint64("block_height", blockHeight),
+		logfields.BlockHeight(blockHeight),
+		zap.String("extra_info", extraInfo),
 	)
 	metrics.BumpBuilderTxidsMinedTotal.Add(float64(len(mined)))
 	// Observe the per-tx age of the previous status row so an operator can see
@@ -179,8 +364,42 @@ func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, b
 			WithLabelValues(string(prev.Status), string(models.StatusMined)).
 			Observe(time.Since(prev.Timestamp).Seconds())
 	}
-	if len(mined) == 0 || b.publisher == nil {
-		return
+
+	minedTxIDs := make([]string, len(mined))
+	for i, st := range mined {
+		minedTxIDs[i] = st.TxID
+	}
+	// MINED line, split by level. Info gets ONE bounded line per block:
+	// TxIDBatch caps the list at maxTxIDsPerLine but txid_count always
+	// carries the TRUE total, so Info-level volume stays flat regardless of
+	// block size (a 40k-tx block previously chunked into ~41 Info lines,
+	// ~2.7 MB per block). Independent of the publisher wiring below, since
+	// this is the lifecycle log, not the downstream fan-out.
+	logger.Info(
+		"transactions mined",
+		append(
+			[]zap.Field{logfields.BlockHash(blockHash), logfields.BlockHeight(blockHeight)},
+			logfields.TxIDBatch(minedTxIDs)...,
+		)...,
+	)
+	// Debug, not Info, for full searchability: every txid appears in the log
+	// stream (chunked, never capped) so a txid or block_hash search in
+	// Coralogix still finds the MINED transition regardless of block size
+	// when debug logging is enabled, while Info-level volume stays flat.
+	logfields.ForEachTxIDChunk(minedTxIDs, func(chunk []string, chunkIdx, totalChunks int) {
+		logger.Debug(
+			"transactions mined",
+			logfields.BlockHash(blockHash),
+			logfields.BlockHeight(blockHeight),
+			logfields.TxIDCount(len(minedTxIDs)),
+			logfields.TxIDs(chunk),
+			zap.Int("chunk_index", chunkIdx),
+			zap.Int("chunk_total", totalChunks),
+		)
+	})
+
+	if len(mined) == 0 || publisher == nil {
+		return len(mined)
 	}
 	// Coalesce the N-per-block MINED fan-out into bulk events. Without this, a
 	// single BUMP build for a 14k-tx block produced 14k individual publish
@@ -194,33 +413,46 @@ func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, b
 	// event was silently dropped for large blocks (the DB status was still
 	// MINED, but SSE/webhook subscribers never saw it). Each txid is ~67 bytes
 	// of JSON, so maxTxIDsPerBulkEvent keeps every event well under the limit.
-	publishTxIDs := make([]string, 0, len(mined))
-	for _, st := range mined {
-		publishTxIDs = append(publishTxIDs, st.TxID)
-	}
+	publishTxIDs := minedTxIDs
 	for start := 0; start < len(publishTxIDs); start += maxTxIDsPerBulkEvent {
 		end := start + maxTxIDsPerBulkEvent
 		if end > len(publishTxIDs) {
 			end = len(publishTxIDs)
 		}
+		// Stamp the event with the STORE's MINED transition timestamp (mined
+		// is parallel to minedTxIDs, and every row of one SetMinedByTxIDs call
+		// shares it), not a fresh time.Now(). The SSE event id is this
+		// timestamp, and SSE catchup (Last-Event-ID reconnect and mid-stream
+		// drop recovery) queries the store strictly-after timestamp_at — a
+		// publish-time stamp sits seconds AFTER timestamp_at for a big block
+		// (the 40k-row UPDATE + chunked logging run in between), so a client
+		// resuming from a live event id would silently skip the whole block's
+		// rows. Keeping the id in the timestamp_at domain makes the resume
+		// watermark exact.
+		ts := mined[start].Timestamp
+		if ts.IsZero() {
+			ts = time.Now()
+		}
 		template := &models.TransactionStatus{
 			Status:      models.StatusMined,
 			BlockHash:   blockHash,
 			BlockHeight: blockHeight,
-			Timestamp:   time.Now(),
+			Timestamp:   ts,
 			TxIDs:       publishTxIDs[start:end],
+			ExtraInfo:   extraInfo,
 		}
-		if pubErr := b.publisher.PublishBulk(ctx, template); pubErr != nil {
+		if pubErr := publisher.PublishBulk(ctx, template); pubErr != nil {
 			logger.Warn(
 				"failed to publish bulk MINED",
-				zap.String("block_hash", blockHash),
+				logfields.BlockHash(blockHash),
 				zap.Int("chunk_start", start),
 				zap.Int("chunk_size", end-start),
-				zap.Int("txid_total", len(publishTxIDs)),
+				logfields.TxIDCount(len(publishTxIDs)),
 				zap.Error(pubErr),
 			)
 		}
 	}
+	return len(mined)
 }
 
 // maxTxIDsPerBulkEvent caps how many txids ride in a single bulk MINED event.
@@ -322,7 +554,7 @@ func (b *Builder) pruneOrphanStumps(ctx context.Context) {
 			if err := b.store.DeleteStumpsByBlockHash(ctx, r.BlockHash); err != nil {
 				b.logger.Warn(
 					"orphan-stump prune: delete failed",
-					zap.String("block_hash", r.BlockHash),
+					logfields.BlockHash(r.BlockHash),
 					zap.Error(err),
 				)
 				continue
@@ -360,9 +592,14 @@ func (b *Builder) Stop() error {
 func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	overallStart := time.Now()
 	metrics.BumpBuilderBlocksProcessedTotal.Inc()
-	// outcome reflects the terminal disposition of this BLOCK_PROCESSED. Set
-	// before each return so the duration histogram lands in the right bucket.
-	outcome := "success"
+	// outcome reflects the terminal disposition of this BLOCK_PROCESSED. Every
+	// return path assigns it before returning so the duration histogram lands
+	// in the right bucket. There is no bare "success" label: a successful
+	// build lands as finalized_complete_no_grace (expected-STUMP set already
+	// complete on arrival, grace window skipped) or grace_waited (built after
+	// the grace-window path). The label set is closed — keep it in sync with
+	// metrics/preregister.go's bumpBuildOutcomes.
+	outcome := "grace_waited"
 	defer func() {
 		metrics.BumpBuilderBuildDuration.WithLabelValues(outcome).Observe(time.Since(overallStart).Seconds())
 	}()
@@ -379,7 +616,7 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 		return fmt.Errorf("empty block hash in block_processed message")
 	}
 
-	logger := b.logger.With(zap.String("block_hash", blockHash))
+	logger := telemetry.LoggerWith(ctx, b.logger.With(logfields.BlockHash(blockHash)))
 
 	// Short-circuit: if a compound BUMP already exists for this block, skip
 	// the datahub fetch + recompute path entirely. See tryShortCircuit for
@@ -389,71 +626,23 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 		return nil
 	}
 
-	// Grace window: merkle-service's stumpGate only waits for the first HTTP attempt
-	// of each STUMP before releasing BLOCK_PROCESSED. STUMPs that got a 5xx on the
-	// first attempt retry asynchronously and may land after BLOCK_PROCESSED.
-	if grace := time.Duration(b.cfg.BumpBuilder.GraceWindowMs) * time.Millisecond; grace > 0 {
-		metrics.BumpBuilderGraceWaitTotal.Inc()
-		logger.Debug("waiting grace window", zap.Duration("duration", grace))
-		select {
-		case <-ctx.Done():
-			outcome = "context_canceled"
-			return ctx.Err()
-		case <-time.After(grace):
-		}
-	}
-
-	// 1. Get all STUMPs for this block
-	stumps, err := b.store.GetStumpsByBlockHash(ctx, blockHash)
+	// Resolve the STUMP set with completeness-first ordering: STUMPs are read
+	// BEFORE any grace-window wait, so a block whose expected-STUMP set is
+	// already complete (or provably empty) finalizes immediately instead of
+	// burning the window. Only an unverifiable set still waits + re-reads.
+	// See resolveStumps for the full contract.
+	stumps, disposition, done, err := b.resolveStumps(ctx, logger, &callback)
 	if err != nil {
-		outcome = "store_failed"
-		return fmt.Errorf("getting STUMPs for block: %w", err)
+		outcome = disposition
+		return err
 	}
-
-	metrics.BumpBuilderStumpCount.Observe(float64(len(stumps)))
-
-	// Completeness gate. merkle-service (PR #162) tells us exactly which subtree
-	// indices produced a STUMP for this block. If any are still missing once the
-	// grace window has elapsed, leave the block un-finalized: do NOT stamp
-	// processed_at, so ListStaleBlockProcessingStatus surfaces it and the
-	// watchdog re-drives it via /reprocess (which re-emits the missing STUMPs and
-	// BLOCK_PROCESSED). Returning nil — not an error — because a Kafka requeue
-	// would just replay against the same gap; only /reprocess can fill it, and
-	// the durable processed_at IS NULL is the recovery signal. An empty/absent
-	// expected set (pre-#162 merkle, or a block with no tracked txs) yields no
-	// missing indices and falls through to the existing behavior below.
-	if missing := missingStumpIndices(callback.ExpectedSubtreeIndices, stumps); len(missing) > 0 {
-		outcome = "incomplete_stumps"
-		metrics.BumpBuilderIncompleteStumpsTotal.Inc()
-		logger.Error(
-			"BLOCK_PROCESSED is missing expected STUMPs — deferring finalization so the watchdog can recover via /reprocess",
-			zap.Ints("missing_subtree_indices", missing),
-			zap.Int("expected_stumps", len(callback.ExpectedSubtreeIndices)),
-			zap.Int("received_stumps", len(stumps)),
-		)
+	if done {
+		outcome = disposition
 		return nil
 	}
-
-	if len(stumps) == 0 {
-		outcome = "no_stumps"
-		metrics.BumpBuilderEmptyStumpBlocksTotal.Inc()
-		// Warn — not Info — because the legitimate case (block contains no
-		// tracked txs) is indistinguishable from the silent-drop case
-		// (STUMP callbacks were dedup'd / DLQ'd / lost upstream). Operators
-		// need to see this rate in logs; a sustained stream while watched
-		// txs are in flight is the signal that merkle-service callbacks
-		// aren't landing.
-		//
-		// Reaching here means the expected set was empty (a non-empty set with
-		// zero received STUMPs would have been caught by the completeness gate
-		// above), so this block has no tracked txs and IS finalized — stamp
-		// processed_at so the watchdog doesn't keep re-driving a complete block.
-		// blockHeight is unknown on this path (no compound built); pass 0, which
-		// the upsert leaves the chaintracks-supplied height intact on conflict.
-		logger.Warn("BLOCK_PROCESSED arrived with zero STUMPs for this block — either no tracked txs in this block, or upstream STUMP callbacks were dropped (check merkle-service callback delivery)")
-		b.markBlockProcessed(ctx, logger, blockHash, 0)
-		return nil
-	}
+	// The build proceeds under its benign disposition; any later failure
+	// return overrides outcome with its failure label.
+	outcome = disposition
 
 	logger.Info("building compound BUMP", zap.Int("stump_count", len(stumps)))
 	logStumpInputs(logger, stumps)
@@ -495,6 +684,7 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	logBlockInputs(logger, subtreeHashes, coinbaseBUMP)
 
 	if len(subtreeHashes) == 0 {
+		outcome = "no_subtrees"
 		logger.Warn("block has no subtrees, cannot construct BUMPs")
 		return nil
 	}
@@ -504,8 +694,9 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	logPerStumpAssembly(logger, stumps, subtreeHashes, coinbaseBUMP)
 
 	// 3. Build compound BUMP (STUMPs are sparse — only for subtrees with tracked txs)
-	compound, txids, err := bump.BuildCompoundBUMP(stumps, subtreeHashes, coinbaseBUMP)
+	compound, txids, err := bump.BuildCompoundBUMP(stumps, subtreeHashes, coinbaseBUMP, headerMerkleRoot)
 	if err != nil {
+		outcome = "build_failed"
 		return fmt.Errorf("building compound BUMP: %w", err)
 	}
 
@@ -519,12 +710,14 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	// fails ComputeRoot, and leave txs non-MINED + STUMPs intact so a retry can
 	// rebuild once the inputs are correct.
 	if err := bump.ValidateCompoundRoot(compound, headerMerkleRoot); err != nil {
+		outcome = "validation_failed"
 		dumpBUMPFailureInputs(logger, stumps, subtreeHashes, coinbaseBUMP, headerMerkleRoot, compound, bumpBytes, txids, err)
 		return fmt.Errorf("compound BUMP root mismatch for block %s: %w", blockHash, err)
 	}
 
 	// 5. Store compound BUMP as binary
 	if err := b.store.InsertBUMP(ctx, blockHash, blockHeight, bumpBytes); err != nil {
+		outcome = "store_failed"
 		return fmt.Errorf("storing BUMP: %w", err)
 	}
 
@@ -541,7 +734,12 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	// and tryShortCircuit re-stamps it on the redelivered BLOCK_PROCESSED.
 	b.markBlockProcessed(ctx, logger, blockHash, blockHeight)
 
-	// 6. Set tracked transactions to MINED.
+	// 6. Set tracked transactions to MINED — unless the anchor guard has
+	// positive evidence the block lost its height to a same-height
+	// competitor (issue #279). The BUMP built above stays stored either
+	// way: it is the store-local re-anchor fuel if the block later wins a
+	// flip-flop, and the source for historical orphaned-anchor proofs.
+	//
 	// blockHeight is threaded through here (and asserted on the returned
 	// statuses below) because downstream SSE/webhook consumers and the
 	// dedup path in BUMP-build rely on the height to anchor each MINED
@@ -554,6 +752,11 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	// previous in-memory pre-filter against TxTracker silently dropped txs
 	// submitted to api-server after bump-builder's per-pod tracker hydration
 	// in microservice mode.
+	if b.anchorDecision(ctx, logger, blockHash, blockHeight) == anchorDeny {
+		outcome = "skipped_inactive_chain"
+		b.handleAnchorDenied(ctx, logger, blockHash, blockHeight, "build")
+		return nil
+	}
 	if len(txids) > 0 {
 		b.markMinedAndPublish(ctx, logger, blockHash, blockHeight, txids)
 	}
@@ -569,6 +772,138 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 		zap.Int("stumps_pruned", len(stumps)),
 	)
 	return nil
+}
+
+// resolveStumps decides which STUMP set handleMessage builds from and whether
+// the grace window has to be waited at all. Extracted from handleMessage to
+// keep its nesting under the lint bar (same motivation as tryShortCircuit).
+//
+// Completeness-first ordering: STUMPs are read BEFORE the grace window.
+// merkle-service (PR #162) tells us exactly which subtree indices produced a
+// STUMP for this block, and the grace window exists only to ride out STUMP
+// callbacks whose first HTTP attempt got a 5xx and are retrying
+// asynchronously (merkle's stumpGate only waits for the first attempt before
+// releasing BLOCK_PROCESSED). So:
+//
+//   - Expected set present and fully satisfied → nothing can still be in
+//     flight that we need; skip the window and build now
+//     (disposition finalized_complete_no_grace).
+//   - Expected set absent AND zero STUMPs stored → merkle ≥ v0.4.5 omits the
+//     field exactly when the block has no tracked txs, so "expect zero, have
+//     zero" is complete; finalize immediately (disposition no_stumps,
+//     done=true).
+//   - Anything else (expected set unsatisfied, or absent with STUMPs present
+//     — pre-#162 merkle, unverifiable) → wait the grace window, re-read, and
+//     re-run the completeness gate (disposition grace_waited on success).
+//
+// The returned disposition is always a valid outcome label for
+// BumpBuilderBuildDuration: on err it is the failure label to stamp; with
+// done=true it is the terminal benign/failure label and handleMessage must
+// return nil; otherwise it is the benign label the successful build lands
+// under. BumpBuilderStumpCount is observed exactly once per message, on the
+// STUMP set that reaches the decision.
+func (b *Builder) resolveStumps(ctx context.Context, logger *zap.Logger, callback *models.CallbackMessage) (stumps []*models.Stump, disposition string, done bool, err error) {
+	blockHash := callback.BlockHash
+	expected := callback.ExpectedSubtreeIndices
+
+	stumps, err = b.store.GetStumpsByBlockHash(ctx, blockHash)
+	if err != nil {
+		return nil, "store_failed", false, fmt.Errorf("getting STUMPs for block: %w", err)
+	}
+
+	switch {
+	case len(expected) > 0 && len(missingStumpIndices(expected, stumps)) == 0:
+		// Complete: every subtree index merkle told us to expect already has
+		// a stored STUMP — there is nothing left to wait for.
+		logger.Info(
+			"expected STUMP set complete — skipping grace window",
+			zap.Int("expected_stumps", len(expected)),
+			zap.Int("received_stumps", len(stumps)),
+		)
+		metrics.BumpBuilderStumpCount.Observe(float64(len(stumps)))
+		return stumps, "finalized_complete_no_grace", false, nil
+
+	case len(expected) == 0 && len(stumps) == 0:
+		// Absent + zero: complete by the absent-means-expect-zero contract —
+		// finalize now instead of burning the grace window first.
+		metrics.BumpBuilderStumpCount.Observe(0)
+		b.finalizeEmptyBlock(ctx, logger, blockHash)
+		return nil, "no_stumps", true, nil
+	}
+
+	// Incomplete (expected set not yet satisfied) or absent-with-STUMPs (no
+	// set to verify against): completeness cannot be established from the
+	// first read, so the grace window is still the only defense against late
+	// STUMP retries.
+	if len(expected) == 0 {
+		logger.Warn(
+			"BLOCK_PROCESSED lacks expected-STUMP set but STUMPs exist — cannot verify completeness; waiting grace window",
+			zap.Int("received_stumps", len(stumps)),
+		)
+	}
+	if grace := time.Duration(b.cfg.BumpBuilder.GraceWindowMs) * time.Millisecond; grace > 0 {
+		metrics.BumpBuilderGraceWaitTotal.Inc()
+		logger.Debug("waiting grace window", zap.Duration("duration", grace))
+		select {
+		case <-ctx.Done():
+			return nil, "context_canceled", false, ctx.Err()
+		case <-time.After(grace):
+		}
+		// Re-read: catching late arrivals is the whole point of the wait.
+		stumps, err = b.store.GetStumpsByBlockHash(ctx, blockHash)
+		if err != nil {
+			return nil, "store_failed", false, fmt.Errorf("getting STUMPs for block: %w", err)
+		}
+	}
+
+	metrics.BumpBuilderStumpCount.Observe(float64(len(stumps)))
+
+	// Completeness gate. If expected STUMPs are still missing once the grace
+	// window has elapsed, leave the block un-finalized: do NOT stamp
+	// processed_at, so ListStaleBlockProcessingStatus surfaces it and the
+	// watchdog re-drives it via /reprocess (which re-emits the missing STUMPs
+	// and BLOCK_PROCESSED). Returning done — not an error — because a Kafka
+	// requeue would just replay against the same gap; only /reprocess can fill
+	// it, and the durable processed_at IS NULL is the recovery signal.
+	if missing := missingStumpIndices(expected, stumps); len(missing) > 0 {
+		metrics.BumpBuilderIncompleteStumpsTotal.Inc()
+		logger.Error(
+			"BLOCK_PROCESSED is missing expected STUMPs — deferring finalization so the watchdog can recover via /reprocess",
+			zap.Ints("missing_subtree_indices", missing),
+			zap.Int("expected_stumps", len(expected)),
+			zap.Int("received_stumps", len(stumps)),
+		)
+		return nil, "deferred_incomplete", true, nil
+	}
+
+	// Zero STUMPs after the wait — only reachable with an absent expected set
+	// (a non-empty set with zero STUMPs is caught by the gate above): the
+	// pre-#162 no-tracked-tx block. Same empty-block finalize.
+	if len(stumps) == 0 {
+		b.finalizeEmptyBlock(ctx, logger, blockHash)
+		return nil, "no_stumps", true, nil
+	}
+
+	return stumps, "grace_waited", false, nil
+}
+
+// finalizeEmptyBlock finalizes a BLOCK_PROCESSED whose block has no stored
+// STUMPs and no unsatisfied expected set — a block with no tracked txs.
+//
+// Warn — not Info — because the legitimate case (block contains no tracked
+// txs) is indistinguishable from the silent-drop case (STUMP callbacks were
+// dedup'd / DLQ'd / lost upstream). Operators need to see this rate in logs;
+// a sustained stream while watched txs are in flight is the signal that
+// merkle-service callbacks aren't landing.
+//
+// The block IS finalized — stamp processed_at so the watchdog doesn't keep
+// re-driving a complete block. blockHeight is unknown on this path (no
+// compound built); pass 0, which the upsert leaves the chaintracks-supplied
+// height intact on conflict.
+func (b *Builder) finalizeEmptyBlock(ctx context.Context, logger *zap.Logger, blockHash string) {
+	metrics.BumpBuilderEmptyStumpBlocksTotal.Inc()
+	logger.Warn("BLOCK_PROCESSED arrived with zero STUMPs for this block — either no tracked txs in this block, or upstream STUMP callbacks were dropped (check merkle-service callback delivery)")
+	b.markBlockProcessed(ctx, logger, blockHash, 0)
 }
 
 // fetchBlockDataFromDatahub is the datahub fallback for block inputs: used when
@@ -718,8 +1053,16 @@ func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, block
 	logger.Info(
 		"BUMP already built — skipping datahub fetch on redelivery",
 		zap.Int("level0_count", len(txids)),
-		zap.Uint64("block_height", existingHeight),
+		logfields.BlockHeight(existingHeight),
 	)
+	// The guard runs on the redelivery path too: a replayed BLOCK_PROCESSED
+	// (DLQ redrive, watchdog /reprocess) for a block that lost its height
+	// must not re-anchor txs from its stored BUMP (issue #279). The denied
+	// block is finalized + orphan-marked exactly like the fresh-build path.
+	if b.anchorDecision(ctx, logger, blockHash, existingHeight) == anchorDeny {
+		b.handleAnchorDenied(ctx, logger, blockHash, existingHeight, "short_circuit")
+		return true
+	}
 	if len(txids) > 0 {
 		b.markMinedAndPublish(ctx, logger, blockHash, existingHeight, txids)
 	}
@@ -759,8 +1102,8 @@ func (b *Builder) markBlockProcessed(ctx context.Context, logger *zap.Logger, bl
 		// never lands), which an aggregator can only group by block hash.
 		logger.Warn(
 			"failed to record block_processed status; block will re-drive via watchdog until the stamp lands",
-			zap.String("block_hash", blockHash),
-			zap.Uint64("block_height", blockHeight),
+			logfields.BlockHash(blockHash),
+			logfields.BlockHeight(blockHeight),
 			zap.Error(err),
 		)
 	}
@@ -922,8 +1265,8 @@ func logCompoundBUMP(logger *zap.Logger, compound *transaction.MerklePath, bumpB
 		zap.Int("levels", len(compound.Path)),
 		zap.Int("bytes", len(bumpBytes)),
 		zap.String("hex", hex.EncodeToString(bumpBytes)),
-		zap.Int("txid_count", len(txids)),
-		zap.Strings("txids", txids),
+		logfields.TxIDCount(len(txids)),
+		logfields.TxIDs(txids),
 	)
 	for level, elems := range compound.Path {
 		logger.Debug(
@@ -986,8 +1329,8 @@ func dumpBUMPFailureInputs(
 		zap.String("compound_hex", hex.EncodeToString(compoundBytes)),
 		zap.Int("compound_levels", len(compound.Path)),
 		zap.Strings("compound_by_level", levelDumps),
-		zap.Int("txid_count", len(txids)),
-		zap.Strings("txids", txids),
+		logfields.TxIDCount(len(txids)),
+		logfields.TxIDs(txids),
 	)
 }
 

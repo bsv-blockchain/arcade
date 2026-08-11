@@ -86,6 +86,12 @@ paths:
       description: |
         Reports liveness of the API server process and the upstream Datahub
         endpoints it depends on. Suitable as a Kubernetes liveness probe.
+
+        `blockHeight` is this instance's own processed chain-tip height — a
+        freshness signal, not a liveness gate. `datahub_urls[].healthy` is
+        reachability-only, so an instance can report healthy while its chain
+        view is stale; clients that compare `blockHeight` against the real
+        network tip can detect a lagging instance and route around it.
       responses:
         "200":
           description: Process is live.
@@ -97,6 +103,7 @@ paths:
                 healthy: true
                 version: v0.8.0
                 status: ok
+                blockHeight: 958779
                 datahub_urls:
                   - url: https://datahub.example.com
                     healthy: true
@@ -200,8 +207,25 @@ paths:
         "400":
           description: |
             Malformed request, decode failure, empty transaction, validation
-            failure, or unsafe callback URL. On validation failure a terminal
-            `REJECTED` row is persisted so subscribers see the outcome.
+            failure, or unsafe callback URL. On a **validator** failure — a
+            verdict about the transaction bytes — a terminal `REJECTED` row is
+            persisted so subscribers see the outcome, carrying the numeric ARC
+            code as `status`.
+
+            The nLockTime/BIP113 finality gate is different: a transaction
+            whose locktime is still ahead of the chain's median-time-past
+            (with a non-final input sequence) gets a `400` with ARC code `476`
+            and a reason stating when it becomes final, but **no verdict is
+            persisted** — non-finality is a condition of this instance's chain
+            view, not a property of the transaction. `GET /tx/{txid}` keeps
+            returning its prior state (`404` for a first submission), so
+            resubmission policies keyed on "no verdict" work unchanged.
+            Resubmit the identical transaction once the locktime expires and
+            it enters the broadcast pipeline normally.
+
+            Validation-failure bodies carry the legacy `error`/`reason`/`txid`
+            fields plus the additive ARC error taxonomy (`status`, `title`,
+            `detail`, `type`) when the failure maps onto it.
           content:
             application/json:
               schema:
@@ -209,6 +233,11 @@ paths:
               example:
                 error: transaction failed validation
                 reason: "script evaluation failed"
+                txid: "<hex>"
+                status: 461
+                title: Malformed transaction
+                detail: Transaction unlocking scripts are invalid
+                type: "https://bitcoin-sv.github.io/arc/#/errors?id=_461"
         "503":
           description: |
             Broker is under backpressure; the transaction was not queued and a
@@ -238,7 +267,9 @@ paths:
 
         Bodies are capped at **256 MiB**. If any transaction in the batch fails
         validation the whole call returns `400` with the offending txid and
-        reason; the failed transaction is recorded as `REJECTED`.
+        reason; a validator failure records the transaction as `REJECTED`,
+        while a non-final (locktime) failure persists nothing — see `POST /tx`
+        for the verdict-vs-condition distinction and the additive ARC fields.
       parameters:
         - name: Content-Type
           in: header
@@ -299,6 +330,32 @@ paths:
       description: |
         Returns the current lifecycle state of a previously submitted
         transaction, including its merkle path once mined.
+
+        `404` means exactly "this instance has no verdict for this txid":
+        either it was never submitted here, or its only submissions were
+        answered with a non-persisting `400` (e.g. the non-final gate).
+        Status rows and mined proofs are retained indefinitely — there is no
+        retention window — so a previously returned verdict never expires
+        into a `404`. A mined transaction whose proof is temporarily
+        unretrievable still returns `200` with `txStatus: MINED` and block
+        fields, with `merklePath` omitted; retry the GET to recover the proof.
+
+        Terminal `REJECTED` rows include the rejection reason in `extraInfo`
+        and, when classifiable, the numeric ARC code in `status`. A reason
+        prefixed `parent rejected` names the rejected ancestor and is
+        retryable: resubmit after the ancestor is accepted (resubmitting a
+        `REJECTED` transaction re-validates and re-broadcasts it).
+
+        With `?callbackToken=…` the response additionally carries a
+        `callbacks` array: the webhook delivery state of the submissions
+        registered under that token (and only that token — a txid can carry
+        subscriptions from multiple clients). `attempts`/`lastAttemptAt`/
+        `lastResult` are stamped on every POST arcade makes, so a receiver
+        whose edge is rejecting callbacks (e.g. a WAF answering 403) can
+        self-diagnose: `lastResult: "status 403"` with a climbing `attempts`
+        means arcade is delivering and the receiver's side is refusing. Note
+        the top-level `retryCount`/`nextRetryAt` fields are the transaction's
+        BROADCAST retry state — webhook retry state lives inside `callbacks`.
       parameters:
         - name: txid
           in: path
@@ -307,6 +364,13 @@ paths:
           schema:
             type: string
             example: "<hex>"
+        - name: callbackToken
+          in: query
+          required: false
+          description: >-
+            The X-CallbackToken supplied at submit time. Reveals the webhook delivery state (`callbacks` array) of this token's submissions for the txid. Same capability model as the SSE stream's callbackToken.
+          schema:
+            type: string
       responses:
         "200":
           description: Current transaction status.
@@ -545,7 +609,18 @@ paths:
             example: "1716205200123456789"
       responses:
         "200":
-          description: An event stream of status updates.
+          description: |
+            An event stream of status updates. Every frame carries
+            txid/txStatus/timestamp; timestamp is RFC 3339 and carries
+            fractional seconds when the event has sub-second precision, so it
+            denotes the same instant as the frame id. MINED (and IMMUTABLE)
+            frames additionally
+            carry blockHash, blockHeight, and merklePath (the transaction's BUMP,
+            hex-encoded) — the same proof GET /tx/{txid} and the webhook callback
+            return, so push-only clients need not poll. Those three fields are
+            omitted from earlier frames. On a Last-Event-ID reconnect, replayed
+            MINED frames include merklePath best-effort (bounded per reconnect);
+            when omitted, recover it via GET /tx/{txid}.
           content:
             text/event-stream:
               schema:
@@ -553,11 +628,11 @@ paths:
               example: |
                 id: 1716205200123456789
                 event: status
-                data: {"txid":"<hex>","txStatus":"SEEN_ON_NETWORK","timestamp":"2026-05-20T12:00:00Z"}
+                data: {"txid":"<hex>","txStatus":"SEEN_ON_NETWORK","timestamp":"2026-05-20T12:00:00.123456789Z"}
 
                 id: 1716205260987654321
                 event: status
-                data: {"txid":"<hex>","txStatus":"MINED","timestamp":"2026-05-20T12:01:00Z"}
+                data: {"txid":"<hex>","txStatus":"MINED","timestamp":"2026-05-20T12:01:00.987654321Z","blockHash":"<hex>","blockHeight":870123,"merklePath":"<BUMP hex>"}
 
                 : keepalive
 
@@ -566,7 +641,7 @@ paths:
       operationId: chaintracksGetNetwork
       tags: [Chaintracks]
       summary: Get the active network
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       responses:
         "200":
           description: The configured network.
@@ -586,7 +661,7 @@ paths:
       operationId: chaintracksGetHeight
       tags: [Chaintracks]
       summary: Get the current chain height
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       responses:
         "200":
           description: Current best-chain height.
@@ -605,7 +680,7 @@ paths:
       operationId: chaintracksGetTip
       tags: [Chaintracks]
       summary: Get the current chain tip header (JSON)
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       responses:
         "200":
           description: The chain tip block header. The `X-Block-Height` response header carries the tip height.
@@ -629,7 +704,7 @@ paths:
       operationId: chaintracksGetTipBinary
       tags: [Chaintracks]
       summary: Get the current chain tip header (binary)
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       responses:
         "200":
           description: The serialized 80-byte block header.
@@ -651,7 +726,7 @@ paths:
       tags: [Chaintracks]
       summary: Get a run of serialized headers (binary)
       description: Returns `count` consecutive serialized headers starting at `height`, concatenated as raw bytes.
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       parameters:
         - name: height
           in: query
@@ -689,7 +764,7 @@ paths:
         Returns the header at the given height. Append `.bin` to the height
         (e.g. `/header/height/870123.bin`) to receive the serialized binary
         header instead of JSON.
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       parameters:
         - name: height
           in: path
@@ -721,7 +796,7 @@ paths:
       description: |
         Returns the header for the given block hash. Append `.bin` to the hash
         to receive the serialized binary header instead of JSON.
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       parameters:
         - name: hash
           in: path
@@ -753,7 +828,7 @@ paths:
         Server-Sent Events stream that emits the current tip immediately on
         connect and then pushes each new tip as blocks arrive. A `: keepalive`
         comment is sent every 15 seconds.
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       responses:
         "200":
           description: An event stream of tip headers.
@@ -767,7 +842,7 @@ paths:
       operationId: chaintracksStreamReorg
       tags: [Chaintracks]
       summary: Stream chain-reorg events (SSE)
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       responses:
         "200":
           description: An event stream of reorg events.
@@ -786,7 +861,7 @@ paths:
         `{ status, value }` envelope (or `{ status, code, description }` on
         error). The `/chaintracks/v1` prefix also serves the full JSON/binary
         surface available under `/chaintracks/v2`.
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       responses:
         "200":
           description: Wrapped network value.
@@ -800,7 +875,7 @@ paths:
       operationId: chaintracksLegacyGetPresentHeight
       tags: [Chaintracks]
       summary: "Legacy: get the current height"
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       responses:
         "200":
           description: Wrapped height value.
@@ -814,7 +889,7 @@ paths:
       operationId: chaintracksLegacyFindChainTipHashHex
       tags: [Chaintracks]
       summary: "Legacy: get the chain tip hash (hex)"
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       responses:
         "200":
           description: Wrapped tip-hash value.
@@ -834,7 +909,7 @@ paths:
       operationId: chaintracksLegacyFindChainTipHeaderHex
       tags: [Chaintracks]
       summary: "Legacy: get the chain tip header"
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       responses:
         "200":
           description: Wrapped tip-header value.
@@ -854,7 +929,7 @@ paths:
       operationId: chaintracksLegacyFindHeaderHexForHeight
       tags: [Chaintracks]
       summary: "Legacy: get a header by height"
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       parameters:
         - name: height
           in: query
@@ -887,7 +962,7 @@ paths:
       operationId: chaintracksLegacyFindHeaderHexForBlockHash
       tags: [Chaintracks]
       summary: "Legacy: get a header by block hash"
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       parameters:
         - name: hash
           in: query
@@ -920,7 +995,7 @@ paths:
       tags: [Chaintracks]
       summary: "Legacy: get a run of headers (hex)"
       description: Returns `count` consecutive headers starting at `height`, concatenated and hex-encoded inside the `value` field.
-      servers: [{ url: "http://localhost:8083", description: chaintracks service (local default) }]
+      servers: [{url: "http://localhost:8083", description: chaintracks service (local default)}]
       parameters:
         - name: height
           in: query
@@ -984,7 +1059,16 @@ components:
       description: |
         Webhook URL Arcade should POST status events to as this transaction
         progresses. Must be a public HTTPS endpoint; private/loopback hosts are
-        rejected unless the deployment is configured to allow them.
+        rejected unless the deployment is configured to allow them. The POST body
+        is a TransactionStatus; MINED/IMMUTABLE callbacks include blockHash,
+        blockHeight, and merklePath (the tx's BUMP), so the proof arrives on the
+        callback without a follow-up GET.
+
+        Every callback POST carries `User-Agent: arcade-webhook/<version>` —
+        allowlist the `arcade-webhook/` prefix at your edge so bot/WAF rules
+        for generic HTTP clients don't silently reject deliveries. Delivery
+        health per submission (attempts, last result) is inspectable via
+        `GET /tx/{txid}?callbackToken=…`.
       schema:
         type: string
         format: uri
@@ -1035,6 +1119,32 @@ components:
         - MINED
         - IMMUTABLE
 
+    CallbackDelivery:
+      type: object
+      description: >-
+        Webhook delivery state of one submission, for delivery self-diagnosis. attempts/lastAttemptAt/lastResult are lifetime bookkeeping stamped on every POST arcade makes (never reset); nextRetryAt/lastDeliveredStatus reflect the current transition's retry scheduling.
+      properties:
+        callbackUrl:
+          type: string
+        lastDeliveredStatus:
+          type: string
+          description: Last status transition claimed for delivery to this URL.
+        attempts:
+          type: integer
+          description: Total POSTs ever attempted for this submission.
+        lastAttemptAt:
+          type: string
+          format: date-time
+        lastResult:
+          type: string
+          description: >-
+            "delivered" on success, otherwise the last failure — an HTTP outcome like "status 403" (the receiver or its edge answered that code) or a transport error.
+          example: status 403
+        nextRetryAt:
+          type: string
+          format: date-time
+          description: When the webhook reaper will retry a failed delivery; absent when not in retry state.
+
     TransactionStatus:
       type: object
       properties:
@@ -1045,7 +1155,8 @@ components:
           $ref: "#/components/schemas/Status"
         status:
           type: integer
-          description: Numeric status code (omitted when zero).
+          description: >-
+            Numeric ARC error code (460-476 taxonomy) recorded with a REJECTED verdict when the failure is classifiable — e.g. 466 conflicting tx, 476 not final. Omitted when zero/unclassified.
         timestamp:
           type: string
           format: date-time
@@ -1062,10 +1173,17 @@ components:
         merklePath:
           type: string
           nullable: true
-          description: BUMP merkle path, hex-encoded. Null/absent until mined.
+          description: >-
+            BUMP merkle path, hex-encoded. Null/absent until mined. On and after MINED it is returned by GET /tx/{txid}, pushed on the webhook callback body, and included in the SSE MINED frame (best-effort on catchup replay).
         extraInfo:
           type: string
           description: Free-form detail (e.g. rejection reason).
+        callbacks:
+          type: array
+          description: >-
+            Webhook delivery state of the requester's submissions. Present only when the request carried a matching ?callbackToken=… — scoped to that token's submissions.
+          items:
+            $ref: "#/components/schemas/CallbackDelivery"
         competingTxs:
           type: array
           items:
@@ -1081,10 +1199,50 @@ components:
         merkleRegisteredAt:
           type: string
           format: date-time
+        orphanedProofs:
+          type: array
+          description: >-
+            Historical MINED anchors a chain reorganization superseded, newest
+            last (capped at 5). Present only on transactions that were once
+            anchored to a block that later lost its height to a competitor —
+            e.g. after a same-height reorg the tx re-anchors to the winning
+            block (blockHash/merklePath above) while the losing block's anchor
+            is preserved here, with its proof still resolvable against the
+            orphaned header.
+          items:
+            $ref: "#/components/schemas/OrphanedProof"
       required:
         - txid
         - txStatus
         - timestamp
+
+    OrphanedProof:
+      type: object
+      description: >-
+        One historical anchor a reorg superseded: the orphaned block the
+        transaction was MINED against, when the anchor was replaced, and the
+        transaction's BUMP against that block (best-effort — absent if the
+        orphaned block's compound BUMP is no longer retained).
+      properties:
+        blockHash:
+          type: string
+          description: Hash of the orphaned block.
+        blockHeight:
+          type: integer
+          format: int64
+        orphanedAt:
+          type: string
+          format: date-time
+          description: When the anchor was superseded (re-anchor or revert).
+        merklePath:
+          type: string
+          description: >-
+            BUMP merkle path against the ORPHANED block, hex-encoded. Computes
+            to the orphaned header's merkle root, not the active chain's.
+      required:
+        - blockHash
+        - blockHeight
+        - orphanedAt
 
     SubmitTxJSON:
       type: object
@@ -1267,6 +1425,12 @@ components:
         status:
           type: string
           example: ok
+        blockHeight:
+          type: integer
+          format: int64
+          description: >-
+            This instance's processed active chain-tip height. A freshness signal (compare against the network tip to detect a stale chain view); omitted when the height has never been readable.
+          example: 958779
         datahub_urls:
           type: array
           items:
@@ -1302,7 +1466,21 @@ components:
           description: Validation failure detail (present when a transaction fails validation).
         txid:
           type: string
-          description: The offending txid (present for batch validation failures).
+          description: The offending txid (present when a specific transaction failed).
+        status:
+          type: integer
+          description: >-
+            Numeric ARC error code (460-476 taxonomy) when the failure maps onto it — e.g. 461 malformed unlocking scripts, 465 fee too low, 476 not final (retryable; resubmit after the locktime expires). Absent for failures with no confident classification.
+          example: 476
+        title:
+          type: string
+          description: ARC error title for the status code.
+        detail:
+          type: string
+          description: ARC error detail for the status code.
+        type:
+          type: string
+          description: ARC error documentation URL for the status code.
       required:
         - error
 

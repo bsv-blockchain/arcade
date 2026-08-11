@@ -51,7 +51,7 @@ func TestBuildCompoundBUMP_Issue167_SingleSubtreeNonPow2(t *testing.T) {
 		{BlockHash: "00000000000000000eb6ea115a5cb140ffeae7b673b4c5b6f3fac62e0adae3c5", SubtreeIndex: 0, StumpData: stumpData},
 	}
 
-	compound, txids, err := BuildCompoundBUMP(stumps, subtreeHashes, coinbaseBUMP)
+	compound, txids, err := BuildCompoundBUMP(stumps, subtreeHashes, coinbaseBUMP, nil)
 	if err != nil {
 		t.Fatalf("BuildCompoundBUMP returned error: %v", err)
 	}

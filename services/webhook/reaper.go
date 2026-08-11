@@ -15,7 +15,7 @@ import (
 const webhookReaperLeaseName = "webhook-reaper"
 
 // webhookReaperBatch caps how many submissions a single tick re-fires. Same
-// shape as propagation's reaperRebroadcastBatch — bounded so a backlog can't
+// shape as propagation's rebroadcast batch cap — bounded so a backlog can't
 // pin the reaper into a multi-minute call, and so a too-broad scan doesn't
 // hold the worker pool against a sudden burst of new deliveries.
 const webhookReaperBatch = 200
@@ -112,6 +112,21 @@ func (s *Service) reapOnce(ctx context.Context) {
 			TxID:      sub.TxID,
 			Status:    sub.LastDeliveredStatus,
 			Timestamp: time.Now(),
+		}
+		// Redeliver the exact transition we failed on: Status stays
+		// LastDeliveredStatus so deliver()'s CAS (expected=LastDeliveredStatus →
+		// next=status.Status) is a no-op advance that clears retry state. For a
+		// mined/immutable redelivery, graft the block context + merkle proof
+		// from the stored row (GetStatus enriches merklePath) so retried
+		// callbacks match the shape of a first-attempt delivery. The lean status
+		// has no BlockHash, so EnrichMerklePath alone would no-op here — GetStatus
+		// supplies both. Best-effort: on any error, redeliver without the proof.
+		if status.Status == models.StatusMined || status.Status == models.StatusImmutable {
+			if full, err := s.store.GetStatus(ctx, sub.TxID); err == nil && full != nil {
+				status.BlockHash = full.BlockHash
+				status.BlockHeight = full.BlockHeight
+				status.MerklePath = full.MerklePath
+			}
 		}
 		s.deliver(ctx, sub, status)
 	}

@@ -1,0 +1,30 @@
+# Local validation collector for the arcade OTEL telemetry pipeline
+# (docs/plans/otel-integration.md). Accepts OTLP over both gRPC and
+# HTTP/protobuf and dumps every trace/metric it receives to stdout via the
+# `debug` exporter, so `docker compose logs otel-collector` is enough to
+# confirm arcade is actually shipping data end to end.
+#
+# Point arcade at this collector with either:
+#   ARCADE_TELEMETRY_ENABLED=true ARCADE_TELEMETRY_ENDPOINT=localhost:4317
+# or the standard OTEL env vars:
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+exporters:
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [debug]
+    metrics:
+      receivers: [otlp]
+      exporters: [debug]

@@ -182,6 +182,18 @@ func announceMultiaddr(announceHost string, listenPort int) string {
 // P2P_BOOTSTRAP_PEERS env var.
 func (h *LibP2PHost) BootstrapMultiaddr() string { return h.bootstrapMA }
 
+// LoopbackMultiaddr is the /ip4/127.0.0.1/.../p2p/<id> form for peers
+// running ON THE HOST (arcade's embedded chaintracks in the e2e tests).
+// The announce address embedded in BootstrapMultiaddr points at the
+// container-side gateway (host.docker.internal / the podman bridge IP),
+// which is dialable from containers but NOT from the host itself on
+// rootless podman — the bridge lives inside the rootless network
+// namespace. The msgbus listener binds 0.0.0.0, so loopback always
+// reaches it from the host.
+func (h *LibP2PHost) LoopbackMultiaddr() string {
+	return fmt.Sprintf("/ip4/127.0.0.1/tcp/%d/p2p/%s", h.listenPort, h.peerID)
+}
+
 // PeerID returns the libp2p peer ID this host advertises.
 func (h *LibP2PHost) PeerID() string { return h.peerID }
 

@@ -140,7 +140,7 @@ func (m *mockStore) ListBlockProcessingStatus(_ context.Context, beforeHeight ui
 	return out, nil
 }
 
-func (m *mockStore) EnsureIndexes() error { return nil }
+func (m *mockStore) EnsureIndexes(context.Context) error { return nil }
 
 func (m *mockStore) InsertStump(_ context.Context, stump *models.Stump) error {
 	m.mu.Lock()
@@ -414,7 +414,7 @@ func expectedCompoundRoot(t *testing.T, stumps []*models.Stump, subtreeHashes []
 	hashesCopy := make([]chainhash.Hash, len(subtreeHashes))
 	copy(hashesCopy, subtreeHashes)
 
-	compound, _, err := bump.BuildCompoundBUMP(stumpsCopy, hashesCopy, coinbaseBUMP)
+	compound, _, err := bump.BuildCompoundBUMP(stumpsCopy, hashesCopy, coinbaseBUMP, nil)
 	if err != nil {
 		t.Fatalf("BuildCompoundBUMP failed: %v", err)
 	}
@@ -591,7 +591,7 @@ func TestBuilder_HandleMessage_ShortCircuit_BUMPAlreadyExists(t *testing.T) {
 	subtreeHash := mustHash(t, testTxidHex)
 	compound, _, err := bump.BuildCompoundBUMP(
 		[]*models.Stump{{BlockHash: blockHash, SubtreeIndex: 0, StumpData: stumpData}},
-		[]chainhash.Hash{subtreeHash}, nil,
+		[]chainhash.Hash{subtreeHash}, nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("BuildCompoundBUMP: %v", err)
@@ -1020,29 +1020,35 @@ func TestBuilder_HandleMessage_InvalidJSON_ReturnsError(t *testing.T) {
 	}
 }
 
-// TestBuilder_LateSTUMP_ArrivesDuringGraceWindow simulates a late-retry STUMP that
-// lands after BLOCK_PROCESSED but within the grace window. The builder should wait
-// the grace window, then find the STUMP and build the BUMP successfully.
-func TestBuilder_LateSTUMP_ArrivesDuringGraceWindow(t *testing.T) {
+// TestBuilder_LateSTUMP_AbsentExpectedSet_FinalizesWithoutWaiting pins the
+// absent-means-expect-zero semantics of completeness-first grace handling: a
+// BLOCK_PROCESSED with NO expectedSubtreeIndices field and zero stored STUMPs
+// finalizes immediately as an empty block — it does NOT wait the grace window
+// for a STUMP that might land later. merkle ≥ v0.4.5 always sends the
+// expected set when the block has tracked txs, so a late STUMP is announced
+// by an (initially unsatisfied) expected set and rides the grace window via
+// that path — see TestBuilder_HandleMessage_IncompleteThenCompleteWithinGrace_Builds,
+// which took over the mid-grace-arrival coverage this test used to provide
+// under the wait-first ordering.
+func TestBuilder_LateSTUMP_AbsentExpectedSet_FinalizesWithoutWaiting(t *testing.T) {
 	ms := newMockStore()
 	blockHash := testBlockHash
 	txidHex := testTxidHex
 
-	// Compute what the late-arriving STUMP will produce so the datahub header
-	// merkle root set up ahead of time matches the compound the builder builds
-	// after the grace window.
 	lateStump := makeMinimalSTUMP(txidHex)
-	subtreeHash := mustHash(t, txidHex)
-	root := expectedCompoundRoot(t,
-		[]*models.Stump{{BlockHash: blockHash, SubtreeIndex: 0, StumpData: lateStump}},
-		[]chainhash.Hash{subtreeHash}, nil)
-	datahub := newDatahubServer(root, []chainhash.Hash{subtreeHash})
-	defer datahub.Close()
 
-	b := newTestBuilder(ms, datahub.URL)
-	b.cfg.BumpBuilder.GraceWindowMs = 100 // short grace for the test
+	// No datahub, teranode nil: the empty-block path must finalize before any
+	// build work; reaching the fetch path would crash the test.
+	b := &Builder{
+		cfg:    &config.Config{},
+		logger: zap.NewNop().Named("bump-builder"),
+		store:  ms,
+	}
+	b.cfg.BumpBuilder.GraceWindowMs = 100
 
-	// Insert STUMP mid-grace-window from another goroutine
+	// A STUMP shows up where the old wait-first ordering would still have been
+	// inside the grace window. Under absent-means-expect-zero it arrives after
+	// the block already finalized as empty.
 	go func() {
 		time.Sleep(30 * time.Millisecond)
 		_ = ms.InsertStump(context.Background(), &models.Stump{
@@ -1052,14 +1058,21 @@ func TestBuilder_LateSTUMP_ArrivesDuringGraceWindow(t *testing.T) {
 		})
 	}()
 
+	start := time.Now()
 	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash)); err != nil {
 		t.Fatalf("expected success, got: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed >= 100*time.Millisecond {
+		t.Errorf("absent set + zero STUMPs must not wait the grace window; took %v", elapsed)
 	}
 
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
-	if _, ok := ms.bumps[blockHash]; !ok {
-		t.Error("expected BUMP to be stored after late STUMP landed in grace window")
+	if len(ms.bumps) != 0 {
+		t.Errorf("no BUMP should be built on the empty-block finalize path, got %d", len(ms.bumps))
+	}
+	if len(ms.processedCalls) != 1 || ms.processedCalls[0].blockHash != blockHash {
+		t.Errorf("expected MarkBlockProcessed(%s) on the empty-block finalize path, got %+v", blockHash, ms.processedCalls)
 	}
 }
 
@@ -1589,17 +1602,80 @@ func (h *heightDroppingMockStore) SetMinedByTxIDs(ctx context.Context, blockHash
 
 // stubChaintracks is a minimal ChainHeaderReader for tests. nil header
 // returns simulate "chaintracks doesn't know this block yet" (soft fail).
-// Non-nil headers simulate the canonical chain.
+// Non-nil headers simulate the canonical chain. setHeader allows tests to
+// inject a header mid-run (the ingestion race lookupHeaderWithWait rides
+// out), so reads and writes are mutex-guarded.
 type stubChaintracks struct {
-	headers map[string]*chaintrackslib.BlockHeader
-	err     error
+	mu       sync.Mutex
+	headers  map[string]*chaintrackslib.BlockHeader
+	byHeight map[uint32]*chaintrackslib.BlockHeader
+	err      error
+	lookups  int
+	// unready simulates an embedded chaintracks still resyncing from genesis:
+	// every GetHeaderByHeight returns (nil, nil) regardless of what is set,
+	// exactly as the real one does before it reaches the tip. Toggle with
+	// setUnready/setReady. Default false ⇒ existing tests are unaffected.
+	unready bool
 }
 
 func (s *stubChaintracks) GetHeaderByHash(_ context.Context, h *chainhash.Hash) (*chaintrackslib.BlockHeader, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lookups++
 	if s.err != nil {
 		return nil, s.err
 	}
 	return s.headers[h.String()], nil
+}
+
+// byHeight backs GetHeaderByHeight for anchor-guard tests. Unset heights
+// return (nil, nil) — "cannot judge", which the guard treats as allow.
+func (s *stubChaintracks) GetHeaderByHeight(_ context.Context, height uint32) (*chaintrackslib.BlockHeader, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.err != nil {
+		return nil, s.err
+	}
+	if s.unready {
+		return nil, nil //nolint:nilnil // (nil,nil) is the ChainHeaderReader "cannot judge this height" contract
+	}
+	return s.byHeight[height], nil
+}
+
+func (s *stubChaintracks) setUnready() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.unready = true
+}
+
+func (s *stubChaintracks) setReady() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.unready = false
+}
+
+func (s *stubChaintracks) setHeightHeader(height uint32, header *chaintrackslib.BlockHeader) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.byHeight == nil {
+		s.byHeight = make(map[uint32]*chaintrackslib.BlockHeader)
+	}
+	s.byHeight[height] = header
+}
+
+func (s *stubChaintracks) setHeader(hash string, header *chaintrackslib.BlockHeader) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.headers == nil {
+		s.headers = map[string]*chaintrackslib.BlockHeader{}
+	}
+	s.headers[hash] = header
+}
+
+func (s *stubChaintracks) lookupCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lookups
 }
 
 // TestBuilder_HandleMessage_PrunedPeerFallthrough simulates the production
@@ -1757,5 +1833,122 @@ func TestBuilder_HandleMessage_ChaintracksUnknownHeader_SoftFails(t *testing.T) 
 	defer ms.mu.Unlock()
 	if _, ok := ms.bumps[blockHash]; !ok {
 		t.Error("BUMP should still be stored when chaintracks doesn't know the header (soft-fail)")
+	}
+}
+
+// TestBuilder_HandleMessage_ChaintracksLateHeader_ValidatesAfterWait covers
+// the ingestion race the header wait exists for: chaintracks doesn't know a
+// freshly-mined block at first lookup, but learns it during the
+// bump_builder.header_wait_ms budget. The validator must pick the header up
+// on a retry and run a REAL canonical-root cross-check (here: matching →
+// build succeeds) instead of silently skipping validation.
+func TestBuilder_HandleMessage_ChaintracksLateHeader_ValidatesAfterWait(t *testing.T) {
+	ms := newMockStore()
+	blockHash := testBlockHash
+	txidHex := testTxidHex
+
+	stumpData := makeMinimalSTUMP(txidHex)
+	ms.addStump(blockHash, 0, stumpData)
+
+	subtreeHash := mustHash(t, txidHex)
+	root := expectedCompoundRoot(t,
+		[]*models.Stump{{BlockHash: blockHash, SubtreeIndex: 0, StumpData: stumpData}},
+		[]chainhash.Hash{subtreeHash}, nil)
+
+	datahub := newDatahubServer(root, []chainhash.Hash{subtreeHash})
+	defer datahub.Close()
+
+	// Header is absent at start; arrives (matching the datahub root) while
+	// the validator waits.
+	var rootHash chainhash.Hash
+	copy(rootHash[:], root)
+	stub := &stubChaintracks{}
+	hashObj, _ := chainhash.NewHashFromHex(blockHash)
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		stub.setHeader(hashObj.String(), &chaintrackslib.BlockHeader{Header: &block.Header{MerkleRoot: rootHash}})
+	}()
+
+	cfg := &config.Config{
+		DatahubURLs: []string{datahub.URL},
+		BumpBuilder: config.BumpBuilderConfig{HeaderWaitMs: 3000},
+	}
+	tc := teranode.NewClient([]string{datahub.URL}, "", teranode.HealthConfig{})
+	b := &Builder{
+		cfg:         cfg,
+		logger:      zap.NewNop().Named("bump-builder"),
+		store:       ms,
+		teranode:    tc,
+		chainHeader: stub,
+	}
+
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash)); err != nil {
+		t.Fatalf("expected late header to validate cleanly, got: %v", err)
+	}
+	if got := stub.lookupCount(); got < 2 {
+		t.Errorf("expected the validator to retry the header lookup, lookups=%d want >= 2", got)
+	}
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if _, ok := ms.bumps[blockHash]; !ok {
+		t.Error("expected BUMP to be stored after late-header validation")
+	}
+}
+
+// TestBuilder_HandleMessage_ChaintracksLateHeader_MismatchRejects proves the
+// wait leads to real enforcement, not just acceptance: the header that
+// arrives during the wait DISAGREES with the datahub's root, so the fetch
+// must be rejected exactly as if chaintracks had known the header up front.
+func TestBuilder_HandleMessage_ChaintracksLateHeader_MismatchRejects(t *testing.T) {
+	ms := newMockStore()
+	blockHash := testBlockHash
+	txidHex := testTxidHex
+
+	stumpData := makeMinimalSTUMP(txidHex)
+	ms.addStump(blockHash, 0, stumpData)
+
+	subtreeHash := mustHash(t, txidHex)
+	datahubRoot := expectedCompoundRoot(t,
+		[]*models.Stump{{BlockHash: blockHash, SubtreeIndex: 0, StumpData: stumpData}},
+		[]chainhash.Hash{subtreeHash}, nil)
+
+	datahub := newDatahubServer(datahubRoot, []chainhash.Hash{subtreeHash})
+	defer datahub.Close()
+
+	canonicalRoot := chainhash.Hash{}
+	for i := range canonicalRoot {
+		canonicalRoot[i] = 0xFF
+	}
+	stub := &stubChaintracks{}
+	hashObj, _ := chainhash.NewHashFromHex(blockHash)
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		stub.setHeader(hashObj.String(), &chaintrackslib.BlockHeader{Header: &block.Header{MerkleRoot: canonicalRoot}})
+	}()
+
+	cfg := &config.Config{
+		DatahubURLs: []string{datahub.URL},
+		BumpBuilder: config.BumpBuilderConfig{HeaderWaitMs: 3000},
+	}
+	tc := teranode.NewClient([]string{datahub.URL}, "", teranode.HealthConfig{})
+	b := &Builder{
+		cfg:         cfg,
+		logger:      zap.NewNop().Named("bump-builder"),
+		store:       ms,
+		teranode:    tc,
+		chainHeader: stub,
+	}
+
+	err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash))
+	if err == nil {
+		t.Fatal("expected error when the late canonical header disagrees with the datahub root")
+	}
+	if !strings.Contains(err.Error(), "merkle_root mismatch") && !strings.Contains(err.Error(), "validator rejected") {
+		t.Errorf("expected merkle_root mismatch error, got: %v", err)
+	}
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if _, ok := ms.bumps[blockHash]; ok {
+		t.Error("BUMP must NOT be stored when the late header disagrees with the datahub")
 	}
 }

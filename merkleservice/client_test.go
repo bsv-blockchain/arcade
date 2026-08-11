@@ -115,7 +115,46 @@ func TestRegister_Error(t *testing.T) {
 	client := NewClient(server.URL, "", 0)
 	err := client.Register(context.Background(), "abc123", "http://callback", "")
 	if err == nil {
-		t.Error("expected error for 500 response")
+		t.Fatal("expected error for 500 response")
+	}
+	var fail *RegisterError
+	if !errors.As(err, &fail) {
+		t.Fatalf("expected *RegisterError, got %T: %v", err, err)
+	}
+	if fail.StatusCode != http.StatusInternalServerError {
+		t.Errorf("StatusCode=%d want 500", fail.StatusCode)
+	}
+}
+
+// TestRegister_AuthReturnsTypedFailure verifies a 401 from /watch surfaces as a
+// *RegisterError carrying the status code so the propagator can distinguish an
+// auth misconfiguration (merkle_service.auth_token) from a transient blip
+// (issue #269).
+func TestRegister_AuthReturnsTypedFailure(t *testing.T) {
+	for _, code := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(code)
+			_, _ = w.Write([]byte("unauthorized"))
+		}))
+
+		client := NewClient(server.URL, "", 0)
+		err := client.Register(context.Background(), "abc123", "http://callback", "")
+		if err == nil {
+			server.Close()
+			t.Fatalf("code %d: expected error, got nil", code)
+		}
+		var fail *RegisterError
+		if !errors.As(err, &fail) {
+			server.Close()
+			t.Fatalf("code %d: expected *RegisterError, got %T: %v", code, err, err)
+		}
+		if fail.StatusCode != code {
+			t.Errorf("StatusCode=%d want %d", fail.StatusCode, code)
+		}
+		if !strings.Contains(fail.Body, "unauthorized") {
+			t.Errorf("Body=%q missing server message", fail.Body)
+		}
+		server.Close()
 	}
 }
 

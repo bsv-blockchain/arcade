@@ -21,14 +21,24 @@ type Block struct {
 }
 
 // BlockProcessingStatusValue tracks whether a block tracked by chaintracks
-// is still on the active chain or has been orphaned by a reorg. Stored as a
-// short string for backend portability (Postgres TEXT, Aerospike string bin,
-// Pebble byte slice).
+// is still on the active chain, has been orphaned by a reorg, or has been
+// parked by the watchdog (reprocess caps exhausted — needs explicit triage,
+// no longer re-driven). Stored as a short string for backend portability
+// (Postgres TEXT, Aerospike string bin, Pebble byte slice).
 type BlockProcessingStatusValue string
 
 const (
 	BlockStatusActive   BlockProcessingStatusValue = "active"
 	BlockStatusOrphaned BlockProcessingStatusValue = "orphaned"
+	// BlockStatusParked marks an on-chain block the watchdog gave up
+	// re-driving (MaxReprocessAttempts / MaxStaleAge crossed). Unlike
+	// orphaned it IS on the active chain — its compound BUMP is genuinely
+	// missing. Parked rows leave the watchdog's stale scan (status='active'
+	// predicate) so they surface as an explicit triage backlog instead of
+	// silent processed_at=NULL churn; a fresh header arrival for the same
+	// hash resets status='active' (UpsertBlockHeaderSeen conflict path) and
+	// revives recovery.
+	BlockStatusParked BlockProcessingStatusValue = "parked"
 )
 
 // BlockProcessingStatus records the milestones we've reached for one block:
@@ -45,4 +55,13 @@ type BlockProcessingStatus struct {
 	BUMPBuiltAt  *time.Time                 `json:"bumpBuiltAt,omitempty"`
 	Status       BlockProcessingStatusValue `json:"status"`
 	OrphanedAt   *time.Time                 `json:"orphanedAt,omitempty"`
+	// ReconciledAt is stamped by the anchor reconciler once every
+	// transaction anchored to this orphaned block has been re-anchored to
+	// the canonical block or reverted (issue #279). NULL on active/parked
+	// rows and on orphaned rows still awaiting reconciliation — the
+	// (status='orphaned' AND reconciled_at IS NULL) pair is the
+	// reconciler's durable work queue. Reset to NULL when the block is
+	// resurrected by a later reorg (UpsertBlockHeaderSeen conflict path)
+	// so a re-orphaning reconciles again.
+	ReconciledAt *time.Time `json:"reconciledAt,omitempty"`
 }

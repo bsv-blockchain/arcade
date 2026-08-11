@@ -13,26 +13,20 @@ package postgres
 
 import (
 	"context"
-	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
-	"github.com/bsv-blockchain/go-sdk/chainhash"
-	"github.com/bsv-blockchain/go-sdk/transaction"
-	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/arcade/store/bumpcache"
 )
-
-//go:embed schema.sql
-var schemaSQL string
 
 var (
 	_ store.Store  = (*Store)(nil)
@@ -40,19 +34,15 @@ var (
 )
 
 // Store is the Postgres-backed implementation of the store interfaces.
-// bumpCacheSize bounds how many parsed compound BUMPs the store keeps
-// resident for merkle-path enrichment. enrichMerklePath runs on every
-// GetStatus of a mined tx and would otherwise re-fetch and re-parse the
-// whole block BUMP on each call — the dominant heap consumer under
-// sustained status-lookup load. Status lookups cluster on recently-mined
-// blocks, so a small LRU gives a
-// high hit rate while keeping the resident set bounded.
-const bumpCacheSize = 8
-
 type Store struct {
-	pool      *pgxpool.Pool
-	stopEmb   func() error
-	bumpCache *lru.Cache[string, *transaction.MerklePath]
+	pool    *pgxpool.Pool
+	stopEmb func() error
+	// bumpCache holds parsed+indexed compound BUMPs for merkle-path
+	// enrichment — sizing, budget, and singleflight live in bumpcache.
+	bumpCache *bumpcache.Cache
+	// schemaApplyTimeout bounds EnsureIndexes' slow path; <=0 means
+	// defaultSchemaApplyTimeout. See schema.go.
+	schemaApplyTimeout time.Duration
 }
 
 // New connects to Postgres (optionally starting the embedded-postgres process
@@ -89,28 +79,12 @@ func New(ctx context.Context, cfg config.Postgres) (*Store, error) {
 		return nil, fmt.Errorf("connect postgres: %w", err)
 	}
 
-	bumpCache, err := lru.New[string, *transaction.MerklePath](bumpCacheSize)
-	if err != nil {
-		pool.Close()
-		if stopEmbedded != nil {
-			_ = stopEmbedded()
-		}
-		return nil, fmt.Errorf("init bump cache: %w", err)
-	}
-
-	return &Store{pool: pool, stopEmb: stopEmbedded, bumpCache: bumpCache}, nil
-}
-
-// EnsureIndexes applies the schema. Safe to call repeatedly — every CREATE
-// statement in schema.sql is IF NOT EXISTS.
-func (s *Store) EnsureIndexes() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	_, err := s.pool.Exec(ctx, schemaSQL)
-	if err != nil {
-		return fmt.Errorf("apply schema: %w", err)
-	}
-	return nil
+	return &Store{
+		pool:               pool,
+		stopEmb:            stopEmbedded,
+		bumpCache:          bumpcache.New(),
+		schemaApplyTimeout: time.Duration(cfg.SchemaApplyTimeoutMs) * time.Millisecond,
+	}, nil
 }
 
 // Close drains the pool and stops the embedded Postgres process (if any).
@@ -384,7 +358,7 @@ func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.Tra
 		return nil
 	}
 
-	const colsPerRow = 7 // txid, status, block_hash, block_height, extra_info, merkle_path, timestamp_at, disallowed_prev
+	const colsPerRow = 8 // txid, status, status_code, block_hash, block_height, extra_info, merkle_path, timestamp_at, disallowed_prev
 
 	args := make([]any, 0, len(statuses)*(colsPerRow+1))
 	now := time.Now()
@@ -409,6 +383,7 @@ func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.Tra
 			args,
 			st.TxID,
 			string(st.Status),
+			st.StatusCode,
 			st.BlockHash,
 			int64(st.BlockHeight), /* #nosec G115 */
 			st.ExtraInfo,
@@ -428,8 +403,8 @@ func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.Tra
 		// right types for the VALUES alias columns.
 		fmt.Fprintf(
 			&values,
-			"($%d::text,$%d::text,$%d::text,$%d::bigint,$%d::text,$%d::bytea,$%d::timestamptz,$%d::text[])",
-			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8,
+			"($%d::text,$%d::text,$%d::int,$%d::text,$%d::bigint,$%d::text,$%d::bytea,$%d::timestamptz,$%d::text[])",
+			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9,
 		)
 	}
 
@@ -440,12 +415,13 @@ func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.Tra
 	q := `
 UPDATE transactions t SET
     status       = v.status,
+    status_code  = COALESCE(NULLIF(v.status_code, 0),     t.status_code),
     block_hash   = COALESCE(NULLIF(v.block_hash, ''),     t.block_hash),
     block_height = COALESCE(NULLIF(v.block_height, 0),    t.block_height),
     extra_info   = COALESCE(NULLIF(v.extra_info, ''),     t.extra_info),
     merkle_path  = COALESCE(v.merkle_path,                t.merkle_path),
     timestamp_at = v.timestamp_at
-FROM (VALUES ` + values.String() + `) AS v(txid, status, block_hash, block_height, extra_info, merkle_path, timestamp_at, disallowed_prev)
+FROM (VALUES ` + values.String() + `) AS v(txid, status, status_code, block_hash, block_height, extra_info, merkle_path, timestamp_at, disallowed_prev)
 WHERE t.txid = v.txid AND t.status <> ALL(v.disallowed_prev)`
 
 	if _, err := s.pool.Exec(ctx, q, args...); err != nil {
@@ -485,6 +461,11 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 	if status.ExtraInfo != "" {
 		sets = append(sets, fmt.Sprintf("extra_info = $%d", idx))
 		args = append(args, status.ExtraInfo)
+		idx++
+	}
+	if status.StatusCode != 0 {
+		sets = append(sets, fmt.Sprintf("status_code = $%d", idx))
+		args = append(args, status.StatusCode)
 		idx++
 	}
 	if len(status.MerklePath) > 0 {
@@ -568,21 +549,84 @@ func disallowedPrevAsStrings(s models.Status) []string {
 }
 
 func (s *Store) GetStatus(ctx context.Context, txid string) (*models.TransactionStatus, error) {
+	// orphaned_anchors rides only on this single-tx read (the GET /tx path
+	// where historical proofs matter) — the scanStatus-shared bulk queries
+	// deliberately skip it.
 	const q = `
 SELECT txid, status, status_code, block_hash, block_height, merkle_path,
        extra_info, competing_txs, raw_tx, retry_count, next_retry_at,
-       timestamp_at, created_at, merkle_registered_at
+       timestamp_at, created_at, merkle_registered_at,
+       COALESCE(orphaned_anchors, 'null'::jsonb)
 FROM transactions WHERE txid = $1`
 	row := s.pool.QueryRow(ctx, q, txid)
-	st, err := scanStatus(row)
+	st, anchorsJSON, err := scanStatusWithAnchors(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
+	if len(anchorsJSON) > 0 && string(anchorsJSON) != "null" {
+		_ = json.Unmarshal(anchorsJSON, &st.OrphanedProofs)
+	}
 	s.enrichMerklePath(ctx, st)
+	s.enrichOrphanedProofs(ctx, st)
 	return st, nil
+}
+
+// scanStatusWithAnchors is scanStatus + the trailing orphaned_anchors JSONB
+// column GetStatus selects.
+func scanStatusWithAnchors(row rowScanner) (*models.TransactionStatus, []byte, error) {
+	var (
+		st                 models.TransactionStatus
+		statusCode         *int
+		blockHash          *string
+		blockHeight        *int64
+		merklePath         []byte
+		extraInfo          *string
+		competingTxs       []byte
+		rawTx              []byte
+		nextRetry          *time.Time
+		merkleRegisteredAt *time.Time
+		anchors            []byte
+	)
+	if err := row.Scan(
+		&st.TxID, &st.Status, &statusCode,
+		&blockHash, &blockHeight, &merklePath,
+		&extraInfo, &competingTxs, &rawTx,
+		&st.RetryCount, &nextRetry,
+		&st.Timestamp, &st.CreatedAt, &merkleRegisteredAt, &anchors,
+	); err != nil {
+		return nil, nil, err
+	}
+	if statusCode != nil {
+		st.StatusCode = *statusCode
+	}
+	if blockHash != nil {
+		st.BlockHash = *blockHash
+	}
+	if blockHeight != nil {
+		st.BlockHeight = uint64(*blockHeight) //nolint:gosec // block height fits in either signed/unsigned 64-bit
+	}
+	if len(merklePath) > 0 {
+		st.MerklePath = merklePath
+	}
+	if extraInfo != nil {
+		st.ExtraInfo = *extraInfo
+	}
+	if len(competingTxs) > 0 {
+		_ = json.Unmarshal(competingTxs, &st.CompetingTxs)
+	}
+	if len(rawTx) > 0 {
+		st.RawTx = rawTx
+	}
+	if nextRetry != nil {
+		st.NextRetryAt = *nextRetry
+	}
+	if merkleRegisteredAt != nil {
+		st.MerkleRegisteredAt = *merkleRegisteredAt
+	}
+	return &st, anchors, nil
 }
 
 func (s *Store) GetStatusesSince(ctx context.Context, since time.Time) ([]*models.TransactionStatus, error) {
@@ -640,24 +684,112 @@ ORDER BY timestamp_at DESC`
 	return rows.Err()
 }
 
+// CensusStatusesSince is one aggregate round-trip: count + min(timestamp_at)
+// per status over the census window, resolved by the idx_tx_status /
+// idx_tx_updated indexes. The reaper's stuck census over a multi-million-row
+// table must never stream rows through the client (issue #290) — this query
+// is the entire point of the method.
+func (s *Store) CensusStatusesSince(ctx context.Context, since, stuckDeadline time.Time, statuses []models.Status) (map[models.Status]store.StatusCensus, error) {
+	out := make(map[models.Status]store.StatusCensus, len(statuses))
+	if len(statuses) == 0 {
+		return out, nil
+	}
+	names := make([]string, len(statuses))
+	for i, st := range statuses {
+		out[st] = store.StatusCensus{}
+		names[i] = string(st)
+	}
+
+	const q = `
+SELECT status, count(*), min(timestamp_at)
+FROM transactions
+WHERE timestamp_at >= $1 AND timestamp_at < $2 AND status = ANY($3)
+GROUP BY status`
+	rows, err := s.pool.Query(ctx, q, since, stuckDeadline, names)
+	if err != nil {
+		return nil, fmt.Errorf("census statuses since: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			name   string
+			count  int64
+			oldest time.Time
+		)
+		if err := rows.Scan(&name, &count, &oldest); err != nil {
+			return nil, err
+		}
+		out[models.Status(name)] = store.StatusCensus{Count: count, Oldest: oldest}
+	}
+	return out, rows.Err()
+}
+
 // SetStatusByBlockHash rewrites every row in the block. Block fields are
 // cleared on SEEN_ON_NETWORK transitions (reorg path) and kept otherwise —
-// matches the Aerospike / Pebble contract.
+// matches the Aerospike / Pebble contract. IMMUTABLE rows are never touched,
+// and the WHERE block_hash predicate is atomic per row, so a tx concurrently
+// re-anchored to a different block simply falls out of the match (issue
+// #279). Reverts append the cleared anchor to orphaned_anchors so the
+// orphaned block's proof stays auditable.
 func (s *Store) SetStatusByBlockHash(ctx context.Context, blockHash string, newStatus models.Status) ([]string, error) {
 	clearBlock := newStatus == models.StatusSeenOnNetwork
 
 	var q string
 	if clearBlock {
-		q = `UPDATE transactions SET status=$2, block_hash=NULL, block_height=NULL, timestamp_at=NOW()
-             WHERE block_hash=$1 RETURNING txid`
+		q = `UPDATE transactions SET status=$2,
+               orphaned_anchors = CASE
+                 WHEN COALESCE(orphaned_anchors -> -1 ->> 'blockHash', '') <> block_hash
+                 THEN (
+                   SELECT jsonb_agg(elem ORDER BY ord)
+                   FROM (
+                     SELECT elem, ord
+                     FROM jsonb_array_elements(
+                            COALESCE(orphaned_anchors, '[]'::jsonb) ||
+                            jsonb_build_array(jsonb_build_object(
+                              'blockHash',   block_hash,
+                              'blockHeight', COALESCE(block_height, 0),
+                              'orphanedAt',  NOW()
+                            ))
+                          ) WITH ORDINALITY AS x(elem, ord)
+                     ORDER BY ord DESC
+                     LIMIT 5
+                   ) tail
+                 )
+                 ELSE orphaned_anchors
+               END,
+               block_hash=NULL, block_height=NULL, timestamp_at=NOW()
+             WHERE block_hash=$1 AND status <> 'IMMUTABLE' RETURNING txid`
 	} else {
 		q = `UPDATE transactions SET status=$2, timestamp_at=NOW()
-             WHERE block_hash=$1 RETURNING txid`
+             WHERE block_hash=$1 AND status <> 'IMMUTABLE' RETURNING txid`
 	}
 
 	rows, err := s.pool.Query(ctx, q, blockHash, string(newStatus))
 	if err != nil {
 		return nil, fmt.Errorf("update by block hash: %w", err)
+	}
+	defer rows.Close()
+
+	var txids []string
+	for rows.Next() {
+		var txid string
+		if err := rows.Scan(&txid); err != nil {
+			return txids, err
+		}
+		txids = append(txids, txid)
+	}
+	return txids, rows.Err()
+}
+
+// GetTxIDsByBlockHash returns every txid currently anchored to blockHash —
+// the reorg reconciler's affected set for an orphaned block. Resolved via
+// idx_tx_block_hash.
+func (s *Store) GetTxIDsByBlockHash(ctx context.Context, blockHash string) ([]string, error) {
+	const q = `SELECT txid FROM transactions WHERE block_hash = $1`
+	rows, err := s.pool.Query(ctx, q, blockHash)
+	if err != nil {
+		return nil, fmt.Errorf("get txids by block hash: %w", err)
 	}
 	defer rows.Close()
 
@@ -688,12 +820,25 @@ func (s *Store) BumpRetryCount(ctx context.Context, txid string) (int, error) {
 	return n, nil
 }
 
+// SetPendingRetryFields records the durable-retry bins for a parked tx.
+//
+// The lattice guard in the WHERE clause is load-bearing, not decorative. The
+// park path writes twice — a lattice-guarded BatchUpdateStatusReturning,
+// then this — so without it the second write would silently undo the first
+// one's protection and force a MINED / IMMUTABLE / SEEN / REJECTED row back
+// to PENDING_RETRY, where the reaper would then rebroadcast it. Rows whose
+// current status forbids PENDING_RETRY are skipped, matching
+// BatchUpdateStatusReturning's silent-skip semantics.
 func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time) error {
 	const q = `
 UPDATE transactions
 SET status=$2, raw_tx=$3, next_retry_at=$4, timestamp_at=NOW()
-WHERE txid=$1`
-	_, err := s.pool.Exec(ctx, q, txid, string(models.StatusPendingRetry), rawTx, nextRetryAt)
+WHERE txid=$1 AND status <> ALL($5)`
+	disallowed := disallowedPrevAsStrings(models.StatusPendingRetry)
+	if disallowed == nil {
+		disallowed = []string{}
+	}
+	_, err := s.pool.Exec(ctx, q, txid, string(models.StatusPendingRetry), rawTx, nextRetryAt, disallowed)
 	if err != nil {
 		return fmt.Errorf("set pending retry fields %s: %w", txid, err)
 	}
@@ -768,16 +913,44 @@ func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeig
 		return nil, nil, nil
 	}
 	now := time.Now()
+	// Lattice hardening + orphaned-anchor history (issue #279):
+	//   - IMMUTABLE rows are excluded from the join — a replayed
+	//     BLOCK_PROCESSED must never demote a confirmation-depth promotion.
+	//   - A MINED row re-anchored to a DIFFERENT block appends its previous
+	//     anchor to orphaned_anchors (models.OrphanedAnchor JSON shape,
+	//     capped at 5 = models.MaxOrphanedAnchors, consecutive duplicates
+	//     collapsed) so the orphaned block's proof stays auditable.
 	const q = `
 WITH prev AS (
-  SELECT txid, status, timestamp_at, block_hash, block_height
+  SELECT txid, status, timestamp_at, block_hash, block_height, orphaned_anchors
   FROM transactions
   WHERE txid = ANY($5)
 )
 UPDATE transactions t
-SET status=$1, block_hash=$2, block_height=$3, timestamp_at=$4
+SET status=$1, block_hash=$2, block_height=$3, timestamp_at=$4,
+    orphaned_anchors = CASE
+      WHEN prev.status = 'MINED' AND prev.block_hash IS NOT NULL AND prev.block_hash <> $2
+           AND COALESCE(prev.orphaned_anchors -> -1 ->> 'blockHash', '') <> prev.block_hash
+      THEN (
+        SELECT jsonb_agg(elem ORDER BY ord)
+        FROM (
+          SELECT elem, ord
+          FROM jsonb_array_elements(
+                 COALESCE(prev.orphaned_anchors, '[]'::jsonb) ||
+                 jsonb_build_array(jsonb_build_object(
+                   'blockHash',   prev.block_hash,
+                   'blockHeight', COALESCE(prev.block_height, 0),
+                   'orphanedAt',  $4::timestamptz
+                 ))
+               ) WITH ORDINALITY AS x(elem, ord)
+          ORDER BY ord DESC
+          LIMIT 5
+        ) tail
+      )
+      ELSE prev.orphaned_anchors
+    END
 FROM prev
-WHERE t.txid = prev.txid
+WHERE t.txid = prev.txid AND t.status <> 'IMMUTABLE'
 RETURNING t.txid, prev.status, prev.timestamp_at, prev.block_hash, prev.block_height`
 	rows, err := s.pool.Query(ctx, q, string(models.StatusMined), blockHash, int64(blockHeight), now, txids) //nolint:gosec // block height fits in int64
 	if err != nil {
@@ -919,9 +1092,10 @@ func (s *Store) UpsertBlockHeaderSeen(ctx context.Context, blockHash string, blo
 INSERT INTO block_processing (block_hash, block_height, header_seen_at, status)
 VALUES ($1, $2, $3, 'active')
 ON CONFLICT (block_hash) DO UPDATE SET
-    block_height = EXCLUDED.block_height,
-    status       = 'active',
-    orphaned_at  = NULL`
+    block_height  = EXCLUDED.block_height,
+    status        = 'active',
+    orphaned_at   = NULL,
+    reconciled_at = NULL`
 	_, err := s.pool.Exec(ctx, q, blockHash, int64(blockHeight), seenAt) //nolint:gosec // block height fits in int64
 	if err != nil {
 		return fmt.Errorf("upsert block header seen %s: %w", blockHash, err)
@@ -970,9 +1144,93 @@ WHERE block_hash = ANY($1)`
 	return nil
 }
 
+// MarkBlockReconciled stamps reconciled_at on an orphaned block's row —
+// the anchor reconciler finished re-anchoring/reverting its transactions.
+// Missing rows are silently skipped.
+func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, at time.Time) error {
+	const q = `UPDATE block_processing SET reconciled_at = $2 WHERE block_hash = $1`
+	if _, err := s.pool.Exec(ctx, q, blockHash, at); err != nil {
+		return fmt.Errorf("mark block reconciled %s: %w", blockHash, err)
+	}
+	return nil
+}
+
+// ListOrphanedBlocksToReconcile returns the reconciler's work queue:
+// orphaned rows not yet reconciled. Rows that can be re-anchored RIGHT NOW —
+// the active (canonical) block at the same height already has a stored BUMP —
+// sort ahead of rows that cannot, with oldest orphaned_at first WITHIN each
+// group. Served by the idx_bp_orphaned_unreconciled partial index for the
+// WHERE, with idx_bp_status_height + the bumps PK serving the re-anchorable
+// probe.
+//
+// Why prioritize: the reconciler processes a small LIMIT per tick. A large
+// backlog of orphans whose canonical block has NO stored BUMP (they can only
+// be parked/deferred, never re-anchored right now) would, under a plain
+// orphaned_at ASC ordering, starve a genuinely re-anchorable recent incident
+// sitting behind them oldest-first. Ordering the re-anchorable ones first
+// guarantees the tick spends its budget on work it can actually complete.
+//
+// The re-anchorable signal mirrors reconcileBlock: it resolves the canonical
+// block at the orphan's height (chaintracks header) and re-anchors from that
+// block's stored compound BUMP. The active block_processing row at a height is
+// the store's record of that canonical block (the tie-scan/tracker keeps the
+// competition winner 'active' and marks losers 'orphaned'), so "an active row
+// at bp.block_height whose block_hash has a bumps row" is the in-SQL proxy for
+// "the canonical block's BUMP is stored". The a.status='active' filter is what
+// makes this correct: an orphan RETAINS its own compound BUMP, so a bare
+// "any bump at this height" test would falsely flag every orphan re-anchorable.
+func (s *Store) ListOrphanedBlocksToReconcile(ctx context.Context, limit int) ([]*models.BlockProcessingStatus, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("limit must be > 0")
+	}
+	const q = `
+SELECT bp.block_hash, bp.block_height, bp.header_seen_at, bp.processed_at, bp.bump_built_at, bp.status, bp.orphaned_at, bp.reconciled_at
+FROM block_processing bp
+WHERE bp.status = 'orphaned' AND bp.reconciled_at IS NULL
+ORDER BY
+    EXISTS (
+        SELECT 1 FROM block_processing a
+        JOIN bumps b ON b.block_hash = a.block_hash
+        WHERE a.block_height = bp.block_height AND a.status = 'active'
+    ) DESC,
+    bp.orphaned_at ASC NULLS LAST
+LIMIT $1`
+	rows, err := s.pool.Query(ctx, q, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list orphaned blocks to reconcile: %w", err)
+	}
+	defer rows.Close()
+	var out []*models.BlockProcessingStatus
+	for rows.Next() {
+		bp, err := scanBlockProcessing(rows.Scan)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, bp)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) MarkBlocksParked(ctx context.Context, blockHashes []string) error {
+	if len(blockHashes) == 0 {
+		return nil
+	}
+	// Only 'active' rows park: an orphaned row is off-chain (a more specific
+	// terminal state) and must not be relabeled as a missing-BUMP backlog.
+	const q = `
+UPDATE block_processing
+SET status = 'parked'
+WHERE block_hash = ANY($1) AND status = 'active'`
+	_, err := s.pool.Exec(ctx, q, blockHashes)
+	if err != nil {
+		return fmt.Errorf("mark blocks parked: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) GetBlockProcessingStatus(ctx context.Context, blockHash string) (*models.BlockProcessingStatus, error) {
 	const q = `
-SELECT block_hash, block_height, header_seen_at, processed_at, bump_built_at, status, orphaned_at
+SELECT block_hash, block_height, header_seen_at, processed_at, bump_built_at, status, orphaned_at, reconciled_at
 FROM block_processing
 WHERE block_hash = $1`
 	row := s.pool.QueryRow(ctx, q, blockHash)
@@ -991,7 +1249,7 @@ func (s *Store) ListBlockProcessingStatus(ctx context.Context, beforeHeight uint
 		return nil, nil
 	}
 	const q = `
-SELECT block_hash, block_height, header_seen_at, processed_at, bump_built_at, status, orphaned_at
+SELECT block_hash, block_height, header_seen_at, processed_at, bump_built_at, status, orphaned_at, reconciled_at
 FROM block_processing
 WHERE ($1 = 0 OR block_height < $1)
 ORDER BY block_height DESC
@@ -1032,7 +1290,7 @@ func (s *Store) ListStaleBlockProcessingStatus(ctx context.Context, olderThan ti
 		return nil, nil
 	}
 	const q = `
-SELECT block_hash, block_height, header_seen_at, processed_at, bump_built_at, status, orphaned_at
+SELECT block_hash, block_height, header_seen_at, processed_at, bump_built_at, status, orphaned_at, reconciled_at
 FROM block_processing
 WHERE processed_at IS NULL
   AND status = 'active'
@@ -1060,15 +1318,16 @@ LIMIT $3`
 // shape lets us share this between QueryRow.Scan and Rows.Scan.
 func scanBlockProcessing(scan func(...any) error) (*models.BlockProcessingStatus, error) {
 	var (
-		bp         models.BlockProcessingStatus
-		height     int64
-		processed  *time.Time
-		bumpBuilt  *time.Time
-		statusVal  string
-		orphanedAt *time.Time
-		seenAt     time.Time
+		bp           models.BlockProcessingStatus
+		height       int64
+		processed    *time.Time
+		bumpBuilt    *time.Time
+		statusVal    string
+		orphanedAt   *time.Time
+		reconciledAt *time.Time
+		seenAt       time.Time
 	)
-	if err := scan(&bp.BlockHash, &height, &seenAt, &processed, &bumpBuilt, &statusVal, &orphanedAt); err != nil {
+	if err := scan(&bp.BlockHash, &height, &seenAt, &processed, &bumpBuilt, &statusVal, &orphanedAt, &reconciledAt); err != nil {
 		return nil, err
 	}
 	bp.BlockHeight = uint64(height) //nolint:gosec // height non-negative in storage
@@ -1077,6 +1336,7 @@ func scanBlockProcessing(scan func(...any) error) (*models.BlockProcessingStatus
 	bp.BUMPBuiltAt = bumpBuilt
 	bp.Status = models.BlockProcessingStatusValue(statusVal)
 	bp.OrphanedAt = orphanedAt
+	bp.ReconciledAt = reconciledAt
 	return &bp, nil
 }
 
@@ -1110,10 +1370,106 @@ func (s *Store) GetSubmissionsByToken(ctx context.Context, token string) ([]*mod
 	return s.submissions(ctx, "callback_token = $1", token)
 }
 
+// tokensForTxIDsChunk bounds how many txids ride in one TokensForTxIDs
+// query. A bulk MINED event carries up to the bump-builder's
+// maxTxIDsPerBulkEvent (5000) txids, so a whole batch resolves in a handful
+// of round-trips while each statement keeps a modest parameter array.
+const tokensForTxIDsChunk = 1000
+
+// TokensForTxIDs answers the SSE fan-out's membership question for a whole
+// batch of txids in one statement per chunk. It replaces a per-(event,
+// client) EXISTS probe that measured 0.583 ms under load against a 4.5M-row
+// submissions table and capped fan-out at ~1.6k events/s.
+//
+// The plan is an Index Only Scan of idx_sub_txid_token: (txid,
+// callback_token) covers both the predicate and the projection, so a match
+// costs no heap fetch. That is also why schema.sql DROPS the narrower
+// idx_sub_txid — verified by EXPLAIN, while it exists the planner costs it
+// lower, picks it, and pays the heap fetch anyway. Access is exclusively from
+// the txid side: a txid has a handful of submissions, a token can have
+// millions (interface contract).
+func (s *Store) TokensForTxIDs(ctx context.Context, txids []string) (map[string][]string, error) {
+	const q = `
+SELECT DISTINCT txid, callback_token
+FROM submissions
+WHERE txid = ANY($1) AND callback_token IS NOT NULL AND callback_token <> ''`
+	out := make(map[string][]string, len(txids))
+	for start := 0; start < len(txids); start += tokensForTxIDsChunk {
+		end := min(start+tokensForTxIDsChunk, len(txids))
+		if err := s.appendTokens(ctx, q, txids[start:end], out); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// appendTokens runs one TokensForTxIDs chunk and folds its rows into out.
+// Split out so the rows cursor is released per chunk instead of accumulating
+// across the whole batch.
+func (s *Store) appendTokens(ctx context.Context, q string, txids []string, out map[string][]string) error {
+	rows, err := s.pool.Query(ctx, q, txids)
+	if err != nil {
+		return fmt.Errorf("tokens for txids: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var txid, token string
+		if err := rows.Scan(&txid, &token); err != nil {
+			return fmt.Errorf("scan submission token row: %w", err)
+		}
+		out[txid] = append(out[txid], token)
+	}
+	return rows.Err()
+}
+
+func (s *Store) IterateStatusesByToken(ctx context.Context, callbackToken string, since time.Time, onlyStatuses []models.Status, fn func(*models.TransactionStatus) error) error {
+	// Projection only — no raw_tx, no merkle_path, no enrichment. This is
+	// the SSE catchup hot path over potentially millions of submissions.
+	q := `
+SELECT t.txid, t.status, t.timestamp_at, COALESCE(t.block_hash, ''), COALESCE(t.block_height, 0)
+FROM transactions t
+WHERE t.txid IN (SELECT DISTINCT txid FROM submissions WHERE callback_token = $1)`
+	args := []any{callbackToken}
+	if !since.IsZero() {
+		args = append(args, since)
+		q += fmt.Sprintf(" AND t.timestamp_at > $%d", len(args))
+	}
+	if len(onlyStatuses) > 0 {
+		vals := make([]string, len(onlyStatuses))
+		for i, st := range onlyStatuses {
+			vals[i] = string(st)
+		}
+		args = append(args, vals)
+		q += fmt.Sprintf(" AND t.status = ANY($%d)", len(args))
+	}
+	q += " ORDER BY t.timestamp_at ASC"
+
+	rows, err := s.pool.Query(ctx, q, args...)
+	if err != nil {
+		return fmt.Errorf("iterate statuses by token: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		st := &models.TransactionStatus{}
+		var status string
+		var height int64
+		if err := rows.Scan(&st.TxID, &status, &st.Timestamp, &st.BlockHash, &height); err != nil {
+			return fmt.Errorf("scan status row: %w", err)
+		}
+		st.Status = models.Status(status)
+		st.BlockHeight = uint64(height) //nolint:gosec // heights are non-negative
+		if err := fn(st); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
 func (s *Store) submissions(ctx context.Context, where string, arg any) ([]*models.Submission, error) {
 	q := `
 SELECT submission_id, txid, callback_url, callback_token, full_status_updates,
-       last_delivered_status, retry_count, next_retry_at, created_at
+       last_delivered_status, retry_count, next_retry_at, attempts,
+       last_attempt_at, last_result, created_at
 FROM submissions WHERE ` + where
 	rows, err := s.pool.Query(ctx, q, arg)
 	if err != nil {
@@ -1123,26 +1479,43 @@ FROM submissions WHERE ` + where
 
 	var out []*models.Submission
 	for rows.Next() {
-		sub := &models.Submission{}
-		var lastStatus *string
-		var nextRetry *time.Time
-		if err := rows.Scan(
-			&sub.SubmissionID, &sub.TxID, &sub.CallbackURL, &sub.CallbackToken,
-			&sub.FullStatusUpdates, &lastStatus, &sub.RetryCount, &nextRetry,
-			&sub.CreatedAt,
-		); err != nil {
+		sub, err := scanSubmission(rows)
+		if err != nil {
 			return out, err
-		}
-		if lastStatus != nil {
-			sub.LastDeliveredStatus = models.Status(*lastStatus)
-		}
-		if nextRetry != nil {
-			t := *nextRetry
-			sub.NextRetryAt = &t
 		}
 		out = append(out, sub)
 	}
 	return out, rows.Err()
+}
+
+// scanSubmission reads one submissions row in the canonical column order
+// (shared by submissions and ListSubmissionsReadyForRetry).
+func scanSubmission(row rowScanner) (*models.Submission, error) {
+	sub := &models.Submission{}
+	var lastStatus, lastResult *string
+	var nextRetry, lastAttempt *time.Time
+	if err := row.Scan(
+		&sub.SubmissionID, &sub.TxID, &sub.CallbackURL, &sub.CallbackToken,
+		&sub.FullStatusUpdates, &lastStatus, &sub.RetryCount, &nextRetry,
+		&sub.Attempts, &lastAttempt, &lastResult, &sub.CreatedAt,
+	); err != nil {
+		return nil, err
+	}
+	if lastStatus != nil {
+		sub.LastDeliveredStatus = models.Status(*lastStatus)
+	}
+	if nextRetry != nil {
+		t := *nextRetry
+		sub.NextRetryAt = &t
+	}
+	if lastAttempt != nil {
+		t := *lastAttempt
+		sub.LastAttemptAt = &t
+	}
+	if lastResult != nil {
+		sub.LastResult = *lastResult
+	}
+	return sub, nil
 }
 
 func (s *Store) UpdateDeliveryStatus(ctx context.Context, submissionID string, lastStatus models.Status, retryCount int, nextRetry *time.Time) error {
@@ -1187,7 +1560,8 @@ func (s *Store) ListSubmissionsReadyForRetry(ctx context.Context, now time.Time,
 	}
 	const q = `
 SELECT submission_id, txid, callback_url, callback_token, full_status_updates,
-       last_delivered_status, retry_count, next_retry_at, created_at
+       last_delivered_status, retry_count, next_retry_at, attempts,
+       last_attempt_at, last_result, created_at
 FROM submissions
 WHERE retry_count > 0
   AND next_retry_at IS NOT NULL
@@ -1202,26 +1576,25 @@ LIMIT $2`
 
 	var out []*models.Submission
 	for rows.Next() {
-		sub := &models.Submission{}
-		var lastStatus *string
-		var nextRetry *time.Time
-		if err := rows.Scan(
-			&sub.SubmissionID, &sub.TxID, &sub.CallbackURL, &sub.CallbackToken,
-			&sub.FullStatusUpdates, &lastStatus, &sub.RetryCount, &nextRetry,
-			&sub.CreatedAt,
-		); err != nil {
+		sub, err := scanSubmission(rows)
+		if err != nil {
 			return out, err
-		}
-		if lastStatus != nil {
-			sub.LastDeliveredStatus = models.Status(*lastStatus)
-		}
-		if nextRetry != nil {
-			t := *nextRetry
-			sub.NextRetryAt = &t
 		}
 		out = append(out, sub)
 	}
 	return out, rows.Err()
+}
+
+// RecordDeliveryAttempt implements store.Store: one atomic in-place update —
+// attempts increments server-side so concurrent workers can't lose counts.
+func (s *Store) RecordDeliveryAttempt(ctx context.Context, submissionID string, at time.Time, result string) error {
+	const q = `
+UPDATE submissions SET attempts = attempts + 1, last_attempt_at=$2, last_result=$3
+WHERE submission_id=$1`
+	if _, err := s.pool.Exec(ctx, q, submissionID, at, result); err != nil {
+		return fmt.Errorf("record delivery attempt: %w", err)
+	}
+	return nil
 }
 
 // --- Leaser ---
@@ -1412,90 +1785,50 @@ func scanStatus(row rowScanner) (*models.TransactionStatus, error) {
 	return &st, nil
 }
 
+// EnrichMerklePath implements store.Store: it populates status.MerklePath in
+// place for a mined/immutable status carrying a BlockHash, extracting the tx's
+// minimal path from the block's compound BUMP. Best-effort — see the interface
+// doc. Delegates to the same enrichMerklePath used by GetStatus.
+func (s *Store) EnrichMerklePath(ctx context.Context, status *models.TransactionStatus) {
+	s.enrichMerklePath(ctx, status)
+}
+
 // enrichMerklePath attaches the per-tx minimal merkle path for mined/immutable
-// rows, extracting it from the compound BUMP. Matches aerospike/pebble — the
-// extraction is duplicated across backends so each store package stays
-// self-contained.
+// rows, extracting it from the block's cached, indexed compound BUMP.
 func (s *Store) enrichMerklePath(ctx context.Context, status *models.TransactionStatus) {
-	if status == nil || len(status.MerklePath) > 0 || status.BlockHash == "" {
-		return
-	}
-	if status.Status != models.StatusMined && status.Status != models.StatusImmutable {
-		return
-	}
-	compound := s.compoundBUMP(ctx, status.BlockHash)
-	if compound == nil {
-		return
-	}
-	status.MerklePath = extractMinimalPathForTx(compound, status.TxID)
+	s.bumpCache.Enrich(status, func() ([]byte, error) {
+		_, bumpData, err := s.GetBUMP(ctx, status.BlockHash)
+		return bumpData, err
+	})
 }
 
-// compoundBUMP returns the parsed compound BUMP for a block, caching the
-// parsed form so repeated status lookups for txs in the same block reuse
-// it instead of re-fetching and re-parsing the (potentially large) BUMP.
-// The returned value is shared and must be treated as read-only.
-func (s *Store) compoundBUMP(ctx context.Context, blockHash string) *transaction.MerklePath {
-	if c, ok := s.bumpCache.Get(blockHash); ok {
-		return c
+// enrichOrphanedProofs resolves each historical anchor's merkle path from
+// the orphaned block's retained compound BUMP (issue #279). Best-effort:
+// an entry whose BUMP is gone or unparseable is served without a path.
+func (s *Store) enrichOrphanedProofs(ctx context.Context, status *models.TransactionStatus) {
+	if status == nil {
+		return
 	}
-	_, bumpData, err := s.GetBUMP(ctx, blockHash)
-	if err != nil || len(bumpData) == 0 {
-		return nil
+	for i := range status.OrphanedProofs {
+		entry := &status.OrphanedProofs[i]
+		if len(entry.MerklePath) > 0 || entry.BlockHash == "" {
+			continue
+		}
+		hash := entry.BlockHash
+		entry.MerklePath = s.bumpCache.MinimalPath(hash, status.TxID, func() ([]byte, error) {
+			_, bumpData, err := s.GetBUMP(ctx, hash)
+			return bumpData, err
+		})
 	}
-	compound, err := transaction.NewMerklePathFromBinary(bumpData)
-	if err != nil {
-		return nil
-	}
-	s.bumpCache.Add(blockHash, compound)
-	return compound
 }
 
-// extractMinimalPathForTx extracts a per-tx minimal merkle path from an
-// already-parsed compound BUMP. compound is shared via the store's bump
-// cache, so this only reads from it and builds a fresh MerklePath result.
-func extractMinimalPathForTx(compound *transaction.MerklePath, txid string) []byte {
-	txHash, err := chainhash.NewHashFromHex(txid)
-	if err != nil {
-		return nil
+// DeleteBUMPByBlockHash removes the stored compound BUMP for a block and
+// drops any cached parse. Idempotent.
+func (s *Store) DeleteBUMPByBlockHash(ctx context.Context, blockHash string) error {
+	const q = `DELETE FROM bumps WHERE block_hash = $1`
+	if _, err := s.pool.Exec(ctx, q, blockHash); err != nil {
+		return fmt.Errorf("delete bump %s: %w", blockHash, err)
 	}
-
-	var txOffset uint64
-	found := false
-	if len(compound.Path) > 0 {
-		for _, leaf := range compound.Path[0] {
-			if leaf.Hash != nil && *leaf.Hash == *txHash {
-				txOffset = leaf.Offset
-				found = true
-				break
-			}
-		}
-	}
-	if !found {
-		return nil
-	}
-
-	mp := &transaction.MerklePath{
-		BlockHeight: compound.BlockHeight,
-		Path:        make([][]*transaction.PathElement, len(compound.Path)),
-	}
-	offset := txOffset
-	for level := 0; level < len(compound.Path); level++ {
-		if level == 0 {
-			for _, leaf := range compound.Path[level] {
-				if leaf.Offset == offset {
-					mp.Path[level] = append(mp.Path[level], leaf)
-					break
-				}
-			}
-		}
-		sibOffset := offset ^ 1
-		for _, leaf := range compound.Path[level] {
-			if leaf.Offset == sibOffset {
-				mp.Path[level] = append(mp.Path[level], leaf)
-				break
-			}
-		}
-		offset = offset >> 1
-	}
-	return mp.Bytes()
+	s.bumpCache.Remove(blockHash)
+	return nil
 }

@@ -27,7 +27,12 @@ type Broker interface {
 	// receives each message once across all its subscriptions (standard Kafka
 	// consumer-group semantics). The returned Subscription is driven by calling
 	// its Consume method.
-	Subscribe(groupID string, topics []string) (Subscription, error)
+	//
+	// start selects where the group begins when it has NO committed offsets;
+	// once the group commits, the stored offset always wins. See StartOffset
+	// for when each value is appropriate. The memory broker retains nothing,
+	// so every subscription there is inherently StartLatest.
+	Subscribe(groupID string, topics []string, start StartOffset) (Subscription, error)
 
 	// PartitionCount reports how many partitions the given topic has. Returns
 	// ErrTopicNotFound if the topic does not exist on the broker. Memory-backed
@@ -40,6 +45,24 @@ type Broker interface {
 	// calls return an error.
 	Close() error
 }
+
+// StartOffset selects where a consumer group with NO committed offsets
+// begins. It is consulted only before the group's first commit (Sarama's
+// Consumer.Offsets.Initial semantics); after that the stored offset wins,
+// so durable groups are unaffected by the choice on redeploys.
+//
+//   - StartOldest (zero value): full retained history. Correct for durable
+//     stable-group consumers (propagation, bump-builder) that must not skip
+//     unprocessed messages on first deployment.
+//   - StartLatest: head of topic. Correct for ephemeral per-process groups
+//     (events subscribers) whose backlog is pure waste: replaying it burns
+//     memory/CPU on every pod start and delivers stale duplicates.
+type StartOffset int
+
+const (
+	StartOldest StartOffset = iota
+	StartLatest
+)
 
 // ErrTopicNotFound is returned by PartitionCount when the topic does not exist.
 var ErrTopicNotFound = brokerSentinelError("topic not found")
