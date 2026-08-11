@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -1237,16 +1239,21 @@ func TestIterateStatusesByToken(t *testing.T) {
 	}
 }
 
-// TestTokenHasSubmissionForTx covers the SSE fan-out membership probe:
-// match, wrong-token, and unknown-txid cases.
-func TestTokenHasSubmissionForTx(t *testing.T) {
+// TestTokensForTxIDs covers the SSE fan-out membership resolution: multiple
+// tokens on one txid, a txid with a single token, unknown txids, duplicate
+// inputs, submissions without a token, and the empty batch.
+func TestTokensForTxIDs(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
 	subs := []*models.Submission{
 		{SubmissionID: "p1", TxID: "tx-probe", CallbackToken: "tok-1", CreatedAt: time.Now()},
 		{SubmissionID: "p2", TxID: "tx-probe", CallbackToken: "tok-2", CreatedAt: time.Now()},
+		// Same (txid, token) twice: the result must be de-duplicated.
+		{SubmissionID: "p2b", TxID: "tx-probe", CallbackToken: "tok-2", CreatedAt: time.Now()},
 		{SubmissionID: "p3", TxID: "tx-solo", CallbackToken: "tok-1", CreatedAt: time.Now()},
+		// SSE-less submission: no callback token, so it contributes nothing.
+		{SubmissionID: "p4", TxID: "tx-notoken", CreatedAt: time.Now()},
 	}
 	for _, sub := range subs {
 		if err := s.InsertSubmission(ctx, sub); err != nil {
@@ -1254,23 +1261,38 @@ func TestTokenHasSubmissionForTx(t *testing.T) {
 		}
 	}
 
-	cases := []struct {
-		token, txid string
-		want        bool
-	}{
-		{"tok-1", "tx-probe", true},
-		{"tok-2", "tx-probe", true},
-		{"tok-2", "tx-solo", false},  // txid exists, different token
-		{"tok-1", "tx-ghost", false}, // unknown txid
-		{"tok-none", "tx-probe", false},
+	// One batch resolves every txid, duplicates included.
+	got, err := s.TokensForTxIDs(ctx, []string{"tx-probe", "tx-probe", "tx-solo", "tx-notoken", "tx-ghost"})
+	if err != nil {
+		t.Fatalf("TokensForTxIDs: %v", err)
 	}
-	for _, tc := range cases {
-		got, err := s.TokenHasSubmissionForTx(ctx, tc.token, tc.txid)
-		if err != nil {
-			t.Fatalf("TokenHasSubmissionForTx(%s,%s): %v", tc.token, tc.txid, err)
+	want := map[string][]string{
+		"tx-probe": {"tok-1", "tok-2"},
+		"tx-solo":  {"tok-1"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("TokensForTxIDs returned %d txids (%v), want %d", len(got), got, len(want))
+	}
+	for txid, wantTokens := range want {
+		gotTokens := append([]string(nil), got[txid]...)
+		sort.Strings(gotTokens)
+		if !slices.Equal(gotTokens, wantTokens) {
+			t.Errorf("tokens for %s = %v, want %v", txid, gotTokens, wantTokens)
 		}
-		if got != tc.want {
-			t.Errorf("TokenHasSubmissionForTx(%s,%s) = %v, want %v", tc.token, tc.txid, got, tc.want)
+	}
+	// Absent, never present-but-empty: fan-out treats a missing key as
+	// "nobody subscribed".
+	for _, txid := range []string{"tx-ghost", "tx-notoken"} {
+		if _, ok := got[txid]; ok {
+			t.Errorf("%s must be absent from the result, got %v", txid, got[txid])
 		}
+	}
+
+	empty, err := s.TokensForTxIDs(ctx, nil)
+	if err != nil {
+		t.Fatalf("TokensForTxIDs(nil): %v", err)
+	}
+	if len(empty) != 0 {
+		t.Errorf("TokensForTxIDs(nil) = %v, want empty", empty)
 	}
 }

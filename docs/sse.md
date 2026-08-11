@@ -39,13 +39,13 @@ You may also set `X-CallbackUrl` to additionally receive status updates as outbo
 ```
 id: 1745870456123456789
 event: status
-data: {"txid":"abc...","txStatus":"SEEN_ON_NETWORK","timestamp":"2026-04-28T18:20:56Z"}
+data: {"txid":"abc...","txStatus":"SEEN_ON_NETWORK","timestamp":"2026-04-28T18:20:56.123456789Z"}
 
 ```
 
 - `id` is a Unix nanosecond timestamp. Clients should remember the most recent `id` and send it back as `Last-Event-ID` on reconnect (browser `EventSource` does this automatically).
 - `event: status` is the only event type emitted for transaction updates.
-- `data` is one JSON object per frame. Every frame carries `txid`, `txStatus`, and `timestamp` (RFC 3339).
+- `data` is one JSON object per frame. Every frame carries `txid`, `txStatus`, and `timestamp` (RFC 3339, with fractional seconds when the event has sub-second precision — the same instant as `id`, so latency can be measured from the payload alone). Fractional seconds are optional in RFC 3339; a whole-second timestamp is still rendered as `2026-04-28T18:20:56Z`.
 - A blank line terminates each frame.
 
 ### Mined frames carry the merkle proof
@@ -55,7 +55,7 @@ When `txStatus` is `MINED` (or `IMMUTABLE`), the frame additionally carries the 
 ```
 id: 1745870512987654321
 event: status
-data: {"txid":"abc...","txStatus":"MINED","timestamp":"2026-04-28T18:21:52Z","blockHash":"0000...","blockHeight":870123,"merklePath":"<BUMP hex>"}
+data: {"txid":"abc...","txStatus":"MINED","timestamp":"2026-04-28T18:21:52.987654321Z","blockHash":"0000...","blockHeight":870123,"merklePath":"<BUMP hex>"}
 
 ```
 

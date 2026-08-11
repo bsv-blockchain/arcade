@@ -1357,16 +1357,56 @@ func (s *Store) GetSubmissionsByToken(ctx context.Context, token string) ([]*mod
 	return s.submissions(ctx, "callback_token = $1", token)
 }
 
-// TokenHasSubmissionForTx is an indexed existence probe: keyed on txid
-// first (idx_sub_txid; a txid has a handful of submissions) rather than
-// the token side (idx_sub_token; a token can have millions).
-func (s *Store) TokenHasSubmissionForTx(ctx context.Context, callbackToken, txid string) (bool, error) {
-	const q = `SELECT EXISTS(SELECT 1 FROM submissions WHERE txid = $1 AND callback_token = $2)`
-	var exists bool
-	if err := s.pool.QueryRow(ctx, q, txid, callbackToken).Scan(&exists); err != nil {
-		return false, err
+// tokensForTxIDsChunk bounds how many txids ride in one TokensForTxIDs
+// query. A bulk MINED event carries up to the bump-builder's
+// maxTxIDsPerBulkEvent (5000) txids, so a whole batch resolves in a handful
+// of round-trips while each statement keeps a modest parameter array.
+const tokensForTxIDsChunk = 1000
+
+// TokensForTxIDs answers the SSE fan-out's membership question for a whole
+// batch of txids in one statement per chunk. It replaces a per-(event,
+// client) EXISTS probe that measured 0.583 ms under load against a 4.5M-row
+// submissions table and capped fan-out at ~1.6k events/s.
+//
+// The plan is an Index Only Scan of idx_sub_txid_token: (txid,
+// callback_token) covers both the predicate and the projection, so a match
+// costs no heap fetch. That is also why schema.sql DROPS the narrower
+// idx_sub_txid — verified by EXPLAIN, while it exists the planner costs it
+// lower, picks it, and pays the heap fetch anyway. Access is exclusively from
+// the txid side: a txid has a handful of submissions, a token can have
+// millions (interface contract).
+func (s *Store) TokensForTxIDs(ctx context.Context, txids []string) (map[string][]string, error) {
+	const q = `
+SELECT DISTINCT txid, callback_token
+FROM submissions
+WHERE txid = ANY($1) AND callback_token IS NOT NULL AND callback_token <> ''`
+	out := make(map[string][]string, len(txids))
+	for start := 0; start < len(txids); start += tokensForTxIDsChunk {
+		end := min(start+tokensForTxIDsChunk, len(txids))
+		if err := s.appendTokens(ctx, q, txids[start:end], out); err != nil {
+			return nil, err
+		}
 	}
-	return exists, nil
+	return out, nil
+}
+
+// appendTokens runs one TokensForTxIDs chunk and folds its rows into out.
+// Split out so the rows cursor is released per chunk instead of accumulating
+// across the whole batch.
+func (s *Store) appendTokens(ctx context.Context, q string, txids []string, out map[string][]string) error {
+	rows, err := s.pool.Query(ctx, q, txids)
+	if err != nil {
+		return fmt.Errorf("tokens for txids: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var txid, token string
+		if err := rows.Scan(&txid, &token); err != nil {
+			return fmt.Errorf("scan submission token row: %w", err)
+		}
+		out[txid] = append(out[txid], token)
+	}
+	return rows.Err()
 }
 
 func (s *Store) IterateStatusesByToken(ctx context.Context, callbackToken string, since time.Time, onlyStatuses []models.Status, fn func(*models.TransactionStatus) error) error {

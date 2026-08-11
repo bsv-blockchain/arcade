@@ -282,14 +282,22 @@ type Store interface {
 	// GetSubmissionsByToken retrieves all submissions for a callback token
 	GetSubmissionsByToken(ctx context.Context, callbackToken string) ([]*models.Submission, error)
 
-	// TokenHasSubmissionForTx reports whether txid has a submission registered
-	// under callbackToken. This is the SSE fan-out hot path — called once per
-	// event per token-filtered client — so implementations MUST resolve it via
-	// the by-txid index (a txid has a handful of submissions) and MUST NOT
-	// materialize the token's submission list: a single token can hold
-	// millions of submissions, and loading them per event is what OOM-killed
-	// the SSE service.
-	TokenHasSubmissionForTx(ctx context.Context, callbackToken, txid string) (bool, error)
+	// TokensForTxIDs returns the DISTINCT non-empty callback tokens registered
+	// against each of the supplied txids, keyed by txid. A txid with no
+	// submission — or none carrying a token — is ABSENT from the result map
+	// (never present with an empty slice), so an absent key means "nobody is
+	// subscribed". Duplicate txids in the input are collapsed.
+	//
+	// This is the SSE fan-out hot path. It replaced a per-(event, client)
+	// existence probe: fan-out now resolves a txid's token set ONCE and
+	// answers every connected client from that set in memory, and resolves a
+	// whole bulk event's txid list in one batch. Implementations MUST resolve
+	// from the txid side only (a txid has a handful of submissions) and MUST
+	// NOT materialize a token's submission list: a single token can hold
+	// millions of submissions, and loading one per event is what OOM-killed
+	// the SSE service (#237/#238). Implementations that cannot issue an
+	// unbounded batch must chunk internally rather than reject the call.
+	TokensForTxIDs(ctx context.Context, txids []string) (map[string][]string, error)
 
 	// IterateStatusesByToken streams the current status of every DISTINCT
 	// txid registered under callbackToken through fn, in ascending
