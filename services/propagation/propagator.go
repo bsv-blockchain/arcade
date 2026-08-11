@@ -539,9 +539,11 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 	terminalRejected := make([]string, 0, rejected)
 	var terminalParked []string
 	// published* drive the bulk publish: only rows whose store status
-	// actually transitioned.
+	// actually transitioned. publishedRejected carries whole rows, not just
+	// txids, because a rejection's payload (the reason arcade just persisted)
+	// has to ride the event out — see publishRejections.
 	publishedAccepted := make([]string, 0, accepted)
-	publishedRejected := make([]string, 0, rejected)
+	publishedRejected := make([]*models.TransactionStatus, 0, rejected)
 	var publishedParked []string
 	now := time.Now()
 	for i, st := range terminalStatuses {
@@ -582,7 +584,7 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 		case models.StatusAcceptedByNetwork:
 			publishedAccepted = append(publishedAccepted, st.TxID)
 		case models.StatusRejected:
-			publishedRejected = append(publishedRejected, st.TxID)
+			publishedRejected = append(publishedRejected, st)
 			p.logger.Info(
 				"transaction rejected",
 				logfields.TxID(st.TxID),
@@ -614,7 +616,7 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 	})
 
 	p.publishBulkStatus(ctx, models.StatusAcceptedByNetwork, publishedAccepted, now)
-	p.publishBulkStatus(ctx, models.StatusRejected, publishedRejected, now)
+	p.publishRejections(ctx, publishedRejected, now)
 	p.publishBulkStatus(ctx, models.StatusPendingRetry, publishedParked, now)
 
 	// Notify the dispatcher ONLY when the batch status write fully
@@ -899,6 +901,13 @@ func (p *Propagator) persistCascade(ctx context.Context, cascaded []cascadeRejec
 			p.schedulePendingRetry(ctx, cr.txid, cr.rawTx)
 		}
 	}
+	if status == models.StatusRejected {
+		// statuses (not txids): every cascaded child's reason names ITS OWN
+		// ancestor, so the publish has to group by reason rather than fan one
+		// payload-free event across the whole cascade — see publishRejections.
+		p.publishRejections(ctx, statuses, now)
+		return
+	}
 	p.publishBulkStatus(ctx, status, txids, now)
 }
 
@@ -911,16 +920,88 @@ func (p *Propagator) publishBulkStatus(ctx context.Context, status models.Status
 	if p.publisher == nil || len(txids) == 0 {
 		return
 	}
-	template := &models.TransactionStatus{
+	p.publishBulk(ctx, &models.TransactionStatus{
 		Status:    status,
 		Timestamp: ts,
 		TxIDs:     txids,
+	})
+}
+
+// publishRejections fans REJECTED transitions onto the events Publisher with
+// the reason attached, grouped so that every txid on an event shares one
+// reason.
+//
+// A bulk event carries no per-transaction payload by construction: one event,
+// N txids, so any field it set would be right for at most one of them. That
+// is correct for the uniform statuses it was built for (ACCEPTED_BY_NETWORK,
+// MINED) and wrong for REJECTED, the one status whose payload decides what
+// the client does next — UTXO_SPENT means "your view of the chain is stale,
+// resync", TX_INVALID means "these bytes will never be accepted, don't
+// retry". Until this, arcade parsed the Teranode reason, persisted it on the
+// row, logged it, and then published REJECTED with an empty extraInfo.
+//
+// Nothing was lost — the row keeps the reason and GET /tx/<txid> serves it —
+// but the push event did not describe itself, so learning why cost a round
+// trip. REJECTED is terminal, which makes that trap worse than it sounds: a
+// client that correctly stops polling on a terminal status stops exactly when
+// polling is the only way to find out (issue #301, found on a 128-chain
+// covenant workload where one rejection condemns a whole chain).
+//
+// Grouping — rather than one event per transaction — is deliberate, and it is
+// the cascade that makes the difference. A dep-cascade condemns every
+// descendant of one rejected ancestor with the SAME cascadeReason string, and
+// that is the burst that gets large (one rejection at the head of a chain
+// condemns the whole chain). Those still ride a single event, so the SSE
+// fan-out keeps its one batched token resolution instead of paying a store
+// round-trip per descendant on its single fan-out goroutine. A Teranode
+// verdict, by contrast, names the offending txid inside its own failure line,
+// so those reasons are distinct per transaction and the grouping degenerates
+// to one event each — which is exactly what carrying a per-transaction reason
+// requires.
+//
+// Only TxID, ExtraInfo and StatusCode are read from each status; the event's
+// Status and Timestamp come from the caller, matching publishBulkStatus.
+func (p *Propagator) publishRejections(ctx context.Context, rejected []*models.TransactionStatus, ts time.Time) {
+	if p.publisher == nil || len(rejected) == 0 {
+		return
 	}
+	// Grouped in first-seen order, not map order, so a batch's events come
+	// out in the order the batch produced them and stay comparable with the
+	// "transaction rejected" log lines emitted alongside them.
+	type reason struct {
+		extraInfo  string
+		statusCode int
+	}
+	index := make(map[reason]int, len(rejected))
+	groups := make([]*models.TransactionStatus, 0, len(rejected))
+	for _, st := range rejected {
+		key := reason{extraInfo: st.ExtraInfo, statusCode: st.StatusCode}
+		i, seen := index[key]
+		if !seen {
+			i = len(groups)
+			index[key] = i
+			groups = append(groups, &models.TransactionStatus{
+				Status:     models.StatusRejected,
+				StatusCode: st.StatusCode,
+				Timestamp:  ts,
+				ExtraInfo:  st.ExtraInfo,
+			})
+		}
+		groups[i].TxIDs = append(groups[i].TxIDs, st.TxID)
+	}
+	for _, g := range groups {
+		p.publishBulk(ctx, g)
+	}
+}
+
+// publishBulk sends one prepared bulk event. Non-fatal: the durable store
+// rows are already written, and SSE catchup recovers any dropped events.
+func (p *Propagator) publishBulk(ctx context.Context, template *models.TransactionStatus) {
 	if err := p.publisher.PublishBulk(ctx, template); err != nil {
 		p.logger.Warn(
 			"failed to publish bulk propagation status",
-			logfields.Status(string(status)),
-			zap.Int("count", len(txids)),
+			logfields.Status(string(template.Status)),
+			zap.Int("count", len(template.TxIDs)),
 			zap.Error(err),
 		)
 	}
@@ -2172,7 +2253,16 @@ func (p *Propagator) schedulePendingRetry(ctx context.Context, txid string, rawT
 			p.logger.Error("clear retry state failed", logfields.TxID(txid), zap.Error(err))
 			return
 		}
-		p.publishBulkStatus(ctx, models.StatusRejected, []string{txid}, time.Now())
+		// Same reason string that just went onto the row. A give-up is the
+		// least self-evident rejection arcade issues — no peer ever answered
+		// for this tx, so there is no verdict to quote and nothing about the
+		// bytes explains it — which makes it the one most worth carrying on
+		// the event rather than leaving to a GET /tx.
+		p.publishRejections(ctx, []*models.TransactionStatus{{
+			TxID:      txid,
+			Status:    models.StatusRejected,
+			ExtraInfo: reason,
+		}}, time.Now())
 		return
 	}
 	next := time.Now().Add(p.nextPendingRetryDelay(count))
