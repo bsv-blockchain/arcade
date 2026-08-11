@@ -357,10 +357,34 @@ type TelemetryConfig struct {
 
 type PropagationConfig struct {
 	MerkleConcurrency int `mapstructure:"merkle_concurrency"`
-	RetryMaxAttempts  int `mapstructure:"retry_max_attempts"`
-	RetryBackoffMs    int `mapstructure:"retry_backoff_ms"`
-	ReaperIntervalMs  int `mapstructure:"reaper_interval_ms"`
-	ReaperBatchSize   int `mapstructure:"reaper_batch_size"`
+	// RetryMaxAttempts bounds how many times the propagator will push a
+	// transaction back through the in-memory requeue loop when a broadcast
+	// produced no per-tx verdict (no healthy peer, body-less 5xx, merkle
+	// /watch blip, or a conflict-family 409 whose lines could not be
+	// attributed to any submitted tx). After the budget is spent the tx is
+	// parked at PENDING_RETRY, which releases the dispatcher's in-flight
+	// entry so the Kafka commit watermark can advance; the reaper then owns
+	// the durable retry.
+	//
+	// The bound is not a nicety. On 2026-08-11 (dev-ovh-1, arcade v0.11.5) a
+	// 21-tx batch of stale transactions drew a permanent HTTP 409 from
+	// Teranode — 21 "UTXO_SPENT (70): <outpoint>:<vout> utxo already spent by
+	// tx <spender>[n]" lines, all keyed by the spent outpoint rather than by
+	// any submitted txid. With no attributable verdict every tx fell to the
+	// requeue arm and looped forever: ~2,410 409s in two minutes, 42 of 43
+	// batches requeued, 4,679 transactions pinned in the dispatcher's
+	// inFlight map and therefore 337,247 messages of Kafka lag frozen on the
+	// single-partition arcade.propagation topic while the leader burned 4.2
+	// cores. Nothing new could propagate until operators seeked the consumer
+	// group past the backlog by hand.
+	//
+	// Defaults to 5 (matching the shipped viper default). Non-positive values
+	// fall back to the default rather than disabling the bound — an unbounded
+	// requeue is the failure mode this exists to prevent.
+	RetryMaxAttempts int `mapstructure:"retry_max_attempts"`
+	RetryBackoffMs   int `mapstructure:"retry_backoff_ms"`
+	ReaperIntervalMs int `mapstructure:"reaper_interval_ms"`
+	ReaperBatchSize  int `mapstructure:"reaper_batch_size"`
 	// ReaperRebroadcastBatch caps how many stuck transactions the reaper's
 	// durable-rebroadcast backstop pushes back through the register+broadcast
 	// pipeline per tick (reapOnce collects at most this many stale RECEIVED /

@@ -434,11 +434,27 @@ func handleRequeue(
 // releases direct waiters whose other-parent set has also cleared —
 // each released waiter goes into pendingMsgs (and its own waiters
 // stay held until IT terminalizes; no recursive cascade). REJECTED
-// recursively cascade-rejects every descendant.
+// recursively cascade-rejects every descendant. PENDING_RETRY (the
+// requeue-budget escape) behaves structurally like REJECTED.
 //
-// Both branches mark the txid's offset Done on the tracker (and every
+// All three branches mark the txid's offset Done on the tracker (and every
 // cascaded descendant's offset too) so the Kafka commit watermark can
 // advance past them.
+//
+// PENDING_RETRY is included precisely BECAUSE it is not a verdict. A tx that
+// burned its whole requeue budget without an answer from any peer must still
+// stop pinning its Kafka offset — otherwise it keeps LowestUnfinished()
+// frozen and, on a single-partition topic, blocks every message behind it.
+// That is the 2026-08-11 dev-ovh-1 wedge in one sentence: 4,679 no-verdict
+// txs held 337,247 messages of lag stationary because nothing ever released
+// their in-flight entries. The tx is not abandoned — the reaper rebroadcasts
+// PENDING_RETRY rows from the store, off the Kafka offset path entirely.
+//
+// Held descendants are cascaded (not released into pendingMsgs) for the same
+// reason they are on the REJECTED branch: their parent never reached
+// ACCEPTED, so broadcasting them now would just draw TX_MISSING_PARENT. They
+// ride the same durable reaper retry as their parked ancestor — the CALLER
+// writes PENDING_RETRY rows for them, not REJECTED (see persistCascade).
 func handleTerminal(
 	ev terminalEvent,
 	inFlight map[string]int64,
@@ -456,7 +472,7 @@ func handleTerminal(
 		releaseWaiters(ev.txid, inFlight, waiters, heldMsgs, pendingMsgs)
 		return terminalResult{}
 
-	case models.StatusRejected:
+	case models.StatusRejected, models.StatusPendingRetry:
 		if offset, ok := inFlight[ev.txid]; ok {
 			tracker.Done(offset)
 		}

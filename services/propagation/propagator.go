@@ -9,12 +9,15 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -63,6 +66,17 @@ type propagationMsg struct {
 	// processBatch to link the batch's "propagation.broadcast" span back to
 	// each tx's originating producer span — see startBroadcastSpan.
 	spanCtx trace.SpanContext
+	// retryCount is how many times this tx has already been pushed back
+	// through requeueAfterDelay on THIS claim. Like spanCtx it is process-
+	// local and deliberately not serialized: a tx re-read from Kafka after a
+	// restart or rebalance is a fresh attempt against (probably) a different
+	// downstream state, so its budget resets. requeueAfterDelay increments it
+	// and parks the tx at PENDING_RETRY once it exceeds
+	// Propagator.retryMaxAttempts — without that ceiling a batch that can
+	// never succeed loops forever and its in-flight entries freeze the Kafka
+	// commit watermark (the 2026-08-11 dev-ovh-1 wedge: 337,247 messages of
+	// lag stationary behind 4,679 in-flight txs).
+	retryCount int
 }
 
 type Propagator struct {
@@ -105,6 +119,18 @@ type Propagator struct {
 	maxParallelChunks int
 	holderID          string
 	leaseTTL          time.Duration
+	// retryMaxAttempts is the per-claim in-memory requeue budget
+	// (propagation.retry_max_attempts, default defaultRetryMaxAttempts). See
+	// requeueAfterDelay / parkExhaustedRequeues for what happens when it runs
+	// out, and config.PropagationConfig.RetryMaxAttempts for the incident that
+	// motivated bounding it at all.
+	retryMaxAttempts int
+	// requeueDelay is the flat wait before a requeue lands back on the
+	// dispatcher. Initialized to defaultRequeueDelay; carried as a field
+	// rather than referenced as a constant so tests can compress the
+	// retry loop to milliseconds instead of spending
+	// retryMaxAttempts × 2s of wall time per case.
+	requeueDelay time.Duration
 
 	// broadcastJobs feeds the persistent worker pool that runs every
 	// per-endpoint POST /txs call. Replaces the previous per-broadcast
@@ -244,6 +270,17 @@ const defaultBroadcastWorkers = 256
 // defaultMaxParallelChunks × len(endpoints).
 const defaultMaxParallelChunks = 4
 
+// defaultRetryMaxAttempts is the in-memory requeue budget applied when
+// propagation.retry_max_attempts is unset or non-positive. Kept equal to the
+// shipped viper default (config.setDefaults) so the code and the config file
+// can never disagree about what "unset" means.
+//
+// Five attempts × defaultRequeueDelay is ~10s of fast-path retry, which
+// comfortably rides out the blips the requeue arm was built for (a peer
+// restarting, a merkle-service hiccup) while guaranteeing a permanently
+// unresolvable batch reaches its terminal escape in seconds rather than never.
+const defaultRetryMaxAttempts = 5
+
 // New constructs a Propagator. leaser may be nil, in which case the reaper
 // runs unguarded — appropriate for tests and single-process deployments that
 // don't need coordination. In production every replica should receive a
@@ -295,6 +332,13 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 	if maxParallelChunks <= 0 {
 		maxParallelChunks = defaultMaxParallelChunks
 	}
+	// A non-positive retry_max_attempts falls back to the default rather than
+	// meaning "unlimited": an unbounded requeue loop is precisely the failure
+	// this budget exists to prevent, so there is no way to configure it away.
+	retryMaxAttempts := cfg.Propagation.RetryMaxAttempts
+	if retryMaxAttempts <= 0 {
+		retryMaxAttempts = defaultRetryMaxAttempts
+	}
 	p := &Propagator{
 		cfg:               cfg,
 		logger:            logger.Named("propagation"),
@@ -314,6 +358,8 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 		maxParallelChunks: maxParallelChunks,
 		holderID:          newHolderID(),
 		leaseTTL:          leaseTTL,
+		retryMaxAttempts:  retryMaxAttempts,
+		requeueDelay:      defaultRequeueDelay,
 		broadcastJobs:     make(chan broadcastJob, broadcastJobBuffer),
 		processBatchSem:   make(chan struct{}, maxConcurrentBatches),
 		admitCh:           make(chan admitRequest, dispatcherChannelBuffer),
@@ -381,9 +427,18 @@ func (p *Propagator) Name() string { return "propagation" }
 
 // applyTerminalStatuses persists the per-tx terminal statuses produced by
 // processBatch in one BatchUpdateStatusReturning call, observes the
-// RECEIVED→{ACCEPTED_BY_NETWORK,REJECTED} transition age, emits one
-// PublishBulk per terminal status, and notifies the dispatcher so it can
+// RECEIVED→{ACCEPTED_BY_NETWORK,REJECTED,PENDING_RETRY} transition age, emits
+// one PublishBulk per status, and notifies the dispatcher so it can
 // release/cascade waiters and mark the Kafka offset Done.
+//
+// "Terminal" here means terminal FOR THE DISPATCHER — the point at which a tx
+// stops pinning its Kafka offset — not terminal for the client. Three statuses
+// qualify: ACCEPTED_BY_NETWORK, REJECTED, and PENDING_RETRY (the requeue-budget
+// escape, see parkExhaustedRequeues). Routing the park through this one
+// function is deliberate: it is the only place that both persists a status and
+// tells the dispatcher to release the in-flight entry, and a park that failed
+// to release would leave the consumer exactly as wedged as the unbounded
+// requeue loop it replaced.
 //
 // It walks the batch with two deliberately separate accounting passes:
 //
@@ -422,14 +477,16 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 		// be released even when the store write failed.
 	}
 
-	// terminalAccepted/terminalRejected drive the dispatcher notification:
-	// every terminalized tx, unconditionally.
+	// terminalAccepted/terminalRejected/terminalParked drive the dispatcher
+	// notification: every terminalized tx, unconditionally.
 	terminalAccepted := make([]string, 0, accepted)
 	terminalRejected := make([]string, 0, rejected)
-	// publishedAccepted/publishedRejected drive the bulk publish: only
-	// rows whose store status actually transitioned.
+	var terminalParked []string
+	// published* drive the bulk publish: only rows whose store status
+	// actually transitioned.
 	publishedAccepted := make([]string, 0, accepted)
 	publishedRejected := make([]string, 0, rejected)
+	var publishedParked []string
 	now := time.Now()
 	for i, st := range terminalStatuses {
 		var prev *models.TransactionStatus
@@ -437,14 +494,16 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 			prev = prevs[i]
 		}
 
-		// Dispatcher accounting — unconditional. processBatch only routes
-		// ACCEPTED_BY_NETWORK and REJECTED into terminalStatuses; the
-		// defensive default keeps the switch exhaustive.
+		// Dispatcher accounting — unconditional. Callers only route
+		// ACCEPTED_BY_NETWORK, REJECTED and PENDING_RETRY into
+		// terminalStatuses; the defensive default keeps the switch exhaustive.
 		switch st.Status {
 		case models.StatusAcceptedByNetwork:
 			terminalAccepted = append(terminalAccepted, st.TxID)
 		case models.StatusRejected:
 			terminalRejected = append(terminalRejected, st.TxID)
+		case models.StatusPendingRetry:
+			terminalParked = append(terminalParked, st.TxID)
 		default:
 		}
 
@@ -474,6 +533,8 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 				zap.String("reason", st.ExtraInfo),
 				logfields.Stage(logfields.StageNetwork),
 			)
+		case models.StatusPendingRetry:
+			publishedParked = append(publishedParked, st.TxID)
 		default:
 		}
 	}
@@ -498,6 +559,7 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 
 	p.publishBulkStatus(ctx, models.StatusAcceptedByNetwork, publishedAccepted, now)
 	p.publishBulkStatus(ctx, models.StatusRejected, publishedRejected, now)
+	p.publishBulkStatus(ctx, models.StatusPendingRetry, publishedParked, now)
 
 	// Notify the dispatcher ONLY when the batch status write fully
 	// succeeded. BatchUpdateStatusReturning surfaces per-row failures as
@@ -520,74 +582,116 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 	// dispatcher's pendingMsgs). REJECTED returns cascaded
 	// descendants we write REJECTED rows for; the cascade reason names
 	// the rejected ancestor but never its cause — see
-	// persistCascadeRejections.
-	var allCascaded []cascadeRejection
+	// persistCascade.
+	//
+	// PENDING_RETRY behaves like REJECTED structurally (offset released,
+	// held descendants collected) but the descendants are parked, not
+	// rejected: their ancestor produced NO verdict, so condemning them would
+	// invent one. They ride the same durable reaper retry as the parked
+	// ancestor.
+	var allRejectCascaded, allParkCascaded []cascadeRejection
 	for _, txid := range terminalAccepted {
 		p.notifyTerminalToDispatcher(ctx, txid, models.StatusAcceptedByNetwork)
 	}
 	for _, txid := range terminalRejected {
 		r := p.notifyTerminalToDispatcher(ctx, txid, models.StatusRejected)
 		for _, child := range r.cascaded {
-			allCascaded = append(allCascaded, cascadeRejection{txid: child, ancestor: txid})
+			allRejectCascaded = append(allRejectCascaded, cascadeRejection{txid: child, ancestor: txid})
 		}
 	}
-	if len(allCascaded) > 0 {
-		p.persistCascadeRejections(ctx, allCascaded, now)
+	for _, txid := range terminalParked {
+		r := p.notifyTerminalToDispatcher(ctx, txid, models.StatusPendingRetry)
+		for _, child := range r.cascaded {
+			allParkCascaded = append(allParkCascaded, cascadeRejection{txid: child, ancestor: txid})
+		}
+	}
+	if len(allRejectCascaded) > 0 {
+		p.persistCascade(ctx, allRejectCascaded, models.StatusRejected, now)
+	}
+	if len(allParkCascaded) > 0 {
+		p.persistCascade(ctx, allParkCascaded, models.StatusPendingRetry, now)
 	}
 }
 
-// cascadeRejection pairs a cascade-rejected tx with the terminal-rejected
-// ancestor whose verdict condemned it, so the persisted reason can name the
-// row a client should look at (and resubmit first).
+// cascadeRejection pairs a cascade-terminalized tx with the ancestor whose
+// outcome condemned (REJECTED) or parked (PENDING_RETRY) it, so the persisted
+// reason can name the row a client should look at (and resubmit first).
 type cascadeRejection struct {
 	txid     string
 	ancestor string
 }
 
-// persistCascadeRejections writes terminal REJECTED rows for txs the
-// dep cascade rejected without ever broadcasting them, then emits one
+// cascadeReason renders the ExtraInfo for a tx that inherited its ancestor's
+// outcome without ever being broadcast itself.
+//
+// "parent rejected" is kept as the stable prefix existing consumers match on.
+// Both variants state the recovery path explicitly, because neither is a
+// verdict about this tx's bytes — it is a consequence of queue state, so once
+// the ancestor clears, a resubmission re-runs the pipeline (intake re-validates
+// and re-broadcasts REJECTED rows).
+func cascadeReason(status models.Status, ancestor string) string {
+	if status == models.StatusPendingRetry {
+		return fmt.Sprintf(
+			"parent parked for durable retry (ancestor %s): retryable — the ancestor got no network verdict; both are rebroadcast by the reaper",
+			ancestor,
+		)
+	}
+	return fmt.Sprintf(
+		"parent rejected (ancestor %s): retryable — resubmit after the ancestor is accepted",
+		ancestor,
+	)
+}
+
+// persistCascade writes rows for txs the dep cascade terminalized without ever
+// broadcasting them — REJECTED when their ancestor was rejected, PENDING_RETRY
+// when their ancestor was parked by the requeue-budget escape — then emits one
 // bulk publish so SSE/webhook subscribers learn about the outcome.
 // Best-effort: a store write failure is logged but doesn't undo the
 // in-memory cascade state (the dispatcher has already terminalized
 // them; we'd be reconciling at restart via Kafka replay anyway).
-func (p *Propagator) persistCascadeRejections(ctx context.Context, cascaded []cascadeRejection, now time.Time) {
+func (p *Propagator) persistCascade(ctx context.Context, cascaded []cascadeRejection, status models.Status, now time.Time) {
 	statuses := make([]*models.TransactionStatus, len(cascaded))
 	txids := make([]string, len(cascaded))
 	for i, cr := range cascaded {
 		txids[i] = cr.txid
-		// "parent rejected" (kept as the stable prefix existing consumers
-		// match on) is the only structural reason that applies to a
-		// cascaded child — it didn't fail for any reason of its own. The
-		// suffix names the rejected ancestor whose row carries the actual
-		// cause, and states the recovery path: this rejection is a
-		// consequence of queue state, not a verdict about this tx's bytes,
-		// so once the ancestor is accepted a resubmission re-runs the
-		// pipeline (intake re-validates and re-broadcasts REJECTED rows).
-		reason := fmt.Sprintf(
-			"parent rejected (ancestor %s): retryable — resubmit after the ancestor is accepted",
-			cr.ancestor,
-		)
+		// The cascaded child didn't fail for any reason of its own; the
+		// reason names the ancestor whose row carries the actual cause.
+		reason := cascadeReason(status, cr.ancestor)
 		statuses[i] = &models.TransactionStatus{
 			TxID:      cr.txid,
-			Status:    models.StatusRejected,
+			Status:    status,
 			Timestamp: now,
 			ExtraInfo: reason,
 		}
-		p.logger.Info(
-			"transaction rejected",
-			logfields.TxID(cr.txid),
-			zap.String("reason", reason),
-			logfields.Stage(logfields.StageCascade),
+		// One line per cascade-REJECTED tx preserves the existing searchable
+		// "transaction rejected" record. The parked cascade gets a single
+		// bounded line below instead — a park is not a verdict, and an
+		// upstream outage can cascade a lot of them at once.
+		if status == models.StatusRejected {
+			p.logger.Info(
+				"transaction rejected",
+				logfields.TxID(cr.txid),
+				zap.String("reason", reason),
+				logfields.Stage(logfields.StageCascade),
+			)
+		}
+	}
+	if status == models.StatusPendingRetry {
+		parkFields := append(
+			[]zap.Field{logfields.Stage(logfields.StageCascade)},
+			logfields.TxIDBatch(txids)...,
 		)
+		p.logger.Warn("transactions parked behind an ancestor with no network verdict", parkFields...)
 	}
 	if _, err := p.store.BatchUpdateStatusReturning(ctx, statuses); err != nil {
 		p.logger.Warn(
-			"cascade rejection write failed",
+			"cascade status write failed",
+			logfields.Status(string(status)),
 			zap.Int("count", len(cascaded)),
 			zap.Error(err),
 		)
 	}
-	p.publishBulkStatus(ctx, models.StatusRejected, txids, now)
+	p.publishBulkStatus(ctx, status, txids, now)
 }
 
 // publishBulkStatus fans a post-broadcast batch status update onto the
@@ -1103,6 +1207,135 @@ func alienFailureLines(failures map[string]string, inBatch map[string]bool) (cou
 	return count, best
 }
 
+// outpointRefPattern matches an "<txid>:<vout>" outpoint reference anywhere in
+// a Teranode failure line. The conflict family renders the spent outpoint in
+// exactly this form — "UTXO_SPENT (70): <outpoint_txid>:<vout> utxo already
+// spent by tx <spender_txid>[n]" — and, crucially, renders the COMPETING
+// SPENDER with a bracketed index instead ("...[0]"), so a colon-anchored match
+// can never pick up the spender by accident. Case-insensitive because Teranode
+// lowercases but the regex stays defensive, exactly like txsTxidPattern.
+var outpointRefPattern = regexp.MustCompile(`[0-9a-fA-F]{64}:[0-9]{1,10}`)
+
+// outpointOwnerAmbiguous marks an outpoint spent by more than one tx in the
+// same submitted batch — an intra-batch double spend. Teranode's single
+// conflict line cannot say which of them lost, so such an outpoint attributes
+// to nobody (see attributeConflictLines).
+const outpointOwnerAmbiguous = -1
+
+// buildSubmittedOutpointIndex maps every outpoint spent by the batch to the
+// index of the single tx that spends it, or outpointOwnerAmbiguous when
+// several do. Keys are lowercase "<txid>:<vout>" so they compare directly
+// against what outpointRefPattern lifts out of a Teranode failure line.
+//
+// The raw bytes are re-parsed here rather than read off propagationMsg —
+// InputTXIDs carries parent txids only, and an outpoint needs the vout to be
+// unambiguous (two inputs of the same batch can spend two different outputs of
+// the same parent). Parsing is confined to the failure path: the caller only
+// builds the index when a peer actually returned alien lines, and builds it at
+// most once per batch no matter how many peers do.
+//
+// Unparseable raw bytes are skipped, not fatal — a tx we cannot parse simply
+// owns no outpoints and therefore attracts no attribution.
+func buildSubmittedOutpointIndex(batch []propagationMsg) map[string]int {
+	owners := make(map[string]int, len(batch))
+	for i, msg := range batch {
+		tx, err := sdkTx.NewTransactionFromBytes(msg.RawTx)
+		if err != nil || tx == nil {
+			continue
+		}
+		for _, in := range tx.Inputs {
+			if in == nil || in.SourceTXID == nil {
+				continue
+			}
+			key := strings.ToLower(in.SourceTXID.String()) + ":" + strconv.FormatUint(uint64(in.SourceTxOutIndex), 10)
+			if prev, seen := owners[key]; seen && prev != i {
+				owners[key] = outpointOwnerAmbiguous
+				continue
+			}
+			owners[key] = i
+		}
+	}
+	return owners
+}
+
+// attributeConflictLines resolves alien (outpoint-keyed) failure lines back to
+// the submitted transactions they actually condemn, returning batch-index →
+// line for every line it could place.
+//
+// This is the fix for the common case behind the 2026-08-11 wedge. Teranode's
+// conflict verdicts name the spent outpoint rather than the submitted txid, so
+// #292 could tell that SOMETHING in the batch had failed but not what — and a
+// tx with neither an accept vote nor an attributable rejection falls to
+// requeue, forever. arcade does hold the submitted raw transactions, so for
+// the overwhelmingly common shape (one line per genuinely double-spent tx) it
+// can simply look up which submitted tx spends that outpoint and terminalize
+// it REJECTED with the real verdict.
+//
+// The safety property from #292 is preserved verbatim: attribution only ever
+// ADDS rejection votes, and only on an exact outpoint match against a
+// submitted input. A line whose outpoint matches nothing, or matches more than
+// one submitted tx, is left alone — nothing is guessed, and no acceptance is
+// ever fabricated. Callers keep withholding implicit accepts for the peer
+// regardless of how many lines were attributed.
+//
+// Iteration is over sorted keys so a batch that draws two attributable lines
+// for the same tx resolves to the same ExtraInfo on every run, independent of
+// Go's map iteration order.
+func attributeConflictLines(failures map[string]string, inBatch map[string]bool, owners map[string]int) map[int]string {
+	if len(failures) == 0 || len(owners) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(failures))
+	for key := range failures {
+		if !inBatch[key] {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+
+	var attributed map[int]string
+	for _, key := range keys {
+		line := failures[key]
+		idx, ok := attributeOneConflictLine(line, owners)
+		if !ok {
+			metrics.PropagationConflictAttributionTotal.WithLabelValues("unattributable").Inc()
+			continue
+		}
+		metrics.PropagationConflictAttributionTotal.WithLabelValues("attributed").Inc()
+		if attributed == nil {
+			attributed = make(map[int]string, len(keys))
+		}
+		attributed[idx] = preferRejectionLine(attributed[idx], line)
+	}
+	return attributed
+}
+
+// attributeOneConflictLine finds the submitted tx a single failure line
+// condemns by matching every "<txid>:<vout>" the line mentions against the
+// batch's spent outpoints. Returns the batch index and true only when the line
+// resolves to exactly one submitted tx.
+func attributeOneConflictLine(line string, owners map[string]int) (int, bool) {
+	matches := outpointRefPattern.FindAllString(line, -1)
+	found := -1
+	for _, ref := range matches {
+		idx, ok := owners[strings.ToLower(ref)]
+		if !ok || idx == outpointOwnerAmbiguous {
+			continue
+		}
+		if found >= 0 && found != idx {
+			// The line names spent outpoints belonging to two different
+			// submitted txs. Nothing about that shape tells us which one the
+			// verdict is about, so decline rather than guess.
+			return 0, false
+		}
+		found = idx
+	}
+	if found < 0 {
+		return 0, false
+	}
+	return found, true
+}
+
 // rejectionLineScore ranks a Teranode failure line for wallet-facing quality.
 // Higher is better. Unknown free text scores 0.
 func rejectionLineScore(line string) int {
@@ -1389,16 +1622,24 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) {
 	)
 }
 
-// requeueDelay is the flat wait before a requeue lands back on the
+// defaultRequeueDelay is the flat wait before a requeue lands back on the
 // dispatcher. Long enough to ride out a brief upstream blip; short
 // enough that submitter-visible latency stays acceptable. Tunable if
-// observed retry traffic suggests a different cadence works better.
-const requeueDelay = 2 * time.Second
+// observed retry traffic suggests a different cadence works better; carried
+// on the Propagator as requeueDelay so tests can compress it.
+const defaultRequeueDelay = 2 * time.Second
 
 // requeueAfterDelay schedules a delayed requeue of msgs through the
-// dispatcher. Spawns a goroutine that sleeps requeueDelay then sends
+// dispatcher. Spawns a goroutine that sleeps p.requeueDelay then sends
 // each msg to requeueCh. The goroutine bails on ctx cancellation so
 // claim revocation and shutdown don't hold txs in limbo.
+//
+// Every requeue costs the tx one unit of its retry budget
+// (propagation.retry_max_attempts). Txs whose budget is spent do NOT go
+// round again: they are parked at PENDING_RETRY by parkExhaustedRequeues,
+// which releases their dispatcher in-flight entry so the Kafka commit
+// watermark can advance. That ceiling is the whole reason this function
+// splits its input — see the incident write-up on parkExhaustedRequeues.
 //
 // Bailing on ctx.Done is safe for at-least-once delivery: a requeue
 // dropped here leaves the tx in the dispatcher's inFlight set with its
@@ -1419,6 +1660,10 @@ func (p *Propagator) requeueAfterDelay(ctx context.Context, msgs []propagationMs
 	// minus the 2s of parked goroutines per aborted batch a rebalance used
 	// to accumulate. Also skips the "transactions requeued for retry" Info,
 	// which would be a lie: nothing is being requeued.
+	//
+	// Checked BEFORE the budget is charged: a claim revocation is not an
+	// attempt, and charging for it would let a rebalance storm park txs that
+	// were never actually broadcast.
 	if ctx.Err() != nil {
 		p.logger.Debug(
 			"requeue dropped before delay elapsed; txs left uncommitted for replay",
@@ -1426,6 +1671,15 @@ func (p *Propagator) requeueAfterDelay(ctx context.Context, msgs []propagationMs
 		)
 		return
 	}
+
+	msgs, exhausted := p.chargeRetryBudget(msgs)
+	if len(exhausted) > 0 {
+		p.parkExhaustedRequeues(ctx, exhausted)
+	}
+	if len(msgs) == 0 {
+		return
+	}
+
 	requeueTxIDs := make([]string, len(msgs))
 	for i, m := range msgs {
 		requeueTxIDs[i] = m.TXID
@@ -1447,7 +1701,7 @@ func (p *Propagator) requeueAfterDelay(ctx context.Context, msgs []propagationMs
 	go func(msgs []propagationMsg) {
 		defer metrics.PropagationPendingRequeues.Dec()
 		select {
-		case <-time.After(requeueDelay):
+		case <-time.After(p.requeueDelay):
 		case <-ctx.Done():
 			p.logger.Debug(
 				"requeue dropped before delay elapsed; txs left uncommitted for replay",
@@ -1468,6 +1722,94 @@ func (p *Propagator) requeueAfterDelay(ctx context.Context, msgs []propagationMs
 			}
 		}
 	}(msgs)
+}
+
+// chargeRetryBudget debits one attempt from every msg and splits the batch
+// into the txs that may go round again and the txs whose budget is spent.
+// The increment is on the local copy of each msg, which is exactly right:
+// requeueToDispatcher sends the value on to the dispatcher, which stores it
+// verbatim in pendingMsgs/heldMsgs, so the count rides with the tx through
+// every subsequent flush on this claim.
+func (p *Propagator) chargeRetryBudget(msgs []propagationMsg) (retry, exhausted []propagationMsg) {
+	retry = make([]propagationMsg, 0, len(msgs))
+	for _, m := range msgs {
+		m.retryCount++
+		if m.retryCount > p.retryMaxAttempts {
+			exhausted = append(exhausted, m)
+			continue
+		}
+		retry = append(retry, m)
+	}
+	return retry, exhausted
+}
+
+// parkExhaustedRequeues is the poison-batch escape hatch: it moves txs that
+// spent their whole requeue budget without ever drawing a network verdict to
+// PENDING_RETRY, which releases their dispatcher in-flight entry and lets the
+// Kafka commit watermark advance past them.
+//
+// WHY this has to exist. Before it, "no verdict" meant "requeue", full stop,
+// and a batch that could never succeed simply went round forever. On
+// 2026-08-11 (dev-ovh-1, arcade v0.11.5) Teranode answered a 21-tx batch of
+// stale transactions with HTTP 409 and 21 conflict lines of the form
+// "UTXO_SPENT (70): <outpoint>:<vout> utxo already spent by tx <spender>[n]".
+// Those lines key under the spent outpoint, not the submitted txid, so
+// alienFailureLines correctly withheld implicit accepts (#292) and — with no
+// attributable rejection either — every tx fell to the requeue arm. Result:
+// ~2,410 409s in two minutes, 42 of 43 batches requeued, 4,679 txs stuck in
+// the dispatcher's inFlight map pinning offsets, and 337,247 messages of lag
+// on the single-partition arcade.propagation topic frozen solid while the
+// leader pod burned 4.2 CPU cores. Every newly submitted transaction sat at
+// RECEIVED until operators hand-seeked the consumer group past the backlog.
+//
+// WHY PENDING_RETRY and not REJECTED. The requeue arm covers genuine infra
+// failure too (no healthy peer, body-less 5xx, merkle /watch blip). Rejecting
+// on a ~10s budget would turn a brief Teranode outage into a wave of false
+// terminal REJECTEDs. PENDING_RETRY is honest — "no verdict yet" — keeps the
+// row's raw bytes, and hands ownership to the reaper, which rebroadcasts
+// PENDING_RETRY rows on its own (much slower, offset-free) cadence. Nothing is
+// dropped; only the fast path gives up.
+//
+// The write goes through applyTerminalStatuses precisely because that is the
+// one path that both persists the status AND notifies the dispatcher. A park
+// that skipped the notify would leave the in-flight entry — and therefore the
+// wedge — exactly as it was.
+func (p *Propagator) parkExhaustedRequeues(ctx context.Context, msgs []propagationMsg) {
+	now := time.Now()
+	txids := make([]string, len(msgs))
+	statuses := make([]*models.TransactionStatus, len(msgs))
+	reason := fmt.Sprintf(
+		"no network verdict after %d propagation attempts: retryable — parked for durable rebroadcast by the propagation reaper",
+		p.retryMaxAttempts,
+	)
+	for i, m := range msgs {
+		txids[i] = m.TXID
+		statuses[i] = &models.TransactionStatus{
+			TxID:      m.TXID,
+			Status:    models.StatusPendingRetry,
+			Timestamp: now,
+			ExtraInfo: reason,
+		}
+	}
+
+	metrics.PropagationRequeueExhaustedTotal.Add(float64(len(msgs)))
+	// ERROR, not Warn: reaching this line means transactions got no answer
+	// from any peer across the entire fast-path budget. It is always worth
+	// waking someone up, and the bounded txid list is what an operator needs
+	// to reproduce the failing submit against Teranode by hand.
+	parkFields := append(
+		[]zap.Field{
+			zap.Int("attempts", p.retryMaxAttempts),
+			logfields.Stage(logfields.StageNetwork),
+		},
+		logfields.TxIDBatch(txids)...,
+	)
+	p.logger.Error(
+		"propagation retry budget exhausted with no network verdict; parking txs at PENDING_RETRY so the Kafka commit watermark can advance",
+		parkFields...,
+	)
+
+	p.applyTerminalStatuses(ctx, statuses, 0, 0)
 }
 
 // Per-batch chunk parallelism is now config-driven via
@@ -1666,8 +2008,12 @@ func (p *Propagator) submitBroadcastJobs(ctx context.Context, endpoints []string
 //     Implicit acceptance is only trusted when every failure line named a
 //     submitted tx; conflict-family lines key under alien hashes (spent
 //     outpoint / competing spender — no [ProcessTransaction] wrapper), in
-//     which case the peer grants no implicit accepts, and a single-tx
-//     batch attributes the alien verdict to its only tx.
+//     which case the peer grants no implicit accepts. Alien lines are then
+//     re-attributed by OUTPOINT (attributeConflictLines): the spent
+//     "<txid>:<vout>" the line names is looked up against the inputs of the
+//     submitted raw transactions, and a unique match rejects that tx with the
+//     real verdict. A single-tx batch attributes any leftover alien verdict to
+//     its only tx.
 //   - Non-200 with no parseable body (gateway 502/503 "no available
 //     server", bare 500, truncated body, network error, unexpected
 //     2xx-but-not-200), or no healthy endpoints → no per-tx information
@@ -1736,6 +2082,12 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 	outcomes := make([]endpointOutcome, 0, submitted)
 	acceptedByAny := make([]bool, len(batch))
 	rejectionLine := make([]string, len(batch))
+	// outpointOwners is the batch's spent-outpoint → tx index map used to
+	// attribute conflict-family lines back to submitted txs. Built lazily and
+	// at most once: it costs a full parse of every raw tx in the batch, which
+	// is pure waste on the (overwhelmingly common) path where no peer returns
+	// an alien-keyed failure line. nil means "not built yet".
+	var outpointOwners map[string]int
 	anySuccess := false
 	for i := 0; i < submitted; i++ {
 		result := <-resultCh
@@ -1808,12 +2160,32 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 		// one unidentifiable submitted tx DID fail; granting implicit
 		// accepts would mark that very tx ACCEPTED_BY_NETWORK.
 		alienCount, bestAlien := alienFailureLines(result.failures, inBatch)
+		// Alien lines are not a dead end. arcade holds the submitted raw
+		// transactions, so the spent "<outpoint>:<vout>" a conflict line names
+		// can be matched against the batch's own inputs and the verdict handed
+		// to the tx that actually spends it. This is what stops the incident
+		// shape from looping: on 2026-08-11 a 21-tx batch drew 21 UTXO_SPENT
+		// 409 lines and, with no attributable verdict, requeued forever
+		// (2,410 failures in two minutes, 42 of 43 batches requeued, 337,247
+		// messages of Kafka lag frozen behind 4,679 in-flight txs).
+		//
+		// Attribution only ever ADDS rejection votes on an exact outpoint
+		// match. The #292 rule is untouched: alienCount > 0 still withholds
+		// every implicit accept from this peer, whether or not the lines could
+		// be placed — a peer that answered 409 has not told us the unnamed txs
+		// are good.
+		var attributed map[int]string
 		if alienCount > 0 {
+			if outpointOwners == nil {
+				outpointOwners = buildSubmittedOutpointIndex(batch)
+			}
+			attributed = attributeConflictLines(result.failures, inBatch, outpointOwners)
 			p.logger.Warn(
 				"teranode failure lines name no submitted tx; withholding implicit accepts from this peer",
 				zap.String("endpoint", result.endpoint),
 				zap.Int("batch_size", len(batch)),
 				zap.Int("alien_line_count", alienCount),
+				zap.Int("attributed_by_outpoint", len(attributed)),
 				zap.String("best_alien_line", bestAlien),
 			)
 		}
@@ -1824,14 +2196,16 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 				acceptedByAny[j] = true
 			}
 		}
+		for idx, line := range attributed {
+			rejectionLine[idx] = preferRejectionLine(rejectionLine[idx], line)
+		}
 		// A single-tx batch has exactly one possible owner for an alien
 		// verdict — the tx itself. Terminalize it with the real reason
 		// (this is the mainnet incident shape: batch_size=1, HTTP 409,
 		// wrapper-less "UTXO_SPENT (70): <outpoint> utxo already spent by
-		// tx <spender>[0]"). Multi-tx batches can't attribute alien lines,
-		// so affected txs simply get no vote from this peer and requeue
-		// unless another peer produces a verdict — the safe pre-fix
-		// behavior, now with the alien reason visible in the Warn log.
+		// tx <spender>[0]"). Kept as the backstop for the case outpoint
+		// attribution can't cover — a conflict line about an outpoint the tx
+		// doesn't visibly spend, or raw bytes we failed to parse.
 		if alienCount > 0 && len(batch) == 1 {
 			rejectionLine[0] = preferRejectionLine(rejectionLine[0], bestAlien)
 		}
