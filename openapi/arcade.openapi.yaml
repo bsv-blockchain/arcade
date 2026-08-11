@@ -611,7 +611,10 @@ paths:
         "200":
           description: |
             An event stream of status updates. Every frame carries
-            txid/txStatus/timestamp. MINED (and IMMUTABLE) frames additionally
+            txid/txStatus/timestamp; timestamp is RFC 3339 and carries
+            fractional seconds when the event has sub-second precision, so it
+            denotes the same instant as the frame id. MINED (and IMMUTABLE)
+            frames additionally
             carry blockHash, blockHeight, and merklePath (the transaction's BUMP,
             hex-encoded) — the same proof GET /tx/{txid} and the webhook callback
             return, so push-only clients need not poll. Those three fields are
@@ -625,11 +628,11 @@ paths:
               example: |
                 id: 1716205200123456789
                 event: status
-                data: {"txid":"<hex>","txStatus":"SEEN_ON_NETWORK","timestamp":"2026-05-20T12:00:00Z"}
+                data: {"txid":"<hex>","txStatus":"SEEN_ON_NETWORK","timestamp":"2026-05-20T12:00:00.123456789Z"}
 
                 id: 1716205260987654321
                 event: status
-                data: {"txid":"<hex>","txStatus":"MINED","timestamp":"2026-05-20T12:01:00Z","blockHash":"<hex>","blockHeight":870123,"merklePath":"<BUMP hex>"}
+                data: {"txid":"<hex>","txStatus":"MINED","timestamp":"2026-05-20T12:01:00.987654321Z","blockHash":"<hex>","blockHeight":870123,"merklePath":"<BUMP hex>"}
 
                 : keepalive
 

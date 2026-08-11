@@ -67,8 +67,8 @@ func (p *fakePublisher) Subscribe(_ context.Context, _ string) (<-chan *models.T
 func (p *fakePublisher) Close() error { return nil }
 
 // sseStoreStub is a minimum-surface fake. The SSE service only touches
-// GetSubmissionsByToken, GetStatus, and IterateStatusesByToken on the
-// Store; embed the interface so every other method panics if
+// GetSubmissionsByToken, GetStatus, TokensForTxIDs and IterateStatusesByToken
+// on the Store; embed the interface so every other method panics if
 // accidentally called.
 type sseStoreStub struct {
 	store.Store
@@ -76,6 +76,12 @@ type sseStoreStub struct {
 	mu          sync.RWMutex
 	subsByToken map[string][]*models.Submission
 	statusByTx  map[string]*models.TransactionStatus
+
+	// tokenCalls counts TokensForTxIDs round-trips and tokenTxIDs the txids
+	// they carried — the fan-out's store cost, which is what
+	// TestFanOutResolvesTokensOncePerEvent asserts on.
+	tokenCalls int
+	tokenTxIDs int
 }
 
 func (s *sseStoreStub) GetSubmissionsByToken(_ context.Context, token string) ([]*models.Submission, error) {
@@ -130,16 +136,37 @@ func (s *sseStoreStub) IterateStatusesByToken(_ context.Context, token string, s
 	return nil
 }
 
-// TokenHasSubmissionForTx mirrors the real backends' membership probe.
-func (s *sseStoreStub) TokenHasSubmissionForTx(_ context.Context, token, txid string) (bool, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for _, sub := range s.subsByToken[token] {
-		if sub.TxID == txid {
-			return true, nil
+// TokensForTxIDs mirrors the real backends' membership resolution and records
+// what fan-out asked of the store.
+func (s *sseStoreStub) TokensForTxIDs(_ context.Context, txids []string) (map[string][]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tokenCalls++
+	s.tokenTxIDs += len(txids)
+
+	want := make(map[string]struct{}, len(txids))
+	for _, txid := range txids {
+		want[txid] = struct{}{}
+	}
+	out := make(map[string][]string)
+	for token, subs := range s.subsByToken {
+		for _, sub := range subs {
+			if _, ok := want[sub.TxID]; !ok {
+				continue
+			}
+			if !slices.Contains(out[sub.TxID], token) {
+				out[sub.TxID] = append(out[sub.TxID], token)
+			}
 		}
 	}
-	return false, nil
+	return out, nil
+}
+
+// storeCounters snapshots the fan-out's store usage.
+func (s *sseStoreStub) storeCounters() (calls, txids int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.tokenCalls, s.tokenTxIDs
 }
 
 func (s *sseStoreStub) setStatus(txid string, status *models.TransactionStatus) {
@@ -426,7 +453,7 @@ func TestSSECatchupFrameCap(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	w := &sseWriter{w: rec, f: nopFlusher{rec}}
-	res := svc.sendCatchup(t.Context(), w, "tok-big", time.Time{}, nil, false)
+	res := svc.sendCatchup(t.Context(), w, "tok-big", time.Time{}, nil, false, catchupMaxFrames)
 
 	frames := strings.Count(rec.Body.String(), "\nevent: status\n")
 	if frames != catchupMaxFrames {
@@ -783,7 +810,7 @@ func TestSSEFanOutDropLogAggregation(t *testing.T) {
 		mgr.fanOut(ctx, &models.TransactionStatus{TxID: "burst", Status: models.StatusMined, Timestamp: time.Now()})
 	}
 
-	warns := logs.FilterMessage("dropped events for slow SSE client; will catch up mid-stream").Len()
+	warns := logs.FilterMessage("sse fan-out could not enqueue events: client send buffer full; will catch up mid-stream").Len()
 	// 100 back-to-back drops land inside one dropLogInterval on any sane
 	// machine, so one aggregate line is expected; tolerate a second in case
 	// the loop straddles an interval boundary. The old code logged all 100.
@@ -793,8 +820,8 @@ func TestSSEFanOutDropLogAggregation(t *testing.T) {
 }
 
 // TestSSEMidstreamCatchupCappedRoundsProgress verifies the multi-round loop:
-// a replay window larger than catchupMaxFrames is delivered across capped
-// rounds whose `since` watermark strictly advances.
+// a replay window larger than one round's frame budget is delivered across
+// capped rounds whose `since` watermark strictly advances.
 func TestSSEMidstreamCatchupCappedRoundsProgress(t *testing.T) {
 	n := catchupMaxFrames + 500
 	subs := make([]*models.Submission, 0, n)
@@ -832,8 +859,12 @@ func TestSSEMidstreamCatchupCappedRoundsProgress(t *testing.T) {
 	if frames := strings.Count(rec.Body.String(), "\nevent: status\n"); frames != n {
 		t.Errorf("frames written = %d, want %d (every status, across rounds)", frames, n)
 	}
-	if got := testutil.ToFloat64(metrics.SSEMidstreamCatchupsTotal) - catchupsBefore; got != 2 {
-		t.Errorf("catchup rounds = %v, want 2 (capped round + resumed round)", got)
+	// Rounds are bounded by the client's send-buffer budget, not by
+	// catchupMaxFrames, so the window pages across ceil(n/budget) rounds.
+	budget := midstreamRoundFrames(client)
+	wantRounds := float64((n + budget - 1) / budget)
+	if got := testutil.ToFloat64(metrics.SSEMidstreamCatchupsTotal) - catchupsBefore; got != wantRounds {
+		t.Errorf("catchup rounds = %v, want %v (capped rounds of %d frames + resumed round)", got, wantRounds, budget)
 	}
 	if got := testutil.ToFloat64(metrics.SSEMidstreamCatchupFramesTotal) - framesBefore; got != float64(n) {
 		t.Errorf("replayed frames metric delta = %v, want %d", got, n)

@@ -131,8 +131,21 @@ ALTER TABLE submissions ADD COLUMN IF NOT EXISTS next_retry_at         TIMESTAMP
 ALTER TABLE submissions ADD COLUMN IF NOT EXISTS attempts              INT NOT NULL DEFAULT 0;
 ALTER TABLE submissions ADD COLUMN IF NOT EXISTS last_attempt_at       TIMESTAMPTZ;
 ALTER TABLE submissions ADD COLUMN IF NOT EXISTS last_result           TEXT;
-CREATE INDEX IF NOT EXISTS idx_sub_txid   ON submissions(txid);
 CREATE INDEX IF NOT EXISTS idx_sub_token  ON submissions(callback_token);
+-- Covering index for the txid-side access path: GetSubmissionsByTxID (webhook
+-- dispatch) and TokensForTxIDs (SSE fan-out membership). Carrying
+-- callback_token in the index turns the fan-out's batch resolution into an
+-- Index Only Scan — measured on 200k rows: Heap Fetches 0 and 97 shared
+-- buffers, against 217 with the heap fetch.
+CREATE INDEX IF NOT EXISTS idx_sub_txid_token ON submissions(txid, callback_token);
+-- idx_sub_txid is a strict prefix of idx_sub_txid_token, so it answers nothing
+-- the composite cannot. It must be DROPPED rather than merely left alone: while
+-- it exists the planner costs the narrower index lower, picks it, and pays the
+-- heap fetch anyway — verified by EXPLAIN, the composite is simply never
+-- chosen. Dropping it also removes one index write per submission INSERT on a
+-- 1000+/s ingest path. A downgrade to a release whose schema still creates it
+-- self-heals: that script's CREATE INDEX IF NOT EXISTS puts it back.
+DROP INDEX IF EXISTS idx_sub_txid;
 -- Partial index keyed off the webhook reaper's scan predicate; stays
 -- proportional to the in-retry backlog, not the full submissions table.
 CREATE INDEX IF NOT EXISTS idx_sub_retry_ready

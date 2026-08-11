@@ -79,14 +79,28 @@ type Client struct {
 // client missed while disconnected is served from the store by sendCatchup
 // via Last-Event-ID, never by Kafka replay.
 //
-// Token-based filtering happens in the fan-out path: every event is
-// checked against each client's token via the indexed existence probe
-// store.TokenHasSubmissionForTx — O(1)-ish per (event, client). Nothing on
-// this path may materialize a token's full submission list (see #237/#238).
+// Token-based filtering happens in the fan-out path, but the store is asked
+// once per EVENT, not once per (event, client): tokenIndex resolves a txid's
+// subscribed token set — batched for bulk events, LRU-cached for live ones —
+// and each client is then matched against that set in memory. Nothing on this
+// path may materialize a token's full submission list (see #237/#238).
 type Manager struct {
 	publisher events.Publisher
 	store     store.Store
 	logger    *zap.Logger
+
+	// tokens resolves txid → subscribed callback tokens for fan-out. Owned
+	// by the fan-out goroutine (the index is itself lock-guarded).
+	tokens *tokenIndex
+
+	// fanoutEWMA is an exponentially-weighted mean of per-event fan-out
+	// duration in nanoseconds, and fanoutEvents the lifetime event count.
+	// Both are written and read ONLY on the single fan-out goroutine (fanOut
+	// → deliver → recordDrop), so they need no synchronization; they exist to
+	// put the dispatcher's own cost into the drop warning, which used to name
+	// only the client.
+	fanoutEWMA   float64
+	fanoutEvents int64
 
 	// parentCtx is the long-lived context that owns the manager
 	// goroutine. Per-client contexts are derived from it so canceling
@@ -128,10 +142,12 @@ func newManager(ctx context.Context, publisher events.Publisher, st store.Store,
 	if publisher == nil {
 		return nil, nil //nolint:nilnil // intentional: nil manager means "no fan-out wired"
 	}
+	named := logger.Named("sse")
 	m := &Manager{
 		publisher:     publisher,
 		store:         st,
-		logger:        logger.Named("sse"),
+		logger:        named,
+		tokens:        newTokenIndex(st, named),
 		parentCtx:     ctx,
 		catchupOnDrop: true,
 		clients:       make(map[int64]*Client),
@@ -168,48 +184,104 @@ func (m *Manager) run(ctx context.Context, in <-chan *models.TransactionStatus) 
 				m.fanOut(ctx, status)
 				continue
 			}
-			for _, txid := range status.TxIDs {
-				perTx := *status
-				perTx.TxID = txid
-				perTx.TxIDs = nil
-				m.fanOut(ctx, &perTx)
-			}
+			m.fanOutBulk(ctx, status)
 		}
 	}
 }
 
-// fanOut delivers a status update to every interested client. A
-// non-empty client.Token causes a per-client check that the txid
-// actually belongs to a submission registered under that token. Sends
-// are non-blocking — slow consumers drop the event and recover via
-// Last-Event-ID catchup on reconnect.
-//
-// Concurrency contract (F-020): we snapshot the client list under
-// RLock and release the lock before sending. A client may unregister
-// between the snapshot and the send. Each client owns a context that
-// unregister cancels; the send selects on Ctx.Done() so a
-// canceled-and-gone client takes the drop arm instead of blocking or
-// panicking. The send channel is never closed by the manager — closing
-// would race this exact send.
-func (m *Manager) fanOut(ctx context.Context, status *models.TransactionStatus) {
+// snapshot copies the client registry. Callers send AFTER releasing the lock
+// (F-020) — see deliver for the concurrency contract that makes that safe.
+func (m *Manager) snapshot() []*Client {
 	m.mu.RLock()
+	defer m.mu.RUnlock()
 	clients := make([]*Client, 0, len(m.clients))
 	for _, c := range m.clients {
 		clients = append(clients, c)
 	}
-	m.mu.RUnlock()
+	return clients
+}
 
-	if len(clients) == 0 {
-		return // nobody listening — skip the token probes and enrichment
+// tokenScoped reports whether any snapshotted client filters by token. When
+// none does, fan-out skips token resolution entirely — a firehose-only pod
+// never touches the store.
+func tokenScoped(clients []*Client) bool {
+	for _, c := range clients {
+		if c.Token != "" {
+			return true
+		}
 	}
+	return false
+}
 
+// fanOut delivers ONE per-tx status update. The txid's subscribed token set
+// is resolved once (cache, else a single store lookup) and every client is
+// then matched against it in memory — the store is never asked per client.
+func (m *Manager) fanOut(ctx context.Context, status *models.TransactionStatus) {
+	start := time.Now()
+	clients := m.snapshot()
+	if len(clients) == 0 {
+		return // nobody listening — skip token resolution and enrichment
+	}
+	var tokens tokenSet
+	if tokenScoped(clients) {
+		tokens = m.tokens.lookup(ctx, status.TxID)
+	}
+	m.deliver(ctx, clients, status, tokens)
+	m.observeFanout("single", start)
+}
+
+// fanOutBulk unfans a bulk event (a block's MINED burst, or a reorg revert)
+// into per-tx frames.
+//
+// The whole txid list is resolved in ONE batched store call before the unfan
+// loop. Previously each synthetic per-tx status ran a full fan-out pass with
+// its own per-client store probe, so a 570k-transaction block cost 570k
+// probes per connected token client on a serial goroutine — the reason
+// block bursts pushed emit→applied p95 to 21.6 s.
+//
+// The client registry is snapshotted once for the whole bulk event rather
+// than per txid: a bulk event unfans in milliseconds, and a client that
+// connects mid-burst is served the same window by its connect-time catchup.
+func (m *Manager) fanOutBulk(ctx context.Context, status *models.TransactionStatus) {
+	start := time.Now()
+	clients := m.snapshot()
+	if len(clients) == 0 {
+		return
+	}
+	var resolved map[string]tokenSet
+	if tokenScoped(clients) {
+		resolved = m.tokens.resolveBatch(ctx, status.TxIDs)
+	}
+	for _, txid := range status.TxIDs {
+		perTx := *status
+		perTx.TxID = txid
+		perTx.TxIDs = nil
+		m.deliver(ctx, clients, &perTx, resolved[txid])
+	}
+	m.observeFanout("bulk", start)
+}
+
+// deliver pushes one status to every client subscribed to it. tokens is the
+// txid's already-resolved subscriber set; a client with a non-empty Token
+// receives the frame only if the set contains it. Sends are non-blocking —
+// an overflowing client drops the event and recovers via mid-stream catchup
+// or a Last-Event-ID reconnect.
+//
+// Concurrency contract (F-020): the caller snapshotted the client list under
+// RLock and released the lock before we send. A client may unregister
+// between the snapshot and the send. Each client owns a context that
+// unregister cancels; the send selects on Ctx.Done() so a canceled-and-gone
+// client takes the drop arm instead of blocking or panicking. The send
+// channel is never closed by the manager — closing would race this exact
+// send.
+func (m *Manager) deliver(ctx context.Context, clients []*Client, status *models.TransactionStatus, tokens tokenSet) {
 	enriched := false
 	for _, c := range clients {
 		if c.Ctx.Err() != nil {
 			metrics.APISSEDroppedTotal.WithLabelValues("client_gone").Inc()
 			continue
 		}
-		if c.Token != "" && !m.txBelongsToToken(ctx, status.TxID, c.Token) {
+		if c.Token != "" && !tokens.has(c.Token) {
 			continue
 		}
 		// This client will receive the frame, so attach the merkle proof — once
@@ -232,6 +304,25 @@ func (m *Manager) fanOut(ctx context.Context, status *models.TransactionStatus) 
 			m.recordDrop(c, status)
 		}
 	}
+}
+
+// fanoutEWMAAlpha weights the newest sample in the fan-out duration mean.
+// 1/64 smooths per-event jitter while still tracking a sustained stall within
+// a second or so of events.
+const fanoutEWMAAlpha = 1.0 / 64.0
+
+// observeFanout records one completed fan-out pass: the Prometheus histogram
+// plus the goroutine-local mean the drop warning quotes. Runs on the single
+// fan-out goroutine, which is what makes the unsynchronized fields safe.
+func (m *Manager) observeFanout(kind string, start time.Time) {
+	d := time.Since(start)
+	metrics.SSEFanoutDuration.WithLabelValues(kind).Observe(d.Seconds())
+	m.fanoutEvents++
+	if m.fanoutEWMA == 0 {
+		m.fanoutEWMA = float64(d)
+		return
+	}
+	m.fanoutEWMA += fanoutEWMAAlpha * (float64(d) - m.fanoutEWMA)
 }
 
 // dropLogInterval rate-limits the aggregate slow-client drop Warn: at most
@@ -265,41 +356,39 @@ func (m *Manager) recordDrop(c *Client, status *models.TransactionStatus) {
 	if now-last < int64(dropLogInterval) || !c.lastDropLog.CompareAndSwap(last, now) {
 		return
 	}
+	// The message deliberately names the BUFFER, not the client. This line
+	// previously read "dropped events for slow SSE client" and was emitted
+	// 1.6M times during a benchmark whose consumer was idle at 6 of 32 cores:
+	// the actual producer-side bottleneck was this manager's own fan-out. The
+	// fan-out cost travels with the warning so the two sides can be told
+	// apart at a glance — a fanout_avg near or above the inter-event interval
+	// means the dispatcher is the limit, not the consumer.
 	m.logger.Warn(
-		"dropped events for slow SSE client; will catch up mid-stream",
+		"sse fan-out could not enqueue events: client send buffer full; will catch up mid-stream",
 		zap.Int64("client_id", c.ID),
 		zap.Int64("dropped", c.dropsSinceLog.Swap(0)),
+		zap.Int("buffer_cap", cap(c.Ch)),
+		zap.Duration("fanout_avg", time.Duration(m.fanoutEWMA)),
+		zap.Int64("fanout_events", m.fanoutEvents),
+		zap.Int("clients", m.clientCount()),
 		zap.Bool("catchup_eligible", m.catchupOnDrop && c.Token != ""),
 	)
 }
 
-// txBelongsToToken reports whether txid was submitted with the given
-// callback token. Runs once per event per token-filtered client, so it
-// uses the store's indexed by-txid existence probe. It MUST NOT load the
-// token's submission list: a token can hold millions of submissions, and
-// materializing them per event is what OOM-killed this service the
-// moment a mega-token client survived catchup into fan-out.
-func (m *Manager) txBelongsToToken(ctx context.Context, txid, token string) bool {
-	if m.store == nil {
-		return false
-	}
-	ok, err := m.store.TokenHasSubmissionForTx(ctx, token, txid)
-	if err != nil {
-		m.logger.Warn(
-			"submission lookup failed",
-			zap.String("token", token),
-			zap.Error(err),
-		)
-		return false
-	}
-	return ok
+// clientCount reports how many clients are registered.
+func (m *Manager) clientCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.clients)
 }
 
 // Register adds a client to the registry.
 func (m *Manager) Register(c *Client) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.clients[c.ID] = c
+	n := len(m.clients)
+	m.mu.Unlock()
+	metrics.SSEConnectedClients.Set(float64(n))
 }
 
 // Unregister removes a client and signals any in-flight fan-out send to
@@ -314,7 +403,9 @@ func (m *Manager) Unregister(id int64) {
 	if ok {
 		delete(m.clients, id)
 	}
+	n := len(m.clients)
 	m.mu.Unlock()
+	metrics.SSEConnectedClients.Set(float64(n))
 	if ok {
 		c.Cancel()
 	}
@@ -387,7 +478,7 @@ func (s *Service) handleEvents(c *gin.Context) {
 		// is initialized from the replayed history — a later mid-stream
 		// catchup then resumes from a fresh watermark instead of replaying
 		// from zero.
-		s.sendCatchup(ctx, writer, token, since, client, false)
+		s.sendCatchup(ctx, writer, token, since, client, false, catchupMaxFrames)
 	}
 
 	keepalive := time.NewTicker(15 * time.Second)
@@ -404,25 +495,11 @@ func (s *Service) handleEvents(c *gin.Context) {
 				}
 				client.lastDelivered.Store(status.Timestamp.UnixNano())
 			}
-			// Coalesce the rest of this burst: drain everything already
-			// buffered on the channel (the default arm breaks the loop once
-			// the channel is empty, so this only ever writes what's ready and
-			// can't spin) and flush once. A bulk-unfan of one Kafka message
-			// lands ~50 frames here; without coalescing we'd flush per frame.
-		drain:
-			for {
-				select {
-				case s := <-client.Ch:
-					if s == nil {
-						continue
-					}
-					if err := writeStatusBuffered(writer, s); err != nil {
-						return
-					}
-					client.lastDelivered.Store(s.Timestamp.UnixNano())
-				default:
-					break drain
-				}
+			// Coalesce the rest of this burst and flush once. A bulk-unfan of
+			// one Kafka message lands ~50 frames here; without coalescing we'd
+			// flush per frame.
+			if _, err := drainLive(writer, client); err != nil {
+				return
 			}
 			if err := writer.flush(); err != nil {
 				return
@@ -463,7 +540,35 @@ const catchupMaxFrames = 10_000
 // GET /tx/:id.
 const catchupBlockBudget = 64
 
-// errCatchupCapped stops the catchup iteration at catchupMaxFrames.
+// midstreamRoundFrames bounds ONE mid-stream catchup round for a client.
+//
+// This is the fix for a self-sustaining drop/catchup loop. A mid-stream round
+// runs on the connection's writer goroutine, which is the same goroutine that
+// drains client.Ch — so for the whole round nothing consumes the live
+// channel. With the shared catchupMaxFrames (10,000) budget and the default
+// 8,192-slot client buffer, a single capped round was GUARANTEED to overflow
+// the buffer if fan-out was producing at all, which re-armed the drop flag
+// and started another round. A production stream logged 34 rounds and 570
+// drop lines in ten minutes while the load generator was stopped, alternating
+// "catchup round frames:11818 capped:true" with "dropped:3919".
+//
+// Half the buffer leaves headroom for what fan-out enqueues during the round;
+// the caller then drains the live channel before the next round, so replay
+// and live delivery interleave instead of starving each other.
+func midstreamRoundFrames(c *Client) int {
+	budget := cap(c.Ch) / 2
+	if budget < minMidstreamRoundFrames {
+		budget = minMidstreamRoundFrames
+	}
+	return min(budget, catchupMaxFrames)
+}
+
+// minMidstreamRoundFrames keeps rounds from degenerating into per-frame
+// queries when a client is configured with a tiny buffer: a round must make
+// enough progress to outpace the store query it costs.
+const minMidstreamRoundFrames = 256
+
+// errCatchupCapped stops the catchup iteration at the pass's frame budget.
 // Internal sentinel, never surfaced to the client.
 var errCatchupCapped = errors.New("sse catchup frame cap reached")
 
@@ -522,7 +627,12 @@ type catchupResult struct {
 // strand the remainder forever. Draining the tie bounds the overshoot by the
 // largest same-timestamp batch, and guarantees `capped` passes always end on
 // a boundary the next round can resume from strictly-after.
-func (s *Service) sendCatchup(ctx context.Context, w *sseWriter, token string, since time.Time, client *Client, midstream bool) catchupResult {
+//
+// maxFrames is the pass's frame budget: catchupMaxFrames for connect-time
+// replay, and the smaller midstreamRoundFrames(client) for live rounds, which
+// must not outrun the client's send buffer while the writer goroutine is busy
+// replaying.
+func (s *Service) sendCatchup(ctx context.Context, w *sseWriter, token string, since time.Time, client *Client, midstream bool, maxFrames int) catchupResult {
 	var only []models.Status
 	if since.IsZero() {
 		only = models.NonTerminalStatuses()
@@ -531,7 +641,7 @@ func (s *Service) sendCatchup(ctx context.Context, w *sseWriter, token string, s
 	enrichedBlocks := make(map[string]struct{})
 	err := s.store.IterateStatusesByToken(ctx, token, since, only, func(status *models.TransactionStatus) error {
 		ts := status.Timestamp.UnixNano()
-		if res.frames >= catchupMaxFrames {
+		if res.frames >= maxFrames {
 			if !midstream || ts != res.lastTS {
 				res.capped = true
 				return errCatchupCapped
@@ -568,7 +678,7 @@ func (s *Service) sendCatchup(ctx context.Context, w *sseWriter, token string, s
 			break
 		}
 		s.logger.Warn("sse catchup truncated at frame cap",
-			zap.Int("cap", catchupMaxFrames),
+			zap.Int("cap", maxFrames),
 			zap.Bool("fresh_connect", since.IsZero()))
 	default:
 		res.err = err
@@ -596,10 +706,18 @@ func (s *Service) sendCatchup(ctx context.Context, w *sseWriter, token string, s
 // catchup source is store.IterateStatusesByToken, which is token-scoped;
 // there is no bounded store query that reconstructs the unfiltered stream.
 // They keep the drop metric and the aggregate Warn.
+//
+// Rounds are rate-matched to the connection rather than run back to back:
+// each round is bounded by midstreamRoundFrames (a fraction of the client's
+// send buffer) and the live channel is drained between rounds. Replaying
+// occupies this same goroutine, so an unbounded round guaranteed the buffer
+// it was healing overflowed again mid-replay — the drop→catchup→drop loop
+// that kept a stream in permanent recovery.
 func (s *Service) midstreamCatchup(ctx context.Context, w *sseWriter, client *Client) bool {
 	if client.Token == "" || !s.manager.catchupOnDrop {
 		return true
 	}
+	roundFrames := midstreamRoundFrames(client)
 	resume := int64(-1) // lastTS of a capped round; -1 = no round pending
 	for client.dropped.Load() || resume >= 0 {
 		// Consume the flag BEFORE the floor: recordDrop writes the floor
@@ -622,7 +740,7 @@ func (s *Service) midstreamCatchup(ctx context.Context, w *sseWriter, client *Cl
 		}
 
 		metrics.SSEMidstreamCatchupsTotal.Inc()
-		res := s.sendCatchup(ctx, w, client.Token, time.Unix(0, sinceNS), client, true)
+		res := s.sendCatchup(ctx, w, client.Token, time.Unix(0, sinceNS), client, true, roundFrames)
 		metrics.SSEMidstreamCatchupFramesTotal.Add(float64(res.frames))
 		if res.err != nil {
 			// Either the connection is dead (write error) or the store
@@ -635,9 +753,24 @@ func (s *Service) midstreamCatchup(ctx context.Context, w *sseWriter, client *Cl
 				zap.Error(res.err))
 			return false
 		}
+		// Rate-match: hand the live channel back the goroutine before the next
+		// round. Without this the replay loop starves the very buffer it is
+		// healing and re-arms its own drop flag. Live frames are newer than
+		// what the round just replayed, so ids move forward again here —
+		// non-monotonic ids across a drop/catchup boundary are already part of
+		// the catchup contract.
+		live, err := drainLive(w, client)
+		if err != nil {
+			return false
+		}
+		if err := w.flush(); err != nil {
+			return false
+		}
 		s.logger.Info("sse mid-stream catchup round",
 			zap.Int64("client_id", client.ID),
 			zap.Int("frames", res.frames),
+			zap.Int("round_cap", roundFrames),
+			zap.Int("live_frames", live),
 			zap.Bool("capped", res.capped),
 			zap.Time("since", time.Unix(0, sinceNS)))
 		if res.capped {
@@ -647,6 +780,29 @@ func (s *Service) midstreamCatchup(ctx context.Context, w *sseWriter, client *Cl
 		}
 	}
 	return true
+}
+
+// drainLive writes every frame already buffered on the client's send channel
+// WITHOUT flushing, returning how many it wrote. The default arm exits once
+// the channel is empty, so it only ever writes what is ready and cannot spin.
+// Callers flush once afterwards.
+func drainLive(w *sseWriter, client *Client) (int, error) {
+	written := 0
+	for {
+		select {
+		case status := <-client.Ch:
+			if status == nil {
+				continue
+			}
+			if err := writeStatusBuffered(w, status); err != nil {
+				return written, err
+			}
+			client.lastDelivered.Store(status.Timestamp.UnixNano())
+			written++
+		default:
+			return written, nil
+		}
+	}
 }
 
 // enrichMerklePath attaches the merkle proof to a mined/immutable status before
@@ -667,11 +823,20 @@ func (m *Manager) enrichMerklePath(ctx context.Context, status *models.Transacti
 // buildStatusFrame renders one status as an SSE frame. Event id is the
 // timestamp in nanoseconds so clients can use it as Last-Event-ID on
 // reconnect.
+//
+// The payload timestamp is RFC3339Nano, not RFC3339: the frame id already
+// carries nanoseconds, so a second-resolution payload left any consumer
+// measuring latency from `data` with up to ±1 s of error against the same
+// event's own id. RFC3339Nano is a strict superset of the previous output —
+// it elides trailing zeros, so a whole-second timestamp still renders
+// byte-identically — and fractional seconds are optional in RFC 3339, so
+// conformant parsers (Go's time.RFC3339, JavaScript's Date, Python's
+// datetime.fromisoformat) accept both spellings unchanged.
 func buildStatusFrame(status *models.TransactionStatus) (string, error) {
 	data, err := json.Marshal(statusPayload{
 		TxID:        status.TxID,
 		TxStatus:    string(status.Status),
-		Timestamp:   status.Timestamp.UTC().Format(time.RFC3339),
+		Timestamp:   status.Timestamp.UTC().Format(time.RFC3339Nano),
 		BlockHash:   status.BlockHash,
 		BlockHeight: status.BlockHeight,
 		MerklePath:  status.MerklePath,

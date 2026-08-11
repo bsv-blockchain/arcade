@@ -204,8 +204,8 @@ func (m *mockStore) IterateStatusesByToken(context.Context, string, time.Time, [
 	return nil
 }
 
-func (m *mockStore) TokenHasSubmissionForTx(context.Context, string, string) (bool, error) {
-	return false, nil
+func (m *mockStore) TokensForTxIDs(context.Context, []string) (map[string][]string, error) {
+	return map[string][]string{}, nil
 }
 
 func (m *mockStore) UpdateDeliveryStatus(context.Context, string, models.Status, int, *time.Time) error {

@@ -597,18 +597,74 @@ var APIRequestBytes = promauto.NewHistogramVec(prometheus.HistogramOpts{
 
 // APISSEDroppedTotal counts SSE fan-out events that were dropped without
 // being delivered to a client. Reasons:
-//   - "slow_client": the client's send buffer was full (the consumer goroutine
-//     wasn't draining it fast enough).
+//   - "slow_client": the client's send buffer was full. The label name is
+//     historical and is KEPT for dashboard/alert compatibility, but it is NOT
+//     a diagnosis — the buffer fills whenever production outruns drain, and
+//     the fan-out goroutine itself has been the producer-side bottleneck.
+//     Read it together with SSEFanoutDuration (is fan-out itself slow?) and
+//     SSEConnectedClients before attributing fault to a consumer.
 //   - "client_gone": the client was unregistering concurrently and its context
 //     had already been canceled by the time fan-out reached it.
 //
-// A non-zero "client_gone" rate is normal under churn; a sustained
-// "slow_client" rate indicates a consumer that can't keep up with the publish
-// rate and may need a larger buffer or a backpressure strategy.
+// A non-zero "client_gone" rate is normal under churn.
 var APISSEDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_api_sse_dropped_total",
 	Help: "SSE fan-out events dropped without delivery, by reason.",
 }, []string{"reason"}) // slow_client, client_gone
+
+// SSEFanoutDuration measures how long the manager's single fan-out goroutine
+// spends on one event, split by kind:
+//   - "single": one per-tx status event.
+//   - "bulk": one bulk event (a block's MINED unfan), covering the batched
+//     token resolution AND every per-tx delivery it expands to.
+//
+// This is THE signal for the fan-out's own throughput ceiling: the goroutine
+// is serial, so sustained 1/p50 below the publish rate means events are
+// queueing upstream and will eventually be dropped — regardless of how fast
+// any consumer drains. It is the metric that was missing when 1.6M drops were
+// attributed to a "slow SSE client" that was idle.
+var SSEFanoutDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Name:    "arcade_sse_fanout_duration_seconds",
+	Help:    "Time the SSE fan-out goroutine spent dispatching one event, by kind.",
+	Buckets: latencyBuckets,
+}, []string{"kind"}) // single, bulk
+
+// SSEConnectedClients tracks how many /events connections are registered on
+// this pod. Fan-out cost per event scales with this, and it disambiguates
+// "one chronically slow consumer" from "many consumers".
+var SSEConnectedClients = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "arcade_sse_connected_clients",
+	Help: "SSE /events clients currently registered on this pod.",
+})
+
+// SSETokenCacheTotal counts txid→token-set cache outcomes on the fan-out
+// path ("hit" / "miss"). Each miss is one store round-trip on the serial
+// fan-out goroutine, so the miss rate multiplied by SSETokenLookupDuration is
+// the store's contribution to fan-out latency. Bulk events bypass the cache
+// by design and are not counted here.
+var SSETokenCacheTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_sse_token_cache_total",
+	Help: "SSE fan-out txid→token-set cache lookups, by result.",
+}, []string{"result"}) // hit, miss
+
+// SSETokenCacheEntries reports the cache's resident entry count. Sitting at
+// the entry cap means the working set is larger than the cache and hits are
+// being lost to eviction; sitting well below it while the byte budget binds
+// means unusually large token strings.
+var SSETokenCacheEntries = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "arcade_sse_token_cache_entries",
+	Help: "Entries resident in the SSE fan-out txid→token-set cache.",
+})
+
+// SSETokenLookupDuration measures one Store.TokensForTxIDs call from the
+// fan-out path, by kind ("single" for a cache miss on one txid, "batch" for a
+// bulk event's chunked resolution). This is the per-event probe latency that
+// had to be measured out-of-band before.
+var SSETokenLookupDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Name:    "arcade_sse_token_lookup_duration_seconds",
+	Help:    "Store.TokensForTxIDs latency from the SSE fan-out path, by kind.",
+	Buckets: latencyBuckets,
+}, []string{"kind"}) // single, batch
 
 // SSEMidstreamCatchupsTotal counts store-backed catchup rounds run on a LIVE
 // /events connection after fan-out overflowed the client's send channel

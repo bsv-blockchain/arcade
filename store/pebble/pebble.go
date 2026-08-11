@@ -1848,19 +1848,13 @@ func (s *Store) GetSubmissionsByToken(ctx context.Context, callbackToken string)
 	return s.submissionsByIndex(ctx, idxSubTokenPrefix(callbackToken))
 }
 
-// TokenHasSubmissionForTx resolves via the by-txid index (a txid has a
-// handful of submissions) — never the token index, which can hold millions.
-func (s *Store) TokenHasSubmissionForTx(ctx context.Context, callbackToken, txid string) (bool, error) {
-	subs, err := s.GetSubmissionsByTxID(ctx, txid)
-	if err != nil {
-		return false, err
-	}
-	for _, sub := range subs {
-		if sub.CallbackToken == callbackToken {
-			return true, nil
-		}
-	}
-	return false, nil
+// TokensForTxIDs resolves via the by-txid index (a txid has a handful of
+// submissions) — never the token index, which can hold millions. Pebble has
+// no set-returning read, so a batch is one local prefix scan per txid; the
+// win over the probe this replaced is that fan-out asks once per txid no
+// matter how many clients are connected.
+func (s *Store) TokensForTxIDs(ctx context.Context, txids []string) (map[string][]string, error) {
+	return store.TokensForTxIDsViaPerTxID(ctx, txids, s.GetSubmissionsByTxID)
 }
 
 func (s *Store) IterateStatusesByToken(ctx context.Context, callbackToken string, since time.Time, onlyStatuses []models.Status, fn func(*models.TransactionStatus) error) error {

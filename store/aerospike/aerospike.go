@@ -1916,20 +1916,13 @@ loop:
 	return subs, nil
 }
 
-// TokenHasSubmissionForTx resolves via the txid secondary index (a txid
-// has a handful of submissions) — never the token side, which can hold
-// millions.
-func (s *Store) TokenHasSubmissionForTx(ctx context.Context, callbackToken, txid string) (bool, error) {
-	subs, err := s.GetSubmissionsByTxID(ctx, txid)
-	if err != nil {
-		return false, err
-	}
-	for _, sub := range subs {
-		if sub.CallbackToken == callbackToken {
-			return true, nil
-		}
-	}
-	return false, nil
+// TokensForTxIDs resolves via the txid secondary index (a txid has a handful
+// of submissions) — never the token side, which can hold millions. Aerospike
+// secondary-index queries take a single equality filter, so a batch is one
+// query per txid; the win over the probe this replaced is that fan-out asks
+// once per txid no matter how many clients are connected.
+func (s *Store) TokensForTxIDs(ctx context.Context, txids []string) (map[string][]string, error) {
+	return store.TokensForTxIDsViaPerTxID(ctx, txids, s.GetSubmissionsByTxID)
 }
 
 func (s *Store) IterateStatusesByToken(ctx context.Context, callbackToken string, since time.Time, onlyStatuses []models.Status, fn func(*models.TransactionStatus) error) error {
