@@ -1601,3 +1601,59 @@ func TestTokensForTxIDs(t *testing.T) {
 		t.Errorf("TokensForTxIDs(nil) = %v, want empty", empty)
 	}
 }
+
+// TestSetPendingRetryFields_RespectsStatusLattice pins that the durable-retry
+// setter cannot drag a transaction back out of a protected status.
+//
+// This matters because the park path writes twice: applyTerminalStatuses does
+// a lattice-guarded BatchUpdateStatusReturning (which correctly SKIPS a row
+// whose current status forbids PENDING_RETRY), and the durable-retry
+// scheduling then records the retry bins. If the second write ignores the
+// lattice it silently undoes the first one's protection — so a MINED
+// transaction redelivered by Kafka and re-broadcast without a verdict would be
+// knocked back to PENDING_RETRY and re-broadcast by the reaper from then on.
+//
+// models.StatusPendingRetry.DisallowedPreviousStatuses() is the source of
+// truth; every status in it must be immune here.
+func TestSetPendingRetryFields_RespectsStatusLattice(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	for _, prev := range models.StatusPendingRetry.DisallowedPreviousStatuses() {
+		t.Run(string(prev), func(t *testing.T) {
+			txid := "lattice-" + string(prev)
+			if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+				TxID: txid, Status: models.StatusReceived,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.UpdateStatus(ctx, &models.TransactionStatus{TxID: txid, Status: prev}); err != nil {
+				t.Fatalf("seed %s: %v", prev, err)
+			}
+
+			err := s.SetPendingRetryFields(ctx, txid, []byte{0xaa}, time.Now().Add(-time.Second))
+			if err != nil {
+				t.Fatalf("SetPendingRetryFields: %v", err)
+			}
+
+			got, err := s.GetStatus(ctx, txid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Status != prev {
+				t.Errorf("status = %s, want %s left untouched: PENDING_RETRY must not be "+
+					"forced over a status the lattice protects", got.Status, prev)
+			}
+			// And it must not have joined the retry drain.
+			ready, err := s.GetReadyRetries(ctx, time.Now(), 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, r := range ready {
+				if r.TxID == txid {
+					t.Errorf("%s row entered the durable retry queue", prev)
+				}
+			}
+		})
+	}
+}
