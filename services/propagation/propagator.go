@@ -652,13 +652,13 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 	for _, txid := range terminalRejected {
 		r := p.notifyTerminalToDispatcher(ctx, io, txid, models.StatusRejected)
 		for _, child := range r.cascaded {
-			allRejectCascaded = append(allRejectCascaded, cascadeRejection{txid: child, ancestor: txid})
+			allRejectCascaded = append(allRejectCascaded, cascadeRejection{txid: child.txid, rawTx: child.rawTx, ancestor: txid})
 		}
 	}
 	for _, txid := range terminalParked {
 		r := p.notifyTerminalToDispatcher(ctx, io, txid, models.StatusPendingRetry)
 		for _, child := range r.cascaded {
-			allParkCascaded = append(allParkCascaded, cascadeRejection{txid: child, ancestor: txid})
+			allParkCascaded = append(allParkCascaded, cascadeRejection{txid: child.txid, rawTx: child.rawTx, ancestor: txid})
 		}
 	}
 	if len(allRejectCascaded) > 0 {
@@ -674,6 +674,7 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 // reason can name the row a client should look at (and resubmit first).
 type cascadeRejection struct {
 	txid     string
+	rawTx    []byte
 	ancestor string
 }
 
@@ -886,6 +887,17 @@ func (p *Propagator) persistCascade(ctx context.Context, cascaded []cascadeRejec
 			zap.Int("count", len(cascaded)),
 			zap.Error(err),
 		)
+	}
+	// A cascade-parked descendant has to enter the durable retry queue too.
+	// It reaches PENDING_RETRY without ever being broadcast — its ancestor
+	// got no verdict, so it was never charged a requeue budget and never went
+	// through parkExhaustedRequeues. Writing only the status row would leave
+	// it with a NULL next_retry_at, which GetReadyRetries cannot see: the row
+	// would sit at PENDING_RETRY forever with nothing scheduled to retry it.
+	if status == models.StatusPendingRetry {
+		for _, cr := range cascaded {
+			p.schedulePendingRetry(ctx, cr.txid, cr.rawTx)
+		}
 	}
 	p.publishBulkStatus(ctx, status, txids, now)
 }

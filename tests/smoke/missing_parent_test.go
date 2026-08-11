@@ -292,3 +292,66 @@ func TestSmoke_OrphanChild_ParksWithoutWedgingPipeline(t *testing.T) {
 		t.Fatalf("orphan child was REJECTED — missing-parent must park, never reject")
 	}
 }
+
+// TestSmoke_DeepChainAcrossSubmissions_ConvergesViaReaper is the end-to-end
+// answer to "how long does the PENDING_RETRY path take to resolve for a
+// worst-case parent/child topology".
+//
+// A depth-12 chain is submitted in REVERSE order, one transaction per request,
+// on a 4-partition topic. That is the shape family keying deliberately does
+// not cover: each tx is its own request, so each is keyed by its own txid and
+// scatters across partitions with no ordering relationship at all. Every child
+// reaches teranode before its parent, draws TX_MISSING_PARENT, burns its
+// (deliberately tiny) fast-path budget and parks at PENDING_RETRY. From there
+// the reaper's durable retry queue is the only thing that can resolve it.
+//
+// The whole chain must reach ACCEPTED_BY_NETWORK, and nothing may ever be
+// REJECTED — an ordering artifact is a condition, not a verdict.
+//
+// Before the durable-retry rework this could not pass in a bounded window at
+// any tick rate: parked rows were selected by scanning timestamp_at behind a
+// hardcoded 5-minute eligibility age, and the reaper broadcast the whole
+// selection as one /txs call, so at most one dependency level cleared per
+// tick. Depth 12 meant 5 minutes plus 12 ticks.
+func TestSmoke_DeepChainAcrossSubmissions_ConvergesViaReaper(t *testing.T) {
+	const depth = 12
+
+	teranode := newDependencyAwareTeranode(t)
+	rt := startArcadeSmoke(t, smokeOptions{
+		TeranodeURL:           teranode.URL(),
+		PropagationPartitions: 4,
+		MutateConfig: func(cfg *config.Config) {
+			// Compress the durable schedule so the reaper's behavior is
+			// observable inside a smoke window. The cadence is what changes;
+			// the ordering and layering under test are not timing-dependent.
+			cfg.Propagation.RetryMaxAttempts = 1
+			cfg.Propagation.RetryBackoffMs = 25
+			cfg.Propagation.ReaperIntervalMs = 100
+			cfg.Propagation.PendingRetryBackoffMs = 25
+			cfg.Propagation.PendingRetryMaxBackoffMs = 100
+		},
+	})
+
+	chain := BuildChains(ChainOpts{TotalTxs: depth, MinDepth: depth, MaxDepth: depth, Seed: 29})[0]
+	if len(chain) != depth {
+		t.Fatalf("built a chain of %d, want %d", len(chain), depth)
+	}
+
+	// Deepest descendant first, root last: every submission but the last is
+	// an orphan at the moment it arrives.
+	for i := len(chain) - 1; i >= 0; i-- {
+		if err := postTxs(rt, []*bt.Tx{chain[i]}); err != nil {
+			t.Fatalf("submit chain[%d]: %v", i, err)
+		}
+	}
+
+	start := time.Now()
+	for i, tx := range chain {
+		waitForArcadeStatus(t, rt, tx.TxID(), "ACCEPTED_BY_NETWORK", 30*time.Second)
+		if got := arcadeTxStatus(t, rt, tx.TxID()); got == "REJECTED" {
+			t.Fatalf("chain[%d] was REJECTED; a missing parent is a condition, not a verdict", i)
+		}
+	}
+	t.Logf("depth-%d chain submitted in reverse across %d requests on 4 partitions "+
+		"converged in %v", depth, depth, time.Since(start).Round(time.Millisecond))
+}

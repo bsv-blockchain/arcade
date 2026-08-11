@@ -76,7 +76,7 @@ type terminalEvent struct {
 // re-enters them into pendingMsgs directly, so the next flushBatch
 // picks them up without any caller action.
 type terminalResult struct {
-	cascaded []string
+	cascaded []cascadedTx
 }
 
 // drainRequest is the protocol between flushBatch and the dispatcher.
@@ -612,14 +612,22 @@ func canRelease(
 // their own, only because an ancestor did. Every cascaded descendant's
 // Kafka offset is marked Done on the tracker so the commit watermark
 // can advance past them once the caller writes the REJECTED rows.
+// cascadedTx is one descendant terminalized by a cascade, carrying the raw
+// bytes captured from its held message so a parked descendant can be booked
+// into the durable retry queue.
+type cascadedTx struct {
+	txid  string
+	rawTx []byte
+}
+
 func cascadeReject(
 	rejectedTxID string,
 	inFlight map[string]int64,
 	waiters map[string]map[string]struct{},
 	heldMsgs map[string]propagationMsg,
 	tracker *offsetTracker,
-) []string {
-	var cascaded []string
+) []cascadedTx {
+	var cascaded []cascadedTx
 	queue := []string{rejectedTxID}
 	for len(queue) > 0 {
 		parent := queue[0]
@@ -631,12 +639,18 @@ func cascadeReject(
 		delete(waiters, parent)
 		for child := range children {
 			cleanupWaiterEntries(child, parent, waiters, heldMsgs)
+			// Capture the raw bytes BEFORE dropping the held message. A
+			// descendant parked by this cascade has to enter the durable
+			// retry queue, and that needs a body to rebroadcast — without it
+			// the row would sit at PENDING_RETRY with no next_retry_at, which
+			// GetReadyRetries cannot see.
+			rawTx := heldMsgs[child].RawTx
 			delete(heldMsgs, child)
 			if offset, ok := inFlight[child]; ok {
 				tracker.Done(offset)
 			}
 			delete(inFlight, child)
-			cascaded = append(cascaded, child)
+			cascaded = append(cascaded, cascadedTx{txid: child, rawTx: rawTx})
 			queue = append(queue, child)
 		}
 	}

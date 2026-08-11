@@ -552,7 +552,7 @@ func TestHandleTerminal_PendingRetry_ReleasesOffsetAndCascades(t *testing.T) {
 	}
 
 	res := s.terminal("parent", models.StatusPendingRetry)
-	if len(res.cascaded) != 1 || res.cascaded[0] != "child" {
+	if len(res.cascaded) != 1 || res.cascaded[0].txid != "child" {
 		t.Fatalf("parking a parent must cascade its held descendants; got %v", res.cascaded)
 	}
 	if !s.tracker.Empty() {
