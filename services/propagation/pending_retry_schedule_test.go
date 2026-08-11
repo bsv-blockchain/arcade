@@ -303,3 +303,60 @@ func TestResolveMissingParents_ReaperPathIsNotLabelledRequeued(t *testing.T) {
 		t.Errorf("outcome=\"reaper_retry\" = %v, want %v", got, reaperBefore+1)
 	}
 }
+
+// TestReapOnce_AdoptsLegacyParkedRows is the upgrade path.
+//
+// Rows parked by a build that predates durable retry scheduling carry no
+// next_retry_at, and GetReadyRetries selects on "next_retry_at <= now" — so
+// moving parked rows onto the durable queue would make every already-parked
+// transaction invisible to both the walk and the drain. That is precisely the
+// silently-abandoned state this change exists to remove, so the reaper adopts
+// such rows into the queue when it encounters them.
+func TestReapOnce_AdoptsLegacyParkedRows(t *testing.T) {
+	root := strings.Repeat("bb", 32)
+	legacy := buildChain(t, root, 1)[0]
+
+	ms := newMockStore()
+	// A legacy park: a PENDING_RETRY status row with raw bytes and NO entry in
+	// the durable retry queue.
+	ms.replayRows = []*models.TransactionStatus{{
+		TxID:      legacy.txid,
+		Status:    models.StatusPendingRetry,
+		RawTx:     legacy.raw,
+		Timestamp: time.Now().Add(-2 * time.Hour),
+	}}
+
+	ms.mu.Lock()
+	queued := len(ms.pendingRetries)
+	ms.mu.Unlock()
+	if queued != 0 {
+		t.Fatalf("fixture should start with an empty durable queue, got %d", queued)
+	}
+
+	tn := newDepAwareTeranode(t, root) // parent on-chain, so a retry succeeds
+	p := newReaperPropagator(t, tn.URL(), ms, 0)
+	p.pendingRetryBackoff = time.Nanosecond
+	p.pendingRetryMaxBackoff = time.Nanosecond
+
+	// First tick adopts it; a later tick drains it once its schedule is due.
+	p.reapOnce(context.Background())
+	ms.mu.Lock()
+	_, adopted := ms.pendingRetries[legacy.txid]
+	ms.mu.Unlock()
+	if !adopted {
+		t.Fatalf("legacy parked row was not adopted into the durable retry queue; " +
+			"with no next_retry_at it is invisible to GetReadyRetries and would sit at " +
+			"PENDING_RETRY forever after the upgrade")
+	}
+
+	// nextPendingRetryDelay floors at 1ms, so an adopted row is not due the
+	// instant it is booked. Tick until it drains rather than assuming it is
+	// ready on the very next pass.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !acceptedTxIDs(ms)[legacy.txid] {
+		p.reapOnce(context.Background())
+	}
+	if !acceptedTxIDs(ms)[legacy.txid] {
+		t.Errorf("adopted legacy row was not retried to ACCEPTED_BY_NETWORK")
+	}
+}

@@ -231,6 +231,9 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 	attrib := make([]stuckRef, 0, stuckAttributionCap)
 
 	stuck := make([]propagationMsg, 0, p.rebroadcastBatch)
+	// adopt collects legacy PENDING_RETRY rows (parked before durable retry
+	// scheduling existed) so they can be booked into the queue after the walk.
+	var adopt []propagationMsg
 	err := p.store.IterateStatusesSince(ctx, since, func(st *models.TransactionStatus) error {
 		// Best-effort per-callback attribution sample (bounded by
 		// stuckAttributionCap). The census COUNTS come from
@@ -281,8 +284,8 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 				return nil
 			}
 		case models.StatusPendingRetry:
-			// Parked rows are NOT selected by this walk any more — they are
-			// drained by next_retry_at via store.GetReadyRetries below.
+			// Parked rows are NOT rebroadcast from this walk any more — they
+			// are drained by next_retry_at via store.GetReadyRetries below.
 			//
 			// Selecting them here meant selecting by timestamp_at, which
 			// Postgres serves newest-first and Pebble oldest-first, capped at
@@ -292,6 +295,17 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 			// again, and on Pebble a block of unresolvable orphans sat at the
 			// head of the queue and starved every other arm of this walk.
 			// Either way the row silently left the 24h scan window for good.
+			//
+			// One job remains here: adopt legacy rows. A tx parked by an
+			// older build has no next_retry_at, so GetReadyRetries — which
+			// selects on "next_retry_at <= now" — cannot see it. Without this
+			// the upgrade would strand every already-parked tx in exactly the
+			// invisible state this change exists to remove. Booking a
+			// schedule for it is idempotent and self-healing: once adopted it
+			// drains normally on a later tick.
+			if st.NextRetryAt.IsZero() {
+				adopt = append(adopt, propagationMsg{TXID: st.TxID, RawTx: st.RawTx})
+			}
 			return nil
 		default:
 			// Terminal statuses (REJECTED, DOUBLE_SPEND_ATTEMPTED, MINED,
@@ -402,6 +416,16 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 	if len(stuck) > 0 {
 		p.logger.Info("reaper: rebroadcasting stuck txs", zap.Int("count", len(stuck)))
 		p.rebroadcastStuck(ctx, stuck, false)
+	}
+
+	// Bring any legacy parked rows into the durable queue before draining, so
+	// an upgrade doesn't strand transactions that were already parked.
+	if len(adopt) > 0 {
+		p.logger.Info("reaper: adopting legacy parked txs into the durable retry queue",
+			zap.Int("count", len(adopt)))
+		for _, m := range adopt {
+			p.schedulePendingRetry(ctx, m.TXID, m.RawTx)
+		}
 	}
 
 	// Parked rows are a separate, next_retry_at-ordered drain.

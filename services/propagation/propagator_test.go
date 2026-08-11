@@ -265,6 +265,18 @@ func (m *mockStore) SetPendingRetryFields(_ context.Context, txid string, rawTx 
 		RetryCount:  m.retryCounts[txid],
 		NextRetryAt: nextRetryAt,
 	}
+	// Mirror the write onto the row the scan walk sees. The real statement
+	// updates the transactions row itself, so a later IterateStatusesSince
+	// observes the new next_retry_at — which is what stops the reaper's
+	// legacy-row adoption from re-firing on every tick.
+	for _, r := range m.replayRows {
+		if r.TxID == txid {
+			r.Status = models.StatusPendingRetry
+			r.NextRetryAt = nextRetryAt
+			r.RetryCount = m.retryCounts[txid]
+			r.Timestamp = time.Now()
+		}
+	}
 	// Reflect PENDING_RETRY status in the updates stream so existing tests that
 	// inspect status updates continue to observe the transition.
 	//
@@ -366,13 +378,19 @@ func (m *mockStore) latestStatusLocked(txid string) (models.Status, bool) {
 func (m *mockStore) parkTx(txid string, rawTx []byte, parkedAt, nextRetryAt time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.replayRows = append(m.replayRows, &models.TransactionStatus{
-		TxID:      txid,
-		Status:    models.StatusPendingRetry,
-		RawTx:     rawTx,
-		Timestamp: parkedAt,
-	})
 	m.retryCounts[txid]++
+	// The status row carries the retry bins too, because the real park writes
+	// them with SetPendingRetryFields. A row without next_retry_at is a LEGACY
+	// park (pre-durable-scheduling) and the reaper deliberately treats it
+	// differently — see TestReapOnce_AdoptsLegacyParkedRows.
+	m.replayRows = append(m.replayRows, &models.TransactionStatus{
+		TxID:        txid,
+		Status:      models.StatusPendingRetry,
+		RawTx:       rawTx,
+		Timestamp:   parkedAt,
+		RetryCount:  m.retryCounts[txid],
+		NextRetryAt: nextRetryAt,
+	})
 	if _, ok := m.retrySeq[txid]; !ok {
 		m.retrySeq[txid] = m.retrySeqNext
 		m.retrySeqNext++
