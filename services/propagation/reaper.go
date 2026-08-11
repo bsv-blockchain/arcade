@@ -336,7 +336,8 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 	// During the 2026-08-10 load test a ~466k-tx uncommitted-offset backlog
 	// was invisible without a DB/Kafka query; this line makes growth
 	// visible in plain logs.
-	p.logger.Info("reaper: propagation backlog depth",
+	p.logger.Info(
+		"reaper: propagation backlog depth",
 		zap.Int64("pending_depth", p.pendingDepth.Load()),
 		zap.Int64("inflight_depth", p.inflightDepth.Load()),
 		zap.Int("reaper_ready_depth", len(stuck)),

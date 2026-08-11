@@ -130,7 +130,9 @@ func partitionForKey(key string, n int) int32 {
 	}
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(key))
-	p := int32(h.Sum32()) % int32(n)
+	// The uint32→int32 wrap is deliberate: it reproduces Sarama's hash
+	// partitioner bit-for-bit, and the abs below handles the negative half.
+	p := int32(h.Sum32()) % int32(n) // #nosec G115 -- sarama-compatible arithmetic
 	if p < 0 {
 		p = -p
 	}

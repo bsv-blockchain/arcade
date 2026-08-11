@@ -406,7 +406,7 @@ type PropagationConfig struct {
 	// declared but unread before #295 — deployments that explicitly set
 	// it (e.g. to the old default 500) start feeling their configured
 	// value on upgrade.
-	RetryBackoffMs int `mapstructure:"retry_backoff_ms"`
+	RetryBackoffMs   int `mapstructure:"retry_backoff_ms"`
 	ReaperIntervalMs int `mapstructure:"reaper_interval_ms"`
 	ReaperBatchSize  int `mapstructure:"reaper_batch_size"`
 	// ReaperRebroadcastBatch caps how many stuck transactions the reaper's

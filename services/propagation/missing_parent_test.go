@@ -328,9 +328,9 @@ func TestRunDispatcher_MissingParentExhaustsBudget_ParksPendingRetry(t *testing.
 
 // --- reaper path ---------------------------------------------------------
 
-// reaperChild builds a stale PENDING_RETRY child row (real bytes so
-// rejectedAncestor can parse the parent) and a propagator wired to reap it.
-func reaperChild(t *testing.T, srvURL string, ms *mockStore, parentTxid string) (childTxid string) {
+// reaperChild seeds ms with a stale PENDING_RETRY child row (real bytes so
+// rejectedAncestor can parse the parent) and returns the child's txid.
+func reaperChild(t *testing.T, ms *mockStore, parentTxid string) (childTxid string) {
 	t.Helper()
 	childTxid, childRaw := spendingTx(t, parentTxid, 0, 1)
 	ms.replayRows = []*models.TransactionStatus{{
@@ -360,7 +360,7 @@ func TestReapOnce_MissingParent_LeavesRowForNextTick(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	childTxid = reaperChild(t, srv.URL, ms, parentTxid)
+	childTxid = reaperChild(t, ms, parentTxid)
 	p := poisonPropagator(srv.URL, ms, 5, time.Millisecond)
 
 	p.reapOnce(context.Background())
@@ -390,7 +390,7 @@ func TestReapOnce_MissingParent_AncestorRejected_CascadesRejected(t *testing.T) 
 	}))
 	defer srv.Close()
 
-	childTxid = reaperChild(t, srv.URL, ms, parentTxid)
+	childTxid = reaperChild(t, ms, parentTxid)
 	p := poisonPropagator(srv.URL, ms, 5, time.Millisecond)
 
 	p.reapOnce(context.Background())

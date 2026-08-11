@@ -44,8 +44,7 @@ func familyPartitionKeys(txids []string, inputs [][]string) []string {
 		parent[i] = i
 		size[i] = 1
 	}
-	var find func(int) int
-	find = func(i int) int {
+	find := func(i int) int {
 		for parent[i] != i {
 			parent[i] = parent[parent[i]] // path halving
 			i = parent[i]

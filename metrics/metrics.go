@@ -264,7 +264,7 @@ var PropagationConflictAttributionTotal = promauto.NewCounterVec(prometheus.Coun
 // state means family keying is not co-locating same-submission chains —
 // check the intake path. outcome="rejected_ancestor": arcade's store showed
 // a parent terminally REJECTED, so the child inherited REJECTED via the
-// standard cascade reason — the cross-partition analogue of the
+// standard cascade reason — the cross-partition analog of the
 // dispatcher's same-partition cascade.
 var PropagationMissingParentTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_propagation_missing_parent_total",

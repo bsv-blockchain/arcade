@@ -21,7 +21,7 @@ import (
 func saramaHashPartition(key string, n int32) int32 {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(key))
-	p := int32(h.Sum32()) % n
+	p := int32(h.Sum32()) % n // #nosec G115 -- sarama-compatible arithmetic
 	if p < 0 {
 		p = -p
 	}
@@ -35,7 +35,7 @@ func TestMemoryBrokerPartitions_KeyRoutingMatchesSaramaHash(t *testing.T) {
 	const topic = "part-routing"
 	const n = 4
 	b := NewMemoryBrokerWithPartitions(100, 0, map[string]int{topic: n})
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	sub, err := b.Subscribe("g", []string{topic}, StartOldest)
 	if err != nil {
@@ -100,7 +100,7 @@ func TestMemoryBrokerPartitions_OneClaimPerPartition(t *testing.T) {
 	const topic = "part-claims"
 	const n = 3
 	b := NewMemoryBrokerWithPartitions(100, 0, map[string]int{topic: n})
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	sub, err := b.Subscribe("g", []string{topic}, StartOldest)
 	if err != nil {
@@ -179,7 +179,7 @@ func TestMemoryBrokerPartitions_OneClaimPerPartition(t *testing.T) {
 // configured topics report their count, everything else reports 1.
 func TestMemoryBrokerPartitions_PartitionCount(t *testing.T) {
 	b := NewMemoryBrokerWithPartitions(10, 0, map[string]int{"wide": 8})
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 	if n, err := b.PartitionCount("wide"); err != nil || n != 8 {
 		t.Errorf("PartitionCount(wide) = %d, %v; want 8, nil", n, err)
 	}
@@ -193,7 +193,7 @@ func TestMemoryBrokerPartitions_PartitionCount(t *testing.T) {
 // before — one claim per subscribed topic.
 func TestMemoryBrokerPartitions_DefaultIsSingleClaim(t *testing.T) {
 	b := NewMemoryBroker(10)
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	sub, err := b.Subscribe("g", []string{"plain"}, StartOldest)
 	if err != nil {
