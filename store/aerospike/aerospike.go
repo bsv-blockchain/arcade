@@ -765,7 +765,8 @@ loop:
 				if payload, mErr := json.Marshal(history); mErr == nil {
 					ops = append(ops, aero.PutOp(aero.NewBin(binOrphAnchors, payload)))
 				}
-				ops = append(ops,
+				ops = append(
+					ops,
 					aero.PutOp(aero.NewBin("block_hash", nil)),
 					aero.PutOp(aero.NewBin("block_height", nil)),
 				)

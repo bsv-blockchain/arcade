@@ -1059,7 +1059,7 @@ type gapPayload struct {
 // writeGap emits an `event: gap` frame and flushes it. Errors are returned so
 // callers on the writer goroutine can treat a failed write as a dead
 // connection, matching writeStatus.
-func writeGap(w *sseWriter, reason string, from int64, count int64) error {
+func writeGap(w *sseWriter, reason string, from, count int64) error {
 	p := gapPayload{Reason: reason, Count: count, Action: "reconcile"}
 	if from > 0 {
 		p.From = strconv.FormatInt(from, 10)

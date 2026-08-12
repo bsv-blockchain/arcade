@@ -146,7 +146,8 @@ func (d *depAwareTeranode) handle(w http.ResponseWriter, req *http.Request) {
 			// that also appears in it.
 			failureLines = append(failureLines, fmt.Sprintf(
 				"TX_MISSING_PARENT (34): [ProcessTransaction][%s] error getting parent transaction %s",
-				p.txid, missing))
+				p.txid, missing,
+			))
 			continue
 		}
 		d.accepted[strings.ToLower(p.txid)] = true
