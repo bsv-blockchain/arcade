@@ -1939,10 +1939,27 @@ func (s *Store) TokensForTxIDs(ctx context.Context, txids []string) (map[string]
 	return store.TokensForTxIDsViaPerTxID(ctx, txids, s.GetSubmissionsByTxID)
 }
 
+// maxTokenReplayScan bounds how many of a token's submissions this backend
+// will walk for one catchup replay.
+//
+// Unlike Postgres, Aerospike has no index over (callback_token, timestamp_at,
+// txid) here, so this implementation loads the token's submission list, does a
+// point Get per txid, and sorts the survivors in memory — O(token cardinality)
+// per connect, against tokens that can hold millions of submissions. That is
+// the shape that OOM-killed the SSE pod (#237/#238). Past this bound, refusing
+// is strictly better than trying: the caller degrades to an explicit gap and
+// the client reconciles over REST, instead of the pod dying and taking every
+// other connected client with it.
+const maxTokenReplayScan = 250_000
+
 func (s *Store) IterateStatusesByToken(ctx context.Context, callbackToken string, since time.Time, onlyStatuses []models.Status, fn func(*models.TransactionStatus) error) error {
 	subs, err := s.GetSubmissionsByToken(ctx, callbackToken)
 	if err != nil {
 		return err
+	}
+	if len(subs) > maxTokenReplayScan {
+		return fmt.Errorf("%w: token has %d submissions, scan budget is %d",
+			store.ErrReplayUnavailable, len(subs), maxTokenReplayScan)
 	}
 	only := make(map[models.Status]struct{}, len(onlyStatuses))
 	for _, st := range onlyStatuses {

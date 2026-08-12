@@ -896,6 +896,16 @@ func (s *Service) midstreamCatchup(ctx context.Context, w *sseWriter, client *Cl
 		metrics.SSEMidstreamCatchupsTotal.Inc()
 		res := s.sendCatchup(ctx, w, client.Token, time.Unix(0, sinceNS), client, true, roundFrames)
 		metrics.SSEMidstreamCatchupFramesTotal.Add(float64(res.frames))
+		if errors.Is(res.err, store.ErrReplayUnavailable) {
+			// The backend refused this replay (a token too large to serve
+			// without an index over it). That is a bounded, declared
+			// degradation, not a dead connection: tell the client to reconcile
+			// and keep the LIVE stream running, which is still useful.
+			s.logger.Warn("sse mid-stream catchup unavailable; client notified of gap",
+				zap.Int64("client_id", client.ID),
+				zap.Error(res.err))
+			return writeGap(w, gapReasonReplayUnavailable, sinceNS, 0) == nil
+		}
 		if res.err != nil {
 			// Either the connection is dead (write error) or the store
 			// iteration failed mid-window. Both ways the safe move is to end

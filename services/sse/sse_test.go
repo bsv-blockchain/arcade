@@ -77,6 +77,10 @@ type sseStoreStub struct {
 	subsByToken map[string][]*models.Submission
 	statusByTx  map[string]*models.TransactionStatus
 
+	// iterErr, when set, is returned by IterateStatusesByToken instead of
+	// streaming — models a backend refusing a replay it cannot bound.
+	iterErr error
+
 	// tokenCalls counts TokensForTxIDs round-trips and tokenTxIDs the txids
 	// they carried — the fan-out's store cost, which is what
 	// TestFanOutResolvesTokensOncePerEvent asserts on.
@@ -106,6 +110,9 @@ func (s *sseStoreStub) EnrichMerklePath(_ context.Context, _ *models.Transaction
 // the token, current status projection, since/only filters, ascending
 // timestamp order.
 func (s *sseStoreStub) IterateStatusesByToken(_ context.Context, token string, since time.Time, onlyStatuses []models.Status, fn func(*models.TransactionStatus) error) error {
+	if s.iterErr != nil {
+		return s.iterErr
+	}
 	s.mu.RLock()
 	seen := make(map[string]bool)
 	var statuses []*models.TransactionStatus
@@ -1189,6 +1196,44 @@ func TestSSEDrainReleasesClientsWithStaggeredRetry(t *testing.T) {
 	}
 	if retryMS <= 0 || retryMS > 30_000 {
 		t.Errorf("retry hint = %dms, want within (0, 30000]", retryMS)
+	}
+}
+
+// TestSSEMidstreamCatchupRefusedRaisesGapAndKeepsStream covers a backend that
+// declines a replay it cannot bound (store.ErrReplayUnavailable, returned by
+// the Pebble/Aerospike scan budget for a token too large to serve without an
+// index over it).
+//
+// The distinction under test: a refused replay is a bounded, DECLARED
+// degradation, not a dead connection. The client is told to reconcile over
+// REST and its live stream keeps running — dropping the connection instead
+// would send it straight back to reconnect and request the same impossible
+// replay again.
+func TestSSEMidstreamCatchupRefusedRaisesGapAndKeepsStream(t *testing.T) {
+	st := &sseStoreStub{
+		subsByToken: map[string][]*models.Submission{tokA: {{TxID: "aaaa", CallbackToken: tokA}}},
+		statusByTx:  map[string]*models.TransactionStatus{},
+		iterErr:     fmt.Errorf("wrapped: %w", store.ErrReplayUnavailable),
+	}
+	svc, _, _, cancel := setupSSEService(t, st)
+	defer cancel()
+
+	client := svc.manager.NewClient(tokA)
+	client.droppedFloor.Store(time.Now().Add(-time.Minute).UnixNano())
+	client.dropped.Store(true)
+
+	gapsBefore := testutil.ToFloat64(metrics.SSEGapEventsTotal.WithLabelValues(gapReasonReplayUnavailable))
+	rec := httptest.NewRecorder()
+	w := &sseWriter{w: rec, f: nopFlusher{rec}}
+
+	if ok := svc.midstreamCatchup(t.Context(), w, client); !ok {
+		t.Error("a refused replay killed the connection; the live stream is still serviceable")
+	}
+	if !strings.Contains(rec.Body.String(), `"reason":"`+gapReasonReplayUnavailable+`"`) {
+		t.Errorf("refused replay raised no gap; body = %q", rec.Body.String())
+	}
+	if got := testutil.ToFloat64(metrics.SSEGapEventsTotal.WithLabelValues(gapReasonReplayUnavailable)) - gapsBefore; got != 1 {
+		t.Errorf("gap metric delta = %v, want 1", got)
 	}
 }
 
