@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,7 +32,7 @@ const dropLogInterval = 5 * time.Second
 // change. Publish JSON-encodes the TransactionStatus and sends it under
 // kafka.TopicStatusUpdate keyed by txid (so updates for the same tx land on
 // the same partition in real Kafka). Subscribe spins up a dedicated
-// consumer group with a random ID — every caller gets every message
+// consumer group per (process, caller) — every caller gets every message
 // published after it subscribed, regardless of how many other subscribers
 // are running. History is never served from Kafka: subscribers are
 // live-only by contract, and missed events recover through store-backed
@@ -47,6 +49,11 @@ type KafkaPublisher struct {
 	mu     sync.Mutex
 	closed bool
 	subs   []*kafkaSubscription
+	// groupSeq counts Subscribe calls per caller so each gets its own consumer
+	// group even when one process subscribes twice under the same caller. See
+	// subscriberGroupID: sharing a group would split the topic's partitions
+	// between the two subscribers instead of giving each the whole stream.
+	groupSeq map[string]int
 }
 
 // NewKafkaPublisher wraps a kafka.Producer. The producer's underlying broker
@@ -116,11 +123,14 @@ func (p *KafkaPublisher) PublishBulk(ctx context.Context, template *models.Trans
 	return err
 }
 
-// Subscribe joins a fresh consumer group on TopicStatusUpdate and returns a
-// channel that yields decoded TransactionStatus values until ctx is canceled.
-// The unique groupID guarantees this subscriber sees every message published
-// from subscription time onward — useful when multiple subscribers (SSE
-// manager + webhook service) coexist in the same process or across pods.
+// Subscribe joins a consumer group on TopicStatusUpdate and returns a channel
+// that yields decoded TransactionStatus values until ctx is canceled.
+//
+// The group id is unique per (process, caller) — see subscriberGroupID — which
+// is what guarantees this subscriber sees EVERY message published from
+// subscription time onward rather than a partition subset. That property is
+// load-bearing: it is why any SSE replica can serve any client and why no
+// sticky routing is needed.
 //
 // The group starts at the LATEST offset. A fresh random group with
 // StartOldest silently replays the topic's entire retained backlog on every
@@ -145,10 +155,16 @@ func (p *KafkaPublisher) Subscribe(ctx context.Context, caller string) (<-chan *
 		caller = "unknown"
 	}
 
-	groupID, err := uniqueGroupID()
+	groupID, err := p.subscriberGroupID(caller)
 	if err != nil {
 		return nil, fmt.Errorf("generating group id: %w", err)
 	}
+	// Logged because a duplicate group id across pods is otherwise invisible:
+	// the partitions would be split between them and each pod's clients would
+	// quietly receive a fraction of the stream.
+	p.logger.Info("events subscriber joining consumer group",
+		zap.String("caller", caller),
+		zap.String("group_id", groupID))
 
 	out := make(chan *models.TransactionStatus, p.subscriberBuffer)
 
@@ -245,14 +261,72 @@ type kafkaSubscription struct {
 	out chan *models.TransactionStatus
 }
 
-// uniqueGroupID returns a per-call group identifier. Used so each Subscribe
-// gets its own consumer group, which in turn guarantees every subscriber
-// sees every message published after it joined (the broker fans out across
-// distinct groups; each group starts at the topic head — see Subscribe).
-func uniqueGroupID() (string, error) {
+// subscriberGroupID returns this subscriber's consumer-group identifier.
+//
+// EVERY Subscribe call must get its own group. That is the Publisher's core
+// fan-out contract: distinct groups each receive the whole topic, whereas two
+// subscribers sharing a group have the partitions split between them and each
+// sees only a fraction of the stream. For SSE that fraction would be silently
+// missing events, and the "every replica sees everything" property — the
+// reason any replica can serve any client without sticky routing — would be
+// gone. Hence the per-caller sequence number: it is what keeps the contract
+// intact for two same-caller subscribers in one process.
+//
+// Within that constraint the id is built from caller + hostname (the pod name
+// under Kubernetes) rather than random bytes. A purely random id made
+// redpanda_kafka_consumer_group_lag effectively unusable: the group label was
+// unrecognizable and changed on every restart, so the most useful broker-side
+// signal could not be matched, aggregated, or alerted on. The id now sorts and
+// regex-matches by caller (`arcade-events-sse-.*`) and names the pod it
+// belongs to, so lag joins back to something an operator can go and look at.
+//
+// This is safe with respect to #239 (the StartOldest backlog-replay OOM):
+// this consumer never marks messages, so the group never commits an offset and
+// Offsets.Initial (StartLatest) applies on every join. A rejoining pod still
+// starts at the head, even if it reuses a name.
+//
+// Falls back to random bytes when the hostname is missing or non-identifying,
+// where uniqueness matters more than legibility.
+func (p *KafkaPublisher) subscriberGroupID(caller string) (string, error) {
+	p.mu.Lock()
+	if p.groupSeq == nil {
+		p.groupSeq = make(map[string]int)
+	}
+	seq := p.groupSeq[caller]
+	p.groupSeq[caller]++
+	p.mu.Unlock()
+
+	host, err := os.Hostname()
+	if err != nil {
+		return uniqueGroupID(caller)
+	}
+	sanitized := sanitizeGroupComponent(host)
+	if sanitized == "" || sanitized == "localhost" {
+		return uniqueGroupID(caller)
+	}
+	return fmt.Sprintf("arcade-events-%s-%s-%d", caller, sanitized, seq), nil
+}
+
+// uniqueGroupID returns a random per-call group identifier, used when no
+// stable identity is available.
+func uniqueGroupID(caller string) (string, error) {
 	var b [12]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", err
 	}
-	return "arcade-events-" + hex.EncodeToString(b[:]), nil
+	return "arcade-events-" + caller + "-" + hex.EncodeToString(b[:]), nil
+}
+
+// sanitizeGroupComponent reduces a string to characters that are safe in a
+// Kafka group id, dropping anything else.
+func sanitizeGroupComponent(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }

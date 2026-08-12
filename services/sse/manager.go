@@ -516,7 +516,15 @@ func (s *Service) handleEvents(c *gin.Context) {
 	s.manager.Register(client)
 	defer s.manager.Unregister(client.ID)
 
+	// outcome records why this connection ended. The rate of this counter is
+	// the reconnect rate and the label is the reason — a storm of write_error
+	// is a completely different problem from a storm of drain, and the two
+	// used to be indistinguishable.
+	outcome := "client_closed"
+	defer func() { metrics.SSEConnectionsTotal.WithLabelValues(outcome).Inc() }()
+
 	if token != "" && !s.connectCatchup(ctx, writer, token, c.GetHeader("Last-Event-ID"), client) {
+		outcome = "write_error"
 		return // connection is gone; nothing left to serve
 	}
 
@@ -531,11 +539,13 @@ func (s *Service) handleEvents(c *gin.Context) {
 			// Manager-initiated release (Drain). Unlike the request-ctx arm
 			// above, the connection is still writable here, so say goodbye
 			// with a staggered reconnect hint rather than dropping the socket.
+			outcome = "drain"
 			writeShutdown(writer, client)
 			return
 		case status := <-client.Ch:
 			if status != nil {
 				if err := writeStatusBuffered(writer, status); err != nil {
+					outcome = "write_error"
 					return
 				}
 				client.lastDelivered.Store(status.Timestamp.UnixNano())
@@ -544,27 +554,53 @@ func (s *Service) handleEvents(c *gin.Context) {
 			// one Kafka message lands ~50 frames here; without coalescing we'd
 			// flush per frame.
 			if _, err := drainLive(writer, client); err != nil {
+				outcome = "write_error"
 				return
 			}
 			if err := writer.flush(); err != nil {
+				outcome = "write_error"
 				return
 			}
 			if !s.midstreamCatchup(ctx, writer, client) {
+				outcome = "write_error"
 				return
 			}
 		case <-keepalive.C:
 			if err := writer.write(": keepalive\n\n"); err != nil {
+				outcome = "write_error"
 				return
 			}
+			observeClientLag(client)
 			// Also heal on the keepalive tick: a drop can land just after the
 			// writer's post-drain check (the flag is set by the concurrent
 			// fan-out goroutine), and if the stream then goes quiet no further
 			// drain cycle would notice it.
 			if !s.midstreamCatchup(ctx, writer, client) {
+				outcome = "write_error"
 				return
 			}
 		}
 	}
+}
+
+// observeClientLag samples how far behind the present this connection's last
+// delivered frame is.
+//
+// Sampled on the keepalive tick rather than per frame: the watermark is
+// already maintained by the writer goroutine, so this costs one atomic load
+// and one histogram observation per client per 15s. It is the signal that
+// describes what a consumer actually experiences — drops and fan-out duration
+// each describe one component in isolation, which is how 1.6M dropped events
+// went unnoticed for a whole benchmark run.
+//
+// Skipped before the first delivery: a connection that has legitimately had
+// nothing to receive would otherwise report its entire uptime as lag.
+func observeClientLag(client *Client) {
+	last := client.lastDelivered.Load()
+	if last <= 0 {
+		return
+	}
+	metrics.SSEClientLagSeconds.Observe(time.Since(time.Unix(0, last)).Seconds())
 }
 
 // connectCatchup runs the pre-stream replay for a token-scoped connection and

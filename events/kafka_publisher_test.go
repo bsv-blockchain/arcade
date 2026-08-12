@@ -2,6 +2,8 @@ package events
 
 import (
 	"context"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -55,6 +57,51 @@ func TestKafkaPublisherRoundtrip(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("did not receive status update")
+	}
+}
+
+// TestSubscriberGroupIDIsUniqueAndAttributable pins both halves of the group-id
+// contract.
+//
+// Uniqueness is a correctness property with a SILENT failure mode: two
+// subscribers sharing a group have the topic's partitions split between them,
+// so each sees only a fraction of the stream. For SSE that is missed events
+// with no error anywhere.
+//
+// Attributability is the observability property: the id must carry the caller
+// and the host so redpanda_kafka_consumer_group_lag can be matched and
+// aggregated. A purely random id — the previous behavior — could not be.
+func TestSubscriberGroupIDIsUniqueAndAttributable(t *testing.T) {
+	broker := kafka.NewMemoryBroker(1)
+	defer func() { _ = broker.Close() }()
+	pub := NewKafkaPublisher(kafka.NewProducer(broker), zap.NewNop(), 0)
+
+	seen := map[string]bool{}
+	for _, caller := range []string{"sse", "sse", "webhook", "sse"} {
+		id, err := pub.subscriberGroupID(caller)
+		if err != nil {
+			t.Fatalf("subscriberGroupID(%q): %v", caller, err)
+		}
+		if seen[id] {
+			t.Fatalf("duplicate group id %q: two subscribers would split partitions and each silently miss events", id)
+		}
+		seen[id] = true
+		if !strings.HasPrefix(id, "arcade-events-"+caller+"-") {
+			t.Errorf("group id %q is not matchable by caller (want prefix arcade-events-%s-)", id, caller)
+		}
+	}
+
+	host, err := os.Hostname()
+	if err == nil && sanitizeGroupComponent(host) != "" && sanitizeGroupComponent(host) != "localhost" {
+		var found bool
+		for id := range seen {
+			if strings.Contains(id, sanitizeGroupComponent(host)) {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no group id names the host; lag cannot be traced back to a pod. got %v", seen)
+		}
 	}
 }
 

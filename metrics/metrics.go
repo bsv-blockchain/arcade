@@ -747,6 +747,38 @@ var SSEMidstreamCatchupFramesTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "Frames replayed from the store by mid-stream SSE catchup rounds.",
 })
 
+// SSEClientLagSeconds measures, per client per keepalive tick, how far behind
+// the present that client's last delivered frame is.
+//
+// This is the single most useful health signal for the push path and the one
+// whose absence let 1.6M dropped events go unnoticed for a whole 45-minute
+// run: drops and fan-out duration each describe one component, while lag
+// describes what a consumer actually EXPERIENCES. It is nearly free — the
+// writer goroutine already maintains the lastDelivered watermark, and this
+// samples it once per client per keepalive rather than per frame.
+//
+// A client with nothing to receive reads as lag, so interpret it against
+// SSEConnectedClients and the publish rate: it is a "is the stream keeping
+// up" signal, not a liveness check.
+var SSEClientLagSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+	Name:    "arcade_sse_client_lag_seconds",
+	Help:    "Age of the last frame delivered to an SSE client, sampled per keepalive tick.",
+	Buckets: []float64{.05, .1, .25, .5, 1, 2.5, 5, 10, 30, 60, 300},
+})
+
+// SSEConnectionsTotal counts finished /events connections by how they ended:
+//   - "client_closed": the request context was canceled (normal disconnect).
+//   - "drain":         released by a graceful shutdown.
+//   - "write_error":   the connection died mid-write.
+//
+// The rate is the reconnect rate, and the label says why. A reconnect storm
+// with outcome="write_error" is a very different problem from one with
+// outcome="drain", and before this the two were indistinguishable.
+var SSEConnectionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_sse_connections_total",
+	Help: "Finished SSE /events connections, by how they ended.",
+}, []string{"outcome"}) // client_closed, drain, write_error
+
 // SSEGapEventsTotal counts `event: gap` frames written to /events clients —
 // every occasion on which the server KNOWS it handed a client a discontiguous
 // stream and said so. Reasons:
