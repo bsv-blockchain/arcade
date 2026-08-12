@@ -1114,6 +1114,84 @@ func TestSSEFirehoseDropEmitsGap(t *testing.T) {
 	}
 }
 
+// TestSSEReadyFailsWhileDrainingButLivenessDoesNot pins the probe split. They
+// were the same handler, so there was no way to say "stop sending me traffic"
+// without also saying "kill me" — and a liveness failure mid-drain is exactly
+// the opposite of draining.
+func TestSSEReadyFailsWhileDrainingButLivenessDoesNot(t *testing.T) {
+	svc := &Service{cfg: &config.Config{}, logger: zap.NewNop()}
+
+	call := func(h gin.HandlerFunc) int {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		h(c)
+		return rec.Code
+	}
+
+	if got := call(svc.handleReady); got != http.StatusOK {
+		t.Errorf("ready before draining = %d, want 200", got)
+	}
+	svc.draining.Store(true)
+	if got := call(svc.handleReady); got != http.StatusServiceUnavailable {
+		t.Errorf("ready while draining = %d, want 503 (pod stays in Service endpoints)", got)
+	}
+	if got := call(svc.handleHealth); got != http.StatusOK {
+		t.Errorf("liveness while draining = %d, want 200 (a failure here kills the pod mid-drain)", got)
+	}
+}
+
+// TestSSEDrainReleasesClientsWithStaggeredRetry covers the graceful drain: a
+// client is released with a clean shutdown frame carrying its OWN reconnect
+// delay, instead of having its socket severed when the process exits.
+func TestSSEDrainReleasesClientsWithStaggeredRetry(t *testing.T) {
+	st := &sseStoreStub{
+		subsByToken: map[string][]*models.Submission{},
+		statusByTx:  map[string]*models.TransactionStatus{},
+	}
+	svc, router, _, cancel := setupSSEService(t, st)
+	defer cancel()
+
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/events") //nolint:noctx // test client
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// Wait for the handler to register before draining.
+	deadline := time.Now().Add(5 * time.Second)
+	for svc.manager.clientCount() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("client never registered")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if released := svc.manager.Drain(30 * time.Second); released != 1 {
+		t.Fatalf("Drain released %d clients, want 1", released)
+	}
+
+	// The stream must END (clean EOF), not hang, and the last thing on it must
+	// be the shutdown frame with a retry directive.
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read drained stream: %v", err)
+	}
+	text := string(body)
+	if !strings.Contains(text, "event: shutdown") {
+		t.Errorf("drained stream carried no shutdown frame: %q", text)
+	}
+	var retryMS int
+	if _, err := fmt.Sscanf(text[strings.Index(text, "retry: "):], "retry: %d", &retryMS); err != nil {
+		t.Fatalf("no retry directive in %q: %v", text, err)
+	}
+	if retryMS <= 0 || retryMS > 30_000 {
+		t.Errorf("retry hint = %dms, want within (0, 30000]", retryMS)
+	}
+}
+
 // readSSEUntilTxIDs consumes SSE frames from r until every txid in want has
 // been seen at least once (duplicates allowed) or the timeout elapses.
 func readSSEUntilTxIDs(r io.Reader, want map[string]bool, timeout time.Duration) error {

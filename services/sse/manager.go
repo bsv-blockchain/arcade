@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"net/http"
 	"strconv"
 	"sync"
@@ -68,6 +69,13 @@ type Client struct {
 	// block's burst used to emit one Warn PER dropped event.
 	dropsSinceLog atomic.Int64
 	lastDropLog   atomic.Int64
+
+	// drainRetryMS is this connection's personal reconnect delay, set by
+	// Manager.Drain just before it cancels Ctx and read once by the writer
+	// goroutine on its way out. Zero means "no hint" (either not a drain, or
+	// hints are disabled). Per-client rather than shared because a single
+	// shared delay relocates a reconnect herd instead of dispersing it.
+	drainRetryMS atomic.Int64
 }
 
 // Manager owns the per-pod registry of SSE clients listening on
@@ -102,10 +110,19 @@ type Manager struct {
 	fanoutEWMA   float64
 	fanoutEvents int64
 
-	// parentCtx is the long-lived context that owns the manager
-	// goroutine. Per-client contexts are derived from it so canceling
-	// the manager also cancels every registered client's fan-out path.
-	parentCtx context.Context //nolint:containedctx // long-lived registry root
+	// parentCtx roots every per-client context, so canceling it cancels every
+	// registered client's fan-out path at once.
+	//
+	// It is deliberately rooted at context.Background(), NOT at the service
+	// context, and is cancelled only by Drain. If it inherited the service
+	// context then a shutdown would cancel every client the instant SIGTERM
+	// landed — before the drain had failed readiness, waited for the endpoint
+	// to be withdrawn, or handed out reconnect hints. The drain would be a
+	// no-op and every stream would still be severed simultaneously. The
+	// manager's own run goroutine keeps using the service context, because it
+	// SHOULD stop immediately.
+	parentCtx    context.Context //nolint:containedctx // long-lived registry root
+	parentCancel context.CancelFunc
 
 	nextClientID atomic.Int64
 
@@ -143,12 +160,15 @@ func newManager(ctx context.Context, publisher events.Publisher, st store.Store,
 		return nil, nil //nolint:nilnil // intentional: nil manager means "no fan-out wired"
 	}
 	named := logger.Named("sse")
+	// clientRoot outlives ctx on purpose — see Manager.parentCtx.
+	clientRoot, cancelClients := context.WithCancel(context.WithoutCancel(ctx))
 	m := &Manager{
 		publisher:     publisher,
 		store:         st,
 		logger:        named,
 		tokens:        newTokenIndex(st, named),
-		parentCtx:     ctx,
+		parentCtx:     clientRoot,
+		parentCancel:  cancelClients,
 		catchupOnDrop: true,
 		clients:       make(map[int64]*Client),
 	}
@@ -411,6 +431,35 @@ func (m *Manager) Unregister(id int64) {
 	}
 }
 
+// Drain releases every registered client for a graceful shutdown and reports
+// how many it released.
+//
+// Each client is given its OWN reconnect delay, drawn uniformly below
+// retryMax, before its context is canceled. The per-client draw is the whole
+// point: releasing N clients with one shared delay just moves the herd, it
+// does not disperse it. The writer goroutine observes the cancellation, emits
+// a shutdown frame carrying that delay as an SSE `retry:` directive, and
+// returns — so the stream ends with a clean FIN instead of the RST that a
+// process exit produces.
+//
+// retryMax <= 0 skips the hint entirely and clients fall back to their own
+// backoff, which is still correct, just less well spread.
+func (m *Manager) Drain(retryMax time.Duration) int {
+	clients := m.snapshot()
+	for _, c := range clients {
+		if retryMax > 0 {
+			//nolint:gosec // reconnect spreading is a load-shaping device, not a security primitive
+			c.drainRetryMS.Store(1 + rand.Int64N(retryMax.Milliseconds()))
+		}
+		c.Cancel()
+	}
+	// Catch anything that connected between the snapshot and here. Those get
+	// no reconnect hint, which is the right trade: they arrived after readiness
+	// had already failed, so there should be none.
+	m.parentCancel()
+	return len(clients)
+}
+
 // NewClient assembles a client with a fresh id, buffered channel, and
 // per-client cancel handle. The client context is derived from the
 // manager's parent ctx so a manager shutdown propagates to every client.
@@ -477,6 +526,12 @@ func (s *Service) handleEvents(c *gin.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			return
+		case <-client.Ctx.Done():
+			// Manager-initiated release (Drain). Unlike the request-ctx arm
+			// above, the connection is still writable here, so say goodbye
+			// with a staggered reconnect hint rather than dropping the socket.
+			writeShutdown(writer, client)
 			return
 		case status := <-client.Ch:
 			if status != nil {
@@ -967,6 +1022,25 @@ func writeGap(w *sseWriter, reason string, from int64, count int64) error {
 	}
 	metrics.SSEGapEventsTotal.WithLabelValues(reason).Inc()
 	return w.write(fmt.Sprintf("event: gap\ndata: %s\n\n", data))
+}
+
+// writeShutdown emits the farewell frame for a client released by
+// Manager.Drain: an SSE `retry:` directive carrying this connection's own
+// reconnect delay, plus a shutdown event naming the reason.
+//
+// `retry:` is the only in-band channel a server has for telling clients when to
+// come back. Without it a rolling restart releases every client at once and
+// they all re-dial on their own identical backoff schedule, landing together on
+// a pod that is still cold. Errors are ignored: the connection is closing
+// either way, and a client that misses the hint just falls back to its own
+// backoff.
+func writeShutdown(w *sseWriter, client *Client) {
+	retryMS := client.drainRetryMS.Load()
+	if retryMS <= 0 {
+		return
+	}
+	_ = w.write(fmt.Sprintf("retry: %d\nevent: shutdown\ndata: {\"reason\":\"draining\",\"reconnectAfterMs\":%d}\n\n",
+		retryMS, retryMS))
 }
 
 // writeStatus emits one status frame and flushes it. Used for single frames
