@@ -747,6 +747,28 @@ var SSEMidstreamCatchupFramesTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "Frames replayed from the store by mid-stream SSE catchup rounds.",
 })
 
+// SSEGapEventsTotal counts `event: gap` frames written to /events clients —
+// every occasion on which the server KNOWS it handed a client a discontiguous
+// stream and said so. Reasons:
+//   - "catchup_truncated": a connect-time replay stopped at the frame cap with
+//     matching history still beyond the cursor.
+//   - "firehose_drop": a tokenless client's frame was dropped on channel
+//     overflow. There is no bounded store query that reconstructs an
+//     unfiltered stream, so a gap notice is the only recovery signal these
+//     clients can be given.
+//   - "replay_unavailable": the store could not serve the replay (iteration
+//     error, or a backend that refused an unbounded scan).
+//
+// This is the counterpart to APISSEDroppedTotal: drops say the server lost
+// something, gaps say the CLIENT was told. A drop rate without a matching gap
+// rate is silent loss, which is the failure mode this metric exists to make
+// impossible to miss. The client's contract on receiving one is to reconcile
+// the window over REST.
+var SSEGapEventsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_sse_gap_events_total",
+	Help: "SSE `event: gap` frames written, by reason.",
+}, []string{"reason"}) // catchup_truncated, firehose_drop, replay_unavailable
+
 // EventsSubscriberDroppedTotal counts events.Publisher.Subscribe channel
 // drops, labeled by which caller's channel filled. The publisher emits a
 // drop when the per-subscriber buffer is at capacity and the kafka handler

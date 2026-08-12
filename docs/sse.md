@@ -149,7 +149,30 @@ The server only replays missed events when **both** of these are present on the 
 
 Replay walks the submissions registered under the token and emits the current status for each txid whose `timestamp` is later than `Last-Event-ID`. There is no replay for unfiltered (no-token) consumers — that mode is for live monitoring only.
 
+Note that replay emits each txid's **current** status, not the sequence of transitions you missed. If a transaction went `ACCEPTED → SEEN_ON_NETWORK → MINED` while you were disconnected, you get one `MINED` frame, not three.
+
 Slow consumers will drop frames: the fan-out is non-blocking, so if your client doesn't drain the connection fast enough, the server skips that update for that client rather than stalling. Reconnecting with `Last-Event-ID` is the recovery path.
+
+### `event: gap` — the stream is discontiguous
+
+Whenever the server knows it handed you an incomplete stream, it says so in-band rather than leaving you to assume you are whole:
+
+```
+event: gap
+data: {"reason":"catchup_truncated","from":"1786493743374103486","count":10000,"action":"reconcile"}
+```
+
+| `reason` | Meaning |
+|---|---|
+| `catchup_truncated` | A reconnect replay hit the server's frame budget. Matching history after `from` was not sent. |
+| `firehose_drop` | A no-token stream dropped a frame. No token-scoped replay can recover it, so this is the only recovery signal available to unfiltered consumers. |
+| `replay_unavailable` | The store could not serve the replay. The connection continues with live frames only. |
+
+`from` is the last nanosecond cursor you can trust; everything between it and the live stream may be missing. `action` is always `reconcile`: re-fetch the affected transactions with `GET /tx/{txid}`.
+
+Treat a gap as an event to act on, not a warning to log. It is the difference between bounded, self-healing loss and silent loss — a stream that never emits `gap` is complete, and one that does tells you exactly where to look.
+
+Unknown `event:` types must be ignored by conformant clients, so this frame is safe for existing consumers: it costs them nothing and they behave exactly as before.
 
 ## Failure modes
 

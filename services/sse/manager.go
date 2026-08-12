@@ -467,18 +467,8 @@ func (s *Service) handleEvents(c *gin.Context) {
 	s.manager.Register(client)
 	defer s.manager.Unregister(client.ID)
 
-	if token != "" {
-		var since time.Time
-		if lastEventID := c.GetHeader("Last-Event-ID"); lastEventID != "" {
-			if ns, err := strconv.ParseInt(lastEventID, 10, 64); err == nil {
-				since = time.Unix(0, ns)
-			}
-		}
-		// The pre-stream catchup threads the client through so lastDelivered
-		// is initialized from the replayed history — a later mid-stream
-		// catchup then resumes from a fresh watermark instead of replaying
-		// from zero.
-		s.sendCatchup(ctx, writer, token, since, client, false, catchupMaxFrames)
+	if token != "" && !s.connectCatchup(ctx, writer, token, c.GetHeader("Last-Event-ID"), client) {
+		return // connection is gone; nothing left to serve
 	}
 
 	keepalive := time.NewTicker(15 * time.Second)
@@ -520,6 +510,39 @@ func (s *Service) handleEvents(c *gin.Context) {
 			}
 		}
 	}
+}
+
+// connectCatchup runs the pre-stream replay for a token-scoped connection and
+// reports whether the connection is still writable.
+//
+// The client is threaded through so lastDelivered is initialized from the
+// replayed history — a later mid-stream catchup then resumes from a fresh
+// watermark instead of replaying from zero. A malformed Last-Event-ID is
+// treated as absent, which yields fresh-connect semantics (non-terminal
+// statuses only) rather than an error.
+//
+// A store failure here leaves a writable connection that owes history it will
+// never send, so it raises a gap rather than sliding silently into live
+// frames. Truncation raises its own gap inside sendCatchup.
+func (s *Service) connectCatchup(ctx context.Context, w *sseWriter, token, lastEventID string, client *Client) bool {
+	var since time.Time
+	if lastEventID != "" {
+		if ns, err := strconv.ParseInt(lastEventID, 10, 64); err == nil {
+			since = time.Unix(0, ns)
+		}
+	}
+	res := s.sendCatchup(ctx, w, token, since, client, false, catchupMaxFrames)
+	if res.writeFailed {
+		return false
+	}
+	if res.err == nil {
+		return true
+	}
+	s.logger.Warn("sse connect catchup failed; client notified of gap",
+		zap.Int64("client_id", client.ID),
+		zap.Int("frames", res.frames),
+		zap.Error(res.err))
+	return writeGap(w, gapReasonReplayUnavailable, since.UnixNano(), 0) == nil
 }
 
 // catchupMaxFrames bounds a single catchup replay. A well-behaved token
@@ -595,6 +618,10 @@ type catchupResult struct {
 	// err is any non-cap error: a write error (connection dead) or a store
 	// iteration error.
 	err error
+	// writeFailed distinguishes the two err sources. A store failure leaves a
+	// writable connection that has silently missed history and must be told so
+	// with a gap frame; a write failure means there is nobody left to tell.
+	writeFailed bool
 }
 
 // sendCatchup replays persisted statuses for txids registered under the
@@ -618,15 +645,23 @@ type catchupResult struct {
 // client, when non-nil, has its lastDelivered watermark advanced per written
 // frame so mid-stream catchup can resume from where any earlier pass ended.
 //
-// midstream=true adapts the pass for the live-loop caller: the frame cap
-// becomes "soft" at a timestamp boundary — once the cap is reached the pass
-// keeps writing while the timestamp stays EQUAL to the last written frame's.
-// The store's since-filter is strictly-after, so a timestamp-cursor cannot
-// resume mid-way through an equal-timestamp run (SetMinedByTxIDs stamps a
-// whole block's rows with one timestamp_at); stopping inside one would
-// strand the remainder forever. Draining the tie bounds the overshoot by the
-// largest same-timestamp batch, and guarantees `capped` passes always end on
-// a boundary the next round can resume from strictly-after.
+// The frame cap is ALWAYS soft at a timestamp boundary, on both the
+// connect-time and the mid-stream path: once the cap is reached the pass keeps
+// writing while the timestamp stays EQUAL to the last written frame's. The
+// store's since-filter is strictly-after and timestamp_at is only
+// microsecond-resolution, so a timestamp cursor cannot resume mid-way through
+// an equal-timestamp run (SetMinedByTxIDs stamps a whole block's rows with one
+// timestamp_at) — stopping inside one strands the remainder FOREVER. That was
+// a silent, permanent loss on the Last-Event-ID reconnect path: the pass
+// stopped mid-tie, reported lastTS as the tied timestamp, and the client
+// resumed strictly after it. Draining the tie bounds the overshoot by the
+// largest same-timestamp batch (frames are streamed, never accumulated, so the
+// cost is time and not memory) and guarantees a `capped` pass always ends on a
+// boundary the next round can resume from.
+//
+// midstream=true only changes how a capped pass is REPORTED: the live loop
+// paginates by design, so it is not logged as a truncation and does not raise
+// a gap.
 //
 // maxFrames is the pass's frame budget: catchupMaxFrames for connect-time
 // replay, and the smaller midstreamRoundFrames(client) for live rounds, which
@@ -641,14 +676,12 @@ func (s *Service) sendCatchup(ctx context.Context, w *sseWriter, token string, s
 	enrichedBlocks := make(map[string]struct{})
 	err := s.store.IterateStatusesByToken(ctx, token, since, only, func(status *models.TransactionStatus) error {
 		ts := status.Timestamp.UnixNano()
-		if res.frames >= maxFrames {
-			if !midstream || ts != res.lastTS {
-				res.capped = true
-				return errCatchupCapped
-			}
-			// midstream: same-timestamp tie with the frame that hit the cap —
-			// finish the tie (see the function comment).
+		if res.frames >= maxFrames && ts != res.lastTS {
+			res.capped = true
+			return errCatchupCapped
 		}
+		// Reaching here past the cap means a same-timestamp tie with the frame
+		// that hit it — finish the tie (see the function comment).
 		if status.Status == models.StatusMined || status.Status == models.StatusImmutable {
 			_, seen := enrichedBlocks[status.BlockHash]
 			if status.BlockHash != "" && (seen || len(enrichedBlocks) < catchupBlockBudget) {
@@ -660,6 +693,7 @@ func (s *Service) sendCatchup(ctx context.Context, w *sseWriter, token string, s
 			}
 		}
 		if err := writeStatus(w, status); err != nil {
+			res.writeFailed = true
 			return err
 		}
 		res.frames++
@@ -680,10 +714,36 @@ func (s *Service) sendCatchup(ctx context.Context, w *sseWriter, token string, s
 		s.logger.Warn("sse catchup truncated at frame cap",
 			zap.Int("cap", maxFrames),
 			zap.Bool("fresh_connect", since.IsZero()))
+		// Tell the CLIENT, not just the log. Everything after res.lastTS that
+		// matched this token is history it will never be pushed; without this
+		// frame it has no way to know that and would carry on as if whole.
+		if gapErr := writeGap(w, gapReasonCatchupTruncated, res.lastTS, int64(res.frames)); gapErr != nil {
+			res.err = gapErr
+			res.writeFailed = true
+		}
 	default:
 		res.err = err
 	}
 	return res
+}
+
+// declareFirehoseGap handles a drop on a tokenless (firehose) connection.
+//
+// No bounded store query can reconstruct an unfiltered stream, so there is
+// nothing to replay — but the drop can still be declared. Consumes the drop
+// flag (so the gap is raised once per episode rather than on every keepalive
+// tick) and writes one gap frame carrying the earliest dropped timestamp as
+// the cursor the client can still trust. Returns false when the connection is
+// no longer writable.
+func declareFirehoseGap(w *sseWriter, client *Client) bool {
+	if !client.dropped.Swap(false) {
+		return true
+	}
+	from := int64(0)
+	if floor := client.droppedFloor.Swap(math.MaxInt64); floor != math.MaxInt64 {
+		from = floor
+	}
+	return writeGap(w, gapReasonFirehoseDrop, from, 0) == nil
 }
 
 // midstreamCatchup heals a live token-scoped connection after fanOut dropped
@@ -714,7 +774,10 @@ func (s *Service) sendCatchup(ctx context.Context, w *sseWriter, token string, s
 // it was healing overflowed again mid-replay — the drop→catchup→drop loop
 // that kept a stream in permanent recovery.
 func (s *Service) midstreamCatchup(ctx context.Context, w *sseWriter, client *Client) bool {
-	if client.Token == "" || !s.manager.catchupOnDrop {
+	if client.Token == "" {
+		return declareFirehoseGap(w, client)
+	}
+	if !s.manager.catchupOnDrop {
 		return true
 	}
 	roundFrames := midstreamRoundFrames(client)
@@ -847,6 +910,63 @@ func buildStatusFrame(status *models.TransactionStatus) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("id: %d\nevent: status\ndata: %s\n\n", status.Timestamp.UnixNano(), data), nil
+}
+
+// Gap reasons. These are the `reason` field on a gap frame and the label on
+// metrics.SSEGapEventsTotal — keep the two in step.
+const (
+	// gapReasonCatchupTruncated: a connect-time replay stopped at the frame cap
+	// with matching history still beyond the cursor.
+	gapReasonCatchupTruncated = "catchup_truncated"
+	// gapReasonFirehoseDrop: a tokenless client's frame was dropped on channel
+	// overflow and no token-scoped replay can recover it.
+	gapReasonFirehoseDrop = "firehose_drop"
+	// gapReasonReplayUnavailable: the store could not serve the replay, so the
+	// connection proceeded to live frames without the history it owed.
+	gapReasonReplayUnavailable = "replay_unavailable"
+)
+
+// gapPayload is the JSON shape inside a `data:` field on an `event: gap`
+// frame. It is the server admitting, in-band, that the stream it just handed
+// this client is discontiguous.
+//
+// Before this existed, the two ways a client silently lost history — a
+// connect-time replay stopped at the frame cap, and a tokenless client's
+// dropped frame — produced only a server-side Warn and a counter. The client
+// streamed on believing it was whole. `from` is the last cursor the client can
+// trust; everything after it, up to the live stream, may be missing.
+//
+// Unknown event types are ignored by every conformant SSE client (including
+// go-arcade-toolbox, which skips any `event:` other than "status"), so this
+// frame is purely additive and safe to emit at any protocol version.
+type gapPayload struct {
+	// Reason is machine-readable and matches the SSEGapEventsTotal label.
+	Reason string `json:"reason"`
+	// From is the nanosecond cursor the gap starts after — the last id the
+	// client was handed. Empty when no cursor is known (a firehose client with
+	// no delivered frame yet).
+	From string `json:"from,omitempty"`
+	// Count is a best-effort magnitude of what was skipped, when known.
+	Count int64 `json:"count,omitempty"`
+	// Action tells the client what to do. Always "reconcile": re-fetch the
+	// affected transactions over REST.
+	Action string `json:"action"`
+}
+
+// writeGap emits an `event: gap` frame and flushes it. Errors are returned so
+// callers on the writer goroutine can treat a failed write as a dead
+// connection, matching writeStatus.
+func writeGap(w *sseWriter, reason string, from int64, count int64) error {
+	p := gapPayload{Reason: reason, Count: count, Action: "reconcile"}
+	if from > 0 {
+		p.From = strconv.FormatInt(from, 10)
+	}
+	data, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+	metrics.SSEGapEventsTotal.WithLabelValues(reason).Inc()
+	return w.write(fmt.Sprintf("event: gap\ndata: %s\n\n", data))
 }
 
 // writeStatus emits one status frame and flushes it. Used for single frames

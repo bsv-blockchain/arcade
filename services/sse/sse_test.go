@@ -741,10 +741,12 @@ func TestSSEMidstreamCatchupDeliversDroppedEvents(t *testing.T) {
 	}
 }
 
-// TestSSEMidstreamCatchupTokenlessKeepsDropOnly verifies the firehose
-// (tokenless) client keeps the historical behavior: drops are counted, but no
-// store-backed catchup runs — the catchup source is token-scoped.
-func TestSSEMidstreamCatchupTokenlessKeepsDropOnly(t *testing.T) {
+// TestSSEMidstreamCatchupTokenlessRaisesGapNotCatchup verifies what a firehose
+// (tokenless) client gets on a drop: NO store-backed catchup round, because the
+// catchup source is token-scoped and no bounded query reconstructs an
+// unfiltered stream — but a gap frame, so the loss is declared rather than
+// silent. Historically this path produced only a counter and a log line.
+func TestSSEMidstreamCatchupTokenlessRaisesGapNotCatchup(t *testing.T) {
 	st := &sseStoreStub{
 		subsByToken: map[string][]*models.Submission{},
 		statusByTx:  map[string]*models.TransactionStatus{},
@@ -775,8 +777,11 @@ func TestSSEMidstreamCatchupTokenlessKeepsDropOnly(t *testing.T) {
 	if ok := svc.midstreamCatchup(t.Context(), w, client); !ok {
 		t.Fatal("midstreamCatchup reported a dead connection")
 	}
-	if rec.Body.Len() != 0 {
-		t.Errorf("tokenless client received catchup frames: %q", rec.Body.String())
+	if strings.Contains(rec.Body.String(), "event: status") {
+		t.Errorf("tokenless client received catchup status frames: %q", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"reason":"`+gapReasonFirehoseDrop+`"`) {
+		t.Errorf("tokenless drop was not declared to the client: %q", rec.Body.String())
 	}
 	if got := testutil.ToFloat64(metrics.SSEMidstreamCatchupsTotal) - catchupsBefore; got != 0 {
 		t.Errorf("catchup rounds ran for tokenless client: %v", got)
@@ -916,6 +921,196 @@ func TestSSEMidstreamCatchupSameTimestampGlut(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(metrics.SSEMidstreamCatchupsTotal) - catchupsBefore; got != 1 {
 		t.Errorf("catchup rounds = %v, want 1 (single round drains the tie)", got)
+	}
+}
+
+// txidsFromFrames extracts the txid of every `event: status` frame in an SSE
+// body, in wire order.
+func txidsFromFrames(t *testing.T, body string) []string {
+	t.Helper()
+	var out []string
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var payload struct {
+			TxID string `json:"txid"`
+		}
+		raw := strings.TrimPrefix(line, "data: ")
+		if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+			continue // gap/lag frames carry a different shape
+		}
+		if payload.TxID != "" {
+			out = append(out, payload.TxID)
+		}
+	}
+	return out
+}
+
+// TestSSEConnectCatchupSameTimestampGlutIsResumable is the regression for the
+// silent-loss bug on the CONNECT-TIME catchup path.
+//
+// transactions.timestamp_at is TIMESTAMPTZ (microsecond) and the store filter
+// is strictly-after, while SetMinedByTxIDs stamps a whole block's rows with one
+// timestamp_at. The mid-stream path already drains an equal-timestamp run that
+// straddles the frame cap; the connect-time path did not, so it stopped
+// mid-tie, reported lastTS as the tied timestamp, and every remaining row
+// sharing that microsecond became unreachable forever — the client resumed
+// strictly after it and was told nothing.
+//
+// The assertion is an identity, not a frame count: replay, resume from the id
+// the client would have kept, replay again, and require that the union covers
+// every row.
+func TestSSEConnectCatchupSameTimestampGlutIsResumable(t *testing.T) {
+	n := catchupMaxFrames + 500
+	subs := make([]*models.Submission, 0, n)
+	statusByTx := make(map[string]*models.TransactionStatus, n)
+	ts := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+	for i := 0; i < n; i++ {
+		txid := fmt.Sprintf("tie-%06d", i)
+		subs = append(subs, &models.Submission{TxID: txid, CallbackToken: "tok-tie"})
+		statusByTx[txid] = &models.TransactionStatus{
+			TxID:      txid,
+			Status:    models.StatusMined,
+			Timestamp: ts, // one SetMinedByTxIDs batch: the whole block shares ONE timestamp
+		}
+	}
+	st := &sseStoreStub{
+		subsByToken: map[string][]*models.Submission{"tok-tie": subs},
+		statusByTx:  statusByTx,
+	}
+	svc, _, _, cancel := setupSSEService(t, st)
+	defer cancel()
+
+	client := svc.manager.NewClient("tok-tie")
+	// A Last-Event-ID reconnect: `since` is non-zero, so terminal statuses
+	// replay and the strictly-after filter admits the whole tie.
+	since := ts.Add(-time.Second)
+
+	seen := make(map[string]bool, n)
+	rec := httptest.NewRecorder()
+	res := svc.sendCatchup(t.Context(), &sseWriter{w: rec, f: nopFlusher{rec}}, "tok-tie", since, client, false, catchupMaxFrames)
+	if res.err != nil {
+		t.Fatalf("connect catchup: %v", res.err)
+	}
+	for _, txid := range txidsFromFrames(t, rec.Body.String()) {
+		seen[txid] = true
+	}
+
+	// Resume exactly as the client would: Last-Event-ID is the last id it was
+	// handed, and the store filter is strictly-after it.
+	rec2 := httptest.NewRecorder()
+	res2 := svc.sendCatchup(t.Context(), &sseWriter{w: rec2, f: nopFlusher{rec2}}, "tok-tie", time.Unix(0, res.lastTS), client, false, catchupMaxFrames)
+	if res2.err != nil {
+		t.Fatalf("resumed catchup: %v", res2.err)
+	}
+	for _, txid := range txidsFromFrames(t, rec2.Body.String()) {
+		seen[txid] = true
+	}
+
+	var missing []string
+	for txid := range statusByTx {
+		if !seen[txid] {
+			missing = append(missing, txid)
+		}
+	}
+	if len(missing) != 0 {
+		sort.Strings(missing)
+		show := missing
+		if len(show) > 5 {
+			show = show[:5]
+		}
+		t.Errorf("%d of %d rows are unreachable after resuming from the delivered cursor (e.g. %v); "+
+			"a same-timestamp run straddling the frame cap must be drained, not stranded", len(missing), n, show)
+	}
+}
+
+// TestSSEConnectCatchupTruncationEmitsGap asserts that a connect-time replay
+// which genuinely runs out of frame budget tells the client so. Truncation is
+// not the bug — SILENT truncation is; before the gap frame this path logged a
+// server-side Warn and the client streamed on believing it was whole.
+func TestSSEConnectCatchupTruncationEmitsGap(t *testing.T) {
+	n := catchupMaxFrames + 500
+	subs := make([]*models.Submission, 0, n)
+	statusByTx := make(map[string]*models.TransactionStatus, n)
+	base := time.Now().UTC().Add(-time.Hour)
+	for i := 0; i < n; i++ {
+		txid := fmt.Sprintf("trunc-%06d", i)
+		subs = append(subs, &models.Submission{TxID: txid, CallbackToken: "tok-trunc"})
+		statusByTx[txid] = &models.TransactionStatus{
+			TxID:   txid,
+			Status: models.StatusMined,
+			// DISTINCT timestamps, so the cap bites at a real boundary rather
+			// than being drained as a tie.
+			Timestamp: base.Add(time.Duration(i) * time.Millisecond),
+		}
+	}
+	st := &sseStoreStub{
+		subsByToken: map[string][]*models.Submission{"tok-trunc": subs},
+		statusByTx:  statusByTx,
+	}
+	svc, _, _, cancel := setupSSEService(t, st)
+	defer cancel()
+
+	client := svc.manager.NewClient("tok-trunc")
+	gapsBefore := testutil.ToFloat64(metrics.SSEGapEventsTotal.WithLabelValues(gapReasonCatchupTruncated))
+
+	rec := httptest.NewRecorder()
+	res := svc.sendCatchup(t.Context(), &sseWriter{w: rec, f: nopFlusher{rec}}, "tok-trunc", base.Add(-time.Second), client, false, catchupMaxFrames)
+	if !res.capped {
+		t.Fatalf("catchup did not cap: frames=%d", res.frames)
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "\nevent: gap\n") && !strings.HasPrefix(body, "event: gap\n") {
+		t.Error("truncated catchup wrote no gap frame; the client cannot know it lost history")
+	}
+	if !strings.Contains(body, `"reason":"`+gapReasonCatchupTruncated+`"`) {
+		t.Errorf("gap frame missing reason %q", gapReasonCatchupTruncated)
+	}
+	if !strings.Contains(body, `"action":"reconcile"`) {
+		t.Error("gap frame missing the reconcile action the client contract depends on")
+	}
+	if got := testutil.ToFloat64(metrics.SSEGapEventsTotal.WithLabelValues(gapReasonCatchupTruncated)) - gapsBefore; got != 1 {
+		t.Errorf("gap metric delta = %v, want 1", got)
+	}
+}
+
+// TestSSEFirehoseDropEmitsGap covers the tokenless client, which has no
+// token-scoped replay available and previously got a counter and a log line and
+// nothing else — its stream degraded silently and permanently.
+func TestSSEFirehoseDropEmitsGap(t *testing.T) {
+	st := &sseStoreStub{
+		subsByToken: map[string][]*models.Submission{},
+		statusByTx:  map[string]*models.TransactionStatus{},
+	}
+	svc, _, _, cancel := setupSSEService(t, st)
+	defer cancel()
+
+	client := svc.manager.NewClient("") // firehose
+	dropTS := time.Now().UTC().Add(-time.Minute).UnixNano()
+	client.droppedFloor.Store(dropTS)
+	client.dropped.Store(true)
+
+	gapsBefore := testutil.ToFloat64(metrics.SSEGapEventsTotal.WithLabelValues(gapReasonFirehoseDrop))
+	rec := httptest.NewRecorder()
+	w := &sseWriter{w: rec, f: nopFlusher{rec}}
+	if ok := svc.midstreamCatchup(t.Context(), w, client); !ok {
+		t.Fatal("midstreamCatchup reported a dead connection")
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `"reason":"`+gapReasonFirehoseDrop+`"`) {
+		t.Errorf("firehose drop wrote no gap frame; body = %q", body)
+	}
+	if !strings.Contains(body, fmt.Sprintf(`"from":"%d"`, dropTS)) {
+		t.Errorf("gap frame missing the drop floor as its cursor; body = %q", body)
+	}
+	if got := testutil.ToFloat64(metrics.SSEGapEventsTotal.WithLabelValues(gapReasonFirehoseDrop)) - gapsBefore; got != 1 {
+		t.Errorf("gap metric delta = %v, want 1", got)
+	}
+	if client.dropped.Load() {
+		t.Error("drop flag not consumed: the gap would be re-emitted on every keepalive tick")
 	}
 }
 
