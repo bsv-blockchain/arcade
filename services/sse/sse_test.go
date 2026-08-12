@@ -1237,6 +1237,49 @@ func TestSSEMidstreamCatchupRefusedRaisesGapAndKeepsStream(t *testing.T) {
 	}
 }
 
+// TestSSEDrainAlwaysAnnouncesShutdown pins that the shutdown event does not
+// depend on reconnect hints being enabled.
+//
+// The two signals carry different information: `event: shutdown` says the
+// release was DELIBERATE — letting a client treat a rolling restart as routine
+// rather than as an error — while `retry:` says when to come back. Suppressing
+// the former because the latter is disabled would drop the more important of
+// the two.
+func TestSSEDrainAlwaysAnnouncesShutdown(t *testing.T) {
+	st := &sseStoreStub{
+		subsByToken: map[string][]*models.Submission{},
+		statusByTx:  map[string]*models.TransactionStatus{},
+	}
+	svc, _, _, cancel := setupSSEService(t, st)
+	defer cancel()
+
+	for _, tc := range []struct {
+		name      string
+		retryMax  time.Duration
+		wantRetry bool
+	}{
+		{"hints enabled", 30 * time.Second, true},
+		{"hints disabled", 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := svc.manager.NewClient("")
+			if tc.retryMax > 0 {
+				client.drainRetryMS.Store(tc.retryMax.Milliseconds())
+			}
+			rec := httptest.NewRecorder()
+			writeShutdown(&sseWriter{w: rec, f: nopFlusher{rec}}, client)
+
+			body := rec.Body.String()
+			if !strings.Contains(body, "event: shutdown") {
+				t.Errorf("no shutdown frame; the client cannot tell a deliberate release from a broken connection. body = %q", body)
+			}
+			if got := strings.Contains(body, "retry: "); got != tc.wantRetry {
+				t.Errorf("retry directive present = %v, want %v; body = %q", got, tc.wantRetry, body)
+			}
+		})
+	}
+}
+
 // readSSEUntilTxIDs consumes SSE frames from r until every txid in want has
 // been seen at least once (duplicates allowed) or the timeout elapses.
 func readSSEUntilTxIDs(r io.Reader, want map[string]bool, timeout time.Duration) error {

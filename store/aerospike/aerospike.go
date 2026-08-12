@@ -1950,16 +1950,17 @@ func (s *Store) TokensForTxIDs(ctx context.Context, txids []string) (map[string]
 // is strictly better than trying: the caller degrades to an explicit gap and
 // the client reconciles over REST, instead of the pod dying and taking every
 // other connected client with it.
+//
+// The bound is enforced while the query result set is being drained, so peak
+// memory is capped at maxTokenReplayScan submissions. Checking the length of an
+// already-materialized list would be no protection at all — the allocation that
+// causes the OOM happens before such a check could run.
 const maxTokenReplayScan = 250_000
 
 func (s *Store) IterateStatusesByToken(ctx context.Context, callbackToken string, since time.Time, onlyStatuses []models.Status, fn func(*models.TransactionStatus) error) error {
-	subs, err := s.GetSubmissionsByToken(ctx, callbackToken)
+	subs, err := s.submissionsByTokenBounded(ctx, callbackToken, maxTokenReplayScan)
 	if err != nil {
 		return err
-	}
-	if len(subs) > maxTokenReplayScan {
-		return fmt.Errorf("%w: token has %d submissions, scan budget is %d",
-			store.ErrReplayUnavailable, len(subs), maxTokenReplayScan)
 	}
 	only := make(map[models.Status]struct{}, len(onlyStatuses))
 	for _, st := range onlyStatuses {
@@ -2016,6 +2017,19 @@ func (s *Store) IterateStatusesByToken(ctx context.Context, callbackToken string
 }
 
 func (s *Store) GetSubmissionsByToken(ctx context.Context, token string) ([]*models.Submission, error) {
+	return s.submissionsByTokenBounded(ctx, token, 0)
+}
+
+// submissionsByTokenBounded is GetSubmissionsByToken with an optional ceiling
+// on how many submissions it will accumulate. A limit of 0 means unbounded.
+//
+// The bound is enforced while the result set is being drained, not after:
+// checking a returned slice's length is no protection, because by then the
+// memory has already been allocated and the OOM it was meant to prevent has
+// already happened. Exceeding the limit abandons the query and returns
+// store.ErrReplayUnavailable, so peak memory is capped at limit entries
+// regardless of the token's real size.
+func (s *Store) submissionsByTokenBounded(ctx context.Context, token string, limit int) ([]*models.Submission, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -2046,6 +2060,10 @@ loop:
 			}
 			if rec.Err != nil {
 				continue
+			}
+			if limit > 0 && len(subs) >= limit {
+				loopErr = fmt.Errorf("%w: token has more than %d submissions", store.ErrReplayUnavailable, limit)
+				break loop
 			}
 			subs = append(subs, recordToSubmission(rec.Record))
 		}

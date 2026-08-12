@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -113,14 +114,15 @@ type Manager struct {
 	// parentCtx roots every per-client context, so canceling it cancels every
 	// registered client's fan-out path at once.
 	//
-	// It is deliberately rooted at context.Background(), NOT at the service
-	// context, and is cancelled only by Drain. If it inherited the service
-	// context then a shutdown would cancel every client the instant SIGTERM
-	// landed — before the drain had failed readiness, waited for the endpoint
-	// to be withdrawn, or handed out reconnect hints. The drain would be a
-	// no-op and every stream would still be severed simultaneously. The
-	// manager's own run goroutine keeps using the service context, because it
-	// SHOULD stop immediately.
+	// It is derived from the service context via context.WithoutCancel, so it
+	// inherits that context's VALUES (trace and logging context stay attached
+	// to per-client work) while dropping its cancellation, and is cancelled
+	// only by Drain. If it inherited cancellation too, a shutdown would cancel
+	// every client the instant SIGTERM landed — before the drain had failed
+	// readiness, waited for the endpoint to be withdrawn, or handed out
+	// reconnect hints. The drain would be a no-op and every stream would still
+	// be severed simultaneously. The manager's own run goroutine keeps using
+	// the service context directly, because it SHOULD stop immediately.
 	parentCtx    context.Context //nolint:containedctx // long-lived registry root
 	parentCancel context.CancelFunc
 
@@ -1071,22 +1073,32 @@ func writeGap(w *sseWriter, reason string, from int64, count int64) error {
 }
 
 // writeShutdown emits the farewell frame for a client released by
-// Manager.Drain: an SSE `retry:` directive carrying this connection's own
-// reconnect delay, plus a shutdown event naming the reason.
+// Manager.Drain: a shutdown event naming the reason, preceded by an SSE
+// `retry:` directive carrying this connection's own reconnect delay when one
+// was assigned.
 //
-// `retry:` is the only in-band channel a server has for telling clients when to
-// come back. Without it a rolling restart releases every client at once and
-// they all re-dial on their own identical backoff schedule, landing together on
-// a pod that is still cold. Errors are ignored: the connection is closing
-// either way, and a client that misses the hint just falls back to its own
-// backoff.
+// The shutdown event is emitted UNCONDITIONALLY. It is what distinguishes a
+// deliberate release from a connection that broke, and a client that can tell
+// those apart does not have to treat a rolling restart as an error — so
+// withholding it when reconnect hints happen to be disabled would remove the
+// more important of the two signals to save a line of output.
+//
+// The `retry:` directive is the only in-band channel a server has for saying
+// WHEN to come back. Without it a rolling restart releases every client at
+// once and they all re-dial on their own identical backoff schedule, landing
+// together on a pod that is still cold; a client that receives no hint simply
+// falls back to its own backoff, which is correct but less well spread.
+//
+// Errors are ignored: the connection is closing either way.
 func writeShutdown(w *sseWriter, client *Client) {
-	retryMS := client.drainRetryMS.Load()
-	if retryMS <= 0 {
-		return
+	var frame strings.Builder
+	if retryMS := client.drainRetryMS.Load(); retryMS > 0 {
+		fmt.Fprintf(&frame, "retry: %d\n", retryMS)
+		fmt.Fprintf(&frame, "event: shutdown\ndata: {\"reason\":\"draining\",\"reconnectAfterMs\":%d}\n\n", retryMS)
+	} else {
+		frame.WriteString("event: shutdown\ndata: {\"reason\":\"draining\"}\n\n")
 	}
-	_ = w.write(fmt.Sprintf("retry: %d\nevent: shutdown\ndata: {\"reason\":\"draining\",\"reconnectAfterMs\":%d}\n\n",
-		retryMS, retryMS))
+	_ = w.write(frame.String())
 }
 
 // writeStatus emits one status frame and flushes it. Used for single frames
