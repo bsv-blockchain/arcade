@@ -11,6 +11,20 @@ import (
 // ErrNotFound is returned when a requested record does not exist.
 var ErrNotFound = errors.New("not found")
 
+// ErrReplayUnavailable is returned by IterateStatusesByToken when a backend
+// cannot serve the replay within its resource bounds — typically a token whose
+// submission set is too large for a backend that has no keyset index over
+// (token, timestamp, txid) and would otherwise materialize and sort the whole
+// thing in memory.
+//
+// It exists so refusing is a first-class outcome. Attempting an unbounded
+// replay is not merely slow: it has OOM-killed the SSE pod and taken every
+// other connected client down with it (#237/#238). The SSE service turns this
+// error into an explicit `event: gap`, so the client learns it must reconcile
+// over REST and the live stream continues — a bounded, declared degradation
+// instead of a crash.
+var ErrReplayUnavailable = errors.New("replay unavailable for this token on this backend")
+
 // PendingRetry is the lightweight row shape the reaper consumes. It avoids
 // pulling full TransactionStatus objects through the retry hot path.
 type PendingRetry struct {
@@ -310,6 +324,12 @@ type Store interface {
 	// are emitted; when onlyStatuses is non-empty, only rows in one of those
 	// statuses are emitted. fn returning a non-nil error stops the iteration
 	// and surfaces that error to the caller.
+	//
+	// An implementation that cannot serve the replay within its own resource
+	// bounds MUST return ErrReplayUnavailable rather than attempt it. Refusing
+	// is a supported outcome — the caller degrades to an explicit gap notice
+	// and the client reconciles over REST — whereas attempting it is how this
+	// path has taken the whole pod down and every connected client with it.
 	IterateStatusesByToken(ctx context.Context, callbackToken string, since time.Time, onlyStatuses []models.Status, fn func(*models.TransactionStatus) error) error
 
 	// UpdateDeliveryStatus updates the delivery tracking for a submission

@@ -1442,6 +1442,22 @@ WHERE t.txid IN (SELECT DISTINCT txid FROM submissions WHERE callback_token = $1
 		args = append(args, vals)
 		q += fmt.Sprintf(" AND t.status = ANY($%d)", len(args))
 	}
+	// No LIMIT here, deliberately, and it is not an oversight.
+	//
+	// The caller's frame budget is SOFT at a timestamp boundary: timestamp_at
+	// is microsecond-resolution and SetMinedByTxIDs stamps a whole block's rows
+	// with one value, so the caller must be able to read past its budget to
+	// finish an equal-timestamp run. A cursor that stops mid-run cannot resume
+	// — the filter above is strictly-after — and the remainder is lost forever.
+	// That was a real, silent data-loss bug on the Last-Event-ID path; a hard
+	// SQL LIMIT would reimpose exactly the cut that caused it.
+	//
+	// Bounding this properly needs a keyset cursor on (timestamp_at, txid),
+	// which makes the position a total order and therefore resumable mid-tie.
+	// LIMIT becomes safe then, and lands with it. Until then the cost is a
+	// planned sort over the token's matching set — idx_sub_token covers the
+	// semi-join and idx_tx_updated the ordering — and rows stream, with the
+	// caller stopping early once its budget and any trailing tie are satisfied.
 	q += " ORDER BY t.timestamp_at ASC"
 
 	rows, err := s.pool.Query(ctx, q, args...)

@@ -1339,3 +1339,59 @@ func TestSetPendingRetryFields_RespectsStatusLattice(t *testing.T) {
 		})
 	}
 }
+
+// TestSubmissionsByIndexBounded_StopsDuringIteration pins WHERE the replay scan
+// budget is enforced.
+//
+// Checking the length of an already-materialized list is no protection: by the
+// time such a check could run, the allocation that causes the OOM has already
+// happened. The bound has to abandon the scan mid-iteration, so peak memory is
+// capped at the limit regardless of how many submissions the token really has.
+func TestSubmissionsByIndexBounded_StopsDuringIteration(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	const (
+		token = "tok-huge"
+		total = 50
+		limit = 10
+	)
+	for i := 0; i < total; i++ {
+		sub := &models.Submission{
+			SubmissionID:  fmt.Sprintf("sub-%03d", i),
+			TxID:          fmt.Sprintf("tx-%03d", i),
+			CallbackToken: token,
+		}
+		if err := s.InsertSubmission(ctx, sub); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+
+	// Unbounded still returns everything — the bound must not change the
+	// behavior of the normal read path.
+	all, err := s.GetSubmissionsByToken(ctx, token)
+	if err != nil {
+		t.Fatalf("unbounded read: %v", err)
+	}
+	if len(all) != total {
+		t.Fatalf("unbounded read returned %d submissions, want %d", len(all), total)
+	}
+
+	got, err := s.submissionsByIndexBounded(ctx, idxSubTokenPrefix(token), limit)
+	if !errors.Is(err, store.ErrReplayUnavailable) {
+		t.Fatalf("bounded read err = %v, want store.ErrReplayUnavailable", err)
+	}
+	if got != nil {
+		t.Errorf("bounded read returned %d submissions alongside its refusal; "+
+			"the point of refusing is to not hold them", len(got))
+	}
+
+	// A token that fits stays served.
+	fits, err := s.submissionsByIndexBounded(ctx, idxSubTokenPrefix(token), total+1)
+	if err != nil {
+		t.Fatalf("within-budget read: %v", err)
+	}
+	if len(fits) != total {
+		t.Errorf("within-budget read returned %d, want %d", len(fits), total)
+	}
+}

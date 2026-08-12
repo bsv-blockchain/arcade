@@ -768,6 +768,25 @@ type SSEConfig struct {
 	// behavior. Tokenless (firehose) clients always keep drop-only behavior —
 	// the store catchup source is token-scoped.
 	CatchupOnDrop bool `mapstructure:"catchup_on_drop"`
+	// DrainQuiesceMS is how long shutdown waits, after /ready starts failing,
+	// before it begins closing client connections. It covers endpoint-removal
+	// propagation: kube-proxy and the ingress learn the pod is unready
+	// asynchronously, so cutting connections immediately means clients
+	// reconnect straight back into a terminating pod. Default
+	// DefaultSSEDrainQuiesceMS.
+	DrainQuiesceMS int `mapstructure:"drain_quiesce_ms"`
+	// DrainRetryMaxMS bounds the reconnect delay handed to clients on
+	// shutdown. Each connection gets its own value drawn uniformly below this
+	// and emitted as an SSE `retry:` directive on its shutdown frame, so a
+	// rolling restart releases clients as a ramp rather than a synchronized
+	// herd hitting a pod that is still cold. Default
+	// DefaultSSEDrainRetryMaxMS; zero omits the hint and clients fall back to
+	// their own backoff.
+	DrainRetryMaxMS int `mapstructure:"drain_retry_max_ms"`
+	// ShutdownTimeoutMS bounds the final http.Server.Shutdown. Connections are
+	// already closing by then, so this only covers stragglers. Default
+	// DefaultSSEShutdownTimeoutMS.
+	ShutdownTimeoutMS int `mapstructure:"shutdown_timeout_ms"`
 }
 
 // WebhookConfig tunes the HTTP webhook delivery service. The service
@@ -872,6 +891,29 @@ const DefaultEventsSubscriberBuffer = 4096
 // headroom over a single ~50-event bulk-unfan while staying a modest
 // per-connection memory cost (channel of *TransactionStatus pointers).
 const DefaultSSEClientBuffer = 8192
+
+// SSE graceful-drain defaults.
+//
+// A long-lived streaming connection is never "idle", so http.Server.Shutdown
+// can never complete on its own: it burns its whole timeout, the process then
+// exits, and every stream is severed with a TCP RST — sending every client back
+// simultaneously. These bound an explicit drain instead: fail readiness, wait
+// for the endpoint to be withdrawn, then release clients with staggered
+// reconnect hints.
+//
+// Their sum must fit inside the pod's terminationGracePeriodSeconds, or the
+// kubelet SIGKILLs mid-drain and the RST is back.
+const (
+	// DefaultSSEDrainQuiesceMS covers endpoint-removal propagation through
+	// kube-proxy and the ingress.
+	DefaultSSEDrainQuiesceMS = 10_000
+	// DefaultSSEDrainRetryMaxMS is the widest reconnect delay handed out during
+	// a drain; each client draws its own beneath it.
+	DefaultSSEDrainRetryMaxMS = 30_000
+	// DefaultSSEShutdownTimeoutMS bounds the final server shutdown once clients
+	// have been released.
+	DefaultSSEShutdownTimeoutMS = 15_000
+)
 
 // ValidatorConfig controls intake-time transaction validation. It carries the
 // operator-facing fee floor enforced against EF/BEEF submissions; the consensus
@@ -1147,6 +1189,9 @@ func setDefaults() {
 	viper.SetDefault("sse.enabled", true)
 	viper.SetDefault("sse.host", "0.0.0.0")
 	viper.SetDefault("sse.port", 8082)
+	viper.SetDefault("sse.drain_quiesce_ms", DefaultSSEDrainQuiesceMS)
+	viper.SetDefault("sse.drain_retry_max_ms", DefaultSSEDrainRetryMaxMS)
+	viper.SetDefault("sse.shutdown_timeout_ms", DefaultSSEShutdownTimeoutMS)
 	viper.SetDefault("sse.client_buffer_size", DefaultSSEClientBuffer)
 	viper.SetDefault("sse.catchup_on_drop", true)
 

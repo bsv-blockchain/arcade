@@ -1865,8 +1865,26 @@ func (s *Store) TokensForTxIDs(ctx context.Context, txids []string) (map[string]
 	return store.TokensForTxIDsViaPerTxID(ctx, txids, s.GetSubmissionsByTxID)
 }
 
+// maxTokenReplayScan bounds how many of a token's submissions this backend
+// will walk for one catchup replay.
+//
+// Unlike Postgres, Pebble has no index over (callback_token, timestamp_at,
+// txid), so this implementation has to load the token's submission list, do a
+// point read per txid, and sort the survivors in memory. That is O(token
+// cardinality) per connect, and a token can hold millions of submissions —
+// the shape that OOM-killed the SSE pod (#237/#238). Past this bound, refusing
+// is strictly better than trying: the caller degrades to an explicit gap and
+// the client reconciles over REST, instead of the pod dying and taking every
+// other connected client with it.
+//
+// The bound is enforced while the index is being walked, so peak memory is
+// capped at maxTokenReplayScan submissions. Checking the length of an
+// already-materialized list would be no protection at all — the allocation
+// that causes the OOM happens before such a check could run.
+const maxTokenReplayScan = 250_000
+
 func (s *Store) IterateStatusesByToken(ctx context.Context, callbackToken string, since time.Time, onlyStatuses []models.Status, fn func(*models.TransactionStatus) error) error {
-	subs, err := s.GetSubmissionsByToken(ctx, callbackToken)
+	subs, err := s.submissionsByIndexBounded(ctx, idxSubTokenPrefix(callbackToken), maxTokenReplayScan)
 	if err != nil {
 		return err
 	}
@@ -1917,6 +1935,18 @@ func (s *Store) IterateStatusesByToken(ctx context.Context, callbackToken string
 }
 
 func (s *Store) submissionsByIndex(ctx context.Context, prefix []byte) ([]*models.Submission, error) {
+	return s.submissionsByIndexBounded(ctx, prefix, 0)
+}
+
+// submissionsByIndexBounded is submissionsByIndex with an optional ceiling on
+// how many submissions it will accumulate. A limit of 0 means unbounded.
+//
+// The bound is enforced DURING iteration, not after: checking a returned
+// slice's length is no protection, because by then the memory has already been
+// allocated and the OOM it was meant to prevent has already happened. Exceeding
+// the limit abandons the scan and returns store.ErrReplayUnavailable, so peak
+// memory is capped at limit entries regardless of the token's real size.
+func (s *Store) submissionsByIndexBounded(ctx context.Context, prefix []byte, limit int) ([]*models.Submission, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -1948,6 +1978,9 @@ func (s *Store) submissionsByIndex(ctx context.Context, prefix []byte) ([]*model
 			continue
 		}
 		_ = closer.Close()
+		if limit > 0 && len(subs) >= limit {
+			return nil, fmt.Errorf("%w: token has more than %d submissions", store.ErrReplayUnavailable, limit)
+		}
 		subs = append(subs, ss.toModel())
 	}
 	return subs, nil
