@@ -427,6 +427,7 @@ func (c *Client) RecordFailure(url string) {
 		transitioned = true
 	}
 	source := h.source
+	consecutive := h.consecutiveFailures
 	c.recomputeBelowThresholdLocked()
 	c.mu.Unlock()
 	if transitioned {
@@ -434,7 +435,7 @@ func (c *Client) RecordFailure(url string) {
 		c.logger.Warn(
 			"endpoint unhealthy",
 			zap.String("endpoint", n),
-			zap.Int("consecutive_failures", h.consecutiveFailures),
+			zap.Int("consecutive_failures", consecutive),
 			zap.String("from", "healthy"),
 			zap.String("to", "unhealthy"),
 			zap.String("reason", "reachability"),
