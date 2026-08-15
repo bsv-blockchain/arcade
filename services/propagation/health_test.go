@@ -1,8 +1,10 @@
 package propagation
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -453,22 +455,29 @@ func TestBroadcast_PerPeerAggregation_AcceptanceWins(t *testing.T) {
 	}
 }
 
-// TestBroadcast_422RejectionSurfacesExtraInfo pins the production gap where
-// one peer returned HTTP 422 + a parseable Teranode failure list (the real
-// validator verdict for a spent-UTXO / invalid tx) while other peers returned
-// opaque gateway 502/500 with no body. Pre-fix the 422 body was discarded
-// (client only parsed status 500), so the tx either requeued forever or
-// never carried the TX_INVALID/UTXO_SPENT line into GET /tx ExtraInfo.
-// Post-fix: REJECTED with the Teranode line as ExtraInfo. Opaque PROCESSING
-// (4) without a nested verdict is a requeue, not this path.
-func TestBroadcast_422RejectionSurfacesExtraInfo(t *testing.T) {
+// TestBroadcast_ParseableVerdictSurvivesGatewayNoise pins the production gap
+// where one peer returned a parseable Teranode failure list while other peers
+// returned opaque gateway 502/503 with no body. Pre-fix the verdict body was
+// discarded (the client only parsed status 500), so the tx either requeued
+// forever or — worse — never carried the Teranode line into GET /tx ExtraInfo.
+// Post-fix: REJECTED with the Teranode line as ExtraInfo, and the gateway text
+// never leaks into it.
+//
+// The fixture carries a real verdict (TX_INVALID) at the status Teranode
+// assigns to the policy family (400). It used to be an opaque PROCESSING line
+// at 422, which was wrong twice over: 422 is reachable from exactly one branch
+// of httpStatusForTxError — ErrTxMissingParent — and an opaque PROCESSING line
+// is not a verdict at all. Both are now routed elsewhere and pinned by
+// TestBroadcast_OpaqueProcessing_RequeuesInsteadOfRejects and row D2 of
+// TestTeranodeRejectionReasonContract.
+func TestBroadcast_ParseableVerdictSurvivesGatewayNoise(t *testing.T) {
 	const txid = "d018bc98d7828b7f095e5d616f7ccba607fc228368e82e74b25304e37699f1e9"
 	verdictBody := "Failed to process transactions:\n" +
 		"TX_INVALID (31): [ProcessTransaction][" + txid + "] tx is invalid because fee too low\n"
 
-	// Peer A: the only peer that actually validated — 422 + failure list.
+	// Peer A: the only peer that actually validated — 400 + failure list.
 	srvVerdict := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusUnprocessableEntity)
+		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte(verdictBody))
 	}))
 	defer srvVerdict.Close()
@@ -753,23 +762,42 @@ func TestBroadcast_409AlienConflict_SingleTxTerminalizes(t *testing.T) {
 	}
 }
 
-// TestBroadcast_409AlienConflict_MultiTxWithholdsAccepts covers the
-// multi-tx half of the alien-line rule: a 409 failure list whose only line
-// names no submitted tx means SOME tx in the batch was rejected but we can't
-// tell which — so the peer must grant no implicit acceptance votes, and with
-// no other peer voting, both txs requeue rather than either terminalizing
-// (no fabricated ACCEPTED_BY_NETWORK, no misattributed REJECTED).
-func TestBroadcast_409AlienConflict_MultiTxWithholdsAccepts(t *testing.T) {
+// TestBroadcast_409AlienConflict_MultiTxNarrowsToTheGuiltyTx covers the
+// multi-tx half of the alien-line rule. A 409 failure list whose only line
+// names no submitted tx means SOME tx in the batch was rejected but the line
+// alone can't say which, so the peer grants no implicit acceptance votes.
+//
+// It used to end there: both txs requeued, forever if the 409 was permanent.
+// Now the chunk is narrowed — re-broadcast in halves until the line lands on a
+// single tx, where "named nobody" can only mean "named this one". That is the
+// same inference the single-tx rule has always made, applied by bisection.
+//
+// The peer here behaves like a real Teranode: it only reports the conflict
+// when the request actually carries the offending transaction. So narrowing
+// must terminalize exactly that one with the real UTXO_SPENT verdict, and the
+// innocent tx must come back accepted rather than being condemned alongside it
+// or left to churn.
+func TestBroadcast_409AlienConflict_MultiTxNarrowsToTheGuiltyTx(t *testing.T) {
 	const (
-		txidA    = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-		txidB    = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-		outpoint = "256fc7143c6ef5436cd5258ade24b68c43d0f8268c086bd9fa90055dd5a7ae43"
-		spender  = "7dfbe0fcacf630066b23036bc007e73d58a61ab9bcb8e66f6b214f8ef5f28489"
+		guiltyOutpoint = "256fc7143c6ef5436cd5258ade24b68c43d0f8268c086bd9fa90055dd5a7ae43"
+		cleanOutpoint  = "9d2c1f0e7b5a48361c0e7f2d6b48a91c33e0f8261c086bd9fa90055dd5a7bb11"
+		spender        = "7dfbe0fcacf630066b23036bc007e73d58a61ab9bcb8e66f6b214f8ef5f28489"
 	)
-	srvConflict := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	// Deliberately vout 2 on an input arcade cannot match: the tx spends
+	// guiltyOutpoint:0, so outpoint attribution declines and only narrowing
+	// can place the verdict.
+	guiltyTxid, guiltyRaw := spendingTx(t, guiltyOutpoint, 0, 21)
+	cleanTxid, cleanRaw := spendingTx(t, cleanOutpoint, 0, 22)
+
+	srvConflict := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if !bytes.Contains(body, guiltyRaw) {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		w.WriteHeader(http.StatusConflict)
 		_, _ = w.Write([]byte("Failed to process transactions:\n" +
-			"UTXO_SPENT (70): UTXO_SPENT (70): " + outpoint + ":2 utxo already spent by tx " + spender + "[0]\n"))
+			"UTXO_SPENT (70): UTXO_SPENT (70): " + guiltyOutpoint + ":2 utxo already spent by tx " + spender + "[0]\n"))
 	}))
 	defer srvConflict.Close()
 
@@ -779,20 +807,31 @@ func TestBroadcast_409AlienConflict_MultiTxWithholdsAccepts(t *testing.T) {
 	tc := teranode.NewClient([]string{srvConflict.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
 	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, nil)
 
-	for _, txid := range []string{txidA, txidB} {
-		if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg(txid))); err != nil {
-			t.Fatalf("handleMessage(%s): %v", txid, err)
+	for _, tx := range []struct {
+		txid string
+		raw  []byte
+	}{{guiltyTxid, guiltyRaw}, {cleanTxid, cleanRaw}} {
+		if err := p.handleMessage(context.Background(), consumerMsg(realPropMsg(t, tx.txid, tx.raw))); err != nil {
+			t.Fatalf("handleMessage(%s): %v", tx.txid, err)
 		}
 	}
 	if err := flushSync(t, p); err != nil {
 		t.Fatalf("flush error: %v", err)
 	}
 
-	for _, txid := range []string{txidA, txidB} {
-		if got := ms.lastUpdateForTxid(txid); got != nil &&
-			(got.Status == models.StatusAcceptedByNetwork || got.Status == models.StatusRejected) {
-			t.Errorf("%s: terminalized as %s (extraInfo=%q); alien-keyed 409 must requeue, not vote", txid, got.Status, got.ExtraInfo)
-		}
+	got := ms.lastUpdateForTxid(guiltyTxid)
+	if got == nil || got.Status != models.StatusRejected {
+		t.Fatalf("guilty tx: got %+v, want REJECTED carrying the conflict verdict", got)
+	}
+	if !strings.Contains(got.ExtraInfo, "UTXO_SPENT") || !strings.Contains(got.ExtraInfo, spender) {
+		t.Errorf("guilty tx ExtraInfo=%q, want the verbatim UTXO_SPENT line naming the competing spender", got.ExtraInfo)
+	}
+	if got.StatusCode != 466 {
+		t.Errorf("guilty tx StatusCode=%d, want 466 (ARC StatusConflict)", got.StatusCode)
+	}
+
+	if got := ms.lastUpdateForTxid(cleanTxid); got == nil || got.Status != models.StatusAcceptedByNetwork {
+		t.Errorf("innocent tx: got %+v, want ACCEPTED_BY_NETWORK — narrowing must not spread one tx's verdict", got)
 	}
 }
 

@@ -770,21 +770,60 @@ func (c *Client) SubmitTransaction(ctx context.Context, endpoint string, rawTx [
 	return resp.StatusCode, nil
 }
 
+// TxsFailures is the per-tx failure information parsed out of a /txs response
+// body. Split in two because Teranode's failure lines do not all carry the
+// submitted txid: the public error boundary (errors.UserMessage) surfaces only
+// the deepest allowlisted cause, discarding the "[ProcessTransaction][<txid>]"
+// wrapper whenever such a cause is present — and most inner messages name no
+// transaction at all.
+type TxsFailures struct {
+	// ByKey maps the hash each failure line named → the verbatim line. The key
+	// is whatever 64-hex string the line carried and is NOT guaranteed to name
+	// a submitted tx: conflict-family lines key under the spent outpoint's tx
+	// or the competing spender. Callers MUST verify each key against the batch
+	// before trusting the "absent ⇒ accepted" contract.
+	ByKey map[string]string
+	// Unkeyed holds failure lines carrying no 64-hex string at all — every
+	// allowlisted cause whose message names no txid ("bad-txns-in-belowout",
+	// "GoBDK fail to ValidateTransaction", "transaction fee is too low", …).
+	// One of the submitted txs definitely failed; which one is not knowable
+	// from the line, so the caller must narrow (re-broadcast smaller chunks)
+	// rather than discard the verdicts that DID key.
+	Unkeyed []string
+}
+
+// Len is the total number of failure lines, keyed and unkeyed.
+func (f *TxsFailures) Len() int {
+	if f == nil {
+		return 0
+	}
+	return len(f.ByKey) + len(f.Unkeyed)
+}
+
+// Keyed returns the txid→line map, or nil when there is no parsed body.
+func (f *TxsFailures) Keyed() map[string]string {
+	if f == nil {
+		return nil
+	}
+	return f.ByKey
+}
+
 // SubmitTransactions submits multiple transactions as a batch to a single endpoint.
 // The raw transaction bytes are concatenated into a single body and POSTed to /txs.
 // Returns the HTTP status code and, when the response carries Teranode's
-// structured failure list, a per-txid map naming the failed txs and their
-// Teranode error code strings:
+// structured failure list, the parsed failures:
 //
 //   - HTTP 200: every tx accepted. failures is nil so callers short-circuit
 //     without per-tx inspection.
 //   - Non-200 + body starting "Failed to process transactions:" (Teranode
 //     upstream main #879): each subsequent line is one tx's error in the form
-//     "<TERANODE_CODE_NAME> (<num>): <message containing the txid via
-//     [ProcessTransaction][<txid>]>". The returned map is keyed by the
-//     extracted txid; the value is the full line verbatim so callers can
-//     surface the Teranode code in wallet-visible rows (GET /tx extraInfo,
-//     SSE, webhooks). Txs not in the map are assumed accepted by that peer.
+//     "<TERANODE_CODE_NAME> (<num>): <message>", where the message carries the
+//     txid via [ProcessTransaction][<txid>] only when no allowlisted cause
+//     shadowed the wrapper. Lines that named a hash land in ByKey (value = the
+//     full line verbatim, so callers can surface the Teranode code in
+//     wallet-visible rows: GET /tx extraInfo, SSE, webhooks); lines that named
+//     none land in Unkeyed. Txs absent from ByKey are accepted by that peer
+//     ONLY when every line keyed to a submitted tx — see broadcastBatchToEndpoints.
 //   - Non-200 without a parseable Teranode failure-list body (gateway 502/503,
 //     "no available server", echo recover panic, bare 500, transport error,
 //     or an unexpected 2xx-but-not-200): failures is nil; the caller treats
@@ -804,7 +843,7 @@ func (c *Client) SubmitTransaction(ctx context.Context, endpoint string, rawTx [
 // UTXO_SPENT / PROCESSING failures visible only in propagation Warn logs
 // while the tx never terminalized — GET /tx stayed RECEIVED/requeued with no
 // reject reason).
-func (c *Client) SubmitTransactions(ctx context.Context, endpoint string, rawTxs [][]byte) (int, map[string]string, error) {
+func (c *Client) SubmitTransactions(ctx context.Context, endpoint string, rawTxs [][]byte) (int, *TxsFailures, error) {
 	start := time.Now()
 	// Calculate total size for pre-allocation
 	totalSize := 0
@@ -896,17 +935,22 @@ var txsWrappedTxidPattern = regexp.MustCompile(`\[ProcessTransaction\]\[([0-9a-f
 //	…
 //	"
 //
-// Returns a txid → full-line map naming every failed tx, or nil if the body
-// doesn't match Teranode's failure-list shape (in which case the caller
-// treats the response as a pure infra failure). Lines whose txid couldn't be
-// extracted are dropped — the contract is "if you appear in the map you
-// failed; if you don't you're accepted," so a malformed line with no
-// recognizable txid would otherwise be silently lost. A trailing nil-map
-// return when nothing parsed forces the whole-batch requeue. Dropped
-// lines are logged at Warn so operators see when Teranode emits a
-// failure line the txid regex can't parse — if this becomes frequent it
-// is a Teranode-format drift bug.
-func parseTxsFailures(body []byte, logger *zap.Logger) map[string]string {
+// Returns the parsed failures, or nil if the body doesn't match Teranode's
+// failure-list shape (in which case the caller treats the response as a pure
+// infra failure).
+//
+// Lines whose txid can't be extracted are NOT discarded, and they do not
+// discard their siblings either. Teranode emits a txid-less line for every
+// failure whose surfaced cause is on its public-cause allowlist — the
+// "[ProcessTransaction][<txid>]" wrapper is exactly what the deepest-cause
+// rule drops — so treating one as a parse failure meant throwing away the
+// whole body: the verdicts that DID key were lost, every tx in the chunk
+// requeued, and the failing one looped until the durable-retry budget gave up
+// with a reason describing a missing parent. They are returned in Unkeyed
+// instead; the caller narrows the chunk until the line can be placed. Still
+// logged at Warn, because a txid-less line means the response cannot be
+// settled in one round trip.
+func parseTxsFailures(body []byte, logger *zap.Logger) *TxsFailures {
 	text := strings.TrimRight(string(body), "\n")
 	if text == "" {
 		return nil
@@ -915,7 +959,7 @@ func parseTxsFailures(body []byte, logger *zap.Logger) map[string]string {
 	if len(lines) == 0 || lines[0] != txsFailureHeader {
 		return nil
 	}
-	failures := make(map[string]string, len(lines)-1)
+	out := &TxsFailures{ByKey: make(map[string]string, len(lines)-1)}
 	for _, line := range lines[1:] {
 		if line == "" {
 			continue
@@ -935,26 +979,25 @@ func parseTxsFailures(body []byte, logger *zap.Logger) map[string]string {
 			txid = txsTxidPattern.FindString(line)
 		}
 		if txid == "" {
-			// Fail-closed: an orphan line means the response isn't fully
-			// trustworthy (Teranode processOne panic, or a future format
-			// drift we don't recognize). Returning nil drops to the
-			// whole-batch requeue path so we re-broadcast every tx
-			// rather than risk mis-marking the orphan's owner as
-			// ACCEPTED.
+			// Unplaceable, not unusable: one of the submitted txs failed for
+			// this reason. The caller withholds every implicit accept from
+			// this peer (it has vouched for nobody) and narrows the chunk
+			// until the line lands on a single tx.
 			if logger != nil {
 				logger.Warn(
-					"parseTxsFailures: failure line with no extractable txid; whole-batch requeue",
+					"parseTxsFailures: failure line names no txid; chunk will be narrowed to place it",
 					zap.String("line", line),
 				)
 			}
-			return nil
+			out.Unkeyed = append(out.Unkeyed, line)
+			continue
 		}
-		failures[strings.ToLower(txid)] = line
+		out.ByKey[strings.ToLower(txid)] = line
 	}
-	if len(failures) == 0 {
+	if out.Len() == 0 {
 		return nil
 	}
-	return failures
+	return out
 }
 
 // newBroadcastTransport configures an http.Transport sized for fan-out

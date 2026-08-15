@@ -1,9 +1,11 @@
 package propagation
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -224,11 +226,17 @@ func TestBroadcast_409ConflictLines_AttributedToSubmittedInputs(t *testing.T) {
 		}
 	}
 
-	// Attribution must not have leaked into a fabricated acceptance for the
-	// tx nobody named. This is the #292 property; a 409 peer grants no
-	// implicit accepts even when every one of its lines resolved.
-	if got := ms.lastUpdateForTxid(txidC); got != nil {
-		t.Errorf("%s: terminalized as %s (extraInfo=%q); an unnamed tx in a 409 batch must get no vote at all", txidC, got.Status, got.ExtraInfo)
+	// The tx nobody named is accepted, because every line this peer returned
+	// was placed. #292 withheld implicit accepts from any 409 peer, which was
+	// right while an alien line meant "some unidentifiable tx failed" — but
+	// once attribution accounts for every line, that uncertainty is gone:
+	// Teranode's /txs body carries one line per failed tx, so a tx absent from
+	// a fully-resolved failure set is one the peer took. Withholding here
+	// bought nothing and requeued transactions the peer had already accepted.
+	// The withholding still applies whenever ANY line is left unplaced (see
+	// TestBroadcast_409UnattributableConflict_NarrowsToPlaceTheVerdict).
+	if got := ms.lastUpdateForTxid(txidC); got == nil || got.Status != models.StatusAcceptedByNetwork {
+		t.Errorf("%s: got %+v, want ACCEPTED_BY_NETWORK — every failure line was placed, so absence means acceptance", txidC, got)
 	}
 
 	// A and B must carry each other's verdicts correctly, not the same line
@@ -246,13 +254,23 @@ func TestBroadcast_409ConflictLines_AttributedToSubmittedInputs(t *testing.T) {
 	}
 }
 
-// TestBroadcast_409UnattributableConflict_WithholdsAcceptsAndRejects is the
-// no-fabrication guard from #292, re-pinned against the attribution path so
-// the new code cannot regress it. The 409 names an outpoint no submitted tx
-// spends: arcade knows SOMETHING failed but not what, so it must invent
-// neither an ACCEPTED_BY_NETWORK nor a REJECTED for anyone. Both txs stay
-// non-terminal and fall to the (now bounded) requeue.
-func TestBroadcast_409UnattributableConflict_WithholdsAcceptsAndRejects(t *testing.T) {
+// TestBroadcast_409UnattributableConflict_NarrowsToPlaceTheVerdict covers the
+// line arcade cannot place from its own knowledge: a 409 naming an outpoint no
+// submitted tx visibly spends (unparseable raw bytes, a message shape without
+// an outpoint, a conflict about a different input than the one named).
+//
+// #292 stopped here — no fabricated accept, no guessed reject, both txs
+// requeue — because guessing which tx a line condemns is worse than waiting.
+// That property is intact: nothing is guessed. What changed is that arcade no
+// longer has to guess. It re-broadcasts the chunk in halves, and the peer's
+// own answers say which transaction is at fault: the half without it comes
+// back 200, the half with it comes back 409 again, until the line is the only
+// answer to a single transaction.
+//
+// The peer models a real Teranode — it reports the conflict only when the
+// request carries the offending tx — so the verdict must land on that tx alone
+// and the other must be accepted.
+func TestBroadcast_409UnattributableConflict_NarrowsToPlaceTheVerdict(t *testing.T) {
 	const (
 		outA     = "256fc7143c6ef5436cd5258ade24b68c43d0f8268c086bd9fa90055dd5a7ae43"
 		outB     = "9d2c1f0e7b5a48361c0e7f2d6b48a91c33e0f8261c086bd9fa90055dd5a7bb11"
@@ -262,9 +280,18 @@ func TestBroadcast_409UnattributableConflict_WithholdsAcceptsAndRejects(t *testi
 	txidA, rawA := spendingTx(t, outA, 1, 11)
 	txidB, rawB := spendingTx(t, outB, 1, 12)
 
-	// The named outpoint belongs to neither submitted tx.
+	// The named outpoint belongs to neither submitted tx, so attribution can
+	// never place it — only narrowing can.
 	body := conflictBody([]string{outpointRef(stranger, 3)}, spender)
-	srv := conflictServer(&eventLog{}, body)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqBody, _ := io.ReadAll(r.Body)
+		if !bytes.Contains(reqBody, rawA) {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(body))
+	}))
 	defer srv.Close()
 
 	ms := newMockStore()
@@ -282,11 +309,15 @@ func TestBroadcast_409UnattributableConflict_WithholdsAcceptsAndRejects(t *testi
 		t.Fatalf("flush error: %v", err)
 	}
 
-	for _, txid := range []string{txidA, txidB} {
-		if got := ms.lastUpdateForTxid(txid); got != nil {
-			t.Errorf("%s: terminalized as %s (extraInfo=%q); an unattributable alien 409 line must produce no vote — no fabricated accept, no guessed reject",
-				txid, got.Status, got.ExtraInfo)
-		}
+	gotA := ms.lastUpdateForTxid(txidA)
+	if gotA == nil || gotA.Status != models.StatusRejected {
+		t.Fatalf("%s: got %+v, want REJECTED — narrowing must place the peer's only verdict on the only tx that drew it", txidA, gotA)
+	}
+	if !strings.Contains(gotA.ExtraInfo, "UTXO_SPENT") || !strings.Contains(gotA.ExtraInfo, spender) {
+		t.Errorf("%s: ExtraInfo=%q, want the verbatim conflict line", txidA, gotA.ExtraInfo)
+	}
+	if gotB := ms.lastUpdateForTxid(txidB); gotB == nil || gotB.Status != models.StatusAcceptedByNetwork {
+		t.Errorf("%s: got %+v, want ACCEPTED_BY_NETWORK — an unplaceable line must not be spread across the batch", txidB, gotB)
 	}
 }
 
@@ -323,32 +354,39 @@ func TestAttributeConflictLines_AmbiguousOutpointDeclines(t *testing.T) {
 
 // --- fix 2: bounded requeue with a terminal escape -----------------------
 
-// TestPoisonBatch_MultiTxConflict409_ParksInsteadOfLoopingForever is the
-// incident in its exact shape: a MULTI-tx batch that permanently draws an
-// HTTP 409 whose conflict line names an outpoint none of the submitted txs
-// spend. Nothing is attributable, no peer accepts, so every tx lands on the
-// `default: txResultClassRequeue` arm — which pre-fix meant "again, forever".
+// TestPoisonBatch_MultiTxOpaque409_ParksInsteadOfLoopingForever is the
+// incident in its exact shape: a MULTI-tx batch that permanently draws an HTTP
+// 409 carrying no per-tx information at all. No peer accepts and nothing can
+// be attributed, so every tx lands on the `default: txResultClassRequeue` arm
+// — which pre-fix meant "again, forever".
+//
+// An opaque body is what makes this unresolvable, and it is the reason the
+// bounded-requeue escape still has to exist. Its parseable sibling — a 409
+// whose conflict line names an outpoint no submitted tx spends — used to reach
+// this same dead end and now does not: arcade narrows the chunk until the peer
+// itself says which transaction the line is about, and the tx terminalizes
+// with the real verdict instead of parking under a generic reason (see
+// TestBroadcast_409UnattributableConflict_NarrowsToPlaceTheVerdict). Narrowing
+// cannot help here, because there is no line to place.
 //
 // The batch has to be multi-tx to reproduce it: for a single-tx batch #292's
-// len(batch) == 1 rule already attributes the alien verdict to the only
+// len(batch) == 1 rule already attributes any alien verdict to the only
 // possible owner, so the loop never forms. That is exactly why the live
 // incident was a 21-tx batch.
 //
 // Driven through the test-mode dispatcher (nil claim ⇒ no 50ms flush ticker),
 // so batching is decided by this test's explicit flushSync calls and the two
 // txs provably stay in one batch across every retry round.
-func TestPoisonBatch_MultiTxConflict409_ParksInsteadOfLoopingForever(t *testing.T) {
+func TestPoisonBatch_MultiTxOpaque409_ParksInsteadOfLoopingForever(t *testing.T) {
 	const (
-		outA     = "256fc7143c6ef5436cd5258ade24b68c43d0f8268c086bd9fa90055dd5a7ae43"
-		outB     = "9d2c1f0e7b5a48361c0e7f2d6b48a91c33e0f8261c086bd9fa90055dd5a7bb11"
-		stranger = "deadbeef00000000000000000000000000000000000000000000000000009999"
-		spender  = "7dfbe0fcacf630066b23036bc007e73d58a61ab9bcb8e66f6b214f8ef5f28489"
+		outA = "256fc7143c6ef5436cd5258ade24b68c43d0f8268c086bd9fa90055dd5a7ae43"
+		outB = "9d2c1f0e7b5a48361c0e7f2d6b48a91c33e0f8261c086bd9fa90055dd5a7bb11"
 	)
 	txidA, rawA := spendingTx(t, outA, 0, 31)
 	txidB, rawB := spendingTx(t, outB, 0, 32)
 
 	broadcasts := &eventLog{}
-	srv := conflictServer(broadcasts, conflictBody([]string{outpointRef(stranger, 1)}, spender))
+	srv := opaqueConflictServer(broadcasts)
 	defer srv.Close()
 
 	const maxAttempts = 2

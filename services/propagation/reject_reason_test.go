@@ -220,7 +220,7 @@ func TestSchedulePendingRetry_GiveUpCarriesReason(t *testing.T) {
 
 	// Attempts 1..3 reschedule; the 4th exceeds the budget and terminalizes.
 	for i := 0; i < 4; i++ {
-		p.schedulePendingRetry(context.Background(), orphan.txid, orphan.raw)
+		p.schedulePendingRetry(context.Background(), orphan.txid, orphan.raw, orphanRetryReason)
 	}
 
 	emitted := pub.bulkSnapshot()
