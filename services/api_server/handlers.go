@@ -47,6 +47,16 @@ func collectInputTXIDs(tx *sdkTx.Transaction) []string {
 	return out
 }
 
+// shouldRepublishExisting reports store rows whose POST /tx retry must
+// re-enter Kafka. REJECTED resubmits re-run broadcast (existing contract).
+// RECEIVED resubmits cover the insert-then-Kafka-fail hole: GetOrInsertStatus
+// already wrote RECEIVED, Send failed, the client retries, and the old
+// duplicate branch echoed 202 without publishing — the tx never left arcade
+// until the one-hour RECEIVED reaper. Seen/accepted/mined rows stay echoed.
+func shouldRepublishExisting(status models.Status) bool {
+	return status == models.StatusRejected || status == models.StatusReceived
+}
+
 const jsonKeyError = "error"
 
 // submitOptions captures the callback subscription preferences a client
@@ -801,18 +811,15 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 			s.logger.Error("dedup CAS failed", logfields.TxID(txid), zap.Error(dedupErr))
 			// Best-effort: continue with publish. The propagator's
 			// in-flight set catches duplicates that slip past.
-		case !inserted && existing != nil && existing.Status == models.StatusRejected:
-			// Resubmission of a previously-rejected tx: fall through to
-			// the normal publish path so the propagator re-runs the
-			// broadcast pipeline. The status row stays at REJECTED until
-			// the new broadcast produces a verdict; the lattice already
-			// allows REJECTED → ACCEPTED / SEEN_* so the eventual
-			// terminal write lands cleanly. The TxTracker gets updated
-			// by the StatusReceived Add below alongside fresh inserts —
-			// both RECEIVED and REJECTED produce the same callback
-			// prefilter behavior because every forward status allows
-			// transitioning from either.
-			submitResult = "retry_rejected"
+		case !inserted && existing != nil && shouldRepublishExisting(existing.Status):
+			// REJECTED resubmit: re-run broadcast. RECEIVED resubmit: the
+			// first attempt wrote the row then failed to Kafka-publish
+			// (503/500). Fall through so this retry actually queues.
+			if existing.Status == models.StatusRejected {
+				submitResult = "retry_rejected"
+			} else {
+				submitResult = "retry_received"
+			}
 		case !inserted && existing != nil:
 			// Idempotent re-submit: row already exists at a non-REJECTED
 			// status. Register the txid with the in-process TxTracker so
@@ -852,8 +859,9 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	}
 	if err := s.producer.Send(c.Request.Context(), kafka.TopicPropagation, txid, msg); err != nil {
 		if errors.Is(err, kafka.ErrBrokerBackpressure) {
-			// Backpressure → shed load to the client. The tx was never queued,
-			// so a retry is safe and is the contract the 503 expresses.
+			// Backpressure → shed load to the client. A RECEIVED row may
+			// already exist; shouldRepublishExisting makes the 503 retry
+			// re-publish instead of echoing 202 with no Kafka message.
 			s.logger.Warn("submit rejected: kafka backpressure", logfields.TxID(txid))
 			c.Header("Retry-After", "1")
 			c.JSON(http.StatusServiceUnavailable, gin.H{jsonKeyError: "service overloaded, retry shortly"})
@@ -1118,15 +1126,13 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				s.logger.Error("dedup CAS failed", logfields.TxID(p.txid), zap.Error(dedupErr))
 				newSubmits++
 				toPublish = append(toPublish, p)
-			case !inserted && existing != nil && existing.Status == models.StatusRejected:
-				// Resubmission of a previously-rejected tx: add to
-				// toPublish so the StatusReceived Add in the
-				// post-loop tracker fan-out also runs against this
-				// txid, and the propagator re-runs the broadcast
-				// pipeline. The status row stays at REJECTED until the
-				// new broadcast produces a verdict. Mirrors
-				// handleSubmitTransaction.
-				retryRejected++
+			case !inserted && existing != nil && shouldRepublishExisting(existing.Status):
+				// REJECTED resubmit and stranded RECEIVED (Kafka send failed
+				// after insert) both re-enter toPublish. Mirrors
+				// handleSubmitTransaction. Seen/accepted rows stay duplicates.
+				if existing.Status == models.StatusRejected {
+					retryRejected++
+				}
 				toPublish = append(toPublish, p)
 			case !inserted && existing != nil:
 				duplicates++

@@ -822,6 +822,55 @@ func TestHandleSubmitTransaction_ResubmitRejected_RepublishesToKafka(t *testing.
 	}
 }
 
+// TestHandleSubmitTransaction_StrandedReceived_RepublishesToKafka is the
+// issue #83 hole: intake wrote RECEIVED then Kafka Send failed. The client
+// retries; the old duplicate branch returned 202 without re-publishing.
+func TestHandleSubmitTransaction_StrandedReceived_RepublishesToKafka(t *testing.T) {
+	rawTx := makeMinimalTx()
+	ms := &mockStore{
+		getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+			return &models.TransactionStatus{
+				TxID:   in.TxID,
+				Status: models.StatusReceived,
+			}, false, nil
+		},
+	}
+	broker := &kafka.RecordingBroker{}
+	gin.SetMode(gin.TestMode)
+	srv := &Server{
+		cfg:            &config.Config{CallbackToken: testCallbackToken},
+		logger:         zap.NewNop(),
+		producer:       kafka.NewProducer(broker),
+		store:          ms,
+		txTracker:      store.NewTxTracker(),
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
+	}
+	router := gin.New()
+	srv.registerRoutes(router)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/tx", bytes.NewReader(rawTx))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := totalMessages(broker); got != 1 {
+		t.Errorf("stranded RECEIVED retry must publish to Kafka, got %d", got)
+	}
+}
+
+func TestShouldRepublishExisting(t *testing.T) {
+	if !shouldRepublishExisting(models.StatusReceived) || !shouldRepublishExisting(models.StatusRejected) {
+		t.Fatal("RECEIVED and REJECTED must republish")
+	}
+	if shouldRepublishExisting(models.StatusSeenOnNetwork) || shouldRepublishExisting(models.StatusMined) {
+		t.Fatal("SEEN/MINED must not republish")
+	}
+}
+
 // TestHandleSubmitTransactions_BatchResubmitRejected_RepublishesToKafka is
 // the batch-path mirror: a batch containing one REJECTED resubmit and one
 // fresh-insert must publish both. The REJECTED resubmit is NOT counted as
