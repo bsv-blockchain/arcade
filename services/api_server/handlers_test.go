@@ -27,6 +27,7 @@ import (
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/validator"
+	tnerr "github.com/bsv-blockchain/teranode/errors"
 )
 
 // mockStore implements store.Store for testing callback handlers.
@@ -985,6 +986,59 @@ func TestHandleSubmitTransaction_ValidationFailure_RecordsSubmissionAndPublishes
 	}
 	if publishes[0].ExtraInfo == "" {
 		t.Errorf("publish ExtraInfo is empty; expected the validator reason to be carried for subscriber context")
+	}
+}
+
+type stubIntakeValidator struct{ err error }
+
+func (s stubIntakeValidator) ValidateTransaction(context.Context, *sdkTx.Transaction, bool) error {
+	return s.err
+}
+
+// TestHandleSubmitTransaction_EngineFailure_NoRejectedRow pins the contract
+// that a BDK/cgo PROCESSING error is not a verdict: HTTP 503, no REJECTED
+// persist, no Kafka publish. A retry of the same bytes is expected to work.
+func TestHandleSubmitTransaction_EngineFailure_NoRejectedRow(t *testing.T) {
+	rawTx := makeMinimalTx()
+	ms := &mockStore{}
+	pub := &recordingCallbackPub{}
+	broker := &kafka.RecordingBroker{}
+	gin.SetMode(gin.TestMode)
+	srv := &Server{
+		cfg:            &config.Config{CallbackToken: testCallbackToken},
+		logger:         zap.NewNop(),
+		producer:       kafka.NewProducer(broker),
+		store:          ms,
+		publisher:      pub,
+		validator:      stubIntakeValidator{err: tnerr.NewProcessingError("GoBDK fail to ValidateTransaction")},
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
+	}
+	router := gin.New()
+	srv.registerRoutes(router)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/tx", bytes.NewReader(rawTx))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d: %s", w.Code, w.Body.String())
+	}
+	ms.mu.Lock()
+	updates := len(ms.updateStatusCalls)
+	ms.mu.Unlock()
+	if updates != 0 {
+		t.Errorf("engine failure must not persist REJECTED, UpdateStatus calls=%d", updates)
+	}
+	pub.mu.Lock()
+	n := len(pub.publishes)
+	pub.mu.Unlock()
+	if n != 0 {
+		t.Errorf("engine failure must not publish REJECTED, got %d events", n)
+	}
+	if totalMessages(broker) != 0 {
+		t.Errorf("engine failure must not Kafka-publish, got %d", totalMessages(broker))
 	}
 }
 

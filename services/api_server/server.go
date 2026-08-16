@@ -52,7 +52,7 @@ type Server struct {
 	// Nil-safe: tests that use struct-literal construction may leave it
 	// unset, in which case the handler skips validation. Production
 	// wiring through New requires it.
-	validator *validator.Validator
+	validator intakeValidator
 	// finality runs the nLockTime/BIP113 pre-check in the submit handler,
 	// rejecting provably non-final txs with an actionable reason instead of
 	// letting teranode bounce them with a generic error (issue #245).

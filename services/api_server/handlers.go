@@ -26,8 +26,16 @@ import (
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/telemetry"
 	"github.com/bsv-blockchain/arcade/teranode"
+	"github.com/bsv-blockchain/arcade/validator"
 	"github.com/bsv-blockchain/arcade/version"
 )
+
+// intakeValidator is the submit-path validator. *validator.Validator
+// implements it; tests stub it when they need an engine failure that must
+// not persist REJECTED.
+type intakeValidator interface {
+	ValidateTransaction(ctx context.Context, tx *sdkTx.Transaction, skipFees bool) error
+}
 
 // collectInputTXIDs returns the parent txids referenced by every input of
 // tx. Empty for coinbase. Used to populate the propagation envelope's
@@ -747,8 +755,7 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// durable and immediate.
 	if s.validator != nil {
 		if err := s.validator.ValidateTransaction(c.Request.Context(), parsedTx, false); err != nil {
-			s.rejectAtIntake(c.Request.Context(), txid, err.Error(), arcStatusCodeOf(err), opts)
-			respondSubmitError(c, txid, err)
+			s.handleValidatorError(c, txid, err, opts)
 			return
 		}
 	}
@@ -875,6 +882,30 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		Status:   http.StatusAccepted,
 		TxStatus: models.StatusReceived,
 	})
+}
+
+// handleValidatorError is the intake failure fork: BDK/cgo PROCESSING
+// (IsInternalEngineError) is an engine condition, not a verdict about the
+// bytes — 503, nothing persisted, retry is safe. Every other validator
+// error remains a terminal REJECTED + 400.
+func (s *Server) handleValidatorError(c *gin.Context, txid string, err error, opts submitOptions) {
+	if validator.IsInternalEngineError(err) {
+		s.logger.Warn(
+			"intake engine failure; no verdict persisted",
+			logfields.TxID(txid),
+			zap.Error(err),
+			logfields.Stage(logfields.StageIntake),
+		)
+		c.Header("Retry-After", "1")
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			jsonKeyError: "transaction processor temporarily unavailable",
+			"txid":       txid,
+			"reason":     err.Error(),
+		})
+		return
+	}
+	s.rejectAtIntake(c.Request.Context(), txid, err.Error(), arcStatusCodeOf(err), opts)
+	respondSubmitError(c, txid, err)
 }
 
 // arcStatusCodeOf extracts the numeric ARC status code (460-476 taxonomy,
@@ -1067,8 +1098,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 		ctx := c.Request.Context()
 		for _, p := range parsed {
 			if vErr := s.validator.ValidateTransaction(ctx, p.tx, false); vErr != nil {
-				s.rejectAtIntake(ctx, p.txid, vErr.Error(), arcStatusCodeOf(vErr), opts)
-				respondSubmitError(c, p.txid, vErr)
+				s.handleValidatorError(c, p.txid, vErr, opts)
 				return
 			}
 		}

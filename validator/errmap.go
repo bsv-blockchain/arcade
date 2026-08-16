@@ -43,6 +43,18 @@ func mapTeranodeError(err error) error {
 	return classifyByMessage(err, msg)
 }
 
+// IsInternalEngineError reports a BDK/cgo/teranode PROCESSING failure that is
+// not a verdict about the submitted bytes (e.g. SCRIPT_ERR_CGO_EXCEPTION).
+// Intake must not persist REJECTED for these — the client should retry.
+// Mapped ArcErrors wrap the original tnerr.Error, so errors.As still finds it.
+func IsInternalEngineError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var te *tnerr.Error
+	return errors.As(err, &te) && te.Code() == tnerr.ERR_PROCESSING
+}
+
 // classifyByMessage picks an ARC status from teranode's deterministic error
 // messages. The BDK adapter wraps fee/script/policy failures under
 // ERR_TX_INVALID, so the precise status is recovered from the message text.

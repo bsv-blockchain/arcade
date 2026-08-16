@@ -164,6 +164,22 @@ func TestMapTeranodeError_Nil(t *testing.T) {
 	}
 }
 
+func TestIsInternalEngineError(t *testing.T) {
+	if IsInternalEngineError(nil) {
+		t.Fatal("nil must not be an engine error")
+	}
+	proc := tnerr.NewProcessingError("GoBDK fail to ValidateTransaction")
+	if !IsInternalEngineError(proc) {
+		t.Fatal("raw PROCESSING error must be detected")
+	}
+	if !IsInternalEngineError(mapTeranodeError(proc)) {
+		t.Fatal("mapped PROCESSING ArcError must still unwrap to ERR_PROCESSING")
+	}
+	if IsInternalEngineError(tnerr.NewTxInvalidError("transaction fee is too low: 1 < 10 required")) {
+		t.Fatal("fee/script verdicts must persist REJECTED, not 503")
+	}
+}
+
 // --- end-to-end BDK validation (#192 Chronicle regression) ---------------
 
 // spendableSource builds an input that spends a fabricated previous output with
