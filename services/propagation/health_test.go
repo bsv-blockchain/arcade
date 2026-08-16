@@ -457,13 +457,14 @@ func TestBroadcast_PerPeerAggregation_AcceptanceWins(t *testing.T) {
 // one peer returned HTTP 422 + a parseable Teranode failure list (the real
 // validator verdict for a spent-UTXO / invalid tx) while other peers returned
 // opaque gateway 502/500 with no body. Pre-fix the 422 body was discarded
-// (client only parsed status 500), so the tx either requeued forever or —
-// worse — never carried the PROCESSING/UTXO_SPENT line into GET /tx ExtraInfo.
-// Post-fix: REJECTED with the Teranode line as ExtraInfo.
+// (client only parsed status 500), so the tx either requeued forever or
+// never carried the TX_INVALID/UTXO_SPENT line into GET /tx ExtraInfo.
+// Post-fix: REJECTED with the Teranode line as ExtraInfo. Opaque PROCESSING
+// (4) without a nested verdict is a requeue, not this path.
 func TestBroadcast_422RejectionSurfacesExtraInfo(t *testing.T) {
 	const txid = "d018bc98d7828b7f095e5d616f7ccba607fc228368e82e74b25304e37699f1e9"
 	verdictBody := "Failed to process transactions:\n" +
-		"PROCESSING (4): [ProcessTransaction][" + txid + "] failed to validate transaction\n"
+		"TX_INVALID (31): [ProcessTransaction][" + txid + "] tx is invalid because fee too low\n"
 
 	// Peer A: the only peer that actually validated — 422 + failure list.
 	srvVerdict := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -508,12 +509,40 @@ func TestBroadcast_422RejectionSurfacesExtraInfo(t *testing.T) {
 	if got.Status != models.StatusRejected {
 		t.Fatalf("status=%s want REJECTED (extraInfo=%q)", got.Status, got.ExtraInfo)
 	}
-	if !strings.Contains(got.ExtraInfo, "PROCESSING (4)") {
-		t.Errorf("ExtraInfo=%q want Teranode PROCESSING line (not gateway 502/503 body)", got.ExtraInfo)
+	if !strings.Contains(got.ExtraInfo, "TX_INVALID (31)") {
+		t.Errorf("ExtraInfo=%q want Teranode TX_INVALID line (not gateway 502/503 body)", got.ExtraInfo)
 	}
 	if strings.Contains(got.ExtraInfo, "no available server") || strings.Contains(got.ExtraInfo, "502") {
 		t.Errorf("ExtraInfo leaked opaque gateway text: %q", got.ExtraInfo)
 	}
+}
+
+// TestBroadcast_OpaqueProcessing_RequeuesInsteadOfRejects pins the other
+// half of PROCESSING: a 422 failure list that is only PROCESSING (4) with
+// no nested TX_*/UTXO_* code is Teranode's catch-all wrapper, not a byte
+// verdict. Pre-fix this terminalized REJECTED; txResultClassRequeue's
+// comment already said PROCESSING requeues. The row stays off REJECTED so
+// a later successful peer (or retry) can still accept the tx.
+func TestBroadcast_OpaqueProcessing_RequeuesInsteadOfRejects(t *testing.T) {
+	const txid = "d018bc98d7828b7f095e5d616f7ccba607fc228368e82e74b25304e37699f1e9"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte("Failed to process transactions:\n" +
+			"PROCESSING (4): [ProcessTransaction][" + txid + "] failed to validate transaction\n"))
+	}))
+	defer srv.Close()
+
+	ms := newMockStore()
+	p := poisonPropagator(srv.URL, ms, 5, time.Millisecond)
+
+	if err := handleAndFlush(t, p, makePropMsg(txid)); err != nil {
+		t.Fatalf("handleAndFlush: %v", err)
+	}
+
+	if got := rejectedUpdates(ms); len(got) != 0 {
+		t.Fatalf("opaque PROCESSING must not terminalize REJECTED, got %d REJECTED writes (first: %+v)", len(got), got[0])
+	}
+	waitForPending(t, p, 1)
 }
 
 // TestBroadcast_422PartialFailureList_ImplicitAccept pins the riskiest
@@ -637,7 +666,7 @@ func TestBroadcast_422RejectionLosesToAcceptance(t *testing.T) {
 	srvReject := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusUnprocessableEntity)
 		_, _ = w.Write([]byte("Failed to process transactions:\n" +
-			"PROCESSING (4): [ProcessTransaction][" + txid + "] failed to validate transaction\n"))
+			"TX_INVALID (31): [ProcessTransaction][" + txid + "] tx is invalid because fee too low\n"))
 	}))
 	defer srvReject.Close()
 
