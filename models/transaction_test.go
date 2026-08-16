@@ -157,6 +157,8 @@ func TestStatus_CanTransitionFrom_Regressions(t *testing.T) {
 		{StatusMined, StatusSeenMultipleNodes, "F-003: late SEEN_MULTIPLE callback after MINED"},
 		{StatusMined, StatusPendingRetry, "delayed retry attempt after MINED"},
 		{StatusMined, StatusRejected, "late rejection after MINED"},
+		{StatusSeenOnNetwork, StatusRejected, "#251: intake reject must not clobber SEEN_ON_NETWORK"},
+		{StatusSeenMultipleNodes, StatusRejected, "#251: intake reject must not clobber SEEN_MULTIPLE_NODES"},
 		{StatusImmutable, StatusMined, "MINED must not pull tx out of IMMUTABLE"},
 		{StatusImmutable, StatusSeenOnNetwork, "late SEEN after IMMUTABLE"},
 		{StatusRejected, StatusSentToNetwork, "republish after REJECTED"},
