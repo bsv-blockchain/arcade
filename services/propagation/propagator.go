@@ -1645,6 +1645,28 @@ func lineIsMissingParentCondition(line string) bool {
 		strings.Contains(line, "TX_NOT_FOUND (")
 }
 
+// teranodeNamedCode matches Teranode's "NAME (n)" tokens, including ones
+// this build has not mapped yet. PROCESSING is the catch-all wrapper.
+var teranodeNamedCode = regexp.MustCompile(`[A-Z][A-Z0-9_]* \(\d+\)`)
+
+func lineHasNestedTeranodeVerdict(line string) bool {
+	for _, m := range teranodeNamedCode.FindAllString(line, -1) {
+		name, _, _ := strings.Cut(m, " (")
+		if name != "PROCESSING" {
+			return true
+		}
+	}
+	return false
+}
+
+// lineIsOpaqueProcessing reports a PROCESSING (4) wrapper with no nested
+// TX_*/UTXO_* (or other named) code. txResultClassRequeue's contract already
+// treats per-slot PROCESSING as infra, not a terminal verdict — but the
+// failure-list loop used to dump every named line into rejectionLine.
+func lineIsOpaqueProcessing(line string) bool {
+	return strings.Contains(line, "PROCESSING (") && !lineHasNestedTeranodeVerdict(line)
+}
+
 func rejectionLineScore(line string) int {
 	name, _, found := strings.Cut(line, " (")
 	if !found {
@@ -1677,14 +1699,12 @@ func rejectionLineScore(line string) int {
 // e.g. "PROCESSING (4): [ProcessTransaction][<txid>] failed to validate
 // transaction" or "TX_INVALID (31): [ProcessTransaction][<txid>] ...".
 //
-// Any per-txid line returned by Teranode is still treated as terminally
-// rejected. Teranode wraps real validator failures with NewProcessingError
-// (see services/propagation/Server.go:1236), so PROCESSING is the catch-all
-// "this tx is bad" code in practice — we can't distinguish a transient
-// infra issue from a permanent validation failure by code alone. The
-// authoritative requeue signal is a 5xx batch response with no parseable
-// per-tx body (handled separately in broadcastBatchToEndpoints), which
-// reflects a true infra outage rather than a tx-level verdict.
+// This helper only maps lines the broadcast loop has already routed as
+// terminal verdicts (rejectionLine). Opaque PROCESSING (4) with no nested
+// named code never reaches here — it requeues. Nested wrappers such as
+// "PROCESSING (4): … TX_INVALID (31)" still arrive as the full line: the
+// leading PROCESSING keeps arcCode 0 while ExtraInfo preserves the inner
+// text. Real validator codes (TX_INVALID, UTXO_SPENT, …) remain REJECTED.
 //
 // What the leading "NAME (n)" code DOES tell us confidently is mapped onto
 // the ARC taxonomy so consumers can branch on a number instead of prose
@@ -2664,9 +2684,15 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 				// and told us the parent isn't there yet. Route it to the
 				// condition bucket; the siblings' implicit accepts above
 				// are untouched (the line is in-batch-keyed, not alien).
+				// PROCESSING (4) with no nested TX_*/UTXO_* code is the
+				// catch-all wrapper, not a verdict: skipping it leaves
+				// rejectionLine empty so the slot falls through to
+				// txResultClassRequeue. Expressed as a negated guard rather
+				// than an empty branch, matching the attributed-line loop
+				// below.
 				if lineIsMissingParentCondition(line) {
 					missingParentLine[j] = preferRejectionLine(missingParentLine[j], line)
-				} else {
+				} else if !lineIsOpaqueProcessing(line) {
 					rejectionLine[j] = preferRejectionLine(rejectionLine[j], line)
 				}
 			} else if alienCount == 0 {
@@ -2679,7 +2705,7 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 			// never become a terminal verdict via the attribution path.
 			if lineIsMissingParentCondition(line) {
 				missingParentLine[idx] = preferRejectionLine(missingParentLine[idx], line)
-			} else {
+			} else if !lineIsOpaqueProcessing(line) {
 				rejectionLine[idx] = preferRejectionLine(rejectionLine[idx], line)
 			}
 		}
@@ -2693,7 +2719,7 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 		if alienCount > 0 && len(batch) == 1 {
 			if lineIsMissingParentCondition(bestAlien) {
 				missingParentLine[0] = preferRejectionLine(missingParentLine[0], bestAlien)
-			} else {
+			} else if !lineIsOpaqueProcessing(bestAlien) {
 				rejectionLine[0] = preferRejectionLine(rejectionLine[0], bestAlien)
 			}
 		}
