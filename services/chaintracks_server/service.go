@@ -27,6 +27,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/services/httpmiddleware"
 	"github.com/bsv-blockchain/arcade/store"
 )
 
@@ -96,7 +97,7 @@ func (s *Service) Start(ctx context.Context) error {
 	addr := fmt.Sprintf("%s:%d", s.cfg.ChaintracksServer.Host, s.cfg.ChaintracksServer.Port)
 	s.server = &http.Server{
 		Addr:              addr,
-		Handler:           router,
+		Handler:           chaintracksHTTPHandler(router),
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 	s.logger.Info("chaintracks service listening", zap.String("addr", addr))
@@ -110,6 +111,14 @@ func (s *Service) Start(ctx context.Context) error {
 		return fmt.Errorf("chaintracks server error: %w", err)
 	}
 	return nil
+}
+
+// chaintracksHTTPHandler applies the same public browser contract as Arcade's
+// API and SSE listeners. The standalone chaintracks pod has its own listener,
+// so relying on the API server's middleware leaves /chaintracks/v2 without
+// CORS headers and makes Gin return 404 for browser OPTIONS preflights.
+func chaintracksHTTPHandler(next http.Handler) http.Handler {
+	return httpmiddleware.WithCORS(next)
 }
 
 // Stop gracefully shuts the HTTP server. chaintracks itself unwinds
