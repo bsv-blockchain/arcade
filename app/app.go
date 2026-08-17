@@ -246,41 +246,58 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		chainTracks = ct
 	}
 
-	finalityChecker := buildFinalityChecker(ctx, cfg, chainTracks, st, logger)
+	// One chain source per process, shared by the finality gate and TxTracker
+	// hydration below.
+	reader := chainReader(ctx, cfg, chainTracks, logger)
+
+	finalityChecker := buildFinalityChecker(cfg, reader, st, logger)
 
 	// Hydrate the TxTracker from the store BEFORE handing it to api-server.
 	// Gated to modes that actually consume it: only api-server reads
 	// deps.TxTracker (see BuildServices). Without hydration a restart leaves the
 	// tracker empty and in-flight transitions can be dropped until re-observed.
-	// LoadFromStore streams the full transactions history into an in-memory map,
-	// a cost that scales with tx volume; running it in modes that never read the
-	// tracker (sse, watchdog, propagation, p2p-client, bump-builder, chaintracks)
-	// is what OOMKilled every 512Mi arcade-v2 component after the v0.9.0 rollout.
-	// Chain height skips deeply-confirmed rows; when chaintracks is disabled we
-	// pass 0 (preserves every MINED row — safe, prunable later).
+	// Running it in modes that never read the tracker (sse, watchdog,
+	// propagation, p2p-client, bump-builder, chaintracks) is what OOMKilled
+	// every 512Mi arcade-v2 component after the v0.9.0 rollout.
 	// Keep in sync with BuildServices / modeNeedsTxTracker.
 	if modeNeedsTxTracker(cfg.Mode) {
-		var hydrateHeight uint64
-		if chainTracks != nil {
-			hydrateHeight = uint64(chainTracks.GetHeight(ctx))
-		}
-		hydrateStart := time.Now()
-		loaded, hydrateErr := txTracker.LoadFromStore(ctx, st, hydrateHeight)
-		if hydrateErr != nil {
+		hydrateHeight, heightKnown, heightSource := hydrationHeight(ctx, reader, st, logger)
+		scan := store.NewTrackerScan(hydrateHeight, heightKnown)
+
+		logger.Info(
+			"tx tracker hydration height resolved",
+			zap.Uint64("height", hydrateHeight),
+			zap.Bool("height_known", heightKnown),
+			zap.String("height_source", heightSource),
+			zap.Uint64("prune_mined_below", scan.PruneMinedBelow),
+			zap.String("chaintracks_mode", string(cfg.Chaintracks.Mode)),
+			zap.Bool("chain_reader_configured", reader != nil),
+		)
+		if !heightKnown {
 			logger.Warn(
-				"tx tracker hydration partial",
-				zap.Int("loaded", loaded),
-				zap.Uint64("current_height", hydrateHeight),
-				zap.Duration("elapsed", time.Since(hydrateStart)),
-				zap.Error(hydrateErr),
+				"tx tracker hydrating without a chain height: MINED pruning is DISABLED and every " +
+					"MINED row will be loaded (the v0.13.0 current_height=0 condition). Check " +
+					"chaintracks.mode/chaintracks.url reachability from this pod, and that " +
+					"block_processing has status='active' rows.",
 			)
+		}
+
+		hydrateStart := time.Now()
+		stats, hydrateErr := txTracker.LoadFromStore(ctx, st, scan)
+		// `loaded` and `current_height` keep their names — dashboards key on them.
+		fields := []zap.Field{
+			zap.Int("loaded", stats.Loaded),
+			zap.Int("scanned", stats.Scanned),
+			zap.Int("skipped", stats.Skipped),
+			zap.Uint64("current_height", hydrateHeight),
+			zap.String("height_source", heightSource),
+			zap.Uint64("prune_mined_below", scan.PruneMinedBelow),
+			zap.Duration("elapsed", time.Since(hydrateStart)),
+		}
+		if hydrateErr != nil {
+			logger.Warn("tx tracker hydration partial", append(fields, zap.Error(hydrateErr))...)
 		} else {
-			logger.Info(
-				"tx tracker hydrated",
-				zap.Int("loaded", loaded),
-				zap.Uint64("current_height", hydrateHeight),
-				zap.Duration("elapsed", time.Since(hydrateStart)),
-			)
+			logger.Info("tx tracker hydrated", fields...)
 		}
 	}
 
@@ -375,12 +392,14 @@ func modeNeedsFinality(mode string) bool {
 // any chaintracks source, height-based locktimes are still gated while
 // timestamp locktimes fail open (they need MTP). Teranode stays the
 // authority in every degraded mode.
-func buildFinalityChecker(ctx context.Context, cfg *config.Config, chainTracks chaintrackslib.Chaintracks, st store.Store, logger *zap.Logger) *finality.Checker {
+// The reader is built by the caller (chainReader) and shared with TxTracker
+// hydration, so a pod holds exactly one chaintracks client and one degradation
+// story.
+func buildFinalityChecker(cfg *config.Config, reader finality.ChainReader, st store.Store, logger *zap.Logger) *finality.Checker {
 	if cfg.Validator.DisableFinalityCheck || !modeNeedsFinality(cfg.Mode) {
 		return nil
 	}
 
-	reader := finalityChainReader(ctx, cfg, chainTracks, logger)
 	if reader == nil {
 		logger.Info("finality pre-check degraded to height-only: no MTP source (enable chaintracks_server or set chaintracks.mode=remote with a URL)")
 	}
@@ -390,22 +409,90 @@ func buildFinalityChecker(ctx context.Context, cfg *config.Config, chainTracks c
 		finality.WithUnavailableHook(metrics.APIFinalityPrecheckUnavailableTotal.Inc))
 }
 
-// finalityChainReader picks the finality gate's chain source: the shared
-// embedded chaintracks when it exists, else a remote go-chaintracks client
-// when configured, else nil.
-func finalityChainReader(ctx context.Context, cfg *config.Config, chainTracks chaintrackslib.Chaintracks, logger *zap.Logger) finality.ChainReader {
+// chainReader picks the process-wide chain source: the shared embedded
+// chaintracks when it exists, else a remote go-chaintracks client when
+// configured, else nil.
+//
+// Two consumers share it — the finality gate and TxTracker hydration — so it
+// is deliberately NOT gated on cfg.Validator.DisableFinalityCheck. Letting a
+// validator flag suppress hydration's height source is exactly the kind of
+// action-at-a-distance that produced issue #276.
+//
+// In remote mode Initialize is just an HTTP client construction: no goroutines,
+// no I/O, and nothing to close.
+func chainReader(ctx context.Context, cfg *config.Config, chainTracks chaintrackslib.Chaintracks, logger *zap.Logger) finality.ChainReader {
 	if chainTracks != nil {
 		return chainTracks
 	}
 	if cfg.Chaintracks.Mode != chaintracksconfig.ModeRemote || cfg.Chaintracks.URL == "" {
 		return nil
 	}
-	remote, err := cfg.Chaintracks.Initialize(ctx, "arcade-finality", nil)
+	remote, err := cfg.Chaintracks.Initialize(ctx, "arcade-chain-reader", nil)
 	if err != nil {
-		logger.Warn("finality pre-check disabled: remote chaintracks init failed", zap.Error(err))
+		logger.Warn(
+			"remote chaintracks init failed: finality pre-check degrades to height-only and "+
+				"tx tracker hydration loses its primary chain-height source",
+			zap.Error(err),
+		)
 		return nil
 	}
 	return remote
+}
+
+// hydrationHeightTimeout bounds each chain-height probe at startup. The remote
+// go-chaintracks client is built on a zero-value http.Client, which has NO
+// timeout of its own, so without this a wedged chaintracks pod would stall
+// boot indefinitely rather than degrading to the store fallback.
+const hydrationHeightTimeout = 5 * time.Second
+
+// hydrationHeight resolves the chain tip used to prune deeply-confirmed MINED
+// rows during hydration, returning whether the height is actually KNOWN.
+//
+// The (value, known) pair is the whole point. go-chaintracks' GetHeight returns
+// uint32 and collapses every failure into 0, indistinguishable from genesis —
+// so api-server pods silently hydrated with height 0, the deeply-confirmed skip
+// never fired, and all 4.48M MINED rows loaded on every boot (issue #276).
+// GetTip returns a nil-able header, which is the only accessor that can express
+// "unavailable", so this uses GetTip and never GetHeight.
+//
+// Sources in order:
+//  1. the chain reader (embedded chaintracks, or the remote client) — the true
+//     tip;
+//  2. the store's active tip, written to block_processing by the chaintracks
+//     pod and shared through the same database, so an api-server pod that runs
+//     no chaintracks of its own still gets a real height. Already the finality
+//     gate's height-only fallback (finality.WithHeightFallback).
+//
+// Both are lower bounds on the true tip, and both fail safe: a height that is
+// too low under-prunes (a bigger map, today's behavior), which costs memory but
+// never correctness — the tracker is only a prefilter, and the store lattice
+// stays authoritative for anything it doesn't know.
+func hydrationHeight(
+	ctx context.Context, reader finality.ChainReader, st store.Store, logger *zap.Logger,
+) (height uint64, known bool, source string) {
+	if reader != nil {
+		tipCtx, cancel := context.WithTimeout(ctx, hydrationHeightTimeout)
+		tip := reader.GetTip(tipCtx)
+		cancel()
+		if tip != nil {
+			return uint64(tip.Height), true, "chaintracks"
+		}
+		logger.Warn("chain height degraded: chaintracks tip unavailable, falling back to the store active tip")
+	}
+
+	storeCtx, cancel := context.WithTimeout(ctx, hydrationHeightTimeout)
+	activeTip, err := st.GetActiveTipBlockHeight(storeCtx)
+	cancel()
+	switch {
+	case err != nil:
+		logger.Warn("chain height unknown: store active tip read failed", zap.Error(err))
+		return 0, false, "none"
+	case activeTip == 0:
+		logger.Warn("chain height unknown: no active blocks recorded (store active tip is 0)")
+		return 0, false, "none"
+	default:
+		return activeTip, true, "store"
+	}
 }
 
 // modeNeedsTxTracker reports whether the configured mode constructs a service

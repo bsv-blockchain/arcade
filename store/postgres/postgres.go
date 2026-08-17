@@ -684,6 +684,73 @@ ORDER BY timestamp_at DESC`
 	return rows.Err()
 }
 
+// IterateTrackerRows streams the three columns hydration needs, filtered
+// server-side. Contrast with IterateStatusesSince above, which this replaced
+// for hydration: that query selects 14 columns including raw_tx / merkle_path
+// / competing_txs and sorts the whole table by timestamp_at. On a ~5M-row
+// store the planner resolved it with a Seq Scan plus an external merge sort
+// over detoasted wide rows, which drove both arcade and its Postgres out of
+// memory on every api-server boot (issue #276).
+//
+// Three properties matter here and each is load-bearing:
+//   - three narrow columns, so raw_tx is never detoasted;
+//   - the status filter is server-side, so REJECTED (~44% of a mature store)
+//     never leaves the database;
+//   - NO ORDER BY — hydration builds a map, order is meaningless, and the
+//     sort was the memory hazard.
+func (s *Store) IterateTrackerRows(ctx context.Context, scan store.TrackerScan, fn func(store.TrackerRow) error) error {
+	statuses := scan.Statuses()
+	if len(statuses) == 0 {
+		return nil
+	}
+	names := make([]string, len(statuses))
+	for i, st := range statuses {
+		names[i] = string(st)
+	}
+
+	// One static query text covering both regimes. When PruneMinedBelow is 0
+	// (chain height unknown) `block_height >= 0` matches every non-null height,
+	// so all MINED rows are kept — the documented degraded behavior. The
+	// COALESCE disjunct keeps MINED rows with height 0 or NULL at any cutoff.
+	const q = `
+SELECT txid, status, COALESCE(block_height, 0)
+FROM transactions
+WHERE status = ANY($1)
+  AND (status <> $2 OR COALESCE(block_height, 0) = 0 OR block_height >= $3)`
+
+	//nolint:gosec // PruneMinedBelow is a block height; far below MaxInt64.
+	rows, err := s.pool.Query(ctx, q, names, string(models.StatusMined), int64(scan.PruneMinedBelow))
+	if err != nil {
+		return fmt.Errorf("iterate tracker rows: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		var (
+			txid        string
+			status      string
+			blockHeight int64
+		)
+		if err := rows.Scan(&txid, &status, &blockHeight); err != nil {
+			return err
+		}
+		if blockHeight < 0 {
+			blockHeight = 0
+		}
+		if err := fn(store.TrackerRow{
+			TxID:        txid,
+			Status:      models.Status(status),
+			BlockHeight: uint64(blockHeight),
+		}); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
 // CensusStatusesSince is one aggregate round-trip: count + min(timestamp_at)
 // per status over the census window, resolved by the idx_tx_status /
 // idx_tx_updated indexes. The reaper's stuck census over a multi-million-row

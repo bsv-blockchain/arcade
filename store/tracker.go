@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"sync"
-	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 
@@ -44,25 +43,43 @@ func NewTxTracker() *TxTracker {
 	}
 }
 
-// statusIterator narrows the Store surface LoadFromStore actually needs so
+// TrackerRowIterator narrows the Store surface LoadFromStore actually needs so
 // tests can supply a fake without standing up every Store method. Any
 // implementation of Store satisfies this implicitly.
-type statusIterator interface {
-	IterateStatusesSince(ctx context.Context, since time.Time, fn func(*models.TransactionStatus) error) error
+type TrackerRowIterator interface {
+	IterateTrackerRows(ctx context.Context, scan TrackerScan, fn func(TrackerRow) error) error
+}
+
+// LoadStats reports what one hydration pass did.
+//
+// Scanned counts rows the store emitted; Loaded counts rows that reached the
+// tracker map. Skipped counts rows the store emitted that TrackerScan.Keep
+// then rejected — with a correct server-side pushdown this is ~0, so a
+// nonzero value in production is the signal that a backend's filter has
+// drifted from the Go predicate (see store/storetest).
+type LoadStats struct {
+	Scanned int
+	Loaded  int
+	Skipped int
 }
 
 // LoadFromStore populates the tracker from the store, streaming rows in
-// fixed-size batches and dropping deeply-confirmed transactions before they
-// reach the tracker map. Peak memory is bounded by loadFromStoreBatchSize
-// rather than the full history depth, which matters at startup on systems
-// with months of accumulated transactions.
-func (t *TxTracker) LoadFromStore(ctx context.Context, store Store, currentHeight uint64) (int, error) {
-	return t.loadFromStore(ctx, store, currentHeight, loadFromStoreBatchSize)
+// fixed-size batches. The store filters server-side per scan, so peak memory
+// is bounded by the kept set rather than the full history depth — which is
+// what matters at startup on systems with months of accumulated transactions.
+//
+// scan carries the MINED pruning cutoff. Build it with NewTrackerScan so an
+// unknown chain height cannot be mistaken for genesis: a zero height silently
+// disables pruning and loads the entire mined history (issue #276).
+func (t *TxTracker) LoadFromStore(ctx context.Context, st TrackerRowIterator, scan TrackerScan) (LoadStats, error) {
+	return t.loadFromStore(ctx, st, scan, loadFromStoreBatchSize)
 }
 
 // loadFromStore is the batchSize-parameterized form of LoadFromStore so tests
 // can drive the batching boundary without inflating fixture sizes.
-func (t *TxTracker) loadFromStore(ctx context.Context, store statusIterator, currentHeight uint64, batchSize int) (int, error) {
+func (t *TxTracker) loadFromStore(
+	ctx context.Context, st TrackerRowIterator, scan TrackerScan, batchSize int,
+) (LoadStats, error) {
 	if batchSize <= 0 {
 		batchSize = loadFromStoreBatchSize
 	}
@@ -72,7 +89,7 @@ func (t *TxTracker) loadFromStore(ctx context.Context, store statusIterator, cur
 		tx   TrackedTx
 	}
 	batch := make([]kept, 0, batchSize)
-	count := 0
+	stats := LoadStats{}
 
 	flush := func() {
 		if len(batch) == 0 {
@@ -83,39 +100,31 @@ func (t *TxTracker) loadFromStore(ctx context.Context, store statusIterator, cur
 			t.txids[k.hash] = k.tx
 		}
 		t.mu.Unlock()
-		count += len(batch)
+		stats.Loaded += len(batch)
 		batch = batch[:0]
 	}
 
-	err := store.IterateStatusesSince(ctx, time.Time{}, func(status *models.TransactionStatus) error {
-		// Skip terminal outcomes that never need tracking. The tracker exists to
-		// recognize in-flight txids that might still land in a mined subtree; a
-		// REJECTED / DOUBLE_SPEND_ATTEMPTED / IMMUTABLE tx never will. Without
-		// this, hydration loaded the entire terminal history into the map —
-		// REJECTED alone was ~44% of a 5M-row store — and OOM-killed the
-		// api-server at startup. MINED is terminal too but is handled below: it
-		// is retained until deeply confirmed so PruneConfirmed can promote it.
-		if status.Status.IsTerminal() && status.Status != models.StatusMined {
+	err := st.IterateTrackerRows(ctx, scan, func(row TrackerRow) error {
+		stats.Scanned++
+
+		// Re-apply the predicate the store was asked to push down. Backends
+		// may legitimately over-emit (an index that cannot express the height
+		// cutoff), so this is what keeps the kept set exact regardless of how
+		// much of the filter a given backend managed server-side.
+		if !scan.Keep(row.Status, row.BlockHeight) {
+			stats.Skipped++
 			return nil
 		}
 
-		// Skip transactions that are deeply confirmed — these would only be
-		// pruned moments later, so never let them touch the tracker map.
-		if status.Status == models.StatusMined && status.BlockHeight > 0 {
-			if currentHeight >= status.BlockHeight+ConfirmationsRequired {
-				return nil
-			}
-		}
-
-		hash, err := chainhash.NewHashFromHex(status.TxID)
+		hash, err := chainhash.NewHashFromHex(row.TxID)
 		if err != nil {
 			return nil //nolint:nilerr // malformed txid: skip the row, keep loading.
 		}
 		batch = append(batch, kept{
 			hash: *hash,
 			tx: TrackedTx{
-				Status:      status.Status,
-				MinedHeight: status.BlockHeight,
+				Status:      row.Status,
+				MinedHeight: row.BlockHeight,
 			},
 		})
 		if len(batch) >= batchSize {
@@ -127,10 +136,10 @@ func (t *TxTracker) loadFromStore(ctx context.Context, store statusIterator, cur
 		// Surface the error but keep whatever we already merged so the
 		// tracker isn't left empty on a transient store hiccup mid-scan.
 		flush()
-		return count, err
+		return stats, err
 	}
 	flush()
-	return count, nil
+	return stats, nil
 }
 
 // Add adds a txid to the tracker with initial status (hex string)
