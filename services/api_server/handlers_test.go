@@ -36,7 +36,12 @@ import (
 // decoding of models.HexBytes). A mutex protects the stumps map because the
 // end-to-end STUMP test fires deliveries concurrently to mirror
 // merkle-service's 64-worker delivery pool.
+// Embeds store.Store so a method added to the interface does not break this
+// fake at compile time; anything not explicitly implemented below panics if a
+// test actually calls it. Matches propagation/sse/watchdog's fakes.
 type mockStore struct {
+	store.Store
+
 	mu                  sync.Mutex
 	updateStatusCalls   []*models.TransactionStatus
 	stumps              map[string]*models.Stump

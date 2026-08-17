@@ -555,6 +555,83 @@ func (s *Store) IterateStatusesSince(ctx context.Context, _ time.Time, fn func(*
 	}
 }
 
+// IterateTrackerRows runs one secondary-index query per tracked status
+// (arcade_idx_tx_status, the same index CensusStatusesSince and GetReadyRetries
+// use) projecting only the three bins hydration reads.
+//
+// This is the largest of the three backend wins: IterateStatusesSince above is
+// a full-namespace scan that ignores `since` entirely and transfers whole
+// records, so hydration used to pull every row in the set — raw_tx included —
+// across the wire on every api-server boot (issue #276).
+//
+// The MINED height cutoff is applied client-side via scan.Keep: Aerospike's
+// equality filter cannot express it, and the store contract explicitly permits
+// a backend to over-emit rather than requiring an exact server-side match.
+func (s *Store) IterateTrackerRows(ctx context.Context, scan store.TrackerScan, fn func(store.TrackerRow) error) error {
+	for _, status := range scan.Statuses() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		stmt := aero.NewStatement(s.namespace, setTransactions, "txid", "status", "block_height")
+		_ = stmt.SetFilter(aero.NewEqualFilter("status", string(status)))
+
+		rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
+		if err != nil {
+			if rs != nil {
+				_ = rs.Close()
+			}
+			return fmt.Errorf("tracker rows query status %s: %w", status, err)
+		}
+
+		var loopErr error
+	loop:
+		for {
+			select {
+			case <-ctx.Done():
+				loopErr = ctx.Err()
+				break loop
+			case rec, ok := <-rs.Results():
+				if !ok {
+					break loop
+				}
+				if rec.Err != nil {
+					loopErr = rec.Err
+					break loop
+				}
+				txid := getString(rec.Record, "txid")
+				if txid == "" {
+					continue
+				}
+				// Trust the record's own status bin rather than the filter we
+				// asked for, so a stale index entry cannot hand the tracker a
+				// status the row no longer holds.
+				rowStatus := models.Status(getString(rec.Record, "status"))
+				height := getInt(rec.Record, "block_height")
+				if height < 0 {
+					height = 0
+				}
+				blockHeight := uint64(height)
+				if !scan.Keep(rowStatus, blockHeight) {
+					continue
+				}
+				if err := fn(store.TrackerRow{
+					TxID:        txid,
+					Status:      rowStatus,
+					BlockHeight: blockHeight,
+				}); err != nil {
+					loopErr = err
+					break loop
+				}
+			}
+		}
+		_ = rs.Close()
+		if loopErr != nil {
+			return loopErr
+		}
+	}
+	return nil
+}
+
 // CensusStatusesSince pushes the census as far into Aerospike as the client
 // allows: one secondary-index query per requested status (arcade_idx_tx_status,
 // same index GetReadyRetries uses) projecting ONLY the timestamp bin, with the

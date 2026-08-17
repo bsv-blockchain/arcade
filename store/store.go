@@ -203,11 +203,44 @@ type Store interface {
 
 	// IterateStatusesSince streams every transaction updated since the given
 	// timestamp through fn, one row at a time. Implementations must avoid
-	// materializing the full result set in memory — this is the bounded-memory
-	// path used by TxTracker.LoadFromStore at startup, where months of history
-	// would otherwise pin a large slice during pruning. fn returning a non-nil
+	// materializing the full result set in memory. fn returning a non-nil
 	// error stops iteration and surfaces that error to the caller.
+	//
+	// This returns FULL rows (raw_tx, merkle_path, competing_txs, …) and, on
+	// Postgres, sorts them. It exists for consumers that genuinely need the
+	// whole row — propagation's replay and reaper. Do NOT reach for it from a
+	// new bulk or startup scan: reusing it for TxTracker hydration shipped 14
+	// columns for ~5M rows on every api-server boot and drove both arcade and
+	// its Postgres out of memory (issue #276). New bulk consumers get a
+	// projected, server-side-filtered method instead — see IterateTrackerRows,
+	// IterateStatusesByToken and CensusStatusesSince.
 	IterateStatusesSince(ctx context.Context, since time.Time, fn func(*models.TransactionStatus) error) error
+
+	// IterateTrackerRows streams the minimal (txid, status, block_height)
+	// projection TxTracker.LoadFromStore needs, filtering server-side so a
+	// multi-million-row history is never shipped to the client (issue #276).
+	//
+	// Contract:
+	//   - MUST emit every row whose status is in TrackerStatuses(), exactly
+	//     once, with Status and BlockHeight equal to the stored values.
+	//   - MUST NOT emit rows in any other status. Pushing the status filter
+	//     server-side is the memory contract, not an optimization: REJECTED
+	//     alone is ~44% of a mature store.
+	//   - MAY additionally drop MINED rows with
+	//     0 < block_height < scan.PruneMinedBelow. Implementations are not
+	//     required to; a backend whose index cannot express the height
+	//     predicate is correct, just less selective.
+	//   - MUST NOT read raw_tx, merkle_path, competing_txs or orphaned_anchors,
+	//     MUST NOT enrich merkle paths, and MUST NOT impose an ordering. The
+	//     ORDER BY over the full table is what pinned gigabytes.
+	//   - fn returning a non-nil error stops iteration and surfaces it.
+	//
+	// TrackerScan.Keep is the specification; the SQL/index filter is only a
+	// pushdown of it. The caller re-applies Keep to every emitted row, so a
+	// backend that over-emits is a performance issue only — a backend that
+	// under-emits is a correctness bug. store/storetest asserts exact
+	// agreement across all three backends.
+	IterateTrackerRows(ctx context.Context, scan TrackerScan, fn func(TrackerRow) error) error
 
 	// CensusStatusesSince aggregates the stuck-transient census store-side:
 	// for each requested status, the number of transaction rows with
