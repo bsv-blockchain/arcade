@@ -424,7 +424,9 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 		p.logger.Info("reaper: adopting legacy parked txs into the durable retry queue",
 			zap.Int("count", len(adopt)))
 		for _, m := range adopt {
-			p.schedulePendingRetry(ctx, m.TXID, m.RawTx)
+			// A legacy row carries no remembered reason; the next pass
+			// records whatever the network says then.
+			p.schedulePendingRetry(ctx, m.TXID, m.RawTx, m.retryReason)
 		}
 	}
 
@@ -566,7 +568,7 @@ func (p *Propagator) rebroadcastStuck(ctx context.Context, msgs []propagationMsg
 
 	if parked {
 		for _, m := range unresolved {
-			p.schedulePendingRetry(ctx, m.TXID, m.RawTx)
+			p.schedulePendingRetry(ctx, m.TXID, m.RawTx, m.retryReason)
 		}
 	}
 }

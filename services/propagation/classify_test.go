@@ -3,6 +3,8 @@ package propagation
 import (
 	"strings"
 	"testing"
+
+	"github.com/bsv-blockchain/arcade/teranode"
 )
 
 // TestClassifyFailureLine pins the conservative Teranode-line → ARC-code map
@@ -74,7 +76,7 @@ func TestClassifyFailureLine(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			msg, code := classifyFailureLine(tc.line)
+			msg, code := classifyFailureLine(tc.line, 0)
 			if code != tc.wantCode {
 				t.Errorf("code = %d, want %d", code, tc.wantCode)
 			}
@@ -140,18 +142,18 @@ func TestFailureLinesForLog(t *testing.T) {
 	if got := failureLinesForLog(nil); got != nil {
 		t.Errorf("failureLinesForLog(nil) = %v, want nil", got)
 	}
-	if got := failureLinesForLog(map[string]string{}); got != nil {
+	if got := failureLinesForLog(&teranode.TxsFailures{}); got != nil {
 		t.Errorf("failureLinesForLog(empty) = %v, want nil", got)
 	}
 
-	failures := make(map[string]string, 10)
+	failures := &teranode.TxsFailures{ByKey: make(map[string]string, 10)}
 	for i := 0; i < 9; i++ {
 		key := strings.Repeat(string(rune('a'+i)), 64)
-		failures[key] = "PROCESSING (4): [ProcessTransaction][" + key + "] failed to validate transaction"
+		failures.ByKey[key] = "PROCESSING (4): [ProcessTransaction][" + key + "] failed to validate transaction"
 	}
 	spentKey := strings.Repeat("f", 64)
 	spentLine := "UTXO_SPENT (70): [ProcessTransaction][" + spentKey + "] utxo already spent"
-	failures[spentKey] = spentLine
+	failures.ByKey[spentKey] = spentLine
 
 	got := failureLinesForLog(failures)
 	if len(got) != 8 {
