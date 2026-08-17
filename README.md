@@ -304,10 +304,10 @@ DOUBLE_SPEND_ATTEMPTED (from rejected-tx gossip with specific reason)
 | `teranode.datahub_urls`     | DataHub URLs for fetching block data (array) | -                     |
 | `teranode.auth_token`       | Authentication token for Teranode API        | -                     |
 | `teranode.timeout`          | HTTP request timeout                         | `30s`                 |
-| `validator.max_tx_size`     | Maximum transaction size (bytes)             | `4294967296`          |
-| `validator.max_script_size` | Maximum script size (bytes)                  | `500000`              |
-| `validator.max_sig_ops`     | Maximum signature operations                 | `4294967295`          |
-| `validator.min_fee_per_kb`  | Minimum fee per KB (satoshis)                | `100`                 |
+| `validator.max_tx_size_policy` | Maximum transaction size (bytes); `0` tracks the network | `0` (→ `10485760`) |
+| `validator.max_script_size_policy` | Maximum script size (bytes); `0` tracks the network | `0` (→ `500000`) |
+| `validator.max_tx_sigops_counts_policy` | Maximum signature operations (`0` = unlimited) | `0`         |
+| `validator.min_fee_per_kb`  | Minimum fee per KB (satoshis); `0` tracks the network | `0` (→ `100`)      |
 | `webhook.max_retries`       | Max webhook retry attempts                   | `10`                  |
 | `auth.enabled`              | Enable Bearer token authentication           | `false`               |
 | `auth.token`                | Bearer token (required if auth enabled)      | -                     |

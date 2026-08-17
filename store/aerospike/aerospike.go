@@ -2992,12 +2992,14 @@ func (s *Store) UpsertPeerPolicy(ctx context.Context, pp store.PeerPolicy) error
 	bins := aero.BinMap{
 		"peer_id": pp.PeerID,
 		"network": pp.Network,
-		// Both narrowings are bounded by PeerPolicy.Validate above; without it a
-		// peer-supplied value over MaxInt64 would wrap negative into the bin and
-		// read back as an astronomical fee.
-		"fee_sats":  int64(pp.MiningFeeSatoshis), //nolint:gosec // bounded by PeerPolicy.Validate
-		"fee_bytes": int64(pp.MiningFeeBytes),    //nolint:gosec // bounded by PeerPolicy.Validate
-		"last_seen": pp.LastSeen.UnixMilli(),
+		// Every narrowing here is bounded by PeerPolicy.Validate above; without
+		// it a peer-supplied value over MaxInt64 would wrap negative into the
+		// bin and read back as an astronomical fee or size limit.
+		"fee_sats":   int64(pp.MiningFeeSatoshis),   //nolint:gosec // bounded by PeerPolicy.Validate
+		"fee_bytes":  int64(pp.MiningFeeBytes),      //nolint:gosec // bounded by PeerPolicy.Validate
+		"max_tx_sz":  int64(pp.MaxTxSizePolicy),     //nolint:gosec // bounded by PeerPolicy.Validate
+		"max_scr_sz": int64(pp.MaxScriptSizePolicy), //nolint:gosec // bounded by PeerPolicy.Validate
+		"last_seen":  pp.LastSeen.UnixMilli(),
 	}
 	return s.client.Put(s.writePolicy(ctx), key, bins)
 }
@@ -3036,11 +3038,17 @@ loop:
 				loopErr = rec.Err
 				break loop
 			}
+			// max_tx_sz / max_scr_sz are absent on records written before the
+			// size limits were observed; getInt64 returns 0 for a missing bin,
+			// which is the "peer did not advertise" sentinel, so old records
+			// need no migration.
 			pp := store.PeerPolicy{
-				PeerID:            getString(rec.Record, "peer_id"),
-				Network:           getString(rec.Record, "network"),
-				MiningFeeSatoshis: uint64(getInt64(rec.Record, "fee_sats")),  //nolint:gosec // stored non-negative
-				MiningFeeBytes:    uint64(getInt64(rec.Record, "fee_bytes")), //nolint:gosec // stored non-negative
+				PeerID:              getString(rec.Record, "peer_id"),
+				Network:             getString(rec.Record, "network"),
+				MiningFeeSatoshis:   uint64(getInt64(rec.Record, "fee_sats")),   //nolint:gosec // stored non-negative
+				MiningFeeBytes:      uint64(getInt64(rec.Record, "fee_bytes")),  //nolint:gosec // stored non-negative
+				MaxTxSizePolicy:     uint64(getInt64(rec.Record, "max_tx_sz")),  //nolint:gosec // stored non-negative
+				MaxScriptSizePolicy: uint64(getInt64(rec.Record, "max_scr_sz")), //nolint:gosec // stored non-negative
 			}
 			if ms := getInt64(rec.Record, "last_seen"); ms > 0 {
 				pp.LastSeen = time.UnixMilli(ms)

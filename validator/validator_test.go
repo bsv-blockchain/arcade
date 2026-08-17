@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"testing"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
@@ -78,6 +79,120 @@ func TestSetMinFeePerKB_UpdatesFloor(t *testing.T) {
 	v.SetMinFeePerKB(0)
 	if v.MinFeePerKB() != 0 {
 		t.Errorf("after SetMinFeePerKB(0), floor = %d, want 0", v.MinFeePerKB())
+	}
+}
+
+// TestSetNetworkPolicy_UpdatesFeeAndSizes covers the runtime swap the
+// api-server's policy refresher uses to track the network (issue #212): fee and
+// size limits move together in a single rebuild, and the sigop cap — which is
+// never network-tracked — rides through untouched.
+func TestSetNetworkPolicy_UpdatesFeeAndSizes(t *testing.T) {
+	v := NewValidator(&Policy{MaxTxSigopsCountsPolicy: 42})
+
+	v.SetNetworkPolicy(37, 100_000_000, 600_000)
+
+	if got := v.MinFeePerKB(); got != 37 {
+		t.Errorf("MinFeePerKB() = %d, want 37", got)
+	}
+	if got := v.MaxTxSizePolicy(); got != 100_000_000 {
+		t.Errorf("MaxTxSizePolicy() = %d, want 100000000", got)
+	}
+	if got := v.MaxScriptSizePolicy(); got != 600_000 {
+		t.Errorf("MaxScriptSizePolicy() = %d, want 600000", got)
+	}
+	if got := v.MaxTxSigopsCountsPolicy(); got != 42 {
+		t.Errorf("sigop cap must survive a network policy update, got %d, want 42", got)
+	}
+}
+
+// TestSetNetworkPolicy_ClampsHostileValues is the safety property that makes it
+// possible to feed unauthenticated peer gossip into the engine at all. The BDK
+// path panics rather than erroring on an out-of-range setting, so a size that
+// would break construction has to be clamped before it gets there — and the
+// validator has to keep validating afterwards.
+func TestSetNetworkPolicy_ClampsHostileValues(t *testing.T) {
+	cases := []struct {
+		name                   string
+		maxTxSize, maxScript   uint64
+		wantTxSize, wantScript int
+	}{
+		{
+			name:      "tx size above the BDK consensus limit is capped",
+			maxTxSize: maxTxSizePolicyConsensusLimit + 1, maxScript: defaultMaxScriptSizePolicy,
+			wantTxSize: maxTxSizePolicyConsensusLimit, wantScript: defaultMaxScriptSizePolicy,
+		},
+		{
+			name:      "MaxUint64 saturates rather than wrapping",
+			maxTxSize: math.MaxUint64, maxScript: math.MaxUint64,
+			// The script cap follows the tx cap: a script cannot exceed the
+			// transaction carrying it.
+			wantTxSize: maxTxSizePolicyConsensusLimit, wantScript: maxTxSizePolicyConsensusLimit,
+		},
+		{
+			name:      "zero means the canonical default, not 'accepts nothing'",
+			maxTxSize: 0, maxScript: 0,
+			wantTxSize: defaultMaxTxSizePolicy, wantScript: defaultMaxScriptSizePolicy,
+		},
+		{
+			name:      "script size is capped at the tx size",
+			maxTxSize: 1_000_000, maxScript: 9_000_000,
+			wantTxSize: 1_000_000, wantScript: 1_000_000,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v := NewValidator(nil)
+			v.SetNetworkPolicy(DefaultMinFeePerKB, tc.maxTxSize, tc.maxScript)
+
+			if got := v.MaxTxSizePolicy(); got != tc.wantTxSize {
+				t.Errorf("MaxTxSizePolicy() = %d, want %d", got, tc.wantTxSize)
+			}
+			if got := v.MaxScriptSizePolicy(); got != tc.wantScript {
+				t.Errorf("MaxScriptSizePolicy() = %d, want %d", got, tc.wantScript)
+			}
+			// The engines must still be usable: a clamp that produced a broken
+			// validator would be no better than the panic it prevents.
+			if eff := v.eff.Load(); eff.tv == nil || eff.tvNoFee == nil {
+				t.Fatal("policy swap left a nil engine")
+			}
+		})
+	}
+}
+
+// TestSetMinFeePerKB_PreservesDiscoveredSizes guards the wrapper: a fee-only
+// update must not silently reset size limits the refresher discovered back to
+// their defaults.
+func TestSetMinFeePerKB_PreservesDiscoveredSizes(t *testing.T) {
+	v := NewValidator(nil)
+	v.SetNetworkPolicy(DefaultMinFeePerKB, 100_000_000, 600_000)
+
+	v.SetMinFeePerKB(7)
+
+	if got := v.MinFeePerKB(); got != 7 {
+		t.Errorf("MinFeePerKB() = %d, want 7", got)
+	}
+	if got := v.MaxTxSizePolicy(); got != 100_000_000 {
+		t.Errorf("MaxTxSizePolicy() = %d, want the discovered 100000000", got)
+	}
+	if got := v.MaxScriptSizePolicy(); got != 600_000 {
+		t.Errorf("MaxScriptSizePolicy() = %d, want the discovered 600000", got)
+	}
+}
+
+// TestSetNetworkPolicy_NoOpKeepsEngines pins the ticker guard: the refresher
+// calls this every 30s, and rebuilding the cgo engines on every unchanged tick
+// would churn C memory for nothing.
+func TestSetNetworkPolicy_NoOpKeepsEngines(t *testing.T) {
+	v := NewValidator(nil)
+	before := v.eff.Load()
+
+	maxTx := uint64(before.maxTxSizePolicy)         //nolint:gosec // resolved sizes are positive and far below MaxInt64
+	maxScript := uint64(before.maxScriptSizePolicy) //nolint:gosec // resolved sizes are positive and far below MaxInt64
+	v.SetNetworkPolicy(before.minFeePerKB, maxTx, maxScript)
+
+	if after := v.eff.Load(); after != before {
+		t.Error("an unchanged policy must not rebuild the BDK engines")
 	}
 }
 
@@ -336,8 +451,9 @@ func TestValidate_PostGenesisLargePushes(t *testing.T) {
 			if err != nil {
 				t.Fatalf("toExtendedBT: %v", err)
 			}
-			preGenesisErr := v.tvNoFee.ValidateTransaction(btx, allForksActiveHeight, []uint32{1}, tnvalidator.NewDefaultOptions())
-			postGenesisErr := v.tvNoFee.ValidateTransaction(btx, allForksActiveHeight, []uint32{postGenesisHeight}, tnvalidator.NewDefaultOptions())
+			tvNoFee := v.eff.Load().tvNoFee
+			preGenesisErr := tvNoFee.ValidateTransaction(btx, allForksActiveHeight, []uint32{1}, tnvalidator.NewDefaultOptions())
+			postGenesisErr := tvNoFee.ValidateTransaction(btx, allForksActiveHeight, []uint32{postGenesisHeight}, tnvalidator.NewDefaultOptions())
 
 			if overLimit && preGenesisErr == nil {
 				t.Errorf("BDK must reject a %d-byte push at pre-Genesis source height 1 (pre-Genesis 520-byte limit)", size)

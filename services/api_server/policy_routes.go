@@ -42,10 +42,11 @@ func firstNonZero(v, fallback uint64) uint64 {
 // handlePolicy serves the ARC-compatible GET /policy document (issue #212).
 // It reports arcade's effective transaction policy: the size/sigop limits and
 // mining fee floor the validator actually enforces, plus the standard-format
-// flag from config. The mining fee is read straight off the validator
-// (MinFeePerKB), which the fee refresher keeps in step with the lowest fee the
-// network will accept — so /policy always advertises exactly what intake
-// enforces. Read-only; always returns 200.
+// flag from config. The fee and size limits are read straight off the
+// validator, which the policy refresher keeps in step with what the network
+// will accept — the lowest fee and the most permissive size limits any peer
+// advertises — so /policy always advertises exactly what intake enforces.
+// Read-only; always returns 200.
 func (s *Server) handlePolicy(c *gin.Context) {
 	pol := models.Policy{
 		StandardFormatSupported: s.cfg.Validator.StandardFormatSupported,

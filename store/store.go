@@ -72,11 +72,11 @@ type StatusCensus struct {
 	Oldest time.Time
 }
 
-// PeerPolicy is a peer's mining fee observed from its node_status gossip
-// announcement, persisted to the shared store so the ARC-compatible
-// GET /policy endpoint (served by api-server pods) can compute the
-// network-wide minimum fee even though only the single p2p-client pod
-// observes node_status (issue #212).
+// PeerPolicy is the transaction policy a peer advertised in its node_status
+// gossip announcement, persisted to the shared store so the ARC-compatible
+// GET /policy endpoint (served by api-server pods) can compute network-wide
+// values even though only the single p2p-client pod observes node_status
+// (issue #212).
 //
 // Keyed by PeerID (a libp2p peer runs on a single network, so PeerID is
 // unique); Network is a filter attribute, not part of the key — matching the
@@ -89,23 +89,39 @@ type PeerPolicy struct {
 	Network           string
 	MiningFeeSatoshis uint64
 	MiningFeeBytes    uint64
-	LastSeen          time.Time
+
+	// MaxTxSizePolicy and MaxScriptSizePolicy are the peer's advertised size
+	// limits in bytes, from node_status FeePolicy. Zero means "not advertised"
+	// — either an older teranode with no fee_policy at all, or a value too
+	// large to store — and readers skip such rows rather than treating the
+	// zero as a real limit.
+	MaxTxSizePolicy     uint64
+	MaxScriptSizePolicy uint64
+
+	LastSeen time.Time
 }
 
-// maxStorableFee bounds a peer policy's fee fields. The Postgres and Aerospike
-// backends store them in signed 64-bit columns, so a value above MaxInt64 wraps
-// negative on write and reads back as an astronomical uint64 — a silently
-// corrupted floor that GET /policy would then advertise as the network minimum.
+// maxStorablePolicyValue bounds a peer policy's numeric fields. The Postgres
+// and Aerospike backends store them in signed 64-bit columns, so a value above
+// MaxInt64 wraps negative on write and reads back as an astronomical uint64 — a
+// silently corrupted value that GET /policy would then advertise as the network
+// consensus.
 //
 // The bound can only ever reject garbage: the entire money supply, 21 million
-// BSV, is 2.1e15 satoshis — some four thousand times below MaxInt64 — so no
-// honest advertisement comes near it. It has to be checked rather than assumed
-// because node_status is unauthenticated gossip: the peer chooses the number.
-const maxStorableFee = uint64(math.MaxInt64)
+// BSV, is 2.1e15 satoshis — some four thousand times below MaxInt64 — and no
+// transaction or script size comes remotely close. It has to be checked rather
+// than assumed because node_status is unauthenticated gossip: the peer chooses
+// the number.
+const maxStorablePolicyValue = uint64(math.MaxInt64)
 
 // Validate reports whether pp can be persisted without loss. Every backend
 // calls it before writing, so the uint64→int64 narrowing each one performs is
 // bounded by a check instead of by assumption.
+//
+// The size limits are allowed to be zero ("peer did not advertise"), but they
+// are still validated for storable range: values above maxStorablePolicyValue
+// are rejected by Validate. recordPeerPolicy calls SanitizePolicySizes to zero
+// out-of-range sizes so the fee observation can still be persisted.
 func (pp PeerPolicy) Validate() error {
 	switch {
 	case pp.PeerID == "":
@@ -115,15 +131,38 @@ func (pp PeerPolicy) Validate() error {
 		// normalize to sat/kB, and lowestObservedFeePerKB has to skip such rows.
 		// Refusing the write keeps them out of the store in the first place.
 		return fmt.Errorf("%w: peer %s has a zero mining fee byte basis", ErrInvalidPeerPolicy, pp.PeerID)
-	case pp.MiningFeeSatoshis > maxStorableFee:
+	case pp.MiningFeeSatoshis > maxStorablePolicyValue:
 		return fmt.Errorf("%w: peer %s advertised %d satoshis, above the storable maximum %d",
-			ErrInvalidPeerPolicy, pp.PeerID, pp.MiningFeeSatoshis, maxStorableFee)
-	case pp.MiningFeeBytes > maxStorableFee:
+			ErrInvalidPeerPolicy, pp.PeerID, pp.MiningFeeSatoshis, maxStorablePolicyValue)
+	case pp.MiningFeeBytes > maxStorablePolicyValue:
 		return fmt.Errorf("%w: peer %s advertised a %d byte basis, above the storable maximum %d",
-			ErrInvalidPeerPolicy, pp.PeerID, pp.MiningFeeBytes, maxStorableFee)
+			ErrInvalidPeerPolicy, pp.PeerID, pp.MiningFeeBytes, maxStorablePolicyValue)
+	case pp.MaxTxSizePolicy > maxStorablePolicyValue:
+		return fmt.Errorf("%w: peer %s advertised a %d byte max tx size, above the storable maximum %d",
+			ErrInvalidPeerPolicy, pp.PeerID, pp.MaxTxSizePolicy, maxStorablePolicyValue)
+	case pp.MaxScriptSizePolicy > maxStorablePolicyValue:
+		return fmt.Errorf("%w: peer %s advertised a %d byte max script size, above the storable maximum %d",
+			ErrInvalidPeerPolicy, pp.PeerID, pp.MaxScriptSizePolicy, maxStorablePolicyValue)
 	default:
 		return nil
 	}
+}
+
+// SanitizePolicySizes returns a copy of pp with any advertised size limit that
+// cannot be stored without loss zeroed, plus the number of fields it dropped.
+// Callers use it to keep an implausible size from failing the whole write: the
+// peer's fee observation is independently useful and must survive.
+func (pp PeerPolicy) SanitizePolicySizes() (PeerPolicy, int) {
+	dropped := 0
+	if pp.MaxTxSizePolicy > maxStorablePolicyValue {
+		pp.MaxTxSizePolicy = 0
+		dropped++
+	}
+	if pp.MaxScriptSizePolicy > maxStorablePolicyValue {
+		pp.MaxScriptSizePolicy = 0
+		dropped++
+	}
+	return pp, dropped
 }
 
 // BatchInsertResult is one entry in the result slice returned by

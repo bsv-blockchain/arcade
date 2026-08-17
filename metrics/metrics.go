@@ -1009,6 +1009,25 @@ var P2PPeerMinMiningFee = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "Minimum mining fee (satoshis per 1000 bytes) advertised by a peer via p2p node_status, by base_url.",
 }, []string{"base_url"})
 
+// P2PPeerMaxTxSizePolicy and P2PPeerMaxScriptSizePolicy report the size limits
+// each peer advertises in its node_status FeePolicy. GET /policy advertises the
+// network-wide maximum of these — the most permissive peer, mirroring the
+// cheapest-peer rule used for the fee — and intake enforces it, so these gauges
+// are how an operator sees which peer is setting the ceiling and spots one
+// advertising an outlier. Labelled by base_url for the same
+// bounded-cardinality reason as P2PPeerMinMiningFee. Only set for peers that
+// actually advertise a limit: a legacy peer's absent limit would otherwise show
+// as 0, reading as "accepts nothing".
+var P2PPeerMaxTxSizePolicy = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "arcade_p2p_peer_max_tx_size_policy",
+	Help: "Maximum transaction size (bytes) advertised by a peer via p2p node_status, by base_url.",
+}, []string{"base_url"})
+
+var P2PPeerMaxScriptSizePolicy = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "arcade_p2p_peer_max_script_size_policy",
+	Help: "Maximum script size (bytes) advertised by a peer via p2p node_status, by base_url.",
+}, []string{"base_url"})
+
 // ChainTipHeight reports arcade's own view of the active chain tip — the
 // highest block_processing row marked active. Refreshed by the api-server's
 // /health handler (which also returns it as blockHeight); alert on this

@@ -70,6 +70,37 @@ func TestPeerPolicyValidate(t *testing.T) {
 			name: "exactly at the ceiling is storable",
 			pp:   PeerPolicy{PeerID: testPeerID, MiningFeeSatoshis: math.MaxInt64, MiningFeeBytes: math.MaxInt64},
 		},
+		{
+			// Zero is the "peer did not advertise" sentinel for the size
+			// limits, so — unlike the fee's byte basis — it must validate.
+			name: "unadvertised size limits are storable",
+			pp:   PeerPolicy{PeerID: testPeerID, MiningFeeSatoshis: okSats, MiningFeeBytes: 1000},
+		},
+		{
+			name: "max tx size above the signed-64-bit ceiling",
+			pp: PeerPolicy{
+				PeerID: testPeerID, MiningFeeSatoshis: okSats, MiningFeeBytes: 1000,
+				MaxTxSizePolicy: math.MaxInt64 + 1,
+			},
+			wantErr: true,
+			mustSay: testPeerID,
+		},
+		{
+			name: "max script size above the signed-64-bit ceiling",
+			pp: PeerPolicy{
+				PeerID: testPeerID, MiningFeeSatoshis: okSats, MiningFeeBytes: 1000,
+				MaxScriptSizePolicy: math.MaxInt64 + 1,
+			},
+			wantErr: true,
+			mustSay: testPeerID,
+		},
+		{
+			name: "realistic size limits are storable",
+			pp: PeerPolicy{
+				PeerID: testPeerID, MiningFeeSatoshis: okSats, MiningFeeBytes: 1000,
+				MaxTxSizePolicy: 100_000_000, MaxScriptSizePolicy: 500_000,
+			},
+		},
 	}
 
 	for _, tc := range cases {
@@ -104,8 +135,70 @@ func TestPeerPolicyValidate_CeilingCannotRejectAnHonestFee(t *testing.T) {
 	if err := pp.Validate(); err != nil {
 		t.Fatalf("a fee of the entire money supply must still be storable, got %v", err)
 	}
-	if wholeMoneySupplySatoshis >= maxStorableFee {
+	if wholeMoneySupplySatoshis >= maxStorablePolicyValue {
 		t.Fatalf("the storable ceiling (%d) is not above the money supply (%d); the bound would be "+
-			"rejecting values the chain can actually express", maxStorableFee, wholeMoneySupplySatoshis)
+			"rejecting values the chain can actually express", maxStorablePolicyValue, wholeMoneySupplySatoshis)
+	}
+}
+
+// TestSanitizePolicySizes pins the asymmetry between the fee and the size
+// limits. An unstorable fee fails the whole write, because a fee is the reason
+// the row exists. An unstorable size must not: the peer's fee observation is
+// independently useful, so a peer advertising a garbage tx size has to keep
+// counting toward the network minimum rather than silently removing itself
+// from it.
+func TestSanitizePolicySizes(t *testing.T) {
+	cases := []struct {
+		name           string
+		pp             PeerPolicy
+		wantTx         uint64
+		wantScript     uint64
+		wantDropped    int
+		wantStillValid bool
+	}{
+		{
+			name:           "in-range limits are untouched",
+			pp:             PeerPolicy{PeerID: testPeerID, MiningFeeSatoshis: 100, MiningFeeBytes: 1000, MaxTxSizePolicy: 100_000_000, MaxScriptSizePolicy: 500_000},
+			wantTx:         100_000_000,
+			wantScript:     500_000,
+			wantStillValid: true,
+		},
+		{
+			name:           "unstorable tx size is zeroed, fee survives",
+			pp:             PeerPolicy{PeerID: testPeerID, MiningFeeSatoshis: 100, MiningFeeBytes: 1000, MaxTxSizePolicy: math.MaxUint64, MaxScriptSizePolicy: 500_000},
+			wantTx:         0,
+			wantScript:     500_000,
+			wantDropped:    1,
+			wantStillValid: true,
+		},
+		{
+			name:           "both unstorable",
+			pp:             PeerPolicy{PeerID: testPeerID, MiningFeeSatoshis: 100, MiningFeeBytes: 1000, MaxTxSizePolicy: math.MaxUint64, MaxScriptSizePolicy: math.MaxInt64 + 1},
+			wantTx:         0,
+			wantScript:     0,
+			wantDropped:    2,
+			wantStillValid: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pp, dropped := tc.pp.SanitizePolicySizes()
+			if dropped != tc.wantDropped {
+				t.Errorf("dropped = %d, want %d", dropped, tc.wantDropped)
+			}
+			if pp.MaxTxSizePolicy != tc.wantTx {
+				t.Errorf("MaxTxSizePolicy = %d, want %d", pp.MaxTxSizePolicy, tc.wantTx)
+			}
+			if pp.MaxScriptSizePolicy != tc.wantScript {
+				t.Errorf("MaxScriptSizePolicy = %d, want %d", pp.MaxScriptSizePolicy, tc.wantScript)
+			}
+			if tc.wantStillValid {
+				if err := pp.Validate(); err != nil {
+					t.Errorf("after sanitizing, the row must be storable so the fee observation "+
+						"is not lost; got %v", err)
+				}
+			}
+		})
 	}
 }

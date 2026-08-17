@@ -98,38 +98,44 @@ type Policy struct {
 	MinFeePerKB *uint64
 }
 
-// Validator performs intake transaction validation by delegating to teranode's
-// BDK-backed TxValidator. It holds two validators: one that enforces the fee
-// floor and one that does not, so ValidateTransaction can honour skipFees
-// without disabling the script/standardness checks (which SkipPolicyChecks
-// would also turn off).
+// effectivePolicy is an immutable snapshot of what arcade currently enforces:
+// the two BDK engines plus the resolved values they were built from. It is
+// swapped atomically as a unit so a reader can never observe an engine and a
+// reported limit that disagree — GET /policy advertises exactly what intake
+// enforces, even mid-swap.
 //
-// The fee-enforcing validator (tv) is swappable at runtime via SetMinFeePerKB:
-// arcade dynamically tracks the lowest fee the network will accept (observed
-// from peer node_status announcements) and rebuilds tv to enforce it (issue
-// #212). tv is an atomic.Pointer so ValidateTransaction reads it lock-free
-// while the fee refresher swaps it. tvNoFee never enforces a fee, so it is
-// fixed.
-type Validator struct {
-	tv          atomic.Pointer[tnvalidator.TxValidator]
-	tvNoFee     *tnvalidator.TxValidator
-	minFeePerKB atomic.Uint64
+// tv enforces minFeePerKB; tvNoFee never enforces a fee, so ValidateTransaction
+// can honour skipFees without disabling the script/standardness checks (which
+// SkipPolicyChecks would also turn off). Both carry the same size/sigop policy.
+type effectivePolicy struct {
+	tv      *tnvalidator.TxValidator
+	tvNoFee *tnvalidator.TxValidator
 
-	// feeMu serializes SetMinFeePerKB so a concurrent burst rebuilds the BDK
-	// engine at most once per distinct value.
-	feeMu sync.Mutex
-
-	// Immutable inputs retained so SetMinFeePerKB can rebuild the fee-enforcing
-	// validator with a new fee floor but the same size/sigop policy.
-	logger ulogger.Logger
-	params *chaincfg.Params
-
-	// Resolved policy values (after applying defaults) surfaced by the
-	// accessors for the ARC-compatible GET /policy endpoint. These reflect
-	// exactly what the BDK validator was built to enforce.
+	minFeePerKB             uint64
 	maxTxSizePolicy         int
 	maxScriptSizePolicy     int
 	maxTxSigopsCountsPolicy int64
+}
+
+// Validator performs intake transaction validation by delegating to teranode's
+// BDK-backed TxValidator.
+//
+// The enforced policy is swappable at runtime via SetNetworkPolicy: arcade
+// tracks the lowest fee and the most permissive size limits the network will
+// accept (observed from peer node_status announcements) and rebuilds the
+// engines to match (issue #212). The snapshot sits behind an atomic.Pointer so
+// ValidateTransaction and the accessors read it lock-free while the policy
+// refresher swaps it.
+type Validator struct {
+	eff atomic.Pointer[effectivePolicy]
+
+	// policyMu serializes SetNetworkPolicy so a concurrent burst rebuilds the
+	// BDK engines at most once per distinct policy.
+	policyMu sync.Mutex
+
+	// Immutable inputs retained so SetNetworkPolicy can rebuild the engines.
+	logger ulogger.Logger
+	params *chaincfg.Params
 }
 
 // NewValidator creates a validator for mainnet with the given policy. A nil
@@ -158,20 +164,8 @@ func NewValidatorForNetwork(network string, policy *Policy) (*Validator, error) 
 		minFee = *policy.MinFeePerKB
 	}
 
-	// 0 => the canonical teranode default. An explicit override is capped at
-	// the BDK consensus limit so construction never panics.
-	maxTxSize := defaultMaxTxSizePolicy
-	if policy != nil && policy.MaxTxSizePolicy > 0 {
-		maxTxSize = policy.MaxTxSizePolicy
-		if maxTxSize > maxTxSizePolicyConsensusLimit {
-			maxTxSize = maxTxSizePolicyConsensusLimit
-		}
-	}
-
-	maxScriptSize := defaultMaxScriptSizePolicy
-	if policy != nil && policy.MaxScriptSizePolicy > 0 {
-		maxScriptSize = policy.MaxScriptSizePolicy
-	}
+	maxTxSize := resolveMaxTxSize(policyMaxTxSize(policy))
+	maxScriptSize := resolveMaxScriptSize(policyMaxScriptSize(policy), maxTxSize)
 
 	var maxSigops int64 // 0 => unlimited (BSV post-Genesis)
 	if policy != nil && policy.MaxTxSigopsCountsPolicy > 0 {
@@ -180,58 +174,151 @@ func NewValidatorForNetwork(network string, policy *Policy) (*Validator, error) 
 
 	logger := ulogger.New("arcade-validator")
 
-	v := &Validator{
+	v := &Validator{logger: logger, params: params}
+	v.eff.Store(&effectivePolicy{
+		tv:                      tnvalidator.NewTxValidator(logger, buildSettings(params, maxTxSize, maxScriptSize, maxSigops, minFee)),
 		tvNoFee:                 tnvalidator.NewTxValidator(logger, buildSettings(params, maxTxSize, maxScriptSize, maxSigops, 0)),
-		logger:                  logger,
-		params:                  params,
+		minFeePerKB:             minFee,
 		maxTxSizePolicy:         maxTxSize,
 		maxScriptSizePolicy:     maxScriptSize,
 		maxTxSigopsCountsPolicy: maxSigops,
-	}
-	v.tv.Store(tnvalidator.NewTxValidator(logger, buildSettings(params, maxTxSize, maxScriptSize, maxSigops, minFee)))
-	v.minFeePerKB.Store(minFee)
+	})
 	return v, nil
 }
 
-// MinFeePerKB returns the current minimum fee floor per kB, in satoshis. It
-// reflects any runtime update applied via SetMinFeePerKB.
-func (v *Validator) MinFeePerKB() uint64 {
-	return v.minFeePerKB.Load()
+func policyMaxTxSize(p *Policy) int {
+	if p == nil {
+		return 0
+	}
+	return p.MaxTxSizePolicy
 }
 
-// SetMinFeePerKB updates the intake fee floor at runtime, rebuilding the
-// fee-enforcing BDK validator so subsequent ValidateTransaction calls enforce
-// the new floor. It is a no-op when minFee already equals the current floor, so
-// callers may invoke it on a ticker without churning the cgo engine. Safe for
-// concurrent use with ValidateTransaction. The superseded validator becomes
-// unreachable and the go-bdk finalizer frees its underlying C engine.
+func policyMaxScriptSize(p *Policy) int {
+	if p == nil {
+		return 0
+	}
+	return p.MaxScriptSizePolicy
+}
+
+// resolveMaxTxSize turns a requested max tx size into one the BDK engine will
+// accept: 0 (unset) means the canonical teranode default, and any value is
+// capped at the BDK consensus limit, above which NewTxValidator panics.
+// Every path that builds an engine goes through here, so no caller — config,
+// or a size discovered from unauthenticated peer gossip — can construct an
+// engine out of range.
+func resolveMaxTxSize(v int) int {
+	if v <= 0 {
+		return defaultMaxTxSizePolicy
+	}
+	if v > maxTxSizePolicyConsensusLimit {
+		return maxTxSizePolicyConsensusLimit
+	}
+	return v
+}
+
+// resolveMaxScriptSize turns a requested max script size into one the BDK
+// engine will accept: 0 (unset) means the canonical teranode default, and the
+// value is capped at the effective max tx size, since a script cannot exceed
+// the transaction carrying it.
+func resolveMaxScriptSize(v, maxTxSize int) int {
+	if v <= 0 {
+		v = defaultMaxScriptSizePolicy
+	}
+	if v > maxTxSize {
+		return maxTxSize
+	}
+	return v
+}
+
+// MinFeePerKB returns the current minimum fee floor per kB, in satoshis. It
+// reflects any runtime update applied via SetNetworkPolicy.
+func (v *Validator) MinFeePerKB() uint64 {
+	return v.eff.Load().minFeePerKB
+}
+
+// SetMinFeePerKB updates the intake fee floor at runtime, leaving the size and
+// sigop policy as-is. Thin wrapper over SetNetworkPolicy.
 func (v *Validator) SetMinFeePerKB(minFee uint64) {
-	v.feeMu.Lock()
-	defer v.feeMu.Unlock()
-	if v.minFeePerKB.Load() == minFee {
+	cur := v.eff.Load()
+	v.SetNetworkPolicy(minFee, uint64(cur.maxTxSizePolicy), uint64(cur.maxScriptSizePolicy)) //nolint:gosec // resolved sizes are positive and far below MaxInt64
+}
+
+// SetNetworkPolicy updates the enforced fee floor and size limits at runtime,
+// rebuilding the BDK engines so subsequent ValidateTransaction calls — and the
+// values GET /policy reports — reflect the new policy. Sizes are in bytes; 0
+// means "use the canonical default". It is a no-op when the resolved policy
+// already matches, so callers may invoke it on a ticker without churning the
+// cgo engines. Safe for concurrent use with ValidateTransaction; superseded
+// engines become unreachable and the go-bdk finalizer frees them.
+//
+// The values may originate in unauthenticated peer gossip, and the BDK engine
+// panics rather than erroring on an out-of-range setting, so the rebuild is
+// both clamped (resolveMaxTxSize / resolveMaxScriptSize) and guarded: if
+// construction panics anyway, the previous policy stays in force and arcade
+// keeps validating rather than taking the pod down.
+func (v *Validator) SetNetworkPolicy(minFee, maxTxSize, maxScriptSize uint64) {
+	v.policyMu.Lock()
+	defer v.policyMu.Unlock()
+
+	cur := v.eff.Load()
+	txSize := resolveMaxTxSize(clampToInt(maxTxSize))
+	scriptSize := resolveMaxScriptSize(clampToInt(maxScriptSize), txSize)
+
+	if cur.minFeePerKB == minFee && cur.maxTxSizePolicy == txSize && cur.maxScriptSizePolicy == scriptSize {
 		return
 	}
-	nv := tnvalidator.NewTxValidator(v.logger, buildSettings(v.params, v.maxTxSizePolicy, v.maxScriptSizePolicy, v.maxTxSigopsCountsPolicy, minFee))
-	v.tv.Store(nv)
-	v.minFeePerKB.Store(minFee)
+
+	defer func() {
+		if r := recover(); r != nil {
+			v.logger.Errorf("validator: keeping previous policy, BDK rebuild panicked for "+
+				"min_fee=%d sat/kB max_tx_size=%d max_script_size=%d: %v", minFee, txSize, scriptSize, r)
+		}
+	}()
+
+	next := &effectivePolicy{
+		tv:                      tnvalidator.NewTxValidator(v.logger, buildSettings(v.params, txSize, scriptSize, cur.maxTxSigopsCountsPolicy, minFee)),
+		tvNoFee:                 cur.tvNoFee,
+		minFeePerKB:             minFee,
+		maxTxSizePolicy:         txSize,
+		maxScriptSizePolicy:     scriptSize,
+		maxTxSigopsCountsPolicy: cur.maxTxSigopsCountsPolicy,
+	}
+	// The fee-agnostic engine enforces the same size limits, so it only needs
+	// rebuilding when a size actually changed — a fee-only update (the common
+	// case, once the network's size limits have settled) reuses it.
+	if cur.maxTxSizePolicy != txSize || cur.maxScriptSizePolicy != scriptSize {
+		next.tvNoFee = tnvalidator.NewTxValidator(v.logger, buildSettings(v.params, txSize, scriptSize, cur.maxTxSigopsCountsPolicy, 0))
+	}
+
+	v.eff.Store(next)
+}
+
+// clampToInt narrows a byte size to int without wrapping on a 32-bit platform.
+// Anything above MaxInt is garbage by any measure; resolveMaxTxSize caps it to
+// the consensus limit immediately after.
+func clampToInt(v uint64) int {
+	if v > uint64(math.MaxInt) {
+		return math.MaxInt
+	}
+	return int(v)
 }
 
 // MaxTxSizePolicy returns the effective maximum accepted transaction size in
 // bytes, as reported by the ARC-compatible GET /policy endpoint.
 func (v *Validator) MaxTxSizePolicy() int {
-	return v.maxTxSizePolicy
+	return v.eff.Load().maxTxSizePolicy
 }
 
 // MaxScriptSizePolicy returns the effective maximum accepted script size in
 // bytes, as reported by GET /policy.
 func (v *Validator) MaxScriptSizePolicy() int {
-	return v.maxScriptSizePolicy
+	return v.eff.Load().maxScriptSizePolicy
 }
 
 // MaxTxSigopsCountsPolicy returns the effective per-transaction sigop cap
 // (0 = unlimited, the BSV post-Genesis default), as reported by GET /policy.
 func (v *Validator) MaxTxSigopsCountsPolicy() int64 {
-	return v.maxTxSigopsCountsPolicy
+	return v.eff.Load().maxTxSigopsCountsPolicy
 }
 
 // ValidateTransaction validates a transaction against current node consensus
@@ -253,9 +340,10 @@ func (v *Validator) ValidateTransaction(_ context.Context, tx *sdkTx.Transaction
 		utxoHeights[i] = unknownParentHeight
 	}
 
-	tv := v.tv.Load()
+	eff := v.eff.Load()
+	tv := eff.tv
 	if skipFees {
-		tv = v.tvNoFee
+		tv = eff.tvNoFee
 	}
 
 	if vErr := tv.ValidateTransaction(btx, allForksActiveHeight, utxoHeights, tnvalidator.NewDefaultOptions()); vErr != nil {
