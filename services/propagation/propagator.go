@@ -2684,13 +2684,15 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 				// and told us the parent isn't there yet. Route it to the
 				// condition bucket; the siblings' implicit accepts above
 				// are untouched (the line is in-batch-keyed, not alien).
+				// PROCESSING (4) with no nested TX_*/UTXO_* code is the
+				// catch-all wrapper, not a verdict: skipping it leaves
+				// rejectionLine empty so the slot falls through to
+				// txResultClassRequeue. Expressed as a negated guard rather
+				// than an empty branch, matching the attributed-line loop
+				// below.
 				if lineIsMissingParentCondition(line) {
 					missingParentLine[j] = preferRejectionLine(missingParentLine[j], line)
-				} else if lineIsOpaqueProcessing(line) {
-					// PROCESSING (4) with no nested TX_*/UTXO_* code is the
-					// catch-all wrapper, not a verdict. Leave rejectionLine
-					// empty so this slot falls through to txResultClassRequeue.
-				} else {
+				} else if !lineIsOpaqueProcessing(line) {
 					rejectionLine[j] = preferRejectionLine(rejectionLine[j], line)
 				}
 			} else if alienCount == 0 {
