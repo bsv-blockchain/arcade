@@ -2,6 +2,8 @@ package pebble
 
 import (
 	"context"
+	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -92,5 +94,44 @@ func TestPeerPolicies_RejectsEmptyPeerID(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.UpsertPeerPolicy(context.Background(), store.PeerPolicy{Network: ppNetMainnet}); err == nil {
 		t.Fatal("expected error upserting peer policy with empty peer id")
+	}
+}
+
+// TestPeerPolicies_RejectsUnstorableFee proves the backend actually consults
+// PeerPolicy.Validate rather than trusting its caller. Pebble stores the fees
+// as JSON uint64 and so could hold these values, but it refuses them anyway:
+// the Postgres and Aerospike backends narrow to int64, and a store whose
+// contract varied by deployment would let a value round-trip in testing and
+// corrupt in production.
+func TestPeerPolicies_RejectsUnstorableFee(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name string
+		pp   store.PeerPolicy
+	}{
+		{
+			name: "zero byte basis",
+			pp:   store.PeerPolicy{PeerID: "peer-a", Network: ppNetMainnet, MiningFeeSatoshis: 100, MiningFeeBytes: 0},
+		},
+		{
+			name: "satoshis above the signed-64-bit ceiling",
+			pp:   store.PeerPolicy{PeerID: "peer-a", Network: ppNetMainnet, MiningFeeSatoshis: math.MaxInt64 + 1, MiningFeeBytes: 1000},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := s.UpsertPeerPolicy(ctx, tc.pp)
+			if !errors.Is(err, store.ErrInvalidPeerPolicy) {
+				t.Fatalf("UpsertPeerPolicy err = %v, want ErrInvalidPeerPolicy", err)
+			}
+			got, listErr := s.ListPeerPolicies(ctx, ppNetMainnet)
+			if listErr != nil {
+				t.Fatalf("ListPeerPolicies: %v", listErr)
+			}
+			if len(got) != 0 {
+				t.Errorf("a refused advertisement must not be persisted, got %+v", got)
+			}
+		})
 	}
 }

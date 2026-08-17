@@ -392,6 +392,20 @@ func (c *Client) recordPeerFee(ctx context.Context, msg teranodep2p.NodeStatusMe
 		MiningFeeBytes:    byts,
 		LastSeen:          time.Now(),
 	}); err != nil {
+		// An implausible advertisement is the peer's fault, not ours: node_status
+		// is unauthenticated gossip and a peer may announce a fee too large to
+		// store. Log it as a dropped advertisement rather than a store failure,
+		// so a hostile peer cannot fill the operator's warning stream.
+		if errors.Is(err, store.ErrInvalidPeerPolicy) {
+			c.logger.Debug(
+				"ignoring implausible peer mining fee",
+				zap.String("peer_id", msg.PeerID),
+				zap.Uint64("mining_fee_satoshis", sats),
+				zap.Uint64("mining_fee_bytes", byts),
+				zap.Error(err),
+			)
+			return
+		}
 		c.logger.Warn(
 			"failed to persist peer mining fee",
 			zap.String("peer_id", msg.PeerID),

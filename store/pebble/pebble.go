@@ -2293,8 +2293,12 @@ func (s *Store) UpsertPeerPolicy(ctx context.Context, pp store.PeerPolicy) error
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if pp.PeerID == "" {
-		return fmt.Errorf("upsert peer policy: empty peer id")
+	// Pebble stores the fees as JSON uint64 and so cannot lose precision, but it
+	// validates on the same terms as the other backends: a zero byte basis is
+	// meaningless everywhere, and one backend silently accepting what the others
+	// reject would make the store's contract depend on its deployment.
+	if err := pp.Validate(); err != nil {
+		return err
 	}
 	stored := storedPeerPolicy{
 		PeerID:            pp.PeerID,

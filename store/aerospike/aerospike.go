@@ -2905,18 +2905,21 @@ loop:
 }
 
 func (s *Store) UpsertPeerPolicy(ctx context.Context, pp store.PeerPolicy) error {
-	if pp.PeerID == "" {
-		return fmt.Errorf("upsert peer policy: empty peer id")
+	if err := pp.Validate(); err != nil {
+		return err
 	}
 	key, err := s.key(setPeerPolicies, pp.PeerID)
 	if err != nil {
 		return err
 	}
 	bins := aero.BinMap{
-		"peer_id":   pp.PeerID,
-		"network":   pp.Network,
-		"fee_sats":  int64(pp.MiningFeeSatoshis), //nolint:gosec // fee in satoshis, non-negative and bounded
-		"fee_bytes": int64(pp.MiningFeeBytes),    //nolint:gosec // fee byte basis, non-negative and bounded
+		"peer_id": pp.PeerID,
+		"network": pp.Network,
+		// Both narrowings are bounded by PeerPolicy.Validate above; without it a
+		// peer-supplied value over MaxInt64 would wrap negative into the bin and
+		// read back as an astronomical fee.
+		"fee_sats":  int64(pp.MiningFeeSatoshis), //nolint:gosec // bounded by PeerPolicy.Validate
+		"fee_bytes": int64(pp.MiningFeeBytes),    //nolint:gosec // bounded by PeerPolicy.Validate
 		"last_seen": pp.LastSeen.UnixMilli(),
 	}
 	return s.client.Put(s.writePolicy(ctx), key, bins)

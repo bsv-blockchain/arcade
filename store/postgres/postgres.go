@@ -1688,8 +1688,8 @@ func (s *Store) ListDatahubEndpoints(ctx context.Context, network string) ([]sto
 }
 
 func (s *Store) UpsertPeerPolicy(ctx context.Context, pp store.PeerPolicy) error {
-	if pp.PeerID == "" {
-		return fmt.Errorf("upsert peer policy: empty peer id")
+	if err := pp.Validate(); err != nil {
+		return err
 	}
 	const q = `
 INSERT INTO peer_policies (peer_id, network, mining_fee_satoshis, mining_fee_bytes, last_seen)
@@ -1699,7 +1699,8 @@ ON CONFLICT (peer_id) DO UPDATE SET
     mining_fee_satoshis = EXCLUDED.mining_fee_satoshis,
     mining_fee_bytes = EXCLUDED.mining_fee_bytes,
     last_seen = EXCLUDED.last_seen`
-	if _, err := s.pool.Exec(ctx, q, pp.PeerID, pp.Network, int64(pp.MiningFeeSatoshis), int64(pp.MiningFeeBytes), pp.LastSeen); err != nil { //nolint:gosec // fees non-negative and bounded
+	// The narrowing is safe: Validate rejected anything above MaxInt64 above.
+	if _, err := s.pool.Exec(ctx, q, pp.PeerID, pp.Network, int64(pp.MiningFeeSatoshis), int64(pp.MiningFeeBytes), pp.LastSeen); err != nil { //nolint:gosec // bounded by PeerPolicy.Validate
 		return fmt.Errorf("upsert peer policy %s: %w", pp.PeerID, err)
 	}
 	return nil

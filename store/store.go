@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
 	"time"
 
 	"github.com/bsv-blockchain/arcade/models"
@@ -10,6 +12,11 @@ import (
 
 // ErrNotFound is returned when a requested record does not exist.
 var ErrNotFound = errors.New("not found")
+
+// ErrInvalidPeerPolicy is returned by PeerPolicy.Validate, and by every
+// backend's UpsertPeerPolicy, for a policy that cannot be stored faithfully.
+// Callers treat it as "drop this advertisement", never as a store fault.
+var ErrInvalidPeerPolicy = errors.New("invalid peer policy")
 
 // ErrReplayUnavailable is returned by IterateStatusesByToken when a backend
 // cannot serve the replay within its resource bounds — typically a token whose
@@ -83,6 +90,40 @@ type PeerPolicy struct {
 	MiningFeeSatoshis uint64
 	MiningFeeBytes    uint64
 	LastSeen          time.Time
+}
+
+// maxStorableFee bounds a peer policy's fee fields. The Postgres and Aerospike
+// backends store them in signed 64-bit columns, so a value above MaxInt64 wraps
+// negative on write and reads back as an astronomical uint64 — a silently
+// corrupted floor that GET /policy would then advertise as the network minimum.
+//
+// The bound can only ever reject garbage: the entire money supply, 21 million
+// BSV, is 2.1e15 satoshis — some four thousand times below MaxInt64 — so no
+// honest advertisement comes near it. It has to be checked rather than assumed
+// because node_status is unauthenticated gossip: the peer chooses the number.
+const maxStorableFee = uint64(math.MaxInt64)
+
+// Validate reports whether pp can be persisted without loss. Every backend
+// calls it before writing, so the uint64→int64 narrowing each one performs is
+// bounded by a check instead of by assumption.
+func (pp PeerPolicy) Validate() error {
+	switch {
+	case pp.PeerID == "":
+		return fmt.Errorf("%w: empty peer id", ErrInvalidPeerPolicy)
+	case pp.MiningFeeBytes == 0:
+		// A zero byte basis makes the fee meaningless: readers divide by it to
+		// normalize to sat/kB, and lowestObservedFeePerKB has to skip such rows.
+		// Refusing the write keeps them out of the store in the first place.
+		return fmt.Errorf("%w: peer %s has a zero mining fee byte basis", ErrInvalidPeerPolicy, pp.PeerID)
+	case pp.MiningFeeSatoshis > maxStorableFee:
+		return fmt.Errorf("%w: peer %s advertised %d satoshis, above the storable maximum %d",
+			ErrInvalidPeerPolicy, pp.PeerID, pp.MiningFeeSatoshis, maxStorableFee)
+	case pp.MiningFeeBytes > maxStorableFee:
+		return fmt.Errorf("%w: peer %s advertised a %d byte basis, above the storable maximum %d",
+			ErrInvalidPeerPolicy, pp.PeerID, pp.MiningFeeBytes, maxStorableFee)
+	default:
+		return nil
+	}
 }
 
 // BatchInsertResult is one entry in the result slice returned by
