@@ -678,6 +678,64 @@ func (s *Store) IterateStatusesSince(ctx context.Context, since time.Time, fn fu
 	return nil
 }
 
+// IterateTrackerRows walks the per-status index (idx:tx:status:<status>:*) for
+// each tracked status, so rows in untracked statuses — REJECTED and IMMUTABLE,
+// the overwhelming majority of a mature store — are never visited at all.
+// Hydration previously walked idx:tx:updated and did a full readStatus point
+// read for every row in the store (issue #276).
+//
+// Rows are decoded with readStoredStatus rather than readStatus: the latter
+// enriches merkle paths and orphaned proofs, none of which the tracker reads.
+func (s *Store) IterateTrackerRows(ctx context.Context, scan store.TrackerScan, fn func(store.TrackerRow) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	for _, status := range scan.Statuses() {
+		prefix := idxTxStatusPrefix(string(status))
+		iter, err := s.db.NewIter(&pebbledb.IterOptions{
+			LowerBound: prefix,
+			UpperBound: endOfPrefix(prefix),
+		})
+		if err != nil {
+			return err
+		}
+		for iter.First(); iter.Valid(); iter.Next() {
+			if err := ctx.Err(); err != nil {
+				_ = iter.Close()
+				return err
+			}
+			st, err := s.readStoredStatus(lastSegment(iter.Key()))
+			if err != nil || st == nil {
+				continue
+			}
+			// Trust the row, not the index key. If an index entry is ever stale
+			// relative to the row it points at, emitting the key's status would
+			// hand the tracker a status the store no longer holds; re-reading
+			// makes a stale entry merely wasted work.
+			rowStatus := models.Status(st.Status)
+			if rowStatus != status {
+				continue
+			}
+			if !scan.Keep(rowStatus, st.BlockHeight) {
+				continue
+			}
+			if err := fn(store.TrackerRow{
+				TxID:        st.TxID,
+				Status:      rowStatus,
+				BlockHeight: st.BlockHeight,
+			}); err != nil {
+				_ = iter.Close()
+				return err
+			}
+		}
+		if err := iter.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // CensusStatusesSince walks the per-status index (idx:tx:status:<status>:*)
 // for each requested status, so rows in other statuses — the overwhelming
 // majority of a mature store — are never visited. Each candidate row is read

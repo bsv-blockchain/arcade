@@ -23,7 +23,13 @@ import (
 const txA = "txA"
 
 // fakeStore implements just enough of store.Store for these tests.
+//
+// Embeds store.Store so a method added to the interface does not break this
+// fake at compile time; anything not explicitly implemented below panics if a
+// test actually calls it. Matches propagation/sse/watchdog's fakes.
 type fakeStore struct {
+	store.Store
+
 	mu   sync.Mutex
 	subs map[string][]*models.Submission
 

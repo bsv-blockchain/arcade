@@ -255,6 +255,57 @@ field set is used by merkle-service:
 - **Rejections by stage**: `stage:"network"` (or `intake`/`cascade`) narrows
   a REJECTED search to where in the pipeline it happened.
 
+## TxTracker hydration at startup (api-server)
+
+`api-server` hydrates its in-memory TxTracker from the store before it binds
+its HTTP listener, so a slow hydration shows up as a pod that stays `0/1` with
+probes getting `connection refused` — not a 404, and not a probe-path problem.
+
+Two lines cover it, both emitted once per boot:
+
+- **`tx tracker hydration height resolved`** — `height`, `height_known`,
+  `height_source` (`chaintracks` | `store` | `none`), `prune_mined_below`,
+  `chaintracks_mode`, `chain_reader_configured`.
+- **`tx tracker hydrated`** (or `tx tracker hydration partial` on error) —
+  `loaded`, `scanned`, `skipped`, `current_height`, `height_source`,
+  `prune_mined_below`, `elapsed`.
+
+What to look for:
+
+- **`height_known=false`** (with the accompanying `tx tracker hydrating without
+  a chain height` Warn) is the degraded state. MINED pruning is off, so every
+  mined row loads and `elapsed` grows with total store size. This is the
+  v0.13.0 condition that made hydration take 147s on a 4.5M-row store. Check
+  that `chaintracks.url` is reachable from the pod and that `block_processing`
+  has `status='active'` rows.
+- **`scanned` ≫ `loaded`** is normal only when `height_known=false`. With a
+  real height the store filters server-side, so the two should be close.
+- **`skipped > 0`** means the backend emitted rows the tracker then rejected —
+  its server-side filter has drifted from `store.TrackerScan.Keep`. The result
+  is still correct (the tracker re-checks every row), but the rows crossed the
+  wire for nothing. `store/storetest` is the suite that should have caught it.
+
+### Postgres: optional hydration index
+
+The hydration query is
+`WHERE status = ANY(...) AND (status <> 'MINED' OR COALESCE(block_height,0) = 0 OR block_height >= $cutoff)`.
+`idx_tx_status` alone leaves the planner scanning every MINED row. On a large
+store a composite index makes it a range scan:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tx_status_height
+    ON transactions (status, block_height);
+
+-- An interrupted CONCURRENTLY build leaves an INVALID index that a later
+-- IF NOT EXISTS silently skips, so always confirm:
+SELECT indisvalid FROM pg_index WHERE indexrelid = 'idx_tx_status_height'::regclass;
+```
+
+Run it out of band, not through `schema.sql`: that file is applied inside a
+single transaction (so `CONCURRENTLY` is impossible there) and any byte change
+to it re-runs the whole DDL script fleet-wide. Hydration is correct without the
+index — only slower.
+
 ## Related docs
 
 - [`docs/plans/otel-integration.md`](plans/otel-integration.md) — the
