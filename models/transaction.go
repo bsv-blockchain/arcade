@@ -224,10 +224,20 @@ func (s Status) DisallowedPreviousStatuses() []Status {
 			StatusRejected, StatusDoubleSpendAttempted,
 			StatusMined, StatusImmutable,
 		}
-	case StatusRejected, StatusDoubleSpendAttempted:
-		// Rejection paths can override any non-terminal in-flight state, but
-		// must not be able to clobber an already-confirmed (MINED/IMMUTABLE)
-		// transaction.
+	case StatusRejected:
+		// REJECTED may overwrite pre-network in-flight state (RECEIVED /
+		// SENT / ACCEPTED / PENDING_RETRY), but must not clobber a tx that
+		// has already been observed on the network or confirmed. Issue #251:
+		// resubmitting an already-broadcast (and often already-mined) tx
+		// must not regress SEEN_* → REJECTED when intake validation fails
+		// on spent inputs of the same txid.
+		return []Status{
+			StatusSeenOnNetwork, StatusSeenMultipleNodes,
+			StatusMined, StatusImmutable,
+		}
+	case StatusDoubleSpendAttempted:
+		// Conflict detection can mark a SEEN tx; it must not clobber MINED /
+		// IMMUTABLE.
 		return []Status{StatusMined, StatusImmutable}
 	case StatusMined:
 		// MINED can be set from any in-flight state, but a transient miner-
