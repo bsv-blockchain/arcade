@@ -19,7 +19,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"net"
 	"sync"
 	"time"
@@ -320,9 +319,13 @@ func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatu
 	}
 	upsertCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	err := c.store.UpsertDatahubEndpoint(upsertCtx, store.DatahubEndpoint{
-		URL:      normalized,
-		Network:  c.cfg.Network,
-		Source:   store.DatahubEndpointSourceDiscovered,
+		URL:     normalized,
+		Network: c.cfg.Network,
+		Source:  store.DatahubEndpointSourceDiscovered,
+		// The node's advertised policy travels with its URL so GET /health can
+		// report, per endpoint, what that node will accept. nil when the peer
+		// advertised none, which leaves any previously recorded policy alone.
+		Policy:   endpointPolicyFrom(msg),
 		LastSeen: time.Now(),
 	})
 	cancel()
@@ -358,21 +361,17 @@ func (c *Client) recordPeerPolicy(ctx context.Context, msg teranodep2p.NodeStatu
 		maxTxSize = msg.FeePolicy.MaxTxSizePolicy
 		maxScriptSize = msg.FeePolicy.MaxScriptSizePolicy
 	case msg.MinMiningTxFee != nil:
-		// BSV/kB -> satoshis per 1000 bytes (1 BSV = 1e8 satoshis). Validate the
-		// untrusted float before converting: a malformed/malicious node_status
-		// could carry NaN/Inf/negative or an absurd magnitude, which uint64()
-		// would turn into a wrapped garbage value that pollutes metrics and the
-		// int64-backed store columns. Drop such advertisements.
-		f := *msg.MinMiningTxFee
-		v := math.Round(f * 1e8)
-		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > math.MaxInt64 {
+		// BSV/kB -> satoshis per 1000 bytes. The conversion rejects an
+		// untrusted NaN/Inf/negative/absurd value; see legacyMiningFeeSatPerKB.
+		v, ok := legacyMiningFeeSatPerKB(msg.MinMiningTxFee)
+		if !ok {
 			c.logger.Debug("ignoring implausible peer MinMiningTxFee",
 				zap.String("peer_id", msg.PeerID),
-				zap.Float64("min_mining_tx_fee", f))
+				zap.Float64("min_mining_tx_fee", *msg.MinMiningTxFee))
 			return
 		}
-		sats = uint64(v)
-		byts = 1000
+		sats = v
+		byts = legacyMiningFeeBytesBasis
 	default:
 		return
 	}

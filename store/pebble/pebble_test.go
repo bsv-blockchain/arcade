@@ -655,8 +655,8 @@ func TestDatahubEndpoints_UpsertAndList(t *testing.T) {
 	now := time.Date(2026, 4, 24, 12, 0, 0, 0, time.UTC)
 
 	in := []store.DatahubEndpoint{
-		{URL: "https://a.example", Network: "mainnet", Source: store.DatahubEndpointSourceConfigured, LastSeen: now},
-		{URL: "https://b.example", Network: "mainnet", Source: store.DatahubEndpointSourceDiscovered, LastSeen: now.Add(time.Minute)},
+		{URL: "https://a.example", Network: ppNetMainnet, Source: store.DatahubEndpointSourceConfigured, LastSeen: now},
+		{URL: "https://b.example", Network: ppNetMainnet, Source: store.DatahubEndpointSourceDiscovered, LastSeen: now.Add(time.Minute)},
 	}
 	for _, ep := range in {
 		if err := s.UpsertDatahubEndpoint(ctx, ep); err != nil {
@@ -664,7 +664,7 @@ func TestDatahubEndpoints_UpsertAndList(t *testing.T) {
 		}
 	}
 
-	out, err := s.ListDatahubEndpoints(ctx, "mainnet")
+	out, err := s.ListDatahubEndpoints(ctx, ppNetMainnet)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -701,8 +701,8 @@ func TestDatahubEndpoints_NetworkScoped(t *testing.T) {
 	now := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
 
 	rows := []store.DatahubEndpoint{
-		{URL: "https://main-a.example", Network: "mainnet", Source: store.DatahubEndpointSourceDiscovered, LastSeen: now},
-		{URL: "https://main-b.example", Network: "mainnet", Source: store.DatahubEndpointSourceDiscovered, LastSeen: now},
+		{URL: "https://main-a.example", Network: ppNetMainnet, Source: store.DatahubEndpointSourceDiscovered, LastSeen: now},
+		{URL: "https://main-b.example", Network: ppNetMainnet, Source: store.DatahubEndpointSourceDiscovered, LastSeen: now},
 		{URL: "https://regtest-a.example", Network: "regtest", Source: store.DatahubEndpointSourceConfigured, LastSeen: now},
 	}
 	for _, ep := range rows {
@@ -719,7 +719,7 @@ func TestDatahubEndpoints_NetworkScoped(t *testing.T) {
 		t.Fatalf("regtest list: got %+v", regtest)
 	}
 
-	mainnet, err := s.ListDatahubEndpoints(ctx, "mainnet")
+	mainnet, err := s.ListDatahubEndpoints(ctx, ppNetMainnet)
 	if err != nil {
 		t.Fatalf("list mainnet: %v", err)
 	}
@@ -743,17 +743,17 @@ func TestDatahubEndpoints_UpsertOverwrites(t *testing.T) {
 	t2 := t1.Add(time.Hour)
 
 	if err := s.UpsertDatahubEndpoint(ctx, store.DatahubEndpoint{
-		URL: "https://a.example", Network: "mainnet", Source: store.DatahubEndpointSourceConfigured, LastSeen: t1,
+		URL: "https://a.example", Network: ppNetMainnet, Source: store.DatahubEndpointSourceConfigured, LastSeen: t1,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.UpsertDatahubEndpoint(ctx, store.DatahubEndpoint{
-		URL: "https://a.example", Network: "mainnet", Source: store.DatahubEndpointSourceDiscovered, LastSeen: t2,
+		URL: "https://a.example", Network: ppNetMainnet, Source: store.DatahubEndpointSourceDiscovered, LastSeen: t2,
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	out, err := s.ListDatahubEndpoints(ctx, "mainnet")
+	out, err := s.ListDatahubEndpoints(ctx, ppNetMainnet)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1393,5 +1393,106 @@ func TestSubmissionsByIndexBounded_StopsDuringIteration(t *testing.T) {
 	}
 	if len(fits) != total {
 		t.Errorf("within-budget read returned %d, want %d", len(fits), total)
+	}
+}
+
+// TestDatahubEndpoints_AdvertisedPolicy covers the policy a node advertises
+// alongside its URL: it round-trips intact, "advertised none" stays
+// distinguishable from "advertised zeros", and — the subtle one — a write
+// carrying no policy leaves a recorded one alone.
+//
+// That last rule is what keeps the configured-URL seed, which re-upserts every
+// URL on each process start with no policy attached, from blanking an announced
+// endpoint's policy on every restart.
+func TestDatahubEndpoints_AdvertisedPolicy(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 24, 12, 0, 0, 0, time.UTC)
+
+	const url = "https://announced.example"
+	policy := store.EndpointPolicy{
+		MiningFeeSatoshis: 100, MiningFeeBytes: 1000,
+		MaxTxSizePolicy: 100_000_000, MaxScriptSizePolicy: 500_000,
+		MaxTxSigopsCountsPolicy: 4_294_967_295,
+	}
+
+	upsert := func(t *testing.T, ep store.DatahubEndpoint) {
+		t.Helper()
+		if err := s.UpsertDatahubEndpoint(ctx, ep); err != nil {
+			t.Fatalf("upsert %s: %v", ep.URL, err)
+		}
+	}
+	get := func(t *testing.T, want string) store.DatahubEndpoint {
+		t.Helper()
+		out, err := s.ListDatahubEndpoints(ctx, ppNetMainnet)
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		for _, ep := range out {
+			if ep.URL == want {
+				return ep
+			}
+		}
+		t.Fatalf("endpoint %s missing from %+v", want, out)
+		return store.DatahubEndpoint{}
+	}
+
+	// An announced endpoint carries its policy; a seeded one carries none.
+	upsert(t, store.DatahubEndpoint{
+		URL: url, Network: ppNetMainnet,
+		Source: store.DatahubEndpointSourceDiscovered, Policy: &policy, LastSeen: now,
+	})
+	upsert(t, store.DatahubEndpoint{
+		URL: "https://seeded.example", Network: ppNetMainnet,
+		Source: store.DatahubEndpointSourceConfigured, LastSeen: now,
+	})
+
+	if got := get(t, url).Policy; got == nil {
+		t.Fatal("announced endpoint lost its policy")
+	} else if *got != policy {
+		t.Errorf("policy round-trip: got %+v want %+v", *got, policy)
+	}
+	if got := get(t, "https://seeded.example").Policy; got != nil {
+		t.Errorf("a seeded endpoint advertises no policy, got %+v", *got)
+	}
+
+	// The restart case: the seed re-upserts the announced URL with no policy.
+	upsert(t, store.DatahubEndpoint{
+		URL: url, Network: ppNetMainnet,
+		Source: store.DatahubEndpointSourceConfigured, LastSeen: now.Add(time.Hour),
+	})
+	got := get(t, url)
+	if got.Policy == nil {
+		t.Fatal("a policy-less write erased the recorded policy; the seed would blank it on every restart")
+	}
+	if *got.Policy != policy {
+		t.Errorf("preserved policy changed: got %+v want %+v", *got.Policy, policy)
+	}
+	// The rest of the row still updates normally.
+	if got.Source != store.DatahubEndpointSourceConfigured {
+		t.Errorf("source: got %q want %q", got.Source, store.DatahubEndpointSourceConfigured)
+	}
+	if !got.LastSeen.Equal(now.Add(time.Hour)) {
+		t.Errorf("last_seen: got %v want %v", got.LastSeen, now.Add(time.Hour))
+	}
+
+	// A write that does carry a policy replaces the old one.
+	updated := policy
+	updated.MaxTxSizePolicy = 5_000_000
+	upsert(t, store.DatahubEndpoint{
+		URL: url, Network: ppNetMainnet,
+		Source: store.DatahubEndpointSourceDiscovered, Policy: &updated, LastSeen: now.Add(2 * time.Hour),
+	})
+	if got := get(t, url).Policy; got == nil || got.MaxTxSizePolicy != 5_000_000 {
+		t.Errorf("a policy-carrying write must replace the old policy, got %+v", got)
+	}
+
+	// A zero-valued policy is a real advertisement, not absence.
+	upsert(t, store.DatahubEndpoint{
+		URL: "https://zero.example", Network: ppNetMainnet,
+		Source: store.DatahubEndpointSourceDiscovered, Policy: &store.EndpointPolicy{}, LastSeen: now,
+	})
+	if got := get(t, "https://zero.example").Policy; got == nil {
+		t.Error("an all-zero policy must survive as advertised, not read back as nil")
 	}
 }

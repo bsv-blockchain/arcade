@@ -18,6 +18,11 @@ var ErrNotFound = errors.New("not found")
 // Callers treat it as "drop this advertisement", never as a store fault.
 var ErrInvalidPeerPolicy = errors.New("invalid peer policy")
 
+// ErrInvalidEndpointPolicy is returned by EndpointPolicy.Validate for an
+// advertised policy that cannot be stored faithfully. Callers drop the policy
+// and still register the URL, so this never reaches a backend as a write error.
+var ErrInvalidEndpointPolicy = errors.New("invalid endpoint policy")
+
 // ErrReplayUnavailable is returned by IterateStatusesByToken when a backend
 // cannot serve the replay within its resource bounds — typically a token whose
 // submission set is too large for a backend that has no keyset index over
@@ -57,11 +62,68 @@ const DatahubEndpointSourceDiscovered = "discovered"
 // between pods on the same persistence backend — never serves a peer from one
 // network to a pod configured for another. Legacy rows written before this
 // field existed have an empty Network and are filtered out by every read.
+//
+// Policy is the transaction policy the node advertised in the same node_status
+// announcement that carried this URL, or nil when it advertised none. See
+// EndpointPolicy for why a write that carries no policy never erases one.
 type DatahubEndpoint struct {
 	URL      string
 	Network  string
 	Source   string // DatahubEndpointSourceConfigured or DatahubEndpointSourceDiscovered
+	Policy   *EndpointPolicy
 	LastSeen time.Time
+}
+
+// EndpointPolicy is the transaction policy a teranode advertised in the
+// node_status fee_policy object alongside its datahub URL: what that specific
+// endpoint will accept. Sizes are in bytes; the mining fee is
+// satoshis-per-Bytes, the node_status FeePolicy.MiningFee shape, e.g.
+// {Satoshis: 100, Bytes: 1000} == 100 sat/kB.
+//
+// It is attached to the URL registration purely so operators can see, per
+// endpoint, what each node enforces — GET /health reports it. The network-wide
+// values arcade itself enforces come from PeerPolicy instead, which is keyed by
+// libp2p PeerID and so also covers peers advertising no URL at all. The two are
+// deliberately separate: same source, different keys, different questions.
+//
+// A nil Policy means "this node advertised none" — a statically configured seed
+// URL, or a teranode predating fee_policy — which is why it is a pointer rather
+// than a zero-valued struct. Every backend treats a nil-policy write as leaving
+// any previously recorded policy in place: the configured-URL seed in
+// app.BuildServices re-upserts on every process start, and without that rule an
+// endpoint that is both configured and announced would lose its policy on each
+// restart and regain it seconds later.
+type EndpointPolicy struct {
+	MiningFeeSatoshis       uint64
+	MiningFeeBytes          uint64
+	MaxTxSizePolicy         uint64
+	MaxScriptSizePolicy     uint64
+	MaxTxSigopsCountsPolicy uint64
+}
+
+// Validate reports whether ep can be persisted without loss, on the same terms
+// as PeerPolicy.Validate: the Postgres and Aerospike backends narrow these to
+// signed 64-bit, and node_status is unauthenticated gossip, so the peer chooses
+// the numbers. Callers drop an invalid policy to nil rather than failing the
+// write — the URL registration is the reason the row exists, and a peer sending
+// a garbage size must not be able to remove its own endpoint from the registry.
+func (ep EndpointPolicy) Validate() error {
+	for _, f := range []struct {
+		name  string
+		value uint64
+	}{
+		{"mining fee satoshis", ep.MiningFeeSatoshis},
+		{"mining fee byte basis", ep.MiningFeeBytes},
+		{"max tx size", ep.MaxTxSizePolicy},
+		{"max script size", ep.MaxScriptSizePolicy},
+		{"max tx sigops count", ep.MaxTxSigopsCountsPolicy},
+	} {
+		if f.value > maxStorablePolicyValue {
+			return fmt.Errorf("%w: advertised %s %d, above the storable maximum %d",
+				ErrInvalidEndpointPolicy, f.name, f.value, maxStorablePolicyValue)
+		}
+	}
+	return nil
 }
 
 // StatusCensus is one status's aggregate in a CensusStatusesSince result:

@@ -2924,6 +2924,26 @@ func (s *Store) UpsertDatahubEndpoint(ctx context.Context, ep store.DatahubEndpo
 		"source":    ep.Source,
 		"last_seen": ep.LastSeen.UnixMilli(),
 	}
+
+	// The advertised-policy bins are written only when the caller has one. A
+	// Put updates just the bins it names, so omitting them is exactly the
+	// "a write carrying no policy must not erase one already recorded"
+	// rule the other backends implement with COALESCE (Postgres) and a
+	// read-modify-write (Pebble). Bin names are abbreviated to stay inside
+	// Aerospike's limit, matching fee_sats/fee_bytes on the peer-policy set.
+	if p := ep.Policy; p != nil {
+		if err := p.Validate(); err != nil {
+			return err
+		}
+		// Every narrowing is bounded by Validate above.
+		bins["fee_sats"] = int64(p.MiningFeeSatoshis)         //nolint:gosec // bounded by EndpointPolicy.Validate
+		bins["fee_bytes"] = int64(p.MiningFeeBytes)           //nolint:gosec // bounded by EndpointPolicy.Validate
+		bins["max_tx_sz"] = int64(p.MaxTxSizePolicy)          //nolint:gosec // bounded by EndpointPolicy.Validate
+		bins["max_scr_sz"] = int64(p.MaxScriptSizePolicy)     //nolint:gosec // bounded by EndpointPolicy.Validate
+		bins["max_sigops"] = int64(p.MaxTxSigopsCountsPolicy) //nolint:gosec // bounded by EndpointPolicy.Validate
+		bins["has_policy"] = 1
+	}
+
 	return s.client.Put(s.writePolicy(ctx), key, bins)
 }
 
@@ -2966,6 +2986,18 @@ loop:
 				URL:     getString(rec.Record, "url"),
 				Network: getString(rec.Record, "network"),
 				Source:  getString(rec.Record, "source"),
+			}
+			// has_policy distinguishes "advertised none" from "advertised all
+			// zeros": getInt64 returns 0 for a missing bin, so without the flag
+			// a legacy record and a genuinely zero policy would look alike.
+			if getInt64(rec.Record, "has_policy") == 1 {
+				ep.Policy = &store.EndpointPolicy{
+					MiningFeeSatoshis:       uint64(getInt64(rec.Record, "fee_sats")),   //nolint:gosec // stored non-negative
+					MiningFeeBytes:          uint64(getInt64(rec.Record, "fee_bytes")),  //nolint:gosec // stored non-negative
+					MaxTxSizePolicy:         uint64(getInt64(rec.Record, "max_tx_sz")),  //nolint:gosec // stored non-negative
+					MaxScriptSizePolicy:     uint64(getInt64(rec.Record, "max_scr_sz")), //nolint:gosec // stored non-negative
+					MaxTxSigopsCountsPolicy: uint64(getInt64(rec.Record, "max_sigops")), //nolint:gosec // stored non-negative
+				}
 			}
 			if ms := getInt64(rec.Record, "last_seen"); ms > 0 {
 				ep.LastSeen = time.UnixMilli(ms)

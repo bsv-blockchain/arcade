@@ -106,6 +106,17 @@ paths:
                 blockHeight: 958779
                 datahub_urls:
                   - url: https://datahub.example.com
+                    source: discovered
+                    healthy: true
+                    policy:
+                      miningFee:
+                        satoshis: 100
+                        bytes: 1000
+                      maxtxsizepolicy: 100000000
+                      maxscriptsizepolicy: 500000
+                      maxtxsigopscountspolicy: 4294967295
+                  - url: https://seeded.example.com
+                    source: configured
                     healthy: true
 
   /ready:
@@ -1486,8 +1497,50 @@ components:
       properties:
         url:
           type: string
+        source:
+          type: string
+          enum: [configured, discovered]
+          description: >-
+            How the endpoint entered the registry: seeded from static config, or
+            discovered at runtime from a peer's node_status announcement.
+          example: discovered
         healthy:
           type: boolean
+        policy:
+          allOf:
+            - $ref: "#/components/schemas/EndpointPolicy"
+          description: >-
+            The transaction policy this node advertised when it registered the
+            URL — what this specific endpoint will accept, as opposed to the
+            single network-wide policy arcade enforces and GET /policy reports.
+            Absent for an endpoint no node_status has announced (a statically
+            configured URL, typically) or whose node predates fee_policy.
+
+    EndpointPolicy:
+      type: object
+      description: >-
+        Transaction policy advertised by a single Teranode endpoint. Field names
+        match the GET /policy document so both surfaces read the same way;
+        standardFormatSupported is absent because it is an ARC transport flag,
+        not something a peer advertises.
+      properties:
+        miningFee:
+          $ref: "#/components/schemas/FeeAmount"
+        maxtxsizepolicy:
+          type: integer
+          format: int64
+          description: Maximum transaction size in bytes this endpoint accepts.
+          example: 100000000
+        maxscriptsizepolicy:
+          type: integer
+          format: int64
+          description: Maximum script size in bytes this endpoint accepts.
+          example: 500000
+        maxtxsigopscountspolicy:
+          type: integer
+          format: int64
+          description: Maximum sigops per transaction this endpoint accepts.
+          example: 4294967295
 
     FeeAmount:
       type: object

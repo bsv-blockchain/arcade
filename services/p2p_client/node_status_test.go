@@ -2,10 +2,13 @@ package p2p_client
 
 import (
 	"fmt"
+	"math"
 	"net"
 	"testing"
 
 	teranodep2p "github.com/bsv-blockchain/teranode/services/p2p"
+
+	"github.com/bsv-blockchain/arcade/store"
 )
 
 func TestPickDatahubURL(t *testing.T) {
@@ -103,6 +106,126 @@ func TestValidateURL(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Errorf("validateURL(%q) = %q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestEndpointPolicyFrom covers what gets recorded against a peer's datahub URL
+// registration and surfaced per endpoint by GET /health.
+//
+// Unlike recordPeerPolicy, which feeds the network-wide policy arcade enforces
+// and so keeps only values it can compute with, this path records what the node
+// advertised verbatim — it answers "what will this endpoint accept". The one
+// thing it will not record is a value too large to store faithfully, since
+// node_status is unauthenticated and a wrapped value would be reported to
+// operators as that node's real policy.
+func TestEndpointPolicyFrom(t *testing.T) {
+	feePolicy := &teranodep2p.FeePolicy{
+		MiningFee:               teranodep2p.FeeAmount{Satoshis: 100, Bytes: 1000},
+		MaxTxSizePolicy:         100_000_000,
+		MaxScriptSizePolicy:     500_000,
+		MaxTxSigopsCountsPolicy: 4_294_967_295,
+	}
+	legacyFee := 0.0000005 // BSV/kB -> 50 sat per 1000 bytes
+	nan := math.NaN()
+	absurd := 1e30
+
+	cases := []struct {
+		name string
+		msg  teranodep2p.NodeStatusMessage
+		want *store.EndpointPolicy
+	}{
+		{
+			name: "structured fee policy is recorded whole",
+			msg:  teranodep2p.NodeStatusMessage{FeePolicy: feePolicy},
+			want: &store.EndpointPolicy{
+				MiningFeeSatoshis: 100, MiningFeeBytes: 1000,
+				MaxTxSizePolicy: 100_000_000, MaxScriptSizePolicy: 500_000,
+				MaxTxSigopsCountsPolicy: 4_294_967_295,
+			},
+		},
+		{
+			name: "legacy peer yields a fee and no size limits",
+			msg:  teranodep2p.NodeStatusMessage{MinMiningTxFee: &legacyFee},
+			want: &store.EndpointPolicy{MiningFeeSatoshis: 50, MiningFeeBytes: 1000},
+		},
+		{
+			name: "peer advertising nothing yields no policy",
+			msg:  teranodep2p.NodeStatusMessage{BaseURL: testPeerURL},
+			want: nil,
+		},
+		{
+			name: "unstorable size drops the whole policy",
+			msg: teranodep2p.NodeStatusMessage{FeePolicy: &teranodep2p.FeePolicy{
+				MiningFee:       teranodep2p.FeeAmount{Satoshis: 100, Bytes: 1000},
+				MaxTxSizePolicy: math.MaxUint64,
+			}},
+			want: nil,
+		},
+		{
+			name: "malformed legacy fee yields no policy",
+			msg:  teranodep2p.NodeStatusMessage{MinMiningTxFee: &nan},
+			want: nil,
+		},
+		{
+			name: "absurd legacy fee yields no policy",
+			msg:  teranodep2p.NodeStatusMessage{MinMiningTxFee: &absurd},
+			want: nil,
+		},
+		{
+			// A node that genuinely accepts free transactions and imposes no
+			// size limits advertises zeros. They are real values, and the nil
+			// pointer — not a zero struct — is what means "advertised none".
+			name: "an all-zero advertisement is a policy, not absence",
+			msg:  teranodep2p.NodeStatusMessage{FeePolicy: &teranodep2p.FeePolicy{}},
+			want: &store.EndpointPolicy{},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := endpointPolicyFrom(tc.msg)
+			switch {
+			case tc.want == nil && got != nil:
+				t.Fatalf("endpointPolicyFrom() = %+v, want nil", *got)
+			case tc.want != nil && got == nil:
+				t.Fatalf("endpointPolicyFrom() = nil, want %+v", *tc.want)
+			case tc.want != nil && *got != *tc.want:
+				t.Errorf("endpointPolicyFrom() = %+v, want %+v", *got, *tc.want)
+			}
+		})
+	}
+}
+
+// TestLegacyMiningFeeSatPerKB pins the shared untrusted-float guard that both
+// recordPeerPolicy and endpointPolicyFrom depend on, so the two cannot drift on
+// what counts as an implausible fee.
+func TestLegacyMiningFeeSatPerKB(t *testing.T) {
+	ok := func(v float64) *float64 { return &v }
+
+	cases := []struct {
+		name  string
+		fee   *float64
+		want  uint64
+		wantK bool
+	}{
+		{name: "nil", fee: nil, wantK: false},
+		{name: "ordinary", fee: ok(0.0000005), want: 50, wantK: true},
+		{name: "zero fee is legitimate", fee: ok(0), want: 0, wantK: true},
+		{name: "NaN", fee: ok(math.NaN()), wantK: false},
+		{name: "positive infinity", fee: ok(math.Inf(1)), wantK: false},
+		{name: "negative", fee: ok(-0.0001), wantK: false},
+		{name: "absurd magnitude", fee: ok(1e30), wantK: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, gotOK := legacyMiningFeeSatPerKB(tc.fee)
+			if gotOK != tc.wantK {
+				t.Fatalf("ok = %v, want %v", gotOK, tc.wantK)
+			}
+			if gotOK && got != tc.want {
+				t.Errorf("got %d sat/kB, want %d", got, tc.want)
 			}
 		})
 	}

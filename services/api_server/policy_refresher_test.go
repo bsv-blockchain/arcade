@@ -19,7 +19,7 @@ func newPolicyServer(ms *mockStore) *Server {
 
 func newPolicyServerWithConfig(ms *mockStore, vcfg config.ValidatorConfig) *Server {
 	return &Server{
-		cfg:       &config.Config{Network: "mainnet", Validator: vcfg},
+		cfg:       &config.Config{Network: config.NetworkMainnet, Validator: vcfg},
 		logger:    zap.NewNop(),
 		store:     ms,
 		validator: validator.NewValidator(nil), // starts at the built-in defaults

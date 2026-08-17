@@ -24,6 +24,7 @@ import (
 	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/telemetry"
 	"github.com/bsv-blockchain/arcade/teranode"
 	"github.com/bsv-blockchain/arcade/version"
@@ -199,11 +200,54 @@ func RenderDocs(w io.Writer) error {
 // route around it (issue #254). Omitted (0) when no store is wired or the
 // height has never been readable.
 type healthResponse struct {
-	Healthy     bool                      `json:"healthy"`
-	Version     string                    `json:"version"`
-	Status      string                    `json:"status"`
-	BlockHeight uint64                    `json:"blockHeight,omitempty"`
-	DatahubURLs []teranode.EndpointStatus `json:"datahub_urls"`
+	Healthy     bool            `json:"healthy"`
+	Version     string          `json:"version"`
+	Status      string          `json:"status"`
+	BlockHeight uint64          `json:"blockHeight,omitempty"`
+	DatahubURLs []datahubStatus `json:"datahub_urls"`
+}
+
+// datahubStatus is one entry of health.datahub_urls: the circuit-breaker view
+// of an endpoint, plus the transaction policy that node advertised when it
+// registered the URL.
+//
+// teranode.EndpointStatus is embedded rather than copied so url/source/healthy
+// keep their exact position and spelling in the JSON — existing health checkers
+// and ARC clients parse this, and policy is purely additive.
+//
+// Policy answers "what will this specific endpoint accept", which
+// GET /policy cannot: that reports the single network-wide policy arcade
+// enforces, so when a broadcast is refused on policy grounds this is what
+// identifies the strict node. Absent for an endpoint no node_status has
+// announced — a statically configured URL, typically — or one whose node
+// predates fee_policy.
+type datahubStatus struct {
+	teranode.EndpointStatus
+
+	Policy *endpointPolicyView `json:"policy,omitempty"`
+}
+
+// endpointPolicyView renders an advertised policy in the same vocabulary as
+// GET /policy (models.Policy), minus standardFormatSupported, which is an ARC
+// transport flag rather than something a peer advertises. Operators reading
+// both endpoints see one set of names.
+type endpointPolicyView struct {
+	MiningFee               models.FeeAmount `json:"miningFee"`
+	MaxTxSizePolicy         uint64           `json:"maxtxsizepolicy"`
+	MaxScriptSizePolicy     uint64           `json:"maxscriptsizepolicy"`
+	MaxTxSigopsCountsPolicy uint64           `json:"maxtxsigopscountspolicy"`
+}
+
+func endpointPolicyViewFrom(p *store.EndpointPolicy) *endpointPolicyView {
+	if p == nil {
+		return nil
+	}
+	return &endpointPolicyView{
+		MiningFee:               models.FeeAmount{Satoshis: p.MiningFeeSatoshis, Bytes: p.MiningFeeBytes},
+		MaxTxSizePolicy:         p.MaxTxSizePolicy,
+		MaxScriptSizePolicy:     p.MaxScriptSizePolicy,
+		MaxTxSigopsCountsPolicy: p.MaxTxSigopsCountsPolicy,
+	}
 }
 
 // healthTipTTL bounds how often /health re-reads the store's active tip
@@ -236,16 +280,70 @@ func (s *Server) activeTipHeight(ctx context.Context) uint64 {
 	return h
 }
 
+// endpointPolicies returns the advertised policy for each registered datahub
+// URL, keyed by normalized URL, cached for healthTipTTL on the same terms as
+// activeTipHeight: /health is probed every few seconds per replica and this is
+// a full-registry read. Never fails the probe — on a store error it serves the
+// last known map and the next probe retries.
+func (s *Server) endpointPolicies(ctx context.Context) map[string]*store.EndpointPolicy {
+	if s.store == nil {
+		return nil
+	}
+	s.policyMu.Lock()
+	defer s.policyMu.Unlock()
+	if time.Since(s.policyFetchedAt) < healthTipTTL {
+		return s.policyByURL
+	}
+	eps, err := s.store.ListDatahubEndpoints(ctx, s.cfg.Network)
+	if err != nil {
+		s.logger.Debug("health endpoint-policy read failed", zap.Error(err))
+		return s.policyByURL
+	}
+	byURL := make(map[string]*store.EndpointPolicy, len(eps))
+	for _, ep := range eps {
+		if ep.Policy != nil {
+			byURL[normalizeEndpointURL(ep.URL)] = ep.Policy
+		}
+	}
+	s.policyByURL = byURL
+	s.policyFetchedAt = time.Now()
+	return s.policyByURL
+}
+
+// normalizeEndpointURL keys a URL the same way on both sides of the policy
+// join. It has to exist because the two sides are normalized differently
+// upstream: teranode.Client trims a trailing slash off every endpoint it
+// registers, while the store holds discovered URLs already normalized by
+// validateURL but statically configured ones exactly as they appear in config.
+// A seed URL written with a trailing slash therefore keys as "https://x/" in
+// the store and "https://x" in the client, and that endpoint's policy would
+// silently vanish from /health.
+//
+// Applied to both sides rather than just the store so the two cannot diverge
+// on anything else either — trimming one side only would reintroduce the same
+// class of miss for leading whitespace.
+func normalizeEndpointURL(u string) string {
+	return strings.TrimSuffix(strings.TrimSpace(u), "/")
+}
+
 func (s *Server) handleHealth(c *gin.Context) {
 	resp := healthResponse{
 		Healthy:     true,
 		Version:     version.Version,
 		Status:      "ok",
 		BlockHeight: s.activeTipHeight(c.Request.Context()),
-		DatahubURLs: []teranode.EndpointStatus{},
+		DatahubURLs: []datahubStatus{},
 	}
 	if s.teranode != nil {
-		resp.DatahubURLs = s.teranode.GetEndpointStatuses()
+		statuses := s.teranode.GetEndpointStatuses()
+		policies := s.endpointPolicies(c.Request.Context())
+		resp.DatahubURLs = make([]datahubStatus, 0, len(statuses))
+		for _, st := range statuses {
+			resp.DatahubURLs = append(resp.DatahubURLs, datahubStatus{
+				EndpointStatus: st,
+				Policy:         endpointPolicyViewFrom(policies[normalizeEndpointURL(st.URL)]),
+			})
+		}
 	}
 	c.JSON(http.StatusOK, resp)
 }

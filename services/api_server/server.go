@@ -75,6 +75,14 @@ type Server struct {
 	tipMu        sync.Mutex
 	tipHeight    uint64
 	tipFetchedAt time.Time
+
+	// policyMu/policyByURL/policyFetchedAt cache the per-endpoint advertised
+	// policies /health reports alongside each datahub URL (see
+	// endpointPolicies), on the same TTL and for the same reason as the tip
+	// height above: one registry read per TTL rather than one per probe.
+	policyMu        sync.Mutex
+	policyByURL     map[string]*store.EndpointPolicy
+	policyFetchedAt time.Time
 }
 
 // submissionRecord is the in-memory payload the async recorder consumes.
