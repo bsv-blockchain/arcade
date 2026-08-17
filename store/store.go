@@ -118,10 +118,10 @@ const maxStorablePolicyValue = uint64(math.MaxInt64)
 // calls it before writing, so the uint64→int64 narrowing each one performs is
 // bounded by a check instead of by assumption.
 //
-// The size limits are not validated here: unlike the fee, zero is a meaningful
-// value for them ("peer did not advertise"), so recordPeerPolicy zeroes an
-// out-of-range size rather than failing the whole row — a peer that advertises
-// a garbage tx size should still contribute its fee observation.
+// The size limits are allowed to be zero ("peer did not advertise"), but they
+// are still validated for storable range: values above maxStorablePolicyValue
+// are rejected by Validate. recordPeerPolicy calls SanitizePolicySizes to zero
+// out-of-range sizes so the fee observation can still be persisted.
 func (pp PeerPolicy) Validate() error {
 	switch {
 	case pp.PeerID == "":
