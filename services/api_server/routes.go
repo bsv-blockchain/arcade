@@ -80,6 +80,15 @@ var routeDocs = []RouteDoc{
 		ResponseBody:   "{\n  \"status\": \"ready\"\n}",
 	},
 	{
+		Method:         "GET",
+		Path:           "/policy",
+		Summary:        "Discover the current fee and size policy (ARC-compatible)",
+		Description:    "Returns Arcade's effective transaction policy in the ARC schema so clients can discover the fee rate and size limits before building transactions. Every value reflects exactly what intake enforces. When the operator hasn't pinned a fee, miningFee tracks the lowest fee the network will accept — the minimum advertised across peer node_status announcements — and Arcade enforces that same floor at intake; it falls back to the built-in default until a peer is heard. Also served at /v1/policy.",
+		ResponseStatus: "200 OK",
+		ResponseBody:   "{\n  \"policy\": {\n    \"miningFee\": { \"satoshis\": 100, \"bytes\": 1000 },\n    \"maxtxsizepolicy\": 10485760,\n    \"maxscriptsizepolicy\": 500000,\n    \"maxtxsigopscountspolicy\": 4294967295,\n    \"standardFormatSupported\": true\n  },\n  \"timestamp\": \"2026-08-07T12:00:00Z\"\n}",
+		Notes:          "maxtxsigopscountspolicy of 4294967295 means unlimited (the BSV post-Genesis default), matching the ARC convention. Always returns 200.",
+	},
+	{
 		Method:      "GET",
 		Path:        "/tx/:txid",
 		Summary:     "Look up transaction status by txid",
@@ -282,4 +291,8 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 	r.GET("/tx/:txid", s.handleGetTransaction)
 	r.POST("/tx", s.handleSubmitTransaction)
 	r.POST("/txs", s.handleSubmitTransactions)
+	// ARC-compatible policy discovery (issue #212). Bare /policy matches the
+	// path clients 404'd on; /v1/policy is the alias used by the ARC spec.
+	r.GET("/policy", s.handlePolicy)
+	r.GET("/v1/policy", s.handlePolicy)
 }

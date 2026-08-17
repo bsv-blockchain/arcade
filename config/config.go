@@ -923,8 +923,15 @@ const (
 type ValidatorConfig struct {
 	// MinFeePerKB is the network's minimum acceptable fee rate in
 	// satoshis per kilobyte. Transactions below this rate are rejected
-	// at intake. Zero falls back to DefaultValidatorMinFeePerKB unless
-	// AcceptZeroFee is true (which forces a zero floor regardless).
+	// at intake. Zero (the default) falls back to DefaultValidatorMinFeePerKB
+	// at intake unless AcceptZeroFee is true (which forces a zero floor
+	// regardless).
+	//
+	// Zero additionally signals "not operator-configured" to the GET /policy
+	// endpoint (issue #212): the advertised miningFee then becomes the lowest
+	// fee observed from peer node_status announcements, falling back to
+	// DefaultValidatorMinFeePerKB when no peer has been heard. A non-zero value
+	// (or AcceptZeroFee) is reported verbatim.
 	MinFeePerKB uint64 `mapstructure:"min_fee_per_kb"`
 
 	// AcceptZeroFee, when true, pins the validator's fee floor to exactly
@@ -940,6 +947,42 @@ type ValidatorConfig struct {
 	// authoritative and the check fails open when chain state is
 	// unavailable — so this exists purely as an emergency escape hatch.
 	DisableFinalityCheck bool `mapstructure:"disable_finality_check"`
+
+	// The fields below back the ARC-compatible GET /policy endpoint
+	// (issue #212). Each is the policy value arcade advertises and, for
+	// the size/sigop fields, enforces. Left at zero, they fall back to
+	// teranode's canonical policy defaults (see validator.defaultPolicySettings).
+
+	// MaxTxSizePolicy caps accepted transaction size in bytes. 0 =>
+	// DefaultValidatorMaxTxSizePolicy.
+	MaxTxSizePolicy uint64 `mapstructure:"max_tx_size_policy"`
+
+	// MaxScriptSizePolicy caps accepted script size in bytes. 0 =>
+	// DefaultValidatorMaxScriptSizePolicy.
+	MaxScriptSizePolicy uint64 `mapstructure:"max_script_size_policy"`
+
+	// MaxTxSigopsCountsPolicy caps sigops per transaction. 0 => unlimited,
+	// the BSV post-Genesis default, and is reported verbatim in /policy.
+	MaxTxSigopsCountsPolicy int64 `mapstructure:"max_tx_sigops_counts_policy"`
+
+	// StandardFormatSupported reports whether standard (non-EF) transaction
+	// format is accepted at intake. Arcade parses standard raw txs (see
+	// handleSubmitTransaction), so this defaults to true.
+	StandardFormatSupported bool `mapstructure:"standard_format_supported"`
+
+	// ObservedFeeTTLMs bounds how long a mining fee observed from a peer's
+	// node_status announcement stays eligible for the network-minimum
+	// computation. A peer not re-heard within this window is dropped from the
+	// minimum so a departed cheap node can't pin the fee low forever.
+	// 0 => DefaultValidatorObservedFeeTTLMs.
+	ObservedFeeTTLMs uint64 `mapstructure:"observed_fee_ttl_ms"`
+
+	// ObservedFeeRefreshMs is how often the api-server recomputes the
+	// network-minimum fee from observed peer policies and pushes it into the
+	// intake validator (issue #212). Only active when the operator has NOT
+	// pinned a fee (min_fee_per_kb=0 and accept_zero_fee=false).
+	// 0 => DefaultValidatorObservedFeeRefreshMs.
+	ObservedFeeRefreshMs uint64 `mapstructure:"observed_fee_refresh_ms"`
 }
 
 // DefaultValidatorMinFeePerKB is the production fee floor in satoshis
@@ -947,6 +990,23 @@ type ValidatorConfig struct {
 // Tests and ad-hoc deployments may set ValidatorConfig.MinFeePerKB to
 // a lower value to accept older or non-standard txs.
 const DefaultValidatorMinFeePerKB = 100
+
+// Default policy values for the GET /policy endpoint. They mirror teranode's
+// canonical BSV policy defaults (validator.defaultPolicySettings) so arcade
+// advertises the same limits the upstream node enforces when the operator
+// leaves them unset.
+const (
+	// DefaultValidatorMaxTxSizePolicy is the max accepted tx size in bytes (10 MiB).
+	DefaultValidatorMaxTxSizePolicy = 10485760
+	// DefaultValidatorMaxScriptSizePolicy is the max accepted script size in bytes.
+	DefaultValidatorMaxScriptSizePolicy = 500000
+	// DefaultValidatorObservedFeeTTLMs is how long (15 min) a peer's observed
+	// mining fee remains eligible for the network-minimum.
+	DefaultValidatorObservedFeeTTLMs = 900000
+	// DefaultValidatorObservedFeeRefreshMs is how often (30 s) the api-server
+	// recomputes the network-minimum fee and updates the intake validator.
+	DefaultValidatorObservedFeeRefreshMs = 30000
+)
 
 func BindFlags(cmd *cobra.Command) {
 	cmd.Flags().String("mode", "all", "Service mode: all, api-server, bump-builder, propagation, p2p-client")
@@ -1203,9 +1263,23 @@ func setDefaults() {
 	viper.SetDefault("chaintracks_server.tie_scan_depth", 20)
 	viper.SetDefault("chaintracks_server.tie_scan_min_interval_ms", 5000)
 
-	// Intake validator fee floor in satoshis per KB. Matches the
-	// current BSV miner policy minimum.
-	viper.SetDefault("validator.min_fee_per_kb", DefaultValidatorMinFeePerKB)
+	// Intake validator fee floor in satoshis per KB. Default 0 means "not
+	// operator-configured": intake still enforces DefaultValidatorMinFeePerKB
+	// (the validator's built-in floor), while GET /policy advertises the
+	// network-observed minimum (issue #212). SetDefault is required even at 0
+	// so AutomaticEnv honors the ARCADE_VALIDATOR_MIN_FEE_PER_KB override.
+	viper.SetDefault("validator.min_fee_per_kb", 0)
+
+	// ARC-compatible GET /policy fields (issue #212). Defaults mirror
+	// teranode's canonical policy so the advertised limits match the
+	// upstream node. Every key needs an explicit SetDefault for AutomaticEnv
+	// to honour its ARCADE_VALIDATOR_* override (same reasoning as above).
+	viper.SetDefault("validator.max_tx_size_policy", DefaultValidatorMaxTxSizePolicy)
+	viper.SetDefault("validator.max_script_size_policy", DefaultValidatorMaxScriptSizePolicy)
+	viper.SetDefault("validator.max_tx_sigops_counts_policy", 0)
+	viper.SetDefault("validator.standard_format_supported", true)
+	viper.SetDefault("validator.observed_fee_ttl_ms", DefaultValidatorObservedFeeTTLMs)
+	viper.SetDefault("validator.observed_fee_refresh_ms", DefaultValidatorObservedFeeRefreshMs)
 }
 
 func validate(cfg *Config) error {

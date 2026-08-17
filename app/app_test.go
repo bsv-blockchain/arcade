@@ -85,16 +85,19 @@ func TestModeNeedsValidator(t *testing.T) {
 }
 
 func TestValidatorPolicyFromConfig(t *testing.T) {
+	// The policy is always non-nil now that the size/sigop fields thread
+	// through (issue #212); wantFeeNil asserts only the MinFeePerKB pointer,
+	// which drives the validator's DefaultMinFeePerKB fallback when nil.
 	cases := []struct {
 		name        string
 		acceptZero  bool
 		minFeePerKB uint64
-		wantNil     bool
+		wantFeeNil  bool
 		wantFee     uint64
 	}{
 		{
-			name:    "unset config returns nil so NewValidator applies its default",
-			wantNil: true,
+			name:       "unset fee leaves MinFeePerKB nil so NewValidator applies its default",
+			wantFeeNil: true,
 		},
 		{
 			name:        "explicit min_fee_per_kb threads through",
@@ -102,9 +105,9 @@ func TestValidatorPolicyFromConfig(t *testing.T) {
 			wantFee:     50,
 		},
 		{
-			name:        "min_fee_per_kb=0 without flag still falls back to default",
+			name:        "min_fee_per_kb=0 without flag leaves MinFeePerKB nil (default floor)",
 			minFeePerKB: 0,
-			wantNil:     true,
+			wantFeeNil:  true,
 		},
 		{
 			name:       "accept_zero_fee pins fee to zero",
@@ -126,14 +129,17 @@ func TestValidatorPolicyFromConfig(t *testing.T) {
 			cfg.Validator.MinFeePerKB = tc.minFeePerKB
 
 			got := validatorPolicyFromConfig(cfg)
-			if tc.wantNil {
-				if got != nil {
-					t.Fatalf("expected nil policy, got %+v", got)
+			if got == nil {
+				t.Fatalf("expected non-nil policy, got nil")
+			}
+			if tc.wantFeeNil {
+				if got.MinFeePerKB != nil {
+					t.Fatalf("expected nil MinFeePerKB, got %d", *got.MinFeePerKB)
 				}
 				return
 			}
-			if got == nil || got.MinFeePerKB == nil {
-				t.Fatalf("expected non-nil policy with MinFeePerKB set, got %+v", got)
+			if got.MinFeePerKB == nil {
+				t.Fatalf("expected non-nil MinFeePerKB, got nil")
 			}
 			if *got.MinFeePerKB != tc.wantFee {
 				t.Errorf("MinFeePerKB = %d, want %d", *got.MinFeePerKB, tc.wantFee)

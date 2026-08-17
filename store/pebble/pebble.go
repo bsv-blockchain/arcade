@@ -241,6 +241,14 @@ type storedDatahubEndpoint struct {
 	LastSeenUnixNs int64  `json:"last_seen"`
 }
 
+type storedPeerPolicy struct {
+	PeerID            string `json:"peer_id"`
+	Network           string `json:"network"`
+	MiningFeeSatoshis uint64 `json:"mining_fee_satoshis"`
+	MiningFeeBytes    uint64 `json:"mining_fee_bytes"`
+	LastSeenUnixNs    int64  `json:"last_seen"`
+}
+
 // New opens a Pebble database at cfg.Path and returns a Store ready to use.
 // If the directory does not exist it's created. The returned Store takes an
 // exclusive file lock on the directory — closing the Store releases it.
@@ -2277,6 +2285,73 @@ func (s *Store) ListDatahubEndpoints(ctx context.Context, network string) ([]sto
 			ep.LastSeen = time.Unix(0, row.LastSeenUnixNs)
 		}
 		out = append(out, ep)
+	}
+	return out, nil
+}
+
+func (s *Store) UpsertPeerPolicy(ctx context.Context, pp store.PeerPolicy) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// Pebble stores the fees as JSON uint64 and so cannot lose precision, but it
+	// validates on the same terms as the other backends: a zero byte basis is
+	// meaningless everywhere, and one backend silently accepting what the others
+	// reject would make the store's contract depend on its deployment.
+	if err := pp.Validate(); err != nil {
+		return err
+	}
+	stored := storedPeerPolicy{
+		PeerID:            pp.PeerID,
+		Network:           pp.Network,
+		MiningFeeSatoshis: pp.MiningFeeSatoshis,
+		MiningFeeBytes:    pp.MiningFeeBytes,
+	}
+	if !pp.LastSeen.IsZero() {
+		stored.LastSeenUnixNs = pp.LastSeen.UnixNano()
+	}
+	payload, err := json.Marshal(stored)
+	if err != nil {
+		return err
+	}
+	return s.db.Set(peerPolicyKey(pp.PeerID), payload, s.writeOpts)
+}
+
+func (s *Store) ListPeerPolicies(ctx context.Context, network string) ([]store.PeerPolicy, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	prefix := peerPolicyPrefix()
+	iter, err := s.db.NewIter(&pebbledb.IterOptions{
+		LowerBound: prefix,
+		UpperBound: endOfPrefix(prefix),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = iter.Close() }()
+
+	var out []store.PeerPolicy
+	for iter.First(); iter.Valid(); iter.Next() {
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
+		var row storedPeerPolicy
+		if err := json.Unmarshal(iter.Value(), &row); err != nil {
+			continue
+		}
+		if row.Network != network {
+			continue
+		}
+		pp := store.PeerPolicy{
+			PeerID:            row.PeerID,
+			Network:           row.Network,
+			MiningFeeSatoshis: row.MiningFeeSatoshis,
+			MiningFeeBytes:    row.MiningFeeBytes,
+		}
+		if row.LastSeenUnixNs != 0 {
+			pp.LastSeen = time.Unix(0, row.LastSeenUnixNs)
+		}
+		out = append(out, pp)
 	}
 	return out, nil
 }

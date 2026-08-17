@@ -250,6 +250,14 @@ func (s *fakeStore) ListDatahubEndpoints(context.Context, string) ([]store.Datah
 	return nil, nil
 }
 
+func (s *fakeStore) UpsertPeerPolicy(context.Context, store.PeerPolicy) error {
+	return nil
+}
+
+func (s *fakeStore) ListPeerPolicies(context.Context, string) ([]store.PeerPolicy, error) {
+	return nil, nil
+}
+
 func (s *fakeStore) UpsertBlockHeaderSeen(context.Context, string, uint64, time.Time) error {
 	return nil
 }
