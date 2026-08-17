@@ -3,7 +3,6 @@ package chaintracks_server
 import (
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -19,7 +18,7 @@ func TestChaintracksHTTPHandlerAllowsBrowserClients(t *testing.T) {
 	handler := chaintracksHTTPHandler(router)
 
 	t.Run("preflight", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodOptions, "/chaintracks/v2/height", nil)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodOptions, "/chaintracks/v2/height", nil)
 		req.Header.Set("Origin", "https://wallet.example")
 		req.Header.Set("Access-Control-Request-Method", http.MethodGet)
 		res := httptest.NewRecorder()
@@ -28,11 +27,11 @@ func TestChaintracksHTTPHandlerAllowsBrowserClients(t *testing.T) {
 
 		require.Equal(t, http.StatusNoContent, res.Code)
 		require.Equal(t, "*", res.Header().Get("Access-Control-Allow-Origin"))
-		require.True(t, strings.Contains(res.Header().Get("Access-Control-Allow-Methods"), http.MethodGet))
+		require.Contains(t, res.Header().Get("Access-Control-Allow-Methods"), http.MethodGet)
 	})
 
 	t.Run("actual request", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/chaintracks/v2/height", nil)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/chaintracks/v2/height", nil)
 		req.Header.Set("Origin", "https://wallet.example")
 		res := httptest.NewRecorder()
 
