@@ -961,7 +961,7 @@ type ValidatorConfig struct {
 	// can only widen the limit from DefaultValidatorMaxTxSizePolicy, never
 	// narrow it, so a misconfigured peer cannot cause false rejections. Falls
 	// back to DefaultValidatorMaxTxSizePolicy when no peer has been heard.
-	// A non-zero value is enforced and reported verbatim.
+	// A non-zero value is enforced and reported, but is clamped to the BDK consensus maximum.
 	MaxTxSizePolicy uint64 `mapstructure:"max_tx_size_policy"`
 
 	// MaxScriptSizePolicy caps accepted script size in bytes. Zero (the
