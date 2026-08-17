@@ -747,6 +747,60 @@ var SSEMidstreamCatchupFramesTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "Frames replayed from the store by mid-stream SSE catchup rounds.",
 })
 
+// SSEClientLagSeconds measures, per client per keepalive tick, how far behind
+// the present that client's last delivered frame is.
+//
+// This is the single most useful health signal for the push path and the one
+// whose absence let 1.6M dropped events go unnoticed for a whole 45-minute
+// run: drops and fan-out duration each describe one component, while lag
+// describes what a consumer actually EXPERIENCES. It is nearly free — the
+// writer goroutine already maintains the lastDelivered watermark, and this
+// samples it once per client per keepalive rather than per frame.
+//
+// A client with nothing to receive reads as lag, so interpret it against
+// SSEConnectedClients and the publish rate: it is a "is the stream keeping
+// up" signal, not a liveness check.
+var SSEClientLagSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+	Name:    "arcade_sse_client_lag_seconds",
+	Help:    "Age of the last frame delivered to an SSE client, sampled per keepalive tick.",
+	Buckets: []float64{.05, .1, .25, .5, 1, 2.5, 5, 10, 30, 60, 300},
+})
+
+// SSEConnectionsTotal counts finished /events connections by how they ended:
+//   - "client_closed": the request context was canceled (normal disconnect).
+//   - "drain":         released by a graceful shutdown.
+//   - "write_error":   the connection died mid-write.
+//
+// The rate is the reconnect rate, and the label says why. A reconnect storm
+// with outcome="write_error" is a very different problem from one with
+// outcome="drain", and before this the two were indistinguishable.
+var SSEConnectionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_sse_connections_total",
+	Help: "Finished SSE /events connections, by how they ended.",
+}, []string{"outcome"}) // client_closed, drain, write_error
+
+// SSEGapEventsTotal counts `event: gap` frames written to /events clients —
+// every occasion on which the server KNOWS it handed a client a discontiguous
+// stream and said so. Reasons:
+//   - "catchup_truncated": a connect-time replay stopped at the frame cap with
+//     matching history still beyond the cursor.
+//   - "firehose_drop": a tokenless client's frame was dropped on channel
+//     overflow. There is no bounded store query that reconstructs an
+//     unfiltered stream, so a gap notice is the only recovery signal these
+//     clients can be given.
+//   - "replay_unavailable": the store could not serve the replay (iteration
+//     error, or a backend that refused an unbounded scan).
+//
+// This is the counterpart to APISSEDroppedTotal: drops say the server lost
+// something, gaps say the CLIENT was told. A drop rate without a matching gap
+// rate is silent loss, which is the failure mode this metric exists to make
+// impossible to miss. The client's contract on receiving one is to reconcile
+// the window over REST.
+var SSEGapEventsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_sse_gap_events_total",
+	Help: "SSE `event: gap` frames written, by reason.",
+}, []string{"reason"}) // catchup_truncated, firehose_drop, replay_unavailable
+
 // EventsSubscriberDroppedTotal counts events.Publisher.Subscribe channel
 // drops, labeled by which caller's channel filled. The publisher emits a
 // drop when the per-subscriber buffer is at capacity and the kafka handler
@@ -942,6 +996,17 @@ var P2PEndpointDiscoveryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 var P2PPeerBestHeight = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "arcade_p2p_peer_best_height",
 	Help: "Best block height advertised by a datahub peer via p2p node_status, by base_url.",
+}, []string{"base_url"})
+
+// P2PPeerMinMiningFee reports the minimum mining fee (satoshis per 1000 bytes)
+// each peer advertises in its node_status FeePolicy. The GET /policy endpoint
+// advertises the network-wide minimum of these (issue #212); this gauge makes
+// the per-peer inputs visible. Labelled by base_url for the same
+// bounded-cardinality reason as P2PPeerBestHeight; peers with no base_url are
+// still persisted for the minimum but not surfaced here.
+var P2PPeerMinMiningFee = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "arcade_p2p_peer_min_mining_fee",
+	Help: "Minimum mining fee (satoshis per 1000 bytes) advertised by a peer via p2p node_status, by base_url.",
 }, []string{"base_url"})
 
 // ChainTipHeight reports arcade's own view of the active chain tip — the

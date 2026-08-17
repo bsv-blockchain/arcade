@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -68,6 +70,13 @@ type Client struct {
 	// block's burst used to emit one Warn PER dropped event.
 	dropsSinceLog atomic.Int64
 	lastDropLog   atomic.Int64
+
+	// drainRetryMS is this connection's personal reconnect delay, set by
+	// Manager.Drain just before it cancels Ctx and read once by the writer
+	// goroutine on its way out. Zero means "no hint" (either not a drain, or
+	// hints are disabled). Per-client rather than shared because a single
+	// shared delay relocates a reconnect herd instead of dispersing it.
+	drainRetryMS atomic.Int64
 }
 
 // Manager owns the per-pod registry of SSE clients listening on
@@ -102,10 +111,20 @@ type Manager struct {
 	fanoutEWMA   float64
 	fanoutEvents int64
 
-	// parentCtx is the long-lived context that owns the manager
-	// goroutine. Per-client contexts are derived from it so canceling
-	// the manager also cancels every registered client's fan-out path.
-	parentCtx context.Context //nolint:containedctx // long-lived registry root
+	// parentCtx roots every per-client context, so canceling it cancels every
+	// registered client's fan-out path at once.
+	//
+	// It is derived from the service context via context.WithoutCancel, so it
+	// inherits that context's VALUES (trace and logging context stay attached
+	// to per-client work) while dropping its cancellation, and is cancelled
+	// only by Drain. If it inherited cancellation too, a shutdown would cancel
+	// every client the instant SIGTERM landed — before the drain had failed
+	// readiness, waited for the endpoint to be withdrawn, or handed out
+	// reconnect hints. The drain would be a no-op and every stream would still
+	// be severed simultaneously. The manager's own run goroutine keeps using
+	// the service context directly, because it SHOULD stop immediately.
+	parentCtx    context.Context //nolint:containedctx // long-lived registry root
+	parentCancel context.CancelFunc
 
 	nextClientID atomic.Int64
 
@@ -143,12 +162,15 @@ func newManager(ctx context.Context, publisher events.Publisher, st store.Store,
 		return nil, nil //nolint:nilnil // intentional: nil manager means "no fan-out wired"
 	}
 	named := logger.Named("sse")
+	// clientRoot outlives ctx on purpose — see Manager.parentCtx.
+	clientRoot, cancelClients := context.WithCancel(context.WithoutCancel(ctx))
 	m := &Manager{
 		publisher:     publisher,
 		store:         st,
 		logger:        named,
 		tokens:        newTokenIndex(st, named),
-		parentCtx:     ctx,
+		parentCtx:     clientRoot,
+		parentCancel:  cancelClients,
 		catchupOnDrop: true,
 		clients:       make(map[int64]*Client),
 	}
@@ -411,6 +433,35 @@ func (m *Manager) Unregister(id int64) {
 	}
 }
 
+// Drain releases every registered client for a graceful shutdown and reports
+// how many it released.
+//
+// Each client is given its OWN reconnect delay, drawn uniformly below
+// retryMax, before its context is canceled. The per-client draw is the whole
+// point: releasing N clients with one shared delay just moves the herd, it
+// does not disperse it. The writer goroutine observes the cancellation, emits
+// a shutdown frame carrying that delay as an SSE `retry:` directive, and
+// returns — so the stream ends with a clean FIN instead of the RST that a
+// process exit produces.
+//
+// retryMax <= 0 skips the hint entirely and clients fall back to their own
+// backoff, which is still correct, just less well spread.
+func (m *Manager) Drain(retryMax time.Duration) int {
+	clients := m.snapshot()
+	for _, c := range clients {
+		if retryMax > 0 {
+			//nolint:gosec // reconnect spreading is a load-shaping device, not a security primitive
+			c.drainRetryMS.Store(1 + rand.Int64N(retryMax.Milliseconds()))
+		}
+		c.Cancel()
+	}
+	// Catch anything that connected between the snapshot and here. Those get
+	// no reconnect hint, which is the right trade: they arrived after readiness
+	// had already failed, so there should be none.
+	m.parentCancel()
+	return len(clients)
+}
+
 // NewClient assembles a client with a fresh id, buffered channel, and
 // per-client cancel handle. The client context is derived from the
 // manager's parent ctx so a manager shutdown propagates to every client.
@@ -467,18 +518,16 @@ func (s *Service) handleEvents(c *gin.Context) {
 	s.manager.Register(client)
 	defer s.manager.Unregister(client.ID)
 
-	if token != "" {
-		var since time.Time
-		if lastEventID := c.GetHeader("Last-Event-ID"); lastEventID != "" {
-			if ns, err := strconv.ParseInt(lastEventID, 10, 64); err == nil {
-				since = time.Unix(0, ns)
-			}
-		}
-		// The pre-stream catchup threads the client through so lastDelivered
-		// is initialized from the replayed history — a later mid-stream
-		// catchup then resumes from a fresh watermark instead of replaying
-		// from zero.
-		s.sendCatchup(ctx, writer, token, since, client, false, catchupMaxFrames)
+	// outcome records why this connection ended. The rate of this counter is
+	// the reconnect rate and the label is the reason — a storm of write_error
+	// is a completely different problem from a storm of drain, and the two
+	// used to be indistinguishable.
+	outcome := "client_closed"
+	defer func() { metrics.SSEConnectionsTotal.WithLabelValues(outcome).Inc() }()
+
+	if token != "" && !s.connectCatchup(ctx, writer, token, c.GetHeader("Last-Event-ID"), client) {
+		outcome = "write_error"
+		return // connection is gone; nothing left to serve
 	}
 
 	keepalive := time.NewTicker(15 * time.Second)
@@ -488,9 +537,17 @@ func (s *Service) handleEvents(c *gin.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-client.Ctx.Done():
+			// Manager-initiated release (Drain). Unlike the request-ctx arm
+			// above, the connection is still writable here, so say goodbye
+			// with a staggered reconnect hint rather than dropping the socket.
+			outcome = "drain"
+			writeShutdown(writer, client)
+			return
 		case status := <-client.Ch:
 			if status != nil {
 				if err := writeStatusBuffered(writer, status); err != nil {
+					outcome = "write_error"
 					return
 				}
 				client.lastDelivered.Store(status.Timestamp.UnixNano())
@@ -499,27 +556,86 @@ func (s *Service) handleEvents(c *gin.Context) {
 			// one Kafka message lands ~50 frames here; without coalescing we'd
 			// flush per frame.
 			if _, err := drainLive(writer, client); err != nil {
+				outcome = "write_error"
 				return
 			}
 			if err := writer.flush(); err != nil {
+				outcome = "write_error"
 				return
 			}
 			if !s.midstreamCatchup(ctx, writer, client) {
+				outcome = "write_error"
 				return
 			}
 		case <-keepalive.C:
 			if err := writer.write(": keepalive\n\n"); err != nil {
+				outcome = "write_error"
 				return
 			}
+			observeClientLag(client)
 			// Also heal on the keepalive tick: a drop can land just after the
 			// writer's post-drain check (the flag is set by the concurrent
 			// fan-out goroutine), and if the stream then goes quiet no further
 			// drain cycle would notice it.
 			if !s.midstreamCatchup(ctx, writer, client) {
+				outcome = "write_error"
 				return
 			}
 		}
 	}
+}
+
+// observeClientLag samples how far behind the present this connection's last
+// delivered frame is.
+//
+// Sampled on the keepalive tick rather than per frame: the watermark is
+// already maintained by the writer goroutine, so this costs one atomic load
+// and one histogram observation per client per 15s. It is the signal that
+// describes what a consumer actually experiences — drops and fan-out duration
+// each describe one component in isolation, which is how 1.6M dropped events
+// went unnoticed for a whole benchmark run.
+//
+// Skipped before the first delivery: a connection that has legitimately had
+// nothing to receive would otherwise report its entire uptime as lag.
+func observeClientLag(client *Client) {
+	last := client.lastDelivered.Load()
+	if last <= 0 {
+		return
+	}
+	metrics.SSEClientLagSeconds.Observe(time.Since(time.Unix(0, last)).Seconds())
+}
+
+// connectCatchup runs the pre-stream replay for a token-scoped connection and
+// reports whether the connection is still writable.
+//
+// The client is threaded through so lastDelivered is initialized from the
+// replayed history — a later mid-stream catchup then resumes from a fresh
+// watermark instead of replaying from zero. A malformed Last-Event-ID is
+// treated as absent, which yields fresh-connect semantics (non-terminal
+// statuses only) rather than an error.
+//
+// A store failure here leaves a writable connection that owes history it will
+// never send, so it raises a gap rather than sliding silently into live
+// frames. Truncation raises its own gap inside sendCatchup.
+func (s *Service) connectCatchup(ctx context.Context, w *sseWriter, token, lastEventID string, client *Client) bool {
+	var since time.Time
+	if lastEventID != "" {
+		if ns, err := strconv.ParseInt(lastEventID, 10, 64); err == nil {
+			since = time.Unix(0, ns)
+		}
+	}
+	res := s.sendCatchup(ctx, w, token, since, client, false, catchupMaxFrames)
+	if res.writeFailed {
+		return false
+	}
+	if res.err == nil {
+		return true
+	}
+	s.logger.Warn("sse connect catchup failed; client notified of gap",
+		zap.Int64("client_id", client.ID),
+		zap.Int("frames", res.frames),
+		zap.Error(res.err))
+	return writeGap(w, gapReasonReplayUnavailable, since.UnixNano(), 0) == nil
 }
 
 // catchupMaxFrames bounds a single catchup replay. A well-behaved token
@@ -595,6 +711,10 @@ type catchupResult struct {
 	// err is any non-cap error: a write error (connection dead) or a store
 	// iteration error.
 	err error
+	// writeFailed distinguishes the two err sources. A store failure leaves a
+	// writable connection that has silently missed history and must be told so
+	// with a gap frame; a write failure means there is nobody left to tell.
+	writeFailed bool
 }
 
 // sendCatchup replays persisted statuses for txids registered under the
@@ -618,15 +738,23 @@ type catchupResult struct {
 // client, when non-nil, has its lastDelivered watermark advanced per written
 // frame so mid-stream catchup can resume from where any earlier pass ended.
 //
-// midstream=true adapts the pass for the live-loop caller: the frame cap
-// becomes "soft" at a timestamp boundary — once the cap is reached the pass
-// keeps writing while the timestamp stays EQUAL to the last written frame's.
-// The store's since-filter is strictly-after, so a timestamp-cursor cannot
-// resume mid-way through an equal-timestamp run (SetMinedByTxIDs stamps a
-// whole block's rows with one timestamp_at); stopping inside one would
-// strand the remainder forever. Draining the tie bounds the overshoot by the
-// largest same-timestamp batch, and guarantees `capped` passes always end on
-// a boundary the next round can resume from strictly-after.
+// The frame cap is ALWAYS soft at a timestamp boundary, on both the
+// connect-time and the mid-stream path: once the cap is reached the pass keeps
+// writing while the timestamp stays EQUAL to the last written frame's. The
+// store's since-filter is strictly-after and timestamp_at is only
+// microsecond-resolution, so a timestamp cursor cannot resume mid-way through
+// an equal-timestamp run (SetMinedByTxIDs stamps a whole block's rows with one
+// timestamp_at) — stopping inside one strands the remainder FOREVER. That was
+// a silent, permanent loss on the Last-Event-ID reconnect path: the pass
+// stopped mid-tie, reported lastTS as the tied timestamp, and the client
+// resumed strictly after it. Draining the tie bounds the overshoot by the
+// largest same-timestamp batch (frames are streamed, never accumulated, so the
+// cost is time and not memory) and guarantees a `capped` pass always ends on a
+// boundary the next round can resume from.
+//
+// midstream=true only changes how a capped pass is REPORTED: the live loop
+// paginates by design, so it is not logged as a truncation and does not raise
+// a gap.
 //
 // maxFrames is the pass's frame budget: catchupMaxFrames for connect-time
 // replay, and the smaller midstreamRoundFrames(client) for live rounds, which
@@ -641,14 +769,12 @@ func (s *Service) sendCatchup(ctx context.Context, w *sseWriter, token string, s
 	enrichedBlocks := make(map[string]struct{})
 	err := s.store.IterateStatusesByToken(ctx, token, since, only, func(status *models.TransactionStatus) error {
 		ts := status.Timestamp.UnixNano()
-		if res.frames >= maxFrames {
-			if !midstream || ts != res.lastTS {
-				res.capped = true
-				return errCatchupCapped
-			}
-			// midstream: same-timestamp tie with the frame that hit the cap —
-			// finish the tie (see the function comment).
+		if res.frames >= maxFrames && ts != res.lastTS {
+			res.capped = true
+			return errCatchupCapped
 		}
+		// Reaching here past the cap means a same-timestamp tie with the frame
+		// that hit it — finish the tie (see the function comment).
 		if status.Status == models.StatusMined || status.Status == models.StatusImmutable {
 			_, seen := enrichedBlocks[status.BlockHash]
 			if status.BlockHash != "" && (seen || len(enrichedBlocks) < catchupBlockBudget) {
@@ -660,6 +786,7 @@ func (s *Service) sendCatchup(ctx context.Context, w *sseWriter, token string, s
 			}
 		}
 		if err := writeStatus(w, status); err != nil {
+			res.writeFailed = true
 			return err
 		}
 		res.frames++
@@ -680,10 +807,36 @@ func (s *Service) sendCatchup(ctx context.Context, w *sseWriter, token string, s
 		s.logger.Warn("sse catchup truncated at frame cap",
 			zap.Int("cap", maxFrames),
 			zap.Bool("fresh_connect", since.IsZero()))
+		// Tell the CLIENT, not just the log. Everything after res.lastTS that
+		// matched this token is history it will never be pushed; without this
+		// frame it has no way to know that and would carry on as if whole.
+		if gapErr := writeGap(w, gapReasonCatchupTruncated, res.lastTS, int64(res.frames)); gapErr != nil {
+			res.err = gapErr
+			res.writeFailed = true
+		}
 	default:
 		res.err = err
 	}
 	return res
+}
+
+// declareFirehoseGap handles a drop on a tokenless (firehose) connection.
+//
+// No bounded store query can reconstruct an unfiltered stream, so there is
+// nothing to replay — but the drop can still be declared. Consumes the drop
+// flag (so the gap is raised once per episode rather than on every keepalive
+// tick) and writes one gap frame carrying the earliest dropped timestamp as
+// the cursor the client can still trust. Returns false when the connection is
+// no longer writable.
+func declareFirehoseGap(w *sseWriter, client *Client) bool {
+	if !client.dropped.Swap(false) {
+		return true
+	}
+	from := int64(0)
+	if floor := client.droppedFloor.Swap(math.MaxInt64); floor != math.MaxInt64 {
+		from = floor
+	}
+	return writeGap(w, gapReasonFirehoseDrop, from, 0) == nil
 }
 
 // midstreamCatchup heals a live token-scoped connection after fanOut dropped
@@ -714,7 +867,10 @@ func (s *Service) sendCatchup(ctx context.Context, w *sseWriter, token string, s
 // it was healing overflowed again mid-replay — the drop→catchup→drop loop
 // that kept a stream in permanent recovery.
 func (s *Service) midstreamCatchup(ctx context.Context, w *sseWriter, client *Client) bool {
-	if client.Token == "" || !s.manager.catchupOnDrop {
+	if client.Token == "" {
+		return declareFirehoseGap(w, client)
+	}
+	if !s.manager.catchupOnDrop {
 		return true
 	}
 	roundFrames := midstreamRoundFrames(client)
@@ -742,6 +898,16 @@ func (s *Service) midstreamCatchup(ctx context.Context, w *sseWriter, client *Cl
 		metrics.SSEMidstreamCatchupsTotal.Inc()
 		res := s.sendCatchup(ctx, w, client.Token, time.Unix(0, sinceNS), client, true, roundFrames)
 		metrics.SSEMidstreamCatchupFramesTotal.Add(float64(res.frames))
+		if errors.Is(res.err, store.ErrReplayUnavailable) {
+			// The backend refused this replay (a token too large to serve
+			// without an index over it). That is a bounded, declared
+			// degradation, not a dead connection: tell the client to reconcile
+			// and keep the LIVE stream running, which is still useful.
+			s.logger.Warn("sse mid-stream catchup unavailable; client notified of gap",
+				zap.Int64("client_id", client.ID),
+				zap.Error(res.err))
+			return writeGap(w, gapReasonReplayUnavailable, sinceNS, 0) == nil
+		}
 		if res.err != nil {
 			// Either the connection is dead (write error) or the store
 			// iteration failed mid-window. Both ways the safe move is to end
@@ -847,6 +1013,92 @@ func buildStatusFrame(status *models.TransactionStatus) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("id: %d\nevent: status\ndata: %s\n\n", status.Timestamp.UnixNano(), data), nil
+}
+
+// Gap reasons. These are the `reason` field on a gap frame and the label on
+// metrics.SSEGapEventsTotal — keep the two in step.
+const (
+	// gapReasonCatchupTruncated: a connect-time replay stopped at the frame cap
+	// with matching history still beyond the cursor.
+	gapReasonCatchupTruncated = "catchup_truncated"
+	// gapReasonFirehoseDrop: a tokenless client's frame was dropped on channel
+	// overflow and no token-scoped replay can recover it.
+	gapReasonFirehoseDrop = "firehose_drop"
+	// gapReasonReplayUnavailable: the store could not serve the replay, so the
+	// connection proceeded to live frames without the history it owed.
+	gapReasonReplayUnavailable = "replay_unavailable"
+)
+
+// gapPayload is the JSON shape inside a `data:` field on an `event: gap`
+// frame. It is the server admitting, in-band, that the stream it just handed
+// this client is discontiguous.
+//
+// Before this existed, the two ways a client silently lost history — a
+// connect-time replay stopped at the frame cap, and a tokenless client's
+// dropped frame — produced only a server-side Warn and a counter. The client
+// streamed on believing it was whole. `from` is the last cursor the client can
+// trust; everything after it, up to the live stream, may be missing.
+//
+// Unknown event types are ignored by every conformant SSE client (including
+// go-arcade-toolbox, which skips any `event:` other than "status"), so this
+// frame is purely additive and safe to emit at any protocol version.
+type gapPayload struct {
+	// Reason is machine-readable and matches the SSEGapEventsTotal label.
+	Reason string `json:"reason"`
+	// From is the nanosecond cursor the gap starts after — the last id the
+	// client was handed. Empty when no cursor is known (a firehose client with
+	// no delivered frame yet).
+	From string `json:"from,omitempty"`
+	// Count is a best-effort magnitude of what was skipped, when known.
+	Count int64 `json:"count,omitempty"`
+	// Action tells the client what to do. Always "reconcile": re-fetch the
+	// affected transactions over REST.
+	Action string `json:"action"`
+}
+
+// writeGap emits an `event: gap` frame and flushes it. Errors are returned so
+// callers on the writer goroutine can treat a failed write as a dead
+// connection, matching writeStatus.
+func writeGap(w *sseWriter, reason string, from, count int64) error {
+	p := gapPayload{Reason: reason, Count: count, Action: "reconcile"}
+	if from > 0 {
+		p.From = strconv.FormatInt(from, 10)
+	}
+	data, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+	metrics.SSEGapEventsTotal.WithLabelValues(reason).Inc()
+	return w.write(fmt.Sprintf("event: gap\ndata: %s\n\n", data))
+}
+
+// writeShutdown emits the farewell frame for a client released by
+// Manager.Drain: a shutdown event naming the reason, preceded by an SSE
+// `retry:` directive carrying this connection's own reconnect delay when one
+// was assigned.
+//
+// The shutdown event is emitted UNCONDITIONALLY. It is what distinguishes a
+// deliberate release from a connection that broke, and a client that can tell
+// those apart does not have to treat a rolling restart as an error — so
+// withholding it when reconnect hints happen to be disabled would remove the
+// more important of the two signals to save a line of output.
+//
+// The `retry:` directive is the only in-band channel a server has for saying
+// WHEN to come back. Without it a rolling restart releases every client at
+// once and they all re-dial on their own identical backoff schedule, landing
+// together on a pod that is still cold; a client that receives no hint simply
+// falls back to its own backoff, which is correct but less well spread.
+//
+// Errors are ignored: the connection is closing either way.
+func writeShutdown(w *sseWriter, client *Client) {
+	var frame strings.Builder
+	if retryMS := client.drainRetryMS.Load(); retryMS > 0 {
+		fmt.Fprintf(&frame, "retry: %d\n", retryMS)
+		fmt.Fprintf(&frame, "event: shutdown\ndata: {\"reason\":\"draining\",\"reconnectAfterMs\":%d}\n\n", retryMS)
+	} else {
+		frame.WriteString("event: shutdown\ndata: {\"reason\":\"draining\"}\n\n")
+	}
+	_ = w.write(frame.String())
 }
 
 // writeStatus emits one status frame and flushes it. Used for single frames

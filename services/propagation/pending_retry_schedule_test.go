@@ -13,6 +13,67 @@ import (
 	"github.com/bsv-blockchain/arcade/models"
 )
 
+// orphanRetryReason is the last thing the network said about a parked orphan:
+// a missing-parent line. schedulePendingRetry quotes it in the give-up reason.
+const orphanRetryReason = "TX_MISSING_PARENT (34): [Validate][child] error getting parent transaction root"
+
+// TestGiveUpReason pins what arcade tells a submitter when the durable-retry
+// budget runs out. Nothing here is a verdict — the transaction exhausted its
+// attempts precisely because no peer ever returned one — so the reason must
+// quote what was actually heard rather than assert a cause.
+//
+// Before this, every exhausted transaction was told the same thing: that a
+// parent it spends had never reached the network. That is true only for the
+// missing-parent case the escape was built for. A transaction parked by a
+// node-side storage fault, or by a verdict arcade could not attribute, was
+// handed a confident explanation of something that never happened — the exact
+// shape of "REJECTED with no reason why" that is worse than silence, because
+// it sends the submitter to look for a parent that was never the problem.
+func TestGiveUpReason(t *testing.T) {
+	cases := []struct {
+		name       string
+		lastReason string
+		want       []string
+		absent     []string
+	}{
+		{
+			name:       "missing parent keeps the diagnosis and quotes the line",
+			lastReason: orphanRetryReason,
+			want:       []string{"giving up", "a parent this transaction spends", orphanRetryReason},
+		},
+		{
+			name:       "node fault quotes the fault instead of blaming a parent",
+			lastReason: "STORAGE_ERROR (69): [ProcessTransaction][abc] failed to save transaction",
+			want:       []string{"giving up", "last network response", "STORAGE_ERROR"},
+			absent:     []string{"a parent this transaction spends"},
+		},
+		{
+			name:       "nothing heard says so plainly",
+			lastReason: "",
+			want:       []string{"giving up", "no peer ever answered"},
+			absent:     []string{"a parent this transaction spends"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := giveUpReason(7, tc.lastReason)
+			if !strings.Contains(got, "7") {
+				t.Errorf("reason = %q, want it to name the attempt budget", got)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(got, want) {
+					t.Errorf("reason = %q, want it to contain %q", got, want)
+				}
+			}
+			for _, absent := range tc.absent {
+				if strings.Contains(got, absent) {
+					t.Errorf("reason = %q, must NOT claim %q", got, absent)
+				}
+			}
+		})
+	}
+}
+
 // TestReapOnce_DeepChain_ConvergesInBoundedTicks is the scale answer to "how
 // long can the PENDING_RETRY path take to resolve".
 //
@@ -138,7 +199,7 @@ func TestSchedulePendingRetry_GivesUpAfterMaxAttempts(t *testing.T) {
 
 	// Attempts 1..3 reschedule; the 4th exceeds the budget.
 	for i := 0; i < 4; i++ {
-		p.schedulePendingRetry(context.Background(), orphan.txid, orphan.raw)
+		p.schedulePendingRetry(context.Background(), orphan.txid, orphan.raw, orphanRetryReason)
 	}
 
 	last := ms.lastUpdateForTxid(orphan.txid)

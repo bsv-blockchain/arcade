@@ -75,7 +75,7 @@
        🐳&nbsp;<a href="DOCKER.md"><code>Docker&nbsp;Guide</code></a>
     </td>
     <td align="center">
-       ☸️&nbsp;<a href="DEPLOY.md"><code>Deployment&nbsp;Guide</code></a>
+       ☸️&nbsp;<a href="doc.md#deployment"><code>Deployment&nbsp;Guide</code></a>
     </td>
     <td align="center">
        🏗️&nbsp;<a href="#-architecture"><code>Architecture</code></a>
@@ -527,7 +527,7 @@ func (h *MyHandler) Start(ctx context.Context) error {
 
 Arcade uses [go-chaintracks](https://github.com/bsv-blockchain/go-chaintracks) for blockchain header tracking and merkle proof validation. Headers are loaded from embedded checkpoint files on startup and updated via P2P block announcements.
 
-For detailed architecture documentation, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+For detailed architecture documentation, see [doc.md](doc.md).
 
 <br/>
 
@@ -574,7 +574,7 @@ Read the [AI Usage & Assistant Guidelines](.github/tech-conventions/ai-complianc
 
 ## 📚 Resources
 
-- [Architecture Documentation](docs/ARCHITECTURE.md)
+- [Architecture Documentation](doc.md)
 - [Observability](docs/observability.md) — OTLP traces/metrics, structured log field canon, and transaction-lifecycle logging
 - [Teranode Documentation](https://docs.bsvblockchain.org/)
 - [Arc API Reference](https://github.com/bitcoin-sv/arc)

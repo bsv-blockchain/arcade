@@ -241,6 +241,14 @@ type storedDatahubEndpoint struct {
 	LastSeenUnixNs int64  `json:"last_seen"`
 }
 
+type storedPeerPolicy struct {
+	PeerID            string `json:"peer_id"`
+	Network           string `json:"network"`
+	MiningFeeSatoshis uint64 `json:"mining_fee_satoshis"`
+	MiningFeeBytes    uint64 `json:"mining_fee_bytes"`
+	LastSeenUnixNs    int64  `json:"last_seen"`
+}
+
 // New opens a Pebble database at cfg.Path and returns a Store ready to use.
 // If the directory does not exist it's created. The returned Store takes an
 // exclusive file lock on the directory — closing the Store releases it.
@@ -1865,8 +1873,26 @@ func (s *Store) TokensForTxIDs(ctx context.Context, txids []string) (map[string]
 	return store.TokensForTxIDsViaPerTxID(ctx, txids, s.GetSubmissionsByTxID)
 }
 
+// maxTokenReplayScan bounds how many of a token's submissions this backend
+// will walk for one catchup replay.
+//
+// Unlike Postgres, Pebble has no index over (callback_token, timestamp_at,
+// txid), so this implementation has to load the token's submission list, do a
+// point read per txid, and sort the survivors in memory. That is O(token
+// cardinality) per connect, and a token can hold millions of submissions —
+// the shape that OOM-killed the SSE pod (#237/#238). Past this bound, refusing
+// is strictly better than trying: the caller degrades to an explicit gap and
+// the client reconciles over REST, instead of the pod dying and taking every
+// other connected client with it.
+//
+// The bound is enforced while the index is being walked, so peak memory is
+// capped at maxTokenReplayScan submissions. Checking the length of an
+// already-materialized list would be no protection at all — the allocation
+// that causes the OOM happens before such a check could run.
+const maxTokenReplayScan = 250_000
+
 func (s *Store) IterateStatusesByToken(ctx context.Context, callbackToken string, since time.Time, onlyStatuses []models.Status, fn func(*models.TransactionStatus) error) error {
-	subs, err := s.GetSubmissionsByToken(ctx, callbackToken)
+	subs, err := s.submissionsByIndexBounded(ctx, idxSubTokenPrefix(callbackToken), maxTokenReplayScan)
 	if err != nil {
 		return err
 	}
@@ -1917,6 +1943,18 @@ func (s *Store) IterateStatusesByToken(ctx context.Context, callbackToken string
 }
 
 func (s *Store) submissionsByIndex(ctx context.Context, prefix []byte) ([]*models.Submission, error) {
+	return s.submissionsByIndexBounded(ctx, prefix, 0)
+}
+
+// submissionsByIndexBounded is submissionsByIndex with an optional ceiling on
+// how many submissions it will accumulate. A limit of 0 means unbounded.
+//
+// The bound is enforced DURING iteration, not after: checking a returned
+// slice's length is no protection, because by then the memory has already been
+// allocated and the OOM it was meant to prevent has already happened. Exceeding
+// the limit abandons the scan and returns store.ErrReplayUnavailable, so peak
+// memory is capped at limit entries regardless of the token's real size.
+func (s *Store) submissionsByIndexBounded(ctx context.Context, prefix []byte, limit int) ([]*models.Submission, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -1948,6 +1986,9 @@ func (s *Store) submissionsByIndex(ctx context.Context, prefix []byte) ([]*model
 			continue
 		}
 		_ = closer.Close()
+		if limit > 0 && len(subs) >= limit {
+			return nil, fmt.Errorf("%w: token has more than %d submissions", store.ErrReplayUnavailable, limit)
+		}
 		subs = append(subs, ss.toModel())
 	}
 	return subs, nil
@@ -2244,6 +2285,73 @@ func (s *Store) ListDatahubEndpoints(ctx context.Context, network string) ([]sto
 			ep.LastSeen = time.Unix(0, row.LastSeenUnixNs)
 		}
 		out = append(out, ep)
+	}
+	return out, nil
+}
+
+func (s *Store) UpsertPeerPolicy(ctx context.Context, pp store.PeerPolicy) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// Pebble stores the fees as JSON uint64 and so cannot lose precision, but it
+	// validates on the same terms as the other backends: a zero byte basis is
+	// meaningless everywhere, and one backend silently accepting what the others
+	// reject would make the store's contract depend on its deployment.
+	if err := pp.Validate(); err != nil {
+		return err
+	}
+	stored := storedPeerPolicy{
+		PeerID:            pp.PeerID,
+		Network:           pp.Network,
+		MiningFeeSatoshis: pp.MiningFeeSatoshis,
+		MiningFeeBytes:    pp.MiningFeeBytes,
+	}
+	if !pp.LastSeen.IsZero() {
+		stored.LastSeenUnixNs = pp.LastSeen.UnixNano()
+	}
+	payload, err := json.Marshal(stored)
+	if err != nil {
+		return err
+	}
+	return s.db.Set(peerPolicyKey(pp.PeerID), payload, s.writeOpts)
+}
+
+func (s *Store) ListPeerPolicies(ctx context.Context, network string) ([]store.PeerPolicy, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	prefix := peerPolicyPrefix()
+	iter, err := s.db.NewIter(&pebbledb.IterOptions{
+		LowerBound: prefix,
+		UpperBound: endOfPrefix(prefix),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = iter.Close() }()
+
+	var out []store.PeerPolicy
+	for iter.First(); iter.Valid(); iter.Next() {
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
+		var row storedPeerPolicy
+		if err := json.Unmarshal(iter.Value(), &row); err != nil {
+			continue
+		}
+		if row.Network != network {
+			continue
+		}
+		pp := store.PeerPolicy{
+			PeerID:            row.PeerID,
+			Network:           row.Network,
+			MiningFeeSatoshis: row.MiningFeeSatoshis,
+			MiningFeeBytes:    row.MiningFeeBytes,
+		}
+		if row.LastSeenUnixNs != 0 {
+			pp.LastSeen = time.Unix(0, row.LastSeenUnixNs)
+		}
+		out = append(out, pp)
 	}
 	return out, nil
 }

@@ -1442,6 +1442,22 @@ WHERE t.txid IN (SELECT DISTINCT txid FROM submissions WHERE callback_token = $1
 		args = append(args, vals)
 		q += fmt.Sprintf(" AND t.status = ANY($%d)", len(args))
 	}
+	// No LIMIT here, deliberately, and it is not an oversight.
+	//
+	// The caller's frame budget is SOFT at a timestamp boundary: timestamp_at
+	// is microsecond-resolution and SetMinedByTxIDs stamps a whole block's rows
+	// with one value, so the caller must be able to read past its budget to
+	// finish an equal-timestamp run. A cursor that stops mid-run cannot resume
+	// — the filter above is strictly-after — and the remainder is lost forever.
+	// That was a real, silent data-loss bug on the Last-Event-ID path; a hard
+	// SQL LIMIT would reimpose exactly the cut that caused it.
+	//
+	// Bounding this properly needs a keyset cursor on (timestamp_at, txid),
+	// which makes the position a total order and therefore resumable mid-tie.
+	// LIMIT becomes safe then, and lands with it. Until then the cost is a
+	// planned sort over the token's matching set — idx_sub_token covers the
+	// semi-join and idx_tx_updated the ordering — and rows stream, with the
+	// caller stopping early once its budget and any trailing tie are satisfied.
 	q += " ORDER BY t.timestamp_at ASC"
 
 	rows, err := s.pool.Query(ctx, q, args...)
@@ -1667,6 +1683,52 @@ func (s *Store) ListDatahubEndpoints(ctx context.Context, network string) ([]sto
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iter datahub endpoints: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Store) UpsertPeerPolicy(ctx context.Context, pp store.PeerPolicy) error {
+	if err := pp.Validate(); err != nil {
+		return err
+	}
+	const q = `
+INSERT INTO peer_policies (peer_id, network, mining_fee_satoshis, mining_fee_bytes, last_seen)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (peer_id) DO UPDATE SET
+    network = EXCLUDED.network,
+    mining_fee_satoshis = EXCLUDED.mining_fee_satoshis,
+    mining_fee_bytes = EXCLUDED.mining_fee_bytes,
+    last_seen = EXCLUDED.last_seen`
+	// The narrowing is safe: Validate rejected anything above MaxInt64 above.
+	if _, err := s.pool.Exec(ctx, q, pp.PeerID, pp.Network, int64(pp.MiningFeeSatoshis), int64(pp.MiningFeeBytes), pp.LastSeen); err != nil { //nolint:gosec // bounded by PeerPolicy.Validate
+		return fmt.Errorf("upsert peer policy %s: %w", pp.PeerID, err)
+	}
+	return nil
+}
+
+func (s *Store) ListPeerPolicies(ctx context.Context, network string) ([]store.PeerPolicy, error) {
+	const q = `SELECT peer_id, network, mining_fee_satoshis, mining_fee_bytes, last_seen FROM peer_policies WHERE network = $1`
+	rows, err := s.pool.Query(ctx, q, network)
+	if err != nil {
+		return nil, fmt.Errorf("list peer policies: %w", err)
+	}
+	defer rows.Close()
+	var out []store.PeerPolicy
+	for rows.Next() {
+		var (
+			pp   store.PeerPolicy
+			sats int64
+			byts int64
+		)
+		if err := rows.Scan(&pp.PeerID, &pp.Network, &sats, &byts, &pp.LastSeen); err != nil {
+			return nil, fmt.Errorf("scan peer policy: %w", err)
+		}
+		pp.MiningFeeSatoshis = uint64(sats) //nolint:gosec // stored non-negative
+		pp.MiningFeeBytes = uint64(byts)    //nolint:gosec // stored non-negative
+		out = append(out, pp)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iter peer policies: %w", err)
 	}
 	return out, nil
 }

@@ -72,6 +72,10 @@ type mockStore struct {
 	// for the GET /tx callback-state tests.
 	subsByTxID  map[string][]*models.Submission
 	getStatusFn func(txid string) *models.TransactionStatus
+	// peerPolicies feeds ListPeerPolicies for the GET /policy tests;
+	// listPeerPoliciesErr injects a store failure.
+	peerPolicies        []store.PeerPolicy
+	listPeerPoliciesErr error
 }
 
 func (m *mockStore) UpdateStatus(_ context.Context, status *models.TransactionStatus) error {
@@ -271,6 +275,17 @@ func (m *mockStore) UpsertDatahubEndpoint(context.Context, store.DatahubEndpoint
 
 func (m *mockStore) ListDatahubEndpoints(context.Context, string) ([]store.DatahubEndpoint, error) {
 	return nil, nil
+}
+
+func (m *mockStore) UpsertPeerPolicy(context.Context, store.PeerPolicy) error {
+	return nil
+}
+
+func (m *mockStore) ListPeerPolicies(context.Context, string) ([]store.PeerPolicy, error) {
+	if m.listPeerPoliciesErr != nil {
+		return nil, m.listPeerPoliciesErr
+	}
+	return m.peerPolicies, nil
 }
 
 func (m *mockStore) UpsertBlockHeaderSeen(context.Context, string, uint64, time.Time) error {
@@ -822,6 +837,55 @@ func TestHandleSubmitTransaction_ResubmitRejected_RepublishesToKafka(t *testing.
 	}
 }
 
+// TestHandleSubmitTransaction_StrandedReceived_RepublishesToKafka is the
+// issue #83 hole: intake wrote RECEIVED then Kafka Send failed. The client
+// retries; the old duplicate branch returned 202 without re-publishing.
+func TestHandleSubmitTransaction_StrandedReceived_RepublishesToKafka(t *testing.T) {
+	rawTx := makeMinimalTx()
+	ms := &mockStore{
+		getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+			return &models.TransactionStatus{
+				TxID:   in.TxID,
+				Status: models.StatusReceived,
+			}, false, nil
+		},
+	}
+	broker := &kafka.RecordingBroker{}
+	gin.SetMode(gin.TestMode)
+	srv := &Server{
+		cfg:            &config.Config{CallbackToken: testCallbackToken},
+		logger:         zap.NewNop(),
+		producer:       kafka.NewProducer(broker),
+		store:          ms,
+		txTracker:      store.NewTxTracker(),
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
+	}
+	router := gin.New()
+	srv.registerRoutes(router)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/tx", bytes.NewReader(rawTx))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := totalMessages(broker); got != 1 {
+		t.Errorf("stranded RECEIVED retry must publish to Kafka, got %d", got)
+	}
+}
+
+func TestShouldRepublishExisting(t *testing.T) {
+	if !shouldRepublishExisting(models.StatusReceived) || !shouldRepublishExisting(models.StatusRejected) {
+		t.Fatal("RECEIVED and REJECTED must republish")
+	}
+	if shouldRepublishExisting(models.StatusSeenOnNetwork) || shouldRepublishExisting(models.StatusMined) {
+		t.Fatal("SEEN/MINED must not republish")
+	}
+}
+
 // TestHandleSubmitTransactions_BatchResubmitRejected_RepublishesToKafka is
 // the batch-path mirror: a batch containing one REJECTED resubmit and one
 // fresh-insert must publish both. The REJECTED resubmit is NOT counted as
@@ -985,6 +1049,66 @@ func TestHandleSubmitTransaction_ValidationFailure_RecordsSubmissionAndPublishes
 	}
 	if publishes[0].ExtraInfo == "" {
 		t.Errorf("publish ExtraInfo is empty; expected the validator reason to be carried for subscriber context")
+	}
+}
+
+// TestHandleSubmitTransaction_ValidationFailure_DoesNotClobberSeen is the
+// issue #251 regression: a resubmit of a tx already at SEEN_* must not
+// persist REJECTED or publish a REJECTED event when intake validation fails
+// (typically because the same tx already spent its inputs on-chain).
+func TestHandleSubmitTransaction_ValidationFailure_DoesNotClobberSeen(t *testing.T) {
+	rawTx := makeMinimalTx()
+
+	ms := &mockStore{
+		getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+			return &models.TransactionStatus{
+				TxID:   in.TxID,
+				Status: models.StatusSeenMultipleNodes,
+			}, false, nil
+		},
+	}
+	pub := &recordingCallbackPub{}
+	val := validator.NewValidator(nil)
+	broker := &kafka.RecordingBroker{}
+	gin.SetMode(gin.TestMode)
+	srv := &Server{
+		cfg:            &config.Config{CallbackToken: testCallbackToken},
+		logger:         zap.NewNop(),
+		producer:       kafka.NewProducer(broker),
+		store:          ms,
+		publisher:      pub,
+		validator:      val,
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
+	}
+	router := gin.New()
+	srv.registerRoutes(router)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/tx", bytes.NewReader(rawTx))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+
+	ms.mu.Lock()
+	updates := append([]*models.TransactionStatus(nil), ms.updateStatusCalls...)
+	ms.mu.Unlock()
+	if len(updates) != 0 {
+		t.Errorf("UpdateStatus must not clobber SEEN_MULTIPLE_NODES, got %v", updates)
+	}
+
+	pub.mu.Lock()
+	publishes := append([]*models.TransactionStatus(nil), pub.publishes...)
+	pub.mu.Unlock()
+	if len(publishes) != 0 {
+		t.Errorf("must not publish REJECTED over a SEEN row, got %v", publishes)
+	}
+
+	if totalMessages(broker) != 0 {
+		t.Errorf("must not publish to Kafka after an intake rejection, got %d", totalMessages(broker))
 	}
 }
 

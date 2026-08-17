@@ -128,6 +128,57 @@ paths:
                     type: string
                     example: ready
 
+  /policy:
+    get:
+      operationId: getPolicy
+      tags: [Operations]
+      summary: Discover the current fee and size policy (ARC-compatible)
+      description: |
+        Returns Arcade's effective transaction policy in the ARC schema so
+        clients can discover the fee rate and size limits before building
+        transactions. Every value reflects exactly what intake enforces.
+
+        When the operator hasn't pinned a fee, `miningFee` tracks the lowest fee
+        the network will accept — the minimum advertised across peer
+        `node_status` announcements — and Arcade enforces that same floor at
+        intake, falling back to the built-in default until a peer is heard.
+        `maxtxsigopscountspolicy` of `4294967295` means unlimited (the BSV
+        post-Genesis default), matching the ARC convention. Also served at
+        `/v1/policy`. Always returns 200.
+      responses:
+        "200":
+          description: Current transaction policy.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PolicyResponse"
+              example:
+                policy:
+                  miningFee:
+                    satoshis: 100
+                    bytes: 1000
+                  maxtxsizepolicy: 10485760
+                  maxscriptsizepolicy: 500000
+                  maxtxsigopscountspolicy: 4294967295
+                  standardFormatSupported: true
+                timestamp: "2026-08-07T12:00:00Z"
+
+  /v1/policy:
+    get:
+      operationId: getPolicyV1
+      tags: [Operations]
+      summary: Discover the current fee and size policy (ARC alias)
+      description: |
+        Alias of `GET /policy` matching the ARC specification path. Returns the
+        identical response.
+      responses:
+        "200":
+          description: Current transaction policy.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PolicyResponse"
+
   /metrics:
     get:
       operationId: getMetrics
@@ -1202,13 +1253,7 @@ components:
         orphanedProofs:
           type: array
           description: >-
-            Historical MINED anchors a chain reorganization superseded, newest
-            last (capped at 5). Present only on transactions that were once
-            anchored to a block that later lost its height to a competitor —
-            e.g. after a same-height reorg the tx re-anchors to the winning
-            block (blockHash/merklePath above) while the losing block's anchor
-            is preserved here, with its proof still resolvable against the
-            orphaned header.
+            Historical MINED anchors a chain reorganization superseded, newest last (capped at 5). Present only on transactions that were once anchored to a block that later lost its height to a competitor — e.g. after a same-height reorg the tx re-anchors to the winning block (blockHash/merklePath above) while the losing block's anchor is preserved here, with its proof still resolvable against the orphaned header.
           items:
             $ref: "#/components/schemas/OrphanedProof"
       required:
@@ -1219,10 +1264,7 @@ components:
     OrphanedProof:
       type: object
       description: >-
-        One historical anchor a reorg superseded: the orphaned block the
-        transaction was MINED against, when the anchor was replaced, and the
-        transaction's BUMP against that block (best-effort — absent if the
-        orphaned block's compound BUMP is no longer retained).
+        One historical anchor a reorg superseded: the orphaned block the transaction was MINED against, when the anchor was replaced, and the transaction's BUMP against that block (best-effort — absent if the orphaned block's compound BUMP is no longer retained).
       properties:
         blockHash:
           type: string
@@ -1237,8 +1279,7 @@ components:
         merklePath:
           type: string
           description: >-
-            BUMP merkle path against the ORPHANED block, hex-encoded. Computes
-            to the orphaned header's merkle root, not the active chain's.
+            BUMP merkle path against the ORPHANED block, hex-encoded. Computes to the orphaned header's merkle root, not the active chain's.
       required:
         - blockHash
         - blockHeight
@@ -1447,6 +1488,68 @@ components:
           type: string
         healthy:
           type: boolean
+
+    FeeAmount:
+      type: object
+      description: Mining-fee rate expressed as satoshis per a number of bytes.
+      properties:
+        satoshis:
+          type: integer
+          format: int64
+          example: 100
+        bytes:
+          type: integer
+          format: int64
+          example: 1000
+      required:
+        - satoshis
+        - bytes
+
+    Policy:
+      type: object
+      description: ARC-compatible transaction policy.
+      properties:
+        miningFee:
+          $ref: "#/components/schemas/FeeAmount"
+        maxtxsizepolicy:
+          type: integer
+          format: int64
+          description: Maximum accepted transaction size in bytes.
+          example: 10485760
+        maxscriptsizepolicy:
+          type: integer
+          format: int64
+          description: Maximum accepted script size in bytes.
+          example: 500000
+        maxtxsigopscountspolicy:
+          type: integer
+          format: int64
+          description: Maximum sigops per transaction; 4294967295 means unlimited (BSV post-Genesis), the ARC convention.
+          example: 4294967295
+        standardFormatSupported:
+          type: boolean
+          description: Whether standard (non-EF) transaction format is accepted at intake.
+          example: true
+      required:
+        - miningFee
+        - maxtxsizepolicy
+        - maxscriptsizepolicy
+        - maxtxsigopscountspolicy
+        - standardFormatSupported
+
+    PolicyResponse:
+      type: object
+      properties:
+        policy:
+          $ref: "#/components/schemas/Policy"
+        timestamp:
+          type: string
+          format: date-time
+          description: Policy timestamp (RFC 3339).
+          example: "2026-08-07T12:00:00Z"
+      required:
+        - policy
+        - timestamp
 
     ErrorResponse:
       type: object

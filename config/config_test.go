@@ -3,6 +3,8 @@ package config
 import (
 	"strings"
 	"testing"
+
+	"github.com/spf13/cobra"
 )
 
 // baseValidConfig returns a Config populated with the minimum fields other
@@ -348,5 +350,42 @@ func TestValidate_AllowsZeroSchemaApplyTimeout(t *testing.T) {
 	cfg.Store.Postgres.SchemaApplyTimeoutMs = 0
 	if err := validate(cfg); err != nil {
 		t.Fatalf("zero schema_apply_timeout_ms (= use default) should be accepted, got: %v", err)
+	}
+}
+
+// TestSSEDrainKnobsBind pins the viper wiring for the SSE drain windows.
+//
+// The failure mode this guards is silent: a typo in a mapstructure tag or a
+// SetDefault key leaves the field at its zero value, the service falls back to
+// its compiled-in default, and nothing anywhere reports that the operator's
+// setting was ignored. These particular knobs have to stay coordinated with
+// the pod's terminationGracePeriodSeconds, so an ignored override is a drain
+// that gets SIGKILLed halfway through.
+func TestSSEDrainKnobsBind(t *testing.T) {
+	cfg, err := Load(&cobra.Command{})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		got  int
+		want int
+	}{
+		{"drain_quiesce_ms", cfg.SSE.DrainQuiesceMS, DefaultSSEDrainQuiesceMS},
+		{"drain_retry_max_ms", cfg.SSE.DrainRetryMaxMS, DefaultSSEDrainRetryMaxMS},
+		{"shutdown_timeout_ms", cfg.SSE.ShutdownTimeoutMS, DefaultSSEShutdownTimeoutMS},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("sse.%s = %d, want %d", tc.name, tc.got, tc.want)
+		}
+	}
+
+	t.Setenv("ARCADE_SSE_DRAIN_QUIESCE_MS", "2500")
+	overridden, err := Load(&cobra.Command{})
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if overridden.SSE.DrainQuiesceMS != 2500 {
+		t.Errorf("ARCADE_SSE_DRAIN_QUIESCE_MS override = %d, want 2500", overridden.SSE.DrainQuiesceMS)
 	}
 }

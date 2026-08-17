@@ -167,6 +167,17 @@ func (s *Server) Start(ctx context.Context) error {
 		go s.runSubmissionRecorder(ctx, &recorderWG)
 	}
 
+	// When the operator hasn't pinned a fee, track the lowest fee the network
+	// will accept (from peer node_status observations) and push it into the
+	// validator so intake enforces it (issue #212). Bound to ctx; no drain
+	// needed, so it isn't part of recorderWG.
+	if s.validator != nil && !s.feePinned() {
+		s.logger.Info("starting dynamic intake fee tracking from network observations",
+			zap.Uint64("refresh_ms", s.observedFeeRefreshMs()),
+			zap.Uint64("ttl_ms", s.observedFeeTTLMs()))
+		go s.runFeeRefresher(ctx)
+	}
+
 	addr := fmt.Sprintf("%s:%d", s.cfg.APIServer.Host, s.cfg.APIServer.Port)
 	s.server = &http.Server{
 		Addr:              addr,

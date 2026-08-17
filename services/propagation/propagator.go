@@ -225,19 +225,20 @@ type broadcastJob struct {
 type broadcastJobResult struct {
 	endpoint   string
 	statusCode int
-	// failures is the per-txid failure map extracted from a non-200 /txs
+	// failures is the per-tx failure information extracted from a non-200 /txs
 	// "Failed to process transactions:" body (Teranode upstream main, post
 	// #879; the HTTP status varies by failure class — 409/422/400/500 all
-	// carry the same shape). Each entry is keyed by the txid embedded in
+	// carry the same shape). ByKey entries are keyed by the txid embedded in
 	// "[ProcessTransaction][<txid>]" when present, else the first bare
 	// 64-hex string in the line (which for conflict-family verdicts is an
 	// alien hash — see alienFailureLines); the value is the full error line
 	// verbatim (e.g. "TX_INVALID (31): [ProcessTransaction][<txid>] tx is
-	// invalid because..."). Absent here means accepted — but only when no
-	// alien-keyed line voids that contract for the peer. nil for 200,
-	// transport errors, and any non-200 that doesn't match the Teranode
-	// failure-list shape — those cases drive the whole-batch requeue path.
-	failures map[string]string
+	// invalid because..."). Unkeyed holds lines naming no hash at all.
+	// Absent here means accepted — but only when every line keyed to a
+	// submitted tx. nil for 200, transport errors, and any non-200 that
+	// doesn't match the Teranode failure-list shape — those cases drive the
+	// whole-batch requeue path.
+	failures *teranode.TxsFailures
 	err      error
 }
 
@@ -539,9 +540,11 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 	terminalRejected := make([]string, 0, rejected)
 	var terminalParked []string
 	// published* drive the bulk publish: only rows whose store status
-	// actually transitioned.
+	// actually transitioned. publishedRejected carries whole rows, not just
+	// txids, because a rejection's payload (the reason arcade just persisted)
+	// has to ride the event out — see publishRejections.
 	publishedAccepted := make([]string, 0, accepted)
-	publishedRejected := make([]string, 0, rejected)
+	publishedRejected := make([]*models.TransactionStatus, 0, rejected)
 	var publishedParked []string
 	now := time.Now()
 	for i, st := range terminalStatuses {
@@ -582,7 +585,7 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 		case models.StatusAcceptedByNetwork:
 			publishedAccepted = append(publishedAccepted, st.TxID)
 		case models.StatusRejected:
-			publishedRejected = append(publishedRejected, st.TxID)
+			publishedRejected = append(publishedRejected, st)
 			p.logger.Info(
 				"transaction rejected",
 				logfields.TxID(st.TxID),
@@ -614,7 +617,7 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 	})
 
 	p.publishBulkStatus(ctx, models.StatusAcceptedByNetwork, publishedAccepted, now)
-	p.publishBulkStatus(ctx, models.StatusRejected, publishedRejected, now)
+	p.publishRejections(ctx, publishedRejected, now)
 	p.publishBulkStatus(ctx, models.StatusPendingRetry, publishedParked, now)
 
 	// Notify the dispatcher ONLY when the batch status write fully
@@ -896,8 +899,17 @@ func (p *Propagator) persistCascade(ctx context.Context, cascaded []cascadeRejec
 	// would sit at PENDING_RETRY forever with nothing scheduled to retry it.
 	if status == models.StatusPendingRetry {
 		for _, cr := range cascaded {
-			p.schedulePendingRetry(ctx, cr.txid, cr.rawTx)
+			// The descendant was never broadcast, so nothing on the network
+			// ever spoke about it; its ancestor's park is the whole story.
+			p.schedulePendingRetry(ctx, cr.txid, cr.rawTx, cascadeReason(status, cr.ancestor))
 		}
+	}
+	if status == models.StatusRejected {
+		// statuses (not txids): every cascaded child's reason names ITS OWN
+		// ancestor, so the publish has to group by reason rather than fan one
+		// payload-free event across the whole cascade — see publishRejections.
+		p.publishRejections(ctx, statuses, now)
+		return
 	}
 	p.publishBulkStatus(ctx, status, txids, now)
 }
@@ -911,16 +923,88 @@ func (p *Propagator) publishBulkStatus(ctx context.Context, status models.Status
 	if p.publisher == nil || len(txids) == 0 {
 		return
 	}
-	template := &models.TransactionStatus{
+	p.publishBulk(ctx, &models.TransactionStatus{
 		Status:    status,
 		Timestamp: ts,
 		TxIDs:     txids,
+	})
+}
+
+// publishRejections fans REJECTED transitions onto the events Publisher with
+// the reason attached, grouped so that every txid on an event shares one
+// reason.
+//
+// A bulk event carries no per-transaction payload by construction: one event,
+// N txids, so any field it set would be right for at most one of them. That
+// is correct for the uniform statuses it was built for (ACCEPTED_BY_NETWORK,
+// MINED) and wrong for REJECTED, the one status whose payload decides what
+// the client does next — UTXO_SPENT means "your view of the chain is stale,
+// resync", TX_INVALID means "these bytes will never be accepted, don't
+// retry". Until this, arcade parsed the Teranode reason, persisted it on the
+// row, logged it, and then published REJECTED with an empty extraInfo.
+//
+// Nothing was lost — the row keeps the reason and GET /tx/<txid> serves it —
+// but the push event did not describe itself, so learning why cost a round
+// trip. REJECTED is terminal, which makes that trap worse than it sounds: a
+// client that correctly stops polling on a terminal status stops exactly when
+// polling is the only way to find out (issue #301, found on a 128-chain
+// covenant workload where one rejection condemns a whole chain).
+//
+// Grouping — rather than one event per transaction — is deliberate, and it is
+// the cascade that makes the difference. A dep-cascade condemns every
+// descendant of one rejected ancestor with the SAME cascadeReason string, and
+// that is the burst that gets large (one rejection at the head of a chain
+// condemns the whole chain). Those still ride a single event, so the SSE
+// fan-out keeps its one batched token resolution instead of paying a store
+// round-trip per descendant on its single fan-out goroutine. A Teranode
+// verdict, by contrast, names the offending txid inside its own failure line,
+// so those reasons are distinct per transaction and the grouping degenerates
+// to one event each — which is exactly what carrying a per-transaction reason
+// requires.
+//
+// Only TxID, ExtraInfo and StatusCode are read from each status; the event's
+// Status and Timestamp come from the caller, matching publishBulkStatus.
+func (p *Propagator) publishRejections(ctx context.Context, rejected []*models.TransactionStatus, ts time.Time) {
+	if p.publisher == nil || len(rejected) == 0 {
+		return
 	}
+	// Grouped in first-seen order, not map order, so a batch's events come
+	// out in the order the batch produced them and stay comparable with the
+	// "transaction rejected" log lines emitted alongside them.
+	type reason struct {
+		extraInfo  string
+		statusCode int
+	}
+	index := make(map[reason]int, len(rejected))
+	groups := make([]*models.TransactionStatus, 0, len(rejected))
+	for _, st := range rejected {
+		key := reason{extraInfo: st.ExtraInfo, statusCode: st.StatusCode}
+		i, seen := index[key]
+		if !seen {
+			i = len(groups)
+			index[key] = i
+			groups = append(groups, &models.TransactionStatus{
+				Status:     models.StatusRejected,
+				StatusCode: st.StatusCode,
+				Timestamp:  ts,
+				ExtraInfo:  st.ExtraInfo,
+			})
+		}
+		groups[i].TxIDs = append(groups[i].TxIDs, st.TxID)
+	}
+	for _, g := range groups {
+		p.publishBulk(ctx, g)
+	}
+}
+
+// publishBulk sends one prepared bulk event. Non-fatal: the durable store
+// rows are already written, and SSE catchup recovers any dropped events.
+func (p *Propagator) publishBulk(ctx context.Context, template *models.TransactionStatus) {
 	if err := p.publisher.PublishBulk(ctx, template); err != nil {
 		p.logger.Warn(
 			"failed to publish bulk propagation status",
-			logfields.Status(string(status)),
-			zap.Int("count", len(txids)),
+			logfields.Status(string(template.Status)),
+			zap.Int("count", len(template.TxIDs)),
 			zap.Error(err),
 		)
 	}
@@ -1351,15 +1435,16 @@ type txResult struct {
 // first (rejectionLineScore, ties broken lexicographically) so the cap keeps
 // the concrete validator verdicts (UTXO_SPENT, TX_CONFLICTING, …) and drops
 // PROCESSING catch-alls, not the reverse. Deterministic across map iteration.
-func failureLinesForLog(failures map[string]string) []string {
+func failureLinesForLog(failures *teranode.TxsFailures) []string {
 	const maxLines = 8
-	if len(failures) == 0 {
+	if failures.Len() == 0 {
 		return nil
 	}
-	lines := make([]string, 0, len(failures))
-	for _, line := range failures {
+	lines := make([]string, 0, failures.Len())
+	for _, line := range failures.ByKey {
 		lines = append(lines, line)
 	}
+	lines = append(lines, failures.Unkeyed...)
 	sort.Slice(lines, func(i, j int) bool {
 		si, sj := rejectionLineScore(lines[i]), rejectionLineScore(lines[j])
 		if si != sj {
@@ -1564,6 +1649,74 @@ func lineIsMissingParentCondition(line string) bool {
 		strings.Contains(line, "TX_NOT_FOUND (")
 }
 
+// teranodeNamedCode matches Teranode's "NAME (n)" tokens, including ones
+// this build has not mapped yet. PROCESSING is the catch-all wrapper.
+var teranodeNamedCode = regexp.MustCompile(`[A-Z][A-Z0-9_]* \(\d+\)`)
+
+func lineHasNestedTeranodeVerdict(line string) bool {
+	for _, m := range teranodeNamedCode.FindAllString(line, -1) {
+		name, _, _ := strings.Cut(m, " (")
+		if name != "PROCESSING" {
+			return true
+		}
+	}
+	return false
+}
+
+// lineIsOpaqueProcessing reports a PROCESSING (4) wrapper with no nested
+// TX_*/UTXO_* (or other named) code — the code Teranode's public error
+// boundary falls back to when no cause in the chain is on its client-safe
+// allowlist. Such a line says only "this transaction did not make it": the
+// actual cause (missing parent, frozen utxo, coinbase immature, a BDK CGO
+// exception, a storage failure inside the validator) was stripped at the
+// boundary.
+//
+// It is therefore the one line shape where the peer's HTTP status carries
+// strictly more information than its message, and the only one for which
+// arcade consults that status. A nested code disqualifies it: a line carrying
+// any named code other than PROCESSING is carrying a verdict, whatever wrapper
+// sits in front of it.
+func lineIsOpaqueProcessing(line string) bool {
+	return strings.Contains(line, "PROCESSING (") && !lineHasNestedTeranodeVerdict(line)
+}
+
+// lineIsInfraCondition reports whether a Teranode failure line names a fault
+// in the node rather than a judgement about the submitted transaction: its
+// blob store rejected the write, a downstream service was unreachable, an
+// unclassified internal error escaped. Nothing about the bytes changed, so
+// these must never terminalize — the same transaction sent to a healthy peer
+// (or to this one a minute later) is expected to be accepted.
+//
+// Matched on the leading code name, which Teranode always emits, rather than
+// on message text. STORAGE_ERROR and SERVICE_ERROR are the two the propagation
+// path produces directly (failed blob save, no HTTP validator configured for
+// an over-sized tx); ERROR is the generic fallback the gRPC boundary uses when
+// it cannot resolve a code at all.
+func lineIsInfraCondition(line string) bool {
+	name, _, found := strings.Cut(line, " (")
+	if !found {
+		return false
+	}
+	switch name {
+	case "STORAGE_ERROR", "SERVICE_ERROR", "ERROR":
+		return true
+	default:
+		return false
+	}
+}
+
+// bestUnplaceableLine picks the most informative line among those that named
+// no submitted transaction — the best alien line and every unkeyed line. Used
+// only once a chunk is down to a single transaction, where "named nobody"
+// unambiguously means "named this one".
+func bestUnplaceableLine(bestAlien string, unkeyed []string) string {
+	best := bestAlien
+	for _, line := range unkeyed {
+		best = preferRejectionLine(best, line)
+	}
+	return best
+}
+
 func rejectionLineScore(line string) int {
 	name, _, found := strings.Cut(line, " (")
 	if !found {
@@ -1596,14 +1749,12 @@ func rejectionLineScore(line string) int {
 // e.g. "PROCESSING (4): [ProcessTransaction][<txid>] failed to validate
 // transaction" or "TX_INVALID (31): [ProcessTransaction][<txid>] ...".
 //
-// Any per-txid line returned by Teranode is still treated as terminally
-// rejected. Teranode wraps real validator failures with NewProcessingError
-// (see services/propagation/Server.go:1236), so PROCESSING is the catch-all
-// "this tx is bad" code in practice — we can't distinguish a transient
-// infra issue from a permanent validation failure by code alone. The
-// authoritative requeue signal is a 5xx batch response with no parseable
-// per-tx body (handled separately in broadcastBatchToEndpoints), which
-// reflects a true infra outage rather than a tx-level verdict.
+// This helper only maps lines the broadcast loop has already routed as
+// terminal verdicts (rejectionLine). Opaque PROCESSING (4) with no nested
+// named code never reaches here — it requeues. Nested wrappers such as
+// "PROCESSING (4): … TX_INVALID (31)" still arrive as the full line: the
+// leading PROCESSING keeps arcCode 0 while ExtraInfo preserves the inner
+// text. Real validator codes (TX_INVALID, UTXO_SPENT, …) remain REJECTED.
 //
 // What the leading "NAME (n)" code DOES tell us confidently is mapped onto
 // the ARC taxonomy so consumers can branch on a number instead of prose
@@ -1628,7 +1779,15 @@ func rejectionLineScore(line string) int {
 //
 // errMsg preserves the Teranode line verbatim (plus the retryable suffix for
 // the non-final family) so wallet rows surface the actual message.
-func classifyFailureLine(line string) (errMsg string, arcCode int) {
+//
+// httpStatus is the peer's HTTP status when its response described exactly one
+// transaction, and 0 otherwise. It is consulted only for the opaque PROCESSING
+// catch-all, where the boundary stripped the cause and the status is the last
+// remaining signal: a 403 there means the node refused the spend outright
+// (frozen or otherwise administratively blocked utxo), which is a real,
+// actionable verdict that would otherwise reach the submitter as "failed to
+// validate transaction" and nothing more.
+func classifyFailureLine(line string, httpStatus int) (errMsg string, arcCode int) {
 	name, _, found := strings.Cut(line, " (")
 	if !found {
 		return line, 0
@@ -1637,10 +1796,22 @@ func classifyFailureLine(line string) (errMsg string, arcCode int) {
 	case "TX_LOCK_TIME", "UTXO_NON_FINAL":
 		return line + " — retryable: the transaction is not final against this peer's chain view; resubmit after the locktime expires",
 			int(arcerrors.StatusNotFinal)
-	case "TX_CONFLICTING", "UTXO_SPENT", "TX_INVALID_DOUBLE_SPEND":
+	case "TX_CONFLICTING", "UTXO_SPENT", "TX_INVALID_DOUBLE_SPEND", "TX_LOCKED":
+		// TX_LOCKED joins the conflict family: Teranode's own /txs handler
+		// groups it under HTTP 409 (httpStatusForTxError), and a wallet must
+		// treat "the utxo is not spendable" the same way it treats "the utxo
+		// is already spent" — do not blind-release the inputs.
 		return line, int(arcerrors.StatusConflict)
 	case "TX_INVALID":
 		return line, int(arcerrors.StatusGeneric)
+	case "PROCESSING":
+		if httpStatus == http.StatusForbidden {
+			return line + " — the peer answered HTTP 403 (forbidden): the transaction spends a frozen or " +
+					"administratively blocked utxo. The peer's error boundary does not surface the frozen-utxo " +
+					"code itself, so this status is the whole of the available detail.",
+				int(arcerrors.StatusFrozenPolicy)
+		}
+		return line, 0
 	default:
 		return line, 0
 	}
@@ -1824,8 +1995,16 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg, i
 			// Requeue / Unknown: transient infra failure. Collect for
 			// requeue after a short flat wait so the dispatcher re-runs
 			// admission (dep-aware) and the tx flows through the next
-			// flush.
-			toRequeue = append(toRequeue, batch[i])
+			// flush. errMsg is set when the peer named the fault (a
+			// STORAGE_ERROR / SERVICE_ERROR line, or an opaque PROCESSING
+			// line its 5xx status marked as a node fault); carrying it means
+			// a tx that eventually exhausts its budget can quote what went
+			// wrong instead of being handed a generic story.
+			msg := batch[i]
+			if res.errMsg != "" {
+				msg.retryReason = res.errMsg
+			}
+			toRequeue = append(toRequeue, msg)
 		}
 	}
 
@@ -2083,7 +2262,7 @@ func (p *Propagator) parkExhaustedRequeues(ctx context.Context, msgs []propagati
 	// at park time and it sank below every newer eligible row until it fell
 	// out of the 24h scan window entirely.
 	for _, m := range msgs {
-		p.schedulePendingRetry(ctx, m.TXID, m.RawTx)
+		p.schedulePendingRetry(ctx, m.TXID, m.RawTx, m.retryReason)
 	}
 }
 
@@ -2137,6 +2316,34 @@ func (p *Propagator) nextPendingRetryDelay(retryCount int) time.Duration {
 	return delay
 }
 
+// giveUpReason renders the terminal reason for a tx whose durable-retry budget
+// ran out. It quotes what the network last said rather than asserting a cause,
+// because by construction nothing here is a verdict about the transaction: the
+// tx exhausted its attempts precisely because no peer ever returned one.
+//
+// The missing-parent wording is used only when the last thing we heard really
+// was a missing parent — the case the give-up escape was built for, and the
+// one where naming the cause genuinely helps the submitter.
+func giveUpReason(maxAttempts int, lastReason string) string {
+	switch {
+	case lastReason == "":
+		return fmt.Sprintf(
+			"no network verdict after %d durable retry attempts: giving up — no peer ever answered for this transaction",
+			maxAttempts,
+		)
+	case lineIsMissingParentCondition(lastReason):
+		return fmt.Sprintf(
+			"no network verdict after %d durable retry attempts: giving up — a parent this transaction spends has never reached the network; last network response: %s",
+			maxAttempts, lastReason,
+		)
+	default:
+		return fmt.Sprintf(
+			"no network verdict after %d durable retry attempts: giving up; last network response: %s",
+			maxAttempts, lastReason,
+		)
+	}
+}
+
 // schedulePendingRetry books a parked tx's next durable attempt, or gives up
 // on it.
 //
@@ -2148,7 +2355,15 @@ func (p *Propagator) nextPendingRetryDelay(retryCount int) time.Duration {
 // accumulated without bound, monopolized the reaper's per-tick batch, and
 // were finally abandoned at 24h in a non-terminal state with no signal of
 // any kind. Now they terminate with a verdict the submitter can read.
-func (p *Propagator) schedulePendingRetry(ctx context.Context, txid string, rawTx []byte) {
+//
+// lastReason is the last thing the network actually said about this tx (a
+// Teranode failure line, or an empty string when no peer ever answered). It is
+// quoted verbatim in the give-up reason. Without it every exhausted tx was
+// told the same story — that a parent it spends had never reached the network
+// — which is true only for the missing-parent case that motivated the escape.
+// A tx parked by a node-side fault, or by a verdict arcade could not attribute,
+// got a confident explanation of something that never happened.
+func (p *Propagator) schedulePendingRetry(ctx context.Context, txid string, rawTx []byte, lastReason string) {
 	if p.store == nil || len(rawTx) == 0 {
 		return
 	}
@@ -2161,10 +2376,7 @@ func (p *Propagator) schedulePendingRetry(ctx context.Context, txid string, rawT
 		return
 	}
 	if count > p.pendingRetryMaxAttempts {
-		reason := fmt.Sprintf(
-			"no network verdict after %d durable retry attempts: giving up — a parent this transaction spends has never reached the network",
-			p.pendingRetryMaxAttempts,
-		)
+		reason := giveUpReason(p.pendingRetryMaxAttempts, lastReason)
 		metrics.PropagationPendingRetryTotal.WithLabelValues("exhausted").Inc()
 		p.logger.Warn("durable retry budget exhausted; terminalizing parked tx as REJECTED",
 			logfields.TxID(txid), zap.Int("attempts", count))
@@ -2172,7 +2384,16 @@ func (p *Propagator) schedulePendingRetry(ctx context.Context, txid string, rawT
 			p.logger.Error("clear retry state failed", logfields.TxID(txid), zap.Error(err))
 			return
 		}
-		p.publishBulkStatus(ctx, models.StatusRejected, []string{txid}, time.Now())
+		// Same reason string that just went onto the row. A give-up is the
+		// least self-evident rejection arcade issues — no peer ever answered
+		// for this tx, so there is no verdict to quote and nothing about the
+		// bytes explains it — which makes it the one most worth carrying on
+		// the event rather than leaving to a GET /tx.
+		p.publishRejections(ctx, []*models.TransactionStatus{{
+			TxID:      txid,
+			Status:    models.StatusRejected,
+			ExtraInfo: reason,
+		}}, time.Now())
 		return
 	}
 	next := time.Now().Add(p.nextPendingRetryDelay(count))
@@ -2240,8 +2461,45 @@ func (p *Propagator) broadcastInChunks(ctx context.Context, batch []propagationM
 // classification path regardless of count.
 func (p *Propagator) broadcastChunk(ctx context.Context, chunk []propagationMsg, rawTxs [][]byte, out []txResult) {
 	metrics.PropagationChunkTotal.WithLabelValues("none").Inc()
-	results, _ := p.broadcastBatchToEndpoints(ctx, rawTxs, chunk)
+	results, _, needsNarrowing := p.broadcastBatchToEndpoints(ctx, rawTxs, chunk)
+	if needsNarrowing && len(chunk) > 1 {
+		p.narrowChunk(ctx, chunk, rawTxs, out)
+		return
+	}
 	copy(out, results)
+}
+
+// narrowChunk re-broadcasts a chunk as two halves after a peer returned a
+// failure line arcade could not bind to any submitted transaction.
+//
+// Teranode's public error boundary surfaces only the deepest allowlisted
+// cause, discarding the "[ProcessTransaction][<txid>]" wrapper — so for whole
+// classes of rejection (every Go-side consensus check, every BDK script and
+// policy failure, the over-size guard) the line names no transaction at all.
+// A chunk that draws one of those knows a transaction failed but not which.
+// Requeueing the whole chunk on that basis is what produced the observed
+// shape: the accepted transactions were re-broadcast pointlessly, the failing
+// one looped until the durable-retry budget gave up, and the submitter was
+// told a parent had never reached the network — a reason with no relationship
+// to the actual verdict.
+//
+// Halving instead settles it. Each pass either lands the line on a chunk of
+// one — where "named nobody" can only mean "named this one" — or discards the
+// half that answers 200. Re-submitting an already-accepted transaction is
+// idempotent: teranode answers ErrTxExists, which its own handler classifies
+// as success. Cost is bounded at roughly 2·log2(n) extra round trips and only
+// on the failure path; once teranode carries the txid on every failure line,
+// nothing reaches here at all.
+func (p *Propagator) narrowChunk(ctx context.Context, chunk []propagationMsg, rawTxs [][]byte, out []txResult) {
+	metrics.PropagationChunkTotal.WithLabelValues("narrowed").Inc()
+	mid := len(chunk) / 2
+	p.logger.Info(
+		"narrowing chunk to place an unattributable teranode failure line",
+		zap.Int("chunk_size", len(chunk)),
+		zap.Int("split_at", mid),
+	)
+	p.broadcastChunk(ctx, chunk[:mid], rawTxs[:mid], out[:mid])
+	p.broadcastChunk(ctx, chunk[mid:], rawTxs[mid:], out[mid:])
 }
 
 // isCanceledByBroadcast reports whether err is a context.Canceled directly
@@ -2415,7 +2673,7 @@ func (p *Propagator) submitBroadcastJobs(ctx context.Context, endpoints []string
 // siblings accept is exactly the slow-track breaker's target. The
 // returned successEndpoint is the URL of the first peer that returned
 // HTTP 200 (empty when none did).
-func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]byte, batch []propagationMsg) (results []txResult, successEndpoint string) {
+func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]byte, batch []propagationMsg) (results []txResult, successEndpoint string, needsNarrowing bool) {
 	start := time.Now()
 	defer func() {
 		metrics.PropagationBroadcastDuration.WithLabelValues("batch").Observe(time.Since(start).Seconds())
@@ -2424,7 +2682,7 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 	endpoints := p.teranodeClient.GetHealthyEndpoints()
 	if len(endpoints) == 0 {
 		p.logger.Error("no healthy teranode endpoints")
-		return makeRequeueResults(batch), ""
+		return makeRequeueResults(batch), "", false
 	}
 
 	submitCtx, cancelSubmit := context.WithTimeout(ctx, 15*time.Second)
@@ -2460,6 +2718,22 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 	// classification. See lineIsMissingParentCondition and
 	// txResultClassMissingParent.
 	missingParentLine := make([]string, len(batch))
+	// infraLine collects lines whose Teranode code names a node-side fault
+	// (STORAGE_ERROR, SERVICE_ERROR, …) rather than anything about the
+	// submitted bytes. Like missing-parent these are conditions, not verdicts:
+	// a peer whose blob store is down has not judged the transaction, and
+	// terminalizing on it makes a transient outage permanent.
+	infraLine := make([]string, len(batch))
+	// rejectionStatus records the HTTP status that accompanied each kept
+	// rejection line, but only when that peer reported a single failure (see
+	// statusHint below). classifyFailureLine uses it to recover meaning the
+	// public error boundary stripped out of the message.
+	rejectionStatus := make([]int, len(batch))
+	// needsNarrowing is set when some peer returned a failure line that could
+	// not be bound to a submitted transaction. The chunk must then be
+	// re-broadcast in smaller pieces until every line lands; see
+	// broadcastChunk.
+	needsNarrowing = false
 	// outpointOwners is the batch's spent-outpoint → tx index map used to
 	// attribute conflict-family lines back to submitted txs. Built lazily and
 	// at most once: it costs a full parse of every raw tx in the batch, which
@@ -2467,6 +2741,39 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 	// an alien-keyed failure line. nil means "not built yet".
 	var outpointOwners map[string]int
 	anySuccess := false
+
+	// route files one failure line into the bucket that matches what it
+	// actually says: a condition of the peer's view (missing parent), a fault
+	// on the peer itself (infra), or a verdict about the transaction. statusHint
+	// is the peer's HTTP status when it described exactly one transaction, and
+	// 0 otherwise; it is the only way to tell the three apart when the cause
+	// collapsed to Teranode's opaque PROCESSING catch-all.
+	//
+	// An opaque line with NO status evidence never terminalizes (#313). Teranode
+	// answers 422 only for a missing parent, 403 only for a frozen utxo, 5xx
+	// only for its own faults — but that mapping is per-transaction, and a body
+	// reporting several failures aggregates them into one status. With nothing
+	// left to distinguish "your bytes are bad" from "my store is down", a
+	// rejection here would be the reasonless REJECTED this whole change exists
+	// to remove. It retries instead, and terminates through the durable-retry
+	// budget quoting the line it actually saw.
+	route := func(idx int, line string, statusHint int) {
+		switch {
+		case lineIsMissingParentCondition(line),
+			statusHint == http.StatusUnprocessableEntity && lineIsOpaqueProcessing(line):
+			missingParentLine[idx] = preferRejectionLine(missingParentLine[idx], line)
+		case lineIsInfraCondition(line),
+			statusHint >= http.StatusInternalServerError && lineIsOpaqueProcessing(line),
+			statusHint == 0 && lineIsOpaqueProcessing(line):
+			infraLine[idx] = preferRejectionLine(infraLine[idx], line)
+		default:
+			kept := preferRejectionLine(rejectionLine[idx], line)
+			if kept == line {
+				rejectionStatus[idx] = statusHint
+			}
+			rejectionLine[idx] = kept
+		}
+	}
 	for i := 0; i < submitted; i++ {
 		result := <-resultCh
 		if isCanceledByBroadcast(broadcastCtx, result.err) {
@@ -2497,7 +2804,7 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 		// cannot tell that the peer actually returned UTXO_SPENT /
 		// PROCESSING (the structured body is not on err in that case).
 		// Opaque gateway 502/503 bodies stay on err alone.
-		if n := len(result.failures); n > 0 {
+		if n := result.failures.Len(); n > 0 {
 			p.logger.Warn(
 				"batch broadcast endpoint failed",
 				zap.String("endpoint", result.endpoint),
@@ -2517,9 +2824,22 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 			)
 		}
 
-		if len(result.failures) == 0 {
+		if result.failures.Len() == 0 {
 			// Non-parseable failure — this peer carried no per-tx info.
 			continue
+		}
+		// statusHint is the peer's HTTP status when it describes exactly one
+		// transaction. Teranode derives the /txs status from the per-tx error
+		// class and then aggregates (a 5xx dominates, otherwise the first 4xx
+		// wins) — so with a single failure line there is nothing to aggregate
+		// and the status describes that one transaction exactly. That makes it
+		// a sound tiebreaker for the opaque PROCESSING catch-all, which is
+		// otherwise indistinguishable between a missing parent (422), a frozen
+		// utxo (403) and a node-side fault (500). With several failure lines
+		// the status is ambiguous, so no hint is recorded.
+		statusHint := 0
+		if result.failures.Len() == 1 {
+			statusHint = result.statusCode
 		}
 
 		// Parseable failure-list body (any non-2xx status): peer accepted
@@ -2530,14 +2850,19 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 		// informative one (specific Teranode codes over PROCESSING over
 		// opaque text) so GET /tx ExtraInfo is useful to wallets.
 		//
-		// The "absent from map ⇒ accepted" half of the contract only holds
-		// when every failure line named a tx we submitted. Conflict-family
-		// lines (UTXO_SPENT et al., HTTP 409) name the spent outpoint / the
-		// competing spender instead of the submitted txid, so they key
-		// under an alien hash — see alienFailureLines. One alien line means
-		// one unidentifiable submitted tx DID fail; granting implicit
-		// accepts would mark that very tx ACCEPTED_BY_NETWORK.
-		alienCount, bestAlien := alienFailureLines(result.failures, inBatch)
+		// The "absent from map ⇒ accepted" half of the contract holds exactly
+		// when every failure line this peer returned has been PLACED on a
+		// submitted tx. Conflict-family lines (UTXO_SPENT et al., HTTP 409)
+		// name the spent outpoint / the competing spender instead of the
+		// submitted txid, so they key under an alien hash — see
+		// alienFailureLines — and allowlisted causes name no hash at all. An
+		// unplaced line means one unidentifiable submitted tx DID fail;
+		// granting implicit accepts would mark that very tx
+		// ACCEPTED_BY_NETWORK. Once outpoint attribution has placed every
+		// alien line the failure set is fully accounted for, and withholding
+		// the remaining accepts would only requeue transactions this peer
+		// demonstrably took — the requeue churn #292 set out to stop.
+		alienCount, bestAlien := alienFailureLines(result.failures.Keyed(), inBatch)
 		// Alien lines are not a dead end. arcade holds the submitted raw
 		// transactions, so the spent "<outpoint>:<vout>" a conflict line names
 		// can be matched against the batch's own inputs and the verdict handed
@@ -2548,18 +2873,16 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 		// messages of Kafka lag frozen behind 4,679 in-flight txs).
 		//
 		// Attribution only ever ADDS rejection votes on an exact outpoint
-		// match. The #292 rule is untouched: alienCount > 0 still withholds
-		// every implicit accept from this peer, whether or not the lines could
-		// be placed — a peer that answered 409 has not told us the unnamed txs
-		// are good.
+		// match, and declines whenever a line could name more than one
+		// submitted tx — so a placed line is placed unambiguously.
 		var attributed map[int]string
 		if alienCount > 0 {
 			if outpointOwners == nil {
 				outpointOwners = buildSubmittedOutpointIndex(batch)
 			}
-			attributed = attributeConflictLines(result.failures, inBatch, outpointOwners)
+			attributed = attributeConflictLines(result.failures.Keyed(), inBatch, outpointOwners)
 			p.logger.Warn(
-				"teranode failure lines name no submitted tx; withholding implicit accepts from this peer",
+				"teranode failure lines name no submitted tx",
 				zap.String("endpoint", result.endpoint),
 				zap.Int("batch_size", len(batch)),
 				zap.Int("alien_line_count", alienCount),
@@ -2567,45 +2890,65 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 				zap.String("best_alien_line", bestAlien),
 			)
 		}
+		// unplaceable counts the lines this peer returned that could not be
+		// bound to a submitted tx: lines naming no hash at all, plus alien
+		// lines outpoint attribution could not resolve. Each one means a
+		// submitted tx failed for a reason we cannot yet name — so this peer
+		// vouches for nobody, and the caller narrows the chunk until the line
+		// lands on a single tx.
+		unattributedAliens := alienCount - len(attributed)
+		if unattributedAliens < 0 {
+			unattributedAliens = 0
+		}
+		unplaceable := unattributedAliens + len(result.failures.Unkeyed)
+		if len(result.failures.Unkeyed) > 0 {
+			p.logger.Warn(
+				"teranode failure lines name no transaction; withholding implicit accepts from this peer",
+				zap.String("endpoint", result.endpoint),
+				zap.Int("batch_size", len(batch)),
+				zap.Int("unkeyed_line_count", len(result.failures.Unkeyed)),
+				zap.Strings("unkeyed_lines", result.failures.Unkeyed),
+			)
+		}
+		if unplaceable > 0 {
+			needsNarrowing = true
+		}
+
+		keyed := result.failures.Keyed()
 		for j, lower := range lowerTxids {
-			if line, failed := result.failures[lower]; failed {
+			if line, failed := keyed[lower]; failed {
 				// A missing-parent line keyed to a submitted tx is NOT a
 				// verdict about its bytes — the peer processed the batch
 				// and told us the parent isn't there yet. Route it to the
 				// condition bucket; the siblings' implicit accepts above
 				// are untouched (the line is in-batch-keyed, not alien).
-				if lineIsMissingParentCondition(line) {
-					missingParentLine[j] = preferRejectionLine(missingParentLine[j], line)
-				} else {
-					rejectionLine[j] = preferRejectionLine(rejectionLine[j], line)
-				}
-			} else if alienCount == 0 {
+				route(j, line, statusHint)
+			} else if _, condemned := attributed[j]; !condemned && unplaceable == 0 {
+				// Every line this peer returned has been placed, so the
+				// failure set is fully accounted for and absence really does
+				// mean acceptance — except for the txs an attributed line
+				// condemns, which are absent from the map only because the
+				// line named their spent outpoint rather than them. Granting
+				// those an implicit accept would beat their own verdict:
+				// acceptance is sticky.
 				acceptedByAny[j] = true
 			}
 		}
 		for idx, line := range attributed {
 			// Attributed lines are conflict-family by construction, but the
-			// condition check is kept for defense: a mis-shaped line must
-			// never become a terminal verdict via the attribution path.
-			if lineIsMissingParentCondition(line) {
-				missingParentLine[idx] = preferRejectionLine(missingParentLine[idx], line)
-			} else {
-				rejectionLine[idx] = preferRejectionLine(rejectionLine[idx], line)
-			}
+			// condition check inside route is kept for defense: a mis-shaped
+			// line must never become a terminal verdict via this path.
+			route(idx, line, statusHint)
 		}
-		// A single-tx batch has exactly one possible owner for an alien
-		// verdict — the tx itself. Terminalize it with the real reason
-		// (this is the mainnet incident shape: batch_size=1, HTTP 409,
-		// wrapper-less "UTXO_SPENT (70): <outpoint> utxo already spent by
-		// tx <spender>[0]"). Kept as the backstop for the case outpoint
-		// attribution can't cover — a conflict line about an outpoint the tx
-		// doesn't visibly spend, or raw bytes we failed to parse.
-		if alienCount > 0 && len(batch) == 1 {
-			if lineIsMissingParentCondition(bestAlien) {
-				missingParentLine[0] = preferRejectionLine(missingParentLine[0], bestAlien)
-			} else {
-				rejectionLine[0] = preferRejectionLine(rejectionLine[0], bestAlien)
-			}
+		// A single-tx chunk has exactly one possible owner for a line that
+		// named nobody — the tx itself. This is what makes narrowing
+		// terminate: whatever teranode said, once the chunk is down to one
+		// transaction the verdict is unambiguous. Covers both the mainnet
+		// conflict shape (batch_size=1, HTTP 409, wrapper-less "UTXO_SPENT
+		// (70): <outpoint> utxo already spent by tx <spender>[0]") and every
+		// allowlisted cause whose message carries no txid at all.
+		if unplaceable > 0 && len(batch) == 1 {
+			route(0, bestUnplaceableLine(bestAlien, result.failures.Unkeyed), statusHint)
 		}
 	}
 	recordBroadcastOutcomes(p.teranodeClient, outcomes)
@@ -2632,7 +2975,7 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 				successEndpoint: successEndpoint,
 			}
 		case rejectionLine[i] != "":
-			errMsg, arcCode := classifyFailureLine(rejectionLine[i])
+			errMsg, arcCode := classifyFailureLine(rejectionLine[i], rejectionStatus[i])
 			results[i] = txResult{
 				class:  txResultClassRejected,
 				errMsg: errMsg,
@@ -2654,6 +2997,15 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 				errMsg: missingParentLine[i],
 				rawTx:  msg.RawTx,
 			}
+		case infraLine[i] != "":
+			// The peer faulted rather than judged. Requeue carrying the line
+			// so the park reason (and the operator log) names the node fault
+			// instead of inventing a story about the transaction.
+			results[i] = txResult{
+				class:  txResultClassRequeue,
+				errMsg: infraLine[i],
+				rawTx:  msg.RawTx,
+			}
 		default:
 			results[i] = txResult{
 				class: txResultClassRequeue,
@@ -2661,7 +3013,7 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 			}
 		}
 	}
-	return results, successEndpoint
+	return results, successEndpoint, needsNarrowing
 }
 
 // makeRequeueResults builds a per-tx requeue result list for a batch

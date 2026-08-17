@@ -43,6 +43,7 @@ const (
 	setBlockProcessing  = "arcade_block_processing"
 	setLeases           = "arcade_leases"
 	setDatahubEndpoints = "arcade_datahub_endpoints"
+	setPeerPolicies     = "arcade_peer_policies"
 )
 
 // BUMP chunking — large compound BUMPs (scaling networks with millions of
@@ -765,7 +766,8 @@ loop:
 				if payload, mErr := json.Marshal(history); mErr == nil {
 					ops = append(ops, aero.PutOp(aero.NewBin(binOrphAnchors, payload)))
 				}
-				ops = append(ops,
+				ops = append(
+					ops,
 					aero.PutOp(aero.NewBin("block_hash", nil)),
 					aero.PutOp(aero.NewBin("block_height", nil)),
 				)
@@ -1939,8 +1941,26 @@ func (s *Store) TokensForTxIDs(ctx context.Context, txids []string) (map[string]
 	return store.TokensForTxIDsViaPerTxID(ctx, txids, s.GetSubmissionsByTxID)
 }
 
+// maxTokenReplayScan bounds how many of a token's submissions this backend
+// will walk for one catchup replay.
+//
+// Unlike Postgres, Aerospike has no index over (callback_token, timestamp_at,
+// txid) here, so this implementation loads the token's submission list, does a
+// point Get per txid, and sorts the survivors in memory — O(token cardinality)
+// per connect, against tokens that can hold millions of submissions. That is
+// the shape that OOM-killed the SSE pod (#237/#238). Past this bound, refusing
+// is strictly better than trying: the caller degrades to an explicit gap and
+// the client reconciles over REST, instead of the pod dying and taking every
+// other connected client with it.
+//
+// The bound is enforced while the query result set is being drained, so peak
+// memory is capped at maxTokenReplayScan submissions. Checking the length of an
+// already-materialized list would be no protection at all — the allocation that
+// causes the OOM happens before such a check could run.
+const maxTokenReplayScan = 250_000
+
 func (s *Store) IterateStatusesByToken(ctx context.Context, callbackToken string, since time.Time, onlyStatuses []models.Status, fn func(*models.TransactionStatus) error) error {
-	subs, err := s.GetSubmissionsByToken(ctx, callbackToken)
+	subs, err := s.submissionsByTokenBounded(ctx, callbackToken, maxTokenReplayScan)
 	if err != nil {
 		return err
 	}
@@ -1999,6 +2019,19 @@ func (s *Store) IterateStatusesByToken(ctx context.Context, callbackToken string
 }
 
 func (s *Store) GetSubmissionsByToken(ctx context.Context, token string) ([]*models.Submission, error) {
+	return s.submissionsByTokenBounded(ctx, token, 0)
+}
+
+// submissionsByTokenBounded is GetSubmissionsByToken with an optional ceiling
+// on how many submissions it will accumulate. A limit of 0 means unbounded.
+//
+// The bound is enforced while the result set is being drained, not after:
+// checking a returned slice's length is no protection, because by then the
+// memory has already been allocated and the OOM it was meant to prevent has
+// already happened. Exceeding the limit abandons the query and returns
+// store.ErrReplayUnavailable, so peak memory is capped at limit entries
+// regardless of the token's real size.
+func (s *Store) submissionsByTokenBounded(ctx context.Context, token string, limit int) ([]*models.Submission, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -2029,6 +2062,10 @@ loop:
 			}
 			if rec.Err != nil {
 				continue
+			}
+			if limit > 0 && len(subs) >= limit {
+				loopErr = fmt.Errorf("%w: token has more than %d submissions", store.ErrReplayUnavailable, limit)
+				break loop
 			}
 			subs = append(subs, recordToSubmission(rec.Record))
 		}
@@ -2858,6 +2895,81 @@ loop:
 			}
 			if ep.URL != "" && ep.Network == network {
 				out = append(out, ep)
+			}
+		}
+	}
+	if loopErr != nil {
+		return nil, loopErr
+	}
+	return out, nil
+}
+
+func (s *Store) UpsertPeerPolicy(ctx context.Context, pp store.PeerPolicy) error {
+	if err := pp.Validate(); err != nil {
+		return err
+	}
+	key, err := s.key(setPeerPolicies, pp.PeerID)
+	if err != nil {
+		return err
+	}
+	bins := aero.BinMap{
+		"peer_id": pp.PeerID,
+		"network": pp.Network,
+		// Both narrowings are bounded by PeerPolicy.Validate above; without it a
+		// peer-supplied value over MaxInt64 would wrap negative into the bin and
+		// read back as an astronomical fee.
+		"fee_sats":  int64(pp.MiningFeeSatoshis), //nolint:gosec // bounded by PeerPolicy.Validate
+		"fee_bytes": int64(pp.MiningFeeBytes),    //nolint:gosec // bounded by PeerPolicy.Validate
+		"last_seen": pp.LastSeen.UnixMilli(),
+	}
+	return s.client.Put(s.writePolicy(ctx), key, bins)
+}
+
+// ListPeerPolicies scans every recorded peer policy, filtering to entries
+// scoped to the given network. Cardinality tracks the peer count (dozens to
+// low hundreds) — no pagination needed.
+func (s *Store) ListPeerPolicies(ctx context.Context, network string) ([]store.PeerPolicy, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	stmt := aero.NewStatement(s.namespace, setPeerPolicies)
+	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
+	if rs != nil {
+		defer func() { _ = rs.Close() }()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query peer policies: %w", err)
+	}
+
+	var (
+		out     []store.PeerPolicy
+		loopErr error
+	)
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			loopErr = ctx.Err()
+			break loop
+		case rec, ok := <-rs.Results():
+			if !ok {
+				break loop
+			}
+			if rec.Err != nil {
+				loopErr = rec.Err
+				break loop
+			}
+			pp := store.PeerPolicy{
+				PeerID:            getString(rec.Record, "peer_id"),
+				Network:           getString(rec.Record, "network"),
+				MiningFeeSatoshis: uint64(getInt64(rec.Record, "fee_sats")),  //nolint:gosec // stored non-negative
+				MiningFeeBytes:    uint64(getInt64(rec.Record, "fee_bytes")), //nolint:gosec // stored non-negative
+			}
+			if ms := getInt64(rec.Record, "last_seen"); ms > 0 {
+				pp.LastSeen = time.UnixMilli(ms)
+			}
+			if pp.PeerID != "" && pp.Network == network {
+				out = append(out, pp)
 			}
 		}
 	}

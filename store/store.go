@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
 	"time"
 
 	"github.com/bsv-blockchain/arcade/models"
@@ -10,6 +12,25 @@ import (
 
 // ErrNotFound is returned when a requested record does not exist.
 var ErrNotFound = errors.New("not found")
+
+// ErrInvalidPeerPolicy is returned by PeerPolicy.Validate, and by every
+// backend's UpsertPeerPolicy, for a policy that cannot be stored faithfully.
+// Callers treat it as "drop this advertisement", never as a store fault.
+var ErrInvalidPeerPolicy = errors.New("invalid peer policy")
+
+// ErrReplayUnavailable is returned by IterateStatusesByToken when a backend
+// cannot serve the replay within its resource bounds — typically a token whose
+// submission set is too large for a backend that has no keyset index over
+// (token, timestamp, txid) and would otherwise materialize and sort the whole
+// thing in memory.
+//
+// It exists so refusing is a first-class outcome. Attempting an unbounded
+// replay is not merely slow: it has OOM-killed the SSE pod and taken every
+// other connected client down with it (#237/#238). The SSE service turns this
+// error into an explicit `event: gap`, so the client learns it must reconcile
+// over REST and the live stream continues — a bounded, declared degradation
+// instead of a crash.
+var ErrReplayUnavailable = errors.New("replay unavailable for this token on this backend")
 
 // PendingRetry is the lightweight row shape the reaper consumes. It avoids
 // pulling full TransactionStatus objects through the retry hot path.
@@ -49,6 +70,60 @@ type DatahubEndpoint struct {
 type StatusCensus struct {
 	Count  int64
 	Oldest time.Time
+}
+
+// PeerPolicy is a peer's mining fee observed from its node_status gossip
+// announcement, persisted to the shared store so the ARC-compatible
+// GET /policy endpoint (served by api-server pods) can compute the
+// network-wide minimum fee even though only the single p2p-client pod
+// observes node_status (issue #212).
+//
+// Keyed by PeerID (a libp2p peer runs on a single network, so PeerID is
+// unique); Network is a filter attribute, not part of the key — matching the
+// DatahubEndpoint pattern. LastSeen lets readers drop peers not re-heard within
+// a TTL so a departed cheap node cannot pin the advertised fee low forever. The
+// mining fee is stored as satoshis-per-Bytes (the node_status FeePolicy.MiningFee
+// shape), e.g. {Satoshis: 100, Bytes: 1000} == 100 sat/kB.
+type PeerPolicy struct {
+	PeerID            string
+	Network           string
+	MiningFeeSatoshis uint64
+	MiningFeeBytes    uint64
+	LastSeen          time.Time
+}
+
+// maxStorableFee bounds a peer policy's fee fields. The Postgres and Aerospike
+// backends store them in signed 64-bit columns, so a value above MaxInt64 wraps
+// negative on write and reads back as an astronomical uint64 — a silently
+// corrupted floor that GET /policy would then advertise as the network minimum.
+//
+// The bound can only ever reject garbage: the entire money supply, 21 million
+// BSV, is 2.1e15 satoshis — some four thousand times below MaxInt64 — so no
+// honest advertisement comes near it. It has to be checked rather than assumed
+// because node_status is unauthenticated gossip: the peer chooses the number.
+const maxStorableFee = uint64(math.MaxInt64)
+
+// Validate reports whether pp can be persisted without loss. Every backend
+// calls it before writing, so the uint64→int64 narrowing each one performs is
+// bounded by a check instead of by assumption.
+func (pp PeerPolicy) Validate() error {
+	switch {
+	case pp.PeerID == "":
+		return fmt.Errorf("%w: empty peer id", ErrInvalidPeerPolicy)
+	case pp.MiningFeeBytes == 0:
+		// A zero byte basis makes the fee meaningless: readers divide by it to
+		// normalize to sat/kB, and lowestObservedFeePerKB has to skip such rows.
+		// Refusing the write keeps them out of the store in the first place.
+		return fmt.Errorf("%w: peer %s has a zero mining fee byte basis", ErrInvalidPeerPolicy, pp.PeerID)
+	case pp.MiningFeeSatoshis > maxStorableFee:
+		return fmt.Errorf("%w: peer %s advertised %d satoshis, above the storable maximum %d",
+			ErrInvalidPeerPolicy, pp.PeerID, pp.MiningFeeSatoshis, maxStorableFee)
+	case pp.MiningFeeBytes > maxStorableFee:
+		return fmt.Errorf("%w: peer %s advertised a %d byte basis, above the storable maximum %d",
+			ErrInvalidPeerPolicy, pp.PeerID, pp.MiningFeeBytes, maxStorableFee)
+	default:
+		return nil
+	}
 }
 
 // BatchInsertResult is one entry in the result slice returned by
@@ -310,6 +385,12 @@ type Store interface {
 	// are emitted; when onlyStatuses is non-empty, only rows in one of those
 	// statuses are emitted. fn returning a non-nil error stops the iteration
 	// and surfaces that error to the caller.
+	//
+	// An implementation that cannot serve the replay within its own resource
+	// bounds MUST return ErrReplayUnavailable rather than attempt it. Refusing
+	// is a supported outcome — the caller degrades to an explicit gap notice
+	// and the client reconciles over REST — whereas attempting it is how this
+	// path has taken the whole pod down and every connected client with it.
 	IterateStatusesByToken(ctx context.Context, callbackToken string, since time.Time, onlyStatuses []models.Status, fn func(*models.TransactionStatus) error) error
 
 	// UpdateDeliveryStatus updates the delivery tracking for a submission
@@ -402,6 +483,15 @@ type Store interface {
 	// excluded — they will be re-registered with the correct network the next
 	// time their peer announces.
 	ListDatahubEndpoints(ctx context.Context, network string) ([]DatahubEndpoint, error)
+
+	// UpsertPeerPolicy records (or refreshes) a peer's observed mining fee.
+	// Called by p2p_client on each node_status announcement carrying a fee.
+	UpsertPeerPolicy(ctx context.Context, pp PeerPolicy) error
+
+	// ListPeerPolicies returns every recorded peer policy scoped to the given
+	// network. The GET /policy handler filters these by LastSeen and takes the
+	// minimum mining fee. Entries with an empty Network (legacy rows) are excluded.
+	ListPeerPolicies(ctx context.Context, network string) ([]PeerPolicy, error)
 
 	// Close closes the database connection
 	Close() error

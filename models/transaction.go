@@ -44,14 +44,18 @@ type TransactionStatus struct {
 	StatusCode int       `json:"status,omitempty"`
 	Timestamp  time.Time `json:"timestamp"`
 	// TxIDs, when populated, marks this as a bulk-transition event: every
-	// txid in the slice carries the same Status/BlockHash/BlockHeight. Used
+	// txid in the slice carries the same payload — Status, BlockHash,
+	// BlockHeight, ExtraInfo and StatusCode all apply to all of them. Used
 	// by bump-builder's MINED fan-out to publish ONE Kafka event per block
 	// instead of N events per block, which previously saturated the webhook
 	// service's bounded work queue (~185k drops/block on testnet bursts).
 	// Subscribers detect bulk via len(TxIDs) > 0 and unfan in their own
-	// handler. omitempty so the HTTP API surface (single-tx status reads)
-	// is unaffected — TxIDs is never set on rows read from the store, only
-	// on transient events on the publisher channel.
+	// handler, copying the whole struct per txid — so a publisher holding a
+	// per-transaction payload must split the event by payload rather than
+	// send one whose fields fit only some of its txids (issue #301; see
+	// propagation.publishRejections). omitempty so the HTTP API surface
+	// (single-tx status reads) is unaffected — TxIDs is never set on rows
+	// read from the store, only on transient events on the publisher channel.
 	TxIDs        []string  `json:"txids,omitempty"`
 	BlockHash    string    `json:"blockHash,omitempty"`
 	BlockHeight  uint64    `json:"blockHeight,omitempty"`
@@ -220,10 +224,20 @@ func (s Status) DisallowedPreviousStatuses() []Status {
 			StatusRejected, StatusDoubleSpendAttempted,
 			StatusMined, StatusImmutable,
 		}
-	case StatusRejected, StatusDoubleSpendAttempted:
-		// Rejection paths can override any non-terminal in-flight state, but
-		// must not be able to clobber an already-confirmed (MINED/IMMUTABLE)
-		// transaction.
+	case StatusRejected:
+		// REJECTED may overwrite pre-network in-flight state (RECEIVED /
+		// SENT / ACCEPTED / PENDING_RETRY), but must not clobber a tx that
+		// has already been observed on the network or confirmed. Issue #251:
+		// resubmitting an already-broadcast (and often already-mined) tx
+		// must not regress SEEN_* → REJECTED when intake validation fails
+		// on spent inputs of the same txid.
+		return []Status{
+			StatusSeenOnNetwork, StatusSeenMultipleNodes,
+			StatusMined, StatusImmutable,
+		}
+	case StatusDoubleSpendAttempted:
+		// Conflict detection can mark a SEEN tx; it must not clobber MINED /
+		// IMMUTABLE.
 		return []Status{StatusMined, StatusImmutable}
 	case StatusMined:
 		// MINED can be set from any in-flight state, but a transient miner-
@@ -350,11 +364,28 @@ type SubmitOptions struct {
 	SkipScriptValidation bool   // Skip script validation
 }
 
-// Policy represents the transaction policy configuration
+// FeeAmount is the ARC mining-fee rate expressed as a number of satoshis per
+// a number of bytes, e.g. {Satoshis: 100, Bytes: 1000} == 100 sat/kB.
+type FeeAmount struct {
+	Satoshis uint64 `json:"satoshis"`
+	Bytes    uint64 `json:"bytes"`
+}
+
+// Policy is the ARC-compatible transaction policy document returned by
+// GET /policy (issue #212). Field names and JSON tags match the ARC contract
+// so arcade is a drop-in target for clients that discover fee/size limits
+// before building transactions.
 type Policy struct {
-	MaxScriptSizePolicy     uint64 `json:"maxscriptsizepolicy"`
-	MaxTxSigOpsCountsPolicy uint64 `json:"maxtxsigopscountspolicy"`
-	MaxTxSizePolicy         uint64 `json:"maxtxsizepolicy"`
-	MiningFeeBytes          uint64 `json:"miningFeeBytes"`
-	MiningFeeSatoshis       uint64 `json:"miningFeeSatoshis"`
+	MiningFee               FeeAmount `json:"miningFee"`
+	MaxTxSizePolicy         uint64    `json:"maxtxsizepolicy"`
+	MaxScriptSizePolicy     uint64    `json:"maxscriptsizepolicy"`
+	MaxTxSigopsCountsPolicy int64     `json:"maxtxsigopscountspolicy"`
+	StandardFormatSupported bool      `json:"standardFormatSupported"`
+}
+
+// PolicyResponse wraps Policy in the ARC response envelope with a policy
+// timestamp (RFC 3339).
+type PolicyResponse struct {
+	Policy    Policy    `json:"policy"`
+	Timestamp time.Time `json:"timestamp"`
 }

@@ -310,22 +310,31 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 }
 
 // validatorPolicyFromConfig builds the validator.Policy from cfg.Validator.
-// Returns nil when no operator-facing fields are set so NewValidator's
-// built-in defaults apply unchanged. When AcceptZeroFee is set, returns
-// a policy with an explicit pointer-to-zero MinFeePerKB so that
-// NewValidator preserves it (its nil-check is on the pointer, not the
-// value) and ValidateTransaction feeds Satoshis=0 to spv.Verify, which
-// accepts any non-negative fee — including fee=0.
+// The size/sigop fields carry their (defaulted) config values through so the
+// GET /policy endpoint and intake validation agree on the advertised limits;
+// a zero there falls back to the validator's canonical teranode default.
+//
+// Fee handling preserves the original semantics: AcceptZeroFee returns an
+// explicit pointer-to-zero MinFeePerKB so NewValidator preserves it (its
+// nil-check is on the pointer, not the value) and ValidateTransaction feeds
+// Satoshis=0 to spv.Verify, which accepts any non-negative fee — including
+// fee=0. A zero MinFeePerKB with AcceptZeroFee=false leaves the pointer nil so
+// the validator's DefaultMinFeePerKB applies.
 func validatorPolicyFromConfig(cfg *config.Config) *validator.Policy {
-	if cfg.Validator.AcceptZeroFee {
+	p := &validator.Policy{
+		MaxTxSizePolicy:         int(cfg.Validator.MaxTxSizePolicy),     //nolint:gosec // policy size in bytes, bounded far below int max
+		MaxScriptSizePolicy:     int(cfg.Validator.MaxScriptSizePolicy), //nolint:gosec // policy size in bytes, bounded far below int max
+		MaxTxSigopsCountsPolicy: cfg.Validator.MaxTxSigopsCountsPolicy,
+	}
+	switch {
+	case cfg.Validator.AcceptZeroFee:
 		zero := uint64(0)
-		return &validator.Policy{MinFeePerKB: &zero}
+		p.MinFeePerKB = &zero
+	case cfg.Validator.MinFeePerKB != 0:
+		minFee := cfg.Validator.MinFeePerKB
+		p.MinFeePerKB = &minFee
 	}
-	if cfg.Validator.MinFeePerKB == 0 {
-		return nil
-	}
-	minFee := cfg.Validator.MinFeePerKB
-	return &validator.Policy{MinFeePerKB: &minFee}
+	return p
 }
 
 // modeNeedsChaintracks reports whether the configured service mode constructs
