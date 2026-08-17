@@ -950,19 +950,29 @@ type ValidatorConfig struct {
 
 	// The fields below back the ARC-compatible GET /policy endpoint
 	// (issue #212). Each is the policy value arcade advertises and, for
-	// the size/sigop fields, enforces. Left at zero, they fall back to
-	// teranode's canonical policy defaults (see validator.defaultPolicySettings).
+	// the size/sigop fields, enforces.
 
-	// MaxTxSizePolicy caps accepted transaction size in bytes. 0 =>
-	// DefaultValidatorMaxTxSizePolicy.
+	// MaxTxSizePolicy caps accepted transaction size in bytes.
+	//
+	// Zero (the default) signals "not operator-configured", the same sentinel
+	// MinFeePerKB uses: the limit then tracks the largest size any peer
+	// advertises in its node_status fee_policy, so arcade rejects a transaction
+	// at intake only when no node on the network would accept it. Observation
+	// can only widen the limit from DefaultValidatorMaxTxSizePolicy, never
+	// narrow it, so a misconfigured peer cannot cause false rejections. Falls
+	// back to DefaultValidatorMaxTxSizePolicy when no peer has been heard.
+	// A non-zero value is enforced and reported verbatim.
 	MaxTxSizePolicy uint64 `mapstructure:"max_tx_size_policy"`
 
-	// MaxScriptSizePolicy caps accepted script size in bytes. 0 =>
-	// DefaultValidatorMaxScriptSizePolicy.
+	// MaxScriptSizePolicy caps accepted script size in bytes. Zero (the
+	// default) tracks the network exactly as MaxTxSizePolicy does, falling back
+	// to DefaultValidatorMaxScriptSizePolicy.
 	MaxScriptSizePolicy uint64 `mapstructure:"max_script_size_policy"`
 
 	// MaxTxSigopsCountsPolicy caps sigops per transaction. 0 => unlimited,
 	// the BSV post-Genesis default, and is reported verbatim in /policy.
+	// Unlike the size limits this is not tracked from the network: 0 already
+	// means "unlimited" here, so it cannot double as an "unset" sentinel.
 	MaxTxSigopsCountsPolicy int64 `mapstructure:"max_tx_sigops_counts_policy"`
 
 	// StandardFormatSupported reports whether standard (non-EF) transaction
@@ -970,17 +980,17 @@ type ValidatorConfig struct {
 	// handleSubmitTransaction), so this defaults to true.
 	StandardFormatSupported bool `mapstructure:"standard_format_supported"`
 
-	// ObservedFeeTTLMs bounds how long a mining fee observed from a peer's
-	// node_status announcement stays eligible for the network-minimum
-	// computation. A peer not re-heard within this window is dropped from the
-	// minimum so a departed cheap node can't pin the fee low forever.
+	// ObservedFeeTTLMs bounds how long a policy observed from a peer's
+	// node_status announcement stays eligible for the network computation. A
+	// peer not re-heard within this window is dropped so a departed node can't
+	// pin the fee low — or the size limits high — forever.
 	// 0 => DefaultValidatorObservedFeeTTLMs.
 	ObservedFeeTTLMs uint64 `mapstructure:"observed_fee_ttl_ms"`
 
 	// ObservedFeeRefreshMs is how often the api-server recomputes the
-	// network-minimum fee from observed peer policies and pushes it into the
-	// intake validator (issue #212). Only active when the operator has NOT
-	// pinned a fee (min_fee_per_kb=0 and accept_zero_fee=false).
+	// network-derived policy from observed peer policies and pushes it into the
+	// intake validator (issue #212). Applies to every dimension the operator
+	// has NOT pinned; a pinned dimension is left alone.
 	// 0 => DefaultValidatorObservedFeeRefreshMs.
 	ObservedFeeRefreshMs uint64 `mapstructure:"observed_fee_refresh_ms"`
 }
@@ -1270,12 +1280,14 @@ func setDefaults() {
 	// so AutomaticEnv honors the ARCADE_VALIDATOR_MIN_FEE_PER_KB override.
 	viper.SetDefault("validator.min_fee_per_kb", 0)
 
-	// ARC-compatible GET /policy fields (issue #212). Defaults mirror
-	// teranode's canonical policy so the advertised limits match the
-	// upstream node. Every key needs an explicit SetDefault for AutomaticEnv
-	// to honour its ARCADE_VALIDATOR_* override (same reasoning as above).
-	viper.SetDefault("validator.max_tx_size_policy", DefaultValidatorMaxTxSizePolicy)
-	viper.SetDefault("validator.max_script_size_policy", DefaultValidatorMaxScriptSizePolicy)
+	// ARC-compatible GET /policy fields (issue #212). The two size limits
+	// default to 0 for the same reason min_fee_per_kb does: it marks them "not
+	// operator-configured", so they track the most permissive limit the network
+	// advertises, falling back to DefaultValidatorMax*Policy until a peer is
+	// heard. Every key needs an explicit SetDefault for AutomaticEnv to honour
+	// its ARCADE_VALIDATOR_* override (same reasoning as above).
+	viper.SetDefault("validator.max_tx_size_policy", 0)
+	viper.SetDefault("validator.max_script_size_policy", 0)
 	viper.SetDefault("validator.max_tx_sigops_counts_policy", 0)
 	viper.SetDefault("validator.standard_format_supported", true)
 	viper.SetDefault("validator.observed_fee_ttl_ms", DefaultValidatorObservedFeeTTLMs)

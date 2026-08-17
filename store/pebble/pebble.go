@@ -246,7 +246,12 @@ type storedPeerPolicy struct {
 	Network           string `json:"network"`
 	MiningFeeSatoshis uint64 `json:"mining_fee_satoshis"`
 	MiningFeeBytes    uint64 `json:"mining_fee_bytes"`
-	LastSeenUnixNs    int64  `json:"last_seen"`
+	// Absent in rows written before the size limits were observed; JSON decodes
+	// a missing key as 0, which is exactly the "peer did not advertise"
+	// sentinel, so no migration is needed.
+	MaxTxSizePolicy     uint64 `json:"max_tx_size_policy,omitempty"`
+	MaxScriptSizePolicy uint64 `json:"max_script_size_policy,omitempty"`
+	LastSeenUnixNs      int64  `json:"last_seen"`
 }
 
 // New opens a Pebble database at cfg.Path and returns a Store ready to use.
@@ -2301,10 +2306,12 @@ func (s *Store) UpsertPeerPolicy(ctx context.Context, pp store.PeerPolicy) error
 		return err
 	}
 	stored := storedPeerPolicy{
-		PeerID:            pp.PeerID,
-		Network:           pp.Network,
-		MiningFeeSatoshis: pp.MiningFeeSatoshis,
-		MiningFeeBytes:    pp.MiningFeeBytes,
+		PeerID:              pp.PeerID,
+		Network:             pp.Network,
+		MiningFeeSatoshis:   pp.MiningFeeSatoshis,
+		MiningFeeBytes:      pp.MiningFeeBytes,
+		MaxTxSizePolicy:     pp.MaxTxSizePolicy,
+		MaxScriptSizePolicy: pp.MaxScriptSizePolicy,
 	}
 	if !pp.LastSeen.IsZero() {
 		stored.LastSeenUnixNs = pp.LastSeen.UnixNano()
@@ -2343,10 +2350,12 @@ func (s *Store) ListPeerPolicies(ctx context.Context, network string) ([]store.P
 			continue
 		}
 		pp := store.PeerPolicy{
-			PeerID:            row.PeerID,
-			Network:           row.Network,
-			MiningFeeSatoshis: row.MiningFeeSatoshis,
-			MiningFeeBytes:    row.MiningFeeBytes,
+			PeerID:              row.PeerID,
+			Network:             row.Network,
+			MiningFeeSatoshis:   row.MiningFeeSatoshis,
+			MiningFeeBytes:      row.MiningFeeBytes,
+			MaxTxSizePolicy:     row.MaxTxSizePolicy,
+			MaxScriptSizePolicy: row.MaxScriptSizePolicy,
 		}
 		if row.LastSeenUnixNs != 0 {
 			pp.LastSeen = time.Unix(0, row.LastSeenUnixNs)

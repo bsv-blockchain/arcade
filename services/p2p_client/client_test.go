@@ -426,11 +426,11 @@ func TestClient_ValidationCacheSkipsRepeatLookups(t *testing.T) {
 	}
 }
 
-// TestRecordPeerFee_FeePolicy verifies the structured FeePolicy.MiningFee is
+// TestRecordPeerPolicy_FeePolicy verifies the structured FeePolicy.MiningFee is
 // persisted verbatim as the peer's observed fee.
-func TestRecordPeerFee_FeePolicy(t *testing.T) {
+func TestRecordPeerPolicy_FeePolicy(t *testing.T) {
 	c, w := newTestClient(t, newFakeTeraClient("sender"))
-	c.recordPeerFee(context.Background(), teranodep2p.NodeStatusMessage{
+	c.recordPeerPolicy(context.Background(), teranodep2p.NodeStatusMessage{
 		PeerID:    "peer-1",
 		BaseURL:   "https://peer.example",
 		FeePolicy: &teranodep2p.FeePolicy{MiningFee: teranodep2p.FeeAmount{Satoshis: 75, Bytes: 1000}},
@@ -448,12 +448,12 @@ func TestRecordPeerFee_FeePolicy(t *testing.T) {
 	}
 }
 
-// TestRecordPeerFee_LegacyMinMiningTxFee verifies the BSV/kB fallback is
+// TestRecordPeerPolicy_LegacyMinMiningTxFee verifies the BSV/kB fallback is
 // converted to satoshis-per-1000-bytes when no structured FeePolicy is present.
-func TestRecordPeerFee_LegacyMinMiningTxFee(t *testing.T) {
+func TestRecordPeerPolicy_LegacyMinMiningTxFee(t *testing.T) {
 	c, w := newTestClient(t, newFakeTeraClient("sender"))
 	fee := 0.0000005 // BSV/kB -> 50 sat per 1000 bytes
-	c.recordPeerFee(context.Background(), teranodep2p.NodeStatusMessage{
+	c.recordPeerPolicy(context.Background(), teranodep2p.NodeStatusMessage{
 		PeerID:         "peer-2",
 		MinMiningTxFee: &fee,
 	})
@@ -467,11 +467,11 @@ func TestRecordPeerFee_LegacyMinMiningTxFee(t *testing.T) {
 	}
 }
 
-// TestRecordPeerFee_URLlessPeerStillRecorded verifies a peer that advertises a
+// TestRecordPeerPolicy_URLlessPeerStillRecorded verifies a peer that advertises a
 // fee but no datahub URL is still counted toward the /policy network-minimum.
-func TestRecordPeerFee_URLlessPeerStillRecorded(t *testing.T) {
+func TestRecordPeerPolicy_URLlessPeerStillRecorded(t *testing.T) {
 	c, w := newTestClient(t, newFakeTeraClient("sender"))
-	c.recordPeerFee(context.Background(), teranodep2p.NodeStatusMessage{
+	c.recordPeerPolicy(context.Background(), teranodep2p.NodeStatusMessage{
 		PeerID:    "peer-3",
 		FeePolicy: &teranodep2p.FeePolicy{MiningFee: teranodep2p.FeeAmount{Satoshis: 10, Bytes: 1000}},
 	})
@@ -480,30 +480,109 @@ func TestRecordPeerFee_URLlessPeerStillRecorded(t *testing.T) {
 	}
 }
 
-// TestRecordPeerFee_NoFeeAdvertised verifies peers advertising no fee (old
+// TestRecordPeerPolicy_NoFeeAdvertised verifies peers advertising no fee (old
 // nodes) are skipped rather than recorded with a zero fee.
-func TestRecordPeerFee_NoFeeAdvertised(t *testing.T) {
+func TestRecordPeerPolicy_NoFeeAdvertised(t *testing.T) {
 	c, w := newTestClient(t, newFakeTeraClient("sender"))
-	c.recordPeerFee(context.Background(), teranodep2p.NodeStatusMessage{PeerID: "peer-4"})
+	c.recordPeerPolicy(context.Background(), teranodep2p.NodeStatusMessage{PeerID: "peer-4"})
 	if fees := w.feeSnapshot(); len(fees) != 0 {
 		t.Fatalf("expected no fee upsert for feeless peer, got %+v", fees)
 	}
 }
 
-// TestRecordPeerFee_RejectsMalformedLegacyFee verifies that a malformed or
+// TestRecordPeerPolicy_RejectsMalformedLegacyFee verifies that a malformed or
 // malicious legacy MinMiningTxFee (NaN, Inf, negative, or absurdly large) is
 // dropped rather than converted into a wrapped uint64 that would pollute the
 // store and metrics.
-func TestRecordPeerFee_RejectsMalformedLegacyFee(t *testing.T) {
+func TestRecordPeerPolicy_RejectsMalformedLegacyFee(t *testing.T) {
 	bad := []float64{math.NaN(), math.Inf(1), -0.0001, 1e30}
 	for _, f := range bad {
 		c, w := newTestClient(t, newFakeTeraClient("sender"))
-		c.recordPeerFee(context.Background(), teranodep2p.NodeStatusMessage{
+		c.recordPeerPolicy(context.Background(), teranodep2p.NodeStatusMessage{
 			PeerID:         "peer-bad",
 			MinMiningTxFee: &f,
 		})
 		if fees := w.feeSnapshot(); len(fees) != 0 {
 			t.Errorf("fee=%v: expected no upsert for malformed fee, got %+v", f, fees)
 		}
+	}
+}
+
+// TestRecordPeerPolicy_RecordsSizeLimits verifies the size limits teranode
+// advertises alongside the fee are carried into the store, so the api-server
+// can derive the network-wide maximum for GET /policy and intake.
+func TestRecordPeerPolicy_RecordsSizeLimits(t *testing.T) {
+	c, w := newTestClient(t, newFakeTeraClient("sender"))
+	c.recordPeerPolicy(context.Background(), teranodep2p.NodeStatusMessage{
+		PeerID:  "peer-sized",
+		BaseURL: "https://peer.example",
+		FeePolicy: &teranodep2p.FeePolicy{
+			MiningFee:           teranodep2p.FeeAmount{Satoshis: 75, Bytes: 1000},
+			MaxTxSizePolicy:     100_000_000,
+			MaxScriptSizePolicy: 500_000,
+		},
+	})
+
+	fees := w.feeSnapshot()
+	if len(fees) != 1 {
+		t.Fatalf("expected 1 policy upsert, got %d: %+v", len(fees), fees)
+	}
+	if fees[0].MaxTxSizePolicy != 100_000_000 {
+		t.Errorf("MaxTxSizePolicy = %d, want 100000000", fees[0].MaxTxSizePolicy)
+	}
+	if fees[0].MaxScriptSizePolicy != 500_000 {
+		t.Errorf("MaxScriptSizePolicy = %d, want 500000", fees[0].MaxScriptSizePolicy)
+	}
+}
+
+// TestRecordPeerPolicy_LegacyPeerLeavesSizesUnset verifies a node old enough to
+// send only min_mining_tx_fee records zero size limits. Zero is the "did not
+// advertise" sentinel readers skip — it must not be mistaken for a peer that
+// accepts nothing, which under the network maximum would be harmless but under
+// any future minimum would be catastrophic.
+func TestRecordPeerPolicy_LegacyPeerLeavesSizesUnset(t *testing.T) {
+	c, w := newTestClient(t, newFakeTeraClient("sender"))
+	fee := 0.0000005
+	c.recordPeerPolicy(context.Background(), teranodep2p.NodeStatusMessage{
+		PeerID:         "peer-legacy",
+		MinMiningTxFee: &fee,
+	})
+
+	fees := w.feeSnapshot()
+	if len(fees) != 1 {
+		t.Fatalf("expected 1 policy upsert, got %d: %+v", len(fees), fees)
+	}
+	if fees[0].MaxTxSizePolicy != 0 || fees[0].MaxScriptSizePolicy != 0 {
+		t.Errorf("legacy peer must advertise no size limits, got {%d %d}",
+			fees[0].MaxTxSizePolicy, fees[0].MaxScriptSizePolicy)
+	}
+}
+
+// TestRecordPeerPolicy_UnstorableSizeKeepsFee pins the asymmetry: node_status
+// is unauthenticated, so a peer can advertise a size too large to store. That
+// must cost only the size — dropping the whole row would let a peer remove
+// itself from the fee minimum just by sending garbage in another field.
+func TestRecordPeerPolicy_UnstorableSizeKeepsFee(t *testing.T) {
+	c, w := newTestClient(t, newFakeTeraClient("sender"))
+	c.recordPeerPolicy(context.Background(), teranodep2p.NodeStatusMessage{
+		PeerID:  "peer-hostile",
+		BaseURL: "https://peer.example",
+		FeePolicy: &teranodep2p.FeePolicy{
+			MiningFee:           teranodep2p.FeeAmount{Satoshis: 5, Bytes: 1000},
+			MaxTxSizePolicy:     math.MaxUint64,
+			MaxScriptSizePolicy: math.MaxUint64,
+		},
+	})
+
+	fees := w.feeSnapshot()
+	if len(fees) != 1 {
+		t.Fatalf("the fee observation must survive an unstorable size, got %d upserts: %+v", len(fees), fees)
+	}
+	if fees[0].MiningFeeSatoshis != 5 || fees[0].MiningFeeBytes != 1000 {
+		t.Errorf("fee = {%d %d}, want {5 1000}", fees[0].MiningFeeSatoshis, fees[0].MiningFeeBytes)
+	}
+	if fees[0].MaxTxSizePolicy != 0 || fees[0].MaxScriptSizePolicy != 0 {
+		t.Errorf("unstorable sizes must be zeroed, got {%d %d}",
+			fees[0].MaxTxSizePolicy, fees[0].MaxScriptSizePolicy)
 	}
 }

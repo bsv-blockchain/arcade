@@ -29,17 +29,22 @@ func loadValidatorDefaults(t *testing.T) ValidatorConfig {
 func TestPolicyConfigDefaults(t *testing.T) {
 	v := loadValidatorDefaults(t)
 
-	// min_fee_per_kb defaults to 0 ("not operator-configured") so /policy can
-	// fall back to the network-observed minimum (issue #212).
+	// min_fee_per_kb and the two size limits default to 0, the
+	// "not operator-configured" sentinel: intake and /policy then track what
+	// the network will accept, falling back to DefaultValidator* until a peer
+	// is heard (issue #212). A non-zero default here would read as an operator
+	// override and pin the value, disabling tracking for everyone.
 	if v.MinFeePerKB != 0 {
 		t.Errorf("MinFeePerKB default = %d, want 0", v.MinFeePerKB)
 	}
-	if v.MaxTxSizePolicy != DefaultValidatorMaxTxSizePolicy {
-		t.Errorf("MaxTxSizePolicy default = %d, want %d", v.MaxTxSizePolicy, DefaultValidatorMaxTxSizePolicy)
+	if v.MaxTxSizePolicy != 0 {
+		t.Errorf("MaxTxSizePolicy default = %d, want 0 (track the network)", v.MaxTxSizePolicy)
 	}
-	if v.MaxScriptSizePolicy != DefaultValidatorMaxScriptSizePolicy {
-		t.Errorf("MaxScriptSizePolicy default = %d, want %d", v.MaxScriptSizePolicy, DefaultValidatorMaxScriptSizePolicy)
+	if v.MaxScriptSizePolicy != 0 {
+		t.Errorf("MaxScriptSizePolicy default = %d, want 0 (track the network)", v.MaxScriptSizePolicy)
 	}
+	// The sigop cap is the exception: 0 already means "unlimited" here, so it
+	// cannot double as an unset sentinel and is never network-tracked.
 	if v.MaxTxSigopsCountsPolicy != 0 {
 		t.Errorf("MaxTxSigopsCountsPolicy default = %d, want 0", v.MaxTxSigopsCountsPolicy)
 	}

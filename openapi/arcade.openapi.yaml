@@ -1514,12 +1514,18 @@ components:
         maxtxsizepolicy:
           type: integer
           format: int64
-          description: Maximum accepted transaction size in bytes.
+          description: >-
+            Maximum accepted transaction size in bytes. Unless the operator has
+            pinned a value, this tracks the largest limit advertised by any
+            Teranode peer, so a transaction is rejected at intake only when no
+            node on the network would accept it.
           example: 10485760
         maxscriptsizepolicy:
           type: integer
           format: int64
-          description: Maximum accepted script size in bytes.
+          description: >-
+            Maximum accepted script size in bytes. Tracks the network the same
+            way maxtxsizepolicy does unless the operator has pinned a value.
           example: 500000
         maxtxsigopscountspolicy:
           type: integer

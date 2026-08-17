@@ -286,10 +286,10 @@ func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatu
 		ce.Write(fields...)
 	}
 
-	// Record the peer's advertised mining fee before the datahub-URL gate
-	// below, so a peer that exposes a fee but no datahub URL still counts
-	// toward the GET /policy network-minimum (issue #212).
-	c.recordPeerFee(ctx, msg)
+	// Record the peer's advertised policy before the datahub-URL gate below, so
+	// a peer that exposes a policy but no datahub URL still counts toward the
+	// GET /policy network values (issue #212).
+	c.recordPeerPolicy(ctx, msg)
 
 	raw := pickDatahubURL(msg)
 	if raw == "" {
@@ -343,18 +343,20 @@ func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatu
 	)
 }
 
-// recordPeerFee extracts the peer's advertised minimum mining fee from a
+// recordPeerPolicy extracts the peer's advertised transaction policy from a
 // node_status announcement and persists it to the shared store so api-server
-// pods can compute the network-minimum fee for GET /policy. It prefers the
-// structured FeePolicy.MiningFee (satoshis per Bytes) and falls back to the
-// legacy MinMiningTxFee (*float64 in BSV/kB). Peers advertising neither (older
-// nodes) are skipped.
-func (c *Client) recordPeerFee(ctx context.Context, msg teranodep2p.NodeStatusMessage) {
-	var sats, byts uint64
+// pods can compute the network-wide values for GET /policy. It prefers the
+// structured FeePolicy (satoshis per Bytes, plus the size limits) and falls
+// back to the legacy MinMiningTxFee (*float64 in BSV/kB), which carries no size
+// limits. Peers advertising neither (older nodes) are skipped.
+func (c *Client) recordPeerPolicy(ctx context.Context, msg teranodep2p.NodeStatusMessage) {
+	var sats, byts, maxTxSize, maxScriptSize uint64
 	switch {
 	case msg.FeePolicy != nil && msg.FeePolicy.MiningFee.Bytes > 0:
 		sats = msg.FeePolicy.MiningFee.Satoshis
 		byts = msg.FeePolicy.MiningFee.Bytes
+		maxTxSize = msg.FeePolicy.MaxTxSizePolicy
+		maxScriptSize = msg.FeePolicy.MaxScriptSizePolicy
 	case msg.MinMiningTxFee != nil:
 		// BSV/kB -> satoshis per 1000 bytes (1 BSV = 1e8 satoshis). Validate the
 		// untrusted float before converting: a malformed/malicious node_status
@@ -375,9 +377,39 @@ func (c *Client) recordPeerFee(ctx context.Context, msg teranodep2p.NodeStatusMe
 		return
 	}
 
+	pp := store.PeerPolicy{
+		PeerID:              msg.PeerID,
+		Network:             c.cfg.Network,
+		MiningFeeSatoshis:   sats,
+		MiningFeeBytes:      byts,
+		MaxTxSizePolicy:     maxTxSize,
+		MaxScriptSizePolicy: maxScriptSize,
+		LastSeen:            time.Now(),
+	}
+
+	// Zero a size limit too large to store rather than failing the whole write:
+	// the fee observation is independently useful and a peer advertising a
+	// garbage size must not silently remove itself from the fee minimum. A
+	// zeroed limit reads downstream as "peer did not advertise" and is skipped.
+	pp, dropped := pp.SanitizePolicySizes()
+	if dropped > 0 {
+		c.logger.Debug("ignoring implausible peer size policy",
+			zap.String("peer_id", msg.PeerID),
+			zap.Uint64("max_tx_size_policy", maxTxSize),
+			zap.Uint64("max_script_size_policy", maxScriptSize))
+	}
+
 	if msg.BaseURL != "" {
 		// Normalize to satoshis per 1000 bytes for a comparable gauge.
 		metrics.P2PPeerMinMiningFee.WithLabelValues(msg.BaseURL).Set(float64(sats) * 1000 / float64(byts))
+		// Only report a size limit the peer actually advertised: a gauge stuck
+		// at 0 for a legacy peer would read as "accepts nothing".
+		if pp.MaxTxSizePolicy > 0 {
+			metrics.P2PPeerMaxTxSizePolicy.WithLabelValues(msg.BaseURL).Set(float64(pp.MaxTxSizePolicy))
+		}
+		if pp.MaxScriptSizePolicy > 0 {
+			metrics.P2PPeerMaxScriptSizePolicy.WithLabelValues(msg.BaseURL).Set(float64(pp.MaxScriptSizePolicy))
+		}
 	}
 
 	if c.store == nil || msg.PeerID == "" {
@@ -385,20 +417,14 @@ func (c *Client) recordPeerFee(ctx context.Context, msg teranodep2p.NodeStatusMe
 	}
 	upsertCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	if err := c.store.UpsertPeerPolicy(upsertCtx, store.PeerPolicy{
-		PeerID:            msg.PeerID,
-		Network:           c.cfg.Network,
-		MiningFeeSatoshis: sats,
-		MiningFeeBytes:    byts,
-		LastSeen:          time.Now(),
-	}); err != nil {
+	if err := c.store.UpsertPeerPolicy(upsertCtx, pp); err != nil {
 		// An implausible advertisement is the peer's fault, not ours: node_status
 		// is unauthenticated gossip and a peer may announce a fee too large to
 		// store. Log it as a dropped advertisement rather than a store failure,
 		// so a hostile peer cannot fill the operator's warning stream.
 		if errors.Is(err, store.ErrInvalidPeerPolicy) {
 			c.logger.Debug(
-				"ignoring implausible peer mining fee",
+				"ignoring implausible peer policy",
 				zap.String("peer_id", msg.PeerID),
 				zap.Uint64("mining_fee_satoshis", sats),
 				zap.Uint64("mining_fee_bytes", byts),
@@ -407,7 +433,7 @@ func (c *Client) recordPeerFee(ctx context.Context, msg teranodep2p.NodeStatusMe
 			return
 		}
 		c.logger.Warn(
-			"failed to persist peer mining fee",
+			"failed to persist peer policy",
 			zap.String("peer_id", msg.PeerID),
 			zap.Error(err),
 		)

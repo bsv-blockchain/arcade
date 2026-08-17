@@ -172,17 +172,25 @@ ALTER TABLE datahub_endpoints ADD COLUMN IF NOT EXISTS network TEXT NOT NULL DEF
 CREATE INDEX IF NOT EXISTS idx_dh_last_seen ON datahub_endpoints(last_seen);
 CREATE INDEX IF NOT EXISTS idx_dh_network   ON datahub_endpoints(network);
 
--- Peer mining fees observed from node_status announcements. Primary key is
--- peer_id (a libp2p peer runs on a single network, so peer_id is unique);
--- network is a filter column, not part of the key. Read by the fee refresher /
--- GET /policy path to compute the network-wide minimum fee (issue #212).
--- last_seen drives TTL filtering.
+-- Peer transaction policy observed from node_status announcements. Primary key
+-- is peer_id (a libp2p peer runs on a single network, so peer_id is unique);
+-- network is a filter column, not part of the key. Read by the policy refresher
+-- / GET /policy path to compute network-wide values (issue #212). last_seen
+-- drives TTL filtering.
 CREATE TABLE IF NOT EXISTS peer_policies (
-    peer_id              TEXT PRIMARY KEY,
-    network              TEXT NOT NULL DEFAULT '',
-    mining_fee_satoshis  BIGINT NOT NULL,
-    mining_fee_bytes     BIGINT NOT NULL,
-    last_seen            TIMESTAMPTZ NOT NULL
+    peer_id                TEXT PRIMARY KEY,
+    network                TEXT NOT NULL DEFAULT '',
+    mining_fee_satoshis    BIGINT NOT NULL,
+    mining_fee_bytes       BIGINT NOT NULL,
+    max_tx_size_policy     BIGINT NOT NULL DEFAULT 0,
+    max_script_size_policy BIGINT NOT NULL DEFAULT 0,
+    last_seen              TIMESTAMPTZ NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pp_network   ON peer_policies(network);
 CREATE INDEX IF NOT EXISTS idx_pp_last_seen ON peer_policies(last_seen);
+
+-- Backfill for deployments created before the size limits were observed. 0
+-- means "peer has not advertised a limit"; the next node_status announcement
+-- from a teranode carrying fee_policy fills them in.
+ALTER TABLE peer_policies ADD COLUMN IF NOT EXISTS max_tx_size_policy     BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE peer_policies ADD COLUMN IF NOT EXISTS max_script_size_policy BIGINT NOT NULL DEFAULT 0;

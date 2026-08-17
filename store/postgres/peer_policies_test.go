@@ -18,7 +18,12 @@ func TestPeerPolicies_UpsertAndList(t *testing.T) {
 	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
 
 	in := []store.PeerPolicy{
-		{PeerID: "peer-a", Network: ppNetMainnet, MiningFeeSatoshis: 100, MiningFeeBytes: 1000, LastSeen: now},
+		{PeerID: "peer-a", Network: ppNetMainnet, MiningFeeSatoshis: 100, MiningFeeBytes: 1000,
+			MaxTxSizePolicy: 100_000_000, MaxScriptSizePolicy: 500_000, LastSeen: now},
+		// peer-b advertises no size limits, as a teranode predating fee_policy
+		// does — and as any row written before the columns existed reads back,
+		// since they default to 0. The zeros must survive the round trip: they
+		// are the "did not advertise" sentinel readers skip.
 		{PeerID: "peer-b", Network: ppNetMainnet, MiningFeeSatoshis: 50, MiningFeeBytes: 1000, LastSeen: now.Add(time.Minute)},
 	}
 	for _, pp := range in {
@@ -46,6 +51,10 @@ func TestPeerPolicies_UpsertAndList(t *testing.T) {
 		if g.MiningFeeSatoshis != want.MiningFeeSatoshis || g.MiningFeeBytes != want.MiningFeeBytes {
 			t.Errorf("%s fee: got {%d %d} want {%d %d}", want.PeerID,
 				g.MiningFeeSatoshis, g.MiningFeeBytes, want.MiningFeeSatoshis, want.MiningFeeBytes)
+		}
+		if g.MaxTxSizePolicy != want.MaxTxSizePolicy || g.MaxScriptSizePolicy != want.MaxScriptSizePolicy {
+			t.Errorf("%s sizes: got {%d %d} want {%d %d}", want.PeerID,
+				g.MaxTxSizePolicy, g.MaxScriptSizePolicy, want.MaxTxSizePolicy, want.MaxScriptSizePolicy)
 		}
 		if !g.LastSeen.Equal(want.LastSeen) {
 			t.Errorf("%s last_seen: got %v want %v", want.PeerID, g.LastSeen, want.LastSeen)

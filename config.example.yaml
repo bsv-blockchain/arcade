@@ -167,20 +167,27 @@ health:
 #   # Intended for teratestnet/regtest where the upstream Teranode is also
 #   # configured to accept zero-fee txs. Leave false on mainnet and testnet.
 #   # accept_zero_fee: false
-#   # GET /policy size/format limits. Left unset (or 0), they fall back to
-#   # teranode's canonical policy defaults shown here. max_tx_sigops_counts_policy
-#   # of 0 means unlimited (the BSV post-Genesis default).
-#   # max_tx_size_policy: 10485760
-#   # max_script_size_policy: 500000
+#   # GET /policy size limits, in bytes. Default 0 means "not
+#   # operator-configured", exactly as for min_fee_per_kb: arcade then tracks
+#   # the LARGEST limit any peer advertises in its node_status fee_policy, so a
+#   # transaction is rejected at intake only when no node on the network would
+#   # accept it. Observation can only widen the limit from the built-in default
+#   # shown below, never narrow it, so one misconfigured peer cannot cause false
+#   # rejections. Set a non-zero value to pin and enforce an exact limit.
+#   # max_tx_size_policy: 0      # built-in default until a peer is heard: 10485760
+#   # max_script_size_policy: 0  # built-in default until a peer is heard: 500000
+#   # max_tx_sigops_counts_policy is NOT tracked from the network: 0 already
+#   # means unlimited here (the BSV post-Genesis default), so it cannot double
+#   # as an "unset" sentinel.
 #   # max_tx_sigops_counts_policy: 0
 #   # standard_format_supported: true
-#   # observed_fee_ttl_ms bounds how long a peer's node_status-advertised fee
-#   # stays eligible for the network-minimum (default 15 min). A peer not
-#   # re-heard within this window is dropped from the minimum.
+#   # observed_fee_ttl_ms bounds how long a peer's node_status-advertised policy
+#   # stays eligible for the network computation (default 15 min). A peer not
+#   # re-heard within this window is dropped.
 #   # observed_fee_ttl_ms: 900000
 #   # observed_fee_refresh_ms is how often the api-server recomputes the
-#   # network-minimum fee and updates the intake floor (default 30 s). Only
-#   # active when min_fee_per_kb=0 and accept_zero_fee=false.
+#   # network-derived policy and updates intake (default 30 s). Applies to every
+#   # dimension left unpinned; a pinned dimension is left alone.
 #   # observed_fee_refresh_ms: 30000
 #   # disable_finality_check turns off the nLockTime/BIP113 intake gate
 #   # that rejects provably non-final txs with an actionable reason

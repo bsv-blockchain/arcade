@@ -1692,22 +1692,32 @@ func (s *Store) UpsertPeerPolicy(ctx context.Context, pp store.PeerPolicy) error
 		return err
 	}
 	const q = `
-INSERT INTO peer_policies (peer_id, network, mining_fee_satoshis, mining_fee_bytes, last_seen)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO peer_policies (peer_id, network, mining_fee_satoshis, mining_fee_bytes, max_tx_size_policy, max_script_size_policy, last_seen)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 ON CONFLICT (peer_id) DO UPDATE SET
     network = EXCLUDED.network,
     mining_fee_satoshis = EXCLUDED.mining_fee_satoshis,
     mining_fee_bytes = EXCLUDED.mining_fee_bytes,
+    max_tx_size_policy = EXCLUDED.max_tx_size_policy,
+    max_script_size_policy = EXCLUDED.max_script_size_policy,
     last_seen = EXCLUDED.last_seen`
-	// The narrowing is safe: Validate rejected anything above MaxInt64 above.
-	if _, err := s.pool.Exec(ctx, q, pp.PeerID, pp.Network, int64(pp.MiningFeeSatoshis), int64(pp.MiningFeeBytes), pp.LastSeen); err != nil { //nolint:gosec // bounded by PeerPolicy.Validate
+	// Every narrowing is safe: Validate rejected anything above MaxInt64 above.
+	var (
+		sats      = int64(pp.MiningFeeSatoshis)   //nolint:gosec // bounded by PeerPolicy.Validate
+		byts      = int64(pp.MiningFeeBytes)      //nolint:gosec // bounded by PeerPolicy.Validate
+		maxTx     = int64(pp.MaxTxSizePolicy)     //nolint:gosec // bounded by PeerPolicy.Validate
+		maxScript = int64(pp.MaxScriptSizePolicy) //nolint:gosec // bounded by PeerPolicy.Validate
+	)
+	if _, err := s.pool.Exec(ctx, q, pp.PeerID, pp.Network, sats, byts, maxTx, maxScript, pp.LastSeen); err != nil {
 		return fmt.Errorf("upsert peer policy %s: %w", pp.PeerID, err)
 	}
 	return nil
 }
 
 func (s *Store) ListPeerPolicies(ctx context.Context, network string) ([]store.PeerPolicy, error) {
-	const q = `SELECT peer_id, network, mining_fee_satoshis, mining_fee_bytes, last_seen FROM peer_policies WHERE network = $1`
+	const q = `SELECT peer_id, network, mining_fee_satoshis, mining_fee_bytes,
+       max_tx_size_policy, max_script_size_policy, last_seen
+FROM peer_policies WHERE network = $1`
 	rows, err := s.pool.Query(ctx, q, network)
 	if err != nil {
 		return nil, fmt.Errorf("list peer policies: %w", err)
@@ -1716,15 +1726,19 @@ func (s *Store) ListPeerPolicies(ctx context.Context, network string) ([]store.P
 	var out []store.PeerPolicy
 	for rows.Next() {
 		var (
-			pp   store.PeerPolicy
-			sats int64
-			byts int64
+			pp        store.PeerPolicy
+			sats      int64
+			byts      int64
+			maxTx     int64
+			maxScript int64
 		)
-		if err := rows.Scan(&pp.PeerID, &pp.Network, &sats, &byts, &pp.LastSeen); err != nil {
+		if err := rows.Scan(&pp.PeerID, &pp.Network, &sats, &byts, &maxTx, &maxScript, &pp.LastSeen); err != nil {
 			return nil, fmt.Errorf("scan peer policy: %w", err)
 		}
-		pp.MiningFeeSatoshis = uint64(sats) //nolint:gosec // stored non-negative
-		pp.MiningFeeBytes = uint64(byts)    //nolint:gosec // stored non-negative
+		pp.MiningFeeSatoshis = uint64(sats)        //nolint:gosec // stored non-negative
+		pp.MiningFeeBytes = uint64(byts)           //nolint:gosec // stored non-negative
+		pp.MaxTxSizePolicy = uint64(maxTx)         //nolint:gosec // stored non-negative
+		pp.MaxScriptSizePolicy = uint64(maxScript) //nolint:gosec // stored non-negative
 		out = append(out, pp)
 	}
 	if err := rows.Err(); err != nil {
