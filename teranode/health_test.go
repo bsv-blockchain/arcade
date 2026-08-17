@@ -430,13 +430,30 @@ func TestProbe_HealthySuccess_DoesNotResetBroadcastCounter(t *testing.T) {
 	c.Start(ctx)
 	defer c.Close()
 
-	for i := 0; i < 5; i++ {
-		// Several probe intervals pass between failures; each probe succeeds
-		// against the live server. If probe success reset the broadcast
-		// counter, the threshold could never be reached.
+	// Accumulate every failure but the last with the probe loop running. Several
+	// probe intervals pass between failures and each probe succeeds against the
+	// live server, so if probe success reset the broadcast counter it would
+	// never reach the threshold and the final failure below would not trip.
+	// That interference is the whole point of the test.
+	for i := 0; i < 4; i++ {
 		time.Sleep(15 * time.Millisecond)
 		c.RecordBroadcastFailure(srv.URL)
 	}
+
+	// Stop probing before the failure that trips the breaker. A probe success
+	// against an unhealthy endpoint legitimately restores it (recordProbeSuccess
+	// treats one good probe as full recovery), so with the loop still running
+	// the assertion is racing a 5ms ticker: locally the endpoint is still
+	// unhealthy microseconds later, but on a loaded runner a probe lands in the
+	// gap and GetHealthyEndpoints reports it healthy again. Closing first makes
+	// the outcome depend only on the counters, never on scheduling. Close
+	// cancels the probe context and waits for the goroutine to exit, so there is
+	// no in-flight probe left; the deferred Close then waits on an already
+	// closed channel, which is fine.
+	c.Close()
+
+	c.RecordBroadcastFailure(srv.URL)
+
 	if got := len(c.GetHealthyEndpoints()); got != 0 {
 		t.Fatal("slow-track breaker did not trip: probe successes must not reset consecutiveBroadcastFailures")
 	}
@@ -461,10 +478,19 @@ func TestProbe_HealthySuccess_DoesNotResetReachabilityCounter(t *testing.T) {
 	c.Start(ctx)
 	defer c.Close()
 
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 2; i++ {
 		time.Sleep(15 * time.Millisecond)
 		c.RecordFailure(srv.URL)
 	}
+
+	// Same reasoning as the slow-track sibling above: the probe successes that
+	// must not reset the counter have already happened, so stop probing before
+	// the failure that trips the breaker and the assertion cannot race a
+	// recovering probe.
+	c.Close()
+
+	c.RecordFailure(srv.URL)
+
 	if got := len(c.GetHealthyEndpoints()); got != 0 {
 		t.Fatal("fast-track breaker did not trip: probe successes must not reset consecutiveFailures")
 	}
