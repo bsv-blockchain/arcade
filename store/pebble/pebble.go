@@ -235,10 +235,22 @@ type storedBump struct {
 }
 
 type storedDatahubEndpoint struct {
-	URL            string `json:"url"`
-	Network        string `json:"network"`
-	Source         string `json:"source"`
-	LastSeenUnixNs int64  `json:"last_seen"`
+	URL     string `json:"url"`
+	Network string `json:"network"`
+	Source  string `json:"source"`
+	// Policy is absent on rows written before endpoints carried an advertised
+	// policy, and on any endpoint whose node advertised none. A missing JSON
+	// key decodes to nil, which is exactly that sentinel — no migration needed.
+	Policy         *storedEndpointPolicy `json:"policy,omitempty"`
+	LastSeenUnixNs int64                 `json:"last_seen"`
+}
+
+type storedEndpointPolicy struct {
+	MiningFeeSatoshis       uint64 `json:"mining_fee_satoshis"`
+	MiningFeeBytes          uint64 `json:"mining_fee_bytes"`
+	MaxTxSizePolicy         uint64 `json:"max_tx_size_policy"`
+	MaxScriptSizePolicy     uint64 `json:"max_script_size_policy"`
+	MaxTxSigopsCountsPolicy uint64 `json:"max_tx_sigops_counts_policy"`
 }
 
 type storedPeerPolicy struct {
@@ -2306,11 +2318,49 @@ func (s *Store) UpsertDatahubEndpoint(ctx context.Context, ep store.DatahubEndpo
 	if !ep.LastSeen.IsZero() {
 		stored.LastSeenUnixNs = ep.LastSeen.UnixNano()
 	}
+
+	switch {
+	case ep.Policy != nil:
+		if err := ep.Policy.Validate(); err != nil {
+			return err
+		}
+		stored.Policy = &storedEndpointPolicy{
+			MiningFeeSatoshis:       ep.Policy.MiningFeeSatoshis,
+			MiningFeeBytes:          ep.Policy.MiningFeeBytes,
+			MaxTxSizePolicy:         ep.Policy.MaxTxSizePolicy,
+			MaxScriptSizePolicy:     ep.Policy.MaxScriptSizePolicy,
+			MaxTxSigopsCountsPolicy: ep.Policy.MaxTxSigopsCountsPolicy,
+		}
+	default:
+		// A write carrying no policy must not erase one already recorded.
+		// Set is a blind overwrite here — unlike Postgres, which COALESCEs, and
+		// Aerospike, which simply omits the bins — so this backend has to read
+		// the current row and carry its policy forward.
+		stored.Policy = s.existingEndpointPolicy(ep.URL)
+	}
+
 	payload, err := json.Marshal(stored)
 	if err != nil {
 		return err
 	}
 	return s.db.Set(datahubEndpointKey(ep.URL), payload, s.writeOpts)
+}
+
+// existingEndpointPolicy returns the policy already stored for url, or nil when
+// there is no row, no policy, or the row cannot be read. A failure here costs
+// only the carried-forward policy, which the peer's next announcement restores;
+// it must never fail the URL registration itself.
+func (s *Store) existingEndpointPolicy(url string) *storedEndpointPolicy {
+	val, closer, err := s.db.Get(datahubEndpointKey(url))
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = closer.Close() }()
+	var row storedDatahubEndpoint
+	if err := json.Unmarshal(val, &row); err != nil {
+		return nil
+	}
+	return row.Policy
 }
 
 func (s *Store) ListDatahubEndpoints(ctx context.Context, network string) ([]store.DatahubEndpoint, error) {
@@ -2343,6 +2393,15 @@ func (s *Store) ListDatahubEndpoints(ctx context.Context, network string) ([]sto
 			URL:     row.URL,
 			Network: row.Network,
 			Source:  row.Source,
+		}
+		if p := row.Policy; p != nil {
+			ep.Policy = &store.EndpointPolicy{
+				MiningFeeSatoshis:       p.MiningFeeSatoshis,
+				MiningFeeBytes:          p.MiningFeeBytes,
+				MaxTxSizePolicy:         p.MaxTxSizePolicy,
+				MaxScriptSizePolicy:     p.MaxScriptSizePolicy,
+				MaxTxSigopsCountsPolicy: p.MaxTxSigopsCountsPolicy,
+			}
 		}
 		if row.LastSeenUnixNs != 0 {
 			ep.LastSeen = time.Unix(0, row.LastSeenUnixNs)

@@ -42,6 +42,13 @@ import (
 type mockStore struct {
 	store.Store
 
+	// datahubEndpoints backs ListDatahubEndpoints, which /health reads to
+	// report each endpoint's advertised policy; datahubCalls counts the reads
+	// so the TTL cache can be asserted, and datahubErr forces the failure path.
+	datahubEndpoints []store.DatahubEndpoint
+	datahubCalls     int
+	datahubErr       error
+
 	mu                  sync.Mutex
 	updateStatusCalls   []*models.TransactionStatus
 	stumps              map[string]*models.Stump
@@ -279,7 +286,13 @@ func (m *mockStore) UpsertDatahubEndpoint(context.Context, store.DatahubEndpoint
 }
 
 func (m *mockStore) ListDatahubEndpoints(context.Context, string) ([]store.DatahubEndpoint, error) {
-	return nil, nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.datahubCalls++
+	if m.datahubErr != nil {
+		return nil, m.datahubErr
+	}
+	return m.datahubEndpoints, nil
 }
 
 func (m *mockStore) UpsertPeerPolicy(context.Context, store.PeerPolicy) error {

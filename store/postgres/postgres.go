@@ -1720,21 +1720,82 @@ func (s *Store) UpsertDatahubEndpoint(ctx context.Context, ep store.DatahubEndpo
 	if ep.URL == "" {
 		return fmt.Errorf("upsert datahub endpoint: empty url")
 	}
+	// COALESCE, not EXCLUDED, on the policy columns: a write that carries no
+	// policy must leave a previously recorded one alone. The configured-URL
+	// seed re-upserts on every process start with no policy attached, and
+	// overwriting would blank an announced endpoint's policy on each restart.
 	const q = `
-INSERT INTO datahub_endpoints (url, network, source, last_seen)
-VALUES ($1, $2, $3, $4)
+INSERT INTO datahub_endpoints (
+    url, network, source, last_seen,
+    mining_fee_satoshis, mining_fee_bytes,
+    max_tx_size_policy, max_script_size_policy, max_tx_sigops_counts_policy)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 ON CONFLICT (url) DO UPDATE SET
     network = EXCLUDED.network,
     source = EXCLUDED.source,
-    last_seen = EXCLUDED.last_seen`
-	if _, err := s.pool.Exec(ctx, q, ep.URL, ep.Network, ep.Source, ep.LastSeen); err != nil {
+    last_seen = EXCLUDED.last_seen,
+    mining_fee_satoshis = COALESCE(EXCLUDED.mining_fee_satoshis, datahub_endpoints.mining_fee_satoshis),
+    mining_fee_bytes = COALESCE(EXCLUDED.mining_fee_bytes, datahub_endpoints.mining_fee_bytes),
+    max_tx_size_policy = COALESCE(EXCLUDED.max_tx_size_policy, datahub_endpoints.max_tx_size_policy),
+    max_script_size_policy = COALESCE(EXCLUDED.max_script_size_policy, datahub_endpoints.max_script_size_policy),
+    max_tx_sigops_counts_policy = COALESCE(EXCLUDED.max_tx_sigops_counts_policy, datahub_endpoints.max_tx_sigops_counts_policy)`
+
+	var sats, byts, maxTx, maxScript, maxSigops *int64
+	if p := ep.Policy; p != nil {
+		if err := p.Validate(); err != nil {
+			return err
+		}
+		// Narrowing is bounded by Validate above.
+		sats = ptrInt64(p.MiningFeeSatoshis)
+		byts = ptrInt64(p.MiningFeeBytes)
+		maxTx = ptrInt64(p.MaxTxSizePolicy)
+		maxScript = ptrInt64(p.MaxScriptSizePolicy)
+		maxSigops = ptrInt64(p.MaxTxSigopsCountsPolicy)
+	}
+
+	if _, err := s.pool.Exec(ctx, q, ep.URL, ep.Network, ep.Source, ep.LastSeen,
+		sats, byts, maxTx, maxScript, maxSigops); err != nil {
 		return fmt.Errorf("upsert datahub endpoint %s: %w", ep.URL, err)
 	}
 	return nil
 }
 
+// ptrInt64 narrows a policy value bounded by EndpointPolicy.Validate and
+// returns a pointer, so a nil policy writes SQL NULL rather than 0.
+func ptrInt64(v uint64) *int64 {
+	n := int64(v) //nolint:gosec // bounded by EndpointPolicy.Validate
+	return &n
+}
+
+// endpointPolicyFromCols rebuilds an advertised policy from its five nullable
+// columns. All-NULL means the node advertised none — including every row
+// written before the columns existed — and yields a nil policy. The five are
+// always written together, so a partial NULL is not expected; it is tolerated
+// by reading the missing value as 0 rather than discarding the rest.
+func endpointPolicyFromCols(sats, byts, maxTx, maxScript, maxSigops *int64) *store.EndpointPolicy {
+	if sats == nil && byts == nil && maxTx == nil && maxScript == nil && maxSigops == nil {
+		return nil
+	}
+	u := func(v *int64) uint64 {
+		if v == nil || *v < 0 {
+			return 0
+		}
+		return uint64(*v)
+	}
+	return &store.EndpointPolicy{
+		MiningFeeSatoshis:       u(sats),
+		MiningFeeBytes:          u(byts),
+		MaxTxSizePolicy:         u(maxTx),
+		MaxScriptSizePolicy:     u(maxScript),
+		MaxTxSigopsCountsPolicy: u(maxSigops),
+	}
+}
+
 func (s *Store) ListDatahubEndpoints(ctx context.Context, network string) ([]store.DatahubEndpoint, error) {
-	const q = `SELECT url, network, source, last_seen FROM datahub_endpoints WHERE network = $1`
+	const q = `SELECT url, network, source, last_seen,
+       mining_fee_satoshis, mining_fee_bytes,
+       max_tx_size_policy, max_script_size_policy, max_tx_sigops_counts_policy
+FROM datahub_endpoints WHERE network = $1`
 	rows, err := s.pool.Query(ctx, q, network)
 	if err != nil {
 		return nil, fmt.Errorf("list datahub endpoints: %w", err)
@@ -1742,10 +1803,15 @@ func (s *Store) ListDatahubEndpoints(ctx context.Context, network string) ([]sto
 	defer rows.Close()
 	var out []store.DatahubEndpoint
 	for rows.Next() {
-		var ep store.DatahubEndpoint
-		if err := rows.Scan(&ep.URL, &ep.Network, &ep.Source, &ep.LastSeen); err != nil {
+		var (
+			ep                                      store.DatahubEndpoint
+			sats, byts, maxTx, maxScript, maxSigops *int64
+		)
+		if err := rows.Scan(&ep.URL, &ep.Network, &ep.Source, &ep.LastSeen,
+			&sats, &byts, &maxTx, &maxScript, &maxSigops); err != nil {
 			return nil, fmt.Errorf("scan datahub endpoint: %w", err)
 		}
+		ep.Policy = endpointPolicyFromCols(sats, byts, maxTx, maxScript, maxSigops)
 		out = append(out, ep)
 	}
 	if err := rows.Err(); err != nil {

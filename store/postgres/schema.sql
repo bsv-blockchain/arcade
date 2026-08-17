@@ -162,13 +162,32 @@ CREATE TABLE IF NOT EXISTS datahub_endpoints (
     url        TEXT PRIMARY KEY,
     network    TEXT NOT NULL DEFAULT '',
     source     TEXT NOT NULL,
-    last_seen  TIMESTAMPTZ NOT NULL
+    last_seen  TIMESTAMPTZ NOT NULL,
+    -- Policy this node advertised in the node_status fee_policy alongside the
+    -- URL. NULL means "advertised none" — a configured seed, or a teranode
+    -- predating fee_policy — which is why these are nullable rather than
+    -- DEFAULT 0: zero is a meaningful policy value and must not be confused
+    -- with absence. The upsert COALESCEs them so a write carrying no policy
+    -- leaves a previously recorded one in place.
+    mining_fee_satoshis         BIGINT,
+    mining_fee_bytes            BIGINT,
+    max_tx_size_policy          BIGINT,
+    max_script_size_policy      BIGINT,
+    max_tx_sigops_counts_policy BIGINT
 );
 -- Idempotent column add for tables created before the network scoping was
 -- introduced. Existing rows keep the empty default, which excludes them from
 -- every ListDatahubEndpoints query — they re-register the next time the peer
 -- announces, with the correct network attached.
 ALTER TABLE datahub_endpoints ADD COLUMN IF NOT EXISTS network TEXT NOT NULL DEFAULT '';
+-- Likewise for deployments created before endpoints carried an advertised
+-- policy. Existing rows read back with a nil policy until their peer announces
+-- again; no backfill is possible or needed.
+ALTER TABLE datahub_endpoints ADD COLUMN IF NOT EXISTS mining_fee_satoshis         BIGINT;
+ALTER TABLE datahub_endpoints ADD COLUMN IF NOT EXISTS mining_fee_bytes            BIGINT;
+ALTER TABLE datahub_endpoints ADD COLUMN IF NOT EXISTS max_tx_size_policy          BIGINT;
+ALTER TABLE datahub_endpoints ADD COLUMN IF NOT EXISTS max_script_size_policy      BIGINT;
+ALTER TABLE datahub_endpoints ADD COLUMN IF NOT EXISTS max_tx_sigops_counts_policy BIGINT;
 CREATE INDEX IF NOT EXISTS idx_dh_last_seen ON datahub_endpoints(last_seen);
 CREATE INDEX IF NOT EXISTS idx_dh_network   ON datahub_endpoints(network);
 

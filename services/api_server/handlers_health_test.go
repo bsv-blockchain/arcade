@@ -13,8 +13,14 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/teranode"
 	"github.com/bsv-blockchain/arcade/version"
+)
+
+const (
+	testDatahubA = "https://a.example"
+	testDatahubB = "https://b.example"
 )
 
 // healthResp mirrors the server's healthResponse shape but uses generic
@@ -52,13 +58,13 @@ func doHealth(t *testing.T, srv *Server) (int, healthResp, []byte) {
 
 func TestHandleHealth_StructuredResponse(t *testing.T) {
 	tc := teranode.NewClient(
-		[]string{"https://a.example", "https://b.example"},
+		[]string{testDatahubA, testDatahubB},
 		"",
 		teranode.HealthConfig{FailureThreshold: 2},
 	)
 	tc.AddEndpoints([]string{"https://c.example"})
-	tc.RecordFailure("https://b.example")
-	tc.RecordFailure("https://b.example") // trip
+	tc.RecordFailure(testDatahubB)
+	tc.RecordFailure(testDatahubB) // trip
 
 	srv := &Server{
 		cfg:      &config.Config{},
@@ -82,8 +88,8 @@ func TestHandleHealth_StructuredResponse(t *testing.T) {
 	}
 
 	want := []teranode.EndpointStatus{
-		{URL: "https://a.example", Source: "configured", Healthy: true},
-		{URL: "https://b.example", Source: "configured", Healthy: false},
+		{URL: testDatahubA, Source: "configured", Healthy: true},
+		{URL: testDatahubB, Source: "configured", Healthy: false},
 		{URL: "https://c.example", Source: "discovered", Healthy: true},
 	}
 	if len(resp.DatahubURLs) != len(want) {
@@ -206,4 +212,204 @@ func TestHandleHealth_UnreachableEndpointFlipsUnhealthy(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("/health kept reporting an unreachable endpoint as healthy for 2s")
+}
+
+// endpointPolicyResp mirrors the policy block of a datahub_urls entry using
+// generic types, for the same reason healthResp does.
+type endpointPolicyResp struct {
+	MiningFee struct {
+		Satoshis uint64 `json:"satoshis"`
+		Bytes    uint64 `json:"bytes"`
+	} `json:"miningFee"`
+	MaxTxSizePolicy         uint64 `json:"maxtxsizepolicy"`
+	MaxScriptSizePolicy     uint64 `json:"maxscriptsizepolicy"`
+	MaxTxSigopsCountsPolicy uint64 `json:"maxtxsigopscountspolicy"`
+}
+
+// datahubResp is one datahub_urls entry as a client sees it: the long-standing
+// url/source/healthy triple, plus the optional advertised policy.
+type datahubResp struct {
+	URL     string              `json:"url"`
+	Source  string              `json:"source"`
+	Healthy bool                `json:"healthy"`
+	Policy  *endpointPolicyResp `json:"policy"`
+}
+
+// doHealthDatahubs runs a probe and decodes only the datahub_urls array, so
+// these tests are independent of the rest of the health envelope.
+func doHealthDatahubs(t *testing.T, srv *Server) []datahubResp {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	srv.registerRoutes(r)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/health", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	var resp struct {
+		DatahubURLs []datahubResp `json:"datahub_urls"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decoding health JSON: %v (body=%s)", err, w.Body.String())
+	}
+	return resp.DatahubURLs
+}
+
+func advertisedPolicy() *store.EndpointPolicy {
+	return &store.EndpointPolicy{
+		MiningFeeSatoshis: 100, MiningFeeBytes: 1000,
+		MaxTxSizePolicy: 100_000_000, MaxScriptSizePolicy: 500_000,
+		MaxTxSigopsCountsPolicy: 4_294_967_295,
+	}
+}
+
+// TestHandleHealth_ReportsAdvertisedPolicy is the operator-facing end of the
+// chain: a node's node_status policy reaches the registry, and /health reports
+// it against that node's endpoint. GET /policy can only report the single
+// network-wide policy arcade enforces, so this is what identifies which node
+// refused an oversized transaction.
+func TestHandleHealth_ReportsAdvertisedPolicy(t *testing.T) {
+	ms := &mockStore{datahubEndpoints: []store.DatahubEndpoint{
+		{URL: testDatahubA, Network: config.NetworkMainnet, Policy: advertisedPolicy()},
+		// Registered with a trailing slash — as a statically configured seed
+		// URL is, since config values are stored verbatim while the teranode
+		// client trims them. The two sides must still join, or this endpoint's
+		// policy silently vanishes from the response.
+		{URL: "https://c.example/", Network: config.NetworkMainnet, Policy: &store.EndpointPolicy{MaxTxSizePolicy: 7}},
+		// A seeded URL nobody has announced carries no policy.
+		{URL: testDatahubB, Network: config.NetworkMainnet},
+	}}
+	tc := teranode.NewClient([]string{testDatahubA, testDatahubB}, "", teranode.HealthConfig{})
+	tc.AddEndpoints([]string{"https://c.example"})
+
+	srv := &Server{
+		cfg:      &config.Config{Network: config.NetworkMainnet},
+		logger:   zap.NewNop(),
+		store:    ms,
+		teranode: tc,
+	}
+
+	got := doHealthDatahubs(t, srv)
+	if len(got) != 3 {
+		t.Fatalf("expected 3 endpoints, got %d: %+v", len(got), got)
+	}
+
+	byURL := map[string]datahubResp{}
+	for _, d := range got {
+		byURL[d.URL] = d
+	}
+
+	a := byURL[testDatahubA]
+	if a.Policy == nil {
+		t.Fatal("a.example lost its advertised policy")
+	}
+	if a.Policy.MiningFee.Satoshis != 100 || a.Policy.MiningFee.Bytes != 1000 {
+		t.Errorf("miningFee = %+v, want {100 1000}", a.Policy.MiningFee)
+	}
+	if a.Policy.MaxTxSizePolicy != 100_000_000 || a.Policy.MaxScriptSizePolicy != 500_000 {
+		t.Errorf("sizes = {%d %d}, want {100000000 500000}",
+			a.Policy.MaxTxSizePolicy, a.Policy.MaxScriptSizePolicy)
+	}
+	if a.Policy.MaxTxSigopsCountsPolicy != 4_294_967_295 {
+		t.Errorf("sigops = %d, want 4294967295", a.Policy.MaxTxSigopsCountsPolicy)
+	}
+
+	if p := byURL["https://c.example"].Policy; p == nil || p.MaxTxSizePolicy != 7 {
+		t.Errorf("trailing-slash URL failed to join: %+v", p)
+	}
+	if p := byURL[testDatahubB].Policy; p != nil {
+		t.Errorf("an unannounced endpoint must carry no policy, got %+v", *p)
+	}
+
+	// The pre-existing keys are untouched — ARC clients and health checkers
+	// parse these, and policy is purely additive.
+	if a.Source != "configured" || !a.Healthy {
+		t.Errorf("url/source/healthy changed shape: %+v", a)
+	}
+}
+
+// TestHandleHealth_PolicyOmittedNotNulled pins the wire shape: an endpoint with
+// no advertised policy omits the key rather than emitting "policy": null, so a
+// client can distinguish "not advertised" without a null check.
+func TestHandleHealth_PolicyOmittedNotNulled(t *testing.T) {
+	ms := &mockStore{datahubEndpoints: []store.DatahubEndpoint{
+		{URL: testDatahubA, Network: config.NetworkMainnet},
+	}}
+	srv := &Server{
+		cfg:      &config.Config{Network: config.NetworkMainnet},
+		logger:   zap.NewNop(),
+		store:    ms,
+		teranode: teranode.NewClient([]string{testDatahubA}, "", teranode.HealthConfig{}),
+	}
+
+	_, _, body := doHealth(t, srv)
+	if strings.Contains(string(body), "policy") {
+		t.Errorf("expected the policy key omitted entirely, body=%s", string(body))
+	}
+}
+
+// TestHandleHealth_PolicyReadIsCachedAndNeverFailsTheProbe covers the two
+// properties the store read has to have on a liveness path: probes arrive every
+// few seconds per replica, so the registry is read once per TTL rather than per
+// probe; and a store failure serves the last known policies rather than
+// blanking them or failing the probe.
+func TestHandleHealth_PolicyReadIsCachedAndNeverFailsTheProbe(t *testing.T) {
+	ms := &mockStore{datahubEndpoints: []store.DatahubEndpoint{
+		{URL: testDatahubA, Network: config.NetworkMainnet, Policy: advertisedPolicy()},
+	}}
+	srv := &Server{
+		cfg:      &config.Config{Network: config.NetworkMainnet},
+		logger:   zap.NewNop(),
+		store:    ms,
+		teranode: teranode.NewClient([]string{testDatahubA}, "", teranode.HealthConfig{}),
+	}
+
+	if got := doHealthDatahubs(t, srv); got[0].Policy == nil {
+		t.Fatal("first probe reported no policy")
+	}
+	// A second probe inside the TTL must serve the cached map.
+	if got := doHealthDatahubs(t, srv); got[0].Policy == nil {
+		t.Fatal("cached probe reported no policy")
+	}
+	ms.mu.Lock()
+	calls := ms.datahubCalls
+	ms.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("expected 1 registry read across 2 probes (TTL cache), got %d", calls)
+	}
+
+	// Force the failure path: expire the cache, then break the store.
+	srv.policyMu.Lock()
+	srv.policyFetchedAt = time.Time{}
+	srv.policyMu.Unlock()
+	ms.mu.Lock()
+	ms.datahubErr = errTest
+	ms.mu.Unlock()
+
+	got := doHealthDatahubs(t, srv)
+	if len(got) != 1 {
+		t.Fatalf("a store error must not change the endpoint list, got %+v", got)
+	}
+	if got[0].Policy == nil {
+		t.Error("a store error must serve the last known policy, not blank it")
+	}
+}
+
+// TestHandleHealth_NoStoreOmitsPolicy covers the struct-literal server with no
+// store wired: endpoints are still listed, just without policies.
+func TestHandleHealth_NoStoreOmitsPolicy(t *testing.T) {
+	srv := &Server{
+		cfg:      &config.Config{Network: config.NetworkMainnet},
+		logger:   zap.NewNop(),
+		teranode: teranode.NewClient([]string{testDatahubA}, "", teranode.HealthConfig{}),
+	}
+
+	got := doHealthDatahubs(t, srv)
+	if len(got) != 1 || got[0].URL != testDatahubA {
+		t.Fatalf("expected the endpoint still listed, got %+v", got)
+	}
+	if got[0].Policy != nil {
+		t.Errorf("expected no policy without a store, got %+v", *got[0].Policy)
+	}
 }

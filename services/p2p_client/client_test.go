@@ -19,6 +19,11 @@ import (
 	"github.com/bsv-blockchain/arcade/store"
 )
 
+const (
+	testPeerID  = "sender"
+	testPeerURL = "https://peer.example"
+)
+
 // fakeEndpointWriter records every UpsertDatahubEndpoint call so tests can
 // assert that p2p_client persisted discovered URLs to the shared store. The
 // store is now the only sink — the in-process teranode.Client AddEndpoints
@@ -178,7 +183,7 @@ func TestNetworkThreading_CanonicalToUpstream(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.canonical, func(t *testing.T) {
-			fc := newFakeTeraClient("sender")
+			fc := newFakeTeraClient(testPeerID)
 			cfg := &config.Config{}
 			cfg.P2P.DatahubDiscovery = true
 			cfg.Network = tc.canonical
@@ -213,7 +218,7 @@ func TestNetworkThreading_CanonicalToUpstream(t *testing.T) {
 // private networks and bootstrap migrations remain possible without new
 // config knobs.
 func TestNetworkThreading_OperatorBootstrapWins(t *testing.T) {
-	fc := newFakeTeraClient("sender")
+	fc := newFakeTeraClient(testPeerID)
 	cfg := &config.Config{}
 	cfg.P2P.DatahubDiscovery = true
 	cfg.Network = config.NetworkTeratestnet
@@ -241,18 +246,18 @@ func TestNetworkThreading_OperatorBootstrapWins(t *testing.T) {
 // only path by which other pods learn the URL, so the test guards the
 // contract end-to-end as far as this service is concerned.
 func TestClient_NovelURLPersisted(t *testing.T) {
-	fc := newFakeTeraClient("sender")
+	fc := newFakeTeraClient(testPeerID)
 	c, w := newTestClient(t, fc)
 	_, stop := runStart(t, c)
 	defer stop()
 
 	fc.ch <- teranodep2p.NodeStatusMessage{
-		PeerID:  "sender",
-		BaseURL: "https://peer.example",
+		PeerID:  testPeerID,
+		BaseURL: testPeerURL,
 	}
 
 	calls := waitForUpserts(t, w, 1)
-	if calls[0].URL != "https://peer.example" {
+	if calls[0].URL != testPeerURL {
 		t.Errorf("upserted wrong URL: %+v", calls[0])
 	}
 	if calls[0].Source != store.DatahubEndpointSourceDiscovered {
@@ -269,18 +274,18 @@ func TestClient_NovelURLPersisted(t *testing.T) {
 // service is intentionally a thin pipe so the registry's LastSeen reflects
 // the most recent observation per peer.
 func TestClient_RepeatedAnnouncementUpsertedEachTime(t *testing.T) {
-	fc := newFakeTeraClient("sender")
+	fc := newFakeTeraClient(testPeerID)
 	c, w := newTestClient(t, fc)
 	_, stop := runStart(t, c)
 	defer stop()
 
 	for i := 0; i < 3; i++ {
-		fc.ch <- teranodep2p.NodeStatusMessage{PeerID: "sender", BaseURL: "https://peer.example"}
+		fc.ch <- teranodep2p.NodeStatusMessage{PeerID: testPeerID, BaseURL: testPeerURL}
 	}
 
 	calls := waitForUpserts(t, w, 3)
 	for _, c := range calls {
-		if c.URL != "https://peer.example" {
+		if c.URL != testPeerURL {
 			t.Errorf("unexpected URL in upsert: %+v", c)
 		}
 	}
@@ -289,12 +294,12 @@ func TestClient_RepeatedAnnouncementUpsertedEachTime(t *testing.T) {
 // TestClient_EmptyURLsIgnored confirms an announcement with no usable URL
 // produces no store write.
 func TestClient_EmptyURLsIgnored(t *testing.T) {
-	fc := newFakeTeraClient("sender")
+	fc := newFakeTeraClient(testPeerID)
 	c, w := newTestClient(t, fc)
 	_, stop := runStart(t, c)
 	defer stop()
 
-	fc.ch <- teranodep2p.NodeStatusMessage{PeerID: "sender"}
+	fc.ch <- teranodep2p.NodeStatusMessage{PeerID: testPeerID}
 
 	time.Sleep(50 * time.Millisecond)
 	if calls := w.snapshot(); len(calls) != 0 {
@@ -306,13 +311,13 @@ func TestClient_EmptyURLsIgnored(t *testing.T) {
 // reach the store. RFC1918 with AllowPrivateURLs=false is the canonical
 // rejection case.
 func TestClient_InvalidURLRejected(t *testing.T) {
-	fc := newFakeTeraClient("sender")
+	fc := newFakeTeraClient(testPeerID)
 	c, w := newTestClient(t, fc)
 	_, stop := runStart(t, c)
 	defer stop()
 
 	fc.ch <- teranodep2p.NodeStatusMessage{
-		PeerID:  "sender",
+		PeerID:  testPeerID,
 		BaseURL: "http://192.168.1.50:8080",
 	}
 
@@ -325,13 +330,13 @@ func TestClient_InvalidURLRejected(t *testing.T) {
 // TestClient_PropagationURLPreferred confirms PropagationURL wins over
 // BaseURL when both are present (pickDatahubURL contract).
 func TestClient_PropagationURLPreferred(t *testing.T) {
-	fc := newFakeTeraClient("sender")
+	fc := newFakeTeraClient(testPeerID)
 	c, w := newTestClient(t, fc)
 	_, stop := runStart(t, c)
 	defer stop()
 
 	fc.ch <- teranodep2p.NodeStatusMessage{
-		PeerID:         "sender",
+		PeerID:         testPeerID,
 		BaseURL:        "https://base.example",
 		PropagationURL: "https://prop.example",
 	}
@@ -383,7 +388,7 @@ func TestClient_DisabledDiscoveryOpensNoBus(t *testing.T) {
 // a peer announcing its own cluster-internal service name (unresolvable from
 // this cluster) must never enter the shared endpoint registry.
 func TestClient_UnresolvableURLNotPersisted(t *testing.T) {
-	fc := newFakeTeraClient("sender")
+	fc := newFakeTeraClient(testPeerID)
 	c, w := newTestClient(t, fc)
 	c.lookupIP = func(_ context.Context, host string) ([]net.IP, error) {
 		return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
@@ -392,7 +397,7 @@ func TestClient_UnresolvableURLNotPersisted(t *testing.T) {
 	defer stop()
 
 	fc.ch <- teranodep2p.NodeStatusMessage{
-		PeerID:  "sender",
+		PeerID:  testPeerID,
 		BaseURL: "http://asset:8090/api/v1",
 	}
 
@@ -406,7 +411,7 @@ func TestClient_UnresolvableURLNotPersisted(t *testing.T) {
 // cache: three announcements of one URL cost exactly one DNS lookup, while
 // the upsert-per-announcement contract (LastSeen advancing) is preserved.
 func TestClient_ValidationCacheSkipsRepeatLookups(t *testing.T) {
-	fc := newFakeTeraClient("sender")
+	fc := newFakeTeraClient(testPeerID)
 	c, w := newTestClient(t, fc)
 	var lookups atomic.Int64
 	c.lookupIP = func(_ context.Context, _ string) ([]net.IP, error) {
@@ -417,7 +422,7 @@ func TestClient_ValidationCacheSkipsRepeatLookups(t *testing.T) {
 	defer stop()
 
 	for i := 0; i < 3; i++ {
-		fc.ch <- teranodep2p.NodeStatusMessage{PeerID: "sender", BaseURL: "https://peer.example"}
+		fc.ch <- teranodep2p.NodeStatusMessage{PeerID: testPeerID, BaseURL: testPeerURL}
 	}
 
 	waitForUpserts(t, w, 3)
@@ -429,10 +434,10 @@ func TestClient_ValidationCacheSkipsRepeatLookups(t *testing.T) {
 // TestRecordPeerPolicy_FeePolicy verifies the structured FeePolicy.MiningFee is
 // persisted verbatim as the peer's observed fee.
 func TestRecordPeerPolicy_FeePolicy(t *testing.T) {
-	c, w := newTestClient(t, newFakeTeraClient("sender"))
+	c, w := newTestClient(t, newFakeTeraClient(testPeerID))
 	c.recordPeerPolicy(context.Background(), teranodep2p.NodeStatusMessage{
 		PeerID:    "peer-1",
-		BaseURL:   "https://peer.example",
+		BaseURL:   testPeerURL,
 		FeePolicy: &teranodep2p.FeePolicy{MiningFee: teranodep2p.FeeAmount{Satoshis: 75, Bytes: 1000}},
 	})
 
@@ -451,7 +456,7 @@ func TestRecordPeerPolicy_FeePolicy(t *testing.T) {
 // TestRecordPeerPolicy_LegacyMinMiningTxFee verifies the BSV/kB fallback is
 // converted to satoshis-per-1000-bytes when no structured FeePolicy is present.
 func TestRecordPeerPolicy_LegacyMinMiningTxFee(t *testing.T) {
-	c, w := newTestClient(t, newFakeTeraClient("sender"))
+	c, w := newTestClient(t, newFakeTeraClient(testPeerID))
 	fee := 0.0000005 // BSV/kB -> 50 sat per 1000 bytes
 	c.recordPeerPolicy(context.Background(), teranodep2p.NodeStatusMessage{
 		PeerID:         "peer-2",
@@ -470,7 +475,7 @@ func TestRecordPeerPolicy_LegacyMinMiningTxFee(t *testing.T) {
 // TestRecordPeerPolicy_URLlessPeerStillRecorded verifies a peer that advertises a
 // fee but no datahub URL is still counted toward the /policy network-minimum.
 func TestRecordPeerPolicy_URLlessPeerStillRecorded(t *testing.T) {
-	c, w := newTestClient(t, newFakeTeraClient("sender"))
+	c, w := newTestClient(t, newFakeTeraClient(testPeerID))
 	c.recordPeerPolicy(context.Background(), teranodep2p.NodeStatusMessage{
 		PeerID:    "peer-3",
 		FeePolicy: &teranodep2p.FeePolicy{MiningFee: teranodep2p.FeeAmount{Satoshis: 10, Bytes: 1000}},
@@ -483,7 +488,7 @@ func TestRecordPeerPolicy_URLlessPeerStillRecorded(t *testing.T) {
 // TestRecordPeerPolicy_NoFeeAdvertised verifies peers advertising no fee (old
 // nodes) are skipped rather than recorded with a zero fee.
 func TestRecordPeerPolicy_NoFeeAdvertised(t *testing.T) {
-	c, w := newTestClient(t, newFakeTeraClient("sender"))
+	c, w := newTestClient(t, newFakeTeraClient(testPeerID))
 	c.recordPeerPolicy(context.Background(), teranodep2p.NodeStatusMessage{PeerID: "peer-4"})
 	if fees := w.feeSnapshot(); len(fees) != 0 {
 		t.Fatalf("expected no fee upsert for feeless peer, got %+v", fees)
@@ -497,7 +502,7 @@ func TestRecordPeerPolicy_NoFeeAdvertised(t *testing.T) {
 func TestRecordPeerPolicy_RejectsMalformedLegacyFee(t *testing.T) {
 	bad := []float64{math.NaN(), math.Inf(1), -0.0001, 1e30}
 	for _, f := range bad {
-		c, w := newTestClient(t, newFakeTeraClient("sender"))
+		c, w := newTestClient(t, newFakeTeraClient(testPeerID))
 		c.recordPeerPolicy(context.Background(), teranodep2p.NodeStatusMessage{
 			PeerID:         "peer-bad",
 			MinMiningTxFee: &f,
@@ -512,10 +517,10 @@ func TestRecordPeerPolicy_RejectsMalformedLegacyFee(t *testing.T) {
 // advertises alongside the fee are carried into the store, so the api-server
 // can derive the network-wide maximum for GET /policy and intake.
 func TestRecordPeerPolicy_RecordsSizeLimits(t *testing.T) {
-	c, w := newTestClient(t, newFakeTeraClient("sender"))
+	c, w := newTestClient(t, newFakeTeraClient(testPeerID))
 	c.recordPeerPolicy(context.Background(), teranodep2p.NodeStatusMessage{
 		PeerID:  "peer-sized",
-		BaseURL: "https://peer.example",
+		BaseURL: testPeerURL,
 		FeePolicy: &teranodep2p.FeePolicy{
 			MiningFee:           teranodep2p.FeeAmount{Satoshis: 75, Bytes: 1000},
 			MaxTxSizePolicy:     100_000_000,
@@ -541,7 +546,7 @@ func TestRecordPeerPolicy_RecordsSizeLimits(t *testing.T) {
 // accepts nothing, which under the network maximum would be harmless but under
 // any future minimum would be catastrophic.
 func TestRecordPeerPolicy_LegacyPeerLeavesSizesUnset(t *testing.T) {
-	c, w := newTestClient(t, newFakeTeraClient("sender"))
+	c, w := newTestClient(t, newFakeTeraClient(testPeerID))
 	fee := 0.0000005
 	c.recordPeerPolicy(context.Background(), teranodep2p.NodeStatusMessage{
 		PeerID:         "peer-legacy",
@@ -563,10 +568,10 @@ func TestRecordPeerPolicy_LegacyPeerLeavesSizesUnset(t *testing.T) {
 // must cost only the size — dropping the whole row would let a peer remove
 // itself from the fee minimum just by sending garbage in another field.
 func TestRecordPeerPolicy_UnstorableSizeKeepsFee(t *testing.T) {
-	c, w := newTestClient(t, newFakeTeraClient("sender"))
+	c, w := newTestClient(t, newFakeTeraClient(testPeerID))
 	c.recordPeerPolicy(context.Background(), teranodep2p.NodeStatusMessage{
 		PeerID:  "peer-hostile",
-		BaseURL: "https://peer.example",
+		BaseURL: testPeerURL,
 		FeePolicy: &teranodep2p.FeePolicy{
 			MiningFee:           teranodep2p.FeeAmount{Satoshis: 5, Bytes: 1000},
 			MaxTxSizePolicy:     math.MaxUint64,
@@ -584,5 +589,83 @@ func TestRecordPeerPolicy_UnstorableSizeKeepsFee(t *testing.T) {
 	if fees[0].MaxTxSizePolicy != 0 || fees[0].MaxScriptSizePolicy != 0 {
 		t.Errorf("unstorable sizes must be zeroed, got {%d %d}",
 			fees[0].MaxTxSizePolicy, fees[0].MaxScriptSizePolicy)
+	}
+}
+
+// TestClient_RegistrationCarriesAdvertisedPolicy is the end of the chain
+// GET /health reads: the policy a node advertises in node_status travels with
+// its URL into the registry, so an operator can see per endpoint what that node
+// will accept.
+func TestClient_RegistrationCarriesAdvertisedPolicy(t *testing.T) {
+	fc := newFakeTeraClient(testPeerID)
+	c, w := newTestClient(t, fc)
+	_, stop := runStart(t, c)
+	defer stop()
+
+	fc.ch <- teranodep2p.NodeStatusMessage{
+		PeerID:  testPeerID,
+		BaseURL: testPeerURL,
+		FeePolicy: &teranodep2p.FeePolicy{
+			MiningFee:               teranodep2p.FeeAmount{Satoshis: 100, Bytes: 1000},
+			MaxTxSizePolicy:         100_000_000,
+			MaxScriptSizePolicy:     500_000,
+			MaxTxSigopsCountsPolicy: 4_294_967_295,
+		},
+	}
+
+	calls := waitForUpserts(t, w, 1)
+	got := calls[0].Policy
+	if got == nil {
+		t.Fatal("registration dropped the advertised policy")
+	}
+	want := store.EndpointPolicy{
+		MiningFeeSatoshis: 100, MiningFeeBytes: 1000,
+		MaxTxSizePolicy: 100_000_000, MaxScriptSizePolicy: 500_000,
+		MaxTxSigopsCountsPolicy: 4_294_967_295,
+	}
+	if *got != want {
+		t.Errorf("policy = %+v, want %+v", *got, want)
+	}
+}
+
+// TestClient_RegistrationWithoutPolicyStillRegisters guards the ordering that
+// matters: a node advertising no policy — or one too large to store — must
+// still get its URL into the registry. The policy is a diagnostic; the URL is
+// how transactions reach that node.
+func TestClient_RegistrationWithoutPolicyStillRegisters(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  teranodep2p.NodeStatusMessage
+	}{
+		{
+			name: "no policy advertised",
+			msg:  teranodep2p.NodeStatusMessage{PeerID: testPeerID, BaseURL: testPeerURL},
+		},
+		{
+			name: "policy too large to store",
+			msg: teranodep2p.NodeStatusMessage{
+				PeerID: testPeerID, BaseURL: testPeerURL,
+				FeePolicy: &teranodep2p.FeePolicy{MaxTxSizePolicy: math.MaxUint64},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := newFakeTeraClient(testPeerID)
+			c, w := newTestClient(t, fc)
+			_, stop := runStart(t, c)
+			defer stop()
+
+			fc.ch <- tc.msg
+
+			calls := waitForUpserts(t, w, 1)
+			if calls[0].URL != testPeerURL {
+				t.Errorf("URL = %q, want the announced URL", calls[0].URL)
+			}
+			if calls[0].Policy != nil {
+				t.Errorf("policy = %+v, want nil", *calls[0].Policy)
+			}
+		})
 	}
 }

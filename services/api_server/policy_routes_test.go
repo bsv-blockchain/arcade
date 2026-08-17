@@ -20,7 +20,7 @@ var errTest = errors.New("policy test: store failure")
 func setupPolicyServer(ms *mockStore, vcfg config.ValidatorConfig, val *validator.Validator) (*Server, *gin.Engine) {
 	gin.SetMode(gin.TestMode)
 	srv := &Server{
-		cfg:       &config.Config{Network: "mainnet", Validator: vcfg},
+		cfg:       &config.Config{Network: config.NetworkMainnet, Validator: vcfg},
 		logger:    zap.NewNop(),
 		store:     ms,
 		validator: val,
