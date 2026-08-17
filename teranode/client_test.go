@@ -137,13 +137,13 @@ func TestParseTxsFailures_WrapperPreferredOverBareHex(t *testing.T) {
 		"UTXO_SPENT (70): UTXO_SPENT (70): " + outpoint + ":2 utxo already spent by tx " + spender + "[0]\n")
 
 	failures := parseTxsFailures(body, nil)
-	if len(failures) != 2 {
+	if failures.Len() != 2 {
 		t.Fatalf("failures=%#v want 2 entries", failures)
 	}
-	if _, ok := failures[submitted]; !ok {
+	if _, ok := failures.ByKey[submitted]; !ok {
 		t.Errorf("wrapped line must key under the wrapper txid, got %#v", failures)
 	}
-	if _, ok := failures[outpoint]; !ok {
+	if _, ok := failures.ByKey[outpoint]; !ok {
 		t.Errorf("wrapper-less conflict line must fall back to first bare hex, got %#v", failures)
 	}
 }
@@ -255,13 +255,13 @@ func testSubmitTransactionsFailureList(t *testing.T, status int) {
 	if code != status {
 		t.Errorf("expected %d, got %d", status, code)
 	}
-	if len(failures) != 2 {
-		t.Fatalf("expected 2 failure entries, got %d (%#v)", len(failures), failures)
+	if failures.Len() != 2 {
+		t.Fatalf("expected 2 failure entries, got %d (%#v)", failures.Len(), failures)
 	}
-	if _, ok := failures[txidA]; !ok {
+	if _, ok := failures.ByKey[txidA]; !ok {
 		t.Errorf("expected failure for txidA, got %#v", failures)
 	}
-	if _, ok := failures[txidB]; !ok {
+	if _, ok := failures.ByKey[txidB]; !ok {
 		t.Errorf("expected failure for txidB, got %#v", failures)
 	}
 }
@@ -288,10 +288,10 @@ func TestSubmitTransactions_422_ProcessingOnly(t *testing.T) {
 	if code != http.StatusUnprocessableEntity {
 		t.Errorf("code=%d want 422", code)
 	}
-	if len(failures) != 1 {
+	if failures.Len() != 1 {
 		t.Fatalf("failures=%#v want 1 entry", failures)
 	}
-	line, ok := failures[txid]
+	line, ok := failures.ByKey[txid]
 	if !ok {
 		t.Fatalf("missing failure for %s: %#v", txid, failures)
 	}
@@ -348,19 +348,29 @@ func TestSubmitTransactions_FailureList_HeaderOnly(t *testing.T) {
 	}
 }
 
-// TestSubmitTransactions_FailureList_GarbledLineWholeBatchRequeue locks in
-// the fail-closed contract on parseTxsFailures: any non-empty failure line
-// without an extractable txid means the response isn't fully trustworthy
-// (Teranode processOne panic recovery is the known offender — it doesn't
-// include the tx's id in the recover wrapper, even though the tx is in
-// scope). Returning nil here drops the caller to the whole-batch requeue
-// path so every tx is re-broadcast rather than risk silently marking the
-// orphan's owner as ACCEPTED.
-func TestSubmitTransactions_FailureList_GarbledLineWholeBatchRequeue(t *testing.T) {
+// TestSubmitTransactions_FailureList_TxidlessLineKeepsKeyedVerdicts pins the
+// replacement for the old fail-closed rule, which returned nil for the WHOLE
+// body as soon as one line carried no txid.
+//
+// Fail-closed was written for a rare accident (Teranode's processOne panic
+// recovery omits the tx id). It is in fact the common case: Teranode's public
+// error boundary surfaces only the deepest allowlisted cause and discards the
+// "[ProcessTransaction][<txid>]" wrapper, so every Go-side consensus check
+// ("bad-txns-in-belowout"), every BDK script and policy failure ("GoBDK fail
+// to ValidateTransaction"), and the over-size guard all arrive with no txid at
+// all. Discarding the body on those meant throwing away the verdicts that DID
+// key, requeueing transactions the peer had accepted, and looping the failing
+// one until the durable-retry budget gave up with a reason about a missing
+// parent that had nothing to do with the real failure.
+//
+// The line is kept in Unkeyed instead. The caller withholds every implicit
+// accept from this peer — it has still vouched for nobody — and narrows the
+// chunk until the line lands on a single transaction.
+func TestSubmitTransactions_FailureList_TxidlessLineKeepsKeyedVerdicts(t *testing.T) {
 	const txidA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	body := "Failed to process transactions:\n" +
-		"TX_INVALID (31): [ProcessTransaction][" + txidA + "] tx is invalid because UTXO_SPENT\n" +
-		"GARBLED: no txid in this line at all\n"
+	const keyedLine = "TX_INVALID (31): [ProcessTransaction][" + txidA + "] tx is invalid because UTXO_SPENT"
+	const txidlessLine = "TX_INVALID (31): bad-txns-in-belowout"
+	body := "Failed to process transactions:\n" + keyedLine + "\n" + txidlessLine + "\n"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte(body))
@@ -374,8 +384,17 @@ func TestSubmitTransactions_FailureList_GarbledLineWholeBatchRequeue(t *testing.
 	if err == nil {
 		t.Fatalf("expected non-nil error")
 	}
-	if failures != nil {
-		t.Errorf("fail-closed contract: any orphan line → whole-batch requeue; expected nil failures, got %#v", failures)
+	if failures == nil {
+		t.Fatalf("a txid-less line must not discard the whole body")
+	}
+	if got := failures.ByKey[txidA]; got != keyedLine {
+		t.Errorf("keyed verdict lost: ByKey[%s] = %q, want %q", txidA[:8], got, keyedLine)
+	}
+	if len(failures.Unkeyed) != 1 || failures.Unkeyed[0] != txidlessLine {
+		t.Errorf("Unkeyed = %#v, want exactly [%q]", failures.Unkeyed, txidlessLine)
+	}
+	if failures.Len() != 2 {
+		t.Errorf("Len() = %d, want 2 (one keyed + one unkeyed)", failures.Len())
 	}
 }
 

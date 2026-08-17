@@ -944,9 +944,9 @@ func (s *Server) rejectAtIntake(ctx context.Context, txid, reason string, status
 		zap.String("reason", reason),
 		logfields.Stage(logfields.StageIntake),
 	)
-	s.persistRejectedAtIntake(ctx, txid, reason, statusCode)
+	wrote := s.persistRejectedAtIntake(ctx, txid, reason, statusCode)
 	s.recordSubmission(ctx, txid, opts)
-	if s.publisher == nil {
+	if !wrote || s.publisher == nil {
 		return
 	}
 	status := &models.TransactionStatus{
@@ -969,10 +969,15 @@ func (s *Server) rejectAtIntake(ctx context.Context, txid, reason string, status
 // failed validation at the intake handler. Best-effort: a write
 // failure is logged but doesn't change the client response (the 400
 // has already told them the tx was rejected). When the store is nil
-// (test setups using struct-literal construction), this is a no-op.
-func (s *Server) persistRejectedAtIntake(ctx context.Context, txid, reason string, statusCode int) {
+// (test setups using struct-literal construction), this is a no-op and
+// reports wrote=true so the REJECTED event still publishes.
+//
+// wrote is false when an existing row already forbids a REJECTED
+// transition (SEEN_*/MINED/IMMUTABLE — issue #251). Callers must not
+// publish a REJECTED status event in that case.
+func (s *Server) persistRejectedAtIntake(ctx context.Context, txid, reason string, statusCode int) (wrote bool) {
 	if s.store == nil {
-		return
+		return true
 	}
 	row := &models.TransactionStatus{
 		TxID:       txid,
@@ -981,16 +986,24 @@ func (s *Server) persistRejectedAtIntake(ctx context.Context, txid, reason strin
 		ExtraInfo:  reason,
 		Timestamp:  time.Now(),
 	}
-	_, inserted, err := s.store.GetOrInsertStatus(ctx, row)
+	existing, inserted, err := s.store.GetOrInsertStatus(ctx, row)
 	if err != nil {
 		s.logger.Warn(
 			"intake rejection persist failed",
 			logfields.TxID(txid),
 			zap.Error(err),
 		)
-		return
+		return true
 	}
 	if !inserted {
+		if existing != nil && !models.StatusRejected.CanTransitionFrom(existing.Status) {
+			s.logger.Info(
+				"intake rejection ignored; existing status forbids REJECTED",
+				logfields.TxID(txid),
+				zap.String("existing_status", string(existing.Status)),
+			)
+			return false
+		}
 		if err := s.store.UpdateStatus(ctx, row); err != nil {
 			s.logger.Warn(
 				"intake rejection status update failed",
@@ -999,6 +1012,7 @@ func (s *Server) persistRejectedAtIntake(ctx context.Context, txid, reason strin
 			)
 		}
 	}
+	return true
 }
 
 // handleSubmitTransactions accepts a batch of concatenated raw transactions.

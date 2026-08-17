@@ -1037,6 +1037,66 @@ func TestHandleSubmitTransaction_ValidationFailure_RecordsSubmissionAndPublishes
 	}
 }
 
+// TestHandleSubmitTransaction_ValidationFailure_DoesNotClobberSeen is the
+// issue #251 regression: a resubmit of a tx already at SEEN_* must not
+// persist REJECTED or publish a REJECTED event when intake validation fails
+// (typically because the same tx already spent its inputs on-chain).
+func TestHandleSubmitTransaction_ValidationFailure_DoesNotClobberSeen(t *testing.T) {
+	rawTx := makeMinimalTx()
+
+	ms := &mockStore{
+		getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+			return &models.TransactionStatus{
+				TxID:   in.TxID,
+				Status: models.StatusSeenMultipleNodes,
+			}, false, nil
+		},
+	}
+	pub := &recordingCallbackPub{}
+	val := validator.NewValidator(nil)
+	broker := &kafka.RecordingBroker{}
+	gin.SetMode(gin.TestMode)
+	srv := &Server{
+		cfg:            &config.Config{CallbackToken: testCallbackToken},
+		logger:         zap.NewNop(),
+		producer:       kafka.NewProducer(broker),
+		store:          ms,
+		publisher:      pub,
+		validator:      val,
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
+	}
+	router := gin.New()
+	srv.registerRoutes(router)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/tx", bytes.NewReader(rawTx))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+
+	ms.mu.Lock()
+	updates := append([]*models.TransactionStatus(nil), ms.updateStatusCalls...)
+	ms.mu.Unlock()
+	if len(updates) != 0 {
+		t.Errorf("UpdateStatus must not clobber SEEN_MULTIPLE_NODES, got %v", updates)
+	}
+
+	pub.mu.Lock()
+	publishes := append([]*models.TransactionStatus(nil), pub.publishes...)
+	pub.mu.Unlock()
+	if len(publishes) != 0 {
+		t.Errorf("must not publish REJECTED over a SEEN row, got %v", publishes)
+	}
+
+	if totalMessages(broker) != 0 {
+		t.Errorf("must not publish to Kafka after an intake rejection, got %d", totalMessages(broker))
+	}
+}
+
 // TestHandleSubmitTransaction_ValidationFailure_NoCallback_StillPublishes
 // guards the "publish symmetrically with the success path" choice: even
 // when the request had no callback URL or token, the REJECTED event is

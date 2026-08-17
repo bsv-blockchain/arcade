@@ -3,14 +3,16 @@ package propagation
 import (
 	"strings"
 	"testing"
+
+	"github.com/bsv-blockchain/arcade/teranode"
 )
 
 // TestClassifyFailureLine pins the conservative Teranode-line → ARC-code map
 // (issue #254 / external feedback item 2). Invariants: the verbatim Teranode
-// line is always preserved in the message (the caller keeps every per-tx line
-// terminally rejected — the requeue signal is a body-less 5xx, decided
-// elsewhere); only confidently-mappable code prefixes gain an ARC status
-// code; and the non-final family carries an explicit retryable hint.
+// line is always preserved in the message; only confidently-mappable code
+// prefixes gain an ARC status code; and the non-final family carries an
+// explicit retryable hint. Opaque PROCESSING is routed to requeue by the
+// broadcast loop (lineIsOpaqueProcessing) and does not reach this helper.
 func TestClassifyFailureLine(t *testing.T) {
 	cases := []struct {
 		name          string
@@ -74,7 +76,7 @@ func TestClassifyFailureLine(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			msg, code := classifyFailureLine(tc.line)
+			msg, code := classifyFailureLine(tc.line, 0)
 			if code != tc.wantCode {
 				t.Errorf("code = %d, want %d", code, tc.wantCode)
 			}
@@ -140,18 +142,18 @@ func TestFailureLinesForLog(t *testing.T) {
 	if got := failureLinesForLog(nil); got != nil {
 		t.Errorf("failureLinesForLog(nil) = %v, want nil", got)
 	}
-	if got := failureLinesForLog(map[string]string{}); got != nil {
+	if got := failureLinesForLog(&teranode.TxsFailures{}); got != nil {
 		t.Errorf("failureLinesForLog(empty) = %v, want nil", got)
 	}
 
-	failures := make(map[string]string, 10)
+	failures := &teranode.TxsFailures{ByKey: make(map[string]string, 10)}
 	for i := 0; i < 9; i++ {
 		key := strings.Repeat(string(rune('a'+i)), 64)
-		failures[key] = "PROCESSING (4): [ProcessTransaction][" + key + "] failed to validate transaction"
+		failures.ByKey[key] = "PROCESSING (4): [ProcessTransaction][" + key + "] failed to validate transaction"
 	}
 	spentKey := strings.Repeat("f", 64)
 	spentLine := "UTXO_SPENT (70): [ProcessTransaction][" + spentKey + "] utxo already spent"
-	failures[spentKey] = spentLine
+	failures.ByKey[spentKey] = spentLine
 
 	got := failureLinesForLog(failures)
 	if len(got) != 8 {
@@ -166,5 +168,57 @@ func TestFailureLinesForLog(t *testing.T) {
 		if got[i] != again[i] {
 			t.Fatalf("non-deterministic output at index %d: %q vs %q", i, got[i], again[i])
 		}
+	}
+}
+
+func TestLineIsOpaqueProcessing(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		want bool
+	}{
+		{
+			name: "bare PROCESSING catch-all",
+			line: "PROCESSING (4): [ProcessTransaction][ab12] failed to validate transaction",
+			want: true,
+		},
+		{
+			name: "repeated PROCESSING wrapper still opaque",
+			line: "PROCESSING (4): PROCESSING (4): failed to validate transaction",
+			want: true,
+		},
+		{
+			name: "nested TX_INVALID is a verdict",
+			line: "PROCESSING (4): [ProcessTransaction][ab12] failed: TX_INVALID (31): fee too low",
+			want: false,
+		},
+		{
+			name: "nested UTXO_SPENT is a verdict",
+			line: "PROCESSING (4): UTXO_SPENT (70): abc:0 already spent",
+			want: false,
+		},
+		{
+			name: "nested TX_MISSING_PARENT is a condition, not opaque",
+			line: "PROCESSING (4): TX_MISSING_PARENT (34): missing parent",
+			want: false,
+		},
+		{
+			name: "unknown nested code is still a nested verdict",
+			line: "PROCESSING (4): SOME_FUTURE_CODE (99): specific reason",
+			want: false,
+		},
+		{
+			name: "bare TX_INVALID is not PROCESSING",
+			line: "TX_INVALID (31): fee too low",
+			want: false,
+		},
+		{name: "empty", line: "", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := lineIsOpaqueProcessing(tc.line); got != tc.want {
+				t.Errorf("lineIsOpaqueProcessing(%q) = %v, want %v", tc.line, got, tc.want)
+			}
+		})
 	}
 }
