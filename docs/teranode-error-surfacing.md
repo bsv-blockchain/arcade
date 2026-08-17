@@ -134,6 +134,13 @@ recovers it from the HTTP status: 422 is reachable from exactly one branch of te
 parent. The status is only consulted when the peer reported a single failure, where it describes
 that one transaction exactly.
 
+An *opaque* line — `PROCESSING` with no nested named code, per `lineIsOpaqueProcessing` — is the
+only shape for which the status is read at all, and it never terminalizes without it. When several
+failures share one body the status is an aggregate that describes none of them individually, so
+such a line requeues rather than being turned into a verdict; it ends, if it keeps failing, through
+the durable-retry budget with the line quoted in the give-up reason. A line carrying any code other
+than `PROCESSING` is a verdict regardless of the status, wrapper or not.
+
 ### E. Response-level
 
 | Situation | Behaviour |
@@ -141,6 +148,8 @@ that one transaction exactly.
 | 502/503, bare 500, no failure-list body, truncated body | no per-tx vote → requeue |
 | some lines placed, others not | placed verdicts kept; no implicit accepts; chunk narrowed |
 | every line placed | absent ⇒ accepted, including transactions an attributed line did not name |
+| opaque `PROCESSING` alone in the body | classified by the peer's status (422 / 403 / 5xx) |
+| opaque `PROCESSING` sharing a body with other failures | status is ambiguous → requeue, never REJECTED |
 | multi-endpoint, one peer accepts | acceptance is sticky and masks every row above |
 
 ## What is still lost, and where it has to be fixed

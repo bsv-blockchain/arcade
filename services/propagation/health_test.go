@@ -554,6 +554,62 @@ func TestBroadcast_OpaqueProcessing_RequeuesInsteadOfRejects(t *testing.T) {
 	waitForPending(t, p, 1)
 }
 
+// TestBroadcast_OpaqueProcessing_AmbiguousStatus_RequeuesAlongsideRealVerdict
+// covers the case where the peer's status cannot rescue an opaque line.
+//
+// arcade reads the HTTP status to recover what Teranode's error boundary
+// stripped — 422 means a missing parent, 403 a frozen utxo, 5xx a fault on the
+// node. That mapping is per transaction, so it only holds when the peer
+// reported a single failure. Here it reported two, and the aggregate status
+// (400, from the genuine TX_INVALID) says nothing about the opaque line
+// sharing the body.
+//
+// The real verdict must still terminalize, and the opaque line must not: with
+// no evidence left to separate "your bytes are bad" from "my store is down",
+// rejecting would produce exactly the reasonless REJECTED row this whole path
+// exists to prevent. It retries instead, and ends — if it keeps failing —
+// through the durable-retry budget with the line it actually saw quoted in the
+// give-up reason.
+func TestBroadcast_OpaqueProcessing_AmbiguousStatus_RequeuesAlongsideRealVerdict(t *testing.T) {
+	const (
+		txidVerdict = "aa11bc98d7828b7f095e5d616f7ccba607fc228368e82e74b25304e37699f1e9"
+		txidOpaque  = "bb22bc98d7828b7f095e5d616f7ccba607fc228368e82e74b25304e37699f1e9"
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte("Failed to process transactions:\n" +
+			"TX_INVALID (31): [ProcessTransaction][" + txidVerdict + "] bad-txns-in-belowout\n" +
+			"PROCESSING (4): [ProcessTransaction][" + txidOpaque + "] failed to validate transaction\n"))
+	}))
+	defer srv.Close()
+
+	ms := newMockStore()
+	p := poisonPropagator(srv.URL, ms, 5, time.Millisecond)
+
+	for _, txid := range []string{txidVerdict, txidOpaque} {
+		if err := p.handleMessage(context.Background(), consumerMsg(makePropMsg(txid))); err != nil {
+			t.Fatalf("handleMessage(%s): %v", txid[:8], err)
+		}
+	}
+	if err := flushSync(t, p); err != nil {
+		t.Fatalf("flushSync: %v", err)
+	}
+
+	got := ms.lastUpdateForTxid(txidVerdict)
+	if got == nil || got.Status != models.StatusRejected {
+		t.Fatalf("named verdict: got %+v, want REJECTED — a real code is actionable whatever the status", got)
+	}
+	if !strings.Contains(got.ExtraInfo, "bad-txns-in-belowout") {
+		t.Errorf("named verdict reason = %q, want the Teranode line", got.ExtraInfo)
+	}
+
+	if got := ms.lastUpdateForTxid(txidOpaque); got != nil && got.Status == models.StatusRejected {
+		t.Fatalf("opaque line shared a body with another failure, so the status describes neither; "+
+			"rejecting on it invents a verdict: got %+v", got)
+	}
+	waitForPending(t, p, 1)
+}
+
 // TestBroadcast_422PartialFailureList_ImplicitAccept pins the riskiest
 // semantics the status-agnostic parse enables: a single 422 whose failure
 // list names ONE tx is a whole-batch verdict — the named tx is REJECTED and
