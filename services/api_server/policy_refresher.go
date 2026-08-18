@@ -91,11 +91,14 @@ func (s *Server) refreshPolicyOnce(ctx context.Context) {
 	// Fee: the lowest any peer will accept, so arcade rejects only what no peer
 	// would mine. Sizes: the highest any peer will accept, the same rule read
 	// the other way round.
-	fee := uint64(config.DefaultValidatorMinFeePerKB)
+	var (
+		fee      uint64
+		cheapest string // peer that set the floor, for the log line below
+	)
 	if s.feePinned() {
 		fee = s.validator.MinFeePerKB() // pinned at construction; leave it be
-	} else if observed, ok := lowestObservedFeePerKB(peers, ttl, now); ok {
-		fee = observed
+	} else {
+		fee, cheapest = discoveredFeePerKB(peers, ttl, now)
 	}
 
 	maxTxSize := s.cfg.Validator.MaxTxSizePolicy
@@ -129,6 +132,9 @@ func (s *Server) refreshPolicyOnce(ctx context.Context) {
 		s.logger.Info("intake policy updated from network observations",
 			zap.Uint64("prev_fee_sat_per_kb", prevFee),
 			zap.Uint64("new_fee_sat_per_kb", newFee),
+			// Which peer set the floor. Without it, "why is the floor 1?" can
+			// only be answered by querying the store by hand.
+			zap.String("cheapest_peer_id", cheapest),
 			zap.Int("prev_max_tx_size", prevTxSize),
 			zap.Int("new_max_tx_size", newTxSize),
 			zap.Int("prev_max_script_size", prevScriptSize),
@@ -157,17 +163,51 @@ func discoveredLimit(peers []store.PeerPolicy, ttl time.Duration, now time.Time,
 	return observed
 }
 
+// minDiscoveredFeePerKB is the floor under the network-observed fee: discovery
+// may track the cheapest node all the way down to 1 sat/kB, but never to 0.
+//
+// This is the fee's counterpart to the floor discoveredLimit applies to the
+// size limits, and it exists for the same reason: node_status is
+// unauthenticated gossip and the rule is a bare minimum, so a single peer
+// advertising 0 — misconfigured, or simply a node with nil policy settings,
+// which teranode advertises as min_mining_tx_fee=0 — silently disabled fee
+// enforcement for an entire arcade instance. Accepting zero-fee transactions is
+// a deliberate operator decision, so accept_zero_fee is the only thing that may
+// produce a 0 floor.
+const minDiscoveredFeePerKB = 1
+
+// discoveredFeePerKB resolves the network-tracked fee floor: the lowest rate a
+// fresh peer will accept, bounded below by minDiscoveredFeePerKB, or the
+// built-in default when nothing fresh has been observed. It also returns the id
+// of the peer that set the floor, so the change is explainable in a log line
+// rather than only by querying the store.
+func discoveredFeePerKB(peers []store.PeerPolicy, ttl time.Duration, now time.Time) (uint64, string) {
+	observed, peerID, ok := lowestObservedFeePerKB(peers, ttl, now)
+	if !ok {
+		return uint64(config.DefaultValidatorMinFeePerKB), ""
+	}
+	if observed < minDiscoveredFeePerKB {
+		return minDiscoveredFeePerKB, peerID
+	}
+	return observed, peerID
+}
+
 // lowestObservedFeePerKB returns the minimum mining fee rate (in satoshis per
-// 1000 bytes) advertised by peers re-heard within ttl. ok is false when no
-// fresh observation exists. A peer's rate is normalized to sat/kB using ceil
-// division so a non-1000 byte basis never rounds the enforced floor *below*
-// what the peer requires (e.g. 1 sat / 1001 bytes must map to 1 sat/kB, not 0,
-// or arcade would accept fee=0 that no node would).
-func lowestObservedFeePerKB(peers []store.PeerPolicy, ttl time.Duration, now time.Time) (uint64, bool) {
+// 1000 bytes) advertised by peers re-heard within ttl, and the id of the peer
+// advertising it. ok is false when no fresh observation exists. A peer's rate
+// is normalized to sat/kB using ceil division so a non-1000 byte basis never
+// rounds the enforced floor *below* what the peer requires (e.g. 1 sat / 1001
+// bytes must map to 1 sat/kB, not 0, or arcade would accept fee=0 that no node
+// would).
+//
+// Callers should use discoveredFeePerKB rather than this directly: the raw
+// minimum is unbounded below and must not reach the validator unfloored.
+func lowestObservedFeePerKB(peers []store.PeerPolicy, ttl time.Duration, now time.Time) (uint64, string, bool) {
 	cutoff := now.Add(-ttl)
 	var (
-		best  uint64
-		found bool
+		best   uint64
+		peerID string
+		found  bool
 	)
 	for _, p := range peers {
 		if p.MiningFeeBytes == 0 {
@@ -179,10 +219,11 @@ func lowestObservedFeePerKB(peers []store.PeerPolicy, ttl time.Duration, now tim
 		perKB := ceilFeePerKB(p.MiningFeeSatoshis, p.MiningFeeBytes)
 		if !found || perKB < best {
 			best = perKB
+			peerID = p.PeerID
 			found = true
 		}
 	}
-	return best, found
+	return best, peerID, found
 }
 
 // highestObservedLimit returns the maximum value pick reports across peers

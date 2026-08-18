@@ -45,7 +45,7 @@ func TestLowestObservedFeePerKB(t *testing.T) {
 			// stale cheapest — must be excluded
 			{PeerID: "p3", MiningFeeSatoshis: 1, MiningFeeBytes: 1000, LastSeen: now.Add(-24 * time.Hour)},
 		}
-		got, ok := lowestObservedFeePerKB(peers, ttl, now)
+		got, _, ok := lowestObservedFeePerKB(peers, ttl, now)
 		if !ok || got != 100 {
 			t.Fatalf("got (%d,%v), want (100,true)", got, ok)
 		}
@@ -55,13 +55,13 @@ func TestLowestObservedFeePerKB(t *testing.T) {
 		peers := []store.PeerPolicy{
 			{PeerID: "p1", MiningFeeSatoshis: 1, MiningFeeBytes: 1000, LastSeen: now.Add(-24 * time.Hour)},
 		}
-		if _, ok := lowestObservedFeePerKB(peers, ttl, now); ok {
+		if _, _, ok := lowestObservedFeePerKB(peers, ttl, now); ok {
 			t.Fatal("expected ok=false when all peers stale")
 		}
 	})
 
 	t.Run("empty", func(t *testing.T) {
-		if _, ok := lowestObservedFeePerKB(nil, ttl, now); ok {
+		if _, _, ok := lowestObservedFeePerKB(nil, ttl, now); ok {
 			t.Fatal("expected ok=false for empty input")
 		}
 	})
@@ -72,7 +72,7 @@ func TestLowestObservedFeePerKB(t *testing.T) {
 			{PeerID: "p1", MiningFeeSatoshis: 250, MiningFeeBytes: 500, LastSeen: now},
 			{PeerID: "p2", MiningFeeSatoshis: 100, MiningFeeBytes: 1000, LastSeen: now},
 		}
-		got, ok := lowestObservedFeePerKB(peers, ttl, now)
+		got, _, ok := lowestObservedFeePerKB(peers, ttl, now)
 		if !ok || got != 100 {
 			t.Fatalf("got (%d,%v), want (100,true)", got, ok)
 		}
@@ -84,7 +84,7 @@ func TestLowestObservedFeePerKB(t *testing.T) {
 		peers := []store.PeerPolicy{
 			{PeerID: "p1", MiningFeeSatoshis: 1, MiningFeeBytes: 1001, LastSeen: now},
 		}
-		got, ok := lowestObservedFeePerKB(peers, ttl, now)
+		got, _, ok := lowestObservedFeePerKB(peers, ttl, now)
 		if !ok || got != 1 {
 			t.Fatalf("got (%d,%v), want (1,true) — ceil, not floor", got, ok)
 		}
@@ -95,7 +95,7 @@ func TestLowestObservedFeePerKB(t *testing.T) {
 			{PeerID: "huge", MiningFeeSatoshis: 1 << 60, MiningFeeBytes: 1, LastSeen: now},
 			{PeerID: "sane", MiningFeeSatoshis: 20, MiningFeeBytes: 1000, LastSeen: now},
 		}
-		got, ok := lowestObservedFeePerKB(peers, ttl, now)
+		got, _, ok := lowestObservedFeePerKB(peers, ttl, now)
 		if !ok || got != 20 {
 			t.Fatalf("got (%d,%v), want (20,true) — huge fee must not wrap into the minimum", got, ok)
 		}
@@ -106,7 +106,7 @@ func TestLowestObservedFeePerKB(t *testing.T) {
 			{PeerID: "bad", MiningFeeSatoshis: 5, MiningFeeBytes: 0, LastSeen: now},
 			{PeerID: "ok", MiningFeeSatoshis: 80, MiningFeeBytes: 1000, LastSeen: now},
 		}
-		got, ok := lowestObservedFeePerKB(peers, ttl, now)
+		got, _, ok := lowestObservedFeePerKB(peers, ttl, now)
 		if !ok || got != 80 {
 			t.Fatalf("got (%d,%v), want (80,true)", got, ok)
 		}
@@ -421,5 +421,120 @@ func TestConfigDefaultsMatchValidatorDefaults(t *testing.T) {
 	if got := v.MinFeePerKB(); got != config.DefaultValidatorMinFeePerKB {
 		t.Errorf("validator default min fee %d != config default %d",
 			got, config.DefaultValidatorMinFeePerKB)
+	}
+}
+
+// TestDiscoveredFeePerKB is the regression for a production report: /policy
+// advertised miningFee 0 sat/kB while every endpoint in /health advertised 100.
+//
+// The rule is a bare minimum over unauthenticated gossip, so one peer at 0 —
+// misconfigured, or a node with nil policy settings, which teranode advertises
+// as min_mining_tx_fee=0 — silently disabled fee enforcement for the whole
+// instance. The floor is the fee's counterpart to the one discoveredLimit
+// applies to the size limits: discovery may track the cheapest node all the way
+// to 1 sat/kB, but only an explicit accept_zero_fee may produce a 0 floor.
+func TestDiscoveredFeePerKB(t *testing.T) {
+	now := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	ttl := 15 * time.Minute
+
+	cases := []struct {
+		name     string
+		peers    []store.PeerPolicy
+		want     uint64
+		wantPeer string
+	}{
+		{
+			name: "tracks the cheapest peer",
+			peers: []store.PeerPolicy{
+				{PeerID: "p1", MiningFeeSatoshis: 500, MiningFeeBytes: 1000, LastSeen: now},
+				{PeerID: "p2", MiningFeeSatoshis: 100, MiningFeeBytes: 1000, LastSeen: now},
+			},
+			want: 100, wantPeer: "p2",
+		},
+		{
+			name: "a single zero-fee peer cannot disable fee enforcement",
+			peers: []store.PeerPolicy{
+				{PeerID: "honest", MiningFeeSatoshis: 100, MiningFeeBytes: 1000, LastSeen: now},
+				{PeerID: "zero", MiningFeeSatoshis: 0, MiningFeeBytes: 1000, LastSeen: now},
+			},
+			want: minDiscoveredFeePerKB, wantPeer: "zero",
+		},
+		{
+			name: "a whole network at zero still floors at the minimum",
+			peers: []store.PeerPolicy{
+				{PeerID: "zero", MiningFeeSatoshis: 0, MiningFeeBytes: 1000, LastSeen: now},
+			},
+			want: minDiscoveredFeePerKB, wantPeer: "zero",
+		},
+		{
+			name: "one satoshi per kB is above the floor and passes through",
+			peers: []store.PeerPolicy{
+				{PeerID: "cheap", MiningFeeSatoshis: 1, MiningFeeBytes: 1000, LastSeen: now},
+			},
+			want: 1, wantPeer: "cheap",
+		},
+		{
+			name:  "no observations falls back to the built-in default",
+			peers: nil,
+			want:  uint64(config.DefaultValidatorMinFeePerKB),
+		},
+		{
+			name: "a stale zero-fee peer is ignored entirely",
+			peers: []store.PeerPolicy{
+				{PeerID: "honest", MiningFeeSatoshis: 100, MiningFeeBytes: 1000, LastSeen: now},
+				{PeerID: "gone", MiningFeeSatoshis: 0, MiningFeeBytes: 1000, LastSeen: now.Add(-24 * time.Hour)},
+			},
+			want: 100, wantPeer: "honest",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, peerID := discoveredFeePerKB(tc.peers, ttl, now)
+			if got != tc.want {
+				t.Errorf("discoveredFeePerKB() = %d, want %d", got, tc.want)
+			}
+			if peerID != tc.wantPeer {
+				t.Errorf("cheapest peer = %q, want %q — the log line naming the "+
+					"culprit is how an operator explains the floor", peerID, tc.wantPeer)
+			}
+		})
+	}
+}
+
+// TestRefreshPolicyOnce_ZeroFeePeerDoesNotZeroTheFloor is the same guarantee
+// end to end through the refresher and the validator, since that is where the
+// production symptom was visible: GET /policy reads the validator's floor.
+func TestRefreshPolicyOnce_ZeroFeePeerDoesNotZeroTheFloor(t *testing.T) {
+	s := newPolicyServer(&mockStore{peerPolicies: []store.PeerPolicy{
+		freshPolicy("honest", 100, 100_000_000, 500_000),
+		freshPolicy("zero", 0, 100_000_000, 500_000),
+	}})
+
+	s.refreshPolicyOnce(context.Background())
+
+	if got := s.validator.MinFeePerKB(); got != minDiscoveredFeePerKB {
+		t.Errorf("intake fee floor = %d, want %d — a zero-fee peer must not "+
+			"make arcade accept transactions no node will mine", got, minDiscoveredFeePerKB)
+	}
+	// The size limits still track normally.
+	if got := s.validator.MaxTxSizePolicy(); got != 100_000_000 {
+		t.Errorf("MaxTxSizePolicy = %d, want 100000000", got)
+	}
+}
+
+// TestRefreshPolicyOnce_AcceptZeroFeeStillPinsZero confirms the floor did not
+// take away the one legitimate route to a zero-fee intake: an operator opting
+// in explicitly, which is what accept_zero_fee is for.
+func TestRefreshPolicyOnce_AcceptZeroFeeStillPinsZero(t *testing.T) {
+	s := newPolicyServerWithConfig(
+		&mockStore{peerPolicies: []store.PeerPolicy{freshPolicy("honest", 100, 0, 0)}},
+		config.ValidatorConfig{AcceptZeroFee: true})
+	s.validator.SetMinFeePerKB(0) // as app wiring does at construction
+
+	s.refreshPolicyOnce(context.Background())
+
+	if got := s.validator.MinFeePerKB(); got != 0 {
+		t.Errorf("intake fee floor = %d, want 0 (accept_zero_fee pins it)", got)
 	}
 }
