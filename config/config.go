@@ -932,6 +932,11 @@ type ValidatorConfig struct {
 	// fee observed from peer node_status announcements, falling back to
 	// DefaultValidatorMinFeePerKB when no peer has been heard. A non-zero value
 	// (or AcceptZeroFee) is reported verbatim.
+	//
+	// An observed fee is floored at 1 sat/kB: peer announcements are
+	// unauthenticated and the rule is a bare minimum, so a single peer
+	// advertising 0 would otherwise disable fee enforcement entirely. Setting
+	// AcceptZeroFee is the only way to reach a 0 floor.
 	MinFeePerKB uint64 `mapstructure:"min_fee_per_kb"`
 
 	// AcceptZeroFee, when true, pins the validator's fee floor to exactly

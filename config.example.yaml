@@ -161,9 +161,16 @@ health:
 #   # announcements — and BOTH enforces it at intake and advertises it via
 #   # GET /policy (issue #212). Until a peer is heard it uses the built-in
 #   # 100 sat/kB floor. Set a non-zero value to pin and enforce an exact floor.
+#   # An observed fee is floored at 1 sat/kB — peer announcements are
+#   # unauthenticated, so one peer advertising 0 must not be able to disable
+#   # fee enforcement for the whole instance. Only accept_zero_fee below can
+#   # produce a 0 floor. Only peers whose datahub URL is registered count
+#   # toward the observation, so /policy's inputs are the endpoints /health
+#   # shows.
 #   min_fee_per_kb: 0
 #   # accept_zero_fee, when true, pins the floor to 0 sat/kB so any tx
-#   # (including fee=0) is accepted at intake, and /policy advertises 0.
+#   # (including fee=0) is accepted at intake, and /policy advertises 0. This
+#   # is the ONLY route to a zero floor; network observation cannot reach it.
 #   # Intended for teratestnet/regtest where the upstream Teranode is also
 #   # configured to accept zero-fee txs. Leave false on mainnet and testnet.
 #   # accept_zero_fee: false

@@ -285,11 +285,6 @@ func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatu
 		ce.Write(fields...)
 	}
 
-	// Record the peer's advertised policy before the datahub-URL gate below, so
-	// a peer that exposes a policy but no datahub URL still counts toward the
-	// GET /policy network values (issue #212).
-	c.recordPeerPolicy(ctx, msg)
-
 	raw := pickDatahubURL(msg)
 	if raw == "" {
 		metrics.P2PEndpointDiscoveryTotal.WithLabelValues("no_url").Inc()
@@ -344,6 +339,19 @@ func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatu
 		zap.String("peer_id", msg.PeerID),
 		zap.String("url", normalized),
 	)
+
+	// Record the peer's advertised policy only once its URL is in the registry,
+	// so the network values GET /policy derives come from exactly the peers
+	// arcade can actually broadcast to — the same set GET /health displays.
+	//
+	// This deliberately reverses the original ordering (issue #212), which ran
+	// ahead of the URL gate so a peer advertising a policy but no usable URL
+	// still counted. That made the fee floor unexplainable in production: a
+	// peer with no URL, or one rejected by SSRF validation (this network really
+	// does see nodes announcing cluster-internal names), set the floor for
+	// everyone while appearing nowhere in /health. An operator looking at a
+	// 0 sat/kB floor could see only peers advertising 100.
+	c.recordPeerPolicy(ctx, msg)
 }
 
 // recordPeerPolicy extracts the peer's advertised transaction policy from a
@@ -352,6 +360,10 @@ func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatu
 // structured FeePolicy (satoshis per Bytes, plus the size limits) and falls
 // back to the legacy MinMiningTxFee (*float64 in BSV/kB), which carries no size
 // limits. Peers advertising neither (older nodes) are skipped.
+//
+// Called only after the peer's datahub URL has been registered, so every row it
+// writes belongs to a peer arcade can broadcast to — see the call site for why
+// that matters.
 func (c *Client) recordPeerPolicy(ctx context.Context, msg teranodep2p.NodeStatusMessage) {
 	var sats, byts, maxTxSize, maxScriptSize uint64
 	switch {

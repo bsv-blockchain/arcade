@@ -155,6 +155,21 @@ func waitForUpserts(t *testing.T, w *fakeEndpointWriter, want int) []store.Datah
 	}
 }
 
+func waitForFeeUpserts(t *testing.T, w *fakeEndpointWriter, want int) []store.PeerPolicy {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		calls := w.feeSnapshot()
+		if len(calls) >= want {
+			return calls
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %d peer-policy upserts, got %d: %+v", want, len(calls), calls)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // captureLibraryConfig returns a clientFactory that sends the config it sees
 // through the returned channel, synchronizing between the Start goroutine
 // and the test goroutine so the race detector stays happy.
@@ -472,16 +487,70 @@ func TestRecordPeerPolicy_LegacyMinMiningTxFee(t *testing.T) {
 	}
 }
 
-// TestRecordPeerPolicy_URLlessPeerStillRecorded verifies a peer that advertises a
-// fee but no datahub URL is still counted toward the /policy network-minimum.
-func TestRecordPeerPolicy_URLlessPeerStillRecorded(t *testing.T) {
-	c, w := newTestClient(t, newFakeTeraClient(testPeerID))
-	c.recordPeerPolicy(context.Background(), teranodep2p.NodeStatusMessage{
-		PeerID:    "peer-3",
-		FeePolicy: &teranodep2p.FeePolicy{MiningFee: teranodep2p.FeeAmount{Satoshis: 10, Bytes: 1000}},
-	})
-	if fees := w.feeSnapshot(); len(fees) != 1 || fees[0].PeerID != "peer-3" {
-		t.Fatalf("expected URL-less peer fee recorded, got %+v", fees)
+// TestPeerPolicyOnlyRecordedForRegisteredURLs is the fix for a fee floor nobody
+// could explain: /policy advertised 0 sat/kB while every endpoint in /health
+// advertised 100.
+//
+// The policy feeding /policy used to be recorded ahead of the datahub-URL gate,
+// so a peer with no URL — or one rejected by SSRF validation, which this
+// network really does produce — set the network minimum while appearing nowhere
+// in /health. Recording it after registration means the values /policy derives
+// come from exactly the peers arcade can broadcast to, which is the set /health
+// displays.
+func TestPeerPolicyOnlyRecordedForRegisteredURLs(t *testing.T) {
+	cheap := &teranodep2p.FeePolicy{MiningFee: teranodep2p.FeeAmount{Satoshis: 0, Bytes: 1000}}
+
+	cases := []struct {
+		name       string
+		msg        teranodep2p.NodeStatusMessage
+		wantRecord bool
+	}{
+		{
+			name:       "peer with a registered URL counts",
+			msg:        teranodep2p.NodeStatusMessage{PeerID: testPeerID, BaseURL: testPeerURL, FeePolicy: cheap},
+			wantRecord: true,
+		},
+		{
+			name: "peer advertising no URL does not count",
+			msg:  teranodep2p.NodeStatusMessage{PeerID: testPeerID, FeePolicy: cheap},
+		},
+		{
+			// A cluster-internal name that resolves nowhere reachable — the
+			// "poisoned registry" case the endpoint source already filters.
+			name: "peer whose URL is rejected does not count",
+			msg:  teranodep2p.NodeStatusMessage{PeerID: testPeerID, BaseURL: "http://10.0.0.5:8090", FeePolicy: cheap},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := newFakeTeraClient(testPeerID)
+			c, w := newTestClient(t, fc)
+			_, stop := runStart(t, c)
+			defer stop()
+
+			fc.ch <- tc.msg
+
+			if tc.wantRecord {
+				fees := waitForFeeUpserts(t, w, 1)
+				if fees[0].PeerID != testPeerID {
+					t.Errorf("recorded the wrong peer: %+v", fees[0])
+				}
+				return
+			}
+
+			// Asserting an absence needs a barrier, not a sleep. Announcements
+			// are consumed in order by a single goroutine, so once a later
+			// message's registration is visible the earlier one has certainly
+			// been handled. This barrier carries no fee policy of its own, so
+			// any recorded fee could only have come from the case's message.
+			fc.ch <- teranodep2p.NodeStatusMessage{PeerID: "barrier", BaseURL: "https://barrier.example"}
+			waitForUpserts(t, w, 1)
+
+			if fees := w.feeSnapshot(); len(fees) != 0 {
+				t.Errorf("a peer with no registered URL must not set the network fee, got %+v", fees)
+			}
+		})
 	}
 }
 
