@@ -5,10 +5,10 @@ go 1.26.3
 require (
 	github.com/IBM/sarama v1.60.1
 	github.com/aerospike/aerospike-client-go/v7 v7.10.2
-	github.com/bsv-blockchain/go-bt/v2 v2.6.8
+	github.com/bsv-blockchain/go-bt/v2 v2.6.9
 	github.com/bsv-blockchain/go-chaincfg v1.6.2
 	github.com/bsv-blockchain/go-chaintracks v1.2.11
-	github.com/bsv-blockchain/go-p2p-message-bus v0.1.22
+	github.com/bsv-blockchain/go-p2p-message-bus v0.1.23
 	github.com/bsv-blockchain/go-sdk v1.3.3
 	github.com/bsv-blockchain/go-teranode-p2p-client v0.2.8
 	github.com/bsv-blockchain/teranode v0.16.0-beta-9
@@ -23,12 +23,12 @@ require (
 	github.com/prometheus/client_model v0.6.2
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
-	github.com/stretchr/testify v1.11.1
+	github.com/stretchr/testify v1.12.0
 	github.com/testcontainers/testcontainers-go v0.44.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.44.0
 	github.com/testcontainers/testcontainers-go/modules/redpanda v0.44.0
 	go.opentelemetry.io/contrib/bridges/prometheus v0.70.0
-	go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin v0.69.0
+	go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin v0.70.0
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.70.0
 	go.opentelemetry.io/otel v1.45.0
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.45.0
@@ -263,7 +263,7 @@ require (
 	github.com/prometheus/common v0.70.1 // indirect
 	github.com/prometheus/procfs v0.21.1 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	github.com/quic-go/quic-go v0.60.0 // indirect
+	github.com/quic-go/quic-go v0.61.0 // indirect
 	github.com/quic-go/webtransport-go v0.11.1 // indirect
 	github.com/rcrowley/go-metrics v0.0.0-20250401214520-65e299d6c5c9 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
