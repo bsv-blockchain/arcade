@@ -161,12 +161,13 @@ health:
 #   # announcements — and BOTH enforces it at intake and advertises it via
 #   # GET /policy (issue #212). Until a peer is heard it uses the built-in
 #   # 100 sat/kB floor. Set a non-zero value to pin and enforce an exact floor.
-#   # An observed fee is floored at 1 sat/kB — peer announcements are
-#   # unauthenticated, so one peer advertising 0 must not be able to disable
-#   # fee enforcement for the whole instance. Only accept_zero_fee below can
-#   # produce a 0 floor. Only peers whose datahub URL is registered count
-#   # toward the observation, so /policy's inputs are the endpoints /health
-#   # shows.
+#   # A peer advertising 0 sat/kB has advertised nothing, not offered to mine
+#   # for free — teranode reports min_mining_tx_fee=0 whenever its policy
+#   # settings are nil — so such an announcement is discarded rather than
+#   # counted. If no fresh peer advertises a fee at all, the built-in
+#   # 100 sat/kB applies. Only accept_zero_fee below can produce a 0 floor.
+#   # Only peers whose datahub URL is registered count toward the observation,
+#   # so /policy's inputs are the endpoints /health shows.
 #   min_fee_per_kb: 0
 #   # accept_zero_fee, when true, pins the floor to 0 sat/kB so any tx
 #   # (including fee=0) is accepted at intake, and /policy advertises 0. This
