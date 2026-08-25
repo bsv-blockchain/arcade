@@ -1501,8 +1501,7 @@ components:
           type: string
           enum: [configured, discovered]
           description: >-
-            How the endpoint entered the registry: seeded from static config, or
-            discovered at runtime from a peer's node_status announcement.
+            How the endpoint entered the registry: seeded from static config, or discovered at runtime from a peer's node_status announcement.
           example: discovered
         healthy:
           type: boolean
@@ -1510,19 +1509,12 @@ components:
           allOf:
             - $ref: "#/components/schemas/EndpointPolicy"
           description: >-
-            The transaction policy this node advertised when it registered the
-            URL — what this specific endpoint will accept, as opposed to the
-            single network-wide policy arcade enforces and GET /policy reports.
-            Absent for an endpoint no node_status has announced (a statically
-            configured URL, typically) or whose node predates fee_policy.
+            The transaction policy this node advertised when it registered the URL — what this specific endpoint will accept, as opposed to the single network-wide policy arcade enforces and GET /policy reports. Absent for an endpoint no node_status has announced (a statically configured URL, typically) or whose node predates fee_policy.
 
     EndpointPolicy:
       type: object
       description: >-
-        Transaction policy advertised by a single Teranode endpoint. Field names
-        match the GET /policy document so both surfaces read the same way;
-        standardFormatSupported is absent because it is an ARC transport flag,
-        not something a peer advertises.
+        Transaction policy advertised by a single Teranode endpoint. Field names match the GET /policy document so both surfaces read the same way; standardFormatSupported is absent because it is an ARC transport flag, not something a peer advertises.
       properties:
         miningFee:
           $ref: "#/components/schemas/FeeAmount"
@@ -1568,17 +1560,13 @@ components:
           type: integer
           format: int64
           description: >-
-            Maximum accepted transaction size in bytes. Unless the operator has
-            pinned a value, this tracks the largest limit advertised by any
-            Teranode peer, so a transaction is rejected at intake only when no
-            node on the network would accept it.
+            Maximum accepted transaction size in bytes. Unless the operator has pinned a value, this tracks the largest limit advertised by any Teranode peer, so a transaction is rejected at intake only when no node on the network would accept it.
           example: 10485760
         maxscriptsizepolicy:
           type: integer
           format: int64
           description: >-
-            Maximum accepted script size in bytes. Tracks the network the same
-            way maxtxsizepolicy does unless the operator has pinned a value.
+            Maximum accepted script size in bytes. Tracks the network the same way maxtxsizepolicy does unless the operator has pinned a value.
           example: 500000
         maxtxsigopscountspolicy:
           type: integer
