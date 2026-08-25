@@ -529,7 +529,8 @@ func TestRefreshPolicyOnce_ZeroFeePeerDoesNotZeroTheFloor(t *testing.T) {
 func TestRefreshPolicyOnce_AcceptZeroFeeStillPinsZero(t *testing.T) {
 	s := newPolicyServerWithConfig(
 		&mockStore{peerPolicies: []store.PeerPolicy{freshPolicy("honest", 100, 0, 0)}},
-		config.ValidatorConfig{AcceptZeroFee: true})
+		config.ValidatorConfig{AcceptZeroFee: true},
+	)
 	s.validator.SetMinFeePerKB(0) // as app wiring does at construction
 
 	s.refreshPolicyOnce(context.Background())
