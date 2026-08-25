@@ -44,6 +44,11 @@ kafka:
   consumer_group: arcade
   max_retries: 5
   buffer_size: 10000
+  # Producer-side cap on one Kafka message (bytes). Default 16 MiB: a
+  # policy-max 10 MiB tx is base64 inside the propagation envelope. The
+  # broker and the arcade.* topics must accept the same size, or large
+  # submits fail with "failed to submit" (see docs/production-kafka.md).
+  max_message_bytes: 16777216
   # Minimum partitions required on hot-path topics (transaction, propagation).
   # Set to the replica count of the largest horizontally-scaled consumer when
   # running in Kubernetes so arcade fails fast on misconfigured topics. Leave
