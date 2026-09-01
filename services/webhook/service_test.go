@@ -854,3 +854,77 @@ func TestReaper_LeaseDenied_SkipsTick(t *testing.T) {
 		t.Fatalf("expected 0 POSTs from non-leader tick, got %d", got)
 	}
 }
+
+// TestDispatchOne_DuplicateRegistrations_DeliverOnce: rows registered before
+// intake became idempotent (one per POST, thousands per txid in the
+// bsv-blockchain/arcade#335 flood) are collapsed per (callback URL, token)
+// at dispatch, so one status event is delivered ONCE to that subscriber.
+// The chosen row is stable (delivery state first, then smallest id), so the
+// CAS-maintained state keeps living on one row across dispatches.
+func TestDispatchOne_DuplicateRegistrations_DeliverOnce(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	st := &fakeStore{
+		subs: map[string][]*models.Submission{
+			txA: {
+				{SubmissionID: "sub-c", TxID: txA, CallbackURL: srv.URL, CallbackToken: "tok"},
+				{SubmissionID: "sub-a", TxID: txA, CallbackURL: srv.URL, CallbackToken: "tok"},
+				{SubmissionID: "sub-b", TxID: txA, CallbackURL: srv.URL, CallbackToken: "tok"},
+				// A different subscriber of the same txid is still its own delivery.
+				{SubmissionID: "sub-z", TxID: txA, CallbackURL: srv.URL, CallbackToken: "other"},
+			},
+		},
+	}
+	svc := New(
+		config.WebhookConfig{HTTPTimeoutMs: 1000, MaxRetries: 3},
+		config.CallbackConfig{AllowPrivateIPs: true},
+		zap.NewNop(), recordingPub{}, st, nil,
+	)
+
+	svc.handleUpdate(t.Context(), &models.TransactionStatus{
+		TxID:      txA,
+		Status:    models.StatusMined,
+		Timestamp: time.Now(),
+	})
+
+	if hits.Load() != 2 {
+		t.Fatalf("expected 2 deliveries (one per distinct subscriber), got %d", hits.Load())
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	var delivered []string
+	for _, d := range st.deliveries {
+		delivered = append(delivered, d.SubmissionID)
+	}
+	for _, id := range delivered {
+		if id == "sub-b" || id == "sub-c" {
+			t.Errorf("delivery state landed on a non-chosen duplicate row %q (want sub-a, the smallest id); all: %v", id, delivered)
+		}
+	}
+}
+
+func TestCollapseDuplicateRegistrations_PrefersRowWithDeliveryState(t *testing.T) {
+	subs := []*models.Submission{
+		{SubmissionID: "sub-a", CallbackURL: "u", CallbackToken: "t"},
+		{SubmissionID: "sub-b", CallbackURL: "u", CallbackToken: "t", LastDeliveredStatus: models.StatusSeenOnNetwork},
+		{SubmissionID: "sub-c", CallbackURL: "u", CallbackToken: "t"},
+	}
+	got := collapseDuplicateRegistrations(subs)
+	if len(got) != 1 || got[0].SubmissionID != "sub-b" {
+		t.Fatalf("want the row carrying delivery state, got %+v", got)
+	}
+	// Order of first appearance is preserved across distinct subscribers.
+	subs = []*models.Submission{
+		{SubmissionID: "1", CallbackURL: "u2", CallbackToken: "t"},
+		{SubmissionID: "2", CallbackURL: "u1", CallbackToken: "t"},
+	}
+	got = collapseDuplicateRegistrations(subs)
+	if len(got) != 2 || got[0].SubmissionID != "1" || got[1].SubmissionID != "2" {
+		t.Fatalf("distinct subscribers must all survive in order, got %+v", got)
+	}
+}

@@ -1124,7 +1124,10 @@ components:
         rejected unless the deployment is configured to allow them. The POST body
         is a TransactionStatus; MINED/IMMUTABLE callbacks include blockHash,
         blockHeight, and merklePath (the tx's BUMP), so the proof arrives on the
-        callback without a follow-up GET.
+        callback without a follow-up GET. Registration is idempotent per
+        (txid, X-CallbackUrl, X-CallbackToken): re-POSTing the same transaction
+        with the same headers updates the existing subscription rather than
+        adding another delivery.
 
         Every callback POST carries `User-Agent: arcade-webhook/<version>` —
         allowlist the `arcade-webhook/` prefix at your edge so bot/WAF rules

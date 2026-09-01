@@ -931,11 +931,28 @@ func (s *Store) BumpRetryCount(ctx context.Context, txid string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	// A terminal row has no retry budget left to spend: return its count
+	// unchanged (see the postgres backend for the incident this closes).
+	rec, gerr := s.client.Get(s.readPolicy(ctx), key, "status", "retry_count")
+	if gerr != nil && !isKeyNotFound(gerr) {
+		return 0, fmt.Errorf("read status for retry bump %s: %w", txid, gerr)
+	}
+	if rec == nil {
+		return 0, fmt.Errorf("bump retry count %s: %w", txid, store.ErrNotFound)
+	}
+	if models.Status(getString(rec, "status")).IsTerminal() {
+		if v, ok := rec.Bins["retry_count"]; ok {
+			if n, ok := v.(int); ok {
+				return n, nil
+			}
+		}
+		return 0, nil
+	}
 	// AddOp is non-idempotent — set MaxRetries=0 so a timed-out attempt is not
 	// retried and double-counted.
 	wp := s.writePolicy(ctx)
 	wp.MaxRetries = 0
-	rec, err := s.client.Operate(wp, key, aero.AddOp(aero.NewBin("retry_count", 1)), aero.GetOp())
+	rec, err = s.client.Operate(wp, key, aero.AddOp(aero.NewBin("retry_count", 1)), aero.GetOp())
 	if err != nil {
 		return 0, fmt.Errorf("bump retry count %s: %w", txid, err)
 	}
@@ -1052,6 +1069,19 @@ func (s *Store) ClearRetryState(ctx context.Context, txid string, finalStatus mo
 	key, err := s.key(setTransactions, txid)
 	if err != nil {
 		return err
+	}
+	// Lattice guard (mirrors SetPendingRetryFields): a row whose current
+	// status forbids finalStatus is left untouched. Silent skip matches the
+	// guarded status update's semantics.
+	rec, gerr := s.client.Get(s.readPolicy(ctx), key, "status")
+	if gerr != nil && !isKeyNotFound(gerr) {
+		return fmt.Errorf("read status for lattice check %s: %w", txid, gerr)
+	}
+	if rec == nil {
+		return nil
+	}
+	if !finalStatus.CanTransitionFrom(models.Status(getString(rec, "status"))) {
+		return nil
 	}
 	ops := []*aero.Operation{
 		aero.PutOp(aero.NewBin("status", string(finalStatus))),
@@ -1953,6 +1983,17 @@ func (s *Store) DeleteStumpsByBlockHash(ctx context.Context, blockHash string) e
 func (s *Store) InsertSubmission(ctx context.Context, sub *models.Submission) error {
 	key, err := s.key(setSubmissions, sub.SubmissionID)
 	if err != nil {
+		return err
+	}
+	// Idempotent re-registration (the id is derived from the subscription
+	// identity): an existing record keeps its delivery bins and created_at;
+	// only the caller's X-FullStatusUpdates intent is refreshed. A blind Put
+	// would drop last_delivered and re-deliver every status already sent.
+	if rec, gerr := s.client.Get(s.readPolicy(ctx), key, "submission_id"); gerr != nil && !isKeyNotFound(gerr) {
+		return fmt.Errorf("read submission %s: %w", sub.SubmissionID, gerr)
+	} else if rec != nil {
+		_, err := s.client.Operate(s.writePolicy(ctx), key,
+			aero.PutOp(aero.NewBin("full_updates", sub.FullStatusUpdates)))
 		return err
 	}
 	// Bin names must be <=15 chars (Aerospike limit) — a longer name
