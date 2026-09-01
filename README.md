@@ -348,7 +348,11 @@ When you provide `X-CallbackUrl`, Arcade will POST status updates:
 ```
 
 **Features:**
-- Automatic retries with linear backoff (1min, 2min, 3min, etc.)
+- Registration is idempotent per `(txid, X-CallbackUrl, X-CallbackToken)`:
+  re-POSTing the same transaction with the same headers updates the existing
+  subscription (its `X-FullStatusUpdates` intent) instead of adding another
+  delivery — a client retry loop cannot multiply callbacks
+- Automatic retries with exponential backoff (5 s doubling to a 5 min cap)
 - Configurable max retries via `webhook.max_retries`
 - Every POST carries `User-Agent: arcade-webhook/<version>` — allowlist the
   `arcade-webhook/` prefix at your edge so bot/WAF rules don't silently

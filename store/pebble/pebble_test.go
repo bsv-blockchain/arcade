@@ -1596,3 +1596,62 @@ func TestClearRetryState_RespectsStatusLattice(t *testing.T) {
 		t.Errorf("live exit: status=%s extra=%q, want REJECTED / giving up", got.Status, got.ExtraInfo)
 	}
 }
+
+// TestInsertSubmission_SameIDIsIdempotentAndKeepsDeliveryState: the api
+// derives the submission id from (txid, callback URL, callback token), so a
+// re-registration must update the existing row's FullStatusUpdates intent and
+// leave its delivery state alone — a blind overwrite would re-deliver every
+// status the subscriber already received.
+func TestInsertSubmission_SameIDIsIdempotentAndKeepsDeliveryState(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	first := &models.Submission{
+		SubmissionID:      "same-id",
+		TxID:              "tx-idem",
+		CallbackURL:       "https://example.test/cb",
+		CallbackToken:     "tok",
+		FullStatusUpdates: true,
+		CreatedAt:         time.Unix(1_700_000_000, 0),
+	}
+	if err := s.InsertSubmission(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateDeliveryStatus(ctx, "same-id", models.StatusSeenOnNetwork, 2, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// The re-registration: same id, full-status intent withdrawn.
+	again := &models.Submission{
+		SubmissionID:      "same-id",
+		TxID:              "tx-idem",
+		CallbackURL:       "https://example.test/cb",
+		CallbackToken:     "tok",
+		FullStatusUpdates: false,
+		CreatedAt:         time.Now(),
+	}
+	if err := s.InsertSubmission(ctx, again); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetSubmissionsByTxID(ctx, "tx-idem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("GetSubmissionsByTxID returned %d rows, want 1 (idempotent registration)", len(got))
+	}
+	sub := got[0]
+	if sub.FullStatusUpdates {
+		t.Errorf("FullStatusUpdates still true; the latest registration intent must win")
+	}
+	if sub.LastDeliveredStatus != models.StatusSeenOnNetwork {
+		t.Errorf("LastDeliveredStatus = %q, want SEEN_ON_NETWORK preserved", sub.LastDeliveredStatus)
+	}
+	if sub.RetryCount != 2 {
+		t.Errorf("RetryCount = %d, want 2 preserved", sub.RetryCount)
+	}
+	if !sub.CreatedAt.Equal(first.CreatedAt) {
+		t.Errorf("CreatedAt = %v, want the original %v", sub.CreatedAt, first.CreatedAt)
+	}
+}

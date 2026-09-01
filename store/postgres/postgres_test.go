@@ -1825,3 +1825,44 @@ func TestClearRetryState_RespectsStatusLattice(t *testing.T) {
 		})
 	}
 }
+
+// TestInsertSubmission_SameIDIsIdempotentAndKeepsDeliveryState is the
+// postgres half of the backend-parity guard; see the pebble test.
+func TestInsertSubmission_SameIDIsIdempotentAndKeepsDeliveryState(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	first := &models.Submission{
+		SubmissionID:      "same-id",
+		TxID:              "tx-idem",
+		CallbackURL:       "https://example.test/cb",
+		CallbackToken:     "tok",
+		FullStatusUpdates: true,
+		CreatedAt:         time.Unix(1_700_000_000, 0),
+	}
+	if err := s.InsertSubmission(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateDeliveryStatus(ctx, "same-id", models.StatusSeenOnNetwork, 2, nil); err != nil {
+		t.Fatal(err)
+	}
+	again := *first
+	again.FullStatusUpdates = false
+	again.CreatedAt = time.Now()
+	if err := s.InsertSubmission(ctx, &again); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetSubmissionsByTxID(ctx, "tx-idem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("GetSubmissionsByTxID returned %d rows, want 1 (idempotent registration)", len(got))
+	}
+	if got[0].FullStatusUpdates {
+		t.Errorf("FullStatusUpdates still true; the latest registration intent must win")
+	}
+	if got[0].LastDeliveredStatus != models.StatusSeenOnNetwork || got[0].RetryCount != 2 {
+		t.Errorf("delivery state not preserved: %+v", got[0])
+	}
+}

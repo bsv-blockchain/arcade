@@ -2502,3 +2502,81 @@ func TestSubmitCounters_SingleDedupResults(t *testing.T) {
 		t.Errorf("duplicate resubmit must not count as new (delta %v)", got)
 	}
 }
+
+// TestHandleSubmitTransaction_RepeatPostSameCallback_RegistersOnce pins the
+// idempotent registration id (bsv-blockchain/arcade#335): two POSTs of the
+// same txid with the same X-CallbackUrl/X-CallbackToken must queue the SAME
+// submission id, so the backends' idempotent InsertSubmission collapses them
+// onto one row — a client retry ladder re-presenting a tx must not multiply
+// its webhook deliveries. A different callback identity still gets its own id.
+func TestHandleSubmitTransaction_RepeatPostSameCallback_RegistersOnce(t *testing.T) {
+	rawTx := makeMinimalTx() // rejected at intake — the intake path records a submission too
+	ms := &mockStore{}
+	pub := &recordingCallbackPub{}
+	val := validator.NewValidator(nil)
+	broker := &kafka.RecordingBroker{}
+	gin.SetMode(gin.TestMode)
+	srv := &Server{
+		cfg:            &config.Config{CallbackToken: testCallbackToken, Callback: config.CallbackConfig{AllowPrivateIPs: true}},
+		logger:         zap.NewNop(),
+		producer:       kafka.NewProducer(broker),
+		store:          ms,
+		publisher:      pub,
+		validator:      val,
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
+	}
+	router := gin.New()
+	srv.registerRoutes(router)
+
+	post := func(url, token string) {
+		t.Helper()
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/tx", bytes.NewReader(rawTx))
+		req.Header.Set("Content-Type", "application/octet-stream")
+		req.Header.Set("X-CallbackUrl", url)
+		req.Header.Set("X-CallbackToken", token)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+	}
+	post("https://example.test/hook", "tok-1")
+	post("https://example.test/hook", "tok-1")
+	post("https://example.test/other", "tok-1")
+	drainSubmissions(t, srv)
+
+	ms.mu.Lock()
+	subs := append([]*models.Submission(nil), ms.insertedSubmissions...)
+	ms.mu.Unlock()
+	if len(subs) != 3 {
+		t.Fatalf("recorded %d submission(s), want 3 (one per POST reaches the recorder)", len(subs))
+	}
+	if subs[0].SubmissionID != subs[1].SubmissionID {
+		t.Errorf("same txid + same callback identity produced different ids %q / %q", subs[0].SubmissionID, subs[1].SubmissionID)
+	}
+	if subs[2].SubmissionID == subs[0].SubmissionID {
+		t.Errorf("a different callback URL must get its own id, got %q for both", subs[2].SubmissionID)
+	}
+	if len(subs[0].SubmissionID) != 32 {
+		t.Errorf("submission id width changed: %q", subs[0].SubmissionID)
+	}
+}
+
+func TestSubmissionIDFor_DeterministicAndIdentityBound(t *testing.T) {
+	a := submissionIDFor("tx", "https://example.test/cb", "tok")
+	if a != submissionIDFor("tx", "https://example.test/cb", "tok") {
+		t.Fatal("same inputs must give the same id")
+	}
+	for _, other := range [][3]string{
+		{"tx2", "https://example.test/cb", "tok"},
+		{"tx", "https://example.test/cb2", "tok"},
+		{"tx", "https://example.test/cb", "tok2"},
+		{"tx", "", "tok"},
+	} {
+		if submissionIDFor(other[0], other[1], other[2]) == a {
+			t.Errorf("inputs %v collided with the base id", other)
+		}
+	}
+	// The separator keeps (url, token) boundaries unambiguous.
+	if submissionIDFor("tx", "ab", "c") == submissionIDFor("tx", "a", "bc") {
+		t.Error("field boundaries must be delimited")
+	}
+}
