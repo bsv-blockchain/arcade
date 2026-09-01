@@ -233,6 +233,66 @@
     font-family: var(--font-mono);
   }
 
+  .service-reference {
+    margin: 0 0 40px;
+    padding: 24px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-elev);
+    box-shadow: var(--shadow);
+  }
+  .service-reference h2 {
+    margin: 0 0 8px;
+    font-size: 24px;
+    letter-spacing: -0.01em;
+  }
+  .service-reference h3 {
+    margin: 28px 0 10px;
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+    font-weight: 600;
+  }
+  .service-reference p {
+    margin: 0;
+    color: var(--text-muted);
+  }
+  .service-reference .meta-grid { margin: 20px 0; }
+  .service-reference .meta-card { background: var(--bg); }
+  .service-reference .note {
+    margin-top: 20px;
+    color: var(--text);
+  }
+
+  .table-wrap { overflow-x: auto; }
+  .endpoint-table {
+    width: 100%;
+    border-collapse: collapse;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    font-size: 13.5px;
+  }
+  .endpoint-table th, .endpoint-table td {
+    text-align: left;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  .endpoint-table thead th {
+    background: var(--bg-code);
+    color: var(--text-muted);
+    font-weight: 600;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .endpoint-table tbody tr:last-child td { border-bottom: 0; }
+  .endpoint-table .endpoint { white-space: nowrap; }
+  .endpoint-table .endpoint code { font-size: 12.5px; }
+  .endpoint-table .detail { color: var(--text-muted); }
+
   .routes { display: flex; flex-direction: column; gap: 14px; }
 
   .route {
@@ -506,7 +566,7 @@
       <p>Click any endpoint to expand its full request / response contract, headers, and examples. The defaults below cover the everyday submit-and-track flow.</p>
       <div class="meta-grid">
         <div class="meta-card">
-          <div class="label">Base URL</div>
+          <div class="label">API server base URL</div>
           <div class="value" id="base-url">—</div>
         </div>
         <div class="meta-card">
@@ -518,6 +578,80 @@
           <div class="value">2xx · 4xx · 5xx</div>
         </div>
       </div>
+    </section>
+
+    <section class="service-reference" id="chaintracks-api" aria-labelledby="chaintracks-heading">
+      <h2 id="chaintracks-heading">Chaintracks API</h2>
+      <p>Chaintracks is a separate Arcade listener for block-header tracking. Its default local base URL is <code>http://localhost:8083</code>; use the Chaintracks Service or Ingress URL configured by your deployment rather than the API server base URL above. New integrations should use <code>/chaintracks/v2</code>. The <code>/chaintracks/v1</code> surface remains for legacy RPC-compatible clients.</p>
+
+      <div class="meta-grid">
+        <div class="meta-card">
+          <div class="label">Default listener</div>
+          <div class="value">http://&lt;arcade-host&gt;:8083</div>
+        </div>
+        <div class="meta-card">
+          <div class="label">Availability check</div>
+          <div class="value">GET /health</div>
+        </div>
+        <div class="meta-card">
+          <div class="label">Current API</div>
+          <div class="value">/chaintracks/v2</div>
+        </div>
+      </div>
+
+      <pre><code>curl -fsS http://localhost:8083/health
+# {"status":"ok"}
+
+curl -fsS http://localhost:8083/chaintracks/v2/network
+curl -fsS http://localhost:8083/chaintracks/v2/height
+curl -fsS http://localhost:8083/chaintracks/v2/tip</code></pre>
+      <p class="note"><strong>Operational check:</strong> <code>/health</code> (and its <code>/ready</code> alias) confirms that the Chaintracks listener is live. A successful <code>/network</code> or <code>/height</code> request confirms that the Chaintracks API is serving data. <code>/tip</code> is a stronger chain-state check: it returns a header and <code>X-Block-Height</code> once a tip is available, or <code>404</code> before then.</p>
+
+      <h3>Current v2 endpoints</h3>
+      <p>All paths below are <code>GET</code> requests relative to the Chaintracks base URL.</p>
+      <div class="table-wrap">
+        <table class="endpoint-table">
+          <thead>
+            <tr><th>Path</th><th>Purpose</th></tr>
+          </thead>
+          <tbody>
+            <tr><td class="endpoint"><code>/chaintracks/v2/network</code></td><td class="detail">Configured network.</td></tr>
+            <tr><td class="endpoint"><code>/chaintracks/v2/height</code></td><td class="detail">Current best-chain height known to Chaintracks.</td></tr>
+            <tr><td class="endpoint"><code>/chaintracks/v2/tip</code></td><td class="detail">Current tip header as JSON.</td></tr>
+            <tr><td class="endpoint"><code>/chaintracks/v2/tip.bin</code></td><td class="detail">Current serialized 80-byte tip header.</td></tr>
+            <tr><td class="endpoint"><code>/chaintracks/v2/headers?height={height}&amp;count={count}</code></td><td class="detail">Consecutive serialized headers as raw bytes.</td></tr>
+            <tr><td class="endpoint"><code>/chaintracks/v2/headers.bin?height={height}&amp;count={count}</code></td><td class="detail">The same header run, with start-height and header-count response headers.</td></tr>
+            <tr><td class="endpoint"><code>/chaintracks/v2/header/height/{height}</code></td><td class="detail">Header at a height as JSON.</td></tr>
+            <tr><td class="endpoint"><code>/chaintracks/v2/header/height/{height}.bin</code></td><td class="detail">Serialized 80-byte header at a height.</td></tr>
+            <tr><td class="endpoint"><code>/chaintracks/v2/header/hash/{hash}</code></td><td class="detail">Header by block hash as JSON.</td></tr>
+            <tr><td class="endpoint"><code>/chaintracks/v2/header/hash/{hash}.bin</code></td><td class="detail">Serialized 80-byte header by block hash.</td></tr>
+            <tr><td class="endpoint"><code>/chaintracks/v2/tip/stream</code></td><td class="detail">Server-Sent Events stream of the current and future tip headers.</td></tr>
+            <tr><td class="endpoint"><code>/chaintracks/v2/reorg/stream</code></td><td class="detail">Server-Sent Events stream of reorganization events.</td></tr>
+            <tr><td class="endpoint"><code>/chaintracks/{file}</code></td><td class="detail">Range-enabled download of an individual stored header file.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Legacy v1 compatibility endpoints</h3>
+      <p>V1 legacy RPC requests return a <code>{"status":"success","value":...}</code> envelope (or an error envelope). The non-stream JSON and binary v2-style endpoints above are also available when only <code>v2</code> is replaced with <code>v1</code>; the two SSE endpoints are v2-only.</p>
+      <div class="table-wrap">
+        <table class="endpoint-table">
+          <thead>
+            <tr><th>Path</th><th>Purpose</th></tr>
+          </thead>
+          <tbody>
+            <tr><td class="endpoint"><code>/chaintracks/v1/getChain</code></td><td class="detail">Configured network.</td></tr>
+            <tr><td class="endpoint"><code>/chaintracks/v1/getPresentHeight</code></td><td class="detail">Current best-chain height.</td></tr>
+            <tr><td class="endpoint"><code>/chaintracks/v1/findChainTipHashHex</code></td><td class="detail">Current tip hash.</td></tr>
+            <tr><td class="endpoint"><code>/chaintracks/v1/findChainTipHeaderHex</code></td><td class="detail">Current tip header.</td></tr>
+            <tr><td class="endpoint"><code>/chaintracks/v1/findHeaderHexForHeight?height={height}</code></td><td class="detail">Header by height.</td></tr>
+            <tr><td class="endpoint"><code>/chaintracks/v1/findHeaderHexForBlockHash?hash={hash}</code></td><td class="detail">Header by block hash.</td></tr>
+            <tr><td class="endpoint"><code>/chaintracks/v1/getHeaders?height={height}&amp;count={count}</code></td><td class="detail">Consecutive headers in a hex-encoded response value.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p class="note"><strong>Need schemas and response details?</strong> The <a href="https://github.com/bsv-blockchain/arcade/blob/main/openapi/arcade.openapi.yaml">OpenAPI reference</a> covers the legacy v1 RPC endpoints and most v2 operations. This page also records the v1 direct-path compatibility aliases, <code>/headers.bin</code>, and stored-header-file download paths that are not represented there.</p>
     </section>
 
     <div class="routes">
