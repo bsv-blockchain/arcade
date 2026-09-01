@@ -578,7 +578,13 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 				WithLabelValues(string(prev.Status), string(st.Status)).
 				Observe(time.Since(prev.Timestamp).Seconds())
 		}
-		if prev.Status == st.Status {
+		// A lattice REFUSAL is a no-op too: the store hands back the row it
+		// declined to move (e.g. PENDING_RETRY over REJECTED), and publishing
+		// the requested status would announce a transition that never
+		// happened. That phantom PENDING_RETRY, followed by the give-up path's
+		// re-emitted REJECTED, was the status "flip" a resubmitted terminal tx
+		// broadcast to every registration on every POST.
+		if prev.Status == st.Status || !st.Status.CanTransitionFrom(prev.Status) {
 			continue
 		}
 		switch st.Status {
@@ -883,13 +889,36 @@ func (p *Propagator) persistCascade(ctx context.Context, cascaded []cascadeRejec
 		)
 		p.logger.Warn("transactions parked behind an ancestor with no network verdict", parkFields...)
 	}
-	if _, err := p.store.BatchUpdateStatusReturning(ctx, statuses); err != nil {
+	prevs, err := p.store.BatchUpdateStatusReturning(ctx, statuses)
+	if err != nil {
 		p.logger.Warn(
 			"cascade status write failed",
 			logfields.Status(string(status)),
 			zap.Int("count", len(cascaded)),
 			zap.Error(err),
 		)
+	}
+	// Publish and schedule only the rows the store actually moved. A cascade
+	// can re-visit a descendant that is already terminal (a resubmitted
+	// REJECTED chain, a MINED child of a late-rejected parent); the lattice
+	// declines those writes and hands back the unchanged row, and announcing
+	// the requested status for them would be the same phantom event
+	// applyTerminalStatuses filters. An unknown prev (per-row store fault)
+	// keeps the pre-existing behaviour: publish, so a subscriber is never
+	// starved of an outcome by a transient read error.
+	moved := make([]cascadeRejection, 0, len(cascaded))
+	movedStatuses := make([]*models.TransactionStatus, 0, len(statuses))
+	movedTxids := make([]string, 0, len(txids))
+	for i, cr := range cascaded {
+		if i < len(prevs) && prevs[i] != nil {
+			prev := prevs[i].Status
+			if prev == status || !status.CanTransitionFrom(prev) {
+				continue
+			}
+		}
+		moved = append(moved, cr)
+		movedStatuses = append(movedStatuses, statuses[i])
+		movedTxids = append(movedTxids, cr.txid)
 	}
 	// A cascade-parked descendant has to enter the durable retry queue too.
 	// It reaches PENDING_RETRY without ever being broadcast — its ancestor
@@ -898,7 +927,7 @@ func (p *Propagator) persistCascade(ctx context.Context, cascaded []cascadeRejec
 	// it with a NULL next_retry_at, which GetReadyRetries cannot see: the row
 	// would sit at PENDING_RETRY forever with nothing scheduled to retry it.
 	if status == models.StatusPendingRetry {
-		for _, cr := range cascaded {
+		for _, cr := range moved {
 			// The descendant was never broadcast, so nothing on the network
 			// ever spoke about it; its ancestor's park is the whole story.
 			p.schedulePendingRetry(ctx, cr.txid, cr.rawTx, cascadeReason(status, cr.ancestor))
@@ -908,10 +937,10 @@ func (p *Propagator) persistCascade(ctx context.Context, cascaded []cascadeRejec
 		// statuses (not txids): every cascaded child's reason names ITS OWN
 		// ancestor, so the publish has to group by reason rather than fan one
 		// payload-free event across the whole cascade — see publishRejections.
-		p.publishRejections(ctx, statuses, now)
+		p.publishRejections(ctx, movedStatuses, now)
 		return
 	}
-	p.publishBulkStatus(ctx, status, txids, now)
+	p.publishBulkStatus(ctx, status, movedTxids, now)
 }
 
 // publishBulkStatus fans a post-broadcast batch status update onto the
@@ -2365,6 +2394,21 @@ func giveUpReason(maxAttempts int, lastReason string) string {
 // got a confident explanation of something that never happened.
 func (p *Propagator) schedulePendingRetry(ctx context.Context, txid string, rawTx []byte, lastReason string) {
 	if p.store == nil || len(rawTx) == 0 {
+		return
+	}
+	// A terminal row never re-enters the durable retry queue. Without this
+	// guard a resubmit of a REJECTED txid (handleSubmitTransaction republishes
+	// REJECTED rows by contract) ran the fast-path budget, hit the lattice on
+	// the PENDING_RETRY write, and still landed here: BumpRetryCount had no
+	// status predicate, so retry_count climbed past the budget on every POST
+	// (observed: 1,483 on a tx whose extra_info already read "giving up"),
+	// ClearRetryState re-wrote the same REJECTED verdict, and a fresh REJECTED
+	// event fanned out to every webhook registration each time. The give-up
+	// has to be terminal in the scheduler too, not only in the lattice.
+	if row, err := p.store.GetStatus(ctx, txid); err == nil && row != nil && row.Status.IsTerminal() {
+		metrics.PropagationPendingRetryTotal.WithLabelValues("skipped_terminal").Inc()
+		p.logger.Debug("durable retry not scheduled: tx is already terminal",
+			logfields.TxID(txid), logfields.Status(string(row.Status)))
 		return
 	}
 	count, err := p.store.BumpRetryCount(ctx, txid)

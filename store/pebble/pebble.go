@@ -935,6 +935,11 @@ func (s *Store) BumpRetryCount(ctx context.Context, txid string) (int, error) {
 	if existing == nil {
 		return 0, fmt.Errorf("bump retry count %s: %w", txid, store.ErrNotFound)
 	}
+	// A terminal row has no retry budget left to spend: return its count
+	// unchanged (see the postgres backend for the incident this closes).
+	if models.Status(existing.Status).IsTerminal() {
+		return existing.RetryCount, nil
+	}
 	existing.RetryCount++
 	payload, err := json.Marshal(existing)
 	if err != nil {
@@ -1077,6 +1082,12 @@ func (s *Store) ClearRetryState(ctx context.Context, txid string, finalStatus mo
 		return err
 	}
 	if existing == nil {
+		return nil
+	}
+	// Lattice guard (mirrors SetPendingRetryFields): a row whose current
+	// status forbids finalStatus is left untouched. Silent skip matches the
+	// guarded status update's semantics.
+	if !finalStatus.CanTransitionFrom(models.Status(existing.Status)) {
 		return nil
 	}
 
@@ -1912,6 +1923,22 @@ func (s *Store) InsertSubmission(ctx context.Context, sub *models.Submission) er
 	}
 	if sub.LastDeliveredStatus != "" {
 		stored.LastDeliveredStatus = string(sub.LastDeliveredStatus)
+	}
+	// Idempotent re-registration (the id is derived from the subscription
+	// identity): an existing row keeps its delivery state and its original
+	// created_at; only the caller's X-FullStatusUpdates intent is refreshed.
+	// A blind overwrite would reset last_delivered_status and re-deliver
+	// every status the subscriber already received.
+	if existingRaw, closer, err := s.db.Get(subKey(sub.SubmissionID)); err == nil {
+		var existing storedSubmission
+		decodeErr := json.Unmarshal(existingRaw, &existing)
+		_ = closer.Close()
+		if decodeErr == nil {
+			existing.FullStatusUpdates = sub.FullStatusUpdates
+			stored = existing
+		}
+	} else if !errors.Is(err, pebbledb.ErrNotFound) {
+		return err
 	}
 	payload, err := json.Marshal(stored)
 	if err != nil {

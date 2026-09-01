@@ -1496,3 +1496,103 @@ func TestDatahubEndpoints_AdvertisedPolicy(t *testing.T) {
 		t.Error("an all-zero policy must survive as advertised, not read back as nil")
 	}
 }
+
+// TestBumpRetryCount_TerminalRowUntouched: a terminal row's retry_count is
+// its durable retry budget already spent — a bump returns the current count
+// and writes nothing (bsv-blockchain/arcade#335: 1,483 bumps on a REJECTED
+// "giving up" row, one per client re-POST).
+func TestBumpRetryCount_TerminalRowUntouched(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	for _, terminal := range []models.Status{
+		models.StatusRejected, models.StatusDoubleSpendAttempted,
+		models.StatusMined, models.StatusImmutable,
+	} {
+		t.Run(string(terminal), func(t *testing.T) {
+			txid := "terminal-bump-" + string(terminal)
+			if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+				TxID: txid, Status: models.StatusReceived,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if n, err := s.BumpRetryCount(ctx, txid); err != nil || n != 1 {
+				t.Fatalf("live row bump = (%d, %v), want (1, nil)", n, err)
+			}
+			if err := s.UpdateStatus(ctx, &models.TransactionStatus{TxID: txid, Status: terminal}); err != nil {
+				t.Fatalf("seed %s: %v", terminal, err)
+			}
+			for i := 0; i < 3; i++ {
+				n, err := s.BumpRetryCount(ctx, txid)
+				if err != nil {
+					t.Fatalf("BumpRetryCount on %s: %v", terminal, err)
+				}
+				if n != 1 {
+					t.Fatalf("retry_count = %d after a bump on a %s row, want 1 (untouched)", n, terminal)
+				}
+			}
+			got, err := s.GetStatus(ctx, txid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.RetryCount != 1 {
+				t.Errorf("stored retry_count = %d, want 1", got.RetryCount)
+			}
+		})
+	}
+}
+
+// TestClearRetryState_RespectsStatusLattice is the ClearRetryState twin of
+// TestSetPendingRetryFields_RespectsStatusLattice: a give-up may not drag a
+// row from a status that forbids the final status (a MINED row asked to
+// become REJECTED by a stale give-up stays MINED).
+func TestClearRetryState_RespectsStatusLattice(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	for _, prev := range models.StatusRejected.DisallowedPreviousStatuses() {
+		t.Run(string(prev), func(t *testing.T) {
+			txid := "clear-lattice-" + string(prev)
+			if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+				TxID: txid, Status: models.StatusReceived,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.UpdateStatus(ctx, &models.TransactionStatus{TxID: txid, Status: prev}); err != nil {
+				t.Fatalf("seed %s: %v", prev, err)
+			}
+			if err := s.ClearRetryState(ctx, txid, models.StatusRejected, "stale give-up"); err != nil {
+				t.Fatalf("ClearRetryState: %v", err)
+			}
+			got, err := s.GetStatus(ctx, txid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Status != prev {
+				t.Errorf("status = %s, want %s left untouched", got.Status, prev)
+			}
+			if got.ExtraInfo == "stale give-up" {
+				t.Errorf("extra_info was rewritten on a refused clear")
+			}
+		})
+	}
+
+	// …while the legitimate exit (PENDING_RETRY -> REJECTED) still lands.
+	txid := "clear-lattice-live"
+	if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{TxID: txid, Status: models.StatusReceived}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPendingRetryFields(ctx, txid, []byte{0xaa}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClearRetryState(ctx, txid, models.StatusRejected, "giving up"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetStatus(ctx, txid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != models.StatusRejected || got.ExtraInfo != "giving up" {
+		t.Errorf("live exit: status=%s extra=%q, want REJECTED / giving up", got.Status, got.ExtraInfo)
+	}
+}

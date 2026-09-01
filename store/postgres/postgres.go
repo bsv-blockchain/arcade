@@ -873,11 +873,26 @@ func (s *Store) GetTxIDsByBlockHash(ctx context.Context, blockHash string) ([]st
 
 // BumpRetryCount is a single-statement atomic increment — no client-side
 // mutex needed because Postgres handles the CAS.
+//
+// A terminal row (REJECTED, DOUBLE_SPEND_ATTEMPTED, MINED, IMMUTABLE) is left
+// untouched and its current count is returned: retry_count is the durable
+// retry budget, and a tx that has already reached its verdict has no budget
+// to spend. Without this predicate every resubmit of a given-up txid kept
+// incrementing the counter past the budget (1,483 on a "giving up" row).
 func (s *Store) BumpRetryCount(ctx context.Context, txid string) (int, error) {
-	const q = `UPDATE transactions SET retry_count = retry_count + 1
-	           WHERE txid = $1 RETURNING retry_count`
+	const bump = `UPDATE transactions SET retry_count = retry_count + 1
+	              WHERE txid = $1 AND status <> ALL($2) RETURNING retry_count`
 	var n int
-	err := s.pool.QueryRow(ctx, q, txid).Scan(&n)
+	err := s.pool.QueryRow(ctx, bump, txid, terminalStatusStrings()).Scan(&n)
+	if err == nil {
+		return n, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return 0, fmt.Errorf("bump retry count %s: %w", txid, err)
+	}
+	// Either the row is terminal (skipped) or it does not exist.
+	const current = `SELECT retry_count FROM transactions WHERE txid = $1`
+	err = s.pool.QueryRow(ctx, current, txid).Scan(&n)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, fmt.Errorf("bump retry count %s: %w", txid, store.ErrNotFound)
 	}
@@ -885,6 +900,19 @@ func (s *Store) BumpRetryCount(ctx context.Context, txid string) (int, error) {
 		return 0, fmt.Errorf("bump retry count %s: %w", txid, err)
 	}
 	return n, nil
+}
+
+// terminalStatusStrings is the status-lattice terminal set as the string
+// slice a `status <> ALL($n)` predicate binds.
+func terminalStatusStrings() []string {
+	out := make([]string, 0, 4)
+	for _, st := range []models.Status{
+		models.StatusRejected, models.StatusDoubleSpendAttempted,
+		models.StatusMined, models.StatusImmutable,
+	} {
+		out = append(out, string(st))
+	}
+	return out
 }
 
 // SetPendingRetryFields records the durable-retry bins for a parked tx.
@@ -956,13 +984,21 @@ FOR UPDATE SKIP LOCKED`
 	return out, tx.Commit(ctx)
 }
 
+// ClearRetryState is lattice-guarded like SetPendingRetryFields: a row whose
+// current status forbids finalStatus (a MINED row asked to become REJECTED by
+// a stale give-up) is left untouched. Silent skip matches the guarded status
+// update's semantics.
 func (s *Store) ClearRetryState(ctx context.Context, txid string, finalStatus models.Status, extraInfo string) error {
 	const q = `
 UPDATE transactions
 SET status=$2, raw_tx=NULL, next_retry_at=NULL, timestamp_at=NOW(),
     extra_info = COALESCE(NULLIF($3,''), extra_info)
-WHERE txid=$1`
-	_, err := s.pool.Exec(ctx, q, txid, string(finalStatus), extraInfo)
+WHERE txid=$1 AND (status = $2 OR status <> ALL($4))`
+	disallowed := disallowedPrevAsStrings(finalStatus)
+	if disallowed == nil {
+		disallowed = []string{}
+	}
+	_, err := s.pool.Exec(ctx, q, txid, string(finalStatus), extraInfo, disallowed)
 	if err != nil {
 		return fmt.Errorf("clear retry state %s: %w", txid, err)
 	}
@@ -1413,11 +1449,18 @@ func (s *Store) InsertSubmission(ctx context.Context, sub *models.Submission) er
 	if sub.CreatedAt.IsZero() {
 		sub.CreatedAt = time.Now()
 	}
+	// The id is derived from (txid, callback URL, callback token), so a repeat
+	// registration lands on the SAME row: the latest X-FullStatusUpdates
+	// intent wins and every delivery-state column (last_delivered_status,
+	// retry_count, attempts, ...) is left exactly as the webhook service has
+	// been maintaining it — a re-register must never re-arm deliveries that
+	// already happened.
 	const q = `
 INSERT INTO submissions (submission_id, txid, callback_url, callback_token,
     full_status_updates, retry_count, created_at)
 VALUES ($1,$2,$3,$4,$5,$6,$7)
-ON CONFLICT (submission_id) DO NOTHING`
+ON CONFLICT (submission_id) DO UPDATE
+    SET full_status_updates = EXCLUDED.full_status_updates`
 	_, err := s.pool.Exec(
 		ctx, q,
 		sub.SubmissionID, sub.TxID, sub.CallbackURL, sub.CallbackToken,

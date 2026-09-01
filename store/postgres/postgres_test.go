@@ -1758,3 +1758,70 @@ func TestDatahubEndpoints_AdvertisedPolicy(t *testing.T) {
 		t.Error("an all-zero policy must survive as advertised, not read back as nil")
 	}
 }
+
+// TestBumpRetryCount_TerminalRowUntouched is the postgres half of the
+// backend-parity guard; see the pebble test of the same name.
+func TestBumpRetryCount_TerminalRowUntouched(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	for _, terminal := range []models.Status{
+		models.StatusRejected, models.StatusDoubleSpendAttempted,
+		models.StatusMined, models.StatusImmutable,
+	} {
+		t.Run(string(terminal), func(t *testing.T) {
+			txid := "terminal-bump-" + string(terminal)
+			if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+				TxID: txid, Status: models.StatusReceived,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if n, err := s.BumpRetryCount(ctx, txid); err != nil || n != 1 {
+				t.Fatalf("live row bump = (%d, %v), want (1, nil)", n, err)
+			}
+			if err := s.UpdateStatus(ctx, &models.TransactionStatus{TxID: txid, Status: terminal}); err != nil {
+				t.Fatalf("seed %s: %v", terminal, err)
+			}
+			for i := 0; i < 3; i++ {
+				n, err := s.BumpRetryCount(ctx, txid)
+				if err != nil {
+					t.Fatalf("BumpRetryCount on %s: %v", terminal, err)
+				}
+				if n != 1 {
+					t.Fatalf("retry_count = %d after a bump on a %s row, want 1 (untouched)", n, terminal)
+				}
+			}
+		})
+	}
+}
+
+// TestClearRetryState_RespectsStatusLattice is the postgres half of the
+// backend-parity guard; see the pebble test of the same name.
+func TestClearRetryState_RespectsStatusLattice(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	for _, prev := range models.StatusRejected.DisallowedPreviousStatuses() {
+		t.Run(string(prev), func(t *testing.T) {
+			txid := "clear-lattice-" + string(prev)
+			if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+				TxID: txid, Status: models.StatusReceived,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.UpdateStatus(ctx, &models.TransactionStatus{TxID: txid, Status: prev}); err != nil {
+				t.Fatalf("seed %s: %v", prev, err)
+			}
+			if err := s.ClearRetryState(ctx, txid, models.StatusRejected, "stale give-up"); err != nil {
+				t.Fatalf("ClearRetryState: %v", err)
+			}
+			got, err := s.GetStatus(ctx, txid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Status != prev {
+				t.Errorf("status = %s, want %s left untouched", got.Status, prev)
+			}
+		})
+	}
+}
