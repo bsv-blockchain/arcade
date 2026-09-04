@@ -29,7 +29,11 @@ Source: Bitcoin SV node revision
 [`879fc8b`](https://github.com/bitcoin-sv/bitcoin-sv/tree/879fc8b42168dd0e608dafd51b39c6dabad37d4d),
 [`src/validation.cpp`](https://github.com/bitcoin-sv/bitcoin-sv/blob/879fc8b42168dd0e608dafd51b39c6dabad37d4d/src/validation.cpp)
 and [`src/txmempool.cpp`](https://github.com/bitcoin-sv/bitcoin-sv/blob/879fc8b42168dd0e608dafd51b39c6dabad37d4d/src/txmempool.cpp).
-Node source behavior is not evidence of a particular deployment's settings.
+The legacy node also has a [functional CPFP test](https://github.com/bitcoin-sv/bitcoin-sv/blob/879fc8b42168dd0e608dafd51b39c6dabad37d4d/test/functional/bsv-cpfp.py#L86-L132)
+that checks low-fee ancestors are absent from a mining candidate until a
+paying child arrives, then mines the group. This test was reviewed in source,
+not executed for this change. Node source behavior is not evidence of a
+particular deployment's settings.
 
 Teranode `v0.16.0-beta-9`, the version pinned by Arcade, instead enforces the
 mining fee during per-transaction policy validation, before admitting the
