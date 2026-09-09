@@ -345,6 +345,21 @@ require (
 	sigs.k8s.io/json v0.0.0-20260909141634-11ed52e25bc5 // indirect
 	sigs.k8s.io/randfill v1.0.0 // indirect
 	sigs.k8s.io/structured-merge-diff/v6 v6.4.2 // indirect
-	sigs.k8s.io/structured-merge-diff/v7 v7.0.0 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
+)
+
+// Pin transitive deps that Dependabot's weekly gomod job keeps bumping past what
+// our pinned direct deps support. Each newer version breaks the build:
+//   - k8s.io/kube-openapi: commits after this switch schemaconv to
+//     structured-merge-diff/v7, but k8s.io/apimachinery@v0.37.0 still uses v6
+//     (typecheck failure in managedfields/internal/typeconverter.go).
+//   - quic-go/webtransport-go: v0.12.0+ removed the Dialer type that
+//     github.com/libp2p/go-libp2p@v0.49.0 still references (undefined: webtransport.Dialer).
+//   - quic-go/quic-go: kept at v0.60.0 to match go-libp2p@v0.49.0 and webtransport-go@v0.11.1.
+// Revisit/remove when apimachinery and go-libp2p are upgraded to versions that
+// track these upstream. See https://github.com/bsv-blockchain/arcade dependabot config.
+replace (
+	github.com/quic-go/quic-go => github.com/quic-go/quic-go v0.60.0
+	github.com/quic-go/webtransport-go => github.com/quic-go/webtransport-go v0.11.1
+	k8s.io/kube-openapi => k8s.io/kube-openapi v0.0.0-20260721132016-d427ff9ee9ad
 )
