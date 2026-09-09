@@ -175,6 +175,12 @@
                     "linters": [
                         "nilnil"
                     ],
+                    "path": "store/mongodb/"
+                },
+                {
+                    "linters": [
+                        "nilnil"
+                    ],
                     "path": "services/api_server/handlers_test\\.go"
                 },
                 {

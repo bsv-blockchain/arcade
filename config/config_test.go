@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 )
 
 // baseValidConfig returns a Config populated with the minimum fields other
@@ -387,5 +388,54 @@ func TestSSEDrainKnobsBind(t *testing.T) {
 	}
 	if overridden.SSE.DrainQuiesceMS != 2500 {
 		t.Errorf("ARCADE_SSE_DRAIN_QUIESCE_MS override = %d, want 2500", overridden.SSE.DrainQuiesceMS)
+	}
+}
+
+// The mongodb backend needs both a connection URI and a database name; the
+// other fields have defaults. The default: error string enumerates every
+// accepted backend, so a typo'd name tells the operator what is valid.
+func TestValidate_MongoDBBackend(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.Store.Backend = "mongodb"
+	cfg.Store.Mongo.URI = "mongodb://localhost:27017"
+	cfg.Store.Mongo.Database = "arcade"
+	if err := validate(cfg); err != nil {
+		t.Fatalf("mongodb backend with uri+database should be accepted, got: %v", err)
+	}
+
+	cfg.Store.Mongo.URI = ""
+	err := validate(cfg)
+	if err == nil || !strings.Contains(err.Error(), "store.mongodb.uri") {
+		t.Fatalf("missing uri should be rejected naming store.mongodb.uri, got: %v", err)
+	}
+
+	cfg.Store.Mongo.URI = "mongodb://localhost:27017"
+	cfg.Store.Mongo.Database = ""
+	err = validate(cfg)
+	if err == nil || !strings.Contains(err.Error(), "store.mongodb.database") {
+		t.Fatalf("missing database should be rejected naming store.mongodb.database, got: %v", err)
+	}
+
+	cfg.Store.Backend = "mongo"
+	err = validate(cfg)
+	if err == nil || !strings.Contains(err.Error(), "mongodb") {
+		t.Fatalf("unknown backend error should list mongodb as an accepted value, got: %v", err)
+	}
+}
+
+// Every store.mongodb.* key must have a SetDefault so ARCADE_STORE_MONGODB_*
+// env overrides are honored by viper's AutomaticEnv (see setDefaults).
+func TestSetDefaults_MongoDBKeysBound(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	setDefaults()
+	for _, key := range []string{
+		"store.mongodb.uri", "store.mongodb.database", "store.mongodb.connect_timeout_ms",
+		"store.mongodb.op_timeout_ms", "store.mongodb.query_timeout_ms",
+		"store.mongodb.max_pool_size", "store.mongodb.batch_size",
+	} {
+		if !viper.IsSet(key) {
+			t.Errorf("%s has no default; ARCADE_%s would be ignored", key, strings.ToUpper(strings.ReplaceAll(key, ".", "_")))
+		}
 	}
 }

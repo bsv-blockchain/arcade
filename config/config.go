@@ -194,7 +194,7 @@ type Kafka struct {
 // storefactory.New; sub-blocks are read only when their backend is selected
 // so operators don't need to fill in unused sections.
 type Store struct {
-	Backend string `mapstructure:"backend"` // "aerospike" (default), "pebble", or "postgres"
+	Backend string `mapstructure:"backend"` // "aerospike" (default), "pebble", "postgres", or "mongodb"
 	// BatchConcurrency tunes the parallel-loop helpers (BatchGetOrInsertStatus,
 	// BatchUpdateStatus) used by backends without a native batch path
 	// (Aerospike, Pebble). Default 0 → runtime.NumCPU(). Raise to match
@@ -204,6 +204,7 @@ type Store struct {
 	Aerospike        Aero     `mapstructure:"aerospike"`
 	Pebble           Pebble   `mapstructure:"pebble"`
 	Postgres         Postgres `mapstructure:"postgres"`
+	Mongo            Mongo    `mapstructure:"mongodb"`
 }
 
 type Aero struct {
@@ -272,6 +273,26 @@ type Pebble struct {
 	MemTableSizeMB        int    `mapstructure:"memtable_size_mb"`
 	L0CompactionThreshold int    `mapstructure:"l0_compaction_threshold"`
 	SyncWrites            bool   `mapstructure:"sync_writes"`
+}
+
+// Mongo configures the MongoDB-backed store. URI is a standard connection
+// string (mongodb:// or mongodb+srv://) and may carry replica-set, auth and
+// TLS options; Database is the database arcade writes its collections and
+// GridFS buckets into. The backend never uses multi-document transactions, so
+// a standalone mongod is sufficient — a replica set is only needed for HA.
+//
+// OpTimeoutMs bounds single-document reads/writes and bounded list queries;
+// QueryTimeoutMs bounds aggregates. Unbounded iterators (IterateStatusesSince,
+// IterateTrackerRows, IterateStatusesByToken) run under the caller's context
+// only. BatchSize caps the documents per bulk write / $in chunk.
+type Mongo struct {
+	URI              string `mapstructure:"uri"`
+	Database         string `mapstructure:"database"`
+	ConnectTimeoutMs int    `mapstructure:"connect_timeout_ms"`
+	OpTimeoutMs      int    `mapstructure:"op_timeout_ms"`
+	QueryTimeoutMs   int    `mapstructure:"query_timeout_ms"`
+	MaxPoolSize      int    `mapstructure:"max_pool_size"`
+	BatchSize        int    `mapstructure:"batch_size"`
 }
 
 type TeranodeConfig struct {
@@ -1124,6 +1145,13 @@ func setDefaults() {
 	viper.SetDefault("store.postgres.embedded_cache_dir", "~/.arcade/postgres-cache")
 	viper.SetDefault("store.postgres.max_conns", 16)
 	viper.SetDefault("store.postgres.schema_apply_timeout_ms", 300000)
+	viper.SetDefault("store.mongodb.uri", "mongodb://localhost:27017")
+	viper.SetDefault("store.mongodb.database", "arcade")
+	viper.SetDefault("store.mongodb.connect_timeout_ms", 10000)
+	viper.SetDefault("store.mongodb.op_timeout_ms", 3000)
+	viper.SetDefault("store.mongodb.query_timeout_ms", 8000)
+	viper.SetDefault("store.mongodb.max_pool_size", 64)
+	viper.SetDefault("store.mongodb.batch_size", 500)
 	viper.SetDefault("health.port", 8081)
 
 	// OTEL telemetry export: off by default. See TelemetryConfig doc comment
@@ -1326,8 +1354,15 @@ func validate(cfg *Config) error {
 		if cfg.Store.Postgres.SchemaApplyTimeoutMs < 0 {
 			return fmt.Errorf("store.postgres.schema_apply_timeout_ms must be >= 0 (0 = default)")
 		}
+	case "mongodb":
+		if cfg.Store.Mongo.URI == "" {
+			return fmt.Errorf("store.mongodb.uri is required when store.backend=mongodb")
+		}
+		if cfg.Store.Mongo.Database == "" {
+			return fmt.Errorf("store.mongodb.database is required when store.backend=mongodb")
+		}
 	default:
-		return fmt.Errorf("unknown store.backend %q (expected aerospike, pebble, or postgres)", cfg.Store.Backend)
+		return fmt.Errorf("unknown store.backend %q (expected aerospike, pebble, postgres, or mongodb)", cfg.Store.Backend)
 	}
 	// merkle_service.url is intentionally optional: an empty value means the
 	// Merkle integration is disabled. The runtime treats URL-presence as the

@@ -224,6 +224,10 @@ curl http://localhost:8080/tx/<txid>
 - **Use embedded PostgreSQL instead of Pebble** — uncomment the alternative
   `store:` block in [`config.example.standalone.yaml`](../config.example.standalone.yaml).
   The first run extracts the postgres binary, which takes a few seconds.
+- **Use MongoDB** — set `store.backend: mongodb` and fill in the commented
+  `mongodb:` block from [`config.example.yaml`](../config.example.yaml). A
+  standalone `mongod` is enough: the backend uses no multi-document
+  transactions and keeps BUMP/STUMP payloads in GridFS.
 - **Production deployment** — start from
   [`config.example.yaml`](../config.example.yaml), which uses external Kafka
   brokers and an Aerospike cluster. Pre-create Kafka topics per
