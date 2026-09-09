@@ -17,7 +17,7 @@ For production deployments (Aerospike + external Kafka), see [`config.example.ya
 
 ## Prerequisites
 
-- Go 1.26 or newer (see [`go.mod`](../go.mod))
+- Go 1.27 or newer (see [`go.mod`](../go.mod))
 - Git
 - ~1 GB free disk for Pebble data and chaintracks headers
 
