@@ -53,6 +53,7 @@ Pluggable via `store.backend`:
 - `aerospike` (default for production) — batched ops everywhere
 - `postgres` — including a `Embedded=true` mode that bundles its own Postgres for single-binary deployments
 - `pebble` — embedded KV, single-process, used by the standalone profile
+- `mongodb` — document store; BUMP/STUMP blobs in GridFS, no multi-document transactions so a standalone `mongod` suffices
 
 ### Endpoint discovery
 
@@ -188,6 +189,7 @@ store/                  Store interface, batch helpers, lease, tx tracker
   aerospike/              Aerospike backend
   postgres/               Postgres backend, optional embedded
   pebble/                 Pebble embedded KV
+  mongodb/                MongoDB backend (GridFS for blobs)
   factory/                backend dispatch
 teranode/               datahub HTTP client + per-endpoint health
 merkleservice/          merkle-service HTTP client

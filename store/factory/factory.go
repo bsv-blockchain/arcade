@@ -11,6 +11,7 @@ import (
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/store/aerospike"
+	"github.com/bsv-blockchain/arcade/store/mongodb"
 	"github.com/bsv-blockchain/arcade/store/pebble"
 	"github.com/bsv-blockchain/arcade/store/postgres"
 )
@@ -40,6 +41,17 @@ func New(ctx context.Context, cfg *config.Config) (store.Store, store.Leaser, er
 		pgCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer cancel()
 		s, err := postgres.New(pgCtx, cfg.Store.Postgres)
+		if err != nil {
+			return nil, nil, err
+		}
+		return s, s, nil
+	case "mongodb":
+		// Server selection against an unreachable or misconfigured deployment
+		// is bounded by store.mongodb.connect_timeout_ms; the outer ceiling
+		// keeps a pathological DNS/TLS handshake from hanging the CLI.
+		mongoCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		defer cancel()
+		s, err := mongodb.New(mongoCtx, cfg.Store.Mongo)
 		if err != nil {
 			return nil, nil, err
 		}
