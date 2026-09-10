@@ -206,6 +206,7 @@ func TestSubmitTransactions_NonParseable4xx_NoFailureList(t *testing.T) {
 		{name: "429 rate limited", status: http.StatusTooManyRequests, body: "rate limit exceeded"},
 		{name: "409 without failure-list body", status: http.StatusConflict, body: "Conflict"},
 		{name: "503 no available server", status: http.StatusServiceUnavailable, body: "no available server\n"},
+		{name: "413 body limit", status: http.StatusRequestEntityTooLarge, body: `{"message":"Request Entity Too Large"}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

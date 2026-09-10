@@ -196,9 +196,11 @@ func buildSmokeConfig(t *testing.T, port int, opts smokeOptions) *config.Config 
 			RetryBackoffMs:    50,
 			ReaperIntervalMs:  60000, // effectively disabled for the test window
 			ReaperBatchSize:   100,
-			// Leave at default-ish so the test exercises chunking
-			// when total tx count > batch size.
-			TeranodeMaxBatchSize: 1024,
+			// Shipped defaults, set explicitly so the test exercises
+			// chunking when total tx count > batch size and can assert
+			// both caps (chained_txs_test.go assertChunkSize).
+			TeranodeMaxBatchSize:  config.DefaultTeranodeMaxBatchSize,
+			TeranodeMaxBatchBytes: config.DefaultTeranodeMaxBatchBytes,
 			EndpointHealth: config.EndpointHealthConfig{
 				FailureThreshold:    3,
 				ProbeIntervalMs:     30000,

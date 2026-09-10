@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+
+	"github.com/bsv-blockchain/arcade/config"
 )
 
 // TestSmoke_ChainedTxBatchOrdering is the load-bearing smoke test for
@@ -27,7 +29,8 @@ import (
 //  2. For every parent→child edge, the parent's batch was sent BEFORE
 //     the child's batch.
 //  3. Every tx broadcasts exactly once — no losses, no duplicates.
-//  4. No batch exceeds Propagation.TeranodeMaxBatchSize.
+//  4. No batch exceeds Propagation.TeranodeMaxBatchSize, and no multi-tx
+//     batch exceeds Propagation.TeranodeMaxBatchBytes.
 //  5. The whole pipeline completes within the test window.
 //
 // (1) is the production invariant teranode's /txs endpoint relies on —
@@ -53,14 +56,15 @@ func TestSmoke_ChainedTxBatchOrdering_MultiPartition(t *testing.T) {
 func runChainedTxBatchOrdering(t *testing.T, partitions int) {
 	t.Helper()
 	const (
-		totalTxs             = 10_000
-		minDepth             = 2
-		maxDepth             = 10
-		submissionBatchSize  = 100
-		concurrentSubmitters = 8
-		broadcastWaitTimeout = 60 * time.Second
-		teranodeMaxBatchSize = 1024 // matches buildSmokeConfig
-		pipelineWallBudget   = 60 * time.Second
+		totalTxs              = 10_000
+		minDepth              = 2
+		maxDepth              = 10
+		submissionBatchSize   = 100
+		concurrentSubmitters  = 8
+		broadcastWaitTimeout  = 60 * time.Second
+		teranodeMaxBatchSize  = config.DefaultTeranodeMaxBatchSize  // matches buildSmokeConfig
+		teranodeMaxBatchBytes = config.DefaultTeranodeMaxBatchBytes // matches buildSmokeConfig
+		pipelineWallBudget    = 60 * time.Second
 	)
 
 	recorder := newRecordingTeranode(t)
@@ -119,7 +123,7 @@ func runChainedTxBatchOrdering(t *testing.T, partitions int) {
 	assertParentChildNeverCohabits(t, batches, chains)
 	assertParentPrecedesChild(t, batches, chains)
 	assertEveryTxBroadcastExactlyOnce(t, batches, chains)
-	assertChunkSize(t, batches, teranodeMaxBatchSize)
+	assertChunkSize(t, batches, teranodeMaxBatchSize, teranodeMaxBatchBytes)
 
 	if elapsed > pipelineWallBudget {
 		t.Errorf("pipeline took %s for %d txs (budget %s) — likely a perf regression",
@@ -314,14 +318,19 @@ func assertEveryTxBroadcastExactlyOnce(t *testing.T, batches []BatchRecord, chai
 }
 
 // assertChunkSize sanity-checks the broadcastInChunks layer: every
-// outbound batch fits the configured TeranodeMaxBatchSize. A regression
-// here would indicate the chunker is no longer slicing.
-func assertChunkSize(t *testing.T, batches []BatchRecord, maxBatchSize int) {
+// outbound batch fits the configured TeranodeMaxBatchSize and, unless it is
+// a single oversize tx travelling alone, TeranodeMaxBatchBytes (issue #271).
+// A regression here would indicate the chunker is no longer slicing.
+func assertChunkSize(t *testing.T, batches []BatchRecord, maxBatchSize, maxBatchBytes int) {
 	t.Helper()
 	for _, b := range batches {
 		if len(b.TxIDs) > maxBatchSize {
 			t.Errorf("batch seq=%d has %d txs, exceeds TeranodeMaxBatchSize=%d",
 				b.Seq, len(b.TxIDs), maxBatchSize)
+		}
+		if b.Bytes > maxBatchBytes && len(b.TxIDs) > 1 {
+			t.Errorf("batch seq=%d has %d bytes across %d txs, exceeds TeranodeMaxBatchBytes=%d",
+				b.Seq, b.Bytes, len(b.TxIDs), maxBatchBytes)
 		}
 	}
 }

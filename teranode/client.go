@@ -39,6 +39,40 @@ const (
 
 var errUnexpectedStatusCode = errors.New("unexpected status code")
 
+// ErrBatchTooLarge marks a POST /txs the peer refused by SHAPE — too many
+// transactions, too many bytes, or a body-limit 413 — rather than by
+// verdict. No per-tx information accompanies it. Teranode's early exit fires
+// after every transaction it already read was dispatched (and possibly
+// accepted), and resubmission is idempotent, so the caller's correct move
+// is to narrow the chunk, never to requeue it blind or condemn any tx.
+// Always wrapped together with errUnexpectedStatusCode.
+var ErrBatchTooLarge = errors.New("batch too large")
+
+// txsBatchLimitBodies are the verbatim bare-text bodies Teranode's /txs
+// handler returns with HTTP 400 when a request trips one of its per-request
+// limits (services/propagation/Server.go handleMultipleTx:
+// maxTransactionsPerRequest, maxDataPerRequest, and the submission-slot
+// budget). Matched exactly, not by prefix: the same handler answers a bare
+// 400 "request context cancelled", which is not a shape rejection, and a
+// false positive costs up to 2n−1 narrowing round trips.
+var txsBatchLimitBodies = [...]string{
+	"Invalid request body: too many transactions",
+	"Invalid request body: too much data",
+	"Invalid request body: too many submissions",
+}
+
+// isTxsBatchLimitBody reports whether a 400 body is one of Teranode's
+// per-request limit early exits.
+func isTxsBatchLimitBody(body []byte) bool {
+	trimmed := strings.TrimSpace(string(body))
+	for _, known := range txsBatchLimitBodies {
+		if trimmed == known {
+			return true
+		}
+	}
+	return false
+}
+
 // healthState is the circuit-breaker state for a single endpoint.
 type healthState int
 
@@ -843,6 +877,12 @@ func (f *TxsFailures) Keyed() map[string]string {
 // UTXO_SPENT / PROCESSING failures visible only in propagation Warn logs
 // while the tx never terminalized — GET /tx stayed RECEIVED/requeued with no
 // reject reason).
+//
+// One opaque case is singled out: a 413, or a 400 whose bare body is one of
+// Teranode's per-request limit early exits (txsBatchLimitBodies), returns an
+// error that also satisfies errors.Is(err, ErrBatchTooLarge). The peer
+// refused the batch by shape, not by verdict — failures is nil, and the
+// caller should narrow the chunk rather than requeue it (issue #271).
 func (c *Client) SubmitTransactions(ctx context.Context, endpoint string, rawTxs [][]byte) (int, *TxsFailures, error) {
 	start := time.Now()
 	// Calculate total size for pre-allocation
@@ -886,6 +926,13 @@ func (c *Client) SubmitTransactions(ctx context.Context, endpoint string, rawTxs
 		return resp.StatusCode, nil, nil
 	}
 
+	if resp.StatusCode == http.StatusRequestEntityTooLarge {
+		// A body-limit refusal (Echo BodyLimit or a proxy) is a shape
+		// rejection whatever the body says — and it happened before the
+		// peer read a single transaction.
+		return resp.StatusCode, nil, fmt.Errorf("%w: %w %d: %s", ErrBatchTooLarge, errUnexpectedStatusCode, resp.StatusCode, string(respBody))
+	}
+
 	if readErr != nil {
 		// Truncated or aborted body (connection reset mid-transfer,
 		// unexpected EOF). A PARTIAL failure list must never be parsed:
@@ -900,6 +947,12 @@ func (c *Client) SubmitTransactions(ctx context.Context, endpoint string, rawTxs
 	// structured per-tx verdict. Status stays on the wire for metrics/logs.
 	if failures := parseTxsFailures(respBody, c.logger); failures != nil {
 		return resp.StatusCode, failures, fmt.Errorf("%w %d", errUnexpectedStatusCode, resp.StatusCode)
+	}
+
+	// Parse-first ordering above guarantees a failure-list body can never
+	// be mistaken for a shape rejection; only a bare limit body reaches here.
+	if resp.StatusCode == http.StatusBadRequest && isTxsBatchLimitBody(respBody) {
+		return resp.StatusCode, nil, fmt.Errorf("%w: %w %d: %s", ErrBatchTooLarge, errUnexpectedStatusCode, resp.StatusCode, string(respBody))
 	}
 
 	return resp.StatusCode, nil, fmt.Errorf("%w %d: %s", errUnexpectedStatusCode, resp.StatusCode, string(respBody))
