@@ -614,21 +614,37 @@ func (s *Store) setMinedChunk(ctx context.Context, blockHash string, blockHeight
 	return prevs, mined, nil
 }
 
-// settleMined resolves one MINED write whose CAS missed: the row is re-read
-// and either already carries the intended anchor (our bulk write or an
-// identical concurrent one landed), became ineligible, or moved — in which
-// case the write is recomputed against the fresh row and retried.
+// minedLanded reports whether the row carries exactly this call's write:
+// MINED on this block at this height with this call's timestamp. A row mined
+// on the same block by a concurrent call has a different timestamp and is
+// deliberately NOT treated as landed — it is re-applied so the persisted row
+// equals the `mined` snapshot this call returns, as the other backends do.
+func minedLanded(d txDoc, blockHash string, blockHeight uint64, now time.Time) bool {
+	return d.Status == string(models.StatusMined) && d.BlockHash == blockHash &&
+		heightFromInt64(d.BlockHeight) == blockHeight && d.Timestamp.Equal(now)
+}
+
+// settleMined resolves one MINED write whose CAS missed. The row is re-read:
+// if it already carries exactly this call's write (the bulk landed it and a
+// sibling op in the chunk raced), it is applied and the snapshot pre-image
+// stands; if it is gone or IMMUTABLE it is skipped; otherwise it moved under
+// us — a concurrent status update, or a same-block MINED write with another
+// timestamp — and the write is recomputed against the fresh row so the
+// returned prev/mined pair matches what is persisted.
 func (s *Store) settleMined(ctx context.Context, txid, blockHash string, blockHeight uint64, now time.Time, prevByTx map[string]*models.TransactionStatus) (bool, error) {
 	for attempt := 0; attempt < maxCASAttempts; attempt++ {
 		d, found, err := s.snapshotOne(ctx, txid)
 		if err != nil {
 			return false, err
 		}
-		if !found || d.Status == string(models.StatusImmutable) {
+		if !found {
 			return false, nil
 		}
-		if d.Status == string(models.StatusMined) && d.BlockHash == blockHash {
+		if minedLanded(d, blockHash, blockHeight, now) {
 			return true, nil
+		}
+		if d.Status == string(models.StatusImmutable) {
+			return false, nil
 		}
 		prevByTx[txid] = prevFromSnapshot(d)
 		op := minedOp(d, blockHash, blockHeight, now)
@@ -700,22 +716,31 @@ func (s *Store) SetStatusByBlockHash(ctx context.Context, blockHash string, newS
 	return txids, nil
 }
 
+// settleBlockRewrite is settleMined's counterpart for SetStatusByBlockHash.
+// The landed check runs before the IMMUTABLE guard because a landed
+// IMMUTABLE promotion of our own must count as applied; only a row that is
+// IMMUTABLE for another reason, or no longer anchored to this block, is
+// skipped. A same-status rewrite by a concurrent call carries a different
+// timestamp and is re-applied.
 func (s *Store) settleBlockRewrite(ctx context.Context, txid, blockHash string, newStatus models.Status, clearBlock bool, now time.Time) (bool, error) {
 	for attempt := 0; attempt < maxCASAttempts; attempt++ {
 		d, found, err := s.snapshotOne(ctx, txid)
 		if err != nil {
 			return false, err
 		}
-		if !found || d.Status == string(models.StatusImmutable) {
+		if !found {
 			return false, nil
 		}
-		landed := d.Status == string(newStatus) && ((clearBlock && d.BlockHash == "") || (!clearBlock && d.BlockHash == blockHash))
+		anchored := d.BlockHash == blockHash
+		landed := d.Status == string(newStatus) && d.Timestamp.Equal(now) &&
+			((clearBlock && d.BlockHash == "") || (!clearBlock && anchored))
 		if landed {
 			return true, nil
 		}
-		if d.BlockHash != blockHash {
-			// Concurrently re-anchored to another block: reverting it now
-			// would undo the canonical anchor. Stale-index guard.
+		if d.Status == string(models.StatusImmutable) || !anchored {
+			// IMMUTABLE rows are never touched, and a row concurrently
+			// re-anchored (or already reverted) elsewhere must not be
+			// rewritten from a stale index read.
 			return false, nil
 		}
 		op := blockRewriteOp(d, blockHash, newStatus, clearBlock, now)
