@@ -389,3 +389,39 @@ func TestSSEDrainKnobsBind(t *testing.T) {
 		t.Errorf("ARCADE_SSE_DRAIN_QUIESCE_MS override = %d, want 2500", overridden.SSE.DrainQuiesceMS)
 	}
 }
+
+// TestPropagationBatchCapsBind pins the shipped /txs chunk caps (issue #271)
+// and proves both keys have a SetDefault, without which the ARCADE_* env
+// override is silently ignored by viper.AutomaticEnv.
+func TestPropagationBatchCapsBind(t *testing.T) {
+	if DefaultTeranodeMaxBatchSize != 1000 {
+		t.Errorf("DefaultTeranodeMaxBatchSize = %d, want 1000 (Teranode rejects a chunk of >= 1024 txs)", DefaultTeranodeMaxBatchSize)
+	}
+	if DefaultTeranodeMaxBatchBytes != 16*1024*1024 {
+		t.Errorf("DefaultTeranodeMaxBatchBytes = %d, want 16 MiB (half of Teranode's 32 MiB maxDataPerRequest)", DefaultTeranodeMaxBatchBytes)
+	}
+
+	cfg, err := Load(&cobra.Command{})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Propagation.TeranodeMaxBatchSize != DefaultTeranodeMaxBatchSize {
+		t.Errorf("propagation.teranode_max_batch_size = %d, want %d", cfg.Propagation.TeranodeMaxBatchSize, DefaultTeranodeMaxBatchSize)
+	}
+	if cfg.Propagation.TeranodeMaxBatchBytes != DefaultTeranodeMaxBatchBytes {
+		t.Errorf("propagation.teranode_max_batch_bytes = %d, want %d", cfg.Propagation.TeranodeMaxBatchBytes, DefaultTeranodeMaxBatchBytes)
+	}
+
+	t.Setenv("ARCADE_PROPAGATION_TERANODE_MAX_BATCH_SIZE", "250")
+	t.Setenv("ARCADE_PROPAGATION_TERANODE_MAX_BATCH_BYTES", "4194304")
+	overridden, err := Load(&cobra.Command{})
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if overridden.Propagation.TeranodeMaxBatchSize != 250 {
+		t.Errorf("ARCADE_PROPAGATION_TERANODE_MAX_BATCH_SIZE override = %d, want 250", overridden.Propagation.TeranodeMaxBatchSize)
+	}
+	if overridden.Propagation.TeranodeMaxBatchBytes != 4194304 {
+		t.Errorf("ARCADE_PROPAGATION_TERANODE_MAX_BATCH_BYTES override = %d, want 4194304", overridden.Propagation.TeranodeMaxBatchBytes)
+	}
+}

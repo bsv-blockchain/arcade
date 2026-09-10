@@ -37,10 +37,25 @@ Narrowing is what makes an unplaceable verdict land. Cost is bounded at ~2·log2
 and only on the failure path; a response whose every line names its transaction settles in one
 round trip.
 
+Narrowing also serves **batch-shape rejections** (issue #271). Teranode's `/txs` handler caps a
+request at `maxTransactionsPerRequest = 1024` and `maxDataPerRequest = 32 MiB`, both checked with
+`>=` *before* each read — so a body holding exactly 1024 transactions, or reaching 32 MiB, trips
+the limit — and answers a bare `400` (`Invalid request body: too many transactions` / `too much
+data` / `too many submissions`); an Echo or proxy body limit answers `413`. Neither carries a per-tx
+line, and Teranode discards the per-tx list it had already built, although every transaction it
+read before the trip was dispatched and may have been accepted. `teranode.Client.SubmitTransactions`
+tags these `ErrBatchTooLarge`; arcade treats the peer as having voted for nobody, narrows the chunk
+(re-submission of an already-accepted transaction is idempotent), and requeues a chunk of one
+carrying the peer's text as its reason. Peer health is untouched: the peer is reachable and judged
+nothing. The proactive half is `Propagation.TeranodeMaxBatchBytes` (see Broadcast modes).
+
 ## Broadcast modes
 
-There is one network path: `POST /txs`, chunked by `Propagation.TeranodeMaxBatchSize` (default
-1024). "Single mode" is that setting at 1 — a chunk of one is just one transaction's bytes.
+There is one network path: `POST /txs`, chunked by both `Propagation.TeranodeMaxBatchSize` (default
+1000 transactions) and `Propagation.TeranodeMaxBatchBytes` (default 16 MiB of raw transaction bytes,
+which is exactly the body's Content-Length); a lone transaction larger than the byte cap still
+travels, alone. "Single mode" is the count cap at 1 — a chunk of one is just one transaction's
+bytes.
 `teranode.Client.SubmitTransaction` (`POST /tx`) exists but no caller uses it.
 
 Both modes now reach the same verdict for every row below. They did not before: single mode
@@ -145,7 +160,8 @@ than `PROCESSING` is a verdict regardless of the status, wrapper or not.
 
 | Situation | Behaviour |
 |---|---|
-| 502/503, bare 500, no failure-list body, truncated body | no per-tx vote → requeue |
+| 502/503, bare 500, bare 400 with any other body, no failure-list body, truncated body | no per-tx vote → requeue |
+| 413, or bare 400 `Invalid request body: too many transactions` / `too much data` / `too many submissions` | batch-shape rejection, not a verdict: no per-tx vote, no implicit accepts; chunk narrowed until each piece fits; a chunk of one requeues carrying the peer text as its reason; never REJECTED here; peer health untouched |
 | some lines placed, others not | placed verdicts kept; no implicit accepts; chunk narrowed |
 | every line placed | absent ⇒ accepted, including transactions an attributed line did not name |
 | opaque `PROCESSING` alone in the body | classified by the peer's status (422 / 403 / 5xx) |

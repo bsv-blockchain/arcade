@@ -455,11 +455,40 @@ type PropagationConfig struct {
 	// doesn't trigger a false-positive failover. Defaults to 3× interval.
 	LeaseTTLMs int `mapstructure:"lease_ttl_ms"`
 	// TeranodeMaxBatchSize caps the number of transactions per POST /txs call.
-	// Teranode rejects oversized batches with "too many transactions" (400),
-	// which previously cascaded into a 1k+ per-tx fallback storm. Splitting
-	// into chunks keeps the batch endpoint in play even under Kafka backlog.
-	TeranodeMaxBatchSize int                  `mapstructure:"teranode_max_batch_size"`
-	EndpointHealth       EndpointHealthConfig `mapstructure:"endpoint_health"`
+	// Teranode's propagation server allows at most maxTransactionsPerRequest
+	// (1024) per request, and since v0.15.0 checks the count with ">=" BEFORE
+	// reading each transaction — so a body holding exactly 1024 is refused
+	// with a bare 400 "Invalid request body: too many transactions" after
+	// every one of them was already read and dispatched. The effective rule
+	// is therefore FEWER than 1024. Splitting into chunks keeps the batch
+	// endpoint in play even under Kafka backlog (an oversize batch used to
+	// cascade into a 1k+ per-tx fallback storm); a chunk the peer still
+	// refuses is narrowed by halving rather than requeued blind.
+	//
+	// The cap is inclusive on arcade's side; the safety margin lives in the
+	// default (DefaultTeranodeMaxBatchSize = 1000), not in the comparison.
+	// Non-positive falls back to the default.
+	TeranodeMaxBatchSize int `mapstructure:"teranode_max_batch_size"`
+	// TeranodeMaxBatchBytes caps the sum of raw transaction bytes per POST
+	// /txs call. The body is the plain concatenation of each tx's bytes, so
+	// this is exactly the request Content-Length. Teranode reads at most
+	// maxDataPerRequest (32 MiB) per request, checked with ">=" before each
+	// read like the count above, so the effective rule is strictly UNDER
+	// 32 MiB; exceeding it draws a bare 400 "Invalid request body: too much
+	// data" after the peer already processed everything it read (a proxy or
+	// Echo body limit answers 413 instead). Neither response carries a
+	// per-tx verdict.
+	//
+	// A single transaction larger than this cap is still sent, alone in its
+	// own chunk — the cap decides where chunks end, never whether a tx is
+	// broadcast; Teranode stays the oracle for per-tx size policy. Resident
+	// request memory per pod is bounded by roughly this value ×
+	// len(endpoints) × max_parallel_chunks × max_concurrent_batches.
+	// Inclusive on arcade's side; the margin is in the default
+	// (DefaultTeranodeMaxBatchBytes = 16 MiB). Non-positive falls back to
+	// the default.
+	TeranodeMaxBatchBytes int                  `mapstructure:"teranode_max_batch_bytes"`
+	EndpointHealth        EndpointHealthConfig `mapstructure:"endpoint_health"`
 	// RegisterReplayOnStart re-registers every non-terminal tx in the store
 	// with merkle-service /watch at startup. This compensates for the lack
 	// of durability of /watch entries on the merkle-service side: when
@@ -1006,6 +1035,24 @@ type ValidatorConfig struct {
 // a lower value to accept older or non-standard txs.
 const DefaultValidatorMinFeePerKB = 100
 
+// Default /txs chunk caps for the propagation service (issue #271). Both sit
+// under Teranode's hard per-request limits (services/propagation/Server.go:
+// maxTransactionsPerRequest = 1024, maxDataPerRequest = 32 MiB), which the
+// peer checks with ">=" before each read — so the effective upstream rules
+// are strictly below those values. The propagator reads these same constants
+// for its non-positive fallback, so the code and the shipped config can never
+// disagree about what "unset" means.
+const (
+	// DefaultTeranodeMaxBatchSize is the fallback for
+	// propagation.teranode_max_batch_size: 1000 txs per POST /txs.
+	DefaultTeranodeMaxBatchSize = 1000
+	// DefaultTeranodeMaxBatchBytes is the fallback for
+	// propagation.teranode_max_batch_bytes: 16 MiB of raw tx bytes per POST
+	// /txs, half of Teranode's 32 MiB ceiling and equal to the Kafka
+	// producer message cap, so anything the pipeline can carry fits.
+	DefaultTeranodeMaxBatchBytes = 16 * 1024 * 1024
+)
+
 // Default policy values for the GET /policy endpoint. They mirror teranode's
 // canonical BSV policy defaults (validator.defaultPolicySettings) so arcade
 // advertises the same limits the upstream node enforces when the operator
@@ -1157,7 +1204,8 @@ func setDefaults() {
 	// 0 keeps New()'s 3×reaper_interval default, so changing reaper_interval
 	// automatically moves the lease TTL unless the operator opts into a fixed value.
 	viper.SetDefault("propagation.lease_ttl_ms", 0)
-	viper.SetDefault("propagation.teranode_max_batch_size", 1024)
+	viper.SetDefault("propagation.teranode_max_batch_size", DefaultTeranodeMaxBatchSize)
+	viper.SetDefault("propagation.teranode_max_batch_bytes", DefaultTeranodeMaxBatchBytes)
 	viper.SetDefault("propagation.max_concurrent_batches", 4)
 	viper.SetDefault("propagation.broadcast_workers", 256)
 	viper.SetDefault("propagation.max_parallel_chunks", 4)
