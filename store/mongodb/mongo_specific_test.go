@@ -270,16 +270,21 @@ func TestGetStumpsByBlockHash_CancelledContext(t *testing.T) {
 
 // The bulk CAS path reports only an aggregate match count, so a concurrent
 // write between snapshot and bulk must be settled per document: recomputed
-// against the fresh row, with prev reflecting what the row had become.
+// against the fresh row, with prev reflecting what the row had become and
+// the persisted row carrying this call's write — including a row a
+// concurrent replica already mined on the same block with another timestamp.
 func TestSetMinedByTxIDs_VersionRaceFallback(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	now := msNow()
+	earlier := now.Add(-time.Minute)
 	seedStatus(t, s, "raced", models.StatusSeenOnNetwork, now)
 	seedStatus(t, s, "frozen", models.StatusSeenOnNetwork, now)
+	seedStatus(t, s, "twice", models.StatusSeenOnNetwork, now)
+	txids := []string{"raced", "frozen", "twice"}
 
-	stale, err := s.snapshot(ctx, doc(kv(fID, doc(kv(opIn, []string{"raced", "frozen"})))))
-	if err != nil || len(stale) != 2 {
+	stale, err := s.snapshot(ctx, doc(kv(fID, doc(kv(opIn, txids)))))
+	if err != nil || len(stale) != 3 {
 		t.Fatalf("snapshot: %v (%d docs)", err, len(stale))
 	}
 	// Concurrent writers land between snapshot and bulk write.
@@ -289,9 +294,15 @@ func TestSetMinedByTxIDs_VersionRaceFallback(t *testing.T) {
 	if _, err := s.tx.UpdateOne(ctx, idFilter("frozen"), doc(kv(opSet, doc(kv(fStatus, string(models.StatusImmutable)))), incVersion())); err != nil {
 		t.Fatal(err)
 	}
+	// Another replica mined "twice" on the same block a minute ago.
+	if _, err := s.tx.UpdateOne(ctx, idFilter("twice"), doc(kv(opSet, doc(
+		kv(fStatus, string(models.StatusMined)), kv(fBlockHash, "blk"), kv(fBlockHeight, int64(42)), kv(fTimestamp, earlier),
+	)), incVersion())); err != nil {
+		t.Fatal(err)
+	}
 
 	prevByTx := map[string]*models.TransactionStatus{}
-	ops := make([]casOp, 0, 2)
+	ops := make([]casOp, 0, len(stale))
 	for _, d := range stale {
 		ops = append(ops, minedOp(d, "blk", 42, now))
 		prevByTx[d.TxID] = prevFromSnapshot(d)
@@ -302,19 +313,73 @@ func TestSetMinedByTxIDs_VersionRaceFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !applied["raced"] || applied["frozen"] {
-		t.Fatalf("expected raced applied and frozen skipped, got %v", applied)
+	if !applied["raced"] || applied["frozen"] || !applied["twice"] {
+		t.Fatalf("expected raced+twice applied and frozen skipped, got %v", applied)
 	}
 	if prevByTx["raced"].Status != models.StatusSeenMultipleNodes {
 		t.Fatalf("prev must reflect the concurrent write, got %s", prevByTx["raced"].Status)
 	}
 	got, _ := s.GetStatus(ctx, "raced")
-	if got.Status != models.StatusMined || got.BlockHash != "blk" || got.BlockHeight != 42 {
-		t.Fatalf("raced row not mined: %+v", got)
+	if got.Status != models.StatusMined || got.BlockHash != "blk" || got.BlockHeight != 42 || !got.Timestamp.Equal(now) {
+		t.Fatalf("raced row not mined with this call's timestamp: %+v", got)
 	}
 	got, _ = s.GetStatus(ctx, "frozen")
 	if got.Status != models.StatusImmutable {
 		t.Fatalf("IMMUTABLE row must be untouched: %+v", got)
+	}
+	// The same-block replay was re-applied: persisted row == returned
+	// snapshot, prev is the replica's MINED row, and no anchor history was
+	// invented for a same-block re-mine.
+	got, _ = s.GetStatus(ctx, "twice")
+	if got.Status != models.StatusMined || got.BlockHash != "blk" || !got.Timestamp.Equal(now) || len(got.OrphanedProofs) != 0 {
+		t.Fatalf("same-block replay must carry this call's timestamp and no history: %+v", got)
+	}
+	if p := prevByTx["twice"]; p.Status != models.StatusMined || !p.Timestamp.Equal(earlier) {
+		t.Fatalf("prev for the replay must be the replica's MINED row, got %+v", p)
+	}
+}
+
+// A landed IMMUTABLE promotion of our own must count as applied when a
+// sibling op forces the per-document settle path: the landed check has to
+// run before the IMMUTABLE guard, or SetStatusByBlockHash under-reports the
+// affected set.
+func TestSetStatusByBlockHash_ImmutableRaceSettles(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := msNow()
+	for _, txid := range []string{"fresh", "stale"} {
+		if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+			TxID: txid, Status: models.StatusMined, BlockHash: "blk", BlockHeight: 42, Timestamp: now.Add(-time.Minute),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	docs, err := s.snapshot(ctx, doc(kv(fBlockHash, "blk")))
+	if err != nil || len(docs) != 2 {
+		t.Fatalf("snapshot: %v (%d docs)", err, len(docs))
+	}
+	// A concurrent UpdateStatus moves "stale" (still anchored to blk).
+	if err := s.UpdateStatus(ctx, &models.TransactionStatus{TxID: "stale", Status: models.StatusMined, ExtraInfo: "touched"}); err != nil {
+		t.Fatal(err)
+	}
+	ops := make([]casOp, 0, 2)
+	for _, d := range docs {
+		ops = append(ops, blockRewriteOp(d, "blk", models.StatusImmutable, false, now))
+	}
+	applied, err := s.applyCAS(ctx, ops, func(ctx context.Context, op casOp) (bool, error) {
+		return s.settleBlockRewrite(ctx, op.txid, "blk", models.StatusImmutable, false, now)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !applied["fresh"] || !applied["stale"] {
+		t.Fatalf("both rows must be reported applied, got %v", applied)
+	}
+	for _, txid := range []string{"fresh", "stale"} {
+		got, _ := s.GetStatus(ctx, txid)
+		if got.Status != models.StatusImmutable || got.BlockHash != "blk" || !got.Timestamp.Equal(now) {
+			t.Fatalf("%s: expected IMMUTABLE on blk at %v, got %+v", txid, now, got)
+		}
 	}
 }
 
