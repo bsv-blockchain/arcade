@@ -215,7 +215,7 @@ func TestNewSaramaConsumerConfig_StartOffset(t *testing.T) {
 // must be >= 0.11 for idempotent produce; WaitForAll is required by
 // idempotence (and was already the sync default here).
 func TestNewSyncProducerConfig_OrderingInvariants(t *testing.T) {
-	cfg := newSyncProducerConfig()
+	cfg := newSyncProducerConfig(0)
 	if !cfg.Producer.Idempotent {
 		t.Error("sync producer must be idempotent — retries may otherwise reorder a family's messages within a partition")
 	}
@@ -230,5 +230,24 @@ func TestNewSyncProducerConfig_OrderingInvariants(t *testing.T) {
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("sarama config invalid: %v", err)
+	}
+}
+
+// TestSyncProducerConfig_MaxMessageBytes pins the producer-side message cap:
+// unset falls back to DefaultProducerMaxMessageBytes (which must exceed a
+// base64-encoded policy-max transaction), and an explicit value passes
+// through unchanged.
+func TestSyncProducerConfig_MaxMessageBytes(t *testing.T) {
+	t.Parallel()
+
+	if got := newSyncProducerConfig(0).Producer.MaxMessageBytes; got != DefaultProducerMaxMessageBytes {
+		t.Fatalf("default MaxMessageBytes = %d, want %d", got, DefaultProducerMaxMessageBytes)
+	}
+	// 10 MiB tx-size policy, base64-encoded inside the JSON envelope.
+	if minNeeded := 10485760 * 4 / 3; DefaultProducerMaxMessageBytes <= minNeeded {
+		t.Fatalf("DefaultProducerMaxMessageBytes %d does not clear a base64-encoded 10 MiB tx (%d)", DefaultProducerMaxMessageBytes, minNeeded)
+	}
+	if got := newSyncProducerConfig(4 << 20).Producer.MaxMessageBytes; got != 4<<20 {
+		t.Fatalf("explicit MaxMessageBytes = %d, want %d", got, 4<<20)
 	}
 }

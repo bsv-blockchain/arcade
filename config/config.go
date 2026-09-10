@@ -188,6 +188,14 @@ type Kafka struct {
 	// producer-side timeouts. Default 2000ms — long enough to absorb brief
 	// flush gaps, short enough that HTTP handlers don't hang.
 	SendTimeoutMs int `mapstructure:"send_timeout_ms"`
+	// MaxMessageBytes caps the size of one produced Kafka message, in bytes,
+	// for the sarama backend (Producer.MaxMessageBytes). 0 selects the kafka
+	// package default (16 MiB), sized so a policy-max 10 MiB transaction still
+	// fits after base64 JSON encoding on TopicPropagation. The broker and the
+	// arcade.* topics must accept at least the same size (message.max.bytes /
+	// Redpanda kafka_batch_max_bytes, topic max.message.bytes); see
+	// docs/production-kafka.md.
+	MaxMessageBytes int `mapstructure:"max_message_bytes"`
 }
 
 // Store picks the persistence backend. Backend dispatches construction in

@@ -46,6 +46,13 @@ spec:
               value: "PLAINTEXT"
             - name: KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE
               value: "true"
+            # Message size: keep in step with kafka.max_message_bytes (16 MiB
+            # default). A policy-max 10 MiB tx is base64 inside the
+            # propagation envelope; the broker default (~1 MiB) rejects it.
+            - name: KAFKA_CFG_MESSAGE_MAX_BYTES
+              value: "16777216"
+            - name: KAFKA_CFG_REPLICA_FETCH_MAX_BYTES
+              value: "16777216"
           readinessProbe:
             tcpSocket:
               port: 9092
