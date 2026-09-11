@@ -76,30 +76,30 @@ store:
     # Per-attempt socket timeout. Should be <= op_timeout_ms; the client
     # may retry on socket timeout up to the op deadline.
     socket_timeout_ms: 5000
-    # Alternative: external PostgreSQL. Only read when backend: postgres.
-    # postgres:
-    #   dsn: postgres://user:pass@host:5432/arcade
-    #   max_conns: 16
-    #   # Ceiling for the boot-time schema apply when it actually has to run
-    #   # (fresh database or schema change). Restarts with a current schema
-    #   # verify a stored checksum and skip DDL entirely, so they boot
-    #   # instantly even under heavy DB load. See issue #278.
-    #   schema_apply_timeout_ms: 300000
-    # Alternative: MongoDB. Only read when backend: mongodb. A standalone
-    # mongod is sufficient (no multi-document transactions are used); a
-    # replica set is only needed for HA. BUMP/STUMP payloads live in GridFS.
-    # mongodb:
-    #   uri: mongodb://localhost:27017
-    #   database: arcade
-    #   # Connect + server-selection deadline for the initial handshake.
-    #   connect_timeout_ms: 10000
-    #   # Deadline for single-document reads/writes and bounded lists.
-    #   op_timeout_ms: 3000
-    #   # Deadline for aggregates. Unbounded iterators use the caller's ctx.
-    #   query_timeout_ms: 8000
-    #   max_pool_size: 64
-    #   # Max documents per bulk write / $in chunk.
-    #   batch_size: 500
+  # Alternative: external PostgreSQL. Only read when backend: postgres.
+  # postgres:
+  #   dsn: postgres://user:pass@host:5432/arcade
+  #   max_conns: 16
+  #   # Ceiling for the boot-time schema apply when it actually has to run
+  #   # (fresh database or schema change). Restarts with a current schema
+  #   # verify a stored checksum and skip DDL entirely, so they boot
+  #   # instantly even under heavy DB load. See issue #278.
+  #   schema_apply_timeout_ms: 300000
+  # Alternative: MongoDB. Only read when backend: mongodb. A standalone
+  # mongod is sufficient (no multi-document transactions are used); a
+  # replica set is only needed for HA. BUMP/STUMP payloads live in GridFS.
+  # mongodb:
+  #   uri: mongodb://localhost:27017
+  #   database: arcade
+  #   # Connect + server-selection deadline for the initial handshake.
+  #   connect_timeout_ms: 10000
+  #   # Deadline for single-document reads/writes and bounded lists.
+  #   op_timeout_ms: 3000
+  #   # Deadline for aggregates. Unbounded iterators use the caller's ctx.
+  #   query_timeout_ms: 8000
+  #   max_pool_size: 64
+  #   # Max documents per bulk write / $in chunk.
+  #   batch_size: 500
 
 # datahub_urls:
 #   - "https://datahub1.example.com"

@@ -27,7 +27,7 @@ var (
 // duplicate-key error is the "lost" signal — reported as (zero, nil), never
 // an error. Wall-clock expiry uses the client clock like Aerospike/Pebble.
 func (s *Store) TryAcquireOrRenew(ctx context.Context, name, holder string, ttl time.Duration) (time.Time, error) {
-	now := time.Now()
+	now := msNow()
 	expires := msTrunc(now.Add(ttl))
 	filter := doc(
 		kv(fID, name),

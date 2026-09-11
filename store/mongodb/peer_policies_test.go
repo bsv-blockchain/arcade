@@ -18,8 +18,10 @@ func TestPeerPolicies_UpsertAndList(t *testing.T) {
 	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
 
 	in := []store.PeerPolicy{
-		{PeerID: "peer-a", Network: ppNetMainnet, MiningFeeSatoshis: 100, MiningFeeBytes: 1000,
-			MaxTxSizePolicy: 100_000_000, MaxScriptSizePolicy: 500_000, LastSeen: now},
+		{
+			PeerID: "peer-a", Network: ppNetMainnet, MiningFeeSatoshis: 100, MiningFeeBytes: 1000,
+			MaxTxSizePolicy: 100_000_000, MaxScriptSizePolicy: 500_000, LastSeen: now,
+		},
 		// peer-b advertises no size limits, as a teranode predating fee_policy
 		// does — and as any row written before the columns existed reads back,
 		// since they default to 0. The zeros must survive the round trip: they
