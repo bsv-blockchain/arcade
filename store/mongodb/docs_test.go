@@ -326,15 +326,30 @@ func TestHeightNarrowing(t *testing.T) {
 	}
 }
 
-// Query-side times must be truncated to the millisecond exactly like stored
-// timestamps, so a sub-millisecond `since` compares against the boundary the
-// writer persisted (BSON datetimes cannot represent anything finer).
-func TestSinceFilter_TruncatesToMillisecond(t *testing.T) {
-	since := time.Unix(1_700_000_000, 999_999_999)
-	f := sinceFilter(since)
+// Stored timestamps are millisecond-aligned, so query bounds must round
+// toward the contract: an inclusive lower bound (>= since) and an exclusive
+// upper bound (< deadline) round UP so a row at 12 ms is excluded for
+// since = 12.345 ms and included for deadline = 12.345 ms; aligned and zero
+// values pass through unchanged.
+func TestQueryTimeBounds(t *testing.T) {
+	aligned := time.Unix(1_700_000_000, 12_000_000)
+	fractional := aligned.Add(345 * time.Microsecond)
+	if got := msCeil(fractional); !got.Equal(aligned.Add(time.Millisecond)) {
+		t.Fatalf("msCeil(12.345ms) = %v, want 13ms", got)
+	}
+	if got := msCeil(aligned); !got.Equal(aligned) {
+		t.Fatalf("msCeil must leave an aligned value unchanged, got %v", got)
+	}
+	if !msCeil(time.Time{}).IsZero() {
+		t.Fatal("msCeil(zero) must stay zero")
+	}
+	if got := msTrunc(fractional); !got.Equal(aligned) {
+		t.Fatalf("msTrunc(12.345ms) = %v, want 12ms", got)
+	}
+	f := sinceFilter(fractional)
 	got := f[0].Value.(bson.D)[0].Value.(time.Time)
-	if !got.Equal(since.Truncate(time.Millisecond)) {
-		t.Fatalf("since not truncated: got %v", got)
+	if !got.Equal(aligned.Add(time.Millisecond)) {
+		t.Fatalf("sinceFilter must round a fractional since up, got %v", got)
 	}
 	if len(sinceFilter(time.Time{})) != 0 {
 		t.Fatal("zero since must produce no clause")

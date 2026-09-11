@@ -3,10 +3,11 @@
 // Design notes, in the order they matter:
 //
 //   - No multi-document transactions. Every method is correct against a
-//     standalone mongod: correctness comes from single-document atomicity,
-//     update filters that carry the guard (status lattice, "still anchored to
-//     this block"), an optimistic `version` counter on transaction documents
-//     for the block-scoped rewrites, and write ordering for the blobs.
+//     standalone mongod (4.4 or newer: pipeline updates, $unset stages):
+//     correctness comes from single-document atomicity, update filters that
+//     carry the guard (status lattice, "still anchored to this block"),
+//     aggregation-pipeline updates that evaluate bookkeeping against the row
+//     as it stands at write time, and write ordering for the blobs.
 //   - Large payloads (compound BUMPs, STUMPs) live in GridFS — a BUMP for a
 //     block on a scaling network exceeds the 16 MB document cap — behind a
 //     small manifest document keyed by block (bump_manifests) or by

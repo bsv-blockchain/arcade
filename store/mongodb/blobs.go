@@ -33,9 +33,13 @@ import (
 // that loses a race between the two steps re-reads the manifest once.
 //
 // A writer that dies between upload and swap leaves an unreferenced file.
-// The next successful write for the same key sweeps files older than
-// staleUploadAge that it does not reference; concurrent writers' uploads
-// are seconds old and are never touched.
+// The next successful write for the same key sweeps files whose upload
+// COMPLETED (files.uploadDate, stamped by the driver when the stream closes)
+// more than staleUploadAge ago and that it does not reference. Age is taken
+// from completion, not from the file id allocated before the upload began,
+// so a slow in-flight upload can never look stale; between completion and
+// the swap there is one round trip, and a file that sat unreferenced for an
+// hour after completing belongs to a writer that died in between.
 
 // Metadata keys stored on GridFS files documents (queried as metadata.<key>).
 const (
@@ -43,8 +47,9 @@ const (
 	metaBlockHeight  = "block_height"
 	metaSubtreeIndex = "subtree_index"
 
-	// staleUploadAge is how old an unreferenced upload must be before a
-	// later write for the same key sweeps it as a crash leftover.
+	// staleUploadAge is how long an upload must have been complete and
+	// unreferenced before a later write for the same key sweeps it as a
+	// crash leftover.
 	staleUploadAge = time.Hour
 
 	// manifestSwapAttempts bounds the retry of an upserting swap that lost
@@ -240,21 +245,24 @@ func (s *Store) replaceBlob(ctx context.Context, b *blobBucket, key, filename st
 		_ = s.deleteFile(ctx, b.bucket, id)
 		return err
 	}
+	// The swap has landed: the new file is in force whatever happens
+	// below. Deleting the superseded file and sweeping leftovers are
+	// best-effort — a copy that survives a transient failure is
+	// unreferenced and is swept by a later write once it is old enough.
 	if hadPrev && prev.FileID != id {
-		if err := s.deleteFile(ctx, b.bucket, prev.FileID); err != nil {
-			return err
-		}
+		_ = s.deleteFile(ctx, b.bucket, prev.FileID)
 	}
 	s.sweepStale(ctx, b.bucket, metadata, id)
 	return nil
 }
 
-// sweepStale deletes files under scope (metadata equality) that are older
-// than staleUploadAge and are not keep: uploads whose writer died before the
-// manifest swap. Best-effort — the write that called it has already landed.
+// sweepStale deletes files under scope (metadata equality) whose upload
+// completed more than staleUploadAge ago and that are not keep: uploads
+// whose writer died before the manifest swap. Best-effort — the write that
+// called it has already landed.
 func (s *Store) sweepStale(ctx context.Context, bucket *mongo.GridFSBucket, scope bson.D, keep bson.ObjectID) {
-	cutoff := bson.NewObjectIDFromTimestamp(time.Now().Add(-staleUploadAge))
-	filter := doc(kv(fID, doc(kv(opLt, cutoff), kv(opNe, keep))))
+	cutoff := time.Now().Add(-staleUploadAge)
+	filter := doc(kv(fUploadDate, doc(kv(opLt, cutoff))), kv(fID, doc(kv(opNe, keep))))
 	for _, e := range scope {
 		filter = append(filter, kv("metadata."+e.Key, e.Value))
 	}
@@ -279,17 +287,19 @@ func (s *Store) sweepStale(ctx context.Context, bucket *mongo.GridFSBucket, scop
 
 // InsertBUMP implements store.Store. A rebuild for an existing block uploads
 // the new compound, swaps the manifest, and deletes the superseded file, so
-// GetBUMP never observes a gap; the parsed-BUMP cache is invalidated last.
+// GetBUMP never observes a gap. The parsed-BUMP cache is invalidated on every
+// exit, success or not: an error after the swap must not leave the cache
+// serving the compound the manifest no longer points at.
 func (s *Store) InsertBUMP(ctx context.Context, blockHash string, blockHeight uint64, bumpData []byte) error {
 	if blockHash == "" {
 		return errors.New("insert bump: empty block hash")
 	}
+	defer s.bumpCache.Remove(blockHash)
 	h := heightToInt64(blockHeight)
 	meta := doc(kv(metaBlockHash, blockHash), kv(metaBlockHeight, h))
 	if err := s.replaceBlob(ctx, &s.bumps, blockHash, blockHash, meta, doc(kv(fBlockHeight, h)), bumpData); err != nil {
 		return fmt.Errorf("insert bump %s: %w", blockHash, err)
 	}
-	s.bumpCache.Remove(blockHash)
 	return nil
 }
 

@@ -15,28 +15,31 @@ import (
 // Index names. Hints reference these, so a rename here must be paired with
 // the hint sites (grep the constant).
 const (
-	idxTxStatusHeight   = "tx_status_block_height_id"
-	idxTxStatusTS       = "tx_status_timestamp"
-	idxTxBlockHash      = "tx_block_hash"
-	idxTxTimestamp      = "tx_timestamp"
-	idxTxRetryReady     = "tx_retry_ready"
-	idxSubTxIDToken     = "sub_txid_token" //nolint:gosec // an index name, not a credential
-	idxSubTokenTxID     = "sub_token_txid" //nolint:gosec // an index name, not a credential
-	idxSubRetryReady    = "sub_retry_ready"
-	idxBPHeightDesc     = "bp_height_desc"
-	idxBPStatusHeight   = "bp_status_height"
-	idxBPStaleSeen      = "bp_stale_seen"
-	idxBPOrphaned       = "bp_orphaned_unreconciled"
-	idxLeaseExpires     = "lease_expires_ttl"
-	idxDHNetwork        = "dh_network"
-	idxDHLastSeen       = "dh_last_seen"
-	idxPPNetwork        = "pp_network"
-	idxPPLastSeen       = "pp_last_seen"
-	idxBumpsBlockHash   = "bumps_block_hash"
-	idxStumpsBlockHash  = "stumps_block_hash_subtree"
-	idxStumpManifests   = "stump_manifest_block_hash"
-	idxGridFSFiles      = "gridfs_filename_uploadDate"
-	idxGridFSChunks     = "gridfs_files_id_n"
+	idxTxStatusHeight  = "tx_status_block_height_id"
+	idxTxStatusTS      = "tx_status_timestamp"
+	idxTxBlockHash     = "tx_block_hash"
+	idxTxTimestamp     = "tx_timestamp"
+	idxTxRetryReady    = "tx_retry_ready"
+	idxSubTxIDToken    = "sub_txid_token" //nolint:gosec // an index name, not a credential
+	idxSubTokenTxID    = "sub_token_txid" //nolint:gosec // an index name, not a credential
+	idxSubRetryReady   = "sub_retry_ready"
+	idxBPHeightDesc    = "bp_height_desc"
+	idxBPStatusHeight  = "bp_status_height"
+	idxBPStaleSeen     = "bp_stale_seen"
+	idxBPOrphaned      = "bp_orphaned_unreconciled"
+	idxLeaseExpires    = "lease_expires_ttl"
+	idxDHNetwork       = "dh_network"
+	idxDHLastSeen      = "dh_last_seen"
+	idxPPNetwork       = "pp_network"
+	idxPPLastSeen      = "pp_last_seen"
+	idxBumpsBlockHash  = "bumps_block_hash"
+	idxStumpsBlockHash = "stumps_block_hash_subtree"
+	idxStumpManifests  = "stump_manifest_block_hash"
+	// The two GridFS-spec indexes keep the driver's default names so a
+	// database the driver (or a restore) already provisioned is recognised as
+	// identical instead of failing createIndexes with a name conflict.
+	idxGridFSFiles      = "filename_1_uploadDate_1"
+	idxGridFSChunks     = "files_id_1_n_1"
 	partialFilterOption = "partialFilterExpression"
 )
 
@@ -64,7 +67,9 @@ func (s *Store) EnsureIndexes(ctx context.Context) error {
 		{s.tx, []mongo.IndexModel{
 			idx(idxTxStatusHeight, bson.D{{Key: fStatus, Value: 1}, {Key: fBlockHeight, Value: 1}, {Key: fID, Value: 1}}),
 			idx(idxTxStatusTS, bson.D{{Key: fStatus, Value: 1}, {Key: fTimestamp, Value: 1}}),
-			idxPartial(idxTxBlockHash, bson.D{{Key: fBlockHash, Value: 1}},
+			// {block_hash, _id}: equality on the hash plus an _id-ordered scan
+			// for SetStatusByBlockHash's keyset pages, no in-memory sort.
+			idxPartial(idxTxBlockHash, bson.D{{Key: fBlockHash, Value: 1}, {Key: fID, Value: 1}},
 				bson.D{{Key: fBlockHash, Value: bson.D{{Key: opExists, Value: true}}}}),
 			idx(idxTxTimestamp, bson.D{{Key: fTimestamp, Value: 1}}),
 			idxPartial(idxTxRetryReady, bson.D{{Key: fNextRetryAt, Value: 1}},
@@ -98,12 +103,13 @@ func (s *Store) EnsureIndexes(ctx context.Context) error {
 			idx(idxStumpManifests, bson.D{{Key: fBlockHash, Value: 1}, {Key: fSubtreeIndex, Value: 1}}),
 		}},
 		// Blob reads go through the manifests; the metadata indexes on the
-		// files collections serve only the stale-upload sweep in blobs.go.
+		// files collections serve only the stale-upload sweep in blobs.go,
+		// which ages files by their completion time (uploadDate).
 		{s.bumps.bucket.GetFilesCollection(), append(gridfsFilesIndexes(),
-			idx(idxBumpsBlockHash, bson.D{{Key: fMetaBlockHash, Value: 1}, {Key: fID, Value: 1}}))},
+			idx(idxBumpsBlockHash, bson.D{{Key: fMetaBlockHash, Value: 1}, {Key: fUploadDate, Value: 1}}))},
 		{s.bumps.bucket.GetChunksCollection(), gridfsChunksIndexes()},
 		{s.stumps.bucket.GetFilesCollection(), append(gridfsFilesIndexes(),
-			idx(idxStumpsBlockHash, bson.D{{Key: fMetaBlockHash, Value: 1}, {Key: fMetaSubtreeIndex, Value: 1}, {Key: fID, Value: 1}}))},
+			idx(idxStumpsBlockHash, bson.D{{Key: fMetaBlockHash, Value: 1}, {Key: fMetaSubtreeIndex, Value: 1}, {Key: fUploadDate, Value: 1}}))},
 		{s.stumps.bucket.GetChunksCollection(), gridfsChunksIndexes()},
 	}
 	// Collections are independent, so provision them concurrently: eleven
