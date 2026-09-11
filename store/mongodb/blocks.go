@@ -17,7 +17,8 @@ import (
 // UpsertBlockHeaderSeen implements store.Store in one upsert: block_height
 // and status are overwritten, orphaned_at/reconciled_at cleared, and
 // header_seen_at written only on insert so a re-arrival keeps the original
-// observation and every later milestone.
+// observation and every later milestone. Two concurrent first upserts for a
+// hash can collide on _id; the loser retries and updates the winner's row.
 func (s *Store) UpsertBlockHeaderSeen(ctx context.Context, blockHash string, blockHeight uint64, seenAt time.Time) error {
 	update := doc(
 		kv(opSet, doc(kv(fBlockHeight, heightToInt64(blockHeight)), kv(fStatus, string(models.BlockStatusActive)))),
@@ -26,7 +27,11 @@ func (s *Store) UpsertBlockHeaderSeen(ctx context.Context, blockHash string, blo
 	)
 	octx, cancel := s.opCtx(ctx)
 	defer cancel()
-	if _, err := s.blocks.UpdateOne(octx, idFilter(blockHash), update, options.UpdateOne().SetUpsert(true)); err != nil {
+	err := withDupKeyRetry(func() error {
+		_, err := s.blocks.UpdateOne(octx, idFilter(blockHash), update, options.UpdateOne().SetUpsert(true))
+		return err
+	})
+	if err != nil {
 		return fmt.Errorf("upsert block header seen %s: %w", blockHash, err)
 	}
 	return nil
@@ -43,7 +48,11 @@ func (s *Store) markBlockMilestone(ctx context.Context, blockHash string, blockH
 	)
 	octx, cancel := s.opCtx(ctx)
 	defer cancel()
-	if _, err := s.blocks.UpdateOne(octx, idFilter(blockHash), update, options.UpdateOne().SetUpsert(true)); err != nil {
+	err := withDupKeyRetry(func() error {
+		_, err := s.blocks.UpdateOne(octx, idFilter(blockHash), update, options.UpdateOne().SetUpsert(true))
+		return err
+	})
+	if err != nil {
 		return fmt.Errorf("mark block %s %s: %w", field, blockHash, err)
 	}
 	return nil
@@ -175,7 +184,7 @@ func (s *Store) ListStaleBlockProcessingStatus(ctx context.Context, olderThan ti
 	filter := doc(
 		kv(fStatus, string(models.BlockStatusActive)),
 		kv(fProcessedAt, doc(kv(opExists, false))),
-		kv(fHeaderSeenAt, doc(kv(opLt, msTrunc(olderThan)))),
+		kv(fHeaderSeenAt, doc(kv(opLt, msCeil(olderThan)))), // exclusive bound rounds up, see msCeil
 		kv(fBlockHeight, doc(kv(opGte, heightToInt64(minHeight)))),
 	)
 	out, err := s.listBlocks(ctx, filter, options.Find().

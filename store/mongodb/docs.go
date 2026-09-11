@@ -485,6 +485,23 @@ func msTrunc(t time.Time) time.Time {
 	return t.Truncate(time.Millisecond)
 }
 
+// msCeil rounds t UP to the next millisecond unless it is already aligned.
+// Stored timestamps are millisecond-aligned, so an inclusive lower bound
+// (>= since) and an exclusive upper bound (< deadline) must round up to keep
+// their contract: with since = 12.345 ms a stored 12 ms is not >= since, and
+// with deadline = 12.345 ms a stored 12 ms is < deadline. Flooring (msTrunc)
+// remains correct for > and <= bounds. Zero stays zero.
+func msCeil(t time.Time) time.Time {
+	if t.IsZero() {
+		return t
+	}
+	floored := t.Truncate(time.Millisecond)
+	if floored.Equal(t) {
+		return floored
+	}
+	return floored.Add(time.Millisecond)
+}
+
 func msTruncPtr(t *time.Time) *time.Time {
 	if t == nil {
 		return nil

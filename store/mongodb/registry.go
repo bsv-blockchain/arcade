@@ -13,7 +13,9 @@ import (
 // UpsertDatahubEndpoint implements store.Store. The policy is $set only when
 // the caller carries one: a write with a nil policy leaves any recorded
 // policy in place, the rule every backend implements (Postgres with
-// COALESCE, Aerospike by omitting bins).
+// COALESCE, Aerospike by omitting bins). Concurrent first upserts for a URL
+// (discovery on several pods plus the configured-URL seed) can collide on
+// _id; the loser retries against the winner's document.
 func (s *Store) UpsertDatahubEndpoint(ctx context.Context, ep store.DatahubEndpoint) error {
 	if ep.URL == "" {
 		return errors.New("upsert datahub endpoint: empty url")
@@ -27,7 +29,11 @@ func (s *Store) UpsertDatahubEndpoint(ctx context.Context, ep store.DatahubEndpo
 	}
 	octx, cancel := s.opCtx(ctx)
 	defer cancel()
-	if _, err := s.datahubs.UpdateOne(octx, idFilter(ep.URL), doc(kv(opSet, set)), options.UpdateOne().SetUpsert(true)); err != nil {
+	err := withDupKeyRetry(func() error {
+		_, err := s.datahubs.UpdateOne(octx, idFilter(ep.URL), doc(kv(opSet, set)), options.UpdateOne().SetUpsert(true))
+		return err
+	})
+	if err != nil {
 		return fmt.Errorf("upsert datahub endpoint %s: %w", ep.URL, err)
 	}
 	return nil
@@ -63,7 +69,12 @@ func (s *Store) UpsertPeerPolicy(ctx context.Context, pp store.PeerPolicy) error
 	}
 	octx, cancel := s.opCtx(ctx)
 	defer cancel()
-	if _, err := s.peers.ReplaceOne(octx, idFilter(pp.PeerID), peerPolicyToDoc(pp), options.Replace().SetUpsert(true)); err != nil {
+	d := peerPolicyToDoc(pp)
+	err := withDupKeyRetry(func() error {
+		_, err := s.peers.ReplaceOne(octx, idFilter(pp.PeerID), d, options.Replace().SetUpsert(true))
+		return err
+	})
+	if err != nil {
 		return fmt.Errorf("upsert peer policy %s: %w", pp.PeerID, err)
 	}
 	return nil

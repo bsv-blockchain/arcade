@@ -6,9 +6,10 @@
 //	go test -tags=mongodb ./store/mongodb/...
 //
 // ARCADE_MONGODB_URI overrides the default mongodb://127.0.0.1:27017. When no
-// server answers, every test skips rather than fails — the suite is gated by
-// the build tag, and no CI workflow passes it today (see
-// store/pebble/conformance_test.go for the rationale).
+// server answers, every test skips rather than fails, unless
+// ARCADE_MONGODB_REQUIRED is set — which .github/workflows/mongodb-store.yml
+// does after provisioning a mongo service container, so CI can never pass
+// by skipping.
 package mongodb
 
 import (
@@ -68,6 +69,10 @@ func connectForTests(uri string) (*mongo.Client, error) {
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
 	if sharedClient == nil {
+		if os.Getenv("ARCADE_MONGODB_REQUIRED") != "" {
+			// CI provisions a server and must fail loudly, never skip.
+			t.Fatalf("mongodb required but unavailable at ARCADE_MONGODB_URI: %v", sharedErr)
+		}
 		t.Skipf("mongodb unavailable (set ARCADE_MONGODB_URI), skipping: %v", sharedErr)
 	}
 	var b [6]byte

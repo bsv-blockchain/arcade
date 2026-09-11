@@ -21,27 +21,22 @@ const (
 	outcomeSkippedLattice = "skipped_lattice"
 	outcomeNotFound       = "not_found"
 	outcomeError          = "error"
-
-	// maxCASAttempts bounds the per-document retry loop of the block-scoped
-	// rewrites. Contention on one txid comes from a handful of concurrent
-	// writers, so hitting the cap means something is looping, not racing.
-	maxCASAttempts = 16
 )
 
 // Projections. IterateTrackerRows and IterateStatusesByToken are bound by the
-// interface to never read raw_tx / merkle_path / orphaned_anchors; the
-// snapshot projection is what the CAS rewrites need and nothing wider.
+// interface to never read raw_tx / merkle_path / orphaned_anchors.
 var (
 	projNoRawTx     = doc(kv(fRawTx, 0))
 	projID          = doc(kv(fID, 1))
 	projTracker     = doc(kv(fStatus, 1), kv(fBlockHeight, 1))
 	projTokenReplay = doc(kv(fStatus, 1), kv(fTimestamp, 1), kv(fBlockHash, 1), kv(fBlockHeight, 1))
-	projSnapshot    = doc(kv(fStatus, 1), kv(fTimestamp, 1), kv(fBlockHash, 1), kv(fBlockHeight, 1), kv(fOrphanedAnchors, 1), kv(fVersion, 1))
 	projRetry       = doc(kv(fRawTx, 1), kv(fRetryCount, 1), kv(fNextRetryAt, 1))
 )
 
-// incVersion is the $inc clause every transactions write carries so the CAS
-// rewrites observe concurrent updates.
+// incVersion is the $inc clause every transactions write carries. The
+// counter is not used as a CAS token by this package any more, but every
+// write still bumps it so an operator (or a future guard) can tell rewrites
+// apart cheaply.
 func incVersion() bson.E { return kv(opInc, doc(kv(fVersion, 1))) }
 
 // --- inserts ---
@@ -272,15 +267,14 @@ func (s *Store) GetStatus(ctx context.Context, txid string) (*models.Transaction
 	return st, nil
 }
 
-// sinceFilter is the "updated at or after since" clause. Query-side times
-// are truncated to the millisecond like every stored timestamp, so a caller
-// passing a sub-millisecond time.Now() compares against the same boundary
-// the writer persisted rather than against a value the store cannot hold.
+// sinceFilter is the "updated at or after since" clause. Stored timestamps
+// are millisecond-aligned, so an inclusive lower bound rounds UP (msCeil): a
+// row stored at 12 ms is not >= 12.345 ms and must not match.
 func sinceFilter(since time.Time) bson.D {
 	if since.IsZero() {
 		return doc()
 	}
-	return doc(kv(fTimestamp, doc(kv(opGte, msTrunc(since)))))
+	return doc(kv(fTimestamp, doc(kv(opGte, msCeil(since)))))
 }
 
 // GetStatusesSince implements store.Store: full rows updated at or after
@@ -372,9 +366,11 @@ func (s *Store) CensusStatusesSince(ctx context.Context, since, stuckDeadline ti
 		out[st] = store.StatusCensus{}
 		names = append(names, string(st))
 	}
-	window := doc(kv(opLt, msTrunc(stuckDeadline)))
+	// Both bounds round up: >= since and < stuckDeadline against
+	// millisecond-aligned rows (see msCeil).
+	window := doc(kv(opLt, msCeil(stuckDeadline)))
 	if !since.IsZero() {
-		window = append(doc(kv(opGte, msTrunc(since))), window...)
+		window = append(doc(kv(opGte, msCeil(since))), window...)
 	}
 	pipeline := mongo.Pipeline{
 		doc(kv(opMatch, doc(kv(fStatus, doc(kv(opIn, names))), kv(fTimestamp, window)))),
@@ -427,109 +423,23 @@ func (s *Store) GetTxIDsByBlockHash(ctx context.Context, blockHash string) ([]st
 	return txids, cur.Err()
 }
 
-// --- block-scoped rewrites (optimistic concurrency) ---
+// --- block-scoped rewrites ---
+//
+// SetMinedByTxIDs and SetStatusByBlockHash rewrite many rows under a guard
+// (not IMMUTABLE; still anchored to this block) and must report exactly the
+// rows they changed, each with its pre-image. Both run one findAndModify per
+// row: the guard rides in the filter, the anchor-history bookkeeping is an
+// aggregation-pipeline update evaluated server-side against the row as it
+// stands at write time, and the pre-image comes back with the result. One
+// round trip per row, run with bounded parallelism like the other backends'
+// batch loops — and exact: no snapshot to go stale, no version to race, and
+// no aggregate bulk count to disambiguate.
 
-// casOp is one version-guarded update in a block-scoped rewrite.
-type casOp struct {
-	txid    string
-	version int64
-	update  bson.D
-}
+// projPreimage is the pre-image the rewrites return: the fields the
+// transition-age metric and the reorg consumers read.
+var projPreimage = doc(kv(fStatus, 1), kv(fTimestamp, 1), kv(fBlockHash, 1), kv(fBlockHeight, 1))
 
-func casFilter(op casOp) bson.D { return doc(kv(fID, op.txid), kv(fVersion, op.version)) }
-
-// settleFunc is consulted for an op whose CAS write did not match. It
-// re-reads the document and reports whether the intended end state now
-// holds (the bulk write landed after all, or an identical concurrent write
-// did), driving a fresh CAS itself when the row simply moved.
-type settleFunc func(ctx context.Context, op casOp) (applied bool, err error)
-
-// applyCAS writes ops in one unordered bulk. A matched count equal to
-// len(ops) proves every write landed against its snapshot. A short count
-// means at least one document moved between snapshot and write — bulkWrite
-// reports only the aggregate, so each op is then retried alone: the same
-// {_id, version} write applies it if the bulk had not, and a zero match hands
-// the op to settle. The fast path is one round trip per chunk; the slow path
-// runs only under a genuine race.
-func (s *Store) applyCAS(ctx context.Context, ops []casOp, settle settleFunc) (map[string]bool, error) {
-	applied := make(map[string]bool, len(ops))
-	if len(ops) == 0 {
-		return applied, nil
-	}
-	writes := make([]mongo.WriteModel, 0, len(ops))
-	for _, op := range ops {
-		writes = append(writes, mongo.NewUpdateOneModel().SetFilter(casFilter(op)).SetUpdate(op.update))
-	}
-	qctx, cancel := s.queryCtx(ctx)
-	res, err := s.tx.BulkWrite(qctx, writes, options.BulkWrite().SetOrdered(false))
-	cancel()
-	if err != nil {
-		return nil, fmt.Errorf("cas bulk write: %w", err)
-	}
-	if res.MatchedCount == int64(len(ops)) {
-		for _, op := range ops {
-			applied[op.txid] = true
-		}
-		return applied, nil
-	}
-	for _, op := range ops {
-		ok, err := s.retryCAS(ctx, op, settle)
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			applied[op.txid] = true
-		}
-	}
-	return applied, nil
-}
-
-func (s *Store) retryCAS(ctx context.Context, op casOp, settle settleFunc) (bool, error) {
-	octx, cancel := s.opCtx(ctx)
-	res, err := s.tx.UpdateOne(octx, casFilter(op), op.update)
-	cancel()
-	if err != nil {
-		return false, fmt.Errorf("cas write %s: %w", op.txid, err)
-	}
-	if res.MatchedCount == 1 {
-		return true, nil
-	}
-	return settle(ctx, op)
-}
-
-// snapshot reads the CAS projection of every document matching filter.
-func (s *Store) snapshot(ctx context.Context, filter bson.D) ([]txDoc, error) {
-	qctx, cancel := s.queryCtx(ctx)
-	defer cancel()
-	cur, err := s.tx.Find(qctx, filter, options.Find().SetProjection(projSnapshot).SetBatchSize(s.cursorBatch()))
-	if err != nil {
-		return nil, err
-	}
-	var docs []txDoc
-	if err := cur.All(qctx, &docs); err != nil {
-		return nil, err
-	}
-	return docs, nil
-}
-
-// snapshotOne reads one document's CAS projection; found is false when absent.
-func (s *Store) snapshotOne(ctx context.Context, txid string) (txDoc, bool, error) {
-	octx, cancel := s.opCtx(ctx)
-	defer cancel()
-	var d txDoc
-	err := s.tx.FindOne(octx, idFilter(txid), options.FindOne().SetProjection(projSnapshot)).Decode(&d)
-	if errors.Is(err, mongo.ErrNoDocuments) {
-		return d, false, nil
-	}
-	if err != nil {
-		return d, false, fmt.Errorf("snapshot tx %s: %w", txid, err)
-	}
-	return d, true, nil
-}
-
-// prevFromSnapshot is the projected pre-image the rewrites return: the five
-// fields the transition-age metric and reorg consumers read.
-func prevFromSnapshot(d txDoc) *models.TransactionStatus {
+func preimage(d txDoc) *models.TransactionStatus {
 	return &models.TransactionStatus{
 		TxID:        d.TxID,
 		Status:      models.Status(d.Status),
@@ -539,33 +449,74 @@ func prevFromSnapshot(d txDoc) *models.TransactionStatus {
 	}
 }
 
-// minedOp builds the MINED write for one snapshot row. Both anchor fields are
-// always written — the interface requires the height to be persisted with
-// the hash, and the other backends store a literal 0 rather than dropping
-// the field, so the row stays distinguishable from a never-anchored one. A
-// row already MINED on a different block appends its previous anchor to
-// orphaned_anchors (issue #279).
-func minedOp(d txDoc, blockHash string, blockHeight uint64, now time.Time) casOp {
-	set := doc(
-		kv(fStatus, string(models.StatusMined)),
-		kv(fBlockHash, blockHash),
-		kv(fBlockHeight, heightToInt64(blockHeight)),
-		kv(fTimestamp, now),
-	)
-	update := doc()
-	if d.Status == string(models.StatusMined) && d.BlockHash != "" && d.BlockHash != blockHash {
-		hist := models.AppendOrphanedAnchor(anchorsFromDocs(d.OrphanedAnchors), models.OrphanedAnchor{
-			BlockHash: d.BlockHash, BlockHeight: heightFromInt64(d.BlockHeight), OrphanedAt: now,
-		})
-		set = append(set, kv(fOrphanedAnchors, anchorsToDocs(hist)))
-	}
-	update = append(update, kv(opSet, set), incVersion())
-	return casOp{txid: d.TxID, version: d.Version, update: update}
+// versionBump is the pipeline form of $inc version.
+func versionBump() bson.D {
+	return doc(kv("$add", bson.A{doc(kv("$ifNull", bson.A{"$" + fVersion, 0})), 1}))
 }
 
-// SetMinedByTxIDs implements store.Store. Per chunk: snapshot the rows,
-// build a version-guarded MINED write for every eligible one (IMMUTABLE and
-// unknown txids are skipped), bulk-write, and settle any that raced.
+// anchorHistoryExpr is models.AppendOrphanedAnchor as a pipeline expression:
+// the row's current anchor appended to orphaned_anchors, unless the row has
+// no anchor or the last entry already names it, keeping the newest
+// MaxOrphanedAnchors. It reads the row's fields BEFORE the same update
+// overwrites them, so it must run in a stage ahead of the field rewrite.
+func anchorHistoryExpr(now time.Time) bson.D {
+	hist := doc(kv("$ifNull", bson.A{"$" + fOrphanedAnchors, bson.A{}}))
+	entry := doc(kv(fBlockHash, "$"+fBlockHash), kv(fBlockHeight, "$"+fBlockHeight), kv(fOrphanedAt, now))
+	unchanged := doc(kv("$or", bson.A{
+		doc(kv("$eq", bson.A{doc(kv("$ifNull", bson.A{"$" + fBlockHash, ""})), ""})),
+		doc(kv("$eq", bson.A{"$$last." + fBlockHash, "$" + fBlockHash})),
+	}))
+	appended := doc(kv("$slice", bson.A{doc(kv("$concatArrays", bson.A{"$$hist", bson.A{entry}})), -models.MaxOrphanedAnchors}))
+	return doc(kv("$let", doc(
+		kv("vars", doc(kv("hist", hist))),
+		kv("in", doc(kv("$let", doc(
+			kv("vars", doc(kv("last", doc(kv("$arrayElemAt", bson.A{"$$hist", -1}))))),
+			kv("in", doc(kv("$cond", bson.A{unchanged, "$$hist", appended}))),
+		)))),
+	)))
+}
+
+// minedPipeline is the SetMinedByTxIDs write: a row already MINED on a
+// different block records that anchor in its history first (issue #279),
+// then status, anchor (both fields, always — a zero height is a literal 0
+// like the other backends store) and timestamp are overwritten.
+func minedPipeline(blockHash string, blockHeight uint64, now time.Time) mongo.Pipeline {
+	reanchored := doc(kv("$and", bson.A{
+		doc(kv("$eq", bson.A{"$" + fStatus, string(models.StatusMined)})),
+		doc(kv("$ne", bson.A{doc(kv("$ifNull", bson.A{"$" + fBlockHash, ""})), ""})),
+		doc(kv("$ne", bson.A{"$" + fBlockHash, doc(kv("$literal", blockHash))})),
+	}))
+	return mongo.Pipeline{
+		doc(kv(opSet, doc(kv(fOrphanedAnchors, doc(kv("$cond", bson.A{reanchored, anchorHistoryExpr(now), "$" + fOrphanedAnchors})))))),
+		doc(kv(opSet, doc(
+			kv(fStatus, string(models.StatusMined)),
+			kv(fBlockHash, doc(kv("$literal", blockHash))),
+			kv(fBlockHeight, heightToInt64(blockHeight)),
+			kv(fTimestamp, now),
+			kv(fVersion, versionBump()),
+		))),
+	}
+}
+
+// blockRewritePipeline is the SetStatusByBlockHash write. A revert records
+// the current anchor in the history and clears the block fields; any other
+// target keeps them.
+func blockRewritePipeline(newStatus models.Status, clearBlock bool, now time.Time) mongo.Pipeline {
+	set := doc(kv(fStatus, string(newStatus)), kv(fTimestamp, now), kv(fVersion, versionBump()))
+	if !clearBlock {
+		return mongo.Pipeline{doc(kv(opSet, set))}
+	}
+	return mongo.Pipeline{
+		doc(kv(opSet, doc(kv(fOrphanedAnchors, anchorHistoryExpr(now))))),
+		doc(kv(opUnset, bson.A{fBlockHash, fBlockHeight})),
+		doc(kv(opSet, set)),
+	}
+}
+
+// SetMinedByTxIDs implements store.Store: one guarded findAndModify per
+// txid, in parallel. Unknown txids and IMMUTABLE rows produce no entry.
+// Results keep input order; on error the rows written so far are returned
+// with it, like the Postgres backend's partial RETURNING scan.
 func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeight uint64, txids []string) ([]*models.TransactionStatus, []*models.TransactionStatus, error) {
 	if len(txids) == 0 {
 		return nil, nil, nil
@@ -574,194 +525,114 @@ func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeig
 		return nil, nil, errors.New("set mined: empty block hash")
 	}
 	now := msNow()
-	var prevs, mined []*models.TransactionStatus
-	for _, chunk := range chunks(dedupe(txids), s.batchSize) {
-		p, m, err := s.setMinedChunk(ctx, blockHash, blockHeight, chunk, now)
-		if err != nil {
-			return prevs, mined, err
-		}
-		prevs = append(prevs, p...)
-		mined = append(mined, m...)
-	}
-	return prevs, mined, nil
-}
-
-func (s *Store) setMinedChunk(ctx context.Context, blockHash string, blockHeight uint64, chunk []string, now time.Time) ([]*models.TransactionStatus, []*models.TransactionStatus, error) {
-	docs, err := s.snapshot(ctx, doc(kv(fID, doc(kv(opIn, chunk)))))
-	if err != nil {
-		return nil, nil, fmt.Errorf("set mined: snapshot: %w", err)
-	}
-	ops := make([]casOp, 0, len(docs))
-	prevByTx := make(map[string]*models.TransactionStatus, len(docs))
-	for _, d := range docs {
-		if d.Status == string(models.StatusImmutable) {
-			continue
-		}
-		ops = append(ops, minedOp(d, blockHash, blockHeight, now))
-		prevByTx[d.TxID] = prevFromSnapshot(d)
-	}
-	settle := func(ctx context.Context, op casOp) (bool, error) {
-		return s.settleMined(ctx, op.txid, blockHash, blockHeight, now, prevByTx)
-	}
-	applied, err := s.applyCAS(ctx, ops, settle)
-	if err != nil {
-		return nil, nil, fmt.Errorf("set mined: %w", err)
-	}
-	prevs := make([]*models.TransactionStatus, 0, len(ops))
-	mined := make([]*models.TransactionStatus, 0, len(ops))
-	for _, op := range ops {
-		if !applied[op.txid] {
-			continue
-		}
-		prevs = append(prevs, prevByTx[op.txid])
-		mined = append(mined, &models.TransactionStatus{
-			TxID: op.txid, Status: models.StatusMined, BlockHash: blockHash, BlockHeight: blockHeight, Timestamp: now,
-		})
-	}
-	return prevs, mined, nil
-}
-
-// minedLanded reports whether the row carries exactly this call's write:
-// MINED on this block at this height with this call's timestamp. A row mined
-// on the same block by a concurrent call has a different timestamp and is
-// deliberately NOT treated as landed — it is re-applied so the persisted row
-// equals the `mined` snapshot this call returns, as the other backends do.
-func minedLanded(d txDoc, blockHash string, blockHeight uint64, now time.Time) bool {
-	return d.Status == string(models.StatusMined) && d.BlockHash == blockHash &&
-		heightFromInt64(d.BlockHeight) == blockHeight && d.Timestamp.Equal(now)
-}
-
-// settleMined resolves one MINED write whose CAS missed. The row is re-read:
-// if it already carries exactly this call's write (the bulk landed it and a
-// sibling op in the chunk raced), it is applied and the snapshot pre-image
-// stands; if it is gone or IMMUTABLE it is skipped; otherwise it moved under
-// us — a concurrent status update, or a same-block MINED write with another
-// timestamp — and the write is recomputed against the fresh row so the
-// returned prev/mined pair matches what is persisted.
-func (s *Store) settleMined(ctx context.Context, txid, blockHash string, blockHeight uint64, now time.Time, prevByTx map[string]*models.TransactionStatus) (bool, error) {
-	for attempt := 0; attempt < maxCASAttempts; attempt++ {
-		d, found, err := s.snapshotOne(ctx, txid)
-		if err != nil {
-			return false, err
-		}
-		if !found {
-			return false, nil
-		}
-		if minedLanded(d, blockHash, blockHeight, now) {
-			return true, nil
-		}
-		if d.Status == string(models.StatusImmutable) {
-			return false, nil
-		}
-		prevByTx[txid] = prevFromSnapshot(d)
-		op := minedOp(d, blockHash, blockHeight, now)
+	uniq := dedupe(txids)
+	update := minedPipeline(blockHash, blockHeight, now)
+	notImmutable := doc(kv(opNe, string(models.StatusImmutable)))
+	slots := make([]*models.TransactionStatus, len(uniq))
+	loopErr := forEach(ctx, len(uniq), func(i int) error {
 		octx, cancel := s.opCtx(ctx)
-		res, err := s.tx.UpdateOne(octx, casFilter(op), op.update)
-		cancel()
+		defer cancel()
+		var before txDoc
+		err := s.tx.FindOneAndUpdate(octx, doc(kv(fID, uniq[i]), kv(fStatus, notImmutable)), update,
+			options.FindOneAndUpdate().SetReturnDocument(options.Before).SetProjection(projPreimage)).Decode(&before)
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return nil // unknown txid or IMMUTABLE: silently skipped
+		}
 		if err != nil {
-			return false, fmt.Errorf("cas write %s: %w", txid, err)
+			return fmt.Errorf("set mined %s: %w", uniq[i], err)
 		}
-		if res.MatchedCount == 1 {
-			return true, nil
+		slots[i] = preimage(before)
+		return nil
+	})
+	prevs := make([]*models.TransactionStatus, 0, len(uniq))
+	mined := make([]*models.TransactionStatus, 0, len(uniq))
+	for i, prev := range slots {
+		if prev == nil {
+			continue
 		}
-	}
-	return false, fmt.Errorf("set mined %s: cas contention exceeded %d attempts", txid, maxCASAttempts)
-}
-
-// blockRewriteOp builds the SetStatusByBlockHash write for one snapshot row.
-// A revert clears the anchor and records it in orphaned_anchors; any other
-// target keeps the block fields.
-func blockRewriteOp(d txDoc, blockHash string, newStatus models.Status, clearBlock bool, now time.Time) casOp {
-	set := doc(kv(fStatus, string(newStatus)), kv(fTimestamp, now))
-	update := doc()
-	if clearBlock {
-		hist := models.AppendOrphanedAnchor(anchorsFromDocs(d.OrphanedAnchors), models.OrphanedAnchor{
-			BlockHash: blockHash, BlockHeight: heightFromInt64(d.BlockHeight), OrphanedAt: now,
+		prevs = append(prevs, prev)
+		mined = append(mined, &models.TransactionStatus{
+			TxID: uniq[i], Status: models.StatusMined, BlockHash: blockHash, BlockHeight: blockHeight, Timestamp: now,
 		})
-		set = append(set, kv(fOrphanedAnchors, anchorsToDocs(hist)))
-		update = append(update, kv(opUnset, doc(kv(fBlockHash, ""), kv(fBlockHeight, ""))))
 	}
-	update = append(update, kv(opSet, set), incVersion())
-	return casOp{txid: d.TxID, version: d.Version, update: update}
+	return prevs, mined, loopErr
 }
 
-// SetStatusByBlockHash implements store.Store. Block fields are cleared on a
-// SEEN_ON_NETWORK revert and kept otherwise; IMMUTABLE rows are never
-// touched. The version CAS doubles as the stale-index guard: a row that was
-// concurrently re-anchored elsewhere fails its write and, on re-read, no
-// longer carries this block hash, so it is skipped (issue #279).
+// SetStatusByBlockHash implements store.Store. The block's rows are walked
+// in keyset pages of batchSize ids (bounded memory for any block size) and
+// each row is rewritten by one guarded update: the filter re-checks, at write
+// time, that the row is still anchored to this block and not IMMUTABLE, so a
+// row concurrently re-anchored elsewhere falls out of the match instead of
+// being reverted from a stale read (issue #279). Rewritten rows leave the
+// page predicate (a revert clears block_hash; a promotion sets IMMUTABLE),
+// and the _id cursor guarantees progress regardless.
 func (s *Store) SetStatusByBlockHash(ctx context.Context, blockHash string, newStatus models.Status) ([]string, error) {
 	if blockHash == "" {
 		return nil, errors.New("set status by block hash: empty block hash")
 	}
 	clearBlock := newStatus == models.StatusSeenOnNetwork
-	now := msNow()
-	docs, err := s.snapshot(ctx, doc(kv(fBlockHash, blockHash), kv(fStatus, doc(kv(opNe, string(models.StatusImmutable))))))
-	if err != nil {
-		return nil, fmt.Errorf("set status by block hash: snapshot: %w", err)
-	}
-	settle := func(ctx context.Context, op casOp) (bool, error) {
-		return s.settleBlockRewrite(ctx, op.txid, blockHash, newStatus, clearBlock, now)
-	}
-	txids := make([]string, 0, len(docs))
-	for start := 0; start < len(docs); start += s.batchSize {
-		end := min(start+s.batchSize, len(docs))
-		ops := make([]casOp, 0, end-start)
-		for _, d := range docs[start:end] {
-			ops = append(ops, blockRewriteOp(d, blockHash, newStatus, clearBlock, now))
-		}
-		applied, err := s.applyCAS(ctx, ops, settle)
+	update := blockRewritePipeline(newStatus, clearBlock, msNow())
+	notImmutable := doc(kv(opNe, string(models.StatusImmutable)))
+	var txids []string
+	after := ""
+	for {
+		page, err := s.blockPage(ctx, blockHash, after)
 		if err != nil {
 			return txids, fmt.Errorf("set status by block hash: %w", err)
 		}
-		for _, op := range ops {
-			if applied[op.txid] {
-				txids = append(txids, op.txid)
+		if len(page) == 0 {
+			return txids, nil
+		}
+		applied := make([]bool, len(page))
+		loopErr := forEach(ctx, len(page), func(i int) error {
+			octx, cancel := s.opCtx(ctx)
+			defer cancel()
+			filter := doc(kv(fID, page[i]), kv(fBlockHash, blockHash), kv(fStatus, notImmutable))
+			res, err := s.tx.UpdateOne(octx, filter, update)
+			if err != nil {
+				return fmt.Errorf("set status by block hash %s: %w", page[i], err)
+			}
+			applied[i] = res.MatchedCount == 1
+			return nil
+		})
+		for i, ok := range applied {
+			if ok {
+				txids = append(txids, page[i])
 			}
 		}
+		if loopErr != nil {
+			return txids, loopErr
+		}
+		after = page[len(page)-1]
 	}
-	return txids, nil
 }
 
-// settleBlockRewrite is settleMined's counterpart for SetStatusByBlockHash.
-// The landed check runs before the IMMUTABLE guard because a landed
-// IMMUTABLE promotion of our own must count as applied; only a row that is
-// IMMUTABLE for another reason, or no longer anchored to this block, is
-// skipped. A same-status rewrite by a concurrent call carries a different
-// timestamp and is re-applied.
-func (s *Store) settleBlockRewrite(ctx context.Context, txid, blockHash string, newStatus models.Status, clearBlock bool, now time.Time) (bool, error) {
-	for attempt := 0; attempt < maxCASAttempts; attempt++ {
-		d, found, err := s.snapshotOne(ctx, txid)
-		if err != nil {
-			return false, err
-		}
-		if !found {
-			return false, nil
-		}
-		anchored := d.BlockHash == blockHash
-		landed := d.Status == string(newStatus) && d.Timestamp.Equal(now) &&
-			((clearBlock && d.BlockHash == "") || (!clearBlock && anchored))
-		if landed {
-			return true, nil
-		}
-		if d.Status == string(models.StatusImmutable) || !anchored {
-			// IMMUTABLE rows are never touched, and a row concurrently
-			// re-anchored (or already reverted) elsewhere must not be
-			// rewritten from a stale index read.
-			return false, nil
-		}
-		op := blockRewriteOp(d, blockHash, newStatus, clearBlock, now)
-		octx, cancel := s.opCtx(ctx)
-		res, err := s.tx.UpdateOne(octx, casFilter(op), op.update)
-		cancel()
-		if err != nil {
-			return false, fmt.Errorf("cas write %s: %w", txid, err)
-		}
-		if res.MatchedCount == 1 {
-			return true, nil
-		}
+// blockPage returns up to batchSize txids anchored to blockHash and not
+// IMMUTABLE with _id > after, ascending — one keyset page over the
+// {block_hash, _id} index.
+func (s *Store) blockPage(ctx context.Context, blockHash, after string) ([]string, error) {
+	filter := doc(kv(fBlockHash, blockHash), kv(fStatus, doc(kv(opNe, string(models.StatusImmutable)))))
+	if after != "" {
+		filter = append(filter, kv(fID, doc(kv(opGt, after))))
 	}
-	return false, fmt.Errorf("set status by block hash %s: cas contention exceeded %d attempts", txid, maxCASAttempts)
+	qctx, cancel := s.queryCtx(ctx)
+	defer cancel()
+	cur, err := s.tx.Find(qctx, filter, options.Find().
+		SetProjection(projID).SetSort(doc(kv(fID, 1))).SetLimit(int64(s.batchSize)).SetHint(idxTxBlockHash))
+	if err != nil {
+		return nil, err
+	}
+	var rows []struct {
+		TxID string `bson:"_id"`
+	}
+	if err := cur.All(qctx, &rows); err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(rows))
+	for _, r := range rows {
+		ids = append(ids, r.TxID)
+	}
+	return ids, nil
 }
 
 // --- durable retry ---

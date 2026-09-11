@@ -369,118 +369,155 @@ func TestGetStumpsByBlockHash_CancelledContext(t *testing.T) {
 	}
 }
 
-// The bulk CAS path reports only an aggregate match count, so a concurrent
-// write between snapshot and bulk must be settled per document: recomputed
-// against the fresh row, with prev reflecting what the row had become and
-// the persisted row carrying this call's write — including a row a
-// concurrent replica already mined on the same block with another timestamp.
-func TestSetMinedByTxIDs_VersionRaceFallback(t *testing.T) {
+// A row already MINED on the same block by another call (a replayed
+// BLOCK_PROCESSED, or a replica) is rewritten with this call's timestamp and
+// reported with that MINED row as its pre-image, so persisted row and
+// returned snapshot agree; IMMUTABLE rows are untouched and unreported.
+func TestSetMinedByTxIDs_SameBlockReplayAndImmutable(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	now := msNow()
 	earlier := now.Add(-time.Minute)
-	seedStatus(t, s, "raced", models.StatusSeenOnNetwork, now)
-	seedStatus(t, s, "frozen", models.StatusSeenOnNetwork, now)
-	seedStatus(t, s, "twice", models.StatusSeenOnNetwork, now)
-	txids := []string{"raced", "frozen", "twice"}
-
-	stale, err := s.snapshot(ctx, doc(kv(fID, doc(kv(opIn, txids)))))
-	if err != nil || len(stale) != 3 {
-		t.Fatalf("snapshot: %v (%d docs)", err, len(stale))
-	}
-	// Concurrent writers land between snapshot and bulk write.
-	if err := s.UpdateStatus(ctx, &models.TransactionStatus{TxID: "raced", Status: models.StatusSeenMultipleNodes}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.tx.UpdateOne(ctx, idFilter("frozen"), doc(kv(opSet, doc(kv(fStatus, string(models.StatusImmutable)))), incVersion())); err != nil {
-		t.Fatal(err)
-	}
-	// Another replica mined "twice" on the same block a minute ago.
-	if _, err := s.tx.UpdateOne(ctx, idFilter("twice"), doc(kv(opSet, doc(
-		kv(fStatus, string(models.StatusMined)), kv(fBlockHash, "blk"), kv(fBlockHeight, int64(42)), kv(fTimestamp, earlier),
-	)), incVersion())); err != nil {
+	seedStatus(t, s, "fresh", models.StatusSeenOnNetwork, earlier)
+	seedStatus(t, s, "twice", models.StatusMined, earlier)
+	seedStatus(t, s, "frozen", models.StatusImmutable, earlier)
+	if err := s.UpdateStatus(ctx, &models.TransactionStatus{TxID: "twice", Status: models.StatusMined, BlockHash: "blk", BlockHeight: 42, Timestamp: earlier}); err != nil {
 		t.Fatal(err)
 	}
 
-	prevByTx := map[string]*models.TransactionStatus{}
-	ops := make([]casOp, 0, len(stale))
-	for _, d := range stale {
-		ops = append(ops, minedOp(d, "blk", 42, now))
-		prevByTx[d.TxID] = prevFromSnapshot(d)
-	}
-	applied, err := s.applyCAS(ctx, ops, func(ctx context.Context, op casOp) (bool, error) {
-		return s.settleMined(ctx, op.txid, "blk", 42, now, prevByTx)
-	})
+	prevs, mined, err := s.SetMinedByTxIDs(ctx, "blk", 42, []string{"fresh", "twice", "frozen", "ghost", "fresh"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !applied["raced"] || applied["frozen"] || !applied["twice"] {
-		t.Fatalf("expected raced+twice applied and frozen skipped, got %v", applied)
+	if len(prevs) != 2 || len(mined) != 2 {
+		t.Fatalf("expected fresh+twice only, got prevs=%d mined=%d", len(prevs), len(mined))
 	}
-	if prevByTx["raced"].Status != models.StatusSeenMultipleNodes {
-		t.Fatalf("prev must reflect the concurrent write, got %s", prevByTx["raced"].Status)
+	byTx := map[string]*models.TransactionStatus{}
+	for _, p := range prevs {
+		byTx[p.TxID] = p
 	}
-	got, _ := s.GetStatus(ctx, "raced")
-	if got.Status != models.StatusMined || got.BlockHash != "blk" || got.BlockHeight != 42 || !got.Timestamp.Equal(now) {
-		t.Fatalf("raced row not mined with this call's timestamp: %+v", got)
+	if p := byTx["fresh"]; p == nil || p.Status != models.StatusSeenOnNetwork || !p.Timestamp.Equal(earlier) {
+		t.Fatalf("fresh prev = %+v", p)
 	}
-	got, _ = s.GetStatus(ctx, "frozen")
-	if got.Status != models.StatusImmutable {
+	if p := byTx["twice"]; p == nil || p.Status != models.StatusMined || p.BlockHash != "blk" || !p.Timestamp.Equal(earlier) {
+		t.Fatalf("twice prev must be the earlier MINED row, got %+v", p)
+	}
+	for _, m := range mined {
+		got, _ := s.GetStatus(ctx, m.TxID)
+		if got.Status != models.StatusMined || got.BlockHash != "blk" || got.BlockHeight != 42 || !got.Timestamp.Equal(m.Timestamp) || !got.Timestamp.After(earlier) {
+			t.Fatalf("%s: persisted %+v disagrees with returned %+v", m.TxID, got, m)
+		}
+		if len(got.OrphanedProofs) != 0 {
+			t.Fatalf("%s: same-block re-mine must not invent history: %+v", m.TxID, got.OrphanedProofs)
+		}
+	}
+	got, _ := s.GetStatus(ctx, "frozen")
+	if got.Status != models.StatusImmutable || !got.Timestamp.Equal(earlier) {
 		t.Fatalf("IMMUTABLE row must be untouched: %+v", got)
-	}
-	// The same-block replay was re-applied: persisted row == returned
-	// snapshot, prev is the replica's MINED row, and no anchor history was
-	// invented for a same-block re-mine.
-	got, _ = s.GetStatus(ctx, "twice")
-	if got.Status != models.StatusMined || got.BlockHash != "blk" || !got.Timestamp.Equal(now) || len(got.OrphanedProofs) != 0 {
-		t.Fatalf("same-block replay must carry this call's timestamp and no history: %+v", got)
-	}
-	if p := prevByTx["twice"]; p.Status != models.StatusMined || !p.Timestamp.Equal(earlier) {
-		t.Fatalf("prev for the replay must be the replica's MINED row, got %+v", p)
 	}
 }
 
-// A landed IMMUTABLE promotion of our own must count as applied when a
-// sibling op forces the per-document settle path: the landed check has to
-// run before the IMMUTABLE guard, or SetStatusByBlockHash under-reports the
-// affected set.
-func TestSetStatusByBlockHash_ImmutableRaceSettles(t *testing.T) {
+// A block larger than one page is rewritten completely through keyset
+// pages, every row is reported exactly once, and the guard re-checked at
+// write time skips a row that was re-anchored elsewhere in the meantime.
+func TestSetStatusByBlockHash_PagesAndReChecksAnchor(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
-	now := msNow()
-	for _, txid := range []string{"fresh", "stale"} {
+	n := s.batchSize*2 + 7
+	want := make(map[string]bool, n)
+	for i := 0; i < n; i++ {
+		txid := fmt.Sprintf("blk-tx-%05d", i)
 		if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
-			TxID: txid, Status: models.StatusMined, BlockHash: "blk", BlockHeight: 42, Timestamp: now.Add(-time.Minute),
+			TxID: txid, Status: models.StatusMined, BlockHash: "blk", BlockHeight: 42, Timestamp: time.Now(),
 		}); err != nil {
 			t.Fatal(err)
 		}
+		want[txid] = true
 	}
-	docs, err := s.snapshot(ctx, doc(kv(fBlockHash, "blk")))
-	if err != nil || len(docs) != 2 {
-		t.Fatalf("snapshot: %v (%d docs)", err, len(docs))
-	}
-	// A concurrent UpdateStatus moves "stale" (still anchored to blk).
-	if err := s.UpdateStatus(ctx, &models.TransactionStatus{TxID: "stale", Status: models.StatusMined, ExtraInfo: "touched"}); err != nil {
+	// One row moved to another block and one was promoted before the revert.
+	if _, _, err := s.SetMinedByTxIDs(ctx, "other", 42, []string{"blk-tx-00003"}); err != nil {
 		t.Fatal(err)
 	}
-	ops := make([]casOp, 0, 2)
-	for _, d := range docs {
-		ops = append(ops, blockRewriteOp(d, "blk", models.StatusImmutable, false, now))
+	if err := s.UpdateStatus(ctx, &models.TransactionStatus{TxID: "blk-tx-00004", Status: models.StatusImmutable}); err != nil {
+		t.Fatal(err)
 	}
-	applied, err := s.applyCAS(ctx, ops, func(ctx context.Context, op casOp) (bool, error) {
-		return s.settleBlockRewrite(ctx, op.txid, "blk", models.StatusImmutable, false, now)
-	})
+	delete(want, "blk-tx-00003")
+	delete(want, "blk-tx-00004")
+
+	got, err := s.SetStatusByBlockHash(ctx, "blk", models.StatusSeenOnNetwork)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !applied["fresh"] || !applied["stale"] {
-		t.Fatalf("both rows must be reported applied, got %v", applied)
+	seen := map[string]int{}
+	for _, txid := range got {
+		seen[txid]++
 	}
-	for _, txid := range []string{"fresh", "stale"} {
-		got, _ := s.GetStatus(ctx, txid)
-		if got.Status != models.StatusImmutable || got.BlockHash != "blk" || !got.Timestamp.Equal(now) {
-			t.Fatalf("%s: expected IMMUTABLE on blk at %v, got %+v", txid, now, got)
+	if len(got) != len(want) || len(seen) != len(want) {
+		t.Fatalf("expected %d distinct txids, got %d (%d distinct)", len(want), len(got), len(seen))
+	}
+	for txid := range want {
+		if seen[txid] != 1 {
+			t.Fatalf("%s reported %d times", txid, seen[txid])
 		}
+	}
+	if left, _ := s.GetTxIDsByBlockHash(ctx, "blk"); len(left) != 1 || left[0] != "blk-tx-00004" {
+		t.Fatalf("only the IMMUTABLE row may stay anchored, got %v", left)
+	}
+	moved, _ := s.GetStatus(ctx, "blk-tx-00003")
+	if moved.Status != models.StatusMined || moved.BlockHash != "other" {
+		t.Fatalf("re-anchored row must be untouched: %+v", moved)
+	}
+	reverted, _ := s.GetStatus(ctx, "blk-tx-00000")
+	if reverted.Status != models.StatusSeenOnNetwork || reverted.BlockHash != "" || reverted.BlockHeight != 0 ||
+		len(reverted.OrphanedProofs) != 1 || reverted.OrphanedProofs[0].BlockHash != "blk" || reverted.OrphanedProofs[0].BlockHeight != 42 {
+		t.Fatalf("reverted row wrong: %+v", reverted)
+	}
+}
+
+// Concurrent first upserts for one key must all succeed and converge on one
+// document: the loser of the insert race retries against the winner's row.
+func TestUpserts_ConcurrentFirstInsert(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const writers = 8
+	run := func(name string, write func(int) error) {
+		t.Helper()
+		var wg sync.WaitGroup
+		errs := make(chan error, writers)
+		for i := 0; i < writers; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				if err := write(i); err != nil {
+					errs <- err
+				}
+			}(i)
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	now := msNow()
+	run("UpsertBlockHeaderSeen", func(int) error { return s.UpsertBlockHeaderSeen(ctx, "race-blk", 7, now) })
+	run("MarkBlockProcessed", func(int) error { return s.MarkBlockProcessed(ctx, "race-blk-2", 8, now) })
+	run("UpsertDatahubEndpoint", func(i int) error {
+		return s.UpsertDatahubEndpoint(ctx, store.DatahubEndpoint{URL: "http://race", Network: "main", Source: "discovered", LastSeen: now})
+	})
+	run("UpsertPeerPolicy", func(i int) error {
+		return s.UpsertPeerPolicy(ctx, store.PeerPolicy{PeerID: "race-peer", Network: "main", MiningFeeSatoshis: uint64(i + 1), MiningFeeBytes: 1000, LastSeen: now})
+	})
+	for _, hash := range []string{"race-blk", "race-blk-2"} {
+		if _, err := s.GetBlockProcessingStatus(ctx, hash); err != nil {
+			t.Fatalf("%s: %v", hash, err)
+		}
+	}
+	if eps, _ := s.ListDatahubEndpoints(ctx, "main"); len(eps) != 1 {
+		t.Fatalf("expected one endpoint, got %d", len(eps))
+	}
+	if pps, _ := s.ListPeerPolicies(ctx, "main"); len(pps) != 1 {
+		t.Fatalf("expected one peer policy, got %d", len(pps))
 	}
 }
 
