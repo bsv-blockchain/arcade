@@ -854,11 +854,12 @@ var MinedPushWithoutMerklePathTotal = promauto.NewCounterVec(prometheus.CounterO
 // WebhookCASErrorTotal counts CAS attempts that failed with a real infra
 // error rather than a generation mismatch — surfaced separately so a flat
 // WebhookCASLostTotal can't mask a backend that's silently failing every
-// write. Only the Aerospike backend emits this today: its CAS path collapses
-// gen-mismatch and infra errors into the same (false, nil) return shape, so
-// the metric is the one observable signal that distinguishes them. Postgres
-// and Pebble propagate infra errors through the function's `err` return and
-// the caller already logs those.
+// write. The Aerospike and MongoDB backends emit it: Aerospike's CAS path
+// collapses gen-mismatch and infra errors into the same (false, nil) return
+// shape, so the metric is the one observable signal that distinguishes them;
+// MongoDB propagates the error as well but counts it so the two document
+// backends stay comparable. Postgres and Pebble propagate infra errors
+// through the function's `err` return and the caller already logs those.
 var WebhookCASErrorTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "arcade_webhook_cas_error_total",
 	Help: "Webhook CAS writes that failed with an infra error (distinct from generation mismatch).",

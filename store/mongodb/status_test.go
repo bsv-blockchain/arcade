@@ -1,0 +1,1668 @@
+//go:build mongodb
+
+package mongodb
+
+// Ported from store/postgres/postgres_test.go: these tests exercise the
+// store.Store contract through the public methods only, so they run unchanged
+// against any backend. Mongo-specific behaviour is covered in mongo_specific_test.go.
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"sort"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/store"
+)
+
+func TestGetOrInsertStatus_InsertsNew(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	in := &models.TransactionStatus{TxID: "abc", Status: models.StatusReceived}
+	got, inserted, err := s.GetOrInsertStatus(ctx, in)
+	if err != nil {
+		t.Fatalf("GetOrInsertStatus: %v", err)
+	}
+	if !inserted {
+		t.Fatal("expected inserted=true for new txid")
+	}
+	if got.TxID != "abc" || got.Status != models.StatusReceived {
+		t.Fatalf("unexpected status: %+v", got)
+	}
+}
+
+func TestGetOrInsertStatus_ReturnsExisting(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	first := &models.TransactionStatus{TxID: "abc", Status: models.StatusReceived}
+	if _, inserted, err := s.GetOrInsertStatus(ctx, first); err != nil || !inserted {
+		t.Fatalf("first insert: inserted=%v err=%v", inserted, err)
+	}
+
+	second := &models.TransactionStatus{TxID: "abc", Status: models.StatusSentToNetwork}
+	got, inserted, err := s.GetOrInsertStatus(ctx, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inserted {
+		t.Fatal("expected inserted=false for existing txid")
+	}
+	if got.Status != models.StatusReceived {
+		t.Fatalf("expected existing status RECEIVED, got %s", got.Status)
+	}
+}
+
+// Postgres handles the CAS natively (ON CONFLICT DO NOTHING); the test still
+// asserts that N concurrent inserts collapse to exactly one winner.
+func TestGetOrInsertStatus_ConcurrentRace(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	const N = 50
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var inserted int
+
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func() {
+			defer wg.Done()
+			_, ok, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+				TxID: "racey", Status: models.StatusReceived,
+			})
+			if err != nil {
+				t.Errorf("concurrent insert: %v", err)
+				return
+			}
+			if ok {
+				mu.Lock()
+				inserted++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+
+	if inserted != 1 {
+		t.Fatalf("expected exactly 1 successful insert, got %d", inserted)
+	}
+}
+
+func TestPendingRetryLifecycle(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	txid := "retry-tx"
+	rawTx := []byte{0x01, 0x02}
+	nextRetry := time.Now().Add(-time.Second) // already due
+
+	if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{TxID: txid, Status: models.StatusReceived}); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := s.BumpRetryCount(ctx, txid)
+	if err != nil || n != 1 {
+		t.Fatalf("BumpRetryCount: n=%d err=%v", n, err)
+	}
+
+	if err := s.SetPendingRetryFields(ctx, txid, rawTx, nextRetry); err != nil {
+		t.Fatal(err)
+	}
+
+	ready, err := s.GetReadyRetries(ctx, time.Now(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ready) != 1 || ready[0].TxID != txid {
+		t.Fatalf("GetReadyRetries: %+v", ready)
+	}
+	if ready[0].RetryCount != 1 {
+		t.Fatalf("expected RetryCount=1, got %d", ready[0].RetryCount)
+	}
+
+	if err := s.ClearRetryState(ctx, txid, models.StatusRejected, "final"); err != nil {
+		t.Fatal(err)
+	}
+	ready, err = s.GetReadyRetries(ctx, time.Now(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ready) != 0 {
+		t.Fatalf("expected 0 ready retries after clear, got %d", len(ready))
+	}
+}
+
+func TestGetReadyRetries_SkipsFutureEntries(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	now := time.Now()
+	cases := []struct {
+		txid    string
+		delay   time.Duration
+		isReady bool
+	}{
+		{"past-1", -2 * time.Second, true},
+		{"past-2", -time.Second, true},
+		{"future-1", time.Hour, false},
+	}
+	for _, c := range cases {
+		if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{TxID: c.txid, Status: models.StatusReceived}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SetPendingRetryFields(ctx, c.txid, []byte{0xff}, now.Add(c.delay)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ready, err := s.GetReadyRetries(ctx, now, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, r := range ready {
+		got[r.TxID] = true
+	}
+	for _, c := range cases {
+		if got[c.txid] != c.isReady {
+			t.Errorf("%s: isReady=%v, got=%v", c.txid, c.isReady, got[c.txid])
+		}
+	}
+}
+
+func TestSetStatusByBlockHash_UpdatesAllInBlock(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	blockHash := "bh-1"
+	txids := []string{"t1", "t2", "t3"}
+	for _, txid := range txids {
+		if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+			TxID: txid, Status: models.StatusMined, BlockHash: blockHash, Timestamp: time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	updated, err := s.SetStatusByBlockHash(ctx, blockHash, models.StatusSeenOnNetwork)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated) != 3 {
+		t.Fatalf("expected 3 updated txids, got %d", len(updated))
+	}
+	for _, txid := range txids {
+		got, _ := s.GetStatus(ctx, txid)
+		if got == nil || got.Status != models.StatusSeenOnNetwork {
+			t.Errorf("%s: expected SEEN_ON_NETWORK, got %+v", txid, got)
+		}
+		if got.BlockHash != "" {
+			t.Errorf("%s: expected empty BlockHash after reorg, got %s", txid, got.BlockHash)
+		}
+	}
+}
+
+func TestMarkMerkleRegisteredByTxIDs_UpdatesExistingRows(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	txids := []string{"mr-1", "mr-2", "mr-3"}
+	for _, txid := range txids {
+		if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+			TxID: txid, Status: models.StatusReceived, Timestamp: time.Now(),
+		}); err != nil {
+			t.Fatalf("seed %s: %v", txid, err)
+		}
+	}
+
+	ts := time.Now().Add(-5 * time.Minute).UTC().Round(time.Microsecond)
+	if err := s.MarkMerkleRegisteredByTxIDs(ctx, txids, ts); err != nil {
+		t.Fatalf("MarkMerkleRegisteredByTxIDs: %v", err)
+	}
+
+	for _, txid := range txids {
+		got, err := s.GetStatus(ctx, txid)
+		if err != nil {
+			t.Fatalf("GetStatus %s: %v", txid, err)
+		}
+		if got == nil {
+			t.Fatalf("%s: status missing after mark", txid)
+		}
+		if delta := got.MerkleRegisteredAt.Sub(ts).Abs(); delta > time.Millisecond {
+			t.Errorf("%s: MerkleRegisteredAt=%v want ~%v (delta %v)", txid, got.MerkleRegisteredAt, ts, delta)
+		}
+	}
+}
+
+func TestMarkMerkleRegisteredByTxIDs_SkipsUnknownTxIDs(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+		TxID: "known", Status: models.StatusReceived, Timestamp: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ts := time.Now()
+	if err := s.MarkMerkleRegisteredByTxIDs(ctx, []string{"known", "unknown-a", "unknown-b"}, ts); err != nil {
+		t.Fatalf("mark: %v", err)
+	}
+
+	got, _ := s.GetStatus(ctx, "known")
+	if got == nil || got.MerkleRegisteredAt.IsZero() {
+		t.Errorf("known: MerkleRegisteredAt should be set, got %+v", got)
+	}
+	for _, txid := range []string{"unknown-a", "unknown-b"} {
+		got, _ := s.GetStatus(ctx, txid)
+		if got != nil {
+			t.Errorf("%s: unknown txid should not have created a row, got %+v", txid, got)
+		}
+	}
+}
+
+func TestMarkMerkleRegisteredByTxIDs_RoundTripsThroughIterate(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+		TxID: "iter-1", Status: models.StatusReceived, Timestamp: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ts := time.Now().UTC().Round(time.Microsecond)
+	if err := s.MarkMerkleRegisteredByTxIDs(ctx, []string{"iter-1"}, ts); err != nil {
+		t.Fatal(err)
+	}
+
+	var seen *models.TransactionStatus
+	if err := s.IterateStatusesSince(ctx, time.Now().Add(-time.Hour), func(st *models.TransactionStatus) error {
+		if st.TxID == "iter-1" {
+			seen = st
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("IterateStatusesSince: %v", err)
+	}
+	if seen == nil {
+		t.Fatalf("row not seen in iterate")
+	}
+	if delta := seen.MerkleRegisteredAt.Sub(ts).Abs(); delta > time.Millisecond {
+		t.Errorf("MerkleRegisteredAt=%v want ~%v", seen.MerkleRegisteredAt, ts)
+	}
+}
+
+func TestSubmissions_InsertAndQueryByTxID(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	sub := &models.Submission{
+		SubmissionID: "sub-1",
+		TxID:         "tx-a",
+		CallbackURL:  "https://example.test/cb",
+		CreatedAt:    time.Now(),
+	}
+	if err := s.InsertSubmission(ctx, sub); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetSubmissionsByTxID(ctx, "tx-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].SubmissionID != "sub-1" {
+		t.Fatalf("GetSubmissionsByTxID: %+v", got)
+	}
+}
+
+// TestUpdateDeliveryStatusCAS_RowAffected is the postgres-side regression for
+// issue #166: only one of two concurrent claims with the same `expected`
+// value can win. Asserts (a) the first call returns claimed=true and the row
+// advances, (b) a second call with the same `expected` returns claimed=false
+// and leaves the row alone, (c) the first-delivery case (expected="") works
+// both against a NULL-valued row (the InsertSubmission default) and after a
+// prior CAS that explicitly set the bin.
+func TestUpdateDeliveryStatusCAS_RowAffected(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	sub := &models.Submission{
+		SubmissionID: "sub-cas",
+		TxID:         "tx-cas",
+		CallbackURL:  "https://example.test/cb",
+		CreatedAt:    time.Now(),
+	}
+	if err := s.InsertSubmission(ctx, sub); err != nil {
+		t.Fatal(err)
+	}
+
+	// First-delivery claim: expected is the zero-value Status, stored is NULL.
+	claimed, err := s.UpdateDeliveryStatusCAS(ctx, "sub-cas", "", models.StatusSeenOnNetwork)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimed {
+		t.Fatalf("first claim should succeed (expected='' matches NULL row)")
+	}
+
+	// Second call with the same expected must lose — the row has moved on.
+	claimed, err = s.UpdateDeliveryStatusCAS(ctx, "sub-cas", "", models.StatusMined)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed {
+		t.Fatalf("stale-expected claim should fail after a prior winner")
+	}
+
+	// Subsequent claim with the correct current expected must succeed.
+	claimed, err = s.UpdateDeliveryStatusCAS(ctx, "sub-cas", models.StatusSeenOnNetwork, models.StatusMined)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimed {
+		t.Fatalf("matching-expected claim should succeed")
+	}
+
+	// Confirm the final row state — LastDeliveredStatus advanced, retry
+	// state cleared.
+	got, err := s.GetSubmissionsByTxID(ctx, "tx-cas")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 submission, got %d", len(got))
+	}
+	if got[0].LastDeliveredStatus != models.StatusMined {
+		t.Errorf("LastDeliveredStatus = %q, want MINED", got[0].LastDeliveredStatus)
+	}
+	if got[0].RetryCount != 0 {
+		t.Errorf("RetryCount = %d, want 0 (cleared by CAS)", got[0].RetryCount)
+	}
+	if got[0].NextRetryAt != nil {
+		t.Errorf("NextRetryAt = %v, want nil (cleared by CAS)", got[0].NextRetryAt)
+	}
+
+	// Unknown submission: claim must report false without an error.
+	claimed, err = s.UpdateDeliveryStatusCAS(ctx, "no-such-row", "", models.StatusMined)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed {
+		t.Errorf("claim on missing row should return false")
+	}
+}
+
+// TestListSubmissionsReadyForRetry covers the webhook reaper's scan predicate:
+// only rows whose retry_count > 0 AND next_retry_at <= now appear, ordered by
+// next_retry_at ASC, and `limit` truncates correctly. Backed by
+// idx_sub_retry_ready (partial index, defined in schema.sql).
+func TestListSubmissionsReadyForRetry(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	now := time.Now()
+	past := now.Add(-1 * time.Minute)
+	earlier := now.Add(-5 * time.Minute)
+	future := now.Add(1 * time.Minute)
+
+	// Seed: three submissions in retry (ready now), one ready-but-in-future,
+	// one with retry_count=0 (not in retry at all).
+	rows := []struct {
+		id    string
+		count int
+		next  *time.Time
+	}{
+		{"sub-ready-old", 2, &earlier}, // oldest ready — expect first
+		{"sub-ready-new", 1, &past},    // ready, but newer than -old
+		{"sub-future", 1, &future},     // not yet due
+		{"sub-no-retry", 0, nil},       // never failed — not in retry
+		{"sub-ready-third", 3, &past},  // ready, second in time order
+	}
+	for _, r := range rows {
+		sub := &models.Submission{
+			SubmissionID: r.id,
+			TxID:         "tx-" + r.id,
+			CallbackURL:  "https://example.test/cb",
+			CreatedAt:    now,
+		}
+		if err := s.InsertSubmission(ctx, sub); err != nil {
+			t.Fatalf("insert %s: %v", r.id, err)
+		}
+		// InsertSubmission doesn't set retry bins; use UpdateDeliveryStatus
+		// to populate them after insert.
+		if r.count > 0 {
+			if err := s.UpdateDeliveryStatus(ctx, r.id, models.StatusMined, r.count, r.next); err != nil {
+				t.Fatalf("update %s: %v", r.id, err)
+			}
+		}
+	}
+
+	// Limit=10 should return the three ready rows in next_retry_at ASC order.
+	got, err := s.ListSubmissionsReadyForRetry(ctx, now, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("expected 3 ready submissions, got %d (%+v)", len(got), got)
+	}
+	wantOrder := []string{"sub-ready-old", "sub-ready-new", "sub-ready-third"}
+	for i, w := range wantOrder {
+		if got[i].SubmissionID != w {
+			t.Errorf("position %d: got %q, want %q (full order: %v)", i, got[i].SubmissionID, w, submissionIDs(got))
+		}
+	}
+
+	// Limit=1 should return only the earliest.
+	got, err = s.ListSubmissionsReadyForRetry(ctx, now, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].SubmissionID != "sub-ready-old" {
+		t.Fatalf("limit=1 returned %+v, want [sub-ready-old]", submissionIDs(got))
+	}
+
+	// Limit=0 short-circuits to empty (matches the documented contract).
+	got, err = s.ListSubmissionsReadyForRetry(ctx, now, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("limit=0 should return empty, got %+v", got)
+	}
+}
+
+func submissionIDs(subs []*models.Submission) []string {
+	out := make([]string, len(subs))
+	for i, s := range subs {
+		out[i] = s.SubmissionID
+	}
+	return out
+}
+
+func TestLease_AcquireAndRenew(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	held, err := s.TryAcquireOrRenew(ctx, "reaper", "holder-a", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held.IsZero() {
+		t.Fatal("expected non-zero heldUntil for fresh lease")
+	}
+
+	// Same holder can renew.
+	renewed, err := s.TryAcquireOrRenew(ctx, "reaper", "holder-a", time.Second)
+	if err != nil || renewed.IsZero() {
+		t.Fatalf("renew: heldUntil=%v err=%v", renewed, err)
+	}
+
+	// Different holder is blocked while the current lease is live.
+	blocked, err := s.TryAcquireOrRenew(ctx, "reaper", "holder-b", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !blocked.IsZero() {
+		t.Fatal("expected zero heldUntil for contention")
+	}
+}
+
+func TestBumpRetryCount_UnknownTxID(t *testing.T) {
+	s := newTestStore(t)
+	_, err := s.BumpRetryCount(context.Background(), "ghost")
+	if err == nil {
+		t.Fatal("expected error for unknown txid")
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestBUMPInsertAndGet(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	if err := s.InsertBUMP(ctx, "bh-bump", 42, []byte{0xde, 0xad, 0xbe, 0xef}); err != nil {
+		t.Fatal(err)
+	}
+	h, data, err := s.GetBUMP(ctx, "bh-bump")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h != 42 || len(data) != 4 {
+		t.Fatalf("unexpected bump: h=%d data=%x", h, data)
+	}
+
+	if _, _, err := s.GetBUMP(ctx, "missing"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for missing bump, got %v", err)
+	}
+}
+
+func TestDatahubEndpoints_UpsertAndList(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 24, 12, 0, 0, 0, time.UTC)
+
+	in := []store.DatahubEndpoint{
+		{URL: "https://a.example", Network: "mainnet", Source: store.DatahubEndpointSourceConfigured, LastSeen: now},
+		{URL: "https://b.example", Network: "mainnet", Source: store.DatahubEndpointSourceDiscovered, LastSeen: now.Add(time.Minute)},
+	}
+	for _, ep := range in {
+		if err := s.UpsertDatahubEndpoint(ctx, ep); err != nil {
+			t.Fatalf("upsert %s: %v", ep.URL, err)
+		}
+	}
+
+	out, err := s.ListDatahubEndpoints(ctx, "mainnet")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("expected 2 endpoints, got %d: %+v", len(out), out)
+	}
+	got := map[string]store.DatahubEndpoint{}
+	for _, ep := range out {
+		got[ep.URL] = ep
+	}
+	for _, want := range in {
+		gotEp, ok := got[want.URL]
+		if !ok {
+			t.Fatalf("missing endpoint %s", want.URL)
+		}
+		if gotEp.Network != want.Network {
+			t.Errorf("%s network: got %q want %q", want.URL, gotEp.Network, want.Network)
+		}
+		if gotEp.Source != want.Source {
+			t.Errorf("%s source: got %q want %q", want.URL, gotEp.Source, want.Source)
+		}
+		if !gotEp.LastSeen.Equal(want.LastSeen) {
+			t.Errorf("%s last_seen: got %v want %v", want.URL, gotEp.LastSeen, want.LastSeen)
+		}
+	}
+}
+
+// TestDatahubEndpoints_NetworkScoped is the regression for the bug where a
+// regtest pod served mainnet URLs persisted from a prior run.
+func TestDatahubEndpoints_NetworkScoped(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
+
+	rows := []store.DatahubEndpoint{
+		{URL: "https://main-a.example", Network: "mainnet", Source: store.DatahubEndpointSourceDiscovered, LastSeen: now},
+		{URL: "https://main-b.example", Network: "mainnet", Source: store.DatahubEndpointSourceDiscovered, LastSeen: now},
+		{URL: "https://regtest-a.example", Network: "regtest", Source: store.DatahubEndpointSourceConfigured, LastSeen: now},
+	}
+	for _, ep := range rows {
+		if err := s.UpsertDatahubEndpoint(ctx, ep); err != nil {
+			t.Fatalf("upsert %s: %v", ep.URL, err)
+		}
+	}
+
+	regtest, err := s.ListDatahubEndpoints(ctx, "regtest")
+	if err != nil {
+		t.Fatalf("list regtest: %v", err)
+	}
+	if len(regtest) != 1 || regtest[0].URL != "https://regtest-a.example" {
+		t.Fatalf("regtest list: got %+v", regtest)
+	}
+
+	mainnet, err := s.ListDatahubEndpoints(ctx, "mainnet")
+	if err != nil {
+		t.Fatalf("list mainnet: %v", err)
+	}
+	if len(mainnet) != 2 {
+		t.Fatalf("mainnet list: got %d entries, want 2: %+v", len(mainnet), mainnet)
+	}
+
+	empty, err := s.ListDatahubEndpoints(ctx, "")
+	if err != nil {
+		t.Fatalf("list empty: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("empty network filter must not match scoped rows: %+v", empty)
+	}
+}
+
+func TestDatahubEndpoints_UpsertOverwrites(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	t1 := time.Date(2026, 4, 24, 12, 0, 0, 0, time.UTC)
+	t2 := t1.Add(time.Hour)
+
+	if err := s.UpsertDatahubEndpoint(ctx, store.DatahubEndpoint{
+		URL: "https://a.example", Network: "mainnet", Source: store.DatahubEndpointSourceConfigured, LastSeen: t1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertDatahubEndpoint(ctx, store.DatahubEndpoint{
+		URL: "https://a.example", Network: "mainnet", Source: store.DatahubEndpointSourceDiscovered, LastSeen: t2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := s.ListDatahubEndpoints(ctx, "mainnet")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("expected 1 endpoint after upsert overwrite, got %d", len(out))
+	}
+	if out[0].Source != store.DatahubEndpointSourceDiscovered {
+		t.Errorf("source not overwritten: %q", out[0].Source)
+	}
+	if !out[0].LastSeen.Equal(t2) {
+		t.Errorf("last_seen not overwritten: got %v want %v", out[0].LastSeen, t2)
+	}
+}
+
+// TestUpdateStatus_TerminalNotOverwritten is the regression for F-003 (#61):
+// once a tx is in a strictly-terminal status (MINED, IMMUTABLE,
+// DOUBLE_SPEND_ATTEMPTED), a later lower-priority UpdateStatus call (e.g. a
+// stray SEEN_ON_NETWORK callback) must be a silent no-op rather than a clobber.
+// REJECTED is covered separately in TestUpdateStatus_RejectedRecovery —
+// it allows forward recovery to ACCEPTED_BY_NETWORK / SEEN_ON_NETWORK /
+// SEEN_MULTIPLE_NODES so a late peer acceptance can correct an earlier
+// rejection.
+func TestUpdateStatus_TerminalNotOverwritten(t *testing.T) {
+	terminals := []models.Status{
+		models.StatusMined,
+		models.StatusImmutable,
+		models.StatusDoubleSpendAttempted,
+	}
+	regressions := []models.Status{
+		models.StatusSeenOnNetwork,
+		models.StatusSeenMultipleNodes,
+		models.StatusSentToNetwork,
+		models.StatusPendingRetry,
+	}
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	for _, terminal := range terminals {
+		for _, regression := range regressions {
+			name := string(terminal) + "_then_" + string(regression)
+			t.Run(name, func(t *testing.T) {
+				txid := "tx-" + name
+
+				if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+					TxID: txid, Status: models.StatusReceived,
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if err := s.UpdateStatus(ctx, &models.TransactionStatus{
+					TxID: txid, Status: terminal, Timestamp: time.Now(),
+				}); err != nil {
+					t.Fatalf("seed terminal: %v", err)
+				}
+
+				if err := s.UpdateStatus(ctx, &models.TransactionStatus{
+					TxID: txid, Status: regression, Timestamp: time.Now(),
+				}); err != nil {
+					t.Fatalf("regression update: %v", err)
+				}
+
+				got, err := s.GetStatus(ctx, txid)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got.Status != terminal {
+					t.Fatalf("terminal status %s overwritten by %s (got %s)",
+						terminal, regression, got.Status)
+				}
+			})
+		}
+	}
+}
+
+// TestUpdateStatus_RejectedRecovery pins REJECTED's partial-terminal
+// behavior at the postgres layer: forward acceptance/seen states must
+// be reachable so late callbacks from a peer that did accept the tx
+// can correct the status, but regressions to pre-broadcast or retry
+// states must still be silently dropped.
+func TestUpdateStatus_RejectedRecovery(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	allowedForward := []models.Status{
+		models.StatusAcceptedByNetwork,
+		models.StatusSeenOnNetwork,
+		models.StatusSeenMultipleNodes,
+	}
+	for _, next := range allowedForward {
+		t.Run("REJECTED_then_"+string(next), func(t *testing.T) {
+			txid := "tx-rejrec-" + string(next)
+			if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+				TxID: txid, Status: models.StatusReceived,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.UpdateStatus(ctx, &models.TransactionStatus{
+				TxID: txid, Status: models.StatusRejected, Timestamp: time.Now(),
+			}); err != nil {
+				t.Fatalf("seed REJECTED: %v", err)
+			}
+			if err := s.UpdateStatus(ctx, &models.TransactionStatus{
+				TxID: txid, Status: next, Timestamp: time.Now(),
+			}); err != nil {
+				t.Fatalf("forward update: %v", err)
+			}
+			got, err := s.GetStatus(ctx, txid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Status != next {
+				t.Fatalf("REJECTED → %s wrongly dropped (got %s)", next, got.Status)
+			}
+		})
+	}
+
+	blockedRegressions := []models.Status{
+		models.StatusSentToNetwork,
+		models.StatusPendingRetry,
+	}
+	for _, next := range blockedRegressions {
+		t.Run("REJECTED_then_"+string(next)+"_blocked", func(t *testing.T) {
+			txid := "tx-rejblk-" + string(next)
+			if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+				TxID: txid, Status: models.StatusReceived,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.UpdateStatus(ctx, &models.TransactionStatus{
+				TxID: txid, Status: models.StatusRejected, Timestamp: time.Now(),
+			}); err != nil {
+				t.Fatalf("seed REJECTED: %v", err)
+			}
+			if err := s.UpdateStatus(ctx, &models.TransactionStatus{
+				TxID: txid, Status: next, Timestamp: time.Now(),
+			}); err != nil {
+				t.Fatalf("regression update: %v", err)
+			}
+			got, err := s.GetStatus(ctx, txid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Status != models.StatusRejected {
+				t.Fatalf("REJECTED overwritten by %s (got %s)", next, got.Status)
+			}
+		})
+	}
+}
+
+// TestUpdateStatus_UnknownTxidReturnsErrNotFound is the regression for F-033
+// (#91): UpdateStatus on a txid that has no existing row must return
+// store.ErrNotFound and must NOT create a phantom row. Previously the UPDATE
+// no-opped silently and callers (notably the merkle-service callback handler)
+// could not distinguish "row missing" from "row updated".
+func TestUpdateStatus_UnknownTxidReturnsErrNotFound(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	txid := "ghost-tx"
+
+	err := s.UpdateStatus(ctx, &models.TransactionStatus{
+		TxID:      txid,
+		Status:    models.StatusSeenOnNetwork,
+		Timestamp: time.Now(),
+	})
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected store.ErrNotFound for unknown txid, got %v", err)
+	}
+
+	// And critically: no phantom row was created.
+	got, gerr := s.GetStatus(ctx, txid)
+	if gerr != nil {
+		t.Fatalf("GetStatus after rejected update: %v", gerr)
+	}
+	if got != nil {
+		t.Fatalf("expected nil status for ghost txid, got %+v", got)
+	}
+}
+
+// TestUpdateStatus_ExistingTxidStillWorks is the F-033 happy-path regression:
+// the unknown-txid guard must not break updates against rows that were
+// legitimately inserted via GetOrInsertStatus.
+func TestUpdateStatus_ExistingTxidStillWorks(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	txid := "real-tx"
+
+	if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+		TxID: txid, Status: models.StatusReceived,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := s.UpdateStatus(ctx, &models.TransactionStatus{
+		TxID:      txid,
+		Status:    models.StatusSeenOnNetwork,
+		Timestamp: time.Now(),
+	}); err != nil {
+		t.Fatalf("UpdateStatus on existing row: %v", err)
+	}
+
+	got, err := s.GetStatus(ctx, txid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Status != models.StatusSeenOnNetwork {
+		t.Fatalf("expected SEEN_ON_NETWORK, got %+v", got)
+	}
+}
+
+// TestBatchUpdateStatus_TerminalNotOverwritten covers the same F-003
+// regression for the batched code path.
+func TestBatchUpdateStatus_TerminalNotOverwritten(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	type row struct {
+		txid     string
+		seedTerm models.Status
+		regress  models.Status
+	}
+	// REJECTED only blocks backward regressions (e.g., SENT_TO_NETWORK),
+	// not forward acceptance/seen states — see TestUpdateStatus_RejectedRecovery
+	// for the full lattice coverage.
+	rows := []row{
+		{"tx-mined", models.StatusMined, models.StatusSeenOnNetwork},
+		{"tx-immutable", models.StatusImmutable, models.StatusSeenOnNetwork},
+		{"tx-rejected", models.StatusRejected, models.StatusSentToNetwork},
+		{"tx-dsa", models.StatusDoubleSpendAttempted, models.StatusPendingRetry},
+	}
+
+	// Seed each row in its terminal status.
+	for _, r := range rows {
+		if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+			TxID: r.txid, Status: models.StatusReceived,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.UpdateStatus(ctx, &models.TransactionStatus{
+			TxID: r.txid, Status: r.seedTerm, Timestamp: time.Now(),
+		}); err != nil {
+			t.Fatalf("seed %s: %v", r.txid, err)
+		}
+	}
+
+	// One batched lower-priority update for the whole set.
+	updates := make([]*models.TransactionStatus, len(rows))
+	for i, r := range rows {
+		updates[i] = &models.TransactionStatus{
+			TxID: r.txid, Status: r.regress, Timestamp: time.Now(),
+		}
+	}
+	if err := s.BatchUpdateStatus(ctx, updates); err != nil {
+		t.Fatalf("BatchUpdateStatus: %v", err)
+	}
+
+	for _, r := range rows {
+		got, err := s.GetStatus(ctx, r.txid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Status != r.seedTerm {
+			t.Errorf("%s: terminal %s overwritten by batch %s (got %s)",
+				r.txid, r.seedTerm, r.regress, got.Status)
+		}
+	}
+}
+
+// --- Block processing status ---
+
+func TestBlockProcessing_Upsert_Header_Then_Processed(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	hash := "aa11"
+	t0 := time.Unix(1700000000, 0).UTC()
+	t1 := t0.Add(2 * time.Second)
+	t2 := t0.Add(4 * time.Second)
+
+	if err := s.UpsertBlockHeaderSeen(ctx, hash, 100, t0); err != nil {
+		t.Fatalf("seen: %v", err)
+	}
+	if err := s.MarkBlockProcessed(ctx, hash, 100, t1); err != nil {
+		t.Fatalf("processed: %v", err)
+	}
+	if err := s.MarkBlockBUMPBuilt(ctx, hash, 100, t2); err != nil {
+		t.Fatalf("bump: %v", err)
+	}
+	got, err := s.GetBlockProcessingStatus(ctx, hash)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.BlockHeight != 100 || !got.HeaderSeenAt.Equal(t0) {
+		t.Errorf("got height=%d seen=%v want 100/%v", got.BlockHeight, got.HeaderSeenAt, t0)
+	}
+	if got.ProcessedAt == nil || !got.ProcessedAt.Equal(t1) {
+		t.Errorf("processed=%v want %v", got.ProcessedAt, t1)
+	}
+	if got.BUMPBuiltAt == nil || !got.BUMPBuiltAt.Equal(t2) {
+		t.Errorf("bumpBuilt=%v want %v", got.BUMPBuiltAt, t2)
+	}
+	if got.Status != models.BlockStatusActive {
+		t.Errorf("status=%q want active", got.Status)
+	}
+}
+
+func TestBlockProcessing_OutOfOrder_Processed_Then_Header(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	hash := "bb22"
+	tProc := time.Unix(1700000010, 0).UTC()
+	tSeen := tProc.Add(time.Second)
+
+	if err := s.MarkBlockProcessed(ctx, hash, 0, tProc); err != nil {
+		t.Fatalf("processed: %v", err)
+	}
+	got, _ := s.GetBlockProcessingStatus(ctx, hash)
+	if !got.HeaderSeenAt.Equal(tProc) {
+		t.Errorf("synthesized seen=%v want %v", got.HeaderSeenAt, tProc)
+	}
+
+	if err := s.UpsertBlockHeaderSeen(ctx, hash, 200, tSeen); err != nil {
+		t.Fatalf("seen: %v", err)
+	}
+	got, _ = s.GetBlockProcessingStatus(ctx, hash)
+	if got.BlockHeight != 200 {
+		t.Errorf("height=%d want 200", got.BlockHeight)
+	}
+	if got.ProcessedAt == nil || !got.ProcessedAt.Equal(tProc) {
+		t.Errorf("processed clobbered: got %v want %v", got.ProcessedAt, tProc)
+	}
+	if !got.HeaderSeenAt.Equal(tProc) {
+		t.Errorf("HeaderSeenAt should preserve %v, got %v", tProc, got.HeaderSeenAt)
+	}
+}
+
+func TestBlockProcessing_HeaderReArrival_Idempotent(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	hash := "cc33"
+	t0 := time.Unix(1700000020, 0).UTC()
+
+	if err := s.UpsertBlockHeaderSeen(ctx, hash, 300, t0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkBlockProcessed(ctx, hash, 300, t0.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertBlockHeaderSeen(ctx, hash, 300, t0.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.GetBlockProcessingStatus(ctx, hash)
+	if !got.HeaderSeenAt.Equal(t0) {
+		t.Errorf("HeaderSeenAt should preserve %v, got %v", t0, got.HeaderSeenAt)
+	}
+	if got.ProcessedAt == nil {
+		t.Error("ProcessedAt cleared on header re-arrival")
+	}
+}
+
+func TestBlockProcessing_MarkOrphaned_AndResurrection(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	hash := "dd44"
+	t0 := time.Unix(1700000030, 0).UTC()
+
+	if err := s.UpsertBlockHeaderSeen(ctx, hash, 400, t0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkBlocksOrphaned(ctx, []string{hash}, t0.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.GetBlockProcessingStatus(ctx, hash)
+	if got.Status != models.BlockStatusOrphaned || got.OrphanedAt == nil {
+		t.Errorf("after orphan: status=%q orphanedAt=%v", got.Status, got.OrphanedAt)
+	}
+
+	if err := s.UpsertBlockHeaderSeen(ctx, hash, 400, t0.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.GetBlockProcessingStatus(ctx, hash)
+	if got.Status != models.BlockStatusActive || got.OrphanedAt != nil {
+		t.Errorf("after resurrect: status=%q orphanedAt=%v", got.Status, got.OrphanedAt)
+	}
+}
+
+func TestBlockProcessing_NotFound(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.GetBlockProcessingStatus(context.Background(), "missing"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("err=%v want ErrNotFound", err)
+	}
+}
+
+func TestBlockProcessing_List_DescendingHeight_Pagination(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	t0 := time.Unix(1700000100, 0).UTC()
+	for i := uint64(1); i <= 75; i++ {
+		hash := fmt.Sprintf("h%04d", i)
+		if err := s.UpsertBlockHeaderSeen(ctx, hash, i, t0); err != nil {
+			t.Fatalf("seed %d: %v", i, err)
+		}
+	}
+
+	var seen []uint64
+	cursor := uint64(0)
+	for {
+		page, err := s.ListBlockProcessingStatus(ctx, cursor, 20)
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		for _, bp := range page {
+			seen = append(seen, bp.BlockHeight)
+		}
+		cursor = page[len(page)-1].BlockHeight
+		if len(page) < 20 {
+			break
+		}
+	}
+	if len(seen) != 75 {
+		t.Fatalf("walked %d want 75", len(seen))
+	}
+	for i := 1; i < len(seen); i++ {
+		if seen[i-1] <= seen[i] {
+			t.Fatalf("not descending at i=%d: %d <= %d", i, seen[i-1], seen[i])
+		}
+	}
+}
+
+func TestBlockProcessing_List_BeforeHeight_Excludes(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	t0 := time.Unix(1700000200, 0).UTC()
+	for _, h := range []uint64{10, 20, 30, 40, 50} {
+		if err := s.UpsertBlockHeaderSeen(ctx, fmt.Sprintf("h%d", h), h, t0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, err := s.ListBlockProcessingStatus(ctx, 30, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 2 || page[0].BlockHeight != 20 || page[1].BlockHeight != 10 {
+		t.Errorf("got %d rows, heights=%v", len(page), heightsOf(page))
+	}
+}
+
+func heightsOf(rows []*models.BlockProcessingStatus) []uint64 {
+	out := make([]uint64, len(rows))
+	for i, r := range rows {
+		out[i] = r.BlockHeight
+	}
+	return out
+}
+
+func TestBlockProcessing_GetActiveTipBlockHeight(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	if h, err := s.GetActiveTipBlockHeight(ctx); err != nil || h != 0 {
+		t.Fatalf("empty: got h=%d err=%v want 0/nil", h, err)
+	}
+
+	t0 := time.Unix(1700001000, 0).UTC()
+	for _, h := range []uint64{100, 200, 150} {
+		if err := s.UpsertBlockHeaderSeen(ctx, fmt.Sprintf("h%d", h), h, t0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.GetActiveTipBlockHeight(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 200 {
+		t.Errorf("tip=%d want 200", got)
+	}
+
+	// Orphaning the highest row must drop the tip back to the next active row.
+	if err := s.MarkBlocksOrphaned(ctx, []string{"h200"}, t0); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.GetActiveTipBlockHeight(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 150 {
+		t.Errorf("tip after orphan=%d want 150", got)
+	}
+}
+
+func TestBlockProcessing_ListStale_FiltersAndOrders(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	baseSeen := time.Unix(1700002000, 0).UTC()
+	threshold := baseSeen.Add(5 * time.Minute) // anything < threshold is stale
+
+	// recent: should not surface (seen >= threshold)
+	if err := s.UpsertBlockHeaderSeen(ctx, "recent", 500, threshold.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	// processed: should not surface (processed_at set)
+	if err := s.UpsertBlockHeaderSeen(ctx, "processed", 400, baseSeen); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkBlockProcessed(ctx, "processed", 400, baseSeen.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	// orphaned: should not surface (status='orphaned')
+	if err := s.UpsertBlockHeaderSeen(ctx, "orphaned", 410, baseSeen); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkBlocksOrphaned(ctx, []string{"orphaned"}, baseSeen.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	// too-low height: surfaces only when minHeight allows
+	if err := s.UpsertBlockHeaderSeen(ctx, "old", 100, baseSeen.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	// stale: should surface
+	if err := s.UpsertBlockHeaderSeen(ctx, "stale-a", 450, baseSeen); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertBlockHeaderSeen(ctx, "stale-b", 460, baseSeen.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.ListStaleBlockProcessingStatus(ctx, threshold, 200, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows=%d want 2 (%v)", len(rows), hashesOf(rows))
+	}
+	// header_seen_at ASC → stale-a (baseSeen) before stale-b (+2m)
+	if rows[0].BlockHash != "stale-a" || rows[1].BlockHash != "stale-b" {
+		t.Errorf("order wrong: %v", hashesOf(rows))
+	}
+
+	// minHeight=0 lets the lower-height row in too.
+	rows, err = s.ListStaleBlockProcessingStatus(ctx, threshold, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("rows=%d want 3 (%v)", len(rows), hashesOf(rows))
+	}
+
+	// Limit truncation: oldest first.
+	rows, err = s.ListStaleBlockProcessingStatus(ctx, threshold, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].BlockHash != "stale-a" {
+		t.Errorf("limit truncation: %v", hashesOf(rows))
+	}
+}
+
+// TestBlockProcessing_ListStale_ExcludesFinalizedEmptyBlock pins the
+// watchdog-interplay contract for empty-block finalization: bump-builder
+// finalizes a zero-STUMP block with MarkBlockProcessed(hash, 0, now) — height
+// 0 because no compound was built — and that exact call must (a) remove the
+// row from ListStaleBlockProcessingStatus (the stale predicate keys on
+// processed_at IS NULL, NOT on bump_built_at) so the watchdog never re-drives
+// a complete empty block, and (b) preserve the chaintracks-supplied height on
+// conflict. A future predicate change (e.g. adding bump_built_at IS NULL)
+// would silently resurrect the empty-block re-drive storm; this test makes
+// that loud.
+func TestBlockProcessing_ListStale_ExcludesFinalizedEmptyBlock(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	baseSeen := time.Unix(1700003000, 0).UTC()
+	threshold := baseSeen.Add(5 * time.Minute) // anything < threshold is stale
+
+	// Empty-block finalize: header seen, then the exact bump-builder call.
+	if err := s.UpsertBlockHeaderSeen(ctx, "empty-finalized", 300, baseSeen); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkBlockProcessed(ctx, "empty-finalized", 0, baseSeen.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Control: identical header-seen row without the stamp must still surface.
+	if err := s.UpsertBlockHeaderSeen(ctx, "still-stale", 310, baseSeen); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.ListStaleBlockProcessingStatus(ctx, threshold, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].BlockHash != "still-stale" {
+		t.Errorf("finalized empty block must be excluded from the stale scan, got %v", hashesOf(rows))
+	}
+
+	// The height-0 stamp must not clobber the chaintracks-supplied height:
+	// the upsert's conflict clause only writes processed_at.
+	all, err := s.ListBlockProcessingStatus(ctx, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range all {
+		if r.BlockHash == "empty-finalized" && r.BlockHeight != 300 {
+			t.Errorf("empty-block finalize clobbered block_height: got %d, want 300", r.BlockHeight)
+		}
+	}
+}
+
+func hashesOf(rows []*models.BlockProcessingStatus) []string {
+	out := make([]string, len(rows))
+	for i, r := range rows {
+		out[i] = r.BlockHash
+	}
+	return out
+}
+
+// Regression: a tx at any pre-MINED status has NULL block_hash / block_height,
+// so the CTE in SetMinedByTxIDs returns NULLs for the previous-row snapshot.
+// Scanning those NULLs into bare string/int64 used to error with
+// "cannot scan NULL into *string", which then caused bump-builder to log
+// "failed to set mined status" and drop the MINED transition entirely.
+func TestSetMinedByTxIDs_HandlesNullPrevBlock(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	in := &models.TransactionStatus{TxID: "tx-prev-null", Status: models.StatusReceived}
+	if _, _, err := s.GetOrInsertStatus(ctx, in); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	prevs, mined, err := s.SetMinedByTxIDs(ctx, "blockhashX", 42, []string{"tx-prev-null"})
+	if err != nil {
+		t.Fatalf("SetMinedByTxIDs: %v", err)
+	}
+	if len(prevs) != 1 || len(mined) != 1 {
+		t.Fatalf("prevs=%d mined=%d want 1/1", len(prevs), len(mined))
+	}
+	if prevs[0].Status != models.StatusReceived {
+		t.Errorf("prev status = %q, want RECEIVED", prevs[0].Status)
+	}
+	if prevs[0].BlockHash != "" || prevs[0].BlockHeight != 0 {
+		t.Errorf("prev block fields should be zero for pre-MINED row, got hash=%q height=%d",
+			prevs[0].BlockHash, prevs[0].BlockHeight)
+	}
+	if mined[0].BlockHash != "blockhashX" || mined[0].BlockHeight != 42 {
+		t.Errorf("mined snapshot mismatch: %+v", mined[0])
+	}
+}
+
+func TestBlockProcessing_MarkParked(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	t0 := time.Now().Add(-time.Hour).UTC().Truncate(time.Millisecond)
+
+	if err := s.UpsertBlockHeaderSeen(ctx, "parkme", 500, t0); err != nil {
+		t.Fatalf("seen: %v", err)
+	}
+	if err := s.MarkBlocksParked(ctx, []string{"parkme"}); err != nil {
+		t.Fatalf("park: %v", err)
+	}
+	got, err := s.GetBlockProcessingStatus(ctx, "parkme")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status != models.BlockStatusParked {
+		t.Errorf("Status=%q, want parked", got.Status)
+	}
+
+	// Parked rows leave the stale scan (status='active' predicate).
+	stale, err := s.ListStaleBlockProcessingStatus(ctx, time.Now(), 0, 10)
+	if err != nil {
+		t.Fatalf("list stale: %v", err)
+	}
+	for _, r := range stale {
+		if r.BlockHash == "parkme" {
+			t.Error("parked row must not surface in the stale scan")
+		}
+	}
+
+	// A fresh header arrival revives the row to active (recovery resumes).
+	if err := s.UpsertBlockHeaderSeen(ctx, "parkme", 500, t0.Add(time.Minute)); err != nil {
+		t.Fatalf("re-seen: %v", err)
+	}
+	got, _ = s.GetBlockProcessingStatus(ctx, "parkme")
+	if got.Status != models.BlockStatusActive {
+		t.Errorf("Status after re-seen=%q, want active", got.Status)
+	}
+}
+
+func TestBlockProcessing_MarkParked_SkipsOrphanedAndMissing(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	t0 := time.Now().Add(-time.Hour)
+
+	if err := s.UpsertBlockHeaderSeen(ctx, "reorged-park", 501, t0); err != nil {
+		t.Fatalf("seen: %v", err)
+	}
+	if err := s.MarkBlocksOrphaned(ctx, []string{"reorged-park"}, t0.Add(time.Minute)); err != nil {
+		t.Fatalf("orphan: %v", err)
+	}
+	// Parking must not relabel an orphaned (off-chain) row, and a missing
+	// row is a silent no-op.
+	if err := s.MarkBlocksParked(ctx, []string{"reorged-park", "never-seen"}); err != nil {
+		t.Fatalf("park: %v", err)
+	}
+	got, _ := s.GetBlockProcessingStatus(ctx, "reorged-park")
+	if got.Status != models.BlockStatusOrphaned {
+		t.Errorf("Status=%q, want orphaned (park must not override)", got.Status)
+	}
+}
+
+// TestIterateStatusesByToken covers the SSE-catchup hot path: distinct
+// txids, since/only filters, ascending order, and the no-heavy-fields
+// projection (raw tx / merkle path stripped).
+func TestIterateStatusesByToken(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	base := time.Now().Add(-time.Hour).UTC().Truncate(time.Millisecond)
+	rows := []*models.TransactionStatus{
+		{TxID: "tx-mined", Status: models.StatusMined, Timestamp: base, RawTx: []byte{0xde, 0xad}, MerklePath: []byte{0xbe, 0xef}},
+		{TxID: "tx-pending", Status: models.StatusSeenOnNetwork, Timestamp: base.Add(time.Minute)},
+		{TxID: "tx-received", Status: models.StatusReceived, Timestamp: base.Add(2 * time.Minute)},
+		{TxID: "tx-other", Status: models.StatusReceived, Timestamp: base.Add(3 * time.Minute)},
+	}
+	for _, r := range rows {
+		if _, _, err := s.GetOrInsertStatus(ctx, r); err != nil {
+			t.Fatalf("insert %s: %v", r.TxID, err)
+		}
+	}
+	subs := []*models.Submission{
+		{SubmissionID: "s1", TxID: "tx-mined", CallbackToken: "tok-1", CreatedAt: base},
+		{SubmissionID: "s2", TxID: "tx-pending", CallbackToken: "tok-1", CreatedAt: base},
+		// Duplicate submission for the same txid — must not double-emit.
+		{SubmissionID: "s3", TxID: "tx-pending", CallbackToken: "tok-1", CreatedAt: base},
+		{SubmissionID: "s4", TxID: "tx-received", CallbackToken: "tok-1", CreatedAt: base},
+		{SubmissionID: "s5", TxID: "tx-other", CallbackToken: "tok-2", CreatedAt: base},
+	}
+	for _, sub := range subs {
+		if err := s.InsertSubmission(ctx, sub); err != nil {
+			t.Fatalf("insert submission %s: %v", sub.SubmissionID, err)
+		}
+	}
+
+	collect := func(since time.Time, only []models.Status) []*models.TransactionStatus {
+		t.Helper()
+		var got []*models.TransactionStatus
+		if err := s.IterateStatusesByToken(ctx, "tok-1", since, only, func(st *models.TransactionStatus) error {
+			got = append(got, st)
+			return nil
+		}); err != nil {
+			t.Fatalf("IterateStatusesByToken: %v", err)
+		}
+		return got
+	}
+
+	// Unfiltered: 3 distinct txids in ascending timestamp order, projected.
+	got := collect(time.Time{}, nil)
+	if len(got) != 3 {
+		t.Fatalf("unfiltered rows = %d, want 3 (%+v)", len(got), got)
+	}
+	wantOrder := []string{"tx-mined", "tx-pending", "tx-received"}
+	for i, want := range wantOrder {
+		if got[i].TxID != want {
+			t.Errorf("row %d = %s, want %s", i, got[i].TxID, want)
+		}
+	}
+	if len(got[0].RawTx) != 0 || len(got[0].MerklePath) != 0 {
+		t.Errorf("projection leaked heavy fields: rawTx=%d merklePath=%d bytes", len(got[0].RawTx), len(got[0].MerklePath))
+	}
+
+	// onlyStatuses filter: non-terminal only drops the MINED row.
+	got = collect(time.Time{}, models.NonTerminalStatuses())
+	if len(got) != 2 || got[0].TxID != "tx-pending" || got[1].TxID != "tx-received" {
+		t.Fatalf("non-terminal rows = %+v, want [tx-pending tx-received]", got)
+	}
+
+	// since filter is strictly-after: cutting at tx-pending's timestamp
+	// leaves only tx-received.
+	got = collect(base.Add(time.Minute), nil)
+	if len(got) != 1 || got[0].TxID != "tx-received" {
+		t.Fatalf("since rows = %+v, want [tx-received]", got)
+	}
+
+	// fn error stops iteration and propagates.
+	sentinel := errors.New("stop")
+	calls := 0
+	err := s.IterateStatusesByToken(ctx, "tok-1", time.Time{}, nil, func(*models.TransactionStatus) error {
+		calls++
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Errorf("fn error not propagated: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("iteration continued after fn error: %d calls", calls)
+	}
+}
+
+// TestTokensForTxIDs covers the SSE fan-out membership resolution: multiple
+// tokens on one txid, a txid with a single token, unknown txids, duplicate
+// inputs, submissions without a token, and the empty batch.
+func TestTokensForTxIDs(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	subs := []*models.Submission{
+		{SubmissionID: "p1", TxID: "tx-probe", CallbackToken: "tok-1", CreatedAt: time.Now()},
+		{SubmissionID: "p2", TxID: "tx-probe", CallbackToken: "tok-2", CreatedAt: time.Now()},
+		// Same (txid, token) twice: the result must be de-duplicated.
+		{SubmissionID: "p2b", TxID: "tx-probe", CallbackToken: "tok-2", CreatedAt: time.Now()},
+		{SubmissionID: "p3", TxID: "tx-solo", CallbackToken: "tok-1", CreatedAt: time.Now()},
+		// SSE-less submission: no callback token, so it contributes nothing.
+		{SubmissionID: "p4", TxID: "tx-notoken", CreatedAt: time.Now()},
+	}
+	for _, sub := range subs {
+		if err := s.InsertSubmission(ctx, sub); err != nil {
+			t.Fatalf("insert %s: %v", sub.SubmissionID, err)
+		}
+	}
+
+	// One batch resolves every txid, duplicates included.
+	got, err := s.TokensForTxIDs(ctx, []string{"tx-probe", "tx-probe", "tx-solo", "tx-notoken", "tx-ghost"})
+	if err != nil {
+		t.Fatalf("TokensForTxIDs: %v", err)
+	}
+	want := map[string][]string{
+		"tx-probe": {"tok-1", "tok-2"},
+		"tx-solo":  {"tok-1"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("TokensForTxIDs returned %d txids (%v), want %d", len(got), got, len(want))
+	}
+	for txid, wantTokens := range want {
+		gotTokens := append([]string(nil), got[txid]...)
+		sort.Strings(gotTokens)
+		if !slices.Equal(gotTokens, wantTokens) {
+			t.Errorf("tokens for %s = %v, want %v", txid, gotTokens, wantTokens)
+		}
+	}
+	// Absent, never present-but-empty: fan-out treats a missing key as
+	// "nobody subscribed".
+	for _, txid := range []string{"tx-ghost", "tx-notoken"} {
+		if _, ok := got[txid]; ok {
+			t.Errorf("%s must be absent from the result, got %v", txid, got[txid])
+		}
+	}
+
+	empty, err := s.TokensForTxIDs(ctx, nil)
+	if err != nil {
+		t.Fatalf("TokensForTxIDs(nil): %v", err)
+	}
+	if len(empty) != 0 {
+		t.Errorf("TokensForTxIDs(nil) = %v, want empty", empty)
+	}
+}
+
+// TestSetPendingRetryFields_RespectsStatusLattice pins that the durable-retry
+// setter cannot drag a transaction back out of a protected status.
+//
+// This matters because the park path writes twice: applyTerminalStatuses does
+// a lattice-guarded BatchUpdateStatusReturning (which correctly SKIPS a row
+// whose current status forbids PENDING_RETRY), and the durable-retry
+// scheduling then records the retry bins. If the second write ignores the
+// lattice it silently undoes the first one's protection — so a MINED
+// transaction redelivered by Kafka and re-broadcast without a verdict would be
+// knocked back to PENDING_RETRY and re-broadcast by the reaper from then on.
+//
+// models.StatusPendingRetry.DisallowedPreviousStatuses() is the source of
+// truth; every status in it must be immune here.
+func TestSetPendingRetryFields_RespectsStatusLattice(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	for _, prev := range models.StatusPendingRetry.DisallowedPreviousStatuses() {
+		t.Run(string(prev), func(t *testing.T) {
+			txid := "lattice-" + string(prev)
+			if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+				TxID: txid, Status: models.StatusReceived,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.UpdateStatus(ctx, &models.TransactionStatus{TxID: txid, Status: prev}); err != nil {
+				t.Fatalf("seed %s: %v", prev, err)
+			}
+
+			err := s.SetPendingRetryFields(ctx, txid, []byte{0xaa}, time.Now().Add(-time.Second))
+			if err != nil {
+				t.Fatalf("SetPendingRetryFields: %v", err)
+			}
+
+			got, err := s.GetStatus(ctx, txid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Status != prev {
+				t.Errorf("status = %s, want %s left untouched: PENDING_RETRY must not be "+
+					"forced over a status the lattice protects", got.Status, prev)
+			}
+			// And it must not have joined the retry drain.
+			ready, err := s.GetReadyRetries(ctx, time.Now(), 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, r := range ready {
+				if r.TxID == txid {
+					t.Errorf("%s row entered the durable retry queue", prev)
+				}
+			}
+		})
+	}
+}
+
+// TestDatahubEndpoints_AdvertisedPolicy covers the policy a node advertises
+// alongside its URL: it round-trips intact, "advertised none" stays
+// distinguishable from "advertised zeros", and — the subtle one — a write
+// carrying no policy leaves a recorded one alone.
+//
+// That last rule is what keeps the configured-URL seed, which re-upserts every
+// URL on each process start with no policy attached, from blanking an announced
+// endpoint's policy on every restart.
+func TestDatahubEndpoints_AdvertisedPolicy(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 24, 12, 0, 0, 0, time.UTC)
+
+	const url = "https://announced.example"
+	policy := store.EndpointPolicy{
+		MiningFeeSatoshis: 100, MiningFeeBytes: 1000,
+		MaxTxSizePolicy: 100_000_000, MaxScriptSizePolicy: 500_000,
+		MaxTxSigopsCountsPolicy: 4_294_967_295,
+	}
+
+	upsert := func(t *testing.T, ep store.DatahubEndpoint) {
+		t.Helper()
+		if err := s.UpsertDatahubEndpoint(ctx, ep); err != nil {
+			t.Fatalf("upsert %s: %v", ep.URL, err)
+		}
+	}
+	get := func(t *testing.T, want string) store.DatahubEndpoint {
+		t.Helper()
+		out, err := s.ListDatahubEndpoints(ctx, "mainnet")
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		for _, ep := range out {
+			if ep.URL == want {
+				return ep
+			}
+		}
+		t.Fatalf("endpoint %s missing from %+v", want, out)
+		return store.DatahubEndpoint{}
+	}
+
+	// An announced endpoint carries its policy; a seeded one carries none.
+	upsert(t, store.DatahubEndpoint{
+		URL: url, Network: "mainnet",
+		Source: store.DatahubEndpointSourceDiscovered, Policy: &policy, LastSeen: now,
+	})
+	upsert(t, store.DatahubEndpoint{
+		URL: "https://seeded.example", Network: "mainnet",
+		Source: store.DatahubEndpointSourceConfigured, LastSeen: now,
+	})
+
+	if got := get(t, url).Policy; got == nil {
+		t.Fatal("announced endpoint lost its policy")
+	} else if *got != policy {
+		t.Errorf("policy round-trip: got %+v want %+v", *got, policy)
+	}
+	if got := get(t, "https://seeded.example").Policy; got != nil {
+		t.Errorf("a seeded endpoint advertises no policy, got %+v", *got)
+	}
+
+	// The restart case: the seed re-upserts the announced URL with no policy.
+	upsert(t, store.DatahubEndpoint{
+		URL: url, Network: "mainnet",
+		Source: store.DatahubEndpointSourceConfigured, LastSeen: now.Add(time.Hour),
+	})
+	got := get(t, url)
+	if got.Policy == nil {
+		t.Fatal("a policy-less write erased the recorded policy; the seed would blank it on every restart")
+	}
+	if *got.Policy != policy {
+		t.Errorf("preserved policy changed: got %+v want %+v", *got.Policy, policy)
+	}
+	// The rest of the row still updates normally.
+	if got.Source != store.DatahubEndpointSourceConfigured {
+		t.Errorf("source: got %q want %q", got.Source, store.DatahubEndpointSourceConfigured)
+	}
+	if !got.LastSeen.Equal(now.Add(time.Hour)) {
+		t.Errorf("last_seen: got %v want %v", got.LastSeen, now.Add(time.Hour))
+	}
+
+	// A write that does carry a policy replaces the old one.
+	updated := policy
+	updated.MaxTxSizePolicy = 5_000_000
+	upsert(t, store.DatahubEndpoint{
+		URL: url, Network: "mainnet",
+		Source: store.DatahubEndpointSourceDiscovered, Policy: &updated, LastSeen: now.Add(2 * time.Hour),
+	})
+	if got := get(t, url).Policy; got == nil || got.MaxTxSizePolicy != 5_000_000 {
+		t.Errorf("a policy-carrying write must replace the old policy, got %+v", got)
+	}
+
+	// A zero-valued policy is a real advertisement, not absence.
+	upsert(t, store.DatahubEndpoint{
+		URL: "https://zero.example", Network: "mainnet",
+		Source: store.DatahubEndpointSourceDiscovered, Policy: &store.EndpointPolicy{}, LastSeen: now,
+	})
+	if got := get(t, "https://zero.example").Policy; got == nil {
+		t.Error("an all-zero policy must survive as advertised, not read back as nil")
+	}
+}

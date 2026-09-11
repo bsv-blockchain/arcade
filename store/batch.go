@@ -41,6 +41,12 @@ func currentBatchConcurrency() int {
 	return int(atomic.LoadInt32(&batchConcurrency))
 }
 
+// BatchConcurrency reports the parallel-loop concurrency configured via
+// SetBatchConcurrency, for backends that run their own bounded per-row
+// loops (e.g. the MongoDB block-scoped rewrites) and want to honour the
+// same operator knob as the shared helpers.
+func BatchConcurrency() int { return currentBatchConcurrency() }
+
 // SingleStore is the narrow contract the parallel-loop helpers need: the
 // single-record GetOrInsertStatus / UpdateStatus methods. Every Store
 // satisfies this trivially. Defined as an interface so the helpers can be
