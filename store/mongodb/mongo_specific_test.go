@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"go.mongodb.org/mongo-driver/v2/bson"
+
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
 )
@@ -197,7 +199,7 @@ func TestInsertBUMP_OverwriteNeverGaps(t *testing.T) {
 	if err != nil || !bytes.Equal(data, v2) {
 		t.Fatalf("final read: %v (len %d)", err, len(data))
 	}
-	n, err := s.bumps.GetFilesCollection().CountDocuments(ctx, doc(kv(fMetaBlockHash, hash)))
+	n, err := s.bumps.bucket.GetFilesCollection().CountDocuments(ctx, doc(kv(fMetaBlockHash, hash)))
 	if err != nil || n != 1 {
 		t.Fatalf("expected exactly one surviving file, got %d (%v)", n, err)
 	}
@@ -244,7 +246,7 @@ func TestStump_LargePayloadAndSupersede(t *testing.T) {
 	if !bytes.Equal(got[1].StumpData, big) {
 		t.Fatalf("17 MB stump did not round-trip (len %d)", len(got[1].StumpData))
 	}
-	n, err := s.stumps.GetFilesCollection().CountDocuments(ctx, doc(kv(fMetaBlockHash, hash)))
+	n, err := s.stumps.bucket.GetFilesCollection().CountDocuments(ctx, doc(kv(fMetaBlockHash, hash)))
 	if err != nil || n != 2 {
 		t.Fatalf("expected 2 surviving files, got %d (%v)", n, err)
 	}
@@ -253,6 +255,105 @@ func TestStump_LargePayloadAndSupersede(t *testing.T) {
 	}
 	if got, err := s.GetStumpsByBlockHash(ctx, hash); err != nil || len(got) != 0 {
 		t.Fatalf("after delete: %d stumps, %v", len(got), err)
+	}
+}
+
+// Concurrent rebuilds of one block must converge on exactly one surviving
+// file that the manifest references, never on none: each writer deletes only
+// the file its own manifest swap replaced. Same for one STUMP subtree.
+func TestInsertBlob_ConcurrentOverwritesKeepExactlyOne(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const hash, writers = "blob-race", 8
+	payloads := make([][]byte, writers)
+	for i := range payloads {
+		payloads[i] = bytes.Repeat([]byte{byte(i + 1)}, 2048+i)
+	}
+	run := func(write func(int) error) {
+		t.Helper()
+		var wg sync.WaitGroup
+		errs := make(chan error, writers)
+		for i := 0; i < writers; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				if err := write(i); err != nil {
+					errs <- err
+				}
+			}(i)
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatal(err)
+		}
+	}
+	isPayload := func(data []byte) bool {
+		for _, p := range payloads {
+			if bytes.Equal(data, p) {
+				return true
+			}
+		}
+		return false
+	}
+
+	run(func(i int) error { return s.InsertBUMP(ctx, hash, 9, payloads[i]) })
+	h, data, err := s.GetBUMP(ctx, hash)
+	if err != nil || h != 9 || !isPayload(data) {
+		t.Fatalf("after concurrent inserts GetBUMP = (%d, %d bytes, %v)", h, len(data), err)
+	}
+	var m bumpManifest
+	if err := s.bumps.manifests.FindOne(ctx, idFilter(hash)).Decode(&m); err != nil {
+		t.Fatal(err)
+	}
+	n, err := s.bumps.bucket.GetFilesCollection().CountDocuments(ctx, doc(kv(fMetaBlockHash, hash)))
+	if err != nil || n != 1 {
+		t.Fatalf("expected exactly one surviving BUMP file, got %d (%v)", n, err)
+	}
+	if c, _ := s.bumps.bucket.GetFilesCollection().CountDocuments(ctx, idFilter(m.FileID.Hex())); c != 0 {
+		t.Fatalf("manifest id lookup by hex must not match; sanity")
+	}
+	var surviving struct {
+		ID bson.ObjectID `bson:"_id"`
+	}
+	if err := s.bumps.bucket.GetFilesCollection().FindOne(ctx, doc(kv(fMetaBlockHash, hash))).Decode(&surviving); err != nil {
+		t.Fatal(err)
+	}
+	if surviving.ID != m.FileID {
+		t.Fatalf("manifest references %s but the surviving file is %s", m.FileID.Hex(), surviving.ID.Hex())
+	}
+
+	run(func(i int) error {
+		return s.InsertStump(ctx, &models.Stump{BlockHash: hash, SubtreeIndex: 4, StumpData: payloads[i]})
+	})
+	stumps, err := s.GetStumpsByBlockHash(ctx, hash)
+	if err != nil || len(stumps) != 1 || stumps[0].SubtreeIndex != 4 || !isPayload(stumps[0].StumpData) {
+		t.Fatalf("after concurrent stump inserts: %d stumps, %v", len(stumps), err)
+	}
+	n, err = s.stumps.bucket.GetFilesCollection().CountDocuments(ctx, doc(kv(fMetaBlockHash, hash)))
+	if err != nil || n != 1 {
+		t.Fatalf("expected exactly one surviving STUMP file, got %d (%v)", n, err)
+	}
+}
+
+// The interface requires both anchor fields on every MINED row; a zero height
+// is persisted as a literal 0 like the other backends, not dropped.
+func TestSetMinedByTxIDs_ZeroHeightPersistsNumeric(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedStatus(t, s, "zero", models.StatusSeenOnNetwork, time.Now())
+	if _, mined, err := s.SetMinedByTxIDs(ctx, "blk", 0, []string{"zero"}); err != nil || len(mined) != 1 {
+		t.Fatalf("SetMinedByTxIDs: %v (%d mined)", err, len(mined))
+	}
+	var raw bson.M
+	if err := s.tx.FindOne(ctx, idFilter("zero")).Decode(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := raw[fBlockHeight]; !ok || v != int64(0) {
+		t.Fatalf("block_height must be stored as a literal 0, got %v (present=%v)", v, ok)
+	}
+	if n := countTracker(t, s); n != 1 {
+		t.Fatalf("MINED row with height 0 must still be tracked, got %d rows", n)
 	}
 }
 

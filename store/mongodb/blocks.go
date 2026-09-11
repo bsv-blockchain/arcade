@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -187,93 +186,64 @@ func (s *Store) ListStaleBlockProcessingStatus(ctx context.Context, olderThan ti
 	return out, nil
 }
 
-// ListOrphanedBlocksToReconcile implements store.Store: the reconciler's
-// work queue, re-anchorable rows first (an active row at the same height
-// whose block has a stored BUMP), then oldest orphaned_at, nil last. The
-// re-anchorable probe is batched: one query for active rows at the candidate
-// heights and one for which of those blocks have a BUMP.
+// ListOrphanedBlocksToReconcile implements store.Store as one aggregation
+// that orders and limits on the server, like the Postgres query: orphaned
+// rows not yet reconciled, re-anchorable first (an active row at the same
+// height whose block has a BUMP manifest), then oldest orphaned_at with
+// missing values last. Only `limit` rows cross the wire, so a large reorg
+// backlog costs the server a bounded sort rather than the process a
+// materialized copy of the whole queue.
 func (s *Store) ListOrphanedBlocksToReconcile(ctx context.Context, limit int) ([]*models.BlockProcessingStatus, error) {
 	if limit <= 0 {
 		return nil, errors.New("limit must be > 0")
 	}
-	queue := doc(kv(fStatus, string(models.BlockStatusOrphaned)), kv(fReconciledAt, doc(kv(opExists, false))))
-	orphans, err := s.listBlocks(ctx, queue, options.Find().SetHint(idxBPOrphaned))
-	if err != nil {
-		return nil, fmt.Errorf("list orphaned blocks: %w", err)
-	}
-	if len(orphans) == 0 {
-		return nil, nil
-	}
-	reanchorable, err := s.reanchorableHeights(ctx, orphans)
-	if err != nil {
-		return nil, fmt.Errorf("list orphaned blocks: probe: %w", err)
-	}
-	sort.SliceStable(orphans, func(i, j int) bool {
-		ri, rj := reanchorable[orphans[i].BlockHeight], reanchorable[orphans[j].BlockHeight]
-		if ri != rj {
-			return ri
-		}
-		return orphanedBefore(orphans[i].OrphanedAt, orphans[j].OrphanedAt)
-	})
-	if len(orphans) > limit {
-		orphans = orphans[:limit]
-	}
-	return orphans, nil
-}
-
-// reanchorableHeights reports, per candidate height, whether the active block
-// at that height has a stored compound BUMP.
-func (s *Store) reanchorableHeights(ctx context.Context, orphans []*models.BlockProcessingStatus) (map[uint64]bool, error) {
-	heights := make([]int64, 0, len(orphans))
-	seen := make(map[uint64]struct{}, len(orphans))
-	for _, o := range orphans {
-		if _, dup := seen[o.BlockHeight]; dup {
-			continue
-		}
-		seen[o.BlockHeight] = struct{}{}
-		heights = append(heights, heightToInt64(o.BlockHeight))
+	// Sentinel for "no orphaned_at": far enough out to sort after any real
+	// value, so absent stamps land last (Postgres NULLS LAST) instead of
+	// first as MongoDB's native null ordering would put them.
+	nullsLast := time.Date(9999, 12, 31, 0, 0, 0, 0, time.UTC)
+	pipeline := mongo.Pipeline{
+		doc(kv(opMatch, doc(kv(fStatus, string(models.BlockStatusOrphaned)), kv(fReconciledAt, doc(kv(opExists, false)))))),
+		// The active (canonical) row at the orphan's height, if any.
+		doc(kv("$lookup", doc(
+			kv("from", collBlockProcessing),
+			kv("let", doc(kv("h", "$"+fBlockHeight))),
+			kv("pipeline", bson.A{
+				doc(kv(opMatch, doc(kv("$expr", doc(kv("$and", bson.A{
+					doc(kv("$eq", bson.A{"$" + fStatus, string(models.BlockStatusActive)})),
+					doc(kv("$eq", bson.A{"$" + fBlockHeight, "$$h"})),
+				})))))),
+				doc(kv("$project", doc(kv(fID, 1)))),
+			}),
+			kv("as", "active"),
+		))),
+		// Whether that canonical block has a stored compound BUMP.
+		doc(kv("$lookup", doc(
+			kv("from", collBumpManifests),
+			kv("localField", "active._id"),
+			kv("foreignField", fID),
+			kv("as", "bumps"),
+		))),
+		doc(kv("$addFields", doc(
+			kv("reanchorable", doc(kv("$gt", bson.A{doc(kv("$size", "$bumps")), 0}))),
+			kv("orphaned_sort", doc(kv("$ifNull", bson.A{"$" + fOrphanedAt, nullsLast}))),
+		))),
+		doc(kv("$sort", doc(kv("reanchorable", -1), kv("orphaned_sort", 1), kv(fID, 1)))),
+		doc(kv("$limit", int64(limit))),
+		doc(kv("$project", doc(kv("active", 0), kv("bumps", 0), kv("reanchorable", 0), kv("orphaned_sort", 0)))),
 	}
 	qctx, cancel := s.queryCtx(ctx)
 	defer cancel()
-	cur, err := s.blocks.Find(qctx,
-		doc(kv(fStatus, string(models.BlockStatusActive)), kv(fBlockHeight, doc(kv(opIn, heights)))),
-		options.Find().SetProjection(doc(kv(fID, 1), kv(fBlockHeight, 1))))
+	cur, err := s.blocks.Aggregate(qctx, pipeline, options.Aggregate().SetHint(idxBPOrphaned).SetAllowDiskUse(true))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list orphaned blocks to reconcile: %w", err)
 	}
-	var actives []struct {
-		Hash   string `bson:"_id"`
-		Height int64  `bson:"block_height"`
+	var docs []blockProcessingDoc
+	if err := cur.All(qctx, &docs); err != nil {
+		return nil, fmt.Errorf("list orphaned blocks to reconcile: %w", err)
 	}
-	if err = cur.All(qctx, &actives); err != nil {
-		return nil, err
-	}
-	hashes := make([]string, 0, len(actives))
-	for _, a := range actives {
-		hashes = append(hashes, a.Hash)
-	}
-	withBUMP, err := s.blocksWithBUMP(ctx, hashes)
-	if err != nil {
-		return nil, err
-	}
-	out := make(map[uint64]bool, len(actives))
-	for _, a := range actives {
-		if withBUMP[a.Hash] {
-			out[heightFromInt64(a.Height)] = true
-		}
+	out := make([]*models.BlockProcessingStatus, 0, len(docs))
+	for _, d := range docs {
+		out = append(out, d.toModel())
 	}
 	return out, nil
-}
-
-// orphanedBefore orders orphaned_at ascending with nil last (Postgres NULLS
-// LAST); MongoDB's native sort would put nulls first.
-func orphanedBefore(a, b *time.Time) bool {
-	switch {
-	case a == nil:
-		return false
-	case b == nil:
-		return true
-	default:
-		return a.Before(*b)
-	}
 }

@@ -7,11 +7,14 @@
 //     update filters that carry the guard (status lattice, "still anchored to
 //     this block"), an optimistic `version` counter on transaction documents
 //     for the block-scoped rewrites, and write ordering for the blobs.
-//   - Large payloads (compound BUMPs, STUMPs) live in GridFS. A BUMP for a
-//     block on a scaling network exceeds the 16 MB document cap, and GridFS
-//     already provides the two orderings the other backends hand-roll: chunks
-//     land before the files document (the linearization point) and the files
-//     document is deleted before its chunks.
+//   - Large payloads (compound BUMPs, STUMPs) live in GridFS — a BUMP for a
+//     block on a scaling network exceeds the 16 MB document cap — behind a
+//     small manifest document keyed by block (bump_manifests) or by
+//     block+subtree (stump_manifests). The manifest swap is the linearization
+//     point: a writer uploads the file first, atomically points the manifest
+//     at it, and deletes only the file the swap replaced, so concurrent
+//     rebuilds of one block can never delete each other's upload and a reader
+//     always finds either the old or the new file, never neither.
 //   - Absent is the only encoding of "no value". Optional fields carry
 //     omitempty, writers clear with $unset, and readers treat absent/null/0
 //     alike. Partial indexes and {field: null} predicates depend on this.
@@ -75,8 +78,10 @@ type Store struct {
 	leases   *mongo.Collection
 	datahubs *mongo.Collection
 	peers    *mongo.Collection
-	bumps    *mongo.GridFSBucket
-	stumps   *mongo.GridFSBucket
+	// bumps / stumps are the GridFS buckets with the manifest collections
+	// that point at the current file; see blobs.go.
+	bumps  blobBucket
+	stumps blobBucket
 
 	bumpCache *bumpcache.Cache
 
@@ -132,16 +137,22 @@ func New(ctx context.Context, cfg config.Mongo) (*Store, error) {
 func newWithClient(client *mongo.Client, database string, cfg config.Mongo) *Store {
 	db := client.Database(database)
 	return &Store{
-		client:           client,
-		db:               db,
-		tx:               db.Collection(collTransactions),
-		subs:             db.Collection(collSubmissions),
-		blocks:           db.Collection(collBlockProcessing),
-		leases:           db.Collection(collLeases),
-		datahubs:         db.Collection(collDatahubEndpoints),
-		peers:            db.Collection(collPeerPolicies),
-		bumps:            db.GridFSBucket(options.GridFSBucket().SetName(bucketBumps).SetChunkSizeBytes(gridfsChunkSize)),
-		stumps:           db.GridFSBucket(options.GridFSBucket().SetName(bucketStumps).SetChunkSizeBytes(gridfsChunkSize)),
+		client:   client,
+		db:       db,
+		tx:       db.Collection(collTransactions),
+		subs:     db.Collection(collSubmissions),
+		blocks:   db.Collection(collBlockProcessing),
+		leases:   db.Collection(collLeases),
+		datahubs: db.Collection(collDatahubEndpoints),
+		peers:    db.Collection(collPeerPolicies),
+		bumps: blobBucket{
+			bucket:    db.GridFSBucket(options.GridFSBucket().SetName(bucketBumps).SetChunkSizeBytes(gridfsChunkSize)),
+			manifests: db.Collection(collBumpManifests),
+		},
+		stumps: blobBucket{
+			bucket:    db.GridFSBucket(options.GridFSBucket().SetName(bucketStumps).SetChunkSizeBytes(gridfsChunkSize)),
+			manifests: db.Collection(collStumpManifests),
+		},
 		bumpCache:        bumpcache.New(),
 		opTimeout:        msOrDefault(cfg.OpTimeoutMs, defaultOpTimeout),
 		queryTimeout:     msOrDefault(cfg.QueryTimeoutMs, defaultQueryTimeout),

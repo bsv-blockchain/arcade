@@ -34,6 +34,7 @@ const (
 	idxPPLastSeen       = "pp_last_seen"
 	idxBumpsBlockHash   = "bumps_block_hash"
 	idxStumpsBlockHash  = "stumps_block_hash_subtree"
+	idxStumpManifests   = "stump_manifest_block_hash"
 	idxGridFSFiles      = "gridfs_filename_uploadDate"
 	idxGridFSChunks     = "gridfs_files_id_n"
 	partialFilterOption = "partialFilterExpression"
@@ -93,12 +94,17 @@ func (s *Store) EnsureIndexes(ctx context.Context) error {
 			idx(idxPPNetwork, bson.D{{Key: fNetwork, Value: 1}}),
 			idx(idxPPLastSeen, bson.D{{Key: fLastSeen, Value: 1}}),
 		}},
-		{s.bumps.GetFilesCollection(), append(gridfsFilesIndexes(),
-			idx(idxBumpsBlockHash, bson.D{{Key: fMetaBlockHash, Value: 1}, {Key: fUploadDate, Value: -1}}))},
-		{s.bumps.GetChunksCollection(), gridfsChunksIndexes()},
-		{s.stumps.GetFilesCollection(), append(gridfsFilesIndexes(),
-			idx(idxStumpsBlockHash, bson.D{{Key: fMetaBlockHash, Value: 1}, {Key: fMetaSubtreeIndex, Value: 1}, {Key: fUploadDate, Value: -1}}))},
-		{s.stumps.GetChunksCollection(), gridfsChunksIndexes()},
+		{s.stumps.manifests, []mongo.IndexModel{
+			idx(idxStumpManifests, bson.D{{Key: fBlockHash, Value: 1}, {Key: fSubtreeIndex, Value: 1}}),
+		}},
+		// Blob reads go through the manifests; the metadata indexes on the
+		// files collections serve only the stale-upload sweep in blobs.go.
+		{s.bumps.bucket.GetFilesCollection(), append(gridfsFilesIndexes(),
+			idx(idxBumpsBlockHash, bson.D{{Key: fMetaBlockHash, Value: 1}, {Key: fID, Value: 1}}))},
+		{s.bumps.bucket.GetChunksCollection(), gridfsChunksIndexes()},
+		{s.stumps.bucket.GetFilesCollection(), append(gridfsFilesIndexes(),
+			idx(idxStumpsBlockHash, bson.D{{Key: fMetaBlockHash, Value: 1}, {Key: fMetaSubtreeIndex, Value: 1}, {Key: fID, Value: 1}}))},
+		{s.stumps.bucket.GetChunksCollection(), gridfsChunksIndexes()},
 	}
 	// Collections are independent, so provision them concurrently: eleven
 	// sequential createIndexes round-trips are the dominant cost of a boot

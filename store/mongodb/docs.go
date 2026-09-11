@@ -18,6 +18,8 @@ const (
 	collLeases           = "leases"
 	collDatahubEndpoints = "datahub_endpoints"
 	collPeerPolicies     = "peer_policies"
+	collBumpManifests    = "bump_manifests"
+	collStumpManifests   = "stump_manifests"
 	bucketBumps          = "bumps"
 	bucketStumps         = "stumps"
 )
@@ -76,6 +78,11 @@ const (
 	fFilename         = "filename"
 	fFilesID          = "files_id"
 	fChunkN           = "n"
+
+	// Blob manifest fields.
+	fFileID       = "file_id"
+	fSubtreeIndex = "subtree_index"
+	fUpdatedAt    = "updated_at"
 )
 
 // Query and update operators.
