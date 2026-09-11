@@ -457,6 +457,96 @@ func TestReconciler_FullScanRespectsHorizon(t *testing.T) {
 	}
 }
 
+// TestReconciler_FullScanResurrectsReconciledOrphan is issue #339 at the
+// deep-backstop layer. The tie loser was orphaned AND reconciled — off the
+// queue, so the resurrection short-circuit can never see it again — and
+// then the competition flipped: it is the active-chain block at its height.
+// The full-scan must reset its row to active with both marks cleared, orphan
+// the competitor that still reads active in the same pass, and re-mine the
+// resurrected block's txs from its retained compound BUMP so the heal does
+// not depend on the competitor's row existing at all.
+func TestReconciler_FullScanResurrectsReconciledOrphan(t *testing.T) {
+	ctx := context.Background()
+	st := newPebbleForTest(t)
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	resurrected, competitor := recOrphan, recCanonical
+	stub.setHeightHeader(10, headerWithHash(t, resurrected, 10))
+
+	// The resurrected block's txs were reverted to SEEN when it lost the tie;
+	// its compound BUMP is retained (they always are) and lists them.
+	seedSeen(t, st, recShared1, recBOnly)
+	if err := st.InsertBUMP(ctx, resurrected, 10, makeCompoundForTest(t, 10, recShared1, recBOnly)); err != nil {
+		t.Fatalf("insert BUMP: %v", err)
+	}
+	_ = st.UpsertBlockHeaderSeen(ctx, competitor, 10, time.Now()) // still reads active
+	_ = st.UpsertBlockHeaderSeen(ctx, resurrected, 10, time.Now())
+	_ = st.MarkBlocksOrphaned(ctx, []string{resurrected}, time.Now())
+	_ = st.MarkBlockReconciled(ctx, resurrected, time.Now()) // the trap: off the queue
+	if rows, _ := st.ListOrphanedBlocksToReconcile(ctx, 10); len(rows) != 0 {
+		t.Fatalf("precondition: resurrected block must be off the reconcile queue, got %d", len(rows))
+	}
+
+	r := newTestReconciler(st, pub, stub, nil)
+	r.defers[resurrected] = 2
+	r.fullScan(ctx)
+
+	bp, err := st.GetBlockProcessingStatus(ctx, resurrected)
+	if err != nil || bp.Status != models.BlockStatusActive || bp.OrphanedAt != nil || bp.ReconciledAt != nil {
+		t.Fatalf("resurrected row must be active with marks cleared, got %+v err=%v", bp, err)
+	}
+	if _, deferred := r.defers[resurrected]; deferred {
+		t.Fatal("reactivation must clear the defer counter")
+	}
+	rows, err := st.ListOrphanedBlocksToReconcile(ctx, 10)
+	if err != nil || len(rows) != 1 || rows[0].BlockHash != competitor {
+		t.Fatalf("competitor must be orphaned and queued in the same pass, got %+v err=%v", rows, err)
+	}
+	for _, id := range []string{recShared1, recBOnly} {
+		if got := statusOf(t, st, id); got.Status != models.StatusMined || got.BlockHash != resurrected {
+			t.Fatalf("%s: want MINED@%s after resurrection, got %s@%s", id, resurrected, got.Status, got.BlockHash)
+		}
+	}
+	if len(pub.bulkEvents()) == 0 {
+		t.Fatal("expected a corrected MINED event for the re-mined txs")
+	}
+}
+
+// TestReconciler_FullScanReactivationRespectsHorizon: the reactivation
+// direction honors the same bounds as the orphan direction — a resurrected
+// row far below the tip is untouched by the default depth and picked up by
+// an explicit target range (the operator lever for an old incident).
+func TestReconciler_FullScanReactivationRespectsHorizon(t *testing.T) {
+	ctx := context.Background()
+	st := newPebbleForTest(t)
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+
+	stub.setHeightHeader(200, headerWithHash(t, recCanonical, 200))
+	_ = st.UpsertBlockHeaderSeen(ctx, recCanonical, 200, time.Now())
+	// An orphaned+reconciled row at height 10 that IS the active block there.
+	stub.setHeightHeader(10, headerWithHash(t, recOrphan, 10))
+	_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+	_ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	_ = st.MarkBlockReconciled(ctx, recOrphan, time.Now())
+
+	r := newTestReconciler(st, pub, stub, nil)
+	r.fullScan(ctx)
+	if bp, err := st.GetBlockProcessingStatus(ctx, recOrphan); err != nil || bp.Status != models.BlockStatusOrphaned {
+		t.Fatalf("out-of-horizon row must stay orphaned under the default depth, got %+v err=%v", bp, err)
+	}
+
+	r2 := newTestReconciler(st, pub, stub, func(c *config.ReconcilerConfig) {
+		c.FullScanMinHeight = 1
+		c.FullScanMaxHeight = 50
+	})
+	r2.fullScan(ctx)
+	bp, err := st.GetBlockProcessingStatus(ctx, recOrphan)
+	if err != nil || bp.Status != models.BlockStatusActive || bp.OrphanedAt != nil || bp.ReconciledAt != nil {
+		t.Fatalf("targeted scan must reactivate the resurrected row, got %+v err=%v", bp, err)
+	}
+}
+
 // TestReconciler_StartupScanDeferredUntilChaintracksReady pins the fix: the
 // startup full-scan must not run while the embedded chaintracks is still
 // resyncing from genesis (every GetHeaderByHeight returns nil), because it

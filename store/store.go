@@ -393,11 +393,15 @@ type Store interface {
 	// table is observability-first: writers must not fail their primary work
 	// because of a status-tracking error.
 
-	// UpsertBlockHeaderSeen records that chaintracks observed a tip header.
-	// On insert, status='active' and header_seen_at=seenAt. On conflict,
-	// implementations MUST overwrite block_height (chaintracks is the
-	// authoritative source) and reset status='active' / orphaned_at=NULL,
-	// but MUST preserve the existing header_seen_at, processed_at, and
+	// UpsertBlockHeaderSeen records that chaintracks observed a tip header,
+	// and is also the resurrection primitive: the block-status tracker and
+	// the anchor reconciler call it to return an orphaned row to active
+	// once the block is the active-chain block at its height again (issue
+	// #339). On insert, status='active' and header_seen_at=seenAt. On
+	// conflict, implementations MUST overwrite block_height (chaintracks is
+	// the authoritative source) and reset status='active' / orphaned_at=NULL
+	// / reconciled_at=NULL (so a later re-orphaning reconciles again), but
+	// MUST preserve the existing header_seen_at, processed_at, and
 	// bump_built_at so a re-arrival or reorg-resurrection does not erase
 	// earlier milestones.
 	UpsertBlockHeaderSeen(ctx context.Context, blockHash string, blockHeight uint64, seenAt time.Time) error

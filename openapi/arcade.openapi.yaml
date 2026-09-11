@@ -1362,11 +1362,22 @@ components:
           format: date-time
         status:
           type: string
-          description: Whether the block is still on the active chain or was orphaned by a reorg.
-          enum: [active, orphaned]
+          description: >-
+            Whether the block is on the active chain (active), was displaced by a reorg or a
+            same-height competition (orphaned), or is an active-chain block whose reprocess
+            attempts the watchdog gave up on (parked). A block that returns to the active chain
+            in a later reorg goes back to active, with orphanedAt and reconciledAt cleared.
+          enum: [active, orphaned, parked]
         orphanedAt:
           type: string
           format: date-time
+        reconciledAt:
+          type: string
+          format: date-time
+          description: >-
+            Set once the anchor reconciler has finished re-anchoring or reverting the
+            transactions of an orphaned block. An orphaned row without it is still queued
+            for reconciliation.
         hasBlockProcessed:
           type: boolean
         hasCompoundBUMP:

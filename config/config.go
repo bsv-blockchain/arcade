@@ -150,12 +150,16 @@ type ChaintracksServerConfig struct {
 	// runs in the same process (mode=all).
 	Port int `mapstructure:"port"`
 	// TieScanDepth is how many heights below the tip the block-status
-	// tracker re-verifies on each tip update: any 'active' block_processing
-	// row in the window whose hash is not the active-chain block at its
-	// height is marked orphaned. This is the detection edge for same-height
-	// competition losers, which never produce a chaintracks ReorgEvent —
-	// an equal-chainwork alternate never becomes tip (issue #279). Default
-	// 20; 0 disables the scan.
+	// tracker re-verifies on each tip update, in both directions: any
+	// 'active' block_processing row in the window whose hash is not the
+	// active-chain block at its height is marked orphaned, and any
+	// 'orphaned' row whose hash IS the active-chain block at its height is
+	// reset to active. The first is the detection edge for same-height
+	// competition losers, which never produce a chaintracks ReorgEvent — an
+	// equal-chainwork alternate never becomes tip (issue #279); the second
+	// heals the flip-flop where that loser wins the next block and the
+	// ReorgEvent names only the orphans and the new tip (issue #339).
+	// Default 20; 0 disables the scan.
 	TieScanDepth int `mapstructure:"tie_scan_depth"`
 	// TieScanMinIntervalMs debounces the scan across tip bursts (regtest
 	// mining, catch-up sync). Default 5000.

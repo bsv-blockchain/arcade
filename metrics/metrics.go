@@ -580,6 +580,37 @@ var ReconcilerBlockDuration = promauto.NewHistogram(prometheus.HistogramOpts{
 })
 
 // ---------------------------------------------------------------------------
+// block-status projection (chaintracks_server tracker + reconciler full-scan)
+
+// Label values for BlockStatusTransitionsTotal. The source names the
+// detection edge that wrote the transition: the ReorgEvent handler and the
+// tie-scan live in services/chaintracks_server; the startup full-scan and
+// the resurrection short-circuit in services/bump_builder's reconciler.
+const (
+	BlockTransitionOrphaned    = "orphaned"
+	BlockTransitionReactivated = "reactivated"
+
+	BlockTransitionSourceReorgEvent = "reorg_event"
+	BlockTransitionSourceTieScan    = "tie_scan"
+	BlockTransitionSourceFullScan   = "full_scan"
+	BlockTransitionSourceReconciler = "reconciler"
+)
+
+// BlockStatusTransitionsTotal counts block_processing status transitions by
+// direction and detection edge. transition=orphaned is a row demoted because
+// the active chain holds a different block at its height; transition=
+// reactivated is an orphaned row reset to active because it IS the
+// active-chain block at its height again — a same-height flip-flop (issue
+// #339). reorg_event/orphaned counts the hashes the ReorgEvent named (rows
+// that never existed are skipped by the store); every other pair counts
+// applied writes. The anchor guard's write-time denials are counted
+// separately by BumpBuilderAnchorGuardDeniedTotal.
+var BlockStatusTransitionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_block_status_transitions_total",
+	Help: "block_processing status transitions by direction (orphaned|reactivated) and detection edge (reorg_event|tie_scan|full_scan|reconciler).",
+}, []string{"transition", "source"})
+
+// ---------------------------------------------------------------------------
 // watchdog (standalone service — block-processing recovery)
 // ---------------------------------------------------------------------------
 

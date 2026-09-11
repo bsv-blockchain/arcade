@@ -27,6 +27,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/services/httpmiddleware"
 	"github.com/bsv-blockchain/arcade/store"
 )
@@ -59,6 +60,10 @@ func New(cfg *config.Config, logger *zap.Logger, st store.Store, ct chaintracks.
 	if !cfg.ChaintracksServer.Enabled || ct == nil {
 		return nil
 	}
+	// Export the block-status transition series at 0 from the first scrape:
+	// a same-height flip-flop is rare, and a series born mid-incident is
+	// invisible to increase() until its second sample.
+	metrics.PreRegisterBlockStatusTransitions()
 	return &Service{
 		cfg:    cfg,
 		logger: logger.Named("chaintracks"),

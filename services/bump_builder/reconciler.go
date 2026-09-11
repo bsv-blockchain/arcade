@@ -237,17 +237,22 @@ func (r *Reconciler) tick(ctx context.Context) {
 	}
 }
 
-// fullScan pages the block_processing table and orphan-marks every 'active'
-// row whose height is provably held by a different block on the active
-// chain. It is the deep backstop that picks up orphans predating the
-// detection edges (guard, tie-scan, ReorgEvents).
+// fullScan pages the block_processing table and re-judges every 'active'
+// and 'orphaned' row within the scan bounds against the active chain:
+// 'active' rows whose height is provably held by a different block are
+// orphan-marked (then consumed by the normal tick), and 'orphaned' rows that
+// ARE the active-chain block at their height are reset to active — including
+// rows already stamped reconciled, which the tick's queue can never revisit
+// (issue #339) — and re-mined from their retained compound BUMP so the heal
+// does not depend on a competitor's row existing. It is the deep backstop
+// that picks up transitions predating the detection edges (guard, tie-scan,
+// ReorgEvents) and the operator lever for an old incident.
 //
-// The scan is BOUNDED (issue #282): rather than re-orphaning the entire
+// The scan is BOUNDED (issue #282): rather than re-judging the entire
 // history oldest-first (which on a long chain grinds through hundreds of
 // historical competition losers, starving the actual recent incident), it
 // considers only heights within FullScanDepth of the active tip — or an
 // explicit FullScan{Min,Max}Height range for operator-targeted recovery.
-// Marked rows are then consumed by the normal tick.
 func (r *Reconciler) fullScan(ctx context.Context) {
 	const page = 1000
 	minHeight, maxHeight, mode := r.fullScanBounds(ctx)
@@ -255,46 +260,110 @@ func (r *Reconciler) fullScan(ctx context.Context) {
 		zap.String("bound_mode", mode),
 		zap.Uint64("min_height", minHeight),
 		zap.Uint64("max_height", maxHeight))
-	// A set, not a slice: the boundary-safe pager may visit a row more than
-	// once at page boundaries (see store.ForEachBlockProcessing).
+	// Sets, not slices: the boundary-safe pager may visit a row more than
+	// once at page boundaries (see store.ForEachBlockProcessing); the first
+	// judgement of a hash wins. Parked rows belong to the watchdog and are
+	// never judged here.
 	markedSet := make(map[string]struct{})
+	resurrectSet := make(map[string]uint64)
 	err := store.ForEachBlockProcessing(ctx, r.store, minHeight, page, func(row *models.BlockProcessingStatus) error {
-		if row.Status != models.BlockStatusActive || row.BlockHeight == 0 || row.BlockHeight > math.MaxUint32 {
+		if (row.Status != models.BlockStatusActive && row.Status != models.BlockStatusOrphaned) ||
+			row.BlockHeight == 0 || row.BlockHeight > math.MaxUint32 {
 			return nil
 		}
 		if maxHeight > 0 && row.BlockHeight > maxHeight {
 			return nil // above the targeted range's upper bound
 		}
+		if _, seen := markedSet[row.BlockHash]; seen {
+			return nil
+		}
+		if _, seen := resurrectSet[row.BlockHash]; seen {
+			return nil
+		}
 		active, hdrErr := r.chainHeader.GetHeaderByHeight(ctx, uint32(row.BlockHeight))
 		if hdrErr != nil || active == nil {
-			return nil //nolint:nilerr // fail-open by contract: never orphan on absence of evidence
+			return nil //nolint:nilerr // fail-open by contract: never judge on absence of evidence
 		}
-		if active.Hash.String() != row.BlockHash {
+		matches := active.Hash.String() == row.BlockHash
+		switch {
+		case row.Status == models.BlockStatusActive && !matches:
 			markedSet[row.BlockHash] = struct{}{}
+		case row.Status == models.BlockStatusOrphaned && matches:
+			resurrectSet[row.BlockHash] = row.BlockHeight
 		}
 		return nil
 	})
 	if err != nil {
 		r.logger.Warn("startup full-scan: incomplete", zap.Error(err))
-		if len(markedSet) == 0 {
-			return
-		}
 		// Whatever was found before the failure still routes into healing.
 	}
-	if len(markedSet) == 0 {
+	if len(markedSet) == 0 && len(resurrectSet) == 0 {
 		r.logger.Info("startup full-scan: no stale anchors found")
 		return
 	}
-	marked := make([]string, 0, len(markedSet))
-	for hash := range markedSet {
+	r.fullScanMarkOrphaned(ctx, markedSet)
+	r.fullScanResurrect(ctx, resurrectSet)
+}
+
+func (r *Reconciler) fullScanMarkOrphaned(ctx context.Context, set map[string]struct{}) {
+	if len(set) == 0 {
+		return
+	}
+	marked := make([]string, 0, len(set))
+	for hash := range set {
 		marked = append(marked, hash)
 	}
 	if err := r.store.MarkBlocksOrphaned(ctx, marked, r.now()); err != nil {
 		r.logger.Warn("startup full-scan: failed to mark orphaned", zap.Error(err))
 		return
 	}
+	metrics.BlockStatusTransitionsTotal.
+		WithLabelValues(metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceFullScan).
+		Add(float64(len(marked)))
 	r.logger.Info("startup full-scan: marked off-chain blocks orphaned",
 		zap.Strings("block_hashes", marked))
+}
+
+// fullScanResurrect resets each resurrected row to active — the header-seen
+// upsert also clears orphaned_at/reconciled_at and preserves the milestone
+// timestamps — and re-mines its txs from the retained compound BUMP, the
+// same fuel reconcileBlock burns for a canonical block, with onlyChanged so
+// rows already anchored right produce no events.
+func (r *Reconciler) fullScanResurrect(ctx context.Context, set map[string]uint64) {
+	if len(set) == 0 {
+		return
+	}
+	batchSize := r.cfg.BumpBuilder.Reconciler.BatchSize
+	if batchSize <= 0 {
+		batchSize = maxTxIDsPerBulkEvent
+	}
+	resurrected := make([]string, 0, len(set))
+	for hash, height := range set {
+		logger := r.logger.With(logfields.BlockHash(hash), logfields.BlockHeight(height))
+		if err := r.store.UpsertBlockHeaderSeen(ctx, hash, height, r.now()); err != nil {
+			logger.Warn("startup full-scan: failed to reactivate resurrected block", zap.Error(err))
+			continue
+		}
+		delete(r.defers, hash)
+		metrics.BlockStatusTransitionsTotal.
+			WithLabelValues(metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceFullScan).
+			Inc()
+		resurrected = append(resurrected, hash)
+		n, ok := r.remineFromStoredBUMP(ctx, logger, hash, batchSize)
+		if !ok {
+			logger.Warn("startup full-scan: resurrected block has no stored compound BUMP; " +
+				"its txs heal through the competitor's orphan row or a BLOCK_PROCESSED redelivery")
+			continue
+		}
+		metrics.ReconcilerTxsReanchoredTotal.Add(float64(n))
+		if n > 0 {
+			logger.Info("startup full-scan: re-mined txs against resurrected block", zap.Int("txs_reanchored", n))
+		}
+	}
+	if len(resurrected) > 0 {
+		r.logger.Warn("startup full-scan: reactivated resurrected canonical blocks that were marked orphaned",
+			zap.Strings("block_hashes", resurrected))
+	}
 }
 
 // fullScanBounds resolves the height window the startup full-scan considers.
@@ -439,6 +508,9 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 				return "error"
 			}
 			delete(r.defers, orphan)
+			metrics.BlockStatusTransitionsTotal.
+				WithLabelValues(metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceReconciler).
+				Inc()
 			return "resurrected"
 		}
 	}

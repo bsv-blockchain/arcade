@@ -88,6 +88,7 @@ func New(
 	// a first-occurrence build failure must not be swallowed by increase().
 	metrics.PreRegisterStatusTransitions(models.StatusMined)
 	metrics.PreRegisterBumpOutcomes()
+	metrics.PreRegisterBlockStatusTransitions()
 	return &Builder{
 		cfg:         cfg,
 		logger:      logger.Named("bump-builder"),
