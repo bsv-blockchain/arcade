@@ -105,6 +105,7 @@ func TestEnsureIndexes_Idempotent(t *testing.T) {
 		collSubmissions:     {"_id_", idxSubTxIDToken, idxSubTokenTxID, idxSubRetryReady},
 		collBlockProcessing: {"_id_", idxBPHeightDesc, idxBPStatusHeight, idxBPStaleSeen, idxBPOrphaned},
 		collLeases:          {"_id_", idxLeaseExpires},
+		collStumpManifests:  {"_id_", idxStumpManifests},
 		"bumps.files":       {"_id_", idxGridFSFiles, idxBumpsBlockHash},
 		"bumps.chunks":      {"_id_", idxGridFSChunks},
 		"stumps.files":      {"_id_", idxGridFSFiles, idxStumpsBlockHash},

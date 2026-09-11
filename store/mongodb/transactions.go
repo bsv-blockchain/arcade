@@ -539,17 +539,20 @@ func prevFromSnapshot(d txDoc) *models.TransactionStatus {
 	}
 }
 
-// minedOp builds the MINED write for one snapshot row. A row already MINED
-// on a different block appends its previous anchor to orphaned_anchors
-// (issue #279); a zero height is expressed as an absent field.
+// minedOp builds the MINED write for one snapshot row. Both anchor fields are
+// always written — the interface requires the height to be persisted with
+// the hash, and the other backends store a literal 0 rather than dropping
+// the field, so the row stays distinguishable from a never-anchored one. A
+// row already MINED on a different block appends its previous anchor to
+// orphaned_anchors (issue #279).
 func minedOp(d txDoc, blockHash string, blockHeight uint64, now time.Time) casOp {
-	set := doc(kv(fStatus, string(models.StatusMined)), kv(fBlockHash, blockHash), kv(fTimestamp, now))
+	set := doc(
+		kv(fStatus, string(models.StatusMined)),
+		kv(fBlockHash, blockHash),
+		kv(fBlockHeight, heightToInt64(blockHeight)),
+		kv(fTimestamp, now),
+	)
 	update := doc()
-	if blockHeight > 0 {
-		set = append(set, kv(fBlockHeight, heightToInt64(blockHeight)))
-	} else {
-		update = append(update, kv(opUnset, doc(kv(fBlockHeight, ""))))
-	}
 	if d.Status == string(models.StatusMined) && d.BlockHash != "" && d.BlockHash != blockHash {
 		hist := models.AppendOrphanedAnchor(anchorsFromDocs(d.OrphanedAnchors), models.OrphanedAnchor{
 			BlockHash: d.BlockHash, BlockHeight: heightFromInt64(d.BlockHeight), OrphanedAt: now,
