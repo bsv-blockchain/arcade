@@ -325,3 +325,18 @@ func TestHeightNarrowing(t *testing.T) {
 		t.Fatal("out-of-range height must clamp, not wrap")
 	}
 }
+
+// Query-side times must be truncated to the millisecond exactly like stored
+// timestamps, so a sub-millisecond `since` compares against the boundary the
+// writer persisted (BSON datetimes cannot represent anything finer).
+func TestSinceFilter_TruncatesToMillisecond(t *testing.T) {
+	since := time.Unix(1_700_000_000, 999_999_999)
+	f := sinceFilter(since)
+	got := f[0].Value.(bson.D)[0].Value.(time.Time)
+	if !got.Equal(since.Truncate(time.Millisecond)) {
+		t.Fatalf("since not truncated: got %v", got)
+	}
+	if len(sinceFilter(time.Time{})) != 0 {
+		t.Fatal("zero since must produce no clause")
+	}
+}

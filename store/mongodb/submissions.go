@@ -199,7 +199,8 @@ func (s *Store) projectedStatuses(ctx context.Context, txids []string, since tim
 	for _, chunk := range chunks(txids, inChunk) {
 		filter := doc(kv(fID, doc(kv(opIn, chunk))))
 		if !since.IsZero() {
-			filter = append(filter, kv(fTimestamp, doc(kv(opGt, since))))
+			// Strictly-after at the store's own resolution (see sinceFilter).
+			filter = append(filter, kv(fTimestamp, doc(kv(opGt, msTrunc(since)))))
 		}
 		if len(names) > 0 {
 			filter = append(filter, kv(fStatus, doc(kv(opIn, names))))
@@ -287,7 +288,7 @@ func (s *Store) ListSubmissionsReadyForRetry(ctx context.Context, now time.Time,
 	if limit <= 0 {
 		return nil, nil
 	}
-	filter := doc(kv(fRetryCount, doc(kv(opGt, 0))), kv(fNextRetryAt, doc(kv(opLte, now))))
+	filter := doc(kv(fRetryCount, doc(kv(opGt, 0))), kv(fNextRetryAt, doc(kv(opLte, msTrunc(now)))))
 	out, err := s.findSubmissions(ctx, filter, options.Find().
 		SetSort(doc(kv(fNextRetryAt, 1))).SetLimit(int64(limit)).SetHint(idxSubRetryReady))
 	if err != nil {

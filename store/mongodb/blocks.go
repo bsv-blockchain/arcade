@@ -176,7 +176,7 @@ func (s *Store) ListStaleBlockProcessingStatus(ctx context.Context, olderThan ti
 	filter := doc(
 		kv(fStatus, string(models.BlockStatusActive)),
 		kv(fProcessedAt, doc(kv(opExists, false))),
-		kv(fHeaderSeenAt, doc(kv(opLt, olderThan))),
+		kv(fHeaderSeenAt, doc(kv(opLt, msTrunc(olderThan)))),
 		kv(fBlockHeight, doc(kv(opGte, heightToInt64(minHeight)))),
 	)
 	out, err := s.listBlocks(ctx, filter, options.Find().

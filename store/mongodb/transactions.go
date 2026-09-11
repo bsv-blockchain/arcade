@@ -272,11 +272,15 @@ func (s *Store) GetStatus(ctx context.Context, txid string) (*models.Transaction
 	return st, nil
 }
 
+// sinceFilter is the "updated at or after since" clause. Query-side times
+// are truncated to the millisecond like every stored timestamp, so a caller
+// passing a sub-millisecond time.Now() compares against the same boundary
+// the writer persisted rather than against a value the store cannot hold.
 func sinceFilter(since time.Time) bson.D {
 	if since.IsZero() {
 		return doc()
 	}
-	return doc(kv(fTimestamp, doc(kv(opGte, since))))
+	return doc(kv(fTimestamp, doc(kv(opGte, msTrunc(since)))))
 }
 
 // GetStatusesSince implements store.Store: full rows updated at or after
@@ -368,9 +372,9 @@ func (s *Store) CensusStatusesSince(ctx context.Context, since, stuckDeadline ti
 		out[st] = store.StatusCensus{}
 		names = append(names, string(st))
 	}
-	window := doc(kv(opLt, stuckDeadline))
+	window := doc(kv(opLt, msTrunc(stuckDeadline)))
 	if !since.IsZero() {
-		window = append(doc(kv(opGte, since)), window...)
+		window = append(doc(kv(opGte, msTrunc(since))), window...)
 	}
 	pipeline := mongo.Pipeline{
 		doc(kv(opMatch, doc(kv(fStatus, doc(kv(opIn, names))), kv(fTimestamp, window)))),
@@ -829,7 +833,7 @@ func (s *Store) GetReadyRetries(ctx context.Context, now time.Time, limit int) (
 	}
 	filter := doc(
 		kv(fStatus, string(models.StatusPendingRetry)),
-		kv(fNextRetryAt, doc(kv(opLte, now))),
+		kv(fNextRetryAt, doc(kv(opLte, msTrunc(now)))),
 		kv(fRawTx, doc(kv(opExists, true))),
 	)
 	qctx, cancel := s.queryCtx(ctx)
