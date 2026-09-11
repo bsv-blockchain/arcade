@@ -10,8 +10,10 @@ import (
 
 	"github.com/bsv-blockchain/go-chaintracks/chaintracks"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
 )
@@ -480,6 +482,42 @@ func TestRecordReorg_ReactivatesResurrectedBranch(t *testing.T) {
 	want := sortedCopy([]string{b.Hash.String(), d.Hash.String()})
 	if ups := sortedCopy(st.upsertCalls()); !equalStrings(ups, want) {
 		t.Fatalf("expected upserts %v, got %v", want, ups)
+	}
+}
+
+// TestRecordReorg_OrphanMetricCountsAppliedTransitions: the store silently
+// skips hashes without a row, and re-marking an already-orphaned row is not
+// a transition, so the reorg_event/orphaned series must count only rows
+// that actually changed status — while the store call still names every
+// hash the event carried.
+func TestRecordReorg_OrphanMetricCountsAppliedTransitions(t *testing.T) {
+	ct := newFakeChaintracks()
+	tip := headerAt(11, 0xDD)
+	ct.headers[11] = tip
+	wasActive := headerAt(10, 0xAA).Hash
+	wasOrphaned := headerAt(10, 0xBB).Hash
+	neverSeen := headerAt(10, 0xCC).Hash
+	st := newTrackerStore(
+		activeRow(wasActive.String(), 10),
+		orphanedRow(wasOrphaned.String(), 10, true),
+	)
+
+	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
+		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceReorgEvent)
+	before := testutil.ToFloat64(counter)
+
+	tr := newTestTracker(ct, st, 20, 0)
+	tr.recordReorg(context.Background(), &chaintracks.ReorgEvent{
+		OrphanedHashes: []chainhash.Hash{wasActive, wasOrphaned, neverSeen},
+		NewTip:         tip,
+	})
+
+	if got := testutil.ToFloat64(counter) - before; got != 1 {
+		t.Fatalf("orphaned transitions = %v, want 1 (re-marks and missing rows are not transitions)", got)
+	}
+	calls := st.orphanCalls()
+	if len(calls) != 1 || len(calls[0]) != 3 {
+		t.Fatalf("every named hash must still be passed to the store, got %v", calls)
 	}
 }
 

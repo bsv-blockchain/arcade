@@ -406,8 +406,8 @@ func TestMarkBlockReconciled_And_ListOrphanedBlocksToReconcile(t *testing.T) {
 	}
 
 	// Reconcile rb-2 — only rb-1 remains queued.
-	if mrErr := s.MarkBlockReconciled(ctx, "rb-2", t0.Add(3*time.Minute)); mrErr != nil {
-		t.Fatalf("MarkBlockReconciled: %v", mrErr)
+	if stamped, mrErr := s.MarkBlockReconciled(ctx, "rb-2", t0.Add(time.Minute), t0.Add(3*time.Minute)); mrErr != nil || !stamped {
+		t.Fatalf("MarkBlockReconciled: stamped=%v err=%v", stamped, mrErr)
 	}
 	rows, err = s.ListOrphanedBlocksToReconcile(ctx, 10)
 	if err != nil {
@@ -425,8 +425,8 @@ func TestMarkBlockReconciled_And_ListOrphanedBlocksToReconcile(t *testing.T) {
 	}
 
 	// Missing rows are silently skipped.
-	if missErr := s.MarkBlockReconciled(ctx, "never-seen", t0); missErr != nil {
-		t.Fatalf("MarkBlockReconciled on missing row: %v", missErr)
+	if stamped, missErr := s.MarkBlockReconciled(ctx, "never-seen", t0, t0); missErr != nil || stamped {
+		t.Fatalf("MarkBlockReconciled on missing row: stamped=%v err=%v", stamped, missErr)
 	}
 
 	// Resurrection: the reconciled block re-joins the main chain with both
@@ -444,6 +444,33 @@ func TestMarkBlockReconciled_And_ListOrphanedBlocksToReconcile(t *testing.T) {
 	if got.OrphanedAt != nil || got.ReconciledAt != nil {
 		t.Errorf("resurrection must clear reorg markers: orphanedAt=%v reconciledAt=%v",
 			got.OrphanedAt, got.ReconciledAt)
+	}
+
+	// Generation check (issue #339): the stamp is a CAS on the orphan
+	// generation the reconciler processed. A stamp for an older generation is
+	// a no-op and rb-1 stays queued…
+	stamped, err := s.MarkBlockReconciled(ctx, "rb-1", t0 /* not rb-1's orphaned_at */, t0.Add(4*time.Minute))
+	if err != nil || stamped {
+		t.Fatalf("stale-generation stamp must be a no-op, got stamped=%v err=%v", stamped, err)
+	}
+	if rows, err = s.ListOrphanedBlocksToReconcile(ctx, 10); err != nil || len(rows) != 1 || rows[0].BlockHash != "rb-1" {
+		t.Fatalf("queue after stale stamp = %v (err=%v), want [rb-1]", hashesOf(rows), err)
+	}
+	// …a resurrected (active) row is never stamped, even without a generation…
+	stamped, err = s.MarkBlockReconciled(ctx, "rb-2", time.Time{}, t0.Add(4*time.Minute))
+	if err != nil || stamped {
+		t.Fatalf("stamp on a resurrected row must be a no-op, got stamped=%v err=%v", stamped, err)
+	}
+	if got, gerr := s.GetBlockProcessingStatus(ctx, "rb-2"); gerr != nil || got.ReconciledAt != nil {
+		t.Fatalf("resurrected row must stay clean, got %+v err=%v", got, gerr)
+	}
+	// …and a zero generation only requires the row to still be orphaned.
+	stamped, err = s.MarkBlockReconciled(ctx, "rb-1", time.Time{}, t0.Add(5*time.Minute))
+	if err != nil || !stamped {
+		t.Fatalf("zero-generation stamp on an orphaned row must apply, got stamped=%v err=%v", stamped, err)
+	}
+	if rows, err = s.ListOrphanedBlocksToReconcile(ctx, 10); err != nil || len(rows) != 0 {
+		t.Fatalf("queue must be empty after the stamp, got %v err=%v", hashesOf(rows), err)
 	}
 }
 

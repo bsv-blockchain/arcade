@@ -267,9 +267,12 @@ func TestSetMinedAndPublish_OnlyChangedFiltersEvents(t *testing.T) {
 	}
 	pub := &capturePublisher{}
 
-	changed := setMinedAndPublish(context.Background(), zap.NewNop(), st, pub,
+	changed, err := setMinedAndPublish(context.Background(), zap.NewNop(), st, pub,
 		guardBlockA, 10, []string{txAlready, txReanchor, txFresh},
 		models.ExtraInfoReorgReanchor, true)
+	if err != nil {
+		t.Fatalf("setMinedAndPublish: %v", err)
+	}
 	if changed != 2 {
 		t.Fatalf("expected 2 changed rows (re-anchor + fresh), got %d", changed)
 	}

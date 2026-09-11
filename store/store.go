@@ -426,9 +426,14 @@ type Store interface {
 	MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) error
 
 	// MarkBlockReconciled stamps reconciled_at on an orphaned block's row,
-	// recording that tx re-anchor/revert for this orphan completed. A
-	// missing row is a silent no-op.
-	MarkBlockReconciled(ctx context.Context, blockHash string, at time.Time) error
+	// recording that tx re-anchor/revert for this orphan completed. It is a
+	// compare-and-set on the orphan generation the caller processed: the
+	// stamp applies only while the row is still status='orphaned' AND its
+	// orphaned_at equals orphanedAt (a zero orphanedAt checks status only).
+	// A row the block-status tracker reactivated — or orphaned again with a
+	// newer orphaned_at — while the reconciler was working is left untouched
+	// (issue #339), as is a missing row. Returns whether the stamp applied.
+	MarkBlockReconciled(ctx context.Context, blockHash string, orphanedAt, at time.Time) (bool, error)
 
 	// ListOrphanedBlocksToReconcile returns up to limit rows with
 	// status='orphaned' AND reconciled_at IS NULL, oldest orphaned_at

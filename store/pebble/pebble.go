@@ -1542,26 +1542,36 @@ func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, or
 	return nil
 }
 
-// MarkBlockReconciled stamps reconciled_at on an orphaned block's row —
-// the anchor reconciler finished re-anchoring/reverting its transactions.
-// Missing rows are silently skipped.
-func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, at time.Time) error {
+// MarkBlockReconciled stamps reconciled_at on an orphaned block's row — the
+// anchor reconciler finished re-anchoring/reverting its transactions — as a
+// compare-and-set on the orphan generation: the row must still be orphaned
+// with the orphaned_at the caller observed (a zero orphanedAt checks status
+// only). Missing, resurrected and re-orphaned rows are silently skipped and
+// reported as not stamped (issue #339). The shard lock makes the
+// read-compare-write atomic against the other block_processing writers.
+func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, orphanedAt, at time.Time) (bool, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return false, err
 	}
 	mu := s.shardFor(blockHash)
 	mu.Lock()
 	defer mu.Unlock()
 	prev, err := s.readBlockProc(blockHash)
 	if err != nil {
-		return err
+		return false, err
 	}
-	if prev == nil {
-		return nil
+	if prev == nil || prev.Status != string(models.BlockStatusOrphaned) {
+		return false, nil
+	}
+	if !orphanedAt.IsZero() && prev.OrphanedAtUnixNs != orphanedAt.UnixNano() {
+		return false, nil
 	}
 	cur := *prev
 	cur.ReconciledAtUnixNs = at.UnixNano()
-	return s.writeBlockProc(prev, &cur)
+	if err := s.writeBlockProc(prev, &cur); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // ListOrphanedBlocksToReconcile scans the block_processing rows for

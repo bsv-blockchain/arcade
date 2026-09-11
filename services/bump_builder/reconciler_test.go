@@ -2,6 +2,7 @@ package bump_builder
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -482,7 +483,7 @@ func TestReconciler_FullScanResurrectsReconciledOrphan(t *testing.T) {
 	_ = st.UpsertBlockHeaderSeen(ctx, competitor, 10, time.Now()) // still reads active
 	_ = st.UpsertBlockHeaderSeen(ctx, resurrected, 10, time.Now())
 	_ = st.MarkBlocksOrphaned(ctx, []string{resurrected}, time.Now())
-	_ = st.MarkBlockReconciled(ctx, resurrected, time.Now()) // the trap: off the queue
+	_, _ = st.MarkBlockReconciled(ctx, resurrected, time.Time{}, time.Now()) // the trap: off the queue
 	if rows, _ := st.ListOrphanedBlocksToReconcile(ctx, 10); len(rows) != 0 {
 		t.Fatalf("precondition: resurrected block must be off the reconcile queue, got %d", len(rows))
 	}
@@ -528,7 +529,7 @@ func TestReconciler_FullScanReactivationRespectsHorizon(t *testing.T) {
 	stub.setHeightHeader(10, headerWithHash(t, recOrphan, 10))
 	_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
 	_ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
-	_ = st.MarkBlockReconciled(ctx, recOrphan, time.Now())
+	_, _ = st.MarkBlockReconciled(ctx, recOrphan, time.Time{}, time.Now())
 
 	r := newTestReconciler(st, pub, stub, nil)
 	r.fullScan(ctx)
@@ -544,6 +545,195 @@ func TestReconciler_FullScanReactivationRespectsHorizon(t *testing.T) {
 	bp, err := st.GetBlockProcessingStatus(ctx, recOrphan)
 	if err != nil || bp.Status != models.BlockStatusActive || bp.OrphanedAt != nil || bp.ReconciledAt != nil {
 		t.Fatalf("targeted scan must reactivate the resurrected row, got %+v err=%v", bp, err)
+	}
+}
+
+// hookedStore wraps the real pebble store so a test can inject a store
+// failure or a concurrent writer at a precise point of the reconcile path.
+// DeleteStumpsByBlockHash is the last store call before the reconciled_at
+// stamp on both the healed and the parked paths, so beforeStamp runs "while
+// the tick is finishing" — where the block-status tracker's reactivation
+// can race it.
+type hookedStore struct {
+	store.Store
+
+	failMined   bool
+	beforeStamp func()
+}
+
+func (h *hookedStore) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeight uint64, txids []string) ([]*models.TransactionStatus, []*models.TransactionStatus, error) {
+	if h.failMined {
+		return nil, nil, errors.New("injected: store unavailable")
+	}
+	return h.Store.SetMinedByTxIDs(ctx, blockHash, blockHeight, txids)
+}
+
+func (h *hookedStore) DeleteStumpsByBlockHash(ctx context.Context, blockHash string) error {
+	if fn := h.beforeStamp; fn != nil {
+		h.beforeStamp = nil
+		fn()
+	}
+	return h.Store.DeleteStumpsByBlockHash(ctx, blockHash)
+}
+
+// TestReconciler_RemineBatchFailureKeepsRowQueued: a failed SetMinedByTxIDs
+// batch while re-mining the canonical BUMP must not fall through to the
+// revert (which would un-mine txs that ARE in the canonical block) or stamp
+// reconciled_at. The row stays queued and the next tick heals once the
+// store recovers.
+func TestReconciler_RemineBatchFailureKeepsRowQueued(t *testing.T) {
+	ctx := context.Background()
+	base := newPebbleForTest(t)
+	hs := &hookedStore{Store: base, failMined: true}
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	stub.setHeightHeader(10, headerWithHash(t, recCanonical, 10))
+
+	seedMined(t, base, recOrphan, 10, recShared1, recBOnly)
+	if err := base.InsertBUMP(ctx, recCanonical, 10, makeCompoundForTest(t, 10, recShared1)); err != nil {
+		t.Fatalf("insert canonical BUMP: %v", err)
+	}
+	_ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+	_ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+
+	r := newTestReconciler(hs, pub, stub, nil)
+	r.tick(ctx)
+
+	for _, id := range []string{recShared1, recBOnly} {
+		if got := statusOf(t, base, id); got.Status != models.StatusMined || got.BlockHash != recOrphan {
+			t.Fatalf("%s: must be untouched after a failed re-mine batch, got %s@%s", id, got.Status, got.BlockHash)
+		}
+	}
+	if rows, err := base.ListOrphanedBlocksToReconcile(ctx, 10); err != nil || len(rows) != 1 {
+		t.Fatalf("row must stay queued for retry, got %+v err=%v", rows, err)
+	}
+
+	hs.failMined = false
+	r.tick(ctx)
+	if got := statusOf(t, base, recShared1); got.Status != models.StatusMined || got.BlockHash != recCanonical {
+		t.Fatalf("shared: want MINED@%s after retry, got %s@%s", recCanonical, got.Status, got.BlockHash)
+	}
+	if got := statusOf(t, base, recBOnly); got.Status != models.StatusSeenOnNetwork {
+		t.Fatalf("bOnly: want reverted SEEN after retry, got %s@%s", got.Status, got.BlockHash)
+	}
+	if rows, err := base.ListOrphanedBlocksToReconcile(ctx, 10); err != nil || len(rows) != 0 {
+		t.Fatalf("row must leave the queue once healed, got %+v err=%v", rows, err)
+	}
+}
+
+// TestReconciler_FullScanRemineFailureLeavesRowForRetry: the full-scan
+// reactivates a resurrected row only once its txs are re-mined. A failed
+// batch leaves the row orphaned (and off the tick's queue, as it was) so the
+// next full-scan retries the whole heal.
+func TestReconciler_FullScanRemineFailureLeavesRowForRetry(t *testing.T) {
+	ctx := context.Background()
+	base := newPebbleForTest(t)
+	hs := &hookedStore{Store: base, failMined: true}
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	stub.setHeightHeader(10, headerWithHash(t, recOrphan, 10))
+
+	seedSeen(t, base, recShared1)
+	if err := base.InsertBUMP(ctx, recOrphan, 10, makeCompoundForTest(t, 10, recShared1)); err != nil {
+		t.Fatalf("insert BUMP: %v", err)
+	}
+	_ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+	_ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	_, _ = base.MarkBlockReconciled(ctx, recOrphan, time.Time{}, time.Now())
+
+	r := newTestReconciler(hs, pub, stub, nil)
+	r.fullScan(ctx)
+	if bp, err := base.GetBlockProcessingStatus(ctx, recOrphan); err != nil || bp.Status != models.BlockStatusOrphaned {
+		t.Fatalf("row must stay orphaned when the re-mine failed, got %+v err=%v", bp, err)
+	}
+	if got := statusOf(t, base, recShared1); got.Status != models.StatusSeenOnNetwork {
+		t.Fatalf("tx must be untouched after the failed re-mine, got %s@%s", got.Status, got.BlockHash)
+	}
+
+	hs.failMined = false
+	r.fullScan(ctx)
+	bp, err := base.GetBlockProcessingStatus(ctx, recOrphan)
+	if err != nil || bp.Status != models.BlockStatusActive || bp.OrphanedAt != nil || bp.ReconciledAt != nil {
+		t.Fatalf("retry must reactivate the row, got %+v err=%v", bp, err)
+	}
+	if got := statusOf(t, base, recShared1); got.Status != models.StatusMined || got.BlockHash != recOrphan {
+		t.Fatalf("retry must re-mine the tx, got %s@%s", got.Status, got.BlockHash)
+	}
+}
+
+// TestReconciler_StaleReconcileDoesNotStampResurrectedRow: the block-status
+// tracker reactivates the row while a tick is mid-reconcile (the tick
+// observed the older competitor as canonical). The final stamp must
+// recognise that the orphan generation it processed is gone and leave the
+// resurrected row clean instead of writing reconciled_at onto an active row.
+func TestReconciler_StaleReconcileDoesNotStampResurrectedRow(t *testing.T) {
+	ctx := context.Background()
+	base := newPebbleForTest(t)
+	hs := &hookedStore{Store: base}
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	stub.setHeightHeader(10, headerWithHash(t, recCanonical, 10))
+
+	seedMined(t, base, recOrphan, 10, recShared1)
+	if err := base.InsertBUMP(ctx, recCanonical, 10, makeCompoundForTest(t, 10, recShared1)); err != nil {
+		t.Fatalf("insert canonical BUMP: %v", err)
+	}
+	_ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+	_ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	rows, err := base.ListOrphanedBlocksToReconcile(ctx, 10)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("precondition: one queued row, got %+v err=%v", rows, err)
+	}
+	// The tracker wins the race right before the stamp: the row is active again.
+	hs.beforeStamp = func() { _ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now()) }
+
+	r := newTestReconciler(hs, pub, stub, nil)
+	if outcome := r.reconcileBlock(ctx, rows[0]); outcome != "stale" {
+		t.Fatalf("outcome = %q, want stale", outcome)
+	}
+	bp, err := base.GetBlockProcessingStatus(ctx, recOrphan)
+	if err != nil || bp.Status != models.BlockStatusActive || bp.OrphanedAt != nil || bp.ReconciledAt != nil {
+		t.Fatalf("resurrected row must stay active and clean, got %+v err=%v", bp, err)
+	}
+}
+
+// TestReconciler_StaleReconcileDoesNotStampReorphanedRow: the row was
+// resurrected AND orphaned again (a newer generation) while the tick ran.
+// The stamp for the old generation must not apply, so the new generation
+// stays queued for its own reconciliation.
+func TestReconciler_StaleReconcileDoesNotStampReorphanedRow(t *testing.T) {
+	ctx := context.Background()
+	base := newPebbleForTest(t)
+	hs := &hookedStore{Store: base}
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	stub.setHeightHeader(10, headerWithHash(t, recCanonical, 10))
+
+	seedMined(t, base, recOrphan, 10, recShared1)
+	if err := base.InsertBUMP(ctx, recCanonical, 10, makeCompoundForTest(t, 10, recShared1)); err != nil {
+		t.Fatalf("insert canonical BUMP: %v", err)
+	}
+	_ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+	_ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	rows, err := base.ListOrphanedBlocksToReconcile(ctx, 10)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("precondition: one queued row, got %+v err=%v", rows, err)
+	}
+	hs.beforeStamp = func() {
+		_ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+		_ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now().Add(time.Second))
+	}
+
+	r := newTestReconciler(hs, pub, stub, nil)
+	if outcome := r.reconcileBlock(ctx, rows[0]); outcome != "stale" {
+		t.Fatalf("outcome = %q, want stale", outcome)
+	}
+	bp, err := base.GetBlockProcessingStatus(ctx, recOrphan)
+	if err != nil || bp.Status != models.BlockStatusOrphaned || bp.ReconciledAt != nil {
+		t.Fatalf("re-orphaned row must stay queued (unstamped), got %+v err=%v", bp, err)
+	}
+	if rows, err := base.ListOrphanedBlocksToReconcile(ctx, 10); err != nil || len(rows) != 1 {
+		t.Fatalf("new generation must remain in the queue, got %+v err=%v", rows, err)
 	}
 }
 

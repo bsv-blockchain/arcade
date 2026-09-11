@@ -1211,15 +1211,28 @@ WHERE block_hash = ANY($1)`
 	return nil
 }
 
-// MarkBlockReconciled stamps reconciled_at on an orphaned block's row —
-// the anchor reconciler finished re-anchoring/reverting its transactions.
-// Missing rows are silently skipped.
-func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, at time.Time) error {
-	const q = `UPDATE block_processing SET reconciled_at = $2 WHERE block_hash = $1`
-	if _, err := s.pool.Exec(ctx, q, blockHash, at); err != nil {
-		return fmt.Errorf("mark block reconciled %s: %w", blockHash, err)
+// MarkBlockReconciled stamps reconciled_at on an orphaned block's row — the
+// anchor reconciler finished re-anchoring/reverting its transactions — as a
+// compare-and-set on the orphan generation: the row must still be orphaned
+// with the orphaned_at the caller observed (a zero orphanedAt checks status
+// only). Missing, resurrected and re-orphaned rows are silently skipped and
+// reported as not stamped (issue #339).
+func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, orphanedAt, at time.Time) (bool, error) {
+	const q = `
+UPDATE block_processing
+SET reconciled_at = $2
+WHERE block_hash = $1
+  AND status = 'orphaned'
+  AND ($3::timestamptz IS NULL OR orphaned_at = $3)`
+	var generation *time.Time
+	if !orphanedAt.IsZero() {
+		generation = &orphanedAt
 	}
-	return nil
+	tag, err := s.pool.Exec(ctx, q, blockHash, at, generation)
+	if err != nil {
+		return false, fmt.Errorf("mark block reconciled %s: %w", blockHash, err)
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
 // ListOrphanedBlocksToReconcile returns the reconciler's work queue:

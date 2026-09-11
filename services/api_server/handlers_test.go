@@ -193,8 +193,11 @@ func (m *mockStore) MarkMerkleRegisteredByTxIDs(context.Context, []string, time.
 func (m *mockStore) GetTxIDsByBlockHash(context.Context, string) ([]string, error) {
 	return nil, nil
 }
-func (m *mockStore) DeleteBUMPByBlockHash(context.Context, string) error          { return nil }
-func (m *mockStore) MarkBlockReconciled(context.Context, string, time.Time) error { return nil }
+func (m *mockStore) DeleteBUMPByBlockHash(context.Context, string) error { return nil }
+func (m *mockStore) MarkBlockReconciled(context.Context, string, time.Time, time.Time) (bool, error) {
+	return true, nil
+}
+
 func (m *mockStore) ListOrphanedBlocksToReconcile(context.Context, int) ([]*models.BlockProcessingStatus, error) {
 	return nil, nil
 }

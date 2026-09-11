@@ -541,7 +541,8 @@ var BumpBuilderAnchorGuardDeniedTotal = promauto.NewCounterVec(prometheus.Counte
 // active again — stale orphan mark), deferred (waiting on the canonical
 // block's BUMP), parked (canonical BUMP unavailable at the defer cap — txs
 // left MINED, NOT reverted, awaiting a later canonical BUMP; issue #282),
-// error.
+// stale (the reconciled_at compare-and-set found the row reactivated or
+// orphaned again mid-pass — nothing stamped; issue #339), error.
 var ReconcilerBlocksTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_reconciler_blocks_total",
 	Help: "Orphaned blocks processed by the anchor reconciler, by outcome.",
@@ -601,10 +602,10 @@ const (
 // the active chain holds a different block at its height; transition=
 // reactivated is an orphaned row reset to active because it IS the
 // active-chain block at its height again — a same-height flip-flop (issue
-// #339). reorg_event/orphaned counts the hashes the ReorgEvent named (rows
-// that never existed are skipped by the store); every other pair counts
-// applied writes. The anchor guard's write-time denials are counted
-// separately by BumpBuilderAnchorGuardDeniedTotal.
+// #339). Every pair counts applied transitions: the reorg_event/orphaned
+// emitter pre-reads the rows a ReorgEvent names, so hashes without a row and
+// rows already orphaned are not counted. The anchor guard's write-time
+// denials are counted separately by BumpBuilderAnchorGuardDeniedTotal.
 var BlockStatusTransitionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_block_status_transitions_total",
 	Help: "block_processing status transitions by direction (orphaned|reactivated) and detection edge (reorg_event|tie_scan|full_scan|reconciler).",

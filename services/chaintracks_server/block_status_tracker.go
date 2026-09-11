@@ -146,14 +146,23 @@ func (t *blockStatusTracker) recordReorg(ctx context.Context, ev *chaintracks.Re
 		for _, h := range ev.OrphanedHashes {
 			hashes = append(hashes, h.String())
 		}
+		// Count transitions, not requests: the store silently skips hashes
+		// without a row (blocks observed before arcade started recording),
+		// and re-marking an already-orphaned row changes nothing.
+		applied := 0
+		for _, hash := range hashes {
+			if row, err := t.store.GetBlockProcessingStatus(ctx, hash); err == nil && row.Status != models.BlockStatusOrphaned {
+				applied++
+			}
+		}
 		if err := t.store.MarkBlocksOrphaned(ctx, hashes, time.Now()); err != nil {
 			t.logger.Warn("failed to mark orphaned blocks",
 				zap.Int("count", len(hashes)),
 				zap.Error(err))
-		} else {
+		} else if applied > 0 {
 			metrics.BlockStatusTransitionsTotal.
 				WithLabelValues(metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceReorgEvent).
-				Add(float64(len(hashes)))
+				Add(float64(applied))
 		}
 	}
 	// chaintracks's tip and reorg channels are independent; the new tip may
