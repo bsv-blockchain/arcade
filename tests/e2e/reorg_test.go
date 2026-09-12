@@ -370,3 +370,109 @@ func assertPathFoldsToRoot(t *testing.T, txid, merklePathHex, wantRoot string) {
 		t.Errorf("tx %s: orphaned proof folds to %s, want %s", txid, root, wantRoot)
 	}
 }
+
+// TestReorg_SameHeightTie_LoserResurrectedByNextBlock replicates issue #339
+// (mainnet height 965773). B is announced first and becomes tip; A arrives
+// seconds later at equal work and is filed as an alternate, so the anchor
+// guard / tie-scan mark A's block_processing row orphaned — correct at that
+// instant. The anchor reconciler then visits A, finds nothing anchored to
+// it and stamps reconciled_at, which takes A off the reconciler's queue for
+// good. When C extends A, chaintracks reorganizes (ReorgEvent{orphaned:
+// [B], newTip: C}) and A is the active-chain block at height 1 again — but
+// on unfixed arcade nothing ever moves A's row back to active: recordReorg
+// touches only the orphaned hashes and the new tip, the tie-scan only
+// demotes 'active' rows, and the reconciler's resurrection short-circuit
+// never sees A again. The public processing-status feed then reports a
+// canonical block as orphaned indefinitely while GET /tx and chaintracks
+// say the opposite.
+//
+// Waiting for reconciled_at before announcing C is what makes the
+// reproduction deterministic: without it the reconciler's short-circuit
+// could race the reorg and mask the defect.
+func TestReorg_SameHeightTie_LoserResurrectedByNextBlock(t *testing.T) {
+	skipIfNoDocker(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 6*time.Minute)
+	defer cancel()
+	s := newReorgStack(ctx, t)
+
+	// 1. B first: tip, its txs legitimately MINED@B.
+	if err := harness.PublishBlockUntilTip(ctx, s.rt, s.h.LibP2P, s.blkB.BlockMessage(s.msDatahub.HostURL()), 90*time.Second); err != nil {
+		t.Fatalf("B → tip: %v", err)
+	}
+	s.assertMinedPathsAgainst(ctx, t, s.blkB, append(append([]string{}, s.shared...), s.bOnly...), 90*time.Second)
+	t.Logf("phase 1: shared+bOnly MINED@B=%s", s.blkB.Hash)
+
+	// 2. A second: an equal-work alternate. Its compound BUMP is built and
+	//    persisted, the anchor guard refuses to mine against it, and its
+	//    row is marked orphaned. Then wait for the reconciler to visit A and
+	//    stamp reconciled_at — A has now LEFT the reconciler's queue, exactly
+	//    the state of mainnet block …6e33 before 965774 arrived (trap armed).
+	if err := harness.PublishBlockUntilTracked(ctx, s.rt, s.h.LibP2P, s.blkA.BlockMessage(s.msDatahub.HostURL()), 90*time.Second); err != nil {
+		t.Fatalf("A → tracked: %v", err)
+	}
+	if err := harness.WaitForBUMPStored(ctx, s.rt, s.blkA.Hash.String(), 90*time.Second); err != nil {
+		t.Fatalf("A's compound BUMP must be persisted even while A is an alternate: %v", err)
+	}
+	if _, err := harness.WaitForBlockStatus(ctx, s.rt, s.blkA.Hash.String(), string(models.BlockStatusOrphaned), 60*time.Second); err != nil {
+		t.Fatalf("A must be marked orphaned while B holds the height: %v", err)
+	}
+	if err := harness.WaitForBlockReconciled(ctx, s.rt, s.blkA.Hash.String(), 60*time.Second); err != nil {
+		t.Fatalf("A must be reconciled (off the reconciler queue) before the flip: %v", err)
+	}
+	t.Logf("phase 2: A=%s orphaned and reconciled — trap armed", s.blkA.Hash)
+
+	// 3. C extends A → A's branch is strictly heavier → chaintracks
+	//    reorganizes and emits ReorgEvent{orphaned: [B], newTip: C}. Two
+	//    DataHubURL variants: container-reachable for merkle-service and
+	//    host-local for chaintracks' backward /headers crawl (A is off
+	//    chaintracks' main chain at this moment).
+	cVariants := []teranode.BlockMessage{
+		s.blkC.BlockMessage(s.msDatahub.HostURL()),
+		s.blkC.BlockMessage(s.msDatahub.LocalURL()),
+	}
+	if err := harness.PublishBlockVariantsUntilTip(ctx, s.rt, s.h.LibP2P, cVariants, 120*time.Second); err != nil {
+		t.Fatalf("C → tip (reorg): %v", err)
+	}
+	t.Logf("phase 3: tip=C=%s — A is the active-chain block at height 1 again", s.blkC.Hash)
+
+	// 4. THE issue-#339 assertion (fails on unfixed arcade): A's row must
+	//    return to active with orphanedAt cleared, on the reorg edge itself —
+	//    not if and when some later sweep happens to visit it.
+	row, err := harness.WaitForBlockStatus(ctx, s.rt, s.blkA.Hash.String(), string(models.BlockStatusActive), 45*time.Second)
+	if err != nil {
+		t.Fatalf("issue #339: block %s is the active-chain block at height 1 after the reorg but "+
+			"block_processing still reports it orphaned: %v", s.blkA.Hash, err)
+	}
+	if row.OrphanedAt != "" || row.ReconciledAt != "" {
+		t.Fatalf("issue #339: reactivated row must clear orphanedAt/reconciledAt, got %+v", row)
+	}
+	//    The loser and the new tip are projected correctly too.
+	bRow, err := harness.WaitForBlockStatus(ctx, s.rt, s.blkB.Hash.String(), string(models.BlockStatusOrphaned), 30*time.Second)
+	if err != nil {
+		t.Fatalf("B must be orphaned by the ReorgEvent: %v", err)
+	}
+	if bRow.OrphanedAt == "" {
+		t.Fatalf("B's orphaned row must carry orphanedAt, got %+v", bRow)
+	}
+	if _, err := harness.WaitForBlockStatus(ctx, s.rt, s.blkC.Hash.String(), string(models.BlockStatusActive), 30*time.Second); err != nil {
+		t.Fatalf("C (new tip) must be active: %v", err)
+	}
+	t.Log("phase 4: block-status projection follows the reorg")
+
+	// 5. Graceful reorg at the tx level: shared re-anchored to A with valid
+	//    A-paths, aOnly finally mined against A (the guard correctly refused
+	//    it while B was tip), bOnly reverted to SEEN_ON_NETWORK.
+	s.assertMinedPathsAgainst(ctx, t, s.blkA, s.shared, 120*time.Second)
+	s.assertMinedPathsAgainst(ctx, t, s.blkA, s.aOnly, 120*time.Second)
+	for _, id := range s.bOnly {
+		if err := harness.WaitForStatus(ctx, s.rt, id, string(models.StatusSeenOnNetwork), 120*time.Second); err != nil {
+			t.Fatalf("bOnly %s must revert to SEEN_ON_NETWORK after B is orphaned: %v", id, err)
+		}
+	}
+	t.Log("phase 5: transactions converged on A")
+
+	// 6. Nothing flips A back: a stale scan or a late reconciler tick must
+	//    not re-orphan the canonical block.
+	harness.AssertBlockStatusStable(ctx, t, s.rt, s.blkA.Hash.String(), string(models.BlockStatusActive), 5*time.Second)
+	t.Log("phase 6: A stayed active")
+}

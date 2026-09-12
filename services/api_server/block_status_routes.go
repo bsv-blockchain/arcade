@@ -19,6 +19,11 @@ const (
 	blockStatusListMaxLimit     = 200
 )
 
+// blockProcessingStatusResponse is one block_processing row as served by
+// GET /api/v1/blocks/processing-status. reconciledAt distinguishes an
+// orphaned row still queued for the anchor reconciler from one it has
+// finished with (issue #339): the latter can only return to active through
+// the block-status tracker's reactivation edges.
 type blockProcessingStatusResponse struct {
 	BlockHash         string                            `json:"blockHash"`
 	BlockHeight       uint64                            `json:"blockHeight"`
@@ -27,6 +32,7 @@ type blockProcessingStatusResponse struct {
 	BUMPBuiltAt       string                            `json:"bumpBuiltAt,omitempty"`
 	Status            models.BlockProcessingStatusValue `json:"status"`
 	OrphanedAt        string                            `json:"orphanedAt,omitempty"`
+	ReconciledAt      string                            `json:"reconciledAt,omitempty"`
 	HasBlockProcessed bool                              `json:"hasBlockProcessed"`
 	HasCompoundBUMP   bool                              `json:"hasCompoundBUMP"`
 }
@@ -55,6 +61,9 @@ func toBlockProcessingResponse(bp *models.BlockProcessingStatus) blockProcessing
 	}
 	if bp.OrphanedAt != nil {
 		resp.OrphanedAt = bp.OrphanedAt.UTC().Format("2006-01-02T15:04:05.000Z07:00")
+	}
+	if bp.ReconciledAt != nil {
+		resp.ReconciledAt = bp.ReconciledAt.UTC().Format("2006-01-02T15:04:05.000Z07:00")
 	}
 	return resp
 }

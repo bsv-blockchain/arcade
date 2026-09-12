@@ -150,3 +150,44 @@ func TestPreRegisterBumpOutcomesCreatesEveryOutcomeChildAtZero(t *testing.T) {
 		}
 	}
 }
+
+func TestPreRegisterBlockStatusTransitionsCreatesEveryPairAtZero(t *testing.T) {
+	PreRegisterBlockStatusTransitions()
+
+	fam := gatherFamily(t, "arcade_block_status_transitions_total")
+	if fam == nil {
+		t.Fatal("arcade_block_status_transitions_total has no series after pre-registration")
+	}
+
+	found := map[[2]string]*dto.Metric{}
+	for _, m := range fam.GetMetric() {
+		found[[2]string{labelValue(m, "transition"), labelValue(m, "source")}] = m
+	}
+
+	// A same-height flip-flop (issue #339) is rare: the reactivated series
+	// must already exist at zero, or increase() swallows the one burst that
+	// matters.
+	for _, pair := range blockStatusTransitions {
+		m, ok := found[pair]
+		if !ok {
+			t.Errorf("child %v not pre-registered", pair)
+			continue
+		}
+		if got := m.GetCounter().GetValue(); got != 0 {
+			t.Errorf("child %v value = %v, want 0", pair, got)
+		}
+	}
+	for _, want := range [][2]string{
+		{BlockTransitionReactivated, BlockTransitionSourceReorgEvent},
+		{BlockTransitionReactivated, BlockTransitionSourceTieScan},
+		{BlockTransitionReactivated, BlockTransitionSourceFullScan},
+		{BlockTransitionReactivated, BlockTransitionSourceReconciler},
+		{BlockTransitionOrphaned, BlockTransitionSourceReorgEvent},
+		{BlockTransitionOrphaned, BlockTransitionSourceTieScan},
+		{BlockTransitionOrphaned, BlockTransitionSourceFullScan},
+	} {
+		if _, ok := found[want]; !ok {
+			t.Errorf("emitted pair %v missing from the pre-registered set", want)
+		}
+	}
+}

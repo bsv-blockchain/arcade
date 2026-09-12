@@ -345,11 +345,14 @@ bump_builder:
 # Set enabled: false in environments without outbound P2P.
 chaintracks_server:
   enabled: true
-  # Tie-scan (issue #279): on each tip update, re-verify the 'active'
+  # Tie-scan (issues #279, #339): on each tip update, re-verify the
   # block_processing rows within tie_scan_depth of the tip against the
-  # active chain and mark same-height losers orphaned — the case where
-  # chaintracks emits NO ReorgEvent (an equal-chainwork alternate never
-  # becomes tip). 0 disables. Debounced by tie_scan_min_interval_ms.
+  # active chain in both directions — mark same-height losers orphaned (the
+  # case where chaintracks emits NO ReorgEvent: an equal-chainwork alternate
+  # never becomes tip) and reset orphaned rows that are the active-chain
+  # block at their height again to active (the flip-flop where that loser
+  # wins the next block). 0 disables. Debounced by tie_scan_min_interval_ms;
+  # the reorg-event handler always runs one scan regardless of the debounce.
   # tie_scan_depth: 20
   # tie_scan_min_interval_ms: 5000
 

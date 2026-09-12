@@ -88,6 +88,7 @@ func New(
 	// a first-occurrence build failure must not be swallowed by increase().
 	metrics.PreRegisterStatusTransitions(models.StatusMined)
 	metrics.PreRegisterBumpOutcomes()
+	metrics.PreRegisterBlockStatusTransitions()
 	return &Builder{
 		cfg:         cfg,
 		logger:      logger.Named("bump-builder"),
@@ -296,7 +297,9 @@ func (b *Builder) handleAnchorDenied(ctx context.Context, logger *zap.Logger, bl
 // repairs it from the compound BUMP's height before fanning out so a
 // half-applied revert can never reintroduce the original bug.
 func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, blockHash string, blockHeight uint64, txids []string) {
-	setMinedAndPublish(ctx, logger, b.store, b.publisher, blockHash, blockHeight, txids, "", false)
+	// A store failure is logged inside; the build path's own handling is
+	// unchanged (finalization proceeds, the watchdog re-drives the block).
+	_, _ = setMinedAndPublish(ctx, logger, b.store, b.publisher, blockHash, blockHeight, txids, "", false)
 }
 
 // setMinedAndPublish is the shared "mark MINED + fan out" core behind the
@@ -318,11 +321,11 @@ func setMinedAndPublish(
 	txids []string,
 	extraInfo string,
 	onlyChanged bool,
-) (changed int) {
+) (int, error) {
 	prevs, mined, err := st.SetMinedByTxIDs(ctx, blockHash, blockHeight, txids)
 	if err != nil {
 		logger.Error("failed to set mined status", zap.Error(err))
-		return 0
+		return 0, err
 	}
 	// onlyChanged: keep only actual anchor transitions. prevs and mined are
 	// parallel slices per the SetMinedByTxIDs contract.
@@ -341,7 +344,7 @@ func setMinedAndPublish(
 		}
 		prevs, mined = filteredPrevs, filteredMined
 		if len(mined) == 0 {
-			return 0
+			return 0, nil
 		}
 	}
 
@@ -399,7 +402,7 @@ func setMinedAndPublish(
 	})
 
 	if len(mined) == 0 || publisher == nil {
-		return len(mined)
+		return len(mined), nil
 	}
 	// Coalesce the N-per-block MINED fan-out into bulk events. Without this, a
 	// single BUMP build for a 14k-tx block produced 14k individual publish
@@ -452,7 +455,7 @@ func setMinedAndPublish(
 			)
 		}
 	}
-	return len(mined)
+	return len(mined), nil
 }
 
 // maxTxIDsPerBulkEvent caps how many txids ride in a single bulk MINED event.

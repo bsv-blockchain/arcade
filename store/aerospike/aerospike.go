@@ -2461,25 +2461,45 @@ func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, or
 }
 
 // MarkBlockReconciled stamps reconciled_at on an orphaned block's row — the
-// anchor reconciler finished re-anchoring/reverting its transactions. A
-// missing row is a silent no-op (UPDATE_ONLY, the RecordDeliveryAttempt
-// pattern).
-func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, at time.Time) error {
+// anchor reconciler finished re-anchoring/reverting its transactions — as a
+// compare-and-set on the orphan generation: the row must still be orphaned
+// with the orphaned_at the caller observed (a zero orphanedAt checks status
+// only). Missing, resurrected and re-orphaned rows are silently skipped and
+// reported as not stamped (issue #339). Read-then-write with
+// EXPECT_GEN_EQUAL (the UpdateDeliveryStatusCAS pattern) so a concurrent
+// writer that moves the row between our Get and Operate wins; UPDATE_ONLY
+// never creates a phantom block row.
+func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, orphanedAt, at time.Time) (bool, error) {
 	key, err := s.key(setBlockProcessing, blockHash)
 	if err != nil {
-		return err
+		return false, err
+	}
+	rec, err := s.client.Get(s.readPolicy(ctx), key, binStatus, binOrphanedAt)
+	if err != nil {
+		if isKeyNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read block for reconcile cas %s: %w", blockHash, err)
+	}
+	if rec == nil || getString(rec, binStatus) != string(models.BlockStatusOrphaned) {
+		return false, nil
+	}
+	if !orphanedAt.IsZero() && getInt64(rec, binOrphanedAt) != orphanedAt.UnixNano() {
+		return false, nil
 	}
 	policy := s.writePolicy(ctx)
-	policy.RecordExistsAction = aero.UPDATE_ONLY // never create a phantom block row
-	_, err = s.client.Operate(policy, key,
+	policy.RecordExistsAction = aero.UPDATE_ONLY
+	policy.GenerationPolicy = aero.EXPECT_GEN_EQUAL
+	policy.Generation = rec.Generation
+	_, opErr := s.client.Operate(policy, key,
 		aero.PutOp(aero.NewBin(binReconciledAt, at.UnixNano())))
-	if isKeyNotFound(err) {
-		return nil
+	if opErr != nil {
+		if isKeyNotFound(opErr) || isGenerationErr(opErr) {
+			return false, nil // the row moved on between read and write: that writer's generation wins
+		}
+		return false, fmt.Errorf("mark block reconciled %s: %w", blockHash, opErr)
 	}
-	if err != nil {
-		return fmt.Errorf("mark block reconciled %s: %w", blockHash, err)
-	}
-	return nil
+	return true, nil
 }
 
 // ListOrphanedBlocksToReconcile narrows by status='orphaned' via the secondary
