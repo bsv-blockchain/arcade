@@ -18,8 +18,8 @@
 //
 // Service ownership
 //
-//   - propagation: batch size, broadcast latency per outcome, chunk count,
-//     dispatcher pending depth, deferred-requeue gauge, reaper lease and
+//   - propagation: batch size, broadcast latency per outcome, chunk count
+//     and chunk payload bytes, dispatcher pending depth, deferred-requeue gauge, reaper lease and
 //     tick outcomes, narrowed-reaper rebroadcast depth, merkle registration
 //     latency.
 //   - bump_builder: build duration, blocks processed, BUMP outcomes, STUMP
@@ -80,6 +80,9 @@ var PropagationBatchSize = promauto.NewHistogram(prometheus.HistogramOpts{
 // metric is the diagnostic for the resilience tunable: if it's growing
 // quickly, the tx generator is producing rejectable txs (double-spends,
 // invalid signatures, insufficient fees, …) — not a peer-health problem.
+// A peer that refused the chunk by shape (PropagationChunkTotal
+// {fallback="size_rejected"}) cast no verdict and is excluded: a broadcast
+// every responder refused by shape counts under no verdict label at all.
 var PropagationBroadcastConsensus = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_propagation_broadcast_consensus_total",
 	Help: "Per-broadcast consensus outcome across all responding endpoints.",
@@ -135,12 +138,38 @@ var PropagationOutcomeTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 }, []string{labelOutcome}) // accepted, rejected, retryable, no_verdict
 
 // PropagationChunkTotal counts how many chunk broadcasts were issued. Combined
-// with PropagationBatchSize this surfaces whether teranode_max_batch_size is
-// well-tuned.
+// with PropagationBatchSize this surfaces whether teranode_max_batch_size and
+// teranode_max_batch_bytes are well-tuned. "none" is one POST as planned;
+// "narrowed" is a re-split after a peer response that could not be bound to
+// individual transactions; "size_rejected" is a chunk a peer refused by
+// shape (too many txs, too many bytes, or a 413) — a non-zero rate means the
+// configured caps are above what some peer accepts.
 var PropagationChunkTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_propagation_chunk_total",
 	Help: "Number of chunk broadcasts issued, by fallback decision.",
-}, []string{"fallback"}) // none
+}, []string{"fallback"}) // none, narrowed, size_rejected
+
+// chunkBytesBuckets diverges from bytesBuckets on purpose: the shared set
+// jumps 4 MiB → 16 MiB → 64 MiB, which cannot tell an 8 MiB chunk from one
+// pinned just under the 16 MiB default of propagation.teranode_max_batch_bytes
+// — and that distinction is the whole tuning question. These add resolution
+// across 1–32 MiB, the band between arcade's default and Teranode's hard
+// 32 MiB maxDataPerRequest.
+var chunkBytesBuckets = []float64{
+	4 * 1024, 64 * 1024, 256 * 1024, 1024 * 1024, 2 * 1024 * 1024, 4 * 1024 * 1024,
+	8 * 1024 * 1024, 12 * 1024 * 1024, 16 * 1024 * 1024, 24 * 1024 * 1024, 32 * 1024 * 1024, 64 * 1024 * 1024,
+}
+
+// PropagationChunkBytes measures the payload of each POST /txs chunk — the
+// concatenated raw tx bytes, which is exactly the request Content-Length.
+// Read next to propagation.teranode_max_batch_bytes: a p99 pinned just under
+// the cap means bytes, not teranode_max_batch_size, decide where chunks end.
+// Observed per POST, including the halves produced by narrowing.
+var PropagationChunkBytes = promauto.NewHistogram(prometheus.HistogramOpts{
+	Name:    "arcade_propagation_chunk_bytes",
+	Help:    "Payload bytes (concatenated raw txs) of each POST /txs chunk broadcast.",
+	Buckets: chunkBytesBuckets,
+})
 
 // PropagationMerkleRegisterDuration measures the merkle-service registration
 // wall time for one flushBatch — a single bounded-concurrency fan-out over

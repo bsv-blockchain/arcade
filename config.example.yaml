@@ -265,6 +265,19 @@ health:
 #   pending_retry_max_backoff_ms: 300000
 #   pending_retry_max_attempts: 288
 #
+#   # POST /txs chunk caps. A flushed batch is split into chunks holding at
+#   # most teranode_max_batch_size transactions AND at most
+#   # teranode_max_batch_bytes of raw transaction bytes (the body is their
+#   # plain concatenation). Teranode refuses a request that reaches 1024
+#   # transactions or 32 MiB — both checked strictly, before each read —
+#   # with a bare 400 carrying no per-tx verdict, so keep both caps under
+#   # those limits; the defaults leave headroom. A single transaction larger
+#   # than the byte cap is still broadcast, alone. A chunk a peer still
+#   # refuses by shape (400 "too much data" / "too many transactions", or a
+#   # 413 body limit) is narrowed by halving rather than requeued blind.
+#   teranode_max_batch_size: 1000
+#   teranode_max_batch_bytes: 16777216
+#
 #   # Per-endpoint circuit-breaker for the datahub URL list. Endpoints that
 #   # accumulate `failure_threshold` consecutive failures are marked unhealthy
 #   # and excluded from broadcasts; a background probe hits GET /health on
