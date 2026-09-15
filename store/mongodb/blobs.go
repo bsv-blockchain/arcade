@@ -55,10 +55,15 @@ import (
 // Close). It cannot see a stall in the sliver before that sample, so it is
 // backed by a check that needs no clock at all: after the swap lands the
 // writer confirms the file it just published still exists, and republishes if
-// a sweeper took it. Between them the two cover both directions — the window
-// check keeps a sweepable file from being published, the confirmation catches
-// a file that was swept before it was published — and the manifest is never
-// left pointing at a file that is gone.
+// it is gone while the manifest still names it. That last qualifier is the
+// whole of it — a published file that is gone is usually not a problem at all
+// but the ordinary result of losing a race, where a later writer swapped onto
+// its own upload and deleted this one. Republishing there would undo a newer
+// write, so who the manifest names now is what tells the two apart. Between
+// them the two checks cover both directions — the window check keeps a
+// sweepable file from being published, the confirmation catches a file that
+// was swept before it was published — and the manifest is never left pointing
+// at a file that is gone.
 
 // Metadata keys stored on GridFS files documents (queried as metadata.<key>).
 const (
@@ -331,24 +336,42 @@ func (s *Store) publishBlob(ctx context.Context, b *blobBucket, key, filename st
 	}
 	// The swap has landed, so everything below is best-effort: the new file
 	// is in force whatever happens, and a copy that survives a transient
-	// delete failure is unreferenced and swept by a later write.
-	//
-	// Except for one thing worth a round trip. The swapWindow check is
-	// measured on this host's clock; a stall between the server stamping
-	// uploadDate and the sample taken just after Close is invisible to it,
-	// and in that sliver a sweeper could have taken this upload for a crash
-	// leftover. That would leave the manifest pointing at nothing, which no
-	// read repairs and no write notices. So confirm what was published still
-	// exists, and republish if it is definitively gone. A check that cannot
-	// be completed is not evidence of deletion and is ignored.
-	if gone, cerr := s.fileMissing(ctx, b.bucket, id); cerr == nil && gone {
-		return false, nil
-	}
+	// delete failure is unreferenced and swept by a later write. Deleting
+	// what this writer replaced happens first and unconditionally — it is
+	// this writer's file to remove no matter what the checks below decide,
+	// and skipping it is how a second copy survives a concurrent overwrite.
 	if hadPrev && prev.FileID != id {
 		_ = s.deleteFile(ctx, b.bucket, prev.FileID)
 	}
+	// One thing below the swap is worth a round trip. The swapWindow check
+	// runs on this host's clock, so a stall between the server stamping
+	// uploadDate and the sample taken just after Close is invisible to it,
+	// and in that sliver a sweeper could have taken this upload for a crash
+	// leftover — leaving the manifest pointing at nothing, which no read
+	// repairs and no write notices. publishedFileLost detects exactly that,
+	// and only that; republish when it does.
+	if s.publishedFileLost(ctx, b, key, id) {
+		return false, nil
+	}
 	s.sweepStale(ctx, b.bucket, metadata, id)
 	return true, nil
+}
+
+// publishedFileLost reports the one state that needs republishing: the file
+// this writer published is gone while the manifest still names it.
+//
+// "Gone" on its own is the ordinary outcome of losing a race — a later writer
+// swapped the manifest onto its own upload and deleted the file it replaced,
+// which is this one. That writer's data is in force and republishing over it
+// would undo a newer write, so who the manifest names now is what separates
+// the two. A check that cannot be completed is not evidence of anything.
+func (s *Store) publishedFileLost(ctx context.Context, b *blobBucket, key string, id bson.ObjectID) bool {
+	gone, err := s.fileMissing(ctx, b.bucket, id)
+	if err != nil || !gone {
+		return false
+	}
+	cur, err := s.readRef(ctx, b.manifests, key)
+	return err == nil && cur.FileID == id
 }
 
 // sweepStale deletes files under scope (metadata equality) whose upload

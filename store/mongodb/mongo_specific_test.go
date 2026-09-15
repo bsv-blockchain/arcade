@@ -365,6 +365,53 @@ func TestFileMissing_AbsentVersusUnknown(t *testing.T) {
 	}
 }
 
+// The republish trigger must fire only for a file that is gone while the
+// manifest still names it. A file that is gone because a later writer
+// superseded it is the ordinary outcome of losing a race: that writer's data
+// is in force, and republishing over it would undo a newer write and leave
+// the file it replaced behind. Getting this wrong is not theoretical — it
+// resurrected stale data and leaked a second file under concurrent
+// overwrites.
+func TestPublishedFileLost_SupersededIsNotLost(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const hash = "blk-lost"
+	if err := s.InsertBUMP(ctx, hash, 4, bytes.Repeat([]byte{9}, 64)); err != nil {
+		t.Fatal(err)
+	}
+	var m bumpManifest
+	if err := s.bumps.manifests.FindOne(ctx, idFilter(hash)).Decode(&m); err != nil {
+		t.Fatal(err)
+	}
+	mine := m.FileID
+
+	// Alive and referenced: nothing to do.
+	if s.publishedFileLost(ctx, &s.bumps, hash, mine) {
+		t.Fatal("a file that still exists is not lost")
+	}
+
+	// Gone, but the manifest has moved on to a later writer's file: that
+	// writer wins and this one must not republish over it.
+	later := bson.NewObjectID()
+	if _, err := s.bumps.manifests.UpdateOne(ctx, idFilter(hash), doc(kv(opSet, doc(kv(fFileID, later))))); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.bumps.bucket.Delete(ctx, mine); err != nil {
+		t.Fatal(err)
+	}
+	if s.publishedFileLost(ctx, &s.bumps, hash, mine) {
+		t.Fatal("a superseded file is not lost — republishing would undo a newer write")
+	}
+
+	// Gone while the manifest still names it: the dangling case, republish.
+	if _, err := s.bumps.manifests.UpdateOne(ctx, idFilter(hash), doc(kv(opSet, doc(kv(fFileID, mine))))); err != nil {
+		t.Fatal(err)
+	}
+	if !s.publishedFileLost(ctx, &s.bumps, hash, mine) {
+		t.Fatal("a file that is gone while the manifest names it must be republished")
+	}
+}
+
 // A manifest left pointing at a file that is gone must be repairable by the
 // next write for the same key. This is the state publishBlob's post-swap
 // confirmation exists to avoid creating, and the state a republish resolves;
