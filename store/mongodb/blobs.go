@@ -49,6 +49,16 @@ import (
 // completing and its swap abandons the upload rather than publish it. No live
 // writer can therefore swap in a file old enough to be swept, so the sweep
 // cannot delete a file another writer is about to reference.
+//
+// That check runs on the writer's own clock, started as close to the server's
+// uploadDate stamp as a client can get (inside upload, on the statement after
+// Close). It cannot see a stall in the sliver before that sample, so it is
+// backed by a check that needs no clock at all: after the swap lands the
+// writer confirms the file it just published still exists, and republishes if
+// a sweeper took it. Between them the two cover both directions — the window
+// check keeps a sweepable file from being published, the confirmation catches
+// a file that was swept before it was published — and the manifest is never
+// left pointing at a file that is gone.
 
 // Metadata keys stored on GridFS files documents (queried as metadata.<key>).
 const (
@@ -74,6 +84,12 @@ const (
 	// the insert race for a brand-new key (E11000); the retry finds the
 	// document and updates it.
 	manifestSwapAttempts = 3
+
+	// blobPublishAttempts bounds the retry of a publish whose file was swept
+	// between upload and swap. Reaching the bound needs that to happen on
+	// every attempt, which means a host stalled for hours; the bound is here
+	// so it fails loudly instead of spinning.
+	blobPublishAttempts = 3
 )
 
 // bumpManifest points bump_manifests/<blockHash> at the current file.
@@ -146,8 +162,16 @@ type blobBucket struct {
 // upload stores data as a new GridFS file under a fresh ObjectID. GridFS
 // writes every chunk before the files document, so the file is complete by
 // the time the id is handed to a manifest.
-func (s *Store) upload(ctx context.Context, b *blobBucket, filename string, metadata bson.D, data []byte) (bson.ObjectID, error) {
+//
+// It also returns when the upload completed, sampled on the statement after
+// Close returns — Close is what makes the server stamp files.uploadDate, the
+// field sweepStale ages files by, so this is the closest a client can read
+// that stamp without fetching it back. The caller measures its swapWindow
+// from here rather than from its own later statements, so nothing between
+// the two can be silently excluded from the window.
+func (s *Store) upload(ctx context.Context, b *blobBucket, filename string, metadata bson.D, data []byte) (bson.ObjectID, time.Time, error) {
 	id := bson.NewObjectID()
+	var completed time.Time
 	err := b.gate.run(func() error {
 		us, err := b.bucket.OpenUploadStreamWithID(ctx, id, filename, options.GridFSUpload().SetMetadata(metadata))
 		if err != nil {
@@ -161,9 +185,23 @@ func (s *Store) upload(ctx context.Context, b *blobBucket, filename string, meta
 			_ = us.Abort()
 			return fmt.Errorf("commit upload: %w", err)
 		}
+		completed = time.Now()
 		return nil
 	})
-	return id, err
+	return id, completed, err
+}
+
+// fileMissing reports whether a GridFS file is definitively gone. A query
+// that cannot be completed reports an error, never absence: not knowing is
+// not the same as knowing it was deleted.
+func (s *Store) fileMissing(ctx context.Context, bucket *mongo.GridFSBucket, id bson.ObjectID) (bool, error) {
+	octx, cancel := s.opCtx(ctx)
+	defer cancel()
+	err := bucket.GetFilesCollection().FindOne(octx, doc(kv(fID, id)), options.FindOne().SetProjection(projID)).Err()
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return true, nil
+	}
+	return false, err
 }
 
 // download reads a whole GridFS file. A short read is an error, never
@@ -249,21 +287,39 @@ func (s *Store) fetch(ctx context.Context, bucket *mongo.GridFSBucket, manifests
 	return s.download(ctx, bucket, fresh)
 }
 
-// replaceBlob is the shared write path: upload, swap the manifest, delete
-// the file the swap replaced, sweep crash leftovers under scope.
+// replaceBlob is the shared write path. publishBlob does the work; this
+// retries the one outcome that is worth retrying, a file swept out from
+// under the writer between its upload and its swap.
 func (s *Store) replaceBlob(ctx context.Context, b *blobBucket, key, filename string, metadata, manifestSet bson.D, data []byte) error {
-	id, err := s.upload(ctx, b, filename, metadata, data)
-	if err != nil {
-		return err
+	for attempt := 0; attempt < blobPublishAttempts; attempt++ {
+		published, err := s.publishBlob(ctx, b, key, filename, metadata, manifestSet, data)
+		if err != nil {
+			return err
+		}
+		if published {
+			return nil
+		}
 	}
-	uploaded := time.Now()
+	return fmt.Errorf("blob %s: upload swept before it could be published, %d attempts running", key, blobPublishAttempts)
+}
+
+// publishBlob uploads data, swaps the manifest onto it, deletes the file the
+// swap replaced and sweeps crash leftovers under scope. It reports whether
+// the file it published is still there; false means the manifest is
+// momentarily pointing at a swept file and the caller should publish again.
+func (s *Store) publishBlob(ctx context.Context, b *blobBucket, key, filename string, metadata, manifestSet bson.D, data []byte) (bool, error) {
+	id, uploaded, err := s.upload(ctx, b, filename, metadata, data)
+	if err != nil {
+		return false, err
+	}
 	set := append(doc(kv(fFileID, id), kv(fLength, int64(len(data))), kv(fUpdatedAt, msNow())), manifestSet...)
 	// Almost always zero — the swap is the next statement — but not free:
 	// a writer descheduled or frozen in between would otherwise publish a
-	// file sweepStale is by then entitled to delete.
+	// file sweepStale is by then entitled to delete. Measured from inside
+	// upload, right after the Close that stamps uploadDate.
 	if waited := time.Since(uploaded); waited > swapWindow {
 		_ = s.deleteFile(ctx, b.bucket, id)
-		return fmt.Errorf("blob %s: waited %s between upload and manifest swap, over the %s window", key, waited, swapWindow)
+		return false, fmt.Errorf("blob %s: waited %s between upload and manifest swap, over the %s window", key, waited, swapWindow)
 	}
 	prev, hadPrev, err := s.swapManifest(ctx, b.manifests, key, set)
 	if err != nil {
@@ -271,17 +327,28 @@ func (s *Store) replaceBlob(ctx context.Context, b *blobBucket, key, filename st
 		// findAndModify that commits can still surface a network failure —
 		// and deleting a file the manifest now references is unrecoverable,
 		// while an upload nothing references is swept later.
-		return err
+		return false, err
 	}
-	// The swap has landed: the new file is in force whatever happens
-	// below. Deleting the superseded file and sweeping leftovers are
-	// best-effort — a copy that survives a transient failure is
-	// unreferenced and is swept by a later write once it is old enough.
+	// The swap has landed, so everything below is best-effort: the new file
+	// is in force whatever happens, and a copy that survives a transient
+	// delete failure is unreferenced and swept by a later write.
+	//
+	// Except for one thing worth a round trip. The swapWindow check is
+	// measured on this host's clock; a stall between the server stamping
+	// uploadDate and the sample taken just after Close is invisible to it,
+	// and in that sliver a sweeper could have taken this upload for a crash
+	// leftover. That would leave the manifest pointing at nothing, which no
+	// read repairs and no write notices. So confirm what was published still
+	// exists, and republish if it is definitively gone. A check that cannot
+	// be completed is not evidence of deletion and is ignored.
+	if gone, cerr := s.fileMissing(ctx, b.bucket, id); cerr == nil && gone {
+		return false, nil
+	}
 	if hadPrev && prev.FileID != id {
 		_ = s.deleteFile(ctx, b.bucket, prev.FileID)
 	}
 	s.sweepStale(ctx, b.bucket, metadata, id)
-	return nil
+	return true, nil
 }
 
 // sweepStale deletes files under scope (metadata equality) whose upload

@@ -337,6 +337,72 @@ func TestInsertBlob_ConcurrentOverwritesKeepExactlyOne(t *testing.T) {
 	}
 }
 
+// fileMissing must distinguish "definitively gone" from "could not tell":
+// reporting absence on a failed query would make publishBlob republish a file
+// that is perfectly fine, on every transient error.
+func TestFileMissing_AbsentVersusUnknown(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const hash = "blk-filemissing"
+	if err := s.InsertBUMP(ctx, hash, 3, bytes.Repeat([]byte{7}, 64)); err != nil {
+		t.Fatal(err)
+	}
+	var m bumpManifest
+	if err := s.bumps.manifests.FindOne(ctx, idFilter(hash)).Decode(&m); err != nil {
+		t.Fatal(err)
+	}
+	if gone, err := s.fileMissing(ctx, s.bumps.bucket, m.FileID); err != nil || gone {
+		t.Fatalf("published file: gone=%v err=%v, want gone=false err=nil", gone, err)
+	}
+	if gone, err := s.fileMissing(ctx, s.bumps.bucket, bson.NewObjectID()); err != nil || !gone {
+		t.Fatalf("never-uploaded file: gone=%v err=%v, want gone=true err=nil", gone, err)
+	}
+	// A cancelled context is "could not tell", never absence.
+	dead, cancel := context.WithCancel(ctx)
+	cancel()
+	if gone, err := s.fileMissing(dead, s.bumps.bucket, m.FileID); err == nil || gone {
+		t.Fatalf("cancelled check: gone=%v err=%v, want gone=false and an error", gone, err)
+	}
+}
+
+// A manifest left pointing at a file that is gone must be repairable by the
+// next write for the same key. This is the state publishBlob's post-swap
+// confirmation exists to avoid creating, and the state a republish resolves;
+// here it is staged directly, since making a sweeper win that race in-process
+// would need a fault-injection seam.
+func TestInsertBUMP_RepairsDanglingManifest(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const hash = "blk-dangling"
+	if err := s.InsertBUMP(ctx, hash, 5, bytes.Repeat([]byte{1}, 128)); err != nil {
+		t.Fatal(err)
+	}
+	var m bumpManifest
+	if err := s.bumps.manifests.FindOne(ctx, idFilter(hash)).Decode(&m); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.bumps.bucket.Delete(ctx, m.FileID); err != nil {
+		t.Fatal(err)
+	}
+	s.bumpCache.Remove(hash)
+	if _, _, err := s.GetBUMP(ctx, hash); err == nil {
+		t.Fatal("GetBUMP must fail while the manifest points at a deleted file")
+	}
+
+	repaired := bytes.Repeat([]byte{2}, 256)
+	if err := s.InsertBUMP(ctx, hash, 5, repaired); err != nil {
+		t.Fatalf("republish over a dangling manifest: %v", err)
+	}
+	height, data, err := s.GetBUMP(ctx, hash)
+	if err != nil || height != 5 || !bytes.Equal(data, repaired) {
+		t.Fatalf("after repair GetBUMP = (%d, %d bytes, %v)", height, len(data), err)
+	}
+	n, err := s.bumps.bucket.GetFilesCollection().CountDocuments(ctx, doc(kv(fMetaBlockHash, hash)))
+	if err != nil || n != 1 {
+		t.Fatalf("expected exactly one file after repair, got %d (%v)", n, err)
+	}
+}
+
 // DeleteBUMPByBlockHash races InsertBUMP for the same block. The tie-break is
 // server order — this delete is unconditional, like the single-statement
 // DELETE on Postgres and Pebble — so either outcome is allowed. What is not
