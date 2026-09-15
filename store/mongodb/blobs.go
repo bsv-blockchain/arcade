@@ -352,9 +352,24 @@ func (s *Store) GetBUMP(ctx context.Context, blockHash string) (uint64, []byte, 
 }
 
 // DeleteBUMPByBlockHash implements store.Store; idempotent, and the cache
-// entry is dropped whether or not a manifest existed. Only the referenced
-// file is deleted, so an upload by a concurrent InsertBUMP that has not yet
-// swapped its manifest survives and wins, as an insert after a delete should.
+// entry is dropped whether or not a manifest existed. The manifest delete is
+// unconditional, so a concurrent InsertBUMP for the same block resolves by
+// server order — last writer wins — the same way the single-statement DELETE
+// does on Postgres and Pebble.
+//
+// Every interleaving still leaves consistent state, because findAndModify
+// hands back the manifest it removed and only that manifest's file is
+// deleted: a swap that lands first is removed together with the file it
+// published (the delete won), and a swap that lands after re-creates the
+// manifest over an upload this call never saw and cannot touch (the insert
+// won). Neither order can leave a manifest pointing at a deleted file.
+//
+// DeleteStumpsByBlockHash deletes conditionally on the file it listed rather
+// than unconditionally, for reasons that do not apply here: it walks many
+// manifests one at a time, so it is not a single atomic statement, and it
+// runs during reorg cleanup while the builder may be re-inserting the same
+// subtrees. This is one document, and the reorg reconciler deliberately
+// never deletes BUMPs (issue #279) — it is an operator lever.
 func (s *Store) DeleteBUMPByBlockHash(ctx context.Context, blockHash string) error {
 	defer s.bumpCache.Remove(blockHash)
 	octx, cancel := s.opCtx(ctx)

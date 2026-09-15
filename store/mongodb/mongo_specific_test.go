@@ -337,6 +337,92 @@ func TestInsertBlob_ConcurrentOverwritesKeepExactlyOne(t *testing.T) {
 	}
 }
 
+// DeleteBUMPByBlockHash races InsertBUMP for the same block. The tie-break is
+// server order — this delete is unconditional, like the single-statement
+// DELETE on Postgres and Pebble — so either outcome is allowed. What is not
+// allowed is an inconsistent one: a manifest pointing at a file the delete
+// removed (GetBUMP would fail forever) or a file left behind with no manifest
+// referencing it. Both outcomes are covered: launched together the delete's
+// single findAndModify beats the insert's multi-round-trip GridFS upload, so
+// the insert wins; the sequential phase pins the other order.
+func TestDeleteBUMPByBlockHash_RacesInsertConsistently(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	payload := bytes.Repeat([]byte{0xAB}, 4096)
+	files := s.bumps.bucket.GetFilesCollection()
+	countFiles := func(hash string) int64 {
+		n, err := files.CountDocuments(ctx, doc(kv(fMetaBlockHash, hash)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	for round := 0; round < 25; round++ {
+		hash := fmt.Sprintf("blk-race-%02d", round)
+		var wg sync.WaitGroup
+		errs := make(chan error, 2)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if err := s.InsertBUMP(ctx, hash, 7, payload); err != nil {
+				errs <- fmt.Errorf("insert: %w", err)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if err := s.DeleteBUMPByBlockHash(ctx, hash); err != nil {
+				errs <- fmt.Errorf("delete: %w", err)
+			}
+		}()
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatalf("round %d: %v", round, err)
+		}
+
+		n := countFiles(hash)
+		height, data, err := s.GetBUMP(ctx, hash)
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			// The delete won: nothing may be left behind.
+			if n != 0 {
+				t.Fatalf("round %d: delete won but %d file(s) survive", round, n)
+			}
+		case err != nil:
+			// Never a dangling manifest: the file the manifest names is gone.
+			t.Fatalf("round %d: GetBUMP after the race: %v", round, err)
+		default:
+			// The insert won: its bytes must be readable, from one file.
+			if height != 7 || !bytes.Equal(data, payload) {
+				t.Fatalf("round %d: insert won but GetBUMP = (%d, %d bytes)", round, height, len(data))
+			}
+			if n != 1 {
+				t.Fatalf("round %d: insert won but %d file(s) present, want 1", round, n)
+			}
+		}
+	}
+
+	// The other order, deterministically: a swap that has already landed is
+	// removed together with the file it published, leaving no orphan behind.
+	const seq = "blk-race-seq"
+	if err := s.InsertBUMP(ctx, seq, 7, payload); err != nil {
+		t.Fatal(err)
+	}
+	if n := countFiles(seq); n != 1 {
+		t.Fatalf("after insert: %d file(s), want 1", n)
+	}
+	if err := s.DeleteBUMPByBlockHash(ctx, seq); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.GetBUMP(ctx, seq); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("GetBUMP after delete = %v, want store.ErrNotFound", err)
+	}
+	if n := countFiles(seq); n != 0 {
+		t.Fatalf("delete left %d GridFS file(s) behind", n)
+	}
+}
+
 // The interface requires both anchor fields on every MINED row; a zero height
 // is persisted as a literal 0 like the other backends, not dropped.
 func TestSetMinedByTxIDs_ZeroHeightPersistsNumeric(t *testing.T) {
