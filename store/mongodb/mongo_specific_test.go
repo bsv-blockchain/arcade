@@ -627,6 +627,112 @@ func TestSetStatusByBlockHash_PagesAndReChecksAnchor(t *testing.T) {
 	}
 }
 
+// A keyset cursor only moves forward, so a row anchored to the block after the
+// cursor passed its id is invisible to the walk that is running — and the
+// reconciler stamps the block reconciled the moment the call returns, which
+// would leave that tx MINED on an orphaned block. The drain exists for that
+// row. Here the interleave is staged at the seam the drain loop uses, one
+// walk at a time, rather than left to chance.
+func TestSetStatusByBlockHash_DrainsRowsAnchoredBehindTheCursor(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const blk = "blk-drain"
+	seed := func(txid string) {
+		t.Helper()
+		if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+			TxID: txid, Status: models.StatusMined, BlockHash: blk, BlockHeight: 9, Timestamp: time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 5; i < 9; i++ {
+		seed(fmt.Sprintf("drain-tx-%02d", i))
+	}
+
+	retired := make(map[string]struct{})
+	fresh, visited, err := s.rewriteBlockOnce(ctx, blk, models.StatusSeenOnNetwork, retired)
+	if err != nil || visited != 4 || len(fresh) != 4 {
+		t.Fatalf("first walk: %d fresh, %d visited, %v", len(fresh), visited, err)
+	}
+
+	// A mine lands for this block at an id the cursor is already past.
+	seed("drain-tx-01")
+
+	fresh, visited, err = s.rewriteBlockOnce(ctx, blk, models.StatusSeenOnNetwork, retired)
+	if err != nil || visited != 1 || len(fresh) != 1 || fresh[0] != "drain-tx-01" {
+		t.Fatalf("second walk must retire the straggler: fresh=%v visited=%d err=%v", fresh, visited, err)
+	}
+	st, _ := s.GetStatus(ctx, "drain-tx-01")
+	if st == nil || st.Status != models.StatusSeenOnNetwork || st.BlockHash != "" {
+		t.Fatalf("straggler not reverted: %+v", st)
+	}
+
+	fresh, visited, err = s.rewriteBlockOnce(ctx, blk, models.StatusSeenOnNetwork, retired)
+	if err != nil || visited != 0 || len(fresh) != 0 {
+		t.Fatalf("third walk must find nothing: fresh=%v visited=%d err=%v", fresh, visited, err)
+	}
+	if left, _ := s.GetTxIDsByBlockHash(ctx, blk); len(left) != 0 {
+		t.Fatalf("nothing may stay anchored, got %v", left)
+	}
+}
+
+// The drain stops on "no new txid", not on "no rows found". A newStatus whose
+// rewrite leaves rows inside the page predicate — anything that neither clears
+// block_hash nor sets IMMUTABLE — must therefore settle after the pass that
+// re-reads them, instead of spinning to the pass bound and failing, and must
+// not report a txid twice for having rewritten it twice.
+func TestSetStatusByBlockHash_TerminatesWhenRowsStayInPredicate(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const blk = "blk-stay"
+	want := 3
+	for i := 0; i < want; i++ {
+		if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+			TxID:      fmt.Sprintf("stay-tx-%02d", i),
+			Status:    models.StatusSeenOnNetwork,
+			BlockHash: blk, BlockHeight: 11, Timestamp: time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	version := func(txid string) int64 {
+		t.Helper()
+		var d struct {
+			Version int64 `bson:"version"`
+		}
+		if err := s.tx.FindOne(ctx, idFilter(txid)).Decode(&d); err != nil {
+			t.Fatal(err)
+		}
+		return d.Version
+	}
+	before := version("stay-tx-00")
+
+	got, err := s.SetStatusByBlockHash(ctx, blk, models.StatusMined)
+	if err != nil {
+		t.Fatalf("a rewrite that keeps rows in the block must still settle: %v", err)
+	}
+
+	// Every applied rewrite bumps the row's version, so a delta of two is
+	// proof the drain ran a second walk over rows the first did not retire —
+	// the walk that would find a row anchored behind the cursor.
+	if delta := version("stay-tx-00") - before; delta < 2 {
+		t.Fatalf("version moved by %d, want >= 2 (a second pass must have re-read the row)", delta)
+	}
+	seen := map[string]int{}
+	for _, txid := range got {
+		seen[txid]++
+		if seen[txid] > 1 {
+			t.Fatalf("%s reported %d times", txid, seen[txid])
+		}
+	}
+	if len(got) != want {
+		t.Fatalf("expected %d txids, got %d (%v)", want, len(got), got)
+	}
+	if left, _ := s.GetTxIDsByBlockHash(ctx, blk); len(left) != want {
+		t.Fatalf("rows must still be anchored after a non-clearing rewrite, got %v", left)
+	}
+}
+
 // Concurrent first upserts for one key must all succeed and converge on one
 // document: the loser of the insert race retries against the winner's row.
 func TestUpserts_ConcurrentFirstInsert(t *testing.T) {
