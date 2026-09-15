@@ -112,10 +112,14 @@ const (
 // index predicates in this package correct. Writers that need to clear a
 // field use $unset, never $set to zero.
 //
-// Version is the optimistic-concurrency token: 1 at insert, $inc'd by every
-// write, and used as a CAS filter by the block-scoped rewrites
-// (SetMinedByTxIDs, SetStatusByBlockHash) so a concurrent UpdateStatus can
-// never be silently overwritten.
+// Version is a write counter, not a CAS token: 1 at insert and bumped by
+// every write, but never filtered on. The block-scoped rewrites
+// (SetMinedByTxIDs, SetStatusByBlockHash) instead carry their guards in the
+// update filter itself — the status lattice as a $nin, "still anchored to
+// this block" — and apply them one findAndModify per row, so a concurrent
+// UpdateStatus is refused by the guard rather than by a version compare. The
+// counter stays because it makes a row's write history cheap to read in the
+// shell and leaves room for a future guard.
 type txDoc struct {
 	TxID               string              `bson:"_id"`
 	Status             string              `bson:"status"`
@@ -244,8 +248,13 @@ type submissionDoc struct {
 	CreatedAt           time.Time  `bson:"created_at"`
 }
 
+// submissionDocFromModel truncates in the caller's struct as well as in the
+// document, including through the optional pointers, so the model a caller
+// hands to InsertSubmission equals what a later read returns.
 func submissionDocFromModel(sub *models.Submission) submissionDoc {
 	sub.CreatedAt = msTrunc(sub.CreatedAt)
+	sub.NextRetryAt = msTruncPtr(sub.NextRetryAt)
+	sub.LastAttemptAt = msTruncPtr(sub.LastAttemptAt)
 	return submissionDoc{
 		SubmissionID:        sub.SubmissionID,
 		TxID:                sub.TxID,
@@ -254,9 +263,9 @@ func submissionDocFromModel(sub *models.Submission) submissionDoc {
 		FullStatusUpdates:   sub.FullStatusUpdates,
 		LastDeliveredStatus: string(sub.LastDeliveredStatus),
 		RetryCount:          sub.RetryCount,
-		NextRetryAt:         msTruncPtr(sub.NextRetryAt),
+		NextRetryAt:         sub.NextRetryAt,
 		Attempts:            sub.Attempts,
-		LastAttemptAt:       msTruncPtr(sub.LastAttemptAt),
+		LastAttemptAt:       sub.LastAttemptAt,
 		LastResult:          sub.LastResult,
 		CreatedAt:           sub.CreatedAt,
 	}

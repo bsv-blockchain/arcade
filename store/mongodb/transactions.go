@@ -277,6 +277,21 @@ func sinceFilter(since time.Time) bson.D {
 	return doc(kv(fTimestamp, doc(kv(opGte, msCeil(since)))))
 }
 
+// afterFilter is sinceFilter's strict sibling, for the one method whose
+// contract is "strictly after since" (IterateStatusesByToken). Stored
+// timestamps are millisecond-aligned — a BSON datetime is a millisecond
+// count — so the smallest stored value that is after since = 12.345 ms is
+// 13 ms, which is exactly what $gt on the floored bound selects: a row at
+// 12 ms is not after since and is excluded. Flooring rather than ceiling is
+// what keeps that exact; $gt on a ceilinged 13 ms would wrongly drop a row
+// stored at 13 ms.
+func afterFilter(since time.Time) bson.D {
+	if since.IsZero() {
+		return doc()
+	}
+	return doc(kv(fTimestamp, doc(kv(opGt, msTrunc(since)))))
+}
+
 // GetStatusesSince implements store.Store: full rows updated at or after
 // since, newest first.
 func (s *Store) GetStatusesSince(ctx context.Context, since time.Time) ([]*models.TransactionStatus, error) {

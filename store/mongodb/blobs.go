@@ -32,14 +32,23 @@ import (
 // pruning each other's upload. Readers resolve manifest → file; a reader
 // that loses a race between the two steps re-reads the manifest once.
 //
-// A writer that dies between upload and swap leaves an unreferenced file.
-// The next successful write for the same key sweeps files whose upload
-// COMPLETED (files.uploadDate, stamped by the driver when the stream closes)
-// more than staleUploadAge ago and that it does not reference. Age is taken
-// from completion, not from the file id allocated before the upload began,
-// so a slow in-flight upload can never look stale; between completion and
-// the swap there is one round trip, and a file that sat unreferenced for an
-// hour after completing belongs to a writer that died in between.
+// A writer that dies between upload and swap leaves an unreferenced file, and
+// so does one whose swap fails or reports an unknown outcome: the upload is
+// kept on purpose there, because a swap that committed and then surfaced a
+// network error would otherwise leave the manifest pointing at a file the
+// writer deleted, which no later read could repair and no later write would
+// notice. Unreferenced files are reclaimed instead: the next successful write
+// for the same key sweeps files whose upload COMPLETED (files.uploadDate,
+// stamped by the driver when the stream closes) more than staleUploadAge ago
+// and that it does not reference. Age is taken from completion, not from the
+// file id allocated before the upload began, so a slow in-flight upload can
+// never look stale.
+//
+// What makes "completed long ago and unreferenced" mean "its writer died" is
+// swapWindow: a writer that took longer than that between its upload
+// completing and its swap abandons the upload rather than publish it. No live
+// writer can therefore swap in a file old enough to be swept, so the sweep
+// cannot delete a file another writer is about to reference.
 
 // Metadata keys stored on GridFS files documents (queried as metadata.<key>).
 const (
@@ -51,6 +60,15 @@ const (
 	// unreferenced before a later write for the same key sweeps it as a
 	// crash leftover.
 	staleUploadAge = time.Hour
+
+	// swapWindow bounds the gap between an upload completing and the
+	// manifest swap that publishes it. Past it the writer abandons its own
+	// upload, which is what lets sweepStale read "completed long ago and
+	// unreferenced" as "the writer died" instead of "the writer is slow".
+	// Far below staleUploadAge, so neither a descheduled goroutine nor skew
+	// between the server-stamped uploadDate and a sweeper's own clock can
+	// close the gap.
+	swapWindow = 5 * time.Minute
 
 	// manifestSwapAttempts bounds the retry of an upserting swap that lost
 	// the insert race for a brand-new key (E11000); the retry finds the
@@ -238,11 +256,21 @@ func (s *Store) replaceBlob(ctx context.Context, b *blobBucket, key, filename st
 	if err != nil {
 		return err
 	}
+	uploaded := time.Now()
 	set := append(doc(kv(fFileID, id), kv(fLength, int64(len(data))), kv(fUpdatedAt, msNow())), manifestSet...)
+	// Almost always zero — the swap is the next statement — but not free:
+	// a writer descheduled or frozen in between would otherwise publish a
+	// file sweepStale is by then entitled to delete.
+	if waited := time.Since(uploaded); waited > swapWindow {
+		_ = s.deleteFile(ctx, b.bucket, id)
+		return fmt.Errorf("blob %s: waited %s between upload and manifest swap, over the %s window", key, waited, swapWindow)
+	}
 	prev, hadPrev, err := s.swapManifest(ctx, b.manifests, key, set)
 	if err != nil {
-		// Nothing references the upload; don't leave it behind.
-		_ = s.deleteFile(ctx, b.bucket, id)
+		// Keep the upload. The swap's outcome is unknown on error — a
+		// findAndModify that commits can still surface a network failure —
+		// and deleting a file the manifest now references is unrecoverable,
+		// while an upload nothing references is swept later.
 		return err
 	}
 	// The swap has landed: the new file is in force whatever happens

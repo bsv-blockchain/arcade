@@ -20,7 +20,8 @@ import (
 
 // Behaviour that is specific to this backend or that no other backend's
 // suite pins: the census aggregate, since-filtering, GridFS atomicity and
-// size, the version-CAS fallback, the replay bound, and lease expiry.
+// size, the guarded per-row rewrites under concurrency, the replay bound,
+// and lease expiry.
 
 func seedStatus(t *testing.T, s *Store, txid string, status models.Status, ts time.Time) {
 	t.Helper()
@@ -542,6 +543,13 @@ func TestIterateStatusesByToken_RefusesPastBound(t *testing.T) {
 	if !errors.Is(err, store.ErrReplayUnavailable) {
 		t.Fatalf("expected ErrReplayUnavailable, got %v", err)
 	}
+	// The preflight count is only advisory — submissions can be inserted
+	// between it and the scan — so the scan enforces the same bound itself.
+	s.tokenReplayLimit = 10
+	if _, err := s.tokenTxIDs(ctx, doc(kv(fCallbackToken, token))); !errors.Is(err, store.ErrReplayUnavailable) {
+		t.Fatalf("scan past the bound = %v, want store.ErrReplayUnavailable", err)
+	}
+
 	s.tokenReplayLimit = total
 	n := 0
 	if err := s.IterateStatusesByToken(ctx, token, time.Time{}, nil, func(*models.TransactionStatus) error { n++; return nil }); err != nil {
@@ -549,6 +557,10 @@ func TestIterateStatusesByToken_RefusesPastBound(t *testing.T) {
 	}
 	if n != total {
 		t.Fatalf("within budget expected %d rows, got %d", total, n)
+	}
+	// A token exactly at the bound is served, not refused.
+	if ids, err := s.tokenTxIDs(ctx, doc(kv(fCallbackToken, token))); err != nil || len(ids) != total {
+		t.Fatalf("token at the bound: %d ids, err %v; want %d ids and no error", len(ids), err, total)
 	}
 }
 

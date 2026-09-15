@@ -116,11 +116,14 @@ func containsString(list []string, v string) bool {
 	return false
 }
 
-// IterateStatusesByToken implements store.Store. The replay is bounded by
-// the token's submission count before anything is materialized — past the
-// bound it refuses with store.ErrReplayUnavailable, as the interface requires.
-// Within it: a covered scan collects the distinct txids, their statuses are
-// read in projected $in chunks, and the (small, filtered) result is sorted by
+// IterateStatusesByToken implements store.Store. The replay is bounded twice:
+// a bounded count refuses an oversized token before any scan, and the scan
+// itself abandons at the same limit, so a token that grows past the bound
+// after the count is refused rather than materialized. Either way the answer
+// is store.ErrReplayUnavailable and peak memory is capped at limit entries,
+// as the interface requires and as Pebble and Aerospike do. Within the bound:
+// a covered scan collects the distinct txids, their statuses are read in
+// projected $in chunks, and the (small, filtered) result is sorted by
 // timestamp and streamed.
 func (s *Store) IterateStatusesByToken(ctx context.Context, callbackToken string, since time.Time, onlyStatuses []models.Status, fn func(*models.TransactionStatus) error) error {
 	if callbackToken == "" {
@@ -160,7 +163,10 @@ func (s *Store) IterateStatusesByToken(ctx context.Context, callbackToken string
 }
 
 // tokenTxIDs collects the distinct txids under a token via the covered
-// {callback_token, txid} index.
+// {callback_token, txid} index, abandoning the scan past tokenReplayLimit
+// rows. The caller's count is only a preflight — submissions can be inserted
+// between it and this scan — so the bound is enforced here, where the memory
+// is actually spent.
 func (s *Store) tokenTxIDs(ctx context.Context, tokenFilter bson.D) ([]string, error) {
 	cur, err := s.subs.Find(ctx, tokenFilter, options.Find().
 		SetProjection(doc(kv(fTxID, 1), kv(fID, 0))).SetHint(idxSubTokenTxID).SetBatchSize(s.cursorBatch()))
@@ -170,7 +176,12 @@ func (s *Store) tokenTxIDs(ctx context.Context, tokenFilter bson.D) ([]string, e
 	defer closeCursor(ctx, cur)
 	seen := make(map[string]struct{})
 	var txids []string
+	var scanned int64
 	for cur.Next(ctx) {
+		scanned++
+		if scanned > s.tokenReplayLimit {
+			return nil, fmt.Errorf("%w: token has more than %d submissions", store.ErrReplayUnavailable, s.tokenReplayLimit)
+		}
 		var r tokenRow
 		if err := cur.Decode(&r); err != nil {
 			return nil, fmt.Errorf("iterate statuses by token: decode: %w", err)
@@ -198,10 +209,7 @@ func (s *Store) projectedStatuses(ctx context.Context, txids []string, since tim
 	var rows []*models.TransactionStatus
 	for _, chunk := range chunks(txids, inChunk) {
 		filter := doc(kv(fID, doc(kv(opIn, chunk))))
-		if !since.IsZero() {
-			// Strictly-after at the store's own resolution (see sinceFilter).
-			filter = append(filter, kv(fTimestamp, doc(kv(opGt, msTrunc(since)))))
-		}
+		filter = append(filter, afterFilter(since)...)
 		if len(names) > 0 {
 			filter = append(filter, kv(fStatus, doc(kv(opIn, names))))
 		}

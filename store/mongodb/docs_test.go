@@ -153,6 +153,35 @@ func TestSubmissionDoc_RoundTrip(t *testing.T) {
 	}
 }
 
+// Truncation is written back into the caller's struct, pointers included, so
+// the Submission a caller hands to InsertSubmission equals what a later read
+// returns. Missing this for the pointer fields would leave nanoseconds in the
+// caller's copy while the store holds milliseconds.
+func TestSubmissionDocFromModel_TruncatesCallerStruct(t *testing.T) {
+	ns := time.Unix(1_700_000_000, 12_345_678)
+	next, last := ns.Add(time.Minute), ns
+	sub := &models.Submission{SubmissionID: "s1", TxID: "t1", CreatedAt: ns, NextRetryAt: &next, LastAttemptAt: &last}
+	d := submissionDocFromModel(sub)
+	for _, c := range []struct {
+		name string
+		got  time.Time
+	}{
+		{"model created_at", sub.CreatedAt},
+		{"model next_retry_at", *sub.NextRetryAt},
+		{"model last_attempt_at", *sub.LastAttemptAt},
+		{"doc created_at", d.CreatedAt},
+		{"doc next_retry_at", *d.NextRetryAt},
+		{"doc last_attempt_at", *d.LastAttemptAt},
+	} {
+		if c.got.Nanosecond()%int(time.Millisecond) != 0 {
+			t.Errorf("%s = %v, want millisecond-aligned", c.name, c.got)
+		}
+	}
+	if !sub.NextRetryAt.Equal(*d.NextRetryAt) || !sub.LastAttemptAt.Equal(*d.LastAttemptAt) {
+		t.Errorf("model and document disagree: %v/%v vs %v/%v", sub.NextRetryAt, sub.LastAttemptAt, d.NextRetryAt, d.LastAttemptAt)
+	}
+}
+
 // The datahub nil-policy rule: nil → key absent; zero policy → present with
 // explicit zeros. Both must survive a round trip distinctly.
 func TestDatahubEndpointDoc_PolicyAbsentVsZero(t *testing.T) {
@@ -352,6 +381,27 @@ func TestQueryTimeBounds(t *testing.T) {
 		t.Fatalf("sinceFilter must round a fractional since up, got %v", got)
 	}
 	if len(sinceFilter(time.Time{})) != 0 {
+		t.Fatal("zero since must produce no clause")
+	}
+
+	// afterFilter is the strict bound (IterateStatusesByToken). Stored times
+	// are millisecond-aligned, so $gt on the floored bound admits exactly the
+	// rows after since: 12 ms is excluded for since = 12.345 ms, 13 ms is not.
+	a := afterFilter(fractional)
+	bound := a[0].Value.(bson.D)[0]
+	if bound.Key != opGt {
+		t.Fatalf("afterFilter must be a strict bound, got %s", bound.Key)
+	}
+	if got := bound.Value.(time.Time); !got.Equal(aligned) {
+		t.Fatalf("afterFilter must floor a fractional since, got %v", got)
+	}
+	if aligned.After(fractional) {
+		t.Fatal("test premise: 12ms must not be after 12.345ms")
+	}
+	if !aligned.Add(time.Millisecond).After(fractional) {
+		t.Fatal("test premise: 13ms must be after 12.345ms")
+	}
+	if len(afterFilter(time.Time{})) != 0 {
 		t.Fatal("zero since must produce no clause")
 	}
 }
