@@ -2,6 +2,7 @@ package bump_builder
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -31,6 +32,12 @@ const ReconcilerLeaseName = "anchor-reconciler"
 // recency window the watchdog uses — and stops the deep backstop from
 // re-orphaning a long chain's entire history oldest-first (issue #282).
 const defaultFullScanDepth = 144
+
+// maxStartupFullScanAttempts bounds how many times a tick re-runs the
+// one-shot startup full-scan after an incomplete run. Enough to ride out a
+// transient store failure; low enough that a persistent one does not re-page
+// the scan window on every tick for the life of the process.
+const maxStartupFullScanAttempts = 5
 
 // defaultFullScanChaintracksReadyTimeout bounds the initial wait for the
 // chain-header source to sync up to the store's active tip before the startup
@@ -82,6 +89,11 @@ type Reconciler struct {
 	// re-arms the one-shot, which is idempotent (fullScan only marks, and marks
 	// are convergent).
 	startupScanDone bool
+
+	// startupScanAttempts counts full-scan runs that ended incomplete; the
+	// one-shot is retired at maxStartupFullScanAttempts. Touched only from
+	// the reconcile goroutine, like startupScanDone.
+	startupScanAttempts int
 
 	now    func() time.Time
 	cancel context.CancelFunc
@@ -146,8 +158,7 @@ func (r *Reconciler) Start(ctx context.Context) error {
 
 	if r.cfg.BumpBuilder.Reconciler.StartupFullScan && r.acquireLease(ctx) {
 		if r.waitForChaintracksReady(ctx) {
-			r.fullScan(ctx)
-			r.startupScanDone = true
+			r.runStartupFullScan(ctx)
 		} else {
 			r.logger.Warn("startup full-scan: chain-header source not ready within timeout; "+
 				"deferring to a later tick (self-heals once chaintracks catches up to the active tip)",
@@ -214,8 +225,7 @@ func (r *Reconciler) tick(ctx context.Context) {
 	// before the readiness probe once done or when the scan is disabled, so
 	// steady-state ticks pay nothing.
 	if r.cfg.BumpBuilder.Reconciler.StartupFullScan && !r.startupScanDone && r.chaintracksReady(ctx) {
-		r.fullScan(ctx)
-		r.startupScanDone = true
+		r.runStartupFullScan(ctx)
 	}
 	blocksPerTick := r.cfg.BumpBuilder.Reconciler.BlocksPerTick
 	if blocksPerTick <= 0 {
@@ -237,6 +247,34 @@ func (r *Reconciler) tick(ctx context.Context) {
 	}
 }
 
+// runStartupFullScan runs the one-shot startup full-scan and retires it only
+// once a scan actually completes. An incomplete scan (paging error, or a
+// repair whose re-mine or write failed) leaves rows that need healing still
+// orphaned — and, when they were already stamped reconciled, off the tick's
+// durable queue — so retiring the one-shot there would strand exactly the
+// deep incident the scan exists for until someone restarts the process
+// (issue #339 review). Later ticks retry, capped so a persistently failing
+// store cannot re-page the window on every tick forever.
+func (r *Reconciler) runStartupFullScan(ctx context.Context) {
+	if r.fullScan(ctx) {
+		r.startupScanDone = true
+		return
+	}
+	r.startupScanAttempts++
+	if r.startupScanAttempts >= maxStartupFullScanAttempts {
+		r.logger.Error("startup full-scan: still incomplete at the attempt cap; retiring the one-shot. "+
+			"Rows needing repair remain orphaned — re-run with a targeted "+
+			"ARCADE_BUMP_BUILDER_RECONCILER_FULL_SCAN_{MIN,MAX}_HEIGHT window once the cause is cleared",
+			zap.Int("attempts", r.startupScanAttempts),
+			zap.Int("attempt_cap", maxStartupFullScanAttempts))
+		r.startupScanDone = true
+		return
+	}
+	r.logger.Warn("startup full-scan: incomplete; retrying on a later tick",
+		zap.Int("attempts", r.startupScanAttempts),
+		zap.Int("attempt_cap", maxStartupFullScanAttempts))
+}
+
 // fullScan pages the block_processing table and re-judges every 'active'
 // and 'orphaned' row within the scan bounds against the active chain:
 // 'active' rows whose height is provably held by a different block are
@@ -253,7 +291,13 @@ func (r *Reconciler) tick(ctx context.Context) {
 // historical competition losers, starving the actual recent incident), it
 // considers only heights within FullScanDepth of the active tip — or an
 // explicit FullScan{Min,Max}Height range for operator-targeted recovery.
-func (r *Reconciler) fullScan(ctx context.Context) {
+//
+// Returns whether the scan COMPLETED: it paged the whole window and every
+// repair it decided on was applied. A false return means at least one row
+// that needs healing is still orphaned — and, if it was already stamped
+// reconciled, off the tick's durable queue — so the caller must retry rather
+// than retire the one-shot (issue #339 review).
+func (r *Reconciler) fullScan(ctx context.Context) bool {
 	const page = 1000
 	minHeight, maxHeight, mode := r.fullScanBounds(ctx)
 	r.logger.Info("startup full-scan: scanning",
@@ -293,35 +337,64 @@ func (r *Reconciler) fullScan(ctx context.Context) {
 		}
 		return nil
 	})
+	complete := true
 	if err != nil {
 		r.logger.Warn("startup full-scan: incomplete", zap.Error(err))
-		// Whatever was found before the failure still routes into healing.
+		// Whatever was found before the failure still routes into healing,
+		// but the window was not fully judged: keep the one-shot armed.
+		complete = false
 	}
 	if len(markedSet) == 0 && len(resurrectSet) == 0 {
 		r.logger.Info("startup full-scan: no stale anchors found")
-		return
+		return complete
 	}
-	r.fullScanMarkOrphaned(ctx, markedSet)
-	r.fullScanResurrect(ctx, resurrectSet)
+	// Both halves always run; && would skip the resurrections whenever the
+	// orphan marking failed.
+	markedOK := r.fullScanMarkOrphaned(ctx, markedSet)
+	resurrectedOK := r.fullScanResurrect(ctx, resurrectSet)
+	return complete && markedOK && resurrectedOK
 }
 
-func (r *Reconciler) fullScanMarkOrphaned(ctx context.Context, set map[string]struct{}) {
+// fullScanMarkOrphaned demotes the off-chain 'active' rows the scan found,
+// reporting whether the write landed.
+func (r *Reconciler) fullScanMarkOrphaned(ctx context.Context, set map[string]struct{}) bool {
 	if len(set) == 0 {
-		return
+		return true
 	}
 	marked := make([]string, 0, len(set))
 	for hash := range set {
 		marked = append(marked, hash)
 	}
+	applied := r.appliedOrphanTransitions(ctx, marked)
 	if err := r.store.MarkBlocksOrphaned(ctx, marked, r.now()); err != nil {
 		r.logger.Warn("startup full-scan: failed to mark orphaned", zap.Error(err))
-		return
+		return false
 	}
-	metrics.BlockStatusTransitionsTotal.
-		WithLabelValues(metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceFullScan).
-		Add(float64(len(marked)))
+	if applied > 0 {
+		metrics.BlockStatusTransitionsTotal.
+			WithLabelValues(metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceFullScan).
+			Add(float64(applied))
+	}
 	r.logger.Info("startup full-scan: marked off-chain blocks orphaned",
 		zap.Strings("block_hashes", marked))
+	return true
+}
+
+// appliedOrphanTransitions re-reads each candidate immediately before the
+// orphan write and reports how many rows that write actually transitions.
+// The paging walk that built the set runs over the whole scan window, so the
+// block-status tracker can have orphaned a candidate in the meantime, and
+// MarkBlocksOrphaned silently skips hashes with no row at all; counting
+// candidates would overstate a series whose help promises applied
+// transitions. Rows that cannot be read are not counted.
+func (r *Reconciler) appliedOrphanTransitions(ctx context.Context, hashes []string) int {
+	applied := 0
+	for _, hash := range hashes {
+		if row, err := r.store.GetBlockProcessingStatus(ctx, hash); err == nil && row.Status != models.BlockStatusOrphaned {
+			applied++
+		}
+	}
+	return applied
 }
 
 // fullScanResurrect re-mines each resurrected block's txs from its retained
@@ -331,11 +404,13 @@ func (r *Reconciler) fullScanMarkOrphaned(ctx context.Context, set map[string]st
 // orphaned_at/reconciled_at and preserves the milestone timestamps). The
 // re-mine runs FIRST: a failed batch leaves the row orphaned so the next
 // full-scan retries the whole heal, whereas reactivating first would leave
-// the txs with nothing left to revisit them.
-func (r *Reconciler) fullScanResurrect(ctx context.Context, set map[string]uint64) {
+// the txs with nothing left to revisit them. Reports whether every row in
+// the set was healed, so a failed repair keeps the one-shot armed.
+func (r *Reconciler) fullScanResurrect(ctx context.Context, set map[string]uint64) bool {
 	if len(set) == 0 {
-		return
+		return true
 	}
+	complete := true
 	batchSize := r.cfg.BumpBuilder.Reconciler.BatchSize
 	if batchSize <= 0 {
 		batchSize = maxTxIDsPerBulkEvent
@@ -347,10 +422,24 @@ func (r *Reconciler) fullScanResurrect(ctx context.Context, set map[string]uint6
 		if remineErr != nil {
 			logger.Error("startup full-scan: re-mine from the resurrected block's BUMP failed; "+
 				"leaving the row orphaned so the next full-scan retries", zap.Error(remineErr))
+			complete = false
+			continue
+		}
+		// The canonical judgement that put this hash in the set was made
+		// during the paging walk, and the re-mine above can run for minutes.
+		// Re-read the chain immediately before the write: a reorg during the
+		// repair would otherwise have this scan reactivate a row that is now
+		// genuinely orphaned AND clear the fresh orphan generation, taking
+		// it off the reconcile queue with nothing left to revisit it.
+		if canonical, canonicalKnown := r.activeHashAt(ctx, height); !canonicalKnown || canonical != hash {
+			logger.Warn("startup full-scan: block is no longer the active-chain block at its height; " +
+				"leaving the row orphaned for the reconciler")
+			complete = false
 			continue
 		}
 		if err := r.store.UpsertBlockHeaderSeen(ctx, hash, height, r.now()); err != nil {
 			logger.Warn("startup full-scan: failed to reactivate resurrected block", zap.Error(err))
+			complete = false
 			continue
 		}
 		delete(r.defers, hash)
@@ -372,6 +461,7 @@ func (r *Reconciler) fullScanResurrect(ctx context.Context, set map[string]uint6
 		r.logger.Warn("startup full-scan: reactivated resurrected canonical blocks that were marked orphaned",
 			zap.Strings("block_hashes", resurrected))
 	}
+	return complete
 }
 
 // fullScanBounds resolves the height window the startup full-scan considers.
@@ -804,13 +894,24 @@ func (r *Reconciler) reanchorNeighborhood(ctx context.Context, logger *zap.Logge
 // remineFromStoredBUMP re-mines every level-0 txid of blockHash's stored
 // compound BUMP against it (onlyChanged — no duplicate events for rows
 // already anchored right). ok=false when no usable BUMP is stored. A
-// non-nil error means a store write failed part-way: the caller must not
-// treat the block as healed (no revert, no reconciled_at stamp) so the work
-// is retried.
+// non-nil error means the BUMP could not be READ reliably, or a store write
+// failed part-way: the caller must not treat the block as healed (no revert,
+// no reconciled_at stamp, no reactivation) so the work is retried.
 func (r *Reconciler) remineFromStoredBUMP(ctx context.Context, logger *zap.Logger, blockHash string, batchSize int) (int, bool, error) {
 	bumpHeight, bumpBytes, bumpErr := r.store.GetBUMP(ctx, blockHash)
-	if bumpErr != nil || len(bumpBytes) == 0 {
-		return 0, false, nil //nolint:nilerr // no usable BUMP is the ok=false signal (defer), not a write failure
+	switch {
+	case bumpErr != nil && !errors.Is(bumpErr, store.ErrNotFound):
+		// A transient read failure is NOT "no BUMP stored". Collapsing the
+		// two would make the caller burn a defer attempt on a healthy block
+		// (and eventually revert it), or — in the full-scan — reactivate a
+		// row whose txs were never re-mined, which then leaves the only
+		// queue that could retry them. Surface it so the caller retries.
+		return 0, false, fmt.Errorf("read stored BUMP for %s: %w", blockHash, bumpErr)
+	case bumpErr != nil || len(bumpBytes) == 0:
+		// ErrNotFound (or an empty blob) genuinely means no BUMP is stored
+		// yet: that is the ok=false signal the caller defers on, not a
+		// failure to propagate.
+		return 0, false, nil //nolint:nilerr // ErrNotFound is the ok=false signal (defer), not a read failure
 	}
 	txids, parseErr := levelZeroTxidsFromBUMP(bumpBytes)
 	if parseErr != nil {

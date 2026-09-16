@@ -146,17 +146,15 @@ func (t *blockStatusTracker) recordReorg(ctx context.Context, ev *chaintracks.Re
 		for _, h := range ev.OrphanedHashes {
 			hashes = append(hashes, h.String())
 		}
-		// Count transitions, not requests: the store silently skips hashes
-		// without a row (blocks observed before arcade started recording),
-		// and re-marking an already-orphaned row changes nothing.
-		applied := 0
-		for _, hash := range hashes {
-			if row, err := t.store.GetBlockProcessingStatus(ctx, hash); err == nil && row.Status != models.BlockStatusOrphaned {
-				applied++
-			}
-		}
+		applied := t.appliedOrphanTransitions(ctx, hashes)
 		if err := t.store.MarkBlocksOrphaned(ctx, hashes, time.Now()); err != nil {
-			t.logger.Warn("failed to mark orphaned blocks",
+			// The event's losers keep status='active' while the branch walk
+			// below still reactivates the winner, so the projection can hold
+			// two active rows at one height until something re-judges them.
+			// The forced tie-scan that follows this call in the reorg loop is
+			// that healing pass (and the reconciler full-scan the backstop) —
+			// but a durable store failure here needs an operator, hence Error.
+			t.logger.Error("failed to mark orphaned blocks; the forced tie-scan that follows is the healing pass",
 				zap.Int("count", len(hashes)),
 				zap.Error(err))
 		} else if applied > 0 {
@@ -173,6 +171,22 @@ func (t *blockStatusTracker) recordReorg(ctx context.Context, ev *chaintracks.Re
 		t.recordHeader(ctx, ev.NewTip)
 		t.reactivateBranch(ctx, ev)
 	}
+}
+
+// appliedOrphanTransitions reports how many of these hashes an orphan write
+// actually transitions: the store silently skips hashes with no row at all
+// (chaintracks emits OrphanedHashes for blocks observed before arcade
+// started recording), and re-marking an already-orphaned row changes no
+// status. Counting requests instead would overstate a series whose help
+// promises applied transitions. Rows that cannot be read are not counted.
+func (t *blockStatusTracker) appliedOrphanTransitions(ctx context.Context, hashes []string) int {
+	applied := 0
+	for _, hash := range hashes {
+		if row, err := t.store.GetBlockProcessingStatus(ctx, hash); err == nil && row.Status != models.BlockStatusOrphaned {
+			applied++
+		}
+	}
+	return applied
 }
 
 // reactivateBranch walks the heights strictly between the fork point and the
@@ -340,15 +354,21 @@ func (t *blockStatusTracker) markOrphaned(ctx context.Context, set map[string]st
 	for hash := range set {
 		orphaned = append(orphaned, hash)
 	}
+	// Re-read immediately before the write: the paging walk that built this
+	// set runs over the whole scan window, so a concurrent ReorgEvent can
+	// have orphaned a candidate since its row was read.
+	applied := t.appliedOrphanTransitions(ctx, orphaned)
 	if err := t.store.MarkBlocksOrphaned(ctx, orphaned, time.Now()); err != nil {
 		t.logger.Warn("tie-scan: failed to mark blocks orphaned",
 			zap.Int("count", len(orphaned)),
 			zap.Error(err))
 		return
 	}
-	metrics.BlockStatusTransitionsTotal.
-		WithLabelValues(metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceTieScan).
-		Add(float64(len(orphaned)))
+	if applied > 0 {
+		metrics.BlockStatusTransitionsTotal.
+			WithLabelValues(metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceTieScan).
+			Add(float64(applied))
+	}
 	t.logger.Info("tie-scan: marked same-height losers orphaned",
 		zap.Strings("block_hashes", orphaned),
 		zap.Uint32("tip_height", tipHeight))

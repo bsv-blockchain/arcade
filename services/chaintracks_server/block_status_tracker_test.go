@@ -2,6 +2,7 @@ package chaintracks_server
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"sort"
 	"sync"
@@ -32,6 +33,13 @@ type trackerStore struct {
 	orphaned [][]string
 	upserts  []string
 	lists    int // ListBlockProcessingStatus calls — "did a scan run" signal
+
+	// afterList fires once, after a page has been read but before the scan
+	// acts on it, so a test can inject the concurrent write that races the
+	// scan's judgement.
+	afterList func()
+	// orphanErr makes every MarkBlocksOrphaned fail, as a store outage does.
+	orphanErr error
 }
 
 func newTrackerStore(rows ...*models.BlockProcessingStatus) *trackerStore {
@@ -45,7 +53,6 @@ func newTrackerStore(rows ...*models.BlockProcessingStatus) *trackerStore {
 
 func (s *trackerStore) ListBlockProcessingStatus(_ context.Context, beforeHeight uint64, limit int) ([]*models.BlockProcessingStatus, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.lists++
 	// Honor the real keyset contract (height DESC, block_height < before,
 	// limit) — the tie-scan pages via store.ForEachBlockProcessing, which
@@ -71,6 +78,12 @@ func (s *trackerStore) ListBlockProcessingStatus(_ context.Context, beforeHeight
 		if len(out) == limit {
 			break
 		}
+	}
+	hook := s.afterList
+	s.afterList = nil
+	s.mu.Unlock()
+	if hook != nil {
+		hook()
 	}
 	return out, nil
 }
@@ -113,6 +126,9 @@ func (s *trackerStore) UpsertBlockHeaderSeen(_ context.Context, hash string, hei
 func (s *trackerStore) MarkBlocksOrphaned(_ context.Context, hashes []string, at time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.orphanErr != nil {
+		return s.orphanErr
+	}
 	s.orphaned = append(s.orphaned, append([]string(nil), hashes...))
 	for _, h := range hashes {
 		if row, ok := s.rows[h]; ok {
@@ -659,4 +675,79 @@ func TestReorgLoop_ReactivatesViaForcedScan(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	assertActiveClean(t, st.row(t, b.Hash.String()))
+}
+
+// TestTieScan_OrphanMetricCountsAppliedTransitions: the tie-scan collects
+// its candidates while paging the whole scan window, so a ReorgEvent can
+// orphan one of them before the write lands. The transition series promises
+// APPLIED transitions, so the already-orphaned candidate must not be
+// counted — while every candidate is still passed to the store.
+func TestTieScan_OrphanMetricCountsAppliedTransitions(t *testing.T) {
+	ct := newFakeChaintracks()
+	ct.headers[10] = headerAt(10, 0xAA) // canonical at 10 is neither candidate
+	ct.headers[11] = headerAt(11, 0xEE)
+	loserA := headerAt(10, 0xB1).Hash.String()
+	loserB := headerAt(10, 0xB2).Hash.String()
+	st := newTrackerStore(activeRow(loserA, 10), activeRow(loserB, 10))
+
+	// A concurrent ReorgEvent orphans loserA between the scan's read and the
+	// tie-scan's own write.
+	st.afterList = func() {
+		at := time.Now()
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		st.rows[loserA].Status = models.BlockStatusOrphaned
+		st.rows[loserA].OrphanedAt = &at
+	}
+
+	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
+		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceTieScan)
+	before := testutil.ToFloat64(counter)
+
+	tr := newTestTracker(ct, st, 20, 0)
+	tr.tieScan(context.Background(), 11, true)
+
+	if got := testutil.ToFloat64(counter) - before; got != 1 {
+		t.Fatalf("tie-scan orphaned transitions = %v, want 1 (the row already orphaned is not a transition)", got)
+	}
+	calls := st.orphanCalls()
+	if len(calls) != 1 || len(calls[0]) != 2 {
+		t.Fatalf("both candidates must still be passed to the store, got %v", calls)
+	}
+	for _, h := range []string{loserA, loserB} {
+		if got := st.row(t, h); got.Status != models.BlockStatusOrphaned {
+			t.Fatalf("%s must end orphaned, got %s", h, got.Status)
+		}
+	}
+}
+
+// TestRecordReorg_BranchWalkStillRunsWhenOrphanMarkFails: a failed orphan
+// write must not suppress the reactivation. The resurrected row IS the
+// canonical block at its height — a fact independent of the competitor's
+// row — and skipping the walk would reinstate issue #339 on any transient
+// store error. The forced tie-scan in the reorg loop re-judges the losers
+// the failed write left active.
+func TestRecordReorg_BranchWalkStillRunsWhenOrphanMarkFails(t *testing.T) {
+	ct := newFakeChaintracks()
+	ancestor, resurrected, tip := headerAt(9, 0x01), headerAt(10, 0x10), headerAt(11, 0x11)
+	ct.headers[9], ct.headers[10], ct.headers[11] = ancestor, resurrected, tip
+	loser := headerAt(10, 0xFF).Hash
+
+	st := newTrackerStore(
+		orphanedRow(resurrected.Hash.String(), 10, true),
+		activeRow(loser.String(), 10),
+	)
+	st.orphanErr = errors.New("injected: store unavailable")
+
+	tr := newTestTracker(ct, st, 20, 0)
+	tr.recordReorg(context.Background(), &chaintracks.ReorgEvent{
+		OrphanedHashes: []chainhash.Hash{loser},
+		CommonAncestor: ancestor,
+		NewTip:         tip,
+	})
+
+	assertActiveClean(t, st.row(t, resurrected.Hash.String()))
+	if got := st.row(t, loser.String()); got.Status != models.BlockStatusActive {
+		t.Fatalf("the failed orphan write must leave the loser as it was, got %s", got.Status)
+	}
 }
