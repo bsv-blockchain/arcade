@@ -16,6 +16,7 @@ import (
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
+	whatsonchain "github.com/mrz1836/go-whatsonchain"
 )
 
 // run is the top-level pipeline. Pulled out of main() so a test can
@@ -26,6 +27,13 @@ func run(cfg config) error {
 	}
 	if err := os.MkdirAll(filepath.Join(cfg.outDir, "txs"), 0o750); err != nil {
 		return fmt.Errorf("mkdir txs: %w", err)
+	}
+
+	ctx := context.Background()
+
+	woc, err := newWOCClient(cfg)
+	if err != nil {
+		return fmt.Errorf("init whatsonchain client: %w", err)
 	}
 
 	// 1. Fetch block bytes from teranode datahub.
@@ -44,7 +52,7 @@ func run(cfg config) error {
 	//    the coinbase txid we extracted from the block binary —
 	//    otherwise the WoC and teranode views of the block disagree
 	//    and our reconstruction won't match the header root.
-	txids, err := fetchBlockTxIDs(cfg.wocURL, cfg.blockHash)
+	txids, err := fetchBlockTxIDs(ctx, woc, cfg.blockHash)
 	if err != nil {
 		return fmt.Errorf("fetch txids: %w", err)
 	}
@@ -80,31 +88,16 @@ func run(cfg config) error {
 	//    expects when it parses /block/<hash>.
 	blockBin := teranodeBlock
 
-	// 7. Pick N random non-coinbase txids, fetch each picked tx, then
-	//    enrich it with per-input source script + satoshis pulled from
-	//    each input's parent. The resulting bytes are Extended Format
-	//    (EF) so arcade's intake validator can execute scripts and
-	//    verify fees without needing a chaintracker. Pace fetches at
-	//    one every ~300ms so we stay below WoC's free-tier rate limit
-	//    (retry loop handles sporadic 429s on top of this).
+	// 7. Pick N random non-coinbase txids, then bulk-fetch each picked tx
+	//    plus every input's parent and build Extended Format (EF) bytes so
+	//    arcade's intake validator can execute scripts and verify fees
+	//    without needing a chaintracker. The WhatsOnChain client's bulk
+	//    processor batches requests and paces them by the configured rate
+	//    limit, and retries sporadic 429s, so no manual throttling is needed.
 	picked := pickRandomTxIDs(txids[1:], cfg.pickN, cfg.rng)
-	rawTxs := make(map[string][]byte, len(picked))
-	parentCache := make(map[string]*sdkTx.Transaction)
-	first := true
-	for _, id := range picked {
-		if !first {
-			time.Sleep(300 * time.Millisecond)
-		}
-		first = false
-		raw, fErr := fetchRawTx(cfg.wocURL, id)
-		if fErr != nil {
-			return fmt.Errorf("fetch raw tx %s: %w", id, fErr)
-		}
-		efRaw, fErr := enrichToEF(cfg.wocURL, raw, parentCache)
-		if fErr != nil {
-			return fmt.Errorf("enrich tx %s to EF: %w", id, fErr)
-		}
-		rawTxs[id] = efRaw
+	rawTxs, err := buildPickedEFTxs(ctx, woc, picked)
+	if err != nil {
+		return err
 	}
 
 	// 8. Write everything to disk.
@@ -293,8 +286,9 @@ func pickRandomTxIDs(txids []string, n int, rng intnRNG) []string {
 }
 
 // httpGetBytes is a small wrapper that GETs a URL with a generous
-// timeout, a body cap, and a polite retry on 429 (WhatsOnChain's free
-// tier rate-limits when fetching many raw txs in quick succession).
+// timeout, a body cap, and a polite retry on 429. It backs the teranode
+// datahub fetch; WhatsOnChain calls go through the go-whatsonchain client,
+// which handles retries and rate limiting itself.
 func httpGetBytes(url string, maxBytes int64) ([]byte, error) {
 	c := &http.Client{Timeout: 60 * time.Second}
 	const maxAttempts = 5
@@ -336,92 +330,143 @@ func httpGetBytes(url string, maxBytes int64) ([]byte, error) {
 	return nil, lastErr
 }
 
-// fetchBlockTxIDs returns the in-block-order txid list (display order)
-// for a block. WhatsOnChain caps the inline `tx` field at the first 100
-// txids and surfaces the rest behind pagination links in `pages.uri`.
-// We follow every page so blocks of any size return their full txid
-// list.
-func fetchBlockTxIDs(wocBase, blockHash string) ([]string, error) {
-	body, err := httpGetBytes(wocBase+"/v1/bsv/main/block/hash/"+blockHash, 32*1024*1024)
+// newWOCClient builds a WhatsOnChain client that targets cfg.wocURL. The base
+// URL is honored via WithBaseURL so --woc can still point at a mirror, proxy,
+// or local test server. The client retries 429/5xx/network errors with
+// exponential backoff and paces its bulk processors by the rate limit, which
+// replaces the tool's former manual 429 loop and ~300ms sleeps.
+func newWOCClient(cfg config) (whatsonchain.ClientInterface, error) {
+	base := strings.TrimRight(cfg.wocURL, "/") + "/v1/"
+	return whatsonchain.NewClient(context.Background(),
+		whatsonchain.WithBaseURL(base),
+		whatsonchain.WithRateLimit(3),
+		whatsonchain.WithRequestTimeout(60*time.Second),
+		whatsonchain.WithRequestRetryCount(4),
+		whatsonchain.WithBackoff(time.Second, 16*time.Second, 2.0, 250*time.Millisecond),
+		whatsonchain.WithUserAgent("arcade-fetch-block-fixture"),
+	)
+}
+
+// fetchBlockTxIDs returns the in-block-order txid list (display order) for a
+// block. GetBlockByHash returns the first page of txids inline in Tx and, for
+// large blocks, the remaining pages as URIs in Pages; we fetch each additional
+// page (1-based) and concatenate so blocks of any size return their full txid
+// list. The caller cross-checks the length and coinbase against the parsed
+// block, which guards this inline-first-page + numbered-pages ordering.
+func fetchBlockTxIDs(ctx context.Context, woc whatsonchain.ClientInterface, blockHash string) ([]string, error) {
+	info, err := woc.GetBlockByHash(ctx, blockHash)
 	if err != nil {
 		return nil, err
 	}
-	var resp struct {
-		Tx    []string `json:"tx"`
-		Pages struct {
-			URI []string `json:"uri"`
-		} `json:"pages"`
-	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, fmt.Errorf("decode block JSON: %w", err)
-	}
-	if len(resp.Tx) == 0 {
+	if len(info.Tx) == 0 {
 		return nil, fmt.Errorf("WhatsOnChain returned no txids for block %s", blockHash)
 	}
-	all := resp.Tx
-	for _, uri := range resp.Pages.URI {
-		// Page URIs in the response are server-relative
-		// ("/block/hash/<h>/page/<n>") and don't include the
-		// /v1/bsv/main prefix; rebuild against wocBase.
-		pageURL := wocBase + "/v1/bsv/main" + uri
-		pageBody, err := httpGetBytes(pageURL, 32*1024*1024)
-		if err != nil {
-			return nil, fmt.Errorf("fetch page %s: %w", uri, err)
+	all := info.Tx
+	for i := range info.Pages.URI {
+		page, pErr := woc.GetBlockPages(ctx, blockHash, i+1)
+		if pErr != nil {
+			return nil, fmt.Errorf("fetch page %d: %w", i+1, pErr)
 		}
-		var pageTxs []string
-		if err := json.Unmarshal(pageBody, &pageTxs); err != nil {
-			return nil, fmt.Errorf("decode page %s: %w", uri, err)
-		}
-		all = append(all, pageTxs...)
+		all = append(all, page...)
 	}
 	return all, nil
 }
 
-// fetchRawTx returns the raw tx bytes for a txid. WhatsOnChain serves
-// hex at /v1/bsv/main/tx/<txid>/hex.
-func fetchRawTx(wocBase, txid string) ([]byte, error) {
-	body, err := httpGetBytes(wocBase+"/v1/bsv/main/tx/"+txid+"/hex", 4*1024*1024)
+// bulkRawTxs fetches raw tx bytes for each txid via WhatsOnChain's bulk raw
+// transaction endpoint, keyed by txid. The SDK's processor batches the ids
+// (20 per request) and paces the batches by the client's rate limit. It
+// returns an error if any requested txid is missing from the response.
+func bulkRawTxs(ctx context.Context, woc whatsonchain.ClientInterface, ids []string) (map[string][]byte, error) {
+	out := make(map[string][]byte, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	list, err := woc.BulkRawTransactionDataProcessor(ctx, &whatsonchain.TxHashes{TxIDs: ids})
 	if err != nil {
 		return nil, err
 	}
-	hexStr := strings.TrimSpace(string(body))
-	raw, err := hex.DecodeString(hexStr)
-	if err != nil {
-		preview := hexStr
-		if len(preview) > 64 {
-			preview = preview[:64]
+	for _, info := range list {
+		if info == nil {
+			continue
 		}
-		return nil, fmt.Errorf("decode hex: %w (preview=%q)", err, preview)
+		raw, dErr := hex.DecodeString(strings.TrimSpace(info.Hex))
+		if dErr != nil {
+			return nil, fmt.Errorf("decode hex for tx %s: %w", info.TxID, dErr)
+		}
+		out[info.TxID] = raw
 	}
-	return raw, nil
+	for _, id := range ids {
+		if _, ok := out[id]; !ok {
+			return nil, fmt.Errorf("WhatsOnChain did not return tx %s", id)
+		}
+	}
+	return out, nil
 }
 
-// enrichToEF takes canonical raw tx bytes, fetches each input's parent
-// tx from WoC (using the parentCache to deduplicate shared parents
-// across picked txs), injects the source script + satoshis into each
-// input via SetSourceTxOutput, and returns the Extended Format bytes.
-// Pace between WoC calls is ~300ms to stay under the free-tier rate
-// limit, same cadence as the picked-tx loop.
-func enrichToEF(wocBase string, raw []byte, parentCache map[string]*sdkTx.Transaction) ([]byte, error) {
-	tx, err := sdkTx.NewTransactionFromBytes(raw)
+// buildPickedEFTxs bulk-fetches the picked txs and all of their input parents,
+// then builds Extended Format (EF) bytes for each picked tx. Parent txids are
+// de-duplicated and sorted so batching (and therefore output) is deterministic
+// for a fixed pick, preserving the tool's fixed-seed idempotency.
+func buildPickedEFTxs(ctx context.Context, woc whatsonchain.ClientInterface, picked []string) (map[string][]byte, error) {
+	// Phase 1: bulk-fetch and parse the picked txs, collecting parent txids.
+	pickedRaw, err := bulkRawTxs(ctx, woc, picked)
 	if err != nil {
-		return nil, fmt.Errorf("parse picked tx: %w", err)
+		return nil, fmt.Errorf("fetch picked txs: %w", err)
 	}
+	pickedTxs := make(map[string]*sdkTx.Transaction, len(picked))
+	parentSet := make(map[string]struct{})
+	for _, id := range picked {
+		tx, pErr := sdkTx.NewTransactionFromBytes(pickedRaw[id])
+		if pErr != nil {
+			return nil, fmt.Errorf("parse picked tx %s: %w", id, pErr)
+		}
+		pickedTxs[id] = tx
+		for _, input := range tx.Inputs {
+			parentSet[input.SourceTXID.String()] = struct{}{}
+		}
+	}
+
+	// Phase 2: bulk-fetch and parse the unique parents (sorted for determinism).
+	parentIDs := make([]string, 0, len(parentSet))
+	for id := range parentSet {
+		parentIDs = append(parentIDs, id)
+	}
+	sort.Strings(parentIDs)
+	parentRaw, err := bulkRawTxs(ctx, woc, parentIDs)
+	if err != nil {
+		return nil, fmt.Errorf("fetch parent txs: %w", err)
+	}
+	parentCache := make(map[string]*sdkTx.Transaction, len(parentIDs))
+	for _, id := range parentIDs {
+		p, pErr := sdkTx.NewTransactionFromBytes(parentRaw[id])
+		if pErr != nil {
+			return nil, fmt.Errorf("parse parent tx %s: %w", id, pErr)
+		}
+		parentCache[id] = p
+	}
+
+	// Phase 3: build EF bytes for each picked tx (no network).
+	rawTxs := make(map[string][]byte, len(picked))
+	for _, id := range picked {
+		efRaw, eErr := enrichToEF(pickedTxs[id], parentCache)
+		if eErr != nil {
+			return nil, fmt.Errorf("enrich tx %s to EF: %w", id, eErr)
+		}
+		rawTxs[id] = efRaw
+	}
+	return rawTxs, nil
+}
+
+// enrichToEF injects each input's source script + satoshis (taken from the
+// input's parent tx in parentCache) into tx via SetSourceTxOutput, then returns
+// the Extended Format (EF) bytes. Every parent referenced by tx's inputs must
+// be present in parentCache.
+func enrichToEF(tx *sdkTx.Transaction, parentCache map[string]*sdkTx.Transaction) ([]byte, error) {
 	for vin, input := range tx.Inputs {
 		parentTXID := input.SourceTXID.String()
 		parent, ok := parentCache[parentTXID]
 		if !ok {
-			time.Sleep(300 * time.Millisecond)
-			parentRaw, fErr := fetchRawTx(wocBase, parentTXID)
-			if fErr != nil {
-				return nil, fmt.Errorf("input %d: fetch parent %s: %w", vin, parentTXID, fErr)
-			}
-			p, pErr := sdkTx.NewTransactionFromBytes(parentRaw)
-			if pErr != nil {
-				return nil, fmt.Errorf("input %d: parse parent %s: %w", vin, parentTXID, pErr)
-			}
-			parentCache[parentTXID] = p
-			parent = p
+			return nil, fmt.Errorf("input %d: missing parent %s", vin, parentTXID)
 		}
 		if int(input.SourceTxOutIndex) >= len(parent.Outputs) {
 			return nil, fmt.Errorf("input %d: parent %s has %d outputs, vout=%d",

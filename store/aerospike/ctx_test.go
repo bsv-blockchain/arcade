@@ -14,7 +14,7 @@ import (
 )
 
 // These tests require a running Aerospike instance on localhost:3200
-// (matches the docker-compose.yml port mapping). Run with:
+// (docker compose --profile aerospike up -d aerospike). Run with:
 //
 //	go test -tags=integration ./store/...
 

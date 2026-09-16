@@ -8,6 +8,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 )
 
 // TestObserveStatusClass — the helper is used everywhere HTTP latency lands
@@ -46,6 +47,7 @@ func TestMetricsHandlerScrapes(t *testing.T) {
 	// Touch a couple of metrics so they actually exist on the registry.
 	BumpBuilderBlocksProcessedTotal.Inc()
 	PropagationOutcomeTotal.WithLabelValues("accepted").Add(3)
+	PropagationChunkBytes.Observe(1024)
 
 	srv := httptest.NewServer(promhttp.Handler())
 	defer srv.Close()
@@ -67,6 +69,7 @@ func TestMetricsHandlerScrapes(t *testing.T) {
 	for _, expected := range []string{
 		"arcade_bump_builder_blocks_processed_total",
 		"arcade_propagation_outcome_total{outcome=\"accepted\"}",
+		"arcade_propagation_chunk_bytes_bucket",
 	} {
 		if !strings.Contains(body, expected) {
 			t.Errorf("scrape output missing %q\n--- body ---\n%s", expected, body)
@@ -116,4 +119,27 @@ func readAll(t *testing.T, resp *http.Response) string {
 		}
 	}
 	return string(buf)
+}
+
+// TestPropagationChunkBytesRegistered — the chunk-payload histogram is the
+// tuning signal for propagation.teranode_max_batch_bytes (issue #271). It
+// must live on the default registry as an unlabeled histogram under the
+// package naming rules (arcade_ prefix, _bytes suffix) so dashboards can
+// quantile it against the configured cap.
+func TestPropagationChunkBytesRegistered(t *testing.T) {
+	PropagationChunkBytes.Observe(12345)
+
+	fam := gatherFamily(t, "arcade_propagation_chunk_bytes")
+	if fam == nil {
+		t.Fatal("arcade_propagation_chunk_bytes is not registered")
+	}
+	if fam.GetType() != dto.MetricType_HISTOGRAM {
+		t.Errorf("type = %v, want HISTOGRAM", fam.GetType())
+	}
+	if len(fam.GetMetric()) != 1 {
+		t.Fatalf("series = %d, want exactly one (unlabeled)", len(fam.GetMetric()))
+	}
+	if n := fam.GetMetric()[0].GetHistogram().GetSampleCount(); n < 1 {
+		t.Errorf("sample count = %d, want >= 1", n)
+	}
 }

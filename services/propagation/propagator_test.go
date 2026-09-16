@@ -1345,6 +1345,21 @@ func TestProcessBatch_ChunksOversizedBatch(t *testing.T) {
 	if ms.updateCount() != 25 {
 		t.Errorf("expected 25 status updates, got %d", ms.updateCount())
 	}
+	// Every POST body is the plain concatenation of its chunk's 4-byte
+	// RawTx payloads, so no chunk may exceed 10 × 4 bytes and the bodies
+	// must add up to the whole batch.
+	sizesMu.Lock()
+	defer sizesMu.Unlock()
+	total := 0
+	for _, n := range batchSizes {
+		if n > 40 {
+			t.Errorf("chunk body of %d bytes exceeds cap 10 × 4 bytes", n)
+		}
+		total += n
+	}
+	if total != 100 {
+		t.Errorf("chunk bodies sum to %d bytes, want 25 × 4 = 100", total)
+	}
 }
 
 // Obsolete tests removed: TestProcessBatch_MerkleFailure_AbortsBatch and

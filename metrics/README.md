@@ -88,6 +88,12 @@ landing.
 - `rate(arcade_propagation_inline_retry_total{outcome="recovered"}[5m])` — saved trips to PENDING_RETRY
 - `rate(arcade_propagation_inline_retry_total{outcome="exhausted"}[5m])` — sustained downstream issues
 
+### Propagation chunking (issue #271)
+
+- `rate(arcade_propagation_chunk_total{fallback="none"}[5m]) / rate(arcade_propagation_batch_size_count[5m])` — POST /txs per flushed batch; climbing means a cap is binding more often
+- `histogram_quantile(0.99, rate(arcade_propagation_chunk_bytes_bucket[5m]))` — p99 chunk payload; pinned just under `propagation.teranode_max_batch_bytes` means bytes, not `teranode_max_batch_size`, decide chunk edges
+- `rate(arcade_propagation_chunk_total{fallback="size_rejected"}[5m])` — a peer refused a chunk by shape (bare 400 / 413); sustained > 0 means the configured caps exceed what some peer accepts, and every such chunk costs extra narrowing round trips
+
 ### Reaper visibility
 
 - `arcade_propagation_reaper_lease_held` per pod — exactly one should be 1

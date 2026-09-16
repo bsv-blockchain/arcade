@@ -124,6 +124,26 @@ services:
       start_period: 5s
     restart: unless-stopped
 
+  # Optional Aerospike for `go test -tags=integration ./store/aerospike/...`
+  # (localhost:3200, namespace arcade). Not used by the default postgres
+  # stack — start with `docker compose --profile aerospike up -d aerospike`.
+  # Pin is the current 7.0 line (same as deploy/aerospike.yaml), not :latest
+  # (F-038 / #96). Digest is the multi-arch index for 7.0.0.26.
+  aerospike:
+    image: docker.io/aerospike/aerospike-server:7.0.0.26@sha256:6b0e92d22dd3b57efeaa48527b29ac8e1ccd464c6a2d9b23563f527ea00d319e
+    profiles: ["aerospike"]
+    ports:
+      - "3200:3000"
+      - "3201:3001"
+      - "3202:3002"
+    volumes:
+      - aerospike-data:/opt/aerospike/data:Z
+      - ./compose/aerospike.conf:/opt/aerospike/etc/aerospike.conf:Z
+    command: ["--config-file", "/opt/aerospike/etc/aerospike.conf"]
+    networks:
+      - arcade-net
+    restart: unless-stopped
+
   # merkle-service's own database (never shared with arcade's; postgres:17
   # matches tests/e2e/harness/containers.go).
   merkle-postgres:
@@ -290,3 +310,4 @@ volumes:
   postgres-data:
   merkle-postgres-data:
   chaintracks-data:
+  aerospike-data:
