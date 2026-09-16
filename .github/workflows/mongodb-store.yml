@@ -9,8 +9,9 @@ name: mongodb-store
 # and runs them with ARCADE_MONGODB_REQUIRED set, so an unreachable server
 # fails the job instead of skipping every test. Scoped to the files that can
 # change the backend's behaviour — the package itself, the store interfaces
-# and shared suite, the models it persists, and the config and factory that
-# select and construct it — so unrelated PRs do not pay for it.
+# and shared suite, the shared bumpcache behind its merkle-path enrichment,
+# the models it persists, and the config and factory that select and construct
+# it — so unrelated PRs do not pay for it.
 # ------------------------------------------------------------------------------------
 
 on:
@@ -18,6 +19,7 @@ on:
     paths:
       - "store/mongodb/**"
       - "store/*.go"
+      - "store/bumpcache/**"
       - "store/factory/**"
       - "store/storetest/**"
       - "models/**"

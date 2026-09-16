@@ -392,3 +392,106 @@ func TestRemove_LateReaderDoesNotJoinThePreInvalidationFlight(t *testing.T) {
 		t.Fatal("the late reader must still get its merkle path")
 	}
 }
+
+// Remove's Forget lets a second fill start while the first is still out. The
+// older fill must never install once the newer one has: it is holding bytes
+// from before the rebuild, and finishing last would put the superseded
+// compound back in the cache with nothing left to invalidate it.
+func TestRemove_OlderOverlappingFillCannotInstallAfterANewerOne(t *testing.T) {
+	stale, err := synthblock.Build(8, 900100)
+	if err != nil {
+		t.Fatalf("synthblock.Build: %v", err)
+	}
+	fresh, err := synthblock.Build(4, 900101)
+	if err != nil {
+		t.Fatalf("synthblock.Build: %v", err)
+	}
+
+	c := New()
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan struct{})
+
+	// Fill A: reads the pre-rebuild compound, then stalls.
+	go func() {
+		defer close(firstDone)
+		c.Enrich(minedStatus(stale.Txids[0]), func() ([]byte, error) {
+			close(firstStarted)
+			<-releaseFirst
+			return stale.BumpBytes, nil
+		})
+	}()
+	<-firstStarted
+
+	// The rebuild lands: entry dropped, singleflight slot released.
+	c.Remove(testBlockHash)
+
+	// Fill B starts and completes while A is still out, installing the
+	// post-rebuild compound.
+	c.Enrich(minedStatus(fresh.Txids[0]), func() ([]byte, error) { return fresh.BumpBytes, nil })
+	if !c.Contains(testBlockHash) {
+		t.Fatal("the fill that started after the rebuild must cache")
+	}
+
+	// Now A finishes last. It must not overwrite B's entry.
+	close(releaseFirst)
+	<-firstDone
+
+	got := minedStatus(fresh.Txids[0])
+	c.Enrich(got, func() ([]byte, error) {
+		t.Error("cache must still be warm with the post-rebuild compound")
+		return fresh.BumpBytes, nil
+	})
+	if len(got.MerklePath) == 0 {
+		t.Fatal("no merkle path from the cached compound")
+	}
+	if vErr := synthblock.VerifyMerklePath(got.MerklePath, fresh.Txids[0], fresh.Root); vErr != nil {
+		t.Fatalf("cache serves the superseded compound after the older fill finished: %v", vErr)
+	}
+}
+
+// Remove skips the generation bump when no fill is registered for the block.
+// That is safe only because a fill registers BEFORE it reads the store: an
+// unregistered fill has not read either, so its read sees post-rebuild bytes.
+// Register after the fetch instead and a fill could read old bytes, miss the
+// bump because it was not yet counted, and install them with nothing left to
+// invalidate it — so pin the ordering here rather than leave it to a comment.
+func TestFill_RegistersBeforeItReadsTheStore(t *testing.T) {
+	blk, err := synthblock.Build(8, 900100)
+	if err != nil {
+		t.Fatalf("synthblock.Build: %v", err)
+	}
+	c := New()
+	c.Enrich(minedStatus(blk.Txids[0]), func() ([]byte, error) {
+		c.mu.Lock()
+		registered := c.inflight[testBlockHash]
+		c.mu.Unlock()
+		if registered == 0 {
+			t.Error("the fill must be registered before it reads the store")
+		}
+		return blk.BumpBytes, nil
+	})
+}
+
+// A fetch that panics must not leave the block registered: singleflight
+// re-panics to the caller, and a pinned entry would leak for the life of the
+// process and make every later Remove for that block bump a generation no
+// live fill holds.
+func TestFill_PanicDoesNotPinTheBlock(t *testing.T) {
+	c := New()
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected the panic to reach the caller")
+			}
+		}()
+		c.Enrich(minedStatus("tx"), func() ([]byte, error) { panic("store exploded") })
+	}()
+
+	c.mu.Lock()
+	inflight, gens := len(c.inflight), len(c.gen)
+	c.mu.Unlock()
+	if inflight != 0 || gens != 0 {
+		t.Fatalf("panicking fetch leaked bookkeeping: inflight=%d gen=%d", inflight, gens)
+	}
+}

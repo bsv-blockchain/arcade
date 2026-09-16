@@ -40,28 +40,35 @@ type Cache struct {
 	group     singleflight.Group
 	maxLeaves int
 
-	// mu guards lru, totalLeaves and epoch. The LRU's evict callback adjusts
-	// totalLeaves and runs synchronously inside mutations, so it MUST NOT
-	// take mu itself — every lru call site below already holds it.
+	// mu guards lru, totalLeaves, gen and inflight — every mutable field on
+	// this struct except the singleflight group, which does its own locking.
+	// The LRU's evict callback adjusts totalLeaves and runs synchronously
+	// inside mutations, so it MUST NOT take mu itself — every lru call site
+	// below already holds it.
 	mu          sync.Mutex
 	lru         *simplelru.LRU[string, *bump.CompoundIndex]
 	totalLeaves int
 
-	// filling holds the blocks with a fill in flight right now, and dirty the
-	// subset of those an invalidation landed on mid-fill. A fill that comes
-	// back dirty must not install what it read: those bytes predate the
-	// rebuild that invalidated them.
+	// gen is a per-block invalidation counter and inflight the number of fills
+	// running for that block. A fill takes gen as a token when it starts and
+	// may install only if the token still matches when it finishes, so any
+	// invalidation in between discards it: those bytes predate the rebuild.
 	//
-	// Both are keyed only for the duration of a fill and deleted when it
-	// ends, so together they hold at most one entry per block being fetched
-	// at this instant — singleflight already collapses concurrent misses for
-	// one block into one fill. Tracking per block matters: a single counter
-	// for the whole cache would let a write to ANY block discard the
+	// A token per fill, rather than one shared flag per block, is what makes
+	// this correct when two fills overlap — which Remove's Forget allows, and
+	// which a shared flag gets wrong: the second fill's start would clear the
+	// mark meant for the first, letting the first install pre-invalidation
+	// bytes after the second had already installed fresh ones.
+	//
+	// Both maps are keyed only while a block has a fill running and are
+	// pruned when its last one ends, so they hold at most one entry per block
+	// being fetched at this instant. Tracking per block matters too: a single
+	// counter for the whole cache would let a write to ANY block discard the
 	// in-flight fill of every other, and during a merkle backlog drain (block
 	// after block arriving, each ending in InsertBUMP) that is every fill,
 	// leaving the cache permanently empty exactly when it is load-bearing.
-	filling map[string]bool
-	dirty   map[string]bool
+	gen      map[string]uint64
+	inflight map[string]int
 }
 
 // New constructs an empty cache with the package's production bounds.
@@ -74,8 +81,8 @@ func New() *Cache {
 func newWithLimits(entries, leaves int) *Cache {
 	c := &Cache{
 		maxLeaves: leaves,
-		filling:   make(map[string]bool),
-		dirty:     make(map[string]bool),
+		gen:       make(map[string]uint64),
+		inflight:  make(map[string]int),
 	}
 	l, err := simplelru.NewLRU(entries, func(_ string, v *bump.CompoundIndex) {
 		c.totalLeaves -= v.Leaves()
@@ -134,18 +141,38 @@ func (c *Cache) MinimalPath(blockHash, txid string, fetch func() ([]byte, error)
 // already be in flight, holding bytes it read from the store BEFORE the
 // rebuild landed; without this it would add them after this call and serve the
 // superseded compound to every later reader until the next write or eviction.
-// Marking the fill dirty makes it decline to install.
+// Advancing the block's generation invalidates the token held by every fill
+// that has REGISTERED for this block, so none of them can install.
 //
-// Forget releases the singleflight slot as well, so a reader arriving after
-// this call starts its own fetch instead of joining the in-flight one and
-// being handed pre-rebuild bytes it could have missed entirely.
+// Fills that have not registered yet need no bump, and that is the invariant
+// holding this together: beginFill runs before the fetch, so a fill with no
+// registration has not read the store either and its read will see
+// post-rebuild bytes. Registering after the fetch instead would silently
+// reintroduce the stale install this guard exists to stop — a fill could read
+// old bytes, miss the bump because it was not yet counted, and install them.
+// TestFill_RegistersBeforeItReadsTheStore pins the ordering.
+//
+// Forget releases the singleflight slot as well, so a reader that misses the
+// cache after this call starts its own fetch instead of joining the in-flight
+// one and being handed pre-rebuild bytes it could have missed entirely. That
+// is what makes two fills for one block overlap, which is why the generation
+// is taken per fill rather than kept as one flag per block.
+//
+// It is deliberately taken before mu, and therefore covers no reader already
+// inside this call: one that looks up between the Forget and the lru.Remove
+// still finds the pre-rebuild entry and is served it. That is the ordinary
+// read-raced-a-write outcome. Taking Forget after the entry is dropped would
+// trade it for a worse one — that reader would miss the cache and join the
+// pre-rebuild flight instead, which is the case Forget is here to prevent.
 func (c *Cache) Remove(blockHash string) {
 	c.group.Forget(blockHash)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.lru.Remove(blockHash)
-	if c.filling[blockHash] {
-		c.dirty[blockHash] = true
+	// Only while a fill is registered: with none out there is no token to
+	// invalidate (see above), and not writing keeps the map to live fills.
+	if c.inflight[blockHash] > 0 {
+		c.gen[blockHash]++
 	}
 }
 
@@ -172,19 +199,24 @@ func (c *Cache) index(blockHash string, fetch func() ([]byte, error)) *bump.Comp
 		if idx, ok := c.lookup(blockHash); ok {
 			return idx, nil
 		}
-		c.beginFill(blockHash)
+		token := c.beginFill(blockHash)
+		// Deregistering is deferred so it also runs when fetch or the parse
+		// panics: singleflight re-panics to the caller, and a fill left
+		// registered would pin its map entries for the life of the process
+		// and make every later Remove for that block bump a generation no
+		// one holds. built stays nil unless there is something to install.
+		var built *bump.CompoundIndex
+		defer func() { c.endFill(blockHash, built, token) }()
+
 		data, err := fetch()
 		if err != nil {
-			c.endFill(blockHash, nil)
 			return nil, err
 		}
 		if len(data) == 0 {
-			c.endFill(blockHash, nil)
 			return (*bump.CompoundIndex)(nil), nil
 		}
 		idx, err := bump.IndexCompound(data)
 		if err != nil {
-			c.endFill(blockHash, nil)
 			return nil, err
 		}
 		// Returned either way: these bytes were current when this fetch
@@ -192,7 +224,7 @@ func (c *Cache) index(blockHash string, fetch func() ([]byte, error)) *bump.Comp
 		// CACHING them is withheld when an invalidation landed in the
 		// meantime, because a cached stale compound outlives the race it
 		// came from.
-		c.endFill(blockHash, idx)
+		built = idx
 		return idx, nil
 	})
 	if err != nil {
@@ -208,27 +240,34 @@ func (c *Cache) lookup(blockHash string) (*bump.CompoundIndex, bool) {
 	return c.lru.Get(blockHash)
 }
 
-// beginFill marks a block as being fetched, clearing any dirty flag left by an
-// invalidation that happened before this fill started — that one is already
-// reflected in what this fetch is about to read.
-func (c *Cache) beginFill(blockHash string) {
+// beginFill registers a fill and returns the block's current generation as its
+// token. An invalidation that happened BEFORE this call is already reflected in
+// what the fetch is about to read, which is why the token is the generation as
+// it stands now rather than a reset of it.
+func (c *Cache) beginFill(blockHash string) uint64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.filling[blockHash] = true
-	delete(c.dirty, blockHash)
+	c.inflight[blockHash]++
+	return c.gen[blockHash]
 }
 
-// endFill clears the in-flight marks and installs idx unless an invalidation
-// landed while the fill was running. A nil idx just clears the marks. Inserting
-// enforces the leaf budget; replacing an existing key removes it first so the
-// evict callback keeps totalLeaves exact (the LRU's in-place update path skips
-// the callback).
-func (c *Cache) endFill(blockHash string, idx *bump.CompoundIndex) {
+// endFill deregisters a fill and installs idx unless the block was invalidated
+// while it ran — that is, unless its token is stale. A nil idx just
+// deregisters. Both maps are pruned once a block's last fill ends, which is
+// safe precisely because no token for it can still be outstanding.
+//
+// Inserting enforces the leaf budget; replacing an existing key removes it
+// first so the evict callback keeps totalLeaves exact (the LRU's in-place
+// update path skips the callback).
+func (c *Cache) endFill(blockHash string, idx *bump.CompoundIndex, token uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.filling, blockHash)
-	stale := c.dirty[blockHash]
-	delete(c.dirty, blockHash)
+	stale := c.gen[blockHash] != token
+	c.inflight[blockHash]--
+	if c.inflight[blockHash] <= 0 {
+		delete(c.inflight, blockHash)
+		delete(c.gen, blockHash)
+	}
 	if stale || idx == nil {
 		return
 	}
