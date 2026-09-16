@@ -281,7 +281,7 @@ func (b *Builder) handleAnchorDenied(ctx context.Context, logger *zap.Logger, bl
 	// never-tip block has no chaintracks header-seen row), so the orphan
 	// mark below always has a row to land on.
 	b.markBlockProcessed(ctx, logger, blockHash, blockHeight)
-	if err := b.store.MarkBlocksOrphaned(ctx, []string{blockHash}, time.Now()); err != nil {
+	if _, err := b.store.MarkBlocksOrphaned(ctx, []string{blockHash}, time.Now()); err != nil {
 		logger.Warn("anchor guard: failed to mark block orphaned; reconciler full-scan will catch it", zap.Error(err))
 	}
 	if err := b.store.DeleteStumpsByBlockHash(ctx, blockHash); err != nil {

@@ -146,8 +146,8 @@ func (t *blockStatusTracker) recordReorg(ctx context.Context, ev *chaintracks.Re
 		for _, h := range ev.OrphanedHashes {
 			hashes = append(hashes, h.String())
 		}
-		applied := t.appliedOrphanTransitions(ctx, hashes)
-		if err := t.store.MarkBlocksOrphaned(ctx, hashes, time.Now()); err != nil {
+		applied, err := t.store.MarkBlocksOrphaned(ctx, hashes, time.Now())
+		if err != nil {
 			// The event's losers keep status='active' while the branch walk
 			// below still reactivates the winner, so the projection can hold
 			// two active rows at one height until something re-judges them.
@@ -171,22 +171,6 @@ func (t *blockStatusTracker) recordReorg(ctx context.Context, ev *chaintracks.Re
 		t.recordHeader(ctx, ev.NewTip)
 		t.reactivateBranch(ctx, ev)
 	}
-}
-
-// appliedOrphanTransitions reports how many of these hashes an orphan write
-// actually transitions: the store silently skips hashes with no row at all
-// (chaintracks emits OrphanedHashes for blocks observed before arcade
-// started recording), and re-marking an already-orphaned row changes no
-// status. Counting requests instead would overstate a series whose help
-// promises applied transitions. Rows that cannot be read are not counted.
-func (t *blockStatusTracker) appliedOrphanTransitions(ctx context.Context, hashes []string) int {
-	applied := 0
-	for _, hash := range hashes {
-		if row, err := t.store.GetBlockProcessingStatus(ctx, hash); err == nil && row.Status != models.BlockStatusOrphaned {
-			applied++
-		}
-	}
-	return applied
 }
 
 // reactivateBranch walks the heights strictly between the fork point and the
@@ -232,7 +216,13 @@ func (t *blockStatusTracker) reactivateBranch(ctx context.Context, ev *chaintrac
 	}
 
 	reactivated := make([]string, 0, 1)
-	for h := hi; h >= lo; h-- {
+	// Counts DOWN over uint32, so the loop is driven by an explicit
+	// iteration count rather than `h >= lo`: lo is 0 whenever
+	// CommonAncestor.Height is MaxUint32 and the span is inside the walk
+	// limit, and an unsigned `h >= 0` is vacuously true — h would wrap past
+	// 0 and spin forever, wedging this goroutine while it holds scanMu and
+	// taking the header loop's tie-scan down with it.
+	for h, n := hi, uint64(hi)-uint64(lo)+1; n > 0; h, n = h-1, n-1 {
 		active, err := t.ct.GetHeaderByHeight(ctx, h)
 		if err != nil || active == nil {
 			continue // fail-open: chaintracks cannot judge this height
@@ -354,11 +344,8 @@ func (t *blockStatusTracker) markOrphaned(ctx context.Context, set map[string]st
 	for hash := range set {
 		orphaned = append(orphaned, hash)
 	}
-	// Re-read immediately before the write: the paging walk that built this
-	// set runs over the whole scan window, so a concurrent ReorgEvent can
-	// have orphaned a candidate since its row was read.
-	applied := t.appliedOrphanTransitions(ctx, orphaned)
-	if err := t.store.MarkBlocksOrphaned(ctx, orphaned, time.Now()); err != nil {
+	applied, err := t.store.MarkBlocksOrphaned(ctx, orphaned, time.Now())
+	if err != nil {
 		t.logger.Warn("tie-scan: failed to mark blocks orphaned",
 			zap.Int("count", len(orphaned)),
 			zap.Error(err))

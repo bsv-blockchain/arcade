@@ -157,12 +157,21 @@ func (r *Reconciler) Start(ctx context.Context) error {
 	}
 
 	if r.cfg.BumpBuilder.Reconciler.StartupFullScan && r.acquireLease(ctx) {
-		if r.waitForChaintracksReady(ctx) {
-			r.runStartupFullScan(ctx)
-		} else {
+		switch {
+		case !r.waitForChaintracksReady(ctx):
 			r.logger.Warn("startup full-scan: chain-header source not ready within timeout; "+
 				"deferring to a later tick (self-heals once chaintracks catches up to the active tip)",
 				zap.Int("timeout_ms", r.cfg.BumpBuilder.Reconciler.FullScanChaintracksReadyTimeoutMs))
+		// The readiness wait can outlast the lease TTL (default: up to 2 min
+		// of waiting against a 90 s TTL), so re-assert leadership before
+		// scanning. Without this two replicas can run the full-scan at once —
+		// convergent, but it double-publishes MINED corrections now that the
+		// scan re-mines and reactivates rather than only marking.
+		case !r.acquireLease(ctx):
+			r.logger.Info("startup full-scan: lease lost while waiting for the chain-header source; " +
+				"deferring to a later tick")
+		default:
+			r.runStartupFullScan(ctx)
 		}
 	}
 	r.tick(ctx)
@@ -365,8 +374,8 @@ func (r *Reconciler) fullScanMarkOrphaned(ctx context.Context, set map[string]st
 	for hash := range set {
 		marked = append(marked, hash)
 	}
-	applied := r.appliedOrphanTransitions(ctx, marked)
-	if err := r.store.MarkBlocksOrphaned(ctx, marked, r.now()); err != nil {
+	applied, err := r.store.MarkBlocksOrphaned(ctx, marked, r.now())
+	if err != nil {
 		r.logger.Warn("startup full-scan: failed to mark orphaned", zap.Error(err))
 		return false
 	}
@@ -378,23 +387,6 @@ func (r *Reconciler) fullScanMarkOrphaned(ctx context.Context, set map[string]st
 	r.logger.Info("startup full-scan: marked off-chain blocks orphaned",
 		zap.Strings("block_hashes", marked))
 	return true
-}
-
-// appliedOrphanTransitions re-reads each candidate immediately before the
-// orphan write and reports how many rows that write actually transitions.
-// The paging walk that built the set runs over the whole scan window, so the
-// block-status tracker can have orphaned a candidate in the meantime, and
-// MarkBlocksOrphaned silently skips hashes with no row at all; counting
-// candidates would overstate a series whose help promises applied
-// transitions. Rows that cannot be read are not counted.
-func (r *Reconciler) appliedOrphanTransitions(ctx context.Context, hashes []string) int {
-	applied := 0
-	for _, hash := range hashes {
-		if row, err := r.store.GetBlockProcessingStatus(ctx, hash); err == nil && row.Status != models.BlockStatusOrphaned {
-			applied++
-		}
-	}
-	return applied
 }
 
 // fullScanResurrect re-mines each resurrected block's txs from its retained
@@ -710,12 +702,14 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 		return "error"
 	}
 	delete(r.defers, orphan)
+	// Observe the tx work BEFORE the stale check: those writes landed
+	// regardless of whether this pass got to stamp the row.
+	metrics.ReconcilerTxsReanchoredTotal.Add(float64(reanchored))
+	metrics.ReconcilerTxsRevertedTotal.Add(float64(len(reverted)))
 	if !stamped {
 		return r.staleOutcome(logger, height)
 	}
 
-	metrics.ReconcilerTxsReanchoredTotal.Add(float64(reanchored))
-	metrics.ReconcilerTxsRevertedTotal.Add(float64(len(reverted)))
 	logger.Info(
 		"orphaned block reconciled",
 		logfields.BlockHeight(height),
@@ -761,12 +755,13 @@ func (r *Reconciler) parkBlock(ctx context.Context, logger *zap.Logger, orphan s
 		return "error"
 	}
 	delete(r.defers, orphan)
+	// As above: the re-anchors and the park already happened.
+	metrics.ReconcilerTxsReanchoredTotal.Add(float64(reanchored))
+	metrics.ReconcilerTxsParkedTotal.Add(float64(parked))
 	if !stamped {
 		return r.staleOutcome(logger, height)
 	}
 
-	metrics.ReconcilerTxsReanchoredTotal.Add(float64(reanchored))
-	metrics.ReconcilerTxsParkedTotal.Add(float64(parked))
 	logger.Warn(
 		"orphaned block parked (unreconcilable): canonical BUMP unavailable at the defer cap — "+
 			"txs left MINED against the orphan, NOT reverted; a later canonical BUMP re-anchors them (issue #282)",

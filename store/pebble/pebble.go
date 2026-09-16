@@ -1514,32 +1514,38 @@ func (s *Store) MarkBlockBUMPBuilt(ctx context.Context, blockHash string, blockH
 	return s.writeBlockProc(prev, &cur)
 }
 
-func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) error {
+func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) (int, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return 0, err
 	}
+	transitions := 0
 	for _, h := range blockHashes {
 		mu := s.shardFor(h)
 		mu.Lock()
 		prev, err := s.readBlockProc(h)
 		if err != nil {
 			mu.Unlock()
-			return err
+			return transitions, err
 		}
 		if prev == nil {
 			mu.Unlock()
 			continue
 		}
+		wasOrphaned := prev.Status == string(models.BlockStatusOrphaned)
 		cur := *prev
 		cur.Status = string(models.BlockStatusOrphaned)
 		cur.OrphanedAtUnixNs = orphanedAt.UnixNano()
+		cur.ReconciledAtUnixNs = 0 // re-enter the reconciler queue for this generation
 		if err := s.writeBlockProc(prev, &cur); err != nil {
 			mu.Unlock()
-			return err
+			return transitions, err
 		}
 		mu.Unlock()
+		if !wasOrphaned {
+			transitions++
+		}
 	}
-	return nil
+	return transitions, nil
 }
 
 // MarkBlockReconciled stamps reconciled_at on an orphaned block's row — the

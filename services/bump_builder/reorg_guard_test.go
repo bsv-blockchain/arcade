@@ -29,11 +29,11 @@ type orphanRecordingStore struct {
 	orphanedCalls [][]string
 }
 
-func (s *orphanRecordingStore) MarkBlocksOrphaned(_ context.Context, hashes []string, _ time.Time) error {
+func (s *orphanRecordingStore) MarkBlocksOrphaned(_ context.Context, hashes []string, _ time.Time) (int, error) {
 	s.orphanMu.Lock()
 	defer s.orphanMu.Unlock()
 	s.orphanedCalls = append(s.orphanedCalls, append([]string(nil), hashes...))
-	return nil
+	return len(hashes), nil
 }
 
 // capturePublisher records PublishBulk templates.

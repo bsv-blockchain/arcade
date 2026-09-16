@@ -2428,36 +2428,46 @@ func (s *Store) markBlockMilestone(ctx context.Context, blockHash string, blockH
 	return nil
 }
 
-func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) error {
+func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) (int, error) {
 	if len(blockHashes) == 0 {
-		return nil
+		return 0, nil
 	}
+	transitions := 0
 	for _, h := range blockHashes {
 		key, err := s.key(setBlockProcessing, h)
 		if err != nil {
-			return err
+			return transitions, err
 		}
 		// Skip rows that don't exist — chaintracks may emit OrphanedHashes
 		// for blocks observed before this service started recording.
-		rec, err := s.client.Get(s.readPolicy(ctx), key, binBlockHash)
+		// binStatus comes back with the existence check so the transition
+		// count needs no second read.
+		rec, err := s.client.Get(s.readPolicy(ctx), key, binBlockHash, binStatus)
 		if err != nil {
 			if isKeyNotFound(err) {
 				continue
 			}
-			return fmt.Errorf("read block_processing %s: %w", h, err)
+			return transitions, fmt.Errorf("read block_processing %s: %w", h, err)
 		}
 		if rec == nil {
 			continue
 		}
+		wasOrphaned := getString(rec, binStatus) == string(models.BlockStatusOrphaned)
 		ops := []*aero.Operation{
 			aero.PutOp(aero.NewBin(binStatus, string(models.BlockStatusOrphaned))),
 			aero.PutOp(aero.NewBin(binOrphanedAt, orphanedAt.UnixNano())),
+			// Clear the previous generation's stamp so the row re-enters the
+			// reconciler queue for this orphaning.
+			aero.PutOp(aero.NewBin(binReconciledAt, nil)),
 		}
 		if _, err := s.client.Operate(s.writePolicy(ctx), key, ops...); err != nil {
-			return fmt.Errorf("mark orphaned %s: %w", h, err)
+			return transitions, fmt.Errorf("mark orphaned %s: %w", h, err)
+		}
+		if !wasOrphaned {
+			transitions++
 		}
 	}
-	return nil
+	return transitions, nil
 }
 
 // MarkBlockReconciled stamps reconciled_at on an orphaned block's row — the

@@ -3,6 +3,7 @@ package chaintracks_server
 import (
 	"context"
 	"errors"
+	"math"
 	"slices"
 	"sort"
 	"sync"
@@ -123,21 +124,30 @@ func (s *trackerStore) UpsertBlockHeaderSeen(_ context.Context, hash string, hei
 
 // MarkBlocksOrphaned records the call and, like every backend, mutates
 // only rows that exist (missing hashes are silently skipped).
-func (s *trackerStore) MarkBlocksOrphaned(_ context.Context, hashes []string, at time.Time) error {
+func (s *trackerStore) MarkBlocksOrphaned(_ context.Context, hashes []string, at time.Time) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.orphanErr != nil {
-		return s.orphanErr
+		return 0, s.orphanErr
 	}
 	s.orphaned = append(s.orphaned, append([]string(nil), hashes...))
+	written := 0
 	for _, h := range hashes {
 		if row, ok := s.rows[h]; ok {
 			ts := at
+			wasOrphaned := row.Status == models.BlockStatusOrphaned
 			row.Status = models.BlockStatusOrphaned
 			row.OrphanedAt = &ts
+			// The real backends clear the previous generation's stamp so the
+			// row re-enters the reconciler queue, and count only rows whose
+			// status actually changed.
+			row.ReconciledAt = nil
+			if !wasOrphaned {
+				written++
+			}
 		}
 	}
-	return nil
+	return written, nil
 }
 
 func (s *trackerStore) orphanCalls() [][]string {
@@ -749,5 +759,34 @@ func TestRecordReorg_BranchWalkStillRunsWhenOrphanMarkFails(t *testing.T) {
 	assertActiveClean(t, st.row(t, resurrected.Hash.String()))
 	if got := st.row(t, loser.String()); got.Status != models.BlockStatusActive {
 		t.Fatalf("the failed orphan write must leave the loser as it was, got %s", got.Status)
+	}
+}
+
+// TestRecordReorg_BranchWalkTerminatesOnHeightWrap: the walk counts DOWN
+// over uint32. With CommonAncestor at MaxUint32 the low bound wraps to 0,
+// where `h >= lo` is vacuously true — the walk would spin forever holding
+// scanMu and take the header loop's tie-scan down with it. Absurd input from
+// the header source, but an unrecoverable hang, so the bound is explicit.
+func TestRecordReorg_BranchWalkTerminatesOnHeightWrap(t *testing.T) {
+	ct := newFakeChaintracks()
+	ancestor := &chaintracks.BlockHeader{Height: math.MaxUint32}
+	tip := headerAt(3, 0x33)
+	ct.headers[3] = tip
+
+	st := newTrackerStore()
+	tr := newTestTracker(ct, st, 20, 0)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		tr.reactivateBranch(context.Background(), &chaintracks.ReorgEvent{
+			CommonAncestor: ancestor,
+			NewTip:         tip,
+		})
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reactivateBranch did not terminate: the height walk wrapped past 0")
 	}
 }

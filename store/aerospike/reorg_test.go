@@ -39,7 +39,7 @@ func TestListOrphanedBlocksToReconcile_PrioritizesReanchorable(t *testing.T) {
 		if err := s.UpsertBlockHeaderSeen(ctx, orphan, h, t0); err != nil {
 			t.Fatalf("seed orphan %s: %v", orphan, err)
 		}
-		if err := s.MarkBlocksOrphaned(ctx, []string{orphan}, t0.Add(time.Duration(i+1)*time.Minute)); err != nil {
+		if _, err := s.MarkBlocksOrphaned(ctx, []string{orphan}, t0.Add(time.Duration(i+1)*time.Minute)); err != nil {
 			t.Fatalf("orphan %s: %v", orphan, err)
 		}
 	}
@@ -57,7 +57,7 @@ func TestListOrphanedBlocksToReconcile_PrioritizesReanchorable(t *testing.T) {
 	if err := s.UpsertBlockHeaderSeen(ctx, "reanchor-canon", canonHeight, t0); err != nil {
 		t.Fatalf("seed reanchor-canon: %v", err)
 	}
-	if err := s.MarkBlocksOrphaned(ctx, []string{"reanchor-canon"}, t0.Add(10*time.Minute)); err != nil {
+	if _, err := s.MarkBlocksOrphaned(ctx, []string{"reanchor-canon"}, t0.Add(10*time.Minute)); err != nil {
 		t.Fatalf("orphan reanchor-canon: %v", err)
 	}
 	if err := s.InsertBUMP(ctx, "reanchor-act-canon", canonHeight, []byte{0xde, 0xad}); err != nil {

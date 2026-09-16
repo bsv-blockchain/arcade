@@ -30,10 +30,10 @@ func TestMarkBlockReconciled_GenerationCheck(t *testing.T) {
 			t.Fatalf("seed %s: %v", hash, err)
 		}
 	}
-	if err := s.MarkBlocksOrphaned(ctx, []string{a}, t0.Add(time.Minute)); err != nil {
+	if _, err := s.MarkBlocksOrphaned(ctx, []string{a}, t0.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.MarkBlocksOrphaned(ctx, []string{b}, t0.Add(2*time.Minute)); err != nil {
+	if _, err := s.MarkBlocksOrphaned(ctx, []string{b}, t0.Add(2*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -68,7 +68,7 @@ func TestMarkBlockReconciled_GenerationCheck(t *testing.T) {
 	}
 
 	// Zero generation only requires the row to be orphaned.
-	if err := s.MarkBlocksOrphaned(ctx, []string{b}, t0.Add(5*time.Minute)); err != nil {
+	if _, err := s.MarkBlocksOrphaned(ctx, []string{b}, t0.Add(5*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	stamped, err = s.MarkBlockReconciled(ctx, b, time.Time{}, t0.Add(6*time.Minute))
@@ -80,5 +80,56 @@ func TestMarkBlockReconciled_GenerationCheck(t *testing.T) {
 	stamped, err = s.MarkBlockReconciled(ctx, "rb-cas-never-seen", t0, t0)
 	if err != nil || stamped {
 		t.Fatalf("stamp on a missing row must be a no-op, got stamped=%v err=%v", stamped, err)
+	}
+}
+
+// TestMarkBlocksOrphaned_ReorphanRequeues pins the re-orphan contract
+// against a live Aerospike (issue #339 review): re-orphaning a row that was
+// already reconciled clears reconciled_at so it re-enters the reconciler
+// queue, and the returned count is applied status transitions only. The
+// namespace is shared, so this uses a unique prefix and unique heights and
+// reads the row back directly instead of through the shared queue.
+func TestMarkBlocksOrphaned_ReorphanRequeues(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	t0 := time.Unix(1700001000, 0).UTC()
+	const height = uint64(9_000_400)
+	hash := "rb-requeue-a"
+
+	if err := s.UpsertBlockHeaderSeen(ctx, hash, height, t0); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	n, err := s.MarkBlocksOrphaned(ctx, []string{hash, "rb-requeue-missing"}, t0.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("transitions = %d, want 1 (a hash with no row is not a transition)", n)
+	}
+	ok, err := s.MarkBlockReconciled(ctx, hash, t0.Add(time.Minute), t0.Add(2*time.Minute))
+	if err != nil || !ok {
+		t.Fatalf("MarkBlockReconciled: ok=%v err=%v", ok, err)
+	}
+
+	n, err = s.MarkBlocksOrphaned(ctx, []string{hash}, t0.Add(3*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("transitions = %d, want 0 (the row was already orphaned)", n)
+	}
+	row, err := s.GetBlockProcessingStatus(ctx, hash)
+	if err != nil {
+		t.Fatalf("GetBlockProcessingStatus: %v", err)
+	}
+	if row.ReconciledAt != nil {
+		t.Fatalf("re-orphaning must clear reconciled_at, got %v", row.ReconciledAt)
+	}
+	if row.OrphanedAt == nil || !row.OrphanedAt.Equal(t0.Add(3*time.Minute)) {
+		t.Fatalf("re-orphaning must stamp the new generation, got %v", row.OrphanedAt)
+	}
+	if row.Status != models.BlockStatusOrphaned {
+		t.Fatalf("status = %s, want orphaned", row.Status)
 	}
 }

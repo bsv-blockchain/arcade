@@ -157,7 +157,7 @@ func TestReconciler_MixedReanchorAndRevert(t *testing.T) {
 	if err := st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now()); err != nil {
 		t.Fatalf("upsert orphan row: %v", err)
 	}
-	if err := st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now()); err != nil {
+	if _, err := st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now()); err != nil {
 		t.Fatalf("mark orphaned: %v", err)
 	}
 
@@ -234,7 +234,7 @@ func TestReconciler_ResurrectedBlockResetsRow(t *testing.T) {
 
 	seedMined(t, st, recOrphan, 10, recShared1)
 	_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
-	_ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	_, _ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
 
 	r := newTestReconciler(st, pub, stub, nil)
 	r.tick(ctx)
@@ -260,7 +260,7 @@ func TestReconciler_DefersUntilCanonicalBUMPArrives(t *testing.T) {
 
 	seedMined(t, st, recOrphan, 10, recShared1)
 	_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
-	_ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	_, _ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
 
 	r := newTestReconciler(st, pub, stub, nil)
 	r.tick(ctx)
@@ -294,7 +294,7 @@ func TestReconciler_DeferCapFallsBackToRevert(t *testing.T) {
 
 	seedMined(t, st, recOrphan, 10, recShared1)
 	_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
-	_ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	_, _ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
 
 	r := newTestReconciler(st, pub, stub, func(c *config.ReconcilerConfig) {
 		c.MaxDeferAttempts = 1
@@ -328,7 +328,7 @@ func TestReconciler_DeferCapParksByDefault(t *testing.T) {
 
 	seedMined(t, st, recOrphan, 10, recShared1)
 	_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
-	_ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	_, _ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
 
 	r := newTestReconciler(st, pub, stub, func(c *config.ReconcilerConfig) { c.MaxDeferAttempts = 1 })
 	r.tick(ctx) // defer 1/1
@@ -378,7 +378,7 @@ func TestReconciler_NeighborhoodReanchor(t *testing.T) {
 	_ = st.InsertBUMP(ctx, recCanonical, 10, makeCompoundForTest(t, 10, recShared1))
 	_ = st.InsertBUMP(ctx, recNeighbor, 11, makeCompoundForTest(t, 11, recRebin))
 	_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
-	_ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	_, _ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
 
 	r := newTestReconciler(st, pub, stub, nil)
 	r.tick(ctx)
@@ -484,7 +484,7 @@ func TestReconciler_FullScanResurrectsReconciledOrphan(t *testing.T) {
 	}
 	_ = st.UpsertBlockHeaderSeen(ctx, competitor, 10, time.Now()) // still reads active
 	_ = st.UpsertBlockHeaderSeen(ctx, resurrected, 10, time.Now())
-	_ = st.MarkBlocksOrphaned(ctx, []string{resurrected}, time.Now())
+	_, _ = st.MarkBlocksOrphaned(ctx, []string{resurrected}, time.Now())
 	_, _ = st.MarkBlockReconciled(ctx, resurrected, time.Time{}, time.Now()) // the trap: off the queue
 	if rows, _ := st.ListOrphanedBlocksToReconcile(ctx, 10); len(rows) != 0 {
 		t.Fatalf("precondition: resurrected block must be off the reconcile queue, got %d", len(rows))
@@ -530,7 +530,7 @@ func TestReconciler_FullScanReactivationRespectsHorizon(t *testing.T) {
 	// An orphaned+reconciled row at height 10 that IS the active block there.
 	stub.setHeightHeader(10, headerWithHash(t, recOrphan, 10))
 	_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
-	_ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	_, _ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
 	_, _ = st.MarkBlockReconciled(ctx, recOrphan, time.Time{}, time.Now())
 
 	r := newTestReconciler(st, pub, stub, nil)
@@ -613,7 +613,7 @@ func TestReconciler_RemineBatchFailureKeepsRowQueued(t *testing.T) {
 		t.Fatalf("insert canonical BUMP: %v", err)
 	}
 	_ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
-	_ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	_, _ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
 
 	r := newTestReconciler(hs, pub, stub, nil)
 	r.tick(ctx)
@@ -657,7 +657,7 @@ func TestReconciler_FullScanRemineFailureLeavesRowForRetry(t *testing.T) {
 		t.Fatalf("insert BUMP: %v", err)
 	}
 	_ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
-	_ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	_, _ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
 	_, _ = base.MarkBlockReconciled(ctx, recOrphan, time.Time{}, time.Now())
 
 	r := newTestReconciler(hs, pub, stub, nil)
@@ -698,7 +698,7 @@ func TestReconciler_StaleReconcileDoesNotStampResurrectedRow(t *testing.T) {
 		t.Fatalf("insert canonical BUMP: %v", err)
 	}
 	_ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
-	_ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	_, _ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
 	rows, err := base.ListOrphanedBlocksToReconcile(ctx, 10)
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("precondition: one queued row, got %+v err=%v", rows, err)
@@ -733,14 +733,14 @@ func TestReconciler_StaleReconcileDoesNotStampReorphanedRow(t *testing.T) {
 		t.Fatalf("insert canonical BUMP: %v", err)
 	}
 	_ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
-	_ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	_, _ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
 	rows, err := base.ListOrphanedBlocksToReconcile(ctx, 10)
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("precondition: one queued row, got %+v err=%v", rows, err)
 	}
 	hs.beforeStamp = func() {
 		_ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
-		_ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now().Add(time.Second))
+		_, _ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now().Add(time.Second))
 	}
 
 	r := newTestReconciler(hs, pub, stub, nil)
@@ -916,7 +916,7 @@ func TestReconciler_FullScanBUMPReadFailureLeavesRowForRetry(t *testing.T) {
 		t.Fatalf("insert BUMP: %v", err)
 	}
 	_ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
-	_ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	_, _ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
 	_, _ = base.MarkBlockReconciled(ctx, recOrphan, time.Time{}, time.Now())
 
 	r := newTestReconciler(hs, pub, stub, nil)
@@ -962,7 +962,7 @@ func TestReconciler_FullScanReorgDuringRemineLeavesRowOrphaned(t *testing.T) {
 		t.Fatalf("insert BUMP: %v", err)
 	}
 	_ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
-	_ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	_, _ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
 	_, _ = base.MarkBlockReconciled(ctx, recOrphan, time.Time{}, time.Now())
 
 	// A reorg hands height 10 to a different block while the re-mine runs.
@@ -997,7 +997,7 @@ func TestReconciler_StartupFullScanRetriesUntilComplete(t *testing.T) {
 		t.Fatalf("insert BUMP: %v", err)
 	}
 	_ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
-	_ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	_, _ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
 	_, _ = base.MarkBlockReconciled(ctx, recOrphan, time.Time{}, time.Now())
 
 	r := newTestReconciler(hs, pub, stub, func(c *config.ReconcilerConfig) { c.StartupFullScan = true })
@@ -1024,7 +1024,7 @@ func TestReconciler_StartupFullScanRetriesUntilComplete(t *testing.T) {
 	// than re-paging the window on every tick for the life of the process.
 	r2 := newTestReconciler(hs, pub, stub, func(c *config.ReconcilerConfig) { c.StartupFullScan = true })
 	hs.failGetBUMP = true
-	_ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	_, _ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
 	_, _ = base.MarkBlockReconciled(ctx, recOrphan, time.Time{}, time.Now())
 	for i := 0; i < maxStartupFullScanAttempts; i++ {
 		if r2.startupScanDone {
@@ -1054,7 +1054,7 @@ func TestReconciler_FullScanOrphanMetricCountsAppliedTransitions(t *testing.T) {
 	_ = st.UpsertBlockHeaderSeen(ctx, recCanonical, 10, time.Now())
 	// One of them was already orphaned by the tracker: re-marking it is not
 	// a transition.
-	_ = st.MarkBlocksOrphaned(ctx, []string{recCanonical}, time.Now())
+	_, _ = st.MarkBlocksOrphaned(ctx, []string{recCanonical}, time.Now())
 
 	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
 		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceFullScan)

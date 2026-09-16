@@ -418,12 +418,23 @@ type Store interface {
 	// MarkBlockProcessed.
 	MarkBlockBUMPBuilt(ctx context.Context, blockHash string, blockHeight uint64, builtAt time.Time) error
 
-	// MarkBlocksOrphaned transitions every named block to status='orphaned'
-	// and stamps orphaned_at. Hashes that have no row are silently skipped
-	// (chaintracks may emit OrphanedHashes for blocks observed before the
-	// service started recording). Orphaned rows with reconciled_at IS NULL
-	// form the anchor reconciler's work queue.
-	MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) error
+	// MarkBlocksOrphaned transitions every named block to status='orphaned',
+	// stamps orphaned_at and CLEARS reconciled_at. Clearing is required, not
+	// cosmetic: orphaned rows with reconciled_at IS NULL form the anchor
+	// reconciler's work queue, so a row orphaned AGAIN after a previous
+	// orphaning was reconciled must re-enter that queue — the old stamp
+	// describes the old generation and says nothing about the new one.
+	// Leaving it set strands the block with no path back (issue #339).
+	// Hashes that have no row are silently skipped (chaintracks may emit
+	// OrphanedHashes for blocks observed before the service started
+	// recording). Returns the number of rows whose status actually CHANGED
+	// to 'orphaned' — the applied-transition count callers report to the
+	// block-status metric. A hash with no row, or a row already 'orphaned',
+	// is still written (generation refreshed, reconciled_at cleared) but is
+	// not a transition and is not counted. The count falls out of the write
+	// itself, so it costs no extra round-trip; pre-reading every hash would
+	// put N of them in front of a latency-critical write.
+	MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) (int, error)
 
 	// MarkBlockReconciled stamps reconciled_at on an orphaned block's row,
 	// recording that tx re-anchor/revert for this orphan completed. It is a

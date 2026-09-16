@@ -103,19 +103,25 @@ func (s *blockProcStore) MarkBlockBUMPBuilt(_ context.Context, hash string, heig
 	return nil
 }
 
-func (s *blockProcStore) MarkBlocksOrphaned(_ context.Context, hashes []string, at time.Time) error {
+func (s *blockProcStore) MarkBlocksOrphaned(_ context.Context, hashes []string, at time.Time) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cp := append([]string(nil), hashes...)
 	s.orphanedCalls = append(s.orphanedCalls, cp)
+	written := 0
 	for _, h := range hashes {
 		if row, ok := s.rows[h]; ok {
+			wasOrphaned := row.Status == models.BlockStatusOrphaned
 			row.Status = models.BlockStatusOrphaned
 			t := at
 			row.OrphanedAt = &t
+			row.ReconciledAt = nil
+			if !wasOrphaned {
+				written++
+			}
 		}
 	}
-	return nil
+	return written, nil
 }
 
 func (s *blockProcStore) MarkBlocksParked(_ context.Context, hashes []string) error {
@@ -293,7 +299,7 @@ func TestHandleGetBlockProcessingStatus_ExposesReconciledAt(t *testing.T) {
 	bs := newBlockProcStore()
 	now := time.Now().UTC().Truncate(time.Millisecond)
 	_ = bs.UpsertBlockHeaderSeen(context.Background(), "abc", 5, now)
-	_ = bs.MarkBlocksOrphaned(context.Background(), []string{"abc"}, now.Add(time.Second))
+	_, _ = bs.MarkBlocksOrphaned(context.Background(), []string{"abc"}, now.Add(time.Second))
 	reconciled := now.Add(2 * time.Second)
 	bs.rows["abc"].ReconciledAt = &reconciled
 	_ = bs.UpsertBlockHeaderSeen(context.Background(), "def", 6, now)

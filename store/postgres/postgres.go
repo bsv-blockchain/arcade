@@ -1196,19 +1196,40 @@ ON CONFLICT (block_hash) DO UPDATE SET
 	return nil
 }
 
-func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) error {
+func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) (int, error) {
 	if len(blockHashes) == 0 {
-		return nil
+		return 0, nil
 	}
+	// The FROM-list alias reads the pre-update snapshot, so RETURNING can
+	// report each row's status BEFORE this statement — that is what makes
+	// the transition count exact without a second round-trip. The join is
+	// on the primary key, so it is strictly 1:1.
 	const q = `
-UPDATE block_processing
-SET status = 'orphaned', orphaned_at = $2
-WHERE block_hash = ANY($1)`
-	_, err := s.pool.Exec(ctx, q, blockHashes, orphanedAt)
+UPDATE block_processing AS bp
+SET status = 'orphaned', orphaned_at = $2, reconciled_at = NULL
+FROM block_processing AS prev
+WHERE bp.block_hash = prev.block_hash
+  AND bp.block_hash = ANY($1)
+RETURNING prev.status`
+	rows, err := s.pool.Query(ctx, q, blockHashes, orphanedAt)
 	if err != nil {
-		return fmt.Errorf("mark blocks orphaned: %w", err)
+		return 0, fmt.Errorf("mark blocks orphaned: %w", err)
 	}
-	return nil
+	defer rows.Close()
+	transitions := 0
+	for rows.Next() {
+		var was string
+		if err := rows.Scan(&was); err != nil {
+			return transitions, fmt.Errorf("mark blocks orphaned: %w", err)
+		}
+		if was != string(models.BlockStatusOrphaned) {
+			transitions++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return transitions, fmt.Errorf("mark blocks orphaned: %w", err)
+	}
+	return transitions, nil
 }
 
 // MarkBlockReconciled stamps reconciled_at on an orphaned block's row — the

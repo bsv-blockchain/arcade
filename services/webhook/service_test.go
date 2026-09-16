@@ -278,8 +278,12 @@ func (s *fakeStore) MarkBlockProcessed(context.Context, string, uint64, time.Tim
 func (s *fakeStore) MarkBlockBUMPBuilt(context.Context, string, uint64, time.Time) error {
 	return nil
 }
-func (s *fakeStore) MarkBlocksOrphaned(context.Context, []string, time.Time) error { return nil }
-func (s *fakeStore) MarkBlocksParked(context.Context, []string) error              { return nil }
+
+func (s *fakeStore) MarkBlocksOrphaned(context.Context, []string, time.Time) (int, error) {
+	return 0, nil
+}
+
+func (s *fakeStore) MarkBlocksParked(context.Context, []string) error { return nil }
 
 //nolint:nilnil // unused stub.
 func (s *fakeStore) GetBlockProcessingStatus(context.Context, string) (*models.BlockProcessingStatus, error) {
