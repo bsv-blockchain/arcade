@@ -393,11 +393,15 @@ type Store interface {
 	// table is observability-first: writers must not fail their primary work
 	// because of a status-tracking error.
 
-	// UpsertBlockHeaderSeen records that chaintracks observed a tip header.
-	// On insert, status='active' and header_seen_at=seenAt. On conflict,
-	// implementations MUST overwrite block_height (chaintracks is the
-	// authoritative source) and reset status='active' / orphaned_at=NULL,
-	// but MUST preserve the existing header_seen_at, processed_at, and
+	// UpsertBlockHeaderSeen records that chaintracks observed a tip header,
+	// and is also the resurrection primitive: the block-status tracker and
+	// the anchor reconciler call it to return an orphaned row to active
+	// once the block is the active-chain block at its height again (issue
+	// #339). On insert, status='active' and header_seen_at=seenAt. On
+	// conflict, implementations MUST overwrite block_height (chaintracks is
+	// the authoritative source) and reset status='active' / orphaned_at=NULL
+	// / reconciled_at=NULL (so a later re-orphaning reconciles again), but
+	// MUST preserve the existing header_seen_at, processed_at, and
 	// bump_built_at so a re-arrival or reorg-resurrection does not erase
 	// earlier milestones.
 	UpsertBlockHeaderSeen(ctx context.Context, blockHash string, blockHeight uint64, seenAt time.Time) error
@@ -414,17 +418,33 @@ type Store interface {
 	// MarkBlockProcessed.
 	MarkBlockBUMPBuilt(ctx context.Context, blockHash string, blockHeight uint64, builtAt time.Time) error
 
-	// MarkBlocksOrphaned transitions every named block to status='orphaned'
-	// and stamps orphaned_at. Hashes that have no row are silently skipped
-	// (chaintracks may emit OrphanedHashes for blocks observed before the
-	// service started recording). Orphaned rows with reconciled_at IS NULL
-	// form the anchor reconciler's work queue.
-	MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) error
+	// MarkBlocksOrphaned transitions every named block to status='orphaned',
+	// stamps orphaned_at and CLEARS reconciled_at. Clearing is required, not
+	// cosmetic: orphaned rows with reconciled_at IS NULL form the anchor
+	// reconciler's work queue, so a row orphaned AGAIN after a previous
+	// orphaning was reconciled must re-enter that queue — the old stamp
+	// describes the old generation and says nothing about the new one.
+	// Leaving it set strands the block with no path back (issue #339).
+	// Hashes that have no row are silently skipped (chaintracks may emit
+	// OrphanedHashes for blocks observed before the service started
+	// recording). Returns the number of rows whose status actually CHANGED
+	// to 'orphaned' — the applied-transition count callers report to the
+	// block-status metric. A hash with no row, or a row already 'orphaned',
+	// is still written (generation refreshed, reconciled_at cleared) but is
+	// not a transition and is not counted. The count falls out of the write
+	// itself, so it costs no extra round-trip; pre-reading every hash would
+	// put N of them in front of a latency-critical write.
+	MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) (int, error)
 
 	// MarkBlockReconciled stamps reconciled_at on an orphaned block's row,
-	// recording that tx re-anchor/revert for this orphan completed. A
-	// missing row is a silent no-op.
-	MarkBlockReconciled(ctx context.Context, blockHash string, at time.Time) error
+	// recording that tx re-anchor/revert for this orphan completed. It is a
+	// compare-and-set on the orphan generation the caller processed: the
+	// stamp applies only while the row is still status='orphaned' AND its
+	// orphaned_at equals orphanedAt (a zero orphanedAt checks status only).
+	// A row the block-status tracker reactivated — or orphaned again with a
+	// newer orphaned_at — while the reconciler was working is left untouched
+	// (issue #339), as is a missing row. Returns whether the stamp applied.
+	MarkBlockReconciled(ctx context.Context, blockHash string, orphanedAt, at time.Time) (bool, error)
 
 	// ListOrphanedBlocksToReconcile returns up to limit rows with
 	// status='orphaned' AND reconciled_at IS NULL, oldest orphaned_at

@@ -69,6 +69,32 @@ func PreRegisterBumpOutcomes() {
 	}
 }
 
+// blockStatusTransitions is the closed set of {transition, source} pairs the
+// block-status tracker (services/chaintracks_server) and the anchor
+// reconciler (services/bump_builder) emit on BlockStatusTransitionsTotal.
+// The reconciler's resurrection short-circuit only ever reactivates, hence
+// no reconciler/orphaned pair. Keep in sync with the emitters.
+var blockStatusTransitions = [][2]string{
+	{BlockTransitionOrphaned, BlockTransitionSourceReorgEvent},
+	{BlockTransitionOrphaned, BlockTransitionSourceTieScan},
+	{BlockTransitionOrphaned, BlockTransitionSourceFullScan},
+	{BlockTransitionReactivated, BlockTransitionSourceReorgEvent},
+	{BlockTransitionReactivated, BlockTransitionSourceTieScan},
+	{BlockTransitionReactivated, BlockTransitionSourceFullScan},
+	{BlockTransitionReactivated, BlockTransitionSourceReconciler},
+}
+
+// PreRegisterBlockStatusTransitions instantiates every {transition, source}
+// child of BlockStatusTransitionsTotal. chaintracks_server and the
+// bump-builder call this at construction time: a same-height flip-flop
+// (issue #339) is rare enough that the reactivated series would otherwise be
+// born mid-incident, and increase() would swallow the one burst that matters.
+func PreRegisterBlockStatusTransitions() {
+	for _, pair := range blockStatusTransitions {
+		BlockStatusTransitionsTotal.WithLabelValues(pair[0], pair[1])
+	}
+}
+
 // PreRegisterPropagationRetryOutcomes instantiates every outcome child of the
 // missing-parent and durable-retry counters. The propagation service calls
 // this at construction time.

@@ -29,11 +29,11 @@ type orphanRecordingStore struct {
 	orphanedCalls [][]string
 }
 
-func (s *orphanRecordingStore) MarkBlocksOrphaned(_ context.Context, hashes []string, _ time.Time) error {
+func (s *orphanRecordingStore) MarkBlocksOrphaned(_ context.Context, hashes []string, _ time.Time) (int, error) {
 	s.orphanMu.Lock()
 	defer s.orphanMu.Unlock()
 	s.orphanedCalls = append(s.orphanedCalls, append([]string(nil), hashes...))
-	return nil
+	return len(hashes), nil
 }
 
 // capturePublisher records PublishBulk templates.
@@ -267,9 +267,12 @@ func TestSetMinedAndPublish_OnlyChangedFiltersEvents(t *testing.T) {
 	}
 	pub := &capturePublisher{}
 
-	changed := setMinedAndPublish(context.Background(), zap.NewNop(), st, pub,
+	changed, err := setMinedAndPublish(context.Background(), zap.NewNop(), st, pub,
 		guardBlockA, 10, []string{txAlready, txReanchor, txFresh},
 		models.ExtraInfoReorgReanchor, true)
+	if err != nil {
+		t.Fatalf("setMinedAndPublish: %v", err)
+	}
 	if changed != 2 {
 		t.Fatalf("expected 2 changed rows (re-anchor + fresh), got %d", changed)
 	}

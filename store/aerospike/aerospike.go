@@ -2428,58 +2428,88 @@ func (s *Store) markBlockMilestone(ctx context.Context, blockHash string, blockH
 	return nil
 }
 
-func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) error {
+func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) (int, error) {
 	if len(blockHashes) == 0 {
-		return nil
+		return 0, nil
 	}
+	transitions := 0
 	for _, h := range blockHashes {
 		key, err := s.key(setBlockProcessing, h)
 		if err != nil {
-			return err
+			return transitions, err
 		}
 		// Skip rows that don't exist — chaintracks may emit OrphanedHashes
 		// for blocks observed before this service started recording.
-		rec, err := s.client.Get(s.readPolicy(ctx), key, binBlockHash)
+		// binStatus comes back with the existence check so the transition
+		// count needs no second read.
+		rec, err := s.client.Get(s.readPolicy(ctx), key, binBlockHash, binStatus)
 		if err != nil {
 			if isKeyNotFound(err) {
 				continue
 			}
-			return fmt.Errorf("read block_processing %s: %w", h, err)
+			return transitions, fmt.Errorf("read block_processing %s: %w", h, err)
 		}
 		if rec == nil {
 			continue
 		}
+		wasOrphaned := getString(rec, binStatus) == string(models.BlockStatusOrphaned)
 		ops := []*aero.Operation{
 			aero.PutOp(aero.NewBin(binStatus, string(models.BlockStatusOrphaned))),
 			aero.PutOp(aero.NewBin(binOrphanedAt, orphanedAt.UnixNano())),
+			// Clear the previous generation's stamp so the row re-enters the
+			// reconciler queue for this orphaning.
+			aero.PutOp(aero.NewBin(binReconciledAt, nil)),
 		}
 		if _, err := s.client.Operate(s.writePolicy(ctx), key, ops...); err != nil {
-			return fmt.Errorf("mark orphaned %s: %w", h, err)
+			return transitions, fmt.Errorf("mark orphaned %s: %w", h, err)
+		}
+		if !wasOrphaned {
+			transitions++
 		}
 	}
-	return nil
+	return transitions, nil
 }
 
 // MarkBlockReconciled stamps reconciled_at on an orphaned block's row — the
-// anchor reconciler finished re-anchoring/reverting its transactions. A
-// missing row is a silent no-op (UPDATE_ONLY, the RecordDeliveryAttempt
-// pattern).
-func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, at time.Time) error {
+// anchor reconciler finished re-anchoring/reverting its transactions — as a
+// compare-and-set on the orphan generation: the row must still be orphaned
+// with the orphaned_at the caller observed (a zero orphanedAt checks status
+// only). Missing, resurrected and re-orphaned rows are silently skipped and
+// reported as not stamped (issue #339). Read-then-write with
+// EXPECT_GEN_EQUAL (the UpdateDeliveryStatusCAS pattern) so a concurrent
+// writer that moves the row between our Get and Operate wins; UPDATE_ONLY
+// never creates a phantom block row.
+func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, orphanedAt, at time.Time) (bool, error) {
 	key, err := s.key(setBlockProcessing, blockHash)
 	if err != nil {
-		return err
+		return false, err
+	}
+	rec, err := s.client.Get(s.readPolicy(ctx), key, binStatus, binOrphanedAt)
+	if err != nil {
+		if isKeyNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read block for reconcile cas %s: %w", blockHash, err)
+	}
+	if rec == nil || getString(rec, binStatus) != string(models.BlockStatusOrphaned) {
+		return false, nil
+	}
+	if !orphanedAt.IsZero() && getInt64(rec, binOrphanedAt) != orphanedAt.UnixNano() {
+		return false, nil
 	}
 	policy := s.writePolicy(ctx)
-	policy.RecordExistsAction = aero.UPDATE_ONLY // never create a phantom block row
-	_, err = s.client.Operate(policy, key,
+	policy.RecordExistsAction = aero.UPDATE_ONLY
+	policy.GenerationPolicy = aero.EXPECT_GEN_EQUAL
+	policy.Generation = rec.Generation
+	_, opErr := s.client.Operate(policy, key,
 		aero.PutOp(aero.NewBin(binReconciledAt, at.UnixNano())))
-	if isKeyNotFound(err) {
-		return nil
+	if opErr != nil {
+		if isKeyNotFound(opErr) || isGenerationErr(opErr) {
+			return false, nil // the row moved on between read and write: that writer's generation wins
+		}
+		return false, fmt.Errorf("mark block reconciled %s: %w", blockHash, opErr)
 	}
-	if err != nil {
-		return fmt.Errorf("mark block reconciled %s: %w", blockHash, err)
-	}
-	return nil
+	return true, nil
 }
 
 // ListOrphanedBlocksToReconcile narrows by status='orphaned' via the secondary
