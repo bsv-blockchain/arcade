@@ -15,7 +15,9 @@
 //     point: a writer uploads the file first, atomically points the manifest
 //     at it, and deletes only the file the swap replaced, so concurrent
 //     rebuilds of one block can never delete each other's upload and a reader
-//     always finds either the old or the new file, never neither.
+//     always finds either the old or the new file, never neither. Like every
+//     guarantee here this assumes reads reach a primary; New warns when the
+//     configured read preference says otherwise.
 //   - Absent is the only encoding of "no value". Optional fields carry
 //     omitempty, writers clear with $unset, and readers treat absent/null/0
 //     alike. Partial indexes and {field: null} predicates depend on this.
@@ -39,6 +41,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
+	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/store/bumpcache"
@@ -97,7 +100,11 @@ type Store struct {
 // New connects to MongoDB, verifies the deployment answers a ping, and
 // returns a Store bound to cfg.Database. It does not create indexes: the
 // process bootstrap calls EnsureIndexes explicitly, like the other backends.
-func New(ctx context.Context, cfg config.Mongo) (*Store, error) {
+// A nil logger is accepted and discards the configuration warnings below.
+func New(ctx context.Context, cfg config.Mongo, logger *zap.Logger) (*Store, error) {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	if cfg.URI == "" {
 		return nil, errors.New("mongodb: uri is required")
 	}
@@ -116,9 +123,19 @@ func New(ctx context.Context, cfg config.Mongo) (*Store, error) {
 	// be arbitrarily stale, which turns those into coin flips — a manifest
 	// read from a lagging node can report a file as still current after a
 	// newer writer replaced it, and the caller then deletes the newer file.
-	// Refuse at startup instead of corrupting quietly.
+	//
+	// Warn rather than refuse: an operator who has deliberately set this may
+	// have a reason, and a backend that will not start is worse than one that
+	// says loudly what it cannot promise. The warning names the consequence
+	// so it is recognizable later from the symptom.
 	if rp := opts.ReadPreference; rp != nil && rp.Mode() != readpref.PrimaryMode {
-		return nil, fmt.Errorf("mongodb: read preference %q is not supported; this backend's write guards require primary reads", rp.Mode())
+		logger.Warn(
+			"store.mongodb.uri sets a non-primary read preference; this backend's write guards "+
+				"(status lattice, still-anchored-to-this-block, manifest-versus-file) are all "+
+				"read-then-write, and a stale secondary read can let them pass wrongly — expect "+
+				"lost status transitions and deleted blobs under concurrency",
+			zap.String("read_preference", rp.Mode().String()),
+		)
 	}
 	if cfg.MaxPoolSize > 0 {
 		opts.SetMaxPoolSize(uint64(cfg.MaxPoolSize))

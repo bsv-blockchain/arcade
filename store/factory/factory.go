@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/store/aerospike"
@@ -20,7 +22,11 @@ import (
 // Both return values point to the same underlying backend — every supported
 // backend implements both interfaces — so callers can pass the returned
 // Leaser into services.propagation without a second factory.
-func New(ctx context.Context, cfg *config.Config) (store.Store, store.Leaser, error) {
+//
+// logger carries construction-time warnings a backend can only raise once it
+// has parsed its own configuration — settings that are legal but cost a
+// guarantee the backend otherwise relies on. It may be nil.
+func New(ctx context.Context, cfg *config.Config, logger *zap.Logger) (store.Store, store.Leaser, error) {
 	switch cfg.Store.Backend {
 	case "", "aerospike":
 		s, err := aerospike.New(ctx, cfg.Store.Aerospike)
@@ -48,10 +54,14 @@ func New(ctx context.Context, cfg *config.Config) (store.Store, store.Leaser, er
 	case "mongodb":
 		// Server selection against an unreachable or misconfigured deployment
 		// is bounded by store.mongodb.connect_timeout_ms; the outer ceiling
-		// keeps a pathological DNS/TLS handshake from hanging the CLI.
+		// keeps a pathological TLS handshake from hanging the CLI. It does NOT
+		// cover a mongodb+srv:// URI's SRV/TXT lookup: the driver resolves that
+		// inside ApplyURI, synchronously and with no context, before this
+		// deadline is ever consulted, so a black-holed resolver still wedges
+		// boot past this ceiling.
 		mongoCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer cancel()
-		s, err := mongodb.New(mongoCtx, cfg.Store.Mongo)
+		s, err := mongodb.New(mongoCtx, cfg.Store.Mongo, logger)
 		if err != nil {
 			return nil, nil, err
 		}

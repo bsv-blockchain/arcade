@@ -88,6 +88,11 @@ store:
   # Alternative: MongoDB. Only read when backend: mongodb. A standalone
   # mongod is sufficient (no multi-document transactions are used); a
   # replica set is only needed for HA. BUMP/STUMP payloads live in GridFS.
+  # Reads must reach a PRIMARY: this backend's guards (status lattice,
+  # still-anchored-to-this-block, manifest-versus-file) are read-then-write,
+  # so a readPreference of secondary/secondaryPreferred in the URI can let
+  # them pass on stale data — losing status transitions and deleting blobs
+  # under concurrency. Arcade warns at startup if the URI asks for one.
   # mongodb:
   #   uri: mongodb://localhost:27017
   #   database: arcade

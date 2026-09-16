@@ -32,6 +32,11 @@ import (
 // pruning each other's upload. Readers resolve manifest → file; a reader
 // that loses a race between the two steps re-reads the manifest once.
 //
+// Every invariant in this file is stated against a primary. They are built out
+// of read-then-write pairs, so a stale read breaks them: New warns about a
+// non-primary read preference (it does not refuse one), and under that
+// configuration none of what follows holds.
+//
 // A writer that dies between upload and swap leaves an unreferenced file, and
 // so does one whose swap fails or reports an unknown outcome: the upload is
 // kept on purpose there, because a swap that committed and then surfaced a
@@ -396,7 +401,11 @@ func (s *Store) publishBlob(ctx context.Context, b *blobBucket, key, filename st
 // returns false.
 //
 // The verdict is two reads, not one atomic observation, and both must reach a
-// primary to mean anything (New refuses any other read preference). A writer
+// primary to mean anything. New only WARNS about a non-primary read
+// preference rather than refusing it, so that is a configuration this code can
+// actually meet: against a lagging secondary this returns false for a file
+// that is genuinely gone, the republish never fires, and the manifest is left
+// naming a deleted file for good. A writer
 // that swaps in between them can still have its file deleted by the republish
 // that follows — the same last-swap-wins outcome as any other concurrent
 // overwrite, since the republish swaps later, but worth knowing it is not

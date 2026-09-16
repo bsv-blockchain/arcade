@@ -18,12 +18,16 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/bsv-blockchain/arcade/config"
 )
@@ -31,6 +35,7 @@ import (
 var (
 	sharedClient *mongo.Client
 	sharedErr    error
+	sharedURI    string
 )
 
 func TestMain(m *testing.M) {
@@ -40,6 +45,7 @@ func TestMain(m *testing.M) {
 		// only, and Go dials ::1 first, which the forwarder resets.
 		uri = "mongodb://127.0.0.1:27017"
 	}
+	sharedURI = uri
 	sharedClient, sharedErr = connectForTests(uri)
 	code := m.Run()
 	if sharedClient != nil {
@@ -145,4 +151,78 @@ func indexNames(t *testing.T, coll *mongo.Collection) map[string]bool {
 		out[sp.Name] = true
 	}
 	return out
+}
+
+// A non-primary read preference is legal configuration that costs this
+// backend's guards their meaning, so New warns and carries on rather than
+// refusing to start. The warning has to actually reach the log, and has to
+// name which preference tripped it: it is the only signal an operator gets
+// before the symptoms (lost status transitions, deleted blobs) show up under
+// concurrency.
+func TestNew_WarnsOnNonPrimaryReadPreference(t *testing.T) {
+	if sharedClient == nil {
+		if os.Getenv("ARCADE_MONGODB_REQUIRED") != "" {
+			// CI provisions a server and must fail loudly, never skip.
+			t.Fatalf("mongodb required but unavailable at ARCADE_MONGODB_URI: %v", sharedErr)
+		}
+		t.Skipf("mongodb unavailable (set ARCADE_MONGODB_URI), skipping: %v", sharedErr)
+	}
+	// A query string needs a path separator after the host: both mongodb://
+	// and mongodb+srv:// carry their own "//", so look past the scheme.
+	withOpt := func(opt string) string {
+		if strings.Contains(sharedURI, "?") {
+			return sharedURI + "&" + opt
+		}
+		base := sharedURI
+		if _, hostAndRest, ok := strings.Cut(base, "://"); ok && !strings.Contains(hostAndRest, "/") {
+			base += "/"
+		}
+		return base + "?" + opt
+	}
+
+	for _, tc := range []struct {
+		name     string
+		uri      string
+		wantMode string // empty: no warning expected
+	}{
+		{"secondaryPreferred warns", withOpt("readPreference=secondaryPreferred"), "secondaryPreferred"},
+		{"secondary warns", withOpt("readPreference=secondary"), "secondary"},
+		{"primary is silent", withOpt("readPreference=primary"), ""},
+		{"unset is silent", sharedURI, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.uri == sharedURI && strings.Contains(strings.ToLower(sharedURI), "readpreference") {
+				t.Skip("ARCADE_MONGODB_URI already sets a read preference; nothing to assert about the unset case")
+			}
+			core, logs := observer.New(zapcore.WarnLevel)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			s, err := New(ctx, config.Mongo{URI: tc.uri, Database: "arcade_readpref_probe"}, zap.New(core))
+			if err != nil {
+				t.Fatalf("New must not refuse a legal read preference: %v", err)
+			}
+			defer func() { _ = s.Close() }()
+
+			warnings := logs.FilterMessageSnippet("non-primary read preference").All()
+			if tc.wantMode == "" {
+				if len(warnings) != 0 {
+					t.Fatalf("expected no warning, got %d: %+v", len(warnings), warnings)
+				}
+				return
+			}
+			if len(warnings) != 1 {
+				t.Fatalf("expected exactly one startup warning, got %d", len(warnings))
+			}
+			// The field, not just the message: an operator needs to know WHICH
+			// preference tripped it, and a message-only assertion passes even
+			// when the field has been dropped.
+			got, ok := warnings[0].ContextMap()["read_preference"]
+			if !ok {
+				t.Fatalf("warning must carry the read_preference field, got %+v", warnings[0].ContextMap())
+			}
+			if got != tc.wantMode {
+				t.Fatalf("read_preference = %v, want %q", got, tc.wantMode)
+			}
+		})
+	}
 }
