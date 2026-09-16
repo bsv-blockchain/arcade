@@ -504,12 +504,20 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 	// legacy fallback) — SEEN_ON_NETWORK puts them back in flight
 	// (rebroadcast/propagation owns them from here), and the store appends O
 	// to their orphaned-anchor history.
+	// Publish BEFORE the error check. SetStatusByBlockHash returns the rows it
+	// rewrote alongside any error — a page that failed mid-walk, or a block
+	// still taking mines faster than it can be retired — and those rows are
+	// already SEEN_ON_NETWORK in the store. They leave the block's index with
+	// that write, so a later retry will not find them again: if their event is
+	// not published here it is never published, and subscribers keep believing
+	// the txs are MINED. Publishing is idempotent for the subscriber, so the
+	// only wrong move is to skip it.
 	reverted, err := r.store.SetStatusByBlockHash(ctx, orphan, models.StatusSeenOnNetwork)
+	r.publishReverted(ctx, logger, reverted)
 	if err != nil {
-		logger.Warn("failed to revert remaining txs", zap.Error(err))
+		logger.Warn("failed to revert remaining txs", zap.Int("published", len(reverted)), zap.Error(err))
 		return "error"
 	}
-	r.publishReverted(ctx, logger, reverted)
 
 	// Cleanup: STUMPs are per-subtree intermediates, safe to drop. The
 	// compound BUMP is deliberately RETAINED — it serves the historical

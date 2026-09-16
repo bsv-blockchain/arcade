@@ -40,12 +40,28 @@ type Cache struct {
 	group     singleflight.Group
 	maxLeaves int
 
-	// mu guards lru and totalLeaves. The LRU's evict callback adjusts
+	// mu guards lru, totalLeaves and epoch. The LRU's evict callback adjusts
 	// totalLeaves and runs synchronously inside mutations, so it MUST NOT
 	// take mu itself — every lru call site below already holds it.
 	mu          sync.Mutex
 	lru         *simplelru.LRU[string, *bump.CompoundIndex]
 	totalLeaves int
+
+	// filling holds the blocks with a fill in flight right now, and dirty the
+	// subset of those an invalidation landed on mid-fill. A fill that comes
+	// back dirty must not install what it read: those bytes predate the
+	// rebuild that invalidated them.
+	//
+	// Both are keyed only for the duration of a fill and deleted when it
+	// ends, so together they hold at most one entry per block being fetched
+	// at this instant — singleflight already collapses concurrent misses for
+	// one block into one fill. Tracking per block matters: a single counter
+	// for the whole cache would let a write to ANY block discard the
+	// in-flight fill of every other, and during a merkle backlog drain (block
+	// after block arriving, each ending in InsertBUMP) that is every fill,
+	// leaving the cache permanently empty exactly when it is load-bearing.
+	filling map[string]bool
+	dirty   map[string]bool
 }
 
 // New constructs an empty cache with the package's production bounds.
@@ -56,7 +72,11 @@ func New() *Cache {
 // newWithLimits is the constructor proper, split out so tests can exercise
 // eviction without building half-million-leaf compounds.
 func newWithLimits(entries, leaves int) *Cache {
-	c := &Cache{maxLeaves: leaves}
+	c := &Cache{
+		maxLeaves: leaves,
+		filling:   make(map[string]bool),
+		dirty:     make(map[string]bool),
+	}
 	l, err := simplelru.NewLRU(entries, func(_ string, v *bump.CompoundIndex) {
 		c.totalLeaves -= v.Leaves()
 	})
@@ -109,10 +129,24 @@ func (c *Cache) MinimalPath(blockHash, txid string, fetch func() ([]byte, error)
 // Remove invalidates a block's cached index. Called by InsertBUMP: a rebuild
 // can overwrite the stored compound for an existing block (e.g. late STUMP
 // callbacks), so the next enrichment must re-fetch and re-parse.
+//
+// Dropping the entry is not enough on its own. A fill for the same block can
+// already be in flight, holding bytes it read from the store BEFORE the
+// rebuild landed; without this it would add them after this call and serve the
+// superseded compound to every later reader until the next write or eviction.
+// Marking the fill dirty makes it decline to install.
+//
+// Forget releases the singleflight slot as well, so a reader arriving after
+// this call starts its own fetch instead of joining the in-flight one and
+// being handed pre-rebuild bytes it could have missed entirely.
 func (c *Cache) Remove(blockHash string) {
+	c.group.Forget(blockHash)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.lru.Remove(blockHash)
+	if c.filling[blockHash] {
+		c.dirty[blockHash] = true
+	}
 }
 
 // Contains reports whether a block's index is currently cached, without
@@ -138,18 +172,27 @@ func (c *Cache) index(blockHash string, fetch func() ([]byte, error)) *bump.Comp
 		if idx, ok := c.lookup(blockHash); ok {
 			return idx, nil
 		}
+		c.beginFill(blockHash)
 		data, err := fetch()
 		if err != nil {
+			c.endFill(blockHash, nil)
 			return nil, err
 		}
 		if len(data) == 0 {
+			c.endFill(blockHash, nil)
 			return (*bump.CompoundIndex)(nil), nil
 		}
 		idx, err := bump.IndexCompound(data)
 		if err != nil {
+			c.endFill(blockHash, nil)
 			return nil, err
 		}
-		c.add(blockHash, idx)
+		// Returned either way: these bytes were current when this fetch
+		// began, which is all a read that raced a write can promise. Only
+		// CACHING them is withheld when an invalidation landed in the
+		// meantime, because a cached stale compound outlives the race it
+		// came from.
+		c.endFill(blockHash, idx)
 		return idx, nil
 	})
 	if err != nil {
@@ -165,12 +208,30 @@ func (c *Cache) lookup(blockHash string) (*bump.CompoundIndex, bool) {
 	return c.lru.Get(blockHash)
 }
 
-// add inserts an entry and enforces the leaf budget. Replacing an existing
-// key removes it first so the evict callback keeps totalLeaves exact (the
-// LRU's in-place update path skips the callback).
-func (c *Cache) add(blockHash string, idx *bump.CompoundIndex) {
+// beginFill marks a block as being fetched, clearing any dirty flag left by an
+// invalidation that happened before this fill started — that one is already
+// reflected in what this fetch is about to read.
+func (c *Cache) beginFill(blockHash string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.filling[blockHash] = true
+	delete(c.dirty, blockHash)
+}
+
+// endFill clears the in-flight marks and installs idx unless an invalidation
+// landed while the fill was running. A nil idx just clears the marks. Inserting
+// enforces the leaf budget; replacing an existing key removes it first so the
+// evict callback keeps totalLeaves exact (the LRU's in-place update path skips
+// the callback).
+func (c *Cache) endFill(blockHash string, idx *bump.CompoundIndex) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.filling, blockHash)
+	stale := c.dirty[blockHash]
+	delete(c.dirty, blockHash)
+	if stale || idx == nil {
+		return
+	}
 	c.lru.Remove(blockHash)
 	c.lru.Add(blockHash, idx)
 	c.totalLeaves += idx.Leaves()

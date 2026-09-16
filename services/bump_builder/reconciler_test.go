@@ -2,6 +2,7 @@ package bump_builder
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -595,5 +596,70 @@ func TestReconciler_StartupScanReadinessWaitIsBounded(t *testing.T) {
 	}
 	if got := statusOf(t, st, recShared1); got.Status != models.StatusMined || got.BlockHash != recCanonical {
 		t.Fatalf("self-heal: deferred scan must eventually heal, got %s@%s", got.Status, got.BlockHash)
+	}
+}
+
+// partialRevertStore applies the revert and then reports an error, the shape
+// SetStatusByBlockHash uses when a walk fails partway through or a block keeps
+// taking mines faster than it can be retired: rows written, error returned.
+type partialRevertStore struct {
+	store.Store
+
+	applied []string
+}
+
+func (s *partialRevertStore) SetStatusByBlockHash(ctx context.Context, blockHash string, st models.Status) ([]string, error) {
+	applied, err := s.Store.SetStatusByBlockHash(ctx, blockHash, st)
+	if err != nil {
+		return applied, err
+	}
+	s.applied = applied
+	return applied, errors.New("rows still arriving after 4 passes")
+}
+
+// A revert that returns rows AND an error has already written those rows, and
+// they have left the block's index — a retry will not find them again. Their
+// correction event must still go out, or subscribers keep believing the txs
+// are MINED forever. The block itself must stay on the queue.
+func TestReconciler_PublishesRevertedTxsWhenTheStoreAlsoErrors(t *testing.T) {
+	ctx := context.Background()
+	base := newPebbleForTest(t)
+	st := &partialRevertStore{Store: base}
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	stub.setHeightHeader(10, headerWithHash(t, recCanonical, 10))
+
+	seedMined(t, base, recOrphan, 10, recBOnly)
+	if err := base.InsertBUMP(ctx, recCanonical, 10, makeCompoundForTest(t, 10, recShared1)); err != nil {
+		t.Fatalf("insert canonical BUMP: %v", err)
+	}
+	if err := base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now()); err != nil {
+		t.Fatalf("upsert orphan row: %v", err)
+	}
+	if err := base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now()); err != nil {
+		t.Fatalf("mark orphaned: %v", err)
+	}
+
+	newTestReconciler(st, pub, stub, nil).tick(ctx)
+
+	if len(st.applied) == 0 {
+		t.Fatal("test premise: the revert must have written at least one row")
+	}
+	var seenEv *models.TransactionStatus
+	for _, ev := range pub.bulkEvents() {
+		if ev.ExtraInfo == models.ExtraInfoReorgUnmined {
+			seenEv = ev
+		}
+	}
+	if seenEv == nil {
+		t.Fatal("the rows the store did write must still be published; their event is never retried")
+	}
+	if len(seenEv.TxIDs) != len(st.applied) || seenEv.TxIDs[0] != st.applied[0] {
+		t.Fatalf("published %v, want the rows the store wrote %v", seenEv.TxIDs, st.applied)
+	}
+	// The block stays queued: the error means the store is not finished.
+	bp, err := base.GetBlockProcessingStatus(ctx, recOrphan)
+	if err != nil || bp.ReconciledAt != nil {
+		t.Fatalf("reconciled_at must NOT be stamped after a revert error: %+v err=%v", bp, err)
 	}
 }

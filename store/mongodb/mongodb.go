@@ -109,6 +109,17 @@ func New(ctx context.Context, cfg config.Mongo) (*Store, error) {
 	opts := options.Client().ApplyURI(cfg.URI).SetAppName("arcade").
 		SetConnectTimeout(connectTimeout).
 		SetServerSelectionTimeout(connectTimeout)
+	// Every guard in this package is a read-then-write or a read-back of
+	// something this process just wrote: the status lattice and the "still
+	// anchored to this block" predicate ride in update filters, and a blob
+	// read pairs a manifest against the file it names. A secondary read can
+	// be arbitrarily stale, which turns those into coin flips — a manifest
+	// read from a lagging node can report a file as still current after a
+	// newer writer replaced it, and the caller then deletes the newer file.
+	// Refuse at startup instead of corrupting quietly.
+	if rp := opts.ReadPreference; rp != nil && rp.Mode() != readpref.PrimaryMode {
+		return nil, fmt.Errorf("mongodb: read preference %q is not supported; this backend's write guards require primary reads", rp.Mode())
+	}
 	if cfg.MaxPoolSize > 0 {
 		opts.SetMaxPoolSize(uint64(cfg.MaxPoolSize))
 	}

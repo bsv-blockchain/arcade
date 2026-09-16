@@ -591,19 +591,23 @@ func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeig
 // One walk is not enough on its own: a keyset cursor only moves forward, so a
 // row anchored to this block after the cursor passed its id — a mine landing
 // for a block the reconciler is already retiring — would be left behind, and
-// the caller stamps the block reconciled straight after this returns. Because
-// a rewritten row leaves the predicate (a revert clears block_hash, a
-// promotion sets IMMUTABLE), walking again from the start returns exactly
-// those stragglers, so the walk repeats until a pass retires nothing new. In
-// the ordinary case that costs a single empty page query.
+// the caller stamps the block reconciled straight after this returns. When the
+// rewrite takes rows OUT of the page predicate, walking again from the start
+// returns exactly those stragglers, so the walk repeats until one finds
+// nothing: normally a single empty page query.
 //
-// Termination is on "no new txid", not on "no rows found", so a newStatus
-// whose rewrite leaves rows inside the page predicate still stops after the
-// pass that re-reads them, instead of spinning to the bound. Passes are
-// bounded anyway: still finding rows that are new after blockRewritePasses
-// means they are arriving faster than they can be retired, which is worth an
-// error — the reconciler leaves reconciled_at unstamped and retries — rather
-// than an unbounded loop.
+// That only holds for a newStatus that leaves the predicate — SEEN_ON_NETWORK
+// clears block_hash, IMMUTABLE fails the status guard — which is every status
+// the interface documents for this method. Any other target leaves all its
+// rows matching, so a second walk would rewrite the whole block again rather
+// than find stragglers; those walk once, as before.
+//
+// Passes are bounded: rows still arriving after blockRewritePasses are a miner
+// writing into the block faster than it can be retired, which is worth an
+// error rather than an unbounded loop. The txids already rewritten come back
+// ALONGSIDE that error — they are written, and their caller owes them an
+// event — so a caller must publish what it got before treating the error as
+// fatal.
 //
 // This closes the gap only up to the last verifying pass; a row anchored
 // after that is the same irreducible race every backend has (Postgres updates
@@ -614,15 +618,15 @@ func (s *Store) SetStatusByBlockHash(ctx context.Context, blockHash string, newS
 	if blockHash == "" {
 		return nil, errors.New("set status by block hash: empty block hash")
 	}
-	retired := make(map[string]struct{})
+	// Does this rewrite take a row out of {block_hash, status != IMMUTABLE}?
+	drains := newStatus == models.StatusSeenOnNetwork || newStatus == models.StatusImmutable
 	var txids []string
 	for pass := 0; pass < blockRewritePasses; pass++ {
-		fresh, visited, err := s.rewriteBlockOnce(ctx, blockHash, newStatus, retired)
-		txids = append(txids, fresh...)
+		visited, err := s.rewriteBlockOnce(ctx, blockHash, newStatus, &txids)
 		if err != nil {
 			return txids, err
 		}
-		if visited == 0 || len(fresh) == 0 {
+		if visited == 0 || !drains {
 			return txids, nil
 		}
 	}
@@ -630,24 +634,22 @@ func (s *Store) SetStatusByBlockHash(ctx context.Context, blockHash string, newS
 }
 
 // rewriteBlockOnce makes one keyset walk over the rows anchored to blockHash,
-// applying the guarded rewrite to each. It returns the txids it rewrote that
-// retired records for the first time, and how many rows the walk visited;
-// zero visited means the block holds nothing left to rewrite. The timestamp is
-// taken per walk so a straggler retired by a later pass is stamped when it was
-// actually rewritten.
-func (s *Store) rewriteBlockOnce(ctx context.Context, blockHash string, newStatus models.Status, retired map[string]struct{}) ([]string, int, error) {
+// applying the guarded rewrite to each and appending the txids it rewrote. It
+// reports how many rows the walk visited; zero means the block holds nothing
+// left to rewrite. The timestamp is taken per walk so a straggler retired by a
+// later pass is stamped when it was actually rewritten.
+func (s *Store) rewriteBlockOnce(ctx context.Context, blockHash string, newStatus models.Status, txids *[]string) (int, error) {
 	update := blockRewritePipeline(newStatus, newStatus == models.StatusSeenOnNetwork, msNow())
 	notImmutable := doc(kv(opNe, string(models.StatusImmutable)))
-	var fresh []string
 	visited := 0
 	after := ""
 	for {
 		page, err := s.blockPage(ctx, blockHash, after)
 		if err != nil {
-			return fresh, visited, fmt.Errorf("set status by block hash: %w", err)
+			return visited, fmt.Errorf("set status by block hash: %w", err)
 		}
 		if len(page) == 0 {
-			return fresh, visited, nil
+			return visited, nil
 		}
 		visited += len(page)
 		applied := make([]bool, len(page))
@@ -663,17 +665,12 @@ func (s *Store) rewriteBlockOnce(ctx context.Context, blockHash string, newStatu
 			return nil
 		})
 		for i, ok := range applied {
-			if !ok {
-				continue
+			if ok {
+				*txids = append(*txids, page[i])
 			}
-			if _, dup := retired[page[i]]; dup {
-				continue
-			}
-			retired[page[i]] = struct{}{}
-			fresh = append(fresh, page[i])
 		}
 		if loopErr != nil {
-			return fresh, visited, loopErr
+			return visited, loopErr
 		}
 		after = page[len(page)-1]
 	}

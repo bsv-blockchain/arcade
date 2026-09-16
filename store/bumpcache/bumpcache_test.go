@@ -240,3 +240,155 @@ func idxLeaves(t *testing.T, bumpBytes []byte) int {
 	}
 	return idx.Leaves()
 }
+
+// A fill that began before an invalidation must not populate the cache with
+// what it read. The fetch holds bytes from before the rebuild landed, so
+// caching them would serve the superseded compound to every later reader
+// until the next write or eviction — indefinitely stale proofs from a race
+// that lasted milliseconds.
+func TestRemove_DiscardsFillThatStartedBeforeIt(t *testing.T) {
+	blk, err := synthblock.Build(8, 900100)
+	if err != nil {
+		t.Fatalf("synthblock.Build: %v", err)
+	}
+
+	fill := func(invalidateDuringFetch bool) *Cache {
+		t.Helper()
+		c := New()
+		started := make(chan struct{})
+		release := make(chan struct{})
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			c.Enrich(minedStatus(blk.Txids[0]), func() ([]byte, error) {
+				close(started)
+				<-release
+				return blk.BumpBytes, nil
+			})
+		}()
+		<-started
+		if invalidateDuringFetch {
+			c.Remove(testBlockHash)
+		}
+		close(release)
+		<-done
+		return c
+	}
+
+	// Control: the same sequence without the invalidation does cache, so the
+	// assertion below is about the race and not about the plumbing.
+	if c := fill(false); !c.Contains(testBlockHash) {
+		t.Fatal("an uncontended fill must populate the cache")
+	}
+	if c := fill(true); c.Contains(testBlockHash) {
+		t.Fatal("a fill that began before the invalidation must not populate the cache")
+	}
+}
+
+// The enrichment still succeeds for the caller that raced: the bytes it read
+// were current when its fetch began, and withholding them would turn a write
+// into a failed read for everyone mid-flight.
+func TestRemove_RacingFillStillAnswersItsOwnCaller(t *testing.T) {
+	blk, err := synthblock.Build(8, 900100)
+	if err != nil {
+		t.Fatalf("synthblock.Build: %v", err)
+	}
+	c := New()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	st := minedStatus(blk.Txids[0])
+	go func() {
+		defer close(done)
+		c.Enrich(st, func() ([]byte, error) {
+			close(started)
+			<-release
+			return blk.BumpBytes, nil
+		})
+	}()
+	<-started
+	c.Remove(testBlockHash)
+	close(release)
+	<-done
+	if len(st.MerklePath) == 0 {
+		t.Fatal("the racing caller must still get its merkle path")
+	}
+	if vErr := synthblock.VerifyMerklePath(st.MerklePath, blk.Txids[0], blk.Root); vErr != nil {
+		t.Fatalf("merklePath does not verify: %v", vErr)
+	}
+}
+
+// Invalidation is per block. A write to a DIFFERENT block must not discard a
+// fill in flight: during a merkle backlog drain, block after block arrives and
+// each one ends in InsertBUMP → Remove, so a cache-wide invalidation would
+// leave almost every fill unable to install and the cache permanently empty —
+// re-fetching and re-parsing whole compounds on the path that has OOM'd this
+// service before (#237/#238).
+func TestRemove_OtherBlockDoesNotDiscardAnInFlightFill(t *testing.T) {
+	blk, err := synthblock.Build(8, 900100)
+	if err != nil {
+		t.Fatalf("synthblock.Build: %v", err)
+	}
+	c := New()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.Enrich(minedStatus(blk.Txids[0]), func() ([]byte, error) {
+			close(started)
+			<-release
+			return blk.BumpBytes, nil
+		})
+	}()
+	<-started
+	// A different block is rebuilt while our fill is out.
+	c.Remove("0000000000000000000000000000000000000000000000000000000000000fff")
+	close(release)
+	<-done
+
+	if !c.Contains(testBlockHash) {
+		t.Fatal("an invalidation for another block must not stop this fill from caching")
+	}
+}
+
+// A reader arriving AFTER the invalidation must not be handed the in-flight
+// fill's pre-rebuild bytes: its own read began after the write was durable.
+// Remove releases the singleflight slot so the late reader fetches for itself.
+func TestRemove_LateReaderDoesNotJoinThePreInvalidationFlight(t *testing.T) {
+	blk, err := synthblock.Build(8, 900100)
+	if err != nil {
+		t.Fatalf("synthblock.Build: %v", err)
+	}
+	c := New()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.Enrich(minedStatus(blk.Txids[0]), func() ([]byte, error) {
+			close(started)
+			<-release
+			return blk.BumpBytes, nil
+		})
+	}()
+	<-started
+	c.Remove(testBlockHash)
+
+	// The late reader must run its own fetch rather than join the stale one.
+	var ownFetch bool
+	late := minedStatus(blk.Txids[1])
+	c.Enrich(late, func() ([]byte, error) {
+		ownFetch = true
+		return blk.BumpBytes, nil
+	})
+	close(release)
+	<-done
+
+	if !ownFetch {
+		t.Fatal("a reader arriving after the invalidation must not be served by the flight that predates it")
+	}
+	if len(late.MerklePath) == 0 {
+		t.Fatal("the late reader must still get its merkle path")
+	}
+}

@@ -365,6 +365,43 @@ func TestFileMissing_AbsentVersusUnknown(t *testing.T) {
 	}
 }
 
+// The manifest's length is a claim about the file, not a size to trust. A
+// length larger than the file would size an allocation off a corrupt or
+// half-restored document; a smaller one would read a prefix and hand back a
+// truncated compound as if it were whole. Both must be refused.
+func TestGetBUMP_RejectsManifestLengthMismatch(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const hash = "blk-badlen"
+	payload := bytes.Repeat([]byte{3}, 512)
+	if err := s.InsertBUMP(ctx, hash, 6, payload); err != nil {
+		t.Fatal(err)
+	}
+	setLength := func(n int64) {
+		t.Helper()
+		if _, err := s.bumps.manifests.UpdateOne(ctx, idFilter(hash), doc(kv(opSet, doc(kv(fLength, n))))); err != nil {
+			t.Fatal(err)
+		}
+		s.bumpCache.Remove(hash)
+	}
+
+	setLength(1 << 40) // absurd: must not be allocated
+	if _, _, err := s.GetBUMP(ctx, hash); err == nil {
+		t.Fatal("a manifest length larger than the file must be refused, not allocated")
+	}
+
+	setLength(int64(len(payload)) - 16) // truncating: must not look like success
+	if _, _, err := s.GetBUMP(ctx, hash); err == nil {
+		t.Fatal("a manifest length shorter than the file must be refused, not served as a prefix")
+	}
+
+	setLength(int64(len(payload)))
+	height, data, err := s.GetBUMP(ctx, hash)
+	if err != nil || height != 6 || !bytes.Equal(data, payload) {
+		t.Fatalf("the honest length must still read: (%d, %d bytes, %v)", height, len(data), err)
+	}
+}
+
 // The republish trigger must fire only for a file that is gone while the
 // manifest still names it. A file that is gone because a later writer
 // superseded it is the ordinary outcome of losing a race: that writer's data
@@ -696,39 +733,39 @@ func TestSetStatusByBlockHash_DrainsRowsAnchoredBehindTheCursor(t *testing.T) {
 		seed(fmt.Sprintf("drain-tx-%02d", i))
 	}
 
-	retired := make(map[string]struct{})
-	fresh, visited, err := s.rewriteBlockOnce(ctx, blk, models.StatusSeenOnNetwork, retired)
-	if err != nil || visited != 4 || len(fresh) != 4 {
-		t.Fatalf("first walk: %d fresh, %d visited, %v", len(fresh), visited, err)
+	var txids []string
+	visited, err := s.rewriteBlockOnce(ctx, blk, models.StatusSeenOnNetwork, &txids)
+	if err != nil || visited != 4 || len(txids) != 4 {
+		t.Fatalf("first walk: %d rewritten, %d visited, %v", len(txids), visited, err)
 	}
 
 	// A mine lands for this block at an id the cursor is already past.
 	seed("drain-tx-01")
 
-	fresh, visited, err = s.rewriteBlockOnce(ctx, blk, models.StatusSeenOnNetwork, retired)
-	if err != nil || visited != 1 || len(fresh) != 1 || fresh[0] != "drain-tx-01" {
-		t.Fatalf("second walk must retire the straggler: fresh=%v visited=%d err=%v", fresh, visited, err)
+	visited, err = s.rewriteBlockOnce(ctx, blk, models.StatusSeenOnNetwork, &txids)
+	if err != nil || visited != 1 || len(txids) != 5 || txids[4] != "drain-tx-01" {
+		t.Fatalf("second walk must retire the straggler: txids=%v visited=%d err=%v", txids, visited, err)
 	}
 	st, _ := s.GetStatus(ctx, "drain-tx-01")
 	if st == nil || st.Status != models.StatusSeenOnNetwork || st.BlockHash != "" {
 		t.Fatalf("straggler not reverted: %+v", st)
 	}
 
-	fresh, visited, err = s.rewriteBlockOnce(ctx, blk, models.StatusSeenOnNetwork, retired)
-	if err != nil || visited != 0 || len(fresh) != 0 {
-		t.Fatalf("third walk must find nothing: fresh=%v visited=%d err=%v", fresh, visited, err)
+	visited, err = s.rewriteBlockOnce(ctx, blk, models.StatusSeenOnNetwork, &txids)
+	if err != nil || visited != 0 || len(txids) != 5 {
+		t.Fatalf("third walk must find nothing: txids=%v visited=%d err=%v", txids, visited, err)
 	}
 	if left, _ := s.GetTxIDsByBlockHash(ctx, blk); len(left) != 0 {
 		t.Fatalf("nothing may stay anchored, got %v", left)
 	}
 }
 
-// The drain stops on "no new txid", not on "no rows found". A newStatus whose
-// rewrite leaves rows inside the page predicate — anything that neither clears
-// block_hash nor sets IMMUTABLE — must therefore settle after the pass that
-// re-reads them, instead of spinning to the pass bound and failing, and must
-// not report a txid twice for having rewritten it twice.
-func TestSetStatusByBlockHash_TerminatesWhenRowsStayInPredicate(t *testing.T) {
+// A newStatus whose rewrite leaves rows inside the page predicate — anything
+// that neither clears block_hash nor sets IMMUTABLE — must walk exactly once.
+// Re-walking would find the same rows again and rewrite the entire block a
+// second time, doubling the writes and the timestamp churn, before stopping;
+// spinning to the pass bound would fail a call that has done its job.
+func TestSetStatusByBlockHash_WalksOnceWhenRowsStayInPredicate(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	const blk = "blk-stay"
@@ -759,11 +796,10 @@ func TestSetStatusByBlockHash_TerminatesWhenRowsStayInPredicate(t *testing.T) {
 		t.Fatalf("a rewrite that keeps rows in the block must still settle: %v", err)
 	}
 
-	// Every applied rewrite bumps the row's version, so a delta of two is
-	// proof the drain ran a second walk over rows the first did not retire —
-	// the walk that would find a row anchored behind the cursor.
-	if delta := version("stay-tx-00") - before; delta < 2 {
-		t.Fatalf("version moved by %d, want >= 2 (a second pass must have re-read the row)", delta)
+	// Every applied rewrite bumps the row's version, so exactly one bump is
+	// proof the block was not rewritten a second time.
+	if delta := version("stay-tx-00") - before; delta != 1 {
+		t.Fatalf("version moved by %d, want exactly 1 (the block must be rewritten once)", delta)
 	}
 	seen := map[string]int{}
 	for _, txid := range got {

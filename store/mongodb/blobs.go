@@ -42,7 +42,10 @@ import (
 // stamped by the driver when the stream closes) more than staleUploadAge ago
 // and that it does not reference. Age is taken from completion, not from the
 // file id allocated before the upload began, so a slow in-flight upload can
-// never look stale.
+// never look stale. Chunks are not covered: the driver writes them before the
+// files document, so an upload whose Close AND whose Abort both fail leaves
+// chunks with no files document for the sweep to find. That costs disk, never
+// correctness — nothing can reference them.
 //
 // What makes "completed long ago and unreferenced" mean "its writer died" is
 // swapWindow: a writer that took longer than that between its upload
@@ -62,8 +65,17 @@ import (
 // write, so who the manifest names now is what tells the two apart. Between
 // them the two checks cover both directions — the window check keeps a
 // sweepable file from being published, the confirmation catches a file that
-// was swept before it was published — and the manifest is never left pointing
-// at a file that is gone.
+// was swept before it was published.
+//
+// Two gaps remain, both narrow and both reported rather than hidden. The
+// confirmation needs two reads to reach a verdict; when either cannot be
+// completed it returns "not lost", because a failed read is not evidence of
+// deletion, so a genuine loss during an outage is published as a success. And
+// a republish that is swept again on every attempt exhausts
+// blobPublishAttempts and returns an error with the manifest still naming the
+// last, confirmed-gone file. In both cases the block's next write repairs the
+// manifest, and until then its reads fail loudly rather than serving wrong
+// bytes.
 
 // Metadata keys stored on GridFS files documents (queried as metadata.<key>).
 const (
@@ -209,8 +221,20 @@ func (s *Store) fileMissing(ctx context.Context, bucket *mongo.GridFSBucket, id 
 	return false, err
 }
 
-// download reads a whole GridFS file. A short read is an error, never
-// partial data.
+// download reads a whole GridFS file. A short read is an error, never partial
+// data.
+//
+// The manifest's length is checked against files.length rather than trusted on
+// its own: a manifest length larger than the file would otherwise size an
+// allocation off a corrupt or half-restored document, and one smaller would
+// read a prefix and return it as the whole compound — a truncated BUMP that
+// parses is worse than an error.
+//
+// This is a cross-check between two documents, not a bound derived from the
+// bytes actually stored: files.length is counted by the driver as it writes
+// and the server never validates it against the chunks. Corruption confined to
+// one of the two documents is caught; a restore that rewrote both consistently
+// would still be believed.
 func (s *Store) download(ctx context.Context, bucket *mongo.GridFSBucket, ref blobRef) ([]byte, error) {
 	if ref.Length < 0 {
 		return nil, fmt.Errorf("file %s has negative length %d", ref.FileID.Hex(), ref.Length)
@@ -220,9 +244,13 @@ func (s *Store) download(ctx context.Context, bucket *mongo.GridFSBucket, ref bl
 		return nil, fmt.Errorf("open download: %w", err)
 	}
 	defer func() { _ = ds.Close() }()
-	buf := make([]byte, ref.Length)
+	stored := ds.GetFile().Length
+	if stored != ref.Length {
+		return nil, fmt.Errorf("file %s is %d bytes but its manifest claims %d", ref.FileID.Hex(), stored, ref.Length)
+	}
+	buf := make([]byte, stored)
 	if _, err := io.ReadFull(ds, buf); err != nil {
-		return nil, fmt.Errorf("read %d bytes: %w", ref.Length, err)
+		return nil, fmt.Errorf("read %d bytes: %w", stored, err)
 	}
 	return buf, nil
 }
@@ -364,7 +392,15 @@ func (s *Store) publishBlob(ctx context.Context, b *blobBucket, key, filename st
 // swapped the manifest onto its own upload and deleted the file it replaced,
 // which is this one. That writer's data is in force and republishing over it
 // would undo a newer write, so who the manifest names now is what separates
-// the two. A check that cannot be completed is not evidence of anything.
+// the two. A check that cannot be completed is not evidence of anything, and
+// returns false.
+//
+// The verdict is two reads, not one atomic observation, and both must reach a
+// primary to mean anything (New refuses any other read preference). A writer
+// that swaps in between them can still have its file deleted by the republish
+// that follows — the same last-swap-wins outcome as any other concurrent
+// overwrite, since the republish swaps later, but worth knowing it is not
+// excluded.
 func (s *Store) publishedFileLost(ctx context.Context, b *blobBucket, key string, id bson.ObjectID) bool {
 	gone, err := s.fileMissing(ctx, b.bucket, id)
 	if err != nil || !gone {
