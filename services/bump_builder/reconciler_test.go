@@ -735,6 +735,7 @@ func TestReconciler_PartialCanonicalRemineDoesNotRevert(t *testing.T) {
 // while the canonical re-mine succeeds.
 type blockFailMineStore struct {
 	store.Store
+
 	failFor string
 }
 
