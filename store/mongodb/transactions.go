@@ -664,7 +664,7 @@ func (s *Store) SetStatusByBlockHash(ctx context.Context, blockHash string, newS
 	// Does this rewrite take a row out of {block_hash, status != IMMUTABLE}?
 	drains := newStatus == models.StatusSeenOnNetwork || newStatus == models.StatusImmutable
 	var txids []string
-	for pass := 0; pass < blockRewritePasses; pass++ {
+	for pass := 0; pass < s.rewritePasses; pass++ {
 		before := len(txids)
 		visited, err := s.rewriteBlockOnce(ctx, blockHash, newStatus, &txids)
 		if pass > 0 && len(txids) > before {
@@ -682,7 +682,21 @@ func (s *Store) SetStatusByBlockHash(ctx context.Context, blockHash string, newS
 			return txids, nil
 		}
 	}
-	return txids, fmt.Errorf("set status by block hash %s: rows still arriving after %d passes", blockHash, blockRewritePasses)
+	// The loop exits with its last pass having retired rows, which is not the
+	// same as rows still arriving: the final pass may have caught the last
+	// straggler and left the block empty. Confirm with one page probe before
+	// reporting failure — the alternative is a spurious error on every block
+	// whose arrivals happened to span all the passes, and the reconciler
+	// answers that by withholding reconciled_at and re-driving a block that
+	// is already done.
+	rest, err := s.blockPage(ctx, blockHash, "")
+	if err != nil {
+		return txids, fmt.Errorf("set status by block hash %s: verifying after %d passes: %w", blockHash, s.rewritePasses, err)
+	}
+	if len(rest) == 0 {
+		return txids, nil
+	}
+	return txids, fmt.Errorf("set status by block hash %s: rows still arriving after %d passes", blockHash, s.rewritePasses)
 }
 
 // dropDuplicateTail removes from txids[from:] any entry already present in

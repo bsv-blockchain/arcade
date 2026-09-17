@@ -729,3 +729,66 @@ func TestReconciler_PartialCanonicalRemineDoesNotRevert(t *testing.T) {
 		t.Fatalf("recovered tick must re-anchor to canonical, got %s@%s", got.Status, got.BlockHash)
 	}
 }
+
+// blockFailMineStore fails SetMinedByTxIDs for one target block and passes
+// every other block through, so a test can fail the neighborhood re-anchor
+// while the canonical re-mine succeeds.
+type blockFailMineStore struct {
+	store.Store
+	failFor string
+}
+
+func (s *blockFailMineStore) SetMinedByTxIDs(
+	ctx context.Context, blockHash string, blockHeight uint64, txids []string,
+) ([]*models.TransactionStatus, []*models.TransactionStatus, error) {
+	if blockHash == s.failFor {
+		return nil, nil, errors.New("primary stepped down before any row landed")
+	}
+	return s.Store.SetMinedByTxIDs(ctx, blockHash, blockHeight, txids)
+}
+
+// TestReconciler_PartialNeighborhoodReanchorDoesNotRevert: the same invariant
+// as the canonical re-mine, one height up. A tx the neighborhood pass failed
+// to move is a proven member of that NEIGHBOR's BUMP and is still anchored to
+// the orphan, so letting the pass report success would hand it to the revert
+// and un-mine it. Shrinking `affected` is not what protects it — the revert
+// works off the store's own block index — so the completion result has to
+// reach reconcileBlock.
+func TestReconciler_PartialNeighborhoodReanchorDoesNotRevert(t *testing.T) {
+	ctx := context.Background()
+	base := newPebbleForTest(t)
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	stub.setHeightHeader(10, headerWithHash(t, recCanonical, 10))
+	stub.setHeightHeader(11, headerWithHash(t, recNeighbor, 11))
+
+	seedMined(t, base, recOrphan, 10, recRebin)
+	// Canonical at 10 does not contain the tx (so the canonical re-mine
+	// succeeds trivially and canonicalReady is true); the block at 11 does.
+	_ = base.InsertBUMP(ctx, recCanonical, 10, makeCompoundForTest(t, 10, recShared1))
+	_ = base.InsertBUMP(ctx, recNeighbor, 11, makeCompoundForTest(t, 11, recRebin))
+	_ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+	_ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+
+	r := newTestReconciler(&blockFailMineStore{Store: base, failFor: recNeighbor}, pub, stub, nil)
+	r.tick(ctx)
+
+	if got := statusOf(t, base, recRebin); got.Status != models.StatusMined || got.BlockHash != recOrphan {
+		t.Fatalf("a failed neighborhood re-anchor must leave the tx MINED@orphan, got %s@%s", got.Status, got.BlockHash)
+	}
+	for _, ev := range pub.bulkEvents() {
+		if ev.Status == models.StatusSeenOnNetwork {
+			t.Fatalf("no revert event may be published for a tx the neighbor's BUMP proves: %+v", ev)
+		}
+	}
+	if rows, _ := base.ListOrphanedBlocksToReconcile(ctx, 10); len(rows) != 1 {
+		t.Fatalf("orphan must stay queued after a failed neighborhood re-anchor, got %d rows", len(rows))
+	}
+
+	// Recovered: the ordinary neighborhood path completes.
+	r.store = base
+	r.tick(ctx)
+	if got := statusOf(t, base, recRebin); got.BlockHash != recNeighbor {
+		t.Fatalf("recovered tick must re-anchor to the neighbor, got %s@%s", got.Status, got.BlockHash)
+	}
+}

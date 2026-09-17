@@ -485,7 +485,19 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 		logger.Warn("failed to read affected txids", zap.Error(err))
 		return "error"
 	}
-	reanchored += r.reanchorNeighborhood(ctx, logger, affected, height, batchSize)
+	nbr, nbrComplete := r.reanchorNeighborhood(ctx, logger, affected, height, batchSize)
+	reanchored += nbr
+	if !nbrComplete {
+		// Leave reconciled_at unstamped and the block queued, exactly as a
+		// failed GetTxIDsByBlockHash above does. Neither the park nor the
+		// revert below is safe here: park would retire the block with rows
+		// stranded MINED@orphan that a neighbour's BUMP proves belong
+		// elsewhere, and revert would un-mine them outright.
+		metrics.ReconcilerTxsReanchoredTotal.Add(float64(reanchored))
+		logger.Warn("neighborhood re-anchor did not land in full; leaving the orphan queued",
+			zap.Int("txs_reanchored", reanchored))
+		return "error"
+	}
 
 	// Park vs revert for whatever is still anchored to O (issue #282). When
 	// the canonical block's BUMP was NOT available (canonicalReady == false),
@@ -628,23 +640,26 @@ func (r *Reconciler) deferForCanonicalBUMP(ctx context.Context, logger *zap.Logg
 // reanchorNeighborhood walks the heights above the orphan looking for
 // canonical blocks whose stored BUMPs contain the still-affected txs (a
 // deep reorg re-bins txs into later blocks) and re-anchors what it finds.
-// Returns the number of rows moved. The affected slice shrinks as txs are
-// claimed; whatever remains falls to the caller's revert.
-func (r *Reconciler) reanchorNeighborhood(ctx context.Context, logger *zap.Logger, affected []string, height uint64, batchSize int) int {
+// Returns the number of rows moved, and whether every mine it attempted
+// landed in full — an incomplete pass must not reach the caller's revert, for
+// the reason spelled out at the failure branch below.
+// The affected slice shrinks as txs are claimed; whatever remains falls to
+// the caller's revert.
+func (r *Reconciler) reanchorNeighborhood(ctx context.Context, logger *zap.Logger, affected []string, height uint64, batchSize int) (reanchored int, complete bool) {
 	if len(affected) == 0 {
-		return 0
+		return 0, true
 	}
 	// A placeholder orphan row with no resolvable height (height==0) has no
 	// meaningful neighborhood above it — walking heights 1..depth is
 	// nonsensical. Skip straight to the caller's revert.
 	if height == 0 {
-		return 0
+		return 0, true
 	}
 	depth := r.cfg.BumpBuilder.Reconciler.NeighborhoodDepth
 	if depth < 0 {
 		depth = 0
 	}
-	reanchored := 0
+	complete = true
 	for h := height + 1; h <= height+uint64(depth) && len(affected) > 0; h++ {
 		if h > math.MaxUint32 {
 			break
@@ -673,13 +688,27 @@ func (r *Reconciler) reanchorNeighborhood(ctx context.Context, logger *zap.Logge
 		}
 		for start := 0; start < len(contained); start += batchSize {
 			end := min(start+batchSize, len(contained))
-			n, _ := setMinedAndPublish(ctx, logger, r.store, r.publisher,
+			n, chunkComplete := setMinedAndPublish(ctx, logger, r.store, r.publisher,
 				neighbor, h, contained[start:end], models.ExtraInfoReorgReanchor, true)
 			reanchored += n
+			if !chunkComplete {
+				// Same hazard as a partial canonical re-mine, one height up:
+				// the rows this chunk failed to write are proven members of
+				// THIS neighbor's BUMP and are still anchored to the orphan,
+				// where the caller's revert would take them to
+				// SEEN_ON_NETWORK. Stop and report incomplete rather than
+				// letting the pass look finished.
+				//
+				// `affected` is not the thing that protects them — it only
+				// steers the remaining heights, while the revert works off
+				// the store's own block index — so shrinking it is neither
+				// the problem nor the fix.
+				return reanchored, false
+			}
 		}
 		affected = rest
 	}
-	return reanchored
+	return reanchored, complete
 }
 
 // remineFromStoredBUMP re-mines every level-0 txid of blockHash's stored

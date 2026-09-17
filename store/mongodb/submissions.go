@@ -135,9 +135,13 @@ func (s *Store) IterateStatusesByToken(ctx context.Context, callbackToken string
 		return nil
 	}
 	tokenFilter := doc(kv(fCallbackToken, callbackToken))
-	octx, cancel := s.opCtx(ctx)
-	n, err := s.subs.CountDocuments(octx, tokenFilter, options.Count().SetLimit(s.tokenReplayLimit+1).SetHint(idxSubTokenTxID))
-	cancel()
+	// The caller's context, not opCtx: SetLimit bounds this count at
+	// tokenReplayLimit+1 KEYS, not at a point read's worth of work, so a token
+	// near the limit walks a quarter of a million index entries. Under the 3 s
+	// point-operation budget the preflight would fail exactly the tokens it
+	// exists to classify, and fail them before the scan it precedes — which
+	// runs under the caller's context — ever got the chance to answer.
+	n, err := s.subs.CountDocuments(ctx, tokenFilter, options.Count().SetLimit(s.tokenReplayLimit+1).SetHint(idxSubTokenTxID))
 	if err != nil {
 		return fmt.Errorf("iterate statuses by token: count: %w", err)
 	}

@@ -676,15 +676,19 @@ func (s *Store) DeleteStumpsByBlockHash(ctx context.Context, blockHash string) e
 }
 
 // stumpManifestsFor lists a block's stump manifests ordered by subtree index.
+// The caller's context, not queryCtx: the result is one manifest per subtree
+// with no limit, so it grows with the block, and both callers
+// (GetStumpsByBlockHash, DeleteStumpsByBlockHash) then do work per row. A
+// fixed 8 s deadline on a data-sized read fails a large block's rebuild or
+// reorg cleanup every time it is attempted, which is the failure mode the
+// GetTxIDsByBlockHash and CensusStatusesSince changes already removed.
 func (s *Store) stumpManifestsFor(ctx context.Context, blockHash string) ([]stumpManifest, error) {
-	qctx, cancel := s.queryCtx(ctx)
-	defer cancel()
-	cur, err := s.stumps.manifests.Find(qctx, doc(kv(fBlockHash, blockHash)), options.Find().SetSort(doc(kv(fSubtreeIndex, 1))))
+	cur, err := s.stumps.manifests.Find(ctx, doc(kv(fBlockHash, blockHash)), options.Find().SetSort(doc(kv(fSubtreeIndex, 1))))
 	if err != nil {
 		return nil, err
 	}
 	var out []stumpManifest
-	if err := cur.All(qctx, &out); err != nil {
+	if err := cur.All(ctx, &out); err != nil {
 		return nil, err
 	}
 	return out, nil

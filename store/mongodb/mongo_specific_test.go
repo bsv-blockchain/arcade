@@ -1193,3 +1193,44 @@ func TestMarkBlockMilestones_SynthesiseHeaderSeen(t *testing.T) {
 		t.Fatalf("header re-arrival must keep header_seen_at/processed_at and overwrite height: %+v", bp)
 	}
 }
+
+// TestSetStatusByBlockHash_LastPassRetiringRowsIsNotAnError: the drain loop
+// exits when its pass budget runs out, and a pass that retired rows is not
+// the same thing as rows still arriving — the last allowed pass may have
+// caught the final straggler. Without the verification probe, any block whose
+// arrivals spanned every pass returned "rows still arriving", and the
+// reconciler answers that by withholding reconciled_at and re-driving a block
+// that is already complete.
+//
+// rewritePasses = 1 makes the boundary reachable: the single pass retires
+// every row, so the loop always exits the way the bug needed.
+func TestSetStatusByBlockHash_LastPassRetiringRowsIsNotAnError(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	s.rewritePasses = 1
+
+	const blk = "blk-lastpass"
+	want := []string{"lp-1", "lp-2", "lp-3"}
+	for _, txid := range want {
+		seedStatus(t, s, txid, models.StatusSeenOnNetwork, time.Now())
+	}
+	if _, _, err := s.SetMinedByTxIDs(ctx, blk, 500, want); err != nil {
+		t.Fatalf("seed mined: %v", err)
+	}
+
+	got, err := s.SetStatusByBlockHash(ctx, blk, models.StatusSeenOnNetwork)
+	if err != nil {
+		t.Fatalf("a final pass that emptied the block must not report failure: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("reverted %d rows, want %d (%v)", len(got), len(want), got)
+	}
+	// And the block really is empty, which is what the probe asserts.
+	rest, err := s.GetTxIDsByBlockHash(ctx, blk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rest) != 0 {
+		t.Fatalf("block still holds %d rows after the rewrite: %v", len(rest), rest)
+	}
+}

@@ -137,6 +137,11 @@ type Store struct {
 
 	// tokenReplayLimit is maxTokenReplayScan, a field so tests can lower it.
 	tokenReplayLimit int64
+
+	// rewritePasses is blockRewritePasses, a field for the same reason: the
+	// drain's boundary behaviour is only reachable in a test that can make
+	// the last allowed pass the one that retires the final row.
+	rewritePasses int
 }
 
 // New connects to MongoDB, verifies the deployment answers a ping, and
@@ -258,6 +263,7 @@ func newWithClient(client *mongo.Client, database string, cfg config.Mongo) *Sto
 		rowConcurrency:   rowConcurrencyFor(intOrDefault(cfg.MaxPoolSize, defaultMaxPoolSize)),
 		logger:           zap.NewNop(),
 		tokenReplayLimit: maxTokenReplayScan,
+		rewritePasses:    blockRewritePasses,
 	}
 }
 
