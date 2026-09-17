@@ -112,14 +112,17 @@ func TestEnsureIndexes_Idempotent(t *testing.T) {
 		t.Fatalf("second EnsureIndexes: %v", err)
 	}
 	want := map[string][]string{
-		collTransactions:    {"_id_", idxTxStatusHeight, idxTxStatusTS, idxTxBlockHash, idxTxTimestamp, idxTxRetryReady},
-		collSubmissions:     {"_id_", idxSubTxIDToken, idxSubTokenTxID, idxSubRetryReady},
-		collBlockProcessing: {"_id_", idxBPHeightDesc, idxBPStatusHeight, idxBPStaleSeen, idxBPOrphaned},
-		collLeases:          {"_id_", idxLeaseExpires},
-		collStumpManifests:  {"_id_", idxStumpManifests},
-		"bumps.files":       {"_id_", idxGridFSFiles, idxBumpsBlockHash},
-		"bumps.chunks":      {"_id_", idxGridFSChunks},
-		"stumps.files":      {"_id_", idxGridFSFiles, idxStumpsBlockHash},
+		collTransactions:     {"_id_", idxTxStatusHeight, idxTxStatusTS, idxTxBlockHash, idxTxTimestamp, idxTxRetryReady},
+		collSubmissions:      {"_id_", idxSubTxIDToken, idxSubTokenTxID, idxSubRetryReady},
+		collBlockProcessing:  {"_id_", idxBPHeightDesc, idxBPStatusHeight, idxBPStaleSeen, idxBPOrphaned},
+		collLeases:           {"_id_", idxLeaseExpires},
+		collStumpManifests:   {"_id_", idxStumpManifests},
+		collDatahubEndpoints: {"_id_", idxDHNetwork, idxDHLastSeen},
+		collPeerPolicies:     {"_id_", idxPPNetwork, idxPPLastSeen},
+		"bumps.files":        {"_id_", idxGridFSFiles, idxBumpsBlockHash},
+		"bumps.chunks":       {"_id_", idxGridFSChunks},
+		"stumps.files":       {"_id_", idxGridFSFiles, idxStumpsBlockHash},
+		"stumps.chunks":      {"_id_", idxGridFSChunks},
 	}
 	for coll, names := range want {
 		got := indexNames(t, s.db.Collection(coll))

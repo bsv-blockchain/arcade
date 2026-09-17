@@ -130,6 +130,15 @@ func forEach(ctx context.Context, n, conc int, fn func(i int) error) error {
 			wg.Wait()
 			return firstErr
 		}
+		// Re-checked after the slot, not only before it: the send blocks
+		// while every worker is busy, which is exactly when one of them
+		// fails, so the check above was made against a state that is stale by
+		// the time the slot frees. Without this, a failing loop dispatches
+		// one more operation — bounded, but the contract above says none.
+		if ctx.Err() != nil || failed() {
+			<-sem
+			break
+		}
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()

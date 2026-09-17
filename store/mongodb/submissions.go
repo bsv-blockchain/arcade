@@ -34,16 +34,21 @@ func (s *Store) InsertSubmission(ctx context.Context, sub *models.Submission) er
 	return nil
 }
 
-// findSubmissions runs a bounded submissions query.
+// findSubmissions runs a submissions query under the context it is given.
+//
+// The deadline is the caller's choice, deliberately: query_timeout_ms sizes a
+// query whose result this package bounds, and only one of the three callers
+// does. GetSubmissionsByTxID and GetSubmissionsByToken return every matching
+// row, so a token with enough submissions would fail at a fixed 8 s even
+// where the caller's own context allowed the read to finish — the same reason
+// GetTxIDsByBlockHash and CensusStatusesSince take the caller's context.
 func (s *Store) findSubmissions(ctx context.Context, filter bson.D, opts *options.FindOptionsBuilder) ([]*models.Submission, error) {
-	qctx, cancel := s.queryCtx(ctx)
-	defer cancel()
-	cur, err := s.subs.Find(qctx, filter, opts)
+	cur, err := s.subs.Find(ctx, filter, opts)
 	if err != nil {
 		return nil, err
 	}
 	var docs []submissionDoc
-	if err := cur.All(qctx, &docs); err != nil {
+	if err := cur.All(ctx, &docs); err != nil {
 		return nil, err
 	}
 	out := make([]*models.Submission, 0, len(docs))
@@ -299,7 +304,12 @@ func (s *Store) ListSubmissionsReadyForRetry(ctx context.Context, now time.Time,
 		return nil, nil
 	}
 	filter := doc(kv(fRetryCount, doc(kv(opGt, 0))), kv(fNextRetryAt, doc(kv(opLte, msTrunc(now)))))
-	out, err := s.findSubmissions(ctx, filter, options.Find().
+	// query_timeout_ms applies here and not to the other two callers: this is
+	// the only submissions read whose size this package bounds (limit), so it
+	// is the only one a fixed deadline can be sized against.
+	qctx, cancel := s.queryCtx(ctx)
+	defer cancel()
+	out, err := s.findSubmissions(qctx, filter, options.Find().
 		SetSort(doc(kv(fNextRetryAt, 1))).SetLimit(int64(limit)).SetHint(idxSubRetryReady))
 	if err != nil {
 		return nil, fmt.Errorf("list submissions ready for retry: %w", err)
