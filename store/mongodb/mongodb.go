@@ -71,6 +71,31 @@ const (
 
 	// inChunk bounds the $in list size for txid-keyed batch reads.
 	inChunk = 1000
+
+	// defaultMaxPoolSize mirrors the driver's own default. It is named here
+	// because rowConcurrency is derived from the effective pool size and must
+	// not guess when the operator left max_pool_size unset.
+	defaultMaxPoolSize = 100
+
+	// maxConnecting caps how many connections the pool establishes in
+	// parallel. The driver's default is 2, which is sized for a steady
+	// trickle, not for this package: the per-row rewrite loops open dozens of
+	// concurrent operations the moment a block lands, and against a cold or
+	// idle-reaped pool each waits behind a two-at-a-time handshake queue —
+	// billed to op_timeout_ms, which is 3 s.
+	maxConnecting = 16
+
+	// rowConcurrencyCeiling caps the per-row rewrite parallelism regardless of
+	// pool size. Past roughly this point the pool's own wait queue, not the
+	// server, becomes the limit: measured on mongod 7 over loopback, the
+	// guarded findAndModify loop ran 2,865 ops/s at 16 in flight, 5,114 at
+	// 128, and fell back to 2,424 at 256.
+	rowConcurrencyCeiling = 128
+
+	// poolHeadroom leaves connections for the point reads, blob round trips
+	// and heartbeats that run alongside a rewrite, so a block landing cannot
+	// starve the rest of the process of its own pool.
+	poolHeadroom = 8
 )
 
 // Store is the MongoDB backend. Construct with New.
@@ -96,6 +121,15 @@ type Store struct {
 	queryTimeout time.Duration
 	indexTimeout time.Duration
 	batchSize    int
+
+	// rowConcurrency bounds the per-row block rewrites. It is deliberately
+	// NOT store.BatchConcurrency(), which the other backends' batch loops use
+	// and which defaults to runtime.NumCPU(): that is the right shape for a
+	// CPU-bound loop, and these loops are neither CPU-bound nor even
+	// I/O-bound in the local sense — each row is one command's round trip to
+	// mongod, so the useful parallelism is set by the connection pool, not by
+	// the core count. See rowConcurrencyFor.
+	rowConcurrency int
 
 	// logger carries the warnings this package can only raise at runtime —
 	// best-effort blob cleanup that keeps failing, mostly. Never nil.
@@ -157,9 +191,22 @@ func New(ctx context.Context, cfg config.Mongo, logger *zap.Logger) (*Store, err
 			zap.String("read_preference", rp.Mode().String()),
 		)
 	}
+	poolSize := defaultMaxPoolSize
 	if cfg.MaxPoolSize > 0 {
+		poolSize = cfg.MaxPoolSize
 		opts.SetMaxPoolSize(uint64(cfg.MaxPoolSize))
 	}
+	// Establish connections more than two at a time (see maxConnecting), and
+	// keep a small warm floor so the first block after an idle period does not
+	// start from zero.
+	//
+	// MinPoolSize is deliberately NOT the rewrite width: these are idle
+	// sockets held open per process, and a deployment runs many arcade pods
+	// against one deployment, so a floor of ~90 each would cost mongod
+	// thousands of connections to save a ramp that maxConnecting already
+	// shortens from ~46 waves to ~6.
+	opts.SetMaxConnecting(maxConnecting)
+	opts.SetMinPoolSize(uint64(min(maxConnecting, poolSize)))
 	client, err := mongo.Connect(opts)
 	if err != nil {
 		// Never echo the URI: it may carry credentials.
@@ -208,9 +255,24 @@ func newWithClient(client *mongo.Client, database string, cfg config.Mongo) *Sto
 		queryTimeout:     msOrDefault(cfg.QueryTimeoutMs, defaultQueryTimeout),
 		indexTimeout:     msOrDefault(cfg.IndexTimeoutMs, defaultIndexTimeout),
 		batchSize:        intOrDefault(cfg.BatchSize, defaultBatchSize),
+		rowConcurrency:   rowConcurrencyFor(intOrDefault(cfg.MaxPoolSize, defaultMaxPoolSize)),
 		logger:           zap.NewNop(),
 		tokenReplayLimit: maxTokenReplayScan,
 	}
+}
+
+// rowConcurrencyFor derives the per-row rewrite parallelism from the pool the
+// client was given.
+//
+// The loops it bounds spend essentially all of their time waiting on one
+// command each, so their useful width is "how many commands can be in flight",
+// which is the pool size less the headroom the rest of the process needs — not
+// runtime.NumCPU(), and not something an operator should have to discover as a
+// third knob. Clamped to rowConcurrencyCeiling because past that the pool's
+// wait queue becomes the bottleneck and throughput falls, and floored at 1 so
+// a deliberately tiny pool still makes progress.
+func rowConcurrencyFor(poolSize int) int {
+	return max(1, min(poolSize-poolHeadroom, rowConcurrencyCeiling))
 }
 
 // Close disconnects the client this Store created. A Store sharing a client

@@ -363,8 +363,15 @@ func (s *Store) IterateTrackerRows(ctx context.Context, scan store.TrackerScan, 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// No SetBatchSize: batch_size sizes a batch of FULL rows, and this scan
+	// streams a ~60-byte covered projection. Pinning it to 500 turns a
+	// million-row hydration into ~2,000 getMore round trips where the driver's
+	// default (fill the 16 MB reply) needs ~10 — measured at 834 ms vs 521 ms
+	// over 500k rows on loopback, and the gap is a round trip each on a real
+	// network. The same knob still sizes IterateStatusesSince, where the rows
+	// are whole documents and 500 is the right order of magnitude.
 	cur, err := s.tx.Find(ctx, trackerFilter(scan), options.Find().
-		SetProjection(projTracker).SetHint(idxTxStatusHeight).SetBatchSize(s.cursorBatch()))
+		SetProjection(projTracker).SetHint(idxTxStatusHeight))
 	if err != nil {
 		return fmt.Errorf("iterate tracker rows: %w", err)
 	}
@@ -586,7 +593,7 @@ func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeig
 	update := minedPipeline(blockHash, blockHeight, now)
 	notImmutable := doc(kv(opNe, string(models.StatusImmutable)))
 	slots := make([]*models.TransactionStatus, len(uniq))
-	loopErr := forEach(ctx, len(uniq), func(i int) error {
+	loopErr := forEach(ctx, len(uniq), s.rowConcurrency, func(i int) error {
 		octx, cancel := s.opCtx(ctx)
 		defer cancel()
 		var before txDoc
@@ -721,7 +728,7 @@ func (s *Store) rewriteBlockOnce(ctx context.Context, blockHash string, newStatu
 		}
 		visited += len(page)
 		applied := make([]bool, len(page))
-		loopErr := forEach(ctx, len(page), func(i int) error {
+		loopErr := forEach(ctx, len(page), s.rowConcurrency, func(i int) error {
 			octx, cancel := s.opCtx(ctx)
 			defer cancel()
 			filter := doc(kv(fID, page[i]), kv(fBlockHash, blockHash), kv(fStatus, notImmutable))
@@ -911,7 +918,9 @@ func (s *Store) exists(ctx context.Context, txid string) (bool, error) {
 	return err == nil, err
 }
 
-// cursorBatch is the per-getMore batch for streaming reads.
+// cursorBatch is the per-getMore batch for streaming reads of FULL rows.
+// Projected scans (IterateTrackerRows, tokenTxIDs) deliberately leave it
+// unset and let the driver fill its reply budget instead — see there.
 func (s *Store) cursorBatch() int32 {
 	if s.batchSize > 1<<30 {
 		return 1 << 30

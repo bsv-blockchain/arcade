@@ -7,8 +7,6 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
-
-	"github.com/bsv-blockchain/arcade/store"
 )
 
 // upsertAttempts bounds the duplicate-key retry of an upsert: the loser of an
@@ -78,8 +76,13 @@ func chunks(ids []string, n int) [][]string {
 // decodes as UTC.
 func msNow() time.Time { return msTrunc(time.Now()) }
 
-// forEach runs fn(i) for every i in [0, n) with at most store.BatchConcurrency
-// calls in flight — the same operator knob the shared batch helpers honour.
+// forEach runs fn(i) for every i in [0, n) with at most conc calls in flight.
+//
+// conc is the caller's choice because this package has two shapes of loop with
+// different limits: the per-row block rewrites are bounded by the connection
+// pool (s.rowConcurrency), while loops that merely want the operator's shared
+// batch knob pass store.BatchConcurrency() like the other backends' batch
+// helpers do.
 // The first error is returned after every started call has finished; once
 // ctx is done, or any call has failed, no further calls start.
 //
@@ -89,8 +92,11 @@ func msNow() time.Time { return msTrunc(time.Now()) }
 // the rows it did write meanwhile are exactly as partial as they would be
 // after one failure. Callers get the same (partial results, first error)
 // pair either way, just promptly.
-func forEach(ctx context.Context, n int, fn func(i int) error) error {
-	sem := make(chan struct{}, store.BatchConcurrency())
+func forEach(ctx context.Context, n, conc int, fn func(i int) error) error {
+	if conc < 1 {
+		conc = 1
+	}
+	sem := make(chan struct{}, conc)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var firstErr error
@@ -140,10 +146,18 @@ func forEach(ctx context.Context, n int, fn func(i int) error) error {
 // withDupKeyRetry runs an upsert and retries it when it lost the insert race
 // for a brand-new _id (E11000): the retry finds the winner's document and
 // updates it, which is what the caller meant all along.
-func withDupKeyRetry(op func() error) error {
+func (s *Store) withDupKeyRetry(ctx context.Context, op func(octx context.Context) error) error {
 	var err error
 	for attempt := 0; attempt < upsertAttempts; attempt++ {
-		if err = op(); err == nil || !mongo.IsDuplicateKeyError(err) {
+		// A fresh op_timeout_ms per attempt. Sharing one budget across the
+		// loop is self-defeating for a retry that exists to ride out
+		// contention on a brand-new key: the attempts that lose the race are
+		// exactly the slow ones, so by the last attempt there can be no budget
+		// left, and a recoverable duplicate-key race surfaces as a deadline.
+		octx, cancel := s.opCtx(ctx)
+		err = op(octx)
+		cancel()
+		if err == nil || !mongo.IsDuplicateKeyError(err) {
 			return err
 		}
 	}

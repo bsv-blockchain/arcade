@@ -168,8 +168,10 @@ func (s *Store) IterateStatusesByToken(ctx context.Context, callbackToken string
 // between it and this scan — so the bound is enforced here, where the memory
 // is actually spent.
 func (s *Store) tokenTxIDs(ctx context.Context, tokenFilter bson.D) ([]string, error) {
+	// No SetBatchSize: this is a covered scan of one 64-byte field, so the
+	// full-row batch_size would only add getMore round trips (see cursorBatch).
 	cur, err := s.subs.Find(ctx, tokenFilter, options.Find().
-		SetProjection(doc(kv(fTxID, 1), kv(fID, 0))).SetHint(idxSubTokenTxID).SetBatchSize(s.cursorBatch()))
+		SetProjection(doc(kv(fTxID, 1), kv(fID, 0))).SetHint(idxSubTokenTxID))
 	if err != nil {
 		return nil, fmt.Errorf("iterate statuses by token: submissions: %w", err)
 	}

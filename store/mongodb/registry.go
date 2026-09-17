@@ -27,9 +27,7 @@ func (s *Store) UpsertDatahubEndpoint(ctx context.Context, ep store.DatahubEndpo
 		}
 		set = append(set, kv(fPolicy, endpointPolicyToDoc(p)))
 	}
-	octx, cancel := s.opCtx(ctx)
-	defer cancel()
-	err := withDupKeyRetry(func() error {
+	err := s.withDupKeyRetry(ctx, func(octx context.Context) error {
 		_, err := s.datahubs.UpdateOne(octx, idFilter(ep.URL), doc(kv(opSet, set)), options.UpdateOne().SetUpsert(true))
 		return err
 	})
@@ -67,10 +65,8 @@ func (s *Store) UpsertPeerPolicy(ctx context.Context, pp store.PeerPolicy) error
 	if err := pp.Validate(); err != nil {
 		return err
 	}
-	octx, cancel := s.opCtx(ctx)
-	defer cancel()
 	d := peerPolicyToDoc(pp)
-	err := withDupKeyRetry(func() error {
+	err := s.withDupKeyRetry(ctx, func(octx context.Context) error {
 		_, err := s.peers.ReplaceOne(octx, idFilter(pp.PeerID), d, options.Replace().SetUpsert(true))
 		return err
 	})

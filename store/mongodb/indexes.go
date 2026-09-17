@@ -126,9 +126,19 @@ func (s *Store) EnsureIndexes(ctx context.Context) error {
 		{s.tx, []mongo.IndexModel{
 			idx(idxTxStatusHeight, bson.D{{Key: fStatus, Value: 1}, {Key: fBlockHeight, Value: 1}, {Key: fID, Value: 1}}),
 			idx(idxTxStatusTS, bson.D{{Key: fStatus, Value: 1}, {Key: fTimestamp, Value: 1}}),
-			// {block_hash, _id}: equality on the hash plus an _id-ordered scan
-			// for SetStatusByBlockHash's keyset pages, no in-memory sort.
-			idxPartial(idxTxBlockHash, bson.D{{Key: fBlockHash, Value: 1}, {Key: fID, Value: 1}},
+			// {block_hash, _id, status}: equality on the hash plus an
+			// _id-ordered scan for SetStatusByBlockHash's keyset pages, no
+			// in-memory sort. status is the third key, after the sort key, so
+			// the page stays index-ordered — it is here to be READ, not to
+			// bound the scan. Without it blockPage's status != IMMUTABLE is a
+			// residual predicate, so the server FETCHes every candidate
+			// document (raw_tx and all) out of WiredTiger just to test one
+			// string inequality and project _id back. With it the page is
+			// PROJECTION_COVERED and examines zero documents — measured on
+			// mongod 7 as 550 -> 0 docsExamined for one 500-row page, over a
+			// scan SetStatusByBlockHash repeats for the whole block and then
+			// re-walks once per drain pass.
+			idxPartial(idxTxBlockHash, bson.D{{Key: fBlockHash, Value: 1}, {Key: fID, Value: 1}, {Key: fStatus, Value: 1}},
 				bson.D{{Key: fBlockHash, Value: bson.D{{Key: opExists, Value: true}}}}),
 			idx(idxTxTimestamp, bson.D{{Key: fTimestamp, Value: 1}}),
 			idxPartial(idxTxRetryReady, bson.D{{Key: fNextRetryAt, Value: 1}},

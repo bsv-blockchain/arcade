@@ -25,9 +25,7 @@ func (s *Store) UpsertBlockHeaderSeen(ctx context.Context, blockHash string, blo
 		kv(opUnset, doc(kv(fOrphanedAt, ""), kv(fReconciledAt, ""))),
 		kv(opSetOnInsert, doc(kv(fHeaderSeenAt, msTrunc(seenAt)))),
 	)
-	octx, cancel := s.opCtx(ctx)
-	defer cancel()
-	err := withDupKeyRetry(func() error {
+	err := s.withDupKeyRetry(ctx, func(octx context.Context) error {
 		_, err := s.blocks.UpdateOne(octx, idFilter(blockHash), update, options.UpdateOne().SetUpsert(true))
 		return err
 	})
@@ -46,9 +44,7 @@ func (s *Store) markBlockMilestone(ctx context.Context, blockHash string, blockH
 		kv(opSet, doc(kv(field, at))),
 		kv(opSetOnInsert, doc(kv(fBlockHeight, heightToInt64(blockHeight)), kv(fHeaderSeenAt, at), kv(fStatus, string(models.BlockStatusActive)))),
 	)
-	octx, cancel := s.opCtx(ctx)
-	defer cancel()
-	err := withDupKeyRetry(func() error {
+	err := s.withDupKeyRetry(ctx, func(octx context.Context) error {
 		_, err := s.blocks.UpdateOne(octx, idFilter(blockHash), update, options.UpdateOne().SetUpsert(true))
 		return err
 	})

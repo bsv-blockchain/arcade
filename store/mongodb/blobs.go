@@ -282,11 +282,14 @@ func (s *Store) deleteFile(ctx context.Context, bucket *mongo.GridFSBucket, id b
 // upserting a brand-new key can collide on _id; the loser retries and
 // updates the document the winner inserted.
 func (s *Store) swapManifest(ctx context.Context, manifests *mongo.Collection, key string, set bson.D) (prev blobRef, hadPrev bool, err error) {
-	octx, cancel := s.opCtx(ctx)
-	defer cancel()
 	for attempt := 0; attempt < manifestSwapAttempts; attempt++ {
+		// A fresh budget per attempt, for the reason in withDupKeyRetry: the
+		// attempts that retry here are the ones that lost a race, so a shared
+		// deadline is spent by the attempts least able to afford it.
+		octx, cancel := s.opCtx(ctx)
 		err = manifests.FindOneAndUpdate(octx, idFilter(key), doc(kv(opSet, set)),
 			options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.Before).SetProjection(projBlobRef)).Decode(&prev)
+		cancel()
 		switch {
 		case err == nil:
 			return prev, true, nil
@@ -604,29 +607,38 @@ func (s *Store) InsertStump(ctx context.Context, stump *models.Stump) error {
 	return nil
 }
 
-// GetStumpsByBlockHash implements store.Store, ordered by subtree index. The
-// context is checked between downloads since each is a multi-round-trip read.
+// GetStumpsByBlockHash implements store.Store, ordered by subtree index.
+//
+// The downloads run with bounded parallelism: each is a manifest read plus a
+// GridFS files read plus a chunks cursor, so a block with thousands of
+// subtrees spent thousands of round trips strictly one after another — with
+// the reconciler waiting on all of them. Results land in their own slot, so
+// the subtree order the caller is promised comes from the manifest listing
+// and not from completion order. forEach stops dispatching at the first
+// failure and checks ctx before each call, which is what the serial loop's
+// per-iteration ctx.Err() did.
 func (s *Store) GetStumpsByBlockHash(ctx context.Context, blockHash string) ([]*models.Stump, error) {
 	manifests, err := s.stumpManifestsFor(ctx, blockHash)
 	if err != nil {
 		return nil, fmt.Errorf("get stumps %s: %w", blockHash, err)
 	}
-	out := make([]*models.Stump, 0, len(manifests))
-	for _, m := range manifests {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
+	out := make([]*models.Stump, len(manifests))
+	if err := forEach(ctx, len(manifests), s.rowConcurrency, func(i int) error {
+		m := manifests[i]
 		// The subtree index is part of the key, so nothing a replacement
 		// could change is reported here; the served reference is not needed.
-		data, _, err := s.fetch(ctx, s.stumps.bucket, s.stumps.manifests, m.Key, blobRef{FileID: m.FileID, Length: m.Length})
-		if err != nil {
-			return nil, fmt.Errorf("get stumps %s/%d: %w", blockHash, m.SubtreeIndex, err)
+		data, _, ferr := s.fetch(ctx, s.stumps.bucket, s.stumps.manifests, m.Key, blobRef{FileID: m.FileID, Length: m.Length})
+		if ferr != nil {
+			return fmt.Errorf("get stumps %s/%d: %w", blockHash, m.SubtreeIndex, ferr)
 		}
-		out = append(out, &models.Stump{
+		out[i] = &models.Stump{
 			BlockHash:    blockHash,
 			SubtreeIndex: int(m.SubtreeIndex),
 			StumpData:    data,
-		})
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -639,10 +651,14 @@ func (s *Store) DeleteStumpsByBlockHash(ctx context.Context, blockHash string) e
 	if err != nil {
 		return fmt.Errorf("delete stumps %s: %w", blockHash, err)
 	}
-	for _, m := range manifests {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
+	// Three round trips per subtree (conditional manifest delete, then the
+	// bucket's files delete and chunks delete), so a reorged block with
+	// thousands of subtrees is thousands of serial round trips inside reorg
+	// cleanup. Each subtree is independent — the conditional delete is what
+	// makes it safe, not the ordering — so they run with the same bounded
+	// parallelism as the rewrites.
+	return forEach(ctx, len(manifests), s.rowConcurrency, func(i int) error {
+		m := manifests[i]
 		octx, cancel := s.opCtx(ctx)
 		res, err := s.stumps.manifests.DeleteOne(octx, doc(kv(fID, m.Key), kv(fFileID, m.FileID)))
 		cancel()
@@ -650,13 +666,13 @@ func (s *Store) DeleteStumpsByBlockHash(ctx context.Context, blockHash string) e
 			return fmt.Errorf("delete stumps %s: %w", blockHash, err)
 		}
 		if res.DeletedCount == 0 {
-			continue // replaced underneath; its writer owns the old file's deletion
+			return nil // replaced underneath; its writer owns the old file's deletion
 		}
 		if err := s.deleteFile(ctx, s.stumps.bucket, m.FileID); err != nil {
 			return fmt.Errorf("delete stumps %s: %w", blockHash, err)
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 // stumpManifestsFor lists a block's stump manifests ordered by subtree index.

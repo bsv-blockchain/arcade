@@ -7,8 +7,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/bsv-blockchain/arcade/store"
 )
 
 // awaitWithin must return ctx's error once the deadline passes even though fn
@@ -42,7 +40,8 @@ func TestAwaitWithin(t *testing.T) {
 func TestForEach_StopsDispatchingOnFailureAndDoneContext(t *testing.T) {
 	const n = 10_000
 	var started atomic.Int64
-	err := forEach(context.Background(), n, func(i int) error {
+	const conc = 16
+	err := forEach(context.Background(), n, conc, func(i int) error {
 		started.Add(1)
 		if i == 0 {
 			return errors.New("row 0 failed")
@@ -52,14 +51,14 @@ func TestForEach_StopsDispatchingOnFailureAndDoneContext(t *testing.T) {
 	if err == nil || err.Error() != "row 0 failed" {
 		t.Fatalf("err = %v, want the first failure", err)
 	}
-	if got := started.Load(); got > int64(store.BatchConcurrency()*4) {
+	if got := started.Load(); got > int64(conc*4) {
 		t.Fatalf("started %d of %d calls after the first failure; must stop dispatching", got, n)
 	}
 
 	started.Store(0)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err = forEach(ctx, n, func(int) error { started.Add(1); return nil })
+	err = forEach(ctx, n, conc, func(int) error { started.Add(1); return nil })
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
