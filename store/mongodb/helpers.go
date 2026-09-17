@@ -135,7 +135,18 @@ func forEach(ctx context.Context, n, conc int, fn func(i int) error) error {
 		// fails, so the check above was made against a state that is stale by
 		// the time the slot frees. Without this, a failing loop dispatches
 		// one more operation — bounded, but the contract above says none.
-		if ctx.Err() != nil || failed() {
+		//
+		// A cancellation is recorded, exactly as the pre-send check records
+		// it. Breaking out silently would leave firstErr nil on a loop that
+		// skipped work, so forEach would report success for a block it never
+		// finished — the one outcome this helper must never produce, since
+		// its callers read a nil error as "every row was written".
+		if err := ctx.Err(); err != nil {
+			record(err)
+			<-sem
+			break
+		}
+		if failed() {
 			<-sem
 			break
 		}

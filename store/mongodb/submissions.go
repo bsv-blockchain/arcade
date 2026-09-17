@@ -87,8 +87,18 @@ var projTokenRow = doc(kv(fTxID, 1), kv(fCallbackToken, 1), kv(fID, 0))
 // TokensForTxIDs implements store.Store from the txid side only, one
 // covered index scan per chunk of txids. Tokens are deduplicated per txid in
 // first-seen order; a txid with no token is absent from the result.
+//
+// The dedupe is a set, not a scan of what has been kept. One txid can carry
+// many submissions — every client that registered a callback for it — and
+// this is the SSE fan-out's hot path, so a linear membership test per row
+// makes the work quadratic in the tokens per txid exactly where it is least
+// affordable. The set is per call, not per chunk: the {txid, callback_token}
+// index means a txid's rows are adjacent and land in one chunk, but nothing
+// in the contract says a caller cannot repeat a txid across chunk boundaries
+// in some future shape of this method.
 func (s *Store) TokensForTxIDs(ctx context.Context, txids []string) (map[string][]string, error) {
 	out := make(map[string][]string, len(txids))
+	seen := make(map[string]map[string]struct{}, len(txids))
 	for _, chunk := range chunks(dedupe(txids), inChunk) {
 		filter := doc(kv(fTxID, doc(kv(opIn, chunk))), kv(fCallbackToken, doc(kv(opGt, ""))))
 		qctx, cancel := s.queryCtx(ctx)
@@ -104,21 +114,19 @@ func (s *Store) TokensForTxIDs(ctx context.Context, txids []string) (map[string]
 			return nil, fmt.Errorf("tokens for txids: %w", err)
 		}
 		for _, r := range rows {
-			if !containsString(out[r.TxID], r.Token) {
-				out[r.TxID] = append(out[r.TxID], r.Token)
+			tokens, ok := seen[r.TxID]
+			if !ok {
+				tokens = make(map[string]struct{})
+				seen[r.TxID] = tokens
 			}
+			if _, dup := tokens[r.Token]; dup {
+				continue
+			}
+			tokens[r.Token] = struct{}{}
+			out[r.TxID] = append(out[r.TxID], r.Token)
 		}
 	}
 	return out, nil
-}
-
-func containsString(list []string, v string) bool {
-	for _, x := range list {
-		if x == v {
-			return true
-		}
-	}
-	return false
 }
 
 // IterateStatusesByToken implements store.Store. The replay is bounded twice:

@@ -751,7 +751,14 @@ func (r *Reconciler) remineFromStoredBUMP(ctx context.Context, logger *zap.Logge
 			blockHash, bumpHeight, txids[start:end], models.ExtraInfoReorgReanchor, true)
 		changed += n
 		if !chunkComplete {
+			// Stop, like reanchorNeighborhood and forEach do. One incomplete
+			// chunk already makes this attempt non-ready, and the retry
+			// re-mines the BUMP's full level-0 set, so the remaining chunks
+			// would buy no progress that the next tick does not — while
+			// during an outage each one pays its own store timeout, turning
+			// a large canonical block into a long stall in the reconciler.
 			complete = false
+			break
 		}
 	}
 	if !complete {

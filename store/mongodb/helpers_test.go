@@ -98,3 +98,64 @@ func TestDropDuplicateTail(t *testing.T) {
 		t.Fatalf("dropDuplicateTail allocated %.0f times for a one-entry tail; its set must be sized by the tail, not the prefix", allocs)
 	}
 }
+
+// lateCancelCtx reports no error for the first `quiet` calls to Err() and
+// context.Canceled thereafter, and never closes Done().
+//
+// It exists because the branch under test is otherwise unreachable on demand:
+// it runs only when the semaphore send wins a random select against a ctx
+// that is already done, and closing Done() makes the select take the other
+// branch essentially every time. Holding Done() open forces the send branch,
+// and the Err() counter puts the cancellation exactly where the dispatcher
+// looks after acquiring its slot. A real context never behaves this way — the
+// double is isolating one observation, not modelling a context.
+type lateCancelCtx struct {
+	context.Context
+
+	done  chan struct{}
+	calls atomic.Int64
+	quiet int64
+}
+
+func (c *lateCancelCtx) Done() <-chan struct{} { return c.done }
+
+func (c *lateCancelCtx) Err() error {
+	if c.calls.Add(1) <= c.quiet {
+		return nil
+	}
+	return context.Canceled
+}
+
+// TestForEach_ReportsCancellationSeenAfterTheSlot: a cancellation the
+// dispatcher first observes AFTER acquiring its semaphore slot must be
+// recorded, not just used to break out of the loop.
+//
+// Callers read a nil error as "every row was written". SetMinedByTxIDs hands
+// this error straight to the bump-builder, which withholds the block's
+// processed_at stamp on failure and takes it on success — so a forEach that
+// skipped rows and returned nil retires a block with rows unwritten, which is
+// exactly the trap that stamp ordering exists to close.
+func TestForEach_ReportsCancellationSeenAfterTheSlot(t *testing.T) {
+	// Three quiet Err() calls — the dispatcher consults ctx twice per item,
+	// before the send and after the slot: i=0 pre-send, i=0 post-slot, i=1
+	// pre-send. The fourth is i=1's post-slot check, which is the branch under
+	// test. Getting this count wrong lands the cancellation on a pre-send
+	// check instead, which has always recorded, so the assertion below on the
+	// number of fn calls is what keeps the test honest about which branch ran.
+	ctx := &lateCancelCtx{Context: context.Background(), done: make(chan struct{}), quiet: 3}
+	var started atomic.Int64
+
+	err := forEach(ctx, 50, 1, func(int) error {
+		started.Add(1)
+		return nil
+	})
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled — a loop truncated by cancellation must not report success", err)
+	}
+	// Exactly one call means the loop really did stop at the post-slot check
+	// for i=1, rather than the test passing via some earlier branch.
+	if got := started.Load(); got != 1 {
+		t.Fatalf("fn called %d times, want 1 — the cancellation was expected at i=1's post-slot check", got)
+	}
+}
