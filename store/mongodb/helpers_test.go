@@ -109,15 +109,21 @@ func TestDropDuplicateTail(t *testing.T) {
 // and the Err() counter puts the cancellation exactly where the dispatcher
 // looks after acquiring its slot. A real context never behaves this way — the
 // double is isolating one observation, not modelling a context.
+// The four methods are spelled out rather than embedding a context.Context:
+// embedding one in a struct is what containedctx flags, and the lint is right
+// about the usual case even though this is the exception — a type whose whole
+// purpose is to BE a context.
 type lateCancelCtx struct {
-	context.Context
-
 	done  chan struct{}
 	calls atomic.Int64
 	quiet int64
 }
 
+func (c *lateCancelCtx) Deadline() (time.Time, bool) { return time.Time{}, false }
+
 func (c *lateCancelCtx) Done() <-chan struct{} { return c.done }
+
+func (c *lateCancelCtx) Value(any) any { return nil }
 
 func (c *lateCancelCtx) Err() error {
 	if c.calls.Add(1) <= c.quiet {
@@ -142,7 +148,7 @@ func TestForEach_ReportsCancellationSeenAfterTheSlot(t *testing.T) {
 	// test. Getting this count wrong lands the cancellation on a pre-send
 	// check instead, which has always recorded, so the assertion below on the
 	// number of fn calls is what keeps the test honest about which branch ran.
-	ctx := &lateCancelCtx{Context: context.Background(), done: make(chan struct{}), quiet: 3}
+	ctx := &lateCancelCtx{done: make(chan struct{}), quiet: 3}
 	var started atomic.Int64
 
 	err := forEach(ctx, 50, 1, func(int) error {
