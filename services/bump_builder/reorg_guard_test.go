@@ -2,6 +2,7 @@ package bump_builder
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/store"
 )
 
 // Anchor-guard unit tests (issue #279): bump-builder must refuse to mark a
@@ -296,3 +298,48 @@ func TestSetMinedAndPublish_OnlyChangedFiltersEvents(t *testing.T) {
 // live in builder_test.go); referenced here to avoid an unused-import churn
 // if helpers move.
 var _ = transaction.NewMerklePath
+
+// partialMineStore anchors the rows and then reports an error — the shape
+// every backend produces when a mine fails partway: Pebble and Aerospike per
+// chunk, MongoDB per row. The rows that landed are MINED in the store.
+type partialMineStore struct {
+	store.Store
+}
+
+func (s *partialMineStore) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeight uint64, txids []string) ([]*models.TransactionStatus, []*models.TransactionStatus, error) {
+	prevs, mined, err := s.Store.SetMinedByTxIDs(ctx, blockHash, blockHeight, txids)
+	if err != nil {
+		return prevs, mined, err
+	}
+	return prevs, mined, errors.New("primary stepped down after these rows")
+}
+
+// Rows anchored before the failure are MINED in the store and processed_at is
+// already stamped, so nothing re-drives them: their MINED event goes out here
+// or never. The old code returned 0 and published nothing.
+func TestSetMinedAndPublish_PublishesRowsAnchoredBeforeTheError(t *testing.T) {
+	ctx := context.Background()
+	base := newPebbleForTest(t)
+	seedSeen(t, base, recShared1, recShared2)
+	pub := &capturePublisher{}
+
+	changed := setMinedAndPublish(ctx, zap.NewNop(), &partialMineStore{Store: base}, pub,
+		recCanonical, 10, []string{recShared1, recShared2}, "", false)
+	if changed != 2 {
+		t.Fatalf("changed = %d, want 2 (both rows landed before the error)", changed)
+	}
+	var minedEv *models.TransactionStatus
+	for _, ev := range pub.bulkEvents() {
+		if ev.Status == models.StatusMined {
+			minedEv = ev
+		}
+	}
+	if minedEv == nil || len(minedEv.TxIDs) != 2 {
+		t.Fatalf("the rows that landed must be published: %+v", minedEv)
+	}
+	for _, id := range []string{recShared1, recShared2} {
+		if st := statusOf(t, base, id); st.Status != models.StatusMined {
+			t.Fatalf("%s: %s, want MINED in the store", id, st.Status)
+		}
+	}
+}

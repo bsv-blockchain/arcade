@@ -2,6 +2,7 @@ package mongodb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -38,10 +39,56 @@ const (
 	// The two GridFS-spec indexes keep the driver's default names so a
 	// database the driver (or a restore) already provisioned is recognised as
 	// identical instead of failing createIndexes with a name conflict.
-	idxGridFSFiles      = "filename_1_uploadDate_1"
-	idxGridFSChunks     = "files_id_1_n_1"
-	partialFilterOption = "partialFilterExpression"
+	idxGridFSFiles  = "filename_1_uploadDate_1"
+	idxGridFSChunks = "files_id_1_n_1"
 )
+
+// leaseReapGraceSeconds is how long after expires_at the TTL monitor may
+// delete a lease row. See the leases index for why it is not zero.
+const leaseReapGraceSeconds = 3600
+
+// ttlIndex names a TTL index and the expireAfterSeconds this build wants for
+// it — the one index option createIndexes can repair rather than refuse.
+type ttlIndex struct {
+	name    string
+	seconds int32
+}
+
+// indexOptionsConflict is the server code for "an index with this name and
+// keys exists with different options" — what createIndexes returns when a
+// deployment provisioned before a TTL change asks for the new value.
+const indexOptionsConflict = 85
+
+// createIndexes is CreateMany with one repair: a TTL index whose
+// expireAfterSeconds has changed since the database was provisioned. Every
+// other option mismatch is a genuine conflict and still fails loudly
+// (IndexKeySpecsConflict for different keys, IndexOptionsConflict for
+// anything but a TTL), but expireAfterSeconds is the one option this package
+// tunes, and the server's own remedy for it is collMod, not drop-and-rebuild.
+// So on IndexOptionsConflict, each TTL index the spec declares is collMod'd to
+// its requested value and the create is retried once; if the conflict was not
+// about a TTL, the retry fails the same way and that error is returned.
+func createIndexes(ctx context.Context, coll *mongo.Collection, models []mongo.IndexModel, ttls []ttlIndex) error {
+	_, err := coll.Indexes().CreateMany(ctx, models)
+	var se mongo.ServerError
+	if err == nil || len(ttls) == 0 || !errors.As(err, &se) || !se.HasErrorCode(indexOptionsConflict) {
+		return err
+	}
+	for _, t := range ttls {
+		cmd := bson.D{
+			{Key: "collMod", Value: coll.Name()},
+			{Key: "index", Value: bson.D{
+				{Key: "name", Value: t.name},
+				{Key: "expireAfterSeconds", Value: t.seconds},
+			}},
+		}
+		if cerr := coll.Database().RunCommand(ctx, cmd).Err(); cerr != nil {
+			return fmt.Errorf("%w (and collMod of TTL index %s failed: %w)", err, t.name, cerr)
+		}
+	}
+	_, err = coll.Indexes().CreateMany(ctx, models)
+	return err
+}
 
 // EnsureIndexes provisions every secondary index the queries in this package
 // rely on. createIndexes is idempotent for an identical spec and fails
@@ -54,14 +101,26 @@ const (
 // the predicate (equality, $gt, $exists:true). `IS NULL` predicates cannot be
 // partial-index conditions, so the block_processing indexes are compound
 // over the nullable field instead — a missing field indexes as null, so the
-// query {status:"active", processed_at:{$exists:false}} still gets tight
-// bounds. GridFS's own indexes are created explicitly too: the driver only
+// query {status:"active", processed_at:null} still gets tight bounds (and
+// null, unlike $exists:false, also matches a document that carries an
+// explicit null — what a migration from Postgres writes for NULL). GridFS's own indexes are created explicitly too: the driver only
 // auto-creates them when the files collection is empty at first write, which
 // a restore or migration can defeat.
+//
+// One exception: a TTL index whose expireAfterSeconds differs from the one
+// this build wants is repaired with collMod and retried (see createIndexes),
+// because that is the one option this package tunes. collMod is a dbAdmin
+// action, not part of readWrite, so the application user needs dbAdmin (or
+// the collMod privilege) on the database as well as readWrite.
 func (s *Store) EnsureIndexes(ctx context.Context) error {
 	type spec struct {
 		coll   *mongo.Collection
 		models []mongo.IndexModel
+	}
+	// The TTL indexes each collection declares, keyed by collection name, so
+	// createIndexes can repair a changed expireAfterSeconds (see there).
+	ttlByColl := map[string][]ttlIndex{
+		collLeases: {{idxLeaseExpires, leaseReapGraceSeconds}},
 	}
 	specs := []spec{
 		{s.tx, []mongo.IndexModel{
@@ -87,9 +146,15 @@ func (s *Store) EnsureIndexes(ctx context.Context) error {
 			idx(idxBPStaleSeen, bson.D{{Key: fStatus, Value: 1}, {Key: fProcessedAt, Value: 1}, {Key: fHeaderSeenAt, Value: 1}}),
 			idx(idxBPOrphaned, bson.D{{Key: fStatus, Value: 1}, {Key: fReconciledAt, Value: 1}, {Key: fOrphanedAt, Value: 1}}),
 		}},
+		// TTL with a grace period, not at expiry. A TTL of zero would make the
+		// server's clock a second authority on lease expiry: a mongod running
+		// ahead of the pods by more than (ttl - renew interval) would delete
+		// a live lease and let the next contender's upsert win — two leaders.
+		// The client-side expires_at comparison is the only expiry that
+		// counts; this reaps rows that have been dead for an hour.
 		{s.leases, []mongo.IndexModel{{
 			Keys:    bson.D{{Key: fExpiresAt, Value: 1}},
-			Options: options.Index().SetName(idxLeaseExpires).SetExpireAfterSeconds(0),
+			Options: options.Index().SetName(idxLeaseExpires).SetExpireAfterSeconds(leaseReapGraceSeconds),
 		}}},
 		{s.datahubs, []mongo.IndexModel{
 			idx(idxDHNetwork, bson.D{{Key: fNetwork, Value: 1}}),
@@ -115,20 +180,36 @@ func (s *Store) EnsureIndexes(ctx context.Context) error {
 	// Collections are independent, so provision them concurrently: eleven
 	// sequential createIndexes round-trips are the dominant cost of a boot
 	// against an already-indexed database.
+	//
+	// Bounded by index_timeout_ms (Postgres's schema_apply_timeout_ms is the
+	// precedent): createIndexes on a restored, populated collection is the
+	// one boot-time operation whose duration scales with data, and without a
+	// deadline a stalled build sits silently past the liveness probe. Every
+	// failure is returned, not just the first — eleven collections can fail
+	// for eleven reasons and the operator should see all of them.
+	if s.indexTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.indexTimeout)
+		defer cancel()
+	}
 	errs := make(chan error, len(specs))
 	var wg sync.WaitGroup
 	for _, sp := range specs {
 		wg.Add(1)
 		go func(sp spec) {
 			defer wg.Done()
-			if _, err := sp.coll.Indexes().CreateMany(ctx, sp.models); err != nil {
+			if err := createIndexes(ctx, sp.coll, sp.models, ttlByColl[sp.coll.Name()]); err != nil {
 				errs <- fmt.Errorf("mongodb: create indexes on %s: %w", sp.coll.Name(), err)
 			}
 		}(sp)
 	}
 	wg.Wait()
 	close(errs)
-	return <-errs
+	var all []error
+	for err := range errs {
+		all = append(all, err)
+	}
+	return errors.Join(all...)
 }
 
 func idx(name string, keys bson.D) mongo.IndexModel {

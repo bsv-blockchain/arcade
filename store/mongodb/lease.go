@@ -31,7 +31,10 @@ func (s *Store) TryAcquireOrRenew(ctx context.Context, name, holder string, ttl 
 	expires := msTrunc(now.Add(ttl))
 	filter := doc(
 		kv(fID, name),
-		kv(opOr, bson.A{doc(kv(fHolder, holder)), doc(kv(fExpiresAt, doc(kv(opLte, now))))}),
+		// Strictly expired, as Postgres has it: a lease whose expires_at IS
+		// this millisecond still belongs to its holder, so a ttl that rounds
+		// to zero does not hand the lease to the next caller in the same ms.
+		kv(opOr, bson.A{doc(kv(fHolder, holder)), doc(kv(fExpiresAt, doc(kv(opLt, now))))}),
 	)
 	update := doc(kv(opSet, doc(kv(fHolder, holder), kv(fExpiresAt, expires))))
 

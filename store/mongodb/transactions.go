@@ -31,6 +31,15 @@ const (
 
 // Projections. IterateTrackerRows and IterateStatusesByToken are bound by the
 // interface to never read raw_tx / merkle_path / orphaned_anchors.
+//
+// projNoRawTx also shapes the pre-image UpdateStatusReturning hands back. That
+// is deliberate, and it is a choice the other backends do not make: Pebble
+// and Postgres return the whole row because they read it whole (Postgres's
+// returning path is the shared per-row GetStatus fallback). The pre-image
+// exists for transition-age metrics, every caller reads Status and Timestamp
+// and nothing else, and returning a multi-megabyte raw transaction per row on
+// the callback hot path would pay for nothing — so the interface says RawTx
+// is not guaranteed there, and this backend is the one that omits it.
 var (
 	projNoRawTx     = doc(kv(fRawTx, 0))
 	projID          = doc(kv(fID, 1))
@@ -181,8 +190,16 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 // returns the pre-image. A zero match with a guard needs one probe to tell
 // "absent" from "blocked".
 func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.TransactionStatus) (*models.TransactionStatus, error) {
-	if status == nil || status.TxID == "" {
-		return nil, errors.New("mongodb: update status: empty txid")
+	if status == nil {
+		return nil, errors.New("mongodb: update status: nil status")
+	}
+	if status.TxID == "" {
+		// An empty txid can never name a row, so it is "unknown", the same
+		// as Pebble and Postgres report it. Anything else would let one
+		// malformed entry fail a whole BatchUpdateStatusReturning call whose
+		// other rows were applied — the shared batch helper maps ErrNotFound
+		// to a nil pre-image and carries on.
+		return nil, store.ErrNotFound
 	}
 	start := time.Now()
 	fromLabel, outcome := "", outcomeError
@@ -377,6 +394,12 @@ type censusRow struct {
 
 // CensusStatusesSince implements store.Store as one aggregate: count and
 // min(timestamp) per status over [since, stuckDeadline).
+//
+// It runs under the caller's context rather than query_timeout_ms for the
+// same reason as GetTxIDsByBlockHash: the aggregate is over the whole
+// stuck-transient window, and the incident that makes it slow is the one the
+// census exists to measure. A timeout here does not degrade the gauges, it
+// zeroes them.
 func (s *Store) CensusStatusesSince(ctx context.Context, since, stuckDeadline time.Time, statuses []models.Status) (map[models.Status]store.StatusCensus, error) {
 	out := make(map[models.Status]store.StatusCensus, len(statuses))
 	if len(statuses) == 0 {
@@ -401,14 +424,12 @@ func (s *Store) CensusStatusesSince(ctx context.Context, since, stuckDeadline ti
 			kv("oldest", doc(kv(opMin, "$"+fTimestamp))),
 		))),
 	}
-	qctx, cancel := s.queryCtx(ctx)
-	defer cancel()
-	cur, err := s.tx.Aggregate(qctx, pipeline, options.Aggregate().SetHint(idxTxStatusTS))
+	cur, err := s.tx.Aggregate(ctx, pipeline, options.Aggregate().SetHint(idxTxStatusTS))
 	if err != nil {
 		return nil, fmt.Errorf("census statuses since: %w", err)
 	}
 	defer closeCursor(ctx, cur)
-	for cur.Next(qctx) {
+	for cur.Next(ctx) {
 		var r censusRow
 		if err := cur.Decode(&r); err != nil {
 			return nil, fmt.Errorf("census statuses since: decode: %w", err)
@@ -423,16 +444,21 @@ func (s *Store) CensusStatusesSince(ctx context.Context, since, stuckDeadline ti
 
 // GetTxIDsByBlockHash implements store.Store. Cursor errors are surfaced, not
 // skipped: a partial affected set would silently under-reconcile a reorg.
+//
+// It runs under the caller's context, not query_timeout_ms: the result is
+// every txid still anchored to the block, which for the blocks this backend
+// exists for (compounds past 16 MB, hundreds of thousands of txs) can take
+// longer to stream than any fixed deadline should assume. A fixed deadline
+// here does not fail one call, it fails the same call every reconciler tick
+// and leaves the block MINED@orphan for good.
 func (s *Store) GetTxIDsByBlockHash(ctx context.Context, blockHash string) ([]string, error) {
-	qctx, cancel := s.queryCtx(ctx)
-	defer cancel()
-	cur, err := s.tx.Find(qctx, doc(kv(fBlockHash, blockHash)), options.Find().SetProjection(projID))
+	cur, err := s.tx.Find(ctx, doc(kv(fBlockHash, blockHash)), options.Find().SetProjection(projID))
 	if err != nil {
 		return nil, fmt.Errorf("get txids by block hash: %w", err)
 	}
 	defer closeCursor(ctx, cur)
 	var txids []string
-	for cur.Next(qctx) {
+	for cur.Next(ctx) {
 		var d struct {
 			TxID string `bson:"_id"`
 		}
@@ -622,7 +648,16 @@ func (s *Store) SetStatusByBlockHash(ctx context.Context, blockHash string, newS
 	drains := newStatus == models.StatusSeenOnNetwork || newStatus == models.StatusImmutable
 	var txids []string
 	for pass := 0; pass < blockRewritePasses; pass++ {
+		before := len(txids)
 		visited, err := s.rewriteBlockOnce(ctx, blockHash, newStatus, &txids)
+		if pass > 0 && len(txids) > before {
+			// A row reverted in an earlier pass and re-anchored to this
+			// block by a concurrent same-block replay is reverted again
+			// here and would be reported twice. Dedupe the tail a later
+			// pass produced against the prefix; dropDuplicateTail sizes
+			// its set by the tail, so this never allocates for the block.
+			txids = dropDuplicateTail(txids, before)
+		}
 		if err != nil {
 			return txids, err
 		}
@@ -631,6 +666,29 @@ func (s *Store) SetStatusByBlockHash(ctx context.Context, blockHash string, newS
 		}
 	}
 	return txids, fmt.Errorf("set status by block hash %s: rows still arriving after %d passes", blockHash, blockRewritePasses)
+}
+
+// dropDuplicateTail removes from txids[from:] any entry already present in
+// txids[:from] (or repeated within the tail), preserving order. The set is
+// built over the TAIL — the stragglers a later pass retired, a handful — and
+// the prefix is scanned once against it, so memory is proportional to the
+// stragglers and never to the block.
+func dropDuplicateTail(txids []string, from int) []string {
+	fresh := make(map[string]struct{}, len(txids)-from)
+	for _, id := range txids[from:] {
+		fresh[id] = struct{}{}
+	}
+	for _, id := range txids[:from] {
+		delete(fresh, id) // seen in an earlier pass: a duplicate
+	}
+	out := txids[:from]
+	for _, id := range txids[from:] {
+		if _, keep := fresh[id]; keep {
+			out = append(out, id)
+			delete(fresh, id) // and once only, if the tail repeats it
+		}
+	}
+	return out
 }
 
 // rewriteBlockOnce makes one keyset walk over the rows anchored to blockHash,

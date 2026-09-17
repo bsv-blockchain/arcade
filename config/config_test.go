@@ -468,10 +468,56 @@ func TestSetDefaults_MongoDBKeysBound(t *testing.T) {
 	for _, key := range []string{
 		"store.mongodb.uri", "store.mongodb.database", "store.mongodb.connect_timeout_ms",
 		"store.mongodb.op_timeout_ms", "store.mongodb.query_timeout_ms",
+		"store.mongodb.index_timeout_ms",
 		"store.mongodb.max_pool_size", "store.mongodb.batch_size",
 	} {
 		if !viper.IsSet(key) {
 			t.Errorf("%s has no default; ARCADE_%s would be ignored", key, strings.ToUpper(strings.ReplaceAll(key, ".", "_")))
 		}
+	}
+}
+
+// The mongodb block rejects values that would otherwise be substituted
+// silently or overflow a server limit: negative timeouts became compiled
+// defaults with no error, and a batch_size past ~200k puts one UpdateMany $in
+// over the 16 MB command limit. index_timeout_ms exists so createIndexes on a
+// restored, populated collection cannot sit past the liveness probe.
+func TestValidate_MongoDBBounds(t *testing.T) {
+	base := func() *Config {
+		cfg := baseValidConfig()
+		cfg.Store.Backend = "mongodb"
+		cfg.Store.Mongo.URI = "mongodb://localhost:27017"
+		cfg.Store.Mongo.Database = "arcade"
+		return cfg
+	}
+	if err := validate(base()); err != nil {
+		t.Fatalf("baseline must validate: %v", err)
+	}
+	cfg := base()
+	cfg.Store.Mongo.OpTimeoutMs = -1
+	if err := validate(cfg); err == nil || !strings.Contains(err.Error(), "op_timeout_ms") {
+		t.Fatalf("negative op_timeout_ms must be rejected naming the key, got: %v", err)
+	}
+	cfg = base()
+	cfg.Store.Mongo.IndexTimeoutMs = -5
+	if err := validate(cfg); err == nil || !strings.Contains(err.Error(), "index_timeout_ms") {
+		t.Fatalf("negative index_timeout_ms must be rejected, got: %v", err)
+	}
+	cfg = base()
+	cfg.Store.Mongo.BatchSize = 10001
+	if err := validate(cfg); err == nil || !strings.Contains(err.Error(), "batch_size") {
+		t.Fatalf("batch_size over 10000 must be rejected, got: %v", err)
+	}
+	cfg = base()
+	cfg.Store.Mongo.BatchSize = 10000
+	if err := validate(cfg); err != nil {
+		t.Fatalf("batch_size 10000 is the inclusive cap: %v", err)
+	}
+
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	setDefaults()
+	if got := viper.GetInt("store.mongodb.index_timeout_ms"); got != 300000 {
+		t.Fatalf("store.mongodb.index_timeout_ms default = %d, want 300000 (matches postgres schema_apply_timeout_ms)", got)
 	}
 }

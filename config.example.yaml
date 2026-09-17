@@ -98,12 +98,19 @@ store:
   #   database: arcade
   #   # Connect + server-selection deadline for the initial handshake.
   #   connect_timeout_ms: 10000
-  #   # Deadline for single-document reads/writes and bounded lists.
+  #   # Deadline for single-document reads/writes and counts.
   #   op_timeout_ms: 3000
-  #   # Deadline for aggregates. Unbounded iterators use the caller's ctx.
+  #   # Deadline for limit-bounded queries: lists, pages, bulk-write chunks.
+  #   # Anything whose size scales with the data (iterators, per-block txid
+  #   # scans, the census aggregate) runs under the caller's context instead.
   #   query_timeout_ms: 8000
+  #   # Deadline for EnsureIndexes at boot; building indexes on a restored,
+  #   # populated collection can take minutes (cf. postgres
+  #   # schema_apply_timeout_ms).
+  #   index_timeout_ms: 300000
   #   max_pool_size: 64
-  #   # Max documents per bulk write / $in chunk.
+  #   # Documents per bulk-write chunk and per $in on the write paths (max
+  #   # 10000; read-path $in chunks are a fixed 1000).
   #   batch_size: 500
 
 # datahub_urls:

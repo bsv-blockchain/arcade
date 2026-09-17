@@ -319,10 +319,26 @@ func setMinedAndPublish(
 	extraInfo string,
 	onlyChanged bool,
 ) (changed int) {
+	// Every backend returns the rows it DID anchor alongside the error —
+	// Aerospike per chunk, Pebble and MongoDB per row — and those rows are
+	// MINED in the store from that moment. processed_at is stamped
+	// unconditionally on both paths that reach here, so nothing re-drives
+	// this block for them: if their MINED event is not
+	// published here it is never published, and subscribers keep them at
+	// SEEN_* forever. So log the failure and carry on with whatever landed;
+	// the rows that did not land stay SEEN_* and are picked up by a later
+	// re-mine (the reconciler's neighborhood pass or /reprocess).
 	prevs, mined, err := st.SetMinedByTxIDs(ctx, blockHash, blockHeight, txids)
 	if err != nil {
-		logger.Error("failed to set mined status", zap.Error(err))
-		return 0
+		logger.Error(
+			"failed to set mined status; publishing the rows that were anchored before the failure",
+			zap.Int("anchored", len(mined)),
+			zap.Int("requested", len(txids)),
+			zap.Error(err),
+		)
+		if len(mined) == 0 {
+			return 0
+		}
 	}
 	// onlyChanged: keep only actual anchor transitions. prevs and mined are
 	// parallel slices per the SetMinedByTxIDs contract.

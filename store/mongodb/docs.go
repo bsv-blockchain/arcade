@@ -71,7 +71,6 @@ const (
 	// GridFS files-collection fields. metadata.* are ours; uploadDate and
 	// length are written by the driver.
 	fMetaBlockHash    = "metadata.block_hash"
-	fMetaBlockHeight  = "metadata.block_height"
 	fMetaSubtreeIndex = "metadata.subtree_index"
 	fUploadDate       = "uploadDate"
 	fLength           = "length"
@@ -315,8 +314,10 @@ func (d blockProcessingDoc) toModel() *models.BlockProcessingStatus {
 	}
 }
 
-// leaseDoc is the leases collection document. expires_at is authoritative;
-// the TTL index on it is only housekeeping for abandoned leases.
+// leaseDoc is the leases collection document. expires_at, compared on the
+// client, is the only expiry that counts; the TTL index on it reaps rows an
+// hour after that (leaseReapGraceSeconds), never at it, so the server's clock
+// cannot expire a live lease.
 type leaseDoc struct {
 	Name      string    `bson:"_id"`
 	Holder    string    `bson:"holder"`

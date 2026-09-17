@@ -3,7 +3,9 @@
 // Design notes, in the order they matter:
 //
 //   - No multi-document transactions. Every method is correct against a
-//     standalone mongod (4.4 or newer: pipeline updates, $unset stages):
+//     standalone mongod (5.0 or newer — pipeline updates and $unset stages
+//     need 4.2, but the reconcile queue's $lookup sub-pipeline is only
+//     index-served from 5.0; CI runs 7):
 //     correctness comes from single-document atomicity, update filters that
 //     carry the guard (status lattice, "still anchored to this block"),
 //     aggregation-pipeline updates that evaluate bookkeeping against the row
@@ -51,6 +53,7 @@ const (
 	defaultConnectTimeout = 10 * time.Second
 	defaultOpTimeout      = 3 * time.Second
 	defaultQueryTimeout   = 8 * time.Second
+	defaultIndexTimeout   = 5 * time.Minute
 	defaultBatchSize      = 500
 	closeTimeout          = 10 * time.Second
 
@@ -91,7 +94,12 @@ type Store struct {
 
 	opTimeout    time.Duration
 	queryTimeout time.Duration
+	indexTimeout time.Duration
 	batchSize    int
+
+	// logger carries the warnings this package can only raise at runtime —
+	// best-effort blob cleanup that keeps failing, mostly. Never nil.
+	logger *zap.Logger
 
 	// tokenReplayLimit is maxTokenReplayScan, a field so tests can lower it.
 	tokenReplayLimit int64
@@ -113,7 +121,19 @@ func New(ctx context.Context, cfg config.Mongo, logger *zap.Logger) (*Store, err
 	}
 	connectTimeout := msOrDefault(cfg.ConnectTimeoutMs, defaultConnectTimeout)
 
-	opts := options.Client().ApplyURI(cfg.URI).SetAppName("arcade").
+	// ApplyURI is where a mongodb+srv:// seed list is resolved, and it does
+	// so synchronously through the net package's default resolver, which
+	// takes no context. Left alone it can outlive every deadline this package
+	// or the factory sets and wedge boot against a black-holed resolver, so
+	// it runs under ctx here; see awaitWithin for what that does and does not
+	// bound.
+	opts, err := awaitWithin(ctx, func() *options.ClientOptions {
+		return options.Client().ApplyURI(cfg.URI)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("mongodb: parsing uri: %w", err)
+	}
+	opts.SetAppName("arcade").
 		SetConnectTimeout(connectTimeout).
 		SetServerSelectionTimeout(connectTimeout)
 	// Every guard in this package is a read-then-write or a read-back of
@@ -156,6 +176,7 @@ func New(ctx context.Context, cfg config.Mongo, logger *zap.Logger) (*Store, err
 	}
 
 	s := newWithClient(client, cfg.Database, cfg)
+	s.logger = logger
 	s.ownsClient = true
 	return s, nil
 }
@@ -185,7 +206,9 @@ func newWithClient(client *mongo.Client, database string, cfg config.Mongo) *Sto
 		bumpCache:        bumpcache.New(),
 		opTimeout:        msOrDefault(cfg.OpTimeoutMs, defaultOpTimeout),
 		queryTimeout:     msOrDefault(cfg.QueryTimeoutMs, defaultQueryTimeout),
+		indexTimeout:     msOrDefault(cfg.IndexTimeoutMs, defaultIndexTimeout),
 		batchSize:        intOrDefault(cfg.BatchSize, defaultBatchSize),
+		logger:           zap.NewNop(),
 		tokenReplayLimit: maxTokenReplayScan,
 	}
 }

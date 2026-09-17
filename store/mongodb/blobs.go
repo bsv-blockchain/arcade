@@ -11,6 +11,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
@@ -98,8 +99,8 @@ const (
 	// upload, which is what lets sweepStale read "completed long ago and
 	// unreferenced" as "the writer died" instead of "the writer is slow".
 	// Far below staleUploadAge, so neither a descheduled goroutine nor skew
-	// between the server-stamped uploadDate and a sweeper's own clock can
-	// close the gap.
+	// between the uploading pod's clock (the driver stamps uploadDate from
+	// it) and a sweeping pod's clock can close the gap.
 	swapWindow = 5 * time.Minute
 
 	// manifestSwapAttempts bounds the retry of an upserting swap that lost
@@ -134,13 +135,18 @@ type stumpManifest struct {
 	UpdatedAt    time.Time     `bson:"updated_at"`
 }
 
-// blobRef is the (file id, length) pair a manifest resolves to.
+// blobRef is the (file id, length) pair a manifest resolves to, plus the
+// block height a bump manifest carries (zero on stump manifests, which key on
+// subtree instead). Height travels WITH the file reference so that a reader
+// which follows the manifest to a replacement file also gets that manifest's
+// height, never the one from the read it started with.
 type blobRef struct {
-	FileID bson.ObjectID `bson:"file_id"`
-	Length int64         `bson:"length"`
+	FileID      bson.ObjectID `bson:"file_id"`
+	Length      int64         `bson:"length"`
+	BlockHeight int64         `bson:"block_height"`
 }
 
-var projBlobRef = doc(kv(fFileID, 1), kv(fLength, 1))
+var projBlobRef = doc(kv(fFileID, 1), kv(fLength, 1), kv(fBlockHeight, 1))
 
 func stumpKey(blockHash string, subtreeIndex int64) string {
 	return fmt.Sprintf("%s:%d", blockHash, subtreeIndex)
@@ -186,8 +192,9 @@ type blobBucket struct {
 // the time the id is handed to a manifest.
 //
 // It also returns when the upload completed, sampled on the statement after
-// Close returns — Close is what makes the server stamp files.uploadDate, the
-// field sweepStale ages files by, so this is the closest a client can read
+// Close returns — Close is where the driver stamps files.uploadDate (from this
+// process's clock, not the server's), the field sweepStale ages files by, so
+// this is the closest a caller can read
 // that stamp without fetching it back. The caller measures its swapWindow
 // from here rather than from its own later statements, so nothing between
 // the two can be silently excluded from the window.
@@ -313,16 +320,22 @@ func (s *Store) readRef(ctx context.Context, manifests *mongo.Collection, key st
 // manifest now references a different file — a concurrent overwrite deleted
 // ref between the caller's manifest read and this download — it follows the
 // new reference once.
-func (s *Store) fetch(ctx context.Context, bucket *mongo.GridFSBucket, manifests *mongo.Collection, key string, ref blobRef) ([]byte, error) {
+//
+// It returns the reference the bytes were actually served from, so a caller
+// that reports manifest metadata alongside the payload reports the metadata
+// of the manifest that named the file, not of a manifest a rebuild has since
+// replaced.
+func (s *Store) fetch(ctx context.Context, bucket *mongo.GridFSBucket, manifests *mongo.Collection, key string, ref blobRef) ([]byte, blobRef, error) {
 	data, err := s.download(ctx, bucket, ref)
 	if err == nil {
-		return data, nil
+		return data, ref, nil
 	}
 	fresh, rerr := s.readRef(ctx, manifests, key)
 	if rerr != nil || fresh.FileID == ref.FileID {
-		return nil, err
+		return nil, ref, err
 	}
-	return s.download(ctx, bucket, fresh)
+	data, err = s.download(ctx, bucket, fresh)
+	return data, fresh, err
 }
 
 // replaceBlob is the shared write path. publishBlob does the work; this
@@ -356,7 +369,9 @@ func (s *Store) publishBlob(ctx context.Context, b *blobBucket, key, filename st
 	// file sweepStale is by then entitled to delete. Measured from inside
 	// upload, right after the Close that stamps uploadDate.
 	if waited := time.Since(uploaded); waited > swapWindow {
-		_ = s.deleteFile(ctx, b.bucket, id)
+		if derr := s.deleteFile(ctx, b.bucket, id); derr != nil {
+			s.logger.Warn("abandoned upload could not be deleted; the stale sweep will reclaim it", zap.String("key", key), zap.Error(derr))
+		}
 		return false, fmt.Errorf("blob %s: waited %s between upload and manifest swap, over the %s window", key, waited, swapWindow)
 	}
 	prev, hadPrev, err := s.swapManifest(ctx, b.manifests, key, set)
@@ -374,11 +389,16 @@ func (s *Store) publishBlob(ctx context.Context, b *blobBucket, key, filename st
 	// this writer's file to remove no matter what the checks below decide,
 	// and skipping it is how a second copy survives a concurrent overwrite.
 	if hadPrev && prev.FileID != id {
-		_ = s.deleteFile(ctx, b.bucket, prev.FileID)
+		if derr := s.deleteFile(ctx, b.bucket, prev.FileID); derr != nil {
+			// Not fatal — the new file is in force — but not silent either:
+			// a delete that keeps failing is how chunks pile up unnoticed.
+			s.logger.Warn("superseded blob file could not be deleted; the stale sweep will reclaim it", zap.String("key", key), zap.Error(derr))
+		}
 	}
 	// One thing below the swap is worth a round trip. The swapWindow check
-	// runs on this host's clock, so a stall between the server stamping
-	// uploadDate and the sample taken just after Close is invisible to it,
+	// runs on this host's clock, so a stall between the driver stamping
+	// uploadDate inside Close and the sample taken just after it is
+	// invisible to the check,
 	// and in that sliver a sweeper could have taken this upload for a crash
 	// leftover — leaving the manifest pointing at nothing, which no read
 	// repairs and no write notices. publishedFileLost detects exactly that,
@@ -422,7 +442,8 @@ func (s *Store) publishedFileLost(ctx context.Context, b *blobBucket, key string
 // sweepStale deletes files under scope (metadata equality) whose upload
 // completed more than staleUploadAge ago and that are not keep: uploads
 // whose writer died before the manifest swap. Best-effort — the write that
-// called it has already landed.
+// called it has already landed — but not silent: a sweep that keeps failing
+// is how chunks accumulate until the disk fills, so every failure is logged.
 func (s *Store) sweepStale(ctx context.Context, bucket *mongo.GridFSBucket, scope bson.D, keep bson.ObjectID) {
 	cutoff := time.Now().Add(-staleUploadAge)
 	filter := doc(kv(fUploadDate, doc(kv(opLt, cutoff))), kv(fID, doc(kv(opNe, keep))))
@@ -433,16 +454,20 @@ func (s *Store) sweepStale(ctx context.Context, bucket *mongo.GridFSBucket, scop
 	defer cancel()
 	cur, err := bucket.GetFilesCollection().Find(qctx, filter, options.Find().SetProjection(projID))
 	if err != nil {
+		s.logger.Warn("stale upload sweep could not list files", zap.Any("scope", scope), zap.Error(err))
 		return
 	}
 	var stale []struct {
 		ID bson.ObjectID `bson:"_id"`
 	}
 	if err := cur.All(qctx, &stale); err != nil {
+		s.logger.Warn("stale upload sweep could not read the file list", zap.Any("scope", scope), zap.Error(err))
 		return
 	}
 	for _, f := range stale {
-		_ = s.deleteFile(ctx, bucket, f.ID)
+		if derr := s.deleteFile(ctx, bucket, f.ID); derr != nil {
+			s.logger.Warn("stale upload could not be deleted", zap.String("file_id", f.ID.Hex()), zap.Error(derr))
+		}
 	}
 }
 
@@ -479,11 +504,14 @@ func (s *Store) GetBUMP(ctx context.Context, blockHash string) (uint64, []byte, 
 	if err != nil {
 		return 0, nil, fmt.Errorf("get bump %s: %w", blockHash, err)
 	}
-	data, err := s.fetch(ctx, s.bumps.bucket, s.bumps.manifests, blockHash, blobRef{FileID: m.FileID, Length: m.Length})
+	data, served, err := s.fetch(ctx, s.bumps.bucket, s.bumps.manifests, blockHash,
+		blobRef{FileID: m.FileID, Length: m.Length, BlockHeight: m.BlockHeight})
 	if err != nil {
 		return 0, nil, fmt.Errorf("get bump %s: %w", blockHash, err)
 	}
-	return heightFromInt64(m.BlockHeight), data, nil
+	// served, not m: if fetch followed the manifest to a replacement file,
+	// the height must be the replacement's too.
+	return heightFromInt64(served.BlockHeight), data, nil
 }
 
 // DeleteBUMPByBlockHash implements store.Store; idempotent, and the cache
@@ -588,7 +616,9 @@ func (s *Store) GetStumpsByBlockHash(ctx context.Context, blockHash string) ([]*
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		data, err := s.fetch(ctx, s.stumps.bucket, s.stumps.manifests, m.Key, blobRef{FileID: m.FileID, Length: m.Length})
+		// The subtree index is part of the key, so nothing a replacement
+		// could change is reported here; the served reference is not needed.
+		data, _, err := s.fetch(ctx, s.stumps.bucket, s.stumps.manifests, m.Key, blobRef{FileID: m.FileID, Length: m.Length})
 		if err != nil {
 			return nil, fmt.Errorf("get stumps %s/%d: %w", blockHash, m.SubtreeIndex, err)
 		}

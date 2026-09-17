@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
@@ -362,6 +364,268 @@ func TestFileMissing_AbsentVersusUnknown(t *testing.T) {
 	cancel()
 	if gone, err := s.fileMissing(dead, s.bumps.bucket, m.FileID); err == nil || gone {
 		t.Fatalf("cancelled check: gone=%v err=%v, want gone=false and an error", gone, err)
+	}
+}
+
+// A reader that opened the manifest before a rebuild and downloads after it
+// follows the manifest to the replacement file. The height it reports must be
+// the replacement manifest's as well: block height is metadata of the same
+// document that names the file, and pairing a new payload with the old height
+// is a wrong answer that looks like a right one.
+func TestFetch_FollowsReplacementWithItsOwnHeight(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const hash = "blk-height-swap"
+	if err := s.InsertBUMP(ctx, hash, 5, bytes.Repeat([]byte{5}, 256)); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := s.readRef(ctx, s.bumps.manifests, hash)
+	if err != nil || stale.BlockHeight != 5 {
+		t.Fatalf("initial ref: %+v, %v", stale, err)
+	}
+
+	// The rebuild lands at a different height and deletes the old file.
+	replacement := bytes.Repeat([]byte{6}, 512)
+	if err := s.InsertBUMP(ctx, hash, 6, replacement); err != nil {
+		t.Fatal(err)
+	}
+
+	data, served, err := s.fetch(ctx, s.bumps.bucket, s.bumps.manifests, hash, stale)
+	if err != nil {
+		t.Fatalf("fetch with a stale ref must follow the manifest: %v", err)
+	}
+	if !bytes.Equal(data, replacement) {
+		t.Fatalf("got %d bytes, want the replacement payload", len(data))
+	}
+	if served.FileID == stale.FileID || served.BlockHeight != 6 {
+		t.Fatalf("served ref must be the replacement's: %+v (stale %+v)", served, stale)
+	}
+	height, got, err := s.GetBUMP(ctx, hash)
+	if err != nil || height != 6 || !bytes.Equal(got, replacement) {
+		t.Fatalf("GetBUMP = (%d, %d bytes, %v), want (6, replacement, nil)", height, len(got), err)
+	}
+}
+
+// Issue #339's queue trap: a block that is orphaned, reconciled, resurrected
+// and orphaned again must re-enter the reconcile queue. It cannot if the
+// second orphaning leaves the first reconciled_at in place.
+func TestMarkBlocksOrphaned_ClearsReconciledAt(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const hash = "blk-339"
+	t0 := time.Unix(1700000000, 0).UTC()
+	if err := s.UpsertBlockHeaderSeen(ctx, hash, 500, t0); err != nil {
+		t.Fatal(err)
+	}
+	queued := func(want bool) {
+		t.Helper()
+		rows, err := s.ListOrphanedBlocksToReconcile(ctx, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := false
+		for _, r := range rows {
+			got = got || r.BlockHash == hash
+		}
+		if got != want {
+			t.Fatalf("queued = %v, want %v", got, want)
+		}
+	}
+	if err := s.MarkBlocksOrphaned(ctx, []string{hash}, t0.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	queued(true)
+	if err := s.MarkBlockReconciled(ctx, hash, t0.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	queued(false)
+	// Orphaned again — a flip-flop, a tie scan, a full-scan re-mark.
+	if err := s.MarkBlocksOrphaned(ctx, []string{hash}, t0.Add(3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	queued(true)
+	bp, err := s.GetBlockProcessingStatus(ctx, hash)
+	if err != nil || bp.ReconciledAt != nil {
+		t.Fatalf("re-orphaning must clear reconciled_at: %+v err=%v", bp, err)
+	}
+}
+
+// The package promises readers treat absent and null alike. $exists:false
+// does not: a row a migration wrote with an explicit null for processed_at or
+// reconciled_at would be invisible to the watchdog and the reconciler.
+func TestBlockQueues_ExplicitNullIsAbsent(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	t0 := time.Unix(1700000000, 0).UTC()
+
+	if err := s.UpsertBlockHeaderSeen(ctx, "blk-null-stale", 600, t0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.blocks.UpdateOne(ctx, idFilter("blk-null-stale"), doc(kv(opSet, doc(kv(fProcessedAt, nil))))); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := s.ListStaleBlockProcessingStatus(ctx, t0.Add(time.Hour), 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stale) != 1 || stale[0].BlockHash != "blk-null-stale" {
+		t.Fatalf("a row with processed_at: null must be listed as stale, got %+v", stale)
+	}
+
+	if err := s.UpsertBlockHeaderSeen(ctx, "blk-null-orphan", 601, t0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkBlocksOrphaned(ctx, []string{"blk-null-orphan"}, t0.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.blocks.UpdateOne(ctx, idFilter("blk-null-orphan"), doc(kv(opSet, doc(kv(fReconciledAt, nil))))); err != nil {
+		t.Fatal(err)
+	}
+	queue, err := s.ListOrphanedBlocksToReconcile(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(queue) != 1 || queue[0].BlockHash != "blk-null-orphan" {
+		t.Fatalf("a row with reconciled_at: null must be queued, got %+v", queue)
+	}
+}
+
+// Reads whose size scales with the data run under the caller's context, not
+// query_timeout_ms: a fixed deadline does not fail one call, it fails the same
+// call on every retry, and for GetTxIDsByBlockHash that leaves an orphaned
+// block MINED@orphan for good. A one-nanosecond query timeout proves neither
+// path consults it.
+func TestDataSizedReads_UseCallerContext(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedStatus(t, s, "sized-1", models.StatusSeenOnNetwork, time.Now())
+	if _, _, err := s.SetMinedByTxIDs(ctx, "blk-sized", 700, []string{"sized-1"}); err != nil {
+		t.Fatal(err)
+	}
+	seedStatus(t, s, "sized-2", models.StatusSeenOnNetwork, time.Now())
+	s.queryTimeout = time.Nanosecond
+
+	ids, err := s.GetTxIDsByBlockHash(ctx, "blk-sized")
+	if err != nil || len(ids) != 1 || ids[0] != "sized-1" {
+		t.Fatalf("GetTxIDsByBlockHash under a 1ns query timeout = (%v, %v); must use the caller's ctx", ids, err)
+	}
+	census, err := s.CensusStatusesSince(ctx, time.Unix(0, 0), time.Now().Add(time.Hour), []models.Status{models.StatusSeenOnNetwork})
+	if err != nil || census[models.StatusSeenOnNetwork].Count != 1 {
+		t.Fatalf("CensusStatusesSince under a 1ns query timeout = (%+v, %v); must use the caller's ctx", census, err)
+	}
+}
+
+// The lease TTL index reaps an hour AFTER expiry, never at it, so the server's
+// clock cannot delete a live lease and hand it to a second holder.
+func TestLeaseIndex_ReapsWithGrace(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	cur, err := s.leases.Indexes().List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var specs []bson.M
+	if err := cur.All(ctx, &specs); err != nil {
+		t.Fatal(err)
+	}
+	for _, spec := range specs {
+		if spec["name"] != idxLeaseExpires {
+			continue
+		}
+		if got := spec["expireAfterSeconds"]; got == nil || fmt.Sprint(got) != fmt.Sprint(leaseReapGraceSeconds) {
+			t.Fatalf("expireAfterSeconds = %v, want %d", got, leaseReapGraceSeconds)
+		}
+		return
+	}
+	t.Fatalf("index %s not found in %+v", idxLeaseExpires, specs)
+}
+
+// An empty txid is "unknown", as Pebble and Postgres report it — not an error
+// that fails the whole returning batch after its other rows were applied.
+func TestUpdateStatusReturning_EmptyTxIDIsUnknown(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedStatus(t, s, "known", models.StatusReceived, time.Now())
+	if _, err := s.UpdateStatusReturning(ctx, &models.TransactionStatus{TxID: "", Status: models.StatusSeenOnNetwork}); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("empty txid: err = %v, want store.ErrNotFound", err)
+	}
+	prevs, err := s.BatchUpdateStatusReturning(ctx, []*models.TransactionStatus{
+		{TxID: "known", Status: models.StatusSeenOnNetwork},
+		{TxID: "", Status: models.StatusSeenOnNetwork},
+	})
+	if err != nil {
+		t.Fatalf("a malformed entry must not fail the batch: %v", err)
+	}
+	if len(prevs) != 2 || prevs[0] == nil || prevs[0].Status != models.StatusReceived || prevs[1] != nil {
+		t.Fatalf("prevs = %+v, want [known-pre-image, nil]", prevs)
+	}
+}
+
+// A database provisioned when the lease TTL was 0 must still boot after the
+// TTL changed: createIndexes on an existing index with different options is
+// IndexOptionsConflict, and the server's remedy for a changed TTL is collMod,
+// which EnsureIndexes now applies before retrying. A conflict on anything
+// other than a TTL is still a hard error.
+func TestEnsureIndexes_RepairsChangedLeaseTTL(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	// Stage the pre-change deployment: the same index at expireAfterSeconds 0.
+	old := bson.D{{Key: "collMod", Value: collLeases}, {Key: "index", Value: bson.D{
+		{Key: "name", Value: idxLeaseExpires}, {Key: "expireAfterSeconds", Value: int32(0)},
+	}}}
+	if err := s.leases.Database().RunCommand(ctx, old).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnsureIndexes(ctx); err != nil {
+		t.Fatalf("EnsureIndexes must repair a changed TTL, got: %v", err)
+	}
+	cur, err := s.leases.Indexes().List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var specs []bson.M
+	if err := cur.All(ctx, &specs); err != nil {
+		t.Fatal(err)
+	}
+	for _, spec := range specs {
+		if spec["name"] == idxLeaseExpires {
+			if fmt.Sprint(spec["expireAfterSeconds"]) != fmt.Sprint(leaseReapGraceSeconds) {
+				t.Fatalf("TTL after repair = %v, want %d", spec["expireAfterSeconds"], leaseReapGraceSeconds)
+			}
+			return
+		}
+	}
+	t.Fatal("lease index missing after repair")
+}
+
+// The TTL repair is narrow: an IndexOptionsConflict about anything other than
+// expireAfterSeconds must still fail EnsureIndexes loudly, because a silently
+// coexisting index with the wrong options is worse than a boot failure.
+func TestEnsureIndexes_NonTTLConflictStillFails(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	// Stage an index with the same name, keys and TTL but sparse:true — an
+	// option the server includes in its equivalence check (unlike hidden,
+	// which it ignores) and which nothing here can or should repair.
+	if err := s.leases.Indexes().DropOne(ctx, idxLeaseExpires); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.leases.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: fExpiresAt, Value: 1}},
+		Options: options.Index().SetName(idxLeaseExpires).SetExpireAfterSeconds(leaseReapGraceSeconds).SetSparse(true),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err := s.EnsureIndexes(ctx)
+	if err == nil {
+		t.Fatal("a non-TTL option conflict must fail EnsureIndexes")
+	}
+	// The server reports a non-TTL mismatch as IndexKeySpecsConflict (86) or
+	// IndexOptionsConflict (85) depending on the option; either must surface
+	// unrepaired.
+	var se mongo.ServerError
+	if !errors.As(err, &se) || !(se.HasErrorCode(indexOptionsConflict) || se.HasErrorCode(86)) {
+		t.Fatalf("expected the index conflict to surface, got: %v", err)
 	}
 }
 

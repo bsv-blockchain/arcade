@@ -69,11 +69,22 @@ func (s *Store) MarkBlockBUMPBuilt(ctx context.Context, blockHash string, blockH
 }
 
 // MarkBlocksOrphaned implements store.Store; hashes without a row are skipped.
+//
+// It clears reconciled_at as well as setting the status. A block that was
+// orphaned, reconciled, resurrected and orphaned again would otherwise carry
+// its old reconciled_at into the new orphaning and never re-enter
+// ListOrphanedBlocksToReconcile — the issue #339 queue trap. PR #343 closes
+// it on the other backends the same way and also changes this method's
+// signature to return the transition count; port that here when it lands.
+// Each orphaning is a new reconciliation job.
 func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) error {
 	if len(blockHashes) == 0 {
 		return nil
 	}
-	update := doc(kv(opSet, doc(kv(fStatus, string(models.BlockStatusOrphaned)), kv(fOrphanedAt, msTrunc(orphanedAt)))))
+	update := doc(
+		kv(opSet, doc(kv(fStatus, string(models.BlockStatusOrphaned)), kv(fOrphanedAt, msTrunc(orphanedAt)))),
+		kv(opUnset, doc(kv(fReconciledAt, ""))),
+	)
 	octx, cancel := s.opCtx(ctx)
 	defer cancel()
 	if _, err := s.blocks.UpdateMany(octx, doc(kv(fID, doc(kv(opIn, blockHashes)))), update); err != nil {
@@ -183,7 +194,7 @@ func (s *Store) ListStaleBlockProcessingStatus(ctx context.Context, olderThan ti
 	}
 	filter := doc(
 		kv(fStatus, string(models.BlockStatusActive)),
-		kv(fProcessedAt, doc(kv(opExists, false))),
+		kv(fProcessedAt, nil),                               // matches absent AND explicit null (a migration's NULL), unlike $exists:false
 		kv(fHeaderSeenAt, doc(kv(opLt, msCeil(olderThan)))), // exclusive bound rounds up, see msCeil
 		kv(fBlockHeight, doc(kv(opGte, heightToInt64(minHeight)))),
 	)
@@ -211,7 +222,9 @@ func (s *Store) ListOrphanedBlocksToReconcile(ctx context.Context, limit int) ([
 	// first as MongoDB's native null ordering would put them.
 	nullsLast := time.Date(9999, 12, 31, 0, 0, 0, 0, time.UTC)
 	pipeline := mongo.Pipeline{
-		doc(kv(opMatch, doc(kv(fStatus, string(models.BlockStatusOrphaned)), kv(fReconciledAt, doc(kv(opExists, false)))))),
+		// reconciled_at: null matches absent and explicit null alike, so a row
+		// a migration wrote with NULL is queued like one this package unset.
+		doc(kv(opMatch, doc(kv(fStatus, string(models.BlockStatusOrphaned)), kv(fReconciledAt, nil)))),
 		// The active (canonical) row at the orphan's height, if any.
 		doc(kv("$lookup", doc(
 			kv("from", collBlockProcessing),

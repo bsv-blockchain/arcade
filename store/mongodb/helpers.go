@@ -72,13 +72,22 @@ func chunks(ids []string, n int) [][]string {
 	return out
 }
 
-// msNow is the current time at BSON resolution.
-func msNow() time.Time { return msTrunc(time.Now()) }
+// msNow is the millisecond-aligned write timestamp, in UTC so that a value
+// this package hands back to a caller compares equal (==, not just Equal) to
+// the same instant read back from the server, which always decodes as UTC.
+func msNow() time.Time { return msTrunc(time.Now().UTC()) }
 
 // forEach runs fn(i) for every i in [0, n) with at most store.BatchConcurrency
 // calls in flight — the same operator knob the shared batch helpers honour.
 // The first error is returned after every started call has finished; once
-// ctx is done no further calls start.
+// ctx is done, or any call has failed, no further calls start.
+//
+// Stopping at the first failure is what keeps a per-row loop from turning an
+// outage into a marathon: with the server gone, a million-row block would
+// otherwise pay op_timeout_ms for every remaining row before returning, and
+// the rows it did write meanwhile are exactly as partial as they would be
+// after one failure. Callers get the same (partial results, first error)
+// pair either way, just promptly.
 func forEach(ctx context.Context, n int, fn func(i int) error) error {
 	sem := make(chan struct{}, store.BatchConcurrency())
 	var wg sync.WaitGroup
@@ -91,7 +100,22 @@ func forEach(ctx context.Context, n int, fn func(i int) error) error {
 		}
 		mu.Unlock()
 	}
+	failed := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return firstErr != nil
+	}
 	for i := 0; i < n; i++ {
+		// Checked explicitly: a select with both a free slot and a done ctx
+		// ready picks at random, which is how a cancelled loop still started
+		// most of its calls.
+		if err := ctx.Err(); err != nil {
+			record(err)
+			break
+		}
+		if failed() {
+			break
+		}
 		select {
 		case sem <- struct{}{}:
 		case <-ctx.Done():
@@ -123,4 +147,26 @@ func withDupKeyRetry(op func() error) error {
 		}
 	}
 	return err
+}
+
+// awaitWithin runs fn on its own goroutine and returns its result, or ctx's
+// error if the deadline passes first. It exists for calls that cannot take a
+// context themselves — the SRV/TXT lookups behind a mongodb+srv:// URI are
+// the case in this package — so that boot can stop waiting on them.
+//
+// What it bounds is the caller's wait, not fn: an abandoned fn keeps running
+// until it returns on its own, and its result is discarded. For a DNS lookup
+// that is the OS resolver's own timeout (attempts × per-query timeout, tens of
+// seconds), which is what makes abandoning it acceptable — the goroutine is
+// leaked for a bounded time, not forever.
+func awaitWithin[T any](ctx context.Context, fn func() T) (T, error) {
+	done := make(chan T, 1)
+	go func() { done <- fn() }()
+	select {
+	case v := <-done:
+		return v, nil
+	case <-ctx.Done():
+		var zero T
+		return zero, ctx.Err()
+	}
 }

@@ -54,11 +54,10 @@ func New(ctx context.Context, cfg *config.Config, logger *zap.Logger) (store.Sto
 	case "mongodb":
 		// Server selection against an unreachable or misconfigured deployment
 		// is bounded by store.mongodb.connect_timeout_ms; the outer ceiling
-		// keeps a pathological TLS handshake from hanging the CLI. It does NOT
-		// cover a mongodb+srv:// URI's SRV/TXT lookup: the driver resolves that
-		// inside ApplyURI, synchronously and with no context, before this
-		// deadline is ever consulted, so a black-holed resolver still wedges
-		// boot past this ceiling.
+		// keeps a pathological TLS handshake — or a mongodb+srv:// SRV/TXT
+		// lookup against a black-holed resolver, which the driver runs with no
+		// context of its own and New therefore waits on under this ctx — from
+		// hanging the CLI.
 		mongoCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer cancel()
 		s, err := mongodb.New(mongoCtx, cfg.Store.Mongo, logger)
