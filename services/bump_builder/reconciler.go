@@ -459,14 +459,18 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 	if height > 0 && height <= math.MaxUint32 {
 		if active, err := r.chainHeader.GetHeaderByHeight(ctx, uint32(height)); err == nil && active != nil {
 			canonicalHash = active.Hash.String()
-			if n, ok := r.remineFromStoredBUMP(ctx, logger, canonicalHash, batchSize); ok {
-				canonicalReady = true
-				reanchored += n
-			}
+			// n is added either way: rows this pass really did re-anchor are
+			// re-anchored whether or not the rest of the batch landed, and
+			// the deferred return below is the only path that would otherwise
+			// drop them from the metric.
+			n, ok := r.remineFromStoredBUMP(ctx, logger, canonicalHash, batchSize)
+			reanchored += n
+			canonicalReady = ok
 		}
 	}
 	if !canonicalReady && canonicalHash != "" {
 		if r.deferForCanonicalBUMP(ctx, logger, orphan, canonicalHash) {
+			metrics.ReconcilerTxsReanchoredTotal.Add(float64(reanchored))
 			return "deferred"
 		}
 	}
@@ -608,7 +612,8 @@ func (r *Reconciler) deferForCanonicalBUMP(ctx context.Context, logger *zap.Logg
 	}
 	r.defers[orphan]++
 	logger.Info(
-		"canonical block's BUMP not stored yet — deferring",
+		"canonical block not yet usable (BUMP unstored, unparseable, or its re-mine "+
+			"did not land in full) — deferring",
 		zap.String("canonical_block_hash", canonicalHash),
 		zap.Int("defer_attempt", r.defers[orphan]),
 	)
@@ -679,7 +684,26 @@ func (r *Reconciler) reanchorNeighborhood(ctx context.Context, logger *zap.Logge
 
 // remineFromStoredBUMP re-mines every level-0 txid of blockHash's stored
 // compound BUMP against it (onlyChanged — no duplicate events for rows
-// already anchored right). ok=false when no usable BUMP is stored.
+// already anchored right).
+//
+// ok=false when no usable BUMP is stored, AND when the re-mine did not land
+// in full. Both mean the same thing to the caller: this canonical block has
+// not been proven to hold what it holds, so the orphan is not ready to
+// reconcile. A partial re-mine is the more dangerous of the two, because it
+// looks like success — the rows it failed to write are provably IN this
+// canonical BUMP and stay anchored to the orphan, the neighborhood pass only
+// walks heights ABOVE the orphan so it cannot claim them, and the caller
+// would then revert them to SEEN_ON_NETWORK and stamp reconciled_at. That
+// un-mines transactions that are demonstrably mined, and nothing re-drives
+// them afterwards: the canonical block already has its BUMP and its
+// processed_at, and the orphan has left the queue.
+//
+// Reporting not-ready instead routes the caller into deferForCanonicalBUMP,
+// which leaves reconciled_at unstamped and pokes merkle-service /reprocess
+// for the canonical block — re-driving it is exactly the remedy, since that
+// re-mines its full level-0 set. At the defer cap the block parks, leaving
+// the rows MINED@orphan rather than reverted, which is the outcome this
+// design already chose for "we cannot prove where these belong".
 func (r *Reconciler) remineFromStoredBUMP(ctx context.Context, logger *zap.Logger, blockHash string, batchSize int) (changed int, ok bool) {
 	bumpHeight, bumpBytes, err := r.store.GetBUMP(ctx, blockHash)
 	if err != nil || len(bumpBytes) == 0 {
@@ -691,17 +715,26 @@ func (r *Reconciler) remineFromStoredBUMP(ctx context.Context, logger *zap.Logge
 			zap.String("canonical_block_hash", blockHash), zap.Error(err))
 		return 0, false
 	}
+	complete := true
 	for start := 0; start < len(txids); start += batchSize {
 		end := min(start+batchSize, len(txids))
-		// A partial re-anchor needs no retry signal here: whatever stayed
-		// anchored to the orphan is still in the block's index, so the revert
-		// below (or the park) resolves it, and MINED@orphan → MINED@canonical
-		// remains lattice-legal for a later pass.
-		n, _ := setMinedAndPublish(ctx, logger, r.store, r.publisher,
+		n, chunkComplete := setMinedAndPublish(ctx, logger, r.store, r.publisher,
 			blockHash, bumpHeight, txids[start:end], models.ExtraInfoReorgReanchor, true)
 		changed += n
+		if !chunkComplete {
+			complete = false
+		}
 	}
-	return changed, true
+	if !complete {
+		logger.Warn(
+			"canonical re-mine did not land in full; treating the orphan as unreconciled so its "+
+				"txs are not reverted while still provably in this block",
+			zap.String("canonical_block_hash", blockHash),
+			zap.Int("txs_reanchored", changed),
+			zap.Int("txs_in_bump", len(txids)),
+		)
+	}
+	return changed, complete
 }
 
 // publishReverted fans out the bulk SEEN_ON_NETWORK correction events for a

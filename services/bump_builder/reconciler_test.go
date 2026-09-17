@@ -663,3 +663,69 @@ func TestReconciler_PublishesRevertedTxsWhenTheStoreAlsoErrors(t *testing.T) {
 		t.Fatalf("reconciled_at must NOT be stamped after a revert error: %+v err=%v", bp, err)
 	}
 }
+
+// failedMineStore reports an error from SetMinedByTxIDs with NO rows written
+// — the shape of a mine that failed on its first row (a primary step-down, a
+// pool exhausted), as distinct from partialMineStore, where every row landed
+// before the error.
+type failedMineStore struct {
+	store.Store
+}
+
+func (s *failedMineStore) SetMinedByTxIDs(
+	_ context.Context, _ string, _ uint64, _ []string,
+) ([]*models.TransactionStatus, []*models.TransactionStatus, error) {
+	return nil, nil, errors.New("primary stepped down before any row landed")
+}
+
+// TestReconciler_PartialCanonicalRemineDoesNotRevert: a canonical re-mine
+// that does not land in full must NOT let the orphan reconcile.
+//
+// The txs it failed to write are provably IN the canonical BUMP and are still
+// anchored to the orphan. The neighborhood pass only walks heights ABOVE the
+// orphan, so it cannot claim them. If the re-mine still reported ready, the
+// revert would take them to SEEN_ON_NETWORK and reconciled_at would be
+// stamped — un-mining transactions that are demonstrably mined, with nothing
+// left to re-drive them: the canonical block already has its BUMP and its
+// processed_at, and the orphan has left the queue.
+func TestReconciler_PartialCanonicalRemineDoesNotRevert(t *testing.T) {
+	ctx := context.Background()
+	base := newPebbleForTest(t)
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	stub.setHeightHeader(10, headerWithHash(t, recCanonical, 10))
+
+	seedMined(t, base, recOrphan, 10, recShared1)
+	_ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+	_ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	// The canonical BUMP IS stored and DOES contain the tx — so the only
+	// reason the re-anchor does not happen is the store failure.
+	if err := base.InsertBUMP(ctx, recCanonical, 10, makeCompoundForTest(t, 10, recShared1)); err != nil {
+		t.Fatalf("insert canonical BUMP: %v", err)
+	}
+
+	r := newTestReconciler(&failedMineStore{Store: base}, pub, stub, nil)
+	r.tick(ctx)
+
+	// The tx must still be MINED@orphan — not reverted, and not silently
+	// treated as belonging nowhere.
+	if got := statusOf(t, base, recShared1); got.Status != models.StatusMined || got.BlockHash != recOrphan {
+		t.Fatalf("a failed canonical re-mine must leave the tx MINED@orphan, got %s@%s", got.Status, got.BlockHash)
+	}
+	for _, ev := range pub.bulkEvents() {
+		if ev.Status == models.StatusSeenOnNetwork {
+			t.Fatalf("no revert event may be published for a tx still provably in the canonical BUMP: %+v", ev)
+		}
+	}
+	// And the block must stay queued so a later tick can retry.
+	if rows, _ := base.ListOrphanedBlocksToReconcile(ctx, 10); len(rows) != 1 {
+		t.Fatalf("orphan must stay queued after a failed canonical re-mine, got %d rows", len(rows))
+	}
+
+	// Once the store recovers, the ordinary path completes the reconcile.
+	r.store = base
+	r.tick(ctx)
+	if got := statusOf(t, base, recShared1); got.BlockHash != recCanonical {
+		t.Fatalf("recovered tick must re-anchor to canonical, got %s@%s", got.Status, got.BlockHash)
+	}
+}
