@@ -269,11 +269,14 @@ func TestSetMinedAndPublish_OnlyChangedFiltersEvents(t *testing.T) {
 	}
 	pub := &capturePublisher{}
 
-	changed := setMinedAndPublish(context.Background(), zap.NewNop(), st, pub,
+	changed, complete := setMinedAndPublish(context.Background(), zap.NewNop(), st, pub,
 		guardBlockA, 10, []string{txAlready, txReanchor, txFresh},
 		models.ExtraInfoReorgReanchor, true)
 	if changed != 2 {
 		t.Fatalf("expected 2 changed rows (re-anchor + fresh), got %d", changed)
+	}
+	if !complete {
+		t.Fatal("complete = false on a store write that did not error")
 	}
 
 	bulks := pub.bulkEvents()
@@ -323,10 +326,15 @@ func TestSetMinedAndPublish_PublishesRowsAnchoredBeforeTheError(t *testing.T) {
 	seedSeen(t, base, recShared1, recShared2)
 	pub := &capturePublisher{}
 
-	changed := setMinedAndPublish(ctx, zap.NewNop(), &partialMineStore{Store: base}, pub,
+	changed, complete := setMinedAndPublish(ctx, zap.NewNop(), &partialMineStore{Store: base}, pub,
 		recCanonical, 10, []string{recShared1, recShared2}, "", false)
 	if changed != 2 {
 		t.Fatalf("changed = %d, want 2 (both rows landed before the error)", changed)
+	}
+	// The rows that landed are published, but the call still reports the
+	// failure: the caller must withhold processed_at so the block re-drives.
+	if complete {
+		t.Fatal("complete = true although SetMinedByTxIDs returned an error")
 	}
 	var minedEv *models.TransactionStatus
 	for _, ev := range pub.bulkEvents() {
@@ -341,5 +349,73 @@ func TestSetMinedAndPublish_PublishesRowsAnchoredBeforeTheError(t *testing.T) {
 		if st := statusOf(t, base, id); st.Status != models.StatusMined {
 			t.Fatalf("%s: %s, want MINED in the store", id, st.Status)
 		}
+	}
+}
+
+// partialMineRecordingStore is partialMineStore over the guard tests' mock:
+// the rows land, then the call reports an error.
+type partialMineRecordingStore struct {
+	*orphanRecordingStore
+}
+
+func (s *partialMineRecordingStore) SetMinedByTxIDs(
+	ctx context.Context, blockHash string, blockHeight uint64, txids []string,
+) ([]*models.TransactionStatus, []*models.TransactionStatus, error) {
+	prevs, mined, err := s.orphanRecordingStore.SetMinedByTxIDs(ctx, blockHash, blockHeight, txids)
+	if err != nil {
+		return prevs, mined, err
+	}
+	return prevs, mined, errors.New("primary stepped down after these rows")
+}
+
+// TestTryShortCircuit_PartialMineWithholdsProcessedStamp: processed_at is the
+// only thing keeping a block in the watchdog's stale scan, and a block with a
+// stored BUMP is never rebuilt — so stamping it after a mine that only partly
+// landed strands the unwritten rows at SEEN_* with nothing to re-drive them.
+// The stamp must wait for a mine that completed.
+func TestTryShortCircuit_PartialMineWithholdsProcessedStamp(t *testing.T) {
+	seed := func() *orphanRecordingStore {
+		ms := &orphanRecordingStore{mockStore: newMockStore()}
+		ms.mu.Lock()
+		ms.bumps[guardBlockB] = makeMinimalSTUMPAtHeight(t, guardTxid, 10)
+		ms.bumpHeights[guardBlockB] = 10
+		ms.mu.Unlock()
+		return ms
+	}
+	stub := &stubChaintracks{}
+	stub.setHeightHeader(10, headerWithHash(t, guardBlockB, 10)) // B is canonical
+
+	// Control: a mine that completes stamps, so the block retires from the
+	// watchdog exactly as before.
+	ok := seed()
+	b := guardBuilder(ok, stub, true)
+	if !b.tryShortCircuit(context.Background(), zap.NewNop(), guardBlockB) {
+		t.Fatal("short-circuit should have handled the redelivery")
+	}
+	ok.mu.Lock()
+	okProcessed := len(ok.processedCalls)
+	ok.mu.Unlock()
+	if okProcessed != 1 {
+		t.Fatalf("a complete mine must stamp processed_at, got %d calls", okProcessed)
+	}
+
+	// Partial mine: the rows that landed are published (that is
+	// setMinedAndPublish's job), but processed_at stays NULL so the watchdog
+	// re-fires BLOCK_PROCESSED and this same path re-mines the stored BUMP.
+	partial := seed()
+	b = guardBuilder(partial, stub, true)
+	b.store = &partialMineRecordingStore{orphanRecordingStore: partial}
+	if !b.tryShortCircuit(context.Background(), zap.NewNop(), guardBlockB) {
+		t.Fatal("short-circuit should have handled the redelivery")
+	}
+	partial.mu.Lock()
+	mined := len(partial.minedCalls)
+	processed := len(partial.processedCalls)
+	partial.mu.Unlock()
+	if mined != 1 {
+		t.Fatalf("the mine must still be attempted, got %d calls", mined)
+	}
+	if processed != 0 {
+		t.Fatalf("a partial mine must leave processed_at unstamped so the watchdog re-drives the block, got %d calls", processed)
 	}
 }

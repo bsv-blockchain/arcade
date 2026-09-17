@@ -405,3 +405,35 @@ func TestQueryTimeBounds(t *testing.T) {
 		t.Fatal("zero since must produce no clause")
 	}
 }
+
+// TestMsTrunc_NormalizesToUTC: a BSON datetime decodes as UTC, so a caller's
+// non-UTC timestamp must be converted before it is written back into the
+// caller's struct — otherwise the struct this package hands back differs from
+// a later read under == / reflect.DeepEqual even though both name the same
+// instant.
+func TestMsTrunc_NormalizesToUTC(t *testing.T) {
+	zone := time.FixedZone("UTC+7", 7*60*60)
+	local := time.Date(2026, 3, 4, 5, 6, 7, 123_456_789, zone)
+
+	got := msTrunc(local)
+	if got.Location() != time.UTC {
+		t.Fatalf("msTrunc kept location %v, want UTC", got.Location())
+	}
+	// Same instant, millisecond-floored — the conversion must not shift it.
+	if want := local.Truncate(time.Millisecond); !got.Equal(want) {
+		t.Fatalf("msTrunc(%v) = %v, want the same instant %v", local, got, want)
+	}
+	// What the server would hand back for that stored value, compared the way
+	// a caller compares it.
+	readBack := time.UnixMilli(got.UnixMilli()).UTC()
+	if got != readBack {
+		t.Fatalf("msTrunc result %v != server read-back %v under ==", got, readBack)
+	}
+
+	if l := msCeil(local).Location(); l != time.UTC {
+		t.Fatalf("msCeil kept location %v, want UTC", l)
+	}
+	if !msTrunc(time.Time{}).IsZero() || !msCeil(time.Time{}).IsZero() {
+		t.Fatal("zero must stay zero so omitempty still drops it")
+	}
+}

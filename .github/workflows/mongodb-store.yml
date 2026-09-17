@@ -10,8 +10,11 @@ name: mongodb-store
 # fails the job instead of skipping every test. Scoped to the files that can
 # change the backend's behaviour — the package itself, the store interfaces
 # and shared suite, the shared bumpcache behind its merkle-path enrichment,
-# the models it persists, and the config and factory that select and construct
-# it — so unrelated PRs do not pay for it.
+# the bump package it parses compounds with, the models it persists, the
+# config and factory that select and construct it, and bump_builder, whose
+# partial-write and reorg handling is written against this backend's
+# SetMinedByTxIDs / SetStatusByBlockHash return contract — so unrelated PRs do
+# not pay for it.
 # ------------------------------------------------------------------------------------
 
 on:
@@ -22,6 +25,8 @@ on:
       - "store/bumpcache/**"
       - "store/factory/**"
       - "store/storetest/**"
+      - "bump/**"
+      - "services/bump_builder/**"
       - "models/**"
       - "config/**"
       - "go.mod"

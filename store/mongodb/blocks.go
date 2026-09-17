@@ -85,10 +85,30 @@ func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, or
 		kv(opSet, doc(kv(fStatus, string(models.BlockStatusOrphaned)), kv(fOrphanedAt, msTrunc(orphanedAt)))),
 		kv(opUnset, doc(kv(fReconciledAt, ""))),
 	)
-	octx, cancel := s.opCtx(ctx)
-	defer cancel()
-	if _, err := s.blocks.UpdateMany(octx, doc(kv(fID, doc(kv(opIn, blockHashes)))), update); err != nil {
-		return fmt.Errorf("mark blocks orphaned: %w", err)
+	return s.updateBlocksIn(ctx, blockHashes, nil, update, "mark blocks orphaned")
+}
+
+// updateBlocksIn applies one update to every row named in blockHashes, in
+// batch_size chunks under the bulk-write deadline.
+//
+// The chunking is not cosmetic: an $in list is one command, and the driver
+// does not split it, so a deep reorg's hash list would eventually exceed the
+// 16 MB command limit and fail the whole call rather than degrade. Chunking
+// also makes the caller's slice the only unbounded thing in play — each
+// command is bounded by the same batch_size knob every other multi-row write
+// in this package honours. queryCtx, not opCtx: these are bulk writes whose
+// cost scales with the chunk, and op_timeout_ms is the point-operation budget.
+// extra, when non-nil, is ANDed onto the _id predicate.
+func (s *Store) updateBlocksIn(ctx context.Context, blockHashes []string, extra, update bson.D, what string) error {
+	for _, chunk := range chunks(dedupe(blockHashes), s.batchSize) {
+		filter := doc(kv(fID, doc(kv(opIn, chunk))))
+		filter = append(filter, extra...)
+		qctx, cancel := s.queryCtx(ctx)
+		_, err := s.blocks.UpdateMany(qctx, filter, update)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("%s: %w", what, err)
+		}
 	}
 	return nil
 }
@@ -108,13 +128,10 @@ func (s *Store) MarkBlocksParked(ctx context.Context, blockHashes []string) erro
 	if len(blockHashes) == 0 {
 		return nil
 	}
-	filter := doc(kv(fID, doc(kv(opIn, blockHashes))), kv(fStatus, string(models.BlockStatusActive)))
-	octx, cancel := s.opCtx(ctx)
-	defer cancel()
-	if _, err := s.blocks.UpdateMany(octx, filter, doc(kv(opSet, doc(kv(fStatus, string(models.BlockStatusParked)))))); err != nil {
-		return fmt.Errorf("mark blocks parked: %w", err)
-	}
-	return nil
+	return s.updateBlocksIn(ctx, blockHashes,
+		doc(kv(fStatus, string(models.BlockStatusActive))),
+		doc(kv(opSet, doc(kv(fStatus, string(models.BlockStatusParked))))),
+		"mark blocks parked")
 }
 
 // GetBlockProcessingStatus implements store.Store.

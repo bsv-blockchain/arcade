@@ -72,10 +72,11 @@ func chunks(ids []string, n int) [][]string {
 	return out
 }
 
-// msNow is the millisecond-aligned write timestamp, in UTC so that a value
-// this package hands back to a caller compares equal (==, not just Equal) to
-// the same instant read back from the server, which always decodes as UTC.
-func msNow() time.Time { return msTrunc(time.Now().UTC()) }
+// msNow is the millisecond-aligned write timestamp. msTrunc normalizes to UTC
+// so that a value this package hands back to a caller compares equal (==, not
+// just Equal) to the same instant read back from the server, which always
+// decodes as UTC.
+func msNow() time.Time { return msTrunc(time.Now()) }
 
 // forEach runs fn(i) for every i in [0, n) with at most store.BatchConcurrency
 // calls in flight — the same operator knob the shared batch helpers honour.

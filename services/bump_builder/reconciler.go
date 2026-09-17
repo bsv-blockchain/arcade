@@ -668,8 +668,9 @@ func (r *Reconciler) reanchorNeighborhood(ctx context.Context, logger *zap.Logge
 		}
 		for start := 0; start < len(contained); start += batchSize {
 			end := min(start+batchSize, len(contained))
-			reanchored += setMinedAndPublish(ctx, logger, r.store, r.publisher,
+			n, _ := setMinedAndPublish(ctx, logger, r.store, r.publisher,
 				neighbor, h, contained[start:end], models.ExtraInfoReorgReanchor, true)
+			reanchored += n
 		}
 		affected = rest
 	}
@@ -692,8 +693,13 @@ func (r *Reconciler) remineFromStoredBUMP(ctx context.Context, logger *zap.Logge
 	}
 	for start := 0; start < len(txids); start += batchSize {
 		end := min(start+batchSize, len(txids))
-		changed += setMinedAndPublish(ctx, logger, r.store, r.publisher,
+		// A partial re-anchor needs no retry signal here: whatever stayed
+		// anchored to the orphan is still in the block's index, so the revert
+		// below (or the park) resolves it, and MINED@orphan → MINED@canonical
+		// remains lattice-legal for a later pass.
+		n, _ := setMinedAndPublish(ctx, logger, r.store, r.publisher,
 			blockHash, bumpHeight, txids[start:end], models.ExtraInfoReorgReanchor, true)
+		changed += n
 	}
 	return changed, true
 }

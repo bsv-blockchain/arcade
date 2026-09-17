@@ -486,13 +486,23 @@ func trackerFilter(scan store.TrackerScan) bson.D {
 
 // --- scalar helpers ---
 
-// msTrunc truncates t to BSON datetime resolution. Zero stays zero so
-// omitempty still drops it.
+// msTrunc truncates t to BSON datetime resolution and normalizes it to UTC.
+// Zero stays zero so omitempty still drops it.
+//
+// The UTC conversion is part of the write-back invariant, not cosmetic: a BSON
+// datetime carries no zone, so the driver decodes every stored timestamp as
+// UTC. A caller handing us a time.Time in Local (or any other location) would
+// otherwise keep its own wall/zone in the struct we wrote back while a later
+// read of the same row returns the same instant in UTC — equal under
+// time.Time.Equal but NOT under == or reflect.DeepEqual, which is the
+// comparison the contract tests and callers actually use. Truncate itself is
+// zone-independent (it rounds the absolute time since the zero instant), so
+// truncating before or after the conversion gives the same answer.
 func msTrunc(t time.Time) time.Time {
 	if t.IsZero() {
 		return t
 	}
-	return t.Truncate(time.Millisecond)
+	return t.Truncate(time.Millisecond).UTC()
 }
 
 // msCeil rounds t UP to the next millisecond unless it is already aligned.
@@ -505,7 +515,7 @@ func msCeil(t time.Time) time.Time {
 	if t.IsZero() {
 		return t
 	}
-	floored := t.Truncate(time.Millisecond)
+	floored := t.Truncate(time.Millisecond).UTC()
 	if floored.Equal(t) {
 		return floored
 	}

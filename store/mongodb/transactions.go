@@ -482,8 +482,18 @@ func (s *Store) GetTxIDsByBlockHash(ctx context.Context, blockHash string) ([]st
 // batch loops — and exact: no snapshot to go stale, no version to race, and
 // no aggregate bulk count to disambiguate.
 
-// projPreimage is the pre-image the rewrites return: the fields the
-// transition-age metric and the reorg consumers read.
+// projPreimage is the pre-image the block-scoped rewrites return. It is an
+// inclusion projection on purpose and it is NOT the BatchUpdateStatusReturning
+// pre-image (that one is projNoRawTx above, which carries extra_info and
+// everything else the interface guarantees there).
+//
+// These four fields are the whole of SetMinedByTxIDs' documented `prevs`
+// contract — the transition-age metric reads Status and Timestamp, and the
+// re-anchor filter reads the anchor — and they are exactly the columns
+// Postgres names in its own RETURNING list for the same call
+// (`t.txid, prev.status, prev.timestamp_at, prev.block_hash, prev.block_height`,
+// store/postgres/postgres.go). Widening it here would fetch raw_tx-adjacent
+// fields for every row of a million-row block to serve no caller.
 var projPreimage = doc(kv(fStatus, 1), kv(fTimestamp, 1), kv(fBlockHash, 1), kv(fBlockHeight, 1))
 
 func preimage(d txDoc) *models.TransactionStatus {
