@@ -95,8 +95,8 @@ func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, or
 // does not split it, so a deep reorg's hash list would eventually exceed the
 // 16 MB command limit and fail the whole call rather than degrade. Chunking
 // also makes the caller's slice the only unbounded thing in play — each
-// command is bounded by the same batch_size knob every other multi-row write
-// in this package honours. queryCtx, not opCtx: these are bulk writes whose
+// command is bounded by the same batch_size knob the rest of this package's
+// multi-row writes honour. queryCtx, not opCtx: these are bulk writes whose
 // cost scales with the chunk, and op_timeout_ms is the point-operation budget.
 // extra, when non-nil, is ANDed onto the _id predicate.
 func (s *Store) updateBlocksIn(ctx context.Context, blockHashes []string, extra, update bson.D, what string) error {
