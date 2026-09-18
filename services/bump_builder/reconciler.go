@@ -459,14 +459,18 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 	if height > 0 && height <= math.MaxUint32 {
 		if active, err := r.chainHeader.GetHeaderByHeight(ctx, uint32(height)); err == nil && active != nil {
 			canonicalHash = active.Hash.String()
-			if n, ok := r.remineFromStoredBUMP(ctx, logger, canonicalHash, batchSize); ok {
-				canonicalReady = true
-				reanchored += n
-			}
+			// n is added either way: rows this pass really did re-anchor are
+			// re-anchored whether or not the rest of the batch landed, and
+			// the deferred return below is the only path that would otherwise
+			// drop them from the metric.
+			n, ok := r.remineFromStoredBUMP(ctx, logger, canonicalHash, batchSize)
+			reanchored += n
+			canonicalReady = ok
 		}
 	}
 	if !canonicalReady && canonicalHash != "" {
 		if r.deferForCanonicalBUMP(ctx, logger, orphan, canonicalHash) {
+			metrics.ReconcilerTxsReanchoredTotal.Add(float64(reanchored))
 			return "deferred"
 		}
 	}
@@ -481,7 +485,19 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 		logger.Warn("failed to read affected txids", zap.Error(err))
 		return "error"
 	}
-	reanchored += r.reanchorNeighborhood(ctx, logger, affected, height, batchSize)
+	nbr, nbrComplete := r.reanchorNeighborhood(ctx, logger, affected, height, batchSize)
+	reanchored += nbr
+	if !nbrComplete {
+		// Leave reconciled_at unstamped and the block queued, exactly as a
+		// failed GetTxIDsByBlockHash above does. Neither the park nor the
+		// revert below is safe here: park would retire the block with rows
+		// stranded MINED@orphan that a neighbour's BUMP proves belong
+		// elsewhere, and revert would un-mine them outright.
+		metrics.ReconcilerTxsReanchoredTotal.Add(float64(reanchored))
+		logger.Warn("neighborhood re-anchor did not land in full; leaving the orphan queued",
+			zap.Int("txs_reanchored", reanchored))
+		return "error"
+	}
 
 	// Park vs revert for whatever is still anchored to O (issue #282). When
 	// the canonical block's BUMP was NOT available (canonicalReady == false),
@@ -504,12 +520,20 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 	// legacy fallback) — SEEN_ON_NETWORK puts them back in flight
 	// (rebroadcast/propagation owns them from here), and the store appends O
 	// to their orphaned-anchor history.
+	// Publish BEFORE the error check. SetStatusByBlockHash returns the rows it
+	// rewrote alongside any error — a page that failed mid-walk, or a block
+	// still taking mines faster than it can be retired — and those rows are
+	// already SEEN_ON_NETWORK in the store. They leave the block's index with
+	// that write, so a later retry will not find them again: if their event is
+	// not published here it is never published, and subscribers keep believing
+	// the txs are MINED. Publishing is idempotent for the subscriber, so the
+	// only wrong move is to skip it.
 	reverted, err := r.store.SetStatusByBlockHash(ctx, orphan, models.StatusSeenOnNetwork)
+	r.publishReverted(ctx, logger, reverted)
 	if err != nil {
-		logger.Warn("failed to revert remaining txs", zap.Error(err))
+		logger.Warn("failed to revert remaining txs", zap.Int("published", len(reverted)), zap.Error(err))
 		return "error"
 	}
-	r.publishReverted(ctx, logger, reverted)
 
 	// Cleanup: STUMPs are per-subtree intermediates, safe to drop. The
 	// compound BUMP is deliberately RETAINED — it serves the historical
@@ -600,7 +624,8 @@ func (r *Reconciler) deferForCanonicalBUMP(ctx context.Context, logger *zap.Logg
 	}
 	r.defers[orphan]++
 	logger.Info(
-		"canonical block's BUMP not stored yet — deferring",
+		"canonical block not yet usable (BUMP unstored, unparseable, or its re-mine "+
+			"did not land in full) — deferring",
 		zap.String("canonical_block_hash", canonicalHash),
 		zap.Int("defer_attempt", r.defers[orphan]),
 	)
@@ -615,23 +640,26 @@ func (r *Reconciler) deferForCanonicalBUMP(ctx context.Context, logger *zap.Logg
 // reanchorNeighborhood walks the heights above the orphan looking for
 // canonical blocks whose stored BUMPs contain the still-affected txs (a
 // deep reorg re-bins txs into later blocks) and re-anchors what it finds.
-// Returns the number of rows moved. The affected slice shrinks as txs are
-// claimed; whatever remains falls to the caller's revert.
-func (r *Reconciler) reanchorNeighborhood(ctx context.Context, logger *zap.Logger, affected []string, height uint64, batchSize int) int {
+// Returns the number of rows moved, and whether every mine it attempted
+// landed in full — an incomplete pass must not reach the caller's revert, for
+// the reason spelled out at the failure branch below.
+// The affected slice shrinks as txs are claimed; whatever remains falls to
+// the caller's revert.
+func (r *Reconciler) reanchorNeighborhood(ctx context.Context, logger *zap.Logger, affected []string, height uint64, batchSize int) (reanchored int, complete bool) {
 	if len(affected) == 0 {
-		return 0
+		return 0, true
 	}
 	// A placeholder orphan row with no resolvable height (height==0) has no
 	// meaningful neighborhood above it — walking heights 1..depth is
 	// nonsensical. Skip straight to the caller's revert.
 	if height == 0 {
-		return 0
+		return 0, true
 	}
 	depth := r.cfg.BumpBuilder.Reconciler.NeighborhoodDepth
 	if depth < 0 {
 		depth = 0
 	}
-	reanchored := 0
+	complete = true
 	for h := height + 1; h <= height+uint64(depth) && len(affected) > 0; h++ {
 		if h > math.MaxUint32 {
 			break
@@ -660,17 +688,51 @@ func (r *Reconciler) reanchorNeighborhood(ctx context.Context, logger *zap.Logge
 		}
 		for start := 0; start < len(contained); start += batchSize {
 			end := min(start+batchSize, len(contained))
-			reanchored += setMinedAndPublish(ctx, logger, r.store, r.publisher,
+			n, chunkComplete := setMinedAndPublish(ctx, logger, r.store, r.publisher,
 				neighbor, h, contained[start:end], models.ExtraInfoReorgReanchor, true)
+			reanchored += n
+			if !chunkComplete {
+				// Same hazard as a partial canonical re-mine, one height up:
+				// the rows this chunk failed to write are proven members of
+				// THIS neighbor's BUMP and are still anchored to the orphan,
+				// where the caller's revert would take them to
+				// SEEN_ON_NETWORK. Stop and report incomplete rather than
+				// letting the pass look finished.
+				//
+				// `affected` is not the thing that protects them — it only
+				// steers the remaining heights, while the revert works off
+				// the store's own block index — so shrinking it is neither
+				// the problem nor the fix.
+				return reanchored, false
+			}
 		}
 		affected = rest
 	}
-	return reanchored
+	return reanchored, complete
 }
 
 // remineFromStoredBUMP re-mines every level-0 txid of blockHash's stored
 // compound BUMP against it (onlyChanged — no duplicate events for rows
-// already anchored right). ok=false when no usable BUMP is stored.
+// already anchored right).
+//
+// ok=false when no usable BUMP is stored, AND when the re-mine did not land
+// in full. Both mean the same thing to the caller: this canonical block has
+// not been proven to hold what it holds, so the orphan is not ready to
+// reconcile. A partial re-mine is the more dangerous of the two, because it
+// looks like success — the rows it failed to write are provably IN this
+// canonical BUMP and stay anchored to the orphan, the neighborhood pass only
+// walks heights ABOVE the orphan so it cannot claim them, and the caller
+// would then revert them to SEEN_ON_NETWORK and stamp reconciled_at. That
+// un-mines transactions that are demonstrably mined, and nothing re-drives
+// them afterwards: the canonical block already has its BUMP and its
+// processed_at, and the orphan has left the queue.
+//
+// Reporting not-ready instead routes the caller into deferForCanonicalBUMP,
+// which leaves reconciled_at unstamped and pokes merkle-service /reprocess
+// for the canonical block — re-driving it is exactly the remedy, since that
+// re-mines its full level-0 set. At the defer cap the block parks, leaving
+// the rows MINED@orphan rather than reverted, which is the outcome this
+// design already chose for "we cannot prove where these belong".
 func (r *Reconciler) remineFromStoredBUMP(ctx context.Context, logger *zap.Logger, blockHash string, batchSize int) (changed int, ok bool) {
 	bumpHeight, bumpBytes, err := r.store.GetBUMP(ctx, blockHash)
 	if err != nil || len(bumpBytes) == 0 {
@@ -682,12 +744,33 @@ func (r *Reconciler) remineFromStoredBUMP(ctx context.Context, logger *zap.Logge
 			zap.String("canonical_block_hash", blockHash), zap.Error(err))
 		return 0, false
 	}
+	complete := true
 	for start := 0; start < len(txids); start += batchSize {
 		end := min(start+batchSize, len(txids))
-		changed += setMinedAndPublish(ctx, logger, r.store, r.publisher,
+		n, chunkComplete := setMinedAndPublish(ctx, logger, r.store, r.publisher,
 			blockHash, bumpHeight, txids[start:end], models.ExtraInfoReorgReanchor, true)
+		changed += n
+		if !chunkComplete {
+			// Stop, like reanchorNeighborhood and forEach do. One incomplete
+			// chunk already makes this attempt non-ready, and the retry
+			// re-mines the BUMP's full level-0 set, so the remaining chunks
+			// would buy no progress that the next tick does not — while
+			// during an outage each one pays its own store timeout, turning
+			// a large canonical block into a long stall in the reconciler.
+			complete = false
+			break
+		}
 	}
-	return changed, true
+	if !complete {
+		logger.Warn(
+			"canonical re-mine did not land in full; treating the orphan as unreconciled so its "+
+				"txs are not reverted while still provably in this block",
+			zap.String("canonical_block_hash", blockHash),
+			zap.Int("txs_reanchored", changed),
+			zap.Int("txs_in_bump", len(txids)),
+		)
+	}
+	return changed, complete
 }
 
 // publishReverted fans out the bulk SEEN_ON_NETWORK correction events for a

@@ -1,0 +1,1236 @@
+//go:build mongodb
+
+package mongodb
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"errors"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+
+	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/store"
+)
+
+// Behaviour that is specific to this backend or that no other backend's
+// suite pins: the census aggregate, since-filtering, GridFS atomicity and
+// size, the guarded per-row rewrites under concurrency, the replay bound,
+// and lease expiry.
+
+func seedStatus(t *testing.T, s *Store, txid string, status models.Status, ts time.Time) {
+	t.Helper()
+	if _, _, err := s.GetOrInsertStatus(context.Background(), &models.TransactionStatus{TxID: txid, Status: status, Timestamp: ts}); err != nil {
+		t.Fatalf("seed %s: %v", txid, err)
+	}
+}
+
+func TestCensusStatusesSince_HalfOpenWindow(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	base := time.Now().Truncate(time.Millisecond).Add(-time.Hour)
+	since, deadline := base.Add(10*time.Minute), base.Add(20*time.Minute)
+
+	seedStatus(t, s, "before", models.StatusReceived, since.Add(-time.Millisecond)) // out: < since
+	seedStatus(t, s, "at-since", models.StatusReceived, since)                      // in: >= since
+	seedStatus(t, s, "mid", models.StatusReceived, since.Add(5*time.Minute))        // in
+	seedStatus(t, s, "at-deadline", models.StatusReceived, deadline)                // out: not < deadline
+	seedStatus(t, s, "sent", models.StatusSentToNetwork, since.Add(time.Minute))    // in, other status
+	seedStatus(t, s, "mined", models.StatusMined, since.Add(time.Minute))           // in window but not requested
+
+	got, err := s.CensusStatusesSince(ctx, since, deadline, []models.Status{models.StatusReceived, models.StatusSentToNetwork, models.StatusPendingRetry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("expected exactly one entry per requested status, got %v", got)
+	}
+	if c := got[models.StatusReceived]; c.Count != 2 || !c.Oldest.Equal(since) {
+		t.Errorf("RECEIVED census = %+v, want count 2 oldest %v", c, since)
+	}
+	if c := got[models.StatusSentToNetwork]; c.Count != 1 {
+		t.Errorf("SENT census = %+v, want count 1", c)
+	}
+	if c := got[models.StatusPendingRetry]; c.Count != 0 || !c.Oldest.IsZero() {
+		t.Errorf("PENDING_RETRY census must be zero-valued, got %+v", c)
+	}
+	if _, ok := got[models.StatusMined]; ok {
+		t.Errorf("unrequested status must not appear")
+	}
+
+	// Zero since: only the deadline bounds the window.
+	got, err = s.CensusStatusesSince(ctx, time.Time{}, deadline, []models.Status{models.StatusReceived})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := got[models.StatusReceived]; c.Count != 3 {
+		t.Errorf("zero-since census = %+v, want count 3", c)
+	}
+}
+
+func TestIterateStatusesSince_HonorsSinceAndDesc(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().Truncate(time.Millisecond)
+	seedStatus(t, s, "old", models.StatusReceived, now.Add(-3*time.Hour))
+	seedStatus(t, s, "mid", models.StatusReceived, now.Add(-2*time.Hour))
+	seedStatus(t, s, "new", models.StatusReceived, now.Add(-time.Hour))
+
+	var order []string
+	if err := s.IterateStatusesSince(ctx, now.Add(-150*time.Minute), func(st *models.TransactionStatus) error {
+		order = append(order, st.TxID)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(order) != 2 || order[0] != "new" || order[1] != "mid" {
+		t.Fatalf("expected [new mid] (since honored, newest first), got %v", order)
+	}
+	all, err := s.GetStatusesSince(ctx, time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 3 || all[0].TxID != "new" || all[2].TxID != "old" {
+		t.Fatalf("zero since must return every row newest first, got %d rows", len(all))
+	}
+	// fn error stops iteration and surfaces.
+	sentinel := errors.New("stop")
+	calls := 0
+	err = s.IterateStatusesSince(ctx, time.Time{}, func(*models.TransactionStatus) error { calls++; return sentinel })
+	if !errors.Is(err, sentinel) || calls != 1 {
+		t.Fatalf("fn error must stop and surface: err=%v calls=%d", err, calls)
+	}
+}
+
+func TestGetStatus_MissingIsNilNil(t *testing.T) {
+	s := newTestStore(t)
+	got, err := s.GetStatus(context.Background(), "nope")
+	if err != nil || got != nil {
+		t.Fatalf("missing row must be (nil, nil), got (%v, %v)", got, err)
+	}
+}
+
+func TestSetPendingRetryFields_UnknownTxIDIsNotFound(t *testing.T) {
+	s := newTestStore(t)
+	err := s.SetPendingRetryFields(context.Background(), "ghost", []byte{1}, time.Now())
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+	if got, _ := s.GetStatus(context.Background(), "ghost"); got != nil {
+		t.Fatalf("must not create a phantom row: %+v", got)
+	}
+}
+
+func TestLease_ExpiryAndRelease(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if held, err := s.TryAcquireOrRenew(ctx, "l", "a", 200*time.Millisecond); err != nil || held.IsZero() {
+		t.Fatalf("a acquire: %v %v", held, err)
+	}
+	if held, err := s.TryAcquireOrRenew(ctx, "l", "b", time.Second); err != nil || !held.IsZero() {
+		t.Fatalf("b must be blocked while a holds: %v %v", held, err)
+	}
+	time.Sleep(250 * time.Millisecond)
+	if held, err := s.TryAcquireOrRenew(ctx, "l", "b", time.Second); err != nil || held.IsZero() {
+		t.Fatalf("b must acquire after a expired: %v %v", held, err)
+	}
+	if err := s.Release(ctx, "l", "a"); err != nil {
+		t.Fatalf("release by non-holder must be a nil no-op: %v", err)
+	}
+	if held, err := s.TryAcquireOrRenew(ctx, "l", "a", time.Second); err != nil || !held.IsZero() {
+		t.Fatalf("a's no-op release must not have freed b's lease: %v %v", held, err)
+	}
+	if err := s.Release(ctx, "l", "b"); err != nil {
+		t.Fatal(err)
+	}
+	if held, err := s.TryAcquireOrRenew(ctx, "l", "a", time.Second); err != nil || held.IsZero() {
+		t.Fatalf("a must acquire after b released: %v %v", held, err)
+	}
+}
+
+// A rebuild must never leave a window where GetBUMP reports ErrNotFound:
+// the new file lands before the old one is pruned, and exactly one copy
+// remains afterwards.
+func TestInsertBUMP_OverwriteNeverGaps(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const hash = "bump-overwrite"
+	v1, v2 := bytes.Repeat([]byte{1}, 3000), bytes.Repeat([]byte{2}, 5000)
+	if err := s.InsertBUMP(ctx, hash, 7, v1); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	var readErr error
+	var mu sync.Mutex
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			h, data, err := s.GetBUMP(ctx, hash)
+			if err != nil || h != 7 || (!bytes.Equal(data, v1) && !bytes.Equal(data, v2)) {
+				mu.Lock()
+				readErr = fmt.Errorf("reader saw h=%d len=%d err=%v", h, len(data), err)
+				mu.Unlock()
+				return
+			}
+		}
+	}()
+	for i := 0; i < 5; i++ {
+		if err := s.InsertBUMP(ctx, hash, 7, v2); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(stop)
+	wg.Wait()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	_, data, err := s.GetBUMP(ctx, hash)
+	if err != nil || !bytes.Equal(data, v2) {
+		t.Fatalf("final read: %v (len %d)", err, len(data))
+	}
+	n, err := s.bumps.bucket.GetFilesCollection().CountDocuments(ctx, doc(kv(fMetaBlockHash, hash)))
+	if err != nil || n != 1 {
+		t.Fatalf("expected exactly one surviving file, got %d (%v)", n, err)
+	}
+	if err := s.DeleteBUMPByBlockHash(ctx, hash); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.GetBUMP(ctx, hash); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("after delete expected ErrNotFound, got %v", err)
+	}
+	if err := s.DeleteBUMPByBlockHash(ctx, hash); err != nil {
+		t.Fatalf("delete must be idempotent: %v", err)
+	}
+}
+
+// GridFS is load-bearing: a STUMP larger than the 16 MB document cap must
+// round-trip, and a re-insert for the same subtree supersedes the old copy.
+func TestStump_LargePayloadAndSupersede(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const hash = "stump-big"
+	big := make([]byte, 17<<20)
+	if _, err := rand.Read(big); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertStump(ctx, &models.Stump{BlockHash: hash, SubtreeIndex: 3, StumpData: big}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertStump(ctx, &models.Stump{BlockHash: hash, SubtreeIndex: 1, StumpData: []byte("small")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertStump(ctx, &models.Stump{BlockHash: hash, SubtreeIndex: 1, StumpData: []byte("small-v2")}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetStumpsByBlockHash(ctx, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].SubtreeIndex != 1 || got[1].SubtreeIndex != 3 {
+		t.Fatalf("expected subtrees [1 3], got %d stumps", len(got))
+	}
+	if string(got[0].StumpData) != "small-v2" {
+		t.Fatalf("re-insert must supersede: got %q", got[0].StumpData)
+	}
+	if !bytes.Equal(got[1].StumpData, big) {
+		t.Fatalf("17 MB stump did not round-trip (len %d)", len(got[1].StumpData))
+	}
+	n, err := s.stumps.bucket.GetFilesCollection().CountDocuments(ctx, doc(kv(fMetaBlockHash, hash)))
+	if err != nil || n != 2 {
+		t.Fatalf("expected 2 surviving files, got %d (%v)", n, err)
+	}
+	if err := s.DeleteStumpsByBlockHash(ctx, hash); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.GetStumpsByBlockHash(ctx, hash); err != nil || len(got) != 0 {
+		t.Fatalf("after delete: %d stumps, %v", len(got), err)
+	}
+}
+
+// Concurrent rebuilds of one block must converge on exactly one surviving
+// file that the manifest references, never on none: each writer deletes only
+// the file its own manifest swap replaced. Same for one STUMP subtree.
+func TestInsertBlob_ConcurrentOverwritesKeepExactlyOne(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const hash, writers = "blob-race", 8
+	payloads := make([][]byte, writers)
+	for i := range payloads {
+		payloads[i] = bytes.Repeat([]byte{byte(i + 1)}, 2048+i)
+	}
+	run := func(write func(int) error) {
+		t.Helper()
+		var wg sync.WaitGroup
+		errs := make(chan error, writers)
+		for i := 0; i < writers; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				if err := write(i); err != nil {
+					errs <- err
+				}
+			}(i)
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatal(err)
+		}
+	}
+	isPayload := func(data []byte) bool {
+		for _, p := range payloads {
+			if bytes.Equal(data, p) {
+				return true
+			}
+		}
+		return false
+	}
+
+	run(func(i int) error { return s.InsertBUMP(ctx, hash, 9, payloads[i]) })
+	h, data, err := s.GetBUMP(ctx, hash)
+	if err != nil || h != 9 || !isPayload(data) {
+		t.Fatalf("after concurrent inserts GetBUMP = (%d, %d bytes, %v)", h, len(data), err)
+	}
+	var m bumpManifest
+	if err := s.bumps.manifests.FindOne(ctx, idFilter(hash)).Decode(&m); err != nil {
+		t.Fatal(err)
+	}
+	n, err := s.bumps.bucket.GetFilesCollection().CountDocuments(ctx, doc(kv(fMetaBlockHash, hash)))
+	if err != nil || n != 1 {
+		t.Fatalf("expected exactly one surviving BUMP file, got %d (%v)", n, err)
+	}
+	if c, _ := s.bumps.bucket.GetFilesCollection().CountDocuments(ctx, idFilter(m.FileID.Hex())); c != 0 {
+		t.Fatalf("manifest id lookup by hex must not match; sanity")
+	}
+	var surviving struct {
+		ID bson.ObjectID `bson:"_id"`
+	}
+	if err := s.bumps.bucket.GetFilesCollection().FindOne(ctx, doc(kv(fMetaBlockHash, hash))).Decode(&surviving); err != nil {
+		t.Fatal(err)
+	}
+	if surviving.ID != m.FileID {
+		t.Fatalf("manifest references %s but the surviving file is %s", m.FileID.Hex(), surviving.ID.Hex())
+	}
+
+	run(func(i int) error {
+		return s.InsertStump(ctx, &models.Stump{BlockHash: hash, SubtreeIndex: 4, StumpData: payloads[i]})
+	})
+	stumps, err := s.GetStumpsByBlockHash(ctx, hash)
+	if err != nil || len(stumps) != 1 || stumps[0].SubtreeIndex != 4 || !isPayload(stumps[0].StumpData) {
+		t.Fatalf("after concurrent stump inserts: %d stumps, %v", len(stumps), err)
+	}
+	n, err = s.stumps.bucket.GetFilesCollection().CountDocuments(ctx, doc(kv(fMetaBlockHash, hash)))
+	if err != nil || n != 1 {
+		t.Fatalf("expected exactly one surviving STUMP file, got %d (%v)", n, err)
+	}
+}
+
+// fileMissing must distinguish "definitively gone" from "could not tell":
+// reporting absence on a failed query would make publishBlob republish a file
+// that is perfectly fine, on every transient error.
+func TestFileMissing_AbsentVersusUnknown(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const hash = "blk-filemissing"
+	if err := s.InsertBUMP(ctx, hash, 3, bytes.Repeat([]byte{7}, 64)); err != nil {
+		t.Fatal(err)
+	}
+	var m bumpManifest
+	if err := s.bumps.manifests.FindOne(ctx, idFilter(hash)).Decode(&m); err != nil {
+		t.Fatal(err)
+	}
+	if gone, err := s.fileMissing(ctx, s.bumps.bucket, m.FileID); err != nil || gone {
+		t.Fatalf("published file: gone=%v err=%v, want gone=false err=nil", gone, err)
+	}
+	if gone, err := s.fileMissing(ctx, s.bumps.bucket, bson.NewObjectID()); err != nil || !gone {
+		t.Fatalf("never-uploaded file: gone=%v err=%v, want gone=true err=nil", gone, err)
+	}
+	// A cancelled context is "could not tell", never absence.
+	dead, cancel := context.WithCancel(ctx)
+	cancel()
+	if gone, err := s.fileMissing(dead, s.bumps.bucket, m.FileID); err == nil || gone {
+		t.Fatalf("cancelled check: gone=%v err=%v, want gone=false and an error", gone, err)
+	}
+}
+
+// A reader that opened the manifest before a rebuild and downloads after it
+// follows the manifest to the replacement file. The height it reports must be
+// the replacement manifest's as well: block height is metadata of the same
+// document that names the file, and pairing a new payload with the old height
+// is a wrong answer that looks like a right one.
+func TestFetch_FollowsReplacementWithItsOwnHeight(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const hash = "blk-height-swap"
+	if err := s.InsertBUMP(ctx, hash, 5, bytes.Repeat([]byte{5}, 256)); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := s.readRef(ctx, s.bumps.manifests, hash)
+	if err != nil || stale.BlockHeight != 5 {
+		t.Fatalf("initial ref: %+v, %v", stale, err)
+	}
+
+	// The rebuild lands at a different height and deletes the old file.
+	replacement := bytes.Repeat([]byte{6}, 512)
+	if err := s.InsertBUMP(ctx, hash, 6, replacement); err != nil {
+		t.Fatal(err)
+	}
+
+	data, served, err := s.fetch(ctx, s.bumps.bucket, s.bumps.manifests, hash, stale)
+	if err != nil {
+		t.Fatalf("fetch with a stale ref must follow the manifest: %v", err)
+	}
+	if !bytes.Equal(data, replacement) {
+		t.Fatalf("got %d bytes, want the replacement payload", len(data))
+	}
+	if served.FileID == stale.FileID || served.BlockHeight != 6 {
+		t.Fatalf("served ref must be the replacement's: %+v (stale %+v)", served, stale)
+	}
+	height, got, err := s.GetBUMP(ctx, hash)
+	if err != nil || height != 6 || !bytes.Equal(got, replacement) {
+		t.Fatalf("GetBUMP = (%d, %d bytes, %v), want (6, replacement, nil)", height, len(got), err)
+	}
+}
+
+// Issue #339's queue trap: a block that is orphaned, reconciled, resurrected
+// and orphaned again must re-enter the reconcile queue. It cannot if the
+// second orphaning leaves the first reconciled_at in place.
+func TestMarkBlocksOrphaned_ClearsReconciledAt(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const hash = "blk-339"
+	t0 := time.Unix(1700000000, 0).UTC()
+	if err := s.UpsertBlockHeaderSeen(ctx, hash, 500, t0); err != nil {
+		t.Fatal(err)
+	}
+	queued := func(want bool) {
+		t.Helper()
+		rows, err := s.ListOrphanedBlocksToReconcile(ctx, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := false
+		for _, r := range rows {
+			got = got || r.BlockHash == hash
+		}
+		if got != want {
+			t.Fatalf("queued = %v, want %v", got, want)
+		}
+	}
+	if err := s.MarkBlocksOrphaned(ctx, []string{hash}, t0.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	queued(true)
+	if err := s.MarkBlockReconciled(ctx, hash, t0.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	queued(false)
+	// Orphaned again — a flip-flop, a tie scan, a full-scan re-mark.
+	if err := s.MarkBlocksOrphaned(ctx, []string{hash}, t0.Add(3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	queued(true)
+	bp, err := s.GetBlockProcessingStatus(ctx, hash)
+	if err != nil || bp.ReconciledAt != nil {
+		t.Fatalf("re-orphaning must clear reconciled_at: %+v err=%v", bp, err)
+	}
+}
+
+// The package promises readers treat absent and null alike. $exists:false
+// does not: a row a migration wrote with an explicit null for processed_at or
+// reconciled_at would be invisible to the watchdog and the reconciler.
+func TestBlockQueues_ExplicitNullIsAbsent(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	t0 := time.Unix(1700000000, 0).UTC()
+
+	if err := s.UpsertBlockHeaderSeen(ctx, "blk-null-stale", 600, t0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.blocks.UpdateOne(ctx, idFilter("blk-null-stale"), doc(kv(opSet, doc(kv(fProcessedAt, nil))))); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := s.ListStaleBlockProcessingStatus(ctx, t0.Add(time.Hour), 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stale) != 1 || stale[0].BlockHash != "blk-null-stale" {
+		t.Fatalf("a row with processed_at: null must be listed as stale, got %+v", stale)
+	}
+
+	if err := s.UpsertBlockHeaderSeen(ctx, "blk-null-orphan", 601, t0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkBlocksOrphaned(ctx, []string{"blk-null-orphan"}, t0.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.blocks.UpdateOne(ctx, idFilter("blk-null-orphan"), doc(kv(opSet, doc(kv(fReconciledAt, nil))))); err != nil {
+		t.Fatal(err)
+	}
+	queue, err := s.ListOrphanedBlocksToReconcile(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(queue) != 1 || queue[0].BlockHash != "blk-null-orphan" {
+		t.Fatalf("a row with reconciled_at: null must be queued, got %+v", queue)
+	}
+}
+
+// Reads whose size scales with the data run under the caller's context, not
+// query_timeout_ms: a fixed deadline does not fail one call, it fails the same
+// call on every retry, and for GetTxIDsByBlockHash that leaves an orphaned
+// block MINED@orphan for good. A one-nanosecond query timeout proves neither
+// path consults it.
+func TestDataSizedReads_UseCallerContext(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedStatus(t, s, "sized-1", models.StatusSeenOnNetwork, time.Now())
+	if _, _, err := s.SetMinedByTxIDs(ctx, "blk-sized", 700, []string{"sized-1"}); err != nil {
+		t.Fatal(err)
+	}
+	seedStatus(t, s, "sized-2", models.StatusSeenOnNetwork, time.Now())
+	s.queryTimeout = time.Nanosecond
+
+	ids, err := s.GetTxIDsByBlockHash(ctx, "blk-sized")
+	if err != nil || len(ids) != 1 || ids[0] != "sized-1" {
+		t.Fatalf("GetTxIDsByBlockHash under a 1ns query timeout = (%v, %v); must use the caller's ctx", ids, err)
+	}
+	census, err := s.CensusStatusesSince(ctx, time.Unix(0, 0), time.Now().Add(time.Hour), []models.Status{models.StatusSeenOnNetwork})
+	if err != nil || census[models.StatusSeenOnNetwork].Count != 1 {
+		t.Fatalf("CensusStatusesSince under a 1ns query timeout = (%+v, %v); must use the caller's ctx", census, err)
+	}
+}
+
+// The lease TTL index reaps an hour AFTER expiry, never at it, so the server's
+// clock cannot delete a live lease and hand it to a second holder.
+func TestLeaseIndex_ReapsWithGrace(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	cur, err := s.leases.Indexes().List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var specs []bson.M
+	if err := cur.All(ctx, &specs); err != nil {
+		t.Fatal(err)
+	}
+	for _, spec := range specs {
+		if spec["name"] != idxLeaseExpires {
+			continue
+		}
+		if got := spec["expireAfterSeconds"]; got == nil || fmt.Sprint(got) != fmt.Sprint(leaseReapGraceSeconds) {
+			t.Fatalf("expireAfterSeconds = %v, want %d", got, leaseReapGraceSeconds)
+		}
+		return
+	}
+	t.Fatalf("index %s not found in %+v", idxLeaseExpires, specs)
+}
+
+// An empty txid is "unknown", as Pebble and Postgres report it — not an error
+// that fails the whole returning batch after its other rows were applied.
+func TestUpdateStatusReturning_EmptyTxIDIsUnknown(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedStatus(t, s, "known", models.StatusReceived, time.Now())
+	if _, err := s.UpdateStatusReturning(ctx, &models.TransactionStatus{TxID: "", Status: models.StatusSeenOnNetwork}); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("empty txid: err = %v, want store.ErrNotFound", err)
+	}
+	prevs, err := s.BatchUpdateStatusReturning(ctx, []*models.TransactionStatus{
+		{TxID: "known", Status: models.StatusSeenOnNetwork},
+		{TxID: "", Status: models.StatusSeenOnNetwork},
+	})
+	if err != nil {
+		t.Fatalf("a malformed entry must not fail the batch: %v", err)
+	}
+	if len(prevs) != 2 || prevs[0] == nil || prevs[0].Status != models.StatusReceived || prevs[1] != nil {
+		t.Fatalf("prevs = %+v, want [known-pre-image, nil]", prevs)
+	}
+}
+
+// A database provisioned when the lease TTL was 0 must still boot after the
+// TTL changed: createIndexes on an existing index with different options is
+// IndexOptionsConflict, and the server's remedy for a changed TTL is collMod,
+// which EnsureIndexes now applies before retrying. A conflict on anything
+// other than a TTL is still a hard error.
+func TestEnsureIndexes_RepairsChangedLeaseTTL(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	// Stage the pre-change deployment: the same index at expireAfterSeconds 0.
+	old := bson.D{{Key: "collMod", Value: collLeases}, {Key: "index", Value: bson.D{
+		{Key: "name", Value: idxLeaseExpires}, {Key: "expireAfterSeconds", Value: int32(0)},
+	}}}
+	if err := s.leases.Database().RunCommand(ctx, old).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnsureIndexes(ctx); err != nil {
+		t.Fatalf("EnsureIndexes must repair a changed TTL, got: %v", err)
+	}
+	cur, err := s.leases.Indexes().List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var specs []bson.M
+	if err := cur.All(ctx, &specs); err != nil {
+		t.Fatal(err)
+	}
+	for _, spec := range specs {
+		if spec["name"] == idxLeaseExpires {
+			if fmt.Sprint(spec["expireAfterSeconds"]) != fmt.Sprint(leaseReapGraceSeconds) {
+				t.Fatalf("TTL after repair = %v, want %d", spec["expireAfterSeconds"], leaseReapGraceSeconds)
+			}
+			return
+		}
+	}
+	t.Fatal("lease index missing after repair")
+}
+
+// The TTL repair is narrow: an IndexOptionsConflict about anything other than
+// expireAfterSeconds must still fail EnsureIndexes loudly, because a silently
+// coexisting index with the wrong options is worse than a boot failure.
+func TestEnsureIndexes_NonTTLConflictStillFails(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	// Stage an index with the same name, keys and TTL but sparse:true — an
+	// option the server includes in its equivalence check (unlike hidden,
+	// which it ignores) and which nothing here can or should repair.
+	if err := s.leases.Indexes().DropOne(ctx, idxLeaseExpires); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.leases.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: fExpiresAt, Value: 1}},
+		Options: options.Index().SetName(idxLeaseExpires).SetExpireAfterSeconds(leaseReapGraceSeconds).SetSparse(true),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err := s.EnsureIndexes(ctx)
+	if err == nil {
+		t.Fatal("a non-TTL option conflict must fail EnsureIndexes")
+	}
+	// The server reports a non-TTL mismatch as IndexKeySpecsConflict (86) or
+	// IndexOptionsConflict (85) depending on the option; either must surface
+	// unrepaired.
+	var se mongo.ServerError
+	if !errors.As(err, &se) || !(se.HasErrorCode(indexOptionsConflict) || se.HasErrorCode(86)) {
+		t.Fatalf("expected the index conflict to surface, got: %v", err)
+	}
+}
+
+// The manifest's length is a claim about the file, not a size to trust. A
+// length larger than the file would size an allocation off a corrupt or
+// half-restored document; a smaller one would read a prefix and hand back a
+// truncated compound as if it were whole. Both must be refused.
+func TestGetBUMP_RejectsManifestLengthMismatch(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const hash = "blk-badlen"
+	payload := bytes.Repeat([]byte{3}, 512)
+	if err := s.InsertBUMP(ctx, hash, 6, payload); err != nil {
+		t.Fatal(err)
+	}
+	setLength := func(n int64) {
+		t.Helper()
+		if _, err := s.bumps.manifests.UpdateOne(ctx, idFilter(hash), doc(kv(opSet, doc(kv(fLength, n))))); err != nil {
+			t.Fatal(err)
+		}
+		s.bumpCache.Remove(hash)
+	}
+
+	setLength(1 << 40) // absurd: must not be allocated
+	if _, _, err := s.GetBUMP(ctx, hash); err == nil {
+		t.Fatal("a manifest length larger than the file must be refused, not allocated")
+	}
+
+	setLength(int64(len(payload)) - 16) // truncating: must not look like success
+	if _, _, err := s.GetBUMP(ctx, hash); err == nil {
+		t.Fatal("a manifest length shorter than the file must be refused, not served as a prefix")
+	}
+
+	setLength(int64(len(payload)))
+	height, data, err := s.GetBUMP(ctx, hash)
+	if err != nil || height != 6 || !bytes.Equal(data, payload) {
+		t.Fatalf("the honest length must still read: (%d, %d bytes, %v)", height, len(data), err)
+	}
+}
+
+// The republish trigger must fire only for a file that is gone while the
+// manifest still names it. A file that is gone because a later writer
+// superseded it is the ordinary outcome of losing a race: that writer's data
+// is in force, and republishing over it would undo a newer write and leave
+// the file it replaced behind. Getting this wrong is not theoretical — it
+// resurrected stale data and leaked a second file under concurrent
+// overwrites.
+func TestPublishedFileLost_SupersededIsNotLost(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const hash = "blk-lost"
+	if err := s.InsertBUMP(ctx, hash, 4, bytes.Repeat([]byte{9}, 64)); err != nil {
+		t.Fatal(err)
+	}
+	var m bumpManifest
+	if err := s.bumps.manifests.FindOne(ctx, idFilter(hash)).Decode(&m); err != nil {
+		t.Fatal(err)
+	}
+	mine := m.FileID
+
+	// Alive and referenced: nothing to do.
+	if s.publishedFileLost(ctx, &s.bumps, hash, mine) {
+		t.Fatal("a file that still exists is not lost")
+	}
+
+	// Gone, but the manifest has moved on to a later writer's file: that
+	// writer wins and this one must not republish over it.
+	later := bson.NewObjectID()
+	if _, err := s.bumps.manifests.UpdateOne(ctx, idFilter(hash), doc(kv(opSet, doc(kv(fFileID, later))))); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.bumps.bucket.Delete(ctx, mine); err != nil {
+		t.Fatal(err)
+	}
+	if s.publishedFileLost(ctx, &s.bumps, hash, mine) {
+		t.Fatal("a superseded file is not lost — republishing would undo a newer write")
+	}
+
+	// Gone while the manifest still names it: the dangling case, republish.
+	if _, err := s.bumps.manifests.UpdateOne(ctx, idFilter(hash), doc(kv(opSet, doc(kv(fFileID, mine))))); err != nil {
+		t.Fatal(err)
+	}
+	if !s.publishedFileLost(ctx, &s.bumps, hash, mine) {
+		t.Fatal("a file that is gone while the manifest names it must be republished")
+	}
+}
+
+// A manifest left pointing at a file that is gone must be repairable by the
+// next write for the same key. This is the state publishBlob's post-swap
+// confirmation exists to avoid creating, and the state a republish resolves;
+// here it is staged directly, since making a sweeper win that race in-process
+// would need a fault-injection seam.
+func TestInsertBUMP_RepairsDanglingManifest(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const hash = "blk-dangling"
+	if err := s.InsertBUMP(ctx, hash, 5, bytes.Repeat([]byte{1}, 128)); err != nil {
+		t.Fatal(err)
+	}
+	var m bumpManifest
+	if err := s.bumps.manifests.FindOne(ctx, idFilter(hash)).Decode(&m); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.bumps.bucket.Delete(ctx, m.FileID); err != nil {
+		t.Fatal(err)
+	}
+	s.bumpCache.Remove(hash)
+	if _, _, err := s.GetBUMP(ctx, hash); err == nil {
+		t.Fatal("GetBUMP must fail while the manifest points at a deleted file")
+	}
+
+	repaired := bytes.Repeat([]byte{2}, 256)
+	if err := s.InsertBUMP(ctx, hash, 5, repaired); err != nil {
+		t.Fatalf("republish over a dangling manifest: %v", err)
+	}
+	height, data, err := s.GetBUMP(ctx, hash)
+	if err != nil || height != 5 || !bytes.Equal(data, repaired) {
+		t.Fatalf("after repair GetBUMP = (%d, %d bytes, %v)", height, len(data), err)
+	}
+	n, err := s.bumps.bucket.GetFilesCollection().CountDocuments(ctx, doc(kv(fMetaBlockHash, hash)))
+	if err != nil || n != 1 {
+		t.Fatalf("expected exactly one file after repair, got %d (%v)", n, err)
+	}
+}
+
+// DeleteBUMPByBlockHash races InsertBUMP for the same block. The tie-break is
+// server order — this delete is unconditional, like the single-statement
+// DELETE on Postgres and Pebble — so either outcome is allowed. What is not
+// allowed is an inconsistent one: a manifest pointing at a file the delete
+// removed (GetBUMP would fail forever) or a file left behind with no manifest
+// referencing it. Both outcomes are covered: launched together the delete's
+// single findAndModify beats the insert's multi-round-trip GridFS upload, so
+// the insert wins; the sequential phase pins the other order.
+func TestDeleteBUMPByBlockHash_RacesInsertConsistently(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	payload := bytes.Repeat([]byte{0xAB}, 4096)
+	files := s.bumps.bucket.GetFilesCollection()
+	countFiles := func(hash string) int64 {
+		n, err := files.CountDocuments(ctx, doc(kv(fMetaBlockHash, hash)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	for round := 0; round < 25; round++ {
+		hash := fmt.Sprintf("blk-race-%02d", round)
+		var wg sync.WaitGroup
+		errs := make(chan error, 2)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if err := s.InsertBUMP(ctx, hash, 7, payload); err != nil {
+				errs <- fmt.Errorf("insert: %w", err)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if err := s.DeleteBUMPByBlockHash(ctx, hash); err != nil {
+				errs <- fmt.Errorf("delete: %w", err)
+			}
+		}()
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatalf("round %d: %v", round, err)
+		}
+
+		n := countFiles(hash)
+		height, data, err := s.GetBUMP(ctx, hash)
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			// The delete won: nothing may be left behind.
+			if n != 0 {
+				t.Fatalf("round %d: delete won but %d file(s) survive", round, n)
+			}
+		case err != nil:
+			// Never a dangling manifest: the file the manifest names is gone.
+			t.Fatalf("round %d: GetBUMP after the race: %v", round, err)
+		default:
+			// The insert won: its bytes must be readable, from one file.
+			if height != 7 || !bytes.Equal(data, payload) {
+				t.Fatalf("round %d: insert won but GetBUMP = (%d, %d bytes)", round, height, len(data))
+			}
+			if n != 1 {
+				t.Fatalf("round %d: insert won but %d file(s) present, want 1", round, n)
+			}
+		}
+	}
+
+	// The other order, deterministically: a swap that has already landed is
+	// removed together with the file it published, leaving no orphan behind.
+	const seq = "blk-race-seq"
+	if err := s.InsertBUMP(ctx, seq, 7, payload); err != nil {
+		t.Fatal(err)
+	}
+	if n := countFiles(seq); n != 1 {
+		t.Fatalf("after insert: %d file(s), want 1", n)
+	}
+	if err := s.DeleteBUMPByBlockHash(ctx, seq); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.GetBUMP(ctx, seq); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("GetBUMP after delete = %v, want store.ErrNotFound", err)
+	}
+	if n := countFiles(seq); n != 0 {
+		t.Fatalf("delete left %d GridFS file(s) behind", n)
+	}
+}
+
+// The interface requires both anchor fields on every MINED row; a zero height
+// is persisted as a literal 0 like the other backends, not dropped.
+func TestSetMinedByTxIDs_ZeroHeightPersistsNumeric(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedStatus(t, s, "zero", models.StatusSeenOnNetwork, time.Now())
+	if _, mined, err := s.SetMinedByTxIDs(ctx, "blk", 0, []string{"zero"}); err != nil || len(mined) != 1 {
+		t.Fatalf("SetMinedByTxIDs: %v (%d mined)", err, len(mined))
+	}
+	var raw bson.M
+	if err := s.tx.FindOne(ctx, idFilter("zero")).Decode(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := raw[fBlockHeight]; !ok || v != int64(0) {
+		t.Fatalf("block_height must be stored as a literal 0, got %v (present=%v)", v, ok)
+	}
+	if n := countTracker(t, s); n != 1 {
+		t.Fatalf("MINED row with height 0 must still be tracked, got %d rows", n)
+	}
+}
+
+func TestGetStumpsByBlockHash_CancelledContext(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.InsertStump(context.Background(), &models.Stump{BlockHash: "h", SubtreeIndex: 0, StumpData: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := s.GetStumpsByBlockHash(ctx, "h"); err == nil {
+		t.Fatal("expected an error from a cancelled context")
+	}
+}
+
+// A row already MINED on the same block by another call (a replayed
+// BLOCK_PROCESSED, or a replica) is rewritten with this call's timestamp and
+// reported with that MINED row as its pre-image, so persisted row and
+// returned snapshot agree; IMMUTABLE rows are untouched and unreported.
+func TestSetMinedByTxIDs_SameBlockReplayAndImmutable(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := msNow()
+	earlier := now.Add(-time.Minute)
+	seedStatus(t, s, "fresh", models.StatusSeenOnNetwork, earlier)
+	seedStatus(t, s, "twice", models.StatusMined, earlier)
+	seedStatus(t, s, "frozen", models.StatusImmutable, earlier)
+	if err := s.UpdateStatus(ctx, &models.TransactionStatus{TxID: "twice", Status: models.StatusMined, BlockHash: "blk", BlockHeight: 42, Timestamp: earlier}); err != nil {
+		t.Fatal(err)
+	}
+
+	prevs, mined, err := s.SetMinedByTxIDs(ctx, "blk", 42, []string{"fresh", "twice", "frozen", "ghost", "fresh"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prevs) != 2 || len(mined) != 2 {
+		t.Fatalf("expected fresh+twice only, got prevs=%d mined=%d", len(prevs), len(mined))
+	}
+	byTx := map[string]*models.TransactionStatus{}
+	for _, p := range prevs {
+		byTx[p.TxID] = p
+	}
+	if p := byTx["fresh"]; p == nil || p.Status != models.StatusSeenOnNetwork || !p.Timestamp.Equal(earlier) {
+		t.Fatalf("fresh prev = %+v", p)
+	}
+	if p := byTx["twice"]; p == nil || p.Status != models.StatusMined || p.BlockHash != "blk" || !p.Timestamp.Equal(earlier) {
+		t.Fatalf("twice prev must be the earlier MINED row, got %+v", p)
+	}
+	for _, m := range mined {
+		got, _ := s.GetStatus(ctx, m.TxID)
+		if got.Status != models.StatusMined || got.BlockHash != "blk" || got.BlockHeight != 42 || !got.Timestamp.Equal(m.Timestamp) || !got.Timestamp.After(earlier) {
+			t.Fatalf("%s: persisted %+v disagrees with returned %+v", m.TxID, got, m)
+		}
+		if len(got.OrphanedProofs) != 0 {
+			t.Fatalf("%s: same-block re-mine must not invent history: %+v", m.TxID, got.OrphanedProofs)
+		}
+	}
+	got, _ := s.GetStatus(ctx, "frozen")
+	if got.Status != models.StatusImmutable || !got.Timestamp.Equal(earlier) {
+		t.Fatalf("IMMUTABLE row must be untouched: %+v", got)
+	}
+}
+
+// A block larger than one page is rewritten completely through keyset
+// pages, every row is reported exactly once, and the guard re-checked at
+// write time skips a row that was re-anchored elsewhere in the meantime.
+func TestSetStatusByBlockHash_PagesAndReChecksAnchor(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	n := s.batchSize*2 + 7
+	want := make(map[string]bool, n)
+	for i := 0; i < n; i++ {
+		txid := fmt.Sprintf("blk-tx-%05d", i)
+		if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+			TxID: txid, Status: models.StatusMined, BlockHash: "blk", BlockHeight: 42, Timestamp: time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		want[txid] = true
+	}
+	// One row moved to another block and one was promoted before the revert.
+	if _, _, err := s.SetMinedByTxIDs(ctx, "other", 42, []string{"blk-tx-00003"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateStatus(ctx, &models.TransactionStatus{TxID: "blk-tx-00004", Status: models.StatusImmutable}); err != nil {
+		t.Fatal(err)
+	}
+	delete(want, "blk-tx-00003")
+	delete(want, "blk-tx-00004")
+
+	got, err := s.SetStatusByBlockHash(ctx, "blk", models.StatusSeenOnNetwork)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]int{}
+	for _, txid := range got {
+		seen[txid]++
+	}
+	if len(got) != len(want) || len(seen) != len(want) {
+		t.Fatalf("expected %d distinct txids, got %d (%d distinct)", len(want), len(got), len(seen))
+	}
+	for txid := range want {
+		if seen[txid] != 1 {
+			t.Fatalf("%s reported %d times", txid, seen[txid])
+		}
+	}
+	if left, _ := s.GetTxIDsByBlockHash(ctx, "blk"); len(left) != 1 || left[0] != "blk-tx-00004" {
+		t.Fatalf("only the IMMUTABLE row may stay anchored, got %v", left)
+	}
+	moved, _ := s.GetStatus(ctx, "blk-tx-00003")
+	if moved.Status != models.StatusMined || moved.BlockHash != "other" {
+		t.Fatalf("re-anchored row must be untouched: %+v", moved)
+	}
+	reverted, _ := s.GetStatus(ctx, "blk-tx-00000")
+	if reverted.Status != models.StatusSeenOnNetwork || reverted.BlockHash != "" || reverted.BlockHeight != 0 ||
+		len(reverted.OrphanedProofs) != 1 || reverted.OrphanedProofs[0].BlockHash != "blk" || reverted.OrphanedProofs[0].BlockHeight != 42 {
+		t.Fatalf("reverted row wrong: %+v", reverted)
+	}
+}
+
+// A keyset cursor only moves forward, so a row anchored to the block after the
+// cursor passed its id is invisible to the walk that is running — and the
+// reconciler stamps the block reconciled the moment the call returns, which
+// would leave that tx MINED on an orphaned block. The drain exists for that
+// row. Here the interleave is staged at the seam the drain loop uses, one
+// walk at a time, rather than left to chance.
+func TestSetStatusByBlockHash_DrainsRowsAnchoredBehindTheCursor(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const blk = "blk-drain"
+	seed := func(txid string) {
+		t.Helper()
+		if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+			TxID: txid, Status: models.StatusMined, BlockHash: blk, BlockHeight: 9, Timestamp: time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 5; i < 9; i++ {
+		seed(fmt.Sprintf("drain-tx-%02d", i))
+	}
+
+	var txids []string
+	visited, err := s.rewriteBlockOnce(ctx, blk, models.StatusSeenOnNetwork, &txids)
+	if err != nil || visited != 4 || len(txids) != 4 {
+		t.Fatalf("first walk: %d rewritten, %d visited, %v", len(txids), visited, err)
+	}
+
+	// A mine lands for this block at an id the cursor is already past.
+	seed("drain-tx-01")
+
+	visited, err = s.rewriteBlockOnce(ctx, blk, models.StatusSeenOnNetwork, &txids)
+	if err != nil || visited != 1 || len(txids) != 5 || txids[4] != "drain-tx-01" {
+		t.Fatalf("second walk must retire the straggler: txids=%v visited=%d err=%v", txids, visited, err)
+	}
+	st, _ := s.GetStatus(ctx, "drain-tx-01")
+	if st == nil || st.Status != models.StatusSeenOnNetwork || st.BlockHash != "" {
+		t.Fatalf("straggler not reverted: %+v", st)
+	}
+
+	visited, err = s.rewriteBlockOnce(ctx, blk, models.StatusSeenOnNetwork, &txids)
+	if err != nil || visited != 0 || len(txids) != 5 {
+		t.Fatalf("third walk must find nothing: txids=%v visited=%d err=%v", txids, visited, err)
+	}
+	if left, _ := s.GetTxIDsByBlockHash(ctx, blk); len(left) != 0 {
+		t.Fatalf("nothing may stay anchored, got %v", left)
+	}
+}
+
+// A newStatus whose rewrite leaves rows inside the page predicate — anything
+// that neither clears block_hash nor sets IMMUTABLE — must walk exactly once.
+// Re-walking would find the same rows again and rewrite the entire block a
+// second time, doubling the writes and the timestamp churn, before stopping;
+// spinning to the pass bound would fail a call that has done its job.
+func TestSetStatusByBlockHash_WalksOnceWhenRowsStayInPredicate(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const blk = "blk-stay"
+	want := 3
+	for i := 0; i < want; i++ {
+		if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+			TxID:      fmt.Sprintf("stay-tx-%02d", i),
+			Status:    models.StatusSeenOnNetwork,
+			BlockHash: blk, BlockHeight: 11, Timestamp: time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	version := func(txid string) int64 {
+		t.Helper()
+		var d struct {
+			Version int64 `bson:"version"`
+		}
+		if err := s.tx.FindOne(ctx, idFilter(txid)).Decode(&d); err != nil {
+			t.Fatal(err)
+		}
+		return d.Version
+	}
+	before := version("stay-tx-00")
+
+	got, err := s.SetStatusByBlockHash(ctx, blk, models.StatusMined)
+	if err != nil {
+		t.Fatalf("a rewrite that keeps rows in the block must still settle: %v", err)
+	}
+
+	// Every applied rewrite bumps the row's version, so exactly one bump is
+	// proof the block was not rewritten a second time.
+	if delta := version("stay-tx-00") - before; delta != 1 {
+		t.Fatalf("version moved by %d, want exactly 1 (the block must be rewritten once)", delta)
+	}
+	seen := map[string]int{}
+	for _, txid := range got {
+		seen[txid]++
+		if seen[txid] > 1 {
+			t.Fatalf("%s reported %d times", txid, seen[txid])
+		}
+	}
+	if len(got) != want {
+		t.Fatalf("expected %d txids, got %d (%v)", want, len(got), got)
+	}
+	if left, _ := s.GetTxIDsByBlockHash(ctx, blk); len(left) != want {
+		t.Fatalf("rows must still be anchored after a non-clearing rewrite, got %v", left)
+	}
+}
+
+// Concurrent first upserts for one key must all succeed and converge on one
+// document: the loser of the insert race retries against the winner's row.
+func TestUpserts_ConcurrentFirstInsert(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const writers = 8
+	run := func(name string, write func(int) error) {
+		t.Helper()
+		var wg sync.WaitGroup
+		errs := make(chan error, writers)
+		for i := 0; i < writers; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				if err := write(i); err != nil {
+					errs <- err
+				}
+			}(i)
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	now := msNow()
+	run("UpsertBlockHeaderSeen", func(int) error { return s.UpsertBlockHeaderSeen(ctx, "race-blk", 7, now) })
+	run("MarkBlockProcessed", func(int) error { return s.MarkBlockProcessed(ctx, "race-blk-2", 8, now) })
+	run("UpsertDatahubEndpoint", func(i int) error {
+		return s.UpsertDatahubEndpoint(ctx, store.DatahubEndpoint{URL: "http://race", Network: "main", Source: "discovered", LastSeen: now})
+	})
+	run("UpsertPeerPolicy", func(i int) error {
+		return s.UpsertPeerPolicy(ctx, store.PeerPolicy{PeerID: "race-peer", Network: "main", MiningFeeSatoshis: uint64(i + 1), MiningFeeBytes: 1000, LastSeen: now})
+	})
+	for _, hash := range []string{"race-blk", "race-blk-2"} {
+		if _, err := s.GetBlockProcessingStatus(ctx, hash); err != nil {
+			t.Fatalf("%s: %v", hash, err)
+		}
+	}
+	if eps, _ := s.ListDatahubEndpoints(ctx, "main"); len(eps) != 1 {
+		t.Fatalf("expected one endpoint, got %d", len(eps))
+	}
+	if pps, _ := s.ListPeerPolicies(ctx, "main"); len(pps) != 1 {
+		t.Fatalf("expected one peer policy, got %d", len(pps))
+	}
+}
+
+// Past the submission bound the replay is refused before anything is
+// materialized; within it, it is served.
+func TestIterateStatusesByToken_RefusesPastBound(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const token, total = "tok-huge", 50
+	for i := 0; i < total; i++ {
+		txid := fmt.Sprintf("tx-%03d", i)
+		seedStatus(t, s, txid, models.StatusSeenOnNetwork, time.Now())
+		if err := s.InsertSubmission(ctx, &models.Submission{SubmissionID: fmt.Sprintf("sub-%03d", i), TxID: txid, CallbackToken: token}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.tokenReplayLimit = 10
+	err := s.IterateStatusesByToken(ctx, token, time.Time{}, nil, func(*models.TransactionStatus) error {
+		t.Fatal("fn must not be called when refusing")
+		return nil
+	})
+	if !errors.Is(err, store.ErrReplayUnavailable) {
+		t.Fatalf("expected ErrReplayUnavailable, got %v", err)
+	}
+	// The preflight count is only advisory — submissions can be inserted
+	// between it and the scan — so the scan enforces the same bound itself.
+	s.tokenReplayLimit = 10
+	if _, err := s.tokenTxIDs(ctx, doc(kv(fCallbackToken, token))); !errors.Is(err, store.ErrReplayUnavailable) {
+		t.Fatalf("scan past the bound = %v, want store.ErrReplayUnavailable", err)
+	}
+
+	s.tokenReplayLimit = total
+	n := 0
+	if err := s.IterateStatusesByToken(ctx, token, time.Time{}, nil, func(*models.TransactionStatus) error { n++; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if n != total {
+		t.Fatalf("within budget expected %d rows, got %d", total, n)
+	}
+	// A token exactly at the bound is served, not refused.
+	if ids, err := s.tokenTxIDs(ctx, doc(kv(fCallbackToken, token))); err != nil || len(ids) != total {
+		t.Fatalf("token at the bound: %d ids, err %v; want %d ids and no error", len(ids), err, total)
+	}
+}
+
+// UpsertPeerPolicy is a full overwrite and ListPeerPolicies scopes by network.
+func TestMarkBlockMilestones_SynthesiseHeaderSeen(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	at := msNow()
+	if err := s.MarkBlockProcessed(ctx, "blk", 5, at); err != nil {
+		t.Fatal(err)
+	}
+	bp, err := s.GetBlockProcessingStatus(ctx, "blk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bp.HeaderSeenAt.Equal(at) || bp.ProcessedAt == nil || bp.Status != models.BlockStatusActive || bp.BlockHeight != 5 {
+		t.Fatalf("callback-before-header row wrong: %+v", bp)
+	}
+	seen := at.Add(-time.Minute)
+	if err := s.UpsertBlockHeaderSeen(ctx, "blk", 6, seen); err != nil {
+		t.Fatal(err)
+	}
+	bp, _ = s.GetBlockProcessingStatus(ctx, "blk")
+	if !bp.HeaderSeenAt.Equal(at) || bp.BlockHeight != 6 || bp.ProcessedAt == nil {
+		t.Fatalf("header re-arrival must keep header_seen_at/processed_at and overwrite height: %+v", bp)
+	}
+}
+
+// TestSetStatusByBlockHash_LastPassRetiringRowsIsNotAnError: the drain loop
+// exits when its pass budget runs out, and a pass that retired rows is not
+// the same thing as rows still arriving — the last allowed pass may have
+// caught the final straggler. Without the verification probe, any block whose
+// arrivals spanned every pass returned "rows still arriving", and the
+// reconciler answers that by withholding reconciled_at and re-driving a block
+// that is already complete.
+//
+// rewritePasses = 1 makes the boundary reachable: the single pass retires
+// every row, so the loop always exits the way the bug needed.
+func TestSetStatusByBlockHash_LastPassRetiringRowsIsNotAnError(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	s.rewritePasses = 1
+
+	const blk = "blk-lastpass"
+	want := []string{"lp-1", "lp-2", "lp-3"}
+	for _, txid := range want {
+		seedStatus(t, s, txid, models.StatusSeenOnNetwork, time.Now())
+	}
+	if _, _, err := s.SetMinedByTxIDs(ctx, blk, 500, want); err != nil {
+		t.Fatalf("seed mined: %v", err)
+	}
+
+	got, err := s.SetStatusByBlockHash(ctx, blk, models.StatusSeenOnNetwork)
+	if err != nil {
+		t.Fatalf("a final pass that emptied the block must not report failure: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("reverted %d rows, want %d (%v)", len(got), len(want), got)
+	}
+	// And the block really is empty, which is what the probe asserts.
+	rest, err := s.GetTxIDsByBlockHash(ctx, blk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rest) != 0 {
+		t.Fatalf("block still holds %d rows after the rewrite: %v", len(rest), rest)
+	}
+}

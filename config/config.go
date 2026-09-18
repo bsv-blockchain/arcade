@@ -194,7 +194,7 @@ type Kafka struct {
 // storefactory.New; sub-blocks are read only when their backend is selected
 // so operators don't need to fill in unused sections.
 type Store struct {
-	Backend string `mapstructure:"backend"` // "aerospike" (default), "pebble", or "postgres"
+	Backend string `mapstructure:"backend"` // "aerospike" (default), "pebble", "postgres", or "mongodb"
 	// BatchConcurrency tunes the parallel-loop helpers (BatchGetOrInsertStatus,
 	// BatchUpdateStatus) used by backends without a native batch path
 	// (Aerospike, Pebble). Default 0 → runtime.NumCPU(). Raise to match
@@ -204,6 +204,7 @@ type Store struct {
 	Aerospike        Aero     `mapstructure:"aerospike"`
 	Pebble           Pebble   `mapstructure:"pebble"`
 	Postgres         Postgres `mapstructure:"postgres"`
+	Mongo            Mongo    `mapstructure:"mongodb"`
 }
 
 type Aero struct {
@@ -272,6 +273,33 @@ type Pebble struct {
 	MemTableSizeMB        int    `mapstructure:"memtable_size_mb"`
 	L0CompactionThreshold int    `mapstructure:"l0_compaction_threshold"`
 	SyncWrites            bool   `mapstructure:"sync_writes"`
+}
+
+// Mongo configures the MongoDB-backed store. URI is a standard connection
+// string (mongodb:// or mongodb+srv://) and may carry replica-set, auth and
+// TLS options; Database is the database arcade writes its collections and
+// GridFS buckets into. The backend never uses multi-document transactions, so
+// a standalone mongod is sufficient — a replica set is only needed for HA.
+//
+// OpTimeoutMs bounds single-document reads and writes (including counts);
+// QueryTimeoutMs bounds the queries whose result is capped by a limit or a
+// page — lists, pages, bulk-write chunks, the blob sweep. Anything whose size
+// scales with the data — the iterators, GetTxIDsByBlockHash, the census
+// aggregate — runs under the caller's context only, because a fixed deadline
+// there does not fail one call, it fails the same call on every retry.
+// IndexTimeoutMs bounds EnsureIndexes at boot (createIndexes on a populated,
+// restored collection is the one boot step that scales with data). BatchSize
+// caps the documents per bulk-write chunk and per $in on the write paths;
+// the txid $in on the read paths is a fixed 1000.
+type Mongo struct {
+	URI              string `mapstructure:"uri"`
+	Database         string `mapstructure:"database"`
+	ConnectTimeoutMs int    `mapstructure:"connect_timeout_ms"`
+	OpTimeoutMs      int    `mapstructure:"op_timeout_ms"`
+	QueryTimeoutMs   int    `mapstructure:"query_timeout_ms"`
+	IndexTimeoutMs   int    `mapstructure:"index_timeout_ms"`
+	MaxPoolSize      int    `mapstructure:"max_pool_size"`
+	BatchSize        int    `mapstructure:"batch_size"`
 }
 
 type TeranodeConfig struct {
@@ -1171,6 +1199,14 @@ func setDefaults() {
 	viper.SetDefault("store.postgres.embedded_cache_dir", "~/.arcade/postgres-cache")
 	viper.SetDefault("store.postgres.max_conns", 16)
 	viper.SetDefault("store.postgres.schema_apply_timeout_ms", 300000)
+	viper.SetDefault("store.mongodb.uri", "mongodb://localhost:27017")
+	viper.SetDefault("store.mongodb.database", "arcade")
+	viper.SetDefault("store.mongodb.connect_timeout_ms", 10000)
+	viper.SetDefault("store.mongodb.op_timeout_ms", 3000)
+	viper.SetDefault("store.mongodb.query_timeout_ms", 8000)
+	viper.SetDefault("store.mongodb.index_timeout_ms", 300000)
+	viper.SetDefault("store.mongodb.max_pool_size", 64)
+	viper.SetDefault("store.mongodb.batch_size", 500)
 	viper.SetDefault("health.port", 8081)
 
 	// OTEL telemetry export: off by default. See TelemetryConfig doc comment
@@ -1374,8 +1410,33 @@ func validate(cfg *Config) error {
 		if cfg.Store.Postgres.SchemaApplyTimeoutMs < 0 {
 			return fmt.Errorf("store.postgres.schema_apply_timeout_ms must be >= 0 (0 = default)")
 		}
+	case "mongodb":
+		if cfg.Store.Mongo.URI == "" {
+			return fmt.Errorf("store.mongodb.uri is required when store.backend=mongodb")
+		}
+		if cfg.Store.Mongo.Database == "" {
+			return fmt.Errorf("store.mongodb.database is required when store.backend=mongodb")
+		}
+		for name, v := range map[string]int{
+			"connect_timeout_ms": cfg.Store.Mongo.ConnectTimeoutMs,
+			"op_timeout_ms":      cfg.Store.Mongo.OpTimeoutMs,
+			"query_timeout_ms":   cfg.Store.Mongo.QueryTimeoutMs,
+			"index_timeout_ms":   cfg.Store.Mongo.IndexTimeoutMs,
+			"max_pool_size":      cfg.Store.Mongo.MaxPoolSize,
+		} {
+			if v < 0 {
+				return fmt.Errorf("store.mongodb.%s must be >= 0 (0 = default)", name)
+			}
+		}
+		// A single UpdateMany carries one $in of batch_size txids, and unlike
+		// BulkWrite it is not split by the driver: past ~200k ids it exceeds
+		// the 16 MB command limit. 10k is far below that and far above any
+		// useful chunk.
+		if b := cfg.Store.Mongo.BatchSize; b < 0 || b > 10000 {
+			return fmt.Errorf("store.mongodb.batch_size must be between 0 (default) and 10000, got %d", b)
+		}
 	default:
-		return fmt.Errorf("unknown store.backend %q (expected aerospike, pebble, or postgres)", cfg.Store.Backend)
+		return fmt.Errorf("unknown store.backend %q (expected aerospike, pebble, postgres, or mongodb)", cfg.Store.Backend)
 	}
 	// merkle_service.url is intentionally optional: an empty value means the
 	// Merkle integration is disabled. The runtime treats URL-presence as the

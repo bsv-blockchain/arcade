@@ -51,8 +51,8 @@ kafka:
   # min_partitions: 0
 
 # Persistence backend. `backend` dispatches construction in storefactory.New;
-# only the matching sub-block is read, so unused sections (pebble, postgres)
-# can be left out entirely.
+# only the matching sub-block is read, so unused sections (pebble, postgres,
+# mongodb) can be left out entirely.
 store:
   backend: aerospike
   aerospike:
@@ -76,15 +76,42 @@ store:
     # Per-attempt socket timeout. Should be <= op_timeout_ms; the client
     # may retry on socket timeout up to the op deadline.
     socket_timeout_ms: 5000
-    # Alternative: external PostgreSQL. Only read when backend: postgres.
-    # postgres:
-    #   dsn: postgres://user:pass@host:5432/arcade
-    #   max_conns: 16
-    #   # Ceiling for the boot-time schema apply when it actually has to run
-    #   # (fresh database or schema change). Restarts with a current schema
-    #   # verify a stored checksum and skip DDL entirely, so they boot
-    #   # instantly even under heavy DB load. See issue #278.
-    #   schema_apply_timeout_ms: 300000
+  # Alternative: external PostgreSQL. Only read when backend: postgres.
+  # postgres:
+  #   dsn: postgres://user:pass@host:5432/arcade
+  #   max_conns: 16
+  #   # Ceiling for the boot-time schema apply when it actually has to run
+  #   # (fresh database or schema change). Restarts with a current schema
+  #   # verify a stored checksum and skip DDL entirely, so they boot
+  #   # instantly even under heavy DB load. See issue #278.
+  #   schema_apply_timeout_ms: 300000
+  # Alternative: MongoDB. Only read when backend: mongodb. A standalone
+  # mongod is sufficient (no multi-document transactions are used); a
+  # replica set is only needed for HA. BUMP/STUMP payloads live in GridFS.
+  # Reads must reach a PRIMARY: this backend's guards (status lattice,
+  # still-anchored-to-this-block, manifest-versus-file) are read-then-write,
+  # so a readPreference of secondary/secondaryPreferred in the URI can let
+  # them pass on stale data — losing status transitions and deleting blobs
+  # under concurrency. Arcade warns at startup if the URI asks for one.
+  # mongodb:
+  #   uri: mongodb://localhost:27017
+  #   database: arcade
+  #   # Connect + server-selection deadline for the initial handshake.
+  #   connect_timeout_ms: 10000
+  #   # Deadline for single-document reads/writes and counts.
+  #   op_timeout_ms: 3000
+  #   # Deadline for limit-bounded queries: lists, pages, bulk-write chunks.
+  #   # Anything whose size scales with the data (iterators, per-block txid
+  #   # scans, the census aggregate) runs under the caller's context instead.
+  #   query_timeout_ms: 8000
+  #   # Deadline for EnsureIndexes at boot; building indexes on a restored,
+  #   # populated collection can take minutes (cf. postgres
+  #   # schema_apply_timeout_ms).
+  #   index_timeout_ms: 300000
+  #   max_pool_size: 64
+  #   # Documents per bulk-write chunk and per $in on the write paths (max
+  #   # 10000; read-path $in chunks are a fixed 1000).
+  #   batch_size: 500
 
 # datahub_urls:
 #   - "https://datahub1.example.com"

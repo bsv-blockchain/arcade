@@ -273,7 +273,11 @@ type Store interface {
 	// previous row that was merged with (i.e. the row as it existed before
 	// the update), or nil for unknown txids and per-row errors. Used by the
 	// inbound callback handlers to observe transition-age metrics
-	// (RECEIVED→SEEN_ON_NETWORK) without an extra round-trip.
+	// (RECEIVED→SEEN_ON_NETWORK) without an extra round-trip. The previous
+	// row's status metadata (Status, Timestamp, block anchor, extra info) is
+	// guaranteed; RawTx is NOT — MongoDB projects it away, since no caller
+	// reads it and it can be megabytes per row on a hot path, while Pebble
+	// and Postgres happen to return it only because they read the row whole.
 	//
 	// Backends are expected to short-circuit when the requested transition
 	// is blocked by the status lattice (CanTransitionFrom) — the returned

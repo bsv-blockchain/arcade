@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 )
 
 // baseValidConfig returns a Config populated with the minimum fields other
@@ -423,5 +424,100 @@ func TestPropagationBatchCapsBind(t *testing.T) {
 	}
 	if overridden.Propagation.TeranodeMaxBatchBytes != 4194304 {
 		t.Errorf("ARCADE_PROPAGATION_TERANODE_MAX_BATCH_BYTES override = %d, want 4194304", overridden.Propagation.TeranodeMaxBatchBytes)
+	}
+}
+
+// The mongodb backend needs both a connection URI and a database name; the
+// other fields have defaults. The default: error string enumerates every
+// accepted backend, so a typo'd name tells the operator what is valid.
+func TestValidate_MongoDBBackend(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.Store.Backend = "mongodb"
+	cfg.Store.Mongo.URI = "mongodb://localhost:27017"
+	cfg.Store.Mongo.Database = "arcade"
+	if err := validate(cfg); err != nil {
+		t.Fatalf("mongodb backend with uri+database should be accepted, got: %v", err)
+	}
+
+	cfg.Store.Mongo.URI = ""
+	err := validate(cfg)
+	if err == nil || !strings.Contains(err.Error(), "store.mongodb.uri") {
+		t.Fatalf("missing uri should be rejected naming store.mongodb.uri, got: %v", err)
+	}
+
+	cfg.Store.Mongo.URI = "mongodb://localhost:27017"
+	cfg.Store.Mongo.Database = ""
+	err = validate(cfg)
+	if err == nil || !strings.Contains(err.Error(), "store.mongodb.database") {
+		t.Fatalf("missing database should be rejected naming store.mongodb.database, got: %v", err)
+	}
+
+	cfg.Store.Backend = "mongo"
+	err = validate(cfg)
+	if err == nil || !strings.Contains(err.Error(), "mongodb") {
+		t.Fatalf("unknown backend error should list mongodb as an accepted value, got: %v", err)
+	}
+}
+
+// Every store.mongodb.* key must have a SetDefault so ARCADE_STORE_MONGODB_*
+// env overrides are honored by viper's AutomaticEnv (see setDefaults).
+func TestSetDefaults_MongoDBKeysBound(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	setDefaults()
+	for _, key := range []string{
+		"store.mongodb.uri", "store.mongodb.database", "store.mongodb.connect_timeout_ms",
+		"store.mongodb.op_timeout_ms", "store.mongodb.query_timeout_ms",
+		"store.mongodb.index_timeout_ms",
+		"store.mongodb.max_pool_size", "store.mongodb.batch_size",
+	} {
+		if !viper.IsSet(key) {
+			t.Errorf("%s has no default; ARCADE_%s would be ignored", key, strings.ToUpper(strings.ReplaceAll(key, ".", "_")))
+		}
+	}
+}
+
+// The mongodb block rejects values that would otherwise be substituted
+// silently or overflow a server limit: negative timeouts became compiled
+// defaults with no error, and a batch_size past ~200k puts one UpdateMany $in
+// over the 16 MB command limit. index_timeout_ms exists so createIndexes on a
+// restored, populated collection cannot sit past the liveness probe.
+func TestValidate_MongoDBBounds(t *testing.T) {
+	base := func() *Config {
+		cfg := baseValidConfig()
+		cfg.Store.Backend = "mongodb"
+		cfg.Store.Mongo.URI = "mongodb://localhost:27017"
+		cfg.Store.Mongo.Database = "arcade"
+		return cfg
+	}
+	if err := validate(base()); err != nil {
+		t.Fatalf("baseline must validate: %v", err)
+	}
+	cfg := base()
+	cfg.Store.Mongo.OpTimeoutMs = -1
+	if err := validate(cfg); err == nil || !strings.Contains(err.Error(), "op_timeout_ms") {
+		t.Fatalf("negative op_timeout_ms must be rejected naming the key, got: %v", err)
+	}
+	cfg = base()
+	cfg.Store.Mongo.IndexTimeoutMs = -5
+	if err := validate(cfg); err == nil || !strings.Contains(err.Error(), "index_timeout_ms") {
+		t.Fatalf("negative index_timeout_ms must be rejected, got: %v", err)
+	}
+	cfg = base()
+	cfg.Store.Mongo.BatchSize = 10001
+	if err := validate(cfg); err == nil || !strings.Contains(err.Error(), "batch_size") {
+		t.Fatalf("batch_size over 10000 must be rejected, got: %v", err)
+	}
+	cfg = base()
+	cfg.Store.Mongo.BatchSize = 10000
+	if err := validate(cfg); err != nil {
+		t.Fatalf("batch_size 10000 is the inclusive cap: %v", err)
+	}
+
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	setDefaults()
+	if got := viper.GetInt("store.mongodb.index_timeout_ms"); got != 300000 {
+		t.Fatalf("store.mongodb.index_timeout_ms default = %d, want 300000 (matches postgres schema_apply_timeout_ms)", got)
 	}
 }
