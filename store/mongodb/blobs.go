@@ -269,7 +269,9 @@ func (s *Store) download(ctx context.Context, bucket *mongo.GridFSBucket, ref bl
 
 // deleteFile removes one GridFS file; one that is already gone is fine.
 func (s *Store) deleteFile(ctx context.Context, bucket *mongo.GridFSBucket, id bson.ObjectID) error {
-	if err := bucket.Delete(ctx, id); err != nil && !errors.Is(err, mongo.ErrFileNotFound) {
+	octx, cancel := s.opCtx(ctx)
+	defer cancel()
+	if err := bucket.Delete(octx, id); err != nil && !errors.Is(err, mongo.ErrFileNotFound) {
 		return fmt.Errorf("delete file %s: %w", id.Hex(), err)
 	}
 	return nil
