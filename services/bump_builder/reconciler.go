@@ -583,16 +583,16 @@ func (r *Reconciler) fullScanResurrect(ctx context.Context, set map[string]*mode
 			// The block's own stored BUMP is corrupt. Retrying the scan
 			// cannot fix that, and once the attempt cap retired the one-shot
 			// the row would sit orphaned, stamped and off every queue. So
-			// hand it off the way the tick path handles an unusable BUMP:
-			// ask merkle-service to redeliver the block (the builder's
-			// short-circuit sees a BUMP that does not parse and rebuilds
-			// it, re-mining the full level-0 set), and requeue the row so
-			// the very next tick's resurrection short-circuit returns it to
-			// active. The repair now has owners, so the scan is not
-			// incomplete for it — unless the requeue write itself failed.
+			// hand it to the tick: requeued, the row reaches the
+			// resurrection short-circuit, whose own re-mine hits the same
+			// corrupt BUMP and takes the deferral path — the row stays
+			// queued and /reprocess is asked to redeliver the block, which
+			// rebuilds the BUMP — until the BUMP parses (see resurrect).
+			// That is a durable retry with its own cap, so the scan is not
+			// incomplete for this row unless the requeue write itself
+			// failed.
 			logger.Error("startup full-scan: resurrected block's stored BUMP is malformed; "+
-				"requesting a rebuild and requeueing the row for the reconciler", zap.Error(remineErr))
-			r.requestRebuild(ctx, logger, hash)
+				"requeueing the row so the reconciler's deferral drives the rebuild", zap.Error(remineErr))
 			if !r.requeueForTick(ctx, logger, hash) {
 				complete = false
 			}
@@ -809,30 +809,23 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 		}
 	}
 
+	batchSize := r.cfg.BumpBuilder.Reconciler.BatchSize
+	if batchSize <= 0 {
+		batchSize = maxTxIDsPerBulkEvent
+	}
+
 	// Resurrection short-circuit: the block is the active-chain block at
-	// its height again (flip-flop). Reset the row to active — the upsert
-	// also clears orphaned_at/reconciled_at — and leave its txs alone; the
-	// COMPETITOR is now the orphan and heals through its own row.
+	// its height again (flip-flop). Re-mine its txs from its own retained
+	// BUMP — the same heal the full-scan applies, onlyChanged so rows already
+	// anchored right produce no events — and reset the row to active (the
+	// write also clears orphaned_at/reconciled_at). The COMPETITOR is now
+	// the orphan and heals through its own row; the re-mine here is what
+	// makes the heal independent of that row existing, and what makes a
+	// requeued row with a corrupt BUMP cycle through the deferral below
+	// rather than be reactivated with its txs never re-mined.
 	if hash, ok := r.activeHashAt(ctx, height); ok && hash == orphan {
-		logger.Warn("orphan mark is stale — block is on the active chain; resetting to active")
-		// A CAS on the generation this pass dequeued, like the reconciled_at
-		// stamp: a row the tracker already reactivated, or that a reorg
-		// orphaned again with a newer generation between the check above
-		// and this write, is left as it is — the newer generation stays
-		// queued for its own pass — and is not counted as a transition.
-		applied, err := r.store.ReactivateBlock(ctx, orphan, height, orphanedAt)
-		if err != nil {
-			logger.Warn("failed to reset resurrected block", zap.Error(err))
-			return "error"
-		}
-		if !applied {
-			return r.staleOutcome(logger, height)
-		}
-		delete(r.defers, orphan)
-		metrics.BlockStatusTransitionsTotal.
-			WithLabelValues(metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceReconciler).
-			Inc()
-		return "resurrected"
+		logger.Warn("orphan mark is stale — block is on the active chain; re-mining and resetting to active")
+		return r.resurrect(ctx, logger, orphan, height, orphanedAt, batchSize)
 	}
 
 	// The canonical block at O's height: re-mine its FULL BUMP set first.
@@ -841,10 +834,6 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 	// still an alternate, and (c) is a no-op for rows already anchored
 	// right (onlyChanged filters their events). Missing canonical BUMP ⇒
 	// defer (optionally poking merkle-service /reprocess) up to the cap.
-	batchSize := r.cfg.BumpBuilder.Reconciler.BatchSize
-	if batchSize <= 0 {
-		batchSize = maxTxIDsPerBulkEvent
-	}
 	reanchored := 0
 	canonicalReady := false
 	canonicalHash, canonicalKnown := r.activeHashAt(ctx, height)
@@ -984,6 +973,70 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 	default:
 		return "empty"
 	}
+}
+
+// resurrect is the tick's half of the #339 repair for a queued row whose
+// block IS the active-chain block at its height: re-mine the block's txs
+// from its own retained BUMP, then return the row to active with a CAS on
+// the generation this pass dequeued (like the reconciled_at stamp: a row the
+// tracker already reactivated, or that a reorg orphaned again with a newer
+// generation in between, is left as it is and not counted).
+//
+// The re-mine's failure modes drive the outcome, so the row is never
+// reactivated with its txs un-remined and no durable retry:
+//   - no BUMP stored (ok=false): nothing to re-mine from; reactivate. The
+//     txs heal through the competitor's orphan row or a BLOCK_PROCESSED
+//     redelivery, as tracker-side reactivations rely on.
+//   - errMalformedBUMP: the stored blob is corrupt and will not fix
+//     itself. Do NOT reactivate; take the same deferral the canonical path
+//     takes for an unusable BUMP — the row stays queued and /reprocess is
+//     asked to redeliver the block, which rebuilds the BUMP — until the
+//     BUMP parses or the defer cap is reached. At the cap the row IS
+//     reactivated, loudly: the alternative (park: stamp and leave it
+//     orphaned) would leave a canonical block orphaned, which is the bug
+//     this PR exists to close; its txs stay on the redelivery path.
+//   - any other error (transient read, failed batch): "error", row queued,
+//     next tick retries.
+func (r *Reconciler) resurrect(ctx context.Context, logger *zap.Logger, orphan string, height uint64, orphanedAt time.Time, batchSize int) string {
+	n, ok, remineErr := r.remineFromStoredBUMP(ctx, logger, orphan, batchSize)
+	switch {
+	case errors.Is(remineErr, errMalformedBUMP):
+		if r.deferForCanonicalBUMP(ctx, logger, orphan, orphan) {
+			logger.Error("resurrected block's stored BUMP is malformed; deferring the reactivation and "+
+				"requesting a rebuild so its txs are re-mined before the row returns to active",
+				zap.Error(remineErr))
+			return "deferred"
+		}
+		logger.Error("resurrected block's stored BUMP is still malformed at the defer cap; reactivating the row "+
+			"anyway so a canonical block is not left orphaned — its txs heal on a BLOCK_PROCESSED redelivery",
+			zap.Error(remineErr))
+	case remineErr != nil:
+		metrics.ReconcilerTxsReanchoredTotal.Add(float64(n))
+		logger.Warn("re-mine from the resurrected block's BUMP failed; leaving the block queued for retry",
+			zap.Int("txs_reanchored", n), zap.Error(remineErr))
+		return "error"
+	case !ok:
+		logger.Warn("resurrected block has no stored compound BUMP; " +
+			"its txs heal through the competitor's orphan row or a BLOCK_PROCESSED redelivery")
+	default:
+		metrics.ReconcilerTxsReanchoredTotal.Add(float64(n))
+		if n > 0 {
+			logger.Info("re-mined txs against the resurrected block", zap.Int("txs_reanchored", n))
+		}
+	}
+	applied, err := r.store.ReactivateBlock(ctx, orphan, height, orphanedAt)
+	if err != nil {
+		logger.Warn("failed to reset resurrected block", zap.Error(err))
+		return "error"
+	}
+	if !applied {
+		return r.staleOutcome(logger, height)
+	}
+	delete(r.defers, orphan)
+	metrics.BlockStatusTransitionsTotal.
+		WithLabelValues(metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceReconciler).
+		Inc()
+	return "resurrected"
 }
 
 // parkBlock is the issue-#282 fallback for an orphan whose canonical BUMP is

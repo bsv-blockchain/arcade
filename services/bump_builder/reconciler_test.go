@@ -1871,64 +1871,6 @@ func TestReconciler_FullScanUnjudgeableHeightKeepsOneShotArmed(t *testing.T) {
 	}
 }
 
-// TestReconciler_FullScanMalformedBUMPRequeuesAndRequestsRebuild: a stored
-// BUMP that does not parse is not "no BUMP stored" — read as absence, the
-// full-scan would reactivate the row without re-mining its txs. But
-// retrying the scan cannot fix a corrupt blob either, and once the attempt
-// cap retired the one-shot the row would sit orphaned, stamped and off every
-// queue. So the scan hands the repair off the way the tick path handles an
-// unusable BUMP: it asks merkle-service to redeliver the block (the builder
-// rebuilds a BUMP it cannot parse) and requeues the row, whose next tick
-// returns it to active through the resurrection short-circuit. The scan is
-// complete for it.
-func TestReconciler_FullScanMalformedBUMPRequeuesAndRequestsRebuild(t *testing.T) {
-	ctx := context.Background()
-	st := newPebbleForTest(t)
-	pub := &capturePublisher{}
-	stub := &stubChaintracks{}
-	stub.setHeightHeader(10, headerWithHash(t, recOrphan, 10))
-	reprocess := newReprocessStub(t)
-
-	seedSeen(t, st, recShared1)
-	_ = st.InsertBUMP(ctx, recOrphan, 10, malformedBUMP)
-	_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
-	_, _ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
-	_, _ = st.MarkBlockReconciled(ctx, recOrphan, time.Time{}, time.Now())
-	if rows, _ := st.ListOrphanedBlocksToReconcile(ctx, 10); len(rows) != 0 {
-		t.Fatalf("precondition: the stamped row must be off the queue, got %d", len(rows))
-	}
-
-	r := newTestReconciler(st, pub, stub, nil)
-	withReprocess(r, reprocess)
-	if !r.fullScan(ctx) {
-		t.Fatal("a repair handed off to the rebuild and the queue must not leave the scan incomplete")
-	}
-	if got := reprocess.requested(); len(got) != 1 || got[0] != recOrphan {
-		t.Fatalf("the block's rebuild must be requested exactly once, got %v", got)
-	}
-	bp, err := st.GetBlockProcessingStatus(ctx, recOrphan)
-	if err != nil || bp.Status != models.BlockStatusOrphaned || bp.ReconciledAt != nil {
-		t.Fatalf("row must be orphaned and unstamped (requeued), got %+v err=%v", bp, err)
-	}
-	if rows, lerr := st.ListOrphanedBlocksToReconcile(ctx, 10); lerr != nil || len(rows) != 1 || rows[0].BlockHash != recOrphan {
-		t.Fatalf("row must be back on the reconcile queue, got %+v err=%v", rows, lerr)
-	}
-	if got := statusOf(t, st, recShared1); got.Status != models.StatusSeenOnNetwork {
-		t.Fatalf("nothing is re-mined from a corrupt BUMP, got %s@%s", got.Status, got.BlockHash)
-	}
-
-	// The tick's resurrection short-circuit returns the canonical row to
-	// active; the rebuild the poke triggered heals its txs on redelivery.
-	r.tick(ctx)
-	bp, err = st.GetBlockProcessingStatus(ctx, recOrphan)
-	if err != nil || bp.Status != models.BlockStatusActive || bp.OrphanedAt != nil || bp.ReconciledAt != nil {
-		t.Fatalf("the tick must reactivate the requeued canonical row, got %+v err=%v", bp, err)
-	}
-	if rows, lerr := st.ListOrphanedBlocksToReconcile(ctx, 10); lerr != nil || len(rows) != 0 {
-		t.Fatalf("row must leave the queue once reactivated, got %+v err=%v", rows, lerr)
-	}
-}
-
 // TestReconciler_NeighborhoodEmptyBUMPKeepsRowQueued: every backend reports
 // a missing BUMP as store.ErrNotFound, so an empty stored blob is a
 // stored-but-unusable one, not absence. Read as absence, the neighbor's txs
@@ -2029,5 +1971,232 @@ func TestReconciler_FullScanOrphanMetricCountsPartialTransitionsOnError(t *testi
 	}
 	if got := testutil.ToFloat64(counter) - before; got != 2 {
 		t.Fatalf("full-scan orphaned transitions = %v, want 2 (the rows that landed before the failure)", got)
+	}
+}
+
+// seedQueuedCanonical puts a queued (orphaned, unstamped) row in the store
+// for a block that IS the active-chain block at height 10, with a SEEN tx
+// and the given stored BUMP blob — the resurrection short-circuit's input.
+func seedQueuedCanonical(t *testing.T, st store.Store, stub *stubChaintracks, bumpBlob []byte) *models.BlockProcessingStatus {
+	t.Helper()
+	ctx := context.Background()
+	stub.setHeightHeader(10, headerWithHash(t, recOrphan, 10))
+	seedSeen(t, st, recShared1)
+	if bumpBlob != nil {
+		if err := st.InsertBUMP(ctx, recOrphan, 10, bumpBlob); err != nil {
+			t.Fatalf("insert BUMP: %v", err)
+		}
+	}
+	_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+	_, _ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	rows, err := st.ListOrphanedBlocksToReconcile(ctx, 10)
+	if err != nil || len(rows) != 1 || rows[0].BlockHash != recOrphan {
+		t.Fatalf("precondition: one queued row, got %+v err=%v", rows, err)
+	}
+	return rows[0]
+}
+
+// TestReconciler_ShortCircuitReminesFromStoredBUMP: the resurrection
+// short-circuit heals the block's own txs from its retained BUMP before it
+// returns the row to active — the same repair the full-scan applies — so a
+// resurrected block's heal does not depend on the competitor's row existing.
+func TestReconciler_ShortCircuitReminesFromStoredBUMP(t *testing.T) {
+	ctx := context.Background()
+	st := newPebbleForTest(t)
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	row := seedQueuedCanonical(t, st, stub, makeCompoundForTest(t, 10, recShared1))
+
+	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
+		metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceReconciler)
+	before := testutil.ToFloat64(counter)
+
+	r := newTestReconciler(st, pub, stub, nil)
+	if outcome := r.reconcileBlock(ctx, row); outcome != "resurrected" {
+		t.Fatalf("outcome = %q, want resurrected", outcome)
+	}
+	if got := statusOf(t, st, recShared1); got.Status != models.StatusMined || got.BlockHash != recOrphan {
+		t.Fatalf("the short-circuit must re-mine the block's txs, got %s@%s", got.Status, got.BlockHash)
+	}
+	bp, err := st.GetBlockProcessingStatus(ctx, recOrphan)
+	if err != nil || bp.Status != models.BlockStatusActive || bp.OrphanedAt != nil || bp.ReconciledAt != nil {
+		t.Fatalf("row must be active and clean, got %+v err=%v", bp, err)
+	}
+	if got := testutil.ToFloat64(counter) - before; got != 1 {
+		t.Fatalf("reconciler reactivated transitions = %v, want 1", got)
+	}
+	if len(pub.bulkEvents()) == 0 {
+		t.Fatal("expected a corrected MINED event for the re-mined tx")
+	}
+}
+
+// TestReconciler_ShortCircuitMalformedBUMPDefersInsteadOfReactivating: a
+// queued canonical row whose stored BUMP does not parse must NOT be returned
+// to active with its txs un-remined and nothing left to retry. The
+// short-circuit takes the deferral the canonical path takes for an unusable
+// BUMP — row still queued, /reprocess asked to rebuild the block — and only
+// reactivates (re-mining) once the BUMP parses. The reactivated series counts
+// nothing until then.
+func TestReconciler_ShortCircuitMalformedBUMPDefersInsteadOfReactivating(t *testing.T) {
+	ctx := context.Background()
+	st := newPebbleForTest(t)
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	reprocess := newReprocessStub(t)
+	row := seedQueuedCanonical(t, st, stub, malformedBUMP)
+
+	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
+		metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceReconciler)
+	before := testutil.ToFloat64(counter)
+
+	r := newTestReconciler(st, pub, stub, nil)
+	withReprocess(r, reprocess)
+	if outcome := r.reconcileBlock(ctx, row); outcome != "deferred" {
+		t.Fatalf("outcome = %q, want deferred", outcome)
+	}
+	if r.defers[recOrphan] != 1 {
+		t.Fatalf("defer count = %d, want 1", r.defers[recOrphan])
+	}
+	if got := reprocess.requested(); len(got) != 1 || got[0] != recOrphan {
+		t.Fatalf("the block's rebuild must be requested, got %v", got)
+	}
+	bp, err := st.GetBlockProcessingStatus(ctx, recOrphan)
+	if err != nil || bp.Status != models.BlockStatusOrphaned || bp.ReconciledAt != nil {
+		t.Fatalf("row must stay orphaned and queued (unstamped), got %+v err=%v", bp, err)
+	}
+	if rows, lerr := st.ListOrphanedBlocksToReconcile(ctx, 10); lerr != nil || len(rows) != 1 {
+		t.Fatalf("row must stay on the reconcile queue, got %+v err=%v", rows, lerr)
+	}
+	if got := statusOf(t, st, recShared1); got.Status != models.StatusSeenOnNetwork {
+		t.Fatalf("nothing is re-mined from a corrupt BUMP, got %s@%s", got.Status, got.BlockHash)
+	}
+	if got := testutil.ToFloat64(counter) - before; got != 0 {
+		t.Fatalf("reconciler reactivated transitions = %v, want 0 (nothing was reactivated)", got)
+	}
+
+	// The rebuild lands: the next tick re-mines and reactivates, counted once.
+	_ = st.InsertBUMP(ctx, recOrphan, 10, makeCompoundForTest(t, 10, recShared1))
+	r.tick(ctx)
+	bp, err = st.GetBlockProcessingStatus(ctx, recOrphan)
+	if err != nil || bp.Status != models.BlockStatusActive || bp.OrphanedAt != nil || bp.ReconciledAt != nil {
+		t.Fatalf("row must be reactivated once the BUMP parses, got %+v err=%v", bp, err)
+	}
+	if got := statusOf(t, st, recShared1); got.Status != models.StatusMined || got.BlockHash != recOrphan {
+		t.Fatalf("the rebuilt BUMP must re-mine the tx, got %s@%s", got.Status, got.BlockHash)
+	}
+	if got := testutil.ToFloat64(counter) - before; got != 1 {
+		t.Fatalf("reconciler reactivated transitions = %v, want 1", got)
+	}
+	if _, deferred := r.defers[recOrphan]; deferred {
+		t.Fatal("reactivation must clear the defer counter")
+	}
+}
+
+// TestReconciler_ShortCircuitMalformedBUMPReactivatesAtDeferCap: when the
+// BUMP never becomes usable, the deferral is bounded like every other. At
+// the cap the row IS reactivated — parking it (stamped, still orphaned)
+// would leave a canonical block orphaned, the bug this PR closes — and the
+// txs stay on the redelivery path.
+func TestReconciler_ShortCircuitMalformedBUMPReactivatesAtDeferCap(t *testing.T) {
+	ctx := context.Background()
+	st := newPebbleForTest(t)
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	row := seedQueuedCanonical(t, st, stub, malformedBUMP)
+
+	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
+		metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceReconciler)
+	before := testutil.ToFloat64(counter)
+
+	r := newTestReconciler(st, pub, stub, func(c *config.ReconcilerConfig) { c.MaxDeferAttempts = 2 })
+	for i := 1; i <= 2; i++ {
+		if outcome := r.reconcileBlock(ctx, row); outcome != "deferred" {
+			t.Fatalf("pass %d: outcome = %q, want deferred", i, outcome)
+		}
+	}
+	if bp, err := st.GetBlockProcessingStatus(ctx, recOrphan); err != nil || bp.Status != models.BlockStatusOrphaned {
+		t.Fatalf("row must stay orphaned while under the cap, got %+v err=%v", bp, err)
+	}
+	if outcome := r.reconcileBlock(ctx, row); outcome != "resurrected" {
+		t.Fatalf("at the cap: outcome = %q, want resurrected", outcome)
+	}
+	bp, err := st.GetBlockProcessingStatus(ctx, recOrphan)
+	if err != nil || bp.Status != models.BlockStatusActive || bp.OrphanedAt != nil || bp.ReconciledAt != nil {
+		t.Fatalf("a canonical block must not be left orphaned at the cap, got %+v err=%v", bp, err)
+	}
+	if got := testutil.ToFloat64(counter) - before; got != 1 {
+		t.Fatalf("reconciler reactivated transitions = %v, want 1 (the cap reactivation is real)", got)
+	}
+	if got := statusOf(t, st, recShared1); got.Status != models.StatusSeenOnNetwork {
+		t.Fatalf("a corrupt BUMP re-mines nothing; the tx stays on the redelivery path, got %s@%s", got.Status, got.BlockHash)
+	}
+}
+
+// TestReconciler_FullScanMalformedBUMPRequeuesForTick is the hand-off end to
+// end: the full-scan cannot fix a corrupt blob by retrying, so it requeues
+// the row and reports complete; the tick's short-circuit then hits the same
+// corrupt BUMP and DEFERS (requesting the rebuild) rather than reactivating
+// with the txs un-remined; once the BUMP parses, the tick re-mines and
+// reactivates. The scan itself requests nothing — the deferral is the one
+// owner of the rebuild.
+func TestReconciler_FullScanMalformedBUMPRequeuesForTick(t *testing.T) {
+	ctx := context.Background()
+	st := newPebbleForTest(t)
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	stub.setHeightHeader(10, headerWithHash(t, recOrphan, 10))
+	reprocess := newReprocessStub(t)
+
+	seedSeen(t, st, recShared1)
+	_ = st.InsertBUMP(ctx, recOrphan, 10, malformedBUMP)
+	_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+	_, _ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	_, _ = st.MarkBlockReconciled(ctx, recOrphan, time.Time{}, time.Now())
+	if rows, _ := st.ListOrphanedBlocksToReconcile(ctx, 10); len(rows) != 0 {
+		t.Fatalf("precondition: the stamped row must be off the queue, got %d", len(rows))
+	}
+
+	r := newTestReconciler(st, pub, stub, nil)
+	withReprocess(r, reprocess)
+	if !r.fullScan(ctx) {
+		t.Fatal("a repair handed to the tick must not leave the scan incomplete")
+	}
+	if got := reprocess.requested(); len(got) != 0 {
+		t.Fatalf("the scan itself must not request a rebuild (the tick's deferral does), got %v", got)
+	}
+	bp, err := st.GetBlockProcessingStatus(ctx, recOrphan)
+	if err != nil || bp.Status != models.BlockStatusOrphaned || bp.ReconciledAt != nil {
+		t.Fatalf("row must be orphaned and unstamped (requeued), got %+v err=%v", bp, err)
+	}
+	if rows, lerr := st.ListOrphanedBlocksToReconcile(ctx, 10); lerr != nil || len(rows) != 1 || rows[0].BlockHash != recOrphan {
+		t.Fatalf("row must be back on the reconcile queue, got %+v err=%v", rows, lerr)
+	}
+
+	// The tick defers rather than reactivating a row whose txs it cannot
+	// re-mine, and asks for the rebuild.
+	r.tick(ctx)
+	if got := reprocess.requested(); len(got) != 1 || got[0] != recOrphan {
+		t.Fatalf("the tick's deferral must request the rebuild once, got %v", got)
+	}
+	bp, err = st.GetBlockProcessingStatus(ctx, recOrphan)
+	if err != nil || bp.Status != models.BlockStatusOrphaned || bp.ReconciledAt != nil {
+		t.Fatalf("the tick must leave the row queued while the BUMP is corrupt, got %+v err=%v", bp, err)
+	}
+	if got := statusOf(t, st, recShared1); got.Status != models.StatusSeenOnNetwork {
+		t.Fatalf("nothing is re-mined from a corrupt BUMP, got %s@%s", got.Status, got.BlockHash)
+	}
+
+	// The rebuild lands: the next tick heals and reactivates.
+	_ = st.InsertBUMP(ctx, recOrphan, 10, makeCompoundForTest(t, 10, recShared1))
+	r.tick(ctx)
+	bp, err = st.GetBlockProcessingStatus(ctx, recOrphan)
+	if err != nil || bp.Status != models.BlockStatusActive || bp.OrphanedAt != nil || bp.ReconciledAt != nil {
+		t.Fatalf("the tick must reactivate the row once the BUMP parses, got %+v err=%v", bp, err)
+	}
+	if got := statusOf(t, st, recShared1); got.Status != models.StatusMined || got.BlockHash != recOrphan {
+		t.Fatalf("the rebuilt BUMP must re-mine the tx, got %s@%s", got.Status, got.BlockHash)
+	}
+	if rows, lerr := st.ListOrphanedBlocksToReconcile(ctx, 10); lerr != nil || len(rows) != 0 {
+		t.Fatalf("row must leave the queue once reactivated, got %+v err=%v", rows, lerr)
 	}
 }
