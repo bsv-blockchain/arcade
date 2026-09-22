@@ -575,7 +575,8 @@ func TestRecordReorg_OrphanMetricCountsAppliedTransitions(t *testing.T) {
 	)
 
 	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
-		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceReorgEvent)
+		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceReorgEvent,
+	)
 	before := testutil.ToFloat64(counter)
 
 	tr := newTestTracker(ct, st, 20, 0)
@@ -759,7 +760,8 @@ func TestTieScan_OrphanMetricCountsAppliedTransitions(t *testing.T) {
 	}
 
 	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
-		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceTieScan)
+		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceTieScan,
+	)
 	before := testutil.ToFloat64(counter)
 
 	tr := newTestTracker(ct, st, 20, 0)
@@ -855,7 +857,8 @@ func TestRecordReorg_ReactivatedMetricCountsAppliedTransitions(t *testing.T) {
 	}
 
 	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
-		metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceReorgEvent)
+		metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceReorgEvent,
+	)
 	before := testutil.ToFloat64(counter)
 
 	tr := newTestTracker(ct, st, 20, 0)
@@ -888,7 +891,8 @@ func TestTieScan_ReactivatedMetricCountsAppliedTransitions(t *testing.T) {
 	}
 
 	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
-		metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceTieScan)
+		metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceTieScan,
+	)
 	before := testutil.ToFloat64(counter)
 
 	tr := newTestTracker(ct, st, 20, 0)
@@ -920,7 +924,8 @@ func TestRecordReorg_OrphanMetricCountsPartialTransitionsOnError(t *testing.T) {
 	st.orphanPartialErr = errors.New("injected: later chunk failed")
 
 	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
-		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceReorgEvent)
+		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceReorgEvent,
+	)
 	before := testutil.ToFloat64(counter)
 
 	tr := newTestTracker(ct, st, 20, 0)
@@ -943,7 +948,8 @@ func TestTieScan_OrphanMetricCountsPartialTransitionsOnError(t *testing.T) {
 	st.orphanPartialErr = errors.New("injected: later chunk failed")
 
 	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
-		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceTieScan)
+		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceTieScan,
+	)
 	before := testutil.ToFloat64(counter)
 
 	tr := newTestTracker(ct, st, 20, 0)

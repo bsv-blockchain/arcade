@@ -16,6 +16,7 @@ import (
 
 	"github.com/bsv-blockchain/arcade/app"
 	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/services"
 )
 
@@ -126,7 +127,43 @@ func startArcadeSmoke(t *testing.T, opts smokeOptions) *arcadeRuntime {
 	if err := rt.waitReady(15 * time.Second); err != nil {
 		t.Fatalf("arcade not ready: %v", err)
 	}
+	if err := rt.waitForPropagationConsumer(15 * time.Second); err != nil {
+		t.Fatalf("arcade not ready: %v", err)
+	}
 	return rt
+}
+
+// waitForPropagationConsumer blocks until the propagation service has
+// subscribed to arcade.propagation on the in-process broker, closing the
+// publish-before-subscribe drop window that waitReady alone leaves open.
+//
+// waitReady only proves the api-server's TCP port is accepting connections;
+// the propagation consumer subscribes later, from its own Start goroutine. A
+// tx POSTed in that gap is stored RECEIVED and published to arcade.propagation
+// while the memory broker still has no mailbox for the topic — and the memory
+// broker retains nothing (kafka.memoryBroker.Subscribe), so that message is
+// silently dropped. The tx then sits at RECEIVED indefinitely: the reaper only
+// rebroadcasts RECEIVED rows older than one hour, far outside any smoke window.
+//
+// The real Kafka path is immune — it retains messages, so a late-joining
+// consumer still reads them — which is why the check is memory-broker-only and
+// this no-ops when the broker doesn't implement it.
+func (rt *arcadeRuntime) waitForPropagationConsumer(timeout time.Duration) error {
+	checker, ok := rt.deps.Broker.(kafka.SubscriberChecker)
+	if !ok {
+		return nil
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		if checker.HasSubscriber(kafka.TopicPropagation) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("propagation consumer did not subscribe to %s within %s",
+				kafka.TopicPropagation, timeout)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // buildSmokeConfig is intentionally close to tests/e2e/harness/arcade.go's

@@ -54,6 +54,20 @@ type memoryBroker struct {
 // caller retry rather than hanging the calling goroutine.
 var ErrBrokerBackpressure = errors.New("broker mailbox full (backpressure)")
 
+// SubscriberChecker reports whether a topic currently has a live subscriber
+// (mailbox). Only the memory broker implements it — it exists so in-process
+// test harnesses can wait out the publish-before-subscribe race before
+// posting work: the memory broker retains nothing (see Subscribe), so a
+// message sent to a topic with no live mailbox is silently dropped. The
+// Sarama broker deliberately does not implement it and does not need to —
+// real Kafka retains messages, so a consumer that joins late still reads
+// them, which is why this is not part of the Broker interface.
+type SubscriberChecker interface {
+	// HasSubscriber reports whether any consumer group holds a live
+	// subscription for topic.
+	HasSubscriber(topic string) bool
+}
+
 // defaultSendTimeout is the upper bound on how long Send blocks waiting for
 // a slot in a full mailbox before returning ErrBrokerBackpressure. 2s is
 // long enough to ride out brief flush gaps in a healthy consumer, short
@@ -296,6 +310,22 @@ func (b *memoryBroker) Subscribe(groupID string, topics []string, _ StartOffset)
 
 func (b *memoryBroker) PartitionCount(topic string) (int, error) {
 	return b.partitionsFor(topic), nil
+}
+
+// HasSubscriber reports whether any consumer group currently holds a live
+// mailbox for topic. Because the memory broker retains nothing (see
+// Subscribe), a message published to a topic with no live mailbox is dropped;
+// test harnesses use this to block until the relevant consumer has subscribed
+// before publishing, closing the publish-before-subscribe drop window.
+func (b *memoryBroker) HasSubscriber(topic string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, topics := range b.groups {
+		if mbs, ok := topics[topic]; ok && len(mbs) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *memoryBroker) Close() error {
