@@ -147,20 +147,23 @@ func (t *blockStatusTracker) recordReorg(ctx context.Context, ev *chaintracks.Re
 			hashes = append(hashes, h.String())
 		}
 		applied, err := t.store.MarkBlocksOrphaned(ctx, hashes, time.Now())
+		// Observed before the error check: the backends report the
+		// transitions that landed before a failure alongside the error, and
+		// those rows are orphaned in the store regardless of how the call
+		// ended.
+		recordOrphanTransitions(metrics.BlockTransitionSourceReorgEvent, applied)
 		if err != nil {
-			// The event's losers keep status='active' while the branch walk
-			// below still reactivates the winner, so the projection can hold
-			// two active rows at one height until something re-judges them.
-			// The forced tie-scan that follows this call in the reorg loop is
-			// that healing pass (and the reconciler full-scan the backstop) —
-			// but a durable store failure here needs an operator, hence Error.
+			// The event's remaining losers keep status='active' while the
+			// branch walk below still reactivates the winner, so the
+			// projection can hold two active rows at one height until
+			// something re-judges them. The forced tie-scan that follows this
+			// call in the reorg loop is that healing pass (and the reconciler
+			// full-scan the backstop) — but a durable store failure here
+			// needs an operator, hence Error.
 			t.logger.Error("failed to mark orphaned blocks; the forced tie-scan that follows is the healing pass",
 				zap.Int("count", len(hashes)),
+				zap.Int("applied_before_failure", applied),
 				zap.Error(err))
-		} else if applied > 0 {
-			metrics.BlockStatusTransitionsTotal.
-				WithLabelValues(metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceReorgEvent).
-				Add(float64(applied))
 		}
 	}
 	// chaintracks's tip and reorg channels are independent; the new tip may
@@ -359,20 +362,30 @@ func (t *blockStatusTracker) markOrphaned(ctx context.Context, set map[string]st
 		orphaned = append(orphaned, hash)
 	}
 	applied, err := t.store.MarkBlocksOrphaned(ctx, orphaned, time.Now())
+	recordOrphanTransitions(metrics.BlockTransitionSourceTieScan, applied) // what landed, error or not
 	if err != nil {
 		t.logger.Warn("tie-scan: failed to mark blocks orphaned",
 			zap.Int("count", len(orphaned)),
+			zap.Int("applied_before_failure", applied),
 			zap.Error(err))
 		return
-	}
-	if applied > 0 {
-		metrics.BlockStatusTransitionsTotal.
-			WithLabelValues(metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceTieScan).
-			Add(float64(applied))
 	}
 	t.logger.Info("tie-scan: marked same-height losers orphaned",
 		zap.Strings("block_hashes", orphaned),
 		zap.Uint32("tip_height", tipHeight))
+}
+
+// recordOrphanTransitions adds applied orphaned transitions to the
+// block-status metric for the given detection edge. Callers pass the count
+// MarkBlocksOrphaned returned whether or not it also returned an error: the
+// backends return the transitions that landed before a partial failure, and
+// the series promises applied transitions.
+func recordOrphanTransitions(source string, applied int) {
+	if applied > 0 {
+		metrics.BlockStatusTransitionsTotal.
+			WithLabelValues(metrics.BlockTransitionOrphaned, source).
+			Add(float64(applied))
+	}
 }
 
 // reactivateRows resets each judged orphaned row to active through

@@ -41,6 +41,10 @@ type trackerStore struct {
 	afterList func()
 	// orphanErr makes every MarkBlocksOrphaned fail, as a store outage does.
 	orphanErr error
+	// orphanPartialErr makes MarkBlocksOrphaned apply its writes and then
+	// report this error alongside the count that landed — the shape the
+	// backends produce when a later hash or chunk fails.
+	orphanPartialErr error
 	// reactivations records every ReactivateBlock call, applied or not.
 	reactivations []string
 	// beforeReactivate fires once, right before a ReactivateBlock judges the
@@ -152,7 +156,7 @@ func (s *trackerStore) MarkBlocksOrphaned(_ context.Context, hashes []string, at
 			}
 		}
 	}
-	return written, nil
+	return written, s.orphanPartialErr
 }
 
 func (s *trackerStore) orphanCalls() [][]string {
@@ -899,5 +903,53 @@ func TestTieScan_ReactivatedMetricCountsAppliedTransitions(t *testing.T) {
 	assertActiveClean(t, st.row(t, b.Hash.String()))
 	if rowA := st.row(t, a.Hash.String()); rowA.Status != models.BlockStatusOrphaned || rowA.ReconciledAt != nil {
 		t.Fatalf("the re-orphaned row must keep its newer generation queued, got status=%s reconciledAt=%v", rowA.Status, rowA.ReconciledAt)
+	}
+}
+
+// TestRecordReorg_OrphanMetricCountsPartialTransitionsOnError: the backends
+// report the transitions that landed before a failure alongside the error,
+// and those rows ARE orphaned in the store. The reorg_event/orphaned series
+// promises applied transitions, so the count must be observed even when the
+// call also failed.
+func TestRecordReorg_OrphanMetricCountsPartialTransitionsOnError(t *testing.T) {
+	ct := newFakeChaintracks()
+	tip := headerAt(11, 0xDD)
+	ct.headers[11] = tip
+	a, b := headerAt(10, 0xAA).Hash, headerAt(10, 0xBB).Hash
+	st := newTrackerStore(activeRow(a.String(), 10), activeRow(b.String(), 10))
+	st.orphanPartialErr = errors.New("injected: later chunk failed")
+
+	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
+		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceReorgEvent)
+	before := testutil.ToFloat64(counter)
+
+	tr := newTestTracker(ct, st, 20, 0)
+	tr.recordReorg(context.Background(), &chaintracks.ReorgEvent{OrphanedHashes: []chainhash.Hash{a, b}, NewTip: tip})
+
+	if got := testutil.ToFloat64(counter) - before; got != 2 {
+		t.Fatalf("orphaned transitions = %v, want 2 (the rows that landed before the failure)", got)
+	}
+}
+
+// TestTieScan_OrphanMetricCountsPartialTransitionsOnError: the same for the
+// tie-scan's write.
+func TestTieScan_OrphanMetricCountsPartialTransitionsOnError(t *testing.T) {
+	ct := newFakeChaintracks()
+	ct.headers[10] = headerAt(10, 0xAA) // canonical at 10 is neither candidate
+	ct.headers[11] = headerAt(11, 0xEE)
+	loserA := headerAt(10, 0xB1).Hash.String()
+	loserB := headerAt(10, 0xB2).Hash.String()
+	st := newTrackerStore(activeRow(loserA, 10), activeRow(loserB, 10))
+	st.orphanPartialErr = errors.New("injected: later chunk failed")
+
+	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
+		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceTieScan)
+	before := testutil.ToFloat64(counter)
+
+	tr := newTestTracker(ct, st, 20, 0)
+	tr.tieScan(context.Background(), 11, true)
+
+	if got := testutil.ToFloat64(counter) - before; got != 2 {
+		t.Fatalf("tie-scan orphaned transitions = %v, want 2 (the rows that landed before the failure)", got)
 	}
 }

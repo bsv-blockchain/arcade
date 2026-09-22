@@ -168,24 +168,12 @@ func (r *Reconciler) Start(ctx context.Context) error {
 	}
 
 	if r.cfg.BumpBuilder.Reconciler.StartupFullScan && r.acquireLease(ctx) {
-		switch {
-		case !r.waitForChaintracksReady(ctx):
+		if r.waitForChaintracksReady(ctx) {
+			r.startupScanUnderLease(ctx)
+		} else {
 			r.logger.Warn("startup full-scan: chain-header source not ready within timeout; "+
 				"deferring to a later tick (self-heals once chaintracks catches up to the active tip)",
 				zap.Int("timeout_ms", r.cfg.BumpBuilder.Reconciler.FullScanChaintracksReadyTimeoutMs))
-		// The readiness wait can outlast the lease TTL (default: up to 2 min
-		// of waiting against a 90 s TTL), so re-assert leadership before
-		// scanning. Without this two replicas can run the full-scan at once —
-		// convergent, but it double-publishes MINED corrections now that the
-		// scan re-mines and reactivates rather than only marking.
-		case !r.acquireLease(ctx):
-			r.logger.Info("startup full-scan: lease lost while waiting for the chain-header source; " +
-				"deferring to a later tick")
-		default:
-			// The scan can outlive the lease TTL by minutes; see holdLease.
-			leaseCtx, release := r.holdLease(ctx)
-			r.runStartupFullScan(leaseCtx)
-			release()
 		}
 	}
 	r.tick(ctx)
@@ -231,24 +219,52 @@ func (r *Reconciler) leaseTTL() time.Duration {
 	return ttl
 }
 
-// acquireLease reports whether this replica currently leads. A nil leaser
-// means single-replica mode (always lead); lease errors skip the tick.
-func (r *Reconciler) acquireLease(ctx context.Context) bool {
+// tryLease acquires or renews the reconciler lease and reports the expiry
+// the store granted, plus whether this replica leads. A nil leaser means
+// single-replica mode (always lead, zero expiry); a lease error is reported
+// as not leading.
+func (r *Reconciler) tryLease(ctx context.Context) (time.Time, bool) {
 	if r.leaser == nil {
-		return true
+		return time.Time{}, true
 	}
 	heldUntil, err := r.leaser.TryAcquireOrRenew(ctx, ReconcilerLeaseName, r.holderID, r.leaseTTL())
 	if err != nil {
 		r.logger.Warn("lease check failed, skipping tick", zap.Error(err))
-		return false
+		return time.Time{}, false
 	}
-	return !heldUntil.IsZero()
+	return heldUntil, !heldUntil.IsZero()
+}
+
+// acquireLease reports whether this replica currently leads.
+func (r *Reconciler) acquireLease(ctx context.Context) bool {
+	_, ok := r.tryLease(ctx)
+	return ok
+}
+
+// startupScanUnderLease runs the startup full-scan once the chain-header
+// source is ready. The readiness wait can outlast the lease TTL (default: up
+// to 2 min of waiting against a 90 s TTL), so leadership is re-asserted
+// first — without this two replicas can run the full-scan at once,
+// convergent but double-publishing MINED corrections now that the scan
+// re-mines and reactivates rather than only marking — and the scan runs
+// under the heartbeat, since it can outlive the TTL by minutes (see
+// holdLease).
+func (r *Reconciler) startupScanUnderLease(ctx context.Context) {
+	heldUntil, ok := r.tryLease(ctx)
+	if !ok {
+		r.logger.Info("startup full-scan: lease lost while waiting for the chain-header source; " +
+			"deferring to a later tick")
+		return
+	}
+	leaseCtx, release := r.holdLease(ctx, heldUntil)
+	defer release()
+	r.runStartupFullScan(leaseCtx)
 }
 
 // holdLease keeps the reconciler lease renewed for as long as the returned
 // context lives, and cancels that context if the lease is lost. The caller
-// must already hold the lease (acquireLease just succeeded) and must call
-// the returned CancelFunc when its pass ends.
+// must already hold the lease — heldUntil is the expiry that acquisition
+// reported — and must call the returned CancelFunc when its pass ends.
 //
 // The lease is acquired once per tick, but a pass can outlive the TTL by a
 // wide margin: the full-scan re-mines a large BUMP for minutes and a tick's
@@ -260,18 +276,21 @@ func (r *Reconciler) acquireLease(ctx context.Context) bool {
 // documents, and cancels the pass when the lease is gone: when a renewal
 // reports another holder, or when renewals keep failing past the last
 // confirmed expiry (a single failed renewal inside a live TTL is retried,
-// not fatal). Cancellation makes the store calls in flight return ctx
-// errors, so the full-scan reports itself incomplete and stays armed and
+// not fatal). That expiry is always the one the store granted, never a
+// local now+TTL: a slow acquire or a skewed backend clock means the real
+// lease lapses earlier than the local estimate, and a run of renewal errors
+// would otherwise keep the pass alive past the point another replica could
+// have taken the lease. Cancellation makes the store calls in flight return
+// ctx errors, so the full-scan reports itself incomplete and stays armed and
 // the tick's block stays queued — for whichever replica now leads. A nil
 // leaser (single-replica mode) returns ctx unchanged.
-func (r *Reconciler) holdLease(ctx context.Context) (context.Context, context.CancelFunc) {
+func (r *Reconciler) holdLease(ctx context.Context, heldUntil time.Time) (context.Context, context.CancelFunc) {
 	if r.leaser == nil {
 		return ctx, func() {}
 	}
 	ttl := r.leaseTTL()
 	leaseCtx, cancel := context.WithCancel(ctx)
 	go func() {
-		heldUntil := time.Now().Add(ttl)
 		ticker := time.NewTicker(ttl / 3)
 		defer ticker.Stop()
 		for {
@@ -307,14 +326,18 @@ func (r *Reconciler) holdLease(ctx context.Context) (context.Context, context.Ca
 
 // tick consumes one batch of the orphaned-block queue.
 func (r *Reconciler) tick(ctx context.Context) {
-	if ctx.Err() != nil || !r.acquireLease(ctx) {
+	if ctx.Err() != nil {
+		return
+	}
+	heldUntil, ok := r.tryLease(ctx)
+	if !ok {
 		return
 	}
 	// Everything below runs under the lease-scoped context: the heartbeat
 	// renews the lease for as long as the pass takes and cancels the pass if
 	// the lease is lost, so a long re-mine never runs alongside another
 	// replica's.
-	ctx, release := r.holdLease(ctx)
+	ctx, release := r.holdLease(ctx, heldUntil)
 	defer release()
 	// Self-heal the startup full-scan: if it was deferred because the embedded
 	// chaintracks was still resyncing from genesis at process start (its
@@ -419,6 +442,12 @@ func (r *Reconciler) fullScan(ctx context.Context) bool {
 	// never judged here.
 	markedSet := make(map[string]struct{})
 	resurrectSet := make(map[string]*models.BlockProcessingStatus)
+	// Candidate rows the chain-header source could not judge. Absence of
+	// evidence never orphans or reactivates a row, but it is not a verdict
+	// either: a transient per-height read failure, or an embedded
+	// chaintracks a few headers behind the store's tip, must leave the
+	// one-shot armed rather than retire it with a stamped orphan untouched.
+	unjudged := 0
 	err := store.ForEachBlockProcessing(ctx, r.store, minHeight, page, func(row *models.BlockProcessingStatus) error {
 		if (row.Status != models.BlockStatusActive && row.Status != models.BlockStatusOrphaned) ||
 			row.BlockHeight == 0 || row.BlockHeight > math.MaxUint32 {
@@ -435,6 +464,7 @@ func (r *Reconciler) fullScan(ctx context.Context) bool {
 		}
 		active, hdrErr := r.chainHeader.GetHeaderByHeight(ctx, uint32(row.BlockHeight))
 		if hdrErr != nil || active == nil {
+			unjudged++
 			return nil //nolint:nilerr // fail-open by contract: never judge on absence of evidence
 		}
 		matches := active.Hash.String() == row.BlockHash
@@ -451,6 +481,12 @@ func (r *Reconciler) fullScan(ctx context.Context) bool {
 		r.logger.Warn("startup full-scan: incomplete", zap.Error(err))
 		// Whatever was found before the failure still routes into healing,
 		// but the window was not fully judged: keep the one-shot armed.
+		complete = false
+	}
+	if unjudged > 0 {
+		r.logger.Warn("startup full-scan: some rows could not be judged against the active chain; "+
+			"keeping the one-shot armed for a retry",
+			zap.Int("unjudged_rows", unjudged))
 		complete = false
 	}
 	if len(markedSet) == 0 && len(resurrectSet) == 0 {
@@ -475,17 +511,45 @@ func (r *Reconciler) fullScanMarkOrphaned(ctx context.Context, set map[string]st
 		marked = append(marked, hash)
 	}
 	applied, err := r.store.MarkBlocksOrphaned(ctx, marked, r.now())
+	// Observed before the error check: the backends report the transitions
+	// that landed before a failure alongside the error, and those rows are
+	// orphaned in the store regardless of how the call ended.
+	recordOrphanTransitions(metrics.BlockTransitionSourceFullScan, applied)
 	if err != nil {
-		r.logger.Warn("startup full-scan: failed to mark orphaned", zap.Error(err))
+		r.logger.Warn("startup full-scan: failed to mark orphaned",
+			zap.Int("applied_before_failure", applied), zap.Error(err))
 		return false
-	}
-	if applied > 0 {
-		metrics.BlockStatusTransitionsTotal.
-			WithLabelValues(metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceFullScan).
-			Add(float64(applied))
 	}
 	r.logger.Info("startup full-scan: marked off-chain blocks orphaned",
 		zap.Strings("block_hashes", marked))
+	return true
+}
+
+// recordOrphanTransitions adds applied orphaned transitions to the
+// block-status metric for the given detection edge. Callers pass the count
+// MarkBlocksOrphaned returned whether or not it also returned an error: the
+// count is what landed.
+func recordOrphanTransitions(source string, applied int) {
+	if applied > 0 {
+		metrics.BlockStatusTransitionsTotal.
+			WithLabelValues(metrics.BlockTransitionOrphaned, source).
+			Add(float64(applied))
+	}
+}
+
+// requeueForTick puts an orphaned row that is off the tick's durable queue
+// (stamped by a previous reconciliation) back on it, by re-orphaning it:
+// MarkBlocksOrphaned writes a fresh generation and clears reconciled_at,
+// which is exactly the queue predicate. Reports whether the write landed.
+func (r *Reconciler) requeueForTick(ctx context.Context, logger *zap.Logger, hash string) bool {
+	applied, err := r.store.MarkBlocksOrphaned(ctx, []string{hash}, r.now())
+	// A row the tracker reactivated meanwhile is orphaned by this write: an
+	// applied transition, counted like any other of the scan's.
+	recordOrphanTransitions(metrics.BlockTransitionSourceFullScan, applied)
+	if err != nil {
+		logger.Error("startup full-scan: failed to requeue the block for the reconciler", zap.Error(err))
+		return false
+	}
 	return true
 }
 
@@ -514,7 +578,26 @@ func (r *Reconciler) fullScanResurrect(ctx context.Context, set map[string]*mode
 		height := row.BlockHeight
 		logger := r.logger.With(logfields.BlockHash(hash), logfields.BlockHeight(height))
 		n, ok, remineErr := r.remineFromStoredBUMP(ctx, logger, hash, batchSize)
-		if remineErr != nil {
+		switch {
+		case errors.Is(remineErr, errMalformedBUMP):
+			// The block's own stored BUMP is corrupt. Retrying the scan
+			// cannot fix that, and once the attempt cap retired the one-shot
+			// the row would sit orphaned, stamped and off every queue. So
+			// hand it off the way the tick path handles an unusable BUMP:
+			// ask merkle-service to redeliver the block (the builder's
+			// short-circuit sees a BUMP that does not parse and rebuilds
+			// it, re-mining the full level-0 set), and requeue the row so
+			// the very next tick's resurrection short-circuit returns it to
+			// active. The repair now has owners, so the scan is not
+			// incomplete for it — unless the requeue write itself failed.
+			logger.Error("startup full-scan: resurrected block's stored BUMP is malformed; "+
+				"requesting a rebuild and requeueing the row for the reconciler", zap.Error(remineErr))
+			r.requestRebuild(ctx, logger, hash)
+			if !r.requeueForTick(ctx, logger, hash) {
+				complete = false
+			}
+			continue
+		case remineErr != nil:
 			logger.Error("startup full-scan: re-mine from the resurrected block's BUMP failed; "+
 				"leaving the row orphaned so the next full-scan retries", zap.Error(remineErr))
 			complete = false
@@ -547,9 +630,9 @@ func (r *Reconciler) fullScanResurrect(ctx context.Context, set map[string]*mode
 			logger.Warn("startup full-scan: block lost its height to a competitor during the re-mine; "+
 				"requeueing it so the reconciler re-anchors its txs to the new canonical block",
 				zap.String("canonical_block_hash", canonical))
-			if _, err := r.store.MarkBlocksOrphaned(ctx, []string{hash}, r.now()); err != nil {
-				logger.Error("startup full-scan: failed to requeue the block; its txs stay MINED against "+
-					"an off-chain block until a ReorgEvent or the next scan revisits it", zap.Error(err))
+			if !r.requeueForTick(ctx, logger, hash) {
+				// Its txs stay MINED against an off-chain block until a
+				// ReorgEvent or the next scan revisits it.
 				complete = false
 			}
 			continue
@@ -995,12 +1078,22 @@ func (r *Reconciler) deferForCanonicalBUMP(ctx context.Context, logger *zap.Logg
 		zap.String("canonical_block_hash", canonicalHash),
 		zap.Int("defer_attempt", r.defers[orphan]),
 	)
-	if r.merkle != nil && r.cfg.CallbackURL != "" {
-		if err := r.merkle.Reprocess(ctx, canonicalHash, r.cfg.CallbackURL, r.cfg.CallbackToken); err != nil {
-			logger.Warn("merkle-service /reprocess for canonical block failed", zap.Error(err))
-		}
-	}
+	r.requestRebuild(ctx, logger, canonicalHash)
 	return true
+}
+
+// requestRebuild asks merkle-service to redeliver BLOCK_PROCESSED for
+// blockHash (/reprocess), which has the builder rebuild — or, when a stored
+// BUMP does not parse, replace — the block's compound BUMP and re-mine its
+// full level-0 set. Best-effort and a no-op when the merkle client or the
+// callback URL is not configured; the caller keeps its own retry.
+func (r *Reconciler) requestRebuild(ctx context.Context, logger *zap.Logger, blockHash string) {
+	if r.merkle == nil || r.cfg.CallbackURL == "" {
+		return
+	}
+	if err := r.merkle.Reprocess(ctx, blockHash, r.cfg.CallbackURL, r.cfg.CallbackToken); err != nil {
+		logger.Warn("merkle-service /reprocess failed", zap.String("reprocess_block_hash", blockHash), zap.Error(err))
+	}
 }
 
 // reanchorNeighborhood walks the heights above the orphan looking for
@@ -1033,15 +1126,20 @@ func (r *Reconciler) reanchorNeighborhood(ctx context.Context, logger *zap.Logge
 		}
 		_, bumpBytes, bumpErr := r.store.GetBUMP(ctx, neighbor)
 		switch {
-		case bumpErr != nil && !errors.Is(bumpErr, store.ErrNotFound):
+		case errors.Is(bumpErr, store.ErrNotFound):
+			continue // positively nothing stored: this neighbor can claim nothing
+		case bumpErr != nil:
 			// Only a positively missing BUMP means "this neighbor can claim
 			// nothing". A read failure while the neighbor's BUMP IS stored
 			// would otherwise leave its txs in `affected`, where the caller's
 			// revert un-mines them and the stamp retires the block — the
 			// retry is lost with the row off the queue.
 			return reanchored, fmt.Errorf("read neighbor %s BUMP: %w", neighbor, bumpErr)
-		case bumpErr != nil || len(bumpBytes) == 0:
-			continue
+		case len(bumpBytes) == 0:
+			// Every backend reports a missing BUMP as store.ErrNotFound, so
+			// an empty blob is a stored-but-unusable one: malformed, like a
+			// blob that does not parse, and handled below the same way.
+			return reanchored, fmt.Errorf("%w: neighbor %s: empty stored blob", errMalformedBUMP, neighbor)
 		}
 		idx, idxErr := bump.IndexCompound(bumpBytes)
 		if idxErr != nil {
@@ -1086,12 +1184,13 @@ func (r *Reconciler) reanchorNeighborhood(ctx context.Context, logger *zap.Logge
 
 // remineFromStoredBUMP re-mines every level-0 txid of blockHash's stored
 // compound BUMP against it (onlyChanged — no duplicate events for rows
-// already anchored right). ok=false when no BUMP is stored (store.ErrNotFound
-// or an empty blob) — the caller's defer signal.
+// already anchored right). ok=false when no BUMP is stored — store.ErrNotFound,
+// which every backend returns for a missing BUMP — the caller's defer signal.
 //
 // A non-nil error means the BUMP could not be READ reliably, is stored but
-// does not parse (wrapping errMalformedBUMP, so callers can tell corruption
-// from a transient failure), or a store write failed part-way. In every case
+// unusable (an empty blob, or one that does not parse: both wrap
+// errMalformedBUMP, so callers can tell corruption from a transient
+// failure), or a store write failed part-way. In every case
 // the caller must not treat the block as healed (no revert,
 // no reconciled_at stamp, no reactivation) so the work is retried. A partial
 // re-mine is the dangerous case, because it can look like success: the rows
@@ -1105,18 +1204,23 @@ func (r *Reconciler) reanchorNeighborhood(ctx context.Context, logger *zap.Logge
 func (r *Reconciler) remineFromStoredBUMP(ctx context.Context, logger *zap.Logger, blockHash string, batchSize int) (int, bool, error) {
 	bumpHeight, bumpBytes, bumpErr := r.store.GetBUMP(ctx, blockHash)
 	switch {
-	case bumpErr != nil && !errors.Is(bumpErr, store.ErrNotFound):
+	case errors.Is(bumpErr, store.ErrNotFound):
+		// Genuinely no BUMP stored yet: that is the ok=false signal the
+		// caller defers on, not a failure to propagate.
+		return 0, false, nil
+	case bumpErr != nil:
 		// A transient read failure is NOT "no BUMP stored". Collapsing the
 		// two would make the caller burn a defer attempt on a healthy block
 		// (and eventually revert it), or — in the full-scan — reactivate a
 		// row whose txs were never re-mined, which then leaves the only
 		// queue that could retry them. Surface it so the caller retries.
 		return 0, false, fmt.Errorf("read stored BUMP for %s: %w", blockHash, bumpErr)
-	case bumpErr != nil || len(bumpBytes) == 0:
-		// ErrNotFound (or an empty blob) genuinely means no BUMP is stored
-		// yet: that is the ok=false signal the caller defers on, not a
-		// failure to propagate.
-		return 0, false, nil //nolint:nilerr // ErrNotFound is the ok=false signal (defer), not a read failure
+	case len(bumpBytes) == 0:
+		// Not "no BUMP" either: every backend reports that as ErrNotFound.
+		// A stored empty blob is unusable in the same way a blob that does
+		// not parse is (the builder never writes one — BuildCompoundBUMP
+		// refuses an empty STUMP set), and takes the same path.
+		return 0, false, fmt.Errorf("%w: %s: empty stored blob", errMalformedBUMP, blockHash)
 	}
 	txids, parseErr := levelZeroTxidsFromBUMP(bumpBytes)
 	if parseErr != nil {

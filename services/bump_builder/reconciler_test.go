@@ -2,7 +2,10 @@ package bump_builder
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +16,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
@@ -576,6 +580,18 @@ type hookedStore struct {
 	// beforeReactivate fires once, right before ReactivateBlock, so a test
 	// can inject the concurrent write that races a reactivation.
 	beforeReactivate func()
+	// orphanPartialErr makes MarkBlocksOrphaned apply its writes and then
+	// report this error alongside the count that landed — the shape the
+	// backends produce when a later hash or chunk fails.
+	orphanPartialErr error
+}
+
+func (h *hookedStore) MarkBlocksOrphaned(ctx context.Context, hashes []string, at time.Time) (int, error) {
+	n, err := h.Store.MarkBlocksOrphaned(ctx, hashes, at)
+	if err == nil && h.orphanPartialErr != nil {
+		return n, h.orphanPartialErr
+	}
+	return n, err
 }
 
 func (h *hookedStore) ReactivateBlock(ctx context.Context, blockHash string, blockHeight uint64, orphanedAt time.Time) (bool, error) {
@@ -1319,6 +1335,13 @@ type fakeLeaser struct {
 	calls int
 	ttls  []time.Duration
 	lost  bool
+	// expiry, when set, is the expiry the store reports on acquisition
+	// instead of now+ttl — a slow acquire or a skewed backend clock makes
+	// the real lease shorter than the local estimate.
+	expiry time.Duration
+	// renewErr, when set, fails every call after the first, as a backend
+	// outage during the pass does.
+	renewErr error
 }
 
 func (l *fakeLeaser) TryAcquireOrRenew(_ context.Context, _, _ string, ttl time.Duration) (time.Time, error) {
@@ -1326,8 +1349,14 @@ func (l *fakeLeaser) TryAcquireOrRenew(_ context.Context, _, _ string, ttl time.
 	defer l.mu.Unlock()
 	l.calls++
 	l.ttls = append(l.ttls, ttl)
+	if l.calls > 1 && l.renewErr != nil {
+		return time.Time{}, l.renewErr
+	}
 	if l.lost {
 		return time.Time{}, nil
+	}
+	if l.expiry > 0 {
+		return time.Now().Add(l.expiry), nil
 	}
 	return time.Now().Add(ttl), nil
 }
@@ -1555,49 +1584,6 @@ func TestReconciler_NeighborhoodMalformedBUMPKeepsRowQueued(t *testing.T) {
 	}
 }
 
-// TestReconciler_FullScanMalformedBUMPLeavesRowForRetry: a stored BUMP that
-// does not parse is not "no BUMP stored". Read as absence, the full-scan
-// would reactivate the row without re-mining its txs and retire the scan —
-// the same trap as a transient read failure. The row must stay orphaned and
-// the scan incomplete until the BUMP is rebuilt.
-func TestReconciler_FullScanMalformedBUMPLeavesRowForRetry(t *testing.T) {
-	ctx := context.Background()
-	st := newPebbleForTest(t)
-	pub := &capturePublisher{}
-	stub := &stubChaintracks{}
-	stub.setHeightHeader(10, headerWithHash(t, recOrphan, 10))
-
-	seedSeen(t, st, recShared1)
-	_ = st.InsertBUMP(ctx, recOrphan, 10, malformedBUMP)
-	_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
-	_, _ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
-	_, _ = st.MarkBlockReconciled(ctx, recOrphan, time.Time{}, time.Now())
-
-	r := newTestReconciler(st, pub, stub, nil)
-	if r.fullScan(ctx) {
-		t.Fatal("a scan that could not re-mine must report itself incomplete")
-	}
-	if bp, err := st.GetBlockProcessingStatus(ctx, recOrphan); err != nil || bp.Status != models.BlockStatusOrphaned {
-		t.Fatalf("row must stay orphaned while its BUMP is corrupt, got %+v err=%v", bp, err)
-	}
-	if got := statusOf(t, st, recShared1); got.Status != models.StatusSeenOnNetwork {
-		t.Fatalf("tx must be untouched, got %s@%s", got.Status, got.BlockHash)
-	}
-
-	// A rebuilt BUMP heals on the retry.
-	_ = st.InsertBUMP(ctx, recOrphan, 10, makeCompoundForTest(t, 10, recShared1))
-	if !r.fullScan(ctx) {
-		t.Fatal("the retry must complete once the BUMP parses")
-	}
-	bp, err := st.GetBlockProcessingStatus(ctx, recOrphan)
-	if err != nil || bp.Status != models.BlockStatusActive || bp.OrphanedAt != nil || bp.ReconciledAt != nil {
-		t.Fatalf("retry must reactivate the row, got %+v err=%v", bp, err)
-	}
-	if got := statusOf(t, st, recShared1); got.Status != models.StatusMined || got.BlockHash != recOrphan {
-		t.Fatalf("retry must re-mine the tx, got %s@%s", got.Status, got.BlockHash)
-	}
-}
-
 // TestReconciler_MalformedCanonicalBUMPDefers: on the tick path a corrupt
 // canonical BUMP proves nothing, like a missing one, so the block defers —
 // its /reprocess poke is what rebuilds the BUMP — rather than sitting in
@@ -1753,5 +1739,295 @@ func TestReconciler_ShortCircuitReactivationIsGenerationChecked(t *testing.T) {
 	bp, err = base.GetBlockProcessingStatus(ctx, recOrphan)
 	if err != nil || bp.Status != models.BlockStatusActive || bp.OrphanedAt != nil || bp.ReconciledAt != nil {
 		t.Fatalf("row must keep the tracker's clean active state, got %+v err=%v", bp, err)
+	}
+}
+
+// reprocessStub is a merkle-service /reprocess endpoint that records the
+// block hashes it was asked to redeliver.
+type reprocessStub struct {
+	mu     sync.Mutex
+	hashes []string
+	srv    *httptest.Server
+}
+
+func newReprocessStub(t *testing.T) *reprocessStub {
+	t.Helper()
+	s := &reprocessStub{}
+	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		var body struct {
+			BlockHash string `json:"blockHash"`
+		}
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		s.mu.Lock()
+		s.hashes = append(s.hashes, body.BlockHash)
+		s.mu.Unlock()
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	t.Cleanup(s.srv.Close)
+	return s
+}
+
+func (s *reprocessStub) requested() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.hashes...)
+}
+
+// withReprocess wires a reconciler to a /reprocess stub the way production
+// does: a merkle client plus the callback URL the poke forwards.
+func withReprocess(r *Reconciler, stub *reprocessStub) {
+	r.merkle = merkleservice.NewClient(stub.srv.URL, "", time.Second)
+	r.cfg.CallbackURL = "http://arcade.test/callback"
+}
+
+// TestReconciler_LeaseHeartbeatHonoursAcquireExpiry: the heartbeat must
+// judge "still held" against the expiry the STORE granted, not a local
+// now+TTL. Here the acquire reports a lease that lapses almost at once (a
+// slow acquire, a skewed backend clock) and every renewal fails: the first
+// failed renewal already falls past the granted expiry, so the pass must be
+// abandoned right there — a local estimate would have kept it running for
+// two more renewals, overlapping whoever took the lease meanwhile.
+func TestReconciler_LeaseHeartbeatHonoursAcquireExpiry(t *testing.T) {
+	ctx := context.Background()
+	base := newPebbleForTest(t)
+	hs := &hookedStore{Store: base}
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	seedResurrectable(t, base, stub)
+
+	fl := &fakeLeaser{expiry: 20 * time.Millisecond, renewErr: errors.New("injected: lease backend down")}
+	r := newTestReconciler(hs, pub, stub, func(c *config.ReconcilerConfig) { c.StartupFullScan = true })
+	r.leaser = fl
+	r.holderID = "replica-a"
+	r.leaseTTLOverride = 300 * time.Millisecond // heartbeat every 100 ms; local now+TTL would last 3 renewals
+	hs.beforeMined = func(passCtx context.Context) {
+		select {
+		case <-passCtx.Done():
+		case <-time.After(2 * time.Second):
+			t.Error("the pass was not cancelled once renewals failed past the granted expiry")
+		}
+	}
+
+	r.tick(ctx)
+
+	// One acquire, then exactly one (failed) renewal before the cancel: the
+	// granted expiry had already passed at the first heartbeat.
+	if got := fl.callCount(); got != 2 {
+		t.Fatalf("lease calls = %d, want 2 (acquire + the single failed renewal that ended the pass)", got)
+	}
+	if r.startupScanDone || r.startupScanAttempts != 0 {
+		t.Fatalf("an abandoned scan must stay armed without burning an attempt, got done=%v attempts=%d",
+			r.startupScanDone, r.startupScanAttempts)
+	}
+	if got := statusOf(t, base, recShared1); got.Status != models.StatusSeenOnNetwork {
+		t.Fatalf("no store write may land after the lease lapsed, got %s@%s", got.Status, got.BlockHash)
+	}
+}
+
+// TestReconciler_FullScanUnjudgeableHeightKeepsOneShotArmed: a candidate row
+// the chain-header source cannot judge (a per-height read failure, an
+// embedded chaintracks a header behind) is never orphaned or reactivated on
+// that absence of evidence — but it is not a verdict either. Retiring the
+// one-shot over it would leave a stamped orphan untouched for the life of
+// the process; the scan must report itself incomplete so the bounded retry
+// runs, and complete once the height can be judged.
+func TestReconciler_FullScanUnjudgeableHeightKeepsOneShotArmed(t *testing.T) {
+	ctx := context.Background()
+	st := newPebbleForTest(t)
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	seedResurrectable(t, st, stub) // judgeable at 10, and healed by the scan
+	// The active tip at 12 is served, so the readiness gate opens; an
+	// active row at 11 below it is not — a per-height gap in the header
+	// source.
+	stub.setHeightHeader(12, headerWithHash(t, recCanonical, 12))
+	_ = st.UpsertBlockHeaderSeen(ctx, recCanonical, 12, time.Now())
+	_ = st.UpsertBlockHeaderSeen(ctx, recNeighbor, 11, time.Now())
+
+	r := newTestReconciler(st, pub, stub, func(c *config.ReconcilerConfig) { c.StartupFullScan = true })
+	r.tick(ctx)
+	if r.startupScanDone {
+		t.Fatal("a scan with an unjudgeable candidate must not retire the one-shot")
+	}
+	if r.startupScanAttempts != 1 {
+		t.Fatalf("attempts = %d, want 1", r.startupScanAttempts)
+	}
+	// What could be judged was still repaired; what could not was left alone.
+	if bp, err := st.GetBlockProcessingStatus(ctx, recOrphan); err != nil || bp.Status != models.BlockStatusActive {
+		t.Fatalf("the judgeable row must still heal, got %+v err=%v", bp, err)
+	}
+	if bp, err := st.GetBlockProcessingStatus(ctx, recNeighbor); err != nil || bp.Status != models.BlockStatusActive {
+		t.Fatalf("the unjudgeable row must be untouched, got %+v err=%v", bp, err)
+	}
+
+	// chaintracks catches up: the retry judges every row and completes.
+	stub.setHeightHeader(11, headerWithHash(t, recNeighbor, 11))
+	r.tick(ctx)
+	if !r.startupScanDone {
+		t.Fatal("once every candidate is judgeable the scan must complete and retire the one-shot")
+	}
+}
+
+// TestReconciler_FullScanMalformedBUMPRequeuesAndRequestsRebuild: a stored
+// BUMP that does not parse is not "no BUMP stored" — read as absence, the
+// full-scan would reactivate the row without re-mining its txs. But
+// retrying the scan cannot fix a corrupt blob either, and once the attempt
+// cap retired the one-shot the row would sit orphaned, stamped and off every
+// queue. So the scan hands the repair off the way the tick path handles an
+// unusable BUMP: it asks merkle-service to redeliver the block (the builder
+// rebuilds a BUMP it cannot parse) and requeues the row, whose next tick
+// returns it to active through the resurrection short-circuit. The scan is
+// complete for it.
+func TestReconciler_FullScanMalformedBUMPRequeuesAndRequestsRebuild(t *testing.T) {
+	ctx := context.Background()
+	st := newPebbleForTest(t)
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	stub.setHeightHeader(10, headerWithHash(t, recOrphan, 10))
+	reprocess := newReprocessStub(t)
+
+	seedSeen(t, st, recShared1)
+	_ = st.InsertBUMP(ctx, recOrphan, 10, malformedBUMP)
+	_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+	_, _ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	_, _ = st.MarkBlockReconciled(ctx, recOrphan, time.Time{}, time.Now())
+	if rows, _ := st.ListOrphanedBlocksToReconcile(ctx, 10); len(rows) != 0 {
+		t.Fatalf("precondition: the stamped row must be off the queue, got %d", len(rows))
+	}
+
+	r := newTestReconciler(st, pub, stub, nil)
+	withReprocess(r, reprocess)
+	if !r.fullScan(ctx) {
+		t.Fatal("a repair handed off to the rebuild and the queue must not leave the scan incomplete")
+	}
+	if got := reprocess.requested(); len(got) != 1 || got[0] != recOrphan {
+		t.Fatalf("the block's rebuild must be requested exactly once, got %v", got)
+	}
+	bp, err := st.GetBlockProcessingStatus(ctx, recOrphan)
+	if err != nil || bp.Status != models.BlockStatusOrphaned || bp.ReconciledAt != nil {
+		t.Fatalf("row must be orphaned and unstamped (requeued), got %+v err=%v", bp, err)
+	}
+	if rows, lerr := st.ListOrphanedBlocksToReconcile(ctx, 10); lerr != nil || len(rows) != 1 || rows[0].BlockHash != recOrphan {
+		t.Fatalf("row must be back on the reconcile queue, got %+v err=%v", rows, lerr)
+	}
+	if got := statusOf(t, st, recShared1); got.Status != models.StatusSeenOnNetwork {
+		t.Fatalf("nothing is re-mined from a corrupt BUMP, got %s@%s", got.Status, got.BlockHash)
+	}
+
+	// The tick's resurrection short-circuit returns the canonical row to
+	// active; the rebuild the poke triggered heals its txs on redelivery.
+	r.tick(ctx)
+	bp, err = st.GetBlockProcessingStatus(ctx, recOrphan)
+	if err != nil || bp.Status != models.BlockStatusActive || bp.OrphanedAt != nil || bp.ReconciledAt != nil {
+		t.Fatalf("the tick must reactivate the requeued canonical row, got %+v err=%v", bp, err)
+	}
+	if rows, lerr := st.ListOrphanedBlocksToReconcile(ctx, 10); lerr != nil || len(rows) != 0 {
+		t.Fatalf("row must leave the queue once reactivated, got %+v err=%v", rows, lerr)
+	}
+}
+
+// TestReconciler_NeighborhoodEmptyBUMPKeepsRowQueued: every backend reports
+// a missing BUMP as store.ErrNotFound, so an empty stored blob is a
+// stored-but-unusable one, not absence. Read as absence, the neighbor's txs
+// would stay in the revert set and be un-mined. The block stays queued until
+// the blob is rebuilt, then heals.
+func TestReconciler_NeighborhoodEmptyBUMPKeepsRowQueued(t *testing.T) {
+	ctx := context.Background()
+	st := newPebbleForTest(t)
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	stub.setHeightHeader(10, headerWithHash(t, recCanonical, 10))
+	stub.setHeightHeader(11, headerWithHash(t, recNeighbor, 11))
+
+	seedMined(t, st, recOrphan, 10, recRebin)
+	_ = st.InsertBUMP(ctx, recCanonical, 10, makeCompoundForTest(t, 10, recShared1))
+	_ = st.InsertBUMP(ctx, recNeighbor, 11, []byte{})
+	_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+	_, _ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	rows, err := st.ListOrphanedBlocksToReconcile(ctx, 10)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("precondition: one queued row, got %+v err=%v", rows, err)
+	}
+
+	r := newTestReconciler(st, pub, stub, nil)
+	if outcome := r.reconcileBlock(ctx, rows[0]); outcome != "error" {
+		t.Fatalf("outcome = %q, want error", outcome)
+	}
+	if got := statusOf(t, st, recRebin); got.Status != models.StatusMined || got.BlockHash != recOrphan {
+		t.Fatalf("tx must not be reverted while the neighbor's blob is empty, got %s@%s", got.Status, got.BlockHash)
+	}
+	if rows, err := st.ListOrphanedBlocksToReconcile(ctx, 10); err != nil || len(rows) != 1 {
+		t.Fatalf("row must stay queued for retry, got %+v err=%v", rows, err)
+	}
+
+	_ = st.InsertBUMP(ctx, recNeighbor, 11, makeCompoundForTest(t, 11, recRebin))
+	r.tick(ctx)
+	if got := statusOf(t, st, recRebin); got.Status != models.StatusMined || got.BlockHash != recNeighbor {
+		t.Fatalf("rebuilt blob must re-anchor the tx to the neighbor, got %s@%s", got.Status, got.BlockHash)
+	}
+}
+
+// TestReconciler_EmptyCanonicalBUMPDefers: the same for the canonical
+// block's own blob on the tick path — an empty blob takes the malformed
+// route (defer and request a rebuild), never the "not stored yet" one, and
+// nothing is reverted or stamped.
+func TestReconciler_EmptyCanonicalBUMPDefers(t *testing.T) {
+	ctx := context.Background()
+	st := newPebbleForTest(t)
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	stub.setHeightHeader(10, headerWithHash(t, recCanonical, 10))
+	reprocess := newReprocessStub(t)
+
+	seedMined(t, st, recOrphan, 10, recShared1)
+	_ = st.InsertBUMP(ctx, recCanonical, 10, []byte{})
+	_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+	_, _ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	rows, err := st.ListOrphanedBlocksToReconcile(ctx, 10)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("precondition: one queued row, got %+v err=%v", rows, err)
+	}
+
+	r := newTestReconciler(st, pub, stub, nil)
+	withReprocess(r, reprocess)
+	if outcome := r.reconcileBlock(ctx, rows[0]); outcome != "deferred" {
+		t.Fatalf("outcome = %q, want deferred", outcome)
+	}
+	if got := reprocess.requested(); len(got) != 1 || got[0] != recCanonical {
+		t.Fatalf("the canonical block's rebuild must be requested, got %v", got)
+	}
+	if got := statusOf(t, st, recShared1); got.Status != models.StatusMined || got.BlockHash != recOrphan {
+		t.Fatalf("tx must be untouched, got %s@%s", got.Status, got.BlockHash)
+	}
+}
+
+// TestReconciler_FullScanOrphanMetricCountsPartialTransitionsOnError: the
+// backends report the transitions that landed before a failure alongside the
+// error, and those rows ARE orphaned in the store. The metric promises
+// applied transitions, so the count must be observed even when the call
+// also failed — and the scan still reports itself incomplete for the retry.
+func TestReconciler_FullScanOrphanMetricCountsPartialTransitionsOnError(t *testing.T) {
+	ctx := context.Background()
+	base := newPebbleForTest(t)
+	hs := &hookedStore{Store: base, orphanPartialErr: errors.New("injected: later chunk failed")}
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	stub.setHeightHeader(10, headerWithHash(t, recNeighbor, 10)) // both rows below are off-chain
+	_ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+	_ = base.UpsertBlockHeaderSeen(ctx, recCanonical, 10, time.Now())
+
+	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
+		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceFullScan)
+	before := testutil.ToFloat64(counter)
+
+	r := newTestReconciler(hs, pub, stub, nil)
+	if r.fullScanMarkOrphaned(ctx, map[string]struct{}{recOrphan: {}, recCanonical: {}}) {
+		t.Fatal("a failed write must report the scan incomplete")
+	}
+	if got := testutil.ToFloat64(counter) - before; got != 2 {
+		t.Fatalf("full-scan orphaned transitions = %v, want 2 (the rows that landed before the failure)", got)
 	}
 }
