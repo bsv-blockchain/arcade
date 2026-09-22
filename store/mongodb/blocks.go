@@ -22,7 +22,7 @@ import (
 func (s *Store) UpsertBlockHeaderSeen(ctx context.Context, blockHash string, blockHeight uint64, seenAt time.Time) error {
 	update := doc(
 		kv(opSet, doc(kv(fBlockHeight, heightToInt64(blockHeight)), kv(fStatus, string(models.BlockStatusActive)))),
-		kv(opUnset, doc(kv(fOrphanedAt, ""), kv(fReconciledAt, ""))),
+		kv(opUnset, doc(kv(fOrphanedAt, ""), kv(fOrphanedGen, ""), kv(fReconciledAt, ""))),
 		kv(opSetOnInsert, doc(kv(fHeaderSeenAt, msTrunc(seenAt)))),
 	)
 	err := s.withDupKeyRetry(ctx, func(octx context.Context) error {
@@ -77,15 +77,29 @@ func (s *Store) MarkBlockBUMPBuilt(ctx context.Context, blockHash string, blockH
 // server evaluates that filter atomically with the update per document, so
 // a row matches — and is counted — exactly when THIS call flipped it. A row
 // a concurrent writer orphaned first does not match and is never
-// double-counted. The second UpdateMany refreshes the generation
-// (orphaned_at) and clears the stamp on rows that were already orphaned;
-// that is not a transition and its count is discarded.
+// double-counted.
+//
+// The second UpdateMany refreshes the generation and clears the stamp on
+// rows that were already orphaned; that is not a transition and its count is
+// discarded. It is guarded to move the generation FORWARD only (orphaned_gen
+// below this call's), because the two statements are not one atomic step:
+// between them another writer can reactivate a row this call just
+// transitioned and orphan it again with a newer generation, and an
+// unguarded refresh would then overwrite that newer generation with this
+// call's older one — letting a reconciler holding the older token pass the
+// CAS for a generation it never processed. The single-write backends cannot
+// interleave like that, so only this one needs the guard.
 func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) (int, error) {
 	if len(blockHashes) == 0 {
 		return 0, nil
 	}
+	gen := orphanedAt.UnixNano()
 	update := doc(
-		kv(opSet, doc(kv(fStatus, string(models.BlockStatusOrphaned)), kv(fOrphanedAt, msTrunc(orphanedAt)))),
+		kv(opSet, doc(
+			kv(fStatus, string(models.BlockStatusOrphaned)),
+			kv(fOrphanedAt, msTrunc(orphanedAt)),
+			kv(fOrphanedGen, gen),
+		)),
 		kv(opUnset, doc(kv(fReconciledAt, ""))),
 	)
 	transitions, err := s.updateBlocksIn(ctx, blockHashes,
@@ -93,11 +107,31 @@ func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, or
 	if err != nil {
 		return int(transitions), err
 	}
-	if _, err := s.updateBlocksIn(ctx, blockHashes,
-		doc(kv(fStatus, string(models.BlockStatusOrphaned))), update, "refresh orphaned generation"); err != nil {
+	refresh := doc(
+		kv(fStatus, string(models.BlockStatusOrphaned)),
+		kv(opOr, bson.A{
+			doc(kv(fOrphanedGen, doc(kv(opLt, gen)))),
+			doc(kv(fOrphanedGen, doc(kv(opExists, false)))), // written before the field existed
+		}),
+	)
+	if _, err := s.updateBlocksIn(ctx, blockHashes, refresh, update, "refresh orphaned generation"); err != nil {
 		return int(transitions), err
 	}
 	return int(transitions), nil
+}
+
+// orphanGenerationFilter matches the orphan generation a caller read back:
+// orphaned_gen at full precision, or — for a row written before that field
+// existed, whose model carried the millisecond orphaned_at — the datetime.
+// A zero orphanedAt matches any generation (status check only).
+func orphanGenerationFilter(orphanedAt time.Time) bson.D {
+	if orphanedAt.IsZero() {
+		return doc()
+	}
+	return doc(kv(opOr, bson.A{
+		doc(kv(fOrphanedGen, orphanedAt.UnixNano())),
+		doc(kv(fOrphanedGen, doc(kv(opExists, false))), kv(fOrphanedAt, msTrunc(orphanedAt))),
+	}))
 }
 
 // updateBlocksIn applies one update to every row named in blockHashes, in
@@ -130,16 +164,15 @@ func (s *Store) updateBlocksIn(ctx context.Context, blockHashes []string, extra,
 
 // MarkBlockReconciled implements store.Store as a compare-and-set on the
 // orphan generation: the filter requires status == orphaned and, unless
-// orphanedAt is zero, orphaned_at == orphanedAt, so a row the block-status
+// orphanedAt is zero, the orphan generation (orphaned_gen, see
+// orphanGenerationFilter) equals orphanedAt, so a row the block-status
 // tracker reactivated — or orphaned again with a newer generation — while
 // the reconciler was working is left untouched, as is a missing row (issue
 // #339). The server evaluates filter and update atomically per document, so
 // no version compare is needed. Returns whether the stamp applied.
 func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, orphanedAt, at time.Time) (bool, error) {
 	filter := doc(kv(fID, blockHash), kv(fStatus, string(models.BlockStatusOrphaned)))
-	if !orphanedAt.IsZero() {
-		filter = append(filter, kv(fOrphanedAt, msTrunc(orphanedAt)))
-	}
+	filter = append(filter, orphanGenerationFilter(orphanedAt)...)
 	octx, cancel := s.opCtx(ctx)
 	defer cancel()
 	res, err := s.blocks.UpdateOne(octx, filter, doc(kv(opSet, doc(kv(fReconciledAt, msTrunc(at))))))
@@ -151,18 +184,17 @@ func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, orpha
 
 // ReactivateBlock implements store.Store as a compare-and-set on the orphan
 // generation (issue #339): the filter requires status == orphaned and, unless
-// orphanedAt is zero, orphaned_at == orphanedAt, so a missing, active, parked
+// orphanedAt is zero, the orphan generation equals orphanedAt (see
+// orphanGenerationFilter), so a missing, active, parked
 // or re-orphaned row is left untouched and reported as not applied. The
 // server evaluates filter and update atomically per document; no upsert, so
 // a missing row is never created.
 func (s *Store) ReactivateBlock(ctx context.Context, blockHash string, blockHeight uint64, orphanedAt time.Time) (bool, error) {
 	filter := doc(kv(fID, blockHash), kv(fStatus, string(models.BlockStatusOrphaned)))
-	if !orphanedAt.IsZero() {
-		filter = append(filter, kv(fOrphanedAt, msTrunc(orphanedAt)))
-	}
+	filter = append(filter, orphanGenerationFilter(orphanedAt)...)
 	update := doc(
 		kv(opSet, doc(kv(fBlockHeight, heightToInt64(blockHeight)), kv(fStatus, string(models.BlockStatusActive)))),
-		kv(opUnset, doc(kv(fOrphanedAt, ""), kv(fReconciledAt, ""))),
+		kv(opUnset, doc(kv(fOrphanedAt, ""), kv(fOrphanedGen, ""), kv(fReconciledAt, ""))),
 	)
 	octx, cancel := s.opCtx(ctx)
 	defer cancel()

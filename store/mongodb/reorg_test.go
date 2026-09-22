@@ -539,6 +539,57 @@ func TestMarkBlocksOrphaned_ReorphanRequeuesAndCountsTransitions(t *testing.T) {
 	}
 }
 
+// TestMarkBlocksOrphaned_RefreshNeverMovesGenerationBackwards: this
+// backend's MarkBlocksOrphaned is two statements — the status transition,
+// then a generation refresh for rows already orphaned — and between them
+// another writer can reactivate a row this call just transitioned and orphan
+// it again with a NEWER generation. The refresh must then leave that
+// generation alone: an unguarded one would overwrite it with this call's
+// older timestamp, and a reconciler holding the older token would pass the
+// CAS for a generation it never processed. The refresh is exactly a
+// MarkBlocksOrphaned with an older timestamp landing on a newer-generation
+// row, which is what this drives directly.
+func TestMarkBlocksOrphaned_RefreshNeverMovesGenerationBackwards(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	t0 := time.Unix(1700000900, 0).UTC()
+	older, newer := t0.Add(time.Minute), t0.Add(2*time.Minute)
+	const hash = "rq-backwards"
+
+	if err := s.UpsertBlockHeaderSeen(ctx, hash, 810, t0); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// Call A transitions the row at `older`; a reconciler dequeues that token.
+	if n, err := s.MarkBlocksOrphaned(ctx, []string{hash}, older); err != nil || n != 1 {
+		t.Fatalf("A's transition: n=%d err=%v", n, err)
+	}
+	// Writer B resurrects the row and orphans it again at `newer`.
+	if applied, err := s.ReactivateBlock(ctx, hash, 810, older); err != nil || !applied {
+		t.Fatalf("B's reactivate: applied=%v err=%v", applied, err)
+	}
+	if n, err := s.MarkBlocksOrphaned(ctx, []string{hash}, newer); err != nil || n != 1 {
+		t.Fatalf("B's re-orphan: n=%d err=%v", n, err)
+	}
+	// A's refresh statement lands last: the same write A would issue.
+	if n, err := s.MarkBlocksOrphaned(ctx, []string{hash}, older); err != nil || n != 0 {
+		t.Fatalf("A's late refresh: n=%d err=%v, want 0", n, err)
+	}
+	got, err := s.GetBlockProcessingStatus(ctx, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OrphanedAt == nil || !got.OrphanedAt.Equal(newer) {
+		t.Fatalf("the refresh must never move the generation backwards, got %v want %v", got.OrphanedAt, newer)
+	}
+	// The stale token cannot stamp B's generation; B's own token can.
+	if ok, err := s.MarkBlockReconciled(ctx, hash, older, t0.Add(time.Hour)); err != nil || ok {
+		t.Fatalf("A's stale token must not stamp B's generation: ok=%v err=%v", ok, err)
+	}
+	if ok, err := s.MarkBlockReconciled(ctx, hash, newer, t0.Add(time.Hour)); err != nil || !ok {
+		t.Fatalf("B's token must stamp: ok=%v err=%v", ok, err)
+	}
+}
+
 // TestListOrphanedBlocksToReconcile_PrioritizesReanchorable pins the
 // work-queue prioritization: an orphan whose active (canonical) block at the
 // same height already has a stored BUMP — so the reconciler can re-anchor it

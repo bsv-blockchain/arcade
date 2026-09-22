@@ -58,6 +58,7 @@ const (
 	fProcessedAt  = "processed_at"
 	fBUMPBuiltAt  = "bump_built_at"
 	fOrphanedAt   = "orphaned_at"
+	fOrphanedGen  = "orphaned_gen"
 	fReconciledAt = "reconciled_at"
 
 	fHolder    = "holder"
@@ -298,10 +299,27 @@ type blockProcessingDoc struct {
 	BUMPBuiltAt  *time.Time `bson:"bump_built_at,omitempty"`
 	Status       string     `bson:"status"`
 	OrphanedAt   *time.Time `bson:"orphaned_at,omitempty"`
+	// OrphanedGen is orphaned_at at full precision (Unix nanoseconds) — the
+	// orphan GENERATION the reconciler's compare-and-set writes
+	// (MarkBlockReconciled, ReactivateBlock) match on. BSON datetimes hold
+	// milliseconds, so two orphanings inside one millisecond would be the
+	// same generation if orphaned_at alone were the token, and a stale
+	// reconciler could then stamp or reactivate the newer one. orphaned_at
+	// stays the sortable, indexed copy; this is the identity. Absent on a
+	// row written before the field existed, so readers fall back to
+	// orphaned_at.
+	OrphanedGen  int64      `bson:"orphaned_gen,omitempty"`
 	ReconciledAt *time.Time `bson:"reconciled_at,omitempty"`
 }
 
 func (d blockProcessingDoc) toModel() *models.BlockProcessingStatus {
+	orphanedAt := d.OrphanedAt
+	if d.OrphanedGen != 0 {
+		// Hand callers the full-precision generation, so the value they
+		// read back is exactly the token the CAS writes compare on.
+		t := time.Unix(0, d.OrphanedGen).UTC()
+		orphanedAt = &t
+	}
 	return &models.BlockProcessingStatus{
 		BlockHash:    d.BlockHash,
 		BlockHeight:  heightFromInt64(d.BlockHeight),
@@ -309,7 +327,7 @@ func (d blockProcessingDoc) toModel() *models.BlockProcessingStatus {
 		ProcessedAt:  d.ProcessedAt,
 		BUMPBuiltAt:  d.BUMPBuiltAt,
 		Status:       models.BlockProcessingStatusValue(d.Status),
-		OrphanedAt:   d.OrphanedAt,
+		OrphanedAt:   orphanedAt,
 		ReconciledAt: d.ReconciledAt,
 	}
 }

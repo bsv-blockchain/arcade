@@ -254,6 +254,48 @@ func RunBlockStatusSuite(t *testing.T, newBackend func(t *testing.T) BlockStatus
 		})
 	})
 
+	t.Run("GenerationSurvivesSubMillisecondSpacing", func(t *testing.T) {
+		// The generation is the CAS token, so two orphanings inside one
+		// millisecond must still be two generations: a reconciler holding
+		// the earlier token must fail both CAS writes after the later
+		// re-orphan. Microsecond spacing is the coarsest every backend keeps
+		// (Postgres timestamptz); the others keep nanoseconds.
+		b := newBackend(t)
+		const hash = "bs-gen-submilli"
+		fine1 := t0.Add(100 * time.Microsecond)
+		fine2 := fine1.Add(300 * time.Microsecond) // same millisecond as fine1
+		if err := b.UpsertBlockHeaderSeen(ctx, hash, blockSuiteHeight+90, t0); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		if n, err := b.MarkBlocksOrphaned(ctx, []string{hash}, fine1); err != nil || n != 1 {
+			t.Fatalf("orphan: transitions=%d err=%v", n, err)
+		}
+		if got := row(t, b, hash); got.OrphanedAt == nil || !got.OrphanedAt.Equal(fine1) {
+			t.Fatalf("the generation must round-trip at full precision, got %v want %v", got.OrphanedAt, fine1)
+		}
+		// The reconciler reads fine1 as its token, then the row is
+		// resurrected and orphaned again 300 µs later.
+		if applied, err := b.ReactivateBlock(ctx, hash, blockSuiteHeight+90, fine1); err != nil || !applied {
+			t.Fatalf("ReactivateBlock: applied=%v err=%v", applied, err)
+		}
+		if n, err := b.MarkBlocksOrphaned(ctx, []string{hash}, fine2); err != nil || n != 1 {
+			t.Fatalf("re-orphan: transitions=%d err=%v", n, err)
+		}
+		got := row(t, b, hash)
+		if got.OrphanedAt == nil || !got.OrphanedAt.Equal(fine2) || got.OrphanedAt.Equal(fine1) {
+			t.Fatalf("two orphanings %v apart must be two generations, got %v", fine2.Sub(fine1), got.OrphanedAt)
+		}
+		if ok, err := b.MarkBlockReconciled(ctx, hash, fine1, fine2.Add(time.Second)); err != nil || ok {
+			t.Fatalf("the earlier token must not stamp the later generation: ok=%v err=%v", ok, err)
+		}
+		if applied, err := b.ReactivateBlock(ctx, hash, blockSuiteHeight+90, fine1); err != nil || applied {
+			t.Fatalf("the earlier token must not reactivate the later generation: applied=%v err=%v", applied, err)
+		}
+		if applied, err := b.ReactivateBlock(ctx, hash, blockSuiteHeight+90, fine2); err != nil || !applied {
+			t.Fatalf("the current token must apply: applied=%v err=%v", applied, err)
+		}
+	})
+
 	t.Run("MarkBlockReconciled", func(t *testing.T) {
 		b := newBackend(t)
 		const hash = "bs-recon"
