@@ -460,3 +460,52 @@ func TestMemoryBroker_SubscribeIsLiveOnly(t *testing.T) {
 		})
 	}
 }
+
+// TestMemoryBroker_HasSubscriber is the observability counterpart to
+// SubscribeIsLiveOnly: because a publish to a topic with no live mailbox is
+// dropped, callers (in-process test harnesses) need a way to wait until the
+// consumer has subscribed before publishing. HasSubscriber is that signal.
+func TestMemoryBroker_HasSubscriber(t *testing.T) {
+	b := NewMemoryBroker(16)
+	defer func() { _ = b.Close() }()
+
+	checker, ok := b.(SubscriberChecker)
+	if !ok {
+		t.Fatal("memory broker must implement SubscriberChecker")
+	}
+
+	if checker.HasSubscriber("topic-x") {
+		t.Fatal("HasSubscriber returned true before any subscribe")
+	}
+
+	sub, err := b.Subscribe("group-a", []string{"topic-x"}, StartOldest)
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	if !checker.HasSubscriber("topic-x") {
+		t.Fatal("HasSubscriber returned false after subscribe to topic-x")
+	}
+	// Other topics are unaffected by an unrelated group's subscription.
+	if checker.HasSubscriber("topic-other") {
+		t.Fatal("HasSubscriber returned true for an unsubscribed topic")
+	}
+
+	// Closing the subscription does not retract the group's mailbox — the
+	// broker owns mailbox lifetime and only tears them down on broker Close
+	// (see memorySubscription.Close). HasSubscriber tracks broker state, which
+	// is exactly what a harness waiting to publish cares about.
+	if err := sub.Close(); err != nil {
+		t.Fatalf("close sub: %v", err)
+	}
+	if !checker.HasSubscriber("topic-x") {
+		t.Fatal("HasSubscriber returned false while the broker still holds the mailbox")
+	}
+
+	if err := b.Close(); err != nil {
+		t.Fatalf("close broker: %v", err)
+	}
+	if checker.HasSubscriber("topic-x") {
+		t.Fatal("HasSubscriber returned true after broker Close cleared all groups")
+	}
+}
