@@ -1,0 +1,330 @@
+package mongodb
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+	"time"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+
+	"github.com/bsv-blockchain/arcade/metrics"
+	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/store"
+)
+
+// InsertSubmission implements store.Store; a duplicate submission id is a
+// no-op, matching Postgres' ON CONFLICT DO NOTHING.
+func (s *Store) InsertSubmission(ctx context.Context, sub *models.Submission) error {
+	if sub == nil || sub.SubmissionID == "" {
+		return errors.New("insert submission: empty submission id")
+	}
+	if sub.CreatedAt.IsZero() {
+		sub.CreatedAt = time.Now()
+	}
+	d := submissionDocFromModel(sub)
+	octx, cancel := s.opCtx(ctx)
+	defer cancel()
+	if _, err := s.subs.InsertOne(octx, d); err != nil && !mongo.IsDuplicateKeyError(err) {
+		return fmt.Errorf("insert submission %s: %w", sub.SubmissionID, err)
+	}
+	return nil
+}
+
+// findSubmissions runs a submissions query under the context it is given.
+//
+// The deadline is the caller's choice, deliberately: query_timeout_ms sizes a
+// query whose result this package bounds, and only one of the three callers
+// does. GetSubmissionsByTxID and GetSubmissionsByToken return every matching
+// row, so a token with enough submissions would fail at a fixed 8 s even
+// where the caller's own context allowed the read to finish — the same reason
+// GetTxIDsByBlockHash and CensusStatusesSince take the caller's context.
+func (s *Store) findSubmissions(ctx context.Context, filter bson.D, opts *options.FindOptionsBuilder) ([]*models.Submission, error) {
+	cur, err := s.subs.Find(ctx, filter, opts)
+	if err != nil {
+		return nil, err
+	}
+	var docs []submissionDoc
+	if err := cur.All(ctx, &docs); err != nil {
+		return nil, err
+	}
+	out := make([]*models.Submission, 0, len(docs))
+	for _, d := range docs {
+		out = append(out, d.toModel())
+	}
+	return out, nil
+}
+
+// GetSubmissionsByTxID implements store.Store.
+func (s *Store) GetSubmissionsByTxID(ctx context.Context, txid string) ([]*models.Submission, error) {
+	out, err := s.findSubmissions(ctx, doc(kv(fTxID, txid)), options.Find())
+	if err != nil {
+		return nil, fmt.Errorf("get submissions by txid %s: %w", txid, err)
+	}
+	return out, nil
+}
+
+// GetSubmissionsByToken implements store.Store.
+func (s *Store) GetSubmissionsByToken(ctx context.Context, callbackToken string) ([]*models.Submission, error) {
+	out, err := s.findSubmissions(ctx, doc(kv(fCallbackToken, callbackToken)), options.Find())
+	if err != nil {
+		return nil, fmt.Errorf("get submissions by token: %w", err)
+	}
+	return out, nil
+}
+
+// tokenRow is the covered (txid, callback_token) projection.
+type tokenRow struct {
+	TxID  string `bson:"txid"`
+	Token string `bson:"callback_token"`
+}
+
+var projTokenRow = doc(kv(fTxID, 1), kv(fCallbackToken, 1), kv(fID, 0))
+
+// TokensForTxIDs implements store.Store from the txid side only, one
+// covered index scan per chunk of txids. Tokens are deduplicated per txid in
+// first-seen order; a txid with no token is absent from the result.
+//
+// The dedupe is a set, not a scan of what has been kept. One txid can carry
+// many submissions — every client that registered a callback for it — and
+// this is the SSE fan-out's hot path, so a linear membership test per row
+// makes the work quadratic in the tokens per txid exactly where it is least
+// affordable. The set is per call, not per chunk: the {txid, callback_token}
+// index means a txid's rows are adjacent and land in one chunk, but nothing
+// in the contract says a caller cannot repeat a txid across chunk boundaries
+// in some future shape of this method.
+func (s *Store) TokensForTxIDs(ctx context.Context, txids []string) (map[string][]string, error) {
+	out := make(map[string][]string, len(txids))
+	seen := make(map[string]map[string]struct{}, len(txids))
+	for _, chunk := range chunks(dedupe(txids), inChunk) {
+		filter := doc(kv(fTxID, doc(kv(opIn, chunk))), kv(fCallbackToken, doc(kv(opGt, ""))))
+		qctx, cancel := s.queryCtx(ctx)
+		cur, err := s.subs.Find(qctx, filter, options.Find().SetProjection(projTokenRow).SetHint(idxSubTxIDToken))
+		if err != nil {
+			cancel()
+			return nil, fmt.Errorf("tokens for txids: %w", err)
+		}
+		var rows []tokenRow
+		err = cur.All(qctx, &rows)
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("tokens for txids: %w", err)
+		}
+		for _, r := range rows {
+			tokens, ok := seen[r.TxID]
+			if !ok {
+				tokens = make(map[string]struct{})
+				seen[r.TxID] = tokens
+			}
+			if _, dup := tokens[r.Token]; dup {
+				continue
+			}
+			tokens[r.Token] = struct{}{}
+			out[r.TxID] = append(out[r.TxID], r.Token)
+		}
+	}
+	return out, nil
+}
+
+// IterateStatusesByToken implements store.Store. The replay is bounded twice:
+// a bounded count refuses an oversized token before any scan, and the scan
+// itself abandons at the same limit, so a token that grows past the bound
+// after the count is refused rather than materialized. Either way the answer
+// is store.ErrReplayUnavailable and peak memory is capped at limit entries,
+// as the interface requires and as Pebble and Aerospike do. Within the bound:
+// a covered scan collects the distinct txids, their statuses are read in
+// projected $in chunks, and the (small, filtered) result is sorted by
+// timestamp and streamed.
+func (s *Store) IterateStatusesByToken(ctx context.Context, callbackToken string, since time.Time, onlyStatuses []models.Status, fn func(*models.TransactionStatus) error) error {
+	if callbackToken == "" {
+		return nil
+	}
+	tokenFilter := doc(kv(fCallbackToken, callbackToken))
+	// The caller's context, not opCtx: SetLimit bounds this count at
+	// tokenReplayLimit+1 KEYS, not at a point read's worth of work, so a token
+	// near the limit walks a quarter of a million index entries. Under the 3 s
+	// point-operation budget the preflight would fail exactly the tokens it
+	// exists to classify, and fail them before the scan it precedes — which
+	// runs under the caller's context — ever got the chance to answer.
+	n, err := s.subs.CountDocuments(ctx, tokenFilter, options.Count().SetLimit(s.tokenReplayLimit+1).SetHint(idxSubTokenTxID))
+	if err != nil {
+		return fmt.Errorf("iterate statuses by token: count: %w", err)
+	}
+	if n > s.tokenReplayLimit {
+		return fmt.Errorf("%w: token has more than %d submissions", store.ErrReplayUnavailable, s.tokenReplayLimit)
+	}
+
+	txids, err := s.tokenTxIDs(ctx, tokenFilter)
+	if err != nil {
+		return err
+	}
+	rows, err := s.projectedStatuses(ctx, txids, since, onlyStatuses)
+	if err != nil {
+		return err
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if !rows[i].Timestamp.Equal(rows[j].Timestamp) {
+			return rows[i].Timestamp.Before(rows[j].Timestamp)
+		}
+		return rows[i].TxID < rows[j].TxID
+	})
+	for _, r := range rows {
+		if err := fn(r); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// tokenTxIDs collects the distinct txids under a token via the covered
+// {callback_token, txid} index, abandoning the scan past tokenReplayLimit
+// rows. The caller's count is only a preflight — submissions can be inserted
+// between it and this scan — so the bound is enforced here, where the memory
+// is actually spent.
+func (s *Store) tokenTxIDs(ctx context.Context, tokenFilter bson.D) ([]string, error) {
+	// No SetBatchSize: this is a covered scan of one 64-byte field, so the
+	// full-row batch_size would only add getMore round trips (see cursorBatch).
+	cur, err := s.subs.Find(ctx, tokenFilter, options.Find().
+		SetProjection(doc(kv(fTxID, 1), kv(fID, 0))).SetHint(idxSubTokenTxID))
+	if err != nil {
+		return nil, fmt.Errorf("iterate statuses by token: submissions: %w", err)
+	}
+	defer closeCursor(ctx, cur)
+	seen := make(map[string]struct{})
+	var txids []string
+	var scanned int64
+	for cur.Next(ctx) {
+		scanned++
+		if scanned > s.tokenReplayLimit {
+			return nil, fmt.Errorf("%w: token has more than %d submissions", store.ErrReplayUnavailable, s.tokenReplayLimit)
+		}
+		var r tokenRow
+		if err := cur.Decode(&r); err != nil {
+			return nil, fmt.Errorf("iterate statuses by token: decode: %w", err)
+		}
+		if _, dup := seen[r.TxID]; dup || r.TxID == "" {
+			continue
+		}
+		seen[r.TxID] = struct{}{}
+		txids = append(txids, r.TxID)
+	}
+	if err := cur.Err(); err != nil {
+		return nil, fmt.Errorf("iterate statuses by token: submissions: %w", err)
+	}
+	return txids, nil
+}
+
+// projectedStatuses reads the streaming projection (txid, status, timestamp,
+// block hash/height) for txids, applying the since / status filters
+// server-side. Never raw_tx, never merkle enrichment.
+func (s *Store) projectedStatuses(ctx context.Context, txids []string, since time.Time, only []models.Status) ([]*models.TransactionStatus, error) {
+	names := make([]string, 0, len(only))
+	for _, st := range only {
+		names = append(names, string(st))
+	}
+	var rows []*models.TransactionStatus
+	for _, chunk := range chunks(txids, inChunk) {
+		filter := doc(kv(fID, doc(kv(opIn, chunk))))
+		filter = append(filter, afterFilter(since)...)
+		if len(names) > 0 {
+			filter = append(filter, kv(fStatus, doc(kv(opIn, names))))
+		}
+		cur, err := s.tx.Find(ctx, filter, options.Find().SetProjection(projTokenReplay))
+		if err != nil {
+			return nil, fmt.Errorf("iterate statuses by token: statuses: %w", err)
+		}
+		var docs []txDoc
+		if err := cur.All(ctx, &docs); err != nil {
+			return nil, fmt.Errorf("iterate statuses by token: statuses: %w", err)
+		}
+		for _, d := range docs {
+			rows = append(rows, &models.TransactionStatus{
+				TxID: d.TxID, Status: models.Status(d.Status), Timestamp: d.Timestamp,
+				BlockHash: d.BlockHash, BlockHeight: heightFromInt64(d.BlockHeight),
+			})
+		}
+	}
+	return rows, nil
+}
+
+// UpdateDeliveryStatus implements store.Store; a nil nextRetry clears the
+// field. Missing rows are a no-op.
+func (s *Store) UpdateDeliveryStatus(ctx context.Context, submissionID string, lastStatus models.Status, retryCount int, nextRetry *time.Time) error {
+	set := doc(kv(fLastDeliveredStatus, string(lastStatus)), kv(fRetryCount, retryCount))
+	update := doc()
+	if nextRetry != nil {
+		set = append(set, kv(fNextRetryAt, msTrunc(*nextRetry)))
+	} else {
+		update = append(update, kv(opUnset, doc(kv(fNextRetryAt, ""))))
+	}
+	update = append(update, kv(opSet, set))
+	octx, cancel := s.opCtx(ctx)
+	defer cancel()
+	if _, err := s.subs.UpdateOne(octx, idFilter(submissionID), update); err != nil {
+		return fmt.Errorf("update delivery %s: %w", submissionID, err)
+	}
+	return nil
+}
+
+// RecordDeliveryAttempt implements store.Store: $inc attempts, overwrite the
+// last-attempt bookkeeping. Missing rows are a no-op.
+func (s *Store) RecordDeliveryAttempt(ctx context.Context, submissionID string, at time.Time, result string) error {
+	update := doc(
+		kv(opInc, doc(kv(fAttempts, 1))),
+		kv(opSet, doc(kv(fLastAttemptAt, msTrunc(at)), kv(fLastResult, result))),
+	)
+	octx, cancel := s.opCtx(ctx)
+	defer cancel()
+	if _, err := s.subs.UpdateOne(octx, idFilter(submissionID), update); err != nil {
+		return fmt.Errorf("record delivery attempt %s: %w", submissionID, err)
+	}
+	return nil
+}
+
+// UpdateDeliveryStatusCAS implements store.Store as one conditional update.
+// An empty expected matches both an absent field and an explicit "" — the
+// never-delivered row — like the Postgres NULL-or-” predicate. Infrastructure
+// errors are returned and counted separately from a lost CAS so a backend
+// failing every write cannot hide behind a flat "lost" metric.
+func (s *Store) UpdateDeliveryStatusCAS(ctx context.Context, submissionID string, expected, next models.Status) (bool, error) {
+	var expect any = string(expected)
+	if expected == "" {
+		expect = doc(kv(opIn, bson.A{"", nil}))
+	}
+	filter := doc(kv(fID, submissionID), kv(fLastDeliveredStatus, expect))
+	update := doc(
+		kv(opSet, doc(kv(fLastDeliveredStatus, string(next)), kv(fRetryCount, 0))),
+		kv(opUnset, doc(kv(fNextRetryAt, ""))),
+	)
+	octx, cancel := s.opCtx(ctx)
+	defer cancel()
+	res, err := s.subs.UpdateOne(octx, filter, update)
+	if err != nil {
+		metrics.WebhookCASErrorTotal.Inc()
+		return false, fmt.Errorf("update delivery cas %s: %w", submissionID, err)
+	}
+	return res.MatchedCount == 1, nil
+}
+
+// ListSubmissionsReadyForRetry implements store.Store via the partial
+// {retry_count > 0} index, oldest backlog first.
+func (s *Store) ListSubmissionsReadyForRetry(ctx context.Context, now time.Time, limit int) ([]*models.Submission, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	filter := doc(kv(fRetryCount, doc(kv(opGt, 0))), kv(fNextRetryAt, doc(kv(opLte, msTrunc(now)))))
+	// query_timeout_ms applies here and not to the other two callers: this is
+	// the only submissions read whose size this package bounds (limit), so it
+	// is the only one a fixed deadline can be sized against.
+	qctx, cancel := s.queryCtx(ctx)
+	defer cancel()
+	out, err := s.findSubmissions(qctx, filter, options.Find().
+		SetSort(doc(kv(fNextRetryAt, 1))).SetLimit(int64(limit)).SetHint(idxSubRetryReady))
+	if err != nil {
+		return nil, fmt.Errorf("list submissions ready for retry: %w", err)
+	}
+	return out, nil
+}

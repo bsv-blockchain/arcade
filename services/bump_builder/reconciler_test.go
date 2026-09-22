@@ -1076,3 +1076,198 @@ func TestReconciler_FullScanOrphanMetricCountsAppliedTransitions(t *testing.T) {
 		}
 	}
 }
+
+// partialRevertStore applies the revert and then reports an error, the shape
+// SetStatusByBlockHash uses when a walk fails partway through or a block keeps
+// taking mines faster than it can be retired: rows written, error returned.
+type partialRevertStore struct {
+	store.Store
+
+	applied []string
+}
+
+func (s *partialRevertStore) SetStatusByBlockHash(ctx context.Context, blockHash string, st models.Status) ([]string, error) {
+	applied, err := s.Store.SetStatusByBlockHash(ctx, blockHash, st)
+	if err != nil {
+		return applied, err
+	}
+	s.applied = applied
+	return applied, errors.New("rows still arriving after 4 passes")
+}
+
+// A revert that returns rows AND an error has already written those rows, and
+// they have left the block's index — a retry will not find them again. Their
+// correction event must still go out, or subscribers keep believing the txs
+// are MINED forever. The block itself must stay on the queue.
+func TestReconciler_PublishesRevertedTxsWhenTheStoreAlsoErrors(t *testing.T) {
+	ctx := context.Background()
+	base := newPebbleForTest(t)
+	st := &partialRevertStore{Store: base}
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	stub.setHeightHeader(10, headerWithHash(t, recCanonical, 10))
+
+	seedMined(t, base, recOrphan, 10, recBOnly)
+	if err := base.InsertBUMP(ctx, recCanonical, 10, makeCompoundForTest(t, 10, recShared1)); err != nil {
+		t.Fatalf("insert canonical BUMP: %v", err)
+	}
+	if err := base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now()); err != nil {
+		t.Fatalf("upsert orphan row: %v", err)
+	}
+	if _, err := base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now()); err != nil {
+		t.Fatalf("mark orphaned: %v", err)
+	}
+
+	newTestReconciler(st, pub, stub, nil).tick(ctx)
+
+	if len(st.applied) == 0 {
+		t.Fatal("test premise: the revert must have written at least one row")
+	}
+	var seenEv *models.TransactionStatus
+	for _, ev := range pub.bulkEvents() {
+		if ev.ExtraInfo == models.ExtraInfoReorgUnmined {
+			seenEv = ev
+		}
+	}
+	if seenEv == nil {
+		t.Fatal("the rows the store did write must still be published; their event is never retried")
+	}
+	if len(seenEv.TxIDs) != len(st.applied) || seenEv.TxIDs[0] != st.applied[0] {
+		t.Fatalf("published %v, want the rows the store wrote %v", seenEv.TxIDs, st.applied)
+	}
+	// The block stays queued: the error means the store is not finished.
+	bp, err := base.GetBlockProcessingStatus(ctx, recOrphan)
+	if err != nil || bp.ReconciledAt != nil {
+		t.Fatalf("reconciled_at must NOT be stamped after a revert error: %+v err=%v", bp, err)
+	}
+}
+
+// failedMineStore reports an error from SetMinedByTxIDs with NO rows written
+// — the shape of a mine that failed on its first row (a primary step-down, a
+// pool exhausted), as distinct from partialMineStore, where every row landed
+// before the error.
+type failedMineStore struct {
+	store.Store
+}
+
+func (s *failedMineStore) SetMinedByTxIDs(
+	_ context.Context, _ string, _ uint64, _ []string,
+) ([]*models.TransactionStatus, []*models.TransactionStatus, error) {
+	return nil, nil, errors.New("primary stepped down before any row landed")
+}
+
+// TestReconciler_PartialCanonicalRemineDoesNotRevert: a canonical re-mine
+// that does not land in full must NOT let the orphan reconcile.
+//
+// The txs it failed to write are provably IN the canonical BUMP and are still
+// anchored to the orphan. The neighborhood pass only walks heights ABOVE the
+// orphan, so it cannot claim them. If the re-mine still reported ready, the
+// revert would take them to SEEN_ON_NETWORK and reconciled_at would be
+// stamped — un-mining transactions that are demonstrably mined, with nothing
+// left to re-drive them: the canonical block already has its BUMP and its
+// processed_at, and the orphan has left the queue.
+func TestReconciler_PartialCanonicalRemineDoesNotRevert(t *testing.T) {
+	ctx := context.Background()
+	base := newPebbleForTest(t)
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	stub.setHeightHeader(10, headerWithHash(t, recCanonical, 10))
+
+	seedMined(t, base, recOrphan, 10, recShared1)
+	_ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+	_, _ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	// The canonical BUMP IS stored and DOES contain the tx — so the only
+	// reason the re-anchor does not happen is the store failure.
+	if err := base.InsertBUMP(ctx, recCanonical, 10, makeCompoundForTest(t, 10, recShared1)); err != nil {
+		t.Fatalf("insert canonical BUMP: %v", err)
+	}
+
+	r := newTestReconciler(&failedMineStore{Store: base}, pub, stub, nil)
+	r.tick(ctx)
+
+	// The tx must still be MINED@orphan — not reverted, and not silently
+	// treated as belonging nowhere.
+	if got := statusOf(t, base, recShared1); got.Status != models.StatusMined || got.BlockHash != recOrphan {
+		t.Fatalf("a failed canonical re-mine must leave the tx MINED@orphan, got %s@%s", got.Status, got.BlockHash)
+	}
+	for _, ev := range pub.bulkEvents() {
+		if ev.Status == models.StatusSeenOnNetwork {
+			t.Fatalf("no revert event may be published for a tx still provably in the canonical BUMP: %+v", ev)
+		}
+	}
+	// And the block must stay queued so a later tick can retry.
+	if rows, _ := base.ListOrphanedBlocksToReconcile(ctx, 10); len(rows) != 1 {
+		t.Fatalf("orphan must stay queued after a failed canonical re-mine, got %d rows", len(rows))
+	}
+
+	// Once the store recovers, the ordinary path completes the reconcile.
+	r.store = base
+	r.tick(ctx)
+	if got := statusOf(t, base, recShared1); got.BlockHash != recCanonical {
+		t.Fatalf("recovered tick must re-anchor to canonical, got %s@%s", got.Status, got.BlockHash)
+	}
+}
+
+// blockFailMineStore fails SetMinedByTxIDs for one target block and passes
+// every other block through, so a test can fail the neighborhood re-anchor
+// while the canonical re-mine succeeds.
+type blockFailMineStore struct {
+	store.Store
+
+	failFor string
+}
+
+func (s *blockFailMineStore) SetMinedByTxIDs(
+	ctx context.Context, blockHash string, blockHeight uint64, txids []string,
+) ([]*models.TransactionStatus, []*models.TransactionStatus, error) {
+	if blockHash == s.failFor {
+		return nil, nil, errors.New("primary stepped down before any row landed")
+	}
+	return s.Store.SetMinedByTxIDs(ctx, blockHash, blockHeight, txids)
+}
+
+// TestReconciler_PartialNeighborhoodReanchorDoesNotRevert: the same invariant
+// as the canonical re-mine, one height up. A tx the neighborhood pass failed
+// to move is a proven member of that NEIGHBOR's BUMP and is still anchored to
+// the orphan, so letting the pass report success would hand it to the revert
+// and un-mine it. Shrinking `affected` is not what protects it — the revert
+// works off the store's own block index — so the completion result has to
+// reach reconcileBlock.
+func TestReconciler_PartialNeighborhoodReanchorDoesNotRevert(t *testing.T) {
+	ctx := context.Background()
+	base := newPebbleForTest(t)
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	stub.setHeightHeader(10, headerWithHash(t, recCanonical, 10))
+	stub.setHeightHeader(11, headerWithHash(t, recNeighbor, 11))
+
+	seedMined(t, base, recOrphan, 10, recRebin)
+	// Canonical at 10 does not contain the tx (so the canonical re-mine
+	// succeeds trivially and canonicalReady is true); the block at 11 does.
+	_ = base.InsertBUMP(ctx, recCanonical, 10, makeCompoundForTest(t, 10, recShared1))
+	_ = base.InsertBUMP(ctx, recNeighbor, 11, makeCompoundForTest(t, 11, recRebin))
+	_ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+	_, _ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+
+	r := newTestReconciler(&blockFailMineStore{Store: base, failFor: recNeighbor}, pub, stub, nil)
+	r.tick(ctx)
+
+	if got := statusOf(t, base, recRebin); got.Status != models.StatusMined || got.BlockHash != recOrphan {
+		t.Fatalf("a failed neighborhood re-anchor must leave the tx MINED@orphan, got %s@%s", got.Status, got.BlockHash)
+	}
+	for _, ev := range pub.bulkEvents() {
+		if ev.Status == models.StatusSeenOnNetwork {
+			t.Fatalf("no revert event may be published for a tx the neighbor's BUMP proves: %+v", ev)
+		}
+	}
+	if rows, _ := base.ListOrphanedBlocksToReconcile(ctx, 10); len(rows) != 1 {
+		t.Fatalf("orphan must stay queued after a failed neighborhood re-anchor, got %d rows", len(rows))
+	}
+
+	// Recovered: the ordinary neighborhood path completes.
+	r.store = base
+	r.tick(ctx)
+	if got := statusOf(t, base, recRebin); got.BlockHash != recNeighbor {
+		t.Fatalf("recovered tick must re-anchor to the neighbor, got %s@%s", got.Status, got.BlockHash)
+	}
+}
