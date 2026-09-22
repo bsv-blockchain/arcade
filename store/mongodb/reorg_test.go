@@ -735,3 +735,105 @@ func TestGetStatus_EnrichesOrphanedProofPaths(t *testing.T) {
 			got.OrphanedProofs[0].MerklePath)
 	}
 }
+
+// TestMarkBlocksOrphaned_EqualTimestampRequeues: the transition statement
+// skips a row that is already orphaned, so a re-orphaning that reuses the
+// stored timestamp can only requeue the row through the refresh — which must
+// therefore match an EQUAL generation, not just an older one. Otherwise a
+// reconciled row re-orphaned with the same token stays stamped and off the
+// queue for good.
+func TestMarkBlocksOrphaned_EqualTimestampRequeues(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	t0 := time.Unix(1700001000, 0).UTC()
+	gen := t0.Add(time.Minute)
+	const hash = "rq-equal"
+
+	if err := s.UpsertBlockHeaderSeen(ctx, hash, 820, t0); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if n, err := s.MarkBlocksOrphaned(ctx, []string{hash}, gen); err != nil || n != 1 {
+		t.Fatalf("orphan: n=%d err=%v", n, err)
+	}
+	if ok, err := s.MarkBlockReconciled(ctx, hash, gen, gen.Add(10*time.Second)); err != nil || !ok {
+		t.Fatalf("stamp: ok=%v err=%v", ok, err)
+	}
+	if rows, err := s.ListOrphanedBlocksToReconcile(ctx, 10); err != nil || len(rows) != 0 {
+		t.Fatalf("premise: a reconciled row is off the queue, got %v err=%v", hashesOf(rows), err)
+	}
+
+	if n, err := s.MarkBlocksOrphaned(ctx, []string{hash}, gen); err != nil || n != 0 {
+		t.Fatalf("equal-timestamp re-orphan: n=%d err=%v, want 0", n, err)
+	}
+	got, err := s.GetBlockProcessingStatus(ctx, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ReconciledAt != nil {
+		t.Fatalf("an equal-timestamp re-orphan must clear reconciled_at, got %v", got.ReconciledAt)
+	}
+	if got.OrphanedAt == nil || !got.OrphanedAt.Equal(gen) {
+		t.Fatalf("generation must be unchanged, got %v want %v", got.OrphanedAt, gen)
+	}
+	if rows, err := s.ListOrphanedBlocksToReconcile(ctx, 10); err != nil || len(rows) != 1 || rows[0].BlockHash != hash {
+		t.Fatalf("the row must be back on the queue, got %v err=%v", hashesOf(rows), err)
+	}
+}
+
+// errCalls is a context whose Err reports Canceled from its n-th call on, so
+// a test can pin where in a chunked write a cancellation is noticed. Its
+// Done channel is the parent's (never closed), so only the store's own
+// ctx.Err checks — not the driver's — see the cancellation.
+type errCalls struct {
+	context.Context //nolint:containedctx // test double: a context whose Err is scripted
+
+	calls, n int
+}
+
+func (c *errCalls) Err() error {
+	c.calls++
+	if c.calls >= c.n {
+		return context.Canceled
+	}
+	return nil
+}
+
+// TestMarkBlocksOrphaned_CancelledContextStopsMidChunk: the chunk loop must
+// check the context before each chunk — a caller cancelled mid-batch (the
+// reconciler's lease heartbeat on lease loss) must not keep writing — and
+// report the transitions that landed alongside the error.
+func TestMarkBlocksOrphaned_CancelledContextStopsMidChunk(t *testing.T) {
+	s := newTestStore(t)
+	s.batchSize = 1 // one hash per chunk, so the cancellation lands between rows
+	ctx := context.Background()
+	t0 := time.Unix(1700001100, 0).UTC()
+	hashes := []string{"cc-a", "cc-b", "cc-c"}
+	for i, h := range hashes {
+		if err := s.UpsertBlockHeaderSeen(ctx, h, uint64(900+i), t0); err != nil {
+			t.Fatalf("seed %s: %v", h, err)
+		}
+	}
+
+	// Err calls: 1 = before chunk a, 2 = before chunk b.
+	cctx := &errCalls{Context: ctx, n: 2}
+	n, err := s.MarkBlocksOrphaned(cctx, hashes, t0.Add(time.Minute))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if n != 1 {
+		t.Fatalf("transitions = %d, want 1 (only the chunk written before the cancellation)", n)
+	}
+	for _, h := range hashes {
+		got, gerr := s.GetBlockProcessingStatus(ctx, h)
+		if gerr != nil {
+			t.Fatal(gerr)
+		}
+		want := models.BlockStatusActive
+		if h == "cc-a" {
+			want = models.BlockStatusOrphaned
+		}
+		if got.Status != want {
+			t.Fatalf("%s: status = %s, want %s", h, got.Status, want)
+		}
+	}
+}

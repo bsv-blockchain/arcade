@@ -1212,6 +1212,17 @@ func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, or
 	// counted. The second CTE refreshes the generation and clears the stamp
 	// on rows that were already orphaned; the snapshot decides which CTE a
 	// row belongs to, so no row is updated twice in one statement.
+	//
+	// The refresh is forward-only-inclusive (orphaned_at <= $2): a stored
+	// generation NEWER than this call's is kept, stamp state and all, so a
+	// delayed call carrying an older timestamp cannot move the generation
+	// backwards and let a reconciler holding that older token pass its CAS.
+	// An EQUAL generation still refreshes and clears the stamp — the
+	// contract does not require a strictly increasing time. Both sides of
+	// the compare are microseconds: pgx encodes the $2 time.Time to
+	// timestamptz by truncating to µs, the same encoding the stored value
+	// went through, so a token read back from this table compares equal to
+	// itself and sub-µs bits on a fresh time.Now() cannot exclude it.
 	const q = `
 WITH transitioned AS (
     UPDATE block_processing
@@ -1222,6 +1233,7 @@ WITH transitioned AS (
     UPDATE block_processing
     SET orphaned_at = $2, reconciled_at = NULL
     WHERE block_hash = ANY($1) AND status = 'orphaned'
+      AND (orphaned_at IS NULL OR orphaned_at <= $2)
 )
 SELECT count(*) FROM transitioned`
 	var transitions int64

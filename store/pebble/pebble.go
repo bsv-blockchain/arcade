@@ -1519,7 +1519,15 @@ func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, or
 		return 0, err
 	}
 	transitions := 0
+	gen := orphanedAt.UnixNano()
 	for _, h := range blockHashes {
+		// Re-checked per row: the reconciler's lease heartbeat cancels the
+		// context mid-batch when the lease is lost, and every row written
+		// after that overlaps the new holder's pass. The rows already
+		// written are reported, as the contract promises.
+		if err := ctx.Err(); err != nil {
+			return transitions, err
+		}
 		mu := s.shardFor(h)
 		mu.Lock()
 		prev, err := s.readBlockProc(h)
@@ -1532,9 +1540,20 @@ func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, or
 			continue
 		}
 		wasOrphaned := prev.Status == string(models.BlockStatusOrphaned)
+		if wasOrphaned && prev.OrphanedAtUnixNs > gen {
+			// A newer generation is already in place — a delayed call must
+			// not move it backwards, or a reconciler holding this older
+			// token could pass the CAS for a generation it never processed.
+			// Its stamp state is left alone too. Equal tokens DO refresh
+			// (below): the contract does not require callers to supply a
+			// strictly increasing time, and a re-orphaning that reuses the
+			// timestamp must still clear the stamp and requeue the row.
+			mu.Unlock()
+			continue
+		}
 		cur := *prev
 		cur.Status = string(models.BlockStatusOrphaned)
-		cur.OrphanedAtUnixNs = orphanedAt.UnixNano()
+		cur.OrphanedAtUnixNs = gen
 		cur.ReconciledAtUnixNs = 0 // re-enter the reconciler queue for this generation
 		if err := s.writeBlockProc(prev, &cur); err != nil {
 			mu.Unlock()
@@ -1731,6 +1750,9 @@ func (s *Store) MarkBlocksParked(ctx context.Context, blockHashes []string) erro
 		return err
 	}
 	for _, h := range blockHashes {
+		if err := ctx.Err(); err != nil {
+			return err // a cancelled caller must not keep writing rows
+		}
 		mu := s.shardFor(h)
 		mu.Lock()
 		prev, err := s.readBlockProc(h)

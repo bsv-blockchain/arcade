@@ -461,6 +461,18 @@ type Store interface {
 	// report ONE transition between them — so the status check belongs IN
 	// the write (a filter or a generation-checked CAS), never in a separate
 	// read whose result an unconditional write then trusts.
+	//
+	// On a row that is ALREADY orphaned the write is a generation refresh,
+	// and it is forward-only-inclusive: a stored orphaned_at newer than
+	// orphanedAt is kept — stamp state and all — so a delayed call carrying
+	// an older timestamp can never move the generation backwards (which
+	// would let a reconciler holding that older token pass its CAS); a
+	// stored orphaned_at equal to orphanedAt still refreshes and clears
+	// reconciled_at, because callers are not required to supply a strictly
+	// increasing time and a re-orphaning that reuses the timestamp must
+	// still requeue the row. Implementations must check ctx between rows
+	// (or chunks): a cancelled caller — the reconciler's lease heartbeat on
+	// lease loss — must not keep writing, and reports what landed.
 	MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) (int, error)
 
 	// MarkBlockReconciled stamps reconciled_at on an orphaned block's row,

@@ -688,3 +688,73 @@ func TestMarkBlocksOrphaned_ReorphanRequeuesAndCountsTransitions(t *testing.T) {
 		t.Fatal("a stamp carrying the OLD generation must not apply")
 	}
 }
+
+// cancelAfterCalls is a context whose Err reports Canceled from its n-th
+// call on. The store only ever consults ctx.Err (its pebble operations take
+// no context), so this pins exactly where in a batch a cancellation is
+// noticed. Single-goroutine use only.
+type cancelAfterCalls struct {
+	context.Context //nolint:containedctx // test double: a context whose Err is scripted
+
+	calls, n int
+}
+
+func (c *cancelAfterCalls) Err() error {
+	c.calls++
+	if c.calls >= c.n {
+		return context.Canceled
+	}
+	return nil
+}
+
+// TestMarkBlocksOrphaned_CancelledContextStopsMidBatch: the reconciler's
+// lease heartbeat cancels the context mid-batch when the lease is lost, and
+// every row written after that overlaps the new holder's pass. The loop must
+// notice before each row, return the rows that landed alongside
+// context.Canceled, and leave the rest untouched. MarkBlocksParked is held
+// to the same rule.
+func TestMarkBlocksOrphaned_CancelledContextStopsMidBatch(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	t0 := time.Unix(1700001100, 0).UTC()
+	hashes := []string{"cc-a", "cc-b", "cc-c"}
+	for i, h := range hashes {
+		if err := s.UpsertBlockHeaderSeen(ctx, h, uint64(900+i), t0); err != nil {
+			t.Fatalf("seed %s: %v", h, err)
+		}
+	}
+
+	// Err calls: 1 = the entry check, 2 = before row a, 3 = before row b.
+	cctx := &cancelAfterCalls{Context: ctx, n: 3}
+	n, err := s.MarkBlocksOrphaned(cctx, hashes, t0.Add(time.Minute))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if n != 1 {
+		t.Fatalf("transitions = %d, want 1 (only the row written before the cancellation)", n)
+	}
+	for _, h := range hashes {
+		got, gerr := s.GetBlockProcessingStatus(ctx, h)
+		if gerr != nil {
+			t.Fatal(gerr)
+		}
+		want := models.BlockStatusActive
+		if h == "cc-a" {
+			want = models.BlockStatusOrphaned
+		}
+		if got.Status != want {
+			t.Fatalf("%s: status = %s, want %s", h, got.Status, want)
+		}
+	}
+
+	pctx := &cancelAfterCalls{Context: ctx, n: 3}
+	if perr := s.MarkBlocksParked(pctx, []string{"cc-b", "cc-c"}); !errors.Is(perr, context.Canceled) {
+		t.Fatalf("MarkBlocksParked err = %v, want context.Canceled", perr)
+	}
+	if got, _ := s.GetBlockProcessingStatus(ctx, "cc-b"); got.Status != models.BlockStatusParked {
+		t.Fatalf("cc-b: status = %s, want parked (written before the cancellation)", got.Status)
+	}
+	if got, _ := s.GetBlockProcessingStatus(ctx, "cc-c"); got.Status != models.BlockStatusActive {
+		t.Fatalf("cc-c: status = %s, want active (untouched after the cancellation)", got.Status)
+	}
+}

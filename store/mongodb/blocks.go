@@ -81,14 +81,18 @@ func (s *Store) MarkBlockBUMPBuilt(ctx context.Context, blockHash string, blockH
 //
 // The second UpdateMany refreshes the generation and clears the stamp on
 // rows that were already orphaned; that is not a transition and its count is
-// discarded. It is guarded to move the generation FORWARD only (orphaned_gen
-// below this call's), because the two statements are not one atomic step:
-// between them another writer can reactivate a row this call just
-// transitioned and orphan it again with a newer generation, and an
-// unguarded refresh would then overwrite that newer generation with this
-// call's older one — letting a reconciler holding the older token pass the
-// CAS for a generation it never processed. The single-write backends cannot
-// interleave like that, so only this one needs the guard.
+// discarded. It is forward-only-INCLUSIVE (orphaned_gen at or below this
+// call's): a stored generation newer than this call's is kept, stamp state
+// and all, because the two statements are not one atomic step — between
+// them another writer can reactivate a row this call just transitioned and
+// orphan it again with a newer generation, and an unguarded refresh would
+// then overwrite that newer generation with this call's older one, letting a
+// reconciler holding the older token pass the CAS for a generation it never
+// processed. An EQUAL generation still refreshes: the contract does not
+// require callers to supply a strictly increasing time, and a re-orphaning
+// that reuses the timestamp must still clear the stamp and requeue the row
+// (it does not match the transition statement, since the row is already
+// orphaned, so this is the only statement that can).
 func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) (int, error) {
 	if len(blockHashes) == 0 {
 		return 0, nil
@@ -110,7 +114,7 @@ func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, or
 	refresh := doc(
 		kv(fStatus, string(models.BlockStatusOrphaned)),
 		kv(opOr, bson.A{
-			doc(kv(fOrphanedGen, doc(kv(opLt, gen)))),
+			doc(kv(fOrphanedGen, doc(kv(opLte, gen)))),
 			doc(kv(fOrphanedGen, doc(kv(opExists, false)))), // written before the field existed
 		}),
 	)
@@ -149,6 +153,12 @@ func orphanGenerationFilter(orphanedAt time.Time) bson.D {
 func (s *Store) updateBlocksIn(ctx context.Context, blockHashes []string, extra, update bson.D, what string) (int64, error) {
 	var modified int64
 	for _, chunk := range chunks(dedupe(blockHashes), s.batchSize) {
+		// Re-checked per chunk: a caller whose context was cancelled
+		// mid-batch (the reconciler's lease heartbeat on lease loss) must
+		// not keep writing; what landed is reported alongside the error.
+		if err := ctx.Err(); err != nil {
+			return modified, fmt.Errorf("%s: %w", what, err)
+		}
 		filter := doc(kv(fID, doc(kv(opIn, chunk))))
 		filter = append(filter, extra...)
 		qctx, cancel := s.queryCtx(ctx)

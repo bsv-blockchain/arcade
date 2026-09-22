@@ -2441,6 +2441,12 @@ func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, or
 	}
 	transitions := 0
 	for _, h := range blockHashes {
+		// Re-checked per row: the reconciler's lease heartbeat cancels the
+		// context mid-batch when the lease is lost, and every row written
+		// after that overlaps the new holder's pass.
+		if err := ctx.Err(); err != nil {
+			return transitions, err
+		}
 		transitioned, err := s.markBlockOrphanedCAS(ctx, h, orphanedAt)
 		if err != nil {
 			return transitions, err
@@ -2462,20 +2468,30 @@ func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, or
 // 'orphaned' and reports no transition. A hash with no record is skipped
 // (chaintracks may emit OrphanedHashes for blocks observed before this
 // service started recording), as is a record deleted between read and write.
+//
+// On a row that is already orphaned the write is a generation refresh, and
+// it is forward-only-inclusive: a stored orphan generation NEWER than this
+// call's is kept, stamp state and all — the record CAS stops lost writes,
+// not a delayed call carrying an older timestamp, which would otherwise move
+// the generation backwards and let a reconciler holding that older token
+// pass its CAS. An EQUAL generation still refreshes (clears the stamp): the
+// contract does not require a strictly increasing time, and a re-orphaning
+// that reuses the timestamp must still requeue the row.
 func (s *Store) markBlockOrphanedCAS(ctx context.Context, blockHash string, orphanedAt time.Time) (bool, error) {
 	key, err := s.key(setBlockProcessing, blockHash)
 	if err != nil {
 		return false, err
 	}
+	gen := orphanedAt.UnixNano()
 	ops := []*aero.Operation{
 		aero.PutOp(aero.NewBin(binStatus, string(models.BlockStatusOrphaned))),
-		aero.PutOp(aero.NewBin(binOrphanedAt, orphanedAt.UnixNano())),
+		aero.PutOp(aero.NewBin(binOrphanedAt, gen)),
 		// Clear the previous generation's stamp so the row re-enters the
 		// reconciler queue for this orphaning.
 		aero.PutOp(aero.NewBin(binReconciledAt, nil)),
 	}
 	for attempt := 0; attempt < casAttempts; attempt++ {
-		rec, err := s.client.Get(s.readPolicy(ctx), key, binStatus)
+		rec, err := s.client.Get(s.readPolicy(ctx), key, binStatus, binOrphanedAt)
 		if err != nil {
 			if isKeyNotFound(err) {
 				return false, nil
@@ -2486,6 +2502,9 @@ func (s *Store) markBlockOrphanedCAS(ctx context.Context, blockHash string, orph
 			return false, nil
 		}
 		wasOrphaned := getString(rec, binStatus) == string(models.BlockStatusOrphaned)
+		if wasOrphaned && getInt64(rec, binOrphanedAt) > gen {
+			return false, nil // a newer generation is in place; nothing to write
+		}
 		policy := s.writePolicy(ctx)
 		policy.RecordExistsAction = aero.UPDATE_ONLY
 		policy.GenerationPolicy = aero.EXPECT_GEN_EQUAL

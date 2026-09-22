@@ -21,6 +21,7 @@ type BlockStatusBackend interface {
 	MarkBlockReconciled(ctx context.Context, blockHash string, orphanedAt, at time.Time) (bool, error)
 	ReactivateBlock(ctx context.Context, blockHash string, blockHeight uint64, orphanedAt time.Time) (bool, error)
 	GetBlockProcessingStatus(ctx context.Context, blockHash string) (*models.BlockProcessingStatus, error)
+	ListOrphanedBlocksToReconcile(ctx context.Context, limit int) ([]*models.BlockProcessingStatus, error)
 }
 
 // blockSuiteHeight keeps the suite's rows far above any real chain and away
@@ -37,7 +38,10 @@ const blockSuiteHeight = uint64(9_300_000)
 //     the shape UpsertBlockHeaderSeen's conflict path produces, and leaves
 //     missing, active, parked and re-orphaned rows alone.
 //   - MarkBlocksOrphaned reports applied transitions only, and re-orphaning
-//     clears the previous generation's stamp.
+//     clears the previous generation's stamp. On a row already orphaned the
+//     generation refresh is forward-only-inclusive: a newer stored
+//     generation is kept (stamp state and all), an equal one still refreshes
+//     and requeues.
 //   - MarkBlockReconciled applies only to a row still orphaned with the
 //     generation the caller processed.
 //
@@ -79,6 +83,22 @@ func RunBlockStatusSuite(t *testing.T, newBackend func(t *testing.T) BlockStatus
 			t.Fatalf("row %s: want orphaned at %v, got status=%s orphanedAt=%v",
 				got.BlockHash, gen, got.Status, got.OrphanedAt)
 		}
+	}
+	// queued reports whether hash is on the reconcile queue. Membership, not
+	// equality: Aerospike runs this suite in a namespace shared with other
+	// integration tests, whose orphaned rows may sit on the same queue.
+	queued := func(t *testing.T, b BlockStatusBackend, hash string) bool {
+		t.Helper()
+		rows, err := b.ListOrphanedBlocksToReconcile(ctx, 1000)
+		if err != nil {
+			t.Fatalf("ListOrphanedBlocksToReconcile: %v", err)
+		}
+		for _, r := range rows {
+			if r.BlockHash == hash {
+				return true
+			}
+		}
+		return false
 	}
 
 	t.Run("ReactivateBlock", func(t *testing.T) {
@@ -250,6 +270,87 @@ func RunBlockStatusSuite(t *testing.T, newBackend func(t *testing.T) BlockStatus
 			assertOrphanedAt(t, got, gen2)
 			if got.ReconciledAt != nil {
 				t.Fatalf("re-orphaning must clear reconciled_at so the new generation is reconciled, got %v", got.ReconciledAt)
+			}
+		})
+
+		t.Run("DelayedOlderGenerationDoesNotRegress", func(t *testing.T) {
+			// A call carrying an older timestamp lands AFTER a newer
+			// orphaning (a delayed replica, a slow reorg handler). The
+			// refresh must keep the newer generation — and its stamp state —
+			// so the newer token still passes the CAS writes and the older
+			// one never does.
+			b := newBackend(t)
+			const hash = "bs-orph-delayed"
+			seedOrphan(t, b, hash, blockSuiteHeight+100) // gen1
+			if applied, err := b.ReactivateBlock(ctx, hash, blockSuiteHeight+100, gen1); err != nil || !applied {
+				t.Fatalf("ReactivateBlock: applied=%v err=%v", applied, err)
+			}
+			if n, err := b.MarkBlocksOrphaned(ctx, []string{hash}, gen2); err != nil || n != 1 {
+				t.Fatalf("newer orphaning: transitions=%d err=%v", n, err)
+			}
+			// The newer generation's reconciliation lands and stamps it.
+			if ok, err := b.MarkBlockReconciled(ctx, hash, gen2, gen2.Add(10*time.Second)); err != nil || !ok {
+				t.Fatalf("stamp gen2: ok=%v err=%v", ok, err)
+			}
+
+			// The delayed older call: no transition, and nothing changes.
+			if n, err := b.MarkBlocksOrphaned(ctx, []string{hash}, gen1); err != nil || n != 0 {
+				t.Fatalf("delayed older call: transitions=%d err=%v, want 0", n, err)
+			}
+			got := row(t, b, hash)
+			assertOrphanedAt(t, got, gen2)
+			if got.ReconciledAt == nil {
+				t.Fatal("a delayed older call must leave the newer generation's stamp state alone")
+			}
+			if queued(t, b, hash) {
+				t.Fatal("a delayed older call must not requeue a row whose newer generation is reconciled")
+			}
+			// Tokens: the older one fails both CAS writes; the newer passes.
+			if ok, err := b.MarkBlockReconciled(ctx, hash, gen1, gen2.Add(time.Minute)); err != nil || ok {
+				t.Fatalf("older token must not stamp: ok=%v err=%v", ok, err)
+			}
+			if applied, err := b.ReactivateBlock(ctx, hash, blockSuiteHeight+100, gen1); err != nil || applied {
+				t.Fatalf("older token must not reactivate: applied=%v err=%v", applied, err)
+			}
+			if ok, err := b.MarkBlockReconciled(ctx, hash, gen2, gen2.Add(time.Minute)); err != nil || !ok {
+				t.Fatalf("newer token must stamp: ok=%v err=%v", ok, err)
+			}
+			if applied, err := b.ReactivateBlock(ctx, hash, blockSuiteHeight+100, gen2); err != nil || !applied {
+				t.Fatalf("newer token must reactivate: applied=%v err=%v", applied, err)
+			}
+		})
+
+		t.Run("EqualTimestampReorphanRequeues", func(t *testing.T) {
+			// The contract does not require a strictly increasing time. A
+			// re-orphaning that reuses the stored timestamp is not a
+			// transition (the row is already orphaned) but must still clear
+			// the stamp and put the row back on the queue — otherwise a
+			// reconciled row re-orphaned with an equal token would sit
+			// stamped and off the queue for good.
+			b := newBackend(t)
+			const hash = "bs-orph-equal"
+			seedOrphan(t, b, hash, blockSuiteHeight+110) // gen1
+			if ok, err := b.MarkBlockReconciled(ctx, hash, gen1, gen1.Add(10*time.Second)); err != nil || !ok {
+				t.Fatalf("stamp: ok=%v err=%v", ok, err)
+			}
+			if queued(t, b, hash) {
+				t.Fatal("premise: a reconciled row is off the queue")
+			}
+
+			if n, err := b.MarkBlocksOrphaned(ctx, []string{hash}, gen1); err != nil || n != 0 {
+				t.Fatalf("equal-timestamp re-orphan: transitions=%d err=%v, want 0", n, err)
+			}
+			got := row(t, b, hash)
+			assertOrphanedAt(t, got, gen1)
+			if got.ReconciledAt != nil {
+				t.Fatalf("an equal-timestamp re-orphan must clear reconciled_at, got %v", got.ReconciledAt)
+			}
+			if !queued(t, b, hash) {
+				t.Fatal("an equal-timestamp re-orphan must put the row back on the reconcile queue")
+			}
+			// And the (unchanged) token still works for the new pass.
+			if ok, err := b.MarkBlockReconciled(ctx, hash, gen1, gen1.Add(time.Minute)); err != nil || !ok {
+				t.Fatalf("the token must still stamp the requeued row: ok=%v err=%v", ok, err)
 			}
 		})
 	})
