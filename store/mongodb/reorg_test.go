@@ -773,11 +773,17 @@ func TestMarkBlocksOrphaned_EqualTimestampRequeues(t *testing.T) {
 	if got.ReconciledAt != nil {
 		t.Fatalf("an equal-timestamp re-orphan must clear reconciled_at, got %v", got.ReconciledAt)
 	}
-	if got.OrphanedAt == nil || !got.OrphanedAt.Equal(gen) {
-		t.Fatalf("generation must be unchanged, got %v want %v", got.OrphanedAt, gen)
+	// The store mints: strictly newer than the reused timestamp, by the
+	// smallest step orphaned_gen holds (1 ns), with the millisecond copy
+	// derived from it.
+	if got.OrphanedAt == nil || !got.OrphanedAt.Equal(gen.Add(time.Nanosecond)) {
+		t.Fatalf("generation must be minted one step above the reused %v, got %v", gen, got.OrphanedAt)
 	}
 	if rows, err := s.ListOrphanedBlocksToReconcile(ctx, 10); err != nil || len(rows) != 1 || rows[0].BlockHash != hash {
 		t.Fatalf("the row must be back on the queue, got %v err=%v", hashesOf(rows), err)
+	}
+	if ok, err := s.MarkBlockReconciled(ctx, hash, gen, gen.Add(time.Hour)); err != nil || ok {
+		t.Fatalf("the reused timestamp must no longer be a valid token: ok=%v err=%v", ok, err)
 	}
 }
 

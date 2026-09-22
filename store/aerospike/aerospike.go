@@ -2351,13 +2351,14 @@ func (s *Store) UpsertBlockHeaderSeen(ctx context.Context, blockHash string, blo
 	// update we must NOT clobber processed_at or bump_built_at, which is
 	// what per-bin Operate gives us — bins not named here are left alone.
 	// We do overwrite block_height (chaintracks is authoritative) and reset
-	// status/orphaned_at/reconciled_at so a returning orphan re-joins active
-	// and a later re-orphaning reconciles again (issue #279).
+	// status/reconciled_at so a returning orphan re-joins active and a later
+	// re-orphaning reconciles again (issue #279). orphaned_at is left as the
+	// row's orphan-generation high-water mark (blockProcessingFromRecord
+	// hides it on an active row); MarkBlocksOrphaned mints above it.
 	ops := []*aero.Operation{
 		aero.PutOp(aero.NewBin(binBlockHash, blockHash)),
 		aero.PutOp(aero.NewBin(binBlockHeight, int(blockHeight))), //nolint:gosec // block height fits in int on 64-bit platforms
 		aero.PutOp(aero.NewBin(binStatus, string(models.BlockStatusActive))),
-		aero.PutOp(aero.NewBin(binOrphanedAt, nil)),
 		aero.PutOp(aero.NewBin(binReconciledAt, nil)),
 		// header_seen_at: only set when the bin is currently absent. Aerospike
 		// has no client-side conditional bin write that's race-free, so we do
@@ -2483,13 +2484,6 @@ func (s *Store) markBlockOrphanedCAS(ctx context.Context, blockHash string, orph
 		return false, err
 	}
 	gen := orphanedAt.UnixNano()
-	ops := []*aero.Operation{
-		aero.PutOp(aero.NewBin(binStatus, string(models.BlockStatusOrphaned))),
-		aero.PutOp(aero.NewBin(binOrphanedAt, gen)),
-		// Clear the previous generation's stamp so the row re-enters the
-		// reconciler queue for this orphaning.
-		aero.PutOp(aero.NewBin(binReconciledAt, nil)),
-	}
 	for attempt := 0; attempt < casAttempts; attempt++ {
 		rec, err := s.client.Get(s.readPolicy(ctx), key, binStatus, binOrphanedAt)
 		if err != nil {
@@ -2502,8 +2496,24 @@ func (s *Store) markBlockOrphanedCAS(ctx context.Context, blockHash string, orph
 			return false, nil
 		}
 		wasOrphaned := getString(rec, binStatus) == string(models.BlockStatusOrphaned)
-		if wasOrphaned && getInt64(rec, binOrphanedAt) > gen {
+		prev := getInt64(rec, binOrphanedAt) // the high-water mark, whatever the status
+		if wasOrphaned && prev > gen {
 			return false, nil // a newer generation is in place; nothing to write
+		}
+		// Mint the generation strictly above any this row has had, with the
+		// caller's timestamp as the lower bound: two orphanings never share
+		// one, so a token read before this write cannot pass the CAS after
+		// it. Computed per attempt, from the record the CAS is pinned to.
+		minted := gen
+		if prev >= gen {
+			minted = prev + 1
+		}
+		ops := []*aero.Operation{
+			aero.PutOp(aero.NewBin(binStatus, string(models.BlockStatusOrphaned))),
+			aero.PutOp(aero.NewBin(binOrphanedAt, minted)),
+			// Clear the previous generation's stamp so the row re-enters the
+			// reconciler queue for this orphaning.
+			aero.PutOp(aero.NewBin(binReconciledAt, nil)),
 		}
 		policy := s.writePolicy(ctx)
 		policy.RecordExistsAction = aero.UPDATE_ONLY
@@ -2629,10 +2639,11 @@ func (s *Store) ReactivateBlock(ctx context.Context, blockHash string, blockHeig
 	if err != nil {
 		return false, err
 	}
+	// orphaned_at is kept as the high-water mark the next orphaning mints
+	// above; blockProcessingFromRecord hides it on an active row.
 	ops := []*aero.Operation{
 		aero.PutOp(aero.NewBin(binBlockHeight, int(blockHeight))), //nolint:gosec // block height fits in int on 64-bit platforms
 		aero.PutOp(aero.NewBin(binStatus, string(models.BlockStatusActive))),
-		aero.PutOp(aero.NewBin(binOrphanedAt, nil)),
 		aero.PutOp(aero.NewBin(binReconciledAt, nil)),
 	}
 	for attempt := 0; attempt < casAttempts; attempt++ {
@@ -2956,7 +2967,9 @@ func blockProcessingFromRecord(rec *aero.Record) *models.BlockProcessingStatus {
 		t := time.Unix(0, v).UTC()
 		bp.BUMPBuiltAt = &t
 	}
-	if v := getInt64(rec, binOrphanedAt); v != 0 {
+	// orphaned_at survives a reactivation as the generation high-water mark;
+	// it is current — and surfaced — only while the row is orphaned.
+	if v := getInt64(rec, binOrphanedAt); v != 0 && bp.Status == models.BlockStatusOrphaned {
 		t := time.Unix(0, v).UTC()
 		bp.OrphanedAt = &t
 	}

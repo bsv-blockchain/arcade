@@ -20,9 +20,12 @@ import (
 // observation and every later milestone. Two concurrent first upserts for a
 // hash can collide on _id; the loser retries and updates the winner's row.
 func (s *Store) UpsertBlockHeaderSeen(ctx context.Context, blockHash string, blockHeight uint64, seenAt time.Time) error {
+	// orphaned_gen/orphaned_at are kept as the row's orphan-generation
+	// high-water mark, which MarkBlocksOrphaned mints above; toModel hides
+	// them on an active row. Only the reconcile stamp is cleared.
 	update := doc(
 		kv(opSet, doc(kv(fBlockHeight, heightToInt64(blockHeight)), kv(fStatus, string(models.BlockStatusActive)))),
-		kv(opUnset, doc(kv(fOrphanedAt, ""), kv(fOrphanedGen, ""), kv(fReconciledAt, ""))),
+		kv(opUnset, doc(kv(fReconciledAt, ""))),
 		kv(opSetOnInsert, doc(kv(fHeaderSeenAt, msTrunc(seenAt)))),
 	)
 	err := s.withDupKeyRetry(ctx, func(octx context.Context) error {
@@ -98,14 +101,7 @@ func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, or
 		return 0, nil
 	}
 	gen := orphanedAt.UnixNano()
-	update := doc(
-		kv(opSet, doc(
-			kv(fStatus, string(models.BlockStatusOrphaned)),
-			kv(fOrphanedAt, msTrunc(orphanedAt)),
-			kv(fOrphanedGen, gen),
-		)),
-		kv(opUnset, doc(kv(fReconciledAt, ""))),
-	)
+	update := mintingOrphanUpdate(gen)
 	transition := doc(kv(fStatus, doc(kv(opNe, string(models.BlockStatusOrphaned)))))
 	refresh := doc(
 		kv(fStatus, string(models.BlockStatusOrphaned)),
@@ -124,13 +120,20 @@ func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, or
 			),
 		}),
 	)
-	// Transition AND refresh per chunk, in that order, before the next chunk:
-	// a failure (or a cancelled context) part-way through the list then
-	// leaves every completed chunk fully processed. Running all transitions
-	// first and all refreshes after would, on a late failure, leave the
-	// already-orphaned rows of the EARLY chunks with their old reconciled_at
-	// — off the queue although this reorg named them — with no error
-	// attached to them. The transition count that landed is reported
+	// Refresh AND transition per chunk before the next chunk: a failure (or
+	// a cancelled context) part-way through the list then leaves every
+	// completed chunk fully processed. Running all transitions first and all
+	// refreshes after would, on a late failure, leave the already-orphaned
+	// rows of the EARLY chunks with their old reconciled_at — off the queue
+	// although this reorg named them — with no error attached to them.
+	//
+	// Refresh BEFORE transition within the chunk, because every write mints:
+	// the refresh matches rows already orphaned at or below this call's
+	// generation, and a row the transition had just written would match it
+	// too (it now holds exactly this generation) and be minted a second
+	// time, leaving the stored generation one step above the token the
+	// caller may already have read back. In this order each row is written
+	// by exactly one arm. The transition count that landed is reported
 	// alongside the error, as the contract promises.
 	transitions := 0
 	for _, chunk := range chunks(dedupe(blockHashes), s.batchSize) {
@@ -140,23 +143,24 @@ func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, or
 		if err := ctx.Err(); err != nil {
 			return transitions, fmt.Errorf("mark blocks orphaned: %w", err)
 		}
+		if _, err := s.updateChunk(ctx, chunk, refresh, update); err != nil {
+			return transitions, fmt.Errorf("refresh orphaned generation: %w", err)
+		}
 		n, err := s.updateChunk(ctx, chunk, transition, update)
 		if err != nil {
 			return transitions, fmt.Errorf("mark blocks orphaned: %w", err)
 		}
 		transitions += int(n)
-		if _, err := s.updateChunk(ctx, chunk, refresh, update); err != nil {
-			return transitions, fmt.Errorf("refresh orphaned generation: %w", err)
-		}
 	}
 	return transitions, nil
 }
 
-// updateChunk applies one update to the rows of one _id chunk that also
-// match extra, under the bulk-write deadline, and returns how many documents
-// it modified. queryCtx, not opCtx: a chunk is a bulk write whose cost
-// scales with its size, and op_timeout_ms is the point-operation budget.
-func (s *Store) updateChunk(ctx context.Context, chunk []string, extra, update bson.D) (int64, error) {
+// updateChunk applies one update (a bson.D document or a mongo.Pipeline) to
+// the rows of one _id chunk that also match extra, under the bulk-write
+// deadline, and returns how many documents it modified. queryCtx, not
+// opCtx: a chunk is a bulk write whose cost scales with its size, and
+// op_timeout_ms is the point-operation budget.
+func (s *Store) updateChunk(ctx context.Context, chunk []string, extra bson.D, update any) (int64, error) {
 	filter := doc(kv(fID, doc(kv(opIn, chunk))))
 	filter = append(filter, extra...)
 	qctx, cancel := s.queryCtx(ctx)
@@ -166,6 +170,40 @@ func (s *Store) updateChunk(ctx context.Context, chunk []string, extra, update b
 		return 0, err
 	}
 	return res.ModifiedCount, nil
+}
+
+// mintingOrphanUpdate is the orphan write as an aggregation-pipeline update,
+// so the stored generation can be computed from the document itself: the
+// new orphaned_gen is max(gen, previous + 1 ns), where "previous" is the
+// generation the row last had — orphaned_gen, kept through reactivation as
+// the high-water mark; for a row written before that field existed, its
+// millisecond orphaned_at scaled to nanoseconds; 0 for a row that never
+// had one. Two orphanings of a row therefore never share a generation even
+// when callers reuse a timestamp, so a token read before this write cannot
+// pass the CAS after it. orphaned_at, the sortable indexed copy, is derived
+// from the minted value: the nanoseconds are truncated to a millisecond
+// boundary with exact long arithmetic before the one lossy step (the
+// division to milliseconds goes through a double), and $round then
+// recovers the exact millisecond.
+func mintingOrphanUpdate(gen int64) mongo.Pipeline {
+	const nsPerMs = int64(1_000_000)
+	legacyGen := doc(kv(opIfNull, bson.A{
+		doc(kv(opMultiply, bson.A{doc(kv(opToLong, "$"+fOrphanedAt)), nsPerMs})),
+		int64(0),
+	}))
+	prev := doc(kv(opIfNull, bson.A{"$" + fOrphanedGen, legacyGen}))
+	minted := doc(kv(opCond, bson.A{
+		doc(kv(opLt, bson.A{prev, gen})),
+		gen,
+		doc(kv(opAdd, bson.A{prev, int64(1)})),
+	}))
+	msFloor := doc(kv(opSubtract, bson.A{"$" + fOrphanedGen, doc(kv(opMod, bson.A{"$" + fOrphanedGen, nsPerMs}))}))
+	asDate := doc(kv(opToDate, doc(kv(opRound, doc(kv(opDivide, bson.A{msFloor, nsPerMs}))))))
+	return mongo.Pipeline{
+		doc(kv(opSet, doc(kv(fStatus, string(models.BlockStatusOrphaned)), kv(fOrphanedGen, minted)))),
+		doc(kv(opSet, doc(kv(fOrphanedAt, asDate)))),
+		doc(kv(opUnset, fReconciledAt)),
+	}
 }
 
 // orphanGenerationFilter matches the orphan generation a caller read back:
@@ -194,7 +232,7 @@ func orphanGenerationFilter(orphanedAt time.Time) bson.D {
 // multi-row writes honour. queryCtx, not opCtx: these are bulk writes whose
 // cost scales with the chunk, and op_timeout_ms is the point-operation budget.
 // extra, when non-nil, is ANDed onto the _id predicate.
-func (s *Store) updateBlocksIn(ctx context.Context, blockHashes []string, extra, update bson.D, what string) (int64, error) {
+func (s *Store) updateBlocksIn(ctx context.Context, blockHashes []string, extra bson.D, update any, what string) (int64, error) {
 	var modified int64
 	for _, chunk := range chunks(dedupe(blockHashes), s.batchSize) {
 		// Re-checked per chunk: a caller whose context was cancelled
@@ -261,9 +299,11 @@ func (s *Store) RequeueOrphanedBlock(ctx context.Context, blockHash string, orph
 func (s *Store) ReactivateBlock(ctx context.Context, blockHash string, blockHeight uint64, orphanedAt time.Time) (bool, error) {
 	filter := doc(kv(fID, blockHash), kv(fStatus, string(models.BlockStatusOrphaned)))
 	filter = append(filter, orphanGenerationFilter(orphanedAt)...)
+	// orphaned_gen/orphaned_at are kept as the high-water mark the next
+	// orphaning mints above; toModel hides them on an active row.
 	update := doc(
 		kv(opSet, doc(kv(fBlockHeight, heightToInt64(blockHeight)), kv(fStatus, string(models.BlockStatusActive)))),
-		kv(opUnset, doc(kv(fOrphanedAt, ""), kv(fOrphanedGen, ""), kv(fReconciledAt, ""))),
+		kv(opUnset, doc(kv(fReconciledAt, ""))),
 	)
 	octx, cancel := s.opCtx(ctx)
 	defer cancel()

@@ -104,6 +104,17 @@ const (
 	opGroup       = "$group"
 	opSum         = "$sum"
 	opMin         = "$min"
+	// Aggregation expressions used by the pipeline-form updates.
+	opIfNull   = "$ifNull"
+	opCond     = "$cond"
+	opAdd      = "$add"
+	opSubtract = "$subtract"
+	opMultiply = "$multiply"
+	opDivide   = "$divide"
+	opMod      = "$mod"
+	opRound    = "$round"
+	opToLong   = "$toLong"
+	opToDate   = "$toDate"
 )
 
 // txDoc is the transactions collection document. Optional fields carry
@@ -313,12 +324,18 @@ type blockProcessingDoc struct {
 }
 
 func (d blockProcessingDoc) toModel() *models.BlockProcessingStatus {
-	orphanedAt := d.OrphanedAt
-	if d.OrphanedGen != 0 {
-		// Hand callers the full-precision generation, so the value they
-		// read back is exactly the token the CAS writes compare on.
-		t := time.Unix(0, d.OrphanedGen).UTC()
-		orphanedAt = &t
+	// The generation survives a reactivation as the high-water mark the
+	// next orphaning mints above; it is current — and surfaced — only while
+	// the row is orphaned.
+	var orphanedAt *time.Time
+	if d.Status == string(models.BlockStatusOrphaned) {
+		orphanedAt = d.OrphanedAt
+		if d.OrphanedGen != 0 {
+			// Hand callers the full-precision generation, so the value they
+			// read back is exactly the token the CAS writes compare on.
+			t := time.Unix(0, d.OrphanedGen).UTC()
+			orphanedAt = &t
+		}
 	}
 	return &models.BlockProcessingStatus{
 		BlockHash:    d.BlockHash,

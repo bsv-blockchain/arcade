@@ -38,11 +38,12 @@ const blockSuiteHeight = uint64(9_300_000)
 //     generation the caller judged (zero = status only), resets the row to
 //     the shape UpsertBlockHeaderSeen's conflict path produces, and leaves
 //     missing, active, parked and re-orphaned rows alone.
-//   - MarkBlocksOrphaned reports applied transitions only, and re-orphaning
-//     clears the previous generation's stamp. On a row already orphaned the
-//     generation refresh is forward-only-inclusive: a newer stored
-//     generation is kept (stamp state and all), an equal one still refreshes
-//     and requeues.
+//   - MarkBlocksOrphaned reports applied transitions only, re-orphaning
+//     clears the previous generation's stamp, and every orphan write MINTS
+//     a generation strictly above any the row has had (the caller's
+//     timestamp is only a lower bound), so an old token never passes a
+//     later orphaning's CAS. On a row already orphaned the refresh is
+//     forward-only: a newer stored generation is kept (stamp state and all).
 //   - MarkBlockReconciled applies only to a row still orphaned with the
 //     generation the caller processed.
 //   - RequeueOrphanedBlock clears the stamp only on a row still orphaned with
@@ -86,6 +87,40 @@ func RunBlockStatusSuite(t *testing.T, newBackend func(t *testing.T) BlockStatus
 		if got.Status != models.BlockStatusOrphaned || got.OrphanedAt == nil || !got.OrphanedAt.Equal(gen) {
 			t.Fatalf("row %s: want orphaned at %v, got status=%s orphanedAt=%v",
 				got.BlockHash, gen, got.Status, got.OrphanedAt)
+		}
+	}
+	// assertTokenSuperseded checks that the OLD generation token can no
+	// longer stamp, reactivate or requeue the row — each write must report
+	// not-applied and leave the row alone — while the token read back from
+	// the row (NEW) passes: RequeueOrphanedBlock and MarkBlockReconciled on
+	// the orphaned row, then ReactivateBlock. This is the whole point of
+	// minting: a pass that read the old generation cannot act on a later
+	// orphaning.
+	assertTokenSuperseded := func(t *testing.T, b BlockStatusBackend, hash string, height uint64, oldTok, newTok time.Time) {
+		t.Helper()
+		before := row(t, b, hash)
+		if ok, err := b.MarkBlockReconciled(ctx, hash, oldTok, newTok.Add(time.Minute)); err != nil || ok {
+			t.Fatalf("old token must not stamp the newer generation: ok=%v err=%v", ok, err)
+		}
+		if applied, err := b.ReactivateBlock(ctx, hash, height, oldTok); err != nil || applied {
+			t.Fatalf("old token must not reactivate the newer generation: applied=%v err=%v", applied, err)
+		}
+		if applied, err := b.RequeueOrphanedBlock(ctx, hash, oldTok); err != nil || applied {
+			t.Fatalf("old token must not requeue the newer generation: applied=%v err=%v", applied, err)
+		}
+		after := row(t, b, hash)
+		if after.Status != before.Status || !after.OrphanedAt.Equal(*before.OrphanedAt) ||
+			(after.ReconciledAt == nil) != (before.ReconciledAt == nil) {
+			t.Fatalf("stale-token writes must leave the row untouched: before %+v, after %+v", before, after)
+		}
+		if applied, err := b.RequeueOrphanedBlock(ctx, hash, newTok); err != nil || !applied {
+			t.Fatalf("the read-back token must requeue: applied=%v err=%v", applied, err)
+		}
+		if ok, err := b.MarkBlockReconciled(ctx, hash, newTok, newTok.Add(time.Minute)); err != nil || !ok {
+			t.Fatalf("the read-back token must stamp: ok=%v err=%v", ok, err)
+		}
+		if applied, err := b.ReactivateBlock(ctx, hash, height, newTok); err != nil || !applied {
+			t.Fatalf("the read-back token must reactivate: applied=%v err=%v", applied, err)
 		}
 	}
 	// queued reports whether hash is on the reconcile queue. Membership, not
@@ -446,9 +481,11 @@ func RunBlockStatusSuite(t *testing.T, newBackend func(t *testing.T) BlockStatus
 			// The contract does not require a strictly increasing time. A
 			// re-orphaning that reuses the stored timestamp is not a
 			// transition (the row is already orphaned) but must still clear
-			// the stamp and put the row back on the queue — otherwise a
-			// reconciled row re-orphaned with an equal token would sit
-			// stamped and off the queue for good.
+			// the stamp and put the row back on the queue — and it must MINT
+			// a strictly newer generation: a reconciler that read the old one
+			// (and is still working on it) must not be able to stamp,
+			// reactivate or requeue this later orphaning with its stale
+			// token. Only the value read back from the row is a valid token.
 			b := newBackend(t)
 			const hash = "bs-orph-equal"
 			seedOrphan(t, b, hash, blockSuiteHeight+110) // gen1
@@ -463,17 +500,76 @@ func RunBlockStatusSuite(t *testing.T, newBackend func(t *testing.T) BlockStatus
 				t.Fatalf("equal-timestamp re-orphan: transitions=%d err=%v, want 0", n, err)
 			}
 			got := row(t, b, hash)
-			assertOrphanedAt(t, got, gen1)
+			if got.Status != models.BlockStatusOrphaned || got.OrphanedAt == nil || !got.OrphanedAt.After(gen1) {
+				t.Fatalf("an equal-timestamp re-orphan must mint a strictly newer generation than %v, got %+v", gen1, got)
+			}
 			if got.ReconciledAt != nil {
 				t.Fatalf("an equal-timestamp re-orphan must clear reconciled_at, got %v", got.ReconciledAt)
 			}
 			if !queued(t, b, hash) {
 				t.Fatal("an equal-timestamp re-orphan must put the row back on the reconcile queue")
 			}
-			// And the (unchanged) token still works for the new pass.
-			if ok, err := b.MarkBlockReconciled(ctx, hash, gen1, gen1.Add(time.Minute)); err != nil || !ok {
-				t.Fatalf("the token must still stamp the requeued row: ok=%v err=%v", ok, err)
+			assertTokenSuperseded(t, b, hash, blockSuiteHeight+110, gen1, *got.OrphanedAt)
+		})
+
+		t.Run("ReusedTimestampAfterReactivationMintsNewGeneration", func(t *testing.T) {
+			// The transition arm must mint too. Reactivation clears the
+			// generation from the model but the row keeps it as a high-water
+			// mark, so a re-orphaning that reuses the very same timestamp —
+			// through either reactivation write — yields a new generation
+			// rather than the old one again.
+			for _, via := range []string{"ReactivateBlock", "UpsertBlockHeaderSeen"} {
+				t.Run(via, func(t *testing.T) {
+					b := newBackend(t)
+					hash := "bs-orph-reuse-" + via
+					seedOrphan(t, b, hash, blockSuiteHeight+115) // gen1
+					if via == "ReactivateBlock" {
+						if applied, err := b.ReactivateBlock(ctx, hash, blockSuiteHeight+115, gen1); err != nil || !applied {
+							t.Fatalf("ReactivateBlock: applied=%v err=%v", applied, err)
+						}
+					} else if err := b.UpsertBlockHeaderSeen(ctx, hash, blockSuiteHeight+115, t0.Add(time.Hour)); err != nil {
+						t.Fatalf("UpsertBlockHeaderSeen: %v", err)
+					}
+					if got := row(t, b, hash); got.Status != models.BlockStatusActive || got.OrphanedAt != nil {
+						t.Fatalf("an active row must not surface its historical generation, got %+v", got)
+					}
+
+					if n, err := b.MarkBlocksOrphaned(ctx, []string{hash}, gen1); err != nil || n != 1 {
+						t.Fatalf("re-orphan with the reused timestamp: transitions=%d err=%v, want 1", n, err)
+					}
+					got := row(t, b, hash)
+					if got.Status != models.BlockStatusOrphaned || got.OrphanedAt == nil || !got.OrphanedAt.After(gen1) {
+						t.Fatalf("the transition arm must mint above the row's high-water mark %v, got %+v", gen1, got)
+					}
+					if got.ReconciledAt != nil {
+						t.Fatalf("a fresh orphaning must be unstamped, got %v", got.ReconciledAt)
+					}
+					assertTokenSuperseded(t, b, hash, blockSuiteHeight+115, gen1, *got.OrphanedAt)
+				})
 			}
+		})
+
+		t.Run("MintedGenerationIsMonotonicAcrossEarlierTimestamps", func(t *testing.T) {
+			// A delayed call carrying a timestamp OLDER than the row's
+			// high-water mark still orphans an active row, and still mints
+			// strictly above that mark — never below it.
+			b := newBackend(t)
+			const hash = "bs-orph-older"
+			seedOrphan(t, b, hash, blockSuiteHeight+117) // gen1
+			if n, err := b.MarkBlocksOrphaned(ctx, []string{hash}, gen2); err != nil || n != 0 {
+				t.Fatalf("refresh to gen2: n=%d err=%v", n, err)
+			}
+			if applied, err := b.ReactivateBlock(ctx, hash, blockSuiteHeight+117, gen2); err != nil || !applied {
+				t.Fatalf("ReactivateBlock: applied=%v err=%v", applied, err)
+			}
+			if n, err := b.MarkBlocksOrphaned(ctx, []string{hash}, gen1 /* older than the mark */); err != nil || n != 1 {
+				t.Fatalf("orphan with an older timestamp: n=%d err=%v, want 1", n, err)
+			}
+			got := row(t, b, hash)
+			if got.OrphanedAt == nil || !got.OrphanedAt.After(gen2) {
+				t.Fatalf("the minted generation must exceed the high-water mark %v, got %v", gen2, got.OrphanedAt)
+			}
+			assertTokenSuperseded(t, b, hash, blockSuiteHeight+117, gen2, *got.OrphanedAt)
 		})
 	})
 

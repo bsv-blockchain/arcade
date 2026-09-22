@@ -1362,7 +1362,10 @@ func (b storedBlockProcessing) toModel() *models.BlockProcessingStatus {
 		t := time.Unix(0, b.BUMPBuiltUnixNs).UTC()
 		out.BUMPBuiltAt = &t
 	}
-	if b.OrphanedAtUnixNs != 0 {
+	// The stored generation is retained through a reactivation as the
+	// high-water mark MarkBlocksOrphaned mints from; it is current — and
+	// surfaced — only while the row is orphaned.
+	if b.OrphanedAtUnixNs != 0 && b.Status == string(models.BlockStatusOrphaned) {
 		t := time.Unix(0, b.OrphanedAtUnixNs).UTC()
 		out.OrphanedAt = &t
 	}
@@ -1438,10 +1441,13 @@ func (s *Store) UpsertBlockHeaderSeen(ctx context.Context, blockHash string, blo
 	if prev != nil {
 		// Preserve milestone timestamps; chaintracks owns block_height and
 		// status, which we forcibly reset to active so a returning orphan
-		// re-joins the main chain.
+		// re-joins the main chain. The orphan generation stays as the row's
+		// high-water mark (toModel hides it on an active row); only the
+		// reconcile stamp is cleared.
 		cur.HeaderSeenUnixNs = prev.HeaderSeenUnixNs
 		cur.ProcessedUnixNs = prev.ProcessedUnixNs
 		cur.BUMPBuiltUnixNs = prev.BUMPBuiltUnixNs
+		cur.OrphanedAtUnixNs = prev.OrphanedAtUnixNs
 	}
 	if cur.HeaderSeenUnixNs == 0 {
 		cur.HeaderSeenUnixNs = seenAt.UnixNano()
@@ -1544,16 +1550,18 @@ func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, or
 			// A newer generation is already in place — a delayed call must
 			// not move it backwards, or a reconciler holding this older
 			// token could pass the CAS for a generation it never processed.
-			// Its stamp state is left alone too. Equal tokens DO refresh
-			// (below): the contract does not require callers to supply a
-			// strictly increasing time, and a re-orphaning that reuses the
-			// timestamp must still clear the stamp and requeue the row.
+			// Its stamp state is left alone too.
 			mu.Unlock()
 			continue
 		}
 		cur := *prev
 		cur.Status = string(models.BlockStatusOrphaned)
-		cur.OrphanedAtUnixNs = gen
+		// Mint the generation: strictly greater than any this row has had
+		// (the retained high-water mark, whatever its status), with the
+		// caller's timestamp as the lower bound. Two orphanings can then
+		// never share a generation even when callers reuse a timestamp, so a
+		// token read before this write can never pass the CAS after it.
+		cur.OrphanedAtUnixNs = mintOrphanGeneration(prev.OrphanedAtUnixNs, gen)
 		cur.ReconciledAtUnixNs = 0 // re-enter the reconciler queue for this generation
 		if err := s.writeBlockProc(prev, &cur); err != nil {
 			mu.Unlock()
@@ -1661,12 +1669,24 @@ func (s *Store) ReactivateBlock(ctx context.Context, blockHash string, blockHeig
 	cur := *prev
 	cur.BlockHeight = blockHeight
 	cur.Status = string(models.BlockStatusActive)
-	cur.OrphanedAtUnixNs = 0
+	// OrphanedAtUnixNs is kept: the high-water mark the next orphaning
+	// mints above. toModel hides it on an active row.
 	cur.ReconciledAtUnixNs = 0
 	if err := s.writeBlockProc(prev, &cur); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+// mintOrphanGeneration returns the generation an orphan write stores: the
+// caller's timestamp (ns) as a lower bound, and strictly greater than the
+// row's previous generation — its high-water mark across reactivations — by
+// the smallest step this backend can represent.
+func mintOrphanGeneration(prevUnixNs, wantUnixNs int64) int64 {
+	if prevUnixNs >= wantUnixNs {
+		return prevUnixNs + 1
+	}
+	return wantUnixNs
 }
 
 // ListOrphanedBlocksToReconcile scans the block_processing rows for

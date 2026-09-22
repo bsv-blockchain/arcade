@@ -1161,8 +1161,10 @@ VALUES ($1, $2, $3, 'active')
 ON CONFLICT (block_hash) DO UPDATE SET
     block_height  = EXCLUDED.block_height,
     status        = 'active',
-    orphaned_at   = NULL,
     reconciled_at = NULL`
+	// orphaned_at is deliberately not reset: it stays as the row's
+	// orphan-generation high-water mark, which MarkBlocksOrphaned mints
+	// above; scanBlockProcessing hides it on an active row.
 	_, err := s.pool.Exec(ctx, q, blockHash, int64(blockHeight), seenAt) //nolint:gosec // block height fits in int64
 	if err != nil {
 		return fmt.Errorf("upsert block header seen %s: %w", blockHash, err)
@@ -1223,15 +1225,26 @@ func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, or
 	// timestamptz by truncating to µs, the same encoding the stored value
 	// went through, so a token read back from this table compares equal to
 	// itself and sub-µs bits on a fresh time.Now() cannot exclude it.
+	//
+	// Both arms MINT the generation: GREATEST($2, orphaned_at + 1 µs) is
+	// strictly above any generation the row has had — orphaned_at is kept
+	// through reactivation as the high-water mark — with the caller's
+	// timestamp as the lower bound, so two orphanings never share a
+	// generation even when callers reuse a timestamp. GREATEST ignores a
+	// NULL operand, so a row that never had one gets $2. One microsecond is
+	// the step timestamptz can represent, and pgx truncates $2 to it too.
 	const q = `
 WITH transitioned AS (
     UPDATE block_processing
-    SET status = 'orphaned', orphaned_at = $2, reconciled_at = NULL
+    SET status = 'orphaned',
+        orphaned_at = GREATEST($2::timestamptz, orphaned_at + interval '1 microsecond'),
+        reconciled_at = NULL
     WHERE block_hash = ANY($1) AND status <> 'orphaned'
     RETURNING 1
 ), refreshed AS (
     UPDATE block_processing
-    SET orphaned_at = $2, reconciled_at = NULL
+    SET orphaned_at = GREATEST($2::timestamptz, orphaned_at + interval '1 microsecond'),
+        reconciled_at = NULL
     WHERE block_hash = ANY($1) AND status = 'orphaned'
       AND (orphaned_at IS NULL OR orphaned_at <= $2)
 )
@@ -1301,9 +1314,11 @@ WHERE block_hash = $1
 // row's current version under READ COMMITTED, so the check and the write are
 // one atomic step.
 func (s *Store) ReactivateBlock(ctx context.Context, blockHash string, blockHeight uint64, orphanedAt time.Time) (bool, error) {
+	// orphaned_at is kept as the high-water mark the next orphaning mints
+	// above; scanBlockProcessing hides it on an active row.
 	const q = `
 UPDATE block_processing
-SET status = 'active', block_height = $2, orphaned_at = NULL, reconciled_at = NULL
+SET status = 'active', block_height = $2, reconciled_at = NULL
 WHERE block_hash = $1
   AND status = 'orphaned'
   AND ($3::timestamptz IS NULL OR orphaned_at = $3)`
@@ -1498,7 +1513,11 @@ func scanBlockProcessing(scan func(...any) error) (*models.BlockProcessingStatus
 	bp.ProcessedAt = processed
 	bp.BUMPBuiltAt = bumpBuilt
 	bp.Status = models.BlockProcessingStatusValue(statusVal)
-	bp.OrphanedAt = orphanedAt
+	// orphaned_at survives a reactivation as the generation high-water mark;
+	// it is current — and surfaced — only while the row is orphaned.
+	if bp.Status == models.BlockStatusOrphaned {
+		bp.OrphanedAt = orphanedAt
+	}
 	bp.ReconciledAt = reconciledAt
 	return &bp, nil
 }
