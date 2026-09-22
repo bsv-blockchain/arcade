@@ -1183,7 +1183,7 @@ func TestReconciler_FullScanOrphanMetricCountsAppliedTransitions(t *testing.T) {
 		c.FullScanMinHeight = 1
 		c.FullScanMaxHeight = 50
 	})
-	r.fullScanMarkOrphaned(ctx, map[string]struct{}{recOrphan: {}, recCanonical: {}})
+	r.fullScanMarkOrphaned(ctx, map[string]uint64{recOrphan: 10, recCanonical: 10})
 
 	if got := testutil.ToFloat64(counter) - before; got != 1 {
 		t.Fatalf("full-scan orphaned transitions = %v, want 1 (a re-mark is not a transition)", got)
@@ -2104,7 +2104,7 @@ func TestReconciler_FullScanOrphanMetricCountsPartialTransitionsOnError(t *testi
 	before := testutil.ToFloat64(counter)
 
 	r := newTestReconciler(hs, pub, stub, nil)
-	if r.fullScanMarkOrphaned(ctx, map[string]struct{}{recOrphan: {}, recCanonical: {}}) {
+	if r.fullScanMarkOrphaned(ctx, map[string]uint64{recOrphan: 10, recCanonical: 10}) {
 		t.Fatal("a failed write must report the scan incomplete")
 	}
 	if got := testutil.ToFloat64(counter) - before; got != 2 {
@@ -3311,4 +3311,101 @@ func TestReconciler_PendingRemineMalformedGivesUpAtDeferCap(t *testing.T) {
 	if bp, err := base.GetBlockProcessingStatus(ctx, recOrphan); err != nil || bp.Status != models.BlockStatusActive {
 		t.Fatalf("the canonical row must never have been re-orphaned, got %+v err=%v", bp, err)
 	}
+}
+
+// TestReconciler_FullScanMarkOrphanedRechecksCanonicality: the active→orphaned
+// candidates are judged during the paging walk, and MarkBlocksOrphaned has
+// no canonicality guard of its own. A reorg during the walk can make a
+// candidate canonical again; marking it on the walk's stale verdict would
+// demote a canonical row (and regress a reactivation the tracker applied
+// meanwhile). Each candidate is therefore re-checked against the active
+// chain immediately before the write: a candidate that is canonical NOW is
+// dropped and the scan still completes for the rest; a candidate whose
+// height the header source can no longer judge — a lookup failure, or a
+// height it cannot serve — is dropped as well and the scan reported
+// incomplete, since absence of evidence never orphans. Only rows the header
+// source positively places off-chain are marked, and the applied count is
+// what the write reports.
+func TestReconciler_FullScanMarkOrphanedRechecksCanonicality(t *testing.T) {
+	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
+		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceFullScan)
+
+	t.Run("CandidateBecameCanonical", func(t *testing.T) {
+		ctx := context.Background()
+		st := newPebbleForTest(t)
+		pub := &capturePublisher{}
+		stub := &stubChaintracks{}
+		// The walk judged both rows at height 10 off-chain (a third block
+		// held the height); before the write, a reorg hands the height to
+		// recOrphan.
+		stub.setHeightHeader(10, headerWithHash(t, recOrphan, 10))
+		_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+		_ = st.UpsertBlockHeaderSeen(ctx, recCanonical, 10, time.Now())
+		before := testutil.ToFloat64(counter)
+
+		r := newTestReconciler(st, pub, stub, nil)
+		if !r.fullScanMarkOrphaned(ctx, map[string]uint64{recOrphan: 10, recCanonical: 10}) {
+			t.Fatal("a candidate that turned canonical is dropped, not a reason to retry: the scan must complete")
+		}
+		bp, err := st.GetBlockProcessingStatus(ctx, recOrphan)
+		if err != nil || bp.Status != models.BlockStatusActive || bp.OrphanedAt != nil {
+			t.Fatalf("the now-canonical candidate must not be orphaned, got %+v err=%v", bp, err)
+		}
+		if bp, err := st.GetBlockProcessingStatus(ctx, recCanonical); err != nil || bp.Status != models.BlockStatusOrphaned {
+			t.Fatalf("the candidate still off-chain must be orphaned, got %+v err=%v", bp, err)
+		}
+		if got := testutil.ToFloat64(counter) - before; got != 1 {
+			t.Fatalf("orphaned/full_scan = %v, want 1 (only the row actually marked)", got)
+		}
+	})
+
+	t.Run("LookupErrorLeavesCandidateForRetry", func(t *testing.T) {
+		ctx := context.Background()
+		st := newPebbleForTest(t)
+		pub := &capturePublisher{}
+		stub := &stubChaintracks{}
+		stub.setHeightHeader(10, headerWithHash(t, recNeighbor, 10)) // a third block holds the height
+		stub.setHeightErr(10, errors.New("injected: header source unavailable"))
+		_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+		before := testutil.ToFloat64(counter)
+
+		r := newTestReconciler(st, pub, stub, nil)
+		if r.fullScanMarkOrphaned(ctx, map[string]uint64{recOrphan: 10}) {
+			t.Fatal("a candidate that could not be re-judged must leave the scan incomplete")
+		}
+		if bp, err := st.GetBlockProcessingStatus(ctx, recOrphan); err != nil || bp.Status != models.BlockStatusActive {
+			t.Fatalf("absence of evidence must never orphan, got %+v err=%v", bp, err)
+		}
+		if got := testutil.ToFloat64(counter) - before; got != 0 {
+			t.Fatalf("orphaned/full_scan = %v, want 0", got)
+		}
+
+		// The header source recovers: the retry marks it.
+		stub.setHeightErr(10, nil)
+		if !r.fullScanMarkOrphaned(ctx, map[string]uint64{recOrphan: 10}) {
+			t.Fatal("the retry must complete once the height can be judged")
+		}
+		if bp, err := st.GetBlockProcessingStatus(ctx, recOrphan); err != nil || bp.Status != models.BlockStatusOrphaned {
+			t.Fatalf("the retry must orphan the off-chain row, got %+v err=%v", bp, err)
+		}
+		if got := testutil.ToFloat64(counter) - before; got != 1 {
+			t.Fatalf("orphaned/full_scan = %v, want 1", got)
+		}
+	})
+
+	t.Run("UnservedHeightLeavesCandidateForRetry", func(t *testing.T) {
+		ctx := context.Background()
+		st := newPebbleForTest(t)
+		pub := &capturePublisher{}
+		stub := &stubChaintracks{} // nothing served at 10: cannot judge
+		_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+
+		r := newTestReconciler(st, pub, stub, nil)
+		if r.fullScanMarkOrphaned(ctx, map[string]uint64{recOrphan: 10}) {
+			t.Fatal("a height the header source cannot serve must leave the scan incomplete")
+		}
+		if bp, err := st.GetBlockProcessingStatus(ctx, recOrphan); err != nil || bp.Status != models.BlockStatusActive {
+			t.Fatalf("absence of evidence must never orphan, got %+v err=%v", bp, err)
+		}
+	})
 }

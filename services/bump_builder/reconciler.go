@@ -511,7 +511,7 @@ func (r *Reconciler) fullScan(ctx context.Context) bool {
 	// once at page boundaries (see store.ForEachBlockProcessing); the first
 	// judgement of a hash wins. Parked rows belong to the watchdog and are
 	// never judged here.
-	markedSet := make(map[string]struct{})
+	markedSet := make(map[string]uint64) // hash → height, for the pre-write re-check
 	resurrectSet := make(map[string]*models.BlockProcessingStatus)
 	// Candidate rows the chain-header source could not judge. Absence of
 	// evidence never orphans or reactivates a row, but it is not a verdict
@@ -541,7 +541,7 @@ func (r *Reconciler) fullScan(ctx context.Context) bool {
 		matches := active.Hash.String() == row.BlockHash
 		switch {
 		case row.Status == models.BlockStatusActive && !matches:
-			markedSet[row.BlockHash] = struct{}{}
+			markedSet[row.BlockHash] = row.BlockHeight
 		case row.Status == models.BlockStatusOrphaned && matches:
 			resurrectSet[row.BlockHash] = row
 		}
@@ -572,14 +572,48 @@ func (r *Reconciler) fullScan(ctx context.Context) bool {
 }
 
 // fullScanMarkOrphaned demotes the off-chain 'active' rows the scan found,
-// reporting whether the write landed.
-func (r *Reconciler) fullScanMarkOrphaned(ctx context.Context, set map[string]struct{}) bool {
+// reporting whether the scan is complete for them: the write landed, and
+// every candidate could be judged.
+//
+// Candidates were judged during the paging walk, which can take a while,
+// and MarkBlocksOrphaned has no canonicality guard of its own — so each one
+// is re-checked against the active chain immediately before the write. A
+// reorg during the walk can have made a candidate canonical again; marking
+// it on that stale evidence would demote a canonical row (and regress a
+// reactivation the tracker may have applied meanwhile). Only rows the
+// header source positively places off-chain NOW are marked; a row it can no
+// longer judge — a lookup failure, or a height it cannot serve — is left
+// alone and the scan reported incomplete so it is retried: absence of
+// evidence never orphans.
+func (r *Reconciler) fullScanMarkOrphaned(ctx context.Context, set map[string]uint64) bool {
 	if len(set) == 0 {
 		return true
 	}
+	complete := true
 	marked := make([]string, 0, len(set))
-	for hash := range set {
-		marked = append(marked, hash)
+	for hash, height := range set {
+		canonical, found, hdrErr := r.activeHashAt(ctx, height)
+		switch {
+		case hdrErr != nil:
+			r.logger.Warn("startup full-scan: chain-header lookup failed before the orphan write; "+
+				"leaving the row for the next scan",
+				logfields.BlockHash(hash), logfields.BlockHeight(height), zap.Error(hdrErr))
+			complete = false
+		case !found:
+			r.logger.Warn("startup full-scan: chain-header source can no longer judge the row's height; "+
+				"leaving it for the next scan",
+				logfields.BlockHash(hash), logfields.BlockHeight(height))
+			complete = false
+		case canonical == hash:
+			r.logger.Info("startup full-scan: candidate became the active-chain block at its height during "+
+				"the walk; not orphaning it",
+				logfields.BlockHash(hash), logfields.BlockHeight(height))
+		default:
+			marked = append(marked, hash)
+		}
+	}
+	if len(marked) == 0 {
+		return complete
 	}
 	applied, err := r.store.MarkBlocksOrphaned(ctx, marked, r.now())
 	// Observed before the error check: the backends report the transitions
@@ -593,7 +627,7 @@ func (r *Reconciler) fullScanMarkOrphaned(ctx context.Context, set map[string]st
 	}
 	r.logger.Info("startup full-scan: marked off-chain blocks orphaned",
 		zap.Strings("block_hashes", marked))
-	return true
+	return complete
 }
 
 // recordOrphanTransitions adds applied orphaned transitions to the
