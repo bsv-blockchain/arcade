@@ -537,18 +537,27 @@ func recordOrphanTransitions(source string, applied int) {
 	}
 }
 
-// requeueForTick puts an orphaned row that is off the tick's durable queue
-// (stamped by a previous reconciliation) back on it, by re-orphaning it:
-// MarkBlocksOrphaned writes a fresh generation and clears reconciled_at,
-// which is exactly the queue predicate. Reports whether the write landed.
-func (r *Reconciler) requeueForTick(ctx context.Context, logger *zap.Logger, hash string) bool {
-	applied, err := r.store.MarkBlocksOrphaned(ctx, []string{hash}, r.now())
-	// A row the tracker reactivated meanwhile is orphaned by this write: an
-	// applied transition, counted like any other of the scan's.
-	recordOrphanTransitions(metrics.BlockTransitionSourceFullScan, applied)
+// requeueForTick puts a resurrect candidate that is off the tick's durable
+// queue (stamped by a previous reconciliation) back on it, as a
+// compare-and-set on the generation the paging walk read:
+// RequeueOrphanedBlock clears reconciled_at only while the row is still
+// orphaned with that generation, and never transitions a row. That matters
+// because the tracker runs alongside this scan and may legitimately have
+// reactivated this canonical row between the walk's read and now — a
+// MarkBlocksOrphaned here would flip that active row back to orphaned. A row
+// that is no longer the judged orphan needs nothing from us: reactivated,
+// it is where the repair wanted it; re-orphaned with a newer generation, it
+// is already queued (MarkBlocksOrphaned clears the stamp). So a not-applied
+// result is a benign hand-off, and only a store error returns false.
+func (r *Reconciler) requeueForTick(ctx context.Context, logger *zap.Logger, row *models.BlockProcessingStatus) bool {
+	applied, err := r.store.RequeueOrphanedBlock(ctx, row.BlockHash, row.OrphanGeneration())
 	if err != nil {
 		logger.Error("startup full-scan: failed to requeue the block for the reconciler", zap.Error(err))
 		return false
+	}
+	if !applied {
+		logger.Info("startup full-scan: row changed since it was judged (reactivated, or re-orphaned with a " +
+			"newer generation); nothing to requeue")
 	}
 	return true
 }
@@ -593,7 +602,7 @@ func (r *Reconciler) fullScanResurrect(ctx context.Context, set map[string]*mode
 			// failed.
 			logger.Error("startup full-scan: resurrected block's stored BUMP is malformed; "+
 				"requeueing the row so the reconciler's deferral drives the rebuild", zap.Error(remineErr))
-			if !r.requeueForTick(ctx, logger, hash) {
+			if !r.requeueForTick(ctx, logger, row) {
 				complete = false
 			}
 			continue
@@ -620,17 +629,18 @@ func (r *Reconciler) fullScanResurrect(ctx context.Context, set map[string]*mode
 			// The re-mine above may have anchored txs to a block that is now
 			// off-chain, and this row — stamped by its previous
 			// reconciliation — is off the tick's durable queue, so nothing
-			// would revisit them. Re-orphan it: a fresh generation with
-			// reconciled_at cleared puts it back on the queue, where the
-			// next tick re-anchors those txs to the new canonical block (or
-			// reverts them) through the ordinary reconcile path. Idempotent
-			// with the ReorgEvent the tracker records for the same flip, and
-			// it hands the repair off, so the scan is not incomplete for it
-			// unless the requeue write itself failed.
+			// would revisit them. Requeue it: with reconciled_at cleared it
+			// is back on the queue, where the next tick re-anchors those txs
+			// to the new canonical block (or reverts them) through the
+			// ordinary reconcile path. The ReorgEvent the tracker records
+			// for the same flip re-orphans it with a newer generation, which
+			// requeues it too; either way the repair is handed off, so the
+			// scan is not incomplete for it unless the requeue write itself
+			// failed.
 			logger.Warn("startup full-scan: block lost its height to a competitor during the re-mine; "+
 				"requeueing it so the reconciler re-anchors its txs to the new canonical block",
 				zap.String("canonical_block_hash", canonical))
-			if !r.requeueForTick(ctx, logger, hash) {
+			if !r.requeueForTick(ctx, logger, row) {
 				// Its txs stay MINED against an off-chain block until a
 				// ReorgEvent or the next scan revisits it.
 				complete = false

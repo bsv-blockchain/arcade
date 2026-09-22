@@ -602,6 +602,17 @@ func (h *hookedStore) ReactivateBlock(ctx context.Context, blockHash string, blo
 	return h.Store.ReactivateBlock(ctx, blockHash, blockHeight, orphanedAt)
 }
 
+// RequeueOrphanedBlock fires beforeReactivate too: both are the write a
+// full-scan hand-off ends in, and a test injects the tracker's concurrent
+// reactivation right before whichever one runs.
+func (h *hookedStore) RequeueOrphanedBlock(ctx context.Context, blockHash string, orphanedAt time.Time) (bool, error) {
+	if fn := h.beforeReactivate; fn != nil {
+		h.beforeReactivate = nil
+		fn()
+	}
+	return h.Store.RequeueOrphanedBlock(ctx, blockHash, orphanedAt)
+}
+
 func (h *hookedStore) GetBUMP(ctx context.Context, blockHash string) (uint64, []byte, error) {
 	if h.failGetBUMP || (h.failGetBUMPFor != "" && blockHash == h.failGetBUMPFor) {
 		return 0, nil, errors.New("injected: backend read failure")
@@ -2199,4 +2210,76 @@ func TestReconciler_FullScanMalformedBUMPRequeuesForTick(t *testing.T) {
 	if rows, lerr := st.ListOrphanedBlocksToReconcile(ctx, 10); lerr != nil || len(rows) != 0 {
 		t.Fatalf("row must leave the queue once reactivated, got %+v err=%v", rows, lerr)
 	}
+}
+
+// TestReconciler_FullScanRequeueNeverReorphansAReactivatedRow: the tracker
+// runs alongside the full-scan and can legitimately reactivate the canonical
+// row between the scan's paging read and its hand-off. The requeue is a
+// compare-and-set on the generation the scan read, never a transition, so
+// that active row must stay active and clean, nothing may be counted on the
+// orphaned/full_scan series, and the scan is complete — there is nothing
+// left to hand off. Both hand-off branches are covered: the malformed-BUMP
+// one and the lost-its-height one.
+func TestReconciler_FullScanRequeueNeverReorphansAReactivatedRow(t *testing.T) {
+	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
+		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceFullScan)
+
+	t.Run("MalformedBUMP", func(t *testing.T) {
+		ctx := context.Background()
+		base := newPebbleForTest(t)
+		hs := &hookedStore{Store: base}
+		pub := &capturePublisher{}
+		stub := &stubChaintracks{}
+		stub.setHeightHeader(10, headerWithHash(t, recOrphan, 10))
+		seedSeen(t, base, recShared1)
+		_ = base.InsertBUMP(ctx, recOrphan, 10, malformedBUMP)
+		_ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+		_, _ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+		_, _ = base.MarkBlockReconciled(ctx, recOrphan, time.Time{}, time.Now())
+		// The tracker reactivates the row right before the hand-off write.
+		hs.beforeReactivate = func() { _ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now()) }
+		before := testutil.ToFloat64(counter)
+
+		r := newTestReconciler(hs, pub, stub, nil)
+		if !r.fullScan(ctx) {
+			t.Fatal("a row another edge already reactivated leaves nothing for the scan to retry")
+		}
+		bp, err := base.GetBlockProcessingStatus(ctx, recOrphan)
+		if err != nil || bp.Status != models.BlockStatusActive || bp.OrphanedAt != nil || bp.ReconciledAt != nil {
+			t.Fatalf("the reactivated row must stay active and clean, got %+v err=%v", bp, err)
+		}
+		if rows, lerr := base.ListOrphanedBlocksToReconcile(ctx, 10); lerr != nil || len(rows) != 0 {
+			t.Fatalf("an active row must not be on the queue, got %+v err=%v", rows, lerr)
+		}
+		if got := testutil.ToFloat64(counter) - before; got != 0 {
+			t.Fatalf("orphaned/full_scan = %v, want 0 (the hand-off is never a transition)", got)
+		}
+	})
+
+	t.Run("LostItsHeight", func(t *testing.T) {
+		ctx := context.Background()
+		base := newPebbleForTest(t)
+		hs := &hookedStore{Store: base}
+		pub := &capturePublisher{}
+		stub := &stubChaintracks{}
+		seedResurrectable(t, base, stub)
+		// A reorg hands height 10 to a competitor during the re-mine, and
+		// the tracker (on its own view) reactivates the row before the
+		// scan's hand-off write.
+		hs.beforeMined = func(context.Context) { stub.setHeightHeader(10, headerWithHash(t, recCanonical, 10)) }
+		hs.beforeReactivate = func() { _ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now()) }
+		before := testutil.ToFloat64(counter)
+
+		r := newTestReconciler(hs, pub, stub, nil)
+		if !r.fullScan(ctx) {
+			t.Fatal("a row another edge already reactivated leaves nothing for the scan to retry")
+		}
+		bp, err := base.GetBlockProcessingStatus(ctx, recOrphan)
+		if err != nil || bp.Status != models.BlockStatusActive || bp.OrphanedAt != nil || bp.ReconciledAt != nil {
+			t.Fatalf("the reactivated row must stay active and clean, got %+v err=%v", bp, err)
+		}
+		if got := testutil.ToFloat64(counter) - before; got != 0 {
+			t.Fatalf("orphaned/full_scan = %v, want 0 (the hand-off is never a transition)", got)
+		}
+	})
 }
