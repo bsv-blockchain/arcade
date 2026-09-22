@@ -3409,3 +3409,142 @@ func TestReconciler_FullScanMarkOrphanedRechecksCanonicality(t *testing.T) {
 		}
 	})
 }
+
+// TestReconciler_HeaderNotFoundAboveTipIsEndOfChain reproduces the e2e
+// failure the round-7 tri-state introduced. go-chaintracks' ChainManager
+// answers every height at or beyond its tip with
+// chaintracks.ErrHeaderNotFound — not (nil, nil) — so the neighborhood walk
+// above an orphan meets that error on every tick. Treated as a lookup
+// FAILURE it kept the orphan in "error" forever and its orphan-only tx
+// MINED against a dead block; it is the ordinary end of the chain, and the
+// walk must finish and revert the remainder exactly as it does for a nil
+// header. The resurrection short-circuit's own lookup at the orphan's
+// height goes through the same classification.
+func TestReconciler_HeaderNotFoundAboveTipIsEndOfChain(t *testing.T) {
+	ctx := context.Background()
+	st := newPebbleForTest(t)
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	stub.setNotFoundErrors()
+	stub.setHeightHeader(10, headerWithHash(t, recCanonical, 10)) // the tip: 11+ are "header not found"
+
+	// The e2e shape: the orphan lost a same-height tie; the canonical
+	// block's BUMP holds the shared tx, nothing above holds bOnly.
+	seedMined(t, st, recOrphan, 10, recShared1, recBOnly)
+	if err := st.InsertBUMP(ctx, recCanonical, 10, makeCompoundForTest(t, 10, recShared1)); err != nil {
+		t.Fatalf("insert canonical BUMP: %v", err)
+	}
+	_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+	_, _ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	rows, err := st.ListOrphanedBlocksToReconcile(ctx, 10)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("precondition: one queued row, got %+v err=%v", rows, err)
+	}
+
+	r := newTestReconciler(st, pub, stub, nil)
+	if outcome := r.reconcileBlock(ctx, rows[0]); outcome != outcomeMixed {
+		t.Fatalf("outcome = %q, want %s (shared re-anchored, bOnly reverted)", outcome, outcomeMixed)
+	}
+	if got := statusOf(t, st, recShared1); got.Status != models.StatusMined || got.BlockHash != recCanonical {
+		t.Fatalf("shared: want MINED@%s, got %s@%s", recCanonical, got.Status, got.BlockHash)
+	}
+	if got := statusOf(t, st, recBOnly); got.Status != models.StatusSeenOnNetwork {
+		t.Fatalf("bOnly must revert to SEEN_ON_NETWORK once the walk reaches the end of the chain, got %s@%s",
+			got.Status, got.BlockHash)
+	}
+	bp, err := st.GetBlockProcessingStatus(ctx, recOrphan)
+	if err != nil || bp.ReconciledAt == nil {
+		t.Fatalf("the orphan must be stamped reconciled, got %+v err=%v", bp, err)
+	}
+	if rows, lerr := st.ListOrphanedBlocksToReconcile(ctx, 10); lerr != nil || len(rows) != 0 {
+		t.Fatalf("the orphan must leave the queue, got %+v err=%v", rows, lerr)
+	}
+}
+
+// TestReconciler_HeaderNotFoundIsAbsenceEverywhere: the same sentinel at
+// the other classification sites. At the orphan's own height it is
+// "cannot judge" — the pass parks (canonical unknown), not "error"; in the
+// full-scan's per-row judgement and its pre-write re-check it leaves the
+// row unjudged and the scan incomplete, never orphaning on it; a transport
+// error at the same heights is still a failure (the round-7 rule).
+func TestReconciler_HeaderNotFoundIsAbsenceEverywhere(t *testing.T) {
+	t.Run("OrphanHeightUnknownParksInsteadOfErroring", func(t *testing.T) {
+		ctx := context.Background()
+		st := newPebbleForTest(t)
+		pub := &capturePublisher{}
+		stub := &stubChaintracks{}
+		stub.setNotFoundErrors() // nothing served: every height is "header not found"
+		seedMined(t, st, recOrphan, 10, recShared1)
+		_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+		_, _ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+		rows, err := st.ListOrphanedBlocksToReconcile(ctx, 10)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("precondition: one queued row, got %+v err=%v", rows, err)
+		}
+		r := newTestReconciler(st, pub, stub, nil)
+		// No canonical block can be named, so nothing to defer on: the
+		// pre-existing fail-open path parks the block (txs left MINED@O).
+		if outcome := r.reconcileBlock(ctx, rows[0]); outcome != outcomeParked {
+			t.Fatalf("outcome = %q, want %s (absence is the fail-open path, not a lookup failure)", outcome, outcomeParked)
+		}
+		if got := statusOf(t, st, recShared1); got.Status != models.StatusMined || got.BlockHash != recOrphan {
+			t.Fatalf("parked txs stay MINED@orphan, got %s@%s", got.Status, got.BlockHash)
+		}
+	})
+
+	t.Run("FullScanLeavesUnservedRowUnjudged", func(t *testing.T) {
+		ctx := context.Background()
+		st := newPebbleForTest(t)
+		pub := &capturePublisher{}
+		stub := &stubChaintracks{}
+		stub.setNotFoundErrors()
+		seedResurrectable(t, st, stub)                                // judgeable at 10
+		stub.setHeightHeader(12, headerWithHash(t, recCanonical, 12)) // the tip
+		_ = st.UpsertBlockHeaderSeen(ctx, recCanonical, 12, time.Now())
+		_ = st.UpsertBlockHeaderSeen(ctx, recNeighbor, 11, time.Now()) // 11 is "header not found"
+
+		r := newTestReconciler(st, pub, stub, func(c *config.ReconcilerConfig) { c.StartupFullScan = true })
+		r.tick(ctx)
+		if r.startupScanDone {
+			t.Fatal("an unserved candidate height must keep the one-shot armed")
+		}
+		if bp, err := st.GetBlockProcessingStatus(ctx, recNeighbor); err != nil || bp.Status != models.BlockStatusActive {
+			t.Fatalf("absence of evidence must never orphan, got %+v err=%v", bp, err)
+		}
+		if bp, err := st.GetBlockProcessingStatus(ctx, recOrphan); err != nil || bp.Status != models.BlockStatusActive {
+			t.Fatalf("the judgeable row must still heal, got %+v err=%v", bp, err)
+		}
+		// The pre-write re-check reads the sentinel the same way.
+		if r.fullScanMarkOrphaned(ctx, map[string]uint64{recNeighbor: 11}) {
+			t.Fatal("a candidate at an unserved height must leave the scan incomplete")
+		}
+		if bp, err := st.GetBlockProcessingStatus(ctx, recNeighbor); err != nil || bp.Status != models.BlockStatusActive {
+			t.Fatalf("absence of evidence must never orphan, got %+v err=%v", bp, err)
+		}
+	})
+
+	t.Run("TransportErrorIsStillAFailure", func(t *testing.T) {
+		ctx := context.Background()
+		st := newPebbleForTest(t)
+		pub := &capturePublisher{}
+		stub := &stubChaintracks{}
+		stub.setNotFoundErrors()
+		stub.setHeightHeader(10, headerWithHash(t, recCanonical, 10))
+		stub.setHeightErr(11, errors.New("injected: header source unavailable")) // not the sentinel
+		seedMined(t, st, recOrphan, 10, recBOnly)
+		_ = st.InsertBUMP(ctx, recCanonical, 10, makeCompoundForTest(t, 10, recShared1))
+		_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+		_, _ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+		rows, err := st.ListOrphanedBlocksToReconcile(ctx, 10)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("precondition: one queued row, got %+v err=%v", rows, err)
+		}
+		r := newTestReconciler(st, pub, stub, nil)
+		if outcome := r.reconcileBlock(ctx, rows[0]); outcome != outcomeError {
+			t.Fatalf("outcome = %q, want %s (a real lookup failure keeps the block queued)", outcome, outcomeError)
+		}
+		if got := statusOf(t, st, recBOnly); got.Status != models.StatusMined || got.BlockHash != recOrphan {
+			t.Fatalf("nothing may be reverted on a failed lookup, got %s@%s", got.Status, got.BlockHash)
+		}
+	})
+}

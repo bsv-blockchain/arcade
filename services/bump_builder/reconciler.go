@@ -8,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	chaintrackslib "github.com/bsv-blockchain/go-chaintracks/chaintracks"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/bump"
@@ -533,12 +534,15 @@ func (r *Reconciler) fullScan(ctx context.Context) bool {
 		if _, seen := resurrectSet[row.BlockHash]; seen {
 			return nil
 		}
-		active, hdrErr := r.chainHeader.GetHeaderByHeight(ctx, uint32(row.BlockHeight))
-		if hdrErr != nil || active == nil {
+		// Through activeHashAt, the one place the header source's answers
+		// are classified. Absence and failure both leave the row unjudged
+		// here — the scan retries either way — but neither is ever evidence.
+		canonical, found, hdrErr := r.activeHashAt(ctx, row.BlockHeight)
+		if hdrErr != nil || !found {
 			unjudged++
 			return nil //nolint:nilerr // fail-open by contract: never judge on absence of evidence
 		}
-		matches := active.Hash.String() == row.BlockHash
+		matches := canonical == row.BlockHash
 		switch {
 		case row.Status == models.BlockStatusActive && !matches:
 			markedSet[row.BlockHash] = row.BlockHeight
@@ -1612,22 +1616,32 @@ func (r *Reconciler) staleOutcome(logger *zap.Logger, height uint64) string {
 }
 
 // activeHashAt resolves the active-chain block hash at height. Tri-state:
-// found=false with a nil error means the chain-header source positively
-// cannot judge that height (unknown, above the tip, or out of range) —
+// found=false with a nil error means the chain-header source positively has
+// no header at that height (above its tip, unknown, or out of range) —
 // callers fail open, never treating absence of evidence as evidence; a
 // non-nil error means the lookup FAILED, which is not a judgement either
 // way, and callers must keep their row for a retry rather than act on it.
 // Collapsing the two made a transient header read look like the end of the
 // chain (issue #339 review).
+//
+// This is the one place the source's answers are classified, per the
+// ChainHeaderReader contract: absence is (nil, nil) OR an error that
+// errors.Is chaintrackslib.ErrHeaderNotFound. go-chaintracks' ChainManager
+// reports every height at or beyond its tip with that sentinel — so a walk
+// upward from a block reaches it on every tick as the ordinary end of the
+// chain — and treating it as a failure kept every orphan's neighborhood
+// walk in "error" forever, with its off-chain txs never reverted.
 func (r *Reconciler) activeHashAt(ctx context.Context, height uint64) (hash string, found bool, err error) {
 	if height == 0 || height > math.MaxUint32 {
 		return "", false, nil
 	}
 	active, err := r.chainHeader.GetHeaderByHeight(ctx, uint32(height))
-	if err != nil {
+	switch {
+	case errors.Is(err, chaintrackslib.ErrHeaderNotFound):
+		return "", false, nil // the source has no header here: absence, not a failure
+	case err != nil:
 		return "", false, fmt.Errorf("look up the active block at height %d: %w", height, err)
-	}
-	if active == nil {
+	case active == nil:
 		return "", false, nil
 	}
 	return active.Hash.String(), true, nil

@@ -36,9 +36,24 @@ import (
 // failing the build outright on a transient chaintracks race.
 type ChainHeaderReader interface {
 	GetHeaderByHash(ctx context.Context, hash *chainhash.Hash) (*chaintrackslib.BlockHeader, error)
-	// GetHeaderByHeight returns the ACTIVE-chain header at height. A
-	// (nil, nil) or error return means "chaintracks cannot judge this
-	// height yet" — callers must fail open, never treat it as evidence.
+	// GetHeaderByHeight returns the ACTIVE-chain header at height. Two
+	// distinct non-answers, and callers must tell them apart:
+	//
+	//   - ABSENCE: (nil, nil), or an error that errors.Is
+	//     chaintrackslib.ErrHeaderNotFound — the source positively has no
+	//     header at this height (above its tip, or a height it does not
+	//     index). go-chaintracks' ChainManager returns the sentinel for
+	//     every height at or beyond its tip, so for a walk upward from a
+	//     block this is the ordinary end of the chain. Never evidence of
+	//     anything: the anchor guard fails open on it, the reconciler
+	//     treats it as "nothing more to check" and carries on.
+	//   - FAILURE: any other error — the lookup itself did not work. Not a
+	//     judgement either way; the anchor guard fails open, but the
+	//     reconciler must keep its block queued for a retry rather than
+	//     act on the missing answer (it reverts, parks or reactivates on
+	//     what it learns here, and a transient failure must not drive
+	//     those). The reconciler classifies both at one place, activeHashAt.
+	//
 	// Unlike GetHeaderByHash, which also resolves same-height alternates
 	// from the header index, this is a main-chain-membership source: the
 	// anchor guard and the reorg reconciler both compare a block hash
