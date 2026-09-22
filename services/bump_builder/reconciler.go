@@ -668,12 +668,22 @@ func (r *Reconciler) fullScanResurrect(ctx context.Context, set map[string]*mode
 			// corrupt BUMP and takes the deferral path — the row stays
 			// queued and /reprocess is asked to redeliver the block, which
 			// rebuilds the BUMP — until the BUMP parses (see resurrect).
-			// That is a durable retry with its own cap, so the scan is not
-			// incomplete for this row unless the requeue write itself
-			// failed.
+			// That is a durable retry with its own cap. The hand-off is
+			// generation-aware: if the tracker reactivated the row since the
+			// walk read it, a plain requeue would find nothing to do and
+			// leave an ACTIVE row with a corrupt BUMP, un-remined txs and no
+			// rebuild requested. keepRemineRetried holds such a row in the
+			// pending set instead — it stays active (nothing was written, and
+			// this path must never flip a canonical row back to orphaned),
+			// the rebuild is requested, and the drain keeps asking under the
+			// defer cap. The scan is not incomplete for the row unless the
+			// hand-off itself failed, in which case the pending set holds it
+			// anyway and the scan retries too.
 			logger.Error("startup full-scan: resurrected block's stored BUMP is malformed; "+
-				"requeueing the row so the reconciler's deferral drives the rebuild", zap.Error(remineErr))
-			if !r.requeueForTick(ctx, logger, row) {
+				"handing the row to the reconciler so its deferral drives the rebuild", zap.Error(remineErr))
+			if !r.keepRemineRetried(ctx, logger, hash, height, row.OrphanGeneration()) {
+				metrics.ReconcilerRemineHandoffFailedTotal.Inc()
+				r.holdPendingRemine(ctx, logger, hash, height)
 				complete = false
 			}
 			continue
@@ -692,15 +702,32 @@ func (r *Reconciler) fullScanResurrect(ctx context.Context, set map[string]*mode
 				// The store refused the hand-off too. The scan retries (it
 				// re-selects the row while it is still orphaned), and the
 				// pending set covers the case where it is not.
+				metrics.ReconcilerRemineHandoffFailedTotal.Inc()
 				r.holdPendingRemine(ctx, logger, hash, height)
 				complete = false
 			}
 			continue
 		case remineErr != nil:
-			// Nothing was read, so nothing was written: the row is as the
-			// walk found it and the next scan retries.
+			// Nothing was read, so nothing was written — but "the row is as
+			// the walk found it" is not a given: the tracker may have
+			// reactivated this canonical row since the paging read, and a
+			// scan retry would then skip it (active rows are never
+			// candidates) with its txs never re-mined, until the attempt cap
+			// retired the one-shot. So the row is re-checked at the
+			// generation the walk read and handed to a path that retries it
+			// whatever its state: still ours → requeued for the tick;
+			// reactivated → held in the pending set, where the drain re-mines
+			// it directly while it is canonical (nothing was written, so
+			// unlike the partial-re-mine branch there is no reason to flip
+			// the canonical row back to orphaned); hand-off refused → the
+			// pending set as well. The scan ALSO stays incomplete, so it
+			// retries the read itself while the row is still orphaned.
 			logger.Error("startup full-scan: could not read the resurrected block's BUMP; "+
-				"leaving the row orphaned so the next full-scan retries", zap.Error(remineErr))
+				"handing the row to the reconciler and retrying the scan", zap.Error(remineErr))
+			if !r.keepRemineRetried(ctx, logger, hash, height, row.OrphanGeneration()) {
+				metrics.ReconcilerRemineHandoffFailedTotal.Inc()
+				r.holdPendingRemine(ctx, logger, hash, height)
+			}
 			complete = false
 			continue
 		}
@@ -1155,6 +1182,7 @@ func (r *Reconciler) resurrect(ctx context.Context, logger *zap.Logger, orphan s
 			// The store refused the hand-off too: the row may be active and
 			// off every in-store queue. Remember it here so the next tick
 			// retries, regardless of what the store holds.
+			metrics.ReconcilerRemineHandoffFailedTotal.Inc()
 			r.holdPendingRemine(ctx, logger, orphan, height)
 		}
 		return outcomeError
@@ -1310,8 +1338,8 @@ func (r *Reconciler) handOffPartialRemine(ctx context.Context, logger *zap.Logge
 			logfields.Status(string(row.Status)))
 		return true, nil
 	}
-	logger.Error("the tracker reactivated the block while its re-mine was failing part-way; re-orphaning it so the " +
-		"reconciler retries the remaining txs next tick (the block reads orphaned until then)")
+	logger.Error("the tracker reactivated the block while its re-mine was failing; re-orphaning it so the " +
+		"reconciler retries the un-remined txs next tick (the block reads orphaned until then)")
 	r.requestRebuild(ctx, logger, hash)
 	transitions, err := r.store.MarkBlocksOrphaned(ctx, []string{hash}, r.now())
 	// Counted from what the write reports — a transition that landed
@@ -1324,17 +1352,82 @@ func (r *Reconciler) handOffPartialRemine(ctx context.Context, logger *zap.Logge
 	return true, nil
 }
 
-// holdPendingRemine records a block whose partial re-mine could not be
-// handed to any in-store path, so the next tick retries it from memory
-// (drainPendingRemines). It also asks merkle-service to redeliver the block
-// right here — the hand-off may have been refused before it reached its own
-// request — because that redelivery (the builder re-mines the stored BUMP's
-// full level-0 set on it) is the only cover left if this process restarts
-// before the set drains; best-effort, never the only path while the process
-// lives. Logged at Error and counted; a full set drops the block, loudly,
-// leaving it to that redelivery alone.
+// keepRemineRetried makes sure a resurrect candidate whose own re-mine could
+// not RUN — its BUMP unreadable or malformed, so nothing was written — stays
+// on a path that retries it, whatever happened to its row since the scan
+// read it. Reports false only when the store refused every check through
+// handOffAttempts tries. The generation the scan judged decides:
+//
+//   - still ours (RequeueOrphanedBlock applies): on the tick's durable queue,
+//     whose resurrection short-circuit re-mines it (or defers on a corrupt
+//     BUMP, asking for the rebuild under the defer cap) next pass.
+//   - re-orphaned with a newer generation: already queued for its own pass.
+//   - reactivated by the tracker: the row is active and off every in-store
+//     queue with its txs un-remined, and no scan will select it again. It
+//     is held in the pending set, where the drain re-mines it directly while
+//     it is canonical — or, for a corrupt BUMP, keeps asking for the rebuild
+//     under the defer cap. Unlike keepPartialRemineQueued it never
+//     re-orphans that row: nothing was written, so there is no half-applied
+//     state to force back onto the durable queue at the cost of a canonical
+//     block reading orphaned — the invariant the malformed path has kept
+//     since round 6 of this PR's review.
+//   - parked or gone: the watchdog owns it / nothing to retry.
+func (r *Reconciler) keepRemineRetried(ctx context.Context, logger *zap.Logger, hash string, height uint64, orphanedAt time.Time) bool {
+	for attempt := 1; ; attempt++ {
+		applied, err := r.store.RequeueOrphanedBlock(ctx, hash, orphanedAt)
+		if err == nil {
+			if applied {
+				return true // still the judged orphan, and on the queue
+			}
+			var row *models.BlockProcessingStatus
+			row, err = r.store.GetBlockProcessingStatus(ctx, hash)
+			switch {
+			case errors.Is(err, store.ErrNotFound):
+				logger.Warn("block row vanished before its re-mine could run; nothing to retry")
+				return true
+			case err != nil:
+				err = fmt.Errorf("read row: %w", err)
+			case row.Status == models.BlockStatusOrphaned:
+				logger.Info("block was orphaned again with a newer generation; that pass re-mines it")
+				return true
+			case row.Status == models.BlockStatusActive:
+				logger.Warn("the tracker reactivated the block before its re-mine could run; " +
+					"holding it so the reconciler re-mines it directly while it is canonical")
+				r.holdPendingRemine(ctx, logger, hash, height)
+				return true
+			default:
+				logger.Warn("block row is no longer active or orphaned; leaving it to its owner",
+					logfields.Status(string(row.Status)))
+				return true
+			}
+		}
+		if attempt >= handOffAttempts || ctx.Err() != nil {
+			logger.Error("the hand-off of an un-run re-mine failed through every retry",
+				zap.Int("attempts", attempt), zap.Error(err))
+			return false
+		}
+		logger.Warn("hand-off of an un-run re-mine failed; retrying in-process",
+			zap.Int("attempt", attempt), zap.Int("max_attempts", handOffAttempts), zap.Error(err))
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(handOffBackoff):
+		}
+	}
+}
+
+// holdPendingRemine records a block whose re-mine no in-store path will
+// retry — its hand-off was refused, or it is active with un-remined txs — so
+// the next tick retries it from memory (drainPendingRemines). It also asks
+// merkle-service to redeliver the block right here — a refused hand-off may
+// not have reached its own request — because that redelivery (the builder
+// re-mines the stored BUMP's full level-0 set on it) is the only cover left
+// if this process restarts before the set drains; best-effort, never the
+// only path while the process lives. Logged at Error; a full set drops the
+// block, loudly, leaving it to that redelivery alone. Callers count a
+// refused durable hand-off on ReconcilerRemineHandoffFailedTotal themselves;
+// the gauge here covers every held block.
 func (r *Reconciler) holdPendingRemine(ctx context.Context, logger *zap.Logger, hash string, height uint64) {
-	metrics.ReconcilerRemineHandoffFailedTotal.Inc()
 	r.requestRebuild(ctx, logger, hash)
 	if r.pendingRemine == nil {
 		r.pendingRemine = make(map[string]uint64)
@@ -1400,10 +1493,22 @@ func (r *Reconciler) drainPendingRemines(ctx context.Context) {
 			} else {
 				logger.Warn("pending re-mine: the block has no stored BUMP any more; nothing left to re-mine from")
 			}
+			delete(r.defers, hash)
 			delete(r.pendingRemine, hash)
 		case errors.Is(err, errMalformedBUMP):
-			logger.Error("pending re-mine: stored BUMP is malformed; requesting a rebuild and keeping the block", zap.Error(err))
-			r.requestRebuild(ctx, logger, hash)
+			// A corrupt BUMP on a canonical, active row: ask for the rebuild
+			// under the same per-block cap the tick's deferral uses — never
+			// re-orphan the row for it — and at the cap leave the block to
+			// the redelivery already requested, loudly.
+			if r.deferForCanonicalBUMP(ctx, logger, hash, hash) {
+				logger.Error("pending re-mine: stored BUMP is malformed; rebuild requested, keeping the block",
+					zap.Int("rebuild_requests", r.defers[hash]), zap.Error(err))
+				continue
+			}
+			logger.Error("pending re-mine: stored BUMP still malformed at the rebuild-request cap; "+
+				"leaving the block to the BLOCK_PROCESSED redelivery", zap.Error(err))
+			delete(r.defers, hash)
+			delete(r.pendingRemine, hash)
 		default:
 			logger.Warn("pending re-mine: re-mine failed again", zap.Int("txs_reanchored", n), zap.Error(err))
 			if r.keepPartialRemineQueued(ctx, logger, hash, time.Time{}) {

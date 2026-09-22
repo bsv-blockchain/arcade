@@ -603,35 +603,38 @@ var ReconcilerTxsParkedTotal = promauto.NewCounter(prometheus.CounterOpts{
 })
 
 // ReconcilerRemineRequeuedTotal counts canonical block rows the reconciler
-// re-orphaned in order to retry a re-mine that failed part-way AFTER the
+// re-orphaned in order to retry a re-mine that failed — part-way, before it
+// could read the block's BUMP, or on a BUMP that does not parse — AFTER the
 // block-status tracker had reactivated the row mid-pass (issue #339
-// review). The row was active and off the durable queue with only some of
-// its transactions re-mined, and the reconciler's queue — whose predicate
+// review). The row was active and off the durable queue with some or all of
+// its transactions un-remined, and the reconciler's queue — whose predicate
 // is status='orphaned' — is the only in-store path that retries; each count
 // is therefore a canonical block reading orphaned for up to one tick, until
 // the next pass re-mines it and reactivates it. Non-zero is worth a look:
-// it means SetMinedByTxIDs failed while a reorg was being healed.
+// it means a store call failed while a reorg was being healed.
 var ReconcilerRemineRequeuedTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "arcade_reconciler_remine_requeue_total",
 	Help: "Canonical block rows re-orphaned to retry a partial re-mine after a concurrent reactivation.",
 })
 
-// ReconcilerRemineHandoffFailedTotal counts partial re-mines whose durable
-// hand-off (RequeueOrphanedBlock, or the re-orphan above) still failed after
-// the in-process retries. The block is then held in the reconciler's
-// in-memory pending set and retried on every tick until it heals or the
-// hand-off lands; that set does not survive a restart, so a non-zero count
-// during an outage is the signal to check ReconcilerRemineHandoffPending
-// before restarting the process.
+// ReconcilerRemineHandoffFailedTotal counts failed re-mines whose durable
+// hand-off (RequeueOrphanedBlock, the row read, or the re-orphan above) the
+// store still refused after the in-process retries. The block is then held
+// in the reconciler's in-memory pending set and retried on every tick until
+// it heals or the hand-off lands; that set does not survive a restart, so a
+// non-zero count during an outage is the signal to check
+// ReconcilerRemineHandoffPending before restarting the process.
 var ReconcilerRemineHandoffFailedTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "arcade_reconciler_remine_handoff_failed_total",
-	Help: "Partial re-mines whose durable hand-off failed after retries and fell back to the in-memory pending set.",
+	Help: "Failed re-mines whose durable hand-off the store refused after retries; the block fell back to the in-memory pending set.",
 })
 
 // ReconcilerRemineHandoffPending is the size of that in-memory pending set:
-// canonical blocks with a partially re-mined tx set that no in-store queue
-// currently holds. Should be 0 in steady state and drain to 0 as soon as the
-// store recovers.
+// canonical blocks with un-remined txs that no in-store queue currently
+// holds — either because the store refused the hand-off, or because the
+// block-status tracker reactivated the row before its re-mine could run and
+// re-orphaning it would be wrong. Should be 0 in steady state and drain to
+// 0 as soon as the store recovers.
 var ReconcilerRemineHandoffPending = promauto.NewGauge(prometheus.GaugeOpts{
 	Name: "arcade_reconciler_remine_handoff_pending",
 	Help: "Blocks awaiting a re-mine retry that only the reconciler's in-memory pending set holds.",

@@ -599,6 +599,10 @@ type hookedStore struct {
 	// test can let the hand-off's requeue and read succeed and refuse the
 	// re-orphan itself. Negative = refuse them all.
 	failOrphanN int
+	// beforeGetBUMP fires once, right before the next GetBUMP, so a test can
+	// inject a concurrent write between the full-scan's paging read and its
+	// BUMP read.
+	beforeGetBUMP func()
 }
 
 // refuseHandOff reports whether this hand-off write is refused, consuming
@@ -655,6 +659,10 @@ func (h *hookedStore) RequeueOrphanedBlock(ctx context.Context, blockHash string
 }
 
 func (h *hookedStore) GetBUMP(ctx context.Context, blockHash string) (uint64, []byte, error) {
+	if fn := h.beforeGetBUMP; fn != nil {
+		h.beforeGetBUMP = nil
+		fn()
+	}
 	if h.failGetBUMP || (h.failGetBUMPFor != "" && blockHash == h.failGetBUMPFor) {
 		return 0, nil, errors.New("injected: backend read failure")
 	}
@@ -3072,5 +3080,235 @@ func TestReconciler_LeaseRenewalBoundedByDeadline(t *testing.T) {
 		if dl.After(time.Now().Add(r.leaseTTL())) {
 			t.Fatalf("renewal deadline %v must be bounded by one heartbeat, not the whole lease", dl)
 		}
+	}
+}
+
+// TestReconciler_FullScanBUMPReadFailureAfterReactivationHoldsPending: the
+// tracker reactivates the canonical row between the full-scan's paging read
+// and its BUMP read, and that read then fails transiently. A scan retry
+// would skip the row — active rows are never candidates — so its txs would
+// never be re-mined once the attempt cap retired the one-shot. The scan
+// must re-check the row at the generation it read and, finding it active
+// with nothing written, hold it in the pending set: the row stays active and
+// clean (this path never re-orphans a canonical row), the rebuild is
+// requested, the durable-hand-off failure counter does not move (nothing
+// failed), the scan still reports itself incomplete, and the next tick
+// re-mines the block directly and drains the set.
+func TestReconciler_FullScanBUMPReadFailureAfterReactivationHoldsPending(t *testing.T) {
+	ctx := context.Background()
+	base := newPebbleForTest(t)
+	hs := &hookedStore{Store: base, failGetBUMP: true}
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	reprocess := newReprocessStub(t)
+	seedResurrectable(t, base, stub)
+	// Between the paging read and the BUMP read: the tracker reactivates it.
+	hs.beforeGetBUMP = func() { _ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now()) }
+	requeued := testutil.ToFloat64(metrics.ReconcilerRemineRequeuedTotal)
+	failed := testutil.ToFloat64(metrics.ReconcilerRemineHandoffFailedTotal)
+	orphaned := testutil.ToFloat64(metrics.BlockStatusTransitionsTotal.WithLabelValues(
+		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceFullScan))
+
+	r := newTestReconciler(hs, pub, stub, nil)
+	withReprocess(r, reprocess)
+	if r.fullScan(ctx) {
+		t.Fatal("a scan whose BUMP read failed must report itself incomplete")
+	}
+	bp, err := base.GetBlockProcessingStatus(ctx, recOrphan)
+	if err != nil || bp.Status != models.BlockStatusActive || bp.OrphanedAt != nil || bp.ReconciledAt != nil {
+		t.Fatalf("the reactivated canonical row must stay active and clean, got %+v err=%v", bp, err)
+	}
+	if h, held := r.pendingRemine[recOrphan]; !held || h != 10 {
+		t.Fatalf("the block must be held in the pending set with its height, got %v", r.pendingRemine)
+	}
+	if got := testutil.ToFloat64(metrics.ReconcilerRemineHandoffPending); got != 1 {
+		t.Fatalf("remine_handoff_pending = %v, want 1", got)
+	}
+	if got := reprocess.requested(); len(got) != 1 || got[0] != recOrphan {
+		t.Fatalf("a rebuild must be requested when the block is held, got %v", got)
+	}
+	if got := testutil.ToFloat64(metrics.ReconcilerRemineRequeuedTotal) - requeued; got != 0 {
+		t.Fatalf("remine_requeue_total = %v, want 0 (nothing was re-orphaned)", got)
+	}
+	if got := testutil.ToFloat64(metrics.ReconcilerRemineHandoffFailedTotal) - failed; got != 0 {
+		t.Fatalf("remine_handoff_failed_total = %v, want 0 (the hand-off succeeded, into the pending set)", got)
+	}
+	if got := testutil.ToFloat64(metrics.BlockStatusTransitionsTotal.WithLabelValues(
+		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceFullScan)) - orphaned; got != 0 {
+		t.Fatalf("orphaned/full_scan = %v, want 0", got)
+	}
+	if got := statusOf(t, base, recShared1); got.Status != models.StatusSeenOnNetwork {
+		t.Fatalf("premise: nothing was re-mined, got %s@%s", got.Status, got.BlockHash)
+	}
+
+	// The store recovers: the next tick re-mines the block directly.
+	hs.failGetBUMP = false
+	r.tick(ctx)
+	if _, held := r.pendingRemine[recOrphan]; held {
+		t.Fatalf("the pending set must drain once the block heals, got %v", r.pendingRemine)
+	}
+	if got := statusOf(t, base, recShared1); got.Status != models.StatusMined || got.BlockHash != recOrphan {
+		t.Fatalf("the next tick must re-mine the tx, got %s@%s", got.Status, got.BlockHash)
+	}
+	bp, err = base.GetBlockProcessingStatus(ctx, recOrphan)
+	if err != nil || bp.Status != models.BlockStatusActive || bp.OrphanedAt != nil || bp.ReconciledAt != nil {
+		t.Fatalf("the row must still be active and clean, got %+v err=%v", bp, err)
+	}
+}
+
+// TestReconciler_FullScanBUMPReadFailureHandOffRefusedStillHeld: the same
+// race, but the store also refuses the hand-off's own reads and writes. The
+// block must still land in the pending set — now counted as a refused
+// durable hand-off — and the next tick, store back, re-mines it directly.
+func TestReconciler_FullScanBUMPReadFailureHandOffRefusedStillHeld(t *testing.T) {
+	ctx := context.Background()
+	base := newPebbleForTest(t)
+	hs := &hookedStore{Store: base, failGetBUMP: true}
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	seedResurrectable(t, base, stub)
+	hs.beforeGetBUMP = func() {
+		_ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+		hs.failHandOffN = -1 // every hand-off write refused
+	}
+	failed := testutil.ToFloat64(metrics.ReconcilerRemineHandoffFailedTotal)
+
+	r := newTestReconciler(hs, pub, stub, nil)
+	if r.fullScan(ctx) {
+		t.Fatal("a scan whose BUMP read failed must report itself incomplete")
+	}
+	if h, held := r.pendingRemine[recOrphan]; !held || h != 10 {
+		t.Fatalf("the block must be held in the pending set with its height, got %v", r.pendingRemine)
+	}
+	if got := testutil.ToFloat64(metrics.ReconcilerRemineHandoffFailedTotal) - failed; got != 1 {
+		t.Fatalf("remine_handoff_failed_total = %v, want 1", got)
+	}
+	if hs.handOffCalls < handOffAttempts {
+		t.Fatalf("the hand-off must be retried in-process, got %d write attempts", hs.handOffCalls)
+	}
+
+	hs.failGetBUMP = false
+	hs.failHandOffN = 0
+	r.tick(ctx)
+	if _, held := r.pendingRemine[recOrphan]; held {
+		t.Fatalf("the pending set must drain once the block heals, got %v", r.pendingRemine)
+	}
+	if got := statusOf(t, base, recShared1); got.Status != models.StatusMined || got.BlockHash != recOrphan {
+		t.Fatalf("the drain must re-mine the tx directly, got %s@%s", got.Status, got.BlockHash)
+	}
+}
+
+// TestReconciler_FullScanMalformedBUMPAfterReactivationHoldsPending: the
+// same race on the malformed-BUMP branch. A plain requeue would find the row
+// active and leave it — a canonical row with a corrupt BUMP, un-remined txs
+// and no rebuild requested — while re-orphaning it would flip a canonical
+// row back to orphaned, which this path must never do. The block is held
+// pending with the rebuild requested; each drain asks again under the defer
+// cap; once the BUMP is rebuilt the drain re-mines directly, the row having
+// stayed active throughout.
+func TestReconciler_FullScanMalformedBUMPAfterReactivationHoldsPending(t *testing.T) {
+	ctx := context.Background()
+	base := newPebbleForTest(t)
+	hs := &hookedStore{Store: base}
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	reprocess := newReprocessStub(t)
+	stub.setHeightHeader(10, headerWithHash(t, recOrphan, 10))
+	seedSeen(t, base, recShared1)
+	_ = base.InsertBUMP(ctx, recOrphan, 10, malformedBUMP)
+	_ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+	_, _ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	_, _ = base.MarkBlockReconciled(ctx, recOrphan, time.Time{}, time.Now())
+	hs.beforeGetBUMP = func() { _ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now()) }
+
+	r := newTestReconciler(hs, pub, stub, nil)
+	withReprocess(r, reprocess)
+	if !r.fullScan(ctx) {
+		t.Fatal("a repair handed to the pending set must not leave the scan incomplete")
+	}
+	assertActive := func(when string) {
+		t.Helper()
+		bp, err := base.GetBlockProcessingStatus(ctx, recOrphan)
+		if err != nil || bp.Status != models.BlockStatusActive || bp.OrphanedAt != nil || bp.ReconciledAt != nil {
+			t.Fatalf("%s: the canonical row must stay active and clean, got %+v err=%v", when, bp, err)
+		}
+	}
+	assertActive("after the scan")
+	if _, held := r.pendingRemine[recOrphan]; !held {
+		t.Fatalf("the block must be held pending, got %v", r.pendingRemine)
+	}
+	if got := reprocess.requested(); len(got) != 1 || got[0] != recOrphan {
+		t.Fatalf("a rebuild must be requested when the block is held, got %v", got)
+	}
+
+	// The drain keeps asking, under the defer cap, without touching the row.
+	r.tick(ctx)
+	assertActive("after a drain on the corrupt BUMP")
+	if got := reprocess.requested(); len(got) != 2 {
+		t.Fatalf("the drain must ask for the rebuild again, got %v", got)
+	}
+	if _, held := r.pendingRemine[recOrphan]; !held {
+		t.Fatal("the block must stay pending while the BUMP is corrupt")
+	}
+
+	// The rebuild lands: the drain re-mines directly.
+	_ = base.InsertBUMP(ctx, recOrphan, 10, makeCompoundForTest(t, 10, recShared1))
+	r.tick(ctx)
+	assertActive("after the heal")
+	if _, held := r.pendingRemine[recOrphan]; held {
+		t.Fatalf("the pending set must drain once the block heals, got %v", r.pendingRemine)
+	}
+	if got := statusOf(t, base, recShared1); got.Status != models.StatusMined || got.BlockHash != recOrphan {
+		t.Fatalf("the rebuilt BUMP must re-mine the tx, got %s@%s", got.Status, got.BlockHash)
+	}
+	if _, deferred := r.defers[recOrphan]; deferred {
+		t.Fatal("a healed block must clear its rebuild-request count")
+	}
+}
+
+// TestReconciler_PendingRemineMalformedGivesUpAtDeferCap: a pending block
+// whose BUMP stays corrupt is asked to be rebuilt once per tick under the
+// same cap the tick's deferral uses, then dropped — loudly, the row still
+// active — rather than requested without bound from memory forever.
+func TestReconciler_PendingRemineMalformedGivesUpAtDeferCap(t *testing.T) {
+	ctx := context.Background()
+	base := newPebbleForTest(t)
+	hs := &hookedStore{Store: base}
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	reprocess := newReprocessStub(t)
+	stub.setHeightHeader(10, headerWithHash(t, recOrphan, 10))
+	seedSeen(t, base, recShared1)
+	_ = base.InsertBUMP(ctx, recOrphan, 10, malformedBUMP)
+	_ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+	_, _ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	_, _ = base.MarkBlockReconciled(ctx, recOrphan, time.Time{}, time.Now())
+	hs.beforeGetBUMP = func() { _ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now()) }
+
+	r := newTestReconciler(hs, pub, stub, func(c *config.ReconcilerConfig) { c.MaxDeferAttempts = 2 })
+	withReprocess(r, reprocess)
+	_ = r.fullScan(ctx)
+	if _, held := r.pendingRemine[recOrphan]; !held {
+		t.Fatal("premise: the block is pending")
+	}
+	for i := 1; i <= 2; i++ {
+		r.tick(ctx)
+		if _, held := r.pendingRemine[recOrphan]; !held {
+			t.Fatalf("drain %d: the block must stay pending under the cap", i)
+		}
+	}
+	r.tick(ctx) // at the cap
+	if _, held := r.pendingRemine[recOrphan]; held {
+		t.Fatalf("at the cap the block must be dropped from the pending set, got %v", r.pendingRemine)
+	}
+	if _, deferred := r.defers[recOrphan]; deferred {
+		t.Fatal("the rebuild-request count must be cleared with the block")
+	}
+	// One request when held, then one per drain under the cap.
+	if got := len(reprocess.requested()); got != 3 {
+		t.Fatalf("rebuild requests = %d, want 3 (held + 2 drains)", got)
+	}
+	if bp, err := base.GetBlockProcessingStatus(ctx, recOrphan); err != nil || bp.Status != models.BlockStatusActive {
+		t.Fatalf("the canonical row must never have been re-orphaned, got %+v err=%v", bp, err)
 	}
 }
