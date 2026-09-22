@@ -602,6 +602,20 @@ var ReconcilerTxsParkedTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "Transactions left MINED against an orphan because no canonical BUMP was available (not reverted).",
 })
 
+// ReconcilerRemineRequeuedTotal counts canonical block rows the reconciler
+// re-orphaned in order to retry a re-mine that failed part-way AFTER the
+// block-status tracker had reactivated the row mid-pass (issue #339
+// review). The row was active and off the durable queue with only some of
+// its transactions re-mined, and the reconciler's queue — whose predicate
+// is status='orphaned' — is the only in-store path that retries; each count
+// is therefore a canonical block reading orphaned for up to one tick, until
+// the next pass re-mines it and reactivates it. Non-zero is worth a look:
+// it means SetMinedByTxIDs failed while a reorg was being healed.
+var ReconcilerRemineRequeuedTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "arcade_reconciler_remine_requeue_total",
+	Help: "Canonical block rows re-orphaned to retry a partial re-mine after a concurrent reactivation.",
+})
+
 // ReconcilerBlockDuration observes wall time per reconciled block.
 var ReconcilerBlockDuration = promauto.NewHistogram(prometheus.HistogramOpts{
 	Name:    "arcade_reconciler_block_duration_seconds",

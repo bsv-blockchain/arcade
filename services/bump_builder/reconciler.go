@@ -53,6 +53,19 @@ const defaultFullScanChaintracksReadyTimeout = 2 * time.Minute
 // only a rebuild (a BLOCK_PROCESSED redelivery via /reprocess) replaces it.
 var errMalformedBUMP = errors.New("stored compound BUMP is malformed")
 
+// reconcileBlock outcomes — the label values of ReconcilerBlocksTotal.
+const (
+	outcomeError       = "error"       // a store or header failure; the block stays queued and the next tick retries
+	outcomeDeferred    = "deferred"    // the canonical BUMP is not usable yet; waiting (and asking) for it, under the cap
+	outcomeResurrected = "resurrected" // the block is canonical again; re-mined and reactivated
+	outcomeStale       = "stale"       // the row changed generation mid-pass; nothing stamped or reactivated
+	outcomeParked      = "parked"      // canonical BUMP unavailable at the cap; stamped, txs left MINED@orphan
+	outcomeMixed       = "mixed"       // some txs re-anchored, some reverted
+	outcomeReanchored  = "reanchored"  // every affected tx re-anchored to a canonical block
+	outcomeReverted    = "reverted"    // every affected tx reverted to SEEN_ON_NETWORK
+	outcomeEmpty       = "empty"       // nothing was anchored to the orphan
+)
+
 // Reconciler heals the transactions of orphaned blocks (issue #279): for
 // every block_processing row with status='orphaned' and no reconciled_at,
 // it re-anchors the txs still MINED against the orphan to the active-chain
@@ -586,7 +599,7 @@ func (r *Reconciler) fullScanResurrect(ctx context.Context, set map[string]*mode
 	for hash, row := range set {
 		height := row.BlockHeight
 		logger := r.logger.With(logfields.BlockHash(hash), logfields.BlockHeight(height))
-		n, ok, remineErr := r.remineFromStoredBUMP(ctx, logger, hash, batchSize)
+		n, ok, remineErr := r.remineWithRetry(ctx, logger, hash, batchSize)
 		switch {
 		case errors.Is(remineErr, errMalformedBUMP):
 			// The block's own stored BUMP is corrupt. Retrying the scan
@@ -606,8 +619,25 @@ func (r *Reconciler) fullScanResurrect(ctx context.Context, set map[string]*mode
 				complete = false
 			}
 			continue
+		case remineErr != nil && ok:
+			// Failed part-way after the in-process retries, and the tracker
+			// may have reactivated the row while the batches ran — in which
+			// case a scan retry would no longer select it (active and
+			// canonical). Hand the remainder to a path that retries it
+			// whatever the row's state; see keepPartialRemineQueued. The
+			// repair then has an owner, so the scan is not incomplete for it
+			// unless that hand-off itself failed.
+			metrics.ReconcilerTxsReanchoredTotal.Add(float64(n))
+			logger.Error("startup full-scan: re-mine from the resurrected block's BUMP failed part-way; "+
+				"handing the remainder to the reconciler", zap.Int("txs_reanchored", n), zap.Error(remineErr))
+			if !r.keepPartialRemineQueued(ctx, logger, hash, row.OrphanGeneration()) {
+				complete = false
+			}
+			continue
 		case remineErr != nil:
-			logger.Error("startup full-scan: re-mine from the resurrected block's BUMP failed; "+
+			// Nothing was read, so nothing was written: the row is as the
+			// walk found it and the next scan retries.
+			logger.Error("startup full-scan: could not read the resurrected block's BUMP; "+
 				"leaving the row orphaned so the next full-scan retries", zap.Error(remineErr))
 			complete = false
 			continue
@@ -618,7 +648,13 @@ func (r *Reconciler) fullScanResurrect(ctx context.Context, set map[string]*mode
 		// repair would otherwise have this scan reactivate a row that is now
 		// genuinely orphaned AND clear the fresh orphan generation, taking
 		// it off the reconcile queue with nothing left to revisit it.
-		canonical, canonicalKnown := r.activeHashAt(ctx, height)
+		canonical, canonicalKnown, hdrErr := r.activeHashAt(ctx, height)
+		if hdrErr != nil {
+			logger.Warn("startup full-scan: chain-header lookup failed before the reactivation; "+
+				"leaving the row orphaned for the next scan", zap.Error(hdrErr))
+			complete = false
+			continue
+		}
 		if !canonicalKnown {
 			logger.Warn("startup full-scan: chain-header source can no longer judge the block's height; " +
 				"leaving the row orphaned for the next scan")
@@ -811,17 +847,42 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 
 	// Resolve the orphan's height — the row may be a height-0 placeholder
 	// created by MarkBlockProcessed before any header arrived; the stored
-	// BUMP knows the height.
+	// BUMP knows the height. Only a positively missing BUMP leaves the
+	// height unresolved: a transient read failure would otherwise make the
+	// canonical block unidentifiable below, and the pass would park the
+	// row — stamping it off the queue with its txs still anchored to the
+	// orphan — over a hiccup. The block stays queued instead.
 	height := row.BlockHeight
 	if height == 0 {
-		if h, _, err := r.store.GetBUMP(ctx, orphan); err == nil {
+		h, _, err := r.store.GetBUMP(ctx, orphan)
+		switch {
+		case err == nil:
 			height = h
+		case errors.Is(err, store.ErrNotFound):
+			// A placeholder with no BUMP either: nothing resolves its height.
+		default:
+			logger.Warn("failed to read the orphan's BUMP to resolve its height; leaving the block queued for retry",
+				zap.Error(err))
+			return outcomeError
 		}
 	}
 
 	batchSize := r.cfg.BumpBuilder.Reconciler.BatchSize
 	if batchSize <= 0 {
 		batchSize = maxTxIDsPerBulkEvent
+	}
+
+	// The active-chain block at O's height. A lookup FAILURE is not a
+	// judgement: with no canonical hash the pass below would find nothing
+	// to re-anchor to and park the row — stamped, off the queue, txs still
+	// anchored to the orphan — so the block stays queued and the next tick
+	// retries. Absence (chaintracks cannot serve the height) keeps the
+	// pre-existing fail-open path.
+	canonicalHash, canonicalKnown, hdrErr := r.activeHashAt(ctx, height)
+	if hdrErr != nil {
+		logger.Warn("chain-header lookup failed; leaving the block queued for retry",
+			logfields.BlockHeight(height), zap.Error(hdrErr))
+		return outcomeError
 	}
 
 	// Resurrection short-circuit: the block is the active-chain block at
@@ -833,7 +894,7 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 	// makes the heal independent of that row existing, and what makes a
 	// requeued row with a corrupt BUMP cycle through the deferral below
 	// rather than be reactivated with its txs never re-mined.
-	if hash, ok := r.activeHashAt(ctx, height); ok && hash == orphan {
+	if canonicalKnown && canonicalHash == orphan {
 		logger.Warn("orphan mark is stale — block is on the active chain; re-mining and resetting to active")
 		return r.resurrect(ctx, logger, orphan, height, orphanedAt, batchSize)
 	}
@@ -846,7 +907,6 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 	// defer (optionally poking merkle-service /reprocess) up to the cap.
 	reanchored := 0
 	canonicalReady := false
-	canonicalHash, canonicalKnown := r.activeHashAt(ctx, height)
 	if canonicalKnown {
 		n, bumpOK, remineErr := r.remineFromStoredBUMP(ctx, logger, canonicalHash, batchSize)
 		// n is added either way: rows this pass really did re-anchor are
@@ -873,7 +933,7 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 				zap.String("canonical_block_hash", canonicalHash),
 				zap.Int("txs_reanchored", reanchored),
 				zap.Error(remineErr))
-			return "error"
+			return outcomeError
 		default:
 			canonicalReady = bumpOK
 		}
@@ -881,7 +941,7 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 	if !canonicalReady && canonicalHash != "" {
 		if r.deferForCanonicalBUMP(ctx, logger, orphan, canonicalHash) {
 			metrics.ReconcilerTxsReanchoredTotal.Add(float64(reanchored))
-			return "deferred"
+			return outcomeDeferred
 		}
 	}
 
@@ -893,7 +953,7 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 	affected, err := r.store.GetTxIDsByBlockHash(ctx, orphan)
 	if err != nil {
 		logger.Warn("failed to read affected txids", zap.Error(err))
-		return "error"
+		return outcomeError
 	}
 	n, neighborErr := r.reanchorNeighborhood(ctx, logger, affected, height, batchSize)
 	reanchored += n
@@ -906,7 +966,7 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 		metrics.ReconcilerTxsReanchoredTotal.Add(float64(reanchored))
 		logger.Warn("neighborhood re-anchor failed; leaving the block queued for retry",
 			zap.Int("txs_reanchored", reanchored), zap.Error(neighborErr))
-		return "error"
+		return outcomeError
 	}
 
 	// Park vs revert for whatever is still anchored to O (issue #282). When
@@ -942,7 +1002,7 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 	r.publishReverted(ctx, logger, reverted)
 	if err != nil {
 		logger.Warn("failed to revert remaining txs", zap.Int("published", len(reverted)), zap.Error(err))
-		return "error"
+		return outcomeError
 	}
 
 	// Cleanup: STUMPs are per-subtree intermediates, safe to drop. The
@@ -955,7 +1015,7 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 	stamped, err := r.store.MarkBlockReconciled(ctx, orphan, orphanedAt, r.now())
 	if err != nil {
 		logger.Warn("failed to stamp reconciled_at", zap.Error(err))
-		return "error"
+		return outcomeError
 	}
 	delete(r.defers, orphan)
 	// Observe the tx work BEFORE the stale check: those writes landed
@@ -975,13 +1035,13 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 	)
 	switch {
 	case reanchored > 0 && len(reverted) > 0:
-		return "mixed"
+		return outcomeMixed
 	case reanchored > 0:
-		return "reanchored"
+		return outcomeReanchored
 	case len(reverted) > 0:
-		return "reverted"
+		return outcomeReverted
 	default:
-		return "empty"
+		return outcomeEmpty
 	}
 }
 
@@ -1008,23 +1068,35 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 //   - any other error (transient read, failed batch): "error", row queued,
 //     next tick retries.
 func (r *Reconciler) resurrect(ctx context.Context, logger *zap.Logger, orphan string, height uint64, orphanedAt time.Time, batchSize int) string {
-	n, ok, remineErr := r.remineFromStoredBUMP(ctx, logger, orphan, batchSize)
+	n, ok, remineErr := r.remineWithRetry(ctx, logger, orphan, batchSize)
 	switch {
 	case errors.Is(remineErr, errMalformedBUMP):
 		if r.deferForCanonicalBUMP(ctx, logger, orphan, orphan) {
 			logger.Error("resurrected block's stored BUMP is malformed; deferring the reactivation and "+
 				"requesting a rebuild so its txs are re-mined before the row returns to active",
 				zap.Error(remineErr))
-			return "deferred"
+			return outcomeDeferred
 		}
 		logger.Error("resurrected block's stored BUMP is still malformed at the defer cap; reactivating the row "+
 			"anyway so a canonical block is not left orphaned — its txs heal on a BLOCK_PROCESSED redelivery",
 			zap.Error(remineErr))
-	case remineErr != nil:
+	case remineErr != nil && ok:
+		// The BUMP was read and the re-mine failed part-way, after the
+		// in-process retries. Some txs are re-mined, the rest are not, and
+		// "the row is still ours and queued" is not a given: the tracker may
+		// have reactivated it while the batches were in flight. Hand the
+		// remainder to a path that WILL retry it, whatever the row's state.
 		metrics.ReconcilerTxsReanchoredTotal.Add(float64(n))
-		logger.Warn("re-mine from the resurrected block's BUMP failed; leaving the block queued for retry",
+		logger.Warn("re-mine from the resurrected block's BUMP failed part-way",
 			zap.Int("txs_reanchored", n), zap.Error(remineErr))
-		return "error"
+		r.keepPartialRemineQueued(ctx, logger, orphan, orphanedAt)
+		return outcomeError
+	case remineErr != nil:
+		// Nothing was read, so nothing was written: the row is exactly as
+		// dequeued and stays queued for the next tick.
+		logger.Warn("re-mine from the resurrected block's BUMP failed before any write; leaving the block queued for retry",
+			zap.Error(remineErr))
+		return outcomeError
 	case !ok:
 		logger.Warn("resurrected block has no stored compound BUMP; " +
 			"its txs heal through the competitor's orphan row or a BLOCK_PROCESSED redelivery")
@@ -1037,7 +1109,7 @@ func (r *Reconciler) resurrect(ctx context.Context, logger *zap.Logger, orphan s
 	applied, err := r.store.ReactivateBlock(ctx, orphan, height, orphanedAt)
 	if err != nil {
 		logger.Warn("failed to reset resurrected block", zap.Error(err))
-		return "error"
+		return outcomeError
 	}
 	if !applied {
 		return r.staleOutcome(logger, height)
@@ -1046,7 +1118,101 @@ func (r *Reconciler) resurrect(ctx context.Context, logger *zap.Logger, orphan s
 	metrics.BlockStatusTransitionsTotal.
 		WithLabelValues(metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceReconciler).
 		Inc()
-	return "resurrected"
+	return outcomeResurrected
+}
+
+// remineRetryAttempts bounds the in-process retries of a block's own re-mine
+// (the resurrection paths) after a batch fails part-way. Immediate retries
+// ride out a transient blip without a full tick of latency; anything longer
+// is handed to a durable path by keepPartialRemineQueued.
+const remineRetryAttempts = 3
+
+// remineRetryBackoff separates those attempts.
+const remineRetryBackoff = 50 * time.Millisecond
+
+// remineWithRetry is remineFromStoredBUMP with bounded in-process retries of
+// a re-mine that failed part-way (ok=true, err non-nil). It never retries a
+// read failure or a malformed BUMP — neither is helped by trying again
+// immediately — and stops on a cancelled context. The returned count sums
+// the rows every attempt landed.
+func (r *Reconciler) remineWithRetry(ctx context.Context, logger *zap.Logger, blockHash string, batchSize int) (int, bool, error) {
+	total := 0
+	for attempt := 1; ; attempt++ {
+		n, ok, err := r.remineFromStoredBUMP(ctx, logger, blockHash, batchSize)
+		total += n
+		if err == nil || !ok || errors.Is(err, errMalformedBUMP) || attempt >= remineRetryAttempts || ctx.Err() != nil {
+			return total, ok, err
+		}
+		logger.Warn("re-mine failed part-way; retrying in-process",
+			zap.Int("attempt", attempt), zap.Int("max_attempts", remineRetryAttempts), zap.Error(err))
+		select {
+		case <-ctx.Done():
+			return total, ok, err
+		case <-time.After(remineRetryBackoff):
+		}
+	}
+}
+
+// keepPartialRemineQueued makes sure a block whose own re-mine failed
+// part-way stays on a path that retries it, whatever happened to its row in
+// the meantime. Reports whether it is (false only on a store failure). The
+// generation the caller judged decides:
+//
+//   - still ours (RequeueOrphanedBlock applies): the row is orphaned at that
+//     generation and now unstamped — on the tick's durable queue, whose
+//     resurrection short-circuit re-mines it (idempotently) next pass.
+//   - re-orphaned with a newer generation: already queued for its own pass,
+//     which re-mines it. Nothing to do.
+//   - reactivated by the tracker mid-re-mine: the row is active and off the
+//     queue with only some of its txs re-mined. The tracker's reactivation
+//     leaves txs to the competitor's orphan row, which need not exist (a
+//     dropped tip header), and the watchdog will not re-drive a block that
+//     already has processed_at — so the reconciler's queue is the only
+//     in-store path that WILL retry, and its predicate is status='orphaned'.
+//     The row is re-orphaned with a fresh generation: the next tick's
+//     short-circuit re-mines the remainder and reactivates it, so the
+//     canonical block reads orphaned for at most one tick — longer only
+//     while the store keeps failing, when an un-healed projection is the
+//     honest state. Logged at Error and counted
+//     (ReconcilerRemineRequeuedTotal), and a /reprocess redelivery is
+//     requested as well — belt and braces, never the only path.
+//   - parked or gone: the watchdog owns it / nothing to requeue.
+func (r *Reconciler) keepPartialRemineQueued(ctx context.Context, logger *zap.Logger, hash string, orphanedAt time.Time) bool {
+	applied, err := r.store.RequeueOrphanedBlock(ctx, hash, orphanedAt)
+	if err != nil {
+		logger.Error("failed to keep the block queued after a partial re-mine", zap.Error(err))
+		return false
+	}
+	if applied {
+		return true // still the judged orphan, and on the queue
+	}
+	row, err := r.store.GetBlockProcessingStatus(ctx, hash)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		logger.Warn("block row vanished during a partial re-mine; nothing to requeue")
+		return true
+	case err != nil:
+		logger.Error("failed to read the block row after a partial re-mine", zap.Error(err))
+		return false
+	case row.Status == models.BlockStatusOrphaned:
+		logger.Info("block was orphaned again with a newer generation during the re-mine; that pass re-mines it")
+		return true
+	case row.Status != models.BlockStatusActive:
+		logger.Warn("block row is no longer active or orphaned; leaving it to its owner",
+			logfields.Status(string(row.Status)))
+		return true
+	}
+	logger.Error("the tracker reactivated the block while its re-mine was failing part-way; re-orphaning it so the " +
+		"reconciler retries the remaining txs next tick (the block reads orphaned until then)")
+	metrics.ReconcilerRemineRequeuedTotal.Inc()
+	r.requestRebuild(ctx, logger, hash)
+	transitions, err := r.store.MarkBlocksOrphaned(ctx, []string{hash}, r.now())
+	recordOrphanTransitions(metrics.BlockTransitionSourceReconciler, transitions)
+	if err != nil {
+		logger.Error("failed to re-orphan the block for the retry", zap.Error(err))
+		return false
+	}
+	return true
 }
 
 // parkBlock is the issue-#282 fallback for an orphan whose canonical BUMP is
@@ -1072,7 +1238,7 @@ func (r *Reconciler) parkBlock(ctx context.Context, logger *zap.Logger, orphan s
 	stamped, err := r.store.MarkBlockReconciled(ctx, orphan, orphanedAt, r.now())
 	if err != nil {
 		logger.Warn("failed to stamp reconciled_at on parked block", zap.Error(err))
-		return "error"
+		return outcomeError
 	}
 	delete(r.defers, orphan)
 	// As above: the re-anchors and the park already happened.
@@ -1090,7 +1256,7 @@ func (r *Reconciler) parkBlock(ctx context.Context, logger *zap.Logger, orphan s
 		zap.Int("txs_reanchored", reanchored),
 		zap.Int("txs_parked", parked),
 	)
-	return "parked"
+	return outcomeParked
 }
 
 // staleOutcome is returned when the reconciled_at CAS found a different
@@ -1103,22 +1269,29 @@ func (r *Reconciler) parkBlock(ctx context.Context, logger *zap.Logger, orphan s
 func (r *Reconciler) staleOutcome(logger *zap.Logger, height uint64) string {
 	logger.Warn("stale reconcile: block row changed generation while reconciling (reactivated or re-orphaned); not stamping",
 		logfields.BlockHeight(height))
-	return "stale"
+	return outcomeStale
 }
 
-// activeHashAt resolves the active-chain block hash at height. ok=false
-// means the chain-header source cannot judge that height (unknown, above
-// the tip, or out of range) — callers fail open, never treating absence of
-// evidence as evidence.
-func (r *Reconciler) activeHashAt(ctx context.Context, height uint64) (string, bool) {
+// activeHashAt resolves the active-chain block hash at height. Tri-state:
+// found=false with a nil error means the chain-header source positively
+// cannot judge that height (unknown, above the tip, or out of range) —
+// callers fail open, never treating absence of evidence as evidence; a
+// non-nil error means the lookup FAILED, which is not a judgement either
+// way, and callers must keep their row for a retry rather than act on it.
+// Collapsing the two made a transient header read look like the end of the
+// chain (issue #339 review).
+func (r *Reconciler) activeHashAt(ctx context.Context, height uint64) (hash string, found bool, err error) {
 	if height == 0 || height > math.MaxUint32 {
-		return "", false
+		return "", false, nil
 	}
 	active, err := r.chainHeader.GetHeaderByHeight(ctx, uint32(height))
-	if err != nil || active == nil {
-		return "", false
+	if err != nil {
+		return "", false, fmt.Errorf("look up the active block at height %d: %w", height, err)
 	}
-	return active.Hash.String(), true
+	if active == nil {
+		return "", false, nil
+	}
+	return active.Hash.String(), true, nil
 }
 
 // deferForCanonicalBUMP handles the canonical-BUMP-missing branch: while
@@ -1183,8 +1356,15 @@ func (r *Reconciler) reanchorNeighborhood(ctx context.Context, logger *zap.Logge
 	}
 	reanchored := 0
 	for h := height + 1; h <= height+uint64(depth) && len(affected) > 0; h++ {
-		neighbor, known := r.activeHashAt(ctx, h)
-		if !known {
+		neighbor, found, hdrErr := r.activeHashAt(ctx, h)
+		if hdrErr != nil {
+			// A failed lookup at an intermediate height is not the end of
+			// the chain: a later neighbor's BUMP may prove the remaining txs
+			// mined, and the caller's revert would un-mine them. Leave the
+			// block queued instead.
+			return reanchored, hdrErr
+		}
+		if !found {
 			break // above the tip — nothing further to check
 		}
 		_, bumpBytes, bumpErr := r.store.GetBUMP(ctx, neighbor)
