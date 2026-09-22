@@ -47,6 +47,12 @@ const maxStartupFullScanAttempts = 5
 // slower resync self-heals through the tick loop instead.
 const defaultFullScanChaintracksReadyTimeout = 2 * time.Minute
 
+// errMalformedBUMP marks a stored compound BUMP that does not parse. It is
+// distinct from store.ErrNotFound (nothing stored) and from a transient read
+// failure: the blob exists and is corrupt, so it will not fix itself, and
+// only a rebuild (a BLOCK_PROCESSED redelivery via /reprocess) replaces it.
+var errMalformedBUMP = errors.New("stored compound BUMP is malformed")
+
 // Reconciler heals the transactions of orphaned blocks (issue #279): for
 // every block_processing row with status='orphaned' and no reconciled_at,
 // it re-anchors the txs still MINED against the orphan to the active-chain
@@ -94,6 +100,11 @@ type Reconciler struct {
 	// one-shot is retired at maxStartupFullScanAttempts. Touched only from
 	// the reconcile goroutine, like startupScanDone.
 	startupScanAttempts int
+
+	// leaseTTLOverride replaces the derived lease TTL (3× the tick interval,
+	// floored at a minute). Tests only — it makes the renewal heartbeat run
+	// at an observable cadence.
+	leaseTTLOverride time.Duration
 
 	now    func() time.Time
 	cancel context.CancelFunc
@@ -171,7 +182,10 @@ func (r *Reconciler) Start(ctx context.Context) error {
 			r.logger.Info("startup full-scan: lease lost while waiting for the chain-header source; " +
 				"deferring to a later tick")
 		default:
-			r.runStartupFullScan(ctx)
+			// The scan can outlive the lease TTL by minutes; see holdLease.
+			leaseCtx, release := r.holdLease(ctx)
+			r.runStartupFullScan(leaseCtx)
+			release()
 		}
 	}
 	r.tick(ctx)
@@ -202,18 +216,28 @@ func (r *Reconciler) Stop() error {
 	return nil
 }
 
-// acquireLease reports whether this replica currently leads. A nil leaser
-// means single-replica mode (always lead); lease errors skip the tick.
-func (r *Reconciler) acquireLease(ctx context.Context) bool {
-	if r.leaser == nil {
-		return true
+// leaseTTL is how long one TryAcquireOrRenew holds the reconciler lease: 3×
+// the tick interval, floored at a minute, so a lease survives two missed
+// ticks before another replica may take it.
+func (r *Reconciler) leaseTTL() time.Duration {
+	if r.leaseTTLOverride > 0 {
+		return r.leaseTTLOverride
 	}
 	interval := time.Duration(r.cfg.BumpBuilder.Reconciler.IntervalMs) * time.Millisecond
 	ttl := 3 * interval
 	if ttl < time.Minute {
 		ttl = time.Minute
 	}
-	heldUntil, err := r.leaser.TryAcquireOrRenew(ctx, ReconcilerLeaseName, r.holderID, ttl)
+	return ttl
+}
+
+// acquireLease reports whether this replica currently leads. A nil leaser
+// means single-replica mode (always lead); lease errors skip the tick.
+func (r *Reconciler) acquireLease(ctx context.Context) bool {
+	if r.leaser == nil {
+		return true
+	}
+	heldUntil, err := r.leaser.TryAcquireOrRenew(ctx, ReconcilerLeaseName, r.holderID, r.leaseTTL())
 	if err != nil {
 		r.logger.Warn("lease check failed, skipping tick", zap.Error(err))
 		return false
@@ -221,11 +245,77 @@ func (r *Reconciler) acquireLease(ctx context.Context) bool {
 	return !heldUntil.IsZero()
 }
 
+// holdLease keeps the reconciler lease renewed for as long as the returned
+// context lives, and cancels that context if the lease is lost. The caller
+// must already hold the lease (acquireLease just succeeded) and must call
+// the returned CancelFunc when its pass ends.
+//
+// The lease is acquired once per tick, but a pass can outlive the TTL by a
+// wide margin: the full-scan re-mines a large BUMP for minutes and a tick's
+// reconcileBlock does the same for a big canonical block, against a TTL of
+// 3× the tick interval (90 s by default). Without renewal another replica
+// acquires the lease mid-pass and runs the same work concurrently —
+// convergent, but it double-publishes MINED corrections and events (issue
+// #339 review). So a heartbeat renews at TTL/3, the cadence store.Leaser
+// documents, and cancels the pass when the lease is gone: when a renewal
+// reports another holder, or when renewals keep failing past the last
+// confirmed expiry (a single failed renewal inside a live TTL is retried,
+// not fatal). Cancellation makes the store calls in flight return ctx
+// errors, so the full-scan reports itself incomplete and stays armed and
+// the tick's block stays queued — for whichever replica now leads. A nil
+// leaser (single-replica mode) returns ctx unchanged.
+func (r *Reconciler) holdLease(ctx context.Context) (context.Context, context.CancelFunc) {
+	if r.leaser == nil {
+		return ctx, func() {}
+	}
+	ttl := r.leaseTTL()
+	leaseCtx, cancel := context.WithCancel(ctx)
+	go func() {
+		heldUntil := time.Now().Add(ttl)
+		ticker := time.NewTicker(ttl / 3)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-leaseCtx.Done():
+				return
+			case <-ticker.C:
+			}
+			until, err := r.leaser.TryAcquireOrRenew(leaseCtx, ReconcilerLeaseName, r.holderID, ttl)
+			if leaseCtx.Err() != nil {
+				return // the pass ended while the renewal was in flight
+			}
+			switch {
+			case err != nil && time.Now().Before(heldUntil):
+				r.logger.Warn("lease renewal failed; the pass continues until the last confirmed expiry",
+					zap.Time("held_until", heldUntil), zap.Error(err))
+				continue
+			case err != nil:
+				r.logger.Error("lease renewal kept failing past the lease expiry; abandoning the in-flight pass "+
+					"so it cannot overlap another replica's", zap.Error(err))
+			case until.IsZero():
+				r.logger.Warn("lease taken by another replica mid-pass; abandoning the in-flight pass")
+			default:
+				heldUntil = until
+				continue
+			}
+			cancel()
+			return
+		}
+	}()
+	return leaseCtx, cancel
+}
+
 // tick consumes one batch of the orphaned-block queue.
 func (r *Reconciler) tick(ctx context.Context) {
 	if ctx.Err() != nil || !r.acquireLease(ctx) {
 		return
 	}
+	// Everything below runs under the lease-scoped context: the heartbeat
+	// renews the lease for as long as the pass takes and cancels the pass if
+	// the lease is lost, so a long re-mine never runs alongside another
+	// replica's.
+	ctx, release := r.holdLease(ctx)
+	defer release()
 	// Self-heal the startup full-scan: if it was deferred because the embedded
 	// chaintracks was still resyncing from genesis at process start (its
 	// storage is ephemeral, so every deploy wipes headers), run it now that the
@@ -235,6 +325,9 @@ func (r *Reconciler) tick(ctx context.Context) {
 	// steady-state ticks pay nothing.
 	if r.cfg.BumpBuilder.Reconciler.StartupFullScan && !r.startupScanDone && r.chaintracksReady(ctx) {
 		r.runStartupFullScan(ctx)
+		if ctx.Err() != nil {
+			return // the lease was lost (or the process is stopping) during the scan
+		}
 	}
 	blocksPerTick := r.cfg.BumpBuilder.Reconciler.BlocksPerTick
 	if blocksPerTick <= 0 {
@@ -267,6 +360,13 @@ func (r *Reconciler) tick(ctx context.Context) {
 func (r *Reconciler) runStartupFullScan(ctx context.Context) {
 	if r.fullScan(ctx) {
 		r.startupScanDone = true
+		return
+	}
+	if ctx.Err() != nil {
+		// Shutdown, or the lease heartbeat abandoned the pass: not a failed
+		// attempt, so it does not count toward the cap. The one-shot stays
+		// armed for whichever replica leads next.
+		r.logger.Warn("startup full-scan: interrupted; leaving the one-shot armed", zap.Error(ctx.Err()))
 		return
 	}
 	r.startupScanAttempts++
@@ -423,10 +523,32 @@ func (r *Reconciler) fullScanResurrect(ctx context.Context, set map[string]uint6
 		// repair would otherwise have this scan reactivate a row that is now
 		// genuinely orphaned AND clear the fresh orphan generation, taking
 		// it off the reconcile queue with nothing left to revisit it.
-		if canonical, canonicalKnown := r.activeHashAt(ctx, height); !canonicalKnown || canonical != hash {
-			logger.Warn("startup full-scan: block is no longer the active-chain block at its height; " +
-				"leaving the row orphaned for the reconciler")
+		canonical, canonicalKnown := r.activeHashAt(ctx, height)
+		if !canonicalKnown {
+			logger.Warn("startup full-scan: chain-header source can no longer judge the block's height; " +
+				"leaving the row orphaned for the next scan")
 			complete = false
+			continue
+		}
+		if canonical != hash {
+			// The re-mine above may have anchored txs to a block that is now
+			// off-chain, and this row — stamped by its previous
+			// reconciliation — is off the tick's durable queue, so nothing
+			// would revisit them. Re-orphan it: a fresh generation with
+			// reconciled_at cleared puts it back on the queue, where the
+			// next tick re-anchors those txs to the new canonical block (or
+			// reverts them) through the ordinary reconcile path. Idempotent
+			// with the ReorgEvent the tracker records for the same flip, and
+			// it hands the repair off, so the scan is not incomplete for it
+			// unless the requeue write itself failed.
+			logger.Warn("startup full-scan: block lost its height to a competitor during the re-mine; "+
+				"requeueing it so the reconciler re-anchors its txs to the new canonical block",
+				zap.String("canonical_block_hash", canonical))
+			if _, err := r.store.MarkBlocksOrphaned(ctx, []string{hash}, r.now()); err != nil {
+				logger.Error("startup full-scan: failed to requeue the block; its txs stay MINED against "+
+					"an off-chain block until a ReorgEvent or the next scan revisits it", zap.Error(err))
+				complete = false
+			}
 			continue
 		}
 		if err := r.store.UpsertBlockHeaderSeen(ctx, hash, height, r.now()); err != nil {
@@ -630,7 +752,17 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 		// error/deferred returns below are the only paths that would
 		// otherwise drop them from the metric.
 		reanchored += n
-		if remineErr != nil {
+		switch {
+		case errors.Is(remineErr, errMalformedBUMP):
+			// A corrupt canonical BUMP proves nothing, exactly like a missing
+			// one, so fall through to the defer below: its /reprocess poke
+			// has merkle-service redeliver the block, which rebuilds and
+			// overwrites the BUMP — the one remedy for this state. Error
+			// rather than Info because, unlike a BUMP that is merely not
+			// stored yet, this does not fix itself.
+			logger.Error("stored canonical BUMP is malformed; deferring and requesting a rebuild",
+				zap.String("canonical_block_hash", canonicalHash), zap.Error(remineErr))
+		case remineErr != nil:
 			// A failed batch must not fall through to the revert below — that
 			// would un-mine txs that ARE in the canonical block — nor stamp
 			// the row. Leave it queued; the next tick retries.
@@ -640,8 +772,9 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 				zap.Int("txs_reanchored", reanchored),
 				zap.Error(remineErr))
 			return "error"
+		default:
+			canonicalReady = bumpOK
 		}
-		canonicalReady = bumpOK
 	}
 	if !canonicalReady && canonicalHash != "" {
 		if r.deferForCanonicalBUMP(ctx, logger, orphan, canonicalHash) {
@@ -879,12 +1012,23 @@ func (r *Reconciler) reanchorNeighborhood(ctx context.Context, logger *zap.Logge
 			break // above the tip — nothing further to check
 		}
 		_, bumpBytes, bumpErr := r.store.GetBUMP(ctx, neighbor)
-		if bumpErr != nil || len(bumpBytes) == 0 {
+		switch {
+		case bumpErr != nil && !errors.Is(bumpErr, store.ErrNotFound):
+			// Only a positively missing BUMP means "this neighbor can claim
+			// nothing". A read failure while the neighbor's BUMP IS stored
+			// would otherwise leave its txs in `affected`, where the caller's
+			// revert un-mines them and the stamp retires the block — the
+			// retry is lost with the row off the queue.
+			return reanchored, fmt.Errorf("read neighbor %s BUMP: %w", neighbor, bumpErr)
+		case bumpErr != nil || len(bumpBytes) == 0:
 			continue
 		}
 		idx, idxErr := bump.IndexCompound(bumpBytes)
 		if idxErr != nil {
-			continue
+			// Same for a stored BUMP that does not parse: it may well hold
+			// these txs, so nothing below may revert them. The block stays
+			// queued, loudly, until the neighbor's BUMP is rebuilt.
+			return reanchored, fmt.Errorf("%w: neighbor %s: %w", errMalformedBUMP, neighbor, idxErr)
 		}
 		contained := make([]string, 0, len(affected))
 		rest := make([]string, 0, len(affected))
@@ -922,11 +1066,13 @@ func (r *Reconciler) reanchorNeighborhood(ctx context.Context, logger *zap.Logge
 
 // remineFromStoredBUMP re-mines every level-0 txid of blockHash's stored
 // compound BUMP against it (onlyChanged — no duplicate events for rows
-// already anchored right). ok=false when no usable BUMP is stored — the
-// caller's defer signal.
+// already anchored right). ok=false when no BUMP is stored (store.ErrNotFound
+// or an empty blob) — the caller's defer signal.
 //
-// A non-nil error means the BUMP could not be READ reliably, or a store write
-// failed part-way. The caller must not treat the block as healed (no revert,
+// A non-nil error means the BUMP could not be READ reliably, is stored but
+// does not parse (wrapping errMalformedBUMP, so callers can tell corruption
+// from a transient failure), or a store write failed part-way. In every case
+// the caller must not treat the block as healed (no revert,
 // no reconciled_at stamp, no reactivation) so the work is retried. A partial
 // re-mine is the dangerous case, because it can look like success: the rows
 // it failed to write are provably IN this canonical BUMP and stay anchored to
@@ -954,9 +1100,13 @@ func (r *Reconciler) remineFromStoredBUMP(ctx context.Context, logger *zap.Logge
 	}
 	txids, parseErr := levelZeroTxidsFromBUMP(bumpBytes)
 	if parseErr != nil {
-		logger.Warn("stored canonical BUMP failed to parse",
-			zap.String("canonical_block_hash", blockHash), zap.Error(parseErr))
-		return 0, false, nil
+		// Not the ok=false "nothing stored" signal: a blob IS stored and it
+		// is corrupt. The full-scan must not read this as "no BUMP" and
+		// reactivate a row whose txs it never re-mined, and it does not
+		// fix itself the way a not-yet-built BUMP does. reconcileBlock
+		// recognises errMalformedBUMP and defers (its /reprocess poke is
+		// the rebuild); every other caller keeps the row for a retry.
+		return 0, false, fmt.Errorf("%w: %s: %w", errMalformedBUMP, blockHash, parseErr)
 	}
 	changed := 0
 	for start := 0; start < len(txids); start += batchSize {
