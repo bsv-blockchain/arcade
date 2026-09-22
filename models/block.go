@@ -54,7 +54,17 @@ type BlockProcessingStatus struct {
 	ProcessedAt  *time.Time                 `json:"processedAt,omitempty"`
 	BUMPBuiltAt  *time.Time                 `json:"bumpBuiltAt,omitempty"`
 	Status       BlockProcessingStatusValue `json:"status"`
-	OrphanedAt   *time.Time                 `json:"orphanedAt,omitempty"`
+	// OrphanedAt is the row's current orphan GENERATION: set while
+	// status='orphaned', nil otherwise. It is the token the store's
+	// generation-checked writes (MarkBlockReconciled, ReactivateBlock,
+	// RequeueOrphanedBlock) compare on, and it is minted by the store, not
+	// copied from the caller: every orphaning yields a generation strictly
+	// greater than any the row has had, so two orphanings can never share
+	// one (issue #339 review). Backends keep the last generation on the row
+	// through a reactivation as a high-water mark for that minting; it is
+	// historical there and is never surfaced — an active or parked row
+	// always reads nil here.
+	OrphanedAt *time.Time `json:"orphanedAt,omitempty"`
 	// ReconciledAt is stamped by the anchor reconciler once every
 	// transaction anchored to this orphaned block has been re-anchored to
 	// the canonical block or reverted (issue #279). NULL on active/parked
@@ -64,4 +74,17 @@ type BlockProcessingStatus struct {
 	// resurrected by a later reorg (UpsertBlockHeaderSeen conflict path)
 	// so a re-orphaning reconciles again.
 	ReconciledAt *time.Time `json:"reconciledAt,omitempty"`
+}
+
+// OrphanGeneration is the orphan generation this row was read with — the
+// token the store's generation-checked writes (MarkBlockReconciled,
+// ReactivateBlock, RequeueOrphanedBlock) compare against — or zero for an
+// orphaned row that never recorded one, which those writes treat as "check
+// status only". Tokens come from here, never from a caller's own
+// timestamp: the store mints the stored generation.
+func (b *BlockProcessingStatus) OrphanGeneration() time.Time {
+	if b == nil || b.OrphanedAt == nil {
+		return time.Time{}
+	}
+	return *b.OrphanedAt
 }

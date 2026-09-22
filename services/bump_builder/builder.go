@@ -36,9 +36,24 @@ import (
 // failing the build outright on a transient chaintracks race.
 type ChainHeaderReader interface {
 	GetHeaderByHash(ctx context.Context, hash *chainhash.Hash) (*chaintrackslib.BlockHeader, error)
-	// GetHeaderByHeight returns the ACTIVE-chain header at height. A
-	// (nil, nil) or error return means "chaintracks cannot judge this
-	// height yet" — callers must fail open, never treat it as evidence.
+	// GetHeaderByHeight returns the ACTIVE-chain header at height. Two
+	// distinct non-answers, and callers must tell them apart:
+	//
+	//   - ABSENCE: (nil, nil), or an error that errors.Is
+	//     chaintrackslib.ErrHeaderNotFound — the source positively has no
+	//     header at this height (above its tip, or a height it does not
+	//     index). go-chaintracks' ChainManager returns the sentinel for
+	//     every height at or beyond its tip, so for a walk upward from a
+	//     block this is the ordinary end of the chain. Never evidence of
+	//     anything: the anchor guard fails open on it, the reconciler
+	//     treats it as "nothing more to check" and carries on.
+	//   - FAILURE: any other error — the lookup itself did not work. Not a
+	//     judgement either way; the anchor guard fails open, but the
+	//     reconciler must keep its block queued for a retry rather than
+	//     act on the missing answer (it reverts, parks or reactivates on
+	//     what it learns here, and a transient failure must not drive
+	//     those). The reconciler classifies both at one place, activeHashAt.
+	//
 	// Unlike GetHeaderByHash, which also resolves same-height alternates
 	// from the header index, this is a main-chain-membership source: the
 	// anchor guard and the reorg reconciler both compare a block hash
@@ -88,6 +103,7 @@ func New(
 	// a first-occurrence build failure must not be swallowed by increase().
 	metrics.PreRegisterStatusTransitions(models.StatusMined)
 	metrics.PreRegisterBumpOutcomes()
+	metrics.PreRegisterBlockStatusTransitions()
 	return &Builder{
 		cfg:         cfg,
 		logger:      logger.Named("bump-builder"),
@@ -280,7 +296,7 @@ func (b *Builder) handleAnchorDenied(ctx context.Context, logger *zap.Logger, bl
 	// never-tip block has no chaintracks header-seen row), so the orphan
 	// mark below always has a row to land on.
 	b.markBlockProcessed(ctx, logger, blockHash, blockHeight)
-	if err := b.store.MarkBlocksOrphaned(ctx, []string{blockHash}, time.Now()); err != nil {
+	if _, err := b.store.MarkBlocksOrphaned(ctx, []string{blockHash}, time.Now()); err != nil {
 		logger.Warn("anchor guard: failed to mark block orphaned; reconciler full-scan will catch it", zap.Error(err))
 	}
 	if err := b.store.DeleteStumpsByBlockHash(ctx, blockHash); err != nil {
@@ -295,8 +311,13 @@ func (b *Builder) handleAnchorDenied(ctx context.Context, logger *zap.Logger, bl
 // regresses and returns a status with BlockHeight == 0, the publish path
 // repairs it from the compound BUMP's height before fanning out so a
 // half-applied revert can never reintroduce the original bug.
-func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, blockHash string, blockHeight uint64, txids []string) {
-	setMinedAndPublish(ctx, logger, b.store, b.publisher, blockHash, blockHeight, txids, "", false)
+//
+// It reports whether the store write completed in full: false means some of
+// the txids are still SEEN_* and the block must stay un-stamped so the
+// watchdog re-drives it.
+func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, blockHash string, blockHeight uint64, txids []string) bool {
+	_, err := setMinedAndPublish(ctx, logger, b.store, b.publisher, blockHash, blockHeight, txids, "", false)
+	return err == nil
 }
 
 // setMinedAndPublish is the shared "mark MINED + fan out" core behind the
@@ -318,11 +339,32 @@ func setMinedAndPublish(
 	txids []string,
 	extraInfo string,
 	onlyChanged bool,
-) (changed int) {
+) (int, error) {
+	// Every backend returns the rows it DID anchor alongside the error —
+	// Aerospike per chunk, Pebble and MongoDB per row — and those rows are
+	// MINED in the store from that moment. They have left the set a retry
+	// would re-derive, so if their MINED event is not published here it is
+	// never published and subscribers keep them at SEEN_* forever. So log
+	// the failure and carry on with whatever landed.
+	//
+	// The rows that did NOT land are the caller's problem, which is why the
+	// error is still returned rather than swallowed: on the build path they
+	// stay SEEN_* and only a re-drive of the block can move them, so the
+	// caller must withhold the processed_at stamp that would retire the
+	// block from the watchdog's stale scan; on the reconciler's paths the
+	// orphan must stay queued rather than be reverted or stamped. The
+	// returned count is the rows that landed AND were fanned out.
 	prevs, mined, err := st.SetMinedByTxIDs(ctx, blockHash, blockHeight, txids)
 	if err != nil {
-		logger.Error("failed to set mined status", zap.Error(err))
-		return 0
+		logger.Error(
+			"failed to set mined status; publishing the rows that were anchored before the failure",
+			zap.Int("anchored", len(mined)),
+			zap.Int("requested", len(txids)),
+			zap.Error(err),
+		)
+		if len(mined) == 0 {
+			return 0, err
+		}
 	}
 	// onlyChanged: keep only actual anchor transitions. prevs and mined are
 	// parallel slices per the SetMinedByTxIDs contract.
@@ -341,7 +383,7 @@ func setMinedAndPublish(
 		}
 		prevs, mined = filteredPrevs, filteredMined
 		if len(mined) == 0 {
-			return 0
+			return 0, err
 		}
 	}
 
@@ -399,7 +441,7 @@ func setMinedAndPublish(
 	})
 
 	if len(mined) == 0 || publisher == nil {
-		return len(mined)
+		return len(mined), err
 	}
 	// Coalesce the N-per-block MINED fan-out into bulk events. Without this, a
 	// single BUMP build for a 14k-tx block produced 14k individual publish
@@ -452,7 +494,7 @@ func setMinedAndPublish(
 			)
 		}
 	}
-	return len(mined)
+	return len(mined), err
 }
 
 // maxTxIDsPerBulkEvent caps how many txids ride in a single bulk MINED event.
@@ -727,13 +769,6 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 		logger.Warn("failed to record bump_built status", zap.Error(err))
 	}
 
-	// Finalize: the BUMP is built and validated and every expected STUMP was
-	// present, so stamp processed_at. This (not the HTTP handler) is now the
-	// sole owner of the stamp — see handleBlockProcessed. A soft failure here is
-	// self-healing: processed_at stays NULL, the watchdog re-drives the block,
-	// and tryShortCircuit re-stamps it on the redelivered BLOCK_PROCESSED.
-	b.markBlockProcessed(ctx, logger, blockHash, blockHeight)
-
 	// 6. Set tracked transactions to MINED — unless the anchor guard has
 	// positive evidence the block lost its height to a same-height
 	// competitor (issue #279). The BUMP built above stays stored either
@@ -757,11 +792,38 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 		b.handleAnchorDenied(ctx, logger, blockHash, blockHeight, "build")
 		return nil
 	}
+	minedComplete := true
 	if len(txids) > 0 {
-		b.markMinedAndPublish(ctx, logger, blockHash, blockHeight, txids)
+		minedComplete = b.markMinedAndPublish(ctx, logger, blockHash, blockHeight, txids)
 	}
 
-	// 7. Prune STUMPs
+	// 7. Finalize: the BUMP is built and validated, every expected STUMP was
+	// present, and every tracked tx is MINED — so stamp processed_at. This
+	// (not the HTTP handler) is now the sole owner of the stamp — see
+	// handleBlockProcessed. A soft failure here is self-healing: processed_at
+	// stays NULL, the watchdog re-drives the block, and tryShortCircuit
+	// re-stamps it on the redelivered BLOCK_PROCESSED.
+	//
+	// The stamp runs AFTER the mine, and only when the mine landed in full,
+	// because processed_at is the only thing keeping this block in the
+	// watchdog's stale scan. A partial SetMinedByTxIDs leaves the rows it did
+	// not write at SEEN_* with nothing else to re-drive them: the block has a
+	// stored BUMP, so no rebuild is triggered, and no other queue holds those
+	// txids. Withholding the stamp is the retry signal — the watchdog re-fires
+	// BLOCK_PROCESSED, tryShortCircuit re-mines the stored BUMP's full level-0
+	// set (idempotent: rows already MINED here are a no-op), and stamps.
+	if minedComplete {
+		b.markBlockProcessed(ctx, logger, blockHash, blockHeight)
+	} else {
+		logger.Warn(
+			"leaving processed_at unstamped after a partial mine so the watchdog re-drives this block",
+			logfields.BlockHash(blockHash),
+			logfields.BlockHeight(blockHeight),
+			zap.Int("requested", len(txids)),
+		)
+	}
+
+	// 8. Prune STUMPs
 	if err := b.store.DeleteStumpsByBlockHash(ctx, blockHash); err != nil {
 		logger.Warn("failed to clean up STUMPs", zap.Error(err))
 	}
@@ -1063,8 +1125,9 @@ func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, block
 		b.handleAnchorDenied(ctx, logger, blockHash, existingHeight, "short_circuit")
 		return true
 	}
+	minedComplete := true
 	if len(txids) > 0 {
-		b.markMinedAndPublish(ctx, logger, blockHash, existingHeight, txids)
+		minedComplete = b.markMinedAndPublish(ctx, logger, blockHash, existingHeight, txids)
 	}
 	// Stamp processed_at on the redelivery too. The typical short-circuit
 	// trigger IS the watchdog re-firing BLOCK_PROCESSED for a block whose BUMP
@@ -1073,7 +1136,20 @@ func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, block
 	// Without re-stamping here that block would loop in the watchdog forever,
 	// since the stale query keys on processed_at IS NULL and a built block can
 	// never be re-detected as incomplete.
-	b.markBlockProcessed(ctx, logger, blockHash, existingHeight)
+	//
+	// A partial mine withholds the stamp for the same reason the build path
+	// does: this IS the recovery path, so retiring the block from the stale
+	// scan while some of its txids are still SEEN_* would strand them.
+	if minedComplete {
+		b.markBlockProcessed(ctx, logger, blockHash, existingHeight)
+	} else {
+		logger.Warn(
+			"leaving processed_at unstamped after a partial short-circuit mine so the watchdog re-drives this block",
+			logfields.BlockHash(blockHash),
+			logfields.BlockHeight(existingHeight),
+			zap.Int("requested", len(txids)),
+		)
+	}
 	// STUMP rows for this block should already have been pruned at the end
 	// of the original build; ensure stragglers are cleared in case a STUMP
 	// arrived after pruning ran.

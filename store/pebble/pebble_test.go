@@ -890,7 +890,7 @@ func TestBlockProcessing_MarkOrphaned_AndResurrection(t *testing.T) {
 	if err := s.UpsertBlockHeaderSeen(ctx, hash, 400, t0); err != nil {
 		t.Fatalf("seen: %v", err)
 	}
-	if err := s.MarkBlocksOrphaned(ctx, []string{hash}, t0.Add(time.Minute)); err != nil {
+	if _, err := s.MarkBlocksOrphaned(ctx, []string{hash}, t0.Add(time.Minute)); err != nil {
 		t.Fatalf("orphan: %v", err)
 	}
 	got, _ := s.GetBlockProcessingStatus(ctx, hash)
@@ -917,7 +917,7 @@ func TestBlockProcessing_MarkOrphaned_AndResurrection(t *testing.T) {
 func TestBlockProcessing_MarkOrphaned_MissingRow_NoOp(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
-	if err := s.MarkBlocksOrphaned(ctx, []string{"never-seen"}, time.Now()); err != nil {
+	if _, err := s.MarkBlocksOrphaned(ctx, []string{"never-seen"}, time.Now()); err != nil {
 		t.Fatalf("orphan missing: %v", err)
 	}
 }
@@ -1015,7 +1015,7 @@ func TestBlockProcessing_GetActiveTipBlockHeight(t *testing.T) {
 	}
 
 	// Orphaning the highest row drops the tip to the next active row.
-	if oErr := s.MarkBlocksOrphaned(ctx, []string{"h200"}, t0); oErr != nil {
+	if _, oErr := s.MarkBlocksOrphaned(ctx, []string{"h200"}, t0); oErr != nil {
 		t.Fatal(oErr)
 	}
 	got, err = s.GetActiveTipBlockHeight(ctx)
@@ -1043,7 +1043,7 @@ func TestBlockProcessing_ListStale_FiltersAndOrders(t *testing.T) {
 	if err := s.UpsertBlockHeaderSeen(ctx, "orphaned", 410, baseSeen); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.MarkBlocksOrphaned(ctx, []string{"orphaned"}, baseSeen.Add(time.Minute)); err != nil {
+	if _, err := s.MarkBlocksOrphaned(ctx, []string{"orphaned"}, baseSeen.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.UpsertBlockHeaderSeen(ctx, "old", 100, baseSeen.Add(time.Minute)); err != nil {
@@ -1137,7 +1137,7 @@ func TestBlockProcessing_MarkParked_SkipsOrphanedAndMissing(t *testing.T) {
 	if err := s.UpsertBlockHeaderSeen(ctx, "reorged", 501, t0); err != nil {
 		t.Fatalf("seen: %v", err)
 	}
-	if err := s.MarkBlocksOrphaned(ctx, []string{"reorged"}, t0.Add(time.Minute)); err != nil {
+	if _, err := s.MarkBlocksOrphaned(ctx, []string{"reorged"}, t0.Add(time.Minute)); err != nil {
 		t.Fatalf("orphan: %v", err)
 	}
 	// Parking must not relabel an orphaned (off-chain) row, and a missing

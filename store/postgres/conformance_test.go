@@ -19,6 +19,15 @@ func TestIterateTrackerRows_Conformance(t *testing.T) {
 	})
 }
 
+// The generation-checked block_processing writes (issue #339): ReactivateBlock,
+// MarkBlocksOrphaned's applied-transition count, MarkBlockReconciled's CAS.
+func TestBlockStatus_Conformance(t *testing.T) {
+	storetest.RunBlockStatusSuite(t, func(t *testing.T) storetest.BlockStatusBackend {
+		t.Helper()
+		return newTestStore(t)
+	})
+}
+
 func TestIterateTrackerRows_NullBlockHeightKept(t *testing.T) {
 	// block_height is nullable (schema.sql). A MINED row with a NULL height
 	// must be kept at any cutoff — the COALESCE disjunct in the query is what

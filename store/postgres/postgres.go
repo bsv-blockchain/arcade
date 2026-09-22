@@ -1161,8 +1161,10 @@ VALUES ($1, $2, $3, 'active')
 ON CONFLICT (block_hash) DO UPDATE SET
     block_height  = EXCLUDED.block_height,
     status        = 'active',
-    orphaned_at   = NULL,
     reconciled_at = NULL`
+	// orphaned_at is deliberately not reset: it stays as the row's
+	// orphan-generation high-water mark, which MarkBlocksOrphaned mints
+	// above; scanBlockProcessing hides it on an active row.
 	_, err := s.pool.Exec(ctx, q, blockHash, int64(blockHeight), seenAt) //nolint:gosec // block height fits in int64
 	if err != nil {
 		return fmt.Errorf("upsert block header seen %s: %w", blockHash, err)
@@ -1196,30 +1198,139 @@ ON CONFLICT (block_hash) DO UPDATE SET
 	return nil
 }
 
-func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) error {
+func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) (int, error) {
 	if len(blockHashes) == 0 {
-		return nil
+		return 0, nil
 	}
+	// Two data-modifying CTEs over one snapshot, so still one round-trip.
+	// The transition count is the row count of the first: its WHERE
+	// excludes rows already orphaned, and under READ COMMITTED a row a
+	// concurrent writer orphans first is re-checked against its UPDATED
+	// version once that writer's lock is released (EvalPlanQual) and drops
+	// out — so two replicas racing on the same row report ONE transition
+	// between them. A FROM-list self-join reading the "previous" status
+	// cannot promise that: EvalPlanQual re-fetches only the target row while
+	// the joined copy keeps the snapshot's value, so both racers would have
+	// counted. The second CTE refreshes the generation and clears the stamp
+	// on rows that were already orphaned; the snapshot decides which CTE a
+	// row belongs to, so no row is updated twice in one statement.
+	//
+	// The refresh is forward-only-inclusive (orphaned_at <= $2): a stored
+	// generation NEWER than this call's is kept, stamp state and all, so a
+	// delayed call carrying an older timestamp cannot move the generation
+	// backwards and let a reconciler holding that older token pass its CAS.
+	// An EQUAL generation still refreshes and clears the stamp — the
+	// contract does not require a strictly increasing time. Both sides of
+	// the compare are microseconds: pgx encodes the $2 time.Time to
+	// timestamptz by truncating to µs, the same encoding the stored value
+	// went through, so a token read back from this table compares equal to
+	// itself and sub-µs bits on a fresh time.Now() cannot exclude it.
+	//
+	// Both arms MINT the generation: GREATEST($2, orphaned_at + 1 µs) is
+	// strictly above any generation the row has had — orphaned_at is kept
+	// through reactivation as the high-water mark — with the caller's
+	// timestamp as the lower bound, so two orphanings never share a
+	// generation even when callers reuse a timestamp. GREATEST ignores a
+	// NULL operand, so a row that never had one gets $2. One microsecond is
+	// the step timestamptz can represent, and pgx truncates $2 to it too.
 	const q = `
-UPDATE block_processing
-SET status = 'orphaned', orphaned_at = $2
-WHERE block_hash = ANY($1)`
-	_, err := s.pool.Exec(ctx, q, blockHashes, orphanedAt)
-	if err != nil {
-		return fmt.Errorf("mark blocks orphaned: %w", err)
+WITH transitioned AS (
+    UPDATE block_processing
+    SET status = 'orphaned',
+        orphaned_at = GREATEST($2::timestamptz, orphaned_at + interval '1 microsecond'),
+        reconciled_at = NULL
+    WHERE block_hash = ANY($1) AND status <> 'orphaned'
+    RETURNING 1
+), refreshed AS (
+    UPDATE block_processing
+    SET orphaned_at = GREATEST($2::timestamptz, orphaned_at + interval '1 microsecond'),
+        reconciled_at = NULL
+    WHERE block_hash = ANY($1) AND status = 'orphaned'
+      AND (orphaned_at IS NULL OR orphaned_at <= $2)
+)
+SELECT count(*) FROM transitioned`
+	var transitions int64
+	if err := s.pool.QueryRow(ctx, q, blockHashes, orphanedAt).Scan(&transitions); err != nil {
+		return 0, fmt.Errorf("mark blocks orphaned: %w", err)
 	}
-	return nil
+	return int(transitions), nil
 }
 
-// MarkBlockReconciled stamps reconciled_at on an orphaned block's row —
-// the anchor reconciler finished re-anchoring/reverting its transactions.
-// Missing rows are silently skipped.
-func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, at time.Time) error {
-	const q = `UPDATE block_processing SET reconciled_at = $2 WHERE block_hash = $1`
-	if _, err := s.pool.Exec(ctx, q, blockHash, at); err != nil {
-		return fmt.Errorf("mark block reconciled %s: %w", blockHash, err)
+// MarkBlockReconciled stamps reconciled_at on an orphaned block's row — the
+// anchor reconciler finished re-anchoring/reverting its transactions — as a
+// compare-and-set on the orphan generation: the row must still be orphaned
+// with the orphaned_at the caller observed (a zero orphanedAt checks status
+// only). Missing, resurrected and re-orphaned rows are silently skipped and
+// reported as not stamped (issue #339).
+func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, orphanedAt, at time.Time) (bool, error) {
+	const q = `
+UPDATE block_processing
+SET reconciled_at = $2
+WHERE block_hash = $1
+  AND status = 'orphaned'
+  AND ($3::timestamptz IS NULL OR orphaned_at = $3)`
+	var generation *time.Time
+	if !orphanedAt.IsZero() {
+		generation = &orphanedAt
 	}
-	return nil
+	tag, err := s.pool.Exec(ctx, q, blockHash, at, generation)
+	if err != nil {
+		return false, fmt.Errorf("mark block reconciled %s: %w", blockHash, err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// RequeueOrphanedBlock clears reconciled_at on a row that is still orphaned
+// with the generation the caller judged (a zero orphanedAt checks status
+// only), putting it back on the reconciler's queue without changing the
+// generation. Missing, active, parked and re-orphaned rows are left
+// untouched and reported as not applied; it never transitions a row. The
+// WHERE is re-checked against the row's current version under READ
+// COMMITTED, so the check and the write are one atomic step.
+func (s *Store) RequeueOrphanedBlock(ctx context.Context, blockHash string, orphanedAt time.Time) (bool, error) {
+	const q = `
+UPDATE block_processing
+SET reconciled_at = NULL
+WHERE block_hash = $1
+  AND status = 'orphaned'
+  AND ($2::timestamptz IS NULL OR orphaned_at = $2)`
+	var generation *time.Time
+	if !orphanedAt.IsZero() {
+		generation = &orphanedAt
+	}
+	tag, err := s.pool.Exec(ctx, q, blockHash, generation)
+	if err != nil {
+		return false, fmt.Errorf("requeue orphaned block %s: %w", blockHash, err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// ReactivateBlock returns an orphaned row to active as a compare-and-set on
+// the orphan generation (issue #339): the row must still be orphaned with the
+// orphaned_at the caller judged (a zero orphanedAt checks status only), so a
+// missing, active, parked or re-orphaned row is left untouched and reported
+// as not applied. block_height is overwritten as the header-seen upsert does;
+// the milestone timestamps are untouched. The WHERE is re-checked against the
+// row's current version under READ COMMITTED, so the check and the write are
+// one atomic step.
+func (s *Store) ReactivateBlock(ctx context.Context, blockHash string, blockHeight uint64, orphanedAt time.Time) (bool, error) {
+	// orphaned_at is kept as the high-water mark the next orphaning mints
+	// above; scanBlockProcessing hides it on an active row.
+	const q = `
+UPDATE block_processing
+SET status = 'active', block_height = $2, reconciled_at = NULL
+WHERE block_hash = $1
+  AND status = 'orphaned'
+  AND ($3::timestamptz IS NULL OR orphaned_at = $3)`
+	var generation *time.Time
+	if !orphanedAt.IsZero() {
+		generation = &orphanedAt
+	}
+	tag, err := s.pool.Exec(ctx, q, blockHash, int64(blockHeight), generation) //nolint:gosec // block height fits in int64
+	if err != nil {
+		return false, fmt.Errorf("reactivate block %s: %w", blockHash, err)
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
 // ListOrphanedBlocksToReconcile returns the reconciler's work queue:
@@ -1402,7 +1513,11 @@ func scanBlockProcessing(scan func(...any) error) (*models.BlockProcessingStatus
 	bp.ProcessedAt = processed
 	bp.BUMPBuiltAt = bumpBuilt
 	bp.Status = models.BlockProcessingStatusValue(statusVal)
-	bp.OrphanedAt = orphanedAt
+	// orphaned_at survives a reactivation as the generation high-water mark;
+	// it is current — and surfaced — only while the row is orphaned.
+	if bp.Status == models.BlockStatusOrphaned {
+		bp.OrphanedAt = orphanedAt
+	}
 	bp.ReconciledAt = reconciledAt
 	return &bp, nil
 }
