@@ -5,6 +5,7 @@ package mongodb
 import (
 	"context"
 	"errors"
+	"slices"
 	"sort"
 	"testing"
 	"time"
@@ -908,5 +909,76 @@ func TestMarkBlocksOrphaned_LegacyRowsFollowForwardOnlyRule(t *testing.T) {
 	}
 	if ok, err := s.MarkBlockReconciled(ctx, rowOlder, incoming, t0.Add(time.Hour)); err != nil || !ok {
 		t.Fatalf("the incoming token must stamp the upgraded row: ok=%v err=%v", ok, err)
+	}
+}
+
+// TestMarkBlocksOrphaned_PartialFailureLeavesCompletedChunksRefreshed: the
+// transition and the generation refresh run per chunk, in that order, before
+// the next chunk. A cancellation (or failure) after chunk 1 must leave chunk
+// 1 FULLY processed — its active row transitioned AND its already-orphaned,
+// stamped row refreshed back onto the queue — and later chunks untouched,
+// with the transition count that landed reported alongside the error. The
+// old all-transitions-then-all-refreshes order left the early chunks'
+// stamped rows off the queue although the reorg named them.
+func TestMarkBlocksOrphaned_PartialFailureLeavesCompletedChunksRefreshed(t *testing.T) {
+	s := newTestStore(t)
+	s.batchSize = 2 // chunk 1 = {a1 active, o1 orphaned+stamped}, chunk 2 = {a2, o2}
+	ctx := context.Background()
+	t0 := time.Unix(1700001300, 0).UTC()
+	older, incoming := t0.Add(time.Minute), t0.Add(2*time.Minute)
+	hashes := []string{"pc-a1", "pc-o1", "pc-a2", "pc-o2"}
+	for i, h := range hashes {
+		if err := s.UpsertBlockHeaderSeen(ctx, h, uint64(940+i), t0); err != nil {
+			t.Fatalf("seed %s: %v", h, err)
+		}
+	}
+	for _, h := range []string{"pc-o1", "pc-o2"} {
+		if n, err := s.MarkBlocksOrphaned(ctx, []string{h}, older); err != nil || n != 1 {
+			t.Fatalf("orphan %s: n=%d err=%v", h, n, err)
+		}
+		if ok, err := s.MarkBlockReconciled(ctx, h, older, older.Add(10*time.Second)); err != nil || !ok {
+			t.Fatalf("stamp %s: ok=%v err=%v", h, ok, err)
+		}
+	}
+	if rows, err := s.ListOrphanedBlocksToReconcile(ctx, 10); err != nil || len(rows) != 0 {
+		t.Fatalf("premise: both stamped rows are off the queue, got %v err=%v", hashesOf(rows), err)
+	}
+
+	// Err calls: 1 = before chunk 1, 2 = before chunk 2.
+	cctx := &errCalls{Context: ctx, n: 2}
+	n, err := s.MarkBlocksOrphaned(cctx, hashes, incoming)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if n != 1 {
+		t.Fatalf("transitions = %d, want 1 (chunk 1's active row)", n)
+	}
+
+	// Chunk 1: transitioned AND refreshed.
+	if got, _ := s.GetBlockProcessingStatus(ctx, "pc-a1"); got.Status != models.BlockStatusOrphaned || got.OrphanedAt == nil || !got.OrphanedAt.Equal(incoming) {
+		t.Fatalf("pc-a1: want orphaned at %v, got %+v", incoming, got)
+	}
+	got, _ := s.GetBlockProcessingStatus(ctx, "pc-o1")
+	if got.ReconciledAt != nil || got.OrphanedAt == nil || !got.OrphanedAt.Equal(incoming) {
+		t.Fatalf("pc-o1: the completed chunk's stamped row must be refreshed onto the queue, got orphanedAt=%v reconciledAt=%v",
+			got.OrphanedAt, got.ReconciledAt)
+	}
+	// Chunk 2: untouched.
+	if got, _ := s.GetBlockProcessingStatus(ctx, "pc-a2"); got.Status != models.BlockStatusActive {
+		t.Fatalf("pc-a2: must be untouched after the cancellation, got %s", got.Status)
+	}
+	got, _ = s.GetBlockProcessingStatus(ctx, "pc-o2")
+	if got.ReconciledAt == nil || got.OrphanedAt == nil || !got.OrphanedAt.Equal(older) {
+		t.Fatalf("pc-o2: must be untouched after the cancellation, got orphanedAt=%v reconciledAt=%v",
+			got.OrphanedAt, got.ReconciledAt)
+	}
+	rows, err := s.ListOrphanedBlocksToReconcile(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued := hashesOf(rows)
+	sort.Strings(queued)
+	if want := []string{"pc-a1", "pc-o1"}; !slices.Equal(queued, want) {
+		t.Fatalf("queue = %v, want exactly chunk 1's rows %v", queued, want)
 	}
 }

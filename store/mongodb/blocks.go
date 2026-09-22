@@ -106,11 +106,7 @@ func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, or
 		)),
 		kv(opUnset, doc(kv(fReconciledAt, ""))),
 	)
-	transitions, err := s.updateBlocksIn(ctx, blockHashes,
-		doc(kv(fStatus, doc(kv(opNe, string(models.BlockStatusOrphaned))))), update, "mark blocks orphaned")
-	if err != nil {
-		return int(transitions), err
-	}
+	transition := doc(kv(fStatus, doc(kv(opNe, string(models.BlockStatusOrphaned)))))
 	refresh := doc(
 		kv(fStatus, string(models.BlockStatusOrphaned)),
 		kv(opOr, bson.A{
@@ -128,10 +124,48 @@ func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, or
 			),
 		}),
 	)
-	if _, err := s.updateBlocksIn(ctx, blockHashes, refresh, update, "refresh orphaned generation"); err != nil {
-		return int(transitions), err
+	// Transition AND refresh per chunk, in that order, before the next chunk:
+	// a failure (or a cancelled context) part-way through the list then
+	// leaves every completed chunk fully processed. Running all transitions
+	// first and all refreshes after would, on a late failure, leave the
+	// already-orphaned rows of the EARLY chunks with their old reconciled_at
+	// — off the queue although this reorg named them — with no error
+	// attached to them. The transition count that landed is reported
+	// alongside the error, as the contract promises.
+	transitions := 0
+	for _, chunk := range chunks(dedupe(blockHashes), s.batchSize) {
+		// Re-checked per chunk: a caller whose context was cancelled
+		// mid-batch (the reconciler's lease heartbeat on lease loss) must
+		// not keep writing.
+		if err := ctx.Err(); err != nil {
+			return transitions, fmt.Errorf("mark blocks orphaned: %w", err)
+		}
+		n, err := s.updateChunk(ctx, chunk, transition, update)
+		if err != nil {
+			return transitions, fmt.Errorf("mark blocks orphaned: %w", err)
+		}
+		transitions += int(n)
+		if _, err := s.updateChunk(ctx, chunk, refresh, update); err != nil {
+			return transitions, fmt.Errorf("refresh orphaned generation: %w", err)
+		}
 	}
-	return int(transitions), nil
+	return transitions, nil
+}
+
+// updateChunk applies one update to the rows of one _id chunk that also
+// match extra, under the bulk-write deadline, and returns how many documents
+// it modified. queryCtx, not opCtx: a chunk is a bulk write whose cost
+// scales with its size, and op_timeout_ms is the point-operation budget.
+func (s *Store) updateChunk(ctx context.Context, chunk []string, extra, update bson.D) (int64, error) {
+	filter := doc(kv(fID, doc(kv(opIn, chunk))))
+	filter = append(filter, extra...)
+	qctx, cancel := s.queryCtx(ctx)
+	defer cancel()
+	res, err := s.blocks.UpdateMany(qctx, filter, update)
+	if err != nil {
+		return 0, err
+	}
+	return res.ModifiedCount, nil
 }
 
 // orphanGenerationFilter matches the orphan generation a caller read back:
@@ -169,15 +203,11 @@ func (s *Store) updateBlocksIn(ctx context.Context, blockHashes []string, extra,
 		if err := ctx.Err(); err != nil {
 			return modified, fmt.Errorf("%s: %w", what, err)
 		}
-		filter := doc(kv(fID, doc(kv(opIn, chunk))))
-		filter = append(filter, extra...)
-		qctx, cancel := s.queryCtx(ctx)
-		res, err := s.blocks.UpdateMany(qctx, filter, update)
-		cancel()
+		n, err := s.updateChunk(ctx, chunk, extra, update)
 		if err != nil {
 			return modified, fmt.Errorf("%s: %w", what, err)
 		}
-		modified += res.ModifiedCount
+		modified += n
 	}
 	return modified, nil
 }
