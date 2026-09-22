@@ -1176,7 +1176,8 @@ func TestReconciler_FullScanOrphanMetricCountsAppliedTransitions(t *testing.T) {
 	_, _ = st.MarkBlocksOrphaned(ctx, []string{recCanonical}, time.Now())
 
 	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
-		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceFullScan)
+		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceFullScan,
+	)
 	before := testutil.ToFloat64(counter)
 
 	r := newTestReconciler(st, pub, stub, func(c *config.ReconcilerConfig) {
@@ -1778,7 +1779,8 @@ func TestReconciler_FullScanReactivatedMetricCountsAppliedTransitions(t *testing
 	hs.beforeReactivate = func() { _ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now()) }
 
 	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
-		metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceFullScan)
+		metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceFullScan,
+	)
 	before := testutil.ToFloat64(counter)
 
 	r := newTestReconciler(hs, pub, stub, nil)
@@ -1821,7 +1823,8 @@ func TestReconciler_ShortCircuitReactivationIsGenerationChecked(t *testing.T) {
 	}
 
 	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
-		metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceReconciler)
+		metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceReconciler,
+	)
 	before := testutil.ToFloat64(counter)
 
 	// Re-orphaned with a newer generation right before the write.
@@ -2100,7 +2103,8 @@ func TestReconciler_FullScanOrphanMetricCountsPartialTransitionsOnError(t *testi
 	_ = base.UpsertBlockHeaderSeen(ctx, recCanonical, 10, time.Now())
 
 	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
-		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceFullScan)
+		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceFullScan,
+	)
 	before := testutil.ToFloat64(counter)
 
 	r := newTestReconciler(hs, pub, stub, nil)
@@ -2146,7 +2150,8 @@ func TestReconciler_ShortCircuitReminesFromStoredBUMP(t *testing.T) {
 	row := seedQueuedCanonical(t, st, stub, makeCompoundForTest(t, 10, recShared1))
 
 	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
-		metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceReconciler)
+		metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceReconciler,
+	)
 	before := testutil.ToFloat64(counter)
 
 	r := newTestReconciler(st, pub, stub, nil)
@@ -2184,7 +2189,8 @@ func TestReconciler_ShortCircuitMalformedBUMPDefersInsteadOfReactivating(t *test
 	row := seedQueuedCanonical(t, st, stub, malformedBUMP)
 
 	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
-		metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceReconciler)
+		metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceReconciler,
+	)
 	before := testutil.ToFloat64(counter)
 
 	r := newTestReconciler(st, pub, stub, nil)
@@ -2243,7 +2249,8 @@ func TestReconciler_ShortCircuitMalformedBUMPReactivatesAtDeferCap(t *testing.T)
 	row := seedQueuedCanonical(t, st, stub, malformedBUMP)
 
 	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
-		metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceReconciler)
+		metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceReconciler,
+	)
 	before := testutil.ToFloat64(counter)
 
 	r := newTestReconciler(st, pub, stub, func(c *config.ReconcilerConfig) { c.MaxDeferAttempts = 2 })
@@ -2349,7 +2356,8 @@ func TestReconciler_FullScanMalformedBUMPRequeuesForTick(t *testing.T) {
 // one and the lost-its-height one.
 func TestReconciler_FullScanRequeueNeverReorphansAReactivatedRow(t *testing.T) {
 	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
-		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceFullScan)
+		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceFullScan,
+	)
 
 	t.Run("MalformedBUMP", func(t *testing.T) {
 		ctx := context.Background()
@@ -2952,7 +2960,8 @@ func TestReconciler_PartialRemineRequeueCounterFollowsTheWrite(t *testing.T) {
 	}
 	requeued := testutil.ToFloat64(metrics.ReconcilerRemineRequeuedTotal)
 	orphaned := testutil.ToFloat64(metrics.BlockStatusTransitionsTotal.WithLabelValues(
-		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceReconciler))
+		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceReconciler,
+	))
 
 	r := newTestReconciler(hs, pub, stub, func(c *config.ReconcilerConfig) { c.BatchSize = 1 })
 	if outcome := r.reconcileBlock(ctx, row); outcome != outcomeError {
@@ -2962,7 +2971,8 @@ func TestReconciler_PartialRemineRequeueCounterFollowsTheWrite(t *testing.T) {
 		t.Fatalf("remine_requeue_total = %v, want 0 (every re-orphan write was refused)", got)
 	}
 	if got := testutil.ToFloat64(metrics.BlockStatusTransitionsTotal.WithLabelValues(
-		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceReconciler)) - orphaned; got != 0 {
+		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceReconciler,
+	)) - orphaned; got != 0 {
 		t.Fatalf("orphaned/reconciler = %v, want 0 (no transition landed)", got)
 	}
 	if _, held := r.pendingRemine[recOrphan]; !held {
@@ -2979,7 +2989,8 @@ func TestReconciler_PartialRemineRequeueCounterFollowsTheWrite(t *testing.T) {
 		t.Fatalf("remine_requeue_total = %v, want 1 (the one re-orphan that landed)", got)
 	}
 	if got := testutil.ToFloat64(metrics.BlockStatusTransitionsTotal.WithLabelValues(
-		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceReconciler)) - orphaned; got != 1 {
+		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceReconciler,
+	)) - orphaned; got != 1 {
 		t.Fatalf("orphaned/reconciler = %v, want 1", got)
 	}
 	if bp, err := base.GetBlockProcessingStatus(ctx, recOrphan); err != nil || bp.Status != models.BlockStatusOrphaned {
@@ -3107,7 +3118,8 @@ func TestReconciler_FullScanBUMPReadFailureAfterReactivationHoldsPending(t *test
 	requeued := testutil.ToFloat64(metrics.ReconcilerRemineRequeuedTotal)
 	failed := testutil.ToFloat64(metrics.ReconcilerRemineHandoffFailedTotal)
 	orphaned := testutil.ToFloat64(metrics.BlockStatusTransitionsTotal.WithLabelValues(
-		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceFullScan))
+		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceFullScan,
+	))
 
 	r := newTestReconciler(hs, pub, stub, nil)
 	withReprocess(r, reprocess)
@@ -3134,7 +3146,8 @@ func TestReconciler_FullScanBUMPReadFailureAfterReactivationHoldsPending(t *test
 		t.Fatalf("remine_handoff_failed_total = %v, want 0 (the hand-off succeeded, into the pending set)", got)
 	}
 	if got := testutil.ToFloat64(metrics.BlockStatusTransitionsTotal.WithLabelValues(
-		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceFullScan)) - orphaned; got != 0 {
+		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceFullScan,
+	)) - orphaned; got != 0 {
 		t.Fatalf("orphaned/full_scan = %v, want 0", got)
 	}
 	if got := statusOf(t, base, recShared1); got.Status != models.StatusSeenOnNetwork {
@@ -3328,7 +3341,8 @@ func TestReconciler_PendingRemineMalformedGivesUpAtDeferCap(t *testing.T) {
 // what the write reports.
 func TestReconciler_FullScanMarkOrphanedRechecksCanonicality(t *testing.T) {
 	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
-		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceFullScan)
+		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceFullScan,
+	)
 
 	t.Run("CandidateBecameCanonical", func(t *testing.T) {
 		ctx := context.Background()
