@@ -185,9 +185,24 @@ func TestPreRegisterBlockStatusTransitionsCreatesEveryPairAtZero(t *testing.T) {
 		{BlockTransitionOrphaned, BlockTransitionSourceReorgEvent},
 		{BlockTransitionOrphaned, BlockTransitionSourceTieScan},
 		{BlockTransitionOrphaned, BlockTransitionSourceFullScan},
+		// The reconciler re-orphans a canonical row the tracker reactivated
+		// while its re-mine was failing part-way (keepPartialRemineQueued).
+		{BlockTransitionOrphaned, BlockTransitionSourceReconciler},
 	} {
 		if _, ok := found[want]; !ok {
 			t.Errorf("emitted pair %v missing from the pre-registered set", want)
+		}
+	}
+	// Every transition × every source: the emitters' label constants are the
+	// whole label space, so a pair missing here would be born mid-incident.
+	for _, transition := range []string{BlockTransitionOrphaned, BlockTransitionReactivated} {
+		for _, source := range []string{
+			BlockTransitionSourceReorgEvent, BlockTransitionSourceTieScan,
+			BlockTransitionSourceFullScan, BlockTransitionSourceReconciler,
+		} {
+			if _, ok := found[[2]string{transition, source}]; !ok {
+				t.Errorf("pair {%s, %s} not pre-registered", transition, source)
+			}
 		}
 	}
 }

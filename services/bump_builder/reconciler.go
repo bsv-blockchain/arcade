@@ -119,6 +119,21 @@ type Reconciler struct {
 	// at an observable cadence.
 	leaseTTLOverride time.Duration
 
+	// pendingRemine holds canonical blocks (hash → height) whose own re-mine
+	// failed part-way AND whose durable hand-off (keepPartialRemineQueued)
+	// then failed too, after retries: the row is active and off every
+	// in-store queue with only some of its txs re-mined, and nothing in the
+	// store would revisit it. Each tick drains this set before the store
+	// queue — re-mining directly while the block is canonical, or landing
+	// the hand-off — until it is empty. In-memory only: it exists for the
+	// window in which the store is refusing single-row writes, and the
+	// moment the store recovers a tick either heals the block or hands it
+	// to the durable queue. It does not survive a restart; the /reprocess
+	// redelivery requested at hand-off time is the only cover then, and it
+	// is best-effort. Bounded by maxPendingRemines. Touched only from the
+	// reconcile goroutine, like defers.
+	pendingRemine map[string]uint64
+
 	now    func() time.Time
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -148,17 +163,18 @@ func NewReconciler(
 	}
 	host, _ := os.Hostname()
 	return &Reconciler{
-		cfg:         cfg,
-		logger:      logger.Named("anchor-reconciler"),
-		store:       st,
-		publisher:   publisher,
-		chainHeader: chainHeader,
-		merkle:      merkle,
-		leaser:      leaser,
-		holderID:    fmt.Sprintf("%s-%d", host, os.Getpid()),
-		defers:      make(map[string]int),
-		now:         time.Now,
-		done:        make(chan struct{}),
+		cfg:           cfg,
+		logger:        logger.Named("anchor-reconciler"),
+		store:         st,
+		publisher:     publisher,
+		chainHeader:   chainHeader,
+		merkle:        merkle,
+		leaser:        leaser,
+		holderID:      fmt.Sprintf("%s-%d", host, os.Getpid()),
+		defers:        make(map[string]int),
+		pendingRemine: make(map[string]uint64),
+		now:           time.Now,
+		done:          make(chan struct{}),
 	}
 }
 
@@ -364,6 +380,12 @@ func (r *Reconciler) tick(ctx context.Context) {
 		if ctx.Err() != nil {
 			return // the lease was lost (or the process is stopping) during the scan
 		}
+	}
+	// Blocks only this process remembers come first: nothing in the store
+	// will retry them, and they are canonical blocks with a partial tx set.
+	r.drainPendingRemines(ctx)
+	if ctx.Err() != nil {
+		return
 	}
 	blocksPerTick := r.cfg.BumpBuilder.Reconciler.BlocksPerTick
 	if blocksPerTick <= 0 {
@@ -631,6 +653,10 @@ func (r *Reconciler) fullScanResurrect(ctx context.Context, set map[string]*mode
 			logger.Error("startup full-scan: re-mine from the resurrected block's BUMP failed part-way; "+
 				"handing the remainder to the reconciler", zap.Int("txs_reanchored", n), zap.Error(remineErr))
 			if !r.keepPartialRemineQueued(ctx, logger, hash, row.OrphanGeneration()) {
+				// The store refused the hand-off too. The scan retries (it
+				// re-selects the row while it is still orphaned), and the
+				// pending set covers the case where it is not.
+				r.holdPendingRemine(ctx, logger, hash, height)
 				complete = false
 			}
 			continue
@@ -1089,7 +1115,12 @@ func (r *Reconciler) resurrect(ctx context.Context, logger *zap.Logger, orphan s
 		metrics.ReconcilerTxsReanchoredTotal.Add(float64(n))
 		logger.Warn("re-mine from the resurrected block's BUMP failed part-way",
 			zap.Int("txs_reanchored", n), zap.Error(remineErr))
-		r.keepPartialRemineQueued(ctx, logger, orphan, orphanedAt)
+		if !r.keepPartialRemineQueued(ctx, logger, orphan, orphanedAt) {
+			// The store refused the hand-off too: the row may be active and
+			// off every in-store queue. Remember it here so the next tick
+			// retries, regardless of what the store holds.
+			r.holdPendingRemine(ctx, logger, orphan, height)
+		}
 		return outcomeError
 	case remineErr != nil:
 		// Nothing was read, so nothing was written: the row is exactly as
@@ -1153,10 +1184,27 @@ func (r *Reconciler) remineWithRetry(ctx context.Context, logger *zap.Logger, bl
 	}
 }
 
+// handOffAttempts bounds the in-process retries of the single-row hand-off
+// writes in keepPartialRemineQueued; handOffBackoff separates them. A blip
+// is ridden out here; anything longer falls back to the pending set.
+const (
+	handOffAttempts = 3
+	handOffBackoff  = 50 * time.Millisecond
+)
+
+// maxPendingRemines bounds the in-memory pending set. It only grows while
+// the store is refusing single-row writes to blocks whose re-mine also
+// failed part-way — a store outage, in which the queue reads that feed the
+// tick fail too — so the bound is a safety net, not a working limit; a block
+// that does not fit is logged at Error and left to the /reprocess
+// redelivery requested for it.
+const maxPendingRemines = 256
+
 // keepPartialRemineQueued makes sure a block whose own re-mine failed
 // part-way stays on a path that retries it, whatever happened to its row in
-// the meantime. Reports whether it is (false only on a store failure). The
-// generation the caller judged decides:
+// the meantime. Reports whether it is: false means every hand-off write was
+// refused through handOffAttempts tries, and the caller must hold the block
+// in the pending set. The generation the caller judged decides:
 //
 //   - still ours (RequeueOrphanedBlock applies): the row is orphaned at that
 //     generation and now unstamped — on the tick's durable queue, whose
@@ -1174,45 +1222,161 @@ func (r *Reconciler) remineWithRetry(ctx context.Context, logger *zap.Logger, bl
 //     canonical block reads orphaned for at most one tick — longer only
 //     while the store keeps failing, when an un-healed projection is the
 //     honest state. Logged at Error and counted
-//     (ReconcilerRemineRequeuedTotal), and a /reprocess redelivery is
-//     requested as well — belt and braces, never the only path.
+//     (ReconcilerRemineRequeuedTotal, from the transition the write
+//     reports, so a refused write counts nothing), and a /reprocess
+//     redelivery is requested as well — belt and braces, never the only
+//     path.
 //   - parked or gone: the watchdog owns it / nothing to requeue.
 func (r *Reconciler) keepPartialRemineQueued(ctx context.Context, logger *zap.Logger, hash string, orphanedAt time.Time) bool {
+	for attempt := 1; ; attempt++ {
+		done, err := r.handOffPartialRemine(ctx, logger, hash, orphanedAt)
+		if err == nil {
+			return done
+		}
+		if attempt >= handOffAttempts || ctx.Err() != nil {
+			logger.Error("the durable hand-off of a partial re-mine failed through every retry",
+				zap.Int("attempts", attempt), zap.Error(err))
+			return false
+		}
+		logger.Warn("hand-off of a partial re-mine failed; retrying in-process",
+			zap.Int("attempt", attempt), zap.Int("max_attempts", handOffAttempts), zap.Error(err))
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(handOffBackoff):
+		}
+	}
+}
+
+// handOffPartialRemine is one attempt of keepPartialRemineQueued. done=true
+// means the block is on a path that retries it (or needs none); a non-nil
+// error means a store call was refused and the attempt should be repeated.
+func (r *Reconciler) handOffPartialRemine(ctx context.Context, logger *zap.Logger, hash string, orphanedAt time.Time) (bool, error) {
 	applied, err := r.store.RequeueOrphanedBlock(ctx, hash, orphanedAt)
 	if err != nil {
-		logger.Error("failed to keep the block queued after a partial re-mine", zap.Error(err))
-		return false
+		return false, fmt.Errorf("requeue: %w", err)
 	}
 	if applied {
-		return true // still the judged orphan, and on the queue
+		return true, nil // still the judged orphan, and on the queue
 	}
 	row, err := r.store.GetBlockProcessingStatus(ctx, hash)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		logger.Warn("block row vanished during a partial re-mine; nothing to requeue")
-		return true
+		return true, nil
 	case err != nil:
-		logger.Error("failed to read the block row after a partial re-mine", zap.Error(err))
-		return false
+		return false, fmt.Errorf("read row: %w", err)
 	case row.Status == models.BlockStatusOrphaned:
 		logger.Info("block was orphaned again with a newer generation during the re-mine; that pass re-mines it")
-		return true
+		return true, nil
 	case row.Status != models.BlockStatusActive:
 		logger.Warn("block row is no longer active or orphaned; leaving it to its owner",
 			logfields.Status(string(row.Status)))
-		return true
+		return true, nil
 	}
 	logger.Error("the tracker reactivated the block while its re-mine was failing part-way; re-orphaning it so the " +
 		"reconciler retries the remaining txs next tick (the block reads orphaned until then)")
-	metrics.ReconcilerRemineRequeuedTotal.Inc()
 	r.requestRebuild(ctx, logger, hash)
 	transitions, err := r.store.MarkBlocksOrphaned(ctx, []string{hash}, r.now())
+	// Counted from what the write reports — a transition that landed
+	// alongside an error included, a refused write not at all.
 	recordOrphanTransitions(metrics.BlockTransitionSourceReconciler, transitions)
+	metrics.ReconcilerRemineRequeuedTotal.Add(float64(transitions))
 	if err != nil {
-		logger.Error("failed to re-orphan the block for the retry", zap.Error(err))
-		return false
+		return false, fmt.Errorf("re-orphan: %w", err)
 	}
-	return true
+	return true, nil
+}
+
+// holdPendingRemine records a block whose partial re-mine could not be
+// handed to any in-store path, so the next tick retries it from memory
+// (drainPendingRemines). It also asks merkle-service to redeliver the block
+// right here — the hand-off may have been refused before it reached its own
+// request — because that redelivery (the builder re-mines the stored BUMP's
+// full level-0 set on it) is the only cover left if this process restarts
+// before the set drains; best-effort, never the only path while the process
+// lives. Logged at Error and counted; a full set drops the block, loudly,
+// leaving it to that redelivery alone.
+func (r *Reconciler) holdPendingRemine(ctx context.Context, logger *zap.Logger, hash string, height uint64) {
+	metrics.ReconcilerRemineHandoffFailedTotal.Inc()
+	r.requestRebuild(ctx, logger, hash)
+	if r.pendingRemine == nil {
+		r.pendingRemine = make(map[string]uint64)
+	}
+	if _, held := r.pendingRemine[hash]; !held && len(r.pendingRemine) >= maxPendingRemines {
+		logger.Error("partial re-mine could not be handed off and the in-memory pending set is full; "+
+			"the block's remaining txs depend on the BLOCK_PROCESSED redelivery requested for it",
+			zap.Int("pending", len(r.pendingRemine)))
+		return
+	}
+	r.pendingRemine[hash] = height
+	metrics.ReconcilerRemineHandoffPending.Set(float64(len(r.pendingRemine)))
+	logger.Error("partial re-mine could not be handed off to the store; holding the block in memory and "+
+		"retrying every tick until it heals or the hand-off lands (lost on restart — the requested "+
+		"BLOCK_PROCESSED redelivery is the only cover then)",
+		zap.Int("pending", len(r.pendingRemine)))
+}
+
+// drainPendingRemines retries every block in the pending set once per tick.
+// While the block is canonical its own BUMP is re-mined directly (the heal
+// itself, no detour through the queue); a failure after the in-process
+// retries goes through the durable hand-off again and, if that lands, the
+// queue owns the block. A block that is no longer canonical is left to the
+// tracker's orphaning and dropped once its row reads orphaned (that
+// generation is queued). A malformed BUMP is asked to be rebuilt and kept.
+// The set shrinks only when a block is healed or durably queued.
+func (r *Reconciler) drainPendingRemines(ctx context.Context) {
+	if len(r.pendingRemine) == 0 {
+		return
+	}
+	batchSize := r.cfg.BumpBuilder.Reconciler.BatchSize
+	if batchSize <= 0 {
+		batchSize = maxTxIDsPerBulkEvent
+	}
+	for hash, height := range r.pendingRemine {
+		if ctx.Err() != nil {
+			return
+		}
+		logger := r.logger.With(logfields.BlockHash(hash), logfields.BlockHeight(height))
+		canonical, found, hdrErr := r.activeHashAt(ctx, height)
+		switch {
+		case hdrErr != nil:
+			logger.Warn("pending re-mine: chain-header lookup failed; keeping the block for the next tick", zap.Error(hdrErr))
+			continue
+		case !found:
+			continue // cannot judge the height yet; keep it
+		case canonical != hash:
+			// Not canonical any more: the tracker's ReorgEvent / tie-scan
+			// orphan the row, and that generation is on the durable queue.
+			// Dropped once that has happened.
+			if row, err := r.store.GetBlockProcessingStatus(ctx, hash); err == nil && row.Status == models.BlockStatusOrphaned {
+				logger.Info("pending re-mine: block lost its height and its row is orphaned and queued; the queue owns it")
+				delete(r.pendingRemine, hash)
+			}
+			continue
+		}
+		n, ok, err := r.remineWithRetry(ctx, logger, hash, batchSize)
+		metrics.ReconcilerTxsReanchoredTotal.Add(float64(n))
+		switch {
+		case err == nil:
+			if ok {
+				logger.Info("pending re-mine: healed", zap.Int("txs_reanchored", n))
+			} else {
+				logger.Warn("pending re-mine: the block has no stored BUMP any more; nothing left to re-mine from")
+			}
+			delete(r.pendingRemine, hash)
+		case errors.Is(err, errMalformedBUMP):
+			logger.Error("pending re-mine: stored BUMP is malformed; requesting a rebuild and keeping the block", zap.Error(err))
+			r.requestRebuild(ctx, logger, hash)
+		default:
+			logger.Warn("pending re-mine: re-mine failed again", zap.Int("txs_reanchored", n), zap.Error(err))
+			if r.keepPartialRemineQueued(ctx, logger, hash, time.Time{}) {
+				logger.Info("pending re-mine: handed off to the durable queue")
+				delete(r.pendingRemine, hash)
+			}
+		}
+	}
+	metrics.ReconcilerRemineHandoffPending.Set(float64(len(r.pendingRemine)))
 }
 
 // parkBlock is the issue-#282 fallback for an orphan whose canonical BUMP is

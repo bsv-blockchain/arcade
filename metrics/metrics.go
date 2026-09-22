@@ -616,6 +616,27 @@ var ReconcilerRemineRequeuedTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "Canonical block rows re-orphaned to retry a partial re-mine after a concurrent reactivation.",
 })
 
+// ReconcilerRemineHandoffFailedTotal counts partial re-mines whose durable
+// hand-off (RequeueOrphanedBlock, or the re-orphan above) still failed after
+// the in-process retries. The block is then held in the reconciler's
+// in-memory pending set and retried on every tick until it heals or the
+// hand-off lands; that set does not survive a restart, so a non-zero count
+// during an outage is the signal to check ReconcilerRemineHandoffPending
+// before restarting the process.
+var ReconcilerRemineHandoffFailedTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "arcade_reconciler_remine_handoff_failed_total",
+	Help: "Partial re-mines whose durable hand-off failed after retries and fell back to the in-memory pending set.",
+})
+
+// ReconcilerRemineHandoffPending is the size of that in-memory pending set:
+// canonical blocks with a partially re-mined tx set that no in-store queue
+// currently holds. Should be 0 in steady state and drain to 0 as soon as the
+// store recovers.
+var ReconcilerRemineHandoffPending = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "arcade_reconciler_remine_handoff_pending",
+	Help: "Blocks awaiting a re-mine retry that only the reconciler's in-memory pending set holds.",
+})
+
 // ReconcilerBlockDuration observes wall time per reconciled block.
 var ReconcilerBlockDuration = promauto.NewHistogram(prometheus.HistogramOpts{
 	Name:    "arcade_reconciler_block_duration_seconds",

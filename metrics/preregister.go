@@ -72,12 +72,15 @@ func PreRegisterBumpOutcomes() {
 // blockStatusTransitions is the closed set of {transition, source} pairs the
 // block-status tracker (services/chaintracks_server) and the anchor
 // reconciler (services/bump_builder) emit on BlockStatusTransitionsTotal.
-// The reconciler's resurrection short-circuit only ever reactivates, hence
-// no reconciler/orphaned pair. Keep in sync with the emitters.
+// The reconciler orphans in exactly one place — re-orphaning a canonical row
+// the tracker reactivated while its re-mine was failing part-way, so the
+// remaining txs get retried (keepPartialRemineQueued) — which is why the
+// reconciler/orphaned pair is here. Keep in sync with the emitters.
 var blockStatusTransitions = [][2]string{
 	{BlockTransitionOrphaned, BlockTransitionSourceReorgEvent},
 	{BlockTransitionOrphaned, BlockTransitionSourceTieScan},
 	{BlockTransitionOrphaned, BlockTransitionSourceFullScan},
+	{BlockTransitionOrphaned, BlockTransitionSourceReconciler},
 	{BlockTransitionReactivated, BlockTransitionSourceReorgEvent},
 	{BlockTransitionReactivated, BlockTransitionSourceTieScan},
 	{BlockTransitionReactivated, BlockTransitionSourceFullScan},

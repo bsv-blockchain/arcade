@@ -115,14 +115,15 @@ func newTestReconciler(st store.Store, pub *capturePublisher, stub *stubChaintra
 		tweak(&cfg.BumpBuilder.Reconciler)
 	}
 	return &Reconciler{
-		cfg:         cfg,
-		logger:      zap.NewNop(),
-		store:       st,
-		publisher:   pub,
-		chainHeader: stub,
-		defers:      make(map[string]int),
-		now:         time.Now,
-		done:        make(chan struct{}),
+		cfg:           cfg,
+		logger:        zap.NewNop(),
+		store:         st,
+		publisher:     pub,
+		chainHeader:   stub,
+		defers:        make(map[string]int),
+		pendingRemine: make(map[string]uint64),
+		now:           time.Now,
+		done:          make(chan struct{}),
 	}
 }
 
@@ -589,9 +590,41 @@ type hookedStore struct {
 	// failMined, inject the tracker's reactivation.
 	onMinedCall func(call int)
 	minedCalls  int
+	// failHandOffN refuses the next N hand-off writes (RequeueOrphanedBlock
+	// and MarkBlocksOrphaned) before they touch the store — a store that is
+	// down for single-row writes. Negative = refuse them all.
+	failHandOffN int
+	handOffCalls int
+	// failOrphanN refuses only the next N MarkBlocksOrphaned writes, so a
+	// test can let the hand-off's requeue and read succeed and refuse the
+	// re-orphan itself. Negative = refuse them all.
+	failOrphanN int
+}
+
+// refuseHandOff reports whether this hand-off write is refused, consuming
+// one of failHandOffN.
+func (h *hookedStore) refuseHandOff() bool {
+	h.handOffCalls++
+	if h.failHandOffN < 0 {
+		return true
+	}
+	if h.failHandOffN > 0 {
+		h.failHandOffN--
+		return true
+	}
+	return false
 }
 
 func (h *hookedStore) MarkBlocksOrphaned(ctx context.Context, hashes []string, at time.Time) (int, error) {
+	if h.refuseHandOff() {
+		return 0, errors.New("injected: store refuses writes")
+	}
+	if h.failOrphanN < 0 || h.failOrphanN > 0 {
+		if h.failOrphanN > 0 {
+			h.failOrphanN--
+		}
+		return 0, errors.New("injected: store refuses the re-orphan")
+	}
 	n, err := h.Store.MarkBlocksOrphaned(ctx, hashes, at)
 	if err == nil && h.orphanPartialErr != nil {
 		return n, h.orphanPartialErr
@@ -614,6 +647,9 @@ func (h *hookedStore) RequeueOrphanedBlock(ctx context.Context, blockHash string
 	if fn := h.beforeReactivate; fn != nil {
 		h.beforeReactivate = nil
 		fn()
+	}
+	if h.refuseHandOff() {
+		return false, errors.New("injected: store refuses writes")
 	}
 	return h.Store.RequeueOrphanedBlock(ctx, blockHash, orphanedAt)
 }
@@ -2626,5 +2662,248 @@ func TestReconciler_FullScanPartialRemineHandsOffToTick(t *testing.T) {
 	}
 	if bp, err := base.GetBlockProcessingStatus(ctx, recOrphan); err != nil || bp.Status != models.BlockStatusActive {
 		t.Fatalf("row must be active after the tick, got %+v err=%v", bp, err)
+	}
+}
+
+// TestReconciler_PartialRemineHandOffRetriedInProcess: the hand-off writes
+// are single-row store writes, so a blip is ridden out in-process. Batch 1
+// lands, the tracker reactivates, batch 2 fails; the first two hand-off
+// writes are refused, the third lands: the row is re-orphaned onto the
+// queue within the same pass, the requeue counter moves once (from the
+// transition the write reported, not before it), and nothing is held in
+// memory.
+func TestReconciler_PartialRemineHandOffRetriedInProcess(t *testing.T) {
+	ctx := context.Background()
+	base := newPebbleForTest(t)
+	hs := &hookedStore{Store: base}
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	row := seedQueuedCanonicalTwoTxs(t, base, stub)
+	hs.onMinedCall = func(call int) {
+		if call == 2 {
+			_ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+			hs.failMined = true
+			hs.failHandOffN = 2 // the requeue attempt and the first re-orphan attempt are refused
+		}
+	}
+	requeued := testutil.ToFloat64(metrics.ReconcilerRemineRequeuedTotal)
+	failed := testutil.ToFloat64(metrics.ReconcilerRemineHandoffFailedTotal)
+
+	r := newTestReconciler(hs, pub, stub, func(c *config.ReconcilerConfig) { c.BatchSize = 1 })
+	if outcome := r.reconcileBlock(ctx, row); outcome != outcomeError {
+		t.Fatalf("outcome = %q, want %s", outcome, outcomeError)
+	}
+	bp, err := base.GetBlockProcessingStatus(ctx, recOrphan)
+	if err != nil || bp.Status != models.BlockStatusOrphaned || bp.ReconciledAt != nil {
+		t.Fatalf("the hand-off must land within the pass once the store answers, got %+v err=%v", bp, err)
+	}
+	if got := testutil.ToFloat64(metrics.ReconcilerRemineRequeuedTotal) - requeued; got != 1 {
+		t.Fatalf("remine_requeue_total = %v, want 1 (the transition the successful write reported)", got)
+	}
+	if got := testutil.ToFloat64(metrics.ReconcilerRemineHandoffFailedTotal) - failed; got != 0 {
+		t.Fatalf("remine_handoff_failed_total = %v, want 0 (the retry landed)", got)
+	}
+	if len(r.pendingRemine) != 0 {
+		t.Fatalf("nothing may be held in memory once the hand-off landed, got %v", r.pendingRemine)
+	}
+}
+
+// TestReconciler_PartialRemineHandOffFailureIsRetriedNextTick: the tracker
+// reactivated the row mid-re-mine and the store refuses every hand-off
+// write, so the row is active and off every in-store queue with one tx still
+// SEEN — the state no scan revisits. The block must be held in memory
+// (counted, gauge up, requeue counter unmoved because no re-orphan landed)
+// and retried on the next tick: with the store back, the tick re-mines the
+// remainder directly, the row stays active and clean, and the set drains.
+func TestReconciler_PartialRemineHandOffFailureIsRetriedNextTick(t *testing.T) {
+	ctx := context.Background()
+	base := newPebbleForTest(t)
+	hs := &hookedStore{Store: base}
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	reprocess := newReprocessStub(t)
+	row := seedQueuedCanonicalTwoTxs(t, base, stub)
+	hs.onMinedCall = func(call int) {
+		if call == 2 {
+			_ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+			hs.failMined = true
+			hs.failHandOffN = -1 // every hand-off write refused
+		}
+	}
+	requeued := testutil.ToFloat64(metrics.ReconcilerRemineRequeuedTotal)
+	failed := testutil.ToFloat64(metrics.ReconcilerRemineHandoffFailedTotal)
+
+	r := newTestReconciler(hs, pub, stub, func(c *config.ReconcilerConfig) { c.BatchSize = 1 })
+	withReprocess(r, reprocess)
+	if outcome := r.reconcileBlock(ctx, row); outcome != outcomeError {
+		t.Fatalf("outcome = %q, want %s", outcome, outcomeError)
+	}
+	// The store refused everything: the row is active, off the queue, half re-mined.
+	bp, err := base.GetBlockProcessingStatus(ctx, recOrphan)
+	if err != nil || bp.Status != models.BlockStatusActive {
+		t.Fatalf("premise: the row is active after the tracker's reactivation, got %+v err=%v", bp, err)
+	}
+	if got := statusOf(t, base, recShared2); got.Status != models.StatusSeenOnNetwork {
+		t.Fatalf("premise: batch 2 must not have landed, got %s@%s", got.Status, got.BlockHash)
+	}
+	if rows, lerr := base.ListOrphanedBlocksToReconcile(ctx, 10); lerr != nil || len(rows) != 0 {
+		t.Fatalf("premise: no in-store queue holds the row, got %+v err=%v", rows, lerr)
+	}
+	// The observable fallback: held in memory, counted, no phantom requeue.
+	if h, held := r.pendingRemine[recOrphan]; !held || h != 10 {
+		t.Fatalf("the block must be held in the pending set with its height, got %v", r.pendingRemine)
+	}
+	if got := testutil.ToFloat64(metrics.ReconcilerRemineHandoffFailedTotal) - failed; got != 1 {
+		t.Fatalf("remine_handoff_failed_total = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.ReconcilerRemineHandoffPending); got != 1 {
+		t.Fatalf("remine_handoff_pending = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.ReconcilerRemineRequeuedTotal) - requeued; got != 0 {
+		t.Fatalf("remine_requeue_total = %v, want 0 (no re-orphan landed)", got)
+	}
+	if hs.handOffCalls < handOffAttempts {
+		t.Fatalf("the hand-off must be retried in-process, got %d write attempts", hs.handOffCalls)
+	}
+	if got := reprocess.requested(); len(got) != 1 || got[0] != recOrphan {
+		t.Fatalf("a rebuild must be requested at hand-off time, got %v", got)
+	}
+
+	// Store still down: the tick keeps the block, unhealed.
+	r.tick(ctx)
+	if _, held := r.pendingRemine[recOrphan]; !held {
+		t.Fatal("the block must stay pending while the store is down")
+	}
+
+	// Store back: the tick re-mines the remainder directly and drains the set.
+	hs.failMined = false
+	hs.failHandOffN = 0
+	r.tick(ctx)
+	if _, held := r.pendingRemine[recOrphan]; held {
+		t.Fatalf("the pending set must drain once the block heals, got %v", r.pendingRemine)
+	}
+	if got := testutil.ToFloat64(metrics.ReconcilerRemineHandoffPending); got != 0 {
+		t.Fatalf("remine_handoff_pending = %v, want 0", got)
+	}
+	for _, id := range []string{recShared1, recShared2} {
+		if got := statusOf(t, base, id); got.Status != models.StatusMined || got.BlockHash != recOrphan {
+			t.Fatalf("%s: want MINED@%s after the drain, got %s@%s", id, recOrphan, got.Status, got.BlockHash)
+		}
+	}
+	bp, err = base.GetBlockProcessingStatus(ctx, recOrphan)
+	if err != nil || bp.Status != models.BlockStatusActive || bp.OrphanedAt != nil || bp.ReconciledAt != nil {
+		t.Fatalf("the canonical row must stay active and clean, got %+v err=%v", bp, err)
+	}
+}
+
+// TestReconciler_PendingRemineHandsOffWhenRemineKeepsFailing: the store is
+// back for the single-row writes but SetMinedByTxIDs still fails. The drain
+// cannot heal the block, so it lands the durable hand-off instead (the row
+// is re-orphaned onto the queue) and drops the block from memory; the
+// queue's next pass re-mines and reactivates it once the mines work.
+func TestReconciler_PendingRemineHandsOffWhenRemineKeepsFailing(t *testing.T) {
+	ctx := context.Background()
+	base := newPebbleForTest(t)
+	hs := &hookedStore{Store: base}
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	row := seedQueuedCanonicalTwoTxs(t, base, stub)
+	hs.onMinedCall = func(call int) {
+		if call == 2 {
+			_ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+			hs.failMined = true
+			hs.failHandOffN = -1
+		}
+	}
+	r := newTestReconciler(hs, pub, stub, func(c *config.ReconcilerConfig) { c.BatchSize = 1 })
+	_ = r.reconcileBlock(ctx, row)
+	if _, held := r.pendingRemine[recOrphan]; !held {
+		t.Fatal("premise: the block is pending")
+	}
+	requeued := testutil.ToFloat64(metrics.ReconcilerRemineRequeuedTotal)
+
+	// Single-row writes work again; mines still fail.
+	hs.failHandOffN = 0
+	r.tick(ctx)
+	if _, held := r.pendingRemine[recOrphan]; held {
+		t.Fatalf("once the hand-off lands the queue owns the block; the set must drop it, got %v", r.pendingRemine)
+	}
+	bp, err := base.GetBlockProcessingStatus(ctx, recOrphan)
+	if err != nil || bp.Status != models.BlockStatusOrphaned || bp.ReconciledAt != nil {
+		t.Fatalf("the block must be re-orphaned onto the durable queue, got %+v err=%v", bp, err)
+	}
+	if got := testutil.ToFloat64(metrics.ReconcilerRemineRequeuedTotal) - requeued; got != 1 {
+		t.Fatalf("remine_requeue_total = %v, want 1", got)
+	}
+
+	// Mines work: the queue's pass finishes the heal.
+	hs.failMined = false
+	r.tick(ctx)
+	if got := statusOf(t, base, recShared2); got.Status != models.StatusMined || got.BlockHash != recOrphan {
+		t.Fatalf("the queued pass must re-mine the remainder, got %s@%s", got.Status, got.BlockHash)
+	}
+	if bp, err := base.GetBlockProcessingStatus(ctx, recOrphan); err != nil || bp.Status != models.BlockStatusActive {
+		t.Fatalf("the row must be reactivated, got %+v err=%v", bp, err)
+	}
+}
+
+// TestReconciler_PartialRemineRequeueCounterFollowsTheWrite: the requeue
+// counter must report re-orphans that LANDED, taken from the transition the
+// write reports — not the attempts. Here the hand-off's requeue and read
+// succeed (the row is active) but the re-orphan write itself is refused on
+// every attempt: the counter must not move, the block is held pending; once
+// the write is accepted (mines still failing, so the drain hands off) the
+// counter moves exactly once, from the transition that landed.
+func TestReconciler_PartialRemineRequeueCounterFollowsTheWrite(t *testing.T) {
+	ctx := context.Background()
+	base := newPebbleForTest(t)
+	hs := &hookedStore{Store: base}
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	row := seedQueuedCanonicalTwoTxs(t, base, stub)
+	hs.onMinedCall = func(call int) {
+		if call == 2 {
+			_ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+			hs.failMined = true
+			hs.failOrphanN = -1 // requeue + read succeed; the re-orphan is refused
+		}
+	}
+	requeued := testutil.ToFloat64(metrics.ReconcilerRemineRequeuedTotal)
+	orphaned := testutil.ToFloat64(metrics.BlockStatusTransitionsTotal.WithLabelValues(
+		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceReconciler))
+
+	r := newTestReconciler(hs, pub, stub, func(c *config.ReconcilerConfig) { c.BatchSize = 1 })
+	if outcome := r.reconcileBlock(ctx, row); outcome != outcomeError {
+		t.Fatalf("outcome = %q, want %s", outcome, outcomeError)
+	}
+	if got := testutil.ToFloat64(metrics.ReconcilerRemineRequeuedTotal) - requeued; got != 0 {
+		t.Fatalf("remine_requeue_total = %v, want 0 (every re-orphan write was refused)", got)
+	}
+	if got := testutil.ToFloat64(metrics.BlockStatusTransitionsTotal.WithLabelValues(
+		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceReconciler)) - orphaned; got != 0 {
+		t.Fatalf("orphaned/reconciler = %v, want 0 (no transition landed)", got)
+	}
+	if _, held := r.pendingRemine[recOrphan]; !held {
+		t.Fatal("the block must be held pending after the refused re-orphan")
+	}
+	if bp, err := base.GetBlockProcessingStatus(ctx, recOrphan); err != nil || bp.Status != models.BlockStatusActive {
+		t.Fatalf("premise: the row is still active, got %+v err=%v", bp, err)
+	}
+
+	// The re-orphan is accepted; mines still fail, so the drain hands off.
+	hs.failOrphanN = 0
+	r.tick(ctx)
+	if got := testutil.ToFloat64(metrics.ReconcilerRemineRequeuedTotal) - requeued; got != 1 {
+		t.Fatalf("remine_requeue_total = %v, want 1 (the one re-orphan that landed)", got)
+	}
+	if got := testutil.ToFloat64(metrics.BlockStatusTransitionsTotal.WithLabelValues(
+		metrics.BlockTransitionOrphaned, metrics.BlockTransitionSourceReconciler)) - orphaned; got != 1 {
+		t.Fatalf("orphaned/reconciler = %v, want 1", got)
+	}
+	if bp, err := base.GetBlockProcessingStatus(ctx, recOrphan); err != nil || bp.Status != models.BlockStatusOrphaned {
+		t.Fatalf("the row must be re-orphaned onto the queue, got %+v err=%v", bp, err)
+	}
+	if _, held := r.pendingRemine[recOrphan]; held {
+		t.Fatalf("the queue owns the block now; the set must drop it, got %v", r.pendingRemine)
 	}
 }
