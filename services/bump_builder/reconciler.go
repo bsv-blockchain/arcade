@@ -313,14 +313,36 @@ func (r *Reconciler) startupScanUnderLease(ctx context.Context) {
 // ctx errors, so the full-scan reports itself incomplete and stays armed and
 // the tick's block stays queued — for whichever replica now leads. A nil
 // leaser (single-replica mode) returns ctx unchanged.
+//
+// Two guards make that hold regardless of whether the renewal RPC ever
+// returns. Each renewal runs under a deadline of min(heldUntil, now+TTL/3),
+// so a renewal that hangs — a pool wait, a network or database stall; the
+// Postgres leaser hands the context straight to pgx with no deadline of its
+// own — comes back with DeadlineExceeded no later than the lease's expiry,
+// and earlier when a retry inside the TTL is still possible. Independently
+// of that, an expiry timer armed for heldUntil cancels the pass when it
+// fires; every successful renewal moves it to the new expiry. The timer runs
+// on its own goroutine, so it fires even while the heartbeat is blocked
+// inside the RPC, and a renewal that returns late and successfully after it
+// fired cannot resurrect the pass: leaseCtx is already cancelled, and the
+// heartbeat re-checks it before trusting any result.
 func (r *Reconciler) holdLease(ctx context.Context, heldUntil time.Time) (context.Context, context.CancelFunc) {
 	if r.leaser == nil {
 		return ctx, func() {}
 	}
 	ttl := r.leaseTTL()
+	beat := ttl / 3
 	leaseCtx, cancel := context.WithCancel(ctx)
+	// The independent expiry: fires at heldUntil unless a successful renewal
+	// moved it. Stopped when the pass ends so it cannot outlive it.
+	expiry := time.AfterFunc(time.Until(heldUntil), func() {
+		r.logger.Error("lease expired with no successful renewal; abandoning the in-flight pass " +
+			"so it cannot overlap another replica's")
+		cancel()
+	})
 	go func() {
-		ticker := time.NewTicker(ttl / 3)
+		defer expiry.Stop()
+		ticker := time.NewTicker(beat)
 		defer ticker.Stop()
 		for {
 			select {
@@ -328,9 +350,17 @@ func (r *Reconciler) holdLease(ctx context.Context, heldUntil time.Time) (contex
 				return
 			case <-ticker.C:
 			}
-			until, err := r.leaser.TryAcquireOrRenew(leaseCtx, ReconcilerLeaseName, r.holderID, ttl)
+			// Bound the RPC: never past the lease, and no longer than one
+			// beat when that leaves room for another attempt inside it.
+			deadline := heldUntil
+			if next := time.Now().Add(beat); next.Before(deadline) {
+				deadline = next
+			}
+			renewCtx, renewCancel := context.WithDeadline(leaseCtx, deadline)
+			until, err := r.leaser.TryAcquireOrRenew(renewCtx, ReconcilerLeaseName, r.holderID, ttl)
+			renewCancel()
 			if leaseCtx.Err() != nil {
-				return // the pass ended while the renewal was in flight
+				return // the pass ended (or the expiry fired) while the renewal was in flight
 			}
 			switch {
 			case err != nil && time.Now().Before(heldUntil):
@@ -344,6 +374,12 @@ func (r *Reconciler) holdLease(ctx context.Context, heldUntil time.Time) (contex
 				r.logger.Warn("lease taken by another replica mid-pass; abandoning the in-flight pass")
 			default:
 				heldUntil = until
+				// A Stop that returns false means the timer fired while the
+				// renewal was in flight: leaseCtx is cancelled, and the next
+				// iteration's Done check ends the heartbeat. Re-arming then is
+				// harmless (a second cancel is a no-op), so no special case.
+				expiry.Stop()
+				expiry.Reset(time.Until(heldUntil))
 				continue
 			}
 			cancel()

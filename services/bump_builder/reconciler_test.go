@@ -1398,23 +1398,88 @@ type fakeLeaser struct {
 	// renewErr, when set, fails every call after the first, as a backend
 	// outage during the pass does.
 	renewErr error
+	// renewGate, when set, makes every call after the first block until the
+	// gate is closed — a renewal RPC that hangs. It ignores the caller's
+	// context on purpose: the store's leaser may not honour one either, and
+	// the reconciler must cope regardless. When it finally returns, the
+	// result is a success (now+ttl), the "late but successful" shape.
+	renewGate chan struct{}
+	// honourCtx makes a gated renewal return ctx.Err() as soon as the
+	// caller's context ends — a leaser that does honour the deadline.
+	honourCtx bool
+	// renewDeadlines records, per renewal call, the deadline the caller's
+	// context carried (zero when it had none).
+	renewDeadlines []time.Time
+	// granted records every expiry this leaser handed back.
+	granted []time.Time
+	// results records, per renewal call, the error it returned (nil on a
+	// success) — so a test can tell a renewal cut by its own deadline
+	// (DeadlineExceeded) from one ended by the pass's cancellation.
+	results []error
 }
 
-func (l *fakeLeaser) TryAcquireOrRenew(_ context.Context, _, _ string, ttl time.Duration) (time.Time, error) {
+func (l *fakeLeaser) TryAcquireOrRenew(ctx context.Context, name, holder string, ttl time.Duration) (time.Time, error) {
+	until, err := l.renew(ctx, name, holder, ttl)
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.calls > 1 { // the acquire is call 1; everything after it is a renewal
+		l.results = append(l.results, err)
+	}
+	return until, err
+}
+
+func (l *fakeLeaser) renew(ctx context.Context, _, _ string, ttl time.Duration) (time.Time, error) {
+	l.mu.Lock()
 	l.calls++
+	call := l.calls
 	l.ttls = append(l.ttls, ttl)
-	if l.calls > 1 && l.renewErr != nil {
+	if call > 1 {
+		dl, _ := ctx.Deadline()
+		l.renewDeadlines = append(l.renewDeadlines, dl)
+	}
+	gate, honour := l.renewGate, l.honourCtx
+	l.mu.Unlock()
+
+	if call > 1 && gate != nil {
+		if honour {
+			select {
+			case <-gate:
+			case <-ctx.Done():
+				return time.Time{}, ctx.Err()
+			}
+		} else {
+			<-gate
+		}
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if call > 1 && l.renewErr != nil {
 		return time.Time{}, l.renewErr
 	}
 	if l.lost {
 		return time.Time{}, nil
 	}
+	until := time.Now().Add(ttl)
 	if l.expiry > 0 {
-		return time.Now().Add(l.expiry), nil
+		until = time.Now().Add(l.expiry)
 	}
-	return time.Now().Add(ttl), nil
+	l.granted = append(l.granted, until)
+	return until, nil
+}
+
+// renewalResults returns the error of every RENEWAL call so far (the
+// acquire is not a renewal).
+func (l *fakeLeaser) renewalResults() []error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]error(nil), l.results...)
+}
+
+func (l *fakeLeaser) renewalDeadlines() []time.Time {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]time.Time(nil), l.renewDeadlines...)
 }
 
 func (l *fakeLeaser) Release(context.Context, string, string) error { return nil }
@@ -1488,11 +1553,15 @@ func TestReconciler_LeaseRenewedWhileFullScanRuns(t *testing.T) {
 	r.leaser = fl
 	r.holderID = "replica-a"
 	r.leaseTTLOverride = 60 * time.Millisecond // heartbeat every 20 ms
-	// The re-mine "takes a while": long enough for at least two renewals
-	// after the tick's own acquire.
-	hs.beforeMined = func(context.Context) {
-		if !waitFor(2*time.Second, func() bool { return fl.callCount() >= 3 }) {
+	// The re-mine "takes a while": well past the 60 ms the acquire granted,
+	// so only renewals moving the expiry forward keep the pass alive — at
+	// least five of them after the tick's own acquire.
+	hs.beforeMined = func(passCtx context.Context) {
+		if !waitFor(2*time.Second, func() bool { return fl.callCount() >= 6 }) {
 			t.Error("the lease was not renewed while the re-mine ran")
+		}
+		if passCtx.Err() != nil {
+			t.Error("the pass was cancelled although every renewal succeeded")
 		}
 	}
 
@@ -1842,10 +1911,11 @@ func withReprocess(r *Reconciler, stub *reprocessStub) {
 // TestReconciler_LeaseHeartbeatHonoursAcquireExpiry: the heartbeat must
 // judge "still held" against the expiry the STORE granted, not a local
 // now+TTL. Here the acquire reports a lease that lapses almost at once (a
-// slow acquire, a skewed backend clock) and every renewal fails: the first
-// failed renewal already falls past the granted expiry, so the pass must be
-// abandoned right there — a local estimate would have kept it running for
-// two more renewals, overlapping whoever took the lease meanwhile.
+// slow acquire, a skewed backend clock) and every renewal fails: the pass
+// must be abandoned at that granted expiry — by the expiry timer, which
+// fires before the first heartbeat is even due, or at the latest by the
+// first failed renewal — whereas a local now+TTL estimate would have kept
+// it running for three renewals, overlapping whoever took the lease.
 func TestReconciler_LeaseHeartbeatHonoursAcquireExpiry(t *testing.T) {
 	ctx := context.Background()
 	base := newPebbleForTest(t)
@@ -1867,12 +1937,16 @@ func TestReconciler_LeaseHeartbeatHonoursAcquireExpiry(t *testing.T) {
 		}
 	}
 
+	start := time.Now()
 	r.tick(ctx)
 
-	// One acquire, then exactly one (failed) renewal before the cancel: the
-	// granted expiry had already passed at the first heartbeat.
-	if got := fl.callCount(); got != 2 {
-		t.Fatalf("lease calls = %d, want 2 (acquire + the single failed renewal that ended the pass)", got)
+	// Abandoned at the 20 ms grant, not the 300 ms estimate: at most the
+	// acquire plus one failed renewal, and long before the third heartbeat.
+	if got := fl.callCount(); got > 2 {
+		t.Fatalf("lease calls = %d, want at most 2 (acquire + at most one failed renewal)", got)
+	}
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("the pass ran %v after a 20 ms grant; it must be abandoned at the granted expiry", elapsed)
 	}
 	if r.startupScanDone || r.startupScanAttempts != 0 {
 		t.Fatalf("an abandoned scan must stay armed without burning an attempt, got done=%v attempts=%d",
@@ -2905,5 +2979,98 @@ func TestReconciler_PartialRemineRequeueCounterFollowsTheWrite(t *testing.T) {
 	}
 	if _, held := r.pendingRemine[recOrphan]; held {
 		t.Fatalf("the queue owns the block now; the set must drop it, got %v", r.pendingRemine)
+	}
+}
+
+// TestReconciler_LeaseExpiryTimerCancelsWhenRenewalHangs: a renewal RPC
+// that never returns must not keep the pass alive past the lease. The fake
+// leaser hangs every renewal and ignores the caller's context altogether, so
+// the only thing that can end the pass is the independent expiry timer:
+// leaseCtx must be cancelled at heldUntil while the heartbeat is still
+// blocked inside the RPC. The RPC did carry a deadline no later than the
+// lease (the other guard). When the hung renewal finally returns — late,
+// and successfully — it must not resurrect the pass, and the heartbeat must
+// exit rather than keep renewing.
+func TestReconciler_LeaseExpiryTimerCancelsWhenRenewalHangs(t *testing.T) {
+	gate := make(chan struct{})
+	fl := &fakeLeaser{renewGate: gate}
+	r := newTestReconciler(newPebbleForTest(t), &capturePublisher{}, &stubChaintracks{}, nil)
+	r.leaser = fl
+	r.holderID = "replica-a"
+	r.leaseTTLOverride = 300 * time.Millisecond // heartbeat every 100 ms
+
+	if _, ok := r.tryLease(context.Background()); !ok {
+		t.Fatal("acquire")
+	}
+	// The pass is told the lease lapses between the first two heartbeats.
+	heldUntil := time.Now().Add(150 * time.Millisecond)
+	leaseCtx, release := r.holdLease(context.Background(), heldUntil)
+	defer release()
+
+	select {
+	case <-leaseCtx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("leaseCtx was not cancelled at the lease expiry while the renewal hung")
+	}
+	if got := fl.callCount(); got != 2 {
+		t.Fatalf("lease calls = %d, want 2 (the acquire and the one renewal still hanging)", got)
+	}
+	for _, dl := range fl.renewalDeadlines() {
+		if dl.IsZero() || dl.After(heldUntil.Add(time.Millisecond)) {
+			t.Fatalf("the renewal RPC must carry a deadline no later than the lease expiry %v, got %v", heldUntil, dl)
+		}
+	}
+
+	// The hung renewal returns late and successfully: ignored.
+	close(gate)
+	time.Sleep(350 * time.Millisecond) // > 3 heartbeats
+	if leaseCtx.Err() == nil {
+		t.Fatal("a late successful renewal must not resurrect a cancelled pass")
+	}
+	if got := fl.callCount(); got != 2 {
+		t.Fatalf("the heartbeat must exit after the pass was cancelled, but kept renewing: %d calls", got)
+	}
+}
+
+// TestReconciler_LeaseRenewalBoundedByDeadline: each renewal RPC runs under
+// a deadline of min(heldUntil, now+TTL/3), so a leaser that does honour its
+// context returns DeadlineExceeded within one heartbeat instead of blocking
+// the goroutine for the rest of the lease. Here the lease is long, so the
+// bound is the heartbeat: the hung renewal must come back with
+// DeadlineExceeded (not the pass's own cancellation) well before the lease
+// expires, and the pass keeps running meanwhile.
+func TestReconciler_LeaseRenewalBoundedByDeadline(t *testing.T) {
+	fl := &fakeLeaser{renewGate: make(chan struct{}), honourCtx: true, expiry: 5 * time.Second}
+	r := newTestReconciler(newPebbleForTest(t), &capturePublisher{}, &stubChaintracks{}, nil)
+	r.leaser = fl
+	r.holderID = "replica-a"
+	r.leaseTTLOverride = 300 * time.Millisecond // heartbeat every 100 ms
+
+	heldUntil, ok := r.tryLease(context.Background())
+	if !ok {
+		t.Fatal("acquire")
+	}
+	leaseCtx, release := r.holdLease(context.Background(), heldUntil)
+	defer release()
+
+	// The first renewal must come back — with DeadlineExceeded — while the
+	// lease is still held and the pass still alive.
+	if !waitFor(2*time.Second, func() bool { return len(fl.renewalResults()) >= 1 }) {
+		t.Fatal("the hung renewal never returned: the RPC carried no effective deadline")
+	}
+	if leaseCtx.Err() != nil {
+		t.Fatal("the pass must keep running while the lease is still held")
+	}
+	res := fl.renewalResults()[0]
+	if !errors.Is(res, context.DeadlineExceeded) {
+		t.Fatalf("the renewal must be cut by its own deadline, got %v", res)
+	}
+	for _, dl := range fl.renewalDeadlines() {
+		if dl.IsZero() || dl.After(heldUntil) {
+			t.Fatalf("renewal deadline %v must be set and no later than the lease expiry %v", dl, heldUntil)
+		}
+		if dl.After(time.Now().Add(r.leaseTTL())) {
+			t.Fatalf("renewal deadline %v must be bounded by one heartbeat, not the whole lease", dl)
+		}
 	}
 }
