@@ -397,11 +397,12 @@ type Store interface {
 	// table is observability-first: writers must not fail their primary work
 	// because of a status-tracking error.
 
-	// UpsertBlockHeaderSeen records that chaintracks observed a tip header,
-	// and is also the resurrection primitive: the block-status tracker and
-	// the anchor reconciler call it to return an orphaned row to active
-	// once the block is the active-chain block at its height again (issue
-	// #339). On insert, status='active' and header_seen_at=seenAt. On
+	// UpsertBlockHeaderSeen records that chaintracks observed a tip header.
+	// It is the UNCONDITIONAL insert-or-reset; the resurrection paths (the
+	// block-status tracker and the anchor reconciler returning an orphaned
+	// row to active once the block is the active-chain block at its height
+	// again, issue #339) use ReactivateBlock, the generation-checked form,
+	// instead. On insert, status='active' and header_seen_at=seenAt. On
 	// conflict, implementations MUST overwrite block_height (chaintracks is
 	// the authoritative source) and reset status='active' / orphaned_at=NULL
 	// / reconciled_at=NULL (so a later re-orphaning reconciles again), but
@@ -409,6 +410,24 @@ type Store interface {
 	// bump_built_at so a re-arrival or reorg-resurrection does not erase
 	// earlier milestones.
 	UpsertBlockHeaderSeen(ctx context.Context, blockHash string, blockHeight uint64, seenAt time.Time) error
+
+	// ReactivateBlock returns an orphaned block's row to status='active'
+	// because the block is the active-chain block at its height again
+	// (issue #339), as a compare-and-set on the orphan generation: it
+	// applies only while the row is still status='orphaned' AND its
+	// orphaned_at equals orphanedAt (a zero orphanedAt checks status only).
+	// On apply, block_height is overwritten (chaintracks is authoritative),
+	// status='active', orphaned_at and reconciled_at are cleared, and the
+	// milestone timestamps are preserved — the row shape
+	// UpsertBlockHeaderSeen's conflict path produces. Missing rows, rows
+	// that are active or parked, and rows orphaned AGAIN with a newer
+	// generation since the caller judged them are left untouched; a missing
+	// row is never created. Returns whether the transition applied — the
+	// applied-transition signal the block-status metric reports, and the
+	// guard that keeps a judgement made against one generation from
+	// clearing a newer one (the tie-scan and full-scan judge during a paging
+	// walk, and the full-scan re-mines for minutes before it writes).
+	ReactivateBlock(ctx context.Context, blockHash string, blockHeight uint64, orphanedAt time.Time) (bool, error)
 
 	// MarkBlockProcessed records that the merkle service delivered
 	// BLOCK_PROCESSED for this block. Upsert: when no row exists (callback
@@ -437,7 +456,11 @@ type Store interface {
 	// is still written (generation refreshed, reconciled_at cleared) but is
 	// not a transition and is not counted. The count falls out of the write
 	// itself, so it costs no extra round-trip; pre-reading every hash would
-	// put N of them in front of a latency-critical write.
+	// put N of them in front of a latency-critical write. It must also be
+	// exact under concurrent writers — two replicas orphaning the same row
+	// report ONE transition between them — so the status check belongs IN
+	// the write (a filter or a generation-checked CAS), never in a separate
+	// read whose result an unconditional write then trusts.
 	MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) (int, error)
 
 	// MarkBlockReconciled stamps reconciled_at on an orphaned block's row,

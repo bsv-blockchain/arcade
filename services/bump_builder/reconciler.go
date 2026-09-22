@@ -418,7 +418,7 @@ func (r *Reconciler) fullScan(ctx context.Context) bool {
 	// judgement of a hash wins. Parked rows belong to the watchdog and are
 	// never judged here.
 	markedSet := make(map[string]struct{})
-	resurrectSet := make(map[string]uint64)
+	resurrectSet := make(map[string]*models.BlockProcessingStatus)
 	err := store.ForEachBlockProcessing(ctx, r.store, minHeight, page, func(row *models.BlockProcessingStatus) error {
 		if (row.Status != models.BlockStatusActive && row.Status != models.BlockStatusOrphaned) ||
 			row.BlockHeight == 0 || row.BlockHeight > math.MaxUint32 {
@@ -442,7 +442,7 @@ func (r *Reconciler) fullScan(ctx context.Context) bool {
 		case row.Status == models.BlockStatusActive && !matches:
 			markedSet[row.BlockHash] = struct{}{}
 		case row.Status == models.BlockStatusOrphaned && matches:
-			resurrectSet[row.BlockHash] = row.BlockHeight
+			resurrectSet[row.BlockHash] = row
 		}
 		return nil
 	})
@@ -492,13 +492,15 @@ func (r *Reconciler) fullScanMarkOrphaned(ctx context.Context, set map[string]st
 // fullScanResurrect re-mines each resurrected block's txs from its retained
 // compound BUMP — the same fuel reconcileBlock burns for a canonical block,
 // with onlyChanged so rows already anchored right produce no events — and
-// then resets the row to active (the header-seen upsert also clears
+// then resets the row to active through ReactivateBlock, a compare-and-set
+// on the orphan generation the paging walk read (it also clears
 // orphaned_at/reconciled_at and preserves the milestone timestamps). The
 // re-mine runs FIRST: a failed batch leaves the row orphaned so the next
 // full-scan retries the whole heal, whereas reactivating first would leave
 // the txs with nothing left to revisit them. Reports whether every row in
-// the set was healed, so a failed repair keeps the one-shot armed.
-func (r *Reconciler) fullScanResurrect(ctx context.Context, set map[string]uint64) bool {
+// the set was healed or handed off, so a failed repair keeps the one-shot
+// armed.
+func (r *Reconciler) fullScanResurrect(ctx context.Context, set map[string]*models.BlockProcessingStatus) bool {
 	if len(set) == 0 {
 		return true
 	}
@@ -508,7 +510,8 @@ func (r *Reconciler) fullScanResurrect(ctx context.Context, set map[string]uint6
 		batchSize = maxTxIDsPerBulkEvent
 	}
 	resurrected := make([]string, 0, len(set))
-	for hash, height := range set {
+	for hash, row := range set {
+		height := row.BlockHeight
 		logger := r.logger.With(logfields.BlockHash(hash), logfields.BlockHeight(height))
 		n, ok, remineErr := r.remineFromStoredBUMP(ctx, logger, hash, batchSize)
 		if remineErr != nil {
@@ -551,9 +554,20 @@ func (r *Reconciler) fullScanResurrect(ctx context.Context, set map[string]uint6
 			}
 			continue
 		}
-		if err := r.store.UpsertBlockHeaderSeen(ctx, hash, height, r.now()); err != nil {
+		applied, err := r.store.ReactivateBlock(ctx, hash, height, row.OrphanGeneration())
+		if err != nil {
 			logger.Warn("startup full-scan: failed to reactivate resurrected block", zap.Error(err))
 			complete = false
+			continue
+		}
+		if !applied {
+			// The row is no longer the one the walk judged: the tracker
+			// reactivated it meanwhile (fine — its txs are re-mined either
+			// way), or a ReorgEvent orphaned it again with a newer
+			// generation, which cleared its stamp and put it back on the
+			// tick's queue. Not a transition, and nothing left for this scan
+			// to do with it.
+			logger.Info("startup full-scan: row changed since it was judged; not reactivated")
 			continue
 		}
 		delete(r.defers, hash)
@@ -696,14 +710,11 @@ func (r *Reconciler) waitForChaintracksReady(ctx context.Context) bool {
 func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProcessingStatus) string {
 	orphan := row.BlockHash
 	logger := r.logger.With(logfields.BlockHash(orphan))
-	// The orphan generation this pass reconciles. The final stamp is a CAS on
-	// it, so a row the block-status tracker reactivated — or that was
-	// orphaned again — while this pass ran is never marked reconciled by
-	// stale work (issue #339).
-	var orphanedAt time.Time
-	if row.OrphanedAt != nil {
-		orphanedAt = *row.OrphanedAt
-	}
+	// The orphan generation this pass reconciles. The final stamp — and the
+	// resurrection write below — are a CAS on it, so a row the block-status
+	// tracker reactivated, or that was orphaned again, while this pass ran
+	// is never marked reconciled or reactivated by stale work (issue #339).
+	orphanedAt := row.OrphanGeneration()
 
 	// Resolve the orphan's height — the row may be a height-0 placeholder
 	// created by MarkBlockProcessed before any header arrived; the stored
@@ -721,9 +732,18 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 	// COMPETITOR is now the orphan and heals through its own row.
 	if hash, ok := r.activeHashAt(ctx, height); ok && hash == orphan {
 		logger.Warn("orphan mark is stale — block is on the active chain; resetting to active")
-		if err := r.store.UpsertBlockHeaderSeen(ctx, orphan, height, r.now()); err != nil {
+		// A CAS on the generation this pass dequeued, like the reconciled_at
+		// stamp: a row the tracker already reactivated, or that a reorg
+		// orphaned again with a newer generation between the check above
+		// and this write, is left as it is — the newer generation stays
+		// queued for its own pass — and is not counted as a transition.
+		applied, err := r.store.ReactivateBlock(ctx, orphan, height, orphanedAt)
+		if err != nil {
 			logger.Warn("failed to reset resurrected block", zap.Error(err))
 			return "error"
+		}
+		if !applied {
+			return r.staleOutcome(logger, height)
 		}
 		delete(r.defers, orphan)
 		metrics.BlockStatusTransitionsTotal.
@@ -1104,7 +1124,7 @@ func (r *Reconciler) remineFromStoredBUMP(ctx context.Context, logger *zap.Logge
 		// is corrupt. The full-scan must not read this as "no BUMP" and
 		// reactivate a row whose txs it never re-mined, and it does not
 		// fix itself the way a not-yet-built BUMP does. reconcileBlock
-		// recognises errMalformedBUMP and defers (its /reprocess poke is
+		// recognizes errMalformedBUMP and defers (its /reprocess poke is
 		// the rebuild); every other caller keeps the row for a retry.
 		return 0, false, fmt.Errorf("%w: %s: %w", errMalformedBUMP, blockHash, parseErr)
 	}

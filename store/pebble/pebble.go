@@ -1580,6 +1580,41 @@ func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, orpha
 	return true, nil
 }
 
+// ReactivateBlock returns an orphaned row to active as a compare-and-set on
+// the orphan generation (issue #339): the row must still be orphaned with the
+// orphaned_at the caller judged (a zero orphanedAt checks status only).
+// Missing, active, parked and re-orphaned rows are left untouched and
+// reported as not applied. The shard lock makes the read-compare-write atomic
+// against the other block_processing writers; writeBlockProc maintains the
+// height index when block_height moves.
+func (s *Store) ReactivateBlock(ctx context.Context, blockHash string, blockHeight uint64, orphanedAt time.Time) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	mu := s.shardFor(blockHash)
+	mu.Lock()
+	defer mu.Unlock()
+	prev, err := s.readBlockProc(blockHash)
+	if err != nil {
+		return false, err
+	}
+	if prev == nil || prev.Status != string(models.BlockStatusOrphaned) {
+		return false, nil
+	}
+	if !orphanedAt.IsZero() && prev.OrphanedAtUnixNs != orphanedAt.UnixNano() {
+		return false, nil
+	}
+	cur := *prev
+	cur.BlockHeight = blockHeight
+	cur.Status = string(models.BlockStatusActive)
+	cur.OrphanedAtUnixNs = 0
+	cur.ReconciledAtUnixNs = 0
+	if err := s.writeBlockProc(prev, &cur); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // ListOrphanedBlocksToReconcile scans the block_processing rows for
 // status='orphaned' AND reconciled_at unset. Rows that can be re-anchored
 // RIGHT NOW — the active (canonical) block at the same height already has a

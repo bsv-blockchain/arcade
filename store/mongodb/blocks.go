@@ -149,6 +149,30 @@ func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, orpha
 	return res.MatchedCount == 1, nil
 }
 
+// ReactivateBlock implements store.Store as a compare-and-set on the orphan
+// generation (issue #339): the filter requires status == orphaned and, unless
+// orphanedAt is zero, orphaned_at == orphanedAt, so a missing, active, parked
+// or re-orphaned row is left untouched and reported as not applied. The
+// server evaluates filter and update atomically per document; no upsert, so
+// a missing row is never created.
+func (s *Store) ReactivateBlock(ctx context.Context, blockHash string, blockHeight uint64, orphanedAt time.Time) (bool, error) {
+	filter := doc(kv(fID, blockHash), kv(fStatus, string(models.BlockStatusOrphaned)))
+	if !orphanedAt.IsZero() {
+		filter = append(filter, kv(fOrphanedAt, msTrunc(orphanedAt)))
+	}
+	update := doc(
+		kv(opSet, doc(kv(fBlockHeight, heightToInt64(blockHeight)), kv(fStatus, string(models.BlockStatusActive)))),
+		kv(opUnset, doc(kv(fOrphanedAt, ""), kv(fReconciledAt, ""))),
+	)
+	octx, cancel := s.opCtx(ctx)
+	defer cancel()
+	res, err := s.blocks.UpdateOne(octx, filter, update)
+	if err != nil {
+		return false, fmt.Errorf("reactivate block %s: %w", blockHash, err)
+	}
+	return res.MatchedCount == 1, nil
+}
+
 // MarkBlocksParked implements store.Store; only active rows park.
 func (s *Store) MarkBlocksParked(ctx context.Context, blockHashes []string) error {
 	if len(blockHashes) == 0 {

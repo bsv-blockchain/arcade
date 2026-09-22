@@ -573,6 +573,17 @@ type hookedStore struct {
 	// in flight, or hold the re-mine open and watch what the reconciler does
 	// around it.
 	beforeMined func(context.Context)
+	// beforeReactivate fires once, right before ReactivateBlock, so a test
+	// can inject the concurrent write that races a reactivation.
+	beforeReactivate func()
+}
+
+func (h *hookedStore) ReactivateBlock(ctx context.Context, blockHash string, blockHeight uint64, orphanedAt time.Time) (bool, error) {
+	if fn := h.beforeReactivate; fn != nil {
+		h.beforeReactivate = nil
+		fn()
+	}
+	return h.Store.ReactivateBlock(ctx, blockHash, blockHeight, orphanedAt)
 }
 
 func (h *hookedStore) GetBUMP(ctx context.Context, blockHash string) (uint64, []byte, error) {
@@ -1629,5 +1640,118 @@ func TestReconciler_MalformedCanonicalBUMPDefers(t *testing.T) {
 	}
 	if rows, err := st.ListOrphanedBlocksToReconcile(ctx, 10); err != nil || len(rows) != 0 {
 		t.Fatalf("row must leave the queue once healed, got %+v err=%v", rows, err)
+	}
+}
+
+// TestReconciler_FullScanReactivatedMetricCountsAppliedTransitions: the
+// full-scan judges during the paging walk and re-mines for minutes before it
+// writes; the tracker can reactivate the row in between. The write is a
+// generation CAS, so it applies nothing, the row keeps the tracker's clean
+// active state, and the full_scan/reactivated series does not count it. The
+// scan is still complete: nothing is left for it to retry.
+func TestReconciler_FullScanReactivatedMetricCountsAppliedTransitions(t *testing.T) {
+	ctx := context.Background()
+	base := newPebbleForTest(t)
+	hs := &hookedStore{Store: base}
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	seedResurrectable(t, base, stub)
+	hs.beforeReactivate = func() { _ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now()) }
+
+	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
+		metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceFullScan)
+	before := testutil.ToFloat64(counter)
+
+	r := newTestReconciler(hs, pub, stub, nil)
+	if !r.fullScan(ctx) {
+		t.Fatal("a row another edge already reactivated leaves nothing for the scan to retry")
+	}
+	if got := testutil.ToFloat64(counter) - before; got != 0 {
+		t.Fatalf("full-scan reactivated transitions = %v, want 0 (the row was already active)", got)
+	}
+	bp, err := base.GetBlockProcessingStatus(ctx, recOrphan)
+	if err != nil || bp.Status != models.BlockStatusActive || bp.OrphanedAt != nil || bp.ReconciledAt != nil {
+		t.Fatalf("row must keep the tracker's clean active state, got %+v err=%v", bp, err)
+	}
+	if got := statusOf(t, base, recShared1); got.Status != models.StatusMined || got.BlockHash != recOrphan {
+		t.Fatalf("the re-mine still runs, got %s@%s", got.Status, got.BlockHash)
+	}
+}
+
+// TestReconciler_ShortCircuitReactivationIsGenerationChecked: the
+// resurrection short-circuit's canonicality check and its write are not
+// atomic. If a reorg orphans the row AGAIN — a newer generation — between
+// them, the write must not clear that generation (it is queued for its own
+// pass): the outcome is stale and the reconciler/reactivated series does not
+// count it. The newer generation then resurrects on its own pass, counted
+// once. A row the tracker reactivated in the gap is likewise left alone.
+func TestReconciler_ShortCircuitReactivationIsGenerationChecked(t *testing.T) {
+	ctx := context.Background()
+	base := newPebbleForTest(t)
+	hs := &hookedStore{Store: base}
+	pub := &capturePublisher{}
+	stub := &stubChaintracks{}
+	stub.setHeightHeader(10, headerWithHash(t, recOrphan, 10)) // the "orphan" is canonical
+
+	seedMined(t, base, recOrphan, 10, recShared1)
+	_ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+	_, _ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	rows, err := base.ListOrphanedBlocksToReconcile(ctx, 10)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("precondition: one queued row, got %+v err=%v", rows, err)
+	}
+
+	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
+		metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceReconciler)
+	before := testutil.ToFloat64(counter)
+
+	// Re-orphaned with a newer generation right before the write.
+	hs.beforeReactivate = func() {
+		_, _ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now().Add(time.Second))
+	}
+	r := newTestReconciler(hs, pub, stub, nil)
+	if outcome := r.reconcileBlock(ctx, rows[0]); outcome != "stale" {
+		t.Fatalf("outcome = %q, want stale", outcome)
+	}
+	if got := testutil.ToFloat64(counter) - before; got != 0 {
+		t.Fatalf("reconciler reactivated transitions = %v, want 0 (a newer generation is not ours to clear)", got)
+	}
+	bp, err := base.GetBlockProcessingStatus(ctx, recOrphan)
+	if err != nil || bp.Status != models.BlockStatusOrphaned || bp.ReconciledAt != nil {
+		t.Fatalf("the newer generation must stay orphaned and queued, got %+v err=%v", bp, err)
+	}
+	rows, err = base.ListOrphanedBlocksToReconcile(ctx, 10)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("the newer generation must remain in the queue, got %+v err=%v", rows, err)
+	}
+
+	// Its own pass finds the block still canonical: resurrected, counted once.
+	if outcome := r.reconcileBlock(ctx, rows[0]); outcome != "resurrected" {
+		t.Fatalf("outcome = %q, want resurrected", outcome)
+	}
+	if got := testutil.ToFloat64(counter) - before; got != 1 {
+		t.Fatalf("reconciler reactivated transitions = %v, want 1", got)
+	}
+	bp, err = base.GetBlockProcessingStatus(ctx, recOrphan)
+	if err != nil || bp.Status != models.BlockStatusActive || bp.OrphanedAt != nil || bp.ReconciledAt != nil {
+		t.Fatalf("row must be active and clean, got %+v err=%v", bp, err)
+	}
+
+	// A row the tracker reactivated in the gap is left alone too.
+	_, _ = base.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now().Add(2*time.Second))
+	rows, err = base.ListOrphanedBlocksToReconcile(ctx, 10)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("precondition: one queued row, got %+v err=%v", rows, err)
+	}
+	hs.beforeReactivate = func() { _ = base.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now()) }
+	if outcome := r.reconcileBlock(ctx, rows[0]); outcome != "stale" {
+		t.Fatalf("outcome = %q, want stale", outcome)
+	}
+	if got := testutil.ToFloat64(counter) - before; got != 1 {
+		t.Fatalf("reconciler reactivated transitions = %v, want still 1 (the tracker's write is not ours)", got)
+	}
+	bp, err = base.GetBlockProcessingStatus(ctx, recOrphan)
+	if err != nil || bp.Status != models.BlockStatusActive || bp.OrphanedAt != nil || bp.ReconciledAt != nil {
+		t.Fatalf("row must keep the tracker's clean active state, got %+v err=%v", bp, err)
 	}
 }

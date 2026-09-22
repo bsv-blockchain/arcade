@@ -631,10 +631,16 @@ const (
 // the active chain holds a different block at its height; transition=
 // reactivated is an orphaned row reset to active because it IS the
 // active-chain block at its height again — a same-height flip-flop (issue
-// #339). Every pair counts applied transitions: the reorg_event/orphaned
-// emitter pre-reads the rows a ReorgEvent names, so hashes without a row and
-// rows already orphaned are not counted. The anchor guard's write-time
-// denials are counted separately by BumpBuilderAnchorGuardDeniedTotal.
+// #339). Every pair counts APPLIED transitions, and the signal comes from the
+// write itself, not from a pre-read: store.MarkBlocksOrphaned returns how
+// many rows its write actually moved to orphaned (hashes with no row, and
+// rows already orphaned, are written or skipped without being counted), and
+// store.ReactivateBlock reports whether its generation-checked write applied
+// (a row another edge already reactivated, or re-orphaned with a newer
+// generation, is not counted). Under concurrent writers this is exact: two
+// replicas moving the same row report one transition between them. The
+// anchor guard's write-time denials are counted separately by
+// BumpBuilderAnchorGuardDeniedTotal.
 var BlockStatusTransitionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_block_status_transitions_total",
 	Help: "block_processing status transitions by direction (orphaned|reactivated) and detection edge (reorg_event|tie_scan|full_scan|reconciler).",

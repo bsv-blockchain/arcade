@@ -41,6 +41,11 @@ type trackerStore struct {
 	afterList func()
 	// orphanErr makes every MarkBlocksOrphaned fail, as a store outage does.
 	orphanErr error
+	// reactivations records every ReactivateBlock call, applied or not.
+	reactivations []string
+	// beforeReactivate fires once, right before a ReactivateBlock judges the
+	// row, so a test can inject the concurrent write that races it.
+	beforeReactivate func()
 }
 
 func newTrackerStore(rows ...*models.BlockProcessingStatus) *trackerStore {
@@ -156,6 +161,40 @@ func (s *trackerStore) orphanCalls() [][]string {
 	return append([][]string(nil), s.orphaned...)
 }
 
+// ReactivateBlock mirrors the backends' generation CAS: the row must still
+// be orphaned with the orphaned_at the caller judged (zero = status only),
+// and on apply it takes the same shape as the header-seen conflict path.
+func (s *trackerStore) ReactivateBlock(_ context.Context, hash string, height uint64, orphanedAt time.Time) (bool, error) {
+	s.mu.Lock()
+	hook := s.beforeReactivate
+	s.beforeReactivate = nil
+	s.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reactivations = append(s.reactivations, hash)
+	row, ok := s.rows[hash]
+	if !ok || row.Status != models.BlockStatusOrphaned {
+		return false, nil
+	}
+	if !orphanedAt.IsZero() && (row.OrphanedAt == nil || !row.OrphanedAt.Equal(orphanedAt)) {
+		return false, nil
+	}
+	row.BlockHeight = height
+	row.Status = models.BlockStatusActive
+	row.OrphanedAt = nil
+	row.ReconciledAt = nil
+	return true, nil
+}
+
+func (s *trackerStore) reactivateCalls() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.reactivations...)
+}
+
 func (s *trackerStore) upsertCalls() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -265,8 +304,8 @@ func TestTieScan_MarksSameHeightLoserOrphaned(t *testing.T) {
 	if len(calls) != 1 || len(calls[0]) != 1 || calls[0][0] != loserHash {
 		t.Fatalf("expected exactly the loser %s orphaned, got %v", loserHash, calls)
 	}
-	if ups := st.upsertCalls(); len(ups) != 0 {
-		t.Fatalf("an already-active winner must not be re-upserted, got %v", ups)
+	if re := st.reactivateCalls(); len(re) != 0 {
+		t.Fatalf("an already-active winner must not be reactivated, got %v", re)
 	}
 }
 
@@ -295,8 +334,8 @@ func TestTieScan_SkipsUnjudgeableRows(t *testing.T) {
 	if calls := st.orphanCalls(); len(calls) != 0 {
 		t.Fatalf("expected no orphan marks, got %v", calls)
 	}
-	if ups := st.upsertCalls(); len(ups) != 0 {
-		t.Fatalf("expected no reactivations, got %v", ups)
+	if re := st.reactivateCalls(); len(re) != 0 {
+		t.Fatalf("expected no reactivations, got %v", re)
 	}
 	if got := st.row(t, orphanHash).Status; got != models.BlockStatusOrphaned {
 		t.Fatalf("unjudgeable orphaned row must stay orphaned, got %s", got)
@@ -398,9 +437,9 @@ func TestTieScan_ReactivatesResurrectedRow(t *testing.T) {
 	if len(calls) != 1 || len(calls[0]) != 1 || calls[0][0] != loserHash {
 		t.Fatalf("expected exactly the loser %s orphaned, got %v", loserHash, calls)
 	}
-	// Reactivation: exactly the winner, via the resurrecting upsert.
-	if ups := st.upsertCalls(); !equalStrings(ups, []string{winnerHash}) {
-		t.Fatalf("expected exactly the winner %s reactivated, got %v", winnerHash, ups)
+	// Reactivation: exactly the winner, via the generation-checked write.
+	if re := st.reactivateCalls(); !equalStrings(re, []string{winnerHash}) {
+		t.Fatalf("expected exactly the winner %s reactivated, got %v", winnerHash, re)
 	}
 	assertActiveClean(t, st.row(t, winnerHash))
 	if got := st.row(t, staleHash).Status; got != models.BlockStatusOrphaned {
@@ -431,8 +470,8 @@ func TestTieScan_ReactivationRespectsWindow(t *testing.T) {
 	tr := newTestTracker(ct, st, 5, 0)
 	tr.tieScan(context.Background(), 12, false)
 
-	if ups := st.upsertCalls(); len(ups) != 0 {
-		t.Fatalf("out-of-window orphaned rows must not be reactivated, got %v", ups)
+	if re := st.reactivateCalls(); len(re) != 0 {
+		t.Fatalf("out-of-window orphaned rows must not be reactivated, got %v", re)
 	}
 }
 
@@ -461,8 +500,8 @@ func TestTieScan_DedupsAcrossPageBoundaries(t *testing.T) {
 	if len(calls) != 1 || !equalStrings(sortedCopy(calls[0]), sortedCopy(wantOrphaned)) {
 		t.Fatalf("expected one MarkBlocksOrphaned call with the 5 losers, got %v", calls)
 	}
-	if ups := st.upsertCalls(); !equalStrings(ups, []string{winner.Hash.String()}) {
-		t.Fatalf("expected exactly one reactivation of %s, got %v", winner.Hash, ups)
+	if re := st.reactivateCalls(); !equalStrings(re, []string{winner.Hash.String()}) {
+		t.Fatalf("expected exactly one reactivation of %s, got %v", winner.Hash, re)
 	}
 }
 
@@ -503,11 +542,14 @@ func TestRecordReorg_ReactivatesResurrectedBranch(t *testing.T) {
 	}
 	assertActiveClean(t, st.row(t, b.Hash.String()))
 	assertActiveClean(t, st.row(t, d.Hash.String()))
-	// Exactly the new tip and the resurrected block are upserted; the
-	// common ancestor was never off the chain and is left alone.
-	want := sortedCopy([]string{b.Hash.String(), d.Hash.String()})
-	if ups := sortedCopy(st.upsertCalls()); !equalStrings(ups, want) {
-		t.Fatalf("expected upserts %v, got %v", want, ups)
+	// Exactly the new tip is upserted and exactly the resurrected block is
+	// reactivated; the common ancestor was never off the chain and is left
+	// alone.
+	if ups := st.upsertCalls(); !equalStrings(ups, []string{d.Hash.String()}) {
+		t.Fatalf("expected exactly the tip %s upserted, got %v", d.Hash, ups)
+	}
+	if re := st.reactivateCalls(); !equalStrings(re, []string{b.Hash.String()}) {
+		t.Fatalf("expected exactly %s reactivated, got %v", b.Hash, re)
 	}
 }
 
@@ -578,9 +620,11 @@ func TestRecordReorg_DeepBranchWalksEveryHeight(t *testing.T) {
 	if got := st.row(t, h12.Hash.String()).Status; got != models.BlockStatusParked {
 		t.Fatalf("parked row must stay parked, got %s", got)
 	}
-	want := sortedCopy([]string{h10.Hash.String(), tip.Hash.String()})
-	if ups := sortedCopy(st.upsertCalls()); !equalStrings(ups, want) {
-		t.Fatalf("expected upserts %v, got %v", want, ups)
+	if ups := st.upsertCalls(); !equalStrings(ups, []string{tip.Hash.String()}) {
+		t.Fatalf("expected exactly the tip upserted, got %v", ups)
+	}
+	if re := st.reactivateCalls(); !equalStrings(re, []string{h10.Hash.String()}) {
+		t.Fatalf("expected exactly %s reactivated, got %v", h10.Hash, re)
 	}
 }
 
@@ -788,5 +832,72 @@ func TestRecordReorg_BranchWalkTerminatesOnHeightWrap(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("reactivateBranch did not terminate: the height walk wrapped past 0")
+	}
+}
+
+// TestRecordReorg_ReactivatedMetricCountsAppliedTransitions: the walk reads
+// the row, then writes. Another edge (here: the header loop's tip upsert for
+// the same hash) can reactivate it in between, so the write applies nothing
+// — and the reorg_event/reactivated series must not count it. The write is
+// a compare-and-set on the generation the walk read.
+func TestRecordReorg_ReactivatedMetricCountsAppliedTransitions(t *testing.T) {
+	ct := newFakeChaintracks()
+	ancestor, resurrected, tip := headerAt(9, 0x01), headerAt(10, 0x10), headerAt(11, 0x11)
+	ct.headers[9], ct.headers[10], ct.headers[11] = ancestor, resurrected, tip
+	st := newTrackerStore(orphanedRow(resurrected.Hash.String(), 10, true))
+	// Another edge reactivates the row between the walk's read and its write.
+	st.beforeReactivate = func() {
+		_ = st.UpsertBlockHeaderSeen(context.Background(), resurrected.Hash.String(), 10, time.Now())
+	}
+
+	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
+		metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceReorgEvent)
+	before := testutil.ToFloat64(counter)
+
+	tr := newTestTracker(ct, st, 20, 0)
+	tr.recordReorg(context.Background(), &chaintracks.ReorgEvent{CommonAncestor: ancestor, NewTip: tip})
+
+	if got := testutil.ToFloat64(counter) - before; got != 0 {
+		t.Fatalf("reorg_event reactivated transitions = %v, want 0 (the row was already active)", got)
+	}
+	if re := st.reactivateCalls(); !equalStrings(re, []string{resurrected.Hash.String()}) {
+		t.Fatalf("the write must still be attempted, got %v", re)
+	}
+	assertActiveClean(t, st.row(t, resurrected.Hash.String()))
+}
+
+// TestTieScan_ReactivatedMetricCountsAppliedTransitions: between the page
+// read and the write, a ReorgEvent orphans one judged row AGAIN with a newer
+// generation. The generation-checked write must leave that newer generation
+// in place — it is queued for its own reconcile — and the tie_scan/
+// reactivated series must not count it, while the other candidate still
+// reactivates and counts once.
+func TestTieScan_ReactivatedMetricCountsAppliedTransitions(t *testing.T) {
+	ct := newFakeChaintracks()
+	a, b := headerAt(10, 0xAA), headerAt(11, 0xBB)
+	ct.headers[10], ct.headers[11], ct.headers[12] = a, b, headerAt(12, 0xEE)
+	st := newTrackerStore(orphanedRow(a.Hash.String(), 10, true), orphanedRow(b.Hash.String(), 11, true))
+	// A concurrent ReorgEvent re-orphans A with a newer generation after the
+	// scan has read its page.
+	st.afterList = func() {
+		_, _ = st.MarkBlocksOrphaned(context.Background(), []string{a.Hash.String()}, time.Now().Add(time.Second))
+	}
+
+	counter := metrics.BlockStatusTransitionsTotal.WithLabelValues(
+		metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceTieScan)
+	before := testutil.ToFloat64(counter)
+
+	tr := newTestTracker(ct, st, 20, 0)
+	tr.tieScan(context.Background(), 12, true)
+
+	if got := testutil.ToFloat64(counter) - before; got != 1 {
+		t.Fatalf("tie-scan reactivated transitions = %v, want 1 (the re-orphaned row is a newer generation, not a transition)", got)
+	}
+	if re := sortedCopy(st.reactivateCalls()); !equalStrings(re, sortedCopy([]string{a.Hash.String(), b.Hash.String()})) {
+		t.Fatalf("both candidates must still be written, got %v", re)
+	}
+	assertActiveClean(t, st.row(t, b.Hash.String()))
+	if rowA := st.row(t, a.Hash.String()); rowA.Status != models.BlockStatusOrphaned || rowA.ReconciledAt != nil {
+		t.Fatalf("the re-orphaned row must keep its newer generation queued, got status=%s reconciledAt=%v", rowA.Status, rowA.ReconciledAt)
 	}
 }

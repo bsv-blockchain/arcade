@@ -21,6 +21,12 @@ func TestIterateTrackerRows_Conformance(t *testing.T) {
 	storetest.RunTrackerRowsSuite(t, func(t *testing.T) storetest.Backend { return newTestStore(t) })
 }
 
+// The generation-checked block_processing writes (issue #339): ReactivateBlock,
+// MarkBlocksOrphaned's applied-transition count, MarkBlockReconciled's CAS.
+func TestBlockStatus_Conformance(t *testing.T) {
+	storetest.RunBlockStatusSuite(t, func(t *testing.T) storetest.BlockStatusBackend { return newTestStore(t) })
+}
+
 // The status filter is what keeps a REJECTED-heavy store out of memory, so a
 // row that leaves the tracked set must stop being emitted immediately.
 func TestIterateTrackerRows_FollowsTransitions(t *testing.T) {

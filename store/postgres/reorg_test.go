@@ -686,3 +686,64 @@ func TestMarkBlocksOrphaned_ReorphanRequeuesAndCountsTransitions(t *testing.T) {
 		t.Fatal("a stamp carrying the OLD generation must not apply")
 	}
 }
+
+// TestMarkBlocksOrphaned_ConcurrentWriterNotDoubleCounted: two replicas
+// orphaning the same row must report ONE transition between them. Replica A
+// holds its UPDATE open in a transaction; replica B blocks on the row lock
+// and, once A commits, is re-evaluated against the row A wrote — already
+// orphaned — so it must count nothing. The FROM-list self-join this replaced
+// read the joined copy from the statement's snapshot under EvalPlanQual and
+// would have counted 1 here.
+func TestMarkBlocksOrphaned_ConcurrentWriterNotDoubleCounted(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	t0 := time.Unix(1700000800, 0).UTC()
+	if err := s.UpsertBlockHeaderSeen(ctx, "cc-1", 900, t0); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, execErr := tx.Exec(ctx,
+		`UPDATE block_processing SET status = 'orphaned', orphaned_at = $2, reconciled_at = NULL WHERE block_hash = $1`,
+		"cc-1", t0.Add(time.Minute)); execErr != nil {
+		t.Fatal(execErr)
+	}
+
+	type result struct {
+		n   int
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		n, markErr := s.MarkBlocksOrphaned(ctx, []string{"cc-1"}, t0.Add(2*time.Minute))
+		done <- result{n, markErr}
+	}()
+	// B must be blocked on A's row lock, not finished.
+	select {
+	case r := <-done:
+		t.Fatalf("second writer returned (%d, %v) before the first committed", r.n, r.err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if commitErr := tx.Commit(ctx); commitErr != nil {
+		t.Fatal(commitErr)
+	}
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		if r.n != 0 {
+			t.Fatalf("transitions = %d, want 0 (the first writer's transition must not be counted again)", r.n)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("second writer never returned after the first committed")
+	}
+	row, err := s.GetBlockProcessingStatus(ctx, "cc-1")
+	if err != nil || row.Status != models.BlockStatusOrphaned || row.OrphanedAt == nil || row.ReconciledAt != nil {
+		t.Fatalf("row must end orphaned and unstamped, got %+v err=%v", row, err)
+	}
+}

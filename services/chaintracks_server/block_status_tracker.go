@@ -238,11 +238,25 @@ func (t *blockStatusTracker) reactivateBranch(ctx context.Context, ev *chaintrac
 		if row.Status != models.BlockStatusOrphaned {
 			continue
 		}
-		if err := t.store.UpsertBlockHeaderSeen(ctx, hash, uint64(h), time.Now()); err != nil {
+		// A compare-and-set on the generation just read: the write applies
+		// only if the row is still orphaned with that orphaned_at.
+		applied, err := t.store.ReactivateBlock(ctx, hash, uint64(h), row.OrphanGeneration())
+		if err != nil {
 			t.logger.Warn("reorg: failed to reactivate resurrected block",
 				logfields.BlockHash(hash),
 				logfields.BlockHeight(uint64(h)),
 				zap.Error(err))
+			continue
+		}
+		if !applied {
+			// The row moved between the read above and the write: another
+			// edge reactivated it, or it was orphaned again with a newer
+			// generation. Either way this judgement is stale — not a
+			// transition, and not ours to force; the tie-scan re-judges the
+			// row on the next tip.
+			t.logger.Info("reorg: row changed under the walk; not reactivated",
+				logfields.BlockHash(hash),
+				logfields.BlockHeight(uint64(h)))
 			continue
 		}
 		metrics.BlockStatusTransitionsTotal.
@@ -293,7 +307,7 @@ func (t *blockStatusTracker) tieScan(ctx context.Context, tipHeight uint32, forc
 	// header arrives are excluded by the height filter; parked rows belong
 	// to the watchdog and are never judged here.
 	orphanedSet := make(map[string]struct{})
-	reactivateSet := make(map[string]uint64)
+	reactivateSet := make(map[string]*models.BlockProcessingStatus)
 	err := store.ForEachBlockProcessing(ctx, t.store, minHeight, t.scanDepth*4, func(row *models.BlockProcessingStatus) error {
 		if (row.Status != models.BlockStatusActive && row.Status != models.BlockStatusOrphaned) ||
 			row.BlockHeight < minHeight ||
@@ -320,7 +334,7 @@ func (t *blockStatusTracker) tieScan(ctx context.Context, tipHeight uint32, forc
 				logfields.BlockHeight(row.BlockHeight),
 				zap.String("active_block_hash", active.Hash.String()))
 		case row.Status == models.BlockStatusOrphaned && matches:
-			reactivateSet[row.BlockHash] = row.BlockHeight
+			reactivateSet[row.BlockHash] = row
 			t.logger.Warn("tie-scan: orphaned row is the active-chain block at its height again",
 				logfields.BlockHash(row.BlockHash),
 				logfields.BlockHeight(row.BlockHeight))
@@ -361,22 +375,31 @@ func (t *blockStatusTracker) markOrphaned(ctx context.Context, set map[string]st
 		zap.Uint32("tip_height", tipHeight))
 }
 
-// reactivateRows resets each orphaned row to active through the same
-// header-seen upsert the tip channel uses: every backend's conflict path
-// resets status, clears orphaned_at/reconciled_at and preserves the
-// milestone timestamps. Per-row writes are fine — a resurrection is a rare,
-// one-block event.
-func (t *blockStatusTracker) reactivateRows(ctx context.Context, rows map[string]uint64, tipHeight uint32) {
+// reactivateRows resets each judged orphaned row to active through
+// ReactivateBlock — a compare-and-set on the orphan generation the scan read,
+// which resets status, clears orphaned_at/reconciled_at and preserves the
+// milestone timestamps. A row another edge reactivated, or re-orphaned with a
+// newer generation, between the page read and this write is left alone and
+// not counted; the next tip's scan re-judges it. Per-row writes are fine — a
+// resurrection is a rare, one-block event.
+func (t *blockStatusTracker) reactivateRows(ctx context.Context, rows map[string]*models.BlockProcessingStatus, tipHeight uint32) {
 	if len(rows) == 0 {
 		return
 	}
 	reactivated := make([]string, 0, len(rows))
-	for hash, height := range rows {
-		if err := t.store.UpsertBlockHeaderSeen(ctx, hash, height, time.Now()); err != nil {
+	for hash, row := range rows {
+		applied, err := t.store.ReactivateBlock(ctx, hash, row.BlockHeight, row.OrphanGeneration())
+		if err != nil {
 			t.logger.Warn("tie-scan: failed to reactivate resurrected block",
 				logfields.BlockHash(hash),
-				logfields.BlockHeight(height),
+				logfields.BlockHeight(row.BlockHeight),
 				zap.Error(err))
+			continue
+		}
+		if !applied {
+			t.logger.Info("tie-scan: row changed since it was judged; not reactivated",
+				logfields.BlockHash(hash),
+				logfields.BlockHeight(row.BlockHeight))
 			continue
 		}
 		metrics.BlockStatusTransitionsTotal.

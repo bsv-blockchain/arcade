@@ -65,3 +65,14 @@ type BlockProcessingStatus struct {
 	// so a re-orphaning reconciles again.
 	ReconciledAt *time.Time `json:"reconciledAt,omitempty"`
 }
+
+// OrphanGeneration is the orphan generation this row was read with — the
+// value the store's generation-checked writes (MarkBlockReconciled,
+// ReactivateBlock) compare against — or zero for an orphaned row that never
+// recorded an orphaned_at, which those writes treat as "check status only".
+func (b *BlockProcessingStatus) OrphanGeneration() time.Time {
+	if b == nil || b.OrphanedAt == nil {
+		return time.Time{}
+	}
+	return *b.OrphanedAt
+}

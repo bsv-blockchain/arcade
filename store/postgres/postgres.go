@@ -1200,36 +1200,35 @@ func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, or
 	if len(blockHashes) == 0 {
 		return 0, nil
 	}
-	// The FROM-list alias reads the pre-update snapshot, so RETURNING can
-	// report each row's status BEFORE this statement — that is what makes
-	// the transition count exact without a second round-trip. The join is
-	// on the primary key, so it is strictly 1:1.
+	// Two data-modifying CTEs over one snapshot, so still one round-trip.
+	// The transition count is the row count of the first: its WHERE
+	// excludes rows already orphaned, and under READ COMMITTED a row a
+	// concurrent writer orphans first is re-checked against its UPDATED
+	// version once that writer's lock is released (EvalPlanQual) and drops
+	// out — so two replicas racing on the same row report ONE transition
+	// between them. A FROM-list self-join reading the "previous" status
+	// cannot promise that: EvalPlanQual re-fetches only the target row while
+	// the joined copy keeps the snapshot's value, so both racers would have
+	// counted. The second CTE refreshes the generation and clears the stamp
+	// on rows that were already orphaned; the snapshot decides which CTE a
+	// row belongs to, so no row is updated twice in one statement.
 	const q = `
-UPDATE block_processing AS bp
-SET status = 'orphaned', orphaned_at = $2, reconciled_at = NULL
-FROM block_processing AS prev
-WHERE bp.block_hash = prev.block_hash
-  AND bp.block_hash = ANY($1)
-RETURNING prev.status`
-	rows, err := s.pool.Query(ctx, q, blockHashes, orphanedAt)
-	if err != nil {
+WITH transitioned AS (
+    UPDATE block_processing
+    SET status = 'orphaned', orphaned_at = $2, reconciled_at = NULL
+    WHERE block_hash = ANY($1) AND status <> 'orphaned'
+    RETURNING 1
+), refreshed AS (
+    UPDATE block_processing
+    SET orphaned_at = $2, reconciled_at = NULL
+    WHERE block_hash = ANY($1) AND status = 'orphaned'
+)
+SELECT count(*) FROM transitioned`
+	var transitions int64
+	if err := s.pool.QueryRow(ctx, q, blockHashes, orphanedAt).Scan(&transitions); err != nil {
 		return 0, fmt.Errorf("mark blocks orphaned: %w", err)
 	}
-	defer rows.Close()
-	transitions := 0
-	for rows.Next() {
-		var was string
-		if err := rows.Scan(&was); err != nil {
-			return transitions, fmt.Errorf("mark blocks orphaned: %w", err)
-		}
-		if was != string(models.BlockStatusOrphaned) {
-			transitions++
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return transitions, fmt.Errorf("mark blocks orphaned: %w", err)
-	}
-	return transitions, nil
+	return int(transitions), nil
 }
 
 // MarkBlockReconciled stamps reconciled_at on an orphaned block's row — the
@@ -1252,6 +1251,32 @@ WHERE block_hash = $1
 	tag, err := s.pool.Exec(ctx, q, blockHash, at, generation)
 	if err != nil {
 		return false, fmt.Errorf("mark block reconciled %s: %w", blockHash, err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// ReactivateBlock returns an orphaned row to active as a compare-and-set on
+// the orphan generation (issue #339): the row must still be orphaned with the
+// orphaned_at the caller judged (a zero orphanedAt checks status only), so a
+// missing, active, parked or re-orphaned row is left untouched and reported
+// as not applied. block_height is overwritten as the header-seen upsert does;
+// the milestone timestamps are untouched. The WHERE is re-checked against the
+// row's current version under READ COMMITTED, so the check and the write are
+// one atomic step.
+func (s *Store) ReactivateBlock(ctx context.Context, blockHash string, blockHeight uint64, orphanedAt time.Time) (bool, error) {
+	const q = `
+UPDATE block_processing
+SET status = 'active', block_height = $2, orphaned_at = NULL, reconciled_at = NULL
+WHERE block_hash = $1
+  AND status = 'orphaned'
+  AND ($3::timestamptz IS NULL OR orphaned_at = $3)`
+	var generation *time.Time
+	if !orphanedAt.IsZero() {
+		generation = &orphanedAt
+	}
+	tag, err := s.pool.Exec(ctx, q, blockHash, int64(blockHeight), generation) //nolint:gosec // block height fits in int64
+	if err != nil {
+		return false, fmt.Errorf("reactivate block %s: %w", blockHash, err)
 	}
 	return tag.RowsAffected() == 1, nil
 }
