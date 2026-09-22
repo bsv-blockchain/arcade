@@ -1599,6 +1599,41 @@ func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, orpha
 	return true, nil
 }
 
+// RequeueOrphanedBlock clears reconciled_at on a row that is still orphaned
+// with the generation the caller judged (a zero orphanedAt checks status
+// only), putting it back on the reconciler's queue without changing the
+// generation. Missing, active, parked and re-orphaned rows are left
+// untouched and reported as not applied; it never transitions a row. The
+// shard lock makes the read-compare-write atomic against the other
+// block_processing writers.
+func (s *Store) RequeueOrphanedBlock(ctx context.Context, blockHash string, orphanedAt time.Time) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	mu := s.shardFor(blockHash)
+	mu.Lock()
+	defer mu.Unlock()
+	prev, err := s.readBlockProc(blockHash)
+	if err != nil {
+		return false, err
+	}
+	if prev == nil || prev.Status != string(models.BlockStatusOrphaned) {
+		return false, nil
+	}
+	if !orphanedAt.IsZero() && prev.OrphanedAtUnixNs != orphanedAt.UnixNano() {
+		return false, nil
+	}
+	if prev.ReconciledAtUnixNs == 0 {
+		return true, nil // already queued; nothing to write
+	}
+	cur := *prev
+	cur.ReconciledAtUnixNs = 0
+	if err := s.writeBlockProc(prev, &cur); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // ReactivateBlock returns an orphaned row to active as a compare-and-set on
 // the orphan generation (issue #339): the row must still be orphaned with the
 // orphaned_at the caller judged (a zero orphanedAt checks status only).

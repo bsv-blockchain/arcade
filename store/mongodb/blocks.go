@@ -115,7 +115,17 @@ func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, or
 		kv(fStatus, string(models.BlockStatusOrphaned)),
 		kv(opOr, bson.A{
 			doc(kv(fOrphanedGen, doc(kv(opLte, gen)))),
-			doc(kv(fOrphanedGen, doc(kv(opExists, false)))), // written before the field existed
+			// A row written before orphaned_gen existed follows the same
+			// forward-only-inclusive rule on the millisecond datetime it
+			// did store — a delayed older call must not regress it either
+			// — and one that never recorded a timestamp is initialized.
+			doc(
+				kv(fOrphanedGen, doc(kv(opExists, false))),
+				kv(opOr, bson.A{
+					doc(kv(fOrphanedAt, doc(kv(opLte, msTrunc(orphanedAt))))),
+					doc(kv(fOrphanedAt, nil)), // absent or explicit null
+				}),
+			),
 		}),
 	)
 	if _, err := s.updateBlocksIn(ctx, blockHashes, refresh, update, "refresh orphaned generation"); err != nil {
@@ -188,6 +198,25 @@ func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, orpha
 	res, err := s.blocks.UpdateOne(octx, filter, doc(kv(opSet, doc(kv(fReconciledAt, msTrunc(at))))))
 	if err != nil {
 		return false, fmt.Errorf("mark block reconciled %s: %w", blockHash, err)
+	}
+	return res.MatchedCount == 1, nil
+}
+
+// RequeueOrphanedBlock implements store.Store: it unsets reconciled_at only
+// while the row is still orphaned with the generation the caller judged (see
+// orphanGenerationFilter; zero = status only), putting it back on the
+// reconciler's queue without changing the generation. Missing, active,
+// parked and re-orphaned rows are left untouched and reported as not
+// applied; it never transitions a row. Filter and update are one atomic
+// step per document; no upsert.
+func (s *Store) RequeueOrphanedBlock(ctx context.Context, blockHash string, orphanedAt time.Time) (bool, error) {
+	filter := doc(kv(fID, blockHash), kv(fStatus, string(models.BlockStatusOrphaned)))
+	filter = append(filter, orphanGenerationFilter(orphanedAt)...)
+	octx, cancel := s.opCtx(ctx)
+	defer cancel()
+	res, err := s.blocks.UpdateOne(octx, filter, doc(kv(opUnset, doc(kv(fReconciledAt, "")))))
+	if err != nil {
+		return false, fmt.Errorf("requeue orphaned block %s: %w", blockHash, err)
 	}
 	return res.MatchedCount == 1, nil
 }

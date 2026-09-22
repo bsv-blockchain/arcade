@@ -2566,6 +2566,54 @@ func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, orpha
 	return true, nil
 }
 
+// RequeueOrphanedBlock clears reconciled_at on a row that is still orphaned
+// with the generation the caller judged (a zero orphanedAt checks status
+// only), putting it back on the reconciler's queue without changing the
+// generation. Missing, active, parked and re-orphaned rows are left
+// untouched and reported as not applied; it never transitions a row.
+// Read-then-EXPECT_GEN_EQUAL with a bounded re-read on a record-generation
+// conflict, like ReactivateBlock; UPDATE_ONLY never creates a phantom row.
+func (s *Store) RequeueOrphanedBlock(ctx context.Context, blockHash string, orphanedAt time.Time) (bool, error) {
+	key, err := s.key(setBlockProcessing, blockHash)
+	if err != nil {
+		return false, err
+	}
+	for attempt := 0; attempt < casAttempts; attempt++ {
+		rec, err := s.client.Get(s.readPolicy(ctx), key, binStatus, binOrphanedAt, binReconciledAt)
+		if err != nil {
+			if isKeyNotFound(err) {
+				return false, nil
+			}
+			return false, fmt.Errorf("read block for requeue cas %s: %w", blockHash, err)
+		}
+		if rec == nil || getString(rec, binStatus) != string(models.BlockStatusOrphaned) {
+			return false, nil
+		}
+		if !orphanedAt.IsZero() && getInt64(rec, binOrphanedAt) != orphanedAt.UnixNano() {
+			return false, nil
+		}
+		if getInt64(rec, binReconciledAt) == 0 {
+			return true, nil // already queued; nothing to write
+		}
+		policy := s.writePolicy(ctx)
+		policy.RecordExistsAction = aero.UPDATE_ONLY
+		policy.GenerationPolicy = aero.EXPECT_GEN_EQUAL
+		policy.Generation = rec.Generation
+		_, opErr := s.client.Operate(policy, key, aero.PutOp(aero.NewBin(binReconciledAt, nil)))
+		switch {
+		case opErr == nil:
+			return true, nil
+		case isKeyNotFound(opErr):
+			return false, nil
+		case isGenerationErr(opErr):
+			continue
+		default:
+			return false, fmt.Errorf("requeue orphaned block %s: %w", blockHash, opErr)
+		}
+	}
+	return false, fmt.Errorf("requeue orphaned block %s: record kept changing across %d CAS attempts", blockHash, casAttempts)
+}
+
 // ReactivateBlock returns an orphaned row to active as a compare-and-set on
 // the orphan generation (issue #339): the row must still be orphaned with the
 // orphaned_at the caller judged (a zero orphanedAt checks status only).

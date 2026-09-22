@@ -1267,6 +1267,31 @@ WHERE block_hash = $1
 	return tag.RowsAffected() == 1, nil
 }
 
+// RequeueOrphanedBlock clears reconciled_at on a row that is still orphaned
+// with the generation the caller judged (a zero orphanedAt checks status
+// only), putting it back on the reconciler's queue without changing the
+// generation. Missing, active, parked and re-orphaned rows are left
+// untouched and reported as not applied; it never transitions a row. The
+// WHERE is re-checked against the row's current version under READ
+// COMMITTED, so the check and the write are one atomic step.
+func (s *Store) RequeueOrphanedBlock(ctx context.Context, blockHash string, orphanedAt time.Time) (bool, error) {
+	const q = `
+UPDATE block_processing
+SET reconciled_at = NULL
+WHERE block_hash = $1
+  AND status = 'orphaned'
+  AND ($2::timestamptz IS NULL OR orphaned_at = $2)`
+	var generation *time.Time
+	if !orphanedAt.IsZero() {
+		generation = &orphanedAt
+	}
+	tag, err := s.pool.Exec(ctx, q, blockHash, generation)
+	if err != nil {
+		return false, fmt.Errorf("requeue orphaned block %s: %w", blockHash, err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
 // ReactivateBlock returns an orphaned row to active as a compare-and-set on
 // the orphan generation (issue #339): the row must still be orphaned with the
 // orphaned_at the caller judged (a zero orphanedAt checks status only), so a

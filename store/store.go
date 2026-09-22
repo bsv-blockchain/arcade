@@ -429,6 +429,24 @@ type Store interface {
 	// walk, and the full-scan re-mines for minutes before it writes).
 	ReactivateBlock(ctx context.Context, blockHash string, blockHeight uint64, orphanedAt time.Time) (bool, error)
 
+	// RequeueOrphanedBlock puts an orphaned row that a previous
+	// reconciliation stamped — and so left the reconciler's durable queue —
+	// back on it, as a compare-and-set on the orphan generation: it clears
+	// reconciled_at only while the row is still status='orphaned' AND its
+	// orphaned_at equals orphanedAt (a zero orphanedAt checks status only).
+	// The generation is NOT changed, so the token the caller holds keeps
+	// matching, and it is never a status transition: a row another edge
+	// reactivated since the caller judged it (the block-status tracker
+	// running alongside the reconciler's full-scan), a row orphaned again
+	// with a newer generation (already back on the queue, since
+	// MarkBlocksOrphaned clears the stamp) and a missing row are all left
+	// untouched. Returns whether the stamp was cleared. This is the
+	// full-scan's hand-off to the tick for a repair it cannot finish itself
+	// (issue #339 review); MarkBlocksOrphaned is the wrong tool for that,
+	// because its transition arm would flip a legitimately reactivated
+	// canonical row back to orphaned.
+	RequeueOrphanedBlock(ctx context.Context, blockHash string, orphanedAt time.Time) (bool, error)
+
 	// MarkBlockProcessed records that the merkle service delivered
 	// BLOCK_PROCESSED for this block. Upsert: when no row exists (callback
 	// arrived before chaintracks emitted the header), insert with

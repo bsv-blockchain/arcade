@@ -837,3 +837,76 @@ func TestMarkBlocksOrphaned_CancelledContextStopsMidChunk(t *testing.T) {
 		}
 	}
 }
+
+// TestMarkBlocksOrphaned_LegacyRowsFollowForwardOnlyRule: a row written
+// before orphaned_gen existed carries only the millisecond orphaned_at. The
+// refresh's legacy arm must apply the same forward-only-inclusive rule on
+// that datetime — a delayed older call must not regress a legacy row's newer
+// generation either — while a legacy row that never recorded a timestamp is
+// initialized. An upgraded row gains orphaned_gen, so its generation reads
+// back at full precision from then on.
+func TestMarkBlocksOrphaned_LegacyRowsFollowForwardOnlyRule(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	t0 := time.Unix(1700001200, 0).UTC()
+	// Sub-millisecond bits prove orphaned_gen was written: a datetime alone
+	// cannot round-trip them.
+	incoming := t0.Add(2*time.Minute + 123*time.Microsecond)
+	newer, older := t0.Add(3*time.Minute), t0.Add(time.Minute)
+	const rowNewer, rowOlder, rowNull = "legacy-newer", "legacy-older", "legacy-null"
+
+	// Seed legacy rows: orphaned, stamped, with orphaned_at but no orphaned_gen.
+	for hash, at := range map[string]*time.Time{rowNewer: &newer, rowOlder: &older, rowNull: nil} {
+		if err := s.UpsertBlockHeaderSeen(ctx, hash, 830, t0); err != nil {
+			t.Fatalf("seed %s: %v", hash, err)
+		}
+		set := doc(kv(fStatus, string(models.BlockStatusOrphaned)), kv(fReconciledAt, t0.Add(10*time.Minute)))
+		if at != nil {
+			set = append(set, kv(fOrphanedAt, msTrunc(*at)))
+		}
+		if _, err := s.blocks.UpdateOne(ctx, idFilter(hash), doc(kv(opSet, set), kv(opUnset, doc(kv(fOrphanedGen, ""))))); err != nil {
+			t.Fatalf("make %s legacy: %v", hash, err)
+		}
+	}
+
+	n, err := s.MarkBlocksOrphaned(ctx, []string{rowNewer, rowOlder, rowNull}, incoming)
+	if err != nil || n != 0 {
+		t.Fatalf("MarkBlocksOrphaned: n=%d err=%v, want 0 (all three were already orphaned)", n, err)
+	}
+
+	// Newer legacy generation: untouched, stamp and all.
+	got, err := s.GetBlockProcessingStatus(ctx, rowNewer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OrphanedAt == nil || !got.OrphanedAt.Equal(newer) || got.ReconciledAt == nil {
+		t.Fatalf("a delayed older call must not regress a legacy row's newer generation, got orphanedAt=%v reconciledAt=%v",
+			got.OrphanedAt, got.ReconciledAt)
+	}
+	// Older legacy generation: upgraded to the incoming one, at full precision.
+	got, err = s.GetBlockProcessingStatus(ctx, rowOlder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OrphanedAt == nil || !got.OrphanedAt.Equal(incoming) || got.ReconciledAt != nil {
+		t.Fatalf("an older legacy row must be refreshed to the incoming generation and requeued, got orphanedAt=%v reconciledAt=%v",
+			got.OrphanedAt, got.ReconciledAt)
+	}
+	// No timestamp at all: initialized.
+	got, err = s.GetBlockProcessingStatus(ctx, rowNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OrphanedAt == nil || !got.OrphanedAt.Equal(incoming) || got.ReconciledAt != nil {
+		t.Fatalf("a legacy row with no timestamp must be initialized and requeued, got orphanedAt=%v reconciledAt=%v",
+			got.OrphanedAt, got.ReconciledAt)
+	}
+	// And the tokens follow: the newer legacy row still answers to its
+	// millisecond datetime, the upgraded rows to the incoming generation.
+	if ok, err := s.MarkBlockReconciled(ctx, rowNewer, incoming, t0.Add(time.Hour)); err != nil || ok {
+		t.Fatalf("the incoming token must not stamp the newer legacy row: ok=%v err=%v", ok, err)
+	}
+	if ok, err := s.MarkBlockReconciled(ctx, rowOlder, incoming, t0.Add(time.Hour)); err != nil || !ok {
+		t.Fatalf("the incoming token must stamp the upgraded row: ok=%v err=%v", ok, err)
+	}
+}

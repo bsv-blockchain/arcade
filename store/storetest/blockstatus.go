@@ -20,6 +20,7 @@ type BlockStatusBackend interface {
 	MarkBlocksParked(ctx context.Context, blockHashes []string) error
 	MarkBlockReconciled(ctx context.Context, blockHash string, orphanedAt, at time.Time) (bool, error)
 	ReactivateBlock(ctx context.Context, blockHash string, blockHeight uint64, orphanedAt time.Time) (bool, error)
+	RequeueOrphanedBlock(ctx context.Context, blockHash string, orphanedAt time.Time) (bool, error)
 	GetBlockProcessingStatus(ctx context.Context, blockHash string) (*models.BlockProcessingStatus, error)
 	ListOrphanedBlocksToReconcile(ctx context.Context, limit int) ([]*models.BlockProcessingStatus, error)
 }
@@ -44,6 +45,9 @@ const blockSuiteHeight = uint64(9_300_000)
 //     and requeues.
 //   - MarkBlockReconciled applies only to a row still orphaned with the
 //     generation the caller processed.
+//   - RequeueOrphanedBlock clears the stamp only on a row still orphaned with
+//     the generation the caller judged, never changes the generation, and
+//     never transitions a row.
 //
 // Whole-second timestamps throughout: the backends store nanoseconds
 // (Pebble, Aerospike), microseconds (Postgres) and milliseconds (MongoDB),
@@ -220,6 +224,124 @@ func RunBlockStatusSuite(t *testing.T, newBackend func(t *testing.T) BlockStatus
 			}
 			if _, err := b.GetBlockProcessingStatus(ctx, hash); !errors.Is(err, store.ErrNotFound) {
 				t.Fatalf("a reactivation must never create a row, got err=%v", err)
+			}
+		})
+	})
+
+	t.Run("RequeueOrphanedBlock", func(t *testing.T) {
+		t.Run("AppliesOnMatchingGeneration", func(t *testing.T) {
+			b := newBackend(t)
+			const hash = "bs-requeue-apply"
+			seedOrphan(t, b, hash, blockSuiteHeight+120)
+			if ok, err := b.MarkBlockReconciled(ctx, hash, gen1, gen1.Add(10*time.Second)); err != nil || !ok {
+				t.Fatalf("stamp: ok=%v err=%v", ok, err)
+			}
+			if queued(t, b, hash) {
+				t.Fatal("premise: a reconciled row is off the queue")
+			}
+
+			applied, err := b.RequeueOrphanedBlock(ctx, hash, gen1)
+			if err != nil || !applied {
+				t.Fatalf("RequeueOrphanedBlock: applied=%v err=%v, want true", applied, err)
+			}
+			got := row(t, b, hash)
+			assertOrphanedAt(t, got, gen1) // the generation is untouched
+			if got.ReconciledAt != nil {
+				t.Fatalf("requeue must clear reconciled_at, got %v", got.ReconciledAt)
+			}
+			if !queued(t, b, hash) {
+				t.Fatal("requeue must put the row back on the reconcile queue")
+			}
+			// Idempotent on an already-queued row, and the unchanged token
+			// still stamps the requeued row.
+			if applied, err = b.RequeueOrphanedBlock(ctx, hash, gen1); err != nil || !applied {
+				t.Fatalf("requeue of a queued row: applied=%v err=%v, want true", applied, err)
+			}
+			if ok, err := b.MarkBlockReconciled(ctx, hash, gen1, gen1.Add(time.Minute)); err != nil || !ok {
+				t.Fatalf("the token must still stamp: ok=%v err=%v", ok, err)
+			}
+		})
+
+		t.Run("NeverTransitionsAnActiveRow", func(t *testing.T) {
+			// The case the full-scan hand-off must be safe against: the
+			// tracker reactivated the canonical row between the scan's read
+			// and the requeue. The row must stay active and clean.
+			b := newBackend(t)
+			const hash = "bs-requeue-active"
+			seedOrphan(t, b, hash, blockSuiteHeight+130)
+			if applied, err := b.ReactivateBlock(ctx, hash, blockSuiteHeight+130, gen1); err != nil || !applied {
+				t.Fatalf("ReactivateBlock: applied=%v err=%v", applied, err)
+			}
+			applied, err := b.RequeueOrphanedBlock(ctx, hash, gen1)
+			if err != nil || applied {
+				t.Fatalf("requeue of an active row: applied=%v err=%v, want false", applied, err)
+			}
+			got := row(t, b, hash)
+			if got.Status != models.BlockStatusActive || got.OrphanedAt != nil || got.ReconciledAt != nil {
+				t.Fatalf("an active row must stay active and clean, got %+v", got)
+			}
+			if queued(t, b, hash) {
+				t.Fatal("an active row must not be on the reconcile queue")
+			}
+			// Nor a parked one.
+			const parked = "bs-requeue-parked"
+			if err := b.UpsertBlockHeaderSeen(ctx, parked, blockSuiteHeight+131, t0); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			if err := b.MarkBlocksParked(ctx, []string{parked}); err != nil {
+				t.Fatalf("park: %v", err)
+			}
+			if applied, err := b.RequeueOrphanedBlock(ctx, parked, time.Time{}); err != nil || applied {
+				t.Fatalf("requeue of a parked row: applied=%v err=%v, want false", applied, err)
+			}
+			if got := row(t, b, parked); got.Status != models.BlockStatusParked {
+				t.Fatalf("parked row must stay parked, got %s", got.Status)
+			}
+		})
+
+		t.Run("StaleGenerationIsNoOp", func(t *testing.T) {
+			// Re-orphaned with a newer generation since the caller judged
+			// it: that generation is already queued (MarkBlocksOrphaned
+			// cleared the stamp) and the old token must not touch it — nor
+			// its stamp once its own pass has stamped it.
+			b := newBackend(t)
+			const hash = "bs-requeue-stale"
+			seedOrphan(t, b, hash, blockSuiteHeight+140)
+			if applied, err := b.ReactivateBlock(ctx, hash, blockSuiteHeight+140, gen1); err != nil || !applied {
+				t.Fatalf("ReactivateBlock: applied=%v err=%v", applied, err)
+			}
+			if n, err := b.MarkBlocksOrphaned(ctx, []string{hash}, gen2); err != nil || n != 1 {
+				t.Fatalf("re-orphan: n=%d err=%v", n, err)
+			}
+			if ok, err := b.MarkBlockReconciled(ctx, hash, gen2, gen2.Add(10*time.Second)); err != nil || !ok {
+				t.Fatalf("stamp gen2: ok=%v err=%v", ok, err)
+			}
+			applied, err := b.RequeueOrphanedBlock(ctx, hash, gen1)
+			if err != nil || applied {
+				t.Fatalf("stale-generation requeue: applied=%v err=%v, want false", applied, err)
+			}
+			got := row(t, b, hash)
+			assertOrphanedAt(t, got, gen2)
+			if got.ReconciledAt == nil {
+				t.Fatal("a stale requeue must leave the newer generation's stamp alone")
+			}
+			// Zero generation checks status only.
+			if applied, err = b.RequeueOrphanedBlock(ctx, hash, time.Time{}); err != nil || !applied {
+				t.Fatalf("zero-generation requeue on an orphaned row: applied=%v err=%v, want true", applied, err)
+			}
+			if got := row(t, b, hash); got.ReconciledAt != nil {
+				t.Fatalf("zero-generation requeue must clear the stamp, got %v", got.ReconciledAt)
+			}
+		})
+
+		t.Run("MissingRowIsNotCreated", func(t *testing.T) {
+			b := newBackend(t)
+			const hash = "bs-requeue-missing"
+			if applied, err := b.RequeueOrphanedBlock(ctx, hash, time.Time{}); err != nil || applied {
+				t.Fatalf("requeue of a missing row: applied=%v err=%v, want false", applied, err)
+			}
+			if _, err := b.GetBlockProcessingStatus(ctx, hash); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("a requeue must never create a row, got err=%v", err)
 			}
 		})
 	})
