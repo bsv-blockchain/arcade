@@ -131,7 +131,7 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		}
 	}
 
-	st, leaser, err := storefactory.New(ctx, cfg)
+	st, leaser, err := storefactory.New(ctx, cfg, logger)
 	if err != nil {
 		_ = producer.Close()
 		return nil, nil, fmt.Errorf("creating store: %w", err)
