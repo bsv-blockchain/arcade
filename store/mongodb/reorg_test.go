@@ -5,6 +5,7 @@ package mongodb
 import (
 	"context"
 	"errors"
+	"slices"
 	"sort"
 	"testing"
 	"time"
@@ -382,10 +383,10 @@ func TestMarkBlockReconciled_And_ListOrphanedBlocksToReconcile(t *testing.T) {
 	}
 	// Orphan rb-2 first in wall-clock terms so the list orders by
 	// orphaned_at, not by insertion or height.
-	if err := s.MarkBlocksOrphaned(ctx, []string{"rb-2"}, t0.Add(time.Minute)); err != nil {
+	if _, err := s.MarkBlocksOrphaned(ctx, []string{"rb-2"}, t0.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.MarkBlocksOrphaned(ctx, []string{"rb-1"}, t0.Add(2*time.Minute)); err != nil {
+	if _, err := s.MarkBlocksOrphaned(ctx, []string{"rb-1"}, t0.Add(2*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -403,8 +404,8 @@ func TestMarkBlockReconciled_And_ListOrphanedBlocksToReconcile(t *testing.T) {
 	}
 
 	// Reconcile rb-2 — only rb-1 remains queued.
-	if err := s.MarkBlockReconciled(ctx, "rb-2", t0.Add(3*time.Minute)); err != nil {
-		t.Fatalf("MarkBlockReconciled: %v", err)
+	if stamped, mrErr := s.MarkBlockReconciled(ctx, "rb-2", t0.Add(time.Minute), t0.Add(3*time.Minute)); mrErr != nil || !stamped {
+		t.Fatalf("MarkBlockReconciled: stamped=%v err=%v", stamped, mrErr)
 	}
 	rows, err = s.ListOrphanedBlocksToReconcile(ctx, 10)
 	if err != nil {
@@ -422,8 +423,8 @@ func TestMarkBlockReconciled_And_ListOrphanedBlocksToReconcile(t *testing.T) {
 	}
 
 	// Missing rows are silently skipped.
-	if err := s.MarkBlockReconciled(ctx, "never-seen", t0); err != nil {
-		t.Fatalf("MarkBlockReconciled on missing row: %v", err)
+	if stamped, missErr := s.MarkBlockReconciled(ctx, "never-seen", t0, t0); missErr != nil || stamped {
+		t.Fatalf("MarkBlockReconciled on missing row: stamped=%v err=%v", stamped, missErr)
 	}
 
 	// Resurrection: the reconciled block re-joins the main chain with both
@@ -441,6 +442,152 @@ func TestMarkBlockReconciled_And_ListOrphanedBlocksToReconcile(t *testing.T) {
 	if got.OrphanedAt != nil || got.ReconciledAt != nil {
 		t.Errorf("resurrection must clear reorg markers: orphanedAt=%v reconciledAt=%v",
 			got.OrphanedAt, got.ReconciledAt)
+	}
+
+	// Generation check (issue #339): the stamp is a CAS on the orphan
+	// generation the reconciler processed. A stamp for an older generation is
+	// a no-op and rb-1 stays queued…
+	stamped, err := s.MarkBlockReconciled(ctx, "rb-1", t0 /* not rb-1's orphaned_at */, t0.Add(4*time.Minute))
+	if err != nil || stamped {
+		t.Fatalf("stale-generation stamp must be a no-op, got stamped=%v err=%v", stamped, err)
+	}
+	if rows, err = s.ListOrphanedBlocksToReconcile(ctx, 10); err != nil || len(rows) != 1 || rows[0].BlockHash != "rb-1" {
+		t.Fatalf("queue after stale stamp = %v (err=%v), want [rb-1]", hashesOf(rows), err)
+	}
+	// …a resurrected (active) row is never stamped, even without a generation…
+	stamped, err = s.MarkBlockReconciled(ctx, "rb-2", time.Time{}, t0.Add(4*time.Minute))
+	if err != nil || stamped {
+		t.Fatalf("stamp on a resurrected row must be a no-op, got stamped=%v err=%v", stamped, err)
+	}
+	if got, gerr := s.GetBlockProcessingStatus(ctx, "rb-2"); gerr != nil || got.ReconciledAt != nil {
+		t.Fatalf("resurrected row must stay clean, got %+v err=%v", got, gerr)
+	}
+	// …and a zero generation only requires the row to still be orphaned.
+	stamped, err = s.MarkBlockReconciled(ctx, "rb-1", time.Time{}, t0.Add(5*time.Minute))
+	if err != nil || !stamped {
+		t.Fatalf("zero-generation stamp on an orphaned row must apply, got stamped=%v err=%v", stamped, err)
+	}
+	if rows, err = s.ListOrphanedBlocksToReconcile(ctx, 10); err != nil || len(rows) != 0 {
+		t.Fatalf("queue must be empty after the stamp, got %v err=%v", hashesOf(rows), err)
+	}
+}
+
+// TestMarkBlocksOrphaned_ReorphanRequeuesAndCountsTransitions pins two
+// contract points of the re-orphan path (issue #339 review):
+//
+//  1. Re-orphaning a row that was already reconciled clears reconciled_at,
+//     so the new generation re-enters the reconciler queue instead of being
+//     stranded behind the previous generation's stamp.
+//  2. The returned count is applied status TRANSITIONS — a hash with no row
+//     and a row that was already orphaned are both written/skipped without
+//     being counted, which is what the block-status metric reports.
+func TestMarkBlocksOrphaned_ReorphanRequeuesAndCountsTransitions(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	t0 := time.Unix(1700000700, 0).UTC()
+
+	if err := s.UpsertBlockHeaderSeen(ctx, "rq-1", 800, t0); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// First orphaning: one real transition, plus a hash with no row at all.
+	n, err := s.MarkBlocksOrphaned(ctx, []string{"rq-1", "rq-missing"}, t0.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("transitions = %d, want 1 (a hash with no row is not a transition)", n)
+	}
+	ok, err := s.MarkBlockReconciled(ctx, "rq-1", t0.Add(time.Minute), t0.Add(2*time.Minute))
+	if err != nil || !ok {
+		t.Fatalf("MarkBlockReconciled: ok=%v err=%v", ok, err)
+	}
+	if rows, lErr := s.ListOrphanedBlocksToReconcile(ctx, 10); lErr != nil || len(rows) != 0 {
+		t.Fatalf("reconciled row must leave the queue, got %v err=%v", hashesOf(rows), lErr)
+	}
+
+	// Re-orphaned by a later reorg: already orphaned, so not a transition,
+	// but the stamp must clear so the new generation is reconciled.
+	n, err = s.MarkBlocksOrphaned(ctx, []string{"rq-1"}, t0.Add(3*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("transitions = %d, want 0 (the row was already orphaned)", n)
+	}
+	row, err := s.GetBlockProcessingStatus(ctx, "rq-1")
+	if err != nil {
+		t.Fatalf("GetBlockProcessingStatus: %v", err)
+	}
+	if row.ReconciledAt != nil {
+		t.Fatalf("re-orphaning must clear reconciled_at, got %v", row.ReconciledAt)
+	}
+	if row.OrphanedAt == nil || !row.OrphanedAt.Equal(t0.Add(3*time.Minute)) {
+		t.Fatalf("re-orphaning must stamp the new generation, got %v", row.OrphanedAt)
+	}
+	rows, err := s.ListOrphanedBlocksToReconcile(ctx, 10)
+	if err != nil || len(rows) != 1 || rows[0].BlockHash != "rq-1" {
+		t.Fatalf("re-orphaned row must re-enter the queue, got %v err=%v", hashesOf(rows), err)
+	}
+
+	// The stale generation cannot stamp the new one.
+	stale, err := s.MarkBlockReconciled(ctx, "rq-1", t0.Add(time.Minute), t0.Add(4*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale {
+		t.Fatal("a stamp carrying the OLD generation must not apply")
+	}
+}
+
+// TestMarkBlocksOrphaned_RefreshNeverMovesGenerationBackwards: this
+// backend's MarkBlocksOrphaned is two statements — the status transition,
+// then a generation refresh for rows already orphaned — and between them
+// another writer can reactivate a row this call just transitioned and orphan
+// it again with a NEWER generation. The refresh must then leave that
+// generation alone: an unguarded one would overwrite it with this call's
+// older timestamp, and a reconciler holding the older token would pass the
+// CAS for a generation it never processed. The refresh is exactly a
+// MarkBlocksOrphaned with an older timestamp landing on a newer-generation
+// row, which is what this drives directly.
+func TestMarkBlocksOrphaned_RefreshNeverMovesGenerationBackwards(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	t0 := time.Unix(1700000900, 0).UTC()
+	older, newer := t0.Add(time.Minute), t0.Add(2*time.Minute)
+	const hash = "rq-backwards"
+
+	if err := s.UpsertBlockHeaderSeen(ctx, hash, 810, t0); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// Call A transitions the row at `older`; a reconciler dequeues that token.
+	if n, err := s.MarkBlocksOrphaned(ctx, []string{hash}, older); err != nil || n != 1 {
+		t.Fatalf("A's transition: n=%d err=%v", n, err)
+	}
+	// Writer B resurrects the row and orphans it again at `newer`.
+	if applied, err := s.ReactivateBlock(ctx, hash, 810, older); err != nil || !applied {
+		t.Fatalf("B's reactivate: applied=%v err=%v", applied, err)
+	}
+	if n, err := s.MarkBlocksOrphaned(ctx, []string{hash}, newer); err != nil || n != 1 {
+		t.Fatalf("B's re-orphan: n=%d err=%v", n, err)
+	}
+	// A's refresh statement lands last: the same write A would issue.
+	if n, err := s.MarkBlocksOrphaned(ctx, []string{hash}, older); err != nil || n != 0 {
+		t.Fatalf("A's late refresh: n=%d err=%v, want 0", n, err)
+	}
+	got, err := s.GetBlockProcessingStatus(ctx, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OrphanedAt == nil || !got.OrphanedAt.Equal(newer) {
+		t.Fatalf("the refresh must never move the generation backwards, got %v want %v", got.OrphanedAt, newer)
+	}
+	// The stale token cannot stamp B's generation; B's own token can.
+	if ok, err := s.MarkBlockReconciled(ctx, hash, older, t0.Add(time.Hour)); err != nil || ok {
+		t.Fatalf("A's stale token must not stamp B's generation: ok=%v err=%v", ok, err)
+	}
+	if ok, err := s.MarkBlockReconciled(ctx, hash, newer, t0.Add(time.Hour)); err != nil || !ok {
+		t.Fatalf("B's token must stamp: ok=%v err=%v", ok, err)
 	}
 }
 
@@ -468,7 +615,7 @@ func TestListOrphanedBlocksToReconcile_PrioritizesReanchorable(t *testing.T) {
 		if err := s.UpsertBlockHeaderSeen(ctx, orphan, h, t0); err != nil {
 			t.Fatalf("seed orphan %s: %v", orphan, err)
 		}
-		if err := s.MarkBlocksOrphaned(ctx, []string{orphan}, t0.Add(time.Duration(i+1)*time.Minute)); err != nil {
+		if _, err := s.MarkBlocksOrphaned(ctx, []string{orphan}, t0.Add(time.Duration(i+1)*time.Minute)); err != nil {
 			t.Fatalf("orphan %s: %v", orphan, err)
 		}
 	}
@@ -486,7 +633,7 @@ func TestListOrphanedBlocksToReconcile_PrioritizesReanchorable(t *testing.T) {
 	if err := s.UpsertBlockHeaderSeen(ctx, "orph-canon", 200, t0); err != nil {
 		t.Fatalf("seed orph-canon: %v", err)
 	}
-	if err := s.MarkBlocksOrphaned(ctx, []string{"orph-canon"}, t0.Add(10*time.Minute)); err != nil {
+	if _, err := s.MarkBlocksOrphaned(ctx, []string{"orph-canon"}, t0.Add(10*time.Minute)); err != nil {
 		t.Fatalf("orphan orph-canon: %v", err)
 	}
 	if err := s.InsertBUMP(ctx, "act-canon", 200, []byte{0xde, 0xad}); err != nil {
@@ -587,5 +734,257 @@ func TestGetStatus_EnrichesOrphanedProofPaths(t *testing.T) {
 	if len(got.OrphanedProofs[0].MerklePath) != 0 {
 		t.Errorf("entry must be served without a path once the BUMP is deleted, got %x",
 			got.OrphanedProofs[0].MerklePath)
+	}
+}
+
+// TestMarkBlocksOrphaned_EqualTimestampRequeues: the transition statement
+// skips a row that is already orphaned, so a re-orphaning that reuses the
+// stored timestamp can only requeue the row through the refresh — which must
+// therefore match an EQUAL generation, not just an older one. Otherwise a
+// reconciled row re-orphaned with the same token stays stamped and off the
+// queue for good.
+func TestMarkBlocksOrphaned_EqualTimestampRequeues(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	t0 := time.Unix(1700001000, 0).UTC()
+	gen := t0.Add(time.Minute)
+	const hash = "rq-equal"
+
+	if err := s.UpsertBlockHeaderSeen(ctx, hash, 820, t0); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if n, err := s.MarkBlocksOrphaned(ctx, []string{hash}, gen); err != nil || n != 1 {
+		t.Fatalf("orphan: n=%d err=%v", n, err)
+	}
+	if ok, err := s.MarkBlockReconciled(ctx, hash, gen, gen.Add(10*time.Second)); err != nil || !ok {
+		t.Fatalf("stamp: ok=%v err=%v", ok, err)
+	}
+	if rows, err := s.ListOrphanedBlocksToReconcile(ctx, 10); err != nil || len(rows) != 0 {
+		t.Fatalf("premise: a reconciled row is off the queue, got %v err=%v", hashesOf(rows), err)
+	}
+
+	if n, err := s.MarkBlocksOrphaned(ctx, []string{hash}, gen); err != nil || n != 0 {
+		t.Fatalf("equal-timestamp re-orphan: n=%d err=%v, want 0", n, err)
+	}
+	got, err := s.GetBlockProcessingStatus(ctx, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ReconciledAt != nil {
+		t.Fatalf("an equal-timestamp re-orphan must clear reconciled_at, got %v", got.ReconciledAt)
+	}
+	// The store mints: strictly newer than the reused timestamp, by the
+	// smallest step orphaned_gen holds (1 ns), with the millisecond copy
+	// derived from it.
+	if got.OrphanedAt == nil || !got.OrphanedAt.Equal(gen.Add(time.Nanosecond)) {
+		t.Fatalf("generation must be minted one step above the reused %v, got %v", gen, got.OrphanedAt)
+	}
+	if rows, err := s.ListOrphanedBlocksToReconcile(ctx, 10); err != nil || len(rows) != 1 || rows[0].BlockHash != hash {
+		t.Fatalf("the row must be back on the queue, got %v err=%v", hashesOf(rows), err)
+	}
+	if ok, err := s.MarkBlockReconciled(ctx, hash, gen, gen.Add(time.Hour)); err != nil || ok {
+		t.Fatalf("the reused timestamp must no longer be a valid token: ok=%v err=%v", ok, err)
+	}
+}
+
+// errCalls is a context whose Err reports Canceled from its n-th call on, so
+// a test can pin where in a chunked write a cancellation is noticed. Its
+// Done channel is the parent's (never closed), so only the store's own
+// ctx.Err checks — not the driver's — see the cancellation.
+type errCalls struct {
+	context.Context //nolint:containedctx // test double: a context whose Err is scripted
+
+	calls, n int
+}
+
+func (c *errCalls) Err() error {
+	c.calls++
+	if c.calls >= c.n {
+		return context.Canceled
+	}
+	return nil
+}
+
+// TestMarkBlocksOrphaned_CancelledContextStopsMidChunk: the chunk loop must
+// check the context before each chunk — a caller cancelled mid-batch (the
+// reconciler's lease heartbeat on lease loss) must not keep writing — and
+// report the transitions that landed alongside the error.
+func TestMarkBlocksOrphaned_CancelledContextStopsMidChunk(t *testing.T) {
+	s := newTestStore(t)
+	s.batchSize = 1 // one hash per chunk, so the cancellation lands between rows
+	ctx := context.Background()
+	t0 := time.Unix(1700001100, 0).UTC()
+	hashes := []string{"cc-a", "cc-b", "cc-c"}
+	for i, h := range hashes {
+		if err := s.UpsertBlockHeaderSeen(ctx, h, uint64(900+i), t0); err != nil {
+			t.Fatalf("seed %s: %v", h, err)
+		}
+	}
+
+	// Err calls: 1 = before chunk a, 2 = before chunk b.
+	cctx := &errCalls{Context: ctx, n: 2}
+	n, err := s.MarkBlocksOrphaned(cctx, hashes, t0.Add(time.Minute))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if n != 1 {
+		t.Fatalf("transitions = %d, want 1 (only the chunk written before the cancellation)", n)
+	}
+	for _, h := range hashes {
+		got, gerr := s.GetBlockProcessingStatus(ctx, h)
+		if gerr != nil {
+			t.Fatal(gerr)
+		}
+		want := models.BlockStatusActive
+		if h == "cc-a" {
+			want = models.BlockStatusOrphaned
+		}
+		if got.Status != want {
+			t.Fatalf("%s: status = %s, want %s", h, got.Status, want)
+		}
+	}
+}
+
+// TestMarkBlocksOrphaned_LegacyRowsFollowForwardOnlyRule: a row written
+// before orphaned_gen existed carries only the millisecond orphaned_at. The
+// refresh's legacy arm must apply the same forward-only-inclusive rule on
+// that datetime — a delayed older call must not regress a legacy row's newer
+// generation either — while a legacy row that never recorded a timestamp is
+// initialized. An upgraded row gains orphaned_gen, so its generation reads
+// back at full precision from then on.
+func TestMarkBlocksOrphaned_LegacyRowsFollowForwardOnlyRule(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	t0 := time.Unix(1700001200, 0).UTC()
+	// Sub-millisecond bits prove orphaned_gen was written: a datetime alone
+	// cannot round-trip them.
+	incoming := t0.Add(2*time.Minute + 123*time.Microsecond)
+	newer, older := t0.Add(3*time.Minute), t0.Add(time.Minute)
+	const rowNewer, rowOlder, rowNull = "legacy-newer", "legacy-older", "legacy-null"
+
+	// Seed legacy rows: orphaned, stamped, with orphaned_at but no orphaned_gen.
+	for hash, at := range map[string]*time.Time{rowNewer: &newer, rowOlder: &older, rowNull: nil} {
+		if err := s.UpsertBlockHeaderSeen(ctx, hash, 830, t0); err != nil {
+			t.Fatalf("seed %s: %v", hash, err)
+		}
+		set := doc(kv(fStatus, string(models.BlockStatusOrphaned)), kv(fReconciledAt, t0.Add(10*time.Minute)))
+		if at != nil {
+			set = append(set, kv(fOrphanedAt, msTrunc(*at)))
+		}
+		if _, err := s.blocks.UpdateOne(ctx, idFilter(hash), doc(kv(opSet, set), kv(opUnset, doc(kv(fOrphanedGen, ""))))); err != nil {
+			t.Fatalf("make %s legacy: %v", hash, err)
+		}
+	}
+
+	n, err := s.MarkBlocksOrphaned(ctx, []string{rowNewer, rowOlder, rowNull}, incoming)
+	if err != nil || n != 0 {
+		t.Fatalf("MarkBlocksOrphaned: n=%d err=%v, want 0 (all three were already orphaned)", n, err)
+	}
+
+	// Newer legacy generation: untouched, stamp and all.
+	got, err := s.GetBlockProcessingStatus(ctx, rowNewer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OrphanedAt == nil || !got.OrphanedAt.Equal(newer) || got.ReconciledAt == nil {
+		t.Fatalf("a delayed older call must not regress a legacy row's newer generation, got orphanedAt=%v reconciledAt=%v",
+			got.OrphanedAt, got.ReconciledAt)
+	}
+	// Older legacy generation: upgraded to the incoming one, at full precision.
+	got, err = s.GetBlockProcessingStatus(ctx, rowOlder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OrphanedAt == nil || !got.OrphanedAt.Equal(incoming) || got.ReconciledAt != nil {
+		t.Fatalf("an older legacy row must be refreshed to the incoming generation and requeued, got orphanedAt=%v reconciledAt=%v",
+			got.OrphanedAt, got.ReconciledAt)
+	}
+	// No timestamp at all: initialized.
+	got, err = s.GetBlockProcessingStatus(ctx, rowNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OrphanedAt == nil || !got.OrphanedAt.Equal(incoming) || got.ReconciledAt != nil {
+		t.Fatalf("a legacy row with no timestamp must be initialized and requeued, got orphanedAt=%v reconciledAt=%v",
+			got.OrphanedAt, got.ReconciledAt)
+	}
+	// And the tokens follow: the newer legacy row still answers to its
+	// millisecond datetime, the upgraded rows to the incoming generation.
+	if ok, err := s.MarkBlockReconciled(ctx, rowNewer, incoming, t0.Add(time.Hour)); err != nil || ok {
+		t.Fatalf("the incoming token must not stamp the newer legacy row: ok=%v err=%v", ok, err)
+	}
+	if ok, err := s.MarkBlockReconciled(ctx, rowOlder, incoming, t0.Add(time.Hour)); err != nil || !ok {
+		t.Fatalf("the incoming token must stamp the upgraded row: ok=%v err=%v", ok, err)
+	}
+}
+
+// TestMarkBlocksOrphaned_PartialFailureLeavesCompletedChunksRefreshed: the
+// transition and the generation refresh run per chunk, in that order, before
+// the next chunk. A cancellation (or failure) after chunk 1 must leave chunk
+// 1 FULLY processed — its active row transitioned AND its already-orphaned,
+// stamped row refreshed back onto the queue — and later chunks untouched,
+// with the transition count that landed reported alongside the error. The
+// old all-transitions-then-all-refreshes order left the early chunks'
+// stamped rows off the queue although the reorg named them.
+func TestMarkBlocksOrphaned_PartialFailureLeavesCompletedChunksRefreshed(t *testing.T) {
+	s := newTestStore(t)
+	s.batchSize = 2 // chunk 1 = {a1 active, o1 orphaned+stamped}, chunk 2 = {a2, o2}
+	ctx := context.Background()
+	t0 := time.Unix(1700001300, 0).UTC()
+	older, incoming := t0.Add(time.Minute), t0.Add(2*time.Minute)
+	hashes := []string{"pc-a1", "pc-o1", "pc-a2", "pc-o2"}
+	for i, h := range hashes {
+		if err := s.UpsertBlockHeaderSeen(ctx, h, uint64(940+i), t0); err != nil {
+			t.Fatalf("seed %s: %v", h, err)
+		}
+	}
+	for _, h := range []string{"pc-o1", "pc-o2"} {
+		if n, err := s.MarkBlocksOrphaned(ctx, []string{h}, older); err != nil || n != 1 {
+			t.Fatalf("orphan %s: n=%d err=%v", h, n, err)
+		}
+		if ok, err := s.MarkBlockReconciled(ctx, h, older, older.Add(10*time.Second)); err != nil || !ok {
+			t.Fatalf("stamp %s: ok=%v err=%v", h, ok, err)
+		}
+	}
+	if rows, err := s.ListOrphanedBlocksToReconcile(ctx, 10); err != nil || len(rows) != 0 {
+		t.Fatalf("premise: both stamped rows are off the queue, got %v err=%v", hashesOf(rows), err)
+	}
+
+	// Err calls: 1 = before chunk 1, 2 = before chunk 2.
+	cctx := &errCalls{Context: ctx, n: 2}
+	n, err := s.MarkBlocksOrphaned(cctx, hashes, incoming)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if n != 1 {
+		t.Fatalf("transitions = %d, want 1 (chunk 1's active row)", n)
+	}
+
+	// Chunk 1: transitioned AND refreshed.
+	if got, _ := s.GetBlockProcessingStatus(ctx, "pc-a1"); got.Status != models.BlockStatusOrphaned || got.OrphanedAt == nil || !got.OrphanedAt.Equal(incoming) {
+		t.Fatalf("pc-a1: want orphaned at %v, got %+v", incoming, got)
+	}
+	got, _ := s.GetBlockProcessingStatus(ctx, "pc-o1")
+	if got.ReconciledAt != nil || got.OrphanedAt == nil || !got.OrphanedAt.Equal(incoming) {
+		t.Fatalf("pc-o1: the completed chunk's stamped row must be refreshed onto the queue, got orphanedAt=%v reconciledAt=%v",
+			got.OrphanedAt, got.ReconciledAt)
+	}
+	// Chunk 2: untouched.
+	if got, _ := s.GetBlockProcessingStatus(ctx, "pc-a2"); got.Status != models.BlockStatusActive {
+		t.Fatalf("pc-a2: must be untouched after the cancellation, got %s", got.Status)
+	}
+	got, _ = s.GetBlockProcessingStatus(ctx, "pc-o2")
+	if got.ReconciledAt == nil || got.OrphanedAt == nil || !got.OrphanedAt.Equal(older) {
+		t.Fatalf("pc-o2: must be untouched after the cancellation, got orphanedAt=%v reconciledAt=%v",
+			got.OrphanedAt, got.ReconciledAt)
+	}
+	rows, err := s.ListOrphanedBlocksToReconcile(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued := hashesOf(rows)
+	sort.Strings(queued)
+	if want := []string{"pc-a1", "pc-o1"}; !slices.Equal(queued, want) {
+		t.Fatalf("queue = %v, want exactly chunk 1's rows %v", queued, want)
 	}
 }

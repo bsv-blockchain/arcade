@@ -20,9 +20,12 @@ import (
 // observation and every later milestone. Two concurrent first upserts for a
 // hash can collide on _id; the loser retries and updates the winner's row.
 func (s *Store) UpsertBlockHeaderSeen(ctx context.Context, blockHash string, blockHeight uint64, seenAt time.Time) error {
+	// orphaned_gen/orphaned_at are kept as the row's orphan-generation
+	// high-water mark, which MarkBlocksOrphaned mints above; toModel hides
+	// them on an active row. Only the reconcile stamp is cleared.
 	update := doc(
 		kv(opSet, doc(kv(fBlockHeight, heightToInt64(blockHeight)), kv(fStatus, string(models.BlockStatusActive)))),
-		kv(opUnset, doc(kv(fOrphanedAt, ""), kv(fReconciledAt, ""))),
+		kv(opUnset, doc(kv(fReconciledAt, ""))),
 		kv(opSetOnInsert, doc(kv(fHeaderSeenAt, msTrunc(seenAt)))),
 	)
 	err := s.withDupKeyRetry(ctx, func(octx context.Context) error {
@@ -69,23 +72,157 @@ func (s *Store) MarkBlockBUMPBuilt(ctx context.Context, blockHash string, blockH
 // It clears reconciled_at as well as setting the status. A block that was
 // orphaned, reconciled, resurrected and orphaned again would otherwise carry
 // its old reconciled_at into the new orphaning and never re-enter
-// ListOrphanedBlocksToReconcile — the issue #339 queue trap. PR #343 closes
-// it on the other backends the same way and also changes this method's
-// signature to return the transition count; port that here when it lands.
-// Each orphaning is a new reconciliation job.
-func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) error {
+// ListOrphanedBlocksToReconcile — the issue #339 queue trap. Each orphaning
+// is a new reconciliation job.
+//
+// The returned count is applied status TRANSITIONS and comes from the write
+// itself: the first UpdateMany is filtered on status != orphaned, and the
+// server evaluates that filter atomically with the update per document, so
+// a row matches — and is counted — exactly when THIS call flipped it. A row
+// a concurrent writer orphaned first does not match and is never
+// double-counted.
+//
+// The second UpdateMany refreshes the generation and clears the stamp on
+// rows that were already orphaned; that is not a transition and its count is
+// discarded. It is forward-only-INCLUSIVE (orphaned_gen at or below this
+// call's): a stored generation newer than this call's is kept, stamp state
+// and all, because the two statements are not one atomic step — between
+// them another writer can reactivate a row this call just transitioned and
+// orphan it again with a newer generation, and an unguarded refresh would
+// then overwrite that newer generation with this call's older one, letting a
+// reconciler holding the older token pass the CAS for a generation it never
+// processed. An EQUAL generation still refreshes: the contract does not
+// require callers to supply a strictly increasing time, and a re-orphaning
+// that reuses the timestamp must still clear the stamp and requeue the row
+// (it does not match the transition statement, since the row is already
+// orphaned, so this is the only statement that can).
+func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) (int, error) {
 	if len(blockHashes) == 0 {
-		return nil
+		return 0, nil
 	}
-	update := doc(
-		kv(opSet, doc(kv(fStatus, string(models.BlockStatusOrphaned)), kv(fOrphanedAt, msTrunc(orphanedAt)))),
-		kv(opUnset, doc(kv(fReconciledAt, ""))),
+	gen := orphanedAt.UnixNano()
+	update := mintingOrphanUpdate(gen)
+	transition := doc(kv(fStatus, doc(kv(opNe, string(models.BlockStatusOrphaned)))))
+	refresh := doc(
+		kv(fStatus, string(models.BlockStatusOrphaned)),
+		kv(opOr, bson.A{
+			doc(kv(fOrphanedGen, doc(kv(opLte, gen)))),
+			// A row written before orphaned_gen existed follows the same
+			// forward-only-inclusive rule on the millisecond datetime it
+			// did store — a delayed older call must not regress it either
+			// — and one that never recorded a timestamp is initialized.
+			doc(
+				kv(fOrphanedGen, doc(kv(opExists, false))),
+				kv(opOr, bson.A{
+					doc(kv(fOrphanedAt, doc(kv(opLte, msTrunc(orphanedAt))))),
+					doc(kv(fOrphanedAt, nil)), // absent or explicit null
+				}),
+			),
+		}),
 	)
-	return s.updateBlocksIn(ctx, blockHashes, nil, update, "mark blocks orphaned")
+	// Refresh AND transition per chunk before the next chunk: a failure (or
+	// a cancelled context) part-way through the list then leaves every
+	// completed chunk fully processed. Running all transitions first and all
+	// refreshes after would, on a late failure, leave the already-orphaned
+	// rows of the EARLY chunks with their old reconciled_at — off the queue
+	// although this reorg named them — with no error attached to them.
+	//
+	// Refresh BEFORE transition within the chunk, because every write mints:
+	// the refresh matches rows already orphaned at or below this call's
+	// generation, and a row the transition had just written would match it
+	// too (it now holds exactly this generation) and be minted a second
+	// time, leaving the stored generation one step above the token the
+	// caller may already have read back. In this order each row is written
+	// by exactly one arm. The transition count that landed is reported
+	// alongside the error, as the contract promises.
+	transitions := 0
+	for _, chunk := range chunks(dedupe(blockHashes), s.batchSize) {
+		// Re-checked per chunk: a caller whose context was cancelled
+		// mid-batch (the reconciler's lease heartbeat on lease loss) must
+		// not keep writing.
+		if err := ctx.Err(); err != nil {
+			return transitions, fmt.Errorf("mark blocks orphaned: %w", err)
+		}
+		if _, err := s.updateChunk(ctx, chunk, refresh, update); err != nil {
+			return transitions, fmt.Errorf("refresh orphaned generation: %w", err)
+		}
+		n, err := s.updateChunk(ctx, chunk, transition, update)
+		if err != nil {
+			return transitions, fmt.Errorf("mark blocks orphaned: %w", err)
+		}
+		transitions += int(n)
+	}
+	return transitions, nil
+}
+
+// updateChunk applies one update (a bson.D document or a mongo.Pipeline) to
+// the rows of one _id chunk that also match extra, under the bulk-write
+// deadline, and returns how many documents it modified. queryCtx, not
+// opCtx: a chunk is a bulk write whose cost scales with its size, and
+// op_timeout_ms is the point-operation budget.
+func (s *Store) updateChunk(ctx context.Context, chunk []string, extra bson.D, update any) (int64, error) {
+	filter := doc(kv(fID, doc(kv(opIn, chunk))))
+	filter = append(filter, extra...)
+	qctx, cancel := s.queryCtx(ctx)
+	defer cancel()
+	res, err := s.blocks.UpdateMany(qctx, filter, update)
+	if err != nil {
+		return 0, err
+	}
+	return res.ModifiedCount, nil
+}
+
+// mintingOrphanUpdate is the orphan write as an aggregation-pipeline update,
+// so the stored generation can be computed from the document itself: the
+// new orphaned_gen is max(gen, previous + 1 ns), where "previous" is the
+// generation the row last had — orphaned_gen, kept through reactivation as
+// the high-water mark; for a row written before that field existed, its
+// millisecond orphaned_at scaled to nanoseconds; 0 for a row that never
+// had one. Two orphanings of a row therefore never share a generation even
+// when callers reuse a timestamp, so a token read before this write cannot
+// pass the CAS after it. orphaned_at, the sortable indexed copy, is derived
+// from the minted value: the nanoseconds are truncated to a millisecond
+// boundary with exact long arithmetic before the one lossy step (the
+// division to milliseconds goes through a double), and $round then
+// recovers the exact millisecond.
+func mintingOrphanUpdate(gen int64) mongo.Pipeline {
+	const nsPerMs = int64(1_000_000)
+	legacyGen := doc(kv(opIfNull, bson.A{
+		doc(kv(opMultiply, bson.A{doc(kv(opToLong, "$"+fOrphanedAt)), nsPerMs})),
+		int64(0),
+	}))
+	prev := doc(kv(opIfNull, bson.A{"$" + fOrphanedGen, legacyGen}))
+	minted := doc(kv(opCond, bson.A{
+		doc(kv(opLt, bson.A{prev, gen})),
+		gen,
+		doc(kv(opAdd, bson.A{prev, int64(1)})),
+	}))
+	msFloor := doc(kv(opSubtract, bson.A{"$" + fOrphanedGen, doc(kv(opMod, bson.A{"$" + fOrphanedGen, nsPerMs}))}))
+	asDate := doc(kv(opToDate, doc(kv(opRound, doc(kv(opDivide, bson.A{msFloor, nsPerMs}))))))
+	return mongo.Pipeline{
+		doc(kv(opSet, doc(kv(fStatus, string(models.BlockStatusOrphaned)), kv(fOrphanedGen, minted)))),
+		doc(kv(opSet, doc(kv(fOrphanedAt, asDate)))),
+		doc(kv(opUnset, fReconciledAt)),
+	}
+}
+
+// orphanGenerationFilter matches the orphan generation a caller read back:
+// orphaned_gen at full precision, or — for a row written before that field
+// existed, whose model carried the millisecond orphaned_at — the datetime.
+// A zero orphanedAt matches any generation (status check only).
+func orphanGenerationFilter(orphanedAt time.Time) bson.D {
+	if orphanedAt.IsZero() {
+		return doc()
+	}
+	return doc(kv(opOr, bson.A{
+		doc(kv(fOrphanedGen, orphanedAt.UnixNano())),
+		doc(kv(fOrphanedGen, doc(kv(opExists, false))), kv(fOrphanedAt, msTrunc(orphanedAt))),
+	}))
 }
 
 // updateBlocksIn applies one update to every row named in blockHashes, in
-// batch_size chunks under the bulk-write deadline.
+// batch_size chunks under the bulk-write deadline, and returns how many
+// documents the update actually modified.
 //
 // The chunking is not cosmetic: an $in list is one command, and the driver
 // does not split it, so a deep reorg's hash list would eventually exceed the
@@ -95,28 +232,86 @@ func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, or
 // multi-row writes honour. queryCtx, not opCtx: these are bulk writes whose
 // cost scales with the chunk, and op_timeout_ms is the point-operation budget.
 // extra, when non-nil, is ANDed onto the _id predicate.
-func (s *Store) updateBlocksIn(ctx context.Context, blockHashes []string, extra, update bson.D, what string) error {
+func (s *Store) updateBlocksIn(ctx context.Context, blockHashes []string, extra bson.D, update any, what string) (int64, error) {
+	var modified int64
 	for _, chunk := range chunks(dedupe(blockHashes), s.batchSize) {
-		filter := doc(kv(fID, doc(kv(opIn, chunk))))
-		filter = append(filter, extra...)
-		qctx, cancel := s.queryCtx(ctx)
-		_, err := s.blocks.UpdateMany(qctx, filter, update)
-		cancel()
-		if err != nil {
-			return fmt.Errorf("%s: %w", what, err)
+		// Re-checked per chunk: a caller whose context was cancelled
+		// mid-batch (the reconciler's lease heartbeat on lease loss) must
+		// not keep writing; what landed is reported alongside the error.
+		if err := ctx.Err(); err != nil {
+			return modified, fmt.Errorf("%s: %w", what, err)
 		}
+		n, err := s.updateChunk(ctx, chunk, extra, update)
+		if err != nil {
+			return modified, fmt.Errorf("%s: %w", what, err)
+		}
+		modified += n
 	}
-	return nil
+	return modified, nil
 }
 
-// MarkBlockReconciled implements store.Store; a missing row is a no-op.
-func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, at time.Time) error {
+// MarkBlockReconciled implements store.Store as a compare-and-set on the
+// orphan generation: the filter requires status == orphaned and, unless
+// orphanedAt is zero, the orphan generation (orphaned_gen, see
+// orphanGenerationFilter) equals orphanedAt, so a row the block-status
+// tracker reactivated — or orphaned again with a newer generation — while
+// the reconciler was working is left untouched, as is a missing row (issue
+// #339). The server evaluates filter and update atomically per document, so
+// no version compare is needed. Returns whether the stamp applied.
+func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, orphanedAt, at time.Time) (bool, error) {
+	filter := doc(kv(fID, blockHash), kv(fStatus, string(models.BlockStatusOrphaned)))
+	filter = append(filter, orphanGenerationFilter(orphanedAt)...)
 	octx, cancel := s.opCtx(ctx)
 	defer cancel()
-	if _, err := s.blocks.UpdateOne(octx, idFilter(blockHash), doc(kv(opSet, doc(kv(fReconciledAt, msTrunc(at)))))); err != nil {
-		return fmt.Errorf("mark block reconciled %s: %w", blockHash, err)
+	res, err := s.blocks.UpdateOne(octx, filter, doc(kv(opSet, doc(kv(fReconciledAt, msTrunc(at))))))
+	if err != nil {
+		return false, fmt.Errorf("mark block reconciled %s: %w", blockHash, err)
 	}
-	return nil
+	return res.MatchedCount == 1, nil
+}
+
+// RequeueOrphanedBlock implements store.Store: it unsets reconciled_at only
+// while the row is still orphaned with the generation the caller judged (see
+// orphanGenerationFilter; zero = status only), putting it back on the
+// reconciler's queue without changing the generation. Missing, active,
+// parked and re-orphaned rows are left untouched and reported as not
+// applied; it never transitions a row. Filter and update are one atomic
+// step per document; no upsert.
+func (s *Store) RequeueOrphanedBlock(ctx context.Context, blockHash string, orphanedAt time.Time) (bool, error) {
+	filter := doc(kv(fID, blockHash), kv(fStatus, string(models.BlockStatusOrphaned)))
+	filter = append(filter, orphanGenerationFilter(orphanedAt)...)
+	octx, cancel := s.opCtx(ctx)
+	defer cancel()
+	res, err := s.blocks.UpdateOne(octx, filter, doc(kv(opUnset, doc(kv(fReconciledAt, "")))))
+	if err != nil {
+		return false, fmt.Errorf("requeue orphaned block %s: %w", blockHash, err)
+	}
+	return res.MatchedCount == 1, nil
+}
+
+// ReactivateBlock implements store.Store as a compare-and-set on the orphan
+// generation (issue #339): the filter requires status == orphaned and, unless
+// orphanedAt is zero, the orphan generation equals orphanedAt (see
+// orphanGenerationFilter), so a missing, active, parked
+// or re-orphaned row is left untouched and reported as not applied. The
+// server evaluates filter and update atomically per document; no upsert, so
+// a missing row is never created.
+func (s *Store) ReactivateBlock(ctx context.Context, blockHash string, blockHeight uint64, orphanedAt time.Time) (bool, error) {
+	filter := doc(kv(fID, blockHash), kv(fStatus, string(models.BlockStatusOrphaned)))
+	filter = append(filter, orphanGenerationFilter(orphanedAt)...)
+	// orphaned_gen/orphaned_at are kept as the high-water mark the next
+	// orphaning mints above; toModel hides them on an active row.
+	update := doc(
+		kv(opSet, doc(kv(fBlockHeight, heightToInt64(blockHeight)), kv(fStatus, string(models.BlockStatusActive)))),
+		kv(opUnset, doc(kv(fReconciledAt, ""))),
+	)
+	octx, cancel := s.opCtx(ctx)
+	defer cancel()
+	res, err := s.blocks.UpdateOne(octx, filter, update)
+	if err != nil {
+		return false, fmt.Errorf("reactivate block %s: %w", blockHash, err)
+	}
+	return res.MatchedCount == 1, nil
 }
 
 // MarkBlocksParked implements store.Store; only active rows park.
@@ -124,10 +319,11 @@ func (s *Store) MarkBlocksParked(ctx context.Context, blockHashes []string) erro
 	if len(blockHashes) == 0 {
 		return nil
 	}
-	return s.updateBlocksIn(ctx, blockHashes,
+	_, err := s.updateBlocksIn(ctx, blockHashes,
 		doc(kv(fStatus, string(models.BlockStatusActive))),
 		doc(kv(opSet, doc(kv(fStatus, string(models.BlockStatusParked))))),
 		"mark blocks parked")
+	return err
 }
 
 // GetBlockProcessingStatus implements store.Store.

@@ -1609,13 +1609,23 @@ type stubChaintracks struct {
 	mu       sync.Mutex
 	headers  map[string]*chaintrackslib.BlockHeader
 	byHeight map[uint32]*chaintrackslib.BlockHeader
-	err      error
-	lookups  int
+	// heightErr fails GetHeaderByHeight for those heights only — a
+	// transient lookup failure at one height while its neighbors resolve.
+	heightErr map[uint32]error
+	err       error
+	lookups   int
 	// unready simulates an embedded chaintracks still resyncing from genesis:
 	// every GetHeaderByHeight returns (nil, nil) regardless of what is set,
 	// exactly as the real one does before it reaches the tip. Toggle with
 	// setUnready/setReady. Default false ⇒ existing tests are unaffected.
 	unready bool
+	// notFoundErr makes GetHeaderByHeight answer an unset height with
+	// chaintracks.ErrHeaderNotFound instead of (nil, nil) — what
+	// go-chaintracks' ChainManager actually returns for every height at or
+	// beyond its tip, and therefore what production sees at the end of
+	// every upward walk. Default false keeps the (nil, nil) shape the
+	// existing tests were written against; both are "absence" by contract.
+	notFoundErr bool
 }
 
 func (s *stubChaintracks) GetHeaderByHash(_ context.Context, h *chainhash.Hash) (*chaintrackslib.BlockHeader, error) {
@@ -1636,10 +1646,38 @@ func (s *stubChaintracks) GetHeaderByHeight(_ context.Context, height uint32) (*
 	if s.err != nil {
 		return nil, s.err
 	}
+	if err := s.heightErr[height]; err != nil {
+		return nil, err
+	}
 	if s.unready {
 		return nil, nil //nolint:nilnil // (nil,nil) is the ChainHeaderReader "cannot judge this height" contract
 	}
-	return s.byHeight[height], nil
+	if h := s.byHeight[height]; h != nil || !s.notFoundErr {
+		return h, nil
+	}
+	return nil, chaintrackslib.ErrHeaderNotFound
+}
+
+// setNotFoundErrors switches unset heights from (nil, nil) to the
+// chaintracks.ErrHeaderNotFound the real ChainManager returns above its tip.
+func (s *stubChaintracks) setNotFoundErrors() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.notFoundErr = true
+}
+
+// setHeightErr makes GetHeaderByHeight fail for height (nil clears it).
+func (s *stubChaintracks) setHeightErr(height uint32, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.heightErr == nil {
+		s.heightErr = make(map[uint32]error)
+	}
+	if err == nil {
+		delete(s.heightErr, height)
+		return
+	}
+	s.heightErr[height] = err
 }
 
 func (s *stubChaintracks) setUnready() {

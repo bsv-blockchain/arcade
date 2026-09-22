@@ -31,11 +31,11 @@ type orphanRecordingStore struct {
 	orphanedCalls [][]string
 }
 
-func (s *orphanRecordingStore) MarkBlocksOrphaned(_ context.Context, hashes []string, _ time.Time) error {
+func (s *orphanRecordingStore) MarkBlocksOrphaned(_ context.Context, hashes []string, _ time.Time) (int, error) {
 	s.orphanMu.Lock()
 	defer s.orphanMu.Unlock()
 	s.orphanedCalls = append(s.orphanedCalls, append([]string(nil), hashes...))
-	return nil
+	return len(hashes), nil
 }
 
 // capturePublisher records PublishBulk templates.
@@ -269,14 +269,14 @@ func TestSetMinedAndPublish_OnlyChangedFiltersEvents(t *testing.T) {
 	}
 	pub := &capturePublisher{}
 
-	changed, complete := setMinedAndPublish(context.Background(), zap.NewNop(), st, pub,
+	changed, err := setMinedAndPublish(context.Background(), zap.NewNop(), st, pub,
 		guardBlockA, 10, []string{txAlready, txReanchor, txFresh},
 		models.ExtraInfoReorgReanchor, true)
+	if err != nil {
+		t.Fatalf("setMinedAndPublish: %v", err)
+	}
 	if changed != 2 {
 		t.Fatalf("expected 2 changed rows (re-anchor + fresh), got %d", changed)
-	}
-	if !complete {
-		t.Fatal("complete = false on a store write that did not error")
 	}
 
 	bulks := pub.bulkEvents()
@@ -326,15 +326,15 @@ func TestSetMinedAndPublish_PublishesRowsAnchoredBeforeTheError(t *testing.T) {
 	seedSeen(t, base, recShared1, recShared2)
 	pub := &capturePublisher{}
 
-	changed, complete := setMinedAndPublish(ctx, zap.NewNop(), &partialMineStore{Store: base}, pub,
+	changed, err := setMinedAndPublish(ctx, zap.NewNop(), &partialMineStore{Store: base}, pub,
 		recCanonical, 10, []string{recShared1, recShared2}, "", false)
 	if changed != 2 {
 		t.Fatalf("changed = %d, want 2 (both rows landed before the error)", changed)
 	}
 	// The rows that landed are published, but the call still reports the
 	// failure: the caller must withhold processed_at so the block re-drives.
-	if complete {
-		t.Fatal("complete = true although SetMinedByTxIDs returned an error")
+	if err == nil {
+		t.Fatal("err = nil although SetMinedByTxIDs returned an error")
 	}
 	var minedEv *models.TransactionStatus
 	for _, ev := range pub.bulkEvents() {

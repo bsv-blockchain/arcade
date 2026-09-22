@@ -398,13 +398,60 @@ type Store interface {
 	// because of a status-tracking error.
 
 	// UpsertBlockHeaderSeen records that chaintracks observed a tip header.
-	// On insert, status='active' and header_seen_at=seenAt. On conflict,
-	// implementations MUST overwrite block_height (chaintracks is the
-	// authoritative source) and reset status='active' / orphaned_at=NULL,
-	// but MUST preserve the existing header_seen_at, processed_at, and
+	// It is the UNCONDITIONAL insert-or-reset; the resurrection paths (the
+	// block-status tracker and the anchor reconciler returning an orphaned
+	// row to active once the block is the active-chain block at its height
+	// again, issue #339) use ReactivateBlock, the generation-checked form,
+	// instead. On insert, status='active' and header_seen_at=seenAt. On
+	// conflict, implementations MUST overwrite block_height (chaintracks is
+	// the authoritative source) and reset status='active' /
+	// reconciled_at=NULL (so a later re-orphaning reconciles again), but
+	// MUST preserve the existing header_seen_at, processed_at, and
 	// bump_built_at so a re-arrival or reorg-resurrection does not erase
-	// earlier milestones.
+	// earlier milestones. The stored orphan generation is RETAINED as the
+	// row's high-water mark (see MarkBlocksOrphaned); it is historical on an
+	// active row and the model's OrphanedAt reads nil.
 	UpsertBlockHeaderSeen(ctx context.Context, blockHash string, blockHeight uint64, seenAt time.Time) error
+
+	// ReactivateBlock returns an orphaned block's row to status='active'
+	// because the block is the active-chain block at its height again
+	// (issue #339), as a compare-and-set on the orphan generation: it
+	// applies only while the row is still status='orphaned' AND its stored
+	// generation equals orphanedAt — the value the caller READ from the row
+	// (BlockProcessingStatus.OrphanGeneration), never a timestamp of its
+	// own; a zero orphanedAt checks status only. On apply, block_height is
+	// overwritten (chaintracks is authoritative), status='active',
+	// reconciled_at is cleared, the milestone timestamps are preserved, and
+	// the generation is retained as the row's high-water mark (historical;
+	// OrphanedAt reads nil) — the row shape UpsertBlockHeaderSeen's
+	// conflict path produces. Missing rows, rows
+	// that are active or parked, and rows orphaned AGAIN with a newer
+	// generation since the caller judged them are left untouched; a missing
+	// row is never created. Returns whether the transition applied — the
+	// applied-transition signal the block-status metric reports, and the
+	// guard that keeps a judgement made against one generation from
+	// clearing a newer one (the tie-scan and full-scan judge during a paging
+	// walk, and the full-scan re-mines for minutes before it writes).
+	ReactivateBlock(ctx context.Context, blockHash string, blockHeight uint64, orphanedAt time.Time) (bool, error)
+
+	// RequeueOrphanedBlock puts an orphaned row that a previous
+	// reconciliation stamped — and so left the reconciler's durable queue —
+	// back on it, as a compare-and-set on the orphan generation: it clears
+	// reconciled_at only while the row is still status='orphaned' AND its
+	// stored generation equals orphanedAt — the value the caller read from
+	// the row, never its own timestamp; a zero orphanedAt checks status
+	// only. The generation is NOT changed, so the token the caller holds
+	// keeps matching, and it is never a status transition: a row another edge
+	// reactivated since the caller judged it (the block-status tracker
+	// running alongside the reconciler's full-scan), a row orphaned again
+	// with a newer generation (already back on the queue, since
+	// MarkBlocksOrphaned clears the stamp) and a missing row are all left
+	// untouched. Returns whether the stamp was cleared. This is the
+	// full-scan's hand-off to the tick for a repair it cannot finish itself
+	// (issue #339 review); MarkBlocksOrphaned is the wrong tool for that,
+	// because its transition arm would flip a legitimately reactivated
+	// canonical row back to orphaned.
+	RequeueOrphanedBlock(ctx context.Context, blockHash string, orphanedAt time.Time) (bool, error)
 
 	// MarkBlockProcessed records that the merkle service delivered
 	// BLOCK_PROCESSED for this block. Upsert: when no row exists (callback
@@ -418,17 +465,61 @@ type Store interface {
 	// MarkBlockProcessed.
 	MarkBlockBUMPBuilt(ctx context.Context, blockHash string, blockHeight uint64, builtAt time.Time) error
 
-	// MarkBlocksOrphaned transitions every named block to status='orphaned'
-	// and stamps orphaned_at. Hashes that have no row are silently skipped
-	// (chaintracks may emit OrphanedHashes for blocks observed before the
-	// service started recording). Orphaned rows with reconciled_at IS NULL
-	// form the anchor reconciler's work queue.
-	MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) error
+	// MarkBlocksOrphaned transitions every named block to status='orphaned',
+	// stamps orphaned_at and CLEARS reconciled_at. Clearing is required, not
+	// cosmetic: orphaned rows with reconciled_at IS NULL form the anchor
+	// reconciler's work queue, so a row orphaned AGAIN after a previous
+	// orphaning was reconciled must re-enter that queue — the old stamp
+	// describes the old generation and says nothing about the new one.
+	// Leaving it set strands the block with no path back (issue #339).
+	// Hashes that have no row are silently skipped (chaintracks may emit
+	// OrphanedHashes for blocks observed before the service started
+	// recording). Returns the number of rows whose status actually CHANGED
+	// to 'orphaned' — the applied-transition count callers report to the
+	// block-status metric. A hash with no row, or a row already 'orphaned',
+	// is still written (generation refreshed, reconciled_at cleared) but is
+	// not a transition and is not counted. The count falls out of the write
+	// itself, so it costs no extra round-trip; pre-reading every hash would
+	// put N of them in front of a latency-critical write. It must also be
+	// exact under concurrent writers — two replicas orphaning the same row
+	// report ONE transition between them — so the status check belongs IN
+	// the write (a filter or a generation-checked CAS), never in a separate
+	// read whose result an unconditional write then trusts.
+	//
+	// The stored orphan GENERATION is minted by the store, with orphanedAt
+	// as a lower bound: on every orphan write — the transition of an
+	// active/parked row and the refresh of a row already orphaned alike —
+	// the new generation is max(orphanedAt, previous + ε), where "previous"
+	// is the last generation the row ever had (retained through
+	// reactivation as a high-water mark) and ε is the backend's smallest
+	// step (1 ns; 1 µs for Postgres' timestamptz). So two orphanings of one
+	// row never share a generation even when callers reuse a timestamp —
+	// which the contract permits — and a reconciler that read generation G
+	// can never stamp, reactivate or requeue a LATER orphaning that a
+	// wall-clock token would have let it mistake for its own. Tokens are
+	// therefore always the value read back from the row
+	// (BlockProcessingStatus.OrphanGeneration), never the caller's own
+	// timestamp. The refresh of a row already orphaned is forward-only: a
+	// stored generation NEWER than orphanedAt is kept — stamp state and all
+	// — so a delayed call carrying an older timestamp cannot touch a newer
+	// orphaning; an equal or older stored generation still refreshes (a new
+	// generation is minted, reconciled_at is cleared, the row is requeued).
+	// Implementations must check ctx between rows (or chunks): a cancelled
+	// caller — the reconciler's lease heartbeat on lease loss — must not
+	// keep writing, and reports what landed.
+	MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) (int, error)
 
 	// MarkBlockReconciled stamps reconciled_at on an orphaned block's row,
-	// recording that tx re-anchor/revert for this orphan completed. A
-	// missing row is a silent no-op.
-	MarkBlockReconciled(ctx context.Context, blockHash string, at time.Time) error
+	// recording that tx re-anchor/revert for this orphan completed. It is a
+	// compare-and-set on the orphan generation the caller processed: the
+	// stamp applies only while the row is still status='orphaned' AND its
+	// stored generation equals orphanedAt — the value the caller read from
+	// the row when it dequeued it, never its own timestamp; a zero
+	// orphanedAt checks status only. A row the block-status tracker
+	// reactivated — or orphaned again, which always mints a newer
+	// generation — while the reconciler was working is left untouched
+	// (issue #339), as is a missing row. Returns whether the stamp applied.
+	MarkBlockReconciled(ctx context.Context, blockHash string, orphanedAt, at time.Time) (bool, error)
 
 	// ListOrphanedBlocksToReconcile returns up to limit rows with
 	// status='orphaned' AND reconciled_at IS NULL, oldest orphaned_at

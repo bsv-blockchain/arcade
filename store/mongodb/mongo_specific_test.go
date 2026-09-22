@@ -431,16 +431,16 @@ func TestMarkBlocksOrphaned_ClearsReconciledAt(t *testing.T) {
 			t.Fatalf("queued = %v, want %v", got, want)
 		}
 	}
-	if err := s.MarkBlocksOrphaned(ctx, []string{hash}, t0.Add(time.Minute)); err != nil {
+	if _, err := s.MarkBlocksOrphaned(ctx, []string{hash}, t0.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	queued(true)
-	if err := s.MarkBlockReconciled(ctx, hash, t0.Add(2*time.Minute)); err != nil {
+	if stamped, err := s.MarkBlockReconciled(ctx, hash, time.Time{}, t0.Add(2*time.Minute)); err != nil || !stamped {
 		t.Fatal(err)
 	}
 	queued(false)
 	// Orphaned again — a flip-flop, a tie scan, a full-scan re-mark.
-	if err := s.MarkBlocksOrphaned(ctx, []string{hash}, t0.Add(3*time.Minute)); err != nil {
+	if _, err := s.MarkBlocksOrphaned(ctx, []string{hash}, t0.Add(3*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	queued(true)
@@ -475,7 +475,7 @@ func TestBlockQueues_ExplicitNullIsAbsent(t *testing.T) {
 	if err := s.UpsertBlockHeaderSeen(ctx, "blk-null-orphan", 601, t0); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.MarkBlocksOrphaned(ctx, []string{"blk-null-orphan"}, t0.Add(time.Minute)); err != nil {
+	if _, err := s.MarkBlocksOrphaned(ctx, []string{"blk-null-orphan"}, t0.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.blocks.UpdateOne(ctx, idFilter("blk-null-orphan"), doc(kv(opSet, doc(kv(fReconciledAt, nil))))); err != nil {

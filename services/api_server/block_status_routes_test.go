@@ -55,6 +55,7 @@ func (s *blockProcStore) UpsertBlockHeaderSeen(_ context.Context, hash string, h
 	row.BlockHeight = height
 	row.Status = models.BlockStatusActive
 	row.OrphanedAt = nil
+	row.ReconciledAt = nil
 	return nil
 }
 
@@ -102,19 +103,25 @@ func (s *blockProcStore) MarkBlockBUMPBuilt(_ context.Context, hash string, heig
 	return nil
 }
 
-func (s *blockProcStore) MarkBlocksOrphaned(_ context.Context, hashes []string, at time.Time) error {
+func (s *blockProcStore) MarkBlocksOrphaned(_ context.Context, hashes []string, at time.Time) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cp := append([]string(nil), hashes...)
 	s.orphanedCalls = append(s.orphanedCalls, cp)
+	written := 0
 	for _, h := range hashes {
 		if row, ok := s.rows[h]; ok {
+			wasOrphaned := row.Status == models.BlockStatusOrphaned
 			row.Status = models.BlockStatusOrphaned
 			t := at
 			row.OrphanedAt = &t
+			row.ReconciledAt = nil
+			if !wasOrphaned {
+				written++
+			}
 		}
 	}
-	return nil
+	return written, nil
 }
 
 func (s *blockProcStore) MarkBlocksParked(_ context.Context, hashes []string) error {
@@ -281,6 +288,47 @@ func TestHandleGetBlockProcessingStatus_Found(t *testing.T) {
 	}
 	if resp.HasCompoundBUMP {
 		t.Error("HasCompoundBUMP should be false")
+	}
+}
+
+// TestHandleGetBlockProcessingStatus_ExposesReconciledAt: an orphaned row the
+// anchor reconciler has finished with carries reconciledAt, so consumers can
+// tell "orphaned, queued for reconcile" from "orphaned and off the queue"
+// (issue #339); rows without the stamp omit the field.
+func TestHandleGetBlockProcessingStatus_ExposesReconciledAt(t *testing.T) {
+	bs := newBlockProcStore()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	_ = bs.UpsertBlockHeaderSeen(context.Background(), "abc", 5, now)
+	_, _ = bs.MarkBlocksOrphaned(context.Background(), []string{"abc"}, now.Add(time.Second))
+	reconciled := now.Add(2 * time.Second)
+	bs.rows["abc"].ReconciledAt = &reconciled
+	_ = bs.UpsertBlockHeaderSeen(context.Background(), "def", 6, now)
+	srv, _ := setupServerWithStoreAndBlockProc(t, bs)
+
+	get := func(hash string) blockProcessingStatusResponse {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/blocks/processing-status/"+hash, nil)
+		srv.routerForTest().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		var resp blockProcessingStatusResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		return resp
+	}
+
+	got := get("abc")
+	if got.Status != models.BlockStatusOrphaned || got.OrphanedAt == "" {
+		t.Fatalf("expected an orphaned row with orphanedAt, got %+v", got)
+	}
+	if want := reconciled.Format("2006-01-02T15:04:05.000Z07:00"); got.ReconciledAt != want {
+		t.Fatalf("reconciledAt = %q, want %q", got.ReconciledAt, want)
+	}
+	if got := get("def"); got.ReconciledAt != "" {
+		t.Fatalf("active row must omit reconciledAt, got %q", got.ReconciledAt)
 	}
 }
 

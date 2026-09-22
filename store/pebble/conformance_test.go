@@ -19,6 +19,15 @@ func TestIterateTrackerRows_Conformance(t *testing.T) {
 	})
 }
 
+// The generation-checked block_processing writes (issue #339): ReactivateBlock,
+// MarkBlocksOrphaned's applied-transition count, MarkBlockReconciled's CAS.
+func TestBlockStatus_Conformance(t *testing.T) {
+	storetest.RunBlockStatusSuite(t, func(t *testing.T) storetest.BlockStatusBackend {
+		t.Helper()
+		return newTestStore(t)
+	})
+}
+
 func TestIterateTrackerRows_StatusIndexStaysFresh(t *testing.T) {
 	// The walk is driven by idx:tx:status:<status>:*, so a status transition
 	// must move the row out of the old status's index. If it did not, a
