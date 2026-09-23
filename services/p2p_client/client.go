@@ -351,7 +351,7 @@ func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatu
 	// does see nodes announcing cluster-internal names), set the floor for
 	// everyone while appearing nowhere in /health. An operator looking at a
 	// 0 sat/kB floor could see only peers advertising 100.
-	c.recordPeerPolicy(ctx, msg)
+	c.recordPeerPolicy(ctx, msg, normalized)
 }
 
 // recordPeerPolicy extracts the peer's advertised transaction policy from a
@@ -363,8 +363,10 @@ func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatu
 //
 // Called only after the peer's datahub URL has been registered, so every row it
 // writes belongs to a peer arcade can broadcast to — see the call site for why
-// that matters.
-func (c *Client) recordPeerPolicy(ctx context.Context, msg teranodep2p.NodeStatusMessage) {
+// that matters. datahubURL is that registered URL, and labels the per-peer
+// gauges so every input to the network policy is visible under the same URL
+// GET /health lists it under.
+func (c *Client) recordPeerPolicy(ctx context.Context, msg teranodep2p.NodeStatusMessage, datahubURL string) {
 	var sats, byts, maxTxSize, maxScriptSize uint64
 	switch {
 	case msg.FeePolicy != nil && msg.FeePolicy.MiningFee.Bytes > 0:
@@ -410,16 +412,24 @@ func (c *Client) recordPeerPolicy(ctx context.Context, msg teranodep2p.NodeStatu
 			zap.Uint64("max_script_size_policy", maxScriptSize))
 	}
 
-	if msg.BaseURL != "" {
+	// Label by the registered datahub URL, not msg.BaseURL. The store row this
+	// function writes — and therefore the network minimum GET /policy derives
+	// from it — is keyed off pickDatahubURL, which prefers PropagationURL. A
+	// peer announcing only a propagation URL used to set the fee floor while
+	// appearing in no gauge at all, which is exactly why a production floor of
+	// 1 sat/kB could not be explained from the outside: every visible series
+	// read 100. Using the registered URL also makes these series join to
+	// /health's datahub_urls[].url, which is normalized the same way.
+	if datahubURL != "" {
 		// Normalize to satoshis per 1000 bytes for a comparable gauge.
-		metrics.P2PPeerMinMiningFee.WithLabelValues(msg.BaseURL).Set(float64(sats) * 1000 / float64(byts))
+		metrics.P2PPeerMinMiningFee.WithLabelValues(datahubURL).Set(float64(sats) * 1000 / float64(byts))
 		// Only report a size limit the peer actually advertised: a gauge stuck
 		// at 0 for a legacy peer would read as "accepts nothing".
 		if pp.MaxTxSizePolicy > 0 {
-			metrics.P2PPeerMaxTxSizePolicy.WithLabelValues(msg.BaseURL).Set(float64(pp.MaxTxSizePolicy))
+			metrics.P2PPeerMaxTxSizePolicy.WithLabelValues(datahubURL).Set(float64(pp.MaxTxSizePolicy))
 		}
 		if pp.MaxScriptSizePolicy > 0 {
-			metrics.P2PPeerMaxScriptSizePolicy.WithLabelValues(msg.BaseURL).Set(float64(pp.MaxScriptSizePolicy))
+			metrics.P2PPeerMaxScriptSizePolicy.WithLabelValues(datahubURL).Set(float64(pp.MaxScriptSizePolicy))
 		}
 	}
 
