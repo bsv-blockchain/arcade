@@ -35,7 +35,7 @@ func discovered(url string) store.DatahubEndpoint {
 func TestEndpointSource_ConfiguredRowsBypassValidation(t *testing.T) {
 	src := newEndpointSource(&fakeDatahubLister{eps: []store.DatahubEndpoint{
 		configured("http://teranode.internal.svc:8090/api/v1"),
-	}}, "mainnet", true, false, zaptest.NewLogger(t))
+	}}, "mainnet", true, false, 0, zaptest.NewLogger(t))
 	src.lookupIP = func(_ context.Context, host string) ([]net.IP, error) {
 		t.Fatalf("configured row triggered DNS lookup for %q", host)
 		return nil, nil
@@ -57,7 +57,7 @@ func TestEndpointSource_DiscoveredUnresolvableFiltered(t *testing.T) {
 	src := newEndpointSource(&fakeDatahubLister{eps: []store.DatahubEndpoint{
 		discovered("http://asset:8090/api/v1"),
 		discovered("https://peer.example/api/v1"),
-	}}, "mainnet", true, false, zaptest.NewLogger(t))
+	}}, "mainnet", true, false, 0, zaptest.NewLogger(t))
 	src.lookupIP = func(_ context.Context, host string) ([]net.IP, error) {
 		if host == "asset" {
 			return nil, fmt.Errorf("lookup asset: no such host")
@@ -79,7 +79,7 @@ func TestEndpointSource_DiscoveredUnresolvableFiltered(t *testing.T) {
 func TestEndpointSource_ValidationCached(t *testing.T) {
 	src := newEndpointSource(&fakeDatahubLister{eps: []store.DatahubEndpoint{
 		discovered("https://peer.example/api/v1"),
-	}}, "mainnet", true, false, zaptest.NewLogger(t))
+	}}, "mainnet", true, false, 0, zaptest.NewLogger(t))
 	var lookups atomic.Int64
 	src.lookupIP = func(_ context.Context, _ string) ([]net.IP, error) {
 		lookups.Add(1)
@@ -101,7 +101,7 @@ func TestEndpointSource_ValidationCached(t *testing.T) {
 func TestEndpointSource_RejectionNotCached(t *testing.T) {
 	src := newEndpointSource(&fakeDatahubLister{eps: []store.DatahubEndpoint{
 		discovered("https://flaky.example/api/v1"),
-	}}, "mainnet", true, false, zaptest.NewLogger(t))
+	}}, "mainnet", true, false, 0, zaptest.NewLogger(t))
 	var resolvable atomic.Bool
 	src.lookupIP = func(_ context.Context, host string) ([]net.IP, error) {
 		if !resolvable.Load() {
@@ -128,7 +128,7 @@ func TestEndpointSource_AllowPrivateAdmitsPrivateResolution(t *testing.T) {
 	src := newEndpointSource(&fakeDatahubLister{eps: []store.DatahubEndpoint{
 		discovered("http://teranode.local:8090/api/v1"),
 		discovered("http://asset:8090/api/v1"),
-	}}, "mainnet", true, true, zaptest.NewLogger(t))
+	}}, "mainnet", true, true, 0, zaptest.NewLogger(t))
 	src.lookupIP = func(_ context.Context, host string) ([]net.IP, error) {
 		if host == "asset" {
 			return nil, fmt.Errorf("lookup asset: no such host")
@@ -151,7 +151,7 @@ func TestEndpointSource_DiscoveredExcludedWhenDiscoveryOff(t *testing.T) {
 	src := newEndpointSource(&fakeDatahubLister{eps: []store.DatahubEndpoint{
 		configured("https://seed.example/api/v1"),
 		discovered("https://peer.example/api/v1"),
-	}}, "mainnet", false, false, zaptest.NewLogger(t))
+	}}, "mainnet", false, false, 0, zaptest.NewLogger(t))
 	src.lookupIP = func(_ context.Context, host string) ([]net.IP, error) {
 		t.Fatalf("lookup should not run when discovery is off, got %q", host)
 		return nil, nil

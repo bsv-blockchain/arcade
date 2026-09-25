@@ -149,6 +149,7 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 
 	txTracker := store.NewTxTracker()
 
+	discoveredTTL := time.Duration(cfg.Propagation.EndpointHealth.DiscoveredTTLMs) * time.Millisecond
 	teranodeClient := teranode.NewClient(cfg.DatahubURLs, cfg.Teranode.AuthToken, teranode.HealthConfig{
 		FailureThreshold:          cfg.Propagation.EndpointHealth.FailureThreshold,
 		BroadcastFailureThreshold: cfg.Propagation.EndpointHealth.BroadcastFailureThreshold,
@@ -156,7 +157,7 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		ProbeTimeout:              time.Duration(cfg.Propagation.EndpointHealth.ProbeTimeoutMs) * time.Millisecond,
 		MinHealthyEndpoints:       cfg.Propagation.EndpointHealth.MinHealthyEndpoints,
 		RefreshInterval:           time.Duration(cfg.Propagation.EndpointHealth.RefreshIntervalMs) * time.Millisecond,
-		Source:                    newEndpointSource(st, cfg.Network, cfg.P2P.DatahubDiscovery, cfg.P2P.AllowPrivateURLs, logger),
+		Source:                    newEndpointSource(st, cfg.Network, cfg.P2P.DatahubDiscovery, cfg.P2P.AllowPrivateURLs, discoveredTTL, logger),
 		Logger:                    logger,
 	})
 
@@ -745,9 +746,16 @@ type endpointSource struct {
 	warnedMu sync.Mutex
 	warned   map[string]struct{}
 	logger   *zap.Logger
+	// discoveredTTL ages out discovered rows not re-announced within it; see
+	// config.EndpointHealthConfig.DiscoveredTTLMs. now is the clock seam.
+	discoveredTTL time.Duration
+	now           func() time.Time
 }
 
-func newEndpointSource(st datahubLister, network string, includeDiscovered, allowPrivate bool, logger *zap.Logger) *endpointSource {
+func newEndpointSource(st datahubLister, network string, includeDiscovered, allowPrivate bool, discoveredTTL time.Duration, logger *zap.Logger) *endpointSource {
+	if discoveredTTL <= 0 {
+		discoveredTTL = time.Duration(config.DefaultEndpointHealthDiscoveredTTLMs) * time.Millisecond
+	}
 	return &endpointSource{
 		st:                st,
 		network:           network,
@@ -756,6 +764,8 @@ func newEndpointSource(st datahubLister, network string, includeDiscovered, allo
 		validated:         ssrfguard.NewSuccessCache(endpointSourceValidationTTL, endpointSourceValidationCacheMax),
 		warned:            map[string]struct{}{},
 		logger:            logger,
+		discoveredTTL:     discoveredTTL,
+		now:               time.Now,
 		lookupIP: func(ctx context.Context, host string) ([]net.IP, error) {
 			lctx, cancel := context.WithTimeout(ctx, endpointSourceLookupTimeout)
 			defer cancel()
@@ -769,12 +779,18 @@ func (a *endpointSource) ListEndpointURLs(ctx context.Context) ([]string, error)
 	if err != nil {
 		return nil, err
 	}
+	cutoff := a.now().Add(-a.discoveredTTL)
 	current := make(map[string]struct{}, len(eps))
 	out := make([]string, 0, len(eps))
 	for _, ep := range eps {
 		current[ep.URL] = struct{}{}
 		if ep.Source == store.DatahubEndpointSourceDiscovered {
 			if !a.includeDiscovered {
+				continue
+			}
+			// Not re-announced within the TTL: the peer stopped advertising
+			// it. Rows with no LastSeen predate its tracking and are kept.
+			if !ep.LastSeen.IsZero() && ep.LastSeen.Before(cutoff) {
 				continue
 			}
 			if !a.validDiscoveredURL(ctx, ep.URL) {
