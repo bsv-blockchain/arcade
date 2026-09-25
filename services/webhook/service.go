@@ -301,7 +301,7 @@ func (s *Service) dispatchOne(ctx context.Context, status *models.TransactionSta
 		return
 	}
 	enriched := false
-	for _, sub := range subs {
+	for _, sub := range collapseDuplicateRegistrations(subs) {
 		if sub.CallbackURL == "" {
 			continue // SSE-only subscription; no webhook to send
 		}
@@ -321,6 +321,44 @@ func (s *Service) dispatchOne(ctx context.Context, status *models.TransactionSta
 		}
 		s.deliver(ctx, sub, status)
 	}
+}
+
+// collapseDuplicateRegistrations keeps ONE submission per (callback URL,
+// callback token) for a txid. Registrations are idempotent at intake now
+// (submissionIDFor), but rows written before that — one per POST, thousands
+// per txid for a client that re-presented a rejected tx for hours — are still
+// stored, and delivering a status once per duplicate row is exactly the
+// webhook flood this guards against. The choice must be STABLE across
+// dispatches so the CAS-maintained delivery state keeps living on one row:
+// prefer a row that already carries delivery state, then the smallest id.
+// Un-chosen rows are never delivered, so they never enter retry state.
+func collapseDuplicateRegistrations(subs []*models.Submission) []*models.Submission {
+	if len(subs) < 2 {
+		return subs
+	}
+	type key struct{ url, token string }
+	chosen := make(map[key]*models.Submission, len(subs))
+	order := make([]key, 0, len(subs))
+	for _, sub := range subs {
+		k := key{sub.CallbackURL, sub.CallbackToken}
+		cur, seen := chosen[k]
+		if !seen {
+			chosen[k] = sub
+			order = append(order, k)
+			continue
+		}
+		curHasState := cur.LastDeliveredStatus != ""
+		subHasState := sub.LastDeliveredStatus != ""
+		if (subHasState && !curHasState) ||
+			(subHasState == curHasState && sub.SubmissionID < cur.SubmissionID) {
+			chosen[k] = sub
+		}
+	}
+	out := make([]*models.Submission, 0, len(order))
+	for _, k := range order {
+		out = append(out, chosen[k])
+	}
+	return out
 }
 
 // shouldDeliver implements the FullStatusUpdates / dedup gating rules:
