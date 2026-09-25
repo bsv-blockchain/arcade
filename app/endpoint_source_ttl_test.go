@@ -123,8 +123,9 @@ func TestEndpointSource_AgedOutRowWarnsAgainWhenReannounced(t *testing.T) {
 	}
 
 	levels := func() []zapcore.Level {
-		var out []zapcore.Level
-		for _, e := range logs.TakeAll() {
+		entries := logs.TakeAll()
+		out := make([]zapcore.Level, 0, len(entries))
+		for _, e := range entries {
 			out = append(out, e.Level)
 		}
 		return out
