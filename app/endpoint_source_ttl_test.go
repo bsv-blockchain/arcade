@@ -2,12 +2,16 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"reflect"
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/store"
@@ -97,5 +101,56 @@ func TestEndpointSource_DiscoveredTTLDefault(t *testing.T) {
 		if src.discoveredTTL != want {
 			t.Fatalf("ttl %v: discoveredTTL = %v, want %v", ttl, src.discoveredTTL, want)
 		}
+	}
+}
+
+// TestEndpointSource_AgedOutRowWarnsAgainWhenReannounced: an aged-out row is
+// not counted as current, so its warn-dampening entry is pruned. If the peer
+// announces the same bad URL again, it is logged at WARN once more rather
+// than staying at DEBUG from the earlier episode.
+func TestEndpointSource_AgedOutRowWarnsAgainWhenReannounced(t *testing.T) {
+	now := time.Date(2026, 8, 18, 1, 13, 0, 0, time.UTC)
+	const bad = "http://asset:8090/api/v1"
+	lister := &fakeDatahubLister{eps: []store.DatahubEndpoint{
+		seenAt(discovered(bad), now.Add(-5*time.Second)),
+	}}
+
+	core, logs := observer.New(zapcore.DebugLevel)
+	src := newEndpointSource(lister, "mainnet", true, false, time.Hour, zap.New(core))
+	src.now = func() time.Time { return now }
+	src.lookupIP = func(_ context.Context, host string) ([]net.IP, error) {
+		return nil, fmt.Errorf("lookup %s: no such host", host)
+	}
+
+	levels := func() []zapcore.Level {
+		var out []zapcore.Level
+		for _, e := range logs.TakeAll() {
+			out = append(out, e.Level)
+		}
+		return out
+	}
+	list := func() {
+		t.Helper()
+		if _, err := src.ListEndpointURLs(context.Background()); err != nil {
+			t.Fatalf("ListEndpointURLs: %v", err)
+		}
+	}
+
+	list()
+	list()
+	if got := levels(); !reflect.DeepEqual(got, []zapcore.Level{zapcore.WarnLevel, zapcore.DebugLevel}) {
+		t.Fatalf("first episode: got %v, want WARN then DEBUG", got)
+	}
+
+	lister.eps[0].LastSeen = now.Add(-2 * time.Hour) // peer went quiet: aged out
+	list()
+	if got := levels(); len(got) != 0 {
+		t.Fatalf("aged-out row was still checked: %v", got)
+	}
+
+	lister.eps[0].LastSeen = now.Add(-5 * time.Second) // announced again, still bad
+	list()
+	if got := levels(); !reflect.DeepEqual(got, []zapcore.Level{zapcore.WarnLevel}) {
+		t.Fatalf("re-announced bad row: got %v, want a fresh WARN", got)
 	}
 }

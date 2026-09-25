@@ -783,14 +783,17 @@ func (a *endpointSource) ListEndpointURLs(ctx context.Context) ([]string, error)
 	current := make(map[string]struct{}, len(eps))
 	out := make([]string, 0, len(eps))
 	for _, ep := range eps {
+		// A discovered row not re-announced within the TTL: the peer stopped
+		// advertising it. It is skipped before being counted as current, so
+		// its warn-dampening entry is pruned and a bad URL that is announced
+		// again WARNs once more. Rows with no LastSeen predate its tracking
+		// and are kept.
+		if ep.Source == store.DatahubEndpointSourceDiscovered && !ep.LastSeen.IsZero() && ep.LastSeen.Before(cutoff) {
+			continue
+		}
 		current[ep.URL] = struct{}{}
 		if ep.Source == store.DatahubEndpointSourceDiscovered {
 			if !a.includeDiscovered {
-				continue
-			}
-			// Not re-announced within the TTL: the peer stopped advertising
-			// it. Rows with no LastSeen predate its tracking and are kept.
-			if !ep.LastSeen.IsZero() && ep.LastSeen.Before(cutoff) {
 				continue
 			}
 			if !a.validDiscoveredURL(ctx, ep.URL) {
