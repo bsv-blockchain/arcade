@@ -30,7 +30,7 @@ func NewBroker(cfg config.Kafka, topicPartitions map[string]int) (Broker, error)
 		if len(cfg.Brokers) == 0 {
 			return nil, fmt.Errorf("kafka.brokers is required when kafka.backend=sarama")
 		}
-		return NewSaramaBroker(cfg.Brokers, cfg.ConsumerGroup)
+		return NewSaramaBrokerWithMaxMessageBytes(cfg.Brokers, cfg.ConsumerGroup, nil, cfg.MaxMessageBytes)
 	case "memory":
 		return NewMemoryBrokerWithPartitions(cfg.BufferSize, time.Duration(cfg.SendTimeoutMs)*time.Millisecond, topicPartitions), nil
 	default:

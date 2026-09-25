@@ -51,12 +51,41 @@ func NewSaramaBroker(brokers []string, consumerGroup string) (Broker, error) {
 // zap logger for async-producer error logging. A nil logger falls back to
 // zap.NewNop() so the broker is always safe to construct.
 func NewSaramaBrokerWithLogger(brokers []string, consumerGroup string, logger *zap.Logger) (Broker, error) {
-	syncProducer, err := sarama.NewSyncProducer(brokers, newSyncProducerConfig())
+	return NewSaramaBrokerWithMaxMessageBytes(brokers, consumerGroup, logger, 0)
+}
+
+// DefaultProducerMaxMessageBytes is the producer-side message cap applied when
+// kafka.max_message_bytes is unset. Sarama's own default (1 MiB) is below what
+// a single TopicPropagation message can legitimately be: raw_tx is JSON-encoded
+// as base64 (x4/3) and the tx-size policy allows 10 MiB, so a policy-valid
+// submit can need ~14 MiB. 16 MiB leaves headroom for the envelope. The
+// broker must accept the same size (Kafka message.max.bytes / Redpanda
+// kafka_batch_max_bytes, and the topic's max.message.bytes) or produces still
+// fail broker-side; see docs/production-kafka.md.
+const DefaultProducerMaxMessageBytes = 16 << 20
+
+// producerMaxMessageBytes resolves the configured cap: non-positive selects
+// the default.
+func producerMaxMessageBytes(v int) int {
+	if v <= 0 {
+		return DefaultProducerMaxMessageBytes
+	}
+	return v
+}
+
+// NewSaramaBrokerWithMaxMessageBytes is NewSaramaBrokerWithLogger with an
+// explicit producer message-size cap (bytes) for both the sync and async
+// producers. maxMessageBytes <= 0 selects DefaultProducerMaxMessageBytes.
+func NewSaramaBrokerWithMaxMessageBytes(brokers []string, consumerGroup string, logger *zap.Logger, maxMessageBytes int) (Broker, error) {
+	maxMessageBytes = producerMaxMessageBytes(maxMessageBytes)
+
+	syncProducer, err := sarama.NewSyncProducer(brokers, newSyncProducerConfig(maxMessageBytes))
 	if err != nil {
 		return nil, fmt.Errorf("creating sync producer: %w", err)
 	}
 
 	asyncCfg := sarama.NewConfig()
+	asyncCfg.Producer.MaxMessageBytes = maxMessageBytes
 	asyncCfg.Producer.RequiredAcks = sarama.WaitForLocal
 	asyncCfg.Producer.Retry.Max = 5
 	asyncCfg.Producer.Return.Successes = true
@@ -81,9 +110,11 @@ func NewSaramaBrokerWithLogger(brokers []string, consumerGroup string, logger *z
 // requires WaitForAll acks (already the sync default here) and protocol
 // >= 0.11; 2.6.0 is safely below anything Redpanda or a maintained
 // Kafka speaks. Extracted so tests can pin these invariants.
-func newSyncProducerConfig() *sarama.Config {
+// maxMessageBytes <= 0 selects DefaultProducerMaxMessageBytes.
+func newSyncProducerConfig(maxMessageBytes int) *sarama.Config {
 	syncCfg := sarama.NewConfig()
 	syncCfg.Version = sarama.V2_6_0_0
+	syncCfg.Producer.MaxMessageBytes = producerMaxMessageBytes(maxMessageBytes)
 	syncCfg.Producer.RequiredAcks = sarama.WaitForAll
 	syncCfg.Producer.Retry.Max = 5
 	syncCfg.Producer.Return.Successes = true
