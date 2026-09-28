@@ -27,7 +27,9 @@ spec:
     spec:
       containers:
         - name: arcade
-          image: ghcr.io/bsv-blockchain/arcade:latest
+          # Pin to the git SHA published by .github/workflows/build.yml
+          # (ghcr.io/bsv-blockchain/arcade:<sha>). The :latest tag moves.
+          image: ghcr.io/bsv-blockchain/arcade:GIT_SHA
           args: ["--mode", "api-server"]
           ports:
             - containerPort: 8080
@@ -39,9 +41,9 @@ spec:
           env:
             - name: ARCADE_KAFKA_BROKERS
               value: "kafka-0.kafka.arcade.svc.cluster.local:9092"
-            - name: ARCADE_AEROSPIKE_HOSTS
+            - name: ARCADE_STORE_AEROSPIKE_HOSTS
               value: "aerospike-0.aerospike.arcade.svc.cluster.local:3000"
-            - name: ARCADE_AEROSPIKE_NAMESPACE
+            - name: ARCADE_STORE_AEROSPIKE_NAMESPACE
               value: "arcade"
             # Chain source for the nLockTime/BIP113 finality gate at intake
             # (issue #245): the remote client keeps this pod free of an
