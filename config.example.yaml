@@ -322,6 +322,11 @@ health:
 #     # synchronously on Start (capped at 2s) so a freshly started pod sees
 #     # the current registry before serving traffic.
 #     refresh_interval_ms: 30000
+#     # Peer-discovered datahub URLs not re-announced (node_status) within
+#     # this window are no longer used, so a URL a peer stopped advertising
+#     # is not probed forever or re-admitted on restart. Configured URLs are
+#     # never aged out. Keep well above the ~10s announcement interval.
+#     discovered_ttl_ms: 3600000
 
 bump_builder:
   # Grace window after BLOCK_PROCESSED before reading STUMPs, to allow for

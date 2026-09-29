@@ -621,6 +621,13 @@ type EndpointHealthConfig struct {
 	ProbeTimeoutMs            int `mapstructure:"probe_timeout_ms"`
 	MinHealthyEndpoints       int `mapstructure:"min_healthy_endpoints"`
 	RefreshIntervalMs         int `mapstructure:"refresh_interval_ms"`
+	// DiscoveredTTLMs ages out peer-discovered datahub URLs: a discovered
+	// registry row whose LastSeen is older than this is no longer handed to
+	// the client, so a URL no peer announces any more stops being probed and
+	// re-admitted on restart. Configured URLs are never aged out. Keep it well
+	// above the node_status announcement interval (~10s). Zero or negative
+	// falls back to DefaultEndpointHealthDiscoveredTTLMs.
+	DiscoveredTTLMs int `mapstructure:"discovered_ttl_ms"`
 }
 
 // BumpBuilderConfig controls the BUMP construction workflow. GraceWindowMs is the
@@ -1100,6 +1107,9 @@ const (
 	// DefaultValidatorObservedFeeRefreshMs is how often (30 s) the api-server
 	// recomputes the network-minimum fee and updates the intake validator.
 	DefaultValidatorObservedFeeRefreshMs = 30000
+	// DefaultEndpointHealthDiscoveredTTLMs is how long (1h) a peer-discovered
+	// datahub URL stays listed after its last node_status announcement.
+	DefaultEndpointHealthDiscoveredTTLMs = 3600000
 )
 
 func BindFlags(cmd *cobra.Command) {
@@ -1255,6 +1265,7 @@ func setDefaults() {
 	viper.SetDefault("propagation.endpoint_health.probe_timeout_ms", 2000)
 	viper.SetDefault("propagation.endpoint_health.min_healthy_endpoints", 0)
 	viper.SetDefault("propagation.endpoint_health.refresh_interval_ms", 30000)
+	viper.SetDefault("propagation.endpoint_health.discovered_ttl_ms", DefaultEndpointHealthDiscoveredTTLMs)
 	// Replay arcade's in-flight tx set to merkle-service /watch at startup.
 	// Defaults to true: /watch is idempotent on merkle-service so the cost
 	// of replaying covers the (real, observed) case where merkle-service

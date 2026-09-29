@@ -148,3 +148,8 @@ bump_builder:
 #     # mode also runs the loop, but the in-process AddEndpoints fast path
 #     # makes it largely a no-op deduper.
 #     refresh_interval_ms: 30000
+#     # Peer-discovered datahub URLs not re-announced (node_status) within
+#     # this window are no longer used, so a URL a peer stopped advertising
+#     # is not probed forever or re-admitted on restart. Configured URLs are
+#     # never aged out. Keep well above the ~10s announcement interval.
+#     discovered_ttl_ms: 3600000
