@@ -3,13 +3,13 @@ module github.com/bsv-blockchain/arcade
 go 1.27.0
 
 require (
-	github.com/IBM/sarama v1.60.2
+	github.com/IBM/sarama v1.61.0
 	github.com/aerospike/aerospike-client-go/v7 v7.10.2
-	github.com/bsv-blockchain/go-bt/v2 v2.7.2
+	github.com/bsv-blockchain/go-bt/v2 v2.7.3
 	github.com/bsv-blockchain/go-chaincfg v1.7.0
 	github.com/bsv-blockchain/go-chaintracks v1.3.0
-	github.com/bsv-blockchain/go-p2p-message-bus v0.1.25
-	github.com/bsv-blockchain/go-sdk v1.5.2
+	github.com/bsv-blockchain/go-p2p-message-bus v0.1.28
+	github.com/bsv-blockchain/go-sdk v1.6.0
 	github.com/bsv-blockchain/go-teranode-p2p-client v0.3.0
 	github.com/bsv-blockchain/teranode v0.16.0-beta-9
 	github.com/cockroachdb/pebble v1.1.5
