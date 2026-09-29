@@ -40,7 +40,12 @@ func TestAwaitWithin(t *testing.T) {
 func TestForEach_StopsDispatchingOnFailureAndDoneContext(t *testing.T) {
 	const n = 10_000
 	var started atomic.Int64
-	const conc = 16
+	// One slot, so the next row can only be dispatched after row 0's worker
+	// has recorded its error and released the slot: the recheck after
+	// acquiring a slot must see the failure. With more slots the count
+	// depended on when row 0's goroutine happened to run, and the test failed
+	// intermittently under load even though forEach was right.
+	const conc = 1
 	err := forEach(context.Background(), n, conc, func(i int) error {
 		started.Add(1)
 		if i == 0 {
@@ -51,7 +56,7 @@ func TestForEach_StopsDispatchingOnFailureAndDoneContext(t *testing.T) {
 	if err == nil || err.Error() != "row 0 failed" {
 		t.Fatalf("err = %v, want the first failure", err)
 	}
-	if got := started.Load(); got > int64(conc*4) {
+	if got := started.Load(); got != 1 {
 		t.Fatalf("started %d of %d calls after the first failure; must stop dispatching", got, n)
 	}
 
