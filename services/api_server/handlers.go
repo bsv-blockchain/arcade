@@ -2,7 +2,7 @@ package api_server
 
 import (
 	"context"
-	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	_ "embed"
 	"encoding/hex"
@@ -125,11 +125,15 @@ func (s *Server) recordSubmission(_ context.Context, txid string, opts submitOpt
 	if !opts.hasSubscription() {
 		return
 	}
-	id, err := newSubmissionID()
-	if err != nil {
-		s.logger.Warn("could not generate submission id", zap.Error(err))
-		return
-	}
+	// Deterministic per (txid, callback URL, callback token): a repeat POST of
+	// the same txid with the same subscription re-registers the SAME row
+	// instead of appending another one. Registrations used to accumulate one
+	// per POST (a random id never conflicts), and every status event was then
+	// delivered once per accumulated row — a client retry ladder re-presenting
+	// a rejected txid for a few hours turned one status flip into thousands of
+	// webhook POSTs. The backends' InsertSubmission are idempotent on this id
+	// and preserve the row's delivery state.
+	id := submissionIDFor(txid, opts.CallbackURL, opts.CallbackToken)
 	sub := &models.Submission{
 		SubmissionID:      id,
 		TxID:              txid,
@@ -149,14 +153,20 @@ func (s *Server) recordSubmission(_ context.Context, txid string, opts submitOpt
 	}
 }
 
-// newSubmissionID returns a 16-byte random hex identifier. Globally unique
-// per call without coordinating across pods.
-func newSubmissionID() (string, error) {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(b[:]), nil
+// submissionIDFor derives the submission id from the subscription identity:
+// hex(sha256(txid || 0x00 || callbackURL || 0x00 || callbackToken)),
+// truncated to 32 hex characters (the width the random ids used, so nothing
+// downstream — bin sizes, log grep, index keys — changes shape). Same inputs
+// on any pod at any time give the same id, which is what makes registration
+// idempotent without a cross-pod lookup.
+func submissionIDFor(txid, callbackURL, callbackToken string) string {
+	h := sha256.New()
+	h.Write([]byte(txid))
+	h.Write([]byte{0})
+	h.Write([]byte(callbackURL))
+	h.Write([]byte{0})
+	h.Write([]byte(callbackToken))
+	return hex.EncodeToString(h.Sum(nil))[:32]
 }
 
 //go:embed docs.html
