@@ -248,3 +248,21 @@ broker's default partition count on first publish. If your broker has
 topics will instead surface as produce errors at first traffic. Either way,
 pre-creating every topic in the table above is the only way to be sure
 partition counts match your deployment.
+
+## Message size (large transactions)
+
+`TopicPropagation` carries the raw transaction base64-encoded inside a JSON
+envelope, so a message is about 4/3 of the transaction size plus the envelope.
+With the default 10 MiB `max_tx_size_policy` a valid submit can need ~14 MiB.
+Three limits must agree, or large submits fail at produce time with
+`failed to submit` (HTTP 500) while `GET /policy` still advertises them as
+accepted:
+
+| where | setting | default | arcade default |
+|---|---|---|---|
+| arcade producer | `kafka.max_message_bytes` (`Producer.MaxMessageBytes`) | 1 MiB (sarama) | 16 MiB |
+| broker | Kafka `message.max.bytes` / Redpanda `kafka_batch_max_bytes` | ~1 MiB | 16 MiB (`compose/topic-init.sh`, `deploy/kafka.yaml`) |
+| topic | `max.message.bytes` on every `arcade.*` topic | inherits broker | 16 MiB (`compose/topic-init.sh`) |
+
+Production topics live in `bsva-infra-flux` (`topics.yaml`); set
+`max.message.bytes` there to the same value.

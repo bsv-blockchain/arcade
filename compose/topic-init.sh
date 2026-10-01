@@ -27,6 +27,13 @@ PROPAGATION_PARTITIONS="${PROPAGATION_PARTITIONS:-1}"
 # them the wrong partition counts.
 "${RPK[@]}" cluster config set auto_create_topics_enabled true
 
+# Message size: a policy-max 10 MiB tx is base64 (x4/3) inside the propagation
+# envelope, so the broker default (1 MiB) rejects large submits at produce
+# time. Keep in step with kafka.max_message_bytes (arcade-config.yaml) and
+# the topic-level max.message.bytes set below.
+MAX_MESSAGE_BYTES="${MAX_MESSAGE_BYTES:-16777216}"
+"${RPK[@]}" cluster config set kafka_batch_max_bytes "$MAX_MESSAGE_BYTES"
+
 declare -A TOPICS=(
   [arcade.block_processed]=8
   [arcade.block_processed.dlq]=8
@@ -41,9 +48,12 @@ for topic in "${!TOPICS[@]}"; do
   if "${RPK[@]}" topic describe "$topic" >/dev/null 2>&1; then
     echo "topic-init: $topic already exists"
   else
-    "${RPK[@]}" topic create "$topic" --partitions "$partitions" --replicas 1
+    "${RPK[@]}" topic create "$topic" --partitions "$partitions" --replicas 1 \
+      --topic-config "max.message.bytes=$MAX_MESSAGE_BYTES"
     echo "topic-init: created $topic (partitions=$partitions)"
   fi
+  # Idempotent: raise the per-topic cap on topics that pre-date this setting.
+  "${RPK[@]}" topic alter-config "$topic" --set "max.message.bytes=$MAX_MESSAGE_BYTES"
 done
 
 # Grow an existing propagation topic in place when the target minimum rose
