@@ -147,8 +147,16 @@ type StatusCensus struct {
 // mining fee is stored as satoshis-per-Bytes (the node_status FeePolicy.MiningFee
 // shape), e.g. {Satoshis: 100, Bytes: 1000} == 100 sat/kB.
 type PeerPolicy struct {
-	PeerID            string
-	Network           string
+	PeerID  string
+	Network string
+
+	// MiningFeeSatoshis is the peer's advertised rate over MiningFeeBytes.
+	// Zero means "not advertised", on exactly the same terms as the size
+	// limits below: teranode reports min_mining_tx_fee=0 whenever its policy
+	// settings are nil, and the legacy BSV/kB conversion carries that 0
+	// through verbatim. Readers skip such rows rather than reading the 0 as
+	// "this peer mines for free" — a genuinely zero-fee network is configured
+	// with accept_zero_fee, never inferred from gossip.
 	MiningFeeSatoshis uint64
 	MiningFeeBytes    uint64
 
