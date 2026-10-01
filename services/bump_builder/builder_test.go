@@ -55,6 +55,7 @@ type mockStore struct {
 	insertBUMPErr    error
 	insertStumpErr   error
 	setMinedErr      error
+	setMinedAttempts int
 	deleteStumpsErr  error
 	markBumpBuiltErr error
 	markProcessedErr error
@@ -174,6 +175,7 @@ func (m *mockStore) InsertBUMP(_ context.Context, blockHash string, _ uint64, bu
 func (m *mockStore) SetMinedByTxIDs(_ context.Context, blockHash string, blockHeight uint64, txids []string) ([]*models.TransactionStatus, []*models.TransactionStatus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.setMinedAttempts++
 	if m.setMinedErr != nil {
 		return nil, nil, m.setMinedErr
 	}

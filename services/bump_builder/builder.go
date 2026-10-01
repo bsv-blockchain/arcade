@@ -815,8 +815,20 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	if minedComplete {
 		b.markBlockProcessed(ctx, logger, blockHash, blockHeight)
 	} else {
+		// Not a terminal lifecycle success. processed_at stays unset, so
+		// ListStaleBlockProcessingStatus (processed_at IS NULL, status
+		// active, header already seen) still returns this block and the
+		// watchdog re-drives it via /reprocess. The stored BUMP is what
+		// that re-drive mines; tryShortCircuit is idempotent for rows
+		// already MINED.
+		//
+		// Kafka redelivery is not that recovery path. This handler returns
+		// nil, and ConsumerGroup.processOne commits the offset when the
+		// handler returns nil. Returning the SetMined error would retry
+		// and then dead-letter a message that cannot finish until the
+		// watchdog re-drives the block.
 		logger.Warn(
-			"leaving processed_at unstamped after a partial mine so the watchdog re-drives this block",
+			"SetMinedByTxIDs did not complete; leaving processed_at unset so the watchdog can re-drive this block",
 			logfields.BlockHash(blockHash),
 			logfields.BlockHeight(blockHeight),
 			zap.Int("requested", len(txids)),
@@ -1143,8 +1155,11 @@ func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, block
 	if minedComplete {
 		b.markBlockProcessed(ctx, logger, blockHash, existingHeight)
 	} else {
+		// Same contract as the build path: Kafka redelivery is not the
+		// recovery path (the caller returns nil and the offset is
+		// committed). processed_at stays unset so the watchdog re-drives.
 		logger.Warn(
-			"leaving processed_at unstamped after a partial short-circuit mine so the watchdog re-drives this block",
+			"SetMinedByTxIDs did not complete; leaving processed_at unset so the watchdog can re-drive this block",
 			logfields.BlockHash(blockHash),
 			logfields.BlockHeight(existingHeight),
 			zap.Int("requested", len(txids)),

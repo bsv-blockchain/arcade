@@ -230,7 +230,7 @@ var routeDocs = []RouteDoc{
 		},
 		ResponseStatus: "200 OK",
 		ResponseBody:   "(empty body)",
-		Notes:          "Request bodies are capped (default 16 MiB) to bound memory cost of embedded STUMP blobs; oversize bodies return 413 Payload Too Large.",
+		Notes:          "Request bodies are capped (default 16 MiB) to bound memory cost of embedded STUMP blobs; oversize bodies return 413 Payload Too Large. A SEEN_ON_NETWORK or SEEN_ON_MULTIPLE_NODES callback whose store write fails returns 500 so Merkle retries; a successful or duplicate callback stays 200. An unknown type is acknowledged with 200 and a warning: a 5xx would retry a message this build cannot apply.",
 	},
 	{
 		Method:      "GET",
