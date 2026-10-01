@@ -58,7 +58,7 @@ var callbackSubscriptionHeaders = []RouteHeader{
 	{
 		Name:        "X-FullStatusUpdates",
 		Requirement: "Optional",
-		Description: "Set to \"true\" to receive every status transition (RECEIVED, SEEN_ON_NETWORK, SEEN_ON_MULTIPLE_NODES, MINED, IMMUTABLE). Default behavior delivers only terminal/notable transitions.",
+		Description: "Set to \"true\" to receive every status transition (RECEIVED, SEEN_ON_NETWORK, SEEN_MULTIPLE_NODES, MINED, IMMUTABLE). Default behavior delivers only terminal/notable transitions.",
 	},
 }
 
@@ -140,7 +140,7 @@ var routeDocs = []RouteDoc{
 		},
 		ResponseStatus: "200 OK · text/event-stream",
 		ResponseBody:   "id: 1716205200123456789\nevent: status\ndata: {\"txid\":\"<hex>\",\"txStatus\":\"SEEN_ON_NETWORK\",\"timestamp\":\"2026-05-20T12:00:00Z\"}\n\nid: 1716205260987654321\nevent: status\ndata: {\"txid\":\"<hex>\",\"txStatus\":\"MINED\",\"timestamp\":\"2026-05-20T12:01:00Z\"}\n\n: keepalive\n\n",
-		Notes:          "Lines prefixed with ':' are SSE comments — Arcade sends a `: keepalive` comment every 15 seconds to hold the connection open through intermediaries. The 'id' field is the event timestamp in nanoseconds; clients reconnecting after a network blip should send it back as Last-Event-ID. The SSE service exposes its own /health and /ready endpoints on the same port. Possible txStatus values: RECEIVED, SEEN_ON_NETWORK, SEEN_ON_MULTIPLE_NODES, MINED, IMMUTABLE, REJECTED.",
+		Notes:          "Lines prefixed with ':' are SSE comments — Arcade sends a `: keepalive` comment every 15 seconds to hold the connection open through intermediaries. The 'id' field is the event timestamp in nanoseconds; clients reconnecting after a network blip should send it back as Last-Event-ID. The SSE service exposes its own /health and /ready endpoints on the same port. Possible txStatus values: RECEIVED, SEEN_ON_NETWORK, SEEN_MULTIPLE_NODES, MINED, IMMUTABLE, REJECTED.",
 	},
 	{
 		Method:      "POST",
@@ -208,7 +208,7 @@ var routeDocs = []RouteDoc{
 		Method:      "POST",
 		Path:        "/api/v1/merkle-service/callback",
 		Summary:     "Internal — receive callbacks from Merkle Service",
-		Description: "Internal endpoint used by the Merkle Service to deliver SEEN_ON_NETWORK, SEEN_ON_MULTIPLE_NODES, STUMP and BLOCK_PROCESSED events. Bearer authentication is mandatory; the deployment refuses to start without a configured callback token.",
+		Description: "Internal endpoint used by the Merkle Service to deliver SEEN_ON_NETWORK, SEEN_MULTIPLE_NODES, STUMP and BLOCK_PROCESSED events. Bearer authentication is mandatory; the deployment refuses to start without a configured callback token.",
 		Headers: []RouteHeader{
 			{
 				Name:        "Authorization",
@@ -230,7 +230,7 @@ var routeDocs = []RouteDoc{
 		},
 		ResponseStatus: "200 OK",
 		ResponseBody:   "(empty body)",
-		Notes:          "Request bodies are capped (default 16 MiB) to bound memory cost of embedded STUMP blobs; oversize bodies return 413 Payload Too Large. A SEEN_ON_NETWORK or SEEN_ON_MULTIPLE_NODES callback whose store write fails returns 500 so Merkle retries; a successful or duplicate callback stays 200. An unknown type is acknowledged with 200 and a warning: a 5xx would retry a message this build cannot apply.",
+		Notes:          "Request bodies are capped (default 16 MiB) to bound memory cost of embedded STUMP blobs; oversize bodies return 413 Payload Too Large. A SEEN_ON_NETWORK or SEEN_MULTIPLE_NODES callback whose store write fails returns 500 so Merkle retries; a successful or duplicate callback stays 200. An unknown type is acknowledged with 200 and a warning: a 5xx would retry a message this build cannot apply.",
 	},
 	{
 		Method:      "GET",

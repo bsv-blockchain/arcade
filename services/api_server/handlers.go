@@ -467,7 +467,7 @@ func (s *Server) handleSeenOnNetwork(c *gin.Context, msg models.CallbackMessage,
 	return s.applySeenCallback(c, msg, logger, models.StatusSeenOnNetwork, "SEEN_ON_NETWORK")
 }
 
-// handleSeenMultipleNodes applies a SEEN_ON_MULTIPLE_NODES callback. Same
+// handleSeenMultipleNodes applies a SEEN_MULTIPLE_NODES callback. Same
 // unknown-txid handling as handleSeenOnNetwork — the store rejects updates
 // to absent rows (F-033 / #91) and we log + continue rather than creating
 // phantom rows.

@@ -167,14 +167,24 @@ func BatchUpdateStatusReturningFallback(ctx context.Context, s GetStatusGetter, 
 			if prev == nil {
 				return
 			}
-			prevs[i] = prev
-			if err := s.UpdateStatus(ctx, st); err != nil && !errors.Is(err, ErrNotFound) {
+			// Assign the previous row only after UpdateStatus succeeds.
+			// Postgres and Aerospike use this fallback. Reporting prev
+			// before the write lets applySeenCallback publish the
+			// transition and advance txTracker for a row that never
+			// persisted; the tracker's prefilter then drops the HTTP 500
+			// retry, so the durable store stays unchanged.
+			if err := s.UpdateStatus(ctx, st); err != nil {
+				if errors.Is(err, ErrNotFound) {
+					return
+				}
 				mu.Lock()
 				if firstErr == nil {
 					firstErr = err
 				}
 				mu.Unlock()
+				return
 			}
+			prevs[i] = prev
 		}()
 	}
 	wg.Wait()

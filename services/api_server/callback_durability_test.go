@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/store/pebble"
 )
 
@@ -190,5 +192,241 @@ func TestHandleCallback_UnknownType_Acknowledged(t *testing.T) {
 	}
 	if len(ms.updateStatusCalls) != 0 || len(ms.batchUpdateReturningCalls) != 0 {
 		t.Fatalf("unknown type must not touch the store, updates=%d batches=%d", len(ms.updateStatusCalls), len(ms.batchUpdateReturningCalls))
+	}
+}
+
+// fallbackSeenStore is the Postgres/Aerospike batch path: GetStatus then
+// UpdateStatus inside BatchUpdateStatusReturningFallback. failTxIDs makes
+// UpdateStatus fail without changing the row.
+type fallbackSeenStore struct {
+	mockStore
+	mu          sync.Mutex
+	rows        map[string]*models.TransactionStatus
+	failTxIDs   map[string]bool
+	updateCalls map[string]int
+}
+
+func (f *fallbackSeenStore) GetStatus(_ context.Context, txid string) (*models.TransactionStatus, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	row := f.rows[txid]
+	if row == nil {
+		return nil, store.ErrNotFound
+	}
+	cp := *row
+	return &cp, nil
+}
+
+func (f *fallbackSeenStore) UpdateStatus(_ context.Context, status *models.TransactionStatus) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.updateCalls[status.TxID]++
+	if f.failTxIDs[status.TxID] {
+		return errors.New("fallback store write failed")
+	}
+	row := f.rows[status.TxID]
+	if row == nil {
+		return store.ErrNotFound
+	}
+	cp := *row
+	cp.Status = status.Status
+	cp.Timestamp = status.Timestamp
+	f.rows[status.TxID] = &cp
+	return nil
+}
+
+func (f *fallbackSeenStore) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
+	return store.BatchUpdateStatusReturningFallback(ctx, f, statuses)
+}
+
+func (f *fallbackSeenStore) calls(txid string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.updateCalls[txid]
+}
+
+func (f *fallbackSeenStore) status(txid string) models.Status {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	row := f.rows[txid]
+	if row == nil {
+		return ""
+	}
+	return row.Status
+}
+
+// TestHandleCallback_FallbackStoreFailure_DoesNotAdvanceTracker is the
+// Postgres/Aerospike durability regression. A failed UpdateStatus must not
+// look like a persisted transition: HTTP 500, tracker stays put, and the
+// retry reaches the store again. The successful retry persists and publishes
+// once.
+func TestHandleCallback_FallbackStoreFailure_DoesNotAdvanceTracker(t *testing.T) {
+	const txid = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	st := &fallbackSeenStore{
+		rows: map[string]*models.TransactionStatus{
+			txid: {TxID: txid, Status: models.StatusAcceptedByNetwork, Timestamp: time.Now()},
+		},
+		failTxIDs:   map[string]bool{txid: true},
+		updateCalls: map[string]int{},
+	}
+	tracker := store.NewTxTracker()
+	tracker.Add(txid, models.StatusAcceptedByNetwork)
+	pub := &recordingCallbackPub{}
+	gin.SetMode(gin.TestMode)
+	srv := &Server{
+		cfg:            &config.Config{CallbackToken: testCallbackToken},
+		logger:         zap.NewNop(),
+		producer:       kafka.NewProducer(&kafka.RecordingBroker{}),
+		store:          st,
+		publisher:      pub,
+		txTracker:      tracker,
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
+	}
+	router := gin.New()
+	srv.registerRoutes(router)
+	body := mustMarshalJSON(t, models.CallbackMessage{
+		Type:  models.CallbackSeenOnNetwork,
+		TxIDs: []string{txid},
+	})
+
+	req := authedCallbackRequest(t, body)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("fallback store failure must be HTTP 500, got %d: %s", w.Code, w.Body.String())
+	}
+	if got, ok := tracker.GetStatus(txid); !ok || got != models.StatusAcceptedByNetwork {
+		t.Fatalf("tracker after failed write = %s ok=%v, want ACCEPTED_BY_NETWORK", got, ok)
+	}
+	if st.status(txid) != models.StatusAcceptedByNetwork {
+		t.Fatalf("store status after failed write = %s, want ACCEPTED_BY_NETWORK", st.status(txid))
+	}
+	if st.calls(txid) != 1 {
+		t.Fatalf("UpdateStatus calls after failure = %d, want 1", st.calls(txid))
+	}
+	pub.mu.Lock()
+	if len(pub.bulkPublishes) != 0 {
+		t.Fatalf("failed write must not publish, got %d", len(pub.bulkPublishes))
+	}
+	pub.mu.Unlock()
+
+	st.mu.Lock()
+	st.failTxIDs[txid] = false
+	st.mu.Unlock()
+	req = authedCallbackRequest(t, body)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("retry must succeed, got %d: %s", w.Code, w.Body.String())
+	}
+	if st.calls(txid) != 2 {
+		t.Fatalf("retry must reach the store again, UpdateStatus calls = %d, want 2", st.calls(txid))
+	}
+	if st.status(txid) != models.StatusSeenOnNetwork {
+		t.Fatalf("store status after retry = %s, want SEEN_ON_NETWORK", st.status(txid))
+	}
+	if got, ok := tracker.GetStatus(txid); !ok || got != models.StatusSeenOnNetwork {
+		t.Fatalf("tracker after retry = %s ok=%v, want SEEN_ON_NETWORK", got, ok)
+	}
+	pub.mu.Lock()
+	defer pub.mu.Unlock()
+	if len(pub.bulkPublishes) != 1 || len(pub.bulkPublishes[0].TxIDs) != 1 || pub.bulkPublishes[0].TxIDs[0] != txid {
+		t.Fatalf("successful retry must publish once, got %+v", pub.bulkPublishes)
+	}
+}
+
+// TestHandleCallback_FallbackPartialBatch_PublishesOnlyPersistedRows proves a
+// mixed batch still publishes the row whose UpdateStatus succeeded, and does
+// not advance the tracker for the row whose write failed.
+func TestHandleCallback_FallbackPartialBatch_PublishesOnlyPersistedRows(t *testing.T) {
+	const (
+		okTx   = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+		failTx = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	)
+	now := time.Now()
+	st := &fallbackSeenStore{
+		rows: map[string]*models.TransactionStatus{
+			okTx:   {TxID: okTx, Status: models.StatusAcceptedByNetwork, Timestamp: now},
+			failTx: {TxID: failTx, Status: models.StatusAcceptedByNetwork, Timestamp: now},
+		},
+		failTxIDs:   map[string]bool{failTx: true},
+		updateCalls: map[string]int{},
+	}
+	tracker := store.NewTxTracker()
+	tracker.Add(okTx, models.StatusAcceptedByNetwork)
+	tracker.Add(failTx, models.StatusAcceptedByNetwork)
+	pub := &recordingCallbackPub{}
+	gin.SetMode(gin.TestMode)
+	srv := &Server{
+		cfg:            &config.Config{CallbackToken: testCallbackToken},
+		logger:         zap.NewNop(),
+		producer:       kafka.NewProducer(&kafka.RecordingBroker{}),
+		store:          st,
+		publisher:      pub,
+		txTracker:      tracker,
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
+	}
+	router := gin.New()
+	srv.registerRoutes(router)
+
+	req := authedCallbackRequest(t, mustMarshalJSON(t, models.CallbackMessage{
+		Type:  models.CallbackSeenOnNetwork,
+		TxIDs: []string{okTx, failTx},
+	}))
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("partial fallback failure must be HTTP 500, got %d: %s", w.Code, w.Body.String())
+	}
+	if st.status(okTx) != models.StatusSeenOnNetwork {
+		t.Fatalf("persisted row = %s, want SEEN_ON_NETWORK", st.status(okTx))
+	}
+	if st.status(failTx) != models.StatusAcceptedByNetwork {
+		t.Fatalf("failed row = %s, want ACCEPTED_BY_NETWORK", st.status(failTx))
+	}
+	if got, _ := tracker.GetStatus(okTx); got != models.StatusSeenOnNetwork {
+		t.Fatalf("tracker for persisted row = %s, want SEEN_ON_NETWORK", got)
+	}
+	if got, _ := tracker.GetStatus(failTx); got != models.StatusAcceptedByNetwork {
+		t.Fatalf("tracker for failed row = %s, want ACCEPTED_BY_NETWORK", got)
+	}
+	pub.mu.Lock()
+	defer pub.mu.Unlock()
+	if len(pub.bulkPublishes) != 1 || len(pub.bulkPublishes[0].TxIDs) != 1 || pub.bulkPublishes[0].TxIDs[0] != okTx {
+		t.Fatalf("publish must contain only the persisted tx, got %+v", pub.bulkPublishes)
+	}
+}
+
+// TestRouteDocs_SeenMultipleNodesEnumMatchesCallbackType pins the wire enum.
+// The callback type and the txStatus value are SEEN_MULTIPLE_NODES.
+// SEEN_ON_MULTIPLE_NODES is not accepted.
+func TestRouteDocs_SeenMultipleNodesEnumMatchesCallbackType(t *testing.T) {
+	var docs strings.Builder
+	var callbackDescription string
+	for _, route := range routeDocs {
+		docs.WriteString(route.Description)
+		docs.WriteString(route.Notes)
+		docs.WriteString(route.ResponseBody)
+		for _, h := range route.Headers {
+			docs.WriteString(h.Description)
+		}
+		for _, body := range route.RequestBodies {
+			docs.WriteString(body.Description)
+			docs.WriteString(body.Example)
+		}
+		if route.Path == "/api/v1/merkle-service/callback" {
+			callbackDescription = route.Description + route.Notes
+		}
+	}
+	if strings.Contains(docs.String(), "SEEN_ON_MULTIPLE_NODES") {
+		t.Fatal("route docs contain SEEN_ON_MULTIPLE_NODES; the accepted enum is SEEN_MULTIPLE_NODES")
+	}
+	if !strings.Contains(callbackDescription, "SEEN_MULTIPLE_NODES") {
+		t.Fatal("callback route docs must name SEEN_MULTIPLE_NODES")
+	}
+	if models.CallbackSeenMultipleNodes != "SEEN_MULTIPLE_NODES" || models.StatusSeenMultipleNodes != "SEEN_MULTIPLE_NODES" {
+		t.Fatalf("enum drift: callback=%s status=%s", models.CallbackSeenMultipleNodes, models.StatusSeenMultipleNodes)
 	}
 }
