@@ -46,6 +46,9 @@ finished block.
   nil error. Kafka redelivery is not the recovery mechanism. Returning the
   store error would retry and then dead-letter a message that cannot finish
   until the watchdog runs.
+- The build-duration outcome is `store_failed` on both the fresh build and
+  the short-circuit redelivery. It is not `finalized_complete_no_grace`,
+  `grace_waited`, or `short_circuited`.
 
 The watchdog is the recovery mechanism. Do not remove it.
 
