@@ -412,6 +412,14 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 	if !status.MerkleRegisteredAt.IsZero() {
 		bins["merkle_reg_at"] = status.MerkleRegisteredAt.UnixMilli()
 	}
+	if len(status.CompetingTxs) > 0 {
+		// JSON bytes, the encoding the GetStatus decoder already reads.
+		ct, err := json.Marshal(status.CompetingTxs)
+		if err != nil {
+			return fmt.Errorf("marshal competing_txs for %s: %w", status.TxID, err)
+		}
+		bins["competing_txs"] = ct
+	}
 
 	// Enforce the status lattice: refuse to overwrite a terminal status with a
 	// later, lower-priority update (e.g. a stray SEEN_ON_NETWORK callback after

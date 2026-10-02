@@ -30,3 +30,12 @@ func TestBlockStatus_Conformance(t *testing.T) {
 		return integrationStore(t)
 	})
 }
+
+// A double spend is discovered after the row exists, so the competing
+// spender must persist through the status-update paths, not only on insert.
+func TestCompetingTxs_Conformance(t *testing.T) {
+	storetest.RunCompetingTxsSuite(t, func(t *testing.T) storetest.CompetingTxsBackend {
+		t.Helper()
+		return integrationStore(t)
+	})
+}

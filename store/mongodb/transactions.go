@@ -170,6 +170,9 @@ func statusUpdate(st *models.TransactionStatus, now time.Time) bson.D {
 	if len(st.MerklePath) > 0 {
 		set = append(set, kv(fMerklePath, []byte(st.MerklePath)))
 	}
+	if len(st.CompetingTxs) > 0 {
+		set = append(set, kv(fCompetingTxs, st.CompetingTxs))
+	}
 	if !st.MerkleRegisteredAt.IsZero() {
 		set = append(set, kv(fMerkleRegisteredAt, st.MerkleRegisteredAt))
 	}

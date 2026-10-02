@@ -1000,14 +1000,15 @@ func (m *Manager) enrichMerklePath(ctx context.Context, status *models.Transacti
 // datetime.fromisoformat) accept both spellings unchanged.
 func buildStatusFrame(status *models.TransactionStatus) (string, error) {
 	data, err := json.Marshal(statusPayload{
-		TxID:        status.TxID,
-		TxStatus:    string(status.Status),
-		Timestamp:   status.Timestamp.UTC().Format(time.RFC3339Nano),
-		BlockHash:   status.BlockHash,
-		BlockHeight: status.BlockHeight,
-		MerklePath:  status.MerklePath,
-		StatusCode:  status.StatusCode,
-		ExtraInfo:   status.ExtraInfo,
+		TxID:         status.TxID,
+		TxStatus:     string(status.Status),
+		Timestamp:    status.Timestamp.UTC().Format(time.RFC3339Nano),
+		BlockHash:    status.BlockHash,
+		BlockHeight:  status.BlockHeight,
+		MerklePath:   status.MerklePath,
+		StatusCode:   status.StatusCode,
+		ExtraInfo:    status.ExtraInfo,
+		CompetingTxs: status.CompetingTxs,
 	})
 	if err != nil {
 		return "", err
@@ -1142,4 +1143,7 @@ type statusPayload struct {
 	MerklePath  models.HexBytes `json:"merklePath,omitempty"`
 	StatusCode  int             `json:"status,omitempty"`
 	ExtraInfo   string          `json:"extraInfo,omitempty"`
+	// CompetingTxs names the transaction(s) that own the outpoints a
+	// double-spend REJECTED frame tried to spend, as on GET /tx.
+	CompetingTxs []string `json:"competingTxs,omitempty"`
 }

@@ -27,6 +27,15 @@ func TestBlockStatus_Conformance(t *testing.T) {
 	storetest.RunBlockStatusSuite(t, func(t *testing.T) storetest.BlockStatusBackend { return newTestStore(t) })
 }
 
+// A double spend is discovered after the row exists, so the competing
+// spender must persist through the status-update paths, not only on insert.
+func TestCompetingTxs_Conformance(t *testing.T) {
+	storetest.RunCompetingTxsSuite(t, func(t *testing.T) storetest.CompetingTxsBackend {
+		t.Helper()
+		return newTestStore(t)
+	})
+}
+
 // The status filter is what keeps a REJECTED-heavy store out of memory, so a
 // row that leaves the tracked set must stop being emitted immediately.
 func TestIterateTrackerRows_FollowsTransitions(t *testing.T) {
