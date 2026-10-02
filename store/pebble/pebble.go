@@ -426,7 +426,7 @@ func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.Transa
 // budget as BatchUpdateStatus; per-row previous rows are returned in input
 // order so callers can observe transition-age metrics without an extra
 // round-trip per txid.
-func (s *Store) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
+func (s *Store) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]store.StatusUpdate, error) {
 	return store.BatchUpdateStatusReturningParallel(ctx, s, statuses)
 }
 
@@ -447,18 +447,17 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 	return err
 }
 
-// UpdateStatusReturning is UpdateStatus plus the row this call applied the
-// transition to. The previous row is returned only when the write landed.
-// A lattice skip returns (nil, nil): the blocking row is not a transition
-// a caller may publish. Transient errors and ctx-cancel also return a nil
-// previous row.
+// UpdateStatusReturning is UpdateStatus plus the applied-result. Prev is
+// the row this call wrote over. Current is the durable row when the lattice
+// skipped the write; that row is known, and it is not a transition a caller
+// may publish. Transient errors and ctx-cancel return an empty result.
 //
 // Hoists the JSON marshal of the merged payload OUT of the per-shard lock
 // so the critical section is bounded to Pebble I/O + index updates. This is
 // the hot-path optimization called out in the latency plan.
-func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.TransactionStatus) (*models.TransactionStatus, error) {
+func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.TransactionStatus) (store.StatusUpdate, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return store.StatusUpdate{}, err
 	}
 
 	timerStart := time.Now()
@@ -478,13 +477,13 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 	if err != nil {
 		mu.Unlock()
 		outcome = "error"
-		return nil, err
+		return store.StatusUpdate{}, err
 	}
 	if existing == nil {
 		mu.Unlock()
 		outcome = "not_found"
 		// Don't create phantom rows. See F-033 / issue #91.
-		return nil, store.ErrNotFound
+		return store.StatusUpdate{}, store.ErrNotFound
 	}
 	fromLabel = existing.Status
 
@@ -496,9 +495,9 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 		if !status.Status.CanTransitionFrom(models.Status(existing.Status)) {
 			mu.Unlock()
 			outcome = "skipped_lattice"
-			// Not applied. Returning the blocking row would let a caller
-			// treat a lattice skip as a transition it can publish.
-			return nil, nil
+			// Known row, transition not applied. Current is the durable
+			// status; Prev stays nil so callers do not publish.
+			return store.StatusUpdate{Current: existing.toModel()}, nil
 		}
 	}
 
@@ -513,7 +512,7 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 	if err != nil {
 		mu.Unlock()
 		outcome = "error"
-		return nil, err
+		return store.StatusUpdate{}, err
 	}
 
 	b := s.db.NewBatch()
@@ -522,7 +521,7 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 		_ = b.Close()
 		mu.Unlock()
 		outcome = "error"
-		return nil, err
+		return store.StatusUpdate{}, err
 	}
 	s.addStatusIndexes(b, merged)
 	commitErr := b.Commit(s.writeOpts)
@@ -531,9 +530,9 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 
 	if commitErr != nil {
 		outcome = "error"
-		return nil, commitErr
+		return store.StatusUpdate{}, commitErr
 	}
-	return existing.toModel(), nil
+	return store.StatusUpdate{Prev: existing.toModel()}, nil
 }
 
 // mergeStatus applies the fields set on update onto existing. Empty strings,

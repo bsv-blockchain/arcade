@@ -371,7 +371,7 @@ func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.Transa
 // BatchUpdateStatusReturning applies each row with UpdateStatusReturning.
 // The generation-checked put is the applied-result: a non-nil previous row
 // is the record this call's CAS wrote over.
-func (s *Store) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
+func (s *Store) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]store.StatusUpdate, error) {
 	return store.BatchUpdateStatusReturningParallel(ctx, s, statuses)
 }
 
@@ -384,16 +384,45 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 	return err
 }
 
-// UpdateStatusReturning applies status and returns the record as it stood
-// immediately before the winning put. The previous row is non-nil only when
-// this call's generation-checked write landed. A lattice skip returns
-// (nil, nil). A generation mismatch retries the read so a concurrent MINED
-// writer cannot leave this call holding a stale ACCEPTED_BY_NETWORK
-// pre-image.
-func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.TransactionStatus) (*models.TransactionStatus, error) {
+// statusUpdateReadBins are the only bins the CAS read fetches. The
+// applied-result needs the lifecycle status, its timestamp, and the block
+// anchor / extra info the contract returns. raw_tx, merkle_path, and
+// competing_txs stay unread.
+var statusUpdateReadBins = []string{
+	"status",
+	"timestamp",
+	"block_hash",
+	"block_height",
+	"extra_info",
+}
+
+// statusFromUpdateBins decodes only statusUpdateReadBins.
+func statusFromUpdateBins(rec *aero.Record, txid string) *models.TransactionStatus {
+	st := &models.TransactionStatus{
+		TxID:      txid,
+		Status:    models.Status(getString(rec, "status")),
+		BlockHash: getString(rec, "block_hash"),
+		ExtraInfo: getString(rec, "extra_info"),
+	}
+	if ms := getInt(rec, "timestamp"); ms != 0 {
+		st.Timestamp = time.UnixMilli(int64(ms))
+	}
+	if h := getInt(rec, "block_height"); h > 0 {
+		st.BlockHeight = uint64(h) //nolint:gosec // block height fits
+	}
+	return st
+}
+
+// UpdateStatusReturning applies status and returns the applied-result.
+// Prev is the record this call's generation-checked put wrote over, decoded
+// from statusUpdateReadBins only. Current is that same narrow record when
+// the lattice skips the write. A generation mismatch retries the read so a
+// concurrent MINED writer cannot leave this call holding a stale
+// ACCEPTED_BY_NETWORK pre-image.
+func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.TransactionStatus) (store.StatusUpdate, error) {
 	key, err := s.key(setTransactions, status.TxID)
 	if err != nil {
-		return nil, err
+		return store.StatusUpdate{}, err
 	}
 
 	bins := aero.BinMap{
@@ -424,18 +453,16 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 	// a generation mismatch retries rather than clobbering their write.
 	// UPDATE_ONLY refuses to create a record (F-033 / #91).
 	for {
-		rec, gerr := s.client.Get(s.readPolicy(ctx), key)
+		rec, gerr := s.client.Get(s.readPolicy(ctx), key, statusUpdateReadBins...)
 		if gerr != nil && !isKeyNotFound(gerr) {
-			return nil, fmt.Errorf("read status for lattice check %s: %w", status.TxID, gerr)
+			return store.StatusUpdate{}, fmt.Errorf("read status for lattice check %s: %w", status.TxID, gerr)
 		}
 		if rec == nil {
-			return nil, store.ErrNotFound
+			return store.StatusUpdate{}, store.ErrNotFound
 		}
-		if status.Status != "" {
-			existing := models.Status(getString(rec, "status"))
-			if !status.Status.CanTransitionFrom(existing) {
-				return nil, nil
-			}
+		observed := statusFromUpdateBins(rec, status.TxID)
+		if status.Status != "" && !status.Status.CanTransitionFrom(observed.Status) {
+			return store.StatusUpdate{Current: observed}, nil
 		}
 		policy := s.writePolicy(ctx)
 		policy.GenerationPolicy = aero.EXPECT_GEN_EQUAL
@@ -446,11 +473,11 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 				continue
 			}
 			if isKeyNotFound(err) {
-				return nil, store.ErrNotFound
+				return store.StatusUpdate{}, store.ErrNotFound
 			}
-			return nil, fmt.Errorf("update tx %s: %w", status.TxID, err)
+			return store.StatusUpdate{}, fmt.Errorf("update tx %s: %w", status.TxID, err)
 		}
-		return recordToStatus(rec, status.TxID), nil
+		return store.StatusUpdate{Prev: observed}, nil
 	}
 }
 

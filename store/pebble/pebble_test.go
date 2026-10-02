@@ -226,8 +226,11 @@ func TestUpdateStatusReturning_SkipIsNotApplied(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lattice skip must not be an error, got %v", err)
 	}
-	if prev != nil {
-		t.Fatalf("lattice skip returned prev %+v; a non-nil prev means the transition was applied", prev)
+	if prev.Prev != nil {
+		t.Fatalf("lattice skip returned applied prev %+v", prev.Prev)
+	}
+	if prev.Current == nil || prev.Current.Status != models.StatusMined {
+		t.Fatalf("known skip current = %+v, want MINED", prev.Current)
 	}
 	got, err := s.GetStatus(ctx, txid)
 	if err != nil {
@@ -254,8 +257,11 @@ func TestUpdateStatusReturning_AppliedReturnsPrevious(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if prev == nil || prev.Status != models.StatusAcceptedByNetwork {
-		t.Fatalf("prev = %+v, want ACCEPTED_BY_NETWORK", prev)
+	if prev.Prev == nil || prev.Prev.Status != models.StatusAcceptedByNetwork {
+		t.Fatalf("prev = %+v, want ACCEPTED_BY_NETWORK", prev.Prev)
+	}
+	if prev.Current != nil {
+		t.Fatalf("applied write must not also report a skip: %+v", prev.Current)
 	}
 	got, err := s.GetStatus(ctx, txid)
 	if err != nil {

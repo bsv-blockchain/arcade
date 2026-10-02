@@ -228,8 +228,8 @@ var routeDocs = []RouteDoc{
 				Example:     "{\n  \"type\": \"SEEN_ON_NETWORK\",\n  \"txid\": \"<hex>\",\n  \"txids\": [\"<hex>\", \"...\"],\n  \"blockHash\": \"<hex>\",\n  \"subtreeIndex\": 0,\n  \"stump\": \"<base64>\"\n}",
 			},
 		},
-		ResponseStatus: "200 OK",
-		ResponseBody:   "(empty body)",
+		ResponseStatus: "200 OK; 500 Internal Server Error",
+		ResponseBody:   "200 OK:\n(empty body)\n\n500 Internal Server Error:\n{\n  \"error\": \"failed to store seen status\"\n}",
 		Notes:          "Request bodies are capped (default 16 MiB) to bound memory cost of embedded STUMP blobs; oversize bodies return 413 Payload Too Large. A SEEN_ON_NETWORK or SEEN_MULTIPLE_NODES callback whose store write fails returns 500 so Merkle retries; a successful or duplicate callback stays 200. An unknown type is acknowledged with 200 and a warning: a 5xx would retry a message this build cannot apply.",
 	},
 	{

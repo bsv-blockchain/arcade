@@ -590,7 +590,7 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 	for i, st := range terminalStatuses {
 		var prev *models.TransactionStatus
 		if i < len(prevs) {
-			prev = prevs[i]
+			prev = prevs[i].Prev
 		}
 
 		// Dispatcher accounting — unconditional. Callers only route

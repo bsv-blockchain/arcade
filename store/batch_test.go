@@ -294,8 +294,8 @@ func TestBatchUpdateStatusReturningFallback_StalePreimageIsNotApplied(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(prevs) != 1 || prevs[0] != nil {
-		t.Fatalf("prevs = %+v, want [nil]: the SEEN write lost the race and must not look applied", prevs)
+	if len(prevs) != 1 || prevs[0].Prev != nil || prevs[0].Current == nil || prevs[0].Current.Status != models.StatusMined {
+		t.Fatalf("prevs = %+v, want a known MINED skip and no applied prev", prevs)
 	}
 	got, err := r.GetStatus(context.Background(), "tx")
 	if err != nil {
@@ -319,8 +319,8 @@ func TestBatchUpdateStatusReturningFallback_AppliedReturnsPrevious(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(prevs) != 1 || prevs[0] == nil || prevs[0].Status != models.StatusAcceptedByNetwork {
-		t.Fatalf("prevs = %+v, want ACCEPTED_BY_NETWORK", prevs)
+	if len(prevs) != 1 || prevs[0].Prev == nil || prevs[0].Prev.Status != models.StatusAcceptedByNetwork || prevs[0].Current != nil {
+		t.Fatalf("prevs = %+v, want applied ACCEPTED_BY_NETWORK", prevs)
 	}
 	got, err := r.GetStatus(context.Background(), "tx")
 	if err != nil {

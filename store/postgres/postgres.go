@@ -326,7 +326,7 @@ func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.Transa
 
 // BatchUpdateStatusReturning applies each row with UpdateStatusReturning.
 // A non-nil previous row means that row's transition was durably applied.
-func (s *Store) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
+func (s *Store) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]store.StatusUpdate, error) {
 	if len(statuses) == 0 {
 		return nil, nil
 	}
@@ -423,16 +423,16 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 	return err
 }
 
-// UpdateStatusReturning applies status and returns the row as it stood
-// immediately before that write. The previous row is non-nil only when this
-// statement applied the transition. The read, the lattice check, and the
-// write are one statement: FOR UPDATE holds the row, and the UPDATE matches
-// only when CanTransitionFrom allows the move (including an idempotent
-// re-assert of the same status). A lattice skip returns (nil, nil). A
-// missing row returns ErrNotFound.
-func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.TransactionStatus) (*models.TransactionStatus, error) {
+// UpdateStatusReturning applies status and returns the applied-result.
+// Prev is the row as it stood immediately before this statement's write.
+// Current is that row when the lattice skipped the write. The read, the
+// lattice check, and the write are one statement: FOR UPDATE holds the row,
+// and the UPDATE matches only when CanTransitionFrom allows the move
+// (including an idempotent re-assert of the same status). A missing row
+// returns ErrNotFound.
+func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.TransactionStatus) (store.StatusUpdate, error) {
 	if status == nil || status.TxID == "" {
-		return nil, store.ErrNotFound
+		return store.StatusUpdate{}, store.ErrNotFound
 	}
 	ts := status.Timestamp
 	if ts.IsZero() {
@@ -501,15 +501,15 @@ FROM old`
 	row := s.pool.QueryRow(ctx, q, args...)
 	prev, applied, err := scanStatusApplied(row)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, store.ErrNotFound
+		return store.StatusUpdate{}, store.ErrNotFound
 	}
 	if err != nil {
-		return nil, fmt.Errorf("update tx %s: %w", status.TxID, err)
+		return store.StatusUpdate{}, fmt.Errorf("update tx %s: %w", status.TxID, err)
 	}
 	if !applied {
-		return nil, nil
+		return store.StatusUpdate{Current: prev}, nil
 	}
-	return prev, nil
+	return store.StatusUpdate{Prev: prev}, nil
 }
 
 // transitionGuardStatuses is DisallowedPreviousStatuses without the target
@@ -533,8 +533,8 @@ func transitionGuardStatuses(s models.Status) []string {
 
 // scanStatusApplied is scanStatus plus the trailing applied flag from
 // UpdateStatusReturning. applied is false when the row existed but the
-// lattice guard skipped the write; the previous row is then discarded by
-// the caller.
+// lattice guard skipped the write; the caller then reports that row as
+// Current.
 func scanStatusApplied(row rowScanner) (*models.TransactionStatus, bool, error) {
 	var (
 		st                 models.TransactionStatus

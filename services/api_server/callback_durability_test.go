@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
@@ -227,16 +228,16 @@ func (f *fallbackSeenStore) UpdateStatus(ctx context.Context, status *models.Tra
 	return err
 }
 
-func (f *fallbackSeenStore) UpdateStatusReturning(_ context.Context, status *models.TransactionStatus) (*models.TransactionStatus, error) {
+func (f *fallbackSeenStore) UpdateStatusReturning(_ context.Context, status *models.TransactionStatus) (store.StatusUpdate, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.updateCalls[status.TxID]++
 	if f.failTxIDs[status.TxID] {
-		return nil, errors.New("fallback store write failed")
+		return store.StatusUpdate{}, errors.New("fallback store write failed")
 	}
 	row := f.rows[status.TxID]
 	if row == nil {
-		return nil, store.ErrNotFound
+		return store.StatusUpdate{}, store.ErrNotFound
 	}
 	prev := *row
 	if landed, ok := f.loseRaceTo[status.TxID]; ok {
@@ -247,19 +248,20 @@ func (f *fallbackSeenStore) UpdateStatusReturning(_ context.Context, status *mod
 		if f.tracker != nil {
 			f.tracker.UpdateStatus(status.TxID, landed)
 		}
-		return nil, nil
+		return store.StatusUpdate{Current: &cp}, nil
 	}
 	if status.Status != "" && !status.Status.CanTransitionFrom(row.Status) {
-		return nil, nil
+		cur := *row
+		return store.StatusUpdate{Current: &cur}, nil
 	}
 	cp := *row
 	cp.Status = status.Status
 	cp.Timestamp = status.Timestamp
 	f.rows[status.TxID] = &cp
-	return &prev, nil
+	return store.StatusUpdate{Prev: &prev}, nil
 }
 
-func (f *fallbackSeenStore) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
+func (f *fallbackSeenStore) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]store.StatusUpdate, error) {
 	return store.BatchUpdateStatusReturningFallback(ctx, f, statuses)
 }
 
@@ -429,9 +431,12 @@ func TestHandleCallback_FallbackPartialBatch_PublishesOnlyPersistedRows(t *testi
 func TestRouteDocs_SeenMultipleNodesEnumMatchesCallbackType(t *testing.T) {
 	var docs strings.Builder
 	var callbackDescription string
+	var callbackRoute RouteDoc
+	var foundCallback bool
 	for _, route := range routeDocs {
 		docs.WriteString(route.Description)
 		docs.WriteString(route.Notes)
+		docs.WriteString(route.ResponseStatus)
 		docs.WriteString(route.ResponseBody)
 		for _, h := range route.Headers {
 			docs.WriteString(h.Description)
@@ -441,7 +446,9 @@ func TestRouteDocs_SeenMultipleNodesEnumMatchesCallbackType(t *testing.T) {
 			docs.WriteString(body.Example)
 		}
 		if route.Path == "/api/v1/merkle-service/callback" {
-			callbackDescription = route.Description + route.Notes
+			callbackRoute = route
+			foundCallback = true
+			callbackDescription = route.Description + route.Notes + route.ResponseStatus + route.ResponseBody
 		}
 	}
 	if strings.Contains(docs.String(), "SEEN_ON_MULTIPLE_NODES") {
@@ -450,6 +457,15 @@ func TestRouteDocs_SeenMultipleNodesEnumMatchesCallbackType(t *testing.T) {
 	if !strings.Contains(callbackDescription, "SEEN_MULTIPLE_NODES") {
 		t.Fatal("callback route docs must name SEEN_MULTIPLE_NODES")
 	}
+	if !foundCallback {
+		t.Fatal("callback route docs missing")
+	}
+	if !strings.Contains(callbackRoute.ResponseStatus, "200") || !strings.Contains(callbackRoute.ResponseStatus, "500") {
+		t.Fatalf("callback ResponseStatus = %q, want 200 and 500", callbackRoute.ResponseStatus)
+	}
+	if !strings.Contains(callbackRoute.ResponseBody, "failed to store seen status") {
+		t.Fatalf("callback ResponseBody = %q, want the 500 JSON error", callbackRoute.ResponseBody)
+	}
 	if models.CallbackSeenMultipleNodes != "SEEN_MULTIPLE_NODES" || models.StatusSeenMultipleNodes != "SEEN_MULTIPLE_NODES" {
 		t.Fatalf("enum drift: callback=%s status=%s", models.CallbackSeenMultipleNodes, models.StatusSeenMultipleNodes)
 	}
@@ -457,7 +473,8 @@ func TestRouteDocs_SeenMultipleNodesEnumMatchesCallbackType(t *testing.T) {
 
 // TestHandleCallback_StalePreimageRace_DoesNotRegressTracker is the
 // ACCEPTED_BY_NETWORK read that loses to a concurrent MINED write. The SEEN
-// update is skipped, nothing is published, and txTracker stays at MINED.
+// update is skipped. The row is known, so the unknown-txid metric does not
+// move. Nothing is published, and txTracker stays at MINED.
 func TestHandleCallback_StalePreimageRace_DoesNotRegressTracker(t *testing.T) {
 	const txid = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	tracker := store.NewTxTracker()
@@ -485,6 +502,7 @@ func TestHandleCallback_StalePreimageRace_DoesNotRegressTracker(t *testing.T) {
 	}
 	router := gin.New()
 	srv.registerRoutes(router)
+	unknownBefore := testutil.ToFloat64(metrics.CallbackUnknownTxIDTotal.WithLabelValues("SEEN_ON_NETWORK"))
 	req := authedCallbackRequest(t, mustMarshalJSON(t, models.CallbackMessage{
 		Type:  models.CallbackSeenOnNetwork,
 		TxIDs: []string{txid},
@@ -505,6 +523,9 @@ func TestHandleCallback_StalePreimageRace_DoesNotRegressTracker(t *testing.T) {
 	defer pub.mu.Unlock()
 	if len(pub.bulkPublishes) != 0 || len(pub.publishes) != 0 {
 		t.Fatalf("lost SEEN race must not publish, bulk=%d per-tx=%d", len(pub.bulkPublishes), len(pub.publishes))
+	}
+	if got := testutil.ToFloat64(metrics.CallbackUnknownTxIDTotal.WithLabelValues("SEEN_ON_NETWORK")) - unknownBefore; got != 0 {
+		t.Fatalf("CallbackUnknownTxIDTotal delta = %v, want 0 for a known lattice skip", got)
 	}
 }
 

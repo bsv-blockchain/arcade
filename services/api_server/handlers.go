@@ -531,7 +531,7 @@ func (s *Server) applySeenCallback(c *gin.Context, msg models.CallbackMessage, l
 		return nil
 	}
 
-	prevs, err := s.store.BatchUpdateStatusReturning(ctx, statuses)
+	updates, err := s.store.BatchUpdateStatusReturning(ctx, statuses)
 	if err != nil {
 		outcome = "error"
 		logger.Error(
@@ -543,53 +543,53 @@ func (s *Server) applySeenCallback(c *gin.Context, msg models.CallbackMessage, l
 		// Rows that landed before the error are still published below.
 		// The error is returned so the HTTP handler answers 500 and Merkle
 		// retries. A retry is safe: the lattice no-ops txids already at
-		// targetStatus. outcome stays "error" even if some prevs are nil,
-		// so the duration histogram does not report a partial success.
+		// targetStatus. outcome stays "error" even if some results are
+		// empty, so the duration histogram does not report a partial success.
 	}
 
 	successful := make([]string, 0, len(statuses))
-	for i, prev := range prevs {
-		if prev == nil {
-			// Not applied: unknown txid, lattice skip, or a lost race.
-			// A batch-level store error leaves failed rows as nil prevs,
-			// and those are indistinguishable from unknown txids. Do not
-			// count them as unknown: the HTTP handler returns 500 and
-			// Merkle retries. Do not publish and do not move txTracker —
-			// a stale ACCEPTED_BY_NETWORK pre-image must not regress a tx
-			// the store has already moved to MINED.
-			if outcome == "error" {
+	for i, upd := range updates {
+		if upd.Prev != nil {
+			// Observe transition age — the headline metric the user asked for.
+			// Use the previous row's Timestamp (last-update wall-clock) as the
+			// anchor; for the RECEIVED→SEEN_ON_NETWORK case it equals the
+			// time the validator marked the tx RECEIVED, which is exactly
+			// the latency we want to optimize against.
+			if !upd.Prev.Timestamp.IsZero() {
+				metrics.StatusTransitionAge.
+					WithLabelValues(string(upd.Prev.Status), string(targetStatus)).
+					Observe(time.Since(upd.Prev.Timestamp).Seconds())
+			}
+			// Status lattice recorded an applied idempotent re-assert, or
+			// the pre-image cannot move to target. No transition to fan out.
+			if upd.Prev.Status == targetStatus || !targetStatus.CanTransitionFrom(upd.Prev.Status) {
+				metrics.CallbackStaleTotal.WithLabelValues(metricLabel, string(upd.Prev.Status)).Inc()
 				continue
 			}
-			outcome = "partial"
-			metrics.CallbackUnknownTxIDTotal.WithLabelValues(metricLabel).Inc()
-			logger.Warn("dropping callback for unknown txid",
-				zap.String("type", metricLabel),
-				logfields.TxID(keptTxIDs[i]))
+			successful = append(successful, keptTxIDs[i])
+			if s.txTracker != nil {
+				s.txTracker.UpdateStatus(keptTxIDs[i], targetStatus)
+			}
 			continue
 		}
-		// Observe transition age — the headline metric the user asked for.
-		// Use the previous row's Timestamp (last-update wall-clock) as the
-		// anchor; for the RECEIVED→SEEN_ON_NETWORK case it equals the
-		// time the validator marked the tx RECEIVED, which is exactly
-		// the latency we want to optimize against.
-		if !prev.Timestamp.IsZero() {
-			metrics.StatusTransitionAge.
-				WithLabelValues(string(prev.Status), string(targetStatus)).
-				Observe(time.Since(prev.Timestamp).Seconds())
-		}
-		// Status lattice skipped the update — no transition to fan out.
-		// Record the stale-callback signal so an operator can alert on
-		// upstream rate without parsing the store_updatestatus histogram.
-		// Two stale sub-cases: prev == target (duplicate callback) and
-		// target not reachable from prev (e.g. MINED → SEEN_ON_NETWORK).
-		if prev.Status == targetStatus || !targetStatus.CanTransitionFrom(prev.Status) {
-			metrics.CallbackStaleTotal.WithLabelValues(metricLabel, string(prev.Status)).Inc()
+		if upd.Current != nil {
+			// Known row, transition not applied. Do not publish, do not
+			// move txTracker, and do not count the txid as unknown.
+			metrics.CallbackStaleTotal.WithLabelValues(metricLabel, string(upd.Current.Status)).Inc()
 			continue
 		}
-		successful = append(successful, keptTxIDs[i])
-		if s.txTracker != nil {
-			s.txTracker.UpdateStatus(keptTxIDs[i], targetStatus)
+		// Genuinely absent, or a per-row failure inside a batch error.
+		// Failed rows are indistinguishable from unknown txids. Do not
+		// count them as unknown: the HTTP handler returns 500 and Merkle
+		// retries.
+		if outcome == "error" {
+			continue
 		}
+		outcome = "partial"
+		metrics.CallbackUnknownTxIDTotal.WithLabelValues(metricLabel).Inc()
+		logger.Warn("dropping callback for unknown txid",
+			zap.String("type", metricLabel),
+			logfields.TxID(keptTxIDs[i]))
 	}
 
 	// Full-coverage SEEN line(s): this callback path is driven by

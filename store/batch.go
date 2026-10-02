@@ -59,11 +59,10 @@ type SingleStore interface {
 
 // SingleStoreReturning extends SingleStore with the diagnostic-rich
 // UpdateStatusReturning variant. Backends that implement it directly get
-// efficient batched per-row "previous status" reads without an extra
-// per-row store round-trip; backends that don't can still satisfy the
-// public Store interface via BatchUpdateStatusReturningFallback below.
+// an atomic applied-result per row. Prev is set only when the write
+// landed; Current is set when the row is known and the lattice skipped it.
 type SingleStoreReturning interface {
-	UpdateStatusReturning(ctx context.Context, status *models.TransactionStatus) (*models.TransactionStatus, error)
+	UpdateStatusReturning(ctx context.Context, status *models.TransactionStatus) (StatusUpdate, error)
 }
 
 // BatchGetOrInsertStatusParallel runs GetOrInsertStatus concurrently for each
@@ -136,11 +135,11 @@ type GetStatusGetter interface {
 // follow-up read shows this call's status and timestamp in place. Backends
 // that implement UpdateStatusReturning are used instead, one atomic
 // applied-result per row.
-func BatchUpdateStatusReturningFallback(ctx context.Context, s GetStatusGetter, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
+func BatchUpdateStatusReturningFallback(ctx context.Context, s GetStatusGetter, statuses []*models.TransactionStatus) ([]StatusUpdate, error) {
 	if len(statuses) == 0 {
 		return nil, nil
 	}
-	prevs := make([]*models.TransactionStatus, len(statuses))
+	out := make([]StatusUpdate, len(statuses))
 	sem := make(chan struct{}, currentBatchConcurrency())
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -161,7 +160,7 @@ func BatchUpdateStatusReturningFallback(ctx context.Context, s GetStatusGetter, 
 			defer wg.Done()
 			defer func() { <-sem }()
 			if returning, ok := s.(SingleStoreReturning); ok {
-				prev, err := returning.UpdateStatusReturning(ctx, st)
+				upd, err := returning.UpdateStatusReturning(ctx, st)
 				if err != nil && !errors.Is(err, ErrNotFound) {
 					mu.Lock()
 					if firstErr == nil {
@@ -170,7 +169,9 @@ func BatchUpdateStatusReturningFallback(ctx context.Context, s GetStatusGetter, 
 					mu.Unlock()
 					return
 				}
-				prevs[i] = prev
+				if err == nil {
+					out[i] = upd
+				}
 				return
 			}
 			prev, getErr := s.GetStatus(ctx, st.TxID)
@@ -210,13 +211,19 @@ func BatchUpdateStatusReturningFallback(ctx context.Context, s GetStatusGetter, 
 				return
 			}
 			if !fallbackTransitionApplied(prev, st, after) {
+				// The row is known when the follow-up read still finds it.
+				// That is a lattice skip or a lost race, not an absent txid.
+				// Do not return the stale pre-read as Prev.
+				if after != nil {
+					out[i] = StatusUpdate{Current: after}
+				}
 				return
 			}
-			prevs[i] = prev
+			out[i] = StatusUpdate{Prev: prev}
 		}()
 	}
 	wg.Wait()
-	return prevs, firstErr
+	return out, firstErr
 }
 
 // fallbackTransitionApplied reports whether the requested write is the one
@@ -244,14 +251,14 @@ func fallbackTransitionApplied(before, requested, after *models.TransactionStatu
 // BatchUpdateStatusReturningParallel is the diagnostic-rich form of
 // BatchUpdateStatusParallel. Each row goes through UpdateStatusReturning so
 // the caller can observe transition-age metrics without an extra read.
-// Returns a slice of previous rows in the same order as input; result[i] is
-// nil for unknown txids and on per-row errors.
-func BatchUpdateStatusReturningParallel(ctx context.Context, s SingleStoreReturning, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
+// result[i].Prev is the applied pre-image; result[i].Current is a known
+// lattice skip; both nil means the txid is absent or the row errored.
+func BatchUpdateStatusReturningParallel(ctx context.Context, s SingleStoreReturning, statuses []*models.TransactionStatus) ([]StatusUpdate, error) {
 	if len(statuses) == 0 {
 		return nil, nil
 	}
 
-	prevs := make([]*models.TransactionStatus, len(statuses))
+	out := make([]StatusUpdate, len(statuses))
 	sem := make(chan struct{}, currentBatchConcurrency())
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -272,7 +279,7 @@ func BatchUpdateStatusReturningParallel(ctx context.Context, s SingleStoreReturn
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			prev, err := s.UpdateStatusReturning(ctx, st)
+			upd, err := s.UpdateStatusReturning(ctx, st)
 			if err != nil && !errors.Is(err, ErrNotFound) {
 				mu.Lock()
 				if firstErr == nil {
@@ -281,12 +288,13 @@ func BatchUpdateStatusReturningParallel(ctx context.Context, s SingleStoreReturn
 				mu.Unlock()
 				return
 			}
-			// prev is nil for not-found by contract; nothing to do.
-			prevs[i] = prev
+			if err == nil {
+				out[i] = upd
+			}
 		}()
 	}
 	wg.Wait()
-	return prevs, firstErr
+	return out, firstErr
 }
 
 // BatchUpdateStatusParallel runs UpdateStatus concurrently for each row,

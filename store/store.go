@@ -236,6 +236,21 @@ type BatchInsertResult struct {
 	Inserted bool
 }
 
+// StatusUpdate is one row of BatchUpdateStatusReturning.
+//
+// Prev is non-nil only when this call durably applied the requested
+// transition. It is the row immediately before that write. Callers that
+// publish a transition or advance an in-memory tracker must use Prev.
+//
+// Current is the durable row when the txid is known and this call did not
+// apply the transition. That is a lattice skip, including a race in which
+// another writer moved the row to a later status before this write. Current
+// is nil when the txid is absent. Prev and Current are mutually exclusive.
+type StatusUpdate struct {
+	Prev    *models.TransactionStatus
+	Current *models.TransactionStatus
+}
+
 // Store handles all persistence operations for transactions and submissions
 type Store interface {
 	// GetOrInsertStatus inserts a new transaction status or returns the existing one if it already exists.
@@ -269,21 +284,25 @@ type Store interface {
 	BatchUpdateStatus(ctx context.Context, statuses []*models.TransactionStatus) error
 
 	// BatchUpdateStatusReturning is the diagnostic-rich form of BatchUpdateStatus.
-	// Returns a slice the same length as `statuses`. result[i] is non-nil
-	// only when this call durably applied statuses[i]: it is the row as it
-	// stood immediately before that write. A non-nil result is not "a row
-	// existed when we looked." Unknown txids, lattice skips, and lost races
-	// are nil — callers must not publish a transition or advance an
-	// in-memory tracker for a nil slot. An idempotent re-assert of the same
-	// status is an applied write, so result[i].Status may equal the
-	// requested status; callers that fan out events skip that case.
+	// Returns a slice the same length as `statuses`. See StatusUpdate.
+	// result[i].Prev is non-nil only when this call durably applied
+	// statuses[i]: it is the row as it stood immediately before that write.
+	// A non-nil Prev is not "a row existed when we looked." An idempotent
+	// re-assert of the same status is an applied write, so Prev.Status may
+	// equal the requested status; callers that fan out events skip that case.
 	//
-	// The previous row's status metadata (Status, Timestamp, block anchor,
-	// extra info) is guaranteed when the result is non-nil. RawTx is NOT —
-	// MongoDB projects it away, since no caller reads it and it can be
-	// megabytes per row on a hot path, while Pebble and Postgres happen to
-	// return it only because they read the row whole.
-	BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error)
+	// result[i].Current is the durable row when the txid is known and this
+	// call did not apply the transition (lattice skip, including a race lost
+	// to a later status). A genuinely absent txid leaves both Prev and
+	// Current nil. Callers must not publish or advance a tracker from
+	// Current, and must not count Current as an unknown txid.
+	//
+	// Prev's status metadata (Status, Timestamp, block anchor, extra info)
+	// is guaranteed. RawTx is NOT — MongoDB projects it away, since no
+	// caller reads it and it can be megabytes per row on a hot path, while
+	// Pebble and Postgres happen to return it only because they read the
+	// row whole.
+	BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]StatusUpdate, error)
 
 	// GetStatus retrieves the status for a transaction
 	GetStatus(ctx context.Context, txid string) (*models.TransactionStatus, error)
