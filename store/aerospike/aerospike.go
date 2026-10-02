@@ -447,6 +447,14 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 	if !status.MerkleRegisteredAt.IsZero() {
 		bins["merkle_reg_at"] = status.MerkleRegisteredAt.UnixMilli()
 	}
+	if len(status.CompetingTxs) > 0 {
+		// JSON bytes, the encoding the GetStatus decoder already reads.
+		ct, err := json.Marshal(status.CompetingTxs)
+		if err != nil {
+			return store.StatusUpdate{}, fmt.Errorf("marshal competing_txs for %s: %w", status.TxID, err)
+		}
+		bins["competing_txs"] = ct
+	}
 
 	// Read-then-CAS-write using the record's generation. The pre-write
 	// lattice check and the put are atomic with respect to other writers:

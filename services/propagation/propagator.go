@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1002,8 +1003,9 @@ func (p *Propagator) publishBulkStatus(ctx context.Context, status models.Status
 // to one event each — which is exactly what carrying a per-transaction reason
 // requires.
 //
-// Only TxID, ExtraInfo and StatusCode are read from each status; the event's
-// Status and Timestamp come from the caller, matching publishBulkStatus.
+// Only TxID, ExtraInfo, StatusCode and CompetingTxs are read from each status;
+// the event's Status and Timestamp come from the caller, matching
+// publishBulkStatus.
 func (p *Propagator) publishRejections(ctx context.Context, rejected []*models.TransactionStatus, ts time.Time) {
 	if p.publisher == nil || len(rejected) == 0 {
 		return
@@ -1014,20 +1016,25 @@ func (p *Propagator) publishRejections(ctx context.Context, rejected []*models.T
 	type reason struct {
 		extraInfo  string
 		statusCode int
+		competing  string
 	}
 	index := make(map[reason]int, len(rejected))
 	groups := make([]*models.TransactionStatus, 0, len(rejected))
 	for _, st := range rejected {
-		key := reason{extraInfo: st.ExtraInfo, statusCode: st.StatusCode}
+		// CompetingTxs is part of the key: an event's fields apply to every
+		// txid it carries, and two double spends of different outpoints lose
+		// to different spenders.
+		key := reason{extraInfo: st.ExtraInfo, statusCode: st.StatusCode, competing: strings.Join(st.CompetingTxs, ",")}
 		i, seen := index[key]
 		if !seen {
 			i = len(groups)
 			index[key] = i
 			groups = append(groups, &models.TransactionStatus{
-				Status:     models.StatusRejected,
-				StatusCode: st.StatusCode,
-				Timestamp:  ts,
-				ExtraInfo:  st.ExtraInfo,
+				Status:       models.StatusRejected,
+				StatusCode:   st.StatusCode,
+				Timestamp:    ts,
+				ExtraInfo:    st.ExtraInfo,
+				CompetingTxs: st.CompetingTxs,
 			})
 		}
 		groups[i].TxIDs = append(groups[i].TxIDs, st.TxID)
@@ -1760,10 +1767,41 @@ func bestUnplaceableLine(bestAlien string, unkeyed []string) string {
 }
 
 func rejectionLineScore(line string) int {
-	name, _, found := strings.Cut(line, " (")
+	name, found := verdictCodeName(line)
 	if !found {
 		return 0
 	}
+	return codeNameScore(name)
+}
+
+// verdictCodeName returns the Teranode code a failure line's verdict should be
+// read from: the most informative "NAME (n)" token anywhere in the line, not
+// merely the leading one. Teranode wraps causes ("PROCESSING (4): … UTXO_SPENT
+// (70): …"), and keying on the leading PROCESSING wrapper would report a
+// double spend as an uncoded catch-all — losing the 466 a wallet branches on to
+// keep its inputs locked. Ties keep the leftmost (outermost) token, so a line
+// whose only code is PROCESSING still reads as PROCESSING. found is false only
+// when the line carries no code token at all.
+func verdictCodeName(line string) (name string, found bool) {
+	best := -1
+	for _, m := range teranodeNamedCode.FindAllString(line, -1) {
+		candidate, _, _ := strings.Cut(m, " (")
+		if score := codeNameScore(candidate); score > best {
+			name, best = candidate, score
+		}
+	}
+	if best >= 0 {
+		return name, true
+	}
+	// No well-formed token (e.g. a non-uppercase prefix): fall back to the
+	// leading "<name> (" shape the parser has always accepted.
+	name, _, found = strings.Cut(line, " (")
+	return name, found
+}
+
+// codeNameScore ranks one Teranode code name for wallet-facing quality; see
+// rejectionLineScore.
+func codeNameScore(name string) int {
 	switch name {
 	case "UTXO_SPENT", "TX_INVALID_DOUBLE_SPEND", "TX_CONFLICTING":
 		return 40
@@ -1794,11 +1832,11 @@ func rejectionLineScore(line string) int {
 // This helper only maps lines the broadcast loop has already routed as
 // terminal verdicts (rejectionLine). Opaque PROCESSING (4) with no nested
 // named code never reaches here — it requeues. Nested wrappers such as
-// "PROCESSING (4): … TX_INVALID (31)" still arrive as the full line: the
-// leading PROCESSING keeps arcCode 0 while ExtraInfo preserves the inner
-// text. Real validator codes (TX_INVALID, UTXO_SPENT, …) remain REJECTED.
+// "PROCESSING (4): … UTXO_SPENT (70)" arrive as the full line and are
+// classified by their most informative code (verdictCodeName), not by the
+// leading PROCESSING wrapper; ExtraInfo keeps the whole line.
 //
-// What the leading "NAME (n)" code DOES tell us confidently is mapped onto
+// What the verdict's "NAME (n)" code DOES tell us confidently is mapped onto
 // the ARC taxonomy so consumers can branch on a number instead of prose
 // (issue #254 / external feedback item 2):
 //
@@ -1817,7 +1855,9 @@ func rejectionLineScore(line string) int {
 //	  is owned by a competing/confirmed tx, not merely unaccepted.
 //	TX_INVALID (31)     → 467 StatusGeneric (wraps fee/script/policy — the
 //	  name alone can't recover which).
-//	PROCESSING (4) and everything else → 0, message verbatim.
+//	UTXO_FROZEN (72)    → 471 StatusFrozenPolicy.
+//	PROCESSING (4) and everything else → 0, message verbatim (PROCESSING
+//	  with a single-tx HTTP 403 → 471, see httpStatus below).
 //
 // errMsg preserves the Teranode line verbatim (plus the retryable suffix for
 // the non-final family) so wallet rows surface the actual message.
@@ -1830,7 +1870,7 @@ func rejectionLineScore(line string) int {
 // actionable verdict that would otherwise reach the submitter as "failed to
 // validate transaction" and nothing more.
 func classifyFailureLine(line string, httpStatus int) (errMsg string, arcCode int) {
-	name, _, found := strings.Cut(line, " (")
+	name, found := verdictCodeName(line)
 	if !found {
 		return line, 0
 	}
@@ -1846,6 +1886,10 @@ func classifyFailureLine(line string, httpStatus int) (errMsg string, arcCode in
 		return line, int(arcerrors.StatusConflict)
 	case "TX_INVALID":
 		return line, int(arcerrors.StatusGeneric)
+	case "UTXO_FROZEN":
+		// The named form of what the opaque-PROCESSING 403 branch below
+		// infers from the status alone.
+		return line, int(arcerrors.StatusFrozenPolicy)
 	case "PROCESSING":
 		if httpStatus == http.StatusForbidden {
 			return line + " — the peer answered HTTP 403 (forbidden): the transaction spends a frozen or " +
@@ -1857,6 +1901,27 @@ func classifyFailureLine(line string, httpStatus int) (errMsg string, arcCode in
 	default:
 		return line, 0
 	}
+}
+
+// competingSpenderPattern lifts the competing spender's txid out of a Teranode
+// conflict line, which renders it as "already spent by tx <txid>[<vin>]"
+// (teranode errors.NewUtxoSpentError over spend.SpendingData.String()).
+var competingSpenderPattern = regexp.MustCompile(`(?i)already spent by tx ([0-9a-f]{64})`)
+
+// competingSpenders returns the distinct txids a conflict line names as the
+// current owners of the outpoints the rejected transaction tried to spend,
+// lowercased, in first-seen order — the value for
+// TransactionStatus.CompetingTxs. nil when the line names none (TX_CONFLICTING
+// and TX_INVALID_DOUBLE_SPEND do not carry the spender).
+func competingSpenders(line string) []string {
+	var out []string
+	for _, m := range competingSpenderPattern.FindAllStringSubmatch(line, -1) {
+		txid := strings.ToLower(m[1])
+		if !slices.Contains(out, txid) {
+			out = append(out, txid)
+		}
+	}
+	return out
 }
 
 // startBroadcastSpan opens one "propagation.broadcast" span per flushed
@@ -3089,15 +3154,20 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 			}
 		case rejectionLine[i] != "":
 			errMsg, arcCode := classifyFailureLine(rejectionLine[i], rejectionStatus[i])
+			var competing []string
+			if arcCode == int(arcerrors.StatusConflict) {
+				competing = competingSpenders(rejectionLine[i])
+			}
 			results[i] = txResult{
 				class:  txResultClassRejected,
 				errMsg: errMsg,
 				status: &models.TransactionStatus{
-					TxID:       msg.TXID,
-					Status:     models.StatusRejected,
-					StatusCode: arcCode,
-					Timestamp:  now,
-					ExtraInfo:  errMsg,
+					TxID:         msg.TXID,
+					Status:       models.StatusRejected,
+					StatusCode:   arcCode,
+					Timestamp:    now,
+					ExtraInfo:    errMsg,
+					CompetingTxs: competing,
 				},
 				rawTx: msg.RawTx,
 			}

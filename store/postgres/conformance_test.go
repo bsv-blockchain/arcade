@@ -28,6 +28,15 @@ func TestBlockStatus_Conformance(t *testing.T) {
 	})
 }
 
+// A double spend is discovered after the row exists, so the competing
+// spender must persist through the status-update paths, not only on insert.
+func TestCompetingTxs_Conformance(t *testing.T) {
+	storetest.RunCompetingTxsSuite(t, func(t *testing.T) storetest.CompetingTxsBackend {
+		t.Helper()
+		return newTestStore(t)
+	})
+}
+
 func TestIterateTrackerRows_NullBlockHeightKept(t *testing.T) {
 	// block_height is nullable (schema.sql). A MINED row with a NULL height
 	// must be kept at any cutoff — the COALESCE disjunct in the query is what
