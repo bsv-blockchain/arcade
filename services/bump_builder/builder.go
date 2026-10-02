@@ -663,8 +663,16 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	// Short-circuit: if a compound BUMP already exists for this block, skip
 	// the datahub fetch + recompute path entirely. See tryShortCircuit for
 	// the full contract.
-	if b.tryShortCircuit(ctx, logger, blockHash) {
-		outcome = "short_circuited"
+	if handled, mineFailed := b.tryShortCircuit(ctx, logger, blockHash); handled {
+		// A stored BUMP means the rebuild was skipped. A failed mine on
+		// that path is still a persistence failure: record store_failed,
+		// not the benign short_circuited label. processed_at stays unset
+		// inside tryShortCircuit so the watchdog can re-drive.
+		if mineFailed {
+			outcome = "store_failed"
+		} else {
+			outcome = "short_circuited"
+		}
 		return nil
 	}
 
@@ -815,8 +823,24 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	if minedComplete {
 		b.markBlockProcessed(ctx, logger, blockHash, blockHeight)
 	} else {
+		// Not a terminal lifecycle success. The histogram must not keep
+		// the benign build disposition (finalized_complete_no_grace or
+		// grace_waited): those labels mean the block finished. store_failed
+		// is the existing failure outcome. processed_at stays unset, so
+		// ListStaleBlockProcessingStatus (processed_at IS NULL, status
+		// active, header already seen) still returns this block and the
+		// watchdog re-drives it via /reprocess. The stored BUMP is what
+		// that re-drive mines; tryShortCircuit is idempotent for rows
+		// already MINED.
+		//
+		// Kafka redelivery is not that recovery path. This handler returns
+		// nil, and ConsumerGroup.processOne commits the offset when the
+		// handler returns nil. Returning the SetMined error would retry
+		// and then dead-letter a message that cannot finish until the
+		// watchdog re-drives the block.
+		outcome = "store_failed"
 		logger.Warn(
-			"leaving processed_at unstamped after a partial mine so the watchdog re-drives this block",
+			"SetMinedByTxIDs did not complete; leaving processed_at unset so the watchdog can re-drive this block",
 			logfields.BlockHash(blockHash),
 			logfields.BlockHeight(blockHeight),
 			zap.Int("requested", len(txids)),
@@ -1078,10 +1102,15 @@ func callbackBlockData(callback *models.CallbackMessage, minSubtrees int, logger
 	return hashes, []byte(callback.CoinbaseBUMP), root, true
 }
 
-// tryShortCircuit attempts the BUMP-already-exists redelivery path. Returns
-// true when the short-circuit handled the message and the caller should
-// treat it as done. Returns false when no usable BUMP exists and the caller
-// should fall through to the normal rebuild.
+// tryShortCircuit attempts the BUMP-already-exists redelivery path.
+// handled is true when the short-circuit consumed the message and the
+// caller must not rebuild. mineFailed is true only when handled is true
+// and SetMinedByTxIDs did not complete: the caller records store_failed,
+// and processed_at is left unset so the watchdog can re-drive. A denied
+// anchor is handled but not a mine failure.
+//
+// Returns handled=false when no usable BUMP exists and the caller should
+// fall through to the normal rebuild.
 //
 // Errors at the store-read step (not-found, etc.) are intentionally
 // swallowed — they're indistinguishable from "no BUMP" and we want the
@@ -1094,14 +1123,14 @@ func callbackBlockData(callback *models.CallbackMessage, minSubtrees int, logger
 // callback. The SetMinedByTxIDs UPDATE is idempotent so repeated calls are
 // safe; the value is letting a tx registered after the original build still
 // get marked MINED on the redelivery.
-func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, blockHash string) bool {
+func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, blockHash string) (handled bool, mineFailed bool) {
 	existingHeight, bumpBytes, getErr := b.store.GetBUMP(ctx, blockHash)
 	if getErr != nil {
 		// not-found / transient store error — fall through to rebuild
-		return false
+		return false, false
 	}
 	if len(bumpBytes) == 0 {
-		return false
+		return false, false
 	}
 	txids, parseErr := levelZeroTxidsFromBUMP(bumpBytes)
 	if parseErr != nil {
@@ -1109,7 +1138,7 @@ func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, block
 		// path so an upstream corruption doesn't pin a block in a broken
 		// state forever.
 		logger.Warn("stored BUMP failed to parse on redelivery — rebuilding", zap.Error(parseErr))
-		return false
+		return false, false
 	}
 	metrics.BumpBuilderShortCircuitTotal.Inc()
 	logger.Info(
@@ -1123,7 +1152,7 @@ func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, block
 	// block is finalized + orphan-marked exactly like the fresh-build path.
 	if b.anchorDecision(ctx, logger, blockHash, existingHeight) == anchorDeny {
 		b.handleAnchorDenied(ctx, logger, blockHash, existingHeight, "short_circuit")
-		return true
+		return true, false
 	}
 	minedComplete := true
 	if len(txids) > 0 {
@@ -1143,8 +1172,11 @@ func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, block
 	if minedComplete {
 		b.markBlockProcessed(ctx, logger, blockHash, existingHeight)
 	} else {
+		// Same contract as the build path: Kafka redelivery is not the
+		// recovery path (the caller returns nil and the offset is
+		// committed). processed_at stays unset so the watchdog re-drives.
 		logger.Warn(
-			"leaving processed_at unstamped after a partial short-circuit mine so the watchdog re-drives this block",
+			"SetMinedByTxIDs did not complete; leaving processed_at unset so the watchdog can re-drive this block",
 			logfields.BlockHash(blockHash),
 			logfields.BlockHeight(existingHeight),
 			zap.Int("requested", len(txids)),
@@ -1156,7 +1188,7 @@ func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, block
 	if delErr := b.store.DeleteStumpsByBlockHash(ctx, blockHash); delErr != nil {
 		logger.Warn("failed to clean up STUMPs on short-circuit", zap.Error(delErr))
 	}
-	return true
+	return true, !minedComplete
 }
 
 // markBlockProcessed stamps processed_at on the block-processing row — the

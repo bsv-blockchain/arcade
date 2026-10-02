@@ -556,8 +556,8 @@ func TestUpdateStatusReturning_EmptyTxIDIsUnknown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a malformed entry must not fail the batch: %v", err)
 	}
-	if len(prevs) != 2 || prevs[0] == nil || prevs[0].Status != models.StatusReceived || prevs[1] != nil {
-		t.Fatalf("prevs = %+v, want [known-pre-image, nil]", prevs)
+	if len(prevs) != 2 || prevs[0].Prev == nil || prevs[0].Prev.Status != models.StatusReceived || prevs[1].Prev != nil || prevs[1].Current != nil {
+		t.Fatalf("prevs = %+v, want [known-pre-image, absent]", prevs)
 	}
 }
 

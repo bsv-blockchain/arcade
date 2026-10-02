@@ -201,6 +201,77 @@ func TestUpdateStatus_TerminalNotOverwritten(t *testing.T) {
 	}
 }
 
+// TestUpdateStatusReturning_SkipIsNotApplied pins the applied-result
+// contract. A lattice skip must not hand back the blocking row: a non-nil
+// previous row means this call wrote the requested transition.
+func TestUpdateStatusReturning_SkipIsNotApplied(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const txid = "tx-returning-skip"
+
+	if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+		TxID: txid, Status: models.StatusAcceptedByNetwork, Timestamp: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateStatus(ctx, &models.TransactionStatus{
+		TxID: txid, Status: models.StatusMined, BlockHash: "blk", BlockHeight: 9, Timestamp: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	prev, err := s.UpdateStatusReturning(ctx, &models.TransactionStatus{
+		TxID: txid, Status: models.StatusSeenOnNetwork, Timestamp: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("lattice skip must not be an error, got %v", err)
+	}
+	if prev.Prev != nil {
+		t.Fatalf("lattice skip returned applied prev %+v", prev.Prev)
+	}
+	if prev.Current == nil || prev.Current.Status != models.StatusMined {
+		t.Fatalf("known skip current = %+v, want MINED", prev.Current)
+	}
+	got, err := s.GetStatus(ctx, txid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != models.StatusMined {
+		t.Fatalf("status = %s, want MINED", got.Status)
+	}
+}
+
+func TestUpdateStatusReturning_AppliedReturnsPrevious(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const txid = "tx-returning-applied"
+
+	if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+		TxID: txid, Status: models.StatusAcceptedByNetwork, Timestamp: time.Now().Add(-time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	prev, err := s.UpdateStatusReturning(ctx, &models.TransactionStatus{
+		TxID: txid, Status: models.StatusSeenOnNetwork, Timestamp: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prev.Prev == nil || prev.Prev.Status != models.StatusAcceptedByNetwork {
+		t.Fatalf("prev = %+v, want ACCEPTED_BY_NETWORK", prev.Prev)
+	}
+	if prev.Current != nil {
+		t.Fatalf("applied write must not also report a skip: %+v", prev.Current)
+	}
+	got, err := s.GetStatus(ctx, txid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != models.StatusSeenOnNetwork {
+		t.Fatalf("status = %s, want SEEN_ON_NETWORK", got.Status)
+	}
+}
+
 // TestUpdateStatus_RejectedRecovery pins REJECTED's partial-terminal behavior
 // at the store layer: forward recovery (ACCEPTED_BY_NETWORK / SEEN_ON_NETWORK
 // / SEEN_MULTIPLE_NODES) is allowed so a late callback from a peer that did

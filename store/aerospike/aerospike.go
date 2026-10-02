@@ -368,26 +368,61 @@ func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.Transa
 	return store.BatchUpdateStatusParallel(ctx, s, statuses)
 }
 
-// BatchUpdateStatusReturning runs UpdateStatus concurrently and returns the
-// previous row per input. Aerospike's UpdateStatus doesn't yet expose the
-// pre-merge bin, so we fall back to GetStatus+UpdateStatus per row — two
-// round-trips. Arcade's primary deployment uses Pebble (which fuses the
-// read into the same locked region); this fallback exists to satisfy the
-// store.Store contract.
-func (s *Store) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
-	return store.BatchUpdateStatusReturningFallback(ctx, s, statuses)
+// BatchUpdateStatusReturning applies each row with UpdateStatusReturning.
+// The generation-checked put is the applied-result: a non-nil previous row
+// is the record this call's CAS wrote over.
+func (s *Store) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]store.StatusUpdate, error) {
+	return store.BatchUpdateStatusReturningParallel(ctx, s, statuses)
 }
 
 // UpdateStatus updates an existing transaction record. If no record exists for
 // status.TxID the call returns store.ErrNotFound without writing — callers
-// must use GetOrInsertStatus to create new rows. This guard closes F-033 /
-// issue #91: previously a callback referencing a never-submitted txid would
-// create a phantom row with no submission/validation history, turning the
-// callback endpoint into a write-anywhere primitive.
+// must use GetOrInsertStatus to create new rows. A lattice skip is a nil
+// error and writes nothing. See UpdateStatusReturning.
 func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStatus) error {
+	_, err := s.UpdateStatusReturning(ctx, status)
+	return err
+}
+
+// statusUpdateReadBins are the only bins the CAS read fetches. The
+// applied-result needs the lifecycle status, its timestamp, and the block
+// anchor / extra info the contract returns. raw_tx, merkle_path, and
+// competing_txs stay unread.
+var statusUpdateReadBins = []string{
+	"status",
+	"timestamp",
+	"block_hash",
+	"block_height",
+	"extra_info",
+}
+
+// statusFromUpdateBins decodes only statusUpdateReadBins.
+func statusFromUpdateBins(rec *aero.Record, txid string) *models.TransactionStatus {
+	st := &models.TransactionStatus{
+		TxID:      txid,
+		Status:    models.Status(getString(rec, "status")),
+		BlockHash: getString(rec, "block_hash"),
+		ExtraInfo: getString(rec, "extra_info"),
+	}
+	if ms := getInt(rec, "timestamp"); ms != 0 {
+		st.Timestamp = time.UnixMilli(int64(ms))
+	}
+	if h := getInt(rec, "block_height"); h > 0 {
+		st.BlockHeight = uint64(h) //nolint:gosec // block height fits
+	}
+	return st
+}
+
+// UpdateStatusReturning applies status and returns the applied-result.
+// Prev is the record this call's generation-checked put wrote over, decoded
+// from statusUpdateReadBins only. Current is that same narrow record when
+// the lattice skips the write. A generation mismatch retries the read so a
+// concurrent MINED writer cannot leave this call holding a stale
+// ACCEPTED_BY_NETWORK pre-image.
+func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.TransactionStatus) (store.StatusUpdate, error) {
 	key, err := s.key(setTransactions, status.TxID)
 	if err != nil {
-		return err
+		return store.StatusUpdate{}, err
 	}
 
 	bins := aero.BinMap{
@@ -413,48 +448,36 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 		bins["merkle_reg_at"] = status.MerkleRegisteredAt.UnixMilli()
 	}
 
-	// Enforce the status lattice: refuse to overwrite a terminal status with a
-	// later, lower-priority update (e.g. a stray SEEN_ON_NETWORK callback after
-	// MINED). Read-then-CAS-write using the record's generation guarantees the
-	// pre-write check and the write are atomic with respect to other writers.
-	// See models.Status.CanTransitionFrom and #61 / F-003.
-	//
-	// Also: never create a record from UpdateStatus (F-033 / #91) — if the
-	// record is genuinely absent we return ErrNotFound. UPDATE_ONLY on the
-	// write enforces this even if a racing writer deleted the row between
-	// our read and our put.
+	// Read-then-CAS-write using the record's generation. The pre-write
+	// lattice check and the put are atomic with respect to other writers:
+	// a generation mismatch retries rather than clobbering their write.
+	// UPDATE_ONLY refuses to create a record (F-033 / #91).
 	for {
-		rec, gerr := s.client.Get(s.readPolicy(ctx), key, "status")
+		rec, gerr := s.client.Get(s.readPolicy(ctx), key, statusUpdateReadBins...)
 		if gerr != nil && !isKeyNotFound(gerr) {
-			return fmt.Errorf("read status for lattice check %s: %w", status.TxID, gerr)
+			return store.StatusUpdate{}, fmt.Errorf("read status for lattice check %s: %w", status.TxID, gerr)
 		}
 		if rec == nil {
-			return store.ErrNotFound
+			return store.StatusUpdate{}, store.ErrNotFound
 		}
-		if status.Status != "" {
-			existing := models.Status(getString(rec, "status"))
-			if !status.Status.CanTransitionFrom(existing) {
-				return nil
-			}
+		observed := statusFromUpdateBins(rec, status.TxID)
+		if status.Status != "" && !status.Status.CanTransitionFrom(observed.Status) {
+			return store.StatusUpdate{Current: observed}, nil
 		}
 		policy := s.writePolicy(ctx)
 		policy.GenerationPolicy = aero.EXPECT_GEN_EQUAL
 		policy.Generation = rec.Generation
 		policy.RecordExistsAction = aero.UPDATE_ONLY
 		if err := s.client.Put(policy, key, bins); err != nil {
-			// Generation mismatch means another writer landed between our read
-			// and our put. Re-read and re-evaluate the lattice rather than
-			// silently clobbering their write.
 			if isGenerationErr(err) {
 				continue
 			}
-			// UPDATE_ONLY on a record that was deleted between our read and put.
 			if isKeyNotFound(err) {
-				return store.ErrNotFound
+				return store.StatusUpdate{}, store.ErrNotFound
 			}
-			return fmt.Errorf("update tx %s: %w", status.TxID, err)
+			return store.StatusUpdate{}, fmt.Errorf("update tx %s: %w", status.TxID, err)
 		}
-		return nil
+		return store.StatusUpdate{Prev: observed}, nil
 	}
 }
 

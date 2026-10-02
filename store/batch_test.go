@@ -3,8 +3,10 @@ package store_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
@@ -239,4 +241,92 @@ func makeTxID(i int) string {
 		b[k] = hex[(i>>(k*4))&0xf]
 	}
 	return "tx-" + string(b[:])
+}
+
+// racedStatusStore is a GetStatus + UpdateStatus backend. loseRace, when
+// set, makes UpdateStatus land loseRace instead of the requested status,
+// the way a concurrent MINED writer wins between the fallback's read and
+// its write.
+type racedStatusStore struct {
+	mu       sync.Mutex
+	row      *models.TransactionStatus
+	loseRace models.Status
+}
+
+func (r *racedStatusStore) GetStatus(context.Context, string) (*models.TransactionStatus, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.row == nil {
+		return nil, store.ErrNotFound
+	}
+	cp := *r.row
+	return &cp, nil
+}
+
+func (r *racedStatusStore) UpdateStatus(_ context.Context, st *models.TransactionStatus) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.row == nil {
+		return store.ErrNotFound
+	}
+	cp := *r.row
+	if r.loseRace != "" {
+		cp.Status = r.loseRace
+		cp.Timestamp = time.Unix(0, 1)
+	} else {
+		cp.Status = st.Status
+		cp.Timestamp = st.Timestamp
+	}
+	r.row = &cp
+	return nil
+}
+
+func TestBatchUpdateStatusReturningFallback_StalePreimageIsNotApplied(t *testing.T) {
+	r := &racedStatusStore{
+		row:      &models.TransactionStatus{TxID: "tx", Status: models.StatusAcceptedByNetwork, Timestamp: time.Unix(0, 2)},
+		loseRace: models.StatusMined,
+	}
+	prevs, err := store.BatchUpdateStatusReturningFallback(context.Background(), r, []*models.TransactionStatus{{
+		TxID:      "tx",
+		Status:    models.StatusSeenOnNetwork,
+		Timestamp: time.Unix(0, 3),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prevs) != 1 || prevs[0].Prev != nil || prevs[0].Current == nil || prevs[0].Current.Status != models.StatusMined {
+		t.Fatalf("prevs = %+v, want a known MINED skip and no applied prev", prevs)
+	}
+	got, err := r.GetStatus(context.Background(), "tx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != models.StatusMined {
+		t.Fatalf("stored status = %s, want MINED", got.Status)
+	}
+}
+
+func TestBatchUpdateStatusReturningFallback_AppliedReturnsPrevious(t *testing.T) {
+	r := &racedStatusStore{
+		row: &models.TransactionStatus{TxID: "tx", Status: models.StatusAcceptedByNetwork, Timestamp: time.Unix(0, 2)},
+	}
+	stamp := time.Unix(0, 3)
+	prevs, err := store.BatchUpdateStatusReturningFallback(context.Background(), r, []*models.TransactionStatus{{
+		TxID:      "tx",
+		Status:    models.StatusSeenOnNetwork,
+		Timestamp: stamp,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prevs) != 1 || prevs[0].Prev == nil || prevs[0].Prev.Status != models.StatusAcceptedByNetwork || prevs[0].Current != nil {
+		t.Fatalf("prevs = %+v, want applied ACCEPTED_BY_NETWORK", prevs)
+	}
+	got, err := r.GetStatus(context.Background(), "tx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != models.StatusSeenOnNetwork || !got.Timestamp.Equal(stamp) {
+		t.Fatalf("stored = %+v, want SEEN at %s", got, stamp)
+	}
 }

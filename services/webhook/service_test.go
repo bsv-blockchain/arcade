@@ -160,7 +160,7 @@ func (s *fakeStore) BatchUpdateStatus(context.Context, []*models.TransactionStat
 	return nil
 }
 
-func (s *fakeStore) BatchUpdateStatusReturning(context.Context, []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
+func (s *fakeStore) BatchUpdateStatusReturning(context.Context, []*models.TransactionStatus) ([]store.StatusUpdate, error) {
 	return nil, nil
 }
 
