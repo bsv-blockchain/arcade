@@ -269,21 +269,20 @@ type Store interface {
 	BatchUpdateStatus(ctx context.Context, statuses []*models.TransactionStatus) error
 
 	// BatchUpdateStatusReturning is the diagnostic-rich form of BatchUpdateStatus.
-	// Returns a slice the same length as `statuses` where result[i] is the
-	// previous row that was merged with (i.e. the row as it existed before
-	// the update), or nil for unknown txids and per-row errors. Used by the
-	// inbound callback handlers to observe transition-age metrics
-	// (RECEIVED→SEEN_ON_NETWORK) without an extra round-trip. The previous
-	// row's status metadata (Status, Timestamp, block anchor, extra info) is
-	// guaranteed; RawTx is NOT — MongoDB projects it away, since no caller
-	// reads it and it can be megabytes per row on a hot path, while Pebble
-	// and Postgres happen to return it only because they read the row whole.
+	// Returns a slice the same length as `statuses`. result[i] is non-nil
+	// only when this call durably applied statuses[i]: it is the row as it
+	// stood immediately before that write. A non-nil result is not "a row
+	// existed when we looked." Unknown txids, lattice skips, and lost races
+	// are nil — callers must not publish a transition or advance an
+	// in-memory tracker for a nil slot. An idempotent re-assert of the same
+	// status is an applied write, so result[i].Status may equal the
+	// requested status; callers that fan out events skip that case.
 	//
-	// Backends are expected to short-circuit when the requested transition
-	// is blocked by the status lattice (CanTransitionFrom) — the returned
-	// `previous[i]` is still the row that existed at lookup time, but the
-	// update is a no-op. Callers can detect "no transition applied" by
-	// comparing previous[i].Status to the requested status[i].Status.
+	// The previous row's status metadata (Status, Timestamp, block anchor,
+	// extra info) is guaranteed when the result is non-nil. RawTx is NOT —
+	// MongoDB projects it away, since no caller reads it and it can be
+	// megabytes per row on a hot path, while Pebble and Postgres happen to
+	// return it only because they read the row whole.
 	BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error)
 
 	// GetStatus retrieves the status for a transaction

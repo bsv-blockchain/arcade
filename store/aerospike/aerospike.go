@@ -368,26 +368,32 @@ func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.Transa
 	return store.BatchUpdateStatusParallel(ctx, s, statuses)
 }
 
-// BatchUpdateStatusReturning runs UpdateStatus concurrently and returns the
-// previous row per input. Aerospike's UpdateStatus doesn't yet expose the
-// pre-merge bin, so we fall back to GetStatus+UpdateStatus per row — two
-// round-trips. Arcade's primary deployment uses Pebble (which fuses the
-// read into the same locked region); this fallback exists to satisfy the
-// store.Store contract.
+// BatchUpdateStatusReturning applies each row with UpdateStatusReturning.
+// The generation-checked put is the applied-result: a non-nil previous row
+// is the record this call's CAS wrote over.
 func (s *Store) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
-	return store.BatchUpdateStatusReturningFallback(ctx, s, statuses)
+	return store.BatchUpdateStatusReturningParallel(ctx, s, statuses)
 }
 
 // UpdateStatus updates an existing transaction record. If no record exists for
 // status.TxID the call returns store.ErrNotFound without writing — callers
-// must use GetOrInsertStatus to create new rows. This guard closes F-033 /
-// issue #91: previously a callback referencing a never-submitted txid would
-// create a phantom row with no submission/validation history, turning the
-// callback endpoint into a write-anywhere primitive.
+// must use GetOrInsertStatus to create new rows. A lattice skip is a nil
+// error and writes nothing. See UpdateStatusReturning.
 func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStatus) error {
+	_, err := s.UpdateStatusReturning(ctx, status)
+	return err
+}
+
+// UpdateStatusReturning applies status and returns the record as it stood
+// immediately before the winning put. The previous row is non-nil only when
+// this call's generation-checked write landed. A lattice skip returns
+// (nil, nil). A generation mismatch retries the read so a concurrent MINED
+// writer cannot leave this call holding a stale ACCEPTED_BY_NETWORK
+// pre-image.
+func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.TransactionStatus) (*models.TransactionStatus, error) {
 	key, err := s.key(setTransactions, status.TxID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	bins := aero.BinMap{
@@ -413,28 +419,22 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 		bins["merkle_reg_at"] = status.MerkleRegisteredAt.UnixMilli()
 	}
 
-	// Enforce the status lattice: refuse to overwrite a terminal status with a
-	// later, lower-priority update (e.g. a stray SEEN_ON_NETWORK callback after
-	// MINED). Read-then-CAS-write using the record's generation guarantees the
-	// pre-write check and the write are atomic with respect to other writers.
-	// See models.Status.CanTransitionFrom and #61 / F-003.
-	//
-	// Also: never create a record from UpdateStatus (F-033 / #91) — if the
-	// record is genuinely absent we return ErrNotFound. UPDATE_ONLY on the
-	// write enforces this even if a racing writer deleted the row between
-	// our read and our put.
+	// Read-then-CAS-write using the record's generation. The pre-write
+	// lattice check and the put are atomic with respect to other writers:
+	// a generation mismatch retries rather than clobbering their write.
+	// UPDATE_ONLY refuses to create a record (F-033 / #91).
 	for {
-		rec, gerr := s.client.Get(s.readPolicy(ctx), key, "status")
+		rec, gerr := s.client.Get(s.readPolicy(ctx), key)
 		if gerr != nil && !isKeyNotFound(gerr) {
-			return fmt.Errorf("read status for lattice check %s: %w", status.TxID, gerr)
+			return nil, fmt.Errorf("read status for lattice check %s: %w", status.TxID, gerr)
 		}
 		if rec == nil {
-			return store.ErrNotFound
+			return nil, store.ErrNotFound
 		}
 		if status.Status != "" {
 			existing := models.Status(getString(rec, "status"))
 			if !status.Status.CanTransitionFrom(existing) {
-				return nil
+				return nil, nil
 			}
 		}
 		policy := s.writePolicy(ctx)
@@ -442,19 +442,15 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 		policy.Generation = rec.Generation
 		policy.RecordExistsAction = aero.UPDATE_ONLY
 		if err := s.client.Put(policy, key, bins); err != nil {
-			// Generation mismatch means another writer landed between our read
-			// and our put. Re-read and re-evaluate the lattice rather than
-			// silently clobbering their write.
 			if isGenerationErr(err) {
 				continue
 			}
-			// UPDATE_ONLY on a record that was deleted between our read and put.
 			if isKeyNotFound(err) {
-				return store.ErrNotFound
+				return nil, store.ErrNotFound
 			}
-			return fmt.Errorf("update tx %s: %w", status.TxID, err)
+			return nil, fmt.Errorf("update tx %s: %w", status.TxID, err)
 		}
-		return nil
+		return recordToStatus(rec, status.TxID), nil
 	}
 }
 

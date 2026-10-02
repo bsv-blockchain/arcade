@@ -14,11 +14,14 @@ A failed `BatchUpdateStatusReturning` returns **HTTP 500** with
 as `batch update seen status failed` and counted on
 `CallbackHandlerDuration` with `outcome="error"`.
 
-Postgres and Aerospike implement that batch through
-`BatchUpdateStatusReturningFallback`. A previous row is reported only after
-`UpdateStatus` succeeds. A failed write does not advance `txTracker`, so the
-HTTP 500 retry is not filtered out and reaches the store again. Rows in the
-same batch that did persist may still be published.
+Postgres, Aerospike, Pebble, and MongoDB report a previous row only when
+that call durably applied the requested transition. A lattice skip is a nil
+previous row, including the race where a callback read `ACCEPTED_BY_NETWORK`
+and a concurrent writer had already moved the tx to `MINED` before the SEEN
+write. The callback does not publish SEEN and does not move `txTracker`
+backwards. A failed write still does not advance `txTracker`, so the HTTP
+500 retry is not filtered out and reaches the store again. Rows in the same
+batch that did persist may still be published.
 
 A successful callback stays **HTTP 200**. Delivering the same SEEN callback
 twice is idempotent: the status lattice does not regress the row, and the

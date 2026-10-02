@@ -447,10 +447,11 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 	return err
 }
 
-// UpdateStatusReturning is UpdateStatus + an extra return: the previous row
-// the merge was applied to (or that the lattice rejected against). Returns
-// nil-previous for transient errors / ctx-cancel; the caller observing a
-// transition-age metric should branch on previous != nil.
+// UpdateStatusReturning is UpdateStatus plus the row this call applied the
+// transition to. The previous row is returned only when the write landed.
+// A lattice skip returns (nil, nil): the blocking row is not a transition
+// a caller may publish. Transient errors and ctx-cancel also return a nil
+// previous row.
 //
 // Hoists the JSON marshal of the merged payload OUT of the per-shard lock
 // so the critical section is bounded to Pebble I/O + index updates. This is
@@ -495,7 +496,9 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 		if !status.Status.CanTransitionFrom(models.Status(existing.Status)) {
 			mu.Unlock()
 			outcome = "skipped_lattice"
-			return existing.toModel(), nil
+			// Not applied. Returning the blocking row would let a caller
+			// treat a lattice skip as a transition it can publish.
+			return nil, nil
 		}
 	}
 
@@ -510,7 +513,7 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 	if err != nil {
 		mu.Unlock()
 		outcome = "error"
-		return existing.toModel(), err
+		return nil, err
 	}
 
 	b := s.db.NewBatch()
@@ -519,7 +522,7 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 		_ = b.Close()
 		mu.Unlock()
 		outcome = "error"
-		return existing.toModel(), err
+		return nil, err
 	}
 	s.addStatusIndexes(b, merged)
 	commitErr := b.Commit(s.writeOpts)
@@ -528,8 +531,9 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 
 	if commitErr != nil {
 		outcome = "error"
+		return nil, commitErr
 	}
-	return existing.toModel(), commitErr
+	return existing.toModel(), nil
 }
 
 // mergeStatus applies the fields set on update onto existing. Empty strings,

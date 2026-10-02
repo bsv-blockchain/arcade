@@ -550,11 +550,13 @@ func (s *Server) applySeenCallback(c *gin.Context, msg models.CallbackMessage, l
 	successful := make([]string, 0, len(statuses))
 	for i, prev := range prevs {
 		if prev == nil {
-			// A batch-level store error leaves failed rows as nil prevs, and
-			// those are indistinguishable from unknown txids. Do not count
-			// them as unknown: the HTTP handler returns 500 and Merkle
-			// retries. Unknown-txid accounting stays on the success path,
-			// where a nil prev really means the row was absent.
+			// Not applied: unknown txid, lattice skip, or a lost race.
+			// A batch-level store error leaves failed rows as nil prevs,
+			// and those are indistinguishable from unknown txids. Do not
+			// count them as unknown: the HTTP handler returns 500 and
+			// Merkle retries. Do not publish and do not move txTracker —
+			// a stale ACCEPTED_BY_NETWORK pre-image must not regress a tx
+			// the store has already moved to MINED.
 			if outcome == "error" {
 				continue
 			}

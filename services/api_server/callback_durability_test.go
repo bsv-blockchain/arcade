@@ -204,6 +204,11 @@ type fallbackSeenStore struct {
 	rows        map[string]*models.TransactionStatus
 	failTxIDs   map[string]bool
 	updateCalls map[string]int
+	// loseRaceTo, when set for a txid, makes UpdateStatus leave the row at
+	// that status instead of applying the request. It models another writer
+	// landing MINED between GetStatus and UpdateStatus.
+	loseRaceTo map[string]models.Status
+	tracker    *store.TxTracker
 }
 
 func (f *fallbackSeenStore) GetStatus(_ context.Context, txid string) (*models.TransactionStatus, error) {
@@ -217,22 +222,41 @@ func (f *fallbackSeenStore) GetStatus(_ context.Context, txid string) (*models.T
 	return &cp, nil
 }
 
-func (f *fallbackSeenStore) UpdateStatus(_ context.Context, status *models.TransactionStatus) error {
+func (f *fallbackSeenStore) UpdateStatus(ctx context.Context, status *models.TransactionStatus) error {
+	_, err := f.UpdateStatusReturning(ctx, status)
+	return err
+}
+
+func (f *fallbackSeenStore) UpdateStatusReturning(_ context.Context, status *models.TransactionStatus) (*models.TransactionStatus, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.updateCalls[status.TxID]++
 	if f.failTxIDs[status.TxID] {
-		return errors.New("fallback store write failed")
+		return nil, errors.New("fallback store write failed")
 	}
 	row := f.rows[status.TxID]
 	if row == nil {
-		return store.ErrNotFound
+		return nil, store.ErrNotFound
+	}
+	prev := *row
+	if landed, ok := f.loseRaceTo[status.TxID]; ok {
+		cp := *row
+		cp.Status = landed
+		cp.Timestamp = time.Unix(0, 1)
+		f.rows[status.TxID] = &cp
+		if f.tracker != nil {
+			f.tracker.UpdateStatus(status.TxID, landed)
+		}
+		return nil, nil
+	}
+	if status.Status != "" && !status.Status.CanTransitionFrom(row.Status) {
+		return nil, nil
 	}
 	cp := *row
 	cp.Status = status.Status
 	cp.Timestamp = status.Timestamp
 	f.rows[status.TxID] = &cp
-	return nil
+	return &prev, nil
 }
 
 func (f *fallbackSeenStore) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
@@ -428,5 +452,136 @@ func TestRouteDocs_SeenMultipleNodesEnumMatchesCallbackType(t *testing.T) {
 	}
 	if models.CallbackSeenMultipleNodes != "SEEN_MULTIPLE_NODES" || models.StatusSeenMultipleNodes != "SEEN_MULTIPLE_NODES" {
 		t.Fatalf("enum drift: callback=%s status=%s", models.CallbackSeenMultipleNodes, models.StatusSeenMultipleNodes)
+	}
+}
+
+// TestHandleCallback_StalePreimageRace_DoesNotRegressTracker is the
+// ACCEPTED_BY_NETWORK read that loses to a concurrent MINED write. The SEEN
+// update is skipped, nothing is published, and txTracker stays at MINED.
+func TestHandleCallback_StalePreimageRace_DoesNotRegressTracker(t *testing.T) {
+	const txid = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	tracker := store.NewTxTracker()
+	tracker.Add(txid, models.StatusAcceptedByNetwork)
+	st := &fallbackSeenStore{
+		rows: map[string]*models.TransactionStatus{
+			txid: {TxID: txid, Status: models.StatusAcceptedByNetwork, Timestamp: time.Unix(0, 2)},
+		},
+		failTxIDs:   map[string]bool{},
+		updateCalls: map[string]int{},
+		loseRaceTo:  map[string]models.Status{txid: models.StatusMined},
+		tracker:     tracker,
+	}
+	pub := &recordingCallbackPub{}
+	gin.SetMode(gin.TestMode)
+	srv := &Server{
+		cfg:            &config.Config{CallbackToken: testCallbackToken},
+		logger:         zap.NewNop(),
+		producer:       kafka.NewProducer(&kafka.RecordingBroker{}),
+		store:          st,
+		publisher:      pub,
+		txTracker:      tracker,
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
+	}
+	router := gin.New()
+	srv.registerRoutes(router)
+	req := authedCallbackRequest(t, mustMarshalJSON(t, models.CallbackMessage{
+		Type:  models.CallbackSeenOnNetwork,
+		TxIDs: []string{txid},
+	}))
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("a lattice skip is not a store failure, got %d: %s", w.Code, w.Body.String())
+	}
+	if st.status(txid) != models.StatusMined {
+		t.Fatalf("store status = %s, want MINED", st.status(txid))
+	}
+	got, ok := tracker.GetStatus(txid)
+	if !ok || (got != models.StatusMined && got != models.StatusImmutable) {
+		t.Fatalf("tracker = %s ok=%v, want MINED or higher", got, ok)
+	}
+	pub.mu.Lock()
+	defer pub.mu.Unlock()
+	if len(pub.bulkPublishes) != 0 || len(pub.publishes) != 0 {
+		t.Fatalf("lost SEEN race must not publish, bulk=%d per-tx=%d", len(pub.bulkPublishes), len(pub.publishes))
+	}
+}
+
+// TestHandleCallback_ConcurrentDuplicate_PublishesOnce proves two SEEN
+// callbacks for the same tx cannot both fan out the ACCEPTED→SEEN
+// transition. Pebble serializes the applied-result, so the second call
+// observes a previous row already at SEEN.
+func TestHandleCallback_ConcurrentDuplicate_PublishesOnce(t *testing.T) {
+	st, err := pebble.New(config.Pebble{Path: t.TempDir()})
+	if err != nil {
+		t.Fatalf("pebble.New: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	const txid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	ctx := context.Background()
+	if _, _, err := st.GetOrInsertStatus(ctx, &models.TransactionStatus{
+		TxID: txid, Status: models.StatusAcceptedByNetwork, Timestamp: time.Now().Add(-time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tracker := store.NewTxTracker()
+	tracker.Add(txid, models.StatusAcceptedByNetwork)
+	pub := &recordingCallbackPub{}
+	gin.SetMode(gin.TestMode)
+	srv := &Server{
+		cfg:            &config.Config{CallbackToken: testCallbackToken},
+		logger:         zap.NewNop(),
+		producer:       kafka.NewProducer(&kafka.RecordingBroker{}),
+		store:          st,
+		publisher:      pub,
+		txTracker:      tracker,
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
+	}
+	router := gin.New()
+	srv.registerRoutes(router)
+	body := mustMarshalJSON(t, models.CallbackMessage{
+		Type:  models.CallbackSeenOnNetwork,
+		TxIDs: []string{txid},
+	})
+
+	var wg sync.WaitGroup
+	codes := make([]int, 2)
+	start := make(chan struct{})
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			req := authedCallbackRequest(t, body)
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			codes[i] = w.Code
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	for i, code := range codes {
+		if code != http.StatusOK {
+			t.Fatalf("callback %d: status %d, want 200", i, code)
+		}
+	}
+	got, err := st.GetStatus(ctx, txid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Status != models.StatusSeenOnNetwork {
+		t.Fatalf("stored status = %+v, want SEEN_ON_NETWORK", got)
+	}
+	tracked, ok := tracker.GetStatus(txid)
+	if !ok || (tracked != models.StatusSeenOnNetwork && tracked != models.StatusSeenMultipleNodes && tracked != models.StatusMined && tracked != models.StatusImmutable) {
+		t.Fatalf("tracker = %s ok=%v, want SEEN_ON_NETWORK or higher", tracked, ok)
+	}
+	pub.mu.Lock()
+	defer pub.mu.Unlock()
+	if len(pub.bulkPublishes) != 1 {
+		t.Fatalf("expected one PublishBulk, got %d", len(pub.bulkPublishes))
 	}
 }

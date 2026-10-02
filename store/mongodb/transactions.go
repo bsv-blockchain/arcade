@@ -185,10 +185,10 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 }
 
 // UpdateStatusReturning is UpdateStatus plus the row as it stood before the
-// write (or the row the lattice rejected against). One round trip on the
-// common path: the lattice guard rides in the filter and findAndModify
-// returns the pre-image. A zero match with a guard needs one probe to tell
-// "absent" from "blocked".
+// write. The pre-image is returned only when this call applied the
+// transition. A lattice skip is (nil, nil): the blocking row is not a
+// transition the caller may publish. A zero match with a guard needs one
+// probe to tell "absent" from "blocked".
 func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.TransactionStatus) (*models.TransactionStatus, error) {
 	if status == nil {
 		return nil, errors.New("mongodb: update status: nil status")
@@ -236,7 +236,7 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 		return nil, fmt.Errorf("update tx %s: existence probe: %w", status.TxID, err)
 	}
 	fromLabel, outcome = before.Status, outcomeSkippedLattice
-	return before.toStatus(), nil
+	return nil, nil
 }
 
 // BatchUpdateStatus implements store.Store as one unordered bulk write per
