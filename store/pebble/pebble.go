@@ -78,6 +78,7 @@ type storedStatus struct {
 	TimestampUnixNs        int64                  `json:"ts"`
 	CreatedUnixNs          int64                  `json:"created_at,omitempty"`
 	NextRetryUnixNs        int64                  `json:"next_retry_at,omitempty"`
+	RetryReason            string                 `json:"retry_reason,omitempty"`
 	MerkleRegisteredUnixNs int64                  `json:"merkle_registered_at,omitempty"`
 	OrphanedAnchors        []storedOrphanedAnchor `json:"orphaned_anchors,omitempty"`
 }
@@ -949,7 +950,7 @@ func (s *Store) BumpRetryCount(ctx context.Context, txid string) (int, error) {
 	return existing.RetryCount, nil
 }
 
-func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time) error {
+func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time, lastReason string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -978,6 +979,9 @@ func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []
 	updated.RawTx = rawTx
 	updated.NextRetryUnixNs = nextRetryAt.UnixNano()
 	updated.TimestampUnixNs = time.Now().UnixNano()
+	if lastReason != "" {
+		updated.RetryReason = lastReason
+	}
 
 	payload, err := json.Marshal(updated)
 	if err != nil {
@@ -1062,6 +1066,7 @@ func (s *Store) GetReadyRetries(ctx context.Context, now time.Time, limit int) (
 			RawTx:       st.RawTx,
 			RetryCount:  st.RetryCount,
 			NextRetryAt: time.Unix(0, st.NextRetryUnixNs),
+			LastReason:  st.RetryReason,
 		})
 	}
 	return results, nil
@@ -1088,6 +1093,7 @@ func (s *Store) ClearRetryState(ctx context.Context, txid string, finalStatus mo
 	updated.TimestampUnixNs = time.Now().UnixNano()
 	updated.RawTx = nil
 	updated.NextRetryUnixNs = 0
+	updated.RetryReason = ""
 	if extraInfo != "" {
 		updated.ExtraInfo = extraInfo
 	}

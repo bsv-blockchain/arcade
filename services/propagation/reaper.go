@@ -485,6 +485,11 @@ func (p *Propagator) drainParkedRetries(ctx context.Context, now, since time.Tim
 			TXID:       r.TxID,
 			RawTx:      r.RawTx,
 			InputTXIDs: parentTxIDsOf(propagationMsg{TXID: r.TxID, RawTx: r.RawTx}),
+			// The last response heard on an earlier attempt. This pass
+			// overwrites it only with a non-empty response of its own, so
+			// a final attempt that hears nothing still gives up quoting
+			// what the network did say.
+			retryReason: r.LastReason,
 		})
 	}
 	p.logger.Info("reaper: rebroadcasting parked txs", zap.Int("count", len(msgs)))

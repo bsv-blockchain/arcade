@@ -981,7 +981,7 @@ func (s *Store) BumpRetryCount(ctx context.Context, txid string) (int, error) {
 // SetPendingRetryFields writes the durable retry bins in one atomic call. The
 // caller is responsible for having already bumped retry_count and computed
 // next_retry_at from that post-increment value.
-func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time) error {
+func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time, lastReason string) error {
 	key, err := s.key(setTransactions, txid)
 	if err != nil {
 		return err
@@ -1005,6 +1005,9 @@ func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []
 		aero.PutOp(aero.NewBin("raw_tx", rawTx)),
 		aero.PutOp(aero.NewBin("next_retry_at", nextRetryAt.UnixMilli())),
 		aero.PutOp(aero.NewBin("timestamp", time.Now().UnixMilli())),
+	}
+	if lastReason != "" {
+		ops = append(ops, aero.PutOp(aero.NewBin("retry_reason", lastReason)))
 	}
 	if _, err := s.client.Operate(s.writePolicy(ctx), key, ops...); err != nil {
 		return fmt.Errorf("set pending retry fields %s: %w", txid, err)
@@ -1064,6 +1067,7 @@ loop:
 				RawTx:       rawTx,
 				RetryCount:  getInt(rec.Record, "retry_count"),
 				NextRetryAt: time.UnixMilli(nextMs),
+				LastReason:  getString(rec.Record, "retry_reason"),
 			})
 			if len(results) >= limit {
 				break loop
@@ -1090,6 +1094,7 @@ func (s *Store) ClearRetryState(ctx context.Context, txid string, finalStatus mo
 		// Aerospike: writing a nil bin value deletes the bin.
 		aero.PutOp(aero.NewBin("raw_tx", nil)),
 		aero.PutOp(aero.NewBin("next_retry_at", nil)),
+		aero.PutOp(aero.NewBin("retry_reason", nil)),
 	}
 	if extraInfo != "" {
 		ops = append(ops, aero.PutOp(aero.NewBin("extra_info", extraInfo)))

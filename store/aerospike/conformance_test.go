@@ -39,3 +39,12 @@ func TestCompetingTxs_Conformance(t *testing.T) {
 		return integrationStore(t)
 	})
 }
+
+// The last network response must survive across durable retry attempts so
+// the reaper's give-up reason can quote it.
+func TestRetryReason_Conformance(t *testing.T) {
+	storetest.RunRetryReasonSuite(t, func(t *testing.T) storetest.RetryReasonBackend {
+		t.Helper()
+		return integrationStore(t)
+	})
+}

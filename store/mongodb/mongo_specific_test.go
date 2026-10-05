@@ -119,7 +119,7 @@ func TestGetStatus_MissingIsNilNil(t *testing.T) {
 
 func TestSetPendingRetryFields_UnknownTxIDIsNotFound(t *testing.T) {
 	s := newTestStore(t)
-	err := s.SetPendingRetryFields(context.Background(), "ghost", []byte{1}, time.Now())
+	err := s.SetPendingRetryFields(context.Background(), "ghost", []byte{1}, time.Now(), "")
 	if !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -181,5 +182,50 @@ func TestReaperGiveUp_QuotesLastNetworkResponse(t *testing.T) {
 	}
 	if strings.Contains(last.ExtraInfo, "no peer ever answered") {
 		t.Errorf("give-up reason = %q claims no peer answered, but every peer did", last.ExtraInfo)
+	}
+}
+
+// TestReaperGiveUp_KeepsResponseFromEarlierAttempt is the cross-attempt form
+// of the test above. The durable queue drains by rebuilding each message from
+// the store, so a response heard on attempt N is only available on attempt
+// N+1 if it was persisted. Here attempt 1 draws the opaque PROCESSING line and
+// the budget-exhausting attempt 2 gets a body-less 500 — no line at all. The
+// give-up must still quote what attempt 1 heard.
+func TestReaperGiveUp_KeepsResponseFromEarlierAttempt(t *testing.T) {
+	txid, raw := spendingTx(t, dsOutpointTxid, 0, 4)
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		if hits.Add(1) == 1 {
+			_, _ = fmt.Fprintf(w, "Failed to process transactions:\n%s\n", opaqueProcessingLine(txid))
+		}
+	}))
+	defer srv.Close()
+
+	ms := newMockStore()
+	ms.parkTx(txid, raw, time.Now(), time.Now().Add(-time.Second)) // retry_count 1
+	p := newReaperPropagator(t, srv.URL, ms, 0)
+	p.pendingRetryMaxAttempts = 2
+	p.pendingRetryBackoff = time.Millisecond
+	p.pendingRetryMaxBackoff = time.Millisecond
+
+	// Attempt 1 (count 2): PROCESSING line, rescheduled. Attempt 2 (count 3):
+	// nothing heard, budget exceeded. Each drain rebuilds the message from
+	// the store.
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		time.Sleep(5 * time.Millisecond) // let the millisecond backoff elapse
+		p.drainParkedRetries(ctx, time.Now(), time.Now().Add(-time.Hour))
+	}
+
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("teranode hit %d times, want 2 (one per durable attempt)", got)
+	}
+	last := ms.lastUpdateForTxid(txid)
+	if last == nil || last.Status != models.StatusRejected {
+		t.Fatalf("last status = %v, want REJECTED after the durable budget", statusOrNone(last))
+	}
+	if !strings.Contains(last.ExtraInfo, opaqueProcessingLine(txid)) {
+		t.Errorf("give-up reason = %q, want it to quote attempt 1's response %q", last.ExtraInfo, opaqueProcessingLine(txid))
 	}
 }

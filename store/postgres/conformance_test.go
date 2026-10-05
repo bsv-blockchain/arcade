@@ -37,6 +37,15 @@ func TestCompetingTxs_Conformance(t *testing.T) {
 	})
 }
 
+// The last network response must survive across durable retry attempts so
+// the reaper's give-up reason can quote it.
+func TestRetryReason_Conformance(t *testing.T) {
+	storetest.RunRetryReasonSuite(t, func(t *testing.T) storetest.RetryReasonBackend {
+		t.Helper()
+		return newTestStore(t)
+	})
+}
+
 func TestIterateTrackerRows_NullBlockHeightKept(t *testing.T) {
 	// block_height is nullable (schema.sql). A MINED row with a NULL height
 	// must be kept at any cutoff — the COALESCE disjunct in the query is what

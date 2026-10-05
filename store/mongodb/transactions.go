@@ -45,7 +45,7 @@ var (
 	projID          = doc(kv(fID, 1))
 	projTracker     = doc(kv(fStatus, 1), kv(fBlockHeight, 1))
 	projTokenReplay = doc(kv(fStatus, 1), kv(fTimestamp, 1), kv(fBlockHash, 1), kv(fBlockHeight, 1))
-	projRetry       = doc(kv(fRawTx, 1), kv(fRetryCount, 1), kv(fNextRetryAt, 1))
+	projRetry       = doc(kv(fRawTx, 1), kv(fRetryCount, 1), kv(fNextRetryAt, 1), kv(fRetryReason, 1))
 )
 
 // incVersion is the $inc clause every transactions write carries. The
@@ -821,9 +821,12 @@ func (s *Store) BumpRetryCount(ctx context.Context, txid string) (int, error) {
 // load-bearing: the park path writes twice, and without it this second write
 // could drag a MINED / REJECTED row back to PENDING_RETRY for rebroadcast.
 // Blocked rows are silently skipped; unknown txids return ErrNotFound.
-func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time) error {
+func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time, lastReason string) error {
 	filter := append(idFilter(txid), latticeFilter(models.StatusPendingRetry)...)
 	set := doc(kv(fStatus, string(models.StatusPendingRetry)), kv(fNextRetryAt, msTrunc(nextRetryAt)), kv(fTimestamp, msNow()))
+	if lastReason != "" {
+		set = append(set, kv(fRetryReason, lastReason))
+	}
 	update := doc(incVersion())
 	if len(rawTx) > 0 {
 		set = append(set, kv(fRawTx, rawTx))
@@ -857,6 +860,7 @@ type retryDoc struct {
 	RawTx       []byte    `bson:"raw_tx"`
 	RetryCount  int       `bson:"retry_count"`
 	NextRetryAt time.Time `bson:"next_retry_at"`
+	RetryReason string    `bson:"retry_reason"`
 }
 
 // GetReadyRetries implements store.Store via the partial retry index. Rows
@@ -887,7 +891,7 @@ func (s *Store) GetReadyRetries(ctx context.Context, now time.Time, limit int) (
 		if len(d.RawTx) == 0 {
 			continue
 		}
-		out = append(out, &store.PendingRetry{TxID: d.TxID, RawTx: d.RawTx, RetryCount: d.RetryCount, NextRetryAt: d.NextRetryAt})
+		out = append(out, &store.PendingRetry{TxID: d.TxID, RawTx: d.RawTx, RetryCount: d.RetryCount, NextRetryAt: d.NextRetryAt, LastReason: d.RetryReason})
 	}
 	return out, cur.Err()
 }
@@ -898,7 +902,7 @@ func (s *Store) ClearRetryState(ctx context.Context, txid string, finalStatus mo
 	if extraInfo != "" {
 		set = append(set, kv(fExtraInfo, extraInfo))
 	}
-	update := doc(kv(opSet, set), kv(opUnset, doc(kv(fRawTx, ""), kv(fNextRetryAt, ""))), incVersion())
+	update := doc(kv(opSet, set), kv(opUnset, doc(kv(fRawTx, ""), kv(fNextRetryAt, ""), kv(fRetryReason, ""))), incVersion())
 	octx, cancel := s.opCtx(ctx)
 	defer cancel()
 	if _, err := s.tx.UpdateOne(octx, idFilter(txid), update); err != nil {

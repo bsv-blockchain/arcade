@@ -37,6 +37,15 @@ func TestCompetingTxs_Conformance(t *testing.T) {
 	})
 }
 
+// The last network response must survive across durable retry attempts so
+// the reaper's give-up reason can quote it.
+func TestRetryReason_Conformance(t *testing.T) {
+	storetest.RunRetryReasonSuite(t, func(t *testing.T) storetest.RetryReasonBackend {
+		t.Helper()
+		return newTestStore(t)
+	})
+}
+
 func TestIterateTrackerRows_StatusIndexStaysFresh(t *testing.T) {
 	// The walk is driven by idx:tx:status:<status>:*, so a status transition
 	// must move the row out of the old status's index. If it did not, a

@@ -973,16 +973,17 @@ func (s *Store) BumpRetryCount(ctx context.Context, txid string) (int, error) {
 // to PENDING_RETRY, where the reaper would then rebroadcast it. Rows whose
 // current status forbids PENDING_RETRY are skipped, matching
 // BatchUpdateStatusReturning's silent-skip semantics.
-func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time) error {
+func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time, lastReason string) error {
 	const q = `
 UPDATE transactions
-SET status=$2, raw_tx=$3, next_retry_at=$4, timestamp_at=NOW()
+SET status=$2, raw_tx=$3, next_retry_at=$4, timestamp_at=NOW(),
+    retry_reason = COALESCE(NULLIF($6,''), retry_reason)
 WHERE txid=$1 AND status <> ALL($5)`
 	disallowed := disallowedPrevAsStrings(models.StatusPendingRetry)
 	if disallowed == nil {
 		disallowed = []string{}
 	}
-	_, err := s.pool.Exec(ctx, q, txid, string(models.StatusPendingRetry), rawTx, nextRetryAt, disallowed)
+	_, err := s.pool.Exec(ctx, q, txid, string(models.StatusPendingRetry), rawTx, nextRetryAt, disallowed, lastReason)
 	if err != nil {
 		return fmt.Errorf("set pending retry fields %s: %w", txid, err)
 	}
@@ -1004,7 +1005,7 @@ func (s *Store) GetReadyRetries(ctx context.Context, now time.Time, limit int) (
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	const q = `
-SELECT txid, raw_tx, retry_count, next_retry_at
+SELECT txid, raw_tx, retry_count, next_retry_at, COALESCE(retry_reason, '')
 FROM transactions
 WHERE status = 'PENDING_RETRY' AND next_retry_at <= $1
 ORDER BY next_retry_at
@@ -1017,7 +1018,7 @@ FOR UPDATE SKIP LOCKED`
 	var out []*store.PendingRetry
 	for rows.Next() {
 		r := &store.PendingRetry{}
-		if err := rows.Scan(&r.TxID, &r.RawTx, &r.RetryCount, &r.NextRetryAt); err != nil {
+		if err := rows.Scan(&r.TxID, &r.RawTx, &r.RetryCount, &r.NextRetryAt, &r.LastReason); err != nil {
 			rows.Close()
 			return out, err
 		}
@@ -1036,7 +1037,7 @@ FOR UPDATE SKIP LOCKED`
 func (s *Store) ClearRetryState(ctx context.Context, txid string, finalStatus models.Status, extraInfo string) error {
 	const q = `
 UPDATE transactions
-SET status=$2, raw_tx=NULL, next_retry_at=NULL, timestamp_at=NOW(),
+SET status=$2, raw_tx=NULL, next_retry_at=NULL, retry_reason=NULL, timestamp_at=NOW(),
     extra_info = COALESCE(NULLIF($3,''), extra_info)
 WHERE txid=$1`
 	_, err := s.pool.Exec(ctx, q, txid, string(finalStatus), extraInfo)

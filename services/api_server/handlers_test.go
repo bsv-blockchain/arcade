@@ -276,7 +276,7 @@ func (m *mockStore) GetStumpsByBlockHash(context.Context, string) ([]*models.Stu
 }
 func (m *mockStore) DeleteStumpsByBlockHash(context.Context, string) error { return nil }
 func (m *mockStore) BumpRetryCount(context.Context, string) (int, error)   { return 0, nil }
-func (m *mockStore) SetPendingRetryFields(context.Context, string, []byte, time.Time) error {
+func (m *mockStore) SetPendingRetryFields(context.Context, string, []byte, time.Time, string) error {
 	return nil
 }
 

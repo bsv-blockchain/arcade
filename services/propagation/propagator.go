@@ -2511,7 +2511,7 @@ func (p *Propagator) schedulePendingRetry(ctx context.Context, txid string, rawT
 		return
 	}
 	next := time.Now().Add(p.nextPendingRetryDelay(count))
-	if err := p.store.SetPendingRetryFields(ctx, txid, rawTx, next); err != nil {
+	if err := p.store.SetPendingRetryFields(ctx, txid, rawTx, next, lastReason); err != nil {
 		p.logger.Error("set pending retry fields failed; tx may not be re-broadcast",
 			logfields.TxID(txid), zap.Error(err))
 		return
