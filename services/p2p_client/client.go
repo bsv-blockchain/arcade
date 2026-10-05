@@ -31,6 +31,7 @@ import (
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/metrics"
+	"github.com/bsv-blockchain/arcade/services"
 	"github.com/bsv-blockchain/arcade/ssrfguard"
 	"github.com/bsv-blockchain/arcade/store"
 )
@@ -91,6 +92,8 @@ const discoveryValidationTTL = 5 * time.Minute
 const discoveryValidationCacheMax = 512
 
 type Client struct {
+	services.ReadyHook
+
 	cfg           *config.Config
 	logger        *zap.Logger
 	producer      *kafka.Producer
@@ -138,7 +141,9 @@ func (c *Client) Start(ctx context.Context) error {
 		)
 		// Block until parent shutdown so the service stays in the service
 		// pool and its Stop is called on the same path as every other
-		// service. Cheap — no goroutines, no sockets.
+		// service. Cheap — no goroutines, no sockets. Discovery being off
+		// is a successful start: the pod is idle on purpose.
+		c.SignalReady()
 		<-ctx.Done()
 		return nil
 	}
@@ -195,6 +200,7 @@ func (c *Client) Start(ctx context.Context) error {
 	c.wg.Add(1)
 	go c.consume(ctx, msgs)
 
+	c.SignalReady()
 	<-ctx.Done()
 	return nil
 }

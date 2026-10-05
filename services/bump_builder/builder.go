@@ -22,6 +22,7 @@ import (
 	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/services"
 	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/telemetry"
 	"github.com/bsv-blockchain/arcade/teranode"
@@ -62,6 +63,8 @@ type ChainHeaderReader interface {
 }
 
 type Builder struct {
+	services.ReadyHook
+
 	cfg       *config.Config
 	logger    *zap.Logger
 	store     store.Store
@@ -532,6 +535,9 @@ func (b *Builder) Start(ctx context.Context) error {
 	// never get cleaned up by the normal flow.
 	go b.pruneOrphanStumps(ctx)
 
+	// The consumer group exists; Run blocks until shutdown. The janitor
+	// above is best-effort cleanup and does not gate readiness.
+	b.SignalReady()
 	return consumer.Run(ctx)
 }
 

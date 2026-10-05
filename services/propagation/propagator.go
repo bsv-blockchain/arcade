@@ -31,6 +31,7 @@ import (
 	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/services"
 	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/teranode"
 )
@@ -86,6 +87,8 @@ type propagationMsg struct {
 }
 
 type Propagator struct {
+	services.ReadyHook
+
 	cfg            *config.Config
 	logger         *zap.Logger
 	producer       *kafka.Producer
@@ -1140,6 +1143,9 @@ func (p *Propagator) Start(ctx context.Context) error {
 	// Stop can proceed past <-p.initDone now that every wg.Add above has
 	// happened-before any wg.Wait Stop will perform.
 	p.initOnce.Do(func() { close(p.initDone) })
+	// Consumer group, workers, and replay/reaper are up. Run blocks for the
+	// process lifetime, so readiness cannot wait for it to return.
+	p.SignalReady()
 	return consumer.Run(ctx)
 }
 
