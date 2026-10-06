@@ -1520,10 +1520,17 @@ func preferRejectionLine(current, candidate string) string {
 	if current == "" {
 		return candidate
 	}
-	if rejectionLineScore(candidate) > rejectionLineScore(current) {
+	switch cand, cur := rejectionLineScore(candidate), rejectionLineScore(current); {
+	case cand > cur:
 		return candidate
+	case cand == cur && len(competingSpenders(candidate)) > 0 && len(competingSpenders(current)) == 0:
+		// Same verdict class, but only the candidate names the competing
+		// spender (UTXO_SPENT does; TX_CONFLICTING does not). Keep the one
+		// that can populate competingTxs, whichever peer answered first.
+		return candidate
+	default:
+		return current
 	}
-	return current
 }
 
 // alienFailureLines scans one peer's parsed failure map for lines whose key
@@ -1767,7 +1774,15 @@ func bestUnplaceableLine(bestAlien string, unkeyed []string) string {
 }
 
 func rejectionLineScore(line string) int {
-	name, found := verdictCodeName(line)
+	best := -1
+	for _, m := range teranodeNamedCode.FindAllString(line, -1) {
+		name, _, _ := strings.Cut(m, " (")
+		best = max(best, codeNameScore(name))
+	}
+	if best >= 0 {
+		return best
+	}
+	name, _, found := strings.Cut(line, " (")
 	if !found {
 		return 0
 	}
@@ -1775,19 +1790,21 @@ func rejectionLineScore(line string) int {
 }
 
 // verdictCodeName returns the Teranode code a failure line's verdict should be
-// read from: the most informative "NAME (n)" token anywhere in the line, not
-// merely the leading one. Teranode wraps causes ("PROCESSING (4): … UTXO_SPENT
-// (70): …"), and keying on the leading PROCESSING wrapper would report a
-// double spend as an uncoded catch-all — losing the 466 a wallet branches on to
-// keep its inputs locked. Ties keep the leftmost (outermost) token, so a line
-// whose only code is PROCESSING still reads as PROCESSING. found is false only
-// when the line carries no code token at all.
+// read from: the most specific "NAME (n)" token anywhere in the line, not
+// merely the leading one. Teranode wraps causes ("PROCESSING (4): … TX_INVALID
+// (31): … UTXO_FROZEN (72): …"), and keying on an outer wrapper would report a
+// double spend as an uncoded catch-all, or a frozen utxo as a generic 467 —
+// losing the code a wallet branches on. Ranked by verdictSpecificity, not by
+// the cross-peer codeNameScore: within one line the question is which code IS
+// the cause, not which peer's line reads best. Ties keep the leftmost
+// (outermost) token, so a line whose only code is PROCESSING still reads as
+// PROCESSING. found is false only when the line carries no code token at all.
 func verdictCodeName(line string) (name string, found bool) {
 	best := -1
 	for _, m := range teranodeNamedCode.FindAllString(line, -1) {
 		candidate, _, _ := strings.Cut(m, " (")
-		if score := codeNameScore(candidate); score > best {
-			name, best = candidate, score
+		if rank := verdictSpecificity(candidate); rank > best {
+			name, best = candidate, rank
 		}
 	}
 	if best >= 0 {
@@ -1797,6 +1814,28 @@ func verdictCodeName(line string) (name string, found bool) {
 	// leading "<name> (" shape the parser has always accepted.
 	name, _, found = strings.Cut(line, " (")
 	return name, found
+}
+
+// verdictSpecificity ranks a code for verdictCodeName: codes classifyFailureLine
+// maps to a specific ARC status beat TX_INVALID, the generic wrapper that maps
+// to 467, which beats known codes with no mapping, then unknown codes, then
+// the PROCESSING catch-all. A specific unmapped code (TX_POLICY under
+// TX_INVALID) therefore never demotes a mapped line to uncoded.
+func verdictSpecificity(name string) int {
+	switch name {
+	case "UTXO_SPENT", "TX_INVALID_DOUBLE_SPEND", "TX_CONFLICTING":
+		return 50
+	case "TX_LOCKED", "UTXO_FROZEN", "TX_LOCK_TIME", "UTXO_NON_FINAL":
+		return 40
+	case "TX_INVALID":
+		return 30
+	case "PROCESSING":
+		return 10
+	}
+	if codeNameScore(name) == 30 {
+		return 20 // known, specific, but unmapped
+	}
+	return 15 // a code this build does not know
 }
 
 // codeNameScore ranks one Teranode code name for wallet-facing quality; see

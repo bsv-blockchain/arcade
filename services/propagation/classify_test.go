@@ -94,6 +94,37 @@ func TestClassifyFailureLine(t *testing.T) {
 			wantCode: 471,
 		},
 		{
+			// A generic TX_INVALID wrapper between PROCESSING and the cause
+			// must not hide the specific mapped code beneath it.
+			name:     "UTXO_FROZEN under a TX_INVALID wrapper maps to frozen-policy 471",
+			line:     "PROCESSING (4): [ProcessTransaction][ab12] failed: TX_INVALID (31): tx invalid: UTXO_FROZEN (72): utxo is frozen",
+			wantCode: 471,
+		},
+		{
+			name:          "TX_LOCK_TIME under a TX_INVALID wrapper maps to non-final 476 with retry hint",
+			line:          "PROCESSING (4): TX_INVALID (31): tx invalid: TX_LOCK_TIME (35): bad lock time",
+			wantCode:      476,
+			wantRetryHint: true,
+		},
+		{
+			name:          "UTXO_NON_FINAL under a TX_INVALID wrapper maps to non-final 476 with retry hint",
+			line:          "TX_INVALID (31): tx invalid: UTXO_NON_FINAL (71): tx is non-final",
+			wantCode:      476,
+			wantRetryHint: true,
+		},
+		{
+			name:     "UTXO_SPENT under a TX_INVALID wrapper maps to conflict 466",
+			line:     "TX_INVALID (31): tx invalid: UTXO_SPENT (70): ab:0 utxo already spent by tx cd[0]",
+			wantCode: 466,
+		},
+		{
+			// An unmapped specific code must not demote a mapped generic one
+			// to uncoded.
+			name:     "TX_INVALID wrapping an unmapped TX_POLICY keeps generic 467",
+			line:     "TX_INVALID (31): tx invalid: TX_POLICY (39): dust output",
+			wantCode: 467,
+		},
+		{
 			name: "unknown code name stays uncoded",
 			line: "SOME_FUTURE_CODE (99): [ProcessTransaction][ab12] who knows",
 		},
@@ -156,6 +187,21 @@ func TestPreferRejectionLine(t *testing.T) {
 			current:   txInvalid,
 			candidate: "PROCESSING (4): [ProcessTransaction][ab] failed: UTXO_SPENT (70): cd:0 utxo already spent by tx ef[0]",
 			want:      "PROCESSING (4): [ProcessTransaction][ab] failed: UTXO_SPENT (70): cd:0 utxo already spent by tx ef[0]",
+		},
+		{
+			// Equal score: a conflict line naming the competing spender
+			// beats one that does not, whichever arrived first — the
+			// spender is what populates competingTxs.
+			name:      "UTXO_SPENT with spender beats earlier TX_CONFLICTING",
+			current:   "TX_CONFLICTING (36): [ProcessTransaction][ab] tx is conflicting",
+			candidate: "UTXO_SPENT (70): [ProcessTransaction][ab] cd:0 utxo already spent by tx " + strings.Repeat("ef", 32) + "[0]",
+			want:      "UTXO_SPENT (70): [ProcessTransaction][ab] cd:0 utxo already spent by tx " + strings.Repeat("ef", 32) + "[0]",
+		},
+		{
+			name:      "later TX_CONFLICTING does not displace UTXO_SPENT with spender",
+			current:   "UTXO_SPENT (70): [ProcessTransaction][ab] cd:0 utxo already spent by tx " + strings.Repeat("ef", 32) + "[0]",
+			candidate: "TX_CONFLICTING (36): [ProcessTransaction][ab] tx is conflicting",
+			want:      "UTXO_SPENT (70): [ProcessTransaction][ab] cd:0 utxo already spent by tx " + strings.Repeat("ef", 32) + "[0]",
 		},
 		{name: "equal score keeps current", current: processing + " a", candidate: processing + " b", want: processing + " a"},
 	}

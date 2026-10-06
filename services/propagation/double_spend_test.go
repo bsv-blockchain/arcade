@@ -284,3 +284,43 @@ func TestReaperGiveUp_NewEpisodeDoesNotInheritOldResponse(t *testing.T) {
 		t.Errorf("give-up reason = %q quotes a response from before the tx was accepted", last.ExtraInfo)
 	}
 }
+
+// TestDoubleSpend_SpenderSurvivesTieWithTxConflicting: two upgraded peers give
+// equally ranked conflict verdicts, only one naming the spender. Whichever
+// answers first, the row and event must carry competingTxs.
+func TestDoubleSpend_SpenderSurvivesTieWithTxConflicting(t *testing.T) {
+	txid, raw := spendingTx(t, dsOutpointTxid, 0, 6)
+	conflicting := failureListServer(http.StatusConflict, func(id string) string {
+		return "TX_CONFLICTING (36): [ProcessTransaction][" + id + "] tx is conflicting"
+	}, txid)
+	defer conflicting.Close()
+	spent := failureListServer(http.StatusConflict, func(id string) string {
+		return "UTXO_SPENT (70): [ProcessTransaction][" + id + "] " + outpointRef(dsOutpointTxid, 0) +
+			" utxo already spent by tx " + dsSpenderTxid + "[0]"
+	}, txid)
+	defer spent.Close()
+
+	for name, urls := range map[string][]string{
+		"conflicting first": {conflicting.URL, spent.URL},
+		"spent first":       {spent.URL, conflicting.URL},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ms := newMockStore()
+			pub := &recordingPublisher{}
+			p := multiPeerPropagator(urls, ms, pub)
+			if err := p.handleMessage(context.Background(), consumerMsg(realPropMsg(t, txid, raw))); err != nil {
+				t.Fatalf("handleMessage: %v", err)
+			}
+			if err := flushSync(t, p); err != nil {
+				t.Fatalf("flush: %v", err)
+			}
+			got := ms.lastUpdateForTxid(txid)
+			if got == nil || got.Status != models.StatusRejected || got.StatusCode != 466 {
+				t.Fatalf("status = %+v, want REJECTED/466", got)
+			}
+			if !slices.Equal(got.CompetingTxs, []string{dsSpenderTxid}) {
+				t.Errorf("CompetingTxs = %v, want [%s] (extraInfo=%q)", got.CompetingTxs, dsSpenderTxid, got.ExtraInfo)
+			}
+		})
+	}
+}
