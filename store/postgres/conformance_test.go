@@ -28,6 +28,24 @@ func TestBlockStatus_Conformance(t *testing.T) {
 	})
 }
 
+// A double spend is discovered after the row exists, so the competing
+// spender must persist through the status-update paths, not only on insert.
+func TestCompetingTxs_Conformance(t *testing.T) {
+	storetest.RunCompetingTxsSuite(t, func(t *testing.T) storetest.CompetingTxsBackend {
+		t.Helper()
+		return newTestStore(t)
+	})
+}
+
+// The last network response must survive across durable retry attempts so
+// the reaper's give-up reason can quote it.
+func TestRetryReason_Conformance(t *testing.T) {
+	storetest.RunRetryReasonSuite(t, func(t *testing.T) storetest.RetryReasonBackend {
+		t.Helper()
+		return newTestStore(t)
+	})
+}
+
 func TestIterateTrackerRows_NullBlockHeightKept(t *testing.T) {
 	// block_height is nullable (schema.sql). A MINED row with a NULL height
 	// must be kept at any cutoff — the COALESCE disjunct in the query is what

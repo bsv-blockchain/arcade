@@ -342,7 +342,7 @@ func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.Tra
 		return nil
 	}
 
-	const colsPerRow = 8 // txid, status, status_code, block_hash, block_height, extra_info, merkle_path, timestamp_at, disallowed_prev
+	const colsPerRow = 9 // txid, status, status_code, block_hash, block_height, extra_info, merkle_path, competing_txs, timestamp_at, disallowed_prev
 
 	args := make([]any, 0, len(statuses)*(colsPerRow+1))
 	now := time.Now()
@@ -354,6 +354,10 @@ func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.Tra
 		var mp any
 		if len(st.MerklePath) > 0 {
 			mp = []byte(st.MerklePath)
+		}
+		competing, err := competingTxsArg(st.CompetingTxs)
+		if err != nil {
+			return fmt.Errorf("marshal competing_txs for %s: %w", st.TxID, err)
 		}
 		// disallowed previous statuses for this row's lattice guard, shared
 		// with UpdateStatusReturning so a same-status re-assert is applied on
@@ -370,6 +374,7 @@ func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.Tra
 			int64(st.BlockHeight), /* #nosec G115 */
 			st.ExtraInfo,
 			mp,
+			competing,
 			ts,
 			disallowed,
 		)
@@ -385,8 +390,8 @@ func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.Tra
 		// right types for the VALUES alias columns.
 		fmt.Fprintf(
 			&values,
-			"($%d::text,$%d::text,$%d::int,$%d::text,$%d::bigint,$%d::text,$%d::bytea,$%d::timestamptz,$%d::text[])",
-			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9,
+			"($%d::text,$%d::text,$%d::int,$%d::text,$%d::bigint,$%d::text,$%d::bytea,$%d::jsonb,$%d::timestamptz,$%d::text[])",
+			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10,
 		)
 	}
 
@@ -402,14 +407,29 @@ UPDATE transactions t SET
     block_height = COALESCE(NULLIF(v.block_height, 0),    t.block_height),
     extra_info   = COALESCE(NULLIF(v.extra_info, ''),     t.extra_info),
     merkle_path  = COALESCE(v.merkle_path,                t.merkle_path),
+    competing_txs = COALESCE(v.competing_txs,             t.competing_txs),
     timestamp_at = v.timestamp_at
-FROM (VALUES ` + values.String() + `) AS v(txid, status, status_code, block_hash, block_height, extra_info, merkle_path, timestamp_at, disallowed_prev)
+FROM (VALUES ` + values.String() + `) AS v(txid, status, status_code, block_hash, block_height, extra_info, merkle_path, competing_txs, timestamp_at, disallowed_prev)
 WHERE t.txid = v.txid AND t.status <> ALL(v.disallowed_prev)`
 
 	if _, err := s.pool.Exec(ctx, q, args...); err != nil {
 		return fmt.Errorf("batch update: %w", err)
 	}
 	return nil
+}
+
+// competingTxsArg renders CompetingTxs for the JSONB competing_txs column: a
+// JSON string so pgx encodes it as JSON rather than BYTEA, or nil for "no
+// competing txs" so COALESCE keeps whatever the row already holds.
+func competingTxsArg(competing []string) (any, error) {
+	if len(competing) == 0 {
+		return nil, nil
+	}
+	b, err := json.Marshal(competing)
+	if err != nil {
+		return nil, err
+	}
+	return string(b), nil
 }
 
 // UpdateStatus updates an existing transaction. If no row exists for
@@ -464,6 +484,15 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 	if len(status.MerklePath) > 0 {
 		sets = append(sets, fmt.Sprintf("merkle_path = $%d", idx))
 		args = append(args, []byte(status.MerklePath))
+		idx++
+	}
+	if len(status.CompetingTxs) > 0 {
+		competing, err := competingTxsArg(status.CompetingTxs)
+		if err != nil {
+			return store.StatusUpdate{}, fmt.Errorf("marshal competing_txs for %s: %w", status.TxID, err)
+		}
+		sets = append(sets, fmt.Sprintf("competing_txs = $%d::jsonb", idx))
+		args = append(args, competing)
 		idx++
 	}
 	disallowed := transitionGuardStatuses(status.Status)
@@ -944,16 +973,17 @@ func (s *Store) BumpRetryCount(ctx context.Context, txid string) (int, error) {
 // to PENDING_RETRY, where the reaper would then rebroadcast it. Rows whose
 // current status forbids PENDING_RETRY are skipped, matching
 // BatchUpdateStatusReturning's silent-skip semantics.
-func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time) error {
+func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time, lastReason string) error {
 	const q = `
 UPDATE transactions
-SET status=$2, raw_tx=$3, next_retry_at=$4, timestamp_at=NOW()
+SET status=$2, raw_tx=$3, next_retry_at=$4, timestamp_at=NOW(),
+    retry_reason = NULLIF($6,'')
 WHERE txid=$1 AND status <> ALL($5)`
 	disallowed := disallowedPrevAsStrings(models.StatusPendingRetry)
 	if disallowed == nil {
 		disallowed = []string{}
 	}
-	_, err := s.pool.Exec(ctx, q, txid, string(models.StatusPendingRetry), rawTx, nextRetryAt, disallowed)
+	_, err := s.pool.Exec(ctx, q, txid, string(models.StatusPendingRetry), rawTx, nextRetryAt, disallowed, lastReason)
 	if err != nil {
 		return fmt.Errorf("set pending retry fields %s: %w", txid, err)
 	}
@@ -975,7 +1005,7 @@ func (s *Store) GetReadyRetries(ctx context.Context, now time.Time, limit int) (
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	const q = `
-SELECT txid, raw_tx, retry_count, next_retry_at
+SELECT txid, raw_tx, retry_count, next_retry_at, COALESCE(retry_reason, '')
 FROM transactions
 WHERE status = 'PENDING_RETRY' AND next_retry_at <= $1
 ORDER BY next_retry_at
@@ -988,7 +1018,7 @@ FOR UPDATE SKIP LOCKED`
 	var out []*store.PendingRetry
 	for rows.Next() {
 		r := &store.PendingRetry{}
-		if err := rows.Scan(&r.TxID, &r.RawTx, &r.RetryCount, &r.NextRetryAt); err != nil {
+		if err := rows.Scan(&r.TxID, &r.RawTx, &r.RetryCount, &r.NextRetryAt, &r.LastReason); err != nil {
 			rows.Close()
 			return out, err
 		}
@@ -1007,7 +1037,7 @@ FOR UPDATE SKIP LOCKED`
 func (s *Store) ClearRetryState(ctx context.Context, txid string, finalStatus models.Status, extraInfo string) error {
 	const q = `
 UPDATE transactions
-SET status=$2, raw_tx=NULL, next_retry_at=NULL, timestamp_at=NOW(),
+SET status=$2, raw_tx=NULL, next_retry_at=NULL, retry_reason=NULL, timestamp_at=NOW(),
     extra_info = COALESCE(NULLIF($3,''), extra_info)
 WHERE txid=$1`
 	_, err := s.pool.Exec(ctx, q, txid, string(finalStatus), extraInfo)

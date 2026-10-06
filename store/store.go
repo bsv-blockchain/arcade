@@ -44,6 +44,11 @@ type PendingRetry struct {
 	RawTx       []byte
 	RetryCount  int
 	NextRetryAt time.Time
+	// LastReason is the last non-empty network response recorded for the
+	// tx across its durable attempts (SetPendingRetryFields), so the
+	// eventual give-up can quote it even when the final attempt drew no
+	// response at all. Empty when no peer ever answered.
+	LastReason string
 }
 
 // DatahubEndpointSourceConfigured marks endpoints seeded from static config.
@@ -696,18 +701,23 @@ type Store interface {
 	BumpRetryCount(ctx context.Context, txid string) (retryCount int, err error)
 
 	// SetPendingRetryFields writes the durable retry bins: status=PENDING_RETRY,
-	// raw_tx, next_retry_at, timestamp. retry_count is untouched — use
-	// BumpRetryCount first to get the value that feeds next_retry_at backoff.
-	SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time) error
+	// raw_tx, next_retry_at, timestamp and retry_reason. lastReason always
+	// replaces the stored reason (empty clears it): carrying a reason across
+	// attempts is the caller's job (the reaper re-passes the one
+	// GetReadyRetries returned), so a tx parked afresh after leaving the
+	// queue — by any exit path — never inherits a response from an earlier
+	// stay. retry_count is untouched — use BumpRetryCount first to get the
+	// value that feeds next_retry_at backoff.
+	SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time, lastReason string) error
 
 	// GetReadyRetries returns up to limit PENDING_RETRY rows whose
-	// next_retry_at has elapsed. Rows include raw_tx and retry_count so the
-	// reaper can act without a second read per row.
+	// next_retry_at has elapsed. Rows include raw_tx, retry_count and
+	// retry_reason so the reaper can act without a second read per row.
 	GetReadyRetries(ctx context.Context, now time.Time, limit int) ([]*PendingRetry, error)
 
 	// ClearRetryState transitions a tx out of PENDING_RETRY (either on success
-	// or final rejection) and deletes the raw_tx + next_retry_at bins so the
-	// row stops showing up in ready-retry queries.
+	// or final rejection) and deletes the raw_tx + next_retry_at +
+	// retry_reason bins so the row stops showing up in ready-retry queries.
 	ClearRetryState(ctx context.Context, txid string, finalStatus models.Status, extraInfo string) error
 
 	// MarkMerkleRegisteredByTxIDs records that the given txids have been

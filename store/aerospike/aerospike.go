@@ -447,6 +447,14 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 	if !status.MerkleRegisteredAt.IsZero() {
 		bins["merkle_reg_at"] = status.MerkleRegisteredAt.UnixMilli()
 	}
+	if len(status.CompetingTxs) > 0 {
+		// JSON bytes, the encoding the GetStatus decoder already reads.
+		ct, err := json.Marshal(status.CompetingTxs)
+		if err != nil {
+			return store.StatusUpdate{}, fmt.Errorf("marshal competing_txs for %s: %w", status.TxID, err)
+		}
+		bins["competing_txs"] = ct
+	}
 
 	// Read-then-CAS-write using the record's generation. The pre-write
 	// lattice check and the put are atomic with respect to other writers:
@@ -973,7 +981,7 @@ func (s *Store) BumpRetryCount(ctx context.Context, txid string) (int, error) {
 // SetPendingRetryFields writes the durable retry bins in one atomic call. The
 // caller is responsible for having already bumped retry_count and computed
 // next_retry_at from that post-increment value.
-func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time) error {
+func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time, lastReason string) error {
 	key, err := s.key(setTransactions, txid)
 	if err != nil {
 		return err
@@ -997,6 +1005,12 @@ func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []
 		aero.PutOp(aero.NewBin("raw_tx", rawTx)),
 		aero.PutOp(aero.NewBin("next_retry_at", nextRetryAt.UnixMilli())),
 		aero.PutOp(aero.NewBin("timestamp", time.Now().UnixMilli())),
+	}
+	if lastReason != "" {
+		ops = append(ops, aero.PutOp(aero.NewBin("retry_reason", lastReason)))
+	} else {
+		// Aerospike: writing a nil bin value deletes the bin.
+		ops = append(ops, aero.PutOp(aero.NewBin("retry_reason", nil)))
 	}
 	if _, err := s.client.Operate(s.writePolicy(ctx), key, ops...); err != nil {
 		return fmt.Errorf("set pending retry fields %s: %w", txid, err)
@@ -1056,6 +1070,7 @@ loop:
 				RawTx:       rawTx,
 				RetryCount:  getInt(rec.Record, "retry_count"),
 				NextRetryAt: time.UnixMilli(nextMs),
+				LastReason:  getString(rec.Record, "retry_reason"),
 			})
 			if len(results) >= limit {
 				break loop
@@ -1082,6 +1097,7 @@ func (s *Store) ClearRetryState(ctx context.Context, txid string, finalStatus mo
 		// Aerospike: writing a nil bin value deletes the bin.
 		aero.PutOp(aero.NewBin("raw_tx", nil)),
 		aero.PutOp(aero.NewBin("next_retry_at", nil)),
+		aero.PutOp(aero.NewBin("retry_reason", nil)),
 	}
 	if extraInfo != "" {
 		ops = append(ops, aero.PutOp(aero.NewBin("extra_info", extraInfo)))
