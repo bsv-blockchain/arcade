@@ -824,16 +824,22 @@ func (s *Store) BumpRetryCount(ctx context.Context, txid string) (int, error) {
 func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time, lastReason string) error {
 	filter := append(idFilter(txid), latticeFilter(models.StatusPendingRetry)...)
 	set := doc(kv(fStatus, string(models.StatusPendingRetry)), kv(fNextRetryAt, msTrunc(nextRetryAt)), kv(fTimestamp, msNow()))
+	update := doc(incVersion())
+	unset := doc()
 	if lastReason != "" {
 		set = append(set, kv(fRetryReason, lastReason))
+	} else {
+		unset = append(unset, kv(fRetryReason, ""))
 	}
-	update := doc(incVersion())
 	if len(rawTx) > 0 {
 		set = append(set, kv(fRawTx, rawTx))
 	} else {
-		update = append(update, kv(opUnset, doc(kv(fRawTx, ""))))
+		unset = append(unset, kv(fRawTx, ""))
 	}
 	update = append(update, kv(opSet, set))
+	if len(unset) > 0 {
+		update = append(update, kv(opUnset, unset))
+	}
 
 	octx, cancel := s.opCtx(ctx)
 	defer cancel()

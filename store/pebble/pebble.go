@@ -979,9 +979,7 @@ func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []
 	updated.RawTx = rawTx
 	updated.NextRetryUnixNs = nextRetryAt.UnixNano()
 	updated.TimestampUnixNs = time.Now().UnixNano()
-	if lastReason != "" {
-		updated.RetryReason = lastReason
-	}
+	updated.RetryReason = lastReason
 
 	payload, err := json.Marshal(updated)
 	if err != nil {

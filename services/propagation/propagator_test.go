@@ -261,12 +261,6 @@ func (m *mockStore) SetPendingRetryFields(_ context.Context, txid string, rawTx 
 		m.retrySeq[txid] = m.retrySeqNext
 		m.retrySeqNext++
 	}
-	// An empty lastReason keeps the stored one, as the real stores do.
-	if lastReason == "" {
-		if prev, ok := m.pendingRetries[txid]; ok {
-			lastReason = prev.LastReason
-		}
-	}
 	m.pendingRetries[txid] = &store.PendingRetry{
 		TxID:        txid,
 		RawTx:       append([]byte(nil), rawTx...),

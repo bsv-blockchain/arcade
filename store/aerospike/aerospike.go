@@ -1008,6 +1008,9 @@ func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []
 	}
 	if lastReason != "" {
 		ops = append(ops, aero.PutOp(aero.NewBin("retry_reason", lastReason)))
+	} else {
+		// Aerospike: writing a nil bin value deletes the bin.
+		ops = append(ops, aero.PutOp(aero.NewBin("retry_reason", nil)))
 	}
 	if _, err := s.client.Operate(s.writePolicy(ctx), key, ops...); err != nil {
 		return fmt.Errorf("set pending retry fields %s: %w", txid, err)

@@ -977,7 +977,7 @@ func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []
 	const q = `
 UPDATE transactions
 SET status=$2, raw_tx=$3, next_retry_at=$4, timestamp_at=NOW(),
-    retry_reason = COALESCE(NULLIF($6,''), retry_reason)
+    retry_reason = NULLIF($6,'')
 WHERE txid=$1 AND status <> ALL($5)`
 	disallowed := disallowedPrevAsStrings(models.StatusPendingRetry)
 	if disallowed == nil {

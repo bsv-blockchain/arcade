@@ -229,3 +229,58 @@ func TestReaperGiveUp_KeepsResponseFromEarlierAttempt(t *testing.T) {
 		t.Errorf("give-up reason = %q, want it to quote attempt 1's response %q", last.ExtraInfo, opaqueProcessingLine(txid))
 	}
 }
+
+// TestReaperGiveUp_NewEpisodeDoesNotInheritOldResponse pins the other edge of
+// the persisted reason: it belongs to one stay in the retry queue. A tx that
+// is parked with a PROCESSING response, then accepted by a rebroadcast, then
+// parked again by a later episode that heard nothing must not give up quoting
+// the response from before its acceptance.
+func TestReaperGiveUp_NewEpisodeDoesNotInheritOldResponse(t *testing.T) {
+	txid, raw := spendingTx(t, dsOutpointTxid, 0, 5)
+	var accept atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if accept.Load() {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		// Body-less 500: no network response at all.
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	ms := newMockStore()
+	p := newReaperPropagator(t, srv.URL, ms, 0)
+	p.pendingRetryMaxAttempts = 2
+	p.pendingRetryBackoff = time.Millisecond
+	p.pendingRetryMaxBackoff = time.Millisecond
+	ctx := context.Background()
+	drain := func() {
+		time.Sleep(5 * time.Millisecond) // let the millisecond backoff elapse
+		p.drainParkedRetries(ctx, time.Now(), time.Now().Add(-time.Hour))
+	}
+
+	// Episode 1: parked having heard the opaque PROCESSING line.
+	p.parkExhaustedRequeues(ctx, []propagationMsg{{TXID: txid, RawTx: raw, retryReason: opaqueProcessingLine(txid)}}, p.defaultIO)
+
+	// A rebroadcast is accepted: the tx leaves the retry queue.
+	accept.Store(true)
+	drain()
+	if got := ms.lastUpdateForTxid(txid); got == nil || got.Status != models.StatusAcceptedByNetwork {
+		t.Fatalf("status after accepted rebroadcast = %v, want ACCEPTED_BY_NETWORK", statusOrNone(got))
+	}
+
+	// Episode 2: parked again having heard nothing, and never answered after.
+	accept.Store(false)
+	p.parkExhaustedRequeues(ctx, []propagationMsg{{TXID: txid, RawTx: raw}}, p.defaultIO)
+	for i := 0; i < 3; i++ {
+		drain()
+	}
+
+	last := ms.lastUpdateForTxid(txid)
+	if last == nil || last.Status != models.StatusRejected {
+		t.Fatalf("last status = %v, want REJECTED after the durable budget", statusOrNone(last))
+	}
+	if strings.Contains(last.ExtraInfo, "PROCESSING") {
+		t.Errorf("give-up reason = %q quotes a response from before the tx was accepted", last.ExtraInfo)
+	}
+}

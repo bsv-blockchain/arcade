@@ -701,11 +701,13 @@ type Store interface {
 	BumpRetryCount(ctx context.Context, txid string) (retryCount int, err error)
 
 	// SetPendingRetryFields writes the durable retry bins: status=PENDING_RETRY,
-	// raw_tx, next_retry_at, timestamp, and — when lastReason is non-empty —
-	// retry_reason. An empty lastReason keeps the stored one, so a
-	// response heard on an earlier attempt survives a later attempt that
-	// heard nothing. retry_count is untouched — use BumpRetryCount first to
-	// get the value that feeds next_retry_at backoff.
+	// raw_tx, next_retry_at, timestamp and retry_reason. lastReason always
+	// replaces the stored reason (empty clears it): carrying a reason across
+	// attempts is the caller's job (the reaper re-passes the one
+	// GetReadyRetries returned), so a tx parked afresh after leaving the
+	// queue — by any exit path — never inherits a response from an earlier
+	// stay. retry_count is untouched — use BumpRetryCount first to get the
+	// value that feeds next_retry_at backoff.
 	SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time, lastReason string) error
 
 	// GetReadyRetries returns up to limit PENDING_RETRY rows whose
