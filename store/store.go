@@ -251,6 +251,10 @@ type StatusUpdate struct {
 	Current *models.TransactionStatus
 }
 
+// Applied reports whether this call durably wrote the requested transition.
+// Only an applied result may be published or used to advance a tracker.
+func (u StatusUpdate) Applied() bool { return u.Prev != nil }
+
 // Store handles all persistence operations for transactions and submissions
 type Store interface {
 	// GetOrInsertStatus inserts a new transaction status or returns the existing one if it already exists.
@@ -298,10 +302,10 @@ type Store interface {
 	// Current, and must not count Current as an unknown txid.
 	//
 	// Prev's status metadata (Status, Timestamp, block anchor, extra info)
-	// is guaranteed. RawTx is NOT — MongoDB projects it away, since no
-	// caller reads it and it can be megabytes per row on a hot path, while
-	// Pebble and Postgres happen to return it only because they read the
-	// row whole.
+	// is guaranteed. RawTx is NOT — MongoDB, Postgres and Aerospike read
+	// only the status metadata, since no caller needs RawTx and it can be
+	// megabytes per row on a hot path, while Pebble happens to return it
+	// only because it reads the row whole.
 	BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]StatusUpdate, error)
 
 	// GetStatus retrieves the status for a transaction

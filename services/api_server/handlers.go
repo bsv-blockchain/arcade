@@ -549,7 +549,7 @@ func (s *Server) applySeenCallback(c *gin.Context, msg models.CallbackMessage, l
 
 	successful := make([]string, 0, len(statuses))
 	for i, upd := range updates {
-		if upd.Prev != nil {
+		if upd.Applied() {
 			// Observe transition age — the headline metric the user asked for.
 			// Use the previous row's Timestamp (last-update wall-clock) as the
 			// anchor; for the RECEIVED→SEEN_ON_NETWORK case it equals the
@@ -560,9 +560,10 @@ func (s *Server) applySeenCallback(c *gin.Context, msg models.CallbackMessage, l
 					WithLabelValues(string(upd.Prev.Status), string(targetStatus)).
 					Observe(time.Since(upd.Prev.Timestamp).Seconds())
 			}
-			// Status lattice recorded an applied idempotent re-assert, or
-			// the pre-image cannot move to target. No transition to fan out.
-			if upd.Prev.Status == targetStatus || !targetStatus.CanTransitionFrom(upd.Prev.Status) {
+			// An applied idempotent re-assert: the row was already at
+			// targetStatus, so there is no transition to fan out. A non-nil
+			// Prev already implies the lattice allowed the move.
+			if upd.Prev.Status == targetStatus {
 				metrics.CallbackStaleTotal.WithLabelValues(metricLabel, string(upd.Prev.Status)).Inc()
 				continue
 			}

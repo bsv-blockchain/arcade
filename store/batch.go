@@ -58,9 +58,10 @@ type SingleStore interface {
 }
 
 // SingleStoreReturning extends SingleStore with the diagnostic-rich
-// UpdateStatusReturning variant. Backends that implement it directly get
-// an atomic applied-result per row. Prev is set only when the write
-// landed; Current is set when the row is known and the lattice skipped it.
+// UpdateStatusReturning variant: one atomic applied-result per row. Prev
+// is set only when the write landed; Current is set when the row is known
+// and the lattice skipped it. Every Store backend implements it, and
+// BatchUpdateStatusReturningParallel is the shared batch driver.
 type SingleStoreReturning interface {
 	UpdateStatusReturning(ctx context.Context, status *models.TransactionStatus) (StatusUpdate, error)
 }
@@ -114,138 +115,6 @@ func BatchGetOrInsertStatusParallel(ctx context.Context, s SingleStore, statuses
 	}
 	wg.Wait()
 	return results, firstErr
-}
-
-// GetStatusGetter is the narrow contract the fallback variant of the
-// diagnostic-rich batch helper needs from backends that haven't natively
-// implemented UpdateStatusReturning.
-type GetStatusGetter interface {
-	GetStatus(ctx context.Context, txid string) (*models.TransactionStatus, error)
-	UpdateStatus(ctx context.Context, status *models.TransactionStatus) error
-}
-
-// BatchUpdateStatusReturningFallback implements the diagnostic-rich batch
-// update for a backend with no fused read-modify-write. A non-nil previous
-// row means this call applied the requested transition.
-//
-// GetStatus followed by UpdateStatus is not that proof: the row can move
-// (ACCEPTED_BY_NETWORK → MINED) between the two calls, the lattice then
-// skips the write, and the earlier snapshot still looks like a legal
-// predecessor. The fallback therefore returns the snapshot only when a
-// follow-up read shows this call's status and timestamp in place. Backends
-// that implement UpdateStatusReturning are used instead, one atomic
-// applied-result per row.
-func BatchUpdateStatusReturningFallback(ctx context.Context, s GetStatusGetter, statuses []*models.TransactionStatus) ([]StatusUpdate, error) {
-	if len(statuses) == 0 {
-		return nil, nil
-	}
-	out := make([]StatusUpdate, len(statuses))
-	sem := make(chan struct{}, currentBatchConcurrency())
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var firstErr error
-	for i, st := range statuses {
-		select {
-		case sem <- struct{}{}:
-		case <-ctx.Done():
-			mu.Lock()
-			if firstErr == nil {
-				firstErr = ctx.Err()
-			}
-			mu.Unlock()
-			continue
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer func() { <-sem }()
-			if returning, ok := s.(SingleStoreReturning); ok {
-				upd, err := returning.UpdateStatusReturning(ctx, st)
-				if err != nil && !errors.Is(err, ErrNotFound) {
-					mu.Lock()
-					if firstErr == nil {
-						firstErr = err
-					}
-					mu.Unlock()
-					return
-				}
-				if err == nil {
-					out[i] = upd
-				}
-				return
-			}
-			prev, getErr := s.GetStatus(ctx, st.TxID)
-			if getErr != nil && !errors.Is(getErr, ErrNotFound) {
-				mu.Lock()
-				if firstErr == nil {
-					firstErr = getErr
-				}
-				mu.Unlock()
-				return
-			}
-			if prev == nil {
-				return
-			}
-			// A failed write must not look applied. Reporting prev before
-			// the write lets applySeenCallback publish the transition and
-			// advance txTracker for a row that never persisted; the
-			// tracker's prefilter then drops the HTTP 500 retry.
-			if err := s.UpdateStatus(ctx, st); err != nil {
-				if errors.Is(err, ErrNotFound) {
-					return
-				}
-				mu.Lock()
-				if firstErr == nil {
-					firstErr = err
-				}
-				mu.Unlock()
-				return
-			}
-			after, afterErr := s.GetStatus(ctx, st.TxID)
-			if afterErr != nil && !errors.Is(afterErr, ErrNotFound) {
-				mu.Lock()
-				if firstErr == nil {
-					firstErr = afterErr
-				}
-				mu.Unlock()
-				return
-			}
-			if !fallbackTransitionApplied(prev, st, after) {
-				// The row is known when the follow-up read still finds it.
-				// That is a lattice skip or a lost race, not an absent txid.
-				// Do not return the stale pre-read as Prev.
-				if after != nil {
-					out[i] = StatusUpdate{Current: after}
-				}
-				return
-			}
-			out[i] = StatusUpdate{Prev: prev}
-		}()
-	}
-	wg.Wait()
-	return out, firstErr
-}
-
-// fallbackTransitionApplied reports whether the requested write is the one
-// now stored. UpdateStatus returns nil both when it writes and when the
-// lattice skips, so the pre-read alone cannot tell those apart. The
-// follow-up read must show the requested status and, when this call sent a
-// timestamp, that timestamp — a concurrent writer that landed the same
-// status keeps its own timestamp, and a lattice skip leaves the old one.
-func fallbackTransitionApplied(before, requested, after *models.TransactionStatus) bool {
-	if before == nil || requested == nil || after == nil {
-		return false
-	}
-	if requested.Status != "" && after.Status != requested.Status {
-		return false
-	}
-	if requested.Status != "" && before.Status != requested.Status && !requested.Status.CanTransitionFrom(before.Status) {
-		return false
-	}
-	if !requested.Timestamp.IsZero() && !after.Timestamp.Equal(requested.Timestamp) {
-		return false
-	}
-	return true
 }
 
 // BatchUpdateStatusReturningParallel is the diagnostic-rich form of

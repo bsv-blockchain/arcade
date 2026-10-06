@@ -408,7 +408,7 @@ func statusFromUpdateBins(rec *aero.Record, txid string) *models.TransactionStat
 		st.Timestamp = time.UnixMilli(int64(ms))
 	}
 	if h := getInt(rec, "block_height"); h > 0 {
-		st.BlockHeight = uint64(h) //nolint:gosec // block height fits
+		st.BlockHeight = uint64(h)
 	}
 	return st
 }

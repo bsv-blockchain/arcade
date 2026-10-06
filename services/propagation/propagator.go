@@ -543,12 +543,12 @@ func (p *Propagator) Name() string { return "propagation" }
 //     receives the terminal event. This pass MUST NOT be filtered by
 //     whether the store write moved the row — a tx re-read from Kafka
 //     after a rebalance is typically already at its terminal status, so
-//     BatchUpdateStatusReturning reports a lattice no-op (prev.Status ==
-//     st.Status) or an unknown row (prev == nil, row reaped). Skipping the
-//     notify for those strands the offset on the tracker and pins
-//     LowestUnfinished() — the Kafka commit watermark — forever, so the
-//     consumer group never commits and every restart re-reads the whole
-//     topic from offset 0.
+//     BatchUpdateStatusReturning reports either no applied write (Prev ==
+//     nil: a lattice skip or a reaped row) or an idempotent re-assert
+//     (Prev.Status == st.Status). Skipping the notify for those strands
+//     the offset on the tracker and pins LowestUnfinished() — the Kafka
+//     commit watermark — forever, so the consumer group never commits and
+//     every restart re-reads the whole topic from offset 0.
 //
 //   - Bulk publish covers only rows that actually transitioned. A lattice
 //     no-op or a reaped row would be a phantom SSE/webhook event.

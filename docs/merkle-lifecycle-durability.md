@@ -58,8 +58,6 @@ The watchdog is the recovery mechanism. Do not remove it.
 
 ## Zero-STUMP finalization
 
-`ZERO_STUMP_FINALIZATION: SAFE`
-
 `BLOCK_PROCESSED` with zero stored STUMPs and no `expectedSubtreeIndices`
 calls `finalizeEmptyBlock` and stamps `processed_at` (height 0, which does
 not replace a chaintracks height). That block is not re-driven. Current
@@ -71,13 +69,10 @@ When `expectedSubtreeIndices` is present and a STUMP is missing, the block
 is not finalized. `processed_at` stays unset and the watchdog re-drives it
 via `/reprocess`.
 
-## Follow-up
+## Enablement precondition
 
-Before enabling Merkle, confirm that deployment's Merkle sends
-`expectedSubtreeIndices` for every block that contains a tracked subtree.
-If that field is omitted, a dropped STUMP set is indistinguishable from an
-empty block and `finalizeEmptyBlock` will stamp `processed_at`. This sprint
-does not change that contract.
-
-No production config was changed. Merkle stays disabled until that check
-and the rest of Stage-2 are done.
+Merkle must send `expectedSubtreeIndices` for every block that contains a
+tracked subtree. If that field is omitted, a dropped STUMP set is
+indistinguishable from an empty block and `finalizeEmptyBlock` stamps
+`processed_at`. Confirm this for a deployment's Merkle before enabling
+callbacks.

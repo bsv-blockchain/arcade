@@ -117,11 +117,12 @@ func TestHandleCallback_SeenTwice_IsIdempotent(t *testing.T) {
 
 			const txid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 			ctx := context.Background()
-			if _, _, err := st.GetOrInsertStatus(ctx, &models.TransactionStatus{
+			_, _, err = st.GetOrInsertStatus(ctx, &models.TransactionStatus{
 				TxID:      txid,
 				Status:    models.StatusAcceptedByNetwork,
 				Timestamp: time.Now(),
-			}); err != nil {
+			})
+			if err != nil {
 				t.Fatalf("GetOrInsertStatus: %v", err)
 			}
 
@@ -196,44 +197,29 @@ func TestHandleCallback_UnknownType_Acknowledged(t *testing.T) {
 	}
 }
 
-// fallbackSeenStore is the Postgres/Aerospike batch path: GetStatus then
-// UpdateStatus inside BatchUpdateStatusReturningFallback. failTxIDs makes
-// UpdateStatus fail without changing the row.
-type fallbackSeenStore struct {
+// rowResultSeenStore is a per-row UpdateStatusReturning backend driven by
+// BatchUpdateStatusReturningParallel, the batch path Postgres, Aerospike
+// and Mongo use. failTxIDs makes the write fail without changing the row.
+type rowResultSeenStore struct {
 	mockStore
+
 	mu          sync.Mutex
 	rows        map[string]*models.TransactionStatus
 	failTxIDs   map[string]bool
 	updateCalls map[string]int
-	// loseRaceTo, when set for a txid, makes UpdateStatus leave the row at
-	// that status instead of applying the request. It models another writer
-	// landing MINED between GetStatus and UpdateStatus.
+	// loseRaceTo, when set for a txid, makes the write report the row at
+	// that status as Current instead of applying the request. It models
+	// another writer landing MINED first.
 	loseRaceTo map[string]models.Status
 	tracker    *store.TxTracker
 }
 
-func (f *fallbackSeenStore) GetStatus(_ context.Context, txid string) (*models.TransactionStatus, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	row := f.rows[txid]
-	if row == nil {
-		return nil, store.ErrNotFound
-	}
-	cp := *row
-	return &cp, nil
-}
-
-func (f *fallbackSeenStore) UpdateStatus(ctx context.Context, status *models.TransactionStatus) error {
-	_, err := f.UpdateStatusReturning(ctx, status)
-	return err
-}
-
-func (f *fallbackSeenStore) UpdateStatusReturning(_ context.Context, status *models.TransactionStatus) (store.StatusUpdate, error) {
+func (f *rowResultSeenStore) UpdateStatusReturning(_ context.Context, status *models.TransactionStatus) (store.StatusUpdate, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.updateCalls[status.TxID]++
 	if f.failTxIDs[status.TxID] {
-		return store.StatusUpdate{}, errors.New("fallback store write failed")
+		return store.StatusUpdate{}, errors.New("store write failed")
 	}
 	row := f.rows[status.TxID]
 	if row == nil {
@@ -261,17 +247,17 @@ func (f *fallbackSeenStore) UpdateStatusReturning(_ context.Context, status *mod
 	return store.StatusUpdate{Prev: &prev}, nil
 }
 
-func (f *fallbackSeenStore) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]store.StatusUpdate, error) {
-	return store.BatchUpdateStatusReturningFallback(ctx, f, statuses)
+func (f *rowResultSeenStore) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]store.StatusUpdate, error) {
+	return store.BatchUpdateStatusReturningParallel(ctx, f, statuses)
 }
 
-func (f *fallbackSeenStore) calls(txid string) int {
+func (f *rowResultSeenStore) calls(txid string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.updateCalls[txid]
 }
 
-func (f *fallbackSeenStore) status(txid string) models.Status {
+func (f *rowResultSeenStore) status(txid string) models.Status {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	row := f.rows[txid]
@@ -281,14 +267,15 @@ func (f *fallbackSeenStore) status(txid string) models.Status {
 	return row.Status
 }
 
-// TestHandleCallback_FallbackStoreFailure_DoesNotAdvanceTracker is the
-// Postgres/Aerospike durability regression. A failed UpdateStatus must not
-// look like a persisted transition: HTTP 500, tracker stays put, and the
-// retry reaches the store again. The successful retry persists and publishes
-// once.
-func TestHandleCallback_FallbackStoreFailure_DoesNotAdvanceTracker(t *testing.T) {
+// TestHandleCallback_RowWriteFailure_DoesNotAdvanceTracker is the per-row
+// durability regression for the backends driven by
+// BatchUpdateStatusReturningParallel (Postgres, Aerospike, Mongo). A failed
+// UpdateStatusReturning must not look like a persisted transition: HTTP
+// 500, tracker stays put, and the retry reaches the store again. The
+// successful retry persists and publishes once.
+func TestHandleCallback_RowWriteFailure_DoesNotAdvanceTracker(t *testing.T) {
 	const txid = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	st := &fallbackSeenStore{
+	st := &rowResultSeenStore{
 		rows: map[string]*models.TransactionStatus{
 			txid: {TxID: txid, Status: models.StatusAcceptedByNetwork, Timestamp: time.Now()},
 		},
@@ -320,7 +307,7 @@ func TestHandleCallback_FallbackStoreFailure_DoesNotAdvanceTracker(t *testing.T)
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("fallback store failure must be HTTP 500, got %d: %s", w.Code, w.Body.String())
+		t.Fatalf("row write failure must be HTTP 500, got %d: %s", w.Code, w.Body.String())
 	}
 	if got, ok := tracker.GetStatus(txid); !ok || got != models.StatusAcceptedByNetwork {
 		t.Fatalf("tracker after failed write = %s ok=%v, want ACCEPTED_BY_NETWORK", got, ok)
@@ -362,16 +349,16 @@ func TestHandleCallback_FallbackStoreFailure_DoesNotAdvanceTracker(t *testing.T)
 	}
 }
 
-// TestHandleCallback_FallbackPartialBatch_PublishesOnlyPersistedRows proves a
-// mixed batch still publishes the row whose UpdateStatus succeeded, and does
-// not advance the tracker for the row whose write failed.
-func TestHandleCallback_FallbackPartialBatch_PublishesOnlyPersistedRows(t *testing.T) {
+// TestHandleCallback_PartialBatchFailure_PublishesOnlyPersistedRows proves a
+// mixed batch still publishes the row whose write succeeded, and does not
+// advance the tracker for the row whose write failed.
+func TestHandleCallback_PartialBatchFailure_PublishesOnlyPersistedRows(t *testing.T) {
 	const (
 		okTx   = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 		failTx = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 	)
 	now := time.Now()
-	st := &fallbackSeenStore{
+	st := &rowResultSeenStore{
 		rows: map[string]*models.TransactionStatus{
 			okTx:   {TxID: okTx, Status: models.StatusAcceptedByNetwork, Timestamp: now},
 			failTx: {TxID: failTx, Status: models.StatusAcceptedByNetwork, Timestamp: now},
@@ -404,7 +391,7 @@ func TestHandleCallback_FallbackPartialBatch_PublishesOnlyPersistedRows(t *testi
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("partial fallback failure must be HTTP 500, got %d: %s", w.Code, w.Body.String())
+		t.Fatalf("partial batch failure must be HTTP 500, got %d: %s", w.Code, w.Body.String())
 	}
 	if st.status(okTx) != models.StatusSeenOnNetwork {
 		t.Fatalf("persisted row = %s, want SEEN_ON_NETWORK", st.status(okTx))
@@ -479,7 +466,7 @@ func TestHandleCallback_StalePreimageRace_DoesNotRegressTracker(t *testing.T) {
 	const txid = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	tracker := store.NewTxTracker()
 	tracker.Add(txid, models.StatusAcceptedByNetwork)
-	st := &fallbackSeenStore{
+	st := &rowResultSeenStore{
 		rows: map[string]*models.TransactionStatus{
 			txid: {TxID: txid, Status: models.StatusAcceptedByNetwork, Timestamp: time.Unix(0, 2)},
 		},
@@ -542,9 +529,10 @@ func TestHandleCallback_ConcurrentDuplicate_PublishesOnce(t *testing.T) {
 
 	const txid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	ctx := context.Background()
-	if _, _, err := st.GetOrInsertStatus(ctx, &models.TransactionStatus{
+	_, _, err = st.GetOrInsertStatus(ctx, &models.TransactionStatus{
 		TxID: txid, Status: models.StatusAcceptedByNetwork, Timestamp: time.Now().Add(-time.Second),
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
 	tracker := store.NewTxTracker()
