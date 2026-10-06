@@ -421,16 +421,30 @@ func (s *Server) handleCallback(c *gin.Context) {
 
 	switch msg.Type {
 	case models.CallbackSeenOnNetwork:
-		s.handleSeenOnNetwork(c, msg, logger)
+		if err := s.handleSeenOnNetwork(c, msg, logger); err != nil {
+			// 500, not 4xx: the callback itself was valid. Merkle retries
+			// non-2xx and treats 2xx as delivered, so a store failure must
+			// not look like success. Matches the STUMP storage-error path.
+			c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to store seen status"})
+			return
+		}
 		c.Status(http.StatusOK)
 	case models.CallbackSeenMultipleNodes:
-		s.handleSeenMultipleNodes(c, msg, logger)
+		if err := s.handleSeenMultipleNodes(c, msg, logger); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to store seen status"})
+			return
+		}
 		c.Status(http.StatusOK)
 	case models.CallbackStump:
 		s.handleStump(c, msg, logger)
 	case models.CallbackBlockProcessed:
 		s.handleBlockProcessed(c, msg, logger)
 	default:
+		// Unknown types stay 200 on purpose. Merkle retries non-2xx, so a
+		// 5xx would retry forever a message this build will never apply,
+		// and a 4xx can permanently reject a delivery. The type is logged;
+		// no lifecycle row is written. A later build that understands the
+		// type still receives new callbacks of that type.
 		logger.Warn("unknown callback type")
 		c.Status(http.StatusOK)
 	}
@@ -449,22 +463,28 @@ func (s *Server) handleCallback(c *gin.Context) {
 // 100 TPS with merkle-service batching ~50 txids per callback that was
 // ~50× the work per callback. See plan: RECEIVED → SEEN_ON_NETWORK
 // Latency.
-func (s *Server) handleSeenOnNetwork(c *gin.Context, msg models.CallbackMessage, logger *zap.Logger) {
-	s.applySeenCallback(c, msg, logger, models.StatusSeenOnNetwork, "SEEN_ON_NETWORK")
+func (s *Server) handleSeenOnNetwork(c *gin.Context, msg models.CallbackMessage, logger *zap.Logger) error {
+	return s.applySeenCallback(c, msg, logger, models.StatusSeenOnNetwork, "SEEN_ON_NETWORK")
 }
 
-// handleSeenMultipleNodes applies a SEEN_ON_MULTIPLE_NODES callback. Same
+// handleSeenMultipleNodes applies a SEEN_MULTIPLE_NODES callback. Same
 // unknown-txid handling as handleSeenOnNetwork — the store rejects updates
 // to absent rows (F-033 / #91) and we log + continue rather than creating
 // phantom rows.
-func (s *Server) handleSeenMultipleNodes(c *gin.Context, msg models.CallbackMessage, logger *zap.Logger) {
-	s.applySeenCallback(c, msg, logger, models.StatusSeenMultipleNodes, "SEEN_MULTIPLE_NODES")
+func (s *Server) handleSeenMultipleNodes(c *gin.Context, msg models.CallbackMessage, logger *zap.Logger) error {
+	return s.applySeenCallback(c, msg, logger, models.StatusSeenMultipleNodes, "SEEN_MULTIPLE_NODES")
 }
 
 // applySeenCallback is the shared body of the two "seen" callback paths.
 // targetStatus is the status to transition each known txid to;
 // metricLabel is the type label used on the callback metrics.
-func (s *Server) applySeenCallback(c *gin.Context, msg models.CallbackMessage, logger *zap.Logger, targetStatus models.Status, metricLabel string) {
+//
+// A non-nil error means the batch store write failed. The caller must
+// answer the HTTP request with a retriable 5xx so Merkle delivers the
+// callback again. Rows that did land before the error are still published;
+// a retry is idempotent because the status lattice skips a tx that is
+// already at targetStatus or past it.
+func (s *Server) applySeenCallback(c *gin.Context, msg models.CallbackMessage, logger *zap.Logger, targetStatus models.Status, metricLabel string) error {
 	start := time.Now()
 	outcome := "success"
 	defer func() {
@@ -474,7 +494,7 @@ func (s *Server) applySeenCallback(c *gin.Context, msg models.CallbackMessage, l
 	txids := msg.ResolveSeenTxIDs()
 	metrics.CallbackBatchSize.WithLabelValues(metricLabel).Observe(float64(len(txids)))
 	if len(txids) == 0 {
-		return
+		return nil
 	}
 
 	ctx := c.Request.Context()
@@ -508,55 +528,69 @@ func (s *Server) applySeenCallback(c *gin.Context, msg models.CallbackMessage, l
 		keptTxIDs = append(keptTxIDs, txid)
 	}
 	if len(statuses) == 0 {
-		return
+		return nil
 	}
 
-	prevs, err := s.store.BatchUpdateStatusReturning(ctx, statuses)
+	updates, err := s.store.BatchUpdateStatusReturning(ctx, statuses)
 	if err != nil {
 		outcome = "error"
-		logger.Warn(
+		logger.Error(
 			"batch update seen status failed",
 			zap.String("type", metricLabel),
 			zap.Int("batch_size", len(txids)),
 			zap.Error(err),
 		)
-		// Continue: per-row errors are nil-prev in the slice; we still want
-		// to publish successful transitions if any.
+		// Rows that landed before the error are still published below.
+		// The error is returned so the HTTP handler answers 500 and Merkle
+		// retries. A retry is safe: the lattice no-ops txids already at
+		// targetStatus. outcome stays "error" even if some results are
+		// empty, so the duration histogram does not report a partial success.
 	}
 
 	successful := make([]string, 0, len(statuses))
-	for i, prev := range prevs {
-		if prev == nil {
-			outcome = "partial"
-			metrics.CallbackUnknownTxIDTotal.WithLabelValues(metricLabel).Inc()
-			logger.Warn("dropping callback for unknown txid",
-				zap.String("type", metricLabel),
-				logfields.TxID(keptTxIDs[i]))
+	for i, upd := range updates {
+		if upd.Applied() {
+			// Observe transition age — the headline metric the user asked for.
+			// Use the previous row's Timestamp (last-update wall-clock) as the
+			// anchor; for the RECEIVED→SEEN_ON_NETWORK case it equals the
+			// time the validator marked the tx RECEIVED, which is exactly
+			// the latency we want to optimize against.
+			if !upd.Prev.Timestamp.IsZero() {
+				metrics.StatusTransitionAge.
+					WithLabelValues(string(upd.Prev.Status), string(targetStatus)).
+					Observe(time.Since(upd.Prev.Timestamp).Seconds())
+			}
+			// An applied idempotent re-assert: the row was already at
+			// targetStatus, so there is no transition to fan out. A non-nil
+			// Prev already implies the lattice allowed the move.
+			if upd.Prev.Status == targetStatus {
+				metrics.CallbackStaleTotal.WithLabelValues(metricLabel, string(upd.Prev.Status)).Inc()
+				continue
+			}
+			successful = append(successful, keptTxIDs[i])
+			if s.txTracker != nil {
+				s.txTracker.UpdateStatus(keptTxIDs[i], targetStatus)
+			}
 			continue
 		}
-		// Observe transition age — the headline metric the user asked for.
-		// Use the previous row's Timestamp (last-update wall-clock) as the
-		// anchor; for the RECEIVED→SEEN_ON_NETWORK case it equals the
-		// time the validator marked the tx RECEIVED, which is exactly
-		// the latency we want to optimize against.
-		if !prev.Timestamp.IsZero() {
-			metrics.StatusTransitionAge.
-				WithLabelValues(string(prev.Status), string(targetStatus)).
-				Observe(time.Since(prev.Timestamp).Seconds())
-		}
-		// Status lattice skipped the update — no transition to fan out.
-		// Record the stale-callback signal so an operator can alert on
-		// upstream rate without parsing the store_updatestatus histogram.
-		// Two stale sub-cases: prev == target (duplicate callback) and
-		// target not reachable from prev (e.g. MINED → SEEN_ON_NETWORK).
-		if prev.Status == targetStatus || !targetStatus.CanTransitionFrom(prev.Status) {
-			metrics.CallbackStaleTotal.WithLabelValues(metricLabel, string(prev.Status)).Inc()
+		if upd.Current != nil {
+			// Known row, transition not applied. Do not publish, do not
+			// move txTracker, and do not count the txid as unknown.
+			metrics.CallbackStaleTotal.WithLabelValues(metricLabel, string(upd.Current.Status)).Inc()
 			continue
 		}
-		successful = append(successful, keptTxIDs[i])
-		if s.txTracker != nil {
-			s.txTracker.UpdateStatus(keptTxIDs[i], targetStatus)
+		// Genuinely absent, or a per-row failure inside a batch error.
+		// Failed rows are indistinguishable from unknown txids. Do not
+		// count them as unknown: the HTTP handler returns 500 and Merkle
+		// retries.
+		if outcome == "error" {
+			continue
 		}
+		outcome = "partial"
+		metrics.CallbackUnknownTxIDTotal.WithLabelValues(metricLabel).Inc()
+		logger.Warn("dropping callback for unknown txid",
+			zap.String("type", metricLabel),
+			logfields.TxID(keptTxIDs[i]))
 	}
 
 	// Full-coverage SEEN line(s): this callback path is driven by
@@ -593,6 +627,7 @@ func (s *Server) applySeenCallback(c *gin.Context, msg models.CallbackMessage, l
 			)
 		}
 	}
+	return err
 }
 
 func (s *Server) handleStump(c *gin.Context, msg models.CallbackMessage, logger *zap.Logger) {

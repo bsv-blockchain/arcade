@@ -184,14 +184,13 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 	return err
 }
 
-// UpdateStatusReturning is UpdateStatus plus the row as it stood before the
-// write (or the row the lattice rejected against). One round trip on the
-// common path: the lattice guard rides in the filter and findAndModify
-// returns the pre-image. A zero match with a guard needs one probe to tell
+// UpdateStatusReturning is UpdateStatus plus the applied-result. Prev is
+// the row this call wrote over. Current is the durable row when the lattice
+// skipped the write. A zero match with a guard needs one probe to tell
 // "absent" from "blocked".
-func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.TransactionStatus) (*models.TransactionStatus, error) {
+func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.TransactionStatus) (store.StatusUpdate, error) {
 	if status == nil {
-		return nil, errors.New("mongodb: update status: nil status")
+		return store.StatusUpdate{}, errors.New("mongodb: update status: nil status")
 	}
 	if status.TxID == "" {
 		// An empty txid can never name a row, so it is "unknown", the same
@@ -199,7 +198,7 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 		// malformed entry fail a whole BatchUpdateStatusReturning call whose
 		// other rows were applied — the shared batch helper maps ErrNotFound
 		// to a nil pre-image and carries on.
-		return nil, store.ErrNotFound
+		return store.StatusUpdate{}, store.ErrNotFound
 	}
 	start := time.Now()
 	fromLabel, outcome := "", outcomeError
@@ -218,25 +217,25 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 		options.FindOneAndUpdate().SetReturnDocument(options.Before).SetProjection(projNoRawTx)).Decode(&before)
 	if err == nil {
 		fromLabel, outcome = before.Status, outcomeApplied
-		return before.toStatus(), nil
+		return store.StatusUpdate{Prev: before.toStatus()}, nil
 	}
 	if !errors.Is(err, mongo.ErrNoDocuments) {
-		return nil, fmt.Errorf("update tx %s: %w", status.TxID, err)
+		return store.StatusUpdate{}, fmt.Errorf("update tx %s: %w", status.TxID, err)
 	}
 	if len(guard) == 0 {
 		outcome = outcomeNotFound
-		return nil, store.ErrNotFound
+		return store.StatusUpdate{}, store.ErrNotFound
 	}
 	err = s.tx.FindOne(octx, idFilter(status.TxID), options.FindOne().SetProjection(projNoRawTx)).Decode(&before)
 	if errors.Is(err, mongo.ErrNoDocuments) {
 		outcome = outcomeNotFound
-		return nil, store.ErrNotFound
+		return store.StatusUpdate{}, store.ErrNotFound
 	}
 	if err != nil {
-		return nil, fmt.Errorf("update tx %s: existence probe: %w", status.TxID, err)
+		return store.StatusUpdate{}, fmt.Errorf("update tx %s: existence probe: %w", status.TxID, err)
 	}
 	fromLabel, outcome = before.Status, outcomeSkippedLattice
-	return before.toStatus(), nil
+	return store.StatusUpdate{Current: before.toStatus()}, nil
 }
 
 // BatchUpdateStatus implements store.Store as one unordered bulk write per
@@ -265,7 +264,7 @@ func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.Transa
 
 // BatchUpdateStatusReturning implements store.Store over the fused
 // UpdateStatusReturning, so each row costs one round trip, not two.
-func (s *Store) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
+func (s *Store) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]store.StatusUpdate, error) {
 	return store.BatchUpdateStatusReturningParallel(ctx, s, statuses)
 }
 
