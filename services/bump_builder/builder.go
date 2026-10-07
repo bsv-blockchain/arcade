@@ -535,7 +535,9 @@ func (b *Builder) Start(ctx context.Context) error {
 	// never get cleaned up by the normal flow.
 	go b.pruneOrphanStumps(ctx)
 
-	// The consumer group exists; Run blocks until shutdown. The janitor
+	// Readiness: the consumer group is constructed (brokers reachable); Run
+	// blocks until shutdown, so the signal precedes the actual group join
+	// and a persistent join failure is not reflected in /ready. The janitor
 	// above is best-effort cleanup and does not gate readiness.
 	b.SignalReady()
 	return consumer.Run(ctx)

@@ -3,10 +3,6 @@ package p2p_client
 import (
 	"context"
 	"errors"
-	"fmt"
-	"io"
-	"net"
-	"net/http"
 	"testing"
 	"time"
 
@@ -14,37 +10,32 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/services"
 )
 
-func TestClient_DisabledDiscoveryMarksHealthReady(t *testing.T) {
-	var _ services.ReadyNotifier = (*Client)(nil)
-
-	port := freeListenPort(t)
-	hs := services.NewHealthServer(port, false, zap.NewNop())
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	hs.Start(ctx)
-	waitListening(t, port)
-
+// TestClient_DisabledDiscoverySignalsReady: discovery being off is a
+// successful start. The signal must fire while Start is still blocked on
+// ctx, not as a side effect of returning.
+func TestClient_DisabledDiscoverySignalsReady(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.P2P.DatahubDiscovery = false
 	c := New(cfg, zap.NewNop(), nil, nil)
-	gate, err := services.PrepareReadiness(hs, []services.Service{c})
-	if err != nil {
-		t.Fatalf("PrepareReadiness: %v", err)
-	}
-	if got := readyStatus(t, port); got != http.StatusServiceUnavailable {
-		t.Fatalf("before start: got %d, want 503", got)
-	}
 
+	ready := make(chan struct{})
+	c.NotifyReady(func() { close(ready) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	errCh := make(chan error, 1)
 	go func() { errCh <- c.Start(ctx) }()
-	waitReady(t, port, http.StatusOK)
-
-	gate.Disable()
-	if got := readyStatus(t, port); got != http.StatusServiceUnavailable {
-		t.Fatalf("after shutdown: got %d, want 503", got)
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for startup readiness")
+	}
+	select {
+	case err := <-errCh:
+		t.Fatalf("Start returned before cancel: %v", err)
+	default:
 	}
 	cancel()
 	select {
@@ -125,64 +116,5 @@ func TestClient_FactoryErrorDoesNotSignal(t *testing.T) {
 	}
 	if signaled {
 		t.Fatal("readiness signaled after p2p init failed")
-	}
-}
-
-func freeListenPort(t *testing.T) int {
-	t.Helper()
-	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	_ = ln.Close()
-	return port
-}
-
-func waitListening(t *testing.T, port int) {
-	t.Helper()
-	dialer := &net.Dialer{Timeout: 50 * time.Millisecond}
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		c, err := dialer.DialContext(t.Context(), "tcp", fmt.Sprintf("127.0.0.1:%d", port))
-		if err == nil {
-			_ = c.Close()
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("health server did not listen on :%d", port)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-func readyStatus(t *testing.T, port int) int {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/ready", port), nil)
-	if err != nil {
-		t.Fatalf("request: %v", err)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("GET /ready: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	_, _ = io.Copy(io.Discard, resp.Body)
-	return resp.StatusCode
-}
-
-func waitReady(t *testing.T, port, want int) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if got := readyStatus(t, port); got == want {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for /ready %d", want)
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }

@@ -9,13 +9,10 @@ import (
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/kafka"
-	"github.com/bsv-blockchain/arcade/services"
 	"github.com/bsv-blockchain/arcade/store"
 )
 
 func TestPropagator_StartSignalsReadyAfterConsumer(t *testing.T) {
-	var _ services.ReadyNotifier = (*Propagator)(nil)
-
 	broker := kafka.NewMemoryBroker(8)
 	t.Cleanup(func() { _ = broker.Close() })
 	cfg := &config.Config{}

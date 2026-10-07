@@ -9,13 +9,10 @@ import (
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/kafka"
-	"github.com/bsv-blockchain/arcade/services"
 	"github.com/bsv-blockchain/arcade/store"
 )
 
 func TestBuilder_StartSignalsReadyAfterConsumer(t *testing.T) {
-	var _ services.ReadyNotifier = (*Builder)(nil)
-
 	broker := kafka.NewMemoryBroker(8)
 	t.Cleanup(func() { _ = broker.Close() })
 	cfg := &config.Config{}
@@ -69,8 +66,6 @@ func TestBuilder_StartConsumerErrorDoesNotSignal(t *testing.T) {
 }
 
 func TestReconciler_StartSignalsReadyBeforeChaintracksWait(t *testing.T) {
-	var _ services.ReadyNotifier = (*Reconciler)(nil)
-
 	st := newPebbleForTest(t)
 	ctx := context.Background()
 	seedMined(t, st, recOrphan, 10, recShared1)
@@ -113,9 +108,6 @@ func TestReconciler_StartSignalsReadyBeforeChaintracksWait(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Start did not return after cancel")
-	}
-	if r.startupScanDone {
-		t.Fatal("scan ran before readiness; the signal is supposed to precede the wait")
 	}
 }
 

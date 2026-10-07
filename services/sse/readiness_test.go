@@ -2,10 +2,9 @@ package sse
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"net"
 	"testing"
-	"time"
 
 	"go.uber.org/zap"
 
@@ -13,17 +12,11 @@ import (
 	"github.com/bsv-blockchain/arcade/events"
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/services"
+	"github.com/bsv-blockchain/arcade/services/servicetest"
 )
 
-func TestService_StartSignalsReadyAfterListen(t *testing.T) {
-	var _ services.ReadyNotifier = (*Service)(nil)
-
-	port := freeListenPort(t)
-	broker := kafka.NewMemoryBroker(8)
-	t.Cleanup(func() { _ = broker.Close() })
-	publisher := events.NewKafkaPublisher(kafka.NewProducer(broker), zap.NewNop(), 0)
-
+func newReadinessService(t *testing.T, port int, publisher events.Publisher) *Service {
+	t.Helper()
 	cfg := &config.Config{}
 	cfg.SSE.Enabled = true
 	cfg.SSE.Host = "127.0.0.1"
@@ -37,79 +30,47 @@ func TestService_StartSignalsReadyAfterListen(t *testing.T) {
 	if svc == nil {
 		t.Fatal("New returned nil")
 	}
+	return svc
+}
 
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	ready := make(chan struct{})
-	var dialErr error
-	svc.NotifyReady(func() {
-		dialer := &net.Dialer{Timeout: time.Second}
-		c, err := dialer.DialContext(context.Background(), "tcp", addr)
-		if err != nil {
-			dialErr = err
-		} else {
-			_ = c.Close()
-		}
-		close(ready)
-	})
+func newMemoryPublisher(t *testing.T) events.Publisher {
+	t.Helper()
+	broker := kafka.NewMemoryBroker(8)
+	t.Cleanup(func() { _ = broker.Close() })
+	return events.NewKafkaPublisher(kafka.NewProducer(broker), zap.NewNop(), 0)
+}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	errCh := make(chan error, 1)
-	go func() { errCh <- svc.Start(ctx) }()
-	select {
-	case <-ready:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for startup readiness")
-	}
-	if dialErr != nil {
-		t.Fatalf("signaled before the listener was bound: %v", dialErr)
-	}
-	cancel()
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("Start: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Start did not return after cancel")
-	}
+func TestService_StartSignalsReadyAfterListen(t *testing.T) {
+	port := servicetest.FreePort(t)
+	svc := newReadinessService(t, port, newMemoryPublisher(t))
+	servicetest.AssertSignalsAfterBind(t, fmt.Sprintf("127.0.0.1:%d", port), svc.Start, svc.NotifyReady)
 }
 
 func TestService_StartListenFailureDoesNotSignal(t *testing.T) {
-	broker := kafka.NewMemoryBroker(8)
-	t.Cleanup(func() { _ = broker.Close() })
-	publisher := events.NewKafkaPublisher(kafka.NewProducer(broker), zap.NewNop(), 0)
-	cfg := &config.Config{}
-	cfg.SSE.Enabled = true
-	cfg.SSE.Host = "127.0.0.1"
-	cfg.SSE.Port = -1
-	cfg.SSE.DrainQuiesceMS = 1
-	cfg.SSE.ShutdownTimeoutMS = 200
-	svc := New(cfg, zap.NewNop(), publisher, &sseStoreStub{
-		subsByToken: map[string][]*models.Submission{},
-		statusByTx:  map[string]*models.TransactionStatus{},
-	})
-
-	signaled := false
-	svc.NotifyReady(func() { signaled = true })
-	ctx, cancel := context.WithCancel(context.Background())
-	err := svc.Start(ctx)
-	cancel()
-	if err == nil {
-		t.Fatal("expected listen failure")
-	}
-	if signaled {
-		t.Fatal("readiness signaled after listen failed")
-	}
+	svc := newReadinessService(t, -1, newMemoryPublisher(t))
+	servicetest.AssertStartFailureSilent(t, svc.Start, svc.NotifyReady)
 }
 
-func freeListenPort(t *testing.T) int {
-	t.Helper()
-	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	_ = ln.Close()
-	return port
+// TestService_SubscribeErrorDoesNotSignal covers the fallible step before
+// the bind: newManager subscribes to the events publisher, and a failure
+// there must leave readiness unsignaled.
+func TestService_SubscribeErrorDoesNotSignal(t *testing.T) {
+	svc := newReadinessService(t, servicetest.FreePort(t), subscribeErrPublisher{})
+	servicetest.AssertStartFailureSilent(t, svc.Start, svc.NotifyReady)
 }
+
+type subscribeErrPublisher struct{}
+
+func (subscribeErrPublisher) Publish(context.Context, *models.TransactionStatus) error {
+	return nil
+}
+
+func (subscribeErrPublisher) PublishBulk(context.Context, *models.TransactionStatus) error {
+	return nil
+}
+
+func (subscribeErrPublisher) Subscribe(context.Context, string) (<-chan *models.TransactionStatus, error) {
+	return nil, errors.New("broker down")
+}
+
+func (subscribeErrPublisher) Close() error { return nil }

@@ -10,12 +10,9 @@ import (
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/services"
 )
 
 func TestService_StartSignalsReadyAfterSubscribe(t *testing.T) {
-	var _ services.ReadyNotifier = (*Service)(nil)
-
 	pub := &scriptedPub{ch: make(chan *models.TransactionStatus)}
 	svc := New(config.WebhookConfig{MaxConcurrentDeliveries: 1}, config.CallbackConfig{}, zap.NewNop(), pub, nil, nil)
 

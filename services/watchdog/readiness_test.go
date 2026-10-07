@@ -8,12 +8,9 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/merkleservice"
-	"github.com/bsv-blockchain/arcade/services"
 )
 
 func TestService_StartSignalsReadyWhileRunning(t *testing.T) {
-	var _ services.ReadyNotifier = (*Service)(nil)
-
 	wd := newTestWatchdog(t, &watchdogStore{}, alwaysLeader(), merkleservice.NewClient("http://127.0.0.1:1", "tok", time.Second))
 	// A long interval keeps the test from spinning ticks after the first one.
 	wd.cfg.Interval = time.Hour

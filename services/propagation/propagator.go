@@ -1143,8 +1143,11 @@ func (p *Propagator) Start(ctx context.Context) error {
 	// Stop can proceed past <-p.initDone now that every wg.Add above has
 	// happened-before any wg.Wait Stop will perform.
 	p.initOnce.Do(func() { close(p.initDone) })
-	// Consumer group, workers, and replay/reaper are up. Run blocks for the
-	// process lifetime, so readiness cannot wait for it to return.
+	// Readiness: the consumer group is constructed (brokers reachable) and
+	// the workers and replay/reaper are up. Run blocks for the process
+	// lifetime, so readiness cannot wait for it. The signal therefore
+	// precedes the actual group join; a persistent join failure (ACL,
+	// missing topic) keeps Run retrying and is not reflected in /ready.
 	p.SignalReady()
 	return consumer.Run(ctx)
 }
