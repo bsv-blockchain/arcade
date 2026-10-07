@@ -8,6 +8,7 @@ import (
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/merkleservice"
+	"github.com/bsv-blockchain/arcade/services"
 	"github.com/bsv-blockchain/arcade/store"
 )
 
@@ -16,6 +17,8 @@ import (
 // recovery logic lives in Watchdog.Run; this layer is purely lifecycle
 // plumbing.
 type Service struct {
+	services.ReadyHook
+
 	wd     *Watchdog
 	logger *zap.Logger
 	cfg    config.WatchdogConfig
@@ -58,6 +61,8 @@ func (s *Service) Start(ctx context.Context) error {
 		zap.Duration("stale_threshold", s.wd.cfg.StaleThreshold),
 		zap.Uint64("recency_depth", s.wd.cfg.RecencyDepth),
 	)
+	// Run blocks until ctx is canceled and has no startup error path.
+	s.SignalReady()
 	s.wd.Run(ctx)
 	return nil
 }

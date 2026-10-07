@@ -18,6 +18,7 @@ import (
 	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/services"
 	"github.com/bsv-blockchain/arcade/store"
 )
 
@@ -86,6 +87,8 @@ const (
 // predating this code (the height-764 incident block on the scaling
 // cluster heals through exactly that path).
 type Reconciler struct {
+	services.ReadyHook
+
 	cfg         *config.Config
 	logger      *zap.Logger
 	store       store.Store
@@ -196,6 +199,14 @@ func (r *Reconciler) Start(ctx context.Context) error {
 	if interval <= 0 {
 		interval = 30 * time.Second
 	}
+
+	// The startup full-scan waits on chaintracks (default two minutes) and
+	// is explicitly allowed to defer. It is recovery work, not a gate on
+	// serving: holding the process readiness probe for it would keep an
+	// all-in-one pod's API out of service for that whole wait. This matches
+	// the API server, which is ready once it is listening while its
+	// background refreshers are still running.
+	r.SignalReady()
 
 	if r.cfg.BumpBuilder.Reconciler.StartupFullScan && r.acquireLease(ctx) {
 		if r.waitForChaintracksReady(ctx) {
