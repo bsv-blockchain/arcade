@@ -111,6 +111,54 @@ func TestLowestObservedFeePerKB(t *testing.T) {
 			t.Fatalf("got (%d,%v), want (80,true)", got, ok)
 		}
 	})
+
+	t.Run("zero satoshis means not advertised, not free", func(t *testing.T) {
+		// The production shape: a node with nil policy settings announces
+		// min_mining_tx_fee=0, which is the absence of a fee, not an offer to
+		// mine for nothing. It must not become the network minimum.
+		peers := []store.PeerPolicy{
+			{PeerID: "zero", MiningFeeSatoshis: 0, MiningFeeBytes: 1000, LastSeen: now},
+			{PeerID: "honest", MiningFeeSatoshis: 100, MiningFeeBytes: 1000, LastSeen: now},
+		}
+		got, peer, ok := lowestObservedFeePerKB(peers, ttl, now)
+		if !ok || got != 100 || peer != "honest" {
+			t.Fatalf("got (%d,%q,%v), want (100,\"honest\",true)", got, peer, ok)
+		}
+	})
+
+	t.Run("a network advertising no fee yields no observation", func(t *testing.T) {
+		peers := []store.PeerPolicy{
+			{PeerID: "zero", MiningFeeSatoshis: 0, MiningFeeBytes: 1000, LastSeen: now},
+		}
+		if got, _, ok := lowestObservedFeePerKB(peers, ttl, now); ok {
+			t.Fatalf("got (%d,true), want ok=false — nobody advertised a fee", got)
+		}
+	})
+
+	t.Run("an undated row is stale, not immortal", func(t *testing.T) {
+		// A row we cannot date cannot be shown to be current. Treating it as
+		// fresh lets a departed peer pin the network policy forever.
+		peers := []store.PeerPolicy{
+			{PeerID: "undated", MiningFeeSatoshis: 1, MiningFeeBytes: 1000},
+			{PeerID: "honest", MiningFeeSatoshis: 100, MiningFeeBytes: 1000, LastSeen: now},
+		}
+		got, peer, ok := lowestObservedFeePerKB(peers, ttl, now)
+		if !ok || got != 100 || peer != "honest" {
+			t.Fatalf("got (%d,%q,%v), want (100,\"honest\",true)", got, peer, ok)
+		}
+	})
+
+	t.Run("a peer that really advertises 1 sat/kB is still tracked", func(t *testing.T) {
+		// Discarding 0 must not turn into a blanket floor: 1 sat/kB is a real
+		// advertisement and mainnet has peers making it.
+		peers := []store.PeerPolicy{
+			{PeerID: "cheap", MiningFeeSatoshis: 1, MiningFeeBytes: 1000, LastSeen: now},
+		}
+		got, peer, ok := lowestObservedFeePerKB(peers, ttl, now)
+		if !ok || got != 1 || peer != "cheap" {
+			t.Fatalf("got (%d,%q,%v), want (1,\"cheap\",true)", got, peer, ok)
+		}
+	})
 }
 
 // TestHighestObservedLimit covers the size-limit counterpart of
@@ -161,6 +209,19 @@ func TestHighestObservedLimit(t *testing.T) {
 	t.Run("empty", func(t *testing.T) {
 		if _, ok := highestObservedLimit(nil, ttl, now, pickTx); ok {
 			t.Fatal("expected ok=false for empty input")
+		}
+	})
+
+	t.Run("an undated row is stale, not immortal", func(t *testing.T) {
+		// Same rule the fee aggregator applies, and for the same reason: an
+		// observation that cannot be dated must not outlive the TTL.
+		peers := []store.PeerPolicy{
+			{PeerID: "undated", MaxTxSizePolicy: 900_000_000},
+			{PeerID: "modern", MaxTxSizePolicy: 20_000_000, LastSeen: now},
+		}
+		got, ok := highestObservedLimit(peers, ttl, now, pickTx)
+		if !ok || got != 20_000_000 {
+			t.Fatalf("got (%d,%v), want (20000000,true)", got, ok)
 		}
 	})
 
@@ -425,14 +486,16 @@ func TestConfigDefaultsMatchValidatorDefaults(t *testing.T) {
 }
 
 // TestDiscoveredFeePerKB is the regression for a production report: /policy
-// advertised miningFee 0 sat/kB while every endpoint in /health advertised 100.
+// advertised a miningFee far below what every endpoint in /health advertised —
+// first 0 sat/kB, then 1 once the 0 was clamped rather than discarded.
 //
-// The rule is a bare minimum over unauthenticated gossip, so one peer at 0 —
-// misconfigured, or a node with nil policy settings, which teranode advertises
-// as min_mining_tx_fee=0 — silently disabled fee enforcement for the whole
-// instance. The floor is the fee's counterpart to the one discoveredLimit
-// applies to the size limits: discovery may track the cheapest node all the way
-// to 1 sat/kB, but only an explicit accept_zero_fee may produce a 0 floor.
+// Both readings were wrong in the same way. A peer advertising 0 has not
+// offered to mine for free, it has advertised nothing: teranode reports
+// min_mining_tx_fee=0 whenever its policy settings are nil, and the legacy
+// BSV/kB path converts that 0.0 straight through. Such a row is discarded, on
+// exactly the terms highestObservedLimit discards a 0 size limit. If no fresh
+// peer advertised a fee at all, the built-in default applies; only an explicit
+// accept_zero_fee may produce a 0 floor.
 func TestDiscoveredFeePerKB(t *testing.T) {
 	now := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
 	ttl := 15 * time.Minute
@@ -452,22 +515,22 @@ func TestDiscoveredFeePerKB(t *testing.T) {
 			want: 100, wantPeer: "p2",
 		},
 		{
-			name: "a single zero-fee peer cannot disable fee enforcement",
+			name: "a peer advertising no fee is discarded, not clamped",
 			peers: []store.PeerPolicy{
 				{PeerID: "honest", MiningFeeSatoshis: 100, MiningFeeBytes: 1000, LastSeen: now},
 				{PeerID: "zero", MiningFeeSatoshis: 0, MiningFeeBytes: 1000, LastSeen: now},
 			},
-			want: minDiscoveredFeePerKB, wantPeer: "zero",
+			want: 100, wantPeer: "honest",
 		},
 		{
-			name: "a whole network at zero still floors at the minimum",
+			name: "a network where nobody advertised a fee falls back to the built-in default",
 			peers: []store.PeerPolicy{
 				{PeerID: "zero", MiningFeeSatoshis: 0, MiningFeeBytes: 1000, LastSeen: now},
 			},
-			want: minDiscoveredFeePerKB, wantPeer: "zero",
+			want: uint64(config.DefaultValidatorMinFeePerKB), wantPeer: "",
 		},
 		{
-			name: "one satoshi per kB is above the floor and passes through",
+			name: "one satoshi per kB is a real advertisement and passes through",
 			peers: []store.PeerPolicy{
 				{PeerID: "cheap", MiningFeeSatoshis: 1, MiningFeeBytes: 1000, LastSeen: now},
 			},
@@ -502,10 +565,10 @@ func TestDiscoveredFeePerKB(t *testing.T) {
 	}
 }
 
-// TestRefreshPolicyOnce_ZeroFeePeerDoesNotZeroTheFloor is the same guarantee
+// TestRefreshPolicyOnce_UnadvertisedFeeDoesNotSetTheFloor is the same guarantee
 // end to end through the refresher and the validator, since that is where the
 // production symptom was visible: GET /policy reads the validator's floor.
-func TestRefreshPolicyOnce_ZeroFeePeerDoesNotZeroTheFloor(t *testing.T) {
+func TestRefreshPolicyOnce_UnadvertisedFeeDoesNotSetTheFloor(t *testing.T) {
 	s := newPolicyServer(&mockStore{peerPolicies: []store.PeerPolicy{
 		freshPolicy("honest", 100, 100_000_000, 500_000),
 		freshPolicy("zero", 0, 100_000_000, 500_000),
@@ -513,13 +576,52 @@ func TestRefreshPolicyOnce_ZeroFeePeerDoesNotZeroTheFloor(t *testing.T) {
 
 	s.refreshPolicyOnce(context.Background())
 
-	if got := s.validator.MinFeePerKB(); got != minDiscoveredFeePerKB {
-		t.Errorf("intake fee floor = %d, want %d — a zero-fee peer must not "+
-			"make arcade accept transactions no node will mine", got, minDiscoveredFeePerKB)
+	if got := s.validator.MinFeePerKB(); got != 100 {
+		t.Errorf("intake fee floor = %d, want 100 — a peer that advertised no "+
+			"fee must not set the floor for the peers that did", got)
 	}
 	// The size limits still track normally.
 	if got := s.validator.MaxTxSizePolicy(); got != 100_000_000 {
 		t.Errorf("MaxTxSizePolicy = %d, want 100000000", got)
+	}
+}
+
+// TestRefreshPolicyOnce_NobodyAdvertisedAFeeUsesTheDefault covers the case the
+// one above cannot: with no honest peer to fall back to, the built-in default
+// applies rather than some value derived from the non-advertisements.
+func TestRefreshPolicyOnce_NobodyAdvertisedAFeeUsesTheDefault(t *testing.T) {
+	s := newPolicyServer(&mockStore{peerPolicies: []store.PeerPolicy{
+		freshPolicy("nil-policy-a", 0, 100_000_000, 500_000),
+		freshPolicy("nil-policy-b", 0, 100_000_000, 500_000),
+	}})
+
+	s.refreshPolicyOnce(context.Background())
+
+	if got := s.validator.MinFeePerKB(); got != config.DefaultValidatorMinFeePerKB {
+		t.Errorf("intake fee floor = %d, want %d (built-in default)",
+			got, config.DefaultValidatorMinFeePerKB)
+	}
+}
+
+// TestRefreshPolicyOnce_MainnetRegression reproduces the exact production shape
+// recorded in peer_policies on arcade-v2 mainnet: six datahub peers advertising
+// 100 sat/kB alongside one node announcing no fee at all. Before this fix the
+// single non-advertisement won the minimum and /policy told wallets to build
+// transactions at 1 sat/kB while /health showed every peer requiring 100.
+func TestRefreshPolicyOnce_MainnetRegression(t *testing.T) {
+	datahubs := []string{"dh-1", "dh-2", "dh-3", "dh-4", "dh-5", "dh-6"}
+	peers := make([]store.PeerPolicy, 0, len(datahubs)+1)
+	peers = append(peers, freshPolicy("nil-policy-node", 0, 0, 0))
+	for _, id := range datahubs {
+		peers = append(peers, freshPolicy(id, 100, 100_000_000, 500_000))
+	}
+	s := newPolicyServer(&mockStore{peerPolicies: peers})
+
+	s.refreshPolicyOnce(context.Background())
+
+	if got := s.validator.MinFeePerKB(); got != 100 {
+		t.Errorf("intake fee floor = %d, want 100 — /policy must advertise what "+
+			"the datahub peers in /health actually require", got)
 	}
 }
 

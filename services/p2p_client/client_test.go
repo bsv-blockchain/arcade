@@ -12,10 +12,12 @@ import (
 
 	p2pclient "github.com/bsv-blockchain/go-teranode-p2p-client"
 	teranodep2p "github.com/bsv-blockchain/teranode/services/p2p"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
 
 	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/store"
 )
 
@@ -454,7 +456,7 @@ func TestRecordPeerPolicy_FeePolicy(t *testing.T) {
 		PeerID:    "peer-1",
 		BaseURL:   testPeerURL,
 		FeePolicy: &teranodep2p.FeePolicy{MiningFee: teranodep2p.FeeAmount{Satoshis: 75, Bytes: 1000}},
-	})
+	}, testPeerURL)
 
 	fees := w.feeSnapshot()
 	if len(fees) != 1 {
@@ -476,7 +478,7 @@ func TestRecordPeerPolicy_LegacyMinMiningTxFee(t *testing.T) {
 	c.recordPeerPolicy(context.Background(), teranodep2p.NodeStatusMessage{
 		PeerID:         "peer-2",
 		MinMiningTxFee: &fee,
-	})
+	}, testPeerURL)
 
 	fees := w.feeSnapshot()
 	if len(fees) != 1 {
@@ -554,11 +556,37 @@ func TestPeerPolicyOnlyRecordedForRegisteredURLs(t *testing.T) {
 	}
 }
 
+// TestRecordPeerPolicy_GaugeCoversPropagationOnlyPeers is the regression for a
+// production fee floor that could not be explained from outside the cluster.
+//
+// The per-peer gauges used to be labelled by msg.BaseURL, but the store row
+// they accompany — and so the network minimum GET /policy derives from it — is
+// keyed off pickDatahubURL, which prefers PropagationURL. A peer announcing
+// only a propagation URL therefore set the floor for the whole instance while
+// appearing in no gauge at all, leaving an operator looking at a floor of 1
+// alongside six visible peers all advertising 100.
+func TestRecordPeerPolicy_GaugeCoversPropagationOnlyPeers(t *testing.T) {
+	const propURL = "https://prop-only.example/api/v1"
+	metrics.P2PPeerMinMiningFee.DeleteLabelValues(propURL)
+
+	c, _ := newTestClient(t, newFakeTeraClient(testPeerID))
+	c.recordPeerPolicy(context.Background(), teranodep2p.NodeStatusMessage{
+		PeerID:         "peer-prop-only",
+		PropagationURL: propURL,
+		FeePolicy:      &teranodep2p.FeePolicy{MiningFee: teranodep2p.FeeAmount{Satoshis: 100, Bytes: 1000}},
+	}, propURL)
+
+	if got := testutil.ToFloat64(metrics.P2PPeerMinMiningFee.WithLabelValues(propURL)); got != 100 {
+		t.Errorf("gauge for a propagation-only peer = %v, want 100 — every peer "+
+			"that can set the network fee floor must be visible in metrics", got)
+	}
+}
+
 // TestRecordPeerPolicy_NoFeeAdvertised verifies peers advertising no fee (old
 // nodes) are skipped rather than recorded with a zero fee.
 func TestRecordPeerPolicy_NoFeeAdvertised(t *testing.T) {
 	c, w := newTestClient(t, newFakeTeraClient(testPeerID))
-	c.recordPeerPolicy(context.Background(), teranodep2p.NodeStatusMessage{PeerID: "peer-4"})
+	c.recordPeerPolicy(context.Background(), teranodep2p.NodeStatusMessage{PeerID: "peer-4"}, "")
 	if fees := w.feeSnapshot(); len(fees) != 0 {
 		t.Fatalf("expected no fee upsert for feeless peer, got %+v", fees)
 	}
@@ -575,7 +603,7 @@ func TestRecordPeerPolicy_RejectsMalformedLegacyFee(t *testing.T) {
 		c.recordPeerPolicy(context.Background(), teranodep2p.NodeStatusMessage{
 			PeerID:         "peer-bad",
 			MinMiningTxFee: &f,
-		})
+		}, "")
 		if fees := w.feeSnapshot(); len(fees) != 0 {
 			t.Errorf("fee=%v: expected no upsert for malformed fee, got %+v", f, fees)
 		}
@@ -595,7 +623,7 @@ func TestRecordPeerPolicy_RecordsSizeLimits(t *testing.T) {
 			MaxTxSizePolicy:     100_000_000,
 			MaxScriptSizePolicy: 500_000,
 		},
-	})
+	}, testPeerURL)
 
 	fees := w.feeSnapshot()
 	if len(fees) != 1 {
@@ -620,7 +648,7 @@ func TestRecordPeerPolicy_LegacyPeerLeavesSizesUnset(t *testing.T) {
 	c.recordPeerPolicy(context.Background(), teranodep2p.NodeStatusMessage{
 		PeerID:         "peer-legacy",
 		MinMiningTxFee: &fee,
-	})
+	}, testPeerURL)
 
 	fees := w.feeSnapshot()
 	if len(fees) != 1 {
@@ -646,7 +674,7 @@ func TestRecordPeerPolicy_UnstorableSizeKeepsFee(t *testing.T) {
 			MaxTxSizePolicy:     math.MaxUint64,
 			MaxScriptSizePolicy: math.MaxUint64,
 		},
-	})
+	}, testPeerURL)
 
 	fees := w.feeSnapshot()
 	if len(fees) != 1 {
