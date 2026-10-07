@@ -78,6 +78,7 @@ type storedStatus struct {
 	TimestampUnixNs        int64                  `json:"ts"`
 	CreatedUnixNs          int64                  `json:"created_at,omitempty"`
 	NextRetryUnixNs        int64                  `json:"next_retry_at,omitempty"`
+	RetryReason            string                 `json:"retry_reason,omitempty"`
 	MerkleRegisteredUnixNs int64                  `json:"merkle_registered_at,omitempty"`
 	OrphanedAnchors        []storedOrphanedAnchor `json:"orphaned_anchors,omitempty"`
 }
@@ -426,7 +427,7 @@ func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.Transa
 // budget as BatchUpdateStatus; per-row previous rows are returned in input
 // order so callers can observe transition-age metrics without an extra
 // round-trip per txid.
-func (s *Store) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
+func (s *Store) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]store.StatusUpdate, error) {
 	return store.BatchUpdateStatusReturningParallel(ctx, s, statuses)
 }
 
@@ -447,17 +448,17 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 	return err
 }
 
-// UpdateStatusReturning is UpdateStatus + an extra return: the previous row
-// the merge was applied to (or that the lattice rejected against). Returns
-// nil-previous for transient errors / ctx-cancel; the caller observing a
-// transition-age metric should branch on previous != nil.
+// UpdateStatusReturning is UpdateStatus plus the applied-result. Prev is
+// the row this call wrote over. Current is the durable row when the lattice
+// skipped the write; that row is known, and it is not a transition a caller
+// may publish. Transient errors and ctx-cancel return an empty result.
 //
 // Hoists the JSON marshal of the merged payload OUT of the per-shard lock
 // so the critical section is bounded to Pebble I/O + index updates. This is
 // the hot-path optimization called out in the latency plan.
-func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.TransactionStatus) (*models.TransactionStatus, error) {
+func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.TransactionStatus) (store.StatusUpdate, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return store.StatusUpdate{}, err
 	}
 
 	timerStart := time.Now()
@@ -477,13 +478,13 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 	if err != nil {
 		mu.Unlock()
 		outcome = "error"
-		return nil, err
+		return store.StatusUpdate{}, err
 	}
 	if existing == nil {
 		mu.Unlock()
 		outcome = "not_found"
 		// Don't create phantom rows. See F-033 / issue #91.
-		return nil, store.ErrNotFound
+		return store.StatusUpdate{}, store.ErrNotFound
 	}
 	fromLabel = existing.Status
 
@@ -495,7 +496,9 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 		if !status.Status.CanTransitionFrom(models.Status(existing.Status)) {
 			mu.Unlock()
 			outcome = "skipped_lattice"
-			return existing.toModel(), nil
+			// Known row, transition not applied. Current is the durable
+			// status; Prev stays nil so callers do not publish.
+			return store.StatusUpdate{Current: existing.toModel()}, nil
 		}
 	}
 
@@ -510,7 +513,7 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 	if err != nil {
 		mu.Unlock()
 		outcome = "error"
-		return existing.toModel(), err
+		return store.StatusUpdate{}, err
 	}
 
 	b := s.db.NewBatch()
@@ -519,7 +522,7 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 		_ = b.Close()
 		mu.Unlock()
 		outcome = "error"
-		return existing.toModel(), err
+		return store.StatusUpdate{}, err
 	}
 	s.addStatusIndexes(b, merged)
 	commitErr := b.Commit(s.writeOpts)
@@ -528,8 +531,9 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 
 	if commitErr != nil {
 		outcome = "error"
+		return store.StatusUpdate{}, commitErr
 	}
-	return existing.toModel(), commitErr
+	return store.StatusUpdate{Prev: existing.toModel()}, nil
 }
 
 // mergeStatus applies the fields set on update onto existing. Empty strings,
@@ -946,7 +950,7 @@ func (s *Store) BumpRetryCount(ctx context.Context, txid string) (int, error) {
 	return existing.RetryCount, nil
 }
 
-func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time) error {
+func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time, lastReason string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -975,6 +979,7 @@ func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []
 	updated.RawTx = rawTx
 	updated.NextRetryUnixNs = nextRetryAt.UnixNano()
 	updated.TimestampUnixNs = time.Now().UnixNano()
+	updated.RetryReason = lastReason
 
 	payload, err := json.Marshal(updated)
 	if err != nil {
@@ -1059,6 +1064,7 @@ func (s *Store) GetReadyRetries(ctx context.Context, now time.Time, limit int) (
 			RawTx:       st.RawTx,
 			RetryCount:  st.RetryCount,
 			NextRetryAt: time.Unix(0, st.NextRetryUnixNs),
+			LastReason:  st.RetryReason,
 		})
 	}
 	return results, nil
@@ -1085,6 +1091,7 @@ func (s *Store) ClearRetryState(ctx context.Context, txid string, finalStatus mo
 	updated.TimestampUnixNs = time.Now().UnixNano()
 	updated.RawTx = nil
 	updated.NextRetryUnixNs = 0
+	updated.RetryReason = ""
 	if extraInfo != "" {
 		updated.ExtraInfo = extraInfo
 	}
@@ -1362,7 +1369,10 @@ func (b storedBlockProcessing) toModel() *models.BlockProcessingStatus {
 		t := time.Unix(0, b.BUMPBuiltUnixNs).UTC()
 		out.BUMPBuiltAt = &t
 	}
-	if b.OrphanedAtUnixNs != 0 {
+	// The stored generation is retained through a reactivation as the
+	// high-water mark MarkBlocksOrphaned mints from; it is current — and
+	// surfaced — only while the row is orphaned.
+	if b.OrphanedAtUnixNs != 0 && b.Status == string(models.BlockStatusOrphaned) {
 		t := time.Unix(0, b.OrphanedAtUnixNs).UTC()
 		out.OrphanedAt = &t
 	}
@@ -1438,10 +1448,13 @@ func (s *Store) UpsertBlockHeaderSeen(ctx context.Context, blockHash string, blo
 	if prev != nil {
 		// Preserve milestone timestamps; chaintracks owns block_height and
 		// status, which we forcibly reset to active so a returning orphan
-		// re-joins the main chain.
+		// re-joins the main chain. The orphan generation stays as the row's
+		// high-water mark (toModel hides it on an active row); only the
+		// reconcile stamp is cleared.
 		cur.HeaderSeenUnixNs = prev.HeaderSeenUnixNs
 		cur.ProcessedUnixNs = prev.ProcessedUnixNs
 		cur.BUMPBuiltUnixNs = prev.BUMPBuiltUnixNs
+		cur.OrphanedAtUnixNs = prev.OrphanedAtUnixNs
 	}
 	if cur.HeaderSeenUnixNs == 0 {
 		cur.HeaderSeenUnixNs = seenAt.UnixNano()
@@ -1514,54 +1527,173 @@ func (s *Store) MarkBlockBUMPBuilt(ctx context.Context, blockHash string, blockH
 	return s.writeBlockProc(prev, &cur)
 }
 
-func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) error {
+func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) (int, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return 0, err
 	}
+	transitions := 0
+	gen := orphanedAt.UnixNano()
 	for _, h := range blockHashes {
+		// Re-checked per row: the reconciler's lease heartbeat cancels the
+		// context mid-batch when the lease is lost, and every row written
+		// after that overlaps the new holder's pass. The rows already
+		// written are reported, as the contract promises.
+		if err := ctx.Err(); err != nil {
+			return transitions, err
+		}
 		mu := s.shardFor(h)
 		mu.Lock()
 		prev, err := s.readBlockProc(h)
 		if err != nil {
 			mu.Unlock()
-			return err
+			return transitions, err
 		}
 		if prev == nil {
 			mu.Unlock()
 			continue
 		}
+		wasOrphaned := prev.Status == string(models.BlockStatusOrphaned)
+		if wasOrphaned && prev.OrphanedAtUnixNs > gen {
+			// A newer generation is already in place — a delayed call must
+			// not move it backwards, or a reconciler holding this older
+			// token could pass the CAS for a generation it never processed.
+			// Its stamp state is left alone too.
+			mu.Unlock()
+			continue
+		}
 		cur := *prev
 		cur.Status = string(models.BlockStatusOrphaned)
-		cur.OrphanedAtUnixNs = orphanedAt.UnixNano()
+		// Mint the generation: strictly greater than any this row has had
+		// (the retained high-water mark, whatever its status), with the
+		// caller's timestamp as the lower bound. Two orphanings can then
+		// never share a generation even when callers reuse a timestamp, so a
+		// token read before this write can never pass the CAS after it.
+		cur.OrphanedAtUnixNs = mintOrphanGeneration(prev.OrphanedAtUnixNs, gen)
+		cur.ReconciledAtUnixNs = 0 // re-enter the reconciler queue for this generation
 		if err := s.writeBlockProc(prev, &cur); err != nil {
 			mu.Unlock()
-			return err
+			return transitions, err
 		}
 		mu.Unlock()
+		if !wasOrphaned {
+			transitions++
+		}
 	}
-	return nil
+	return transitions, nil
 }
 
-// MarkBlockReconciled stamps reconciled_at on an orphaned block's row —
-// the anchor reconciler finished re-anchoring/reverting its transactions.
-// Missing rows are silently skipped.
-func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, at time.Time) error {
+// MarkBlockReconciled stamps reconciled_at on an orphaned block's row — the
+// anchor reconciler finished re-anchoring/reverting its transactions — as a
+// compare-and-set on the orphan generation: the row must still be orphaned
+// with the orphaned_at the caller observed (a zero orphanedAt checks status
+// only). Missing, resurrected and re-orphaned rows are silently skipped and
+// reported as not stamped (issue #339). The shard lock makes the
+// read-compare-write atomic against the other block_processing writers.
+func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, orphanedAt, at time.Time) (bool, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return false, err
 	}
 	mu := s.shardFor(blockHash)
 	mu.Lock()
 	defer mu.Unlock()
 	prev, err := s.readBlockProc(blockHash)
 	if err != nil {
-		return err
+		return false, err
 	}
-	if prev == nil {
-		return nil
+	if prev == nil || prev.Status != string(models.BlockStatusOrphaned) {
+		return false, nil
+	}
+	if !orphanedAt.IsZero() && prev.OrphanedAtUnixNs != orphanedAt.UnixNano() {
+		return false, nil
 	}
 	cur := *prev
 	cur.ReconciledAtUnixNs = at.UnixNano()
-	return s.writeBlockProc(prev, &cur)
+	if err := s.writeBlockProc(prev, &cur); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// RequeueOrphanedBlock clears reconciled_at on a row that is still orphaned
+// with the generation the caller judged (a zero orphanedAt checks status
+// only), putting it back on the reconciler's queue without changing the
+// generation. Missing, active, parked and re-orphaned rows are left
+// untouched and reported as not applied; it never transitions a row. The
+// shard lock makes the read-compare-write atomic against the other
+// block_processing writers.
+func (s *Store) RequeueOrphanedBlock(ctx context.Context, blockHash string, orphanedAt time.Time) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	mu := s.shardFor(blockHash)
+	mu.Lock()
+	defer mu.Unlock()
+	prev, err := s.readBlockProc(blockHash)
+	if err != nil {
+		return false, err
+	}
+	if prev == nil || prev.Status != string(models.BlockStatusOrphaned) {
+		return false, nil
+	}
+	if !orphanedAt.IsZero() && prev.OrphanedAtUnixNs != orphanedAt.UnixNano() {
+		return false, nil
+	}
+	if prev.ReconciledAtUnixNs == 0 {
+		return true, nil // already queued; nothing to write
+	}
+	cur := *prev
+	cur.ReconciledAtUnixNs = 0
+	if err := s.writeBlockProc(prev, &cur); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ReactivateBlock returns an orphaned row to active as a compare-and-set on
+// the orphan generation (issue #339): the row must still be orphaned with the
+// orphaned_at the caller judged (a zero orphanedAt checks status only).
+// Missing, active, parked and re-orphaned rows are left untouched and
+// reported as not applied. The shard lock makes the read-compare-write atomic
+// against the other block_processing writers; writeBlockProc maintains the
+// height index when block_height moves.
+func (s *Store) ReactivateBlock(ctx context.Context, blockHash string, blockHeight uint64, orphanedAt time.Time) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	mu := s.shardFor(blockHash)
+	mu.Lock()
+	defer mu.Unlock()
+	prev, err := s.readBlockProc(blockHash)
+	if err != nil {
+		return false, err
+	}
+	if prev == nil || prev.Status != string(models.BlockStatusOrphaned) {
+		return false, nil
+	}
+	if !orphanedAt.IsZero() && prev.OrphanedAtUnixNs != orphanedAt.UnixNano() {
+		return false, nil
+	}
+	cur := *prev
+	cur.BlockHeight = blockHeight
+	cur.Status = string(models.BlockStatusActive)
+	// OrphanedAtUnixNs is kept: the high-water mark the next orphaning
+	// mints above. toModel hides it on an active row.
+	cur.ReconciledAtUnixNs = 0
+	if err := s.writeBlockProc(prev, &cur); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// mintOrphanGeneration returns the generation an orphan write stores: the
+// caller's timestamp (ns) as a lower bound, and strictly greater than the
+// row's previous generation — its high-water mark across reactivations — by
+// the smallest step this backend can represent.
+func mintOrphanGeneration(prevUnixNs, wantUnixNs int64) int64 {
+	if prevUnixNs >= wantUnixNs {
+		return prevUnixNs + 1
+	}
+	return wantUnixNs
 }
 
 // ListOrphanedBlocksToReconcile scans the block_processing rows for
@@ -1680,6 +1812,9 @@ func (s *Store) MarkBlocksParked(ctx context.Context, blockHashes []string) erro
 		return err
 	}
 	for _, h := range blockHashes {
+		if err := ctx.Err(); err != nil {
+			return err // a cancelled caller must not keep writing rows
+		}
 		mu := s.shardFor(h)
 		mu.Lock()
 		prev, err := s.readBlockProc(h)

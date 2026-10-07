@@ -560,3 +560,126 @@ func WaitForMined(ctx context.Context, t *testing.T, rt *ArcadeRuntime, txids []
 	}
 	return nil
 }
+
+// BlockStatusResponse is the shape returned by
+// GET /api/v1/blocks/processing-status/:blockHash — the durable projection
+// of the reorg stream that external consumers read (issue #339). Only the
+// fields the reorg scenarios assert on are decoded.
+type BlockStatusResponse struct {
+	BlockHash    string `json:"blockHash"`
+	BlockHeight  uint64 `json:"blockHeight"`
+	Status       string `json:"status"`
+	OrphanedAt   string `json:"orphanedAt,omitempty"`
+	ReconciledAt string `json:"reconciledAt,omitempty"`
+}
+
+// GetBlockProcessingStatus fetches one block_processing row over the public
+// API. Returns (row, true) on 200, (zero, false) on 404, error otherwise.
+func GetBlockProcessingStatus(ctx context.Context, rt *ArcadeRuntime, blockHash string) (BlockStatusResponse, bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rt.BaseURL+"/api/v1/blocks/processing-status/"+blockHash, nil)
+	if err != nil {
+		return BlockStatusResponse{}, false, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return BlockStatusResponse{}, false, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusNotFound {
+		return BlockStatusResponse{}, false, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return BlockStatusResponse{}, false, fmt.Errorf("GET /api/v1/blocks/processing-status/%s status %d: %s", blockHash, resp.StatusCode, body)
+	}
+	var out BlockStatusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return BlockStatusResponse{}, false, fmt.Errorf("decode block status: %w", err)
+	}
+	return out, true, nil
+}
+
+// WaitForBlockStatus polls the public block-status endpoint until the row
+// for blockHash reports wantStatus, or timeout elapses. The last observed
+// row rides along in the timeout error so a stuck projection reads crisply
+// (issue #339: "still orphaned").
+func WaitForBlockStatus(ctx context.Context, rt *ArcadeRuntime, blockHash, wantStatus string, timeout time.Duration) (BlockStatusResponse, error) {
+	deadline := time.Now().Add(timeout)
+	var last BlockStatusResponse
+	found := false
+	for {
+		row, ok, err := GetBlockProcessingStatus(ctx, rt, blockHash)
+		if err != nil {
+			return BlockStatusResponse{}, err
+		}
+		if ok {
+			last, found = row, true
+			if row.Status == wantStatus {
+				return row, nil
+			}
+		}
+		if time.Now().After(deadline) {
+			if !found {
+				return BlockStatusResponse{}, fmt.Errorf("timed out waiting for block %s status=%s: no block_processing row", blockHash, wantStatus)
+			}
+			return last, fmt.Errorf("timed out waiting for block %s status=%s (last: status=%s orphanedAt=%q reconciledAt=%q)",
+				blockHash, wantStatus, last.Status, last.OrphanedAt, last.ReconciledAt)
+		}
+		select {
+		case <-ctx.Done():
+			return last, ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+}
+
+// AssertBlockStatusStable polls the public block-status endpoint for the
+// whole window and fails the moment the row for blockHash reports anything
+// other than wantStatus. Use after a reorg has been projected to prove no
+// stale scan or late reconciler tick flips the canonical block back.
+func AssertBlockStatusStable(ctx context.Context, t *testing.T, rt *ArcadeRuntime, blockHash, wantStatus string, window time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(window)
+	for time.Now().Before(deadline) {
+		row, ok, err := GetBlockProcessingStatus(ctx, rt, blockHash)
+		if err != nil {
+			t.Fatalf("block status %s: %v", blockHash, err)
+		}
+		if !ok || row.Status != wantStatus {
+			t.Fatalf("block %s left status=%s during the stability window (now ok=%v status=%s orphanedAt=%q)",
+				blockHash, wantStatus, ok, row.Status, row.OrphanedAt)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("context done during stability window: %v", ctx.Err())
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+}
+
+// WaitForBlockReconciled polls the store directly until the anchor
+// reconciler has stamped reconciled_at on blockHash's row. Reorg scenarios
+// use it to make sure a tie-orphaned block has LEFT the reconciler's queue
+// (status='orphaned' AND reconciled_at IS NULL) before the competition
+// flips — the state the mainnet incident of issue #339 was in, and the one
+// the reconciler's own resurrection short-circuit can no longer reach.
+func WaitForBlockReconciled(ctx context.Context, rt *ArcadeRuntime, blockHash string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		row, err := rt.Deps.Store.GetBlockProcessingStatus(ctx, blockHash)
+		if err == nil && row != nil && row.ReconciledAt != nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				return fmt.Errorf("timed out waiting for reconciled_at on block %s: %w", blockHash, err)
+			}
+			return fmt.Errorf("timed out waiting for reconciled_at on block %s (row=%+v)", blockHash, row)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}

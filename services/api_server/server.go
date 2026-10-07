@@ -20,6 +20,7 @@ import (
 	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/services"
 	"github.com/bsv-blockchain/arcade/services/httpmiddleware"
 	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/telemetry"
@@ -40,6 +41,8 @@ const (
 )
 
 type Server struct {
+	services.ReadyHook
+
 	cfg          *config.Config
 	logger       *zap.Logger
 	producer     *kafka.Producer
@@ -205,7 +208,9 @@ func (s *Server) Start(ctx context.Context) error {
 		recorderWG.Wait()
 	}()
 
-	if err := s.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	// /ready on this listener is served only after the bind succeeds, which is
+	// the same moment the process-wide health gate is signaled.
+	if err := services.ListenAndServeReady(ctx, s.server, &s.ReadyHook); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("server error: %w", err)
 	}
 	return nil

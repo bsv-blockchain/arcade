@@ -339,7 +339,51 @@ func initMetrics(ctx context.Context, cfg config.TelemetryConfig, res *resource.
 	mp := sdkmetric.NewMeterProvider(
 		sdkmetric.WithResource(res),
 		sdkmetric.WithReader(reader),
+		sdkmetric.WithView(metricViews()...),
 	)
 
 	return mp, mp.Shutdown, mp.ForceFlush, nil
+}
+
+// httpClientDurationBoundaries are the explicit bucket boundaries applied to
+// `http.client.request.duration`, the histogram otelhttp.NewTransport records
+// on every outbound call (teranode, merkleservice, bump/datahub, webhook).
+//
+// The values are seconds: the instrument is declared with unit "s" and the
+// transport records `durationToSeconds(...)`, so the boundaries are read in
+// the same unit the instrumentation writes. Every value is also an edge of
+// the shared latency buckets in metrics/metrics.go, so a quantile taken off
+// this histogram and one taken off `arcade_teranode_request_duration_seconds`
+// for the same calls interpolate over the same edges rather than different
+// ones.
+//
+// Eight boundaries replace the fourteen otelhttp advises (see
+// internal/semconv/client.go in the instrumentation): nine buckets per
+// attribute set instead of fifteen, on a histogram emitted per target host,
+// method and status code. The top boundary is 30s because that is the client
+// timeout on the teranode and merkleservice paths — without it a timed-out
+// request is indistinguishable from a merely slow one, both landing in the
+// overflow bucket.
+var httpClientDurationBoundaries = []float64{0.005, 0.025, 0.1, 0.25, 1, 2.5, 10, 30}
+
+// metricViews returns the SDK Views registered on the MeterProvider.
+//
+// Views only reach instruments created through the OTEL metric API. The
+// `arcade_*` metrics arrive on the same reader through
+// prometheusbridge.NewMetricProducer, which appends already-aggregated
+// ScopeMetrics at collection time and never passes through view resolution —
+// so their promauto bucket definitions in metrics/metrics.go stay
+// authoritative regardless of what is registered here. The exact (wildcard-
+// free) instrument name below keeps that true by matching as well.
+func metricViews() []sdkmetric.View {
+	return []sdkmetric.View{
+		sdkmetric.NewView(
+			sdkmetric.Instrument{Name: "http.client.request.duration"},
+			sdkmetric.Stream{
+				Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
+					Boundaries: httpClientDurationBoundaries,
+				},
+			},
+		),
+	}
 }

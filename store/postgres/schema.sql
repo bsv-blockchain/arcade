@@ -46,6 +46,9 @@ ALTER TABLE transactions ADD COLUMN IF NOT EXISTS merkle_registered_at TIMESTAMP
 -- capped at 5 entries by the writers. NULL for the overwhelming majority of
 -- rows that never lived through a reorg.
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS orphaned_anchors JSONB;
+-- Last non-empty network response across a PENDING_RETRY row's durable
+-- attempts, quoted by the give-up reason. NULL outside the retry queue.
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS retry_reason TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_tx_status        ON transactions(status);
 CREATE INDEX IF NOT EXISTS idx_tx_block_hash    ON transactions(block_hash);

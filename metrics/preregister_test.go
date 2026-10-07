@@ -150,3 +150,59 @@ func TestPreRegisterBumpOutcomesCreatesEveryOutcomeChildAtZero(t *testing.T) {
 		}
 	}
 }
+
+func TestPreRegisterBlockStatusTransitionsCreatesEveryPairAtZero(t *testing.T) {
+	PreRegisterBlockStatusTransitions()
+
+	fam := gatherFamily(t, "arcade_block_status_transitions_total")
+	if fam == nil {
+		t.Fatal("arcade_block_status_transitions_total has no series after pre-registration")
+	}
+
+	found := map[[2]string]*dto.Metric{}
+	for _, m := range fam.GetMetric() {
+		found[[2]string{labelValue(m, "transition"), labelValue(m, "source")}] = m
+	}
+
+	// A same-height flip-flop (issue #339) is rare: the reactivated series
+	// must already exist at zero, or increase() swallows the one burst that
+	// matters.
+	for _, pair := range blockStatusTransitions {
+		m, ok := found[pair]
+		if !ok {
+			t.Errorf("child %v not pre-registered", pair)
+			continue
+		}
+		if got := m.GetCounter().GetValue(); got != 0 {
+			t.Errorf("child %v value = %v, want 0", pair, got)
+		}
+	}
+	for _, want := range [][2]string{
+		{BlockTransitionReactivated, BlockTransitionSourceReorgEvent},
+		{BlockTransitionReactivated, BlockTransitionSourceTieScan},
+		{BlockTransitionReactivated, BlockTransitionSourceFullScan},
+		{BlockTransitionReactivated, BlockTransitionSourceReconciler},
+		{BlockTransitionOrphaned, BlockTransitionSourceReorgEvent},
+		{BlockTransitionOrphaned, BlockTransitionSourceTieScan},
+		{BlockTransitionOrphaned, BlockTransitionSourceFullScan},
+		// The reconciler re-orphans a canonical row the tracker reactivated
+		// while its re-mine was failing part-way (keepPartialRemineQueued).
+		{BlockTransitionOrphaned, BlockTransitionSourceReconciler},
+	} {
+		if _, ok := found[want]; !ok {
+			t.Errorf("emitted pair %v missing from the pre-registered set", want)
+		}
+	}
+	// Every transition × every source: the emitters' label constants are the
+	// whole label space, so a pair missing here would be born mid-incident.
+	for _, transition := range []string{BlockTransitionOrphaned, BlockTransitionReactivated} {
+		for _, source := range []string{
+			BlockTransitionSourceReorgEvent, BlockTransitionSourceTieScan,
+			BlockTransitionSourceFullScan, BlockTransitionSourceReconciler,
+		} {
+			if _, ok := found[[2]string{transition, source}]; !ok {
+				t.Errorf("pair {%s, %s} not pre-registered", transition, source)
+			}
+		}
+	}
+}

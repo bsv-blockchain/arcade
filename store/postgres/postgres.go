@@ -320,45 +320,29 @@ func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.Transa
 	if len(statuses) == 0 {
 		return nil
 	}
-	_, err := s.batchUpdateStatusImpl(ctx, statuses, false)
+	err := s.batchUpdateStatusSQL(ctx, statuses)
 	return err
 }
 
-// BatchUpdateStatusReturning is the diagnostic-rich form. Postgres's CTE-
-// based batch UPDATE returns the previous row from the same statement (no
-// extra round-trip) via RETURNING old.* — see batchUpdateStatusImpl.
-func (s *Store) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
+// BatchUpdateStatusReturning applies each row with UpdateStatusReturning.
+// A non-nil previous row means that row's transition was durably applied.
+func (s *Store) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]store.StatusUpdate, error) {
 	if len(statuses) == 0 {
 		return nil, nil
 	}
-	return s.batchUpdateStatusImpl(ctx, statuses, true)
+	return store.BatchUpdateStatusReturningParallel(ctx, s, statuses)
 }
 
-// batchUpdateStatusImpl is the shared implementation. When returnPrev is
-// false we discard the per-row previous data the SQL emits; when true we
-// thread it back to the caller. The Postgres-native form would extend the
-// existing batch UPDATE statement; here we fall back to per-row reads to
-// avoid a much larger SQL refactor — arcade's primary deployment uses
-// Pebble, which has the fused form.
-func (s *Store) batchUpdateStatusImpl(ctx context.Context, statuses []*models.TransactionStatus, returnPrev bool) ([]*models.TransactionStatus, error) {
-	if returnPrev {
-		return store.BatchUpdateStatusReturningFallback(ctx, s, statuses)
-	}
-	if err := s.batchUpdateStatusSQL(ctx, statuses); err != nil {
-		return nil, err
-	}
-	return nil, nil
-}
-
-// batchUpdateStatusSQL is the original single-round-trip batch UPDATE.
-// Extracted from BatchUpdateStatus so the new returning-variant can share
-// the no-prev fast path.
+// batchUpdateStatusSQL is the single-round-trip batch UPDATE. The
+// returning variant cannot share it: a non-nil previous row has to be the
+// pre-image of a write this call applied, which the per-row CTE in
+// UpdateStatusReturning decides under FOR UPDATE.
 func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.TransactionStatus) error {
 	if len(statuses) == 0 {
 		return nil
 	}
 
-	const colsPerRow = 8 // txid, status, status_code, block_hash, block_height, extra_info, merkle_path, timestamp_at, disallowed_prev
+	const colsPerRow = 9 // txid, status, status_code, block_hash, block_height, extra_info, merkle_path, competing_txs, timestamp_at, disallowed_prev
 
 	args := make([]any, 0, len(statuses)*(colsPerRow+1))
 	now := time.Now()
@@ -371,14 +355,16 @@ func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.Tra
 		if len(st.MerklePath) > 0 {
 			mp = []byte(st.MerklePath)
 		}
-		// disallowed previous statuses for this row's lattice guard. A nil/
-		// empty slice means "no constraint" — the AND clause uses ALL() so an
-		// empty array is satisfied trivially (status <> ALL('{}'::text[]) is
-		// true for every row).
-		disallowed := disallowedPrevAsStrings(st.Status)
-		if disallowed == nil {
-			disallowed = []string{}
+		competing, err := competingTxsArg(st.CompetingTxs)
+		if err != nil {
+			return fmt.Errorf("marshal competing_txs for %s: %w", st.TxID, err)
 		}
+		// disallowed previous statuses for this row's lattice guard, shared
+		// with UpdateStatusReturning so a same-status re-assert is applied on
+		// both paths (CanTransitionFrom allows it). An empty array means "no
+		// constraint" — the AND clause uses ALL() so it is satisfied
+		// trivially (status <> ALL('{}'::text[]) is true for every row).
+		disallowed := transitionGuardStatuses(st.Status)
 		args = append(
 			args,
 			st.TxID,
@@ -388,6 +374,7 @@ func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.Tra
 			int64(st.BlockHeight), /* #nosec G115 */
 			st.ExtraInfo,
 			mp,
+			competing,
 			ts,
 			disallowed,
 		)
@@ -403,8 +390,8 @@ func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.Tra
 		// right types for the VALUES alias columns.
 		fmt.Fprintf(
 			&values,
-			"($%d::text,$%d::text,$%d::int,$%d::text,$%d::bigint,$%d::text,$%d::bytea,$%d::timestamptz,$%d::text[])",
-			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9,
+			"($%d::text,$%d::text,$%d::int,$%d::text,$%d::bigint,$%d::text,$%d::bytea,$%d::jsonb,$%d::timestamptz,$%d::text[])",
+			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10,
 		)
 	}
 
@@ -420,8 +407,9 @@ UPDATE transactions t SET
     block_height = COALESCE(NULLIF(v.block_height, 0),    t.block_height),
     extra_info   = COALESCE(NULLIF(v.extra_info, ''),     t.extra_info),
     merkle_path  = COALESCE(v.merkle_path,                t.merkle_path),
+    competing_txs = COALESCE(v.competing_txs,             t.competing_txs),
     timestamp_at = v.timestamp_at
-FROM (VALUES ` + values.String() + `) AS v(txid, status, status_code, block_hash, block_height, extra_info, merkle_path, timestamp_at, disallowed_prev)
+FROM (VALUES ` + values.String() + `) AS v(txid, status, status_code, block_hash, block_height, extra_info, merkle_path, competing_txs, timestamp_at, disallowed_prev)
 WHERE t.txid = v.txid AND t.status <> ALL(v.disallowed_prev)`
 
 	if _, err := s.pool.Exec(ctx, q, args...); err != nil {
@@ -430,23 +418,48 @@ WHERE t.txid = v.txid AND t.status <> ALL(v.disallowed_prev)`
 	return nil
 }
 
+// competingTxsArg renders CompetingTxs for the JSONB competing_txs column: a
+// JSON string so pgx encodes it as JSON rather than BYTEA, or nil for "no
+// competing txs" so COALESCE keeps whatever the row already holds.
+func competingTxsArg(competing []string) (any, error) {
+	if len(competing) == 0 {
+		return nil, nil
+	}
+	b, err := json.Marshal(competing)
+	if err != nil {
+		return nil, err
+	}
+	return string(b), nil
+}
+
 // UpdateStatus updates an existing transaction. If no row exists for
 // status.TxID the call returns store.ErrNotFound without writing — callers
-// must use GetOrInsertStatus to create new rows. This guard closes F-033 /
-// issue #91: previously a callback referencing a never-submitted txid would
-// create a phantom row with no submission/validation history, turning the
-// callback endpoint into a write-anywhere primitive. Postgres' UPDATE …
-// WHERE txid=$1 already no-ops on missing rows; we now distinguish the
-// "row absent" case from "row present but lattice rejected" by checking
-// existence in a separate query when the UPDATE affects zero rows.
+// must use GetOrInsertStatus to create new rows. A lattice skip is a nil
+// error and writes nothing. See UpdateStatusReturning.
 func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStatus) error {
-	// Mirror Aerospike's BinMap semantics: empty fields are ignored, so the
-	// caller can issue partial updates without clobbering unrelated columns.
-	sets := []string{"status = $2", "timestamp_at = $3"}
-	args := []any{status.TxID, string(status.Status), status.Timestamp}
-	if status.Timestamp.IsZero() {
-		args[2] = time.Now()
+	_, err := s.UpdateStatusReturning(ctx, status)
+	return err
+}
+
+// UpdateStatusReturning applies status and returns the applied-result.
+// Prev is the row as it stood immediately before this statement's write.
+// Current is that row when the lattice skipped the write. The read, the
+// lattice check, and the write are one statement: FOR UPDATE holds the row,
+// and the UPDATE matches only when CanTransitionFrom allows the move
+// (including an idempotent re-assert of the same status). A missing row
+// returns ErrNotFound. Prev and Current carry status metadata only:
+// raw_tx, merkle_path and competing_txs are not read, matching the
+// StatusUpdate contract and the Mongo/Aerospike projections.
+func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.TransactionStatus) (store.StatusUpdate, error) {
+	if status == nil || status.TxID == "" {
+		return store.StatusUpdate{}, store.ErrNotFound
 	}
+	ts := status.Timestamp
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	sets := []string{"status = $2", "timestamp_at = $3"}
+	args := []any{status.TxID, string(status.Status), ts}
 	idx := 4
 	if status.BlockHash != "" {
 		sets = append(sets, fmt.Sprintf("block_hash = $%d", idx))
@@ -473,66 +486,130 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 		args = append(args, []byte(status.MerklePath))
 		idx++
 	}
+	if len(status.CompetingTxs) > 0 {
+		competing, err := competingTxsArg(status.CompetingTxs)
+		if err != nil {
+			return store.StatusUpdate{}, fmt.Errorf("marshal competing_txs for %s: %w", status.TxID, err)
+		}
+		sets = append(sets, fmt.Sprintf("competing_txs = $%d::jsonb", idx))
+		args = append(args, competing)
+		idx++
+	}
+	disallowed := transitionGuardStatuses(status.Status)
+	args = append(args, disallowed)
+	guard := fmt.Sprintf("($2 = '' OR old.status = $2 OR NOT (old.status = ANY($%d::text[])))", idx)
 
-	q := "UPDATE transactions SET "
+	var setSQL strings.Builder
 	for i, set := range sets {
 		if i > 0 {
-			q += ", "
+			setSQL.WriteString(", ")
 		}
-		q += set
+		setSQL.WriteString(set)
 	}
-	q += " WHERE txid = $1"
+	q := `
+WITH old AS (
+    SELECT txid, status, status_code, block_hash, block_height, extra_info,
+           retry_count, next_retry_at, timestamp_at, created_at, merkle_registered_at
+    FROM transactions
+    WHERE txid = $1
+    FOR UPDATE
+), upd AS (
+    UPDATE transactions t SET ` + setSQL.String() + `
+    FROM old
+    WHERE t.txid = old.txid
+      AND ` + guard + `
+    RETURNING t.txid
+)
+SELECT old.txid, old.status, old.status_code, old.block_hash, old.block_height, old.extra_info,
+       old.retry_count, old.next_retry_at, old.timestamp_at, old.created_at, old.merkle_registered_at,
+       EXISTS (SELECT 1 FROM upd) AS applied
+FROM old`
 
-	// Enforce the status lattice atomically inside the same UPDATE: refuse to
-	// overwrite a terminal status (MINED/IMMUTABLE/REJECTED/DOUBLE_SPEND_ATTEMPTED)
-	// with a later, lower-priority update such as a stray SEEN_ON_NETWORK
-	// callback. See models.Status.DisallowedPreviousStatuses and #61 / F-003.
-	hasLatticeGuard := false
-	if disallowed := disallowedPrevAsStrings(status.Status); len(disallowed) > 0 {
-		q += fmt.Sprintf(" AND status <> ALL($%d::text[])", idx)
-		args = append(args, disallowed)
-		hasLatticeGuard = true
+	row := s.pool.QueryRow(ctx, q, args...)
+	prev, applied, err := scanStatusApplied(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return store.StatusUpdate{}, store.ErrNotFound
 	}
-
-	tag, err := s.pool.Exec(ctx, q, args...)
 	if err != nil {
-		return fmt.Errorf("update tx %s: %w", status.TxID, err)
+		return store.StatusUpdate{}, fmt.Errorf("update tx %s: %w", status.TxID, err)
 	}
-	if tag.RowsAffected() > 0 {
-		return nil
+	if !applied {
+		return store.StatusUpdate{Current: prev}, nil
 	}
-	// Zero rows: when no lattice guard was applied, the only way to reach
-	// here is "txid not in the table" — return ErrNotFound. With a lattice
-	// guard, zero rows could also mean "row present but transition refused";
-	// disambiguate with a cheap existence probe so legitimate lattice no-ops
-	// don't surface as ErrNotFound.
-	if !hasLatticeGuard {
-		return store.ErrNotFound
-	}
-	return s.probeMissingTxID(ctx, status.TxID)
+	return store.StatusUpdate{Prev: prev}, nil
 }
 
-// probeMissingTxID returns store.ErrNotFound if no row exists for txid, nil
-// otherwise. Used by UpdateStatus to distinguish "row absent" from "row
-// present but lattice rejected" when an UPDATE … WHERE … AND status<>ALL(…)
-// affects zero rows.
-func (s *Store) probeMissingTxID(ctx context.Context, txid string) error {
-	var exists bool
-	if err := s.pool.QueryRow(
-		ctx,
-		"SELECT EXISTS(SELECT 1 FROM transactions WHERE txid = $1)",
-		txid,
-	).Scan(&exists); err != nil {
-		return fmt.Errorf("update tx %s: existence probe: %w", txid, err)
+// transitionGuardStatuses is DisallowedPreviousStatuses without the target
+// itself, as a text[] for the status-update lattice guards
+// (UpdateStatusReturning and batchUpdateStatusSQL). CanTransitionFrom
+// allows re-asserting the same status, so the array holds only what
+// cannot move to the target. Never nil: an empty array is "no constraint".
+func transitionGuardStatuses(s models.Status) []string {
+	if s == "" {
+		return []string{}
 	}
-	if !exists {
-		return store.ErrNotFound
+	prev := s.DisallowedPreviousStatuses()
+	out := make([]string, 0, len(prev))
+	for _, p := range prev {
+		if p == s {
+			continue
+		}
+		out = append(out, string(p))
 	}
-	return nil
+	return out
 }
 
-// disallowedPrevAsStrings is a small adapter so UpdateStatus / BatchUpdateStatus
-// can drop the lattice into a parameterised text[] clause.
+// scanStatusApplied decodes the UpdateStatusReturning row: the status
+// metadata the StatusUpdate contract guarantees plus the trailing applied
+// flag. raw_tx, merkle_path and competing_txs are deliberately not read —
+// no caller of the returning path uses them and raw_tx can be megabytes
+// per row on the callback hot path. applied is false when the row existed
+// but the lattice guard skipped the write; the caller then reports that
+// row as Current.
+func scanStatusApplied(row rowScanner) (*models.TransactionStatus, bool, error) {
+	var (
+		st                 models.TransactionStatus
+		statusCode         *int
+		blockHash          *string
+		blockHeight        *int64
+		extraInfo          *string
+		nextRetry          *time.Time
+		merkleRegisteredAt *time.Time
+		applied            bool
+	)
+	if err := row.Scan(
+		&st.TxID, &st.Status, &statusCode,
+		&blockHash, &blockHeight, &extraInfo,
+		&st.RetryCount, &nextRetry,
+		&st.Timestamp, &st.CreatedAt, &merkleRegisteredAt, &applied,
+	); err != nil {
+		return nil, false, err
+	}
+	if statusCode != nil {
+		st.StatusCode = *statusCode
+	}
+	if blockHash != nil {
+		st.BlockHash = *blockHash
+	}
+	if blockHeight != nil {
+		st.BlockHeight = uint64(*blockHeight) //nolint:gosec // block height fits in either signed/unsigned 64-bit
+	}
+	if extraInfo != nil {
+		st.ExtraInfo = *extraInfo
+	}
+	if nextRetry != nil {
+		st.NextRetryAt = *nextRetry
+	}
+	if merkleRegisteredAt != nil {
+		st.MerkleRegisteredAt = *merkleRegisteredAt
+	}
+	return &st, applied, nil
+}
+
+// disallowedPrevAsStrings drops the full DisallowedPreviousStatuses list,
+// target included, into a parameterised text[] clause. The status-update
+// paths use transitionGuardStatuses instead so a same-status re-assert is
+// applied.
 func disallowedPrevAsStrings(s models.Status) []string {
 	if s == "" {
 		return nil
@@ -896,16 +973,17 @@ func (s *Store) BumpRetryCount(ctx context.Context, txid string) (int, error) {
 // to PENDING_RETRY, where the reaper would then rebroadcast it. Rows whose
 // current status forbids PENDING_RETRY are skipped, matching
 // BatchUpdateStatusReturning's silent-skip semantics.
-func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time) error {
+func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time, lastReason string) error {
 	const q = `
 UPDATE transactions
-SET status=$2, raw_tx=$3, next_retry_at=$4, timestamp_at=NOW()
+SET status=$2, raw_tx=$3, next_retry_at=$4, timestamp_at=NOW(),
+    retry_reason = NULLIF($6,'')
 WHERE txid=$1 AND status <> ALL($5)`
 	disallowed := disallowedPrevAsStrings(models.StatusPendingRetry)
 	if disallowed == nil {
 		disallowed = []string{}
 	}
-	_, err := s.pool.Exec(ctx, q, txid, string(models.StatusPendingRetry), rawTx, nextRetryAt, disallowed)
+	_, err := s.pool.Exec(ctx, q, txid, string(models.StatusPendingRetry), rawTx, nextRetryAt, disallowed, lastReason)
 	if err != nil {
 		return fmt.Errorf("set pending retry fields %s: %w", txid, err)
 	}
@@ -927,7 +1005,7 @@ func (s *Store) GetReadyRetries(ctx context.Context, now time.Time, limit int) (
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	const q = `
-SELECT txid, raw_tx, retry_count, next_retry_at
+SELECT txid, raw_tx, retry_count, next_retry_at, COALESCE(retry_reason, '')
 FROM transactions
 WHERE status = 'PENDING_RETRY' AND next_retry_at <= $1
 ORDER BY next_retry_at
@@ -940,7 +1018,7 @@ FOR UPDATE SKIP LOCKED`
 	var out []*store.PendingRetry
 	for rows.Next() {
 		r := &store.PendingRetry{}
-		if err := rows.Scan(&r.TxID, &r.RawTx, &r.RetryCount, &r.NextRetryAt); err != nil {
+		if err := rows.Scan(&r.TxID, &r.RawTx, &r.RetryCount, &r.NextRetryAt, &r.LastReason); err != nil {
 			rows.Close()
 			return out, err
 		}
@@ -959,7 +1037,7 @@ FOR UPDATE SKIP LOCKED`
 func (s *Store) ClearRetryState(ctx context.Context, txid string, finalStatus models.Status, extraInfo string) error {
 	const q = `
 UPDATE transactions
-SET status=$2, raw_tx=NULL, next_retry_at=NULL, timestamp_at=NOW(),
+SET status=$2, raw_tx=NULL, next_retry_at=NULL, retry_reason=NULL, timestamp_at=NOW(),
     extra_info = COALESCE(NULLIF($3,''), extra_info)
 WHERE txid=$1`
 	_, err := s.pool.Exec(ctx, q, txid, string(finalStatus), extraInfo)
@@ -1161,8 +1239,10 @@ VALUES ($1, $2, $3, 'active')
 ON CONFLICT (block_hash) DO UPDATE SET
     block_height  = EXCLUDED.block_height,
     status        = 'active',
-    orphaned_at   = NULL,
     reconciled_at = NULL`
+	// orphaned_at is deliberately not reset: it stays as the row's
+	// orphan-generation high-water mark, which MarkBlocksOrphaned mints
+	// above; scanBlockProcessing hides it on an active row.
 	_, err := s.pool.Exec(ctx, q, blockHash, int64(blockHeight), seenAt) //nolint:gosec // block height fits in int64
 	if err != nil {
 		return fmt.Errorf("upsert block header seen %s: %w", blockHash, err)
@@ -1196,30 +1276,139 @@ ON CONFLICT (block_hash) DO UPDATE SET
 	return nil
 }
 
-func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) error {
+func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) (int, error) {
 	if len(blockHashes) == 0 {
-		return nil
+		return 0, nil
 	}
+	// Two data-modifying CTEs over one snapshot, so still one round-trip.
+	// The transition count is the row count of the first: its WHERE
+	// excludes rows already orphaned, and under READ COMMITTED a row a
+	// concurrent writer orphans first is re-checked against its UPDATED
+	// version once that writer's lock is released (EvalPlanQual) and drops
+	// out — so two replicas racing on the same row report ONE transition
+	// between them. A FROM-list self-join reading the "previous" status
+	// cannot promise that: EvalPlanQual re-fetches only the target row while
+	// the joined copy keeps the snapshot's value, so both racers would have
+	// counted. The second CTE refreshes the generation and clears the stamp
+	// on rows that were already orphaned; the snapshot decides which CTE a
+	// row belongs to, so no row is updated twice in one statement.
+	//
+	// The refresh is forward-only-inclusive (orphaned_at <= $2): a stored
+	// generation NEWER than this call's is kept, stamp state and all, so a
+	// delayed call carrying an older timestamp cannot move the generation
+	// backwards and let a reconciler holding that older token pass its CAS.
+	// An EQUAL generation still refreshes and clears the stamp — the
+	// contract does not require a strictly increasing time. Both sides of
+	// the compare are microseconds: pgx encodes the $2 time.Time to
+	// timestamptz by truncating to µs, the same encoding the stored value
+	// went through, so a token read back from this table compares equal to
+	// itself and sub-µs bits on a fresh time.Now() cannot exclude it.
+	//
+	// Both arms MINT the generation: GREATEST($2, orphaned_at + 1 µs) is
+	// strictly above any generation the row has had — orphaned_at is kept
+	// through reactivation as the high-water mark — with the caller's
+	// timestamp as the lower bound, so two orphanings never share a
+	// generation even when callers reuse a timestamp. GREATEST ignores a
+	// NULL operand, so a row that never had one gets $2. One microsecond is
+	// the step timestamptz can represent, and pgx truncates $2 to it too.
 	const q = `
-UPDATE block_processing
-SET status = 'orphaned', orphaned_at = $2
-WHERE block_hash = ANY($1)`
-	_, err := s.pool.Exec(ctx, q, blockHashes, orphanedAt)
-	if err != nil {
-		return fmt.Errorf("mark blocks orphaned: %w", err)
+WITH transitioned AS (
+    UPDATE block_processing
+    SET status = 'orphaned',
+        orphaned_at = GREATEST($2::timestamptz, orphaned_at + interval '1 microsecond'),
+        reconciled_at = NULL
+    WHERE block_hash = ANY($1) AND status <> 'orphaned'
+    RETURNING 1
+), refreshed AS (
+    UPDATE block_processing
+    SET orphaned_at = GREATEST($2::timestamptz, orphaned_at + interval '1 microsecond'),
+        reconciled_at = NULL
+    WHERE block_hash = ANY($1) AND status = 'orphaned'
+      AND (orphaned_at IS NULL OR orphaned_at <= $2)
+)
+SELECT count(*) FROM transitioned`
+	var transitions int64
+	if err := s.pool.QueryRow(ctx, q, blockHashes, orphanedAt).Scan(&transitions); err != nil {
+		return 0, fmt.Errorf("mark blocks orphaned: %w", err)
 	}
-	return nil
+	return int(transitions), nil
 }
 
-// MarkBlockReconciled stamps reconciled_at on an orphaned block's row —
-// the anchor reconciler finished re-anchoring/reverting its transactions.
-// Missing rows are silently skipped.
-func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, at time.Time) error {
-	const q = `UPDATE block_processing SET reconciled_at = $2 WHERE block_hash = $1`
-	if _, err := s.pool.Exec(ctx, q, blockHash, at); err != nil {
-		return fmt.Errorf("mark block reconciled %s: %w", blockHash, err)
+// MarkBlockReconciled stamps reconciled_at on an orphaned block's row — the
+// anchor reconciler finished re-anchoring/reverting its transactions — as a
+// compare-and-set on the orphan generation: the row must still be orphaned
+// with the orphaned_at the caller observed (a zero orphanedAt checks status
+// only). Missing, resurrected and re-orphaned rows are silently skipped and
+// reported as not stamped (issue #339).
+func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, orphanedAt, at time.Time) (bool, error) {
+	const q = `
+UPDATE block_processing
+SET reconciled_at = $2
+WHERE block_hash = $1
+  AND status = 'orphaned'
+  AND ($3::timestamptz IS NULL OR orphaned_at = $3)`
+	var generation *time.Time
+	if !orphanedAt.IsZero() {
+		generation = &orphanedAt
 	}
-	return nil
+	tag, err := s.pool.Exec(ctx, q, blockHash, at, generation)
+	if err != nil {
+		return false, fmt.Errorf("mark block reconciled %s: %w", blockHash, err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// RequeueOrphanedBlock clears reconciled_at on a row that is still orphaned
+// with the generation the caller judged (a zero orphanedAt checks status
+// only), putting it back on the reconciler's queue without changing the
+// generation. Missing, active, parked and re-orphaned rows are left
+// untouched and reported as not applied; it never transitions a row. The
+// WHERE is re-checked against the row's current version under READ
+// COMMITTED, so the check and the write are one atomic step.
+func (s *Store) RequeueOrphanedBlock(ctx context.Context, blockHash string, orphanedAt time.Time) (bool, error) {
+	const q = `
+UPDATE block_processing
+SET reconciled_at = NULL
+WHERE block_hash = $1
+  AND status = 'orphaned'
+  AND ($2::timestamptz IS NULL OR orphaned_at = $2)`
+	var generation *time.Time
+	if !orphanedAt.IsZero() {
+		generation = &orphanedAt
+	}
+	tag, err := s.pool.Exec(ctx, q, blockHash, generation)
+	if err != nil {
+		return false, fmt.Errorf("requeue orphaned block %s: %w", blockHash, err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// ReactivateBlock returns an orphaned row to active as a compare-and-set on
+// the orphan generation (issue #339): the row must still be orphaned with the
+// orphaned_at the caller judged (a zero orphanedAt checks status only), so a
+// missing, active, parked or re-orphaned row is left untouched and reported
+// as not applied. block_height is overwritten as the header-seen upsert does;
+// the milestone timestamps are untouched. The WHERE is re-checked against the
+// row's current version under READ COMMITTED, so the check and the write are
+// one atomic step.
+func (s *Store) ReactivateBlock(ctx context.Context, blockHash string, blockHeight uint64, orphanedAt time.Time) (bool, error) {
+	// orphaned_at is kept as the high-water mark the next orphaning mints
+	// above; scanBlockProcessing hides it on an active row.
+	const q = `
+UPDATE block_processing
+SET status = 'active', block_height = $2, reconciled_at = NULL
+WHERE block_hash = $1
+  AND status = 'orphaned'
+  AND ($3::timestamptz IS NULL OR orphaned_at = $3)`
+	var generation *time.Time
+	if !orphanedAt.IsZero() {
+		generation = &orphanedAt
+	}
+	tag, err := s.pool.Exec(ctx, q, blockHash, int64(blockHeight), generation) //nolint:gosec // block height fits in int64
+	if err != nil {
+		return false, fmt.Errorf("reactivate block %s: %w", blockHash, err)
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
 // ListOrphanedBlocksToReconcile returns the reconciler's work queue:
@@ -1402,7 +1591,11 @@ func scanBlockProcessing(scan func(...any) error) (*models.BlockProcessingStatus
 	bp.ProcessedAt = processed
 	bp.BUMPBuiltAt = bumpBuilt
 	bp.Status = models.BlockProcessingStatusValue(statusVal)
-	bp.OrphanedAt = orphanedAt
+	// orphaned_at survives a reactivation as the generation high-water mark;
+	// it is current — and surfaced — only while the row is orphaned.
+	if bp.Status == models.BlockStatusOrphaned {
+		bp.OrphanedAt = orphanedAt
+	}
 	bp.ReconciledAt = reconciledAt
 	return &bp, nil
 }

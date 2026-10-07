@@ -27,6 +27,8 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/metrics"
+	"github.com/bsv-blockchain/arcade/services"
 	"github.com/bsv-blockchain/arcade/services/httpmiddleware"
 	"github.com/bsv-blockchain/arcade/store"
 )
@@ -36,6 +38,8 @@ const jsonKeyError = "error"
 // Service is the services.Service-conforming wrapper around the
 // embedded chaintracks instance. Owns its own gin.Engine + http.Server.
 type Service struct {
+	services.ReadyHook
+
 	cfg    *config.Config
 	logger *zap.Logger
 	store  store.Store
@@ -59,6 +63,10 @@ func New(cfg *config.Config, logger *zap.Logger, st store.Store, ct chaintracks.
 	if !cfg.ChaintracksServer.Enabled || ct == nil {
 		return nil
 	}
+	// Export the block-status transition series at 0 from the first scrape:
+	// a same-height flip-flop is rare, and a series born mid-incident is
+	// invisible to increase() until its second sample.
+	metrics.PreRegisterBlockStatusTransitions()
 	return &Service{
 		cfg:    cfg,
 		logger: logger.Named("chaintracks"),
@@ -107,7 +115,7 @@ func (s *Service) Start(ctx context.Context) error {
 		_ = s.Stop()
 	}()
 
-	if err := s.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := services.ListenAndServeReady(ctx, s.server, &s.ReadyHook); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("chaintracks server error: %w", err)
 	}
 	return nil

@@ -45,6 +45,18 @@ node-local OTLP collector  (http://$(HOST_IP):4317, one per k8s node)
   bridge just re-reads the Prometheus default registry on each OTLP export
   tick. Both exporters run simultaneously; this is expected, not a bug (see
   the dual-export note in the design doc).
+- **Histogram views.** `telemetry/telemetry.go` registers one SDK View, which
+  narrows `http.client.request.duration` — the histogram
+  `otelhttp.NewTransport` records on every outbound call — from the 14 bucket
+  boundaries the instrumentation advises to 8. The values are seconds (the
+  instrument's unit) and are a subset of the latency buckets in
+  `metrics/metrics.go`, so a quantile off this histogram and one off
+  `arcade_teranode_request_duration_seconds` land on shared bucket edges; the
+  top boundary is the 30s client timeout, so a timed-out request stays
+  distinguishable from a merely slow one. Views reach only instruments
+  created through the OTEL metric API — the bridged `arcade_*` families are
+  appended by the producer at collection time and never pass through view
+  resolution, so their promauto bucket definitions stay authoritative.
 - Arcade never talks to Coralogix directly. It only ever dials the
   collector endpoint in `telemetry.endpoint` / `OTEL_EXPORTER_OTLP_ENDPOINT`
   — how that collector gets data to Coralogix (or anywhere else) is outside

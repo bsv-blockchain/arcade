@@ -18,8 +18,8 @@
 //
 // Service ownership
 //
-//   - propagation: batch size, broadcast latency per outcome, chunk count,
-//     dispatcher pending depth, deferred-requeue gauge, reaper lease and
+//   - propagation: batch size, broadcast latency per outcome, chunk count
+//     and chunk payload bytes, dispatcher pending depth, deferred-requeue gauge, reaper lease and
 //     tick outcomes, narrowed-reaper rebroadcast depth, merkle registration
 //     latency.
 //   - bump_builder: build duration, blocks processed, BUMP outcomes, STUMP
@@ -80,6 +80,9 @@ var PropagationBatchSize = promauto.NewHistogram(prometheus.HistogramOpts{
 // metric is the diagnostic for the resilience tunable: if it's growing
 // quickly, the tx generator is producing rejectable txs (double-spends,
 // invalid signatures, insufficient fees, …) — not a peer-health problem.
+// A peer that refused the chunk by shape (PropagationChunkTotal
+// {fallback="size_rejected"}) cast no verdict and is excluded: a broadcast
+// every responder refused by shape counts under no verdict label at all.
 var PropagationBroadcastConsensus = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_propagation_broadcast_consensus_total",
 	Help: "Per-broadcast consensus outcome across all responding endpoints.",
@@ -135,12 +138,38 @@ var PropagationOutcomeTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 }, []string{labelOutcome}) // accepted, rejected, retryable, no_verdict
 
 // PropagationChunkTotal counts how many chunk broadcasts were issued. Combined
-// with PropagationBatchSize this surfaces whether teranode_max_batch_size is
-// well-tuned.
+// with PropagationBatchSize this surfaces whether teranode_max_batch_size and
+// teranode_max_batch_bytes are well-tuned. "none" is one POST as planned;
+// "narrowed" is a re-split after a peer response that could not be bound to
+// individual transactions; "size_rejected" is a chunk a peer refused by
+// shape (too many txs, too many bytes, or a 413) — a non-zero rate means the
+// configured caps are above what some peer accepts.
 var PropagationChunkTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_propagation_chunk_total",
 	Help: "Number of chunk broadcasts issued, by fallback decision.",
-}, []string{"fallback"}) // none
+}, []string{"fallback"}) // none, narrowed, size_rejected
+
+// chunkBytesBuckets diverges from bytesBuckets on purpose: the shared set
+// jumps 4 MiB → 16 MiB → 64 MiB, which cannot tell an 8 MiB chunk from one
+// pinned just under the 16 MiB default of propagation.teranode_max_batch_bytes
+// — and that distinction is the whole tuning question. These add resolution
+// across 1–32 MiB, the band between arcade's default and Teranode's hard
+// 32 MiB maxDataPerRequest.
+var chunkBytesBuckets = []float64{
+	4 * 1024, 64 * 1024, 256 * 1024, 1024 * 1024, 2 * 1024 * 1024, 4 * 1024 * 1024,
+	8 * 1024 * 1024, 12 * 1024 * 1024, 16 * 1024 * 1024, 24 * 1024 * 1024, 32 * 1024 * 1024, 64 * 1024 * 1024,
+}
+
+// PropagationChunkBytes measures the payload of each POST /txs chunk — the
+// concatenated raw tx bytes, which is exactly the request Content-Length.
+// Read next to propagation.teranode_max_batch_bytes: a p99 pinned just under
+// the cap means bytes, not teranode_max_batch_size, decide where chunks end.
+// Observed per POST, including the halves produced by narrowing.
+var PropagationChunkBytes = promauto.NewHistogram(prometheus.HistogramOpts{
+	Name:    "arcade_propagation_chunk_bytes",
+	Help:    "Payload bytes (concatenated raw txs) of each POST /txs chunk broadcast.",
+	Buckets: chunkBytesBuckets,
+})
 
 // PropagationMerkleRegisterDuration measures the merkle-service registration
 // wall time for one flushBatch — a single bounded-concurrency fan-out over
@@ -541,7 +570,8 @@ var BumpBuilderAnchorGuardDeniedTotal = promauto.NewCounterVec(prometheus.Counte
 // active again — stale orphan mark), deferred (waiting on the canonical
 // block's BUMP), parked (canonical BUMP unavailable at the defer cap — txs
 // left MINED, NOT reverted, awaiting a later canonical BUMP; issue #282),
-// error.
+// stale (the reconciled_at compare-and-set found the row reactivated or
+// orphaned again mid-pass — nothing stamped; issue #339), error.
 var ReconcilerBlocksTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_reconciler_blocks_total",
 	Help: "Orphaned blocks processed by the anchor reconciler, by outcome.",
@@ -572,12 +602,87 @@ var ReconcilerTxsParkedTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "Transactions left MINED against an orphan because no canonical BUMP was available (not reverted).",
 })
 
+// ReconcilerRemineRequeuedTotal counts canonical block rows the reconciler
+// re-orphaned in order to retry a re-mine that failed — part-way, before it
+// could read the block's BUMP, or on a BUMP that does not parse — AFTER the
+// block-status tracker had reactivated the row mid-pass (issue #339
+// review). The row was active and off the durable queue with some or all of
+// its transactions un-remined, and the reconciler's queue — whose predicate
+// is status='orphaned' — is the only in-store path that retries; each count
+// is therefore a canonical block reading orphaned for up to one tick, until
+// the next pass re-mines it and reactivates it. Non-zero is worth a look:
+// it means a store call failed while a reorg was being healed.
+var ReconcilerRemineRequeuedTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "arcade_reconciler_remine_requeue_total",
+	Help: "Canonical block rows re-orphaned to retry a partial re-mine after a concurrent reactivation.",
+})
+
+// ReconcilerRemineHandoffFailedTotal counts failed re-mines whose durable
+// hand-off (RequeueOrphanedBlock, the row read, or the re-orphan above) the
+// store still refused after the in-process retries. The block is then held
+// in the reconciler's in-memory pending set and retried on every tick until
+// it heals or the hand-off lands; that set does not survive a restart, so a
+// non-zero count during an outage is the signal to check
+// ReconcilerRemineHandoffPending before restarting the process.
+var ReconcilerRemineHandoffFailedTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "arcade_reconciler_remine_handoff_failed_total",
+	Help: "Failed re-mines whose durable hand-off the store refused after retries; the block fell back to the in-memory pending set.",
+})
+
+// ReconcilerRemineHandoffPending is the size of that in-memory pending set:
+// canonical blocks with un-remined txs that no in-store queue currently
+// holds — either because the store refused the hand-off, or because the
+// block-status tracker reactivated the row before its re-mine could run and
+// re-orphaning it would be wrong. Should be 0 in steady state and drain to
+// 0 as soon as the store recovers.
+var ReconcilerRemineHandoffPending = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "arcade_reconciler_remine_handoff_pending",
+	Help: "Blocks awaiting a re-mine retry that only the reconciler's in-memory pending set holds.",
+})
+
 // ReconcilerBlockDuration observes wall time per reconciled block.
 var ReconcilerBlockDuration = promauto.NewHistogram(prometheus.HistogramOpts{
 	Name:    "arcade_reconciler_block_duration_seconds",
 	Help:    "Wall time spent reconciling one orphaned block's transactions.",
 	Buckets: prometheus.ExponentialBuckets(0.01, 4, 8), // 10ms .. ~11m
 })
+
+// ---------------------------------------------------------------------------
+// block-status projection (chaintracks_server tracker + reconciler full-scan)
+
+// Label values for BlockStatusTransitionsTotal. The source names the
+// detection edge that wrote the transition: the ReorgEvent handler and the
+// tie-scan live in services/chaintracks_server; the startup full-scan and
+// the resurrection short-circuit in services/bump_builder's reconciler.
+const (
+	BlockTransitionOrphaned    = "orphaned"
+	BlockTransitionReactivated = "reactivated"
+
+	BlockTransitionSourceReorgEvent = "reorg_event"
+	BlockTransitionSourceTieScan    = "tie_scan"
+	BlockTransitionSourceFullScan   = "full_scan"
+	BlockTransitionSourceReconciler = "reconciler"
+)
+
+// BlockStatusTransitionsTotal counts block_processing status transitions by
+// direction and detection edge. transition=orphaned is a row demoted because
+// the active chain holds a different block at its height; transition=
+// reactivated is an orphaned row reset to active because it IS the
+// active-chain block at its height again — a same-height flip-flop (issue
+// #339). Every pair counts APPLIED transitions, and the signal comes from the
+// write itself, not from a pre-read: store.MarkBlocksOrphaned returns how
+// many rows its write actually moved to orphaned (hashes with no row, and
+// rows already orphaned, are written or skipped without being counted), and
+// store.ReactivateBlock reports whether its generation-checked write applied
+// (a row another edge already reactivated, or re-orphaned with a newer
+// generation, is not counted). Under concurrent writers this is exact: two
+// replicas moving the same row report one transition between them. The
+// anchor guard's write-time denials are counted separately by
+// BumpBuilderAnchorGuardDeniedTotal.
+var BlockStatusTransitionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_block_status_transitions_total",
+	Help: "block_processing status transitions by direction (orphaned|reactivated) and detection edge (reorg_event|tie_scan|full_scan|reconciler).",
+}, []string{"transition", "source"})
 
 // ---------------------------------------------------------------------------
 // watchdog (standalone service — block-processing recovery)
@@ -854,11 +959,12 @@ var MinedPushWithoutMerklePathTotal = promauto.NewCounterVec(prometheus.CounterO
 // WebhookCASErrorTotal counts CAS attempts that failed with a real infra
 // error rather than a generation mismatch — surfaced separately so a flat
 // WebhookCASLostTotal can't mask a backend that's silently failing every
-// write. Only the Aerospike backend emits this today: its CAS path collapses
-// gen-mismatch and infra errors into the same (false, nil) return shape, so
-// the metric is the one observable signal that distinguishes them. Postgres
-// and Pebble propagate infra errors through the function's `err` return and
-// the caller already logs those.
+// write. The Aerospike and MongoDB backends emit it: Aerospike's CAS path
+// collapses gen-mismatch and infra errors into the same (false, nil) return
+// shape, so the metric is the one observable signal that distinguishes them;
+// MongoDB propagates the error as well but counts it so the two document
+// backends stay comparable. Postgres and Pebble propagate infra errors
+// through the function's `err` return and the caller already logs those.
 var WebhookCASErrorTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "arcade_webhook_cas_error_total",
 	Help: "Webhook CAS writes that failed with an infra error (distinct from generation mismatch).",

@@ -131,7 +131,7 @@ go get -u github.com/bsv-blockchain/arcade
 
 ### Prerequisites
 
-- **Go 1.26+** (see `go.mod` for exact version)
+- **Go 1.27+** (see `go.mod` for exact version)
 - **SQLite** (included with most systems)
 - **Teranode broadcast URL** (e.g., `https://arc.taal.com`)
 
@@ -533,7 +533,7 @@ For detailed architecture documentation, see [doc.md](doc.md).
 
 ## 🧪 Examples & Tests
 
-All unit tests and examples run via [GitHub Actions](https://github.com/bsv-blockchain/arcade/actions) and use [Go version 1.26.x](https://go.dev/doc/go1.26). View the [configuration file](.github/workflows/fortress.yml).
+All unit tests and examples run via [GitHub Actions](https://github.com/bsv-blockchain/arcade/actions) and use [Go version 1.27.x](https://go.dev/doc/go1.27). View the [configuration file](.github/workflows/fortress.yml).
 
 Run all tests (fast):
 

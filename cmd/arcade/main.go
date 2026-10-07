@@ -85,12 +85,23 @@ func run(cmd *cobra.Command, _ []string) error {
 
 	svcs := app.BuildServices(deps)
 
-	// Start health server for non-API modes (api-server serves /health on its own port)
+	// Start health server for non-API modes (api-server serves /health on its own port).
+	// /ready stays 503 until every service below has signaled startup success
+	// into the readiness gate. api-server mode runs no HealthServer: its own
+	// listener answers /ready with 200 once it is bound, and the gate has
+	// nothing to flip. (The webhook service that runs alongside api-server is
+	// not observed by that endpoint.)
 	var hs *services.HealthServer
 	if cfg.Mode != "api-server" {
 		hs = services.NewHealthServer(cfg.Health.Port, cfg.Health.PprofEnabled, logger)
 		hs.Start(ctx)
 	}
+	if len(svcs) == 0 {
+		// Every service for this mode is config-gated off. The gate opens at
+		// once (nothing to wait for) and the process idles until signaled.
+		logger.Warn("no services enabled for mode", zap.String("mode", cfg.Mode))
+	}
+	gate := services.PrepareReadiness(hs, svcs)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -110,10 +121,6 @@ func run(cmd *cobra.Command, _ []string) error {
 		}(svc)
 	}
 
-	if hs != nil {
-		hs.SetReady(true)
-	}
-
 	select {
 	case sig := <-sigCh:
 		logger.Info("received signal, shutting down", zap.String("signal", sig.String()))
@@ -122,9 +129,7 @@ func run(cmd *cobra.Command, _ []string) error {
 	}
 
 	// Fail readiness, then wait for kube-proxy to drop the endpoint before draining.
-	if hs != nil {
-		hs.SetReady(false)
-	}
+	gate.Disable()
 	time.Sleep(5 * time.Second)
 
 	cancel()

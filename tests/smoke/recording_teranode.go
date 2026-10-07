@@ -22,6 +22,7 @@ import (
 type BatchRecord struct {
 	Seq        int
 	TxIDs      []string
+	Bytes      int // request body length: the chunk's raw tx bytes concatenated
 	ReceivedAt time.Time
 }
 
@@ -74,7 +75,7 @@ func (r *recordingTeranode) handle(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, "parse batch: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		r.recordBatch(txids)
+		r.recordBatch(txids, len(body))
 		w.WriteHeader(http.StatusOK)
 	default:
 		// Health probes and unknown paths fall through to 200 so the
@@ -104,12 +105,13 @@ func parseBatchTxIDs(body []byte) ([]string, error) {
 	return txids, nil
 }
 
-func (r *recordingTeranode) recordBatch(txids []string) {
+func (r *recordingTeranode) recordBatch(txids []string, bodyBytes int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.batches = append(r.batches, BatchRecord{
 		Seq:        len(r.batches),
 		TxIDs:      append([]string(nil), txids...),
+		Bytes:      bodyBytes,
 		ReceivedAt: time.Now(),
 	})
 	for _, id := range txids {

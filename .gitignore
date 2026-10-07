@@ -49,6 +49,7 @@ peer_cache.json
 config.yaml
 
 .claude/
+.agents/
 
 bin/
 

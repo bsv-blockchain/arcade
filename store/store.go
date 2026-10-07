@@ -44,6 +44,11 @@ type PendingRetry struct {
 	RawTx       []byte
 	RetryCount  int
 	NextRetryAt time.Time
+	// LastReason is the last non-empty network response recorded for the
+	// tx across its durable attempts (SetPendingRetryFields), so the
+	// eventual give-up can quote it even when the final attempt drew no
+	// response at all. Empty when no peer ever answered.
+	LastReason string
 }
 
 // DatahubEndpointSourceConfigured marks endpoints seeded from static config.
@@ -244,6 +249,25 @@ type BatchInsertResult struct {
 	Inserted bool
 }
 
+// StatusUpdate is one row of BatchUpdateStatusReturning.
+//
+// Prev is non-nil only when this call durably applied the requested
+// transition. It is the row immediately before that write. Callers that
+// publish a transition or advance an in-memory tracker must use Prev.
+//
+// Current is the durable row when the txid is known and this call did not
+// apply the transition. That is a lattice skip, including a race in which
+// another writer moved the row to a later status before this write. Current
+// is nil when the txid is absent. Prev and Current are mutually exclusive.
+type StatusUpdate struct {
+	Prev    *models.TransactionStatus
+	Current *models.TransactionStatus
+}
+
+// Applied reports whether this call durably wrote the requested transition.
+// Only an applied result may be published or used to advance a tracker.
+func (u StatusUpdate) Applied() bool { return u.Prev != nil }
+
 // Store handles all persistence operations for transactions and submissions
 type Store interface {
 	// GetOrInsertStatus inserts a new transaction status or returns the existing one if it already exists.
@@ -277,18 +301,25 @@ type Store interface {
 	BatchUpdateStatus(ctx context.Context, statuses []*models.TransactionStatus) error
 
 	// BatchUpdateStatusReturning is the diagnostic-rich form of BatchUpdateStatus.
-	// Returns a slice the same length as `statuses` where result[i] is the
-	// previous row that was merged with (i.e. the row as it existed before
-	// the update), or nil for unknown txids and per-row errors. Used by the
-	// inbound callback handlers to observe transition-age metrics
-	// (RECEIVED→SEEN_ON_NETWORK) without an extra round-trip.
+	// Returns a slice the same length as `statuses`. See StatusUpdate.
+	// result[i].Prev is non-nil only when this call durably applied
+	// statuses[i]: it is the row as it stood immediately before that write.
+	// A non-nil Prev is not "a row existed when we looked." An idempotent
+	// re-assert of the same status is an applied write, so Prev.Status may
+	// equal the requested status; callers that fan out events skip that case.
 	//
-	// Backends are expected to short-circuit when the requested transition
-	// is blocked by the status lattice (CanTransitionFrom) — the returned
-	// `previous[i]` is still the row that existed at lookup time, but the
-	// update is a no-op. Callers can detect "no transition applied" by
-	// comparing previous[i].Status to the requested status[i].Status.
-	BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error)
+	// result[i].Current is the durable row when the txid is known and this
+	// call did not apply the transition (lattice skip, including a race lost
+	// to a later status). A genuinely absent txid leaves both Prev and
+	// Current nil. Callers must not publish or advance a tracker from
+	// Current, and must not count Current as an unknown txid.
+	//
+	// Prev's status metadata (Status, Timestamp, block anchor, extra info)
+	// is guaranteed. RawTx is NOT — MongoDB, Postgres and Aerospike read
+	// only the status metadata, since no caller needs RawTx and it can be
+	// megabytes per row on a hot path, while Pebble happens to return it
+	// only because it reads the row whole.
+	BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]StatusUpdate, error)
 
 	// GetStatus retrieves the status for a transaction
 	GetStatus(ctx context.Context, txid string) (*models.TransactionStatus, error)
@@ -402,13 +433,60 @@ type Store interface {
 	// because of a status-tracking error.
 
 	// UpsertBlockHeaderSeen records that chaintracks observed a tip header.
-	// On insert, status='active' and header_seen_at=seenAt. On conflict,
-	// implementations MUST overwrite block_height (chaintracks is the
-	// authoritative source) and reset status='active' / orphaned_at=NULL,
-	// but MUST preserve the existing header_seen_at, processed_at, and
+	// It is the UNCONDITIONAL insert-or-reset; the resurrection paths (the
+	// block-status tracker and the anchor reconciler returning an orphaned
+	// row to active once the block is the active-chain block at its height
+	// again, issue #339) use ReactivateBlock, the generation-checked form,
+	// instead. On insert, status='active' and header_seen_at=seenAt. On
+	// conflict, implementations MUST overwrite block_height (chaintracks is
+	// the authoritative source) and reset status='active' /
+	// reconciled_at=NULL (so a later re-orphaning reconciles again), but
+	// MUST preserve the existing header_seen_at, processed_at, and
 	// bump_built_at so a re-arrival or reorg-resurrection does not erase
-	// earlier milestones.
+	// earlier milestones. The stored orphan generation is RETAINED as the
+	// row's high-water mark (see MarkBlocksOrphaned); it is historical on an
+	// active row and the model's OrphanedAt reads nil.
 	UpsertBlockHeaderSeen(ctx context.Context, blockHash string, blockHeight uint64, seenAt time.Time) error
+
+	// ReactivateBlock returns an orphaned block's row to status='active'
+	// because the block is the active-chain block at its height again
+	// (issue #339), as a compare-and-set on the orphan generation: it
+	// applies only while the row is still status='orphaned' AND its stored
+	// generation equals orphanedAt — the value the caller READ from the row
+	// (BlockProcessingStatus.OrphanGeneration), never a timestamp of its
+	// own; a zero orphanedAt checks status only. On apply, block_height is
+	// overwritten (chaintracks is authoritative), status='active',
+	// reconciled_at is cleared, the milestone timestamps are preserved, and
+	// the generation is retained as the row's high-water mark (historical;
+	// OrphanedAt reads nil) — the row shape UpsertBlockHeaderSeen's
+	// conflict path produces. Missing rows, rows
+	// that are active or parked, and rows orphaned AGAIN with a newer
+	// generation since the caller judged them are left untouched; a missing
+	// row is never created. Returns whether the transition applied — the
+	// applied-transition signal the block-status metric reports, and the
+	// guard that keeps a judgement made against one generation from
+	// clearing a newer one (the tie-scan and full-scan judge during a paging
+	// walk, and the full-scan re-mines for minutes before it writes).
+	ReactivateBlock(ctx context.Context, blockHash string, blockHeight uint64, orphanedAt time.Time) (bool, error)
+
+	// RequeueOrphanedBlock puts an orphaned row that a previous
+	// reconciliation stamped — and so left the reconciler's durable queue —
+	// back on it, as a compare-and-set on the orphan generation: it clears
+	// reconciled_at only while the row is still status='orphaned' AND its
+	// stored generation equals orphanedAt — the value the caller read from
+	// the row, never its own timestamp; a zero orphanedAt checks status
+	// only. The generation is NOT changed, so the token the caller holds
+	// keeps matching, and it is never a status transition: a row another edge
+	// reactivated since the caller judged it (the block-status tracker
+	// running alongside the reconciler's full-scan), a row orphaned again
+	// with a newer generation (already back on the queue, since
+	// MarkBlocksOrphaned clears the stamp) and a missing row are all left
+	// untouched. Returns whether the stamp was cleared. This is the
+	// full-scan's hand-off to the tick for a repair it cannot finish itself
+	// (issue #339 review); MarkBlocksOrphaned is the wrong tool for that,
+	// because its transition arm would flip a legitimately reactivated
+	// canonical row back to orphaned.
+	RequeueOrphanedBlock(ctx context.Context, blockHash string, orphanedAt time.Time) (bool, error)
 
 	// MarkBlockProcessed records that the merkle service delivered
 	// BLOCK_PROCESSED for this block. Upsert: when no row exists (callback
@@ -422,17 +500,61 @@ type Store interface {
 	// MarkBlockProcessed.
 	MarkBlockBUMPBuilt(ctx context.Context, blockHash string, blockHeight uint64, builtAt time.Time) error
 
-	// MarkBlocksOrphaned transitions every named block to status='orphaned'
-	// and stamps orphaned_at. Hashes that have no row are silently skipped
-	// (chaintracks may emit OrphanedHashes for blocks observed before the
-	// service started recording). Orphaned rows with reconciled_at IS NULL
-	// form the anchor reconciler's work queue.
-	MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) error
+	// MarkBlocksOrphaned transitions every named block to status='orphaned',
+	// stamps orphaned_at and CLEARS reconciled_at. Clearing is required, not
+	// cosmetic: orphaned rows with reconciled_at IS NULL form the anchor
+	// reconciler's work queue, so a row orphaned AGAIN after a previous
+	// orphaning was reconciled must re-enter that queue — the old stamp
+	// describes the old generation and says nothing about the new one.
+	// Leaving it set strands the block with no path back (issue #339).
+	// Hashes that have no row are silently skipped (chaintracks may emit
+	// OrphanedHashes for blocks observed before the service started
+	// recording). Returns the number of rows whose status actually CHANGED
+	// to 'orphaned' — the applied-transition count callers report to the
+	// block-status metric. A hash with no row, or a row already 'orphaned',
+	// is still written (generation refreshed, reconciled_at cleared) but is
+	// not a transition and is not counted. The count falls out of the write
+	// itself, so it costs no extra round-trip; pre-reading every hash would
+	// put N of them in front of a latency-critical write. It must also be
+	// exact under concurrent writers — two replicas orphaning the same row
+	// report ONE transition between them — so the status check belongs IN
+	// the write (a filter or a generation-checked CAS), never in a separate
+	// read whose result an unconditional write then trusts.
+	//
+	// The stored orphan GENERATION is minted by the store, with orphanedAt
+	// as a lower bound: on every orphan write — the transition of an
+	// active/parked row and the refresh of a row already orphaned alike —
+	// the new generation is max(orphanedAt, previous + ε), where "previous"
+	// is the last generation the row ever had (retained through
+	// reactivation as a high-water mark) and ε is the backend's smallest
+	// step (1 ns; 1 µs for Postgres' timestamptz). So two orphanings of one
+	// row never share a generation even when callers reuse a timestamp —
+	// which the contract permits — and a reconciler that read generation G
+	// can never stamp, reactivate or requeue a LATER orphaning that a
+	// wall-clock token would have let it mistake for its own. Tokens are
+	// therefore always the value read back from the row
+	// (BlockProcessingStatus.OrphanGeneration), never the caller's own
+	// timestamp. The refresh of a row already orphaned is forward-only: a
+	// stored generation NEWER than orphanedAt is kept — stamp state and all
+	// — so a delayed call carrying an older timestamp cannot touch a newer
+	// orphaning; an equal or older stored generation still refreshes (a new
+	// generation is minted, reconciled_at is cleared, the row is requeued).
+	// Implementations must check ctx between rows (or chunks): a cancelled
+	// caller — the reconciler's lease heartbeat on lease loss — must not
+	// keep writing, and reports what landed.
+	MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) (int, error)
 
 	// MarkBlockReconciled stamps reconciled_at on an orphaned block's row,
-	// recording that tx re-anchor/revert for this orphan completed. A
-	// missing row is a silent no-op.
-	MarkBlockReconciled(ctx context.Context, blockHash string, at time.Time) error
+	// recording that tx re-anchor/revert for this orphan completed. It is a
+	// compare-and-set on the orphan generation the caller processed: the
+	// stamp applies only while the row is still status='orphaned' AND its
+	// stored generation equals orphanedAt — the value the caller read from
+	// the row when it dequeued it, never its own timestamp; a zero
+	// orphanedAt checks status only. A row the block-status tracker
+	// reactivated — or orphaned again, which always mints a newer
+	// generation — while the reconciler was working is left untouched
+	// (issue #339), as is a missing row. Returns whether the stamp applied.
+	MarkBlockReconciled(ctx context.Context, blockHash string, orphanedAt, at time.Time) (bool, error)
 
 	// ListOrphanedBlocksToReconcile returns up to limit rows with
 	// status='orphaned' AND reconciled_at IS NULL, oldest orphaned_at
@@ -587,18 +709,23 @@ type Store interface {
 	BumpRetryCount(ctx context.Context, txid string) (retryCount int, err error)
 
 	// SetPendingRetryFields writes the durable retry bins: status=PENDING_RETRY,
-	// raw_tx, next_retry_at, timestamp. retry_count is untouched — use
-	// BumpRetryCount first to get the value that feeds next_retry_at backoff.
-	SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time) error
+	// raw_tx, next_retry_at, timestamp and retry_reason. lastReason always
+	// replaces the stored reason (empty clears it): carrying a reason across
+	// attempts is the caller's job (the reaper re-passes the one
+	// GetReadyRetries returned), so a tx parked afresh after leaving the
+	// queue — by any exit path — never inherits a response from an earlier
+	// stay. retry_count is untouched — use BumpRetryCount first to get the
+	// value that feeds next_retry_at backoff.
+	SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time, lastReason string) error
 
 	// GetReadyRetries returns up to limit PENDING_RETRY rows whose
-	// next_retry_at has elapsed. Rows include raw_tx and retry_count so the
-	// reaper can act without a second read per row.
+	// next_retry_at has elapsed. Rows include raw_tx, retry_count and
+	// retry_reason so the reaper can act without a second read per row.
 	GetReadyRetries(ctx context.Context, now time.Time, limit int) ([]*PendingRetry, error)
 
 	// ClearRetryState transitions a tx out of PENDING_RETRY (either on success
-	// or final rejection) and deletes the raw_tx + next_retry_at bins so the
-	// row stops showing up in ready-retry queries.
+	// or final rejection) and deletes the raw_tx + next_retry_at +
+	// retry_reason bins so the row stops showing up in ready-retry queries.
 	ClearRetryState(ctx context.Context, txid string, finalStatus models.Status, extraInfo string) error
 
 	// MarkMerkleRegisteredByTxIDs records that the given txids have been

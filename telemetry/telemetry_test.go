@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -14,11 +15,16 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	prometheusbridge "go.opentelemetry.io/contrib/bridges/prometheus"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
 
 	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/metrics"
 )
 
 // restoreOTELGlobals snapshots the global tracer provider, meter provider,
@@ -325,5 +331,188 @@ func TestBuildResource_EnvOverridesServiceName(t *testing.T) {
 	}
 	if got := val.AsString(); got != "env-supplied-service" {
 		t.Fatalf("service.name = %q, want env override %q", got, "env-supplied-service")
+	}
+}
+
+// otelhttpAdvisedDurationBoundaries is the bucket boundary set otelhttp
+// advises for http.client.request.duration at the pinned instrumentation
+// version (internal/semconv/client.go passes these to
+// metric.WithExplicitBucketBoundaries; httpconv declares the instrument with
+// unit "s" and the transport records durationToSeconds, so they are seconds).
+//
+// The SDK treats an instrument advisory as the default aggregation's
+// boundaries, which a View overrides. Asserting the pre-View baseline here is
+// what makes the post-View assertion mean something, and it fails loudly if a
+// dependency bump changes the advisory — in particular if it ever reverts to
+// the SDK's millisecond-shaped default (0, 5, 10, … 10000), which against a
+// seconds-valued instrument would leave every bucket but the first empty.
+var otelhttpAdvisedDurationBoundaries = []float64{
+	0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10,
+}
+
+// collectMetrics drives one real request through an otelhttp-instrumented
+// transport bound to a MeterProvider built with views (none, if views is
+// empty) and the same Prometheus bridge producer initMetrics installs, then
+// returns everything the reader collected — both the SDK-side instruments
+// otelhttp created and the bridged `arcade_*` families.
+func collectMetrics(t *testing.T, views ...sdkmetric.View) metricdata.ResourceMetrics {
+	t.Helper()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer server.Close()
+
+	reader := sdkmetric.NewManualReader(sdkmetric.WithProducer(prometheusbridge.NewMetricProducer()))
+	opts := []sdkmetric.Option{sdkmetric.WithReader(reader)}
+	if len(views) > 0 {
+		opts = append(opts, sdkmetric.WithView(views...))
+	}
+	mp := sdkmetric.NewMeterProvider(opts...)
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+
+	// A local MeterProvider, not the global one: this asserts against the
+	// provider configuration under test without touching OTEL globals.
+	client := &http.Client{
+		Transport: otelhttp.NewTransport(http.DefaultTransport, otelhttp.WithMeterProvider(mp)),
+	}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, server.URL, nil)
+	if err != nil {
+		t.Fatalf("building request: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("instrumented request failed: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collecting metrics: %v", err)
+	}
+	return rm
+}
+
+// findMetric returns the collected metric with the given name, failing the
+// test if it is absent.
+func findMetric(t *testing.T, rm metricdata.ResourceMetrics, name string) metricdata.Metrics {
+	t.Helper()
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name == name {
+				return m
+			}
+		}
+	}
+	t.Fatalf("metric %q not present in collected data", name)
+	return metricdata.Metrics{}
+}
+
+// histogramBounds returns the explicit bucket boundaries of the first data
+// point of a float64 histogram metric.
+func histogramBounds(t *testing.T, m metricdata.Metrics) []float64 {
+	t.Helper()
+	hist, ok := m.Data.(metricdata.Histogram[float64])
+	if !ok {
+		t.Fatalf("metric %q has data type %T, want metricdata.Histogram[float64]", m.Name, m.Data)
+	}
+	if len(hist.DataPoints) == 0 {
+		t.Fatalf("metric %q has no data points", m.Name)
+	}
+	return hist.DataPoints[0].Bounds
+}
+
+// promHistogramBounds reads the bucket boundaries a histogram family declares
+// on the Prometheus side, so a bridged metric can be compared against its own
+// promauto definition rather than against a copy of it hardcoded here.
+func promHistogramBounds(t *testing.T, name string) []float64 {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("gathering from the Prometheus default registry: %v", err)
+	}
+	for _, fam := range families {
+		if fam.GetName() != name {
+			continue
+		}
+		for _, m := range fam.GetMetric() {
+			h := m.GetHistogram()
+			if h == nil {
+				continue
+			}
+			bounds := make([]float64, 0, len(h.GetBucket()))
+			for _, b := range h.GetBucket() {
+				bounds = append(bounds, b.GetUpperBound())
+			}
+			return bounds
+		}
+	}
+	t.Fatalf("histogram %q not found in the Prometheus default registry", name)
+	return nil
+}
+
+// TestMetricViews_HTTPClientRequestDuration asserts the View registered by
+// metricViews actually reaches the instrument otelhttp creates — by running a
+// request through a real otelhttp Transport rather than by inspecting the
+// View value — and that the resulting histogram carries the intended
+// boundaries.
+//
+// The baseline subtest pins what the instrumentation emits without the View,
+// which is both the control for the assertion above and the guard on the unit
+// question: boundaries in the 0.005..10 range can only be seconds for an
+// instrument whose recorded values are seconds.
+func TestMetricViews_HTTPClientRequestDuration(t *testing.T) {
+	const name = "http.client.request.duration"
+
+	t.Run("view narrows the boundary set", func(t *testing.T) {
+		m := findMetric(t, collectMetrics(t, metricViews()...), name)
+		if m.Unit != "s" {
+			t.Errorf("%s unit = %q, want %q — the values in httpClientDurationBoundaries are "+
+				"seconds and must be re-scaled if the instrument's unit changes", name, m.Unit, "s")
+		}
+		if got := histogramBounds(t, m); !slices.Equal(got, httpClientDurationBoundaries) {
+			t.Errorf("%s boundaries = %v, want %v (the View did not reach the instrument)",
+				name, got, httpClientDurationBoundaries)
+		}
+	})
+
+	t.Run("baseline without the view", func(t *testing.T) {
+		m := findMetric(t, collectMetrics(t), name)
+		if got := histogramBounds(t, m); !slices.Equal(got, otelhttpAdvisedDurationBoundaries) {
+			t.Errorf("%s boundaries without a View = %v, want the instrumentation advisory %v — "+
+				"otelhttp changed what it advises; re-check the unit and the boundary choice in "+
+				"httpClientDurationBoundaries", name, got, otelhttpAdvisedDurationBoundaries)
+		}
+		if len(otelhttpAdvisedDurationBoundaries) <= len(httpClientDurationBoundaries) {
+			t.Errorf("the View sets %d boundaries against an advised %d — it is not reducing anything",
+				len(httpClientDurationBoundaries), len(otelhttpAdvisedDurationBoundaries))
+		}
+	})
+}
+
+// TestMetricViews_LeaveBridgedArcadeMetricsAlone guards the blast radius. The
+// `arcade_*` families reach the same reader through the Prometheus bridge
+// producer, whose ScopeMetrics are appended at collection time and never pass
+// through view resolution — and the View matches one wildcard-free instrument
+// name regardless. This asserts the outcome of both: a bridged histogram
+// keeps the buckets its promauto definition declares.
+func TestMetricViews_LeaveBridgedArcadeMetricsAlone(t *testing.T) {
+	const name = "arcade_teranode_request_duration_seconds"
+
+	// A histogram vec has no children until something observes on it, so the
+	// family would be absent from the bridge's output otherwise.
+	metrics.TeranodeRequestDuration.WithLabelValues("submit_tx", "2xx").Observe(0.12)
+
+	got := histogramBounds(t, findMetric(t, collectMetrics(t, metricViews()...), name))
+	want := promHistogramBounds(t, name)
+	if !slices.Equal(got, want) {
+		t.Errorf("%s boundaries after bridging = %v, want its promauto definition %v — "+
+			"a View is rewriting an arcade_* metric", name, got, want)
+	}
+	if slices.Equal(got, httpClientDurationBoundaries) {
+		t.Errorf("%s boundaries = %v, which is the http.client.request.duration View's set — "+
+			"the View is matching more than its named instrument", name, got)
 	}
 }

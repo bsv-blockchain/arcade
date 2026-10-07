@@ -368,26 +368,61 @@ func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.Transa
 	return store.BatchUpdateStatusParallel(ctx, s, statuses)
 }
 
-// BatchUpdateStatusReturning runs UpdateStatus concurrently and returns the
-// previous row per input. Aerospike's UpdateStatus doesn't yet expose the
-// pre-merge bin, so we fall back to GetStatus+UpdateStatus per row — two
-// round-trips. Arcade's primary deployment uses Pebble (which fuses the
-// read into the same locked region); this fallback exists to satisfy the
-// store.Store contract.
-func (s *Store) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
-	return store.BatchUpdateStatusReturningFallback(ctx, s, statuses)
+// BatchUpdateStatusReturning applies each row with UpdateStatusReturning.
+// The generation-checked put is the applied-result: a non-nil previous row
+// is the record this call's CAS wrote over.
+func (s *Store) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]store.StatusUpdate, error) {
+	return store.BatchUpdateStatusReturningParallel(ctx, s, statuses)
 }
 
 // UpdateStatus updates an existing transaction record. If no record exists for
 // status.TxID the call returns store.ErrNotFound without writing — callers
-// must use GetOrInsertStatus to create new rows. This guard closes F-033 /
-// issue #91: previously a callback referencing a never-submitted txid would
-// create a phantom row with no submission/validation history, turning the
-// callback endpoint into a write-anywhere primitive.
+// must use GetOrInsertStatus to create new rows. A lattice skip is a nil
+// error and writes nothing. See UpdateStatusReturning.
 func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStatus) error {
+	_, err := s.UpdateStatusReturning(ctx, status)
+	return err
+}
+
+// statusUpdateReadBins are the only bins the CAS read fetches. The
+// applied-result needs the lifecycle status, its timestamp, and the block
+// anchor / extra info the contract returns. raw_tx, merkle_path, and
+// competing_txs stay unread.
+var statusUpdateReadBins = []string{
+	"status",
+	"timestamp",
+	"block_hash",
+	"block_height",
+	"extra_info",
+}
+
+// statusFromUpdateBins decodes only statusUpdateReadBins.
+func statusFromUpdateBins(rec *aero.Record, txid string) *models.TransactionStatus {
+	st := &models.TransactionStatus{
+		TxID:      txid,
+		Status:    models.Status(getString(rec, "status")),
+		BlockHash: getString(rec, "block_hash"),
+		ExtraInfo: getString(rec, "extra_info"),
+	}
+	if ms := getInt(rec, "timestamp"); ms != 0 {
+		st.Timestamp = time.UnixMilli(int64(ms))
+	}
+	if h := getInt(rec, "block_height"); h > 0 {
+		st.BlockHeight = uint64(h)
+	}
+	return st
+}
+
+// UpdateStatusReturning applies status and returns the applied-result.
+// Prev is the record this call's generation-checked put wrote over, decoded
+// from statusUpdateReadBins only. Current is that same narrow record when
+// the lattice skips the write. A generation mismatch retries the read so a
+// concurrent MINED writer cannot leave this call holding a stale
+// ACCEPTED_BY_NETWORK pre-image.
+func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.TransactionStatus) (store.StatusUpdate, error) {
 	key, err := s.key(setTransactions, status.TxID)
 	if err != nil {
-		return err
+		return store.StatusUpdate{}, err
 	}
 
 	bins := aero.BinMap{
@@ -412,49 +447,45 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 	if !status.MerkleRegisteredAt.IsZero() {
 		bins["merkle_reg_at"] = status.MerkleRegisteredAt.UnixMilli()
 	}
+	if len(status.CompetingTxs) > 0 {
+		// JSON bytes, the encoding the GetStatus decoder already reads.
+		ct, err := json.Marshal(status.CompetingTxs)
+		if err != nil {
+			return store.StatusUpdate{}, fmt.Errorf("marshal competing_txs for %s: %w", status.TxID, err)
+		}
+		bins["competing_txs"] = ct
+	}
 
-	// Enforce the status lattice: refuse to overwrite a terminal status with a
-	// later, lower-priority update (e.g. a stray SEEN_ON_NETWORK callback after
-	// MINED). Read-then-CAS-write using the record's generation guarantees the
-	// pre-write check and the write are atomic with respect to other writers.
-	// See models.Status.CanTransitionFrom and #61 / F-003.
-	//
-	// Also: never create a record from UpdateStatus (F-033 / #91) — if the
-	// record is genuinely absent we return ErrNotFound. UPDATE_ONLY on the
-	// write enforces this even if a racing writer deleted the row between
-	// our read and our put.
+	// Read-then-CAS-write using the record's generation. The pre-write
+	// lattice check and the put are atomic with respect to other writers:
+	// a generation mismatch retries rather than clobbering their write.
+	// UPDATE_ONLY refuses to create a record (F-033 / #91).
 	for {
-		rec, gerr := s.client.Get(s.readPolicy(ctx), key, "status")
+		rec, gerr := s.client.Get(s.readPolicy(ctx), key, statusUpdateReadBins...)
 		if gerr != nil && !isKeyNotFound(gerr) {
-			return fmt.Errorf("read status for lattice check %s: %w", status.TxID, gerr)
+			return store.StatusUpdate{}, fmt.Errorf("read status for lattice check %s: %w", status.TxID, gerr)
 		}
 		if rec == nil {
-			return store.ErrNotFound
+			return store.StatusUpdate{}, store.ErrNotFound
 		}
-		if status.Status != "" {
-			existing := models.Status(getString(rec, "status"))
-			if !status.Status.CanTransitionFrom(existing) {
-				return nil
-			}
+		observed := statusFromUpdateBins(rec, status.TxID)
+		if status.Status != "" && !status.Status.CanTransitionFrom(observed.Status) {
+			return store.StatusUpdate{Current: observed}, nil
 		}
 		policy := s.writePolicy(ctx)
 		policy.GenerationPolicy = aero.EXPECT_GEN_EQUAL
 		policy.Generation = rec.Generation
 		policy.RecordExistsAction = aero.UPDATE_ONLY
 		if err := s.client.Put(policy, key, bins); err != nil {
-			// Generation mismatch means another writer landed between our read
-			// and our put. Re-read and re-evaluate the lattice rather than
-			// silently clobbering their write.
 			if isGenerationErr(err) {
 				continue
 			}
-			// UPDATE_ONLY on a record that was deleted between our read and put.
 			if isKeyNotFound(err) {
-				return store.ErrNotFound
+				return store.StatusUpdate{}, store.ErrNotFound
 			}
-			return fmt.Errorf("update tx %s: %w", status.TxID, err)
+			return store.StatusUpdate{}, fmt.Errorf("update tx %s: %w", status.TxID, err)
 		}
-		return nil
+		return store.StatusUpdate{Prev: observed}, nil
 	}
 }
 
@@ -950,7 +981,7 @@ func (s *Store) BumpRetryCount(ctx context.Context, txid string) (int, error) {
 // SetPendingRetryFields writes the durable retry bins in one atomic call. The
 // caller is responsible for having already bumped retry_count and computed
 // next_retry_at from that post-increment value.
-func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time) error {
+func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time, lastReason string) error {
 	key, err := s.key(setTransactions, txid)
 	if err != nil {
 		return err
@@ -974,6 +1005,12 @@ func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []
 		aero.PutOp(aero.NewBin("raw_tx", rawTx)),
 		aero.PutOp(aero.NewBin("next_retry_at", nextRetryAt.UnixMilli())),
 		aero.PutOp(aero.NewBin("timestamp", time.Now().UnixMilli())),
+	}
+	if lastReason != "" {
+		ops = append(ops, aero.PutOp(aero.NewBin("retry_reason", lastReason)))
+	} else {
+		// Aerospike: writing a nil bin value deletes the bin.
+		ops = append(ops, aero.PutOp(aero.NewBin("retry_reason", nil)))
 	}
 	if _, err := s.client.Operate(s.writePolicy(ctx), key, ops...); err != nil {
 		return fmt.Errorf("set pending retry fields %s: %w", txid, err)
@@ -1033,6 +1070,7 @@ loop:
 				RawTx:       rawTx,
 				RetryCount:  getInt(rec.Record, "retry_count"),
 				NextRetryAt: time.UnixMilli(nextMs),
+				LastReason:  getString(rec.Record, "retry_reason"),
 			})
 			if len(results) >= limit {
 				break loop
@@ -1059,6 +1097,7 @@ func (s *Store) ClearRetryState(ctx context.Context, txid string, finalStatus mo
 		// Aerospike: writing a nil bin value deletes the bin.
 		aero.PutOp(aero.NewBin("raw_tx", nil)),
 		aero.PutOp(aero.NewBin("next_retry_at", nil)),
+		aero.PutOp(aero.NewBin("retry_reason", nil)),
 	}
 	if extraInfo != "" {
 		ops = append(ops, aero.PutOp(aero.NewBin("extra_info", extraInfo)))
@@ -2351,13 +2390,14 @@ func (s *Store) UpsertBlockHeaderSeen(ctx context.Context, blockHash string, blo
 	// update we must NOT clobber processed_at or bump_built_at, which is
 	// what per-bin Operate gives us — bins not named here are left alone.
 	// We do overwrite block_height (chaintracks is authoritative) and reset
-	// status/orphaned_at/reconciled_at so a returning orphan re-joins active
-	// and a later re-orphaning reconciles again (issue #279).
+	// status/reconciled_at so a returning orphan re-joins active and a later
+	// re-orphaning reconciles again (issue #279). orphaned_at is left as the
+	// row's orphan-generation high-water mark (blockProcessingFromRecord
+	// hides it on an active row); MarkBlocksOrphaned mints above it.
 	ops := []*aero.Operation{
 		aero.PutOp(aero.NewBin(binBlockHash, blockHash)),
 		aero.PutOp(aero.NewBin(binBlockHeight, int(blockHeight))), //nolint:gosec // block height fits in int on 64-bit platforms
 		aero.PutOp(aero.NewBin(binStatus, string(models.BlockStatusActive))),
-		aero.PutOp(aero.NewBin(binOrphanedAt, nil)),
 		aero.PutOp(aero.NewBin(binReconciledAt, nil)),
 		// header_seen_at: only set when the bin is currently absent. Aerospike
 		// has no client-side conditional bin write that's race-free, so we do
@@ -2428,58 +2468,254 @@ func (s *Store) markBlockMilestone(ctx context.Context, blockHash string, blockH
 	return nil
 }
 
-func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) error {
+// casAttempts bounds the read-then-EXPECT_GEN_EQUAL-write loops the
+// block_processing status writes use. A block row has a handful of writers
+// at most (tracker, tie-scan, anchor guard, reconciler), so the loop settles
+// in one or two rounds; the cap only stops a pathological hot spot from
+// spinning.
+const casAttempts = 8
+
+func (s *Store) MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) (int, error) {
 	if len(blockHashes) == 0 {
-		return nil
+		return 0, nil
 	}
+	transitions := 0
 	for _, h := range blockHashes {
-		key, err := s.key(setBlockProcessing, h)
-		if err != nil {
-			return err
+		// Re-checked per row: the reconciler's lease heartbeat cancels the
+		// context mid-batch when the lease is lost, and every row written
+		// after that overlaps the new holder's pass.
+		if err := ctx.Err(); err != nil {
+			return transitions, err
 		}
-		// Skip rows that don't exist — chaintracks may emit OrphanedHashes
-		// for blocks observed before this service started recording.
-		rec, err := s.client.Get(s.readPolicy(ctx), key, binBlockHash)
+		transitioned, err := s.markBlockOrphanedCAS(ctx, h, orphanedAt)
+		if err != nil {
+			return transitions, err
+		}
+		if transitioned {
+			transitions++
+		}
+	}
+	return transitions, nil
+}
+
+// markBlockOrphanedCAS orphans one row and reports whether that changed its
+// status. The pre-read's status is only trustworthy if the write that follows
+// is conditioned on the record not having moved in between: with an
+// unconditional Operate, two replicas orphaning the same row could both read
+// 'active' and both report a transition although only one write changed it.
+// So the write carries EXPECT_GEN_EQUAL on the generation the read saw, and a
+// generation mismatch re-reads and retries — the loser of the race then reads
+// 'orphaned' and reports no transition. A hash with no record is skipped
+// (chaintracks may emit OrphanedHashes for blocks observed before this
+// service started recording), as is a record deleted between read and write.
+//
+// On a row that is already orphaned the write is a generation refresh, and
+// it is forward-only-inclusive: a stored orphan generation NEWER than this
+// call's is kept, stamp state and all — the record CAS stops lost writes,
+// not a delayed call carrying an older timestamp, which would otherwise move
+// the generation backwards and let a reconciler holding that older token
+// pass its CAS. An EQUAL generation still refreshes (clears the stamp): the
+// contract does not require a strictly increasing time, and a re-orphaning
+// that reuses the timestamp must still requeue the row.
+func (s *Store) markBlockOrphanedCAS(ctx context.Context, blockHash string, orphanedAt time.Time) (bool, error) {
+	key, err := s.key(setBlockProcessing, blockHash)
+	if err != nil {
+		return false, err
+	}
+	gen := orphanedAt.UnixNano()
+	for attempt := 0; attempt < casAttempts; attempt++ {
+		rec, err := s.client.Get(s.readPolicy(ctx), key, binStatus, binOrphanedAt)
 		if err != nil {
 			if isKeyNotFound(err) {
-				continue
+				return false, nil
 			}
-			return fmt.Errorf("read block_processing %s: %w", h, err)
+			return false, fmt.Errorf("read block_processing %s: %w", blockHash, err)
 		}
 		if rec == nil {
-			continue
+			return false, nil
+		}
+		wasOrphaned := getString(rec, binStatus) == string(models.BlockStatusOrphaned)
+		prev := getInt64(rec, binOrphanedAt) // the high-water mark, whatever the status
+		if wasOrphaned && prev > gen {
+			return false, nil // a newer generation is in place; nothing to write
+		}
+		// Mint the generation strictly above any this row has had, with the
+		// caller's timestamp as the lower bound: two orphanings never share
+		// one, so a token read before this write cannot pass the CAS after
+		// it. Computed per attempt, from the record the CAS is pinned to.
+		minted := gen
+		if prev >= gen {
+			minted = prev + 1
 		}
 		ops := []*aero.Operation{
 			aero.PutOp(aero.NewBin(binStatus, string(models.BlockStatusOrphaned))),
-			aero.PutOp(aero.NewBin(binOrphanedAt, orphanedAt.UnixNano())),
+			aero.PutOp(aero.NewBin(binOrphanedAt, minted)),
+			// Clear the previous generation's stamp so the row re-enters the
+			// reconciler queue for this orphaning.
+			aero.PutOp(aero.NewBin(binReconciledAt, nil)),
 		}
-		if _, err := s.client.Operate(s.writePolicy(ctx), key, ops...); err != nil {
-			return fmt.Errorf("mark orphaned %s: %w", h, err)
+		policy := s.writePolicy(ctx)
+		policy.RecordExistsAction = aero.UPDATE_ONLY
+		policy.GenerationPolicy = aero.EXPECT_GEN_EQUAL
+		policy.Generation = rec.Generation
+		_, opErr := s.client.Operate(policy, key, ops...)
+		switch {
+		case opErr == nil:
+			return !wasOrphaned, nil
+		case isKeyNotFound(opErr):
+			return false, nil // deleted between read and write
+		case isGenerationErr(opErr):
+			continue // another writer moved the row: re-read, re-judge, retry
+		default:
+			return false, fmt.Errorf("mark orphaned %s: %w", blockHash, opErr)
 		}
 	}
-	return nil
+	return false, fmt.Errorf("mark orphaned %s: record kept changing across %d CAS attempts", blockHash, casAttempts)
 }
 
 // MarkBlockReconciled stamps reconciled_at on an orphaned block's row — the
-// anchor reconciler finished re-anchoring/reverting its transactions. A
-// missing row is a silent no-op (UPDATE_ONLY, the RecordDeliveryAttempt
-// pattern).
-func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, at time.Time) error {
+// anchor reconciler finished re-anchoring/reverting its transactions — as a
+// compare-and-set on the orphan generation: the row must still be orphaned
+// with the orphaned_at the caller observed (a zero orphanedAt checks status
+// only). Missing, resurrected and re-orphaned rows are silently skipped and
+// reported as not stamped (issue #339). Read-then-write with
+// EXPECT_GEN_EQUAL (the UpdateDeliveryStatusCAS pattern) so a concurrent
+// writer that moves the row between our Get and Operate wins; UPDATE_ONLY
+// never creates a phantom block row.
+func (s *Store) MarkBlockReconciled(ctx context.Context, blockHash string, orphanedAt, at time.Time) (bool, error) {
 	key, err := s.key(setBlockProcessing, blockHash)
 	if err != nil {
-		return err
+		return false, err
+	}
+	rec, err := s.client.Get(s.readPolicy(ctx), key, binStatus, binOrphanedAt)
+	if err != nil {
+		if isKeyNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read block for reconcile cas %s: %w", blockHash, err)
+	}
+	if rec == nil || getString(rec, binStatus) != string(models.BlockStatusOrphaned) {
+		return false, nil
+	}
+	if !orphanedAt.IsZero() && getInt64(rec, binOrphanedAt) != orphanedAt.UnixNano() {
+		return false, nil
 	}
 	policy := s.writePolicy(ctx)
-	policy.RecordExistsAction = aero.UPDATE_ONLY // never create a phantom block row
-	_, err = s.client.Operate(policy, key,
+	policy.RecordExistsAction = aero.UPDATE_ONLY
+	policy.GenerationPolicy = aero.EXPECT_GEN_EQUAL
+	policy.Generation = rec.Generation
+	_, opErr := s.client.Operate(policy, key,
 		aero.PutOp(aero.NewBin(binReconciledAt, at.UnixNano())))
-	if isKeyNotFound(err) {
-		return nil
+	if opErr != nil {
+		if isKeyNotFound(opErr) || isGenerationErr(opErr) {
+			return false, nil // the row moved on between read and write: that writer's generation wins
+		}
+		return false, fmt.Errorf("mark block reconciled %s: %w", blockHash, opErr)
 	}
+	return true, nil
+}
+
+// RequeueOrphanedBlock clears reconciled_at on a row that is still orphaned
+// with the generation the caller judged (a zero orphanedAt checks status
+// only), putting it back on the reconciler's queue without changing the
+// generation. Missing, active, parked and re-orphaned rows are left
+// untouched and reported as not applied; it never transitions a row.
+// Read-then-EXPECT_GEN_EQUAL with a bounded re-read on a record-generation
+// conflict, like ReactivateBlock; UPDATE_ONLY never creates a phantom row.
+func (s *Store) RequeueOrphanedBlock(ctx context.Context, blockHash string, orphanedAt time.Time) (bool, error) {
+	key, err := s.key(setBlockProcessing, blockHash)
 	if err != nil {
-		return fmt.Errorf("mark block reconciled %s: %w", blockHash, err)
+		return false, err
 	}
-	return nil
+	for attempt := 0; attempt < casAttempts; attempt++ {
+		rec, err := s.client.Get(s.readPolicy(ctx), key, binStatus, binOrphanedAt, binReconciledAt)
+		if err != nil {
+			if isKeyNotFound(err) {
+				return false, nil
+			}
+			return false, fmt.Errorf("read block for requeue cas %s: %w", blockHash, err)
+		}
+		if rec == nil || getString(rec, binStatus) != string(models.BlockStatusOrphaned) {
+			return false, nil
+		}
+		if !orphanedAt.IsZero() && getInt64(rec, binOrphanedAt) != orphanedAt.UnixNano() {
+			return false, nil
+		}
+		if getInt64(rec, binReconciledAt) == 0 {
+			return true, nil // already queued; nothing to write
+		}
+		policy := s.writePolicy(ctx)
+		policy.RecordExistsAction = aero.UPDATE_ONLY
+		policy.GenerationPolicy = aero.EXPECT_GEN_EQUAL
+		policy.Generation = rec.Generation
+		_, opErr := s.client.Operate(policy, key, aero.PutOp(aero.NewBin(binReconciledAt, nil)))
+		switch {
+		case opErr == nil:
+			return true, nil
+		case isKeyNotFound(opErr):
+			return false, nil
+		case isGenerationErr(opErr):
+			continue
+		default:
+			return false, fmt.Errorf("requeue orphaned block %s: %w", blockHash, opErr)
+		}
+	}
+	return false, fmt.Errorf("requeue orphaned block %s: record kept changing across %d CAS attempts", blockHash, casAttempts)
+}
+
+// ReactivateBlock returns an orphaned row to active as a compare-and-set on
+// the orphan generation (issue #339): the row must still be orphaned with the
+// orphaned_at the caller judged (a zero orphanedAt checks status only).
+// Read-then-EXPECT_GEN_EQUAL like MarkBlockReconciled, but a generation
+// mismatch re-reads and re-judges rather than giving up: a concurrent
+// milestone write (processed_at, bump_built_at) bumps the generation without
+// touching status or orphaned_at and must not turn a valid reactivation into
+// a spurious "not applied". A row that fails the check on re-read —
+// resurrected, parked, re-orphaned or gone — is left untouched and reported
+// as not applied; UPDATE_ONLY never creates a phantom row.
+func (s *Store) ReactivateBlock(ctx context.Context, blockHash string, blockHeight uint64, orphanedAt time.Time) (bool, error) {
+	key, err := s.key(setBlockProcessing, blockHash)
+	if err != nil {
+		return false, err
+	}
+	// orphaned_at is kept as the high-water mark the next orphaning mints
+	// above; blockProcessingFromRecord hides it on an active row.
+	ops := []*aero.Operation{
+		aero.PutOp(aero.NewBin(binBlockHeight, int(blockHeight))), //nolint:gosec // block height fits in int on 64-bit platforms
+		aero.PutOp(aero.NewBin(binStatus, string(models.BlockStatusActive))),
+		aero.PutOp(aero.NewBin(binReconciledAt, nil)),
+	}
+	for attempt := 0; attempt < casAttempts; attempt++ {
+		rec, err := s.client.Get(s.readPolicy(ctx), key, binStatus, binOrphanedAt)
+		if err != nil {
+			if isKeyNotFound(err) {
+				return false, nil
+			}
+			return false, fmt.Errorf("read block for reactivate cas %s: %w", blockHash, err)
+		}
+		if rec == nil || getString(rec, binStatus) != string(models.BlockStatusOrphaned) {
+			return false, nil
+		}
+		if !orphanedAt.IsZero() && getInt64(rec, binOrphanedAt) != orphanedAt.UnixNano() {
+			return false, nil
+		}
+		policy := s.writePolicy(ctx)
+		policy.RecordExistsAction = aero.UPDATE_ONLY
+		policy.GenerationPolicy = aero.EXPECT_GEN_EQUAL
+		policy.Generation = rec.Generation
+		_, opErr := s.client.Operate(policy, key, ops...)
+		switch {
+		case opErr == nil:
+			return true, nil
+		case isKeyNotFound(opErr):
+			return false, nil
+		case isGenerationErr(opErr):
+			continue
+		default:
+			return false, fmt.Errorf("reactivate block %s: %w", blockHash, opErr)
+		}
+	}
+	return false, fmt.Errorf("reactivate block %s: record kept changing across %d CAS attempts", blockHash, casAttempts)
 }
 
 // ListOrphanedBlocksToReconcile narrows by status='orphaned' via the secondary
@@ -2770,7 +3006,9 @@ func blockProcessingFromRecord(rec *aero.Record) *models.BlockProcessingStatus {
 		t := time.Unix(0, v).UTC()
 		bp.BUMPBuiltAt = &t
 	}
-	if v := getInt64(rec, binOrphanedAt); v != 0 {
+	// orphaned_at survives a reactivation as the generation high-water mark;
+	// it is current — and surfaced — only while the row is orphaned.
+	if v := getInt64(rec, binOrphanedAt); v != 0 && bp.Status == models.BlockStatusOrphaned {
 		t := time.Unix(0, v).UTC()
 		bp.OrphanedAt = &t
 	}

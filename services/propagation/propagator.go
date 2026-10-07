@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,6 +32,7 @@ import (
 	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/services"
 	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/teranode"
 )
@@ -86,6 +88,8 @@ type propagationMsg struct {
 }
 
 type Propagator struct {
+	services.ReadyHook
+
 	cfg            *config.Config
 	logger         *zap.Logger
 	producer       *kafka.Producer
@@ -121,12 +125,16 @@ type Propagator struct {
 	// rebroadcastBatch caps stuck-tx rebroadcasts per reaper tick
 	// (propagation.reaper_rebroadcast_batch, default
 	// defaultReaperRebroadcastBatch). See reapOnce.
-	rebroadcastBatch  int
-	teranodeBatchCap  int
-	broadcastWorkers  int
-	maxParallelChunks int
-	holderID          string
-	leaseTTL          time.Duration
+	rebroadcastBatch int
+	// teranodeBatchCap and teranodeBatchBytesCap bound each POST /txs chunk by
+	// transaction count and by payload bytes respectively (issue #271); see
+	// planChunks. Both default from config.DefaultTeranodeMaxBatch*.
+	teranodeBatchCap      int
+	teranodeBatchBytesCap int
+	broadcastWorkers      int
+	maxParallelChunks     int
+	holderID              string
+	leaseTTL              time.Duration
 	// retryMaxAttempts is the per-claim in-memory requeue budget
 	// (propagation.retry_max_attempts, default defaultRetryMaxAttempts). See
 	// requeueAfterDelay / parkExhaustedRequeues for what happens when it runs
@@ -309,6 +317,19 @@ const defaultMaxParallelChunks = 4
 // unresolvable batch reaches its terminal escape in seconds rather than never.
 const defaultRetryMaxAttempts = 5
 
+// teranodeHardMaxBatchTxs and teranodeHardMaxBatchBytes mirror Teranode's
+// propagation server (services/propagation/Server.go:
+// maxTransactionsPerRequest and maxDataPerRequest). Since Teranode v0.15.0
+// both are checked there with ">=" BEFORE each read, so a /txs body that
+// merely reaches either value is refused with a bare 400 after the peer has
+// already dispatched everything it read. The shipped defaults
+// (config.DefaultTeranodeMaxBatchSize / DefaultTeranodeMaxBatchBytes) sit
+// under them; New warns when a configured cap reaches them.
+const (
+	teranodeHardMaxBatchTxs   = 1024
+	teranodeHardMaxBatchBytes = 32 << 20
+)
+
 // New constructs a Propagator. leaser may be nil, in which case the reaper
 // runs unguarded — appropriate for tests and single-process deployments that
 // don't need coordination. In production every replica should receive a
@@ -342,7 +363,29 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 	}
 	teranodeBatchCap := cfg.Propagation.TeranodeMaxBatchSize
 	if teranodeBatchCap <= 0 {
-		teranodeBatchCap = 1024
+		teranodeBatchCap = config.DefaultTeranodeMaxBatchSize
+	}
+	teranodeBatchBytesCap := cfg.Propagation.TeranodeMaxBatchBytes
+	if teranodeBatchBytesCap <= 0 {
+		teranodeBatchBytesCap = config.DefaultTeranodeMaxBatchBytes
+	}
+	// Teranode refuses a chunk that merely REACHES its per-request limits
+	// (see teranodeHardMaxBatch*). Warn rather than clamp: the operator asked
+	// for the value, and the size-rejection narrowing path still copes — at
+	// the cost of extra round trips on every full chunk.
+	if teranodeBatchCap >= teranodeHardMaxBatchTxs {
+		logger.Warn(
+			"teranode_max_batch_size reaches teranode's per-request limit; a full chunk will be refused",
+			zap.Int("teranode_max_batch_size", teranodeBatchCap),
+			zap.Int("teranode_limit", teranodeHardMaxBatchTxs),
+		)
+	}
+	if teranodeBatchBytesCap >= teranodeHardMaxBatchBytes {
+		logger.Warn(
+			"teranode_max_batch_bytes reaches teranode's per-request limit; a full chunk will be refused",
+			zap.Int("teranode_max_batch_bytes", teranodeBatchBytesCap),
+			zap.Int("teranode_limit", teranodeHardMaxBatchBytes),
+		)
 	}
 	maxPending := cfg.Propagation.MaxPending
 	if maxPending <= 0 {
@@ -391,26 +434,27 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 		pendingRetryMaxAttempts = cfg.Propagation.PendingRetryMaxAttempts
 	}
 	p := &Propagator{
-		cfg:               cfg,
-		logger:            logger.Named("propagation"),
-		producer:          producer,
-		publisher:         publisher,
-		store:             st,
-		leaser:            leaser,
-		teranodeClient:    tc,
-		merkleClient:      mc,
-		maxPending:        maxPending,
-		merkleConcurrency: merkleConcurrency,
-		reaperInterval:    reaperInterval,
-		reaperBatchSize:   reaperBatch,
-		rebroadcastBatch:  rebroadcastBatch,
-		teranodeBatchCap:  teranodeBatchCap,
-		broadcastWorkers:  broadcastWorkers,
-		maxParallelChunks: maxParallelChunks,
-		holderID:          newHolderID(),
-		leaseTTL:          leaseTTL,
-		retryMaxAttempts:  retryMaxAttempts,
-		requeueDelay:      requeueDelay,
+		cfg:                   cfg,
+		logger:                logger.Named("propagation"),
+		producer:              producer,
+		publisher:             publisher,
+		store:                 st,
+		leaser:                leaser,
+		teranodeClient:        tc,
+		merkleClient:          mc,
+		maxPending:            maxPending,
+		merkleConcurrency:     merkleConcurrency,
+		reaperInterval:        reaperInterval,
+		reaperBatchSize:       reaperBatch,
+		rebroadcastBatch:      rebroadcastBatch,
+		teranodeBatchCap:      teranodeBatchCap,
+		teranodeBatchBytesCap: teranodeBatchBytesCap,
+		broadcastWorkers:      broadcastWorkers,
+		maxParallelChunks:     maxParallelChunks,
+		holderID:              newHolderID(),
+		leaseTTL:              leaseTTL,
+		retryMaxAttempts:      retryMaxAttempts,
+		requeueDelay:          requeueDelay,
 
 		pendingRetryBackoff:     pendingRetryBackoff,
 		pendingRetryMaxBackoff:  pendingRetryMaxBackoff,
@@ -503,12 +547,12 @@ func (p *Propagator) Name() string { return "propagation" }
 //     receives the terminal event. This pass MUST NOT be filtered by
 //     whether the store write moved the row — a tx re-read from Kafka
 //     after a rebalance is typically already at its terminal status, so
-//     BatchUpdateStatusReturning reports a lattice no-op (prev.Status ==
-//     st.Status) or an unknown row (prev == nil, row reaped). Skipping the
-//     notify for those strands the offset on the tracker and pins
-//     LowestUnfinished() — the Kafka commit watermark — forever, so the
-//     consumer group never commits and every restart re-reads the whole
-//     topic from offset 0.
+//     BatchUpdateStatusReturning reports either no applied write (Prev ==
+//     nil: a lattice skip or a reaped row) or an idempotent re-assert
+//     (Prev.Status == st.Status). Skipping the notify for those strands
+//     the offset on the tracker and pins LowestUnfinished() — the Kafka
+//     commit watermark — forever, so the consumer group never commits and
+//     every restart re-reads the whole topic from offset 0.
 //
 //   - Bulk publish covers only rows that actually transitioned. A lattice
 //     no-op or a reaped row would be a phantom SSE/webhook event.
@@ -550,7 +594,7 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 	for i, st := range terminalStatuses {
 		var prev *models.TransactionStatus
 		if i < len(prevs) {
-			prev = prevs[i]
+			prev = prevs[i].Prev
 		}
 
 		// Dispatcher accounting — unconditional. Callers only route
@@ -962,8 +1006,9 @@ func (p *Propagator) publishBulkStatus(ctx context.Context, status models.Status
 // to one event each — which is exactly what carrying a per-transaction reason
 // requires.
 //
-// Only TxID, ExtraInfo and StatusCode are read from each status; the event's
-// Status and Timestamp come from the caller, matching publishBulkStatus.
+// Only TxID, ExtraInfo, StatusCode and CompetingTxs are read from each status;
+// the event's Status and Timestamp come from the caller, matching
+// publishBulkStatus.
 func (p *Propagator) publishRejections(ctx context.Context, rejected []*models.TransactionStatus, ts time.Time) {
 	if p.publisher == nil || len(rejected) == 0 {
 		return
@@ -974,20 +1019,25 @@ func (p *Propagator) publishRejections(ctx context.Context, rejected []*models.T
 	type reason struct {
 		extraInfo  string
 		statusCode int
+		competing  string
 	}
 	index := make(map[reason]int, len(rejected))
 	groups := make([]*models.TransactionStatus, 0, len(rejected))
 	for _, st := range rejected {
-		key := reason{extraInfo: st.ExtraInfo, statusCode: st.StatusCode}
+		// CompetingTxs is part of the key: an event's fields apply to every
+		// txid it carries, and two double spends of different outpoints lose
+		// to different spenders.
+		key := reason{extraInfo: st.ExtraInfo, statusCode: st.StatusCode, competing: strings.Join(st.CompetingTxs, ",")}
 		i, seen := index[key]
 		if !seen {
 			i = len(groups)
 			index[key] = i
 			groups = append(groups, &models.TransactionStatus{
-				Status:     models.StatusRejected,
-				StatusCode: st.StatusCode,
-				Timestamp:  ts,
-				ExtraInfo:  st.ExtraInfo,
+				Status:       models.StatusRejected,
+				StatusCode:   st.StatusCode,
+				Timestamp:    ts,
+				ExtraInfo:    st.ExtraInfo,
+				CompetingTxs: st.CompetingTxs,
 			})
 		}
 		groups[i].TxIDs = append(groups[i].TxIDs, st.TxID)
@@ -1093,11 +1143,19 @@ func (p *Propagator) Start(ctx context.Context) error {
 		zap.Duration("reaper_interval", p.reaperInterval),
 		zap.Int("broadcast_workers", p.broadcastWorkers),
 		zap.Int("max_parallel_chunks", p.maxParallelChunks),
+		zap.Int("teranode_max_batch_size", p.teranodeBatchCap),
+		zap.Int("teranode_max_batch_bytes", p.teranodeBatchBytesCap),
 	)
 	// Signal init complete before blocking on consumer.Run so a concurrent
 	// Stop can proceed past <-p.initDone now that every wg.Add above has
 	// happened-before any wg.Wait Stop will perform.
 	p.initOnce.Do(func() { close(p.initDone) })
+	// Readiness: the consumer group is constructed (brokers reachable) and
+	// the workers and replay/reaper are up. Run blocks for the process
+	// lifetime, so readiness cannot wait for it. The signal therefore
+	// precedes the actual group join; a persistent join failure (ACL,
+	// missing topic) keeps Run retrying and is not reflected in /ready.
+	p.SignalReady()
 	return consumer.Run(ctx)
 }
 
@@ -1471,10 +1529,17 @@ func preferRejectionLine(current, candidate string) string {
 	if current == "" {
 		return candidate
 	}
-	if rejectionLineScore(candidate) > rejectionLineScore(current) {
+	switch cand, cur := rejectionLineScore(candidate), rejectionLineScore(current); {
+	case cand > cur:
 		return candidate
+	case cand == cur && len(competingSpenders(candidate)) > 0 && len(competingSpenders(current)) == 0:
+		// Same verdict class, but only the candidate names the competing
+		// spender (UTXO_SPENT does; TX_CONFLICTING does not). Keep the one
+		// that can populate competingTxs, whichever peer answered first.
+		return candidate
+	default:
+		return current
 	}
-	return current
 }
 
 // alienFailureLines scans one peer's parsed failure map for lines whose key
@@ -1718,10 +1783,73 @@ func bestUnplaceableLine(bestAlien string, unkeyed []string) string {
 }
 
 func rejectionLineScore(line string) int {
+	best := -1
+	for _, m := range teranodeNamedCode.FindAllString(line, -1) {
+		name, _, _ := strings.Cut(m, " (")
+		best = max(best, codeNameScore(name))
+	}
+	if best >= 0 {
+		return best
+	}
 	name, _, found := strings.Cut(line, " (")
 	if !found {
 		return 0
 	}
+	return codeNameScore(name)
+}
+
+// verdictCodeName returns the Teranode code a failure line's verdict should be
+// read from: the most specific "NAME (n)" token anywhere in the line, not
+// merely the leading one. Teranode wraps causes ("PROCESSING (4): … TX_INVALID
+// (31): … UTXO_FROZEN (72): …"), and keying on an outer wrapper would report a
+// double spend as an uncoded catch-all, or a frozen utxo as a generic 467 —
+// losing the code a wallet branches on. Ranked by verdictSpecificity, not by
+// the cross-peer codeNameScore: within one line the question is which code IS
+// the cause, not which peer's line reads best. Ties keep the leftmost
+// (outermost) token, so a line whose only code is PROCESSING still reads as
+// PROCESSING. found is false only when the line carries no code token at all.
+func verdictCodeName(line string) (name string, found bool) {
+	best := -1
+	for _, m := range teranodeNamedCode.FindAllString(line, -1) {
+		candidate, _, _ := strings.Cut(m, " (")
+		if rank := verdictSpecificity(candidate); rank > best {
+			name, best = candidate, rank
+		}
+	}
+	if best >= 0 {
+		return name, true
+	}
+	// No well-formed token (e.g. a non-uppercase prefix): fall back to the
+	// leading "<name> (" shape the parser has always accepted.
+	name, _, found = strings.Cut(line, " (")
+	return name, found
+}
+
+// verdictSpecificity ranks a code for verdictCodeName: codes classifyFailureLine
+// maps to a specific ARC status beat TX_INVALID, the generic wrapper that maps
+// to 467, which beats known codes with no mapping, then unknown codes, then
+// the PROCESSING catch-all. A specific unmapped code (TX_POLICY under
+// TX_INVALID) therefore never demotes a mapped line to uncoded.
+func verdictSpecificity(name string) int {
+	switch name {
+	case "UTXO_SPENT", "TX_INVALID_DOUBLE_SPEND", "TX_CONFLICTING":
+		return 50
+	case "TX_LOCKED", "UTXO_FROZEN", "TX_LOCK_TIME", "UTXO_NON_FINAL":
+		return 40
+	case "TX_INVALID":
+		return 30
+	case "PROCESSING":
+		return 10
+	}
+	if codeNameScore(name) == 30 {
+		return 20 // known, specific, but unmapped
+	}
+	return 15 // a code this build does not know
+}
+
+// codeNameScore ranks one Teranode code name for wallet-facing quality; see
+// rejectionLineScore.
+func codeNameScore(name string) int {
 	switch name {
 	case "UTXO_SPENT", "TX_INVALID_DOUBLE_SPEND", "TX_CONFLICTING":
 		return 40
@@ -1752,11 +1880,11 @@ func rejectionLineScore(line string) int {
 // This helper only maps lines the broadcast loop has already routed as
 // terminal verdicts (rejectionLine). Opaque PROCESSING (4) with no nested
 // named code never reaches here — it requeues. Nested wrappers such as
-// "PROCESSING (4): … TX_INVALID (31)" still arrive as the full line: the
-// leading PROCESSING keeps arcCode 0 while ExtraInfo preserves the inner
-// text. Real validator codes (TX_INVALID, UTXO_SPENT, …) remain REJECTED.
+// "PROCESSING (4): … UTXO_SPENT (70)" arrive as the full line and are
+// classified by their most informative code (verdictCodeName), not by the
+// leading PROCESSING wrapper; ExtraInfo keeps the whole line.
 //
-// What the leading "NAME (n)" code DOES tell us confidently is mapped onto
+// What the verdict's "NAME (n)" code DOES tell us confidently is mapped onto
 // the ARC taxonomy so consumers can branch on a number instead of prose
 // (issue #254 / external feedback item 2):
 //
@@ -1775,7 +1903,9 @@ func rejectionLineScore(line string) int {
 //	  is owned by a competing/confirmed tx, not merely unaccepted.
 //	TX_INVALID (31)     → 467 StatusGeneric (wraps fee/script/policy — the
 //	  name alone can't recover which).
-//	PROCESSING (4) and everything else → 0, message verbatim.
+//	UTXO_FROZEN (72)    → 471 StatusFrozenPolicy.
+//	PROCESSING (4) and everything else → 0, message verbatim (PROCESSING
+//	  with a single-tx HTTP 403 → 471, see httpStatus below).
 //
 // errMsg preserves the Teranode line verbatim (plus the retryable suffix for
 // the non-final family) so wallet rows surface the actual message.
@@ -1788,7 +1918,7 @@ func rejectionLineScore(line string) int {
 // actionable verdict that would otherwise reach the submitter as "failed to
 // validate transaction" and nothing more.
 func classifyFailureLine(line string, httpStatus int) (errMsg string, arcCode int) {
-	name, _, found := strings.Cut(line, " (")
+	name, found := verdictCodeName(line)
 	if !found {
 		return line, 0
 	}
@@ -1804,6 +1934,10 @@ func classifyFailureLine(line string, httpStatus int) (errMsg string, arcCode in
 		return line, int(arcerrors.StatusConflict)
 	case "TX_INVALID":
 		return line, int(arcerrors.StatusGeneric)
+	case "UTXO_FROZEN":
+		// The named form of what the opaque-PROCESSING 403 branch below
+		// infers from the status alone.
+		return line, int(arcerrors.StatusFrozenPolicy)
 	case "PROCESSING":
 		if httpStatus == http.StatusForbidden {
 			return line + " — the peer answered HTTP 403 (forbidden): the transaction spends a frozen or " +
@@ -1815,6 +1949,27 @@ func classifyFailureLine(line string, httpStatus int) (errMsg string, arcCode in
 	default:
 		return line, 0
 	}
+}
+
+// competingSpenderPattern lifts the competing spender's txid out of a Teranode
+// conflict line, which renders it as "already spent by tx <txid>[<vin>]"
+// (teranode errors.NewUtxoSpentError over spend.SpendingData.String()).
+var competingSpenderPattern = regexp.MustCompile(`(?i)already spent by tx ([0-9a-f]{64})`)
+
+// competingSpenders returns the distinct txids a conflict line names as the
+// current owners of the outpoints the rejected transaction tried to spend,
+// lowercased, in first-seen order — the value for
+// TransactionStatus.CompetingTxs. nil when the line names none (TX_CONFLICTING
+// and TX_INVALID_DOUBLE_SPEND do not carry the spender).
+func competingSpenders(line string) []string {
+	var out []string
+	for _, m := range competingSpenderPattern.FindAllStringSubmatch(line, -1) {
+		txid := strings.ToLower(m[1])
+		if !slices.Contains(out, txid) {
+			out = append(out, txid)
+		}
+	}
+	return out
 }
 
 // startBroadcastSpan opens one "propagation.broadcast" span per flushed
@@ -2214,16 +2369,23 @@ func (p *Propagator) parkExhaustedRequeues(ctx context.Context, msgs []propagati
 	)
 	for i, m := range msgs {
 		txids[i] = m.TXID
-		// A tx that cycled here on a named condition (missing parent)
-		// gets a reason stating it, so GET /tx explains WHY the fast
-		// path gave up instead of the generic no-verdict text.
+		// A tx that cycled here on a named condition gets a reason stating
+		// it, so GET /tx explains WHY the fast path gave up instead of the
+		// generic no-verdict text. The missing-parent wording is reserved
+		// for a missing-parent line, mirroring giveUpReason: a node fault
+		// (STORAGE_ERROR) or a batch-shape refusal quotes the peer as-is
+		// rather than inventing a story about the transaction's ancestry.
 		reason := genericReason
-		if m.retryReason != "" {
+		switch {
+		case m.retryReason == "":
+		case lineIsMissingParentCondition(m.retryReason):
 			reason = fmt.Sprintf(
 				"parent not yet accepted by the network after %d propagation attempts: retryable — parked for durable rebroadcast by the propagation reaper; last error: %s",
 				p.retryMaxAttempts,
 				m.retryReason,
 			)
+		default:
+			reason = genericReason + "; last network response: " + m.retryReason
 		}
 		statuses[i] = &models.TransactionStatus{
 			TxID:      m.TXID,
@@ -2397,7 +2559,7 @@ func (p *Propagator) schedulePendingRetry(ctx context.Context, txid string, rawT
 		return
 	}
 	next := time.Now().Add(p.nextPendingRetryDelay(count))
-	if err := p.store.SetPendingRetryFields(ctx, txid, rawTx, next); err != nil {
+	if err := p.store.SetPendingRetryFields(ctx, txid, rawTx, next, lastReason); err != nil {
 		p.logger.Error("set pending retry fields failed; tx may not be re-broadcast",
 			logfields.TxID(txid), zap.Error(err))
 		return
@@ -2409,28 +2571,15 @@ func (p *Propagator) schedulePendingRetry(ctx context.Context, txid string, rawT
 // cfg.Propagation.MaxParallelChunks (see Propagator.maxParallelChunks);
 // defaults to defaultMaxParallelChunks.
 
-// broadcastInChunks splits a batch into teranodeBatchCap-sized chunks and
-// broadcasts each via /txs. Chunks run in parallel bounded by
-// p.maxParallelChunks so a large flush doesn't serialize behind one slow
-// endpoint. Returns per-tx results in the same order as the input.
+// broadcastInChunks splits a batch into chunks bounded by both
+// p.teranodeBatchCap transactions and p.teranodeBatchBytesCap payload bytes
+// (see planChunks) and broadcasts each via /txs. Chunks run in parallel
+// bounded by p.maxParallelChunks so a large flush doesn't serialize behind
+// one slow endpoint. Returns per-tx results in the same order as the input.
+// Precondition: len(batch) == len(rawTxs), index-aligned.
 func (p *Propagator) broadcastInChunks(ctx context.Context, batch []propagationMsg, rawTxs [][]byte) []txResult {
 	results := make([]txResult, len(batch))
-	chunkSize := p.teranodeBatchCap
-	if chunkSize <= 0 {
-		chunkSize = len(batch)
-	}
-
-	type chunk struct {
-		start, end int
-	}
-	var chunks []chunk
-	for start := 0; start < len(batch); start += chunkSize {
-		end := start + chunkSize
-		if end > len(batch) {
-			end = len(batch)
-		}
-		chunks = append(chunks, chunk{start: start, end: end})
-	}
+	chunks := planChunks(rawTxs, p.teranodeBatchCap, p.teranodeBatchBytesCap)
 
 	if len(chunks) <= 1 {
 		if len(chunks) == 1 {
@@ -2455,13 +2604,27 @@ func (p *Propagator) broadcastInChunks(ctx context.Context, batch []propagationM
 	return results
 }
 
-// broadcastChunk broadcasts a single chunk (≤ teranodeBatchCap) via POST
-// /txs and writes per-tx classifications into out. /txs handles any chunk
-// size — a chunk of one is just one tx's bytes — so there's a single
+// broadcastChunk broadcasts a single chunk (≤ teranodeBatchCap txs and, unless
+// it is one oversize tx travelling alone, ≤ teranodeBatchBytesCap bytes) via
+// POST /txs and writes per-tx classifications into out. /txs handles any
+// chunk size — a chunk of one is just one tx's bytes — so there's a single
 // classification path regardless of count.
 func (p *Propagator) broadcastChunk(ctx context.Context, chunk []propagationMsg, rawTxs [][]byte, out []txResult) {
+	chunkBytes := rawTxsBytes(rawTxs)
 	metrics.PropagationChunkTotal.WithLabelValues("none").Inc()
-	results, _, needsNarrowing := p.broadcastBatchToEndpoints(ctx, rawTxs, chunk)
+	metrics.PropagationChunkBytes.Observe(float64(chunkBytes))
+	if len(chunk) == 1 && p.teranodeBatchBytesCap > 0 && chunkBytes > p.teranodeBatchBytesCap {
+		// planChunks never pairs an oversize tx with another, so this fires
+		// once per oversize tx per broadcast attempt. It is sent regardless:
+		// Teranode, not arcade, rules on per-tx size policy.
+		p.logger.Warn(
+			"transaction exceeds teranode_max_batch_bytes; broadcasting it alone",
+			logfields.TxID(chunk[0].TXID),
+			zap.Int("tx_bytes", chunkBytes),
+			zap.Int("max_batch_bytes", p.teranodeBatchBytesCap),
+		)
+	}
+	results, _, needsNarrowing := p.broadcastBatchToEndpoints(ctx, rawTxs, chunk, chunkBytes)
 	if needsNarrowing && len(chunk) > 1 {
 		p.narrowChunk(ctx, chunk, rawTxs, out)
 		return
@@ -2494,7 +2657,7 @@ func (p *Propagator) narrowChunk(ctx context.Context, chunk []propagationMsg, ra
 	metrics.PropagationChunkTotal.WithLabelValues("narrowed").Inc()
 	mid := len(chunk) / 2
 	p.logger.Info(
-		"narrowing chunk to place an unattributable teranode failure line",
+		"narrowing chunk: peer response cannot be bound to individual transactions",
 		zap.Int("chunk_size", len(chunk)),
 		zap.Int("split_at", mid),
 	)
@@ -2522,6 +2685,9 @@ func isCanceledByBroadcast(broadcastCtx context.Context, err error) bool {
 type endpointOutcome struct {
 	endpoint   string
 	statusCode int
+	// shapeRejected marks a peer that refused the chunk by shape
+	// (teranode.ErrBatchTooLarge): reachable, but it judged nothing.
+	shapeRejected bool
 }
 
 // recordBroadcastOutcomes applies circuit-breaker accounting to a complete
@@ -2538,9 +2704,18 @@ func recordBroadcastOutcomes(tc *teranode.Client, outcomes []endpointOutcome) {
 	if len(outcomes) == 0 {
 		return
 	}
+	// Consensus is computed over VOTING outcomes only. A shape rejection
+	// (teranode.ErrBatchTooLarge) proves the peer is reachable and says
+	// nothing about the transactions, so it counts neither toward
+	// unanimity nor against it.
 	any2xx := false
 	anyResponded := false
+	anyVote := false
 	for _, o := range outcomes {
+		if o.shapeRejected {
+			continue
+		}
+		anyVote = true
 		if o.statusCode >= 200 && o.statusCode < 300 {
 			any2xx = true
 		}
@@ -2550,6 +2725,10 @@ func recordBroadcastOutcomes(tc *teranode.Client, outcomes []endpointOutcome) {
 	}
 	unanimousReject := !any2xx && anyResponded
 	switch {
+	case !anyVote:
+		// Every responder refused the chunk by shape: no verdict was cast,
+		// so there is no consensus to count. PropagationChunkTotal
+		// {fallback="size_rejected"} already records the event.
 	case any2xx:
 		metrics.PropagationBroadcastConsensus.WithLabelValues("accepted").Inc()
 	case unanimousReject:
@@ -2564,6 +2743,11 @@ func recordBroadcastOutcomes(tc *teranode.Client, outcomes []endpointOutcome) {
 			tc.RecordFailure(o.endpoint)
 		case o.statusCode >= 200 && o.statusCode < 300:
 			tc.RecordSuccess(o.endpoint)
+		case o.shapeRejected:
+			// Neutral. Charging the slow-track breaker would sideline a
+			// healthy peer whose body limit is merely below arcade's chunk
+			// size; resetting it (the unanimous arm) would launder real
+			// failures the same peer produced earlier.
 		case unanimousReject:
 			// Network consensus — peer responded, did its job. Reset its
 			// counters so a long rejection storm doesn't progressively
@@ -2673,7 +2857,7 @@ func (p *Propagator) submitBroadcastJobs(ctx context.Context, endpoints []string
 // siblings accept is exactly the slow-track breaker's target. The
 // returned successEndpoint is the URL of the first peer that returned
 // HTTP 200 (empty when none did).
-func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]byte, batch []propagationMsg) (results []txResult, successEndpoint string, needsNarrowing bool) {
+func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]byte, batch []propagationMsg, chunkBytes int) (results []txResult, successEndpoint string, needsNarrowing bool) {
 	start := time.Now()
 	defer func() {
 		metrics.PropagationBroadcastDuration.WithLabelValues("batch").Observe(time.Since(start).Seconds())
@@ -2722,7 +2906,9 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 	// (STORAGE_ERROR, SERVICE_ERROR, …) rather than anything about the
 	// submitted bytes. Like missing-parent these are conditions, not verdicts:
 	// a peer whose blob store is down has not judged the transaction, and
-	// terminalizing on it makes a transient outage permanent.
+	// terminalizing on it makes a transient outage permanent. It also carries
+	// a batch-shape refusal (teranode.ErrBatchTooLarge) for a tx nobody voted
+	// on, so a chunk of one requeues with the peer's words as its reason.
 	infraLine := make([]string, len(batch))
 	// rejectionStatus records the HTTP status that accompanied each kept
 	// rejection line, but only when that peer reported a single failure (see
@@ -2774,12 +2960,20 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 			rejectionLine[idx] = kept
 		}
 	}
+	// sizeRejected records that at least one peer refused the chunk by shape
+	// (teranode.ErrBatchTooLarge, issue #271): no per-tx information, and
+	// Teranode has already dispatched whatever it read before the trip. Such
+	// a peer votes for nobody; any tx left without a vote makes the caller
+	// narrow the chunk, and a chunk of one requeues quoting the peer.
+	sizeRejected := false
+	var sizeReason string
 	for i := 0; i < submitted; i++ {
 		result := <-resultCh
 		if isCanceledByBroadcast(broadcastCtx, result.err) {
 			continue
 		}
-		outcomes = append(outcomes, endpointOutcome{endpoint: result.endpoint, statusCode: result.statusCode})
+		shapeRejected := errors.Is(result.err, teranode.ErrBatchTooLarge)
+		outcomes = append(outcomes, endpointOutcome{endpoint: result.endpoint, statusCode: result.statusCode, shapeRejected: shapeRejected})
 
 		if result.err == nil {
 			// HTTP 200 — peer accepted the entire batch.
@@ -2787,6 +2981,7 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 				"batch broadcast endpoint succeeded",
 				zap.String("endpoint", result.endpoint),
 				zap.Int("batch_size", len(batch)),
+				zap.Int("batch_bytes", chunkBytes),
 			)
 			if !anySuccess {
 				successEndpoint = result.endpoint
@@ -2795,6 +2990,21 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 			for j := range batch {
 				acceptedByAny[j] = true
 			}
+			continue
+		}
+
+		if shapeRejected {
+			sizeRejected = true
+			sizeReason = fmt.Sprintf("teranode rejected the batch as submitted (%d txs, %d bytes): %v", len(batch), chunkBytes, result.err)
+			p.logger.Warn(
+				"teranode rejected chunk by size or count; no per-tx verdict",
+				zap.String("endpoint", result.endpoint),
+				zap.Int("status_code", result.statusCode),
+				zap.Int("chunk_size", len(batch)),
+				zap.Int("chunk_bytes", chunkBytes),
+				zap.Bool("narrowable", len(batch) > 1),
+				zap.Error(result.err),
+			)
 			continue
 		}
 
@@ -2809,6 +3019,7 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 				"batch broadcast endpoint failed",
 				zap.String("endpoint", result.endpoint),
 				zap.Int("batch_size", len(batch)),
+				zap.Int("batch_bytes", chunkBytes),
 				zap.Int("status_code", result.statusCode),
 				zap.Error(result.err),
 				zap.Int("failure_count", n),
@@ -2819,6 +3030,7 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 				"batch broadcast endpoint failed",
 				zap.String("endpoint", result.endpoint),
 				zap.Int("batch_size", len(batch)),
+				zap.Int("batch_bytes", chunkBytes),
 				zap.Int("status_code", result.statusCode),
 				zap.Error(result.err),
 			)
@@ -2951,6 +3163,20 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 			route(0, bestUnplaceableLine(bestAlien, result.failures.Unkeyed), statusHint)
 		}
 	}
+	if sizeRejected {
+		metrics.PropagationChunkTotal.WithLabelValues("size_rejected").Inc()
+		for i := range batch {
+			if acceptedByAny[i] || rejectionLine[i] != "" || missingParentLine[i] != "" || infraLine[i] != "" {
+				continue
+			}
+			// Nobody voted on this tx and a peer refused the chunk by shape:
+			// halve if there is anything to halve (a sibling's sticky accept
+			// or verdict above already settled the rest), and for a chunk of
+			// one requeue carrying the peer's own words as the reason.
+			needsNarrowing = true
+			infraLine[i] = sizeReason
+		}
+	}
 	recordBroadcastOutcomes(p.teranodeClient, outcomes)
 
 	p.logger.Debug(
@@ -2976,15 +3202,20 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 			}
 		case rejectionLine[i] != "":
 			errMsg, arcCode := classifyFailureLine(rejectionLine[i], rejectionStatus[i])
+			var competing []string
+			if arcCode == int(arcerrors.StatusConflict) {
+				competing = competingSpenders(rejectionLine[i])
+			}
 			results[i] = txResult{
 				class:  txResultClassRejected,
 				errMsg: errMsg,
 				status: &models.TransactionStatus{
-					TxID:       msg.TXID,
-					Status:     models.StatusRejected,
-					StatusCode: arcCode,
-					Timestamp:  now,
-					ExtraInfo:  errMsg,
+					TxID:         msg.TXID,
+					Status:       models.StatusRejected,
+					StatusCode:   arcCode,
+					Timestamp:    now,
+					ExtraInfo:    errMsg,
+					CompetingTxs: competing,
 				},
 				rawTx: msg.RawTx,
 			}

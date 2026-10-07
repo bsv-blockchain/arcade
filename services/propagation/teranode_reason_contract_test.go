@@ -383,17 +383,9 @@ func boundaryCases() []boundaryCase {
 				return wrapProcessTransaction(target, wrapSpend(target,
 					tnerr.NewUtxoFrozenError("[SPEND_BATCH_LUA][%s] UTXO is frozen, vout %d: %s", other, spentOutpointVout, "frozen by alert system")))
 			},
-			want: outcomeRejected,
-			// The cause is gone, so all arcade can honestly say is what the
-			// peer's own status code means. That is still a real, actionable
-			// answer — which is the bar — but it is recovered from the HTTP
-			// layer, not from teranode's message.
-			wantReason: "HTTP 403",
+			want:       outcomeRejected,
+			wantReason: "UTXO is frozen",
 			wantARC:    int(arcerrors.StatusFrozenPolicy),
-			upstreamGap: "ERR_UTXO_FROZEN is not on publicCauseCodes, so the reason collapses to the outer " +
-				"PROCESSING wrapper and arcade can only recover the class from the 403; teranode must " +
-				"allowlist it for the submitter to learn WHICH utxo is frozen and why",
-			mustNotContain: "UTXO_FROZEN",
 		},
 		{
 			row:    "D10",
@@ -599,13 +591,23 @@ func TestBoundaryLine_DropsTheProcessTransactionWrapper(t *testing.T) {
 	}
 
 	collapsed := boundaryLine(wrapProcessTransaction(target,
-		tnerr.NewTxMissingParentError("[Validate][%s] error getting parent transaction %s", target, strings.Repeat("a", 64))))
-	if !strings.Contains(collapsed, target) {
+		tnerr.NewTxCoinbaseImmatureError("[Validate][%s] coinbase is not mature", target)))
+	if !strings.Contains(collapsed, "[ProcessTransaction]["+target+"]") {
 		t.Errorf("non-allowlisted cause should collapse to the outer wrapper (which carries the txid), got %q", collapsed)
 	}
-	if strings.Contains(collapsed, "TX_MISSING_PARENT") {
-		t.Errorf("TX_MISSING_PARENT is now allowlisted (%q) — arcade's lineIsMissingParentCondition "+
-			"can match again; drop the 422-status fallback", collapsed)
+	if strings.Contains(collapsed, "TX_COINBASE_IMMATURE") {
+		t.Errorf("TX_COINBASE_IMMATURE is now allowlisted (%q) — pick another non-allowlisted cause "+
+			"for this assertion and add the coinbase-immature row to the contract table", collapsed)
+	}
+
+	// TX_MISSING_PARENT has been allowlisted since teranode v0.16.0, so
+	// lineIsMissingParentCondition matches the line directly. The 422-status
+	// fallback in route stays for peers still running an older build.
+	missingParent := boundaryLine(wrapProcessTransaction(target,
+		tnerr.NewTxMissingParentError("[Validate][%s] error getting parent transaction %s", target, strings.Repeat("a", 64))))
+	if !lineIsMissingParentCondition(missingParent) {
+		t.Errorf("TX_MISSING_PARENT no longer survives the boundary (%q) — only the 422-status "+
+			"fallback can recover the condition now", missingParent)
 	}
 }
 

@@ -1,0 +1,75 @@
+name: mongodb-store
+
+# ------------------------------------------------------------------------------------
+#  MongoDB store backend — live-server suite
+# ------------------------------------------------------------------------------------
+# store/mongodb's contract, concurrency and conformance tests are gated by
+# the `mongodb` build tag and skip when no server answers, like the postgres
+# and aerospike suites. This workflow provisions a mongo service container
+# and runs them with ARCADE_MONGODB_REQUIRED set, so an unreachable server
+# fails the job instead of skipping every test. Scoped to the files that can
+# change the backend's behaviour — the package itself, the store interfaces
+# and shared suite, the shared bumpcache behind its merkle-path enrichment,
+# the bump package it parses compounds with, the models it persists, the
+# config and factory that select and construct it, and bump_builder, whose
+# partial-write and reorg handling is written against this backend's
+# SetMinedByTxIDs / SetStatusByBlockHash return contract — so unrelated PRs do
+# not pay for it.
+# ------------------------------------------------------------------------------------
+
+on:
+  pull_request:
+    paths:
+      - "store/mongodb/**"
+      - "store/*.go"
+      - "store/bumpcache/**"
+      - "store/factory/**"
+      - "store/storetest/**"
+      - "bump/**"
+      - "services/bump_builder/**"
+      - "models/**"
+      - "config/**"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/mongodb-store.yml"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mongodb-store-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mongodb-store:
+    name: mongodb-store
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ping:1}).ok'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run MongoDB store tests
+        env:
+          ARCADE_MONGODB_URI: mongodb://127.0.0.1:27017
+          ARCADE_MONGODB_REQUIRED: "1"
+        run: go test -tags=mongodb -race -timeout=15m ./store/mongodb/...

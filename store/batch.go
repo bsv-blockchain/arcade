@@ -41,6 +41,12 @@ func currentBatchConcurrency() int {
 	return int(atomic.LoadInt32(&batchConcurrency))
 }
 
+// BatchConcurrency reports the parallel-loop concurrency configured via
+// SetBatchConcurrency, for backends that run their own bounded per-row
+// loops (e.g. the MongoDB block-scoped rewrites) and want to honour the
+// same operator knob as the shared helpers.
+func BatchConcurrency() int { return currentBatchConcurrency() }
+
 // SingleStore is the narrow contract the parallel-loop helpers need: the
 // single-record GetOrInsertStatus / UpdateStatus methods. Every Store
 // satisfies this trivially. Defined as an interface so the helpers can be
@@ -52,12 +58,12 @@ type SingleStore interface {
 }
 
 // SingleStoreReturning extends SingleStore with the diagnostic-rich
-// UpdateStatusReturning variant. Backends that implement it directly get
-// efficient batched per-row "previous status" reads without an extra
-// per-row store round-trip; backends that don't can still satisfy the
-// public Store interface via BatchUpdateStatusReturningFallback below.
+// UpdateStatusReturning variant: one atomic applied-result per row. Prev
+// is set only when the write landed; Current is set when the row is known
+// and the lattice skipped it. Every Store backend implements it, and
+// BatchUpdateStatusReturningParallel is the shared batch driver.
 type SingleStoreReturning interface {
-	UpdateStatusReturning(ctx context.Context, status *models.TransactionStatus) (*models.TransactionStatus, error)
+	UpdateStatusReturning(ctx context.Context, status *models.TransactionStatus) (StatusUpdate, error)
 }
 
 // BatchGetOrInsertStatusParallel runs GetOrInsertStatus concurrently for each
@@ -111,81 +117,17 @@ func BatchGetOrInsertStatusParallel(ctx context.Context, s SingleStore, statuses
 	return results, firstErr
 }
 
-// GetStatusGetter is the narrow contract the fallback variant of the
-// diagnostic-rich batch helper needs from backends that haven't natively
-// implemented UpdateStatusReturning. GetStatus + UpdateStatus give us the
-// "previous row" via a separate read.
-type GetStatusGetter interface {
-	GetStatus(ctx context.Context, txid string) (*models.TransactionStatus, error)
-	UpdateStatus(ctx context.Context, status *models.TransactionStatus) error
-}
-
-// BatchUpdateStatusReturningFallback implements the diagnostic-rich batch
-// update for backends that don't have a fused read-modify-write helper. Two
-// store calls per row: GetStatus to snapshot the previous row, then
-// UpdateStatus. Used by Aerospike and Postgres (arcade's primary deployment
-// uses Pebble, which implements the fused form directly).
-func BatchUpdateStatusReturningFallback(ctx context.Context, s GetStatusGetter, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
-	if len(statuses) == 0 {
-		return nil, nil
-	}
-	prevs := make([]*models.TransactionStatus, len(statuses))
-	sem := make(chan struct{}, currentBatchConcurrency())
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var firstErr error
-	for i, st := range statuses {
-		select {
-		case sem <- struct{}{}:
-		case <-ctx.Done():
-			mu.Lock()
-			if firstErr == nil {
-				firstErr = ctx.Err()
-			}
-			mu.Unlock()
-			continue
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer func() { <-sem }()
-			prev, getErr := s.GetStatus(ctx, st.TxID)
-			if getErr != nil && !errors.Is(getErr, ErrNotFound) {
-				mu.Lock()
-				if firstErr == nil {
-					firstErr = getErr
-				}
-				mu.Unlock()
-				return
-			}
-			if prev == nil {
-				return
-			}
-			prevs[i] = prev
-			if err := s.UpdateStatus(ctx, st); err != nil && !errors.Is(err, ErrNotFound) {
-				mu.Lock()
-				if firstErr == nil {
-					firstErr = err
-				}
-				mu.Unlock()
-			}
-		}()
-	}
-	wg.Wait()
-	return prevs, firstErr
-}
-
 // BatchUpdateStatusReturningParallel is the diagnostic-rich form of
 // BatchUpdateStatusParallel. Each row goes through UpdateStatusReturning so
 // the caller can observe transition-age metrics without an extra read.
-// Returns a slice of previous rows in the same order as input; result[i] is
-// nil for unknown txids and on per-row errors.
-func BatchUpdateStatusReturningParallel(ctx context.Context, s SingleStoreReturning, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
+// result[i].Prev is the applied pre-image; result[i].Current is a known
+// lattice skip; both nil means the txid is absent or the row errored.
+func BatchUpdateStatusReturningParallel(ctx context.Context, s SingleStoreReturning, statuses []*models.TransactionStatus) ([]StatusUpdate, error) {
 	if len(statuses) == 0 {
 		return nil, nil
 	}
 
-	prevs := make([]*models.TransactionStatus, len(statuses))
+	out := make([]StatusUpdate, len(statuses))
 	sem := make(chan struct{}, currentBatchConcurrency())
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -206,7 +148,7 @@ func BatchUpdateStatusReturningParallel(ctx context.Context, s SingleStoreReturn
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			prev, err := s.UpdateStatusReturning(ctx, st)
+			upd, err := s.UpdateStatusReturning(ctx, st)
 			if err != nil && !errors.Is(err, ErrNotFound) {
 				mu.Lock()
 				if firstErr == nil {
@@ -215,12 +157,13 @@ func BatchUpdateStatusReturningParallel(ctx context.Context, s SingleStoreReturn
 				mu.Unlock()
 				return
 			}
-			// prev is nil for not-found by contract; nothing to do.
-			prevs[i] = prev
+			if err == nil {
+				out[i] = upd
+			}
 		}()
 	}
 	wg.Wait()
-	return prevs, firstErr
+	return out, firstErr
 }
 
 // BatchUpdateStatusParallel runs UpdateStatus concurrently for each row,

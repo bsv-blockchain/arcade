@@ -122,6 +122,27 @@
                 },
                 {
                     "linters": [
+                        "gomoddirectives"
+                    ],
+                    "path": "go\\.mod",
+                    "text": "github.com/quic-go/quic-go"
+                },
+                {
+                    "linters": [
+                        "gomoddirectives"
+                    ],
+                    "path": "go\\.mod",
+                    "text": "github.com/quic-go/webtransport-go"
+                },
+                {
+                    "linters": [
+                        "gomoddirectives"
+                    ],
+                    "path": "go\\.mod",
+                    "text": "k8s.io/kube-openapi"
+                },
+                {
+                    "linters": [
                         "nilerr"
                     ],
                     "path": "bump/datahub\\.go"
@@ -149,6 +170,12 @@
                         "nilnil"
                     ],
                     "path": "store/aerospike/"
+                },
+                {
+                    "linters": [
+                        "nilnil"
+                    ],
+                    "path": "store/mongodb/"
                 },
                 {
                     "linters": [

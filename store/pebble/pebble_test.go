@@ -201,6 +201,77 @@ func TestUpdateStatus_TerminalNotOverwritten(t *testing.T) {
 	}
 }
 
+// TestUpdateStatusReturning_SkipIsNotApplied pins the applied-result
+// contract. A lattice skip must not hand back the blocking row: a non-nil
+// previous row means this call wrote the requested transition.
+func TestUpdateStatusReturning_SkipIsNotApplied(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const txid = "tx-returning-skip"
+
+	if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+		TxID: txid, Status: models.StatusAcceptedByNetwork, Timestamp: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateStatus(ctx, &models.TransactionStatus{
+		TxID: txid, Status: models.StatusMined, BlockHash: "blk", BlockHeight: 9, Timestamp: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	prev, err := s.UpdateStatusReturning(ctx, &models.TransactionStatus{
+		TxID: txid, Status: models.StatusSeenOnNetwork, Timestamp: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("lattice skip must not be an error, got %v", err)
+	}
+	if prev.Prev != nil {
+		t.Fatalf("lattice skip returned applied prev %+v", prev.Prev)
+	}
+	if prev.Current == nil || prev.Current.Status != models.StatusMined {
+		t.Fatalf("known skip current = %+v, want MINED", prev.Current)
+	}
+	got, err := s.GetStatus(ctx, txid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != models.StatusMined {
+		t.Fatalf("status = %s, want MINED", got.Status)
+	}
+}
+
+func TestUpdateStatusReturning_AppliedReturnsPrevious(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const txid = "tx-returning-applied"
+
+	if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+		TxID: txid, Status: models.StatusAcceptedByNetwork, Timestamp: time.Now().Add(-time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	prev, err := s.UpdateStatusReturning(ctx, &models.TransactionStatus{
+		TxID: txid, Status: models.StatusSeenOnNetwork, Timestamp: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prev.Prev == nil || prev.Prev.Status != models.StatusAcceptedByNetwork {
+		t.Fatalf("prev = %+v, want ACCEPTED_BY_NETWORK", prev.Prev)
+	}
+	if prev.Current != nil {
+		t.Fatalf("applied write must not also report a skip: %+v", prev.Current)
+	}
+	got, err := s.GetStatus(ctx, txid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != models.StatusSeenOnNetwork {
+		t.Fatalf("status = %s, want SEEN_ON_NETWORK", got.Status)
+	}
+}
+
 // TestUpdateStatus_RejectedRecovery pins REJECTED's partial-terminal behavior
 // at the store layer: forward recovery (ACCEPTED_BY_NETWORK / SEEN_ON_NETWORK
 // / SEEN_MULTIPLE_NODES) is allowed so a late callback from a peer that did
@@ -398,7 +469,7 @@ func TestPendingRetryLifecycle(t *testing.T) {
 		t.Fatalf("BumpRetryCount: n=%d err=%v", n, err)
 	}
 
-	if sErr := s.SetPendingRetryFields(ctx, txid, rawTx, nextRetry); sErr != nil {
+	if sErr := s.SetPendingRetryFields(ctx, txid, rawTx, nextRetry, ""); sErr != nil {
 		t.Fatal(sErr)
 	}
 
@@ -443,7 +514,7 @@ func TestGetReadyRetries_SkipsFutureEntries(t *testing.T) {
 		if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{TxID: c.txid, Status: models.StatusReceived}); err != nil {
 			t.Fatal(err)
 		}
-		if err := s.SetPendingRetryFields(ctx, c.txid, []byte{0xff}, now.Add(c.delay)); err != nil {
+		if err := s.SetPendingRetryFields(ctx, c.txid, []byte{0xff}, now.Add(c.delay), ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -890,7 +961,7 @@ func TestBlockProcessing_MarkOrphaned_AndResurrection(t *testing.T) {
 	if err := s.UpsertBlockHeaderSeen(ctx, hash, 400, t0); err != nil {
 		t.Fatalf("seen: %v", err)
 	}
-	if err := s.MarkBlocksOrphaned(ctx, []string{hash}, t0.Add(time.Minute)); err != nil {
+	if _, err := s.MarkBlocksOrphaned(ctx, []string{hash}, t0.Add(time.Minute)); err != nil {
 		t.Fatalf("orphan: %v", err)
 	}
 	got, _ := s.GetBlockProcessingStatus(ctx, hash)
@@ -917,7 +988,7 @@ func TestBlockProcessing_MarkOrphaned_AndResurrection(t *testing.T) {
 func TestBlockProcessing_MarkOrphaned_MissingRow_NoOp(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
-	if err := s.MarkBlocksOrphaned(ctx, []string{"never-seen"}, time.Now()); err != nil {
+	if _, err := s.MarkBlocksOrphaned(ctx, []string{"never-seen"}, time.Now()); err != nil {
 		t.Fatalf("orphan missing: %v", err)
 	}
 }
@@ -1015,7 +1086,7 @@ func TestBlockProcessing_GetActiveTipBlockHeight(t *testing.T) {
 	}
 
 	// Orphaning the highest row drops the tip to the next active row.
-	if oErr := s.MarkBlocksOrphaned(ctx, []string{"h200"}, t0); oErr != nil {
+	if _, oErr := s.MarkBlocksOrphaned(ctx, []string{"h200"}, t0); oErr != nil {
 		t.Fatal(oErr)
 	}
 	got, err = s.GetActiveTipBlockHeight(ctx)
@@ -1043,7 +1114,7 @@ func TestBlockProcessing_ListStale_FiltersAndOrders(t *testing.T) {
 	if err := s.UpsertBlockHeaderSeen(ctx, "orphaned", 410, baseSeen); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.MarkBlocksOrphaned(ctx, []string{"orphaned"}, baseSeen.Add(time.Minute)); err != nil {
+	if _, err := s.MarkBlocksOrphaned(ctx, []string{"orphaned"}, baseSeen.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.UpsertBlockHeaderSeen(ctx, "old", 100, baseSeen.Add(time.Minute)); err != nil {
@@ -1137,7 +1208,7 @@ func TestBlockProcessing_MarkParked_SkipsOrphanedAndMissing(t *testing.T) {
 	if err := s.UpsertBlockHeaderSeen(ctx, "reorged", 501, t0); err != nil {
 		t.Fatalf("seen: %v", err)
 	}
-	if err := s.MarkBlocksOrphaned(ctx, []string{"reorged"}, t0.Add(time.Minute)); err != nil {
+	if _, err := s.MarkBlocksOrphaned(ctx, []string{"reorged"}, t0.Add(time.Minute)); err != nil {
 		t.Fatalf("orphan: %v", err)
 	}
 	// Parking must not relabel an orphaned (off-chain) row, and a missing
@@ -1316,7 +1387,7 @@ func TestSetPendingRetryFields_RespectsStatusLattice(t *testing.T) {
 				t.Fatalf("seed %s: %v", prev, err)
 			}
 
-			if err := s.SetPendingRetryFields(ctx, txid, []byte{0xaa}, time.Now().Add(-time.Second)); err != nil {
+			if err := s.SetPendingRetryFields(ctx, txid, []byte{0xaa}, time.Now().Add(-time.Second), ""); err != nil {
 				t.Fatalf("SetPendingRetryFields: %v", err)
 			}
 

@@ -121,18 +121,18 @@ func (m *mockStore) BatchUpdateStatus(context.Context, []*models.TransactionStat
 // (each input status is appended to updateStatusCalls as if the legacy
 // per-row path had run). Tests that need a different prev shape override
 // via batchUpdatePrevFunc.
-func (m *mockStore) BatchUpdateStatusReturning(_ context.Context, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
+func (m *mockStore) BatchUpdateStatusReturning(_ context.Context, statuses []*models.TransactionStatus) ([]store.StatusUpdate, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.batchUpdateReturningCalls = append(m.batchUpdateReturningCalls, append([]*models.TransactionStatus(nil), statuses...))
 	if m.batchUpdateReturningErr != nil {
 		return nil, m.batchUpdateReturningErr
 	}
-	out := make([]*models.TransactionStatus, len(statuses))
+	out := make([]store.StatusUpdate, len(statuses))
 	// updateStatusErr == ErrNotFound models the production "unknown txid"
 	// guard (F-033 / #91): the legacy backend silently skipped the write
-	// AND did not record the call. The batch path mirrors that — nil prev
-	// for every input, and no append to updateStatusCalls.
+	// AND did not record the call. The batch path mirrors that — an absent
+	// result for every input, and no append to updateStatusCalls.
 	if errors.Is(m.updateStatusErr, store.ErrNotFound) {
 		return out, nil
 	}
@@ -141,16 +141,20 @@ func (m *mockStore) BatchUpdateStatusReturning(_ context.Context, statuses []*mo
 		// had been called per-row, so existing assertions on
 		// updateStatusCalls keep working without rewriting every test.
 		m.updateStatusCalls = append(m.updateStatusCalls, st)
+		var prev *models.TransactionStatus
 		if m.batchUpdatePrevFunc != nil {
-			out[i] = m.batchUpdatePrevFunc(st.TxID)
+			prev = m.batchUpdatePrevFunc(st.TxID)
 		} else {
 			// Default prev: RECEIVED with a fresh timestamp so the
 			// handler's transition-age observation has a non-zero value.
-			out[i] = &models.TransactionStatus{
+			prev = &models.TransactionStatus{
 				TxID:      st.TxID,
 				Status:    models.StatusReceived,
 				Timestamp: time.Now(),
 			}
+		}
+		if prev != nil {
+			out[i] = store.StatusUpdate{Prev: prev}
 		}
 	}
 	return out, nil
@@ -193,8 +197,11 @@ func (m *mockStore) MarkMerkleRegisteredByTxIDs(context.Context, []string, time.
 func (m *mockStore) GetTxIDsByBlockHash(context.Context, string) ([]string, error) {
 	return nil, nil
 }
-func (m *mockStore) DeleteBUMPByBlockHash(context.Context, string) error          { return nil }
-func (m *mockStore) MarkBlockReconciled(context.Context, string, time.Time) error { return nil }
+func (m *mockStore) DeleteBUMPByBlockHash(context.Context, string) error { return nil }
+func (m *mockStore) MarkBlockReconciled(context.Context, string, time.Time, time.Time) (bool, error) {
+	return true, nil
+}
+
 func (m *mockStore) ListOrphanedBlocksToReconcile(context.Context, int) ([]*models.BlockProcessingStatus, error) {
 	return nil, nil
 }
@@ -269,7 +276,7 @@ func (m *mockStore) GetStumpsByBlockHash(context.Context, string) ([]*models.Stu
 }
 func (m *mockStore) DeleteStumpsByBlockHash(context.Context, string) error { return nil }
 func (m *mockStore) BumpRetryCount(context.Context, string) (int, error)   { return 0, nil }
-func (m *mockStore) SetPendingRetryFields(context.Context, string, []byte, time.Time) error {
+func (m *mockStore) SetPendingRetryFields(context.Context, string, []byte, time.Time, string) error {
 	return nil
 }
 
@@ -318,8 +325,10 @@ func (m *mockStore) MarkBlockBUMPBuilt(context.Context, string, uint64, time.Tim
 	return nil
 }
 
-func (m *mockStore) MarkBlocksOrphaned(context.Context, []string, time.Time) error { return nil }
-func (m *mockStore) MarkBlocksParked(context.Context, []string) error              { return nil }
+func (m *mockStore) MarkBlocksOrphaned(context.Context, []string, time.Time) (int, error) {
+	return 0, nil
+}
+func (m *mockStore) MarkBlocksParked(context.Context, []string) error { return nil }
 
 func (m *mockStore) GetBlockProcessingStatus(context.Context, string) (*models.BlockProcessingStatus, error) {
 	return nil, store.ErrNotFound
@@ -1549,6 +1558,7 @@ func TestHandleCallback_UnknownTxid_NoPhantomRow(t *testing.T) {
 		t.Run(string(cbType), func(t *testing.T) {
 			ms := &mockStore{updateStatusErr: store.ErrNotFound}
 			_, router := setupServerWithStore(&kafka.RecordingBroker{}, ms)
+			unknownBefore := testutil.ToFloat64(metrics.CallbackUnknownTxIDTotal.WithLabelValues(string(cbType)))
 
 			payload := models.CallbackMessage{
 				Type:  cbType,
@@ -1571,6 +1581,9 @@ func TestHandleCallback_UnknownTxid_NoPhantomRow(t *testing.T) {
 			if len(ms.updateStatusCalls) != 0 {
 				t.Fatalf("expected 0 recorded UpdateStatus calls when store returns ErrNotFound, got %d",
 					len(ms.updateStatusCalls))
+			}
+			if got := testutil.ToFloat64(metrics.CallbackUnknownTxIDTotal.WithLabelValues(string(cbType))) - unknownBefore; got != 2 {
+				t.Fatalf("CallbackUnknownTxIDTotal delta = %v, want 2 for the absent txids", got)
 			}
 		})
 	}

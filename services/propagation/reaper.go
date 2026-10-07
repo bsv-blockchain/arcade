@@ -485,6 +485,12 @@ func (p *Propagator) drainParkedRetries(ctx context.Context, now, since time.Tim
 			TXID:       r.TxID,
 			RawTx:      r.RawTx,
 			InputTXIDs: parentTxIDsOf(propagationMsg{TXID: r.TxID, RawTx: r.RawTx}),
+			// The last response heard on an earlier attempt. This pass
+			// overwrites it only with a non-empty response of its own and
+			// hands it back to SetPendingRetryFields (which always
+			// replaces), so a final attempt that hears nothing still gives
+			// up quoting what the network did say.
+			retryReason: r.LastReason,
 		})
 	}
 	p.logger.Info("reaper: rebroadcasting parked txs", zap.Int("count", len(msgs)))
@@ -545,18 +551,26 @@ func (p *Propagator) rebroadcastStuck(ctx context.Context, msgs []propagationMsg
 				// Condition, not verdict (#254/#295): only a REJECTED
 				// ancestor in arcade's own store condemns the child. A
 				// missing parent that is merely late must never terminalize.
-				cascaded, _ := p.resolveMissingParents(ctx, []propagationMsg{layer[i]}, []string{res.errMsg}, missingParentOutcomeReaperRetry)
+				cascaded, requeue := p.resolveMissingParents(ctx, []propagationMsg{layer[i]}, []string{res.errMsg}, missingParentOutcomeReaperRetry)
 				if len(cascaded) > 0 {
 					rejected += len(cascaded)
 					terminalStatuses = append(terminalStatuses, cascaded...)
 					continue
 				}
-				unresolved = append(unresolved, layer[i])
+				// requeue carries the missing-parent line as retryReason.
+				unresolved = append(unresolved, requeue...)
 			case txResultClassUnknown, txResultClassRequeue:
 				// No verdict from any peer. The reaper bypasses the
 				// dispatcher, so there is no inFlight entry to requeue
 				// against — the retry is the next scheduled attempt.
-				unresolved = append(unresolved, layer[i])
+				// Carry what the peers did say (an opaque PROCESSING
+				// line, a node fault) so the give-up reason quotes it
+				// instead of claiming no peer ever answered.
+				m := layer[i]
+				if res.errMsg != "" {
+					m.retryReason = res.errMsg
+				}
+				unresolved = append(unresolved, m)
 			}
 		}
 	}
