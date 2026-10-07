@@ -44,6 +44,11 @@ type PendingRetry struct {
 	RawTx       []byte
 	RetryCount  int
 	NextRetryAt time.Time
+	// LastReason is the last non-empty network response recorded for the
+	// tx across its durable attempts (SetPendingRetryFields), so the
+	// eventual give-up can quote it even when the final attempt drew no
+	// response at all. Empty when no peer ever answered.
+	LastReason string
 }
 
 // DatahubEndpointSourceConfigured marks endpoints seeded from static config.
@@ -236,6 +241,25 @@ type BatchInsertResult struct {
 	Inserted bool
 }
 
+// StatusUpdate is one row of BatchUpdateStatusReturning.
+//
+// Prev is non-nil only when this call durably applied the requested
+// transition. It is the row immediately before that write. Callers that
+// publish a transition or advance an in-memory tracker must use Prev.
+//
+// Current is the durable row when the txid is known and this call did not
+// apply the transition. That is a lattice skip, including a race in which
+// another writer moved the row to a later status before this write. Current
+// is nil when the txid is absent. Prev and Current are mutually exclusive.
+type StatusUpdate struct {
+	Prev    *models.TransactionStatus
+	Current *models.TransactionStatus
+}
+
+// Applied reports whether this call durably wrote the requested transition.
+// Only an applied result may be published or used to advance a tracker.
+func (u StatusUpdate) Applied() bool { return u.Prev != nil }
+
 // Store handles all persistence operations for transactions and submissions
 type Store interface {
 	// GetOrInsertStatus inserts a new transaction status or returns the existing one if it already exists.
@@ -269,22 +293,25 @@ type Store interface {
 	BatchUpdateStatus(ctx context.Context, statuses []*models.TransactionStatus) error
 
 	// BatchUpdateStatusReturning is the diagnostic-rich form of BatchUpdateStatus.
-	// Returns a slice the same length as `statuses` where result[i] is the
-	// previous row that was merged with (i.e. the row as it existed before
-	// the update), or nil for unknown txids and per-row errors. Used by the
-	// inbound callback handlers to observe transition-age metrics
-	// (RECEIVED→SEEN_ON_NETWORK) without an extra round-trip. The previous
-	// row's status metadata (Status, Timestamp, block anchor, extra info) is
-	// guaranteed; RawTx is NOT — MongoDB projects it away, since no caller
-	// reads it and it can be megabytes per row on a hot path, while Pebble
-	// and Postgres happen to return it only because they read the row whole.
+	// Returns a slice the same length as `statuses`. See StatusUpdate.
+	// result[i].Prev is non-nil only when this call durably applied
+	// statuses[i]: it is the row as it stood immediately before that write.
+	// A non-nil Prev is not "a row existed when we looked." An idempotent
+	// re-assert of the same status is an applied write, so Prev.Status may
+	// equal the requested status; callers that fan out events skip that case.
 	//
-	// Backends are expected to short-circuit when the requested transition
-	// is blocked by the status lattice (CanTransitionFrom) — the returned
-	// `previous[i]` is still the row that existed at lookup time, but the
-	// update is a no-op. Callers can detect "no transition applied" by
-	// comparing previous[i].Status to the requested status[i].Status.
-	BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error)
+	// result[i].Current is the durable row when the txid is known and this
+	// call did not apply the transition (lattice skip, including a race lost
+	// to a later status). A genuinely absent txid leaves both Prev and
+	// Current nil. Callers must not publish or advance a tracker from
+	// Current, and must not count Current as an unknown txid.
+	//
+	// Prev's status metadata (Status, Timestamp, block anchor, extra info)
+	// is guaranteed. RawTx is NOT — MongoDB, Postgres and Aerospike read
+	// only the status metadata, since no caller needs RawTx and it can be
+	// megabytes per row on a hot path, while Pebble happens to return it
+	// only because it reads the row whole.
+	BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]StatusUpdate, error)
 
 	// GetStatus retrieves the status for a transaction
 	GetStatus(ctx context.Context, txid string) (*models.TransactionStatus, error)
@@ -674,18 +701,23 @@ type Store interface {
 	BumpRetryCount(ctx context.Context, txid string) (retryCount int, err error)
 
 	// SetPendingRetryFields writes the durable retry bins: status=PENDING_RETRY,
-	// raw_tx, next_retry_at, timestamp. retry_count is untouched — use
-	// BumpRetryCount first to get the value that feeds next_retry_at backoff.
-	SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time) error
+	// raw_tx, next_retry_at, timestamp and retry_reason. lastReason always
+	// replaces the stored reason (empty clears it): carrying a reason across
+	// attempts is the caller's job (the reaper re-passes the one
+	// GetReadyRetries returned), so a tx parked afresh after leaving the
+	// queue — by any exit path — never inherits a response from an earlier
+	// stay. retry_count is untouched — use BumpRetryCount first to get the
+	// value that feeds next_retry_at backoff.
+	SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time, lastReason string) error
 
 	// GetReadyRetries returns up to limit PENDING_RETRY rows whose
-	// next_retry_at has elapsed. Rows include raw_tx and retry_count so the
-	// reaper can act without a second read per row.
+	// next_retry_at has elapsed. Rows include raw_tx, retry_count and
+	// retry_reason so the reaper can act without a second read per row.
 	GetReadyRetries(ctx context.Context, now time.Time, limit int) ([]*PendingRetry, error)
 
 	// ClearRetryState transitions a tx out of PENDING_RETRY (either on success
-	// or final rejection) and deletes the raw_tx + next_retry_at bins so the
-	// row stops showing up in ready-retry queries.
+	// or final rejection) and deletes the raw_tx + next_retry_at +
+	// retry_reason bins so the row stops showing up in ready-retry queries.
 	ClearRetryState(ctx context.Context, txid string, finalStatus models.Status, extraInfo string) error
 
 	// MarkMerkleRegisteredByTxIDs records that the given txids have been

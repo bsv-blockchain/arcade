@@ -119,7 +119,7 @@ func TestGetStatus_MissingIsNilNil(t *testing.T) {
 
 func TestSetPendingRetryFields_UnknownTxIDIsNotFound(t *testing.T) {
 	s := newTestStore(t)
-	err := s.SetPendingRetryFields(context.Background(), "ghost", []byte{1}, time.Now())
+	err := s.SetPendingRetryFields(context.Background(), "ghost", []byte{1}, time.Now(), "")
 	if !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
@@ -556,8 +556,8 @@ func TestUpdateStatusReturning_EmptyTxIDIsUnknown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a malformed entry must not fail the batch: %v", err)
 	}
-	if len(prevs) != 2 || prevs[0] == nil || prevs[0].Status != models.StatusReceived || prevs[1] != nil {
-		t.Fatalf("prevs = %+v, want [known-pre-image, nil]", prevs)
+	if len(prevs) != 2 || prevs[0].Prev == nil || prevs[0].Prev.Status != models.StatusReceived || prevs[1].Prev != nil || prevs[1].Current != nil {
+		t.Fatalf("prevs = %+v, want [known-pre-image, absent]", prevs)
 	}
 }
 

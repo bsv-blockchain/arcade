@@ -160,7 +160,7 @@ func (s *fakeStore) BatchUpdateStatus(context.Context, []*models.TransactionStat
 	return nil
 }
 
-func (s *fakeStore) BatchUpdateStatusReturning(context.Context, []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
+func (s *fakeStore) BatchUpdateStatusReturning(context.Context, []*models.TransactionStatus) ([]store.StatusUpdate, error) {
 	return nil, nil
 }
 
@@ -213,7 +213,7 @@ func (s *fakeStore) GetStumpsByBlockHash(context.Context, string) ([]*models.Stu
 }
 func (s *fakeStore) DeleteStumpsByBlockHash(context.Context, string) error { return nil }
 func (s *fakeStore) BumpRetryCount(context.Context, string) (int, error)   { return 0, nil }
-func (s *fakeStore) SetPendingRetryFields(context.Context, string, []byte, time.Time) error {
+func (s *fakeStore) SetPendingRetryFields(context.Context, string, []byte, time.Time, string) error {
 	return nil
 }
 

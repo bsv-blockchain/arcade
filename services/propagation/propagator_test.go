@@ -226,21 +226,23 @@ func (m *mockStore) UpdateStatus(_ context.Context, status *models.TransactionSt
 // observation and lattice no-op detection both behave naturally: prev.Status
 // (RECEIVED) ≠ new.Status (ACCEPTED_BY_NETWORK or REJECTED), so every row is
 // emitted as a transition.
-func (m *mockStore) BatchUpdateStatusReturning(_ context.Context, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
+func (m *mockStore) BatchUpdateStatusReturning(_ context.Context, statuses []*models.TransactionStatus) ([]store.StatusUpdate, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	prevs := make([]*models.TransactionStatus, len(statuses))
+	prevs := make([]store.StatusUpdate, len(statuses))
 	for i, s := range statuses {
 		m.updates = append(m.updates, s)
 		if m.returningPrev != nil {
-			prevs[i] = m.returningPrev(s)
+			if prev := m.returningPrev(s); prev != nil {
+				prevs[i] = store.StatusUpdate{Prev: prev}
+			}
 			continue
 		}
-		prevs[i] = &models.TransactionStatus{
+		prevs[i] = store.StatusUpdate{Prev: &models.TransactionStatus{
 			TxID:      s.TxID,
 			Status:    models.StatusReceived,
 			Timestamp: time.Now(),
-		}
+		}}
 	}
 	return prevs, m.returningErr
 }
@@ -252,7 +254,7 @@ func (m *mockStore) BumpRetryCount(_ context.Context, txid string) (int, error) 
 	return m.retryCounts[txid], nil
 }
 
-func (m *mockStore) SetPendingRetryFields(_ context.Context, txid string, rawTx []byte, nextRetryAt time.Time) error {
+func (m *mockStore) SetPendingRetryFields(_ context.Context, txid string, rawTx []byte, nextRetryAt time.Time, lastReason string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.retrySeq[txid]; !ok {
@@ -264,6 +266,7 @@ func (m *mockStore) SetPendingRetryFields(_ context.Context, txid string, rawTx 
 		RawTx:       append([]byte(nil), rawTx...),
 		RetryCount:  m.retryCounts[txid],
 		NextRetryAt: nextRetryAt,
+		LastReason:  lastReason,
 	}
 	// Mirror the write onto the row the scan walk sees. The real statement
 	// updates the transactions row itself, so a later IterateStatusesSince

@@ -45,7 +45,7 @@ var (
 	projID          = doc(kv(fID, 1))
 	projTracker     = doc(kv(fStatus, 1), kv(fBlockHeight, 1))
 	projTokenReplay = doc(kv(fStatus, 1), kv(fTimestamp, 1), kv(fBlockHash, 1), kv(fBlockHeight, 1))
-	projRetry       = doc(kv(fRawTx, 1), kv(fRetryCount, 1), kv(fNextRetryAt, 1))
+	projRetry       = doc(kv(fRawTx, 1), kv(fRetryCount, 1), kv(fNextRetryAt, 1), kv(fRetryReason, 1))
 )
 
 // incVersion is the $inc clause every transactions write carries. The
@@ -170,6 +170,9 @@ func statusUpdate(st *models.TransactionStatus, now time.Time) bson.D {
 	if len(st.MerklePath) > 0 {
 		set = append(set, kv(fMerklePath, []byte(st.MerklePath)))
 	}
+	if len(st.CompetingTxs) > 0 {
+		set = append(set, kv(fCompetingTxs, st.CompetingTxs))
+	}
 	if !st.MerkleRegisteredAt.IsZero() {
 		set = append(set, kv(fMerkleRegisteredAt, st.MerkleRegisteredAt))
 	}
@@ -184,14 +187,13 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 	return err
 }
 
-// UpdateStatusReturning is UpdateStatus plus the row as it stood before the
-// write (or the row the lattice rejected against). One round trip on the
-// common path: the lattice guard rides in the filter and findAndModify
-// returns the pre-image. A zero match with a guard needs one probe to tell
+// UpdateStatusReturning is UpdateStatus plus the applied-result. Prev is
+// the row this call wrote over. Current is the durable row when the lattice
+// skipped the write. A zero match with a guard needs one probe to tell
 // "absent" from "blocked".
-func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.TransactionStatus) (*models.TransactionStatus, error) {
+func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.TransactionStatus) (store.StatusUpdate, error) {
 	if status == nil {
-		return nil, errors.New("mongodb: update status: nil status")
+		return store.StatusUpdate{}, errors.New("mongodb: update status: nil status")
 	}
 	if status.TxID == "" {
 		// An empty txid can never name a row, so it is "unknown", the same
@@ -199,7 +201,7 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 		// malformed entry fail a whole BatchUpdateStatusReturning call whose
 		// other rows were applied — the shared batch helper maps ErrNotFound
 		// to a nil pre-image and carries on.
-		return nil, store.ErrNotFound
+		return store.StatusUpdate{}, store.ErrNotFound
 	}
 	start := time.Now()
 	fromLabel, outcome := "", outcomeError
@@ -218,25 +220,25 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 		options.FindOneAndUpdate().SetReturnDocument(options.Before).SetProjection(projNoRawTx)).Decode(&before)
 	if err == nil {
 		fromLabel, outcome = before.Status, outcomeApplied
-		return before.toStatus(), nil
+		return store.StatusUpdate{Prev: before.toStatus()}, nil
 	}
 	if !errors.Is(err, mongo.ErrNoDocuments) {
-		return nil, fmt.Errorf("update tx %s: %w", status.TxID, err)
+		return store.StatusUpdate{}, fmt.Errorf("update tx %s: %w", status.TxID, err)
 	}
 	if len(guard) == 0 {
 		outcome = outcomeNotFound
-		return nil, store.ErrNotFound
+		return store.StatusUpdate{}, store.ErrNotFound
 	}
 	err = s.tx.FindOne(octx, idFilter(status.TxID), options.FindOne().SetProjection(projNoRawTx)).Decode(&before)
 	if errors.Is(err, mongo.ErrNoDocuments) {
 		outcome = outcomeNotFound
-		return nil, store.ErrNotFound
+		return store.StatusUpdate{}, store.ErrNotFound
 	}
 	if err != nil {
-		return nil, fmt.Errorf("update tx %s: existence probe: %w", status.TxID, err)
+		return store.StatusUpdate{}, fmt.Errorf("update tx %s: existence probe: %w", status.TxID, err)
 	}
 	fromLabel, outcome = before.Status, outcomeSkippedLattice
-	return before.toStatus(), nil
+	return store.StatusUpdate{Current: before.toStatus()}, nil
 }
 
 // BatchUpdateStatus implements store.Store as one unordered bulk write per
@@ -265,7 +267,7 @@ func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.Transa
 
 // BatchUpdateStatusReturning implements store.Store over the fused
 // UpdateStatusReturning, so each row costs one round trip, not two.
-func (s *Store) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]*models.TransactionStatus, error) {
+func (s *Store) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]store.StatusUpdate, error) {
 	return store.BatchUpdateStatusReturningParallel(ctx, s, statuses)
 }
 
@@ -819,16 +821,25 @@ func (s *Store) BumpRetryCount(ctx context.Context, txid string) (int, error) {
 // load-bearing: the park path writes twice, and without it this second write
 // could drag a MINED / REJECTED row back to PENDING_RETRY for rebroadcast.
 // Blocked rows are silently skipped; unknown txids return ErrNotFound.
-func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time) error {
+func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time, lastReason string) error {
 	filter := append(idFilter(txid), latticeFilter(models.StatusPendingRetry)...)
 	set := doc(kv(fStatus, string(models.StatusPendingRetry)), kv(fNextRetryAt, msTrunc(nextRetryAt)), kv(fTimestamp, msNow()))
 	update := doc(incVersion())
+	unset := doc()
+	if lastReason != "" {
+		set = append(set, kv(fRetryReason, lastReason))
+	} else {
+		unset = append(unset, kv(fRetryReason, ""))
+	}
 	if len(rawTx) > 0 {
 		set = append(set, kv(fRawTx, rawTx))
 	} else {
-		update = append(update, kv(opUnset, doc(kv(fRawTx, ""))))
+		unset = append(unset, kv(fRawTx, ""))
 	}
 	update = append(update, kv(opSet, set))
+	if len(unset) > 0 {
+		update = append(update, kv(opUnset, unset))
+	}
 
 	octx, cancel := s.opCtx(ctx)
 	defer cancel()
@@ -855,6 +866,7 @@ type retryDoc struct {
 	RawTx       []byte    `bson:"raw_tx"`
 	RetryCount  int       `bson:"retry_count"`
 	NextRetryAt time.Time `bson:"next_retry_at"`
+	RetryReason string    `bson:"retry_reason"`
 }
 
 // GetReadyRetries implements store.Store via the partial retry index. Rows
@@ -885,7 +897,7 @@ func (s *Store) GetReadyRetries(ctx context.Context, now time.Time, limit int) (
 		if len(d.RawTx) == 0 {
 			continue
 		}
-		out = append(out, &store.PendingRetry{TxID: d.TxID, RawTx: d.RawTx, RetryCount: d.RetryCount, NextRetryAt: d.NextRetryAt})
+		out = append(out, &store.PendingRetry{TxID: d.TxID, RawTx: d.RawTx, RetryCount: d.RetryCount, NextRetryAt: d.NextRetryAt, LastReason: d.RetryReason})
 	}
 	return out, cur.Err()
 }
@@ -896,7 +908,7 @@ func (s *Store) ClearRetryState(ctx context.Context, txid string, finalStatus mo
 	if extraInfo != "" {
 		set = append(set, kv(fExtraInfo, extraInfo))
 	}
-	update := doc(kv(opSet, set), kv(opUnset, doc(kv(fRawTx, ""), kv(fNextRetryAt, ""))), incVersion())
+	update := doc(kv(opSet, set), kv(opUnset, doc(kv(fRawTx, ""), kv(fNextRetryAt, ""), kv(fRetryReason, ""))), incVersion())
 	octx, cancel := s.opCtx(ctx)
 	defer cancel()
 	if _, err := s.tx.UpdateOne(octx, idFilter(txid), update); err != nil {

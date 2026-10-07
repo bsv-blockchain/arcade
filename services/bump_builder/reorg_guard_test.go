@@ -178,7 +178,7 @@ func TestTryShortCircuit_GuardDeniesRedelivery(t *testing.T) {
 	stub.setHeightHeader(10, headerWithHash(t, guardBlockA, 10)) // A holds height 10
 
 	b := guardBuilder(ms, stub, true)
-	if !b.tryShortCircuit(context.Background(), zap.NewNop(), guardBlockB) {
+	if handled, _ := b.tryShortCircuit(context.Background(), zap.NewNop(), guardBlockB); !handled {
 		t.Fatal("short-circuit should have handled the redelivery")
 	}
 
@@ -217,7 +217,7 @@ func TestTryShortCircuit_GuardAllowsActiveBlock(t *testing.T) {
 	stub.setHeightHeader(10, headerWithHash(t, guardBlockB, 10))
 
 	b := guardBuilder(ms, stub, true)
-	if !b.tryShortCircuit(context.Background(), zap.NewNop(), guardBlockB) {
+	if handled, _ := b.tryShortCircuit(context.Background(), zap.NewNop(), guardBlockB); !handled {
 		t.Fatal("short-circuit should have handled the redelivery")
 	}
 
@@ -389,7 +389,7 @@ func TestTryShortCircuit_PartialMineWithholdsProcessedStamp(t *testing.T) {
 	// watchdog exactly as before.
 	ok := seed()
 	b := guardBuilder(ok, stub, true)
-	if !b.tryShortCircuit(context.Background(), zap.NewNop(), guardBlockB) {
+	if handled, _ := b.tryShortCircuit(context.Background(), zap.NewNop(), guardBlockB); !handled {
 		t.Fatal("short-circuit should have handled the redelivery")
 	}
 	ok.mu.Lock()
@@ -405,7 +405,7 @@ func TestTryShortCircuit_PartialMineWithholdsProcessedStamp(t *testing.T) {
 	partial := seed()
 	b = guardBuilder(partial, stub, true)
 	b.store = &partialMineRecordingStore{orphanRecordingStore: partial}
-	if !b.tryShortCircuit(context.Background(), zap.NewNop(), guardBlockB) {
+	if handled, _ := b.tryShortCircuit(context.Background(), zap.NewNop(), guardBlockB); !handled {
 		t.Fatal("short-circuit should have handled the redelivery")
 	}
 	partial.mu.Lock()
