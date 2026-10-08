@@ -145,13 +145,19 @@ The `api_server` exposes:
 
 ### Merkle-service callback states
 
-The `/api/v1/merkle-service/callback` endpoint is a thin Kafka publisher. All real work happens downstream so the API server stays cheap and horizontally scalable. Recognized states:
+The `/api/v1/merkle-service/callback` endpoint applies SEEN transitions and
+stores STUMPs synchronously (a 2xx from arcade implies durability) and hands
+`BLOCK_PROCESSED` to Kafka so BUMP construction runs in the bump-builder.
+Recognized callback types:
 
-- `REJECTED`
 - `SEEN_ON_NETWORK`
 - `SEEN_MULTIPLE_NODES`
-- `STUMP` — STUMP is stored synchronously, so a 2xx from arcade implies durability
+- `STUMP` — stored keyed by block hash and subtree index
 - `BLOCK_PROCESSED` — triggers BUMP construction after `grace_window_ms`
+
+With several merkle-services configured every callback arrives once per
+service; a delivery that carries nothing new is a no-op (see
+`docs/merkle-lifecycle-durability.md`).
 
 ## Observability
 

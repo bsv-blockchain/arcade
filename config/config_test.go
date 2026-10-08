@@ -521,3 +521,73 @@ func TestValidate_MongoDBBounds(t *testing.T) {
 		t.Fatalf("store.mongodb.index_timeout_ms default = %d, want 300000 (matches postgres schema_apply_timeout_ms)", got)
 	}
 }
+
+// Multi-endpoint merkle_service: `urls` extends `url`, and Endpoints() is
+// the single normalized view every consumer uses.
+func TestMerkleServiceEndpoints_MergesURLAndURLs(t *testing.T) {
+	cfg := MerkleServiceConfig{
+		URL:  "http://merkle-a.local/",
+		URLs: []string{" http://merkle-b.local ", "http://merkle-a.local", "http://merkle-b.local/"},
+	}
+	got := cfg.Endpoints()
+	want := []string{"http://merkle-a.local", "http://merkle-b.local"}
+	if len(got) != len(want) {
+		t.Fatalf("Endpoints() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("Endpoints()[%d] = %q, want %q (full: %v)", i, got[i], want[i], got)
+		}
+	}
+	if !cfg.Enabled() {
+		t.Fatal("Enabled() must be true with endpoints")
+	}
+	if (MerkleServiceConfig{}).Enabled() {
+		t.Fatal("Enabled() must be false with no endpoints")
+	}
+}
+
+func TestValidate_MerkleServiceURLsOnlyRequiresCallbackToken(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.MerkleService.URL = ""
+	cfg.MerkleService.URLs = []string{"http://merkle-a.local", "http://merkle-b.local"}
+	if err := validate(cfg); err != nil {
+		t.Fatalf("urls-only config should validate, got: %v", err)
+	}
+	cfg.CallbackToken = ""
+	if err := validate(cfg); err == nil {
+		t.Fatal("callback_token must be required when merkle_service.urls is set")
+	}
+}
+
+func TestValidate_MerkleServiceRejectsEmptyAndMalformedEntries(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.MerkleService.URLs = []string{"http://merkle-b.local", "  "}
+	if err := validate(cfg); err == nil {
+		t.Fatal("a blank merkle_service.urls entry must be rejected")
+	}
+
+	for _, bad := range []string{"merkle.local", "ftp://merkle.local", "http://"} {
+		cfg := baseValidConfig()
+		cfg.MerkleService.URL = bad
+		if err := validate(cfg); err == nil {
+			t.Fatalf("merkle_service.url %q must be rejected", bad)
+		}
+	}
+}
+
+// ARCADE_MERKLE_SERVICE_URLS is the env form of the list; viper splits it
+// on commas the same way it does ARCADE_KAFKA_BROKERS. This only works
+// because setDefaults registers the key.
+func TestMerkleServiceURLsBindFromEnv(t *testing.T) {
+	t.Setenv("ARCADE_MERKLE_SERVICE_URLS", "http://merkle-a.local,http://merkle-b.local/")
+	t.Setenv("ARCADE_CALLBACK_TOKEN", "tok")
+	cfg, err := Load(&cobra.Command{})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	got := cfg.MerkleService.Endpoints()
+	if len(got) != 2 || got[0] != "http://merkle-a.local" || got[1] != "http://merkle-b.local" {
+		t.Fatalf("Endpoints() from env = %v", got)
+	}
+}

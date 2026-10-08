@@ -76,3 +76,44 @@ tracked subtree. If that field is omitted, a dropped STUMP set is
 indistinguishable from an empty block and `finalizeEmptyBlock` stamps
 `processed_at`. Confirm this for a deployment's Merkle before enabling
 callbacks.
+
+## Multiple merkle-services
+
+`merkle_service.urls` lists additional endpoints. The `merkleservice.Pool`
+fans every `/watch` and `/reprocess` out to all of them, so each service
+watches the same txids and each delivers its own callbacks.
+
+Registration succeeds when **any** endpoint accepts; only a tx refused or
+unreachable on every endpoint is requeued (F-024 still gates broadcast). When
+every endpoint failed, the surfaced error is the most retryable one (context
+error, then network/5xx, then 401/403, then other 4xx), so `auth_error` on the
+registration metrics now means every endpoint rejected the token.
+
+An endpoint that fails three consecutive transport/5xx requests has its
+breaker opened and is skipped; 4xx answers never trip it. The pool probes
+`GET /health` on open endpoints every 5s and closes the breaker on any non-5xx
+answer. Closing fires the propagation recovery replay: every non-terminal tx
+whose row moved since the breaker opened (minus 5 minutes of slack) is
+re-registered with that endpoint only, ignoring `merkle_registered_at`
+(the stamp is pool-wide). `/watch` is idempotent on merkle-service.
+
+Duplicate callbacks:
+
+- `SEEN_ON_NETWORK` / `SEEN_MULTIPLE_NODES` from a second service hit the
+  tracker prefilter or the lattice re-assert path and are not published. A
+  forward move (`SEEN_ON_NETWORK` → `SEEN_MULTIPLE_NODES`) from whichever
+  service reports it first is applied and published once; a late
+  `SEEN_ON_NETWORK` after that is a lattice skip.
+- `STUMP` for the same `(block, subtree)` is an upsert of identical bytes.
+- `BLOCK_PROCESSED` from a second service takes `tryShortCircuit`, which
+  re-mines the stored BUMP's level-0 set with `onlyChanged=true`: rows already
+  `MINED` against this block are not re-published, a tx registered after the
+  first build still publishes. `processed_at` is re-stamped. The build
+  duration histogram records `short_circuited` once per extra service.
+
+Known limitation in this stage: a service that was down while txs were
+registered (and therefore only knows a subset) emits STUMPs that lack those
+txs' paths. Because STUMPs are keyed by `(block, subtree)` and overwritten on
+insert, which variant the first build sees depends on arrival order; the
+content-addressed STUMP handling that closes this lands in the follow-up
+change.

@@ -98,6 +98,7 @@ teranode:
 
 merkle_service:
   url: ""
+  urls: []
   auth_token: ""
 
 # P2P discovery via go-teranode-p2p-client. When enabled, arcade joins the

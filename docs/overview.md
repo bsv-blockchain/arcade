@@ -125,7 +125,7 @@ A transaction's journey through Arcade v2 has five phases.
 
 ### Phase 1 — Submission
 
-Client calls `SubmitTransaction()`. Arcade parses the raw tx (BEEF or raw bytes), deduplicates via `store.GetOrInsertStatus()`, validates against policy (fee rates, script rules, size limits), tracks it in TxTracker (an in-memory O(1) hash map), registers it with Merkle Service via `POST /watch {txid, callbackUrl}` (best-effort, non-blocking — registration failure does not block broadcast), and broadcasts concurrently to Teranode endpoints, returning on first success.
+Client calls `SubmitTransaction()`. Arcade parses the raw tx (BEEF or raw bytes), deduplicates via `store.GetOrInsertStatus()`, validates against policy (fee rates, script rules, size limits), tracks it in TxTracker (an in-memory O(1) hash map), registers it with every configured Merkle Service via `POST /watch {txid, callbackUrl}` (a tx is registered once any endpoint accepts it; a tx no endpoint accepted is requeued and never broadcast, so a proof can always be delivered for a broadcast tx), and broadcasts concurrently to Teranode endpoints, returning on first success.
 
 Status: `RECEIVED` → `SENT_TO_NETWORK` → `ACCEPTED_BY_NETWORK`.
 
@@ -257,7 +257,7 @@ Operators can detect the stale-chain-view condition before it causes non-final r
 
 **TxTracker as source of truth for tracked transactions.** Both STUMP processing and BUMP construction use `TxTracker.FilterTrackedHashes()` to discover which level-0 hashes correspond to tracked transactions. The tracker is an in-memory concurrent hash map loaded from the store at startup.
 
-**Best-effort registration.** Merkle Service registration failures don't block broadcast. Transactions can be re-registered later.
+**Registration before broadcast, with redundancy.** A tx is broadcast only after at least one Merkle Service accepted its `/watch`; several Merkle Services can be configured and each one delivers callbacks, with duplicates handled idempotently. In-flight transactions are re-registered on startup and whenever an endpoint comes back from an outage.
 
 **Backward compatibility.** STUMP callback handling works against both old per-tx and new per-subtree Merkle Service implementations.
 

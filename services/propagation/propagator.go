@@ -97,7 +97,7 @@ type Propagator struct {
 	store          store.Store
 	leaser         store.Leaser
 	teranodeClient *teranode.Client
-	merkleClient   *merkleservice.Client
+	merkleClient   merkleservice.Service // nil when no merkle_service endpoint is configured
 	// consumer is written by Start (after kafka.NewConsumerGroup returns) and
 	// read by Stop. atomic.Pointer makes that handoff race-free without
 	// needing a mutex: in tests the harness can call Stop concurrently with
@@ -188,12 +188,20 @@ type Propagator struct {
 	inflightDepth atomic.Int64
 
 	// backgroundWG tracks the long-running Start-spawned goroutines —
-	// runReaper, runMerkleReplay — so Stop can wait for them to exit
+	// runReaper, runMerkleReplay, and any recovery replay spawned by the
+	// merkle pool's breaker-closed hook — so Stop can wait for them to exit
 	// before the surrounding app cleanup closes the store backing them.
 	// Without this, a reaper mid-lease-release or mid-status-scan
 	// races with store.Close and the test framework attributes the
 	// resulting goroutine panic to the test's Cleanup callback.
 	backgroundWG sync.WaitGroup
+
+	// recovery coalesces per-endpoint recovery replays (see
+	// scheduleRecoveryReplay). recoveryStopped is set by Stop before it
+	// waits on backgroundWG so a late hook cannot Add to it.
+	recoveryMu      sync.Mutex
+	recovery        map[string]*recoveryState
+	recoveryStopped bool
 
 	// initDone is closed once Start has finished its init phase (all
 	// wg.Add()s done, all goroutines spawned) OR Start has returned with
@@ -334,7 +342,7 @@ const (
 // runs unguarded — appropriate for tests and single-process deployments that
 // don't need coordination. In production every replica should receive a
 // non-nil Leaser so only one reaper is active at a time across the cluster.
-func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publisher events.Publisher, st store.Store, leaser store.Leaser, tc *teranode.Client, mc *merkleservice.Client) *Propagator {
+func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publisher events.Publisher, st store.Store, leaser store.Leaser, tc *teranode.Client, mc merkleservice.Service) *Propagator {
 	// Export every series this service can emit at 0 from the first scrape —
 	// a series born mid-burst is invisible to increase() until its second
 	// sample, which zeroed the REJECTED count after every rollout.
@@ -1133,6 +1141,17 @@ func (p *Propagator) Start(ctx context.Context) error {
 		defer p.backgroundWG.Done()
 		p.runMerkleReplay(ctx)
 	}()
+	// With several merkle-services, an endpoint whose breaker was open
+	// missed every registration the others accepted meanwhile. Re-register
+	// the window with that endpoint when it comes back (see
+	// runRecoveryReplay). A single endpoint never diverges from itself: when
+	// it is down nothing is registered anywhere and the txs are requeued, so
+	// the hook is only wired for 2+ endpoints.
+	if rp, ok := p.merkleClient.(merkleservice.Recoverable); ok && len(rp.Endpoints()) > 1 {
+		rp.OnRecovered(func(endpoint string, openedAt time.Time) {
+			p.scheduleRecoveryReplay(ctx, rp, endpoint, openedAt)
+		})
+	}
 	go func() {
 		defer p.backgroundWG.Done()
 		p.runReaper(ctx)
@@ -1239,6 +1258,9 @@ func (p *Propagator) Stop() error {
 	// attributes the failure to t.Cleanup. Their parent ctx has
 	// already been canceled by the caller, so this only blocks on
 	// in-flight scan/release work.
+	p.recoveryMu.Lock()
+	p.recoveryStopped = true
+	p.recoveryMu.Unlock()
 	p.backgroundWG.Wait()
 	return consumerErr
 }

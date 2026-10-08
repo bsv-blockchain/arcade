@@ -204,6 +204,27 @@ var PropagationMerkleRegisterBatchOutcomeTotal = promauto.NewCounterVec(promethe
 	Help: "Per-batch merkle-service registration outcome.",
 }, []string{labelOutcome}) // fully_ok, partial, all_failed
 
+// MerkleEndpointRequestsTotal counts every request the merkle-service pool
+// issued to (or skipped for) one endpoint, by operation and outcome. The
+// existing pool-level merkle metrics answer "did the tx get registered";
+// this one answers "which endpoint is failing". op is watch, reprocess or
+// probe; outcome is ok, err_auth, err_4xx, err_5xx, err_network, canceled or
+// skipped_open (breaker open, request not sent). The endpoint label is the
+// configured base URL, so cardinality is bounded by the config.
+var MerkleEndpointRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_merkle_endpoint_requests_total",
+	Help: "Per-endpoint merkle-service request outcomes by operation.",
+}, []string{"endpoint", "op", labelOutcome})
+
+// MerkleEndpointHealthy is 1 while the endpoint's circuit breaker is closed
+// (requests are sent to it) and 0 while it is open (skipped until the
+// background /health probe answers). Alert on sum() falling below the number
+// of configured endpoints.
+var MerkleEndpointHealthy = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "arcade_merkle_endpoint_healthy",
+	Help: "1 while the merkle-service endpoint's circuit breaker is closed, 0 while open.",
+}, []string{"endpoint"})
+
 // PropagationReaperLease is 1 when this pod holds the reaper lease, 0 otherwise.
 // In K8s, sum across pods should always equal 1 (or 0 during failover).
 var PropagationReaperLease = promauto.NewGauge(prometheus.GaugeOpts{
