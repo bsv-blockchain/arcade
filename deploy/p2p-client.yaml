@@ -22,7 +22,9 @@ spec:
     spec:
       containers:
         - name: arcade
-          image: ghcr.io/bsv-blockchain/arcade:latest
+          # Pin to the git SHA published by .github/workflows/build.yml
+          # (ghcr.io/bsv-blockchain/arcade:<sha>). The :latest tag moves.
+          image: ghcr.io/bsv-blockchain/arcade:GIT_SHA
           args: ["--mode", "p2p-client"]
           ports:
             - containerPort: 8081
@@ -31,9 +33,9 @@ spec:
           env:
             - name: ARCADE_KAFKA_BROKERS
               value: "kafka-0.kafka.arcade.svc.cluster.local:9092"
-            - name: ARCADE_AEROSPIKE_HOSTS
+            - name: ARCADE_STORE_AEROSPIKE_HOSTS
               value: "aerospike-0.aerospike.arcade.svc.cluster.local:3000"
-            - name: ARCADE_AEROSPIKE_NAMESPACE
+            - name: ARCADE_STORE_AEROSPIKE_NAMESPACE
               value: "arcade"
             # HOST_IP feeds OTEL_EXPORTER_OTLP_ENDPOINT below to reach the
             # node-local OTLP collector via the Kubernetes downward API; it
