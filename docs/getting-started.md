@@ -150,11 +150,14 @@ transaction with every endpoint and each endpoint delivers its own callbacks:
   each transition is published to SSE/webhook subscribers once. A duplicate
   `BLOCK_PROCESSED` re-uses the stored BUMP and publishes `MINED` only for
   transactions that were not already mined.
-- An endpoint that fails three consecutive requests is skipped until its
-  `GET /health` answers again; on recovery arcade re-registers the in-flight
-  transactions that endpoint missed. `/health` on the api-server lists each
-  endpoint under `merkle_endpoints`, and
-  `arcade_merkle_endpoint_healthy{endpoint}` exposes the same state.
+- A registration one endpoint accepted but another refused, timed out on,
+  or was skipped for is queued and re-sent to that endpoint in the
+  background, so every endpoint ends up watching the same set. An endpoint
+  that fails three consecutive requests is skipped until its `GET /health`
+  answers again. `/health` on the api-server lists each endpoint under
+  `merkle_endpoints` (breaker state and queued registrations), and
+  `arcade_merkle_endpoint_healthy` / `arcade_merkle_endpoint_catchup_pending`
+  expose the same.
 - `/reprocess` (watchdog and `POST /api/v1/blocks/:hash/reprocess`) is sent
   to every endpoint and succeeds if any accepts.
 

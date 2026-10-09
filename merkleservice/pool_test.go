@@ -70,6 +70,50 @@ func (f *fakeMerkle) watchedCount() int {
 	return len(f.watched)
 }
 
+func (f *fakeMerkle) watchedSet() map[string]int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[string]int, len(f.watched))
+	for _, id := range f.watched {
+		out[id]++
+	}
+	return out
+}
+
+func (f *fakeMerkle) setFail(txid string, fail bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if fail {
+		f.failTxIDs[txid] = true
+	} else {
+		delete(f.failTxIDs, txid)
+	}
+}
+
+// pendingFor reads one endpoint's catch-up queue length from the pool's
+// status surface.
+func pendingFor(p *Pool, url string) int {
+	for _, st := range p.EndpointStatuses() {
+		if st.URL == url {
+			return st.CatchupPending
+		}
+	}
+	return -1
+}
+
+// waitFor polls cond for up to 3s.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
 func (f *fakeMerkle) url() string { return f.srv.URL }
 
 func decodeJSON(r *http.Request, v any) {
@@ -110,6 +154,176 @@ func TestPool_RegisterBatchWithResults_MergesPerTx(t *testing.T) {
 	}
 	if a.watchedCount() != 3 || b.watchedCount() != 3 {
 		t.Fatalf("every tx goes to every endpoint: a=%d b=%d", a.watchedCount(), b.watchedCount())
+	}
+	// tx3 was accepted by a but refused by b: b owes it. tx2 failed
+	// everywhere (the caller requeues it), so nobody owes it.
+	if got := pendingFor(p, b.url()); got != 1 {
+		t.Fatalf("b catch-up pending = %d, want 1 (tx3)", got)
+	}
+	if got := pendingFor(p, a.url()); got != 0 {
+		t.Fatalf("a catch-up pending = %d, want 0", got)
+	}
+}
+
+// An isolated failure on one endpoint (below the breaker threshold) behind
+// a pool-level success is not forgotten: the background loop re-sends it
+// until the endpoint acknowledges, so both watch sets converge.
+func TestPool_IsolatedFailureIsQueuedAndRedelivered(t *testing.T) {
+	a, b := newFakeMerkle(t), newFakeMerkle(t)
+	b.setFail("tx2", true)
+	p := NewPool([]string{a.url(), b.url()}, "", time.Second, WithProbeInterval(10*time.Millisecond))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.Start(ctx)
+
+	regs := []Registration{{TxID: "tx1", CallbackURL: testCallbackURL}, {TxID: "tx2", CallbackURL: testCallbackURL}}
+	for i, err := range p.RegisterBatchWithResults(ctx, regs, 2) {
+		if err != nil {
+			t.Fatalf("errs[%d]=%v, a accepted both", i, err)
+		}
+	}
+	if st := p.EndpointStatuses()[1]; !st.Healthy || st.CatchupPending != 1 {
+		t.Fatalf("b must stay healthy with tx2 owed: %+v", st)
+	}
+
+	b.setFail("tx2", false)
+	waitFor(t, "b to acknowledge tx2", func() bool { return b.watchedSet()["tx2"] >= 2 })
+	waitFor(t, "b's queue to drain", func() bool { return pendingFor(p, b.url()) == 0 })
+	if got := testutil.ToFloat64(metrics.MerkleEndpointCatchupPending.WithLabelValues(b.url())); got != 0 {
+		t.Fatalf("catchup_pending gauge = %v, want 0", got)
+	}
+}
+
+// Registrations skipped while an endpoint's breaker was open are owed to it
+// and delivered once the probe closes the breaker.
+func TestPool_SkippedWhileOpenIsDeliveredAfterRecovery(t *testing.T) {
+	a, b := newFakeMerkle(t), newFakeMerkle(t)
+	b.watchCode.Store(http.StatusServiceUnavailable)
+	b.healthCode.Store(http.StatusServiceUnavailable)
+	p := NewPool([]string{a.url(), b.url()}, "", time.Second, WithFailureThreshold(2), WithProbeInterval(10*time.Millisecond))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.Start(ctx)
+
+	// Two refusals open b; both txs are owed to it.
+	for _, id := range []string{"tx1", "tx2", "tx3"} {
+		if err := p.Register(ctx, id, testCallbackURL, ""); err != nil {
+			t.Fatalf("register %s: %v (a accepts)", id, err)
+		}
+	}
+	if st := p.EndpointStatuses()[1]; st.Healthy || st.CatchupPending != 3 {
+		t.Fatalf("b must be open and owe all three: %+v", st)
+	}
+	// A 5xx /health keeps it open and nothing drains.
+	time.Sleep(50 * time.Millisecond)
+	if st := p.EndpointStatuses()[1]; st.Healthy || st.CatchupPending != 3 {
+		t.Fatalf("b must stay open while /health is 503: %+v", st)
+	}
+	if got := testutil.ToFloat64(metrics.MerkleEndpointRequestsTotal.WithLabelValues(b.url(), opProbe, outcome5xx)); got == 0 {
+		t.Fatal("a 503 /health must be counted as err_5xx on the probe op")
+	}
+
+	b.healthCode.Store(http.StatusOK)
+	b.watchCode.Store(http.StatusOK)
+	waitFor(t, "b to recover and drain", func() bool {
+		st := p.EndpointStatuses()[1]
+		return st.Healthy && st.CatchupPending == 0
+	})
+	got := b.watchedSet()
+	for _, id := range []string{"tx1", "tx2", "tx3"} {
+		if got[id] == 0 {
+			t.Fatalf("b never received %s after recovery: %v", id, got)
+		}
+	}
+}
+
+// Past the queue bound the oldest entries are dropped; once the queue
+// drains, the pool asks for a full resync of that endpoint exactly once.
+func TestPool_CatchupOverflowRequestsResync(t *testing.T) {
+	a, b := newFakeMerkle(t), newFakeMerkle(t)
+	b.watchCode.Store(http.StatusServiceUnavailable)
+	b.healthCode.Store(http.StatusServiceUnavailable)
+	p := NewPool([]string{a.url(), b.url()}, "", time.Second,
+		WithFailureThreshold(1), WithProbeInterval(10*time.Millisecond), WithCatchupQueueSize(2))
+	resyncs := make(chan string, 4)
+	p.OnResyncNeeded(func(endpoint string) { resyncs <- endpoint })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.Start(ctx)
+
+	for _, id := range []string{"tx1", "tx2", "tx3", "tx4", "tx5"} {
+		if err := p.Register(ctx, id, testCallbackURL, ""); err != nil {
+			t.Fatalf("register %s: %v", id, err)
+		}
+	}
+	if got := pendingFor(p, b.url()); got != 2 {
+		t.Fatalf("queue must be capped at 2, got %d", got)
+	}
+	select {
+	case ep := <-resyncs:
+		t.Fatalf("resync must not fire before the queue drains, got %s", ep)
+	default:
+	}
+
+	b.healthCode.Store(http.StatusOK)
+	b.watchCode.Store(http.StatusOK)
+	select {
+	case ep := <-resyncs:
+		if ep != b.url() {
+			t.Fatalf("resync for %s, want %s", ep, b.url())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("resync hook never fired after the overflowed queue drained")
+	}
+	if got := pendingFor(p, b.url()); got != 0 {
+		t.Fatalf("queue must be empty after drain, got %d", got)
+	}
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case ep := <-resyncs:
+		t.Fatalf("resync must fire once per overflow, got a second one for %s", ep)
+	default:
+	}
+}
+
+// The Service from Endpoint() targets one endpoint, keeps its failures in
+// the catch-up queue, and refuses fast while the breaker is open.
+func TestPool_EndpointServiceQueuesFailures(t *testing.T) {
+	a, b := newFakeMerkle(t), newFakeMerkle(t)
+	p := NewPool([]string{a.url(), b.url()}, "", time.Second, WithFailureThreshold(2))
+	ctx := context.Background()
+	single := p.Endpoint(b.url())
+	if single == nil {
+		t.Fatal("known endpoint must be returned")
+	}
+
+	b.setFail("tx2", true)
+	errs := single.RegisterBatchWithResults(ctx, []Registration{{TxID: "tx1"}, {TxID: "tx2"}}, 2)
+	if errs[0] != nil || errs[1] == nil {
+		t.Fatalf("errs = %v, want tx1 ok / tx2 refused", errs)
+	}
+	if a.watchedCount() != 0 {
+		t.Fatal("Endpoint() must not fan out to other endpoints")
+	}
+	if got := pendingFor(p, b.url()); got != 1 {
+		t.Fatalf("refused tx must be queued for b, pending = %d", got)
+	}
+
+	b.watchCode.Store(http.StatusServiceUnavailable)
+	_ = single.Register(ctx, "tx3", testCallbackURL, "")
+	_ = single.Register(ctx, "tx4", testCallbackURL, "")
+	if st := p.EndpointStatuses()[1]; st.Healthy {
+		t.Fatalf("two 5xx through Endpoint() must open the breaker: %+v", st)
+	}
+	before := b.watchedCount()
+	if err := single.Register(ctx, "tx5", testCallbackURL, ""); !errors.Is(err, ErrNoHealthyEndpoints) {
+		t.Fatalf("open endpoint must refuse fast, got %v", err)
+	}
+	if b.watchedCount() != before {
+		t.Fatal("open endpoint must not be called")
+	}
+	if got := pendingFor(p, b.url()); got != 4 {
+		t.Fatalf("tx2..tx5 must all be owed to b, pending = %d", got)
 	}
 }
 
@@ -245,54 +459,25 @@ func TestPool_AllBreakersOpenFailsFast(t *testing.T) {
 	}
 }
 
-func TestPool_ProbeClosesBreakerAndFiresOnRecovered(t *testing.T) {
+// A canceled context during a probe is counted as canceled, not as an
+// endpoint failure.
+func TestPool_ProbeCancellationIsNotNetworkFailure(t *testing.T) {
 	a := newFakeMerkle(t)
 	a.watchCode.Store(http.StatusServiceUnavailable)
-	a.healthCode.Store(http.StatusServiceUnavailable)
-	p := NewPool([]string{a.url()}, "", time.Second, WithFailureThreshold(2), WithProbeInterval(10*time.Millisecond))
-
-	type recovered struct {
-		endpoint string
-		openedAt time.Time
+	p := NewPool([]string{a.url()}, "", time.Second, WithFailureThreshold(1))
+	_ = p.Register(context.Background(), "tx", testCallbackURL, "")
+	if st := p.EndpointStatuses()[0]; st.Healthy {
+		t.Fatalf("breaker should be open: %+v", st)
 	}
-	got := make(chan recovered, 1)
-	p.OnRecovered(func(endpoint string, openedAt time.Time) {
-		got <- recovered{endpoint, openedAt}
-	})
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	p.Start(ctx)
-
-	for i := 0; i < 2; i++ {
-		_ = p.Register(ctx, "tx", testCallbackURL, "")
+	cancel()
+	before := testutil.ToFloat64(metrics.MerkleEndpointRequestsTotal.WithLabelValues(a.url(), opProbe, outcomeCanceled))
+	p.probeOpenEndpoints(ctx)
+	if got := testutil.ToFloat64(metrics.MerkleEndpointRequestsTotal.WithLabelValues(a.url(), opProbe, outcomeCanceled)) - before; got != 1 {
+		t.Fatalf("probe under a canceled context must count as canceled, delta=%v", got)
 	}
 	if st := p.EndpointStatuses()[0]; st.Healthy {
-		t.Fatalf("breaker should be open after two 5xx: %+v", st)
-	}
-
-	// A 5xx /health keeps the breaker open.
-	time.Sleep(50 * time.Millisecond)
-	select {
-	case r := <-got:
-		t.Fatalf("recovered while /health still 503: %+v", r)
-	default:
-	}
-
-	a.healthCode.Store(http.StatusOK)
-	a.watchCode.Store(http.StatusOK)
-	select {
-	case r := <-got:
-		if r.endpoint != a.url() || r.openedAt.IsZero() {
-			t.Fatalf("hook args = %+v", r)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("OnRecovered hook never fired")
-	}
-	if st := p.EndpointStatuses()[0]; !st.Healthy || st.OpenSince != nil {
-		t.Fatalf("breaker should be closed after probe: %+v", st)
-	}
-	if err := p.Register(ctx, "tx", testCallbackURL, ""); err != nil {
-		t.Fatalf("register after recovery: %v", err)
+		t.Fatalf("a canceled probe must not close the breaker: %+v", st)
 	}
 }
 

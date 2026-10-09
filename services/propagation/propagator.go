@@ -188,20 +188,20 @@ type Propagator struct {
 	inflightDepth atomic.Int64
 
 	// backgroundWG tracks the long-running Start-spawned goroutines —
-	// runReaper, runMerkleReplay, and any recovery replay spawned by the
-	// merkle pool's breaker-closed hook — so Stop can wait for them to exit
+	// runReaper, runMerkleReplay, and any resync replay spawned by the
+	// merkle pool's overflow hook — so Stop can wait for them to exit
 	// before the surrounding app cleanup closes the store backing them.
 	// Without this, a reaper mid-lease-release or mid-status-scan
 	// races with store.Close and the test framework attributes the
 	// resulting goroutine panic to the test's Cleanup callback.
 	backgroundWG sync.WaitGroup
 
-	// recovery coalesces per-endpoint recovery replays (see
-	// scheduleRecoveryReplay). recoveryStopped is set by Stop before it
-	// waits on backgroundWG so a late hook cannot Add to it.
-	recoveryMu      sync.Mutex
-	recovery        map[string]*recoveryState
-	recoveryStopped bool
+	// resync coalesces per-endpoint resync replays (see scheduleResync).
+	// resyncStopped is set by Stop before it waits on backgroundWG so a late
+	// hook cannot Add to it.
+	resyncMu      sync.Mutex
+	resync        map[string]*resyncState
+	resyncStopped bool
 
 	// initDone is closed once Start has finished its init phase (all
 	// wg.Add()s done, all goroutines spawned) OR Start has returned with
@@ -1141,15 +1141,13 @@ func (p *Propagator) Start(ctx context.Context) error {
 		defer p.backgroundWG.Done()
 		p.runMerkleReplay(ctx)
 	}()
-	// With several merkle-services, an endpoint whose breaker was open
-	// missed every registration the others accepted meanwhile. Re-register
-	// the window with that endpoint when it comes back (see
-	// runRecoveryReplay). A single endpoint never diverges from itself: when
-	// it is down nothing is registered anywhere and the txs are requeued, so
-	// the hook is only wired for 2+ endpoints.
-	if rp, ok := p.merkleClient.(merkleservice.Recoverable); ok && len(rp.Endpoints()) > 1 {
-		rp.OnRecovered(func(endpoint string, openedAt time.Time) {
-			p.scheduleRecoveryReplay(ctx, rp, endpoint, openedAt)
+	// With several merkle-services the pool re-sends every registration an
+	// endpoint missed from a bounded per-endpoint queue. If that queue
+	// overflowed, the dropped registrations are unknown and the endpoint
+	// needs a full lookback replay (see runResyncReplay).
+	if rp, ok := p.merkleClient.(merkleservice.Recoverable); ok {
+		rp.OnResyncNeeded(func(endpoint string) {
+			p.scheduleResync(ctx, rp, endpoint)
 		})
 	}
 	go func() {
@@ -1258,9 +1256,9 @@ func (p *Propagator) Stop() error {
 	// attributes the failure to t.Cleanup. Their parent ctx has
 	// already been canceled by the caller, so this only blocks on
 	// in-flight scan/release work.
-	p.recoveryMu.Lock()
-	p.recoveryStopped = true
-	p.recoveryMu.Unlock()
+	p.resyncMu.Lock()
+	p.resyncStopped = true
+	p.resyncMu.Unlock()
 	p.backgroundWG.Wait()
 	return consumerErr
 }

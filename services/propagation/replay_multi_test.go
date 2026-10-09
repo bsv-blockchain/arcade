@@ -46,12 +46,23 @@ func TestRegisterBatch_PoolWithOneDeadEndpoint_FullyOK(t *testing.T) {
 	if len(ms.merkleMarks) != 1 || len(ms.merkleMarks[0]) != 2 {
 		t.Fatalf("merkle_registered_at must be stamped for both txs, marks=%v", ms.merkleMarks)
 	}
+	// The dead endpoint still owes both registrations; the pool re-sends
+	// them once it answers again.
+	for _, st := range pool.EndpointStatuses() {
+		if st.URL == live.URL && st.CatchupPending != 0 {
+			t.Fatalf("live endpoint must owe nothing, got %+v", st)
+		}
+		if st.URL != live.URL && st.CatchupPending != 2 {
+			t.Fatalf("dead endpoint must owe both txs, got %+v", st)
+		}
+	}
 }
 
-// When an endpoint's breaker closes, the recovery replay re-registers the
-// window with THAT endpoint only, ignoring merkle_registered_at (the stamp is
-// pool-wide and cannot say which endpoint missed the row).
-func TestRunRecoveryReplay_TargetsOnlyRecoveredEndpoint(t *testing.T) {
+// When an endpoint's catch-up queue overflowed, the resync replay
+// re-registers the whole lookback window with THAT endpoint only, ignoring
+// merkle_registered_at (the stamp is pool-wide and cannot say which endpoint
+// missed the row).
+func TestRunResyncReplay_TargetsOnlyThatEndpoint(t *testing.T) {
 	logA, logB := &eventLog{}, &eventLog{}
 	srvA := newMerkleServer(logA, http.StatusOK)
 	defer srvA.Close()
@@ -69,20 +80,20 @@ func TestRunRecoveryReplay_TargetsOnlyRecoveredEndpoint(t *testing.T) {
 	}
 	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, nil, pool)
 
-	p.runRecoveryReplay(context.Background(), pool, srvB.URL, time.Now())
+	p.runResyncReplay(context.Background(), pool, srvB.URL)
 
 	if n := logB.count("register:"); n != 2 {
-		t.Fatalf("recovered endpoint registrations=%d want 2 (recent stamp must NOT skip)", n)
+		t.Fatalf("resynced endpoint registrations=%d want 2 (recent stamp must NOT skip)", n)
 	}
 	if n := logA.count("register:"); n != 0 {
-		t.Fatalf("healthy endpoint must not be re-registered, got %d", n)
+		t.Fatalf("other endpoint must not be re-registered, got %d", n)
 	}
 }
 
-// scheduleRecoveryReplay coalesces: a second breaker-closed event for the
-// same endpoint while a pass is running triggers exactly one more pass, and
-// nothing runs after Stop flagged the propagator.
-func TestScheduleRecoveryReplay_CoalescesAndHonorsStop(t *testing.T) {
+// scheduleResync coalesces: a second request for the same endpoint while a
+// pass is running triggers exactly one more pass, and nothing runs after
+// Stop flagged the propagator.
+func TestScheduleResync_CoalescesAndHonorsStop(t *testing.T) {
 	logB := &eventLog{}
 	srvB := newMerkleServer(logB, http.StatusOK)
 	defer srvB.Close()
@@ -97,25 +108,24 @@ func TestScheduleRecoveryReplay_CoalescesAndHonorsStop(t *testing.T) {
 	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, nil, pool)
 
 	ctx := context.Background()
-	opened := time.Now().Add(-time.Minute)
-	p.scheduleRecoveryReplay(ctx, pool, srvB.URL, opened)
-	p.scheduleRecoveryReplay(ctx, pool, srvB.URL, opened)
-	p.scheduleRecoveryReplay(ctx, pool, srvB.URL, opened)
+	p.scheduleResync(ctx, pool, srvB.URL)
+	p.scheduleResync(ctx, pool, srvB.URL)
+	p.scheduleResync(ctx, pool, srvB.URL)
 	p.backgroundWG.Wait()
 
 	// At most two passes (the running one, plus one coalesced rerun), never
 	// three; at least one.
 	if n := logB.count("register:"); n < 1 || n > 2 {
-		t.Fatalf("recovery passes registered tx-1 %d times, want 1..2", n)
+		t.Fatalf("resync passes registered tx-1 %d times, want 1..2", n)
 	}
 
-	p.recoveryMu.Lock()
-	p.recoveryStopped = true
-	p.recoveryMu.Unlock()
+	p.resyncMu.Lock()
+	p.resyncStopped = true
+	p.resyncMu.Unlock()
 	before := logB.count("register:")
-	p.scheduleRecoveryReplay(ctx, pool, srvB.URL, opened)
+	p.scheduleResync(ctx, pool, srvB.URL)
 	p.backgroundWG.Wait()
 	if logB.count("register:") != before {
-		t.Fatal("no recovery pass may start after Stop")
+		t.Fatal("no resync pass may start after Stop")
 	}
 }

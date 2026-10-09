@@ -25,21 +25,22 @@ type Service interface {
 }
 
 // Recoverable is the optional surface a multi-endpoint implementation exposes
-// so a consumer can react when an endpoint comes back after an outage. *Pool
-// implements it; *Client does not. propagation type-asserts for it to run the
-// per-endpoint catch-up replay (re-registering the txs that endpoint missed
-// while its breaker was open).
+// so a consumer can resync one endpoint. *Pool implements it; *Client does
+// not. The pool itself re-sends every registration an endpoint missed from a
+// bounded per-endpoint catch-up queue; propagation type-asserts for this
+// interface to run a full lookback replay against one endpoint when that
+// queue overflowed and the dropped registrations are unknown.
 type Recoverable interface {
 	// Endpoints lists the configured base URLs, in config order.
 	Endpoints() []string
-	// Endpoint returns a Service that talks to exactly one endpoint, bypassing
-	// the breaker, or nil when baseURL is not part of the pool.
+	// Endpoint returns a Service that talks to exactly one endpoint (still
+	// honoring its breaker and queueing its failures), or nil when baseURL
+	// is not part of the pool.
 	Endpoint(baseURL string) Service
-	// OnRecovered registers fn to run (synchronously, on the pool's probe
-	// goroutine) each time an endpoint's breaker closes. openedAt is when the
-	// breaker opened, i.e. the start of the window the endpoint may have
-	// missed registrations for. fn must return quickly; spawn work if needed.
-	OnRecovered(fn func(endpoint string, openedAt time.Time))
+	// OnResyncNeeded registers fn to run (synchronously, on the pool's
+	// background goroutine) when an endpoint's catch-up queue overflowed and
+	// has since drained. fn must return quickly; spawn work if needed.
+	OnResyncNeeded(fn func(endpoint string))
 }
 
 // HealthReporter is the optional surface the api-server's /health uses to
@@ -48,13 +49,17 @@ type HealthReporter interface {
 	EndpointStatuses() []EndpointStatus
 }
 
-// EndpointStatus is one endpoint's breaker view for /health and tests.
+// EndpointStatus is one endpoint's breaker and catch-up view for /health
+// and tests.
 type EndpointStatus struct {
 	URL                 string     `json:"url"`
 	Healthy             bool       `json:"healthy"`
 	ConsecutiveFailures int        `json:"consecutiveFailures"`
 	LastFailureAt       *time.Time `json:"lastFailureAt,omitempty"`
 	OpenSince           *time.Time `json:"openSince,omitempty"`
+	// CatchupPending is how many registrations the pool still owes this
+	// endpoint (accepted elsewhere, not yet acknowledged here).
+	CatchupPending int `json:"catchupPending"`
 }
 
 var (

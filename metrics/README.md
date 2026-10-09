@@ -82,9 +82,13 @@ landing.
 
 - Per-endpoint `arcade_merkle_endpoint_healthy` (one row per `endpoint`); alert
   when `sum()` drops below the number of configured endpoints.
-- `rate(arcade_merkle_endpoint_requests_total{op="watch",outcome!="ok"}[5m])`
-  by `endpoint, outcome` — which merkle-service is failing and how
-  (`err_network`, `err_5xx`, `err_auth`, `err_4xx`, `skipped_open`).
+- `sum by (endpoint, outcome) (rate(arcade_merkle_endpoint_requests_total{op="watch",outcome!="ok"}[5m]))`
+  — which merkle-service is failing and how (`err_network`, `err_5xx`,
+  `err_auth`, `err_4xx`, `skipped_open`).
+- `arcade_merkle_endpoint_catchup_pending` (one row per `endpoint`) —
+  registrations another endpoint accepted that this one has not acknowledged
+  yet; the pool re-sends them in the background. Alert when it stays above 0
+  for longer than a few minutes while the endpoint is healthy.
 - `arcade_propagation_merkle_register_batch_outcome_total` stays the
   pool-level view: `fully_ok` while any endpoint accepts, `all_failed` only
   when every endpoint refused.

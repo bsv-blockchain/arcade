@@ -29,31 +29,32 @@ const defaultReplaySkipRecent = 30 * time.Minute
 // issues against merkle-service when MerkleReplayRPS isn't set.
 const defaultReplayRPS = 50
 
-// recoveryReplaySlack is subtracted from the breaker's open time when an
-// endpoint recovers: the three failures that tripped the breaker belong to
-// txs registered just before it opened, and those txs are part of what the
-// endpoint missed.
-const recoveryReplaySlack = 5 * time.Minute
-
 // replayParams parameterizes one replay pass. The startup pass and the
-// per-endpoint recovery pass differ only in target, window and the
+// per-endpoint resync pass differ only in target, label and the
 // merkle_registered_at skip.
 type replayParams struct {
 	// target receives the /watch calls: the whole pool on startup, a single
-	// endpoint on recovery.
+	// endpoint on resync.
 	target merkleservice.Service
 	// since bounds IterateStatusesSince.
 	since time.Time
 	// skipRecent skips rows whose merkle_registered_at is within this
 	// window; 0 disables the skip. The stamp is pool-wide (set when any
-	// endpoint accepted), so the recovery pass must pass 0: it cannot tell
+	// endpoint accepted), so the resync pass must pass 0: it cannot tell
 	// which endpoint a recent stamp came from.
 	skipRecent time.Duration
-	// label tags the log lines ("startup" or "recovery").
+	// label tags the log lines ("startup" or "resync").
 	label string
-	// endpoint is the recovered endpoint's base URL for the recovery pass;
-	// empty on startup.
+	// endpoint is the resynced endpoint's base URL; empty on startup.
 	endpoint string
+}
+
+// replayLookback is the IterateStatusesSince window for a full replay.
+func (p *Propagator) replayLookback() time.Duration {
+	if lookback := time.Duration(p.cfg.Propagation.RegisterReplayLookbackHours) * time.Hour; lookback > 0 {
+		return lookback
+	}
+	return defaultReplayLookback
 }
 
 // runMerkleReplay re-registers every non-terminal tx in the store with
@@ -80,10 +81,6 @@ func (p *Propagator) runMerkleReplay(ctx context.Context) {
 		return
 	}
 
-	lookback := time.Duration(p.cfg.Propagation.RegisterReplayLookbackHours) * time.Hour
-	if lookback <= 0 {
-		lookback = defaultReplayLookback
-	}
 	// skipRecent: rows registered within this window are skipped. 0 disables
 	// the skip — useful for forcing a full re-sync after a known
 	// merkle-service wipe (issue #145).
@@ -99,32 +96,30 @@ func (p *Propagator) runMerkleReplay(ctx context.Context) {
 
 	p.replayTo(ctx, replayParams{
 		target:     p.merkleClient,
-		since:      time.Now().Add(-lookback),
+		since:      time.Now().Add(-p.replayLookback()),
 		skipRecent: skipRecent,
 		label:      "startup",
 	})
 }
 
-// runRecoveryReplay re-registers, with ONE endpoint, every non-terminal tx
-// whose status row moved since that endpoint's breaker opened. While the
-// breaker was open the pool kept registering txs with the other endpoints
-// (a tx is registered once any endpoint accepts it), so this endpoint's
-// watch set is now a strict subset and the STUMPs it emits would lack those
-// txs' paths. Re-registering closes that gap for every block mined after the
-// pass completes; the bump-builder's content-addressed STUMP handling covers
-// a block mined before then.
-//
-// The pass bypasses the breaker (merkleservice.Recoverable.Endpoint) because
-// the pool would otherwise fan the calls out to every endpoint again.
-func (p *Propagator) runRecoveryReplay(ctx context.Context, rp merkleservice.Recoverable, endpoint string, openedAt time.Time) {
+// runResyncReplay re-registers, with ONE endpoint, every non-terminal tx in
+// the lookback window. The pool normally keeps an endpoint's watch set
+// complete on its own: a tx another endpoint accepted but this one refused,
+// timed out on, or was skipped for (breaker open) sits in the endpoint's
+// catch-up queue until it lands. That queue is bounded; when it overflowed,
+// the dropped registrations are unknown and only a full replay of the
+// in-flight set restores the endpoint's watch set. The target is
+// merkleservice.Recoverable.Endpoint, so a /watch that fails during the pass
+// goes back to that endpoint's queue instead of being lost.
+func (p *Propagator) runResyncReplay(ctx context.Context, rp merkleservice.Recoverable, endpoint string) {
 	target := rp.Endpoint(endpoint)
 	if target == nil || p.cfg.CallbackURL == "" {
 		return
 	}
 	p.replayTo(ctx, replayParams{
 		target:   target,
-		since:    openedAt.Add(-recoveryReplaySlack),
-		label:    "recovery",
+		since:    time.Now().Add(-p.replayLookback()),
+		label:    "resync",
 		endpoint: endpoint,
 	})
 }
@@ -185,7 +180,10 @@ func (p *Propagator) replayTo(ctx context.Context, rp replayParams) {
 		}
 		// Per-tx results, not fail-fast: one refused /watch must not drop
 		// the merkle_registered_at stamp for the rest of the batch, or the
-		// next boot re-registers them all again.
+		// next boot re-registers them all again. A failed entry is not
+		// retried here: the pool keeps it in the endpoint's catch-up queue
+		// (startup: for every endpoint that did not accept it; resync: for
+		// the single target endpoint).
 		errs := rp.target.RegisterBatchWithResults(ctx, batch, concurrency)
 		okTxIDs := make([]string, 0, len(batch))
 		var sampleErr error
@@ -208,9 +206,9 @@ func (p *Propagator) replayTo(ctx context.Context, rp replayParams) {
 			)
 		}
 		// Stamp merkle_registered_at on the rows that landed so future
-		// startup replays can skip them. The stamp is pool-wide: a recovery
+		// startup replays can skip them. The stamp is pool-wide: a resync
 		// pass stamping it is harmless (the row IS registered with every
-		// live endpoint now).
+		// endpoint that is up).
 		if len(okTxIDs) > 0 {
 			if err := p.store.MarkMerkleRegisteredByTxIDs(ctx, okTxIDs, time.Now()); err != nil {
 				logger.Warn(
@@ -280,37 +278,33 @@ func (p *Propagator) replayTo(ctx context.Context, rp replayParams) {
 	)
 }
 
-// recoveryState coalesces breaker-closed events per endpoint: while a
-// recovery replay for an endpoint is running, a second event for the same
-// endpoint only records the earliest open time and asks the running pass to
-// go again, so a flapping endpoint never stacks concurrent replays.
-type recoveryState struct {
-	running  bool
-	again    bool
-	openedAt time.Time
+// resyncState coalesces resync requests per endpoint: while a resync for an
+// endpoint is running, a second request for the same endpoint only asks the
+// running pass to go again, so a flapping endpoint never stacks concurrent
+// replays.
+type resyncState struct {
+	running bool
+	again   bool
 }
 
-// scheduleRecoveryReplay is the merkleservice.Recoverable hook. It runs on
-// the pool's probe goroutine and must not block, so the replay itself is
+// scheduleResync is the merkleservice.Recoverable hook. It runs on the
+// pool's background goroutine and must not block, so the replay itself is
 // spawned under backgroundWG (Stop waits for it) and guarded by
-// recoveryStopped so a hook firing during shutdown cannot Add to a WaitGroup
+// resyncStopped so a hook firing during shutdown cannot Add to a WaitGroup
 // that Stop is already waiting on.
-func (p *Propagator) scheduleRecoveryReplay(ctx context.Context, rp merkleservice.Recoverable, endpoint string, openedAt time.Time) {
-	p.recoveryMu.Lock()
-	defer p.recoveryMu.Unlock()
-	if p.recoveryStopped || ctx.Err() != nil {
+func (p *Propagator) scheduleResync(ctx context.Context, rp merkleservice.Recoverable, endpoint string) {
+	p.resyncMu.Lock()
+	defer p.resyncMu.Unlock()
+	if p.resyncStopped || ctx.Err() != nil {
 		return
 	}
-	if p.recovery == nil {
-		p.recovery = make(map[string]*recoveryState)
+	if p.resync == nil {
+		p.resync = make(map[string]*resyncState)
 	}
-	st := p.recovery[endpoint]
+	st := p.resync[endpoint]
 	if st == nil {
-		st = &recoveryState{}
-		p.recovery[endpoint] = st
-	}
-	if st.openedAt.IsZero() || openedAt.Before(st.openedAt) {
-		st.openedAt = openedAt
+		st = &resyncState{}
+		p.resync[endpoint] = st
 	}
 	if st.running {
 		st.again = true
@@ -318,28 +312,26 @@ func (p *Propagator) scheduleRecoveryReplay(ctx context.Context, rp merkleservic
 	}
 	st.running = true
 	p.backgroundWG.Add(1)
-	go p.recoveryLoop(ctx, rp, endpoint, st)
+	go p.resyncLoop(ctx, rp, endpoint, st)
 }
 
-// recoveryLoop runs recovery passes for one endpoint until no further
-// breaker-closed event arrived while the last pass was running.
-func (p *Propagator) recoveryLoop(ctx context.Context, rp merkleservice.Recoverable, endpoint string, st *recoveryState) {
+// resyncLoop runs resync passes for one endpoint until no further request
+// arrived while the last pass was running.
+func (p *Propagator) resyncLoop(ctx context.Context, rp merkleservice.Recoverable, endpoint string, st *resyncState) {
 	defer p.backgroundWG.Done()
 	for {
-		p.recoveryMu.Lock()
-		openedAt := st.openedAt
-		st.openedAt = time.Time{}
+		p.resyncMu.Lock()
 		st.again = false
-		p.recoveryMu.Unlock()
+		p.resyncMu.Unlock()
 
-		p.runRecoveryReplay(ctx, rp, endpoint, openedAt)
+		p.runResyncReplay(ctx, rp, endpoint)
 
-		p.recoveryMu.Lock()
-		if !st.again || ctx.Err() != nil || p.recoveryStopped {
+		p.resyncMu.Lock()
+		if !st.again || ctx.Err() != nil || p.resyncStopped {
 			st.running = false
-			p.recoveryMu.Unlock()
+			p.resyncMu.Unlock()
 			return
 		}
-		p.recoveryMu.Unlock()
+		p.resyncMu.Unlock()
 	}
 }

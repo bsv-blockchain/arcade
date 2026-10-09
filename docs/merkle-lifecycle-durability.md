@@ -89,13 +89,26 @@ every endpoint failed, the surfaced error is the most retryable one (context
 error, then network/5xx, then 401/403, then other 4xx), so `auth_error` on the
 registration metrics now means every endpoint rejected the token.
 
+A tx the pool reported registered must still reach every endpoint, or the
+endpoints' watch sets diverge and their STUMPs disagree. Every endpoint-
+specific failure behind a pool-level success — a refused or timed-out
+`/watch`, or an endpoint skipped because its breaker was open — is kept in
+that endpoint's in-memory catch-up queue (`arcade_merkle_endpoint_catchup_pending`)
+and re-sent from the pool's background loop once the endpoint answers again,
+500 per 5s tick with backoff; what fails again goes back to the queue. The
+queue is bounded (200k entries per endpoint, about half an hour at 100 TPS);
+past that the oldest entries are dropped and, once the queue drains, the
+pool asks propagation to resync that endpoint with a full lookback replay
+(`register_replay_lookback_hours`, ignoring `merkle_registered_at`, since
+the stamp is pool-wide). A `/watch` that fails during the resync goes back
+to the queue. `/watch` is idempotent on merkle-service. The startup replay
+re-registers every in-flight tx with the whole pool, so a restart loses
+nothing durable.
+
 An endpoint that fails three consecutive transport/5xx requests has its
 breaker opened and is skipped; 4xx answers never trip it. The pool probes
 `GET /health` on open endpoints every 5s and closes the breaker on any non-5xx
-answer. Closing fires the propagation recovery replay: every non-terminal tx
-whose row moved since the breaker opened (minus 5 minutes of slack) is
-re-registered with that endpoint only, ignoring `merkle_registered_at`
-(the stamp is pool-wide). `/watch` is idempotent on merkle-service.
+answer; the catch-up queue then drains.
 
 Duplicate callbacks:
 

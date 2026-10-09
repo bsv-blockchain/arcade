@@ -131,9 +131,10 @@ merkle_service:
   # registered with every endpoint and each endpoint delivers its own
   # callbacks, so one merkle-service going down neither blocks registration
   # (a tx is registered once any endpoint accepts it) nor stops SEEN/STUMP/
-  # BLOCK_PROCESSED delivery. Duplicate callbacks are no-ops. An endpoint
-  # that fails three consecutive requests is skipped until GET /health on it
-  # answers; when it comes back, in-flight txs are re-registered with it.
+  # BLOCK_PROCESSED delivery. Duplicate callbacks are no-ops. A registration
+  # one endpoint accepted but another missed is re-sent to it in the
+  # background. An endpoint that fails three consecutive requests is skipped
+  # until GET /health on it answers.
   # All endpoints share `auth_token`. Env form: ARCADE_MERKLE_SERVICE_URLS as
   # a comma-separated list.
   url: ""
