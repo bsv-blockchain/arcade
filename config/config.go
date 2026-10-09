@@ -406,12 +406,15 @@ type PropagationConfig struct {
 	MerkleConcurrency int `mapstructure:"merkle_concurrency"`
 	// RetryMaxAttempts bounds how many times the propagator will push a
 	// transaction back through the in-memory requeue loop when a broadcast
-	// produced no per-tx verdict (no healthy peer, body-less 5xx, merkle
-	// /watch blip, or a conflict-family 409 whose lines could not be
-	// attributed to any submitted tx). After the budget is spent the tx is
-	// parked at PENDING_RETRY, which releases the dispatcher's in-flight
-	// entry so the Kafka commit watermark can advance; the reaper then owns
-	// the durable retry.
+	// produced no per-tx network verdict (no healthy peer, body-less 5xx,
+	// or a conflict-family 409 whose lines could not be attributed to any
+	// submitted tx). Merkle /watch failures do not consume this budget:
+	// registration retries are a separate failure domain, and /watch must
+	// succeed before broadcast (F-024) without counting as a propagation
+	// attempt. After the network budget is spent the tx is parked at
+	// PENDING_RETRY, which releases the dispatcher's in-flight entry so the
+	// Kafka commit watermark can advance; the reaper then owns the durable
+	// retry.
 	//
 	// The bound is not a nicety. On 2026-08-11 (dev-ovh-1, arcade v0.11.5) a
 	// 21-tx batch of stale transactions drew a permanent HTTP 409 from

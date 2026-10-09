@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"regexp"
@@ -69,19 +70,33 @@ type propagationMsg struct {
 	// each tx's originating producer span — see startBroadcastSpan.
 	spanCtx trace.SpanContext
 	// retryCount is how many times this tx has already been pushed back
-	// through requeueAfterDelay on THIS claim. Like spanCtx it is process-
-	// local and deliberately not serialized: a tx re-read from Kafka after a
-	// restart or rebalance is a fresh attempt against (probably) a different
-	// downstream state, so its budget resets. requeueAfterDelay increments it
-	// and parks the tx at PENDING_RETRY once it exceeds
-	// Propagator.retryMaxAttempts — without that ceiling a batch that can
-	// never succeed loops forever and its in-flight entries freeze the Kafka
-	// commit watermark (the 2026-08-11 dev-ovh-1 wedge: 337,247 messages of
-	// lag stationary behind 4,679 in-flight txs).
+	// through the NETWORK propagation requeue on THIS claim. Merkle /watch
+	// failures do not increment it — registration and broadcast are
+	// different failure domains, and a tx must not exhaust
+	// propagation.retry_max_attempts before it has been broadcast.
+	// Like spanCtx it is process-local and deliberately not serialized: a
+	// tx re-read from Kafka after a restart or rebalance is a fresh attempt
+	// against (probably) a different downstream state, so its budget resets.
+	// The network requeue increments it and parks the tx at PENDING_RETRY
+	// once it exceeds Propagator.retryMaxAttempts — without that ceiling a
+	// batch that can never succeed loops forever and its in-flight entries
+	// freeze the Kafka commit watermark (the 2026-08-11 dev-ovh-1 wedge:
+	// 337,247 messages of lag stationary behind 4,679 in-flight txs).
 	retryCount int
+	// merkleRetryCount is how many times this tx has been requeued because
+	// Merkle /watch failed, on THIS claim. Independent of retryCount.
+	// F-024 still holds: the tx is not broadcast until registration
+	// succeeds. Exhausting this counter parks at PENDING_RETRY without
+	// debiting the network budget. Process-local; not serialized.
+	merkleRetryCount int
+	// merkleFailureReason is the last /watch error that sent this tx
+	// through the merkle requeue, clipped for the park reason. Cleared
+	// when registration succeeds so a later network park does not quote
+	// it. Process-local; not serialized.
+	merkleFailureReason string
 	// retryReason, when non-empty, names the condition that sent this tx
-	// through the requeue loop (currently only the missing-parent line
-	// from Teranode) so parkExhaustedRequeues can write a specific
+	// through the network requeue loop (currently only the missing-parent
+	// line from Teranode) so parkExhaustedRequeues can write a specific
 	// PENDING_RETRY reason instead of the generic no-verdict text.
 	// Process-local like retryCount; never serialized.
 	retryReason string
@@ -135,12 +150,17 @@ type Propagator struct {
 	maxParallelChunks     int
 	holderID              string
 	leaseTTL              time.Duration
-	// retryMaxAttempts is the per-claim in-memory requeue budget
-	// (propagation.retry_max_attempts, default defaultRetryMaxAttempts). See
-	// requeueAfterDelay / parkExhaustedRequeues for what happens when it runs
-	// out, and config.PropagationConfig.RetryMaxAttempts for the incident that
+	// retryMaxAttempts is the per-claim in-memory NETWORK requeue budget
+	// (propagation.retry_max_attempts, default defaultRetryMaxAttempts).
+	// Merkle /watch failures do not debit it. See requeueAfterDelay /
+	// parkExhaustedRequeues for what happens when it runs out, and
+	// config.PropagationConfig.RetryMaxAttempts for the incident that
 	// motivated bounding it at all.
 	retryMaxAttempts int
+	// merkleRetryMaxAttempts bounds fast-path Merkle /watch requeues.
+	// It is not propagation.retry_max_attempts. See
+	// defaultMerkleRetryMaxAttempts.
+	merkleRetryMaxAttempts int
 	// requeueDelay is the flat wait before a requeue lands back on the
 	// dispatcher. Initialized to defaultRequeueDelay; carried as a field
 	// rather than referenced as a constant so tests can compress the
@@ -312,10 +332,27 @@ const defaultMaxParallelChunks = 4
 // can never disagree about what "unset" means.
 //
 // Five attempts × defaultRequeueDelay is ~10s of fast-path retry, which
-// comfortably rides out the blips the requeue arm was built for (a peer
-// restarting, a merkle-service hiccup) while guaranteeing a permanently
-// unresolvable batch reaches its terminal escape in seconds rather than never.
+// rides out a peer restart while guaranteeing a permanently unresolvable
+// batch reaches its terminal escape in seconds rather than never.
+// Merkle /watch failures are not part of this budget; see
+// defaultMerkleRetryMaxAttempts.
 const defaultRetryMaxAttempts = 5
+
+// defaultMerkleRetryMaxAttempts bounds fast-path Merkle /watch requeues.
+// It is intentionally not propagation.retry_max_attempts.
+//
+// Sharing the network counter parked transactions after five registration
+// failures, before any Teranode broadcast. This ceiling stays strictly
+// above defaultRetryMaxAttempts so a /watch burst that used to exhaust the
+// network budget still gets a fast-path broadcast. It is still bounded:
+// past this many failures the tx parks at PENDING_RETRY and the reaper
+// owns it, so a prolonged Merkle outage cannot pin Kafka offsets or spin
+// a hot loop. Sixteen attempts at defaultRequeueDelay is about 32s.
+//
+// There is no config knob. Wiring this to retry_max_attempts would give
+// that setting two meanings. The wait between attempts is the existing
+// propagation.retry_backoff_ms (requeueDelay).
+const defaultMerkleRetryMaxAttempts = 16
 
 // teranodeHardMaxBatchTxs and teranodeHardMaxBatchBytes mirror Teranode's
 // propagation server (services/propagation/Server.go:
@@ -434,27 +471,28 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 		pendingRetryMaxAttempts = cfg.Propagation.PendingRetryMaxAttempts
 	}
 	p := &Propagator{
-		cfg:                   cfg,
-		logger:                logger.Named("propagation"),
-		producer:              producer,
-		publisher:             publisher,
-		store:                 st,
-		leaser:                leaser,
-		teranodeClient:        tc,
-		merkleClient:          mc,
-		maxPending:            maxPending,
-		merkleConcurrency:     merkleConcurrency,
-		reaperInterval:        reaperInterval,
-		reaperBatchSize:       reaperBatch,
-		rebroadcastBatch:      rebroadcastBatch,
-		teranodeBatchCap:      teranodeBatchCap,
-		teranodeBatchBytesCap: teranodeBatchBytesCap,
-		broadcastWorkers:      broadcastWorkers,
-		maxParallelChunks:     maxParallelChunks,
-		holderID:              newHolderID(),
-		leaseTTL:              leaseTTL,
-		retryMaxAttempts:      retryMaxAttempts,
-		requeueDelay:          requeueDelay,
+		cfg:                    cfg,
+		logger:                 logger.Named("propagation"),
+		producer:               producer,
+		publisher:              publisher,
+		store:                  st,
+		leaser:                 leaser,
+		teranodeClient:         tc,
+		merkleClient:           mc,
+		maxPending:             maxPending,
+		merkleConcurrency:      merkleConcurrency,
+		reaperInterval:         reaperInterval,
+		reaperBatchSize:        reaperBatch,
+		rebroadcastBatch:       rebroadcastBatch,
+		teranodeBatchCap:       teranodeBatchCap,
+		teranodeBatchBytesCap:  teranodeBatchBytesCap,
+		broadcastWorkers:       broadcastWorkers,
+		maxParallelChunks:      maxParallelChunks,
+		holderID:               newHolderID(),
+		leaseTTL:               leaseTTL,
+		retryMaxAttempts:       retryMaxAttempts,
+		merkleRetryMaxAttempts: defaultMerkleRetryMaxAttempts,
+		requeueDelay:           requeueDelay,
 
 		pendingRetryBackoff:     pendingRetryBackoff,
 		pendingRetryMaxBackoff:  pendingRetryMaxBackoff,
@@ -1248,8 +1286,10 @@ func (p *Propagator) Stop() error {
 //
 // F-024 durability is preserved at the batch level: processBatch runs
 // RegisterBatchWithResults before broadcasting, and any tx whose registration
-// failed is excluded from the broadcast and left at RECEIVED for the reaper
-// to retry on its next tick.
+// failed is excluded from the broadcast. That failure is retried on the
+// Merkle registration budget, which does not consume a network propagation
+// attempt. Exhausting the Merkle budget parks the tx at PENDING_RETRY for
+// the reaper; it is still not broadcast unregistered.
 //
 // A high-water-mark on pendingMsgs guards against unbounded growth if a
 // downstream stall lasts longer than the consumer's offset commit window.
@@ -1371,50 +1411,58 @@ func (p *Propagator) registerBatch(ctx context.Context, batch []propagationMsg) 
 	canceledFailures := 0
 	for i, err := range errs {
 		if err == nil {
-			registered = append(registered, batch[i])
-			successTxIDs = append(successTxIDs, batch[i].TXID)
+			// A successful registration ends this episode. The network
+			// budget (retryCount) is left as it was — /watch failures
+			// never incremented it — and the merkle counter resets so a
+			// later registration blip gets a full merkle budget.
+			msg := batch[i]
+			msg.merkleRetryCount = 0
+			msg.merkleFailureReason = ""
+			registered = append(registered, msg)
+			successTxIDs = append(successTxIDs, msg.TXID)
 			continue
 		}
 		// F-024: a tx we failed to register must NOT be broadcast, so every
 		// failure goes to the requeue subset regardless of cause. Keeping
 		// auth failures in the same requeue path preserves the dispatcher's
 		// offset / in-flight bookkeeping (a diverted tx would strand its Kafka
-		// offset and freeze the commit watermark — see handleAdmit).
-		failed = append(failed, batch[i])
-		// Context cancellation isn't a merkle-service failure at all: the
-		// claim was revoked (consumer-group rebalance) or the service is
-		// shutting down, and every in-flight /watch call collapsed at once.
-		// Classify it under the distinct "claim_revoked" label — one
-		// rebalance used to pump tens of thousands of bogus "register_error"
-		// counts into the metric (2026-08-10: 39,189 in one batch) — and
-		// keep it out of sampleErr so the partial-failure WARN below fires
-		// only for real /watch errors. ctx.Err() is checked alongside the
-		// error chain because a call raced by the cancel can surface
-		// transport wrappers that don't unwrap to context.Canceled.
-		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
-			canceledFailures++
-			metrics.PropagationMerkleRegisterFailures.WithLabelValues("claim_revoked").Inc()
-			continue
+		// offset and freeze the commit watermark — see handleAdmit). The
+		// requeue itself debits the merkle budget, not the network budget.
+		reason := merkleRegisterFailureReason(ctx, err)
+		msg := batch[i]
+		if reason != "claim_revoked" {
+			msg.merkleFailureReason = clipRetryReason(err.Error())
 		}
-		// But classify the reason: a 401/403 is an auth rejection
-		// (merkle_service.auth_token missing or wrong — issue #269), not a
-		// transient blip. Surface it under its own metric label + a distinct
-		// WARN below so an operator isn't left staring at a generic
-		// "register_error" while every registration silently fails and self-
-		// heals only once the token is set.
-		var regErr *merkleservice.RegisterError
-		if errors.As(err, &regErr) && (regErr.StatusCode == http.StatusUnauthorized || regErr.StatusCode == http.StatusForbidden) {
+		failed = append(failed, msg)
+		metrics.PropagationMerkleRegisterFailures.WithLabelValues(reason).Inc()
+		switch reason {
+		case "claim_revoked":
+			// Context cancellation isn't a merkle-service failure at all:
+			// the claim was revoked (consumer-group rebalance) or the
+			// service is shutting down. One rebalance used to pump tens of
+			// thousands of bogus "register_error" counts into the metric
+			// (2026-08-10: 39,189 in one batch). Keep it out of sampleErr
+			// so the partial-failure WARN below fires only for real /watch
+			// errors, and do not treat it as a merkle retry — processBatch
+			// aborts before requeue when the claim context is dead.
+			canceledFailures++
+		case "auth_error":
+			// A 401/403 is an auth rejection (merkle_service.auth_token
+			// missing or wrong — issue #269), not a transient blip. Its
+			// own metric label + the WARN below keep an operator from
+			// staring at a generic "register_error" while every
+			// registration silently fails. The txs are still requeued on
+			// the merkle budget (bounded, same delay) and self-heal once
+			// the token is set; nothing is dropped and nothing spins.
 			authFailures++
 			if sampleAuthErr == nil {
 				sampleAuthErr = err
 			}
-			metrics.PropagationMerkleRegisterFailures.WithLabelValues("auth_error").Inc()
-			continue
+		default:
+			if sampleErr == nil {
+				sampleErr = err
+			}
 		}
-		if sampleErr == nil {
-			sampleErr = err
-		}
-		metrics.PropagationMerkleRegisterFailures.WithLabelValues("register_error").Inc()
 	}
 
 	switch {
@@ -1470,6 +1518,43 @@ func (p *Propagator) registerBatch(ctx context.Context, batch []propagationMsg) 
 		p.logger.Debug("registered with merkle-service", logfields.TxIDBatch(successTxIDs)...)
 	}
 	return registered, failed
+}
+
+// merkleRegisterFailureReason classifies a /watch error for the
+// bounded-cardinality failure metric. claim_revoked is not a Merkle
+// retry: the claim context died, and processBatch must not charge either
+// budget for it. txids are not part of the label.
+func merkleRegisterFailureReason(ctx context.Context, err error) string {
+	if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+		return "claim_revoked"
+	}
+	var regErr *merkleservice.RegisterError
+	if errors.As(err, &regErr) {
+		switch {
+		case regErr.StatusCode == http.StatusUnauthorized || regErr.StatusCode == http.StatusForbidden:
+			return "auth_error"
+		case regErr.StatusCode >= 500:
+			return "http_5xx"
+		default:
+			return "register_error"
+		}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout"
+	}
+	return "transport"
+}
+
+func clipRetryReason(s string) string {
+	const maxReason = 240
+	if len(s) <= maxReason {
+		return s
+	}
+	return s[:maxReason]
 }
 
 // txResult carries per-tx outcome of a broadcast. class is the
@@ -2045,7 +2130,9 @@ func (p *Propagator) abortBatchOnRevokedClaim(ctx context.Context, txCount int) 
 
 // processBatch handles one drained batch:
 //  1. Register every tx with merkle-service. Txs whose /watch failed are
-//     requeued through the dispatcher after a short flat wait.
+//     requeued on the Merkle registration budget (not the network
+//     propagation budget) after a short flat wait. They are not broadcast
+//     until registration succeeds (F-024).
 //  2. Broadcast the registered subset to teranode in /txs chunks.
 //  3. For each per-tx result, apply the corresponding action:
 //     - Accepted → terminal ACCEPTED row + dispatcher notify (releases waiters)
@@ -2080,7 +2167,9 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg, i
 		return
 	}
 	if len(failedRegister) > 0 {
-		p.requeueAfterDelay(ctx, failedRegister, io)
+		// Merkle registration retries are a different failure domain from
+		// Teranode propagation. F-024: these txs are not broadcast.
+		p.requeueMerkleRegistration(ctx, failedRegister, io)
 	}
 	if len(registered) == 0 {
 		return
@@ -2214,17 +2303,35 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg, i
 // on the Propagator as requeueDelay so tests can compress it.
 const defaultRequeueDelay = 2 * time.Second
 
-// requeueAfterDelay schedules a delayed requeue of msgs through the
-// dispatcher. Spawns a goroutine that sleeps p.requeueDelay then sends
+// retryStage names which fast-path budget a requeue debits. The two
+// stages are independent failure domains.
+type retryStage int
+
+const (
+	retryStageNetwork retryStage = iota
+	retryStageMerkle
+)
+
+func (s retryStage) String() string {
+	if s == retryStageMerkle {
+		return logfields.RetryStageMerkle
+	}
+	return logfields.RetryStageNetwork
+}
+
+// requeueAfterDelay schedules a delayed NETWORK requeue of msgs through
+// the dispatcher. Spawns a goroutine that sleeps p.requeueDelay then sends
 // each msg to requeueCh. The goroutine bails on ctx cancellation so
 // claim revocation and shutdown don't hold txs in limbo.
 //
-// Every requeue costs the tx one unit of its retry budget
+// Every requeue costs the tx one unit of its network propagation budget
 // (propagation.retry_max_attempts). Txs whose budget is spent do NOT go
 // round again: they are parked at PENDING_RETRY by parkExhaustedRequeues,
 // which releases their dispatcher in-flight entry so the Kafka commit
 // watermark can advance. That ceiling is the whole reason this function
 // splits its input — see the incident write-up on parkExhaustedRequeues.
+// Merkle /watch failures must not call this; they use
+// requeueMerkleRegistration so they cannot exhaust this budget.
 //
 // Bailing on ctx.Done is safe for at-least-once delivery: a requeue
 // dropped here leaves the tx in the dispatcher's inFlight set with its
@@ -2235,6 +2342,17 @@ const defaultRequeueDelay = 2 * time.Second
 // it's logged so a teardown that strands a large requeue batch is
 // visible in the operator's logs rather than looking like lost work.
 func (p *Propagator) requeueAfterDelay(ctx context.Context, msgs []propagationMsg, io *dispatcherIO) {
+	p.requeueAfterDelayStaged(ctx, msgs, io, retryStageNetwork)
+}
+
+// requeueMerkleRegistration schedules a delayed Merkle-/watch requeue.
+// It debits merkleRetryCount only. The tx stays unbroadcast (F-024) until
+// registration succeeds. Claim cancellation is not charged.
+func (p *Propagator) requeueMerkleRegistration(ctx context.Context, msgs []propagationMsg, io *dispatcherIO) {
+	p.requeueAfterDelayStaged(ctx, msgs, io, retryStageMerkle)
+}
+
+func (p *Propagator) requeueAfterDelayStaged(ctx context.Context, msgs []propagationMsg, io *dispatcherIO, stage retryStage) {
 	if len(msgs) == 0 {
 		return
 	}
@@ -2257,24 +2375,45 @@ func (p *Propagator) requeueAfterDelay(ctx context.Context, msgs []propagationMs
 		return
 	}
 
-	msgs, exhausted := p.chargeRetryBudget(msgs)
-	if len(exhausted) > 0 {
-		p.parkExhaustedRequeues(ctx, exhausted, io)
+	var exhausted []propagationMsg
+	switch stage {
+	case retryStageMerkle:
+		msgs, exhausted = p.chargeMerkleRetryBudget(msgs)
+		if len(exhausted) > 0 {
+			p.parkExhaustedMerkleRegistrations(ctx, exhausted, io)
+		}
+	default:
+		msgs, exhausted = p.chargeRetryBudget(msgs)
+		if len(exhausted) > 0 {
+			p.parkExhaustedRequeues(ctx, exhausted, io)
+		}
 	}
 	if len(msgs) == 0 {
 		return
 	}
+	metrics.PropagationRetryTotal.WithLabelValues(stage.String()).Add(float64(len(msgs)))
 
 	requeueTxIDs := make([]string, len(msgs))
 	for i, m := range msgs {
 		requeueTxIDs[i] = m.TXID
 	}
-	// Failure-path only (register blip / no verdict), so volume is low and a
-	// bounded TxIDBatch line suffices. Plain component logger, not
-	// telemetry.LoggerWith: a requeued batch aggregates txs from many
-	// unrelated producer traces, so there is no single trace_id to attach.
-	requeueFields := append([]zap.Field{logfields.Stage(logfields.StageNetwork)}, logfields.TxIDBatch(requeueTxIDs)...)
-	p.logger.Info("transactions requeued for retry", requeueFields...)
+	// Failure-path only, so volume is low and a bounded TxIDBatch line
+	// suffices. Plain component logger, not telemetry.LoggerWith: a
+	// requeued batch aggregates txs from many unrelated producer traces,
+	// so there is no single trace_id to attach. retry_stage separates
+	// Merkle registration retries from network propagation retries; txids
+	// stay in the log line and never on a metric label.
+	stageName := logfields.StageNetwork
+	line := "transactions requeued for retry"
+	if stage == retryStageMerkle {
+		stageName = logfields.StageMerkle
+		line = "merkle registration requeued for retry"
+	}
+	requeueFields := append(
+		[]zap.Field{logfields.Stage(stageName), logfields.RetryStage(stage.String())},
+		logfields.TxIDBatch(requeueTxIDs)...,
+	)
+	p.logger.Info(line, requeueFields...)
 
 	// Track pending requeue goroutines on the metric so sustained
 	// upstream pressure shows up in dashboards without needing to
@@ -2328,6 +2467,74 @@ func (p *Propagator) chargeRetryBudget(msgs []propagationMsg) (retry, exhausted 
 	return retry, exhausted
 }
 
+// chargeMerkleRetryBudget debits merkleRetryCount only. retryCount, the
+// network propagation budget, is not touched.
+func (p *Propagator) chargeMerkleRetryBudget(msgs []propagationMsg) (retry, exhausted []propagationMsg) {
+	retry = make([]propagationMsg, 0, len(msgs))
+	for _, m := range msgs {
+		m.merkleRetryCount++
+		if m.merkleRetryCount > p.merkleRetryMaxAttempts {
+			exhausted = append(exhausted, m)
+			continue
+		}
+		retry = append(retry, m)
+	}
+	return retry, exhausted
+}
+
+// parkExhaustedMerkleRegistrations moves txs that spent the fast-path
+// Merkle /watch budget to PENDING_RETRY. The network propagation budget
+// is not consumed: retryCount is unchanged, and
+// PropagationRequeueExhaustedTotal (the "no network verdict" alert) does
+// not move. The same applyTerminalStatuses path releases the dispatcher
+// in-flight entry so the Kafka watermark can advance. The reaper later
+// retries registration and, only after /watch succeeds, broadcast (F-024).
+//
+// This is not a new terminal status. PENDING_RETRY is the existing
+// durable-retry state. A Merkle outage must not become REJECTED just
+// because registration has not succeeded yet.
+func (p *Propagator) parkExhaustedMerkleRegistrations(ctx context.Context, msgs []propagationMsg, io *dispatcherIO) {
+	now := time.Now()
+	txids := make([]string, len(msgs))
+	statuses := make([]*models.TransactionStatus, len(msgs))
+	base := fmt.Sprintf(
+		"merkle-service /watch failed after %d registration attempts: retryable — parked for durable rebroadcast by the propagation reaper; network propagation budget was not consumed",
+		p.merkleRetryMaxAttempts,
+	)
+	for i, m := range msgs {
+		txids[i] = m.TXID
+		reason := base
+		if m.merkleFailureReason != "" {
+			reason = base + "; last registration error: " + m.merkleFailureReason
+		}
+		statuses[i] = &models.TransactionStatus{
+			TxID:      m.TXID,
+			Status:    models.StatusPendingRetry,
+			Timestamp: now,
+			ExtraInfo: reason,
+		}
+	}
+
+	metrics.PropagationMerkleRetryExhaustedTotal.Add(float64(len(msgs)))
+	parkFields := append(
+		[]zap.Field{
+			zap.Int("attempts", p.merkleRetryMaxAttempts),
+			logfields.Stage(logfields.StageMerkle),
+			logfields.RetryStage(logfields.RetryStageMerkle),
+		},
+		logfields.TxIDBatch(txids)...,
+	)
+	p.logger.Error(
+		"merkle registration retry budget exhausted; parking txs at PENDING_RETRY without consuming the network propagation budget",
+		parkFields...,
+	)
+
+	p.applyTerminalStatuses(ctx, statuses, 0, 0, io)
+	for _, m := range msgs {
+		p.schedulePendingRetry(ctx, m.TXID, m.RawTx, m.merkleFailureReason)
+	}
+}
+
 // parkExhaustedRequeues is the poison-batch escape hatch: it moves txs that
 // spent their whole requeue budget without ever drawing a network verdict to
 // PENDING_RETRY, which releases their dispatcher in-flight entry and lets the
@@ -2347,13 +2554,15 @@ func (p *Propagator) chargeRetryBudget(msgs []propagationMsg) (retry, exhausted 
 // leader pod burned 4.2 CPU cores. Every newly submitted transaction sat at
 // RECEIVED until operators hand-seeked the consumer group past the backlog.
 //
-// WHY PENDING_RETRY and not REJECTED. The requeue arm covers genuine infra
-// failure too (no healthy peer, body-less 5xx, merkle /watch blip). Rejecting
-// on a ~10s budget would turn a brief Teranode outage into a wave of false
-// terminal REJECTEDs. PENDING_RETRY is honest — "no verdict yet" — keeps the
-// row's raw bytes, and hands ownership to the reaper, which rebroadcasts
-// PENDING_RETRY rows on its own (much slower, offset-free) cadence. Nothing is
-// dropped; only the fast path gives up.
+// WHY PENDING_RETRY and not REJECTED. The network requeue arm covers
+// genuine infra failure too (no healthy peer, body-less 5xx). Rejecting
+// on a ~10s budget would turn a brief Teranode outage into a wave of
+// false terminal REJECTEDs. Merkle /watch failures are not this arm —
+// they have their own budget and their own park path. PENDING_RETRY is
+// honest — "no verdict yet" — keeps the row's raw bytes, and hands
+// ownership to the reaper, which rebroadcasts PENDING_RETRY rows on its
+// own (much slower, offset-free) cadence. Nothing is dropped; only the
+// fast path gives up.
 //
 // The write goes through applyTerminalStatuses precisely because that is the
 // one path that both persists the status AND notifies the dispatcher. A park
@@ -2404,6 +2613,7 @@ func (p *Propagator) parkExhaustedRequeues(ctx context.Context, msgs []propagati
 		[]zap.Field{
 			zap.Int("attempts", p.retryMaxAttempts),
 			logfields.Stage(logfields.StageNetwork),
+			logfields.RetryStage(logfields.RetryStageNetwork),
 		},
 		logfields.TxIDBatch(txids)...,
 	)
