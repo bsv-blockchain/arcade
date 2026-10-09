@@ -586,7 +586,7 @@ func newPropagator(merkleSrvURL, teranodeSrvURL string, st store.Store) *Propaga
 	}
 	cfg.Propagation.MerkleConcurrency = 10
 
-	var mc *merkleservice.Client
+	var mc merkleservice.Service
 	if merkleSrvURL != "" {
 		mc = merkleservice.NewClient(merkleSrvURL, "", 5*time.Second)
 	}

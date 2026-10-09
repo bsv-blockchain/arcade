@@ -133,10 +133,36 @@ The service watches the network for arcade's registered txids and drives the
 transaction lifecycle forward via callbacks
 (`SEEN_ON_NETWORK` → `MINED` → `IMMUTABLE`).
 
-**If `merkle_service.url` is left empty, arcade still accepts and broadcasts
-transactions, but every row stays at `RECEIVED` forever** — no callback source
-means nothing advances the state machine. Configure Merkle Service whenever
-you want real status progression.
+**If `merkle_service.url` and `merkle_service.urls` are both left empty, arcade
+still accepts and broadcasts transactions, but every row stays at `RECEIVED`
+forever** — no callback source means nothing advances the state machine.
+Configure Merkle Service whenever you want real status progression.
+
+### Running against several Merkle Services
+
+List additional instances under `merkle_service.urls` (or set
+`ARCADE_MERKLE_SERVICE_URLS` to a comma-separated list). Arcade registers every
+transaction with every endpoint and each endpoint delivers its own callbacks:
+
+- A transaction is registered, and therefore broadcast, as soon as **one**
+  endpoint accepts it. Only when every endpoint refuses is the tx requeued.
+- Duplicate `SEEN_ON_NETWORK` / `SEEN_MULTIPLE_NODES` callbacks are no-ops;
+  each transition is published to SSE/webhook subscribers once. A duplicate
+  `BLOCK_PROCESSED` re-uses the stored BUMP and publishes `MINED` only for
+  transactions that were not already mined.
+- A registration one endpoint accepted but another refused, timed out on,
+  or was skipped for is queued and re-sent to that endpoint in the
+  background, so every endpoint ends up watching the same set. An endpoint
+  that fails three consecutive requests is skipped until its `GET /health`
+  answers again. `/health` on the api-server lists each endpoint under
+  `merkle_endpoints` (breaker state and queued registrations), and
+  `arcade_merkle_endpoint_healthy` / `arcade_merkle_endpoint_catchup_pending`
+  expose the same.
+- `/reprocess` (watchdog and `POST /api/v1/blocks/:hash/reprocess`) is sent
+  to every endpoint and succeeds if any accepts.
+
+All endpoints share `merkle_service.auth_token` and the top-level
+`callback_url` / `callback_token`.
 
 ### Public Merkle Service endpoints
 

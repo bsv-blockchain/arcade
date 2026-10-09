@@ -76,3 +76,57 @@ tracked subtree. If that field is omitted, a dropped STUMP set is
 indistinguishable from an empty block and `finalizeEmptyBlock` stamps
 `processed_at`. Confirm this for a deployment's Merkle before enabling
 callbacks.
+
+## Multiple merkle-services
+
+`merkle_service.urls` lists additional endpoints. The `merkleservice.Pool`
+fans every `/watch` and `/reprocess` out to all of them, so each service
+watches the same txids and each delivers its own callbacks.
+
+Registration succeeds when **any** endpoint accepts; only a tx refused or
+unreachable on every endpoint is requeued (F-024 still gates broadcast). When
+every endpoint failed, the surfaced error is the most retryable one (context
+error, then network/5xx, then 401/403, then other 4xx), so `auth_error` on the
+registration metrics now means every endpoint rejected the token.
+
+A tx the pool reported registered must still reach every endpoint, or the
+endpoints' watch sets diverge and their STUMPs disagree. Every endpoint-
+specific failure behind a pool-level success — a refused or timed-out
+`/watch`, or an endpoint skipped because its breaker was open — is kept in
+that endpoint's in-memory catch-up queue (`arcade_merkle_endpoint_catchup_pending`)
+and re-sent from the pool's background loop once the endpoint answers again,
+500 per 5s tick with backoff; what fails again goes back to the queue. The
+queue is bounded (200k entries per endpoint, about half an hour at 100 TPS);
+past that the oldest entries are dropped and, once the queue drains, the
+pool asks propagation to resync that endpoint with a full lookback replay
+(`register_replay_lookback_hours`, ignoring `merkle_registered_at`, since
+the stamp is pool-wide). A `/watch` that fails during the resync goes back
+to the queue. `/watch` is idempotent on merkle-service. The startup replay
+re-registers every in-flight tx with the whole pool, so a restart loses
+nothing durable.
+
+An endpoint that fails three consecutive transport/5xx requests has its
+breaker opened and is skipped; 4xx answers never trip it. The pool probes
+`GET /health` on open endpoints every 5s and closes the breaker on any non-5xx
+answer; the catch-up queue then drains.
+
+Duplicate callbacks:
+
+- `SEEN_ON_NETWORK` / `SEEN_MULTIPLE_NODES` from a second service hit the
+  tracker prefilter or the lattice re-assert path and are not published. A
+  forward move (`SEEN_ON_NETWORK` → `SEEN_MULTIPLE_NODES`) from whichever
+  service reports it first is applied and published once; a late
+  `SEEN_ON_NETWORK` after that is a lattice skip.
+- `STUMP` for the same `(block, subtree)` is an upsert of identical bytes.
+- `BLOCK_PROCESSED` from a second service takes `tryShortCircuit`, which
+  re-mines the stored BUMP's level-0 set with `onlyChanged=true`: rows already
+  `MINED` against this block are not re-published, a tx registered after the
+  first build still publishes. `processed_at` is re-stamped. The build
+  duration histogram records `short_circuited` once per extra service.
+
+Known limitation in this stage: a service that was down while txs were
+registered (and therefore only knows a subset) emits STUMPs that lack those
+txs' paths. Because STUMPs are keyed by `(block, subtree)` and overwritten on
+insert, which variant the first build sees depends on arrival order; the
+content-addressed STUMP handling that closes this lands in the follow-up
+change.

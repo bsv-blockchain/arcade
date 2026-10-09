@@ -22,6 +22,7 @@ import (
 	arcerrors "github.com/bsv-blockchain/arcade/errors"
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/logfields"
+	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
@@ -205,6 +206,10 @@ type healthResponse struct {
 	Status      string          `json:"status"`
 	BlockHeight uint64          `json:"blockHeight,omitempty"`
 	DatahubURLs []datahubStatus `json:"datahub_urls"`
+	// MerkleEndpoints is the per-endpoint breaker view of the configured
+	// merkle-services (url, healthy, consecutive failures, open since).
+	// Omitted when the Merkle integration is disabled.
+	MerkleEndpoints []merkleservice.EndpointStatus `json:"merkle_endpoints,omitempty"`
 }
 
 // datahubStatus is one entry of health.datahub_urls: the circuit-breaker view
@@ -333,6 +338,9 @@ func (s *Server) handleHealth(c *gin.Context) {
 		Status:      "ok",
 		BlockHeight: s.activeTipHeight(c.Request.Context()),
 		DatahubURLs: []datahubStatus{},
+	}
+	if hr, ok := s.merkleClient.(merkleservice.HealthReporter); ok {
+		resp.MerkleEndpoints = hr.EndpointStatuses()
 	}
 	if s.teranode != nil {
 		statuses := s.teranode.GetEndpointStatuses()

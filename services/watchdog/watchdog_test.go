@@ -218,7 +218,7 @@ func (r *recordingReprocessServer) capturedCalls() []reprocessCall {
 
 // --- tests ---
 
-func newTestWatchdog(t *testing.T, st *watchdogStore, leaser *watchdogLeaser, mc *merkleservice.Client) *Watchdog {
+func newTestWatchdog(t *testing.T, st *watchdogStore, leaser *watchdogLeaser, mc merkleservice.Service) *Watchdog {
 	t.Helper()
 	cfg := Config{
 		Interval:        10 * time.Millisecond,

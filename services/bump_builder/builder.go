@@ -318,8 +318,17 @@ func (b *Builder) handleAnchorDenied(ctx context.Context, logger *zap.Logger, bl
 // It reports whether the store write completed in full: false means some of
 // the txids are still SEEN_* and the block must stay un-stamped so the
 // watchdog re-drives it.
+//
+// onlyChanged is always true on the builder's paths. With several
+// merkle-services every block's BLOCK_PROCESSED arrives once per service, and
+// each redelivery re-mines the stored BUMP's level-0 set through
+// tryShortCircuit; rows already MINED against this block must not fan out a
+// second MINED event to SSE/webhook subscribers. On the fresh-build path the
+// filter is a no-op (every previous status is SEEN_*), and a tx registered
+// after the original build still publishes on redelivery because its previous
+// status is not MINED.
 func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, blockHash string, blockHeight uint64, txids []string) bool {
-	_, err := setMinedAndPublish(ctx, logger, b.store, b.publisher, blockHash, blockHeight, txids, "", false)
+	_, err := setMinedAndPublish(ctx, logger, b.store, b.publisher, blockHash, blockHeight, txids, "", true)
 	return err == nil
 }
 

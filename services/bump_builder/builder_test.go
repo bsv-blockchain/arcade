@@ -56,6 +56,10 @@ type mockStore struct {
 	insertStumpErr   error
 	setMinedErr      error
 	setMinedAttempts int
+	// alreadyMined maps txid → block hash for rows the store already holds
+	// at MINED; SetMinedByTxIDs reports them with a MINED previous status so
+	// tests can drive the onlyChanged filter.
+	alreadyMined     map[string]string
 	deleteStumpsErr  error
 	markBumpBuiltErr error
 	markProcessedErr error
@@ -182,11 +186,17 @@ func (m *mockStore) SetMinedByTxIDs(_ context.Context, blockHash string, blockHe
 	m.minedCalls = append(m.minedCalls, minedCall{blockHash, blockHeight, txids})
 	var prevs, statuses []*models.TransactionStatus
 	for _, txid := range txids {
-		prevs = append(prevs, &models.TransactionStatus{
+		prev := &models.TransactionStatus{
 			TxID:      txid,
 			Status:    models.StatusSeenOnNetwork,
 			Timestamp: time.Now(),
-		})
+		}
+		if bh, ok := m.alreadyMined[txid]; ok {
+			prev.Status = models.StatusMined
+			prev.BlockHash = bh
+			prev.BlockHeight = blockHeight
+		}
+		prevs = append(prevs, prev)
 		statuses = append(statuses, &models.TransactionStatus{
 			TxID:        txid,
 			Status:      models.StatusMined,

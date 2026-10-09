@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -310,9 +311,52 @@ type TeranodeConfig struct {
 	AuthToken string `mapstructure:"auth_token"`
 }
 
+// MerkleServiceConfig selects the merkle-service endpoints arcade registers
+// transactions with. URL is the original single-endpoint form; URLs is the
+// multi-endpoint form. Both feed Endpoints(), so an existing config with only
+// `url` keeps working and `urls` may be added alongside it.
+//
+// With several endpoints every tx is registered with all of them and every
+// endpoint delivers callbacks; arcade treats a callback that carries nothing
+// new as a no-op. A tx counts as registered once at least one endpoint
+// accepted it, so a single unreachable merkle-service no longer blocks
+// broadcast (F-024 still holds: zero acceptances means no broadcast).
 type MerkleServiceConfig struct {
-	URL       string `mapstructure:"url"`
-	AuthToken string `mapstructure:"auth_token"`
+	URL       string   `mapstructure:"url"`
+	URLs      []string `mapstructure:"urls"`
+	AuthToken string   `mapstructure:"auth_token"`
+}
+
+// Endpoints returns every configured merkle-service base URL, in config
+// order (URL first, then URLs), trimmed, without a trailing slash, and with
+// duplicates removed. Empty entries are dropped here; validate rejects them so
+// a typo in `urls` fails loudly at startup instead of silently shrinking the
+// redundancy set.
+func (c MerkleServiceConfig) Endpoints() []string {
+	raw := make([]string, 0, 1+len(c.URLs))
+	raw = append(raw, c.URL)
+	raw = append(raw, c.URLs...)
+	seen := make(map[string]struct{}, len(raw))
+	out := make([]string, 0, len(raw))
+	for _, u := range raw {
+		u = strings.TrimSuffix(strings.TrimSpace(u), "/")
+		if u == "" {
+			continue
+		}
+		if _, dup := seen[u]; dup {
+			continue
+		}
+		seen[u] = struct{}{}
+		out = append(out, u)
+	}
+	return out
+}
+
+// Enabled reports whether the Merkle integration is configured at all. It is
+// the single toggle every consumer checks: no endpoints means no /watch
+// registration, no /reprocess recovery, and no watchdog.
+func (c MerkleServiceConfig) Enabled() bool {
+	return len(c.Endpoints()) > 0
 }
 
 // P2PConfig controls the libp2p-based peer discovery service. Seeds is the
@@ -748,8 +792,8 @@ type ReconcilerConfig struct {
 
 // WatchdogConfig tunes the stale-block recovery watchdog. Defaults are
 // applied in setDefaults; zero values for everything except Enabled fall
-// back to those defaults. The watchdog requires merkle_service.url to be
-// set (no /reprocess target otherwise) and runs as a standalone arcade
+// back to those defaults. The watchdog requires at least one merkle_service
+// endpoint (no /reprocess target otherwise) and runs as a standalone arcade
 // service (mode=watchdog) or alongside other services when mode=all. At
 // most one replica fires per tick — coordination via the
 // `block-processing-watchdog` lease.
@@ -1187,6 +1231,17 @@ func setDefaults() {
 	viper.SetDefault("api.host", "0.0.0.0")
 	viper.SetDefault("api.port", 8080)
 	viper.SetDefault("kafka.backend", "sarama")
+	// callback_* and merkle_service.* defaults exist so viper.AutomaticEnv
+	// knows the keys: without a registered key an ARCADE_MERKLE_SERVICE_URLS
+	// or ARCADE_CALLBACK_TOKEN override is silently ignored (see
+	// TestPropagationBatchCapsBind for the same trap). Empty values keep the
+	// integration disabled.
+	viper.SetDefault("callback_url", "")
+	viper.SetDefault("callback_token", "")
+	viper.SetDefault("merkle_service.url", "")
+	viper.SetDefault("merkle_service.urls", []string{})
+	viper.SetDefault("merkle_service.auth_token", "")
+
 	viper.SetDefault("kafka.brokers", []string{"localhost:9092"})
 	viper.SetDefault("kafka.consumer_group", "arcade")
 	viper.SetDefault("kafka.max_retries", 5)
@@ -1342,7 +1397,7 @@ func setDefaults() {
 	// Block-processing watchdog (standalone arcade service — mode=watchdog
 	// in production, in-process under mode=all): on by default. The runtime
 	// nil-guards the merkle-service client; an unconfigured deployment
-	// (merkle_service.url unset) skips the watchdog regardless of this flag.
+	// (no merkle_service.url/urls) skips the watchdog regardless of this flag.
 	viper.SetDefault("watchdog.enabled", true)
 	viper.SetDefault("watchdog.interval_ms", 30000)
 	viper.SetDefault("watchdog.stale_threshold_ms", 120000)
@@ -1396,6 +1451,33 @@ func setDefaults() {
 	viper.SetDefault("validator.standard_format_supported", true)
 	viper.SetDefault("validator.observed_fee_ttl_ms", DefaultValidatorObservedFeeTTLMs)
 	viper.SetDefault("validator.observed_fee_refresh_ms", DefaultValidatorObservedFeeRefreshMs)
+}
+
+// validateMerkleService checks the merkle_service block. Every entry of
+// `url`/`urls` must be an absolute http(s) URL; a blank entry in `urls` is a
+// misconfiguration rather than "disabled" (only an entirely empty block
+// disables the integration). When at least one endpoint is set the top-level
+// callback_token is mandatory — see the comment in validate.
+func validateMerkleService(cfg *Config) error {
+	for i, u := range cfg.MerkleService.URLs {
+		if strings.TrimSpace(u) == "" {
+			return fmt.Errorf("merkle_service.urls[%d] is empty; remove the entry or set a URL", i)
+		}
+	}
+	for _, u := range cfg.MerkleService.Endpoints() {
+		parsed, err := url.Parse(u)
+		if err != nil {
+			return fmt.Errorf("merkle_service url %q: %w", u, err)
+		}
+		if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+			return fmt.Errorf("merkle_service url %q must be an absolute http(s) URL", u)
+		}
+	}
+	if cfg.MerkleService.Enabled() && cfg.CallbackToken == "" {
+		return fmt.Errorf("callback_token is required when merkle_service.url/urls is set " +
+			"(unauthenticated /api/v1/merkle-service/callback would accept forged callbacks; see issue #76)")
+	}
+	return nil
 }
 
 func validate(cfg *Config) error {
@@ -1453,15 +1535,16 @@ func validate(cfg *Config) error {
 	default:
 		return fmt.Errorf("unknown store.backend %q (expected aerospike, pebble, postgres, or mongodb)", cfg.Store.Backend)
 	}
-	// merkle_service.url is intentionally optional: an empty value means the
-	// Merkle integration is disabled. The runtime treats URL-presence as the
-	// toggle — cmd/arcade/main.go only constructs a merkleservice.Client when
-	// the URL is set, and propagation.Propagator nil-guards every dereference
-	// of the client. The documented standalone and zero-dependency profiles
+	// merkle_service.url / urls are intentionally optional: no endpoints means
+	// the Merkle integration is disabled. The runtime treats
+	// MerkleServiceConfig.Enabled() as the toggle — app.Bootstrap only
+	// constructs a merkleservice.Pool when at least one endpoint is set, and
+	// propagation.Propagator nil-guards every dereference of the client. The
+	// documented standalone and zero-dependency profiles
 	// (config.example.standalone.yaml) ship with merkle_service.url: "" for
 	// exactly this reason. See issue #59 / finding F-001.
 	//
-	// When the Merkle integration IS enabled (URL set), callback_token is
+	// When the Merkle integration IS enabled, callback_token is
 	// mandatory. The /api/v1/merkle-service/callback endpoint accepts forged
 	// status updates for any txid in the system if it runs without bearer-token
 	// auth, so we fail-closed here at config load rather than silently exposing
@@ -1473,9 +1556,8 @@ func validate(cfg *Config) error {
 	// callbacks. Without a configured token there's nothing to forward AND the
 	// inbound receiver would 401 anyway — the same fail-closed posture covers
 	// both ends, so a duplicate "outbound token required" check is unnecessary.
-	if cfg.MerkleService.URL != "" && cfg.CallbackToken == "" {
-		return fmt.Errorf("callback_token is required when merkle_service.url is set " +
-			"(unauthenticated /api/v1/merkle-service/callback would accept forged callbacks; see issue #76)")
+	if err := validateMerkleService(cfg); err != nil {
+		return err
 	}
 	if cfg.Network == "" {
 		cfg.Network = NetworkMainnet

@@ -121,11 +121,26 @@ teranode:
   auth_token: ""
 
 merkle_service:
-  # Merkle Service base URL. Leaving this empty disables the Merkle integration
-  # (standalone profiles). When set, the top-level `callback_token` becomes
-  # REQUIRED — arcade fails to start otherwise so that the inbound callback
-  # endpoint never runs unauthenticated. See issue #76 / finding F-018.
+  # Merkle Service base URL(s). Leaving both `url` and `urls` empty disables
+  # the Merkle integration (standalone profiles). When at least one endpoint
+  # is set, the top-level `callback_token` becomes REQUIRED — arcade fails to
+  # start otherwise so that the inbound callback endpoint never runs
+  # unauthenticated. See issue #76 / finding F-018.
+  #
+  # `url` is the single-endpoint form; `urls` adds more. Every tx is
+  # registered with every endpoint and each endpoint delivers its own
+  # callbacks, so one merkle-service going down neither blocks registration
+  # (a tx is registered once any endpoint accepts it) nor stops SEEN/STUMP/
+  # BLOCK_PROCESSED delivery. Duplicate callbacks are no-ops. A registration
+  # one endpoint accepted but another missed is re-sent to it in the
+  # background. An endpoint that fails three consecutive requests is skipped
+  # until GET /health on it answers.
+  # All endpoints share `auth_token`. Env form: ARCADE_MERKLE_SERVICE_URLS as
+  # a comma-separated list.
   url: ""
+  urls: []
+  #   - "https://merkle-service-us-1.bsvb.tech"
+  #   - "https://merkle-service-us-2.bsvb.tech"
   auth_token: ""
 
 p2p:
