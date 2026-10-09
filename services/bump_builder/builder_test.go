@@ -60,10 +60,11 @@ type mockStore struct {
 	// alreadyMined maps txid → block hash for rows the store already holds
 	// at MINED; SetMinedByTxIDs reports them with a MINED previous status so
 	// tests can drive the onlyChanged filter.
-	alreadyMined     map[string]string
-	deleteStumpsErr  error
-	markBumpBuiltErr error
-	markProcessedErr error
+	alreadyMined      map[string]string
+	deleteStumpsErr   error
+	markBumpBuiltErr  error
+	markProcessedErr  error
+	clearProcessedErr error
 
 	// Janitor fixtures: tipHeight feeds GetActiveTipBlockHeight; blockProc
 	// feeds ListBlockProcessingStatus. Both default empty so existing tests
@@ -188,6 +189,9 @@ func (m *mockStore) GetBlockProcessingStatus(_ context.Context, blockHash string
 func (m *mockStore) ClearBlockProcessed(_ context.Context, blockHash string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.clearProcessedErr != nil {
+		return m.clearProcessedErr
+	}
 	m.clearedBlocks = append(m.clearedBlocks, blockHash)
 	for _, r := range m.blockProc {
 		if r.BlockHash == blockHash {

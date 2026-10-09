@@ -2,6 +2,8 @@ package bump_builder
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -343,5 +345,116 @@ func TestBuilder_HandleMessage_RebuildWouldDropLeaves_KeepsBUMPAndDefers(t *test
 	}
 	if got := len(f.pub.snapshot()); got != 2 {
 		t.Fatalf("nothing new may be published, total = %d", got)
+	}
+}
+
+// A redelivery whose STUMP set cannot be read must not take the
+// short-circuit: that would re-stamp processed_at and retire a block this
+// delivery may have added leaves to. The message fails so Kafka retries it.
+func TestBuilder_HandleMessage_RedeliveryStumpReadError_FailsMessage(t *testing.T) {
+	f := newMultiSourceFixture(t)
+	ctx := context.Background()
+	f.ms.addStump(f.blockHash, 0, f.variantA)
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsg(f.blockHash)); err != nil {
+		t.Fatalf("first build: %v", err)
+	}
+	f.ms.mu.Lock()
+	f.ms.getStumpsErr = errors.New("store: read timeout")
+	minedBefore, stampedBefore := len(f.ms.minedCalls), len(f.ms.processedCalls)
+	f.ms.mu.Unlock()
+
+	before := bumpOutcomeSampleCount(t, "store_failed")
+	err := f.b.handleMessage(ctx, makeBlockProcessedMsg(f.blockHash))
+	if err == nil {
+		t.Fatal("a STUMP read failure on redelivery must fail the message")
+	}
+	if got := bumpOutcomeSampleCount(t, "store_failed"); got != before+1 {
+		t.Fatalf("store_failed samples = %d, want %d", got, before+1)
+	}
+	f.ms.mu.Lock()
+	defer f.ms.mu.Unlock()
+	if len(f.ms.minedCalls) != minedBefore || len(f.ms.processedCalls) != stampedBefore {
+		t.Fatalf("nothing may be mined or stamped on a failed read: mined %d->%d stamped %d->%d",
+			minedBefore, len(f.ms.minedCalls), stampedBefore, len(f.ms.processedCalls))
+	}
+}
+
+// If clearing processed_at fails, the deferral must fail the message too:
+// committing it with the old stamp still set would leave the block
+// known-incomplete and invisible to the watchdog.
+func TestBuilder_HandleMessage_DeferralClearFails_FailsMessage(t *testing.T) {
+	f := newMultiSourceFixture(t)
+	ctx := context.Background()
+	f.ms.addStump(f.blockHash, 0, f.variantA)
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsg(f.blockHash)); err != nil {
+		t.Fatalf("first build: %v", err)
+	}
+	stamped := time.Now()
+	f.ms.mu.Lock()
+	f.ms.blockProc = []*models.BlockProcessingStatus{{BlockHash: f.blockHash, BlockHeight: 1, ProcessedAt: &stamped}}
+	f.ms.clearProcessedErr = errors.New("store: write timeout")
+	f.ms.mu.Unlock()
+	f.b.cfg.BumpBuilder.GraceWindowMs = 0
+
+	const lateTx = "5555555555555555555555555555555555555555555555555555555555555555"
+	f.ms.addStump(f.blockHash, 1, makeMinimalSTUMP(lateTx))
+	beforeDeferred := bumpOutcomeSampleCount(t, "deferred_incomplete")
+	beforeFailed := bumpOutcomeSampleCount(t, "store_failed")
+	err := f.b.handleMessage(ctx, makeBlockProcessedMsgWithExpected(f.blockHash, []int{1, 2}))
+	if err == nil {
+		t.Fatal("a failed ClearBlockProcessed must fail the message")
+	}
+	if got := bumpOutcomeSampleCount(t, "deferred_incomplete"); got != beforeDeferred {
+		t.Fatalf("deferred_incomplete must not be recorded when the clear failed, got %d want %d", got, beforeDeferred)
+	}
+	if got := bumpOutcomeSampleCount(t, "store_failed"); got != beforeFailed+1 {
+		t.Fatalf("store_failed samples = %d, want %d", got, beforeFailed+1)
+	}
+
+	// The rebuild-would-drop path fails the same way.
+	f.ms.mu.Lock()
+	delete(f.ms.stumps, f.blockHash)
+	f.ms.alreadyMined = map[string]string{f.leaves[0].String(): f.blockHash, f.leaves[1].String(): f.blockHash}
+	f.ms.mu.Unlock()
+	f.ms.addStump(f.blockHash, 0, f.variantB)
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsg(f.blockHash)); err == nil {
+		t.Fatal("a failed ClearBlockProcessed on the rebuild-would-drop path must fail the message")
+	}
+}
+
+// The janitor walks by height but prunes by bump_built_at age, so it must
+// keep walking below the watchdog's recency depth while a page may still
+// hold retained rows, or a block that ages out after dropping below the
+// depth is never visited again.
+func TestBuilder_PruneOrphanStumps_WalksPastRecencyDepthWhileRowsRetained(t *testing.T) {
+	ms := newMockStore()
+	ms.tipHeight = 1000
+	old := time.Now().Add(-3 * time.Hour)
+	recent := time.Now().Add(-time.Minute)
+	// 200 in-flight rows fill the first page down to height 801, below the
+	// 144-block recency depth (horizon 856). Their headers are recent, so
+	// the page may still hold retained rows and the walk continues to the
+	// deep built rows.
+	for h := uint64(1000); h >= 801; h-- {
+		ms.blockProc = append(ms.blockProc, &models.BlockProcessingStatus{BlockHash: fmt.Sprintf("inflight-%d", h), BlockHeight: h, HeaderSeenAt: recent})
+	}
+	ms.blockProc = append(ms.blockProc,
+		&models.BlockProcessingStatus{BlockHash: "deep-fresh", BlockHeight: 700, HeaderSeenAt: old, BUMPBuiltAt: &recent}, // late build, keep
+		&models.BlockProcessingStatus{BlockHash: "deep-old", BlockHeight: 690, HeaderSeenAt: old, BUMPBuiltAt: &old},      // aged out, prune
+	)
+	ms.addStump("deep-fresh", 0, []byte("fresh"))
+	ms.addStump("deep-old", 0, []byte("old"))
+
+	b := &Builder{cfg: &config.Config{}, logger: zap.NewNop(), store: ms}
+	b.cfg.Watchdog.RecencyDepth = 144
+	b.pruneOrphanStumps(context.Background())
+
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if len(ms.stumps["deep-old"]) != 0 {
+		t.Fatalf("deep-old aged out and must be pruned even below the recency depth, still has %d", len(ms.stumps["deep-old"]))
+	}
+	if len(ms.stumps["deep-fresh"]) != 1 {
+		t.Fatalf("deep-fresh is inside retention and must be kept, got %d", len(ms.stumps["deep-fresh"]))
 	}
 }

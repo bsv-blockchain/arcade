@@ -1815,6 +1815,15 @@ func (s *Store) GetStumpsByBlockHash(ctx context.Context, blockHash string) ([]*
 		return nil, err
 	}
 
+	// A secondary-index query returns records in no particular order; the
+	// store contract is subtree-index order, with variants of one subtree
+	// ordered by content hash so repeated reads agree.
+	sort.Slice(manifests, func(i, j int) bool {
+		if manifests[i].subtreeIndex != manifests[j].subtreeIndex {
+			return manifests[i].subtreeIndex < manifests[j].subtreeIndex
+		}
+		return manifests[i].contentHash < manifests[j].contentHash
+	})
 	stumps := make([]*models.Stump, 0, len(manifests))
 	for _, m := range manifests {
 		data, err := s.readStumpChunks(ctx, blockHash, m.subtreeIndex, m.contentHash, m.chunkCount, m.totalSize)
