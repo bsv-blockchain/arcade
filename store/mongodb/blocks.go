@@ -67,6 +67,18 @@ func (s *Store) MarkBlockBUMPBuilt(ctx context.Context, blockHash string, blockH
 	return s.markBlockMilestone(ctx, blockHash, blockHeight, builtAt, fBUMPBuiltAt)
 }
 
+// ClearBlockProcessed implements store.Store: unsets processed_at on an
+// existing row; a missing row is a no-op (no upsert).
+func (s *Store) ClearBlockProcessed(ctx context.Context, blockHash string) error {
+	octx, cancel := s.opCtx(ctx)
+	defer cancel()
+	_, err := s.blocks.UpdateOne(octx, idFilter(blockHash), doc(kv(opUnset, doc(kv(fProcessedAt, "")))))
+	if err != nil {
+		return fmt.Errorf("clear block processed %s: %w", blockHash, err)
+	}
+	return nil
+}
+
 // MarkBlocksOrphaned implements store.Store; hashes without a row are skipped.
 //
 // It clears reconciled_at as well as setting the status. A block that was

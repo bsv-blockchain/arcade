@@ -43,8 +43,12 @@ func datahubEndpointPrefix() []byte        { return []byte(prefixDatahub) }
 func peerPolicyKey(peerID string) []byte { return []byte(prefixPeerPolicy + peerID) }
 func peerPolicyPrefix() []byte           { return []byte(prefixPeerPolicy) }
 
-func stumpKey(blockHash string, idx int) []byte {
-	return []byte(fmt.Sprintf("%s%s:%010d", prefixStump, blockHash, idx))
+// stumpKey is content-addressed: several merkle-services may deliver the
+// same subtree's STUMP, and a service that missed registrations delivers a
+// different one. Identical bytes map to the same key; variants coexist under
+// the block prefix for the bump-builder to merge.
+func stumpKey(blockHash string, idx int, contentHash string) []byte {
+	return []byte(fmt.Sprintf("%s%s:%010d:%s", prefixStump, blockHash, idx, contentHash))
 }
 
 // stumpBlockPrefix returns the prefix used to iterate all STUMP rows for a block.
@@ -108,8 +112,13 @@ func idxSubTokenPrefix(token string) []byte {
 	return []byte(prefixIdxSubToken + token + ":")
 }
 
-func idxStumpBlockKey(blockHash string, subtreeIndex int) []byte {
-	return []byte(fmt.Sprintf("%s%s:%010d", prefixIdxStumpBlock, blockHash, subtreeIndex))
+func idxStumpBlockKey(blockHash string, subtreeIndex int, contentHash string) []byte {
+	return []byte(fmt.Sprintf("%s%s:%010d:%s", prefixIdxStumpBlock, blockHash, subtreeIndex, contentHash))
+}
+
+// idxStumpBlockPrefix is the prefix of every idxStumpBlockKey for a block.
+func idxStumpBlockPrefix(blockHash string) []byte {
+	return []byte(prefixIdxStumpBlock + blockHash + ":")
 }
 
 // blockProcKey is the primary record key for a block-processing row.

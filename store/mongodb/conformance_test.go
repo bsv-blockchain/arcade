@@ -27,6 +27,12 @@ func TestBlockStatus_Conformance(t *testing.T) {
 	storetest.RunBlockStatusSuite(t, func(t *testing.T) storetest.BlockStatusBackend { return newTestStore(t) })
 }
 
+// STUMP rows are content-addressed so several merkle-services can deliver
+// the same subtree: identical bytes collapse, divergent variants coexist.
+func TestStumps_Conformance(t *testing.T) {
+	storetest.RunStumpSuite(t, func(t *testing.T) storetest.StumpBackend { return newTestStore(t) })
+}
+
 // A double spend is discovered after the row exists, so the competing
 // spender must persist through the status-update paths, not only on insert.
 func TestCompetingTxs_Conformance(t *testing.T) {

@@ -1293,16 +1293,17 @@ func (s *Store) InsertStump(ctx context.Context, stump *models.Stump) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	hash := stump.EnsureContentHash()
 	payload, err := json.Marshal(stump)
 	if err != nil {
 		return err
 	}
 	b := s.db.NewBatch()
 	defer func() { _ = b.Close() }()
-	if err := b.Set(stumpKey(stump.BlockHash, stump.SubtreeIndex), payload, nil); err != nil {
+	if err := b.Set(stumpKey(stump.BlockHash, stump.SubtreeIndex, hash), payload, nil); err != nil {
 		return err
 	}
-	if err := b.Set(idxStumpBlockKey(stump.BlockHash, stump.SubtreeIndex), nil, nil); err != nil {
+	if err := b.Set(idxStumpBlockKey(stump.BlockHash, stump.SubtreeIndex, hash), nil, nil); err != nil {
 		return err
 	}
 	return b.Commit(s.writeOpts)
@@ -1331,6 +1332,7 @@ func (s *Store) GetStumpsByBlockHash(ctx context.Context, blockHash string) ([]*
 		if err := json.Unmarshal(iter.Value(), &st); err != nil {
 			continue
 		}
+		st.EnsureContentHash()
 		stumps = append(stumps, &st)
 	}
 	return stumps, nil
@@ -1493,6 +1495,25 @@ func (s *Store) MarkBlockProcessed(ctx context.Context, blockHash string, blockH
 		// observability. The next UpsertBlockHeaderSeen will preserve it.
 		cur.HeaderSeenUnixNs = processedAt.UnixNano()
 	}
+	return s.writeBlockProc(prev, &cur)
+}
+
+// ClearBlockProcessed unsets processed_at on an existing row; a missing row
+// is a no-op.
+func (s *Store) ClearBlockProcessed(ctx context.Context, blockHash string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	mu := s.shardFor(blockHash)
+	mu.Lock()
+	defer mu.Unlock()
+
+	prev, err := s.readBlockProc(blockHash)
+	if err != nil || prev == nil {
+		return err
+	}
+	cur := *prev
+	cur.ProcessedUnixNs = 0
 	return s.writeBlockProc(prev, &cur)
 }
 
@@ -2007,23 +2028,35 @@ func (s *Store) DeleteStumpsByBlockHash(ctx context.Context, blockHash string) e
 		return err
 	}
 
-	var toDelete []*models.Stump
+	// Delete the keys as found rather than recomputing them: rows written
+	// before content addressing carry the old two-part key, and a block's
+	// rows must all go regardless of which layout wrote them.
+	var toDelete [][]byte
 	for iter.First(); iter.Valid(); iter.Next() {
-		var st models.Stump
-		if err := json.Unmarshal(iter.Value(), &st); err != nil {
-			continue
-		}
-		toDelete = append(toDelete, &st)
+		toDelete = append(toDelete, append([]byte(nil), iter.Key()...))
 	}
-	if err := iter.Close(); err != nil {
+	if cerr := iter.Close(); cerr != nil {
+		return cerr
+	}
+	idxPrefix := idxStumpBlockPrefix(blockHash)
+	idxIter, err := s.db.NewIter(&pebbledb.IterOptions{
+		LowerBound: idxPrefix,
+		UpperBound: endOfPrefix(idxPrefix),
+	})
+	if err != nil {
 		return err
+	}
+	for idxIter.First(); idxIter.Valid(); idxIter.Next() {
+		toDelete = append(toDelete, append([]byte(nil), idxIter.Key()...))
+	}
+	if cerr := idxIter.Close(); cerr != nil {
+		return cerr
 	}
 
 	b := s.db.NewBatch()
 	defer func() { _ = b.Close() }()
-	for _, st := range toDelete {
-		_ = b.Delete(stumpKey(st.BlockHash, st.SubtreeIndex), nil)
-		_ = b.Delete(idxStumpBlockKey(st.BlockHash, st.SubtreeIndex), nil)
+	for _, key := range toDelete {
+		_ = b.Delete(key, nil)
 	}
 	return b.Commit(s.writeOpts)
 }

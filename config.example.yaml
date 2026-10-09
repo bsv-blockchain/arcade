@@ -356,6 +356,12 @@ bump_builder:
   # Mitigates F-007.
   # datahub_max_block_bytes: 1073741824
   #
+  # How long STUMP rows stay after the block's BUMP is built. With several
+  # merkle-services each delivers its own STUMP set; a later BLOCK_PROCESSED
+  # re-reads the retained set and rebuilds only if it adds leaves the stored
+  # BUMP lacks. The janitor deletes rows older than this.
+  # stump_retention_minutes: 60
+  #
   # Write-time anchor guard (issue #279): refuse to mark a block's txs MINED
   # when chaintracks' active chain provably has a DIFFERENT block at its
   # height (same-height competition loser). Fails open on any uncertainty.

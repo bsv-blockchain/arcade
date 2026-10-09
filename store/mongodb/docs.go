@@ -57,6 +57,7 @@ const (
 
 	fHeaderSeenAt = "header_seen_at"
 	fProcessedAt  = "processed_at"
+	fContentHash  = "content_hash"
 	fBUMPBuiltAt  = "bump_built_at"
 	fOrphanedAt   = "orphaned_at"
 	fOrphanedGen  = "orphaned_gen"

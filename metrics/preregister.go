@@ -49,6 +49,9 @@ var bumpBuildOutcomes = []string{
 	// window was skipped, grace_waited otherwise) plus the non-build ones
 	"finalized_complete_no_grace", "grace_waited",
 	"short_circuited", "no_stumps", "context_canceled",
+	// a redelivered BLOCK_PROCESSED (another merkle-service) carried STUMPs
+	// with leaves the stored BUMP lacked, so the compound was rebuilt
+	"rebuilt",
 	// the anchor guard refused to mark the block's txs MINED because the
 	// active chain has a different block at its height (issue #279)
 	"skipped_inactive_chain",

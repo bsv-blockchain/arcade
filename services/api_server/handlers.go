@@ -645,15 +645,13 @@ func (s *Server) handleStump(c *gin.Context, msg models.CallbackMessage, logger 
 		return
 	}
 
-	// Store STUMP keyed by (blockHash, subtreeIndex). Synchronous write so that
-	// a 200 to merkle-service is a durability guarantee — merkle-service only
-	// fires BLOCK_PROCESSED after all STUMPs succeed, so the bump builder can
-	// then rely on finding them all in Aerospike.
-	stump := &models.Stump{
-		BlockHash:    msg.BlockHash,
-		SubtreeIndex: msg.SubtreeIndex,
-		StumpData:    msg.Stump,
-	}
+	// Store STUMP keyed by (blockHash, subtreeIndex, contentHash). Synchronous
+	// write so that a 200 to merkle-service is a durability guarantee —
+	// merkle-service only fires BLOCK_PROCESSED after all STUMPs succeed, so
+	// the bump builder can then rely on finding them all. Content addressing
+	// makes the same STUMP from a second merkle-service a no-op and keeps a
+	// divergent one (a service that missed registrations) as its own row.
+	stump := models.NewStump(msg.BlockHash, msg.SubtreeIndex, msg.Stump)
 	if err := s.store.InsertStump(c.Request.Context(), stump); err != nil {
 		logger.Error("failed to store STUMP", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to store stump"})

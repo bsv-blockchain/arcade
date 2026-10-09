@@ -218,8 +218,11 @@ func TestInsertBUMP_OverwriteNeverGaps(t *testing.T) {
 }
 
 // GridFS is load-bearing: a STUMP larger than the 16 MB document cap must
-// round-trip, and a re-insert for the same subtree supersedes the old copy.
-func TestStump_LargePayloadAndSupersede(t *testing.T) {
+// round-trip. STUMP rows are content-addressed: re-inserting the same bytes
+// for a subtree is a no-op (no second file either), while a different STUMP
+// for the same subtree — another merkle-service with a different registered
+// set — is kept as a second variant.
+func TestStump_LargePayloadAndVariants(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	const hash = "stump-big"
@@ -233,7 +236,8 @@ func TestStump_LargePayloadAndSupersede(t *testing.T) {
 	if err := s.InsertStump(ctx, &models.Stump{BlockHash: hash, SubtreeIndex: 1, StumpData: []byte("small")}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.InsertStump(ctx, &models.Stump{BlockHash: hash, SubtreeIndex: 1, StumpData: []byte("small-v2")}); err != nil {
+	// Same bytes again: still one row, one file.
+	if err := s.InsertStump(ctx, &models.Stump{BlockHash: hash, SubtreeIndex: 1, StumpData: []byte("small")}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.GetStumpsByBlockHash(ctx, hash)
@@ -243,15 +247,36 @@ func TestStump_LargePayloadAndSupersede(t *testing.T) {
 	if len(got) != 2 || got[0].SubtreeIndex != 1 || got[1].SubtreeIndex != 3 {
 		t.Fatalf("expected subtrees [1 3], got %d stumps", len(got))
 	}
-	if string(got[0].StumpData) != "small-v2" {
-		t.Fatalf("re-insert must supersede: got %q", got[0].StumpData)
-	}
 	if !bytes.Equal(got[1].StumpData, big) {
 		t.Fatalf("17 MB stump did not round-trip (len %d)", len(got[1].StumpData))
 	}
 	n, err := s.stumps.bucket.GetFilesCollection().CountDocuments(ctx, doc(kv(fMetaBlockHash, hash)))
 	if err != nil || n != 2 {
-		t.Fatalf("expected 2 surviving files, got %d (%v)", n, err)
+		t.Fatalf("expected 2 surviving files after an identical re-insert, got %d (%v)", n, err)
+	}
+	// A different STUMP for subtree 1 is a second variant, not a replacement.
+	if err := s.InsertStump(ctx, &models.Stump{BlockHash: hash, SubtreeIndex: 1, StumpData: []byte("small-v2")}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.GetStumpsByBlockHash(ctx, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 || got[0].SubtreeIndex != 1 || got[1].SubtreeIndex != 1 || got[2].SubtreeIndex != 3 {
+		t.Fatalf("expected subtrees [1 1 3], got %d stumps", len(got))
+	}
+	variants := map[string]bool{string(got[0].StumpData): true, string(got[1].StumpData): true}
+	if !variants["small"] || !variants["small-v2"] {
+		t.Fatalf("both variants must be kept, got %q / %q", got[0].StumpData, got[1].StumpData)
+	}
+	for _, st := range got {
+		if st.ContentHash != models.StumpContentHash(st.StumpData) {
+			t.Fatalf("content hash mismatch on subtree %d", st.SubtreeIndex)
+		}
+	}
+	n, err = s.stumps.bucket.GetFilesCollection().CountDocuments(ctx, doc(kv(fMetaBlockHash, hash)))
+	if err != nil || n != 3 {
+		t.Fatalf("expected 3 surviving files, got %d (%v)", n, err)
 	}
 	if err := s.DeleteStumpsByBlockHash(ctx, hash); err != nil {
 		t.Fatal(err)
@@ -263,7 +288,10 @@ func TestStump_LargePayloadAndSupersede(t *testing.T) {
 
 // Concurrent rebuilds of one block must converge on exactly one surviving
 // file that the manifest references, never on none: each writer deletes only
-// the file its own manifest swap replaced. Same for one STUMP subtree.
+// the file its own manifest swap replaced. Same for one STUMP row: STUMPs are
+// content-addressed, so the race is several merkle-services delivering the
+// SAME bytes at once (all miss the existence check and all publish), which
+// must still leave one manifest and one file.
 func TestInsertBlob_ConcurrentOverwritesKeepExactlyOne(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
@@ -326,16 +354,30 @@ func TestInsertBlob_ConcurrentOverwritesKeepExactlyOne(t *testing.T) {
 		t.Fatalf("manifest references %s but the surviving file is %s", m.FileID.Hex(), surviving.ID.Hex())
 	}
 
-	run(func(i int) error {
-		return s.InsertStump(ctx, &models.Stump{BlockHash: hash, SubtreeIndex: 4, StumpData: payloads[i]})
+	run(func(_ int) error {
+		return s.InsertStump(ctx, &models.Stump{BlockHash: hash, SubtreeIndex: 4, StumpData: payloads[0]})
 	})
 	stumps, err := s.GetStumpsByBlockHash(ctx, hash)
-	if err != nil || len(stumps) != 1 || stumps[0].SubtreeIndex != 4 || !isPayload(stumps[0].StumpData) {
-		t.Fatalf("after concurrent stump inserts: %d stumps, %v", len(stumps), err)
+	if err != nil || len(stumps) != 1 || stumps[0].SubtreeIndex != 4 || !bytes.Equal(stumps[0].StumpData, payloads[0]) {
+		t.Fatalf("after concurrent identical stump inserts: %d stumps, %v", len(stumps), err)
 	}
 	n, err = s.stumps.bucket.GetFilesCollection().CountDocuments(ctx, doc(kv(fMetaBlockHash, hash)))
 	if err != nil || n != 1 {
 		t.Fatalf("expected exactly one surviving STUMP file, got %d (%v)", n, err)
+	}
+
+	// Distinct payloads for the same subtree are distinct variants: one row
+	// and one file each, nothing orphaned.
+	run(func(i int) error {
+		return s.InsertStump(ctx, &models.Stump{BlockHash: hash, SubtreeIndex: 5, StumpData: payloads[i]})
+	})
+	stumps, err = s.GetStumpsByBlockHash(ctx, hash)
+	if err != nil || len(stumps) != 1+writers {
+		t.Fatalf("after concurrent variant inserts: %d stumps, %v (want %d)", len(stumps), err, 1+writers)
+	}
+	n, err = s.stumps.bucket.GetFilesCollection().CountDocuments(ctx, doc(kv(fMetaBlockHash, hash)))
+	if err != nil || n != 1+writers {
+		t.Fatalf("expected %d surviving STUMP files, got %d (%v)", 1+writers, n, err)
 	}
 }
 

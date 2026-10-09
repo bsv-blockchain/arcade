@@ -472,9 +472,11 @@ var StuckTransientTxsByCallback = promauto.NewGaugeVec(prometheus.GaugeOpts{
 // (expected-STUMP set complete on the first read — no grace wait) and
 // `grace_waited` (built via the grace-window path; also stamped when the
 // window is configured to 0). Three more are benign non-failures:
-// `short_circuited` (a BUMP already existed, so a redelivery was skipped),
-// `no_stumps` (block contains no tracked txs) and `context_canceled`
-// (shutdown). The rest are failures:
+// `short_circuited` (a BUMP already existed and the redelivery added no
+// leaves, so the rebuild was skipped), `rebuilt` (a redelivery from another
+// merkle-service carried leaves the stored BUMP lacked, so the compound was
+// rebuilt), `no_stumps` (block contains no tracked txs) and
+// `context_canceled` (shutdown). The rest are failures:
 //
 //	parse_failed, deferred_incomplete, fetch_failed, no_subtrees,
 //	build_failed, validation_failed, store_failed

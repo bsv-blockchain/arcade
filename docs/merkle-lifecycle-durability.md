@@ -117,16 +117,50 @@ Duplicate callbacks:
   forward move (`SEEN_ON_NETWORK` → `SEEN_MULTIPLE_NODES`) from whichever
   service reports it first is applied and published once; a late
   `SEEN_ON_NETWORK` after that is a lattice skip.
-- `STUMP` for the same `(block, subtree)` is an upsert of identical bytes.
-- `BLOCK_PROCESSED` from a second service takes `tryShortCircuit`, which
-  re-mines the stored BUMP's level-0 set with `onlyChanged=true`: rows already
-  `MINED` against this block are not re-published, a tx registered after the
-  first build still publishes. `processed_at` is re-stamped. The build
-  duration histogram records `short_circuited` once per extra service.
+- `STUMP` rows are content-addressed: the key is
+  `(block_hash, subtree_index, sha256(stump_data))`. Identical bytes from a
+  second service are a no-op; a different STUMP for the same subtree is a
+  second row. The difference is real: each merkle-service builds its STUMP
+  from the txids *it* has registrations for, so a service that was down while
+  txs were registered delivers a STUMP that lacks those txs' paths.
+  `bump.BuildCompoundBUMP` merges same-subtree variants by `(level, offset)`
+  union (hashes must agree; the tracked marker is OR-ed).
+- `BLOCK_PROCESSED` is processed every time. When a compound BUMP already
+  exists, the builder reads the retained STUMP set and diffs its level-0
+  hashes against the stored BUMP:
+  - nothing new ⇒ short-circuit: re-mine the stored level-0 set with
+    `onlyChanged=true` (rows already `MINED` against this block are not
+    re-published; a tx registered after the first build still publishes),
+    re-stamp `processed_at`. Outcome `short_circuited`, once per extra
+    service.
+  - new leaves ⇒ rebuild from the full STUMP set, overwrite the BUMP, mine the
+    union with `onlyChanged=true` so only the newly covered txs are
+    published. Outcome `rebuilt`. A rebuild always waits the grace window
+    first: the expected set names subtree indices, and an index covered by
+    the earlier service's variant says nothing about whether the later
+    service's own STUMP for it has landed. The rebuilt compound must cover
+    every leaf of the stored one; if it would not (only possible if the
+    janitor pruned the earlier STUMPs), the stored BUMP is kept and the block
+    is deferred.
 
-Known limitation in this stage: a service that was down while txs were
-registered (and therefore only knows a subset) emits STUMPs that lack those
-txs' paths. Because STUMPs are keyed by `(block, subtree)` and overwritten on
-insert, which variant the first build sees depends on arrival order; the
-content-addressed STUMP handling that closes this lands in the follow-up
-change.
+  Residual window: a later service's STUMP that straggles past the grace
+  window for an index the earlier service already covered is not detected
+  (the index looks satisfied and no further `BLOCK_PROCESSED` follows). It
+  needs both a partial registration and a STUMP retry slower than
+  `grace_window_ms`; `/reprocess` on the block recovers it.
+
+## STUMP retention and deferral with several sources
+
+STUMPs are no longer pruned right after a build. The janitor
+(`pruneOrphanStumps`, run at startup and every quarter of the window) deletes
+a block's STUMP rows once its `bump_built_at` is older than
+`bump_builder.stump_retention_minutes` (default 60). Anchor-denied and
+reconciler cleanups still delete immediately.
+
+`processed_at` is still the watchdog's signal. The first service's build
+stamps it. If a later service's `BLOCK_PROCESSED` then defers the block (its
+expected STUMP set is still missing after the grace window, or a rebuild would
+drop leaves), `deferStampedBlock` clears the stamp with the new store method
+`ClearBlockProcessed`, so `ListStaleBlockProcessingStatus` surfaces the block
+and the watchdog's `/reprocess` (fanned out to every merkle-service) re-drives
+it. `ClearBlockProcessed` only unsets `processed_at` and never creates a row.

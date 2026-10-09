@@ -66,12 +66,30 @@ CREATE TABLE IF NOT EXISTS bumps (
     bump_data    BYTEA NOT NULL
 );
 
+-- STUMP rows are content-addressed: (block_hash, subtree_index, content_hash).
+-- Several merkle-services may deliver the same subtree's STUMP; identical
+-- bytes collapse to one row, divergent variants (a service that missed
+-- registrations during an outage) coexist and are merged at build time.
 CREATE TABLE IF NOT EXISTS stumps (
     block_hash    TEXT NOT NULL,
     subtree_index INT NOT NULL,
+    content_hash  TEXT NOT NULL DEFAULT '',
     stump_data    BYTEA NOT NULL,
-    PRIMARY KEY (block_hash, subtree_index)
+    PRIMARY KEY (block_hash, subtree_index, content_hash)
 );
+-- Idempotent upgrade for stores created with the (block_hash, subtree_index)
+-- key: add the column, then swap the primary key once.
+ALTER TABLE stumps ADD COLUMN IF NOT EXISTS content_hash TEXT NOT NULL DEFAULT '';
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'stumps'::regclass AND contype = 'p' AND array_length(conkey, 1) = 3
+    ) THEN
+        ALTER TABLE stumps DROP CONSTRAINT IF EXISTS stumps_pkey;
+        ALTER TABLE stumps ADD PRIMARY KEY (block_hash, subtree_index, content_hash);
+    END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS idx_stump_block_hash ON stumps(block_hash);
 
 -- Per-block processing status. One row per block hash; tracks the milestones

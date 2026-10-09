@@ -49,6 +49,7 @@ type mockStore struct {
 	bumpHeights      map[string]uint64          // blockHash → blockHeight
 	minedCalls       []minedCall
 	deletedBlocks    []string
+	clearedBlocks    []string
 	bumpBuiltCalls   []bumpBuiltCall
 	processedCalls   []bumpBuiltCall
 	getStumpsErr     error
@@ -59,10 +60,11 @@ type mockStore struct {
 	// alreadyMined maps txid → block hash for rows the store already holds
 	// at MINED; SetMinedByTxIDs reports them with a MINED previous status so
 	// tests can drive the onlyChanged filter.
-	alreadyMined     map[string]string
-	deleteStumpsErr  error
-	markBumpBuiltErr error
-	markProcessedErr error
+	alreadyMined      map[string]string
+	deleteStumpsErr   error
+	markBumpBuiltErr  error
+	markProcessedErr  error
+	clearProcessedErr error
 
 	// Janitor fixtures: tipHeight feeds GetActiveTipBlockHeight; blockProc
 	// feeds ListBlockProcessingStatus. Both default empty so existing tests
@@ -147,13 +149,55 @@ func (m *mockStore) ListBlockProcessingStatus(_ context.Context, beforeHeight ui
 
 func (m *mockStore) EnsureIndexes(context.Context) error { return nil }
 
+// InsertStump mirrors the store contract: rows are content-addressed, so
+// the same bytes for the same subtree are one row and a variant is another.
 func (m *mockStore) InsertStump(_ context.Context, stump *models.Stump) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.insertStumpErr != nil {
 		return m.insertStumpErr
 	}
+	m.addStumpLocked(stump)
+	return nil
+}
+
+func (m *mockStore) addStumpLocked(stump *models.Stump) {
+	stump.EnsureContentHash()
+	for _, have := range m.stumps[stump.BlockHash] {
+		if have.SubtreeIndex == stump.SubtreeIndex && have.ContentHash == stump.ContentHash {
+			return
+		}
+	}
 	m.stumps[stump.BlockHash] = append(m.stumps[stump.BlockHash], stump)
+}
+
+// GetBlockProcessingStatus serves rows from blockProc by hash.
+func (m *mockStore) GetBlockProcessingStatus(_ context.Context, blockHash string) (*models.BlockProcessingStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, r := range m.blockProc {
+		if r.BlockHash == blockHash {
+			cp := *r
+			return &cp, nil
+		}
+	}
+	return nil, store.ErrNotFound
+}
+
+// ClearBlockProcessed records the call and unsets processed_at on the
+// blockProc fixture row, if any.
+func (m *mockStore) ClearBlockProcessed(_ context.Context, blockHash string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.clearProcessedErr != nil {
+		return m.clearProcessedErr
+	}
+	m.clearedBlocks = append(m.clearedBlocks, blockHash)
+	for _, r := range m.blockProc {
+		if r.BlockHash == blockHash {
+			r.ProcessedAt = nil
+		}
+	}
 	return nil
 }
 
@@ -249,11 +293,7 @@ func (m *mockStore) MarkBlockProcessed(_ context.Context, blockHash string, bloc
 func (m *mockStore) addStump(blockHash string, subtreeIndex int, stumpData []byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.stumps[blockHash] = append(m.stumps[blockHash], &models.Stump{
-		BlockHash:    blockHash,
-		SubtreeIndex: subtreeIndex,
-		StumpData:    stumpData,
-	})
+	m.addStumpLocked(models.NewStump(blockHash, subtreeIndex, stumpData))
 }
 
 // --- Helpers ---
@@ -653,16 +693,22 @@ func TestBuilder_HandleMessage_ShortCircuit_BUMPAlreadyExists(t *testing.T) {
 func TestBuilder_PruneOrphanStumps_DeletesAfterSuccess(t *testing.T) {
 	ms := newMockStore()
 	ms.tipHeight = 1000
-	built := time.Now()
+	// Older than the default retention: STUMPs now outlive the build by
+	// bump_builder.stump_retention_minutes so a later merkle-service's
+	// BLOCK_PROCESSED can re-read the full set.
+	built := time.Now().Add(-2 * time.Hour)
+	recent := time.Now().Add(-time.Minute)
 	ms.blockProc = []*models.BlockProcessingStatus{
-		{BlockHash: "done-1", BlockHeight: 999, BUMPBuiltAt: &built}, // BUMP built — prune
-		{BlockHash: "done-2", BlockHeight: 998, BUMPBuiltAt: &built}, // BUMP built — prune
+		{BlockHash: "done-1", BlockHeight: 999, BUMPBuiltAt: &built}, // BUMP built, aged out — prune
+		{BlockHash: "done-2", BlockHeight: 998, BUMPBuiltAt: &built}, // BUMP built, aged out — prune
 		{BlockHash: "in-flight", BlockHeight: 997, BUMPBuiltAt: nil}, // still pending — keep
+		{BlockHash: "fresh", BlockHeight: 996, BUMPBuiltAt: &recent}, // built, within retention — keep
 	}
-	// Seed stumps for all three so we can verify the in-flight one survives.
+	// Seed stumps for all four so we can verify the kept ones survive.
 	ms.addStump("done-1", 0, []byte("orphan-1"))
 	ms.addStump("done-2", 0, []byte("orphan-2"))
 	ms.addStump("in-flight", 0, []byte("pending"))
+	ms.addStump("fresh", 0, []byte("fresh"))
 
 	b := &Builder{
 		cfg:    &config.Config{},
@@ -684,6 +730,9 @@ func TestBuilder_PruneOrphanStumps_DeletesAfterSuccess(t *testing.T) {
 	}
 	if len(ms.stumps["in-flight"]) != 1 {
 		t.Errorf("in-flight STUMPs should have been preserved, got %d", len(ms.stumps["in-flight"]))
+	}
+	if len(ms.stumps["fresh"]) != 1 {
+		t.Errorf("STUMPs of a block built within the retention window must be kept, got %d", len(ms.stumps["fresh"]))
 	}
 }
 
@@ -728,9 +777,11 @@ func TestBuilder_HandleMessage_HappyPath_SingleSubtree(t *testing.T) {
 		t.Error("expected BUMP to be stored")
 	}
 
-	// Verify STUMPs were pruned
-	if len(ms.deletedBlocks) != 1 || ms.deletedBlocks[0] != blockHash {
-		t.Errorf("expected STUMPs for %s to be deleted, got: %v", blockHash, ms.deletedBlocks)
+	// STUMPs are retained after the build for the janitor's retention
+	// window, so a redelivered BLOCK_PROCESSED from another merkle-service
+	// can be compared against the stored BUMP.
+	if len(ms.deletedBlocks) != 0 || len(ms.stumps[blockHash]) == 0 {
+		t.Errorf("STUMPs must be retained after the build, deletes=%v stumps=%d", ms.deletedBlocks, len(ms.stumps[blockHash]))
 	}
 
 	// Verify the block-processing observability row was updated.
@@ -1152,9 +1203,9 @@ func TestBuilder_E2E_InsertStump_GetStumps_BuildBUMP(t *testing.T) {
 		t.Error("expected non-empty BUMP data")
 	}
 
-	// Verify STUMPs were cleaned up
-	if len(ms.deletedBlocks) != 1 || ms.deletedBlocks[0] != blockHash {
-		t.Errorf("expected STUMPs for %s to be deleted, got: %v", blockHash, ms.deletedBlocks)
+	// STUMPs are retained after the build (janitor-pruned later).
+	if len(ms.deletedBlocks) != 0 {
+		t.Errorf("STUMPs must be retained after the build, got deletes: %v", ms.deletedBlocks)
 	}
 }
 
