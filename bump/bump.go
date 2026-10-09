@@ -648,25 +648,27 @@ func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, c
 
 	numSubtrees := len(subtreeHashes)
 
+	// Several merkle-services may each deliver a STUMP for the same subtree,
+	// and a service that missed registrations delivers one that lacks those
+	// txs' paths. Merge same-index variants into one path per subtree first
+	// so the compound covers the union of every tracked tx any service knew.
+	merged, err := mergeStumpVariants(stumps)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	// Single-subtree edge case (and pathological zero-subtree case): the
 	// STUMP IS the full BUMP. Reuse assembleFullPath which handles the
 	// coinbase placeholder swap and odd-leaf padding for us.
 	if numSubtrees <= 1 {
-		full, _, err := assembleFullPath(stumps[0].StumpData, stumps[0].SubtreeIndex, subtreeHashes, coinbaseBUMP)
+		full, _, err := assembleFullPath(merged[0].data, merged[0].index, subtreeHashes, coinbaseBUMP)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to assemble single-subtree BUMP: %w", err)
 		}
-		txids := make([]string, 0)
-		for _, h := range ExtractLevel0Hashes(stumps[0].StumpData) {
-			txids = append(txids, h.String())
-		}
-		return full, txids, nil
+		return full, merged[0].txids, nil
 	}
 
-	firstPath, err := transaction.NewMerklePathFromBinary(stumps[0].StumpData)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to parse first STUMP: %w", err)
-	}
+	firstPath := merged[0].path
 	blockHeight := firstPath.BlockHeight
 
 	subtreeRootLayer := int(math.Ceil(math.Log2(float64(numSubtrees))))
@@ -704,24 +706,17 @@ func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, c
 	// of its levels' offsets from local-to-subtree to global-to-block, and
 	// place the elements directly into the compound. Tracked-leaf Txid
 	// markers carried on the parsed PathElements are preserved by reference.
-	haveSTUMP := make(map[int]bool, len(stumps))
+	haveSTUMP := make(map[int]bool, len(merged))
 	var txids []string
 
-	for _, stump := range stumps {
-		if haveSTUMP[stump.SubtreeIndex] {
-			continue // duplicate STUMP for the same subtree — keep the first
-		}
-		haveSTUMP[stump.SubtreeIndex] = true
-
-		path, err := transaction.NewMerklePathFromBinary(stump.StumpData)
-		if err != nil {
-			return nil, nil, fmt.Errorf("parse STUMP for subtree %d: %w", stump.SubtreeIndex, err)
-		}
+	for _, stump := range merged {
+		haveSTUMP[stump.index] = true
+		path := stump.path
 		// The lifted final subtree's STUMP is legitimately shorter: its
 		// natural height is internalHeight - liftLevels. Every other subtree
 		// is complete and must cover internalHeight levels.
 		requiredHeight := internalHeight
-		if stump.SubtreeIndex == finalIdx {
+		if stump.index == finalIdx {
 			requiredHeight = finalNaturalHeight
 		}
 		// A STUMP taller than requiredHeight is tolerated: merkle-service
@@ -730,23 +725,21 @@ func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, c
 		// loop below reads exactly those. A STUMP SHORTER than requiredHeight
 		// cannot cover its subtree and is rejected.
 		if len(path.Path) < requiredHeight {
-			return nil, nil, fmt.Errorf("subtree %d STUMP has internal height %d, expected at least %d", stump.SubtreeIndex, len(path.Path), requiredHeight)
+			return nil, nil, fmt.Errorf("subtree %d STUMP has internal height %d, expected at least %d", stump.index, len(path.Path), requiredHeight)
 		}
-		if stump.SubtreeIndex == 0 && coinbaseTxID != nil {
+		if stump.index == 0 && coinbaseTxID != nil {
 			applyCoinbaseToSTUMP(path, coinbaseTxID, coinbaseBUMP)
 		}
 
 		for level := 0; level < requiredHeight; level++ {
-			shift := uint64(stump.SubtreeIndex) << uint(internalHeight-level) //nolint:gosec // subtreeIndex is bounded by numSubtrees; height is small
+			shift := uint64(stump.index) << uint(internalHeight-level) //nolint:gosec // subtreeIndex is bounded by numSubtrees; height is small
 			for _, elem := range path.Path[level] {
 				elem.Offset += shift
 				addLeaf(compound, level, elem)
 			}
 		}
 
-		for _, h := range ExtractLevel0Hashes(stump.StumpData) {
-			txids = append(txids, h.String())
-		}
+		txids = append(txids, stump.txids...)
 	}
 
 	// Represent the final subtree's lift levels: from its natural height up
@@ -789,6 +782,118 @@ func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, c
 	computeAndPadCompound(compound, internalHeight, numSubtrees)
 
 	return compound, txids, nil
+}
+
+// mergedStump is one subtree's STUMP after same-index variants were merged.
+type mergedStump struct {
+	index int
+	path  *transaction.MerklePath
+	// data is the BRC-74 encoding of path: the original bytes when a single
+	// STUMP was delivered for the subtree, a re-encoding of the union
+	// otherwise. Captured before placement shifts the element offsets.
+	data []byte
+	// txids is every level-0 hash of the merged path, deduplicated, in
+	// first-seen order.
+	txids []string
+}
+
+// mergeStumpVariants parses every STUMP and merges those that share a
+// subtree index into one path by (level, offset) union. Variants come from
+// different merkle-services: each builds its STUMP from the txids IT has
+// registrations for, so a service that was down while txs were registered
+// delivers a path that lacks them. Two variants describe the same subtree of
+// the same block, so a slot they both carry must hold the same hash; a
+// disagreement is a merkle-service bug and is reported rather than built.
+// The Txid marker is OR-ed so a leaf tracked by any service stays tracked.
+// Output preserves first-seen subtree order.
+func mergeStumpVariants(stumps []*models.Stump) ([]mergedStump, error) {
+	byIndex := make(map[int]*mergedStump, len(stumps))
+	variants := make(map[int]int, len(stumps))
+	order := make([]int, 0, len(stumps))
+	for _, st := range stumps {
+		path, err := transaction.NewMerklePathFromBinary(st.StumpData)
+		if err != nil {
+			return nil, fmt.Errorf("parse STUMP for subtree %d: %w", st.SubtreeIndex, err)
+		}
+		variants[st.SubtreeIndex]++
+		g, ok := byIndex[st.SubtreeIndex]
+		if !ok {
+			byIndex[st.SubtreeIndex] = &mergedStump{index: st.SubtreeIndex, path: path, data: st.StumpData}
+			order = append(order, st.SubtreeIndex)
+			continue
+		}
+		if err := unionMerklePath(g.path, path); err != nil {
+			return nil, fmt.Errorf("subtree %d: %w", st.SubtreeIndex, err)
+		}
+	}
+	out := make([]mergedStump, 0, len(order))
+	for _, idx := range order {
+		g := byIndex[idx]
+		if variants[idx] > 1 {
+			g.data = g.path.Bytes()
+		}
+		g.txids = level0TxIDs(g.path)
+		out = append(out, *g)
+	}
+	return out, nil
+}
+
+// unionMerklePath adds every element of src that dst lacks, keyed by
+// (level, offset), and reconciles shared slots: hashes must agree, a hash
+// beats a duplicate marker, and the Txid flag is OR-ed. Levels are kept
+// sorted by offset so the re-encoded path is canonical.
+func unionMerklePath(dst, src *transaction.MerklePath) error {
+	for level := range src.Path {
+		for level >= len(dst.Path) {
+			dst.Path = append(dst.Path, nil)
+		}
+		existing := make(map[uint64]*transaction.PathElement, len(dst.Path[level]))
+		for _, e := range dst.Path[level] {
+			existing[e.Offset] = e
+		}
+		for _, e := range src.Path[level] {
+			have, ok := existing[e.Offset]
+			if !ok {
+				dst.Path[level] = append(dst.Path[level], e)
+				existing[e.Offset] = e
+				continue
+			}
+			switch {
+			case have.Hash != nil && e.Hash != nil && !have.Hash.IsEqual(e.Hash):
+				return fmt.Errorf("STUMP variants disagree at level %d offset %d: %s vs %s", level, e.Offset, have.Hash, e.Hash)
+			case have.Hash == nil && e.Hash != nil:
+				have.Hash = e.Hash
+				have.Duplicate = nil
+			}
+			if e.Txid != nil && *e.Txid && (have.Txid == nil || !*have.Txid) {
+				tracked := true
+				have.Txid = &tracked
+			}
+		}
+		slices.SortFunc(dst.Path[level], func(a, b *transaction.PathElement) int { return cmp.Compare(a.Offset, b.Offset) })
+	}
+	return nil
+}
+
+// level0TxIDs lists the level-0 hashes of a path, deduplicated, in order.
+func level0TxIDs(path *transaction.MerklePath) []string {
+	if len(path.Path) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(path.Path[0]))
+	out := make([]string, 0, len(path.Path[0]))
+	for _, leaf := range path.Path[0] {
+		if leaf.Hash == nil {
+			continue
+		}
+		id := leaf.Hash.String()
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
 }
 
 // topTreeRoot folds subtree-root-layer hashes to the block merkle root using

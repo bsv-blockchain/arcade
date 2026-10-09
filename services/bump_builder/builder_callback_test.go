@@ -141,8 +141,11 @@ func TestBuilder_HandleMessage_CallbackPath_NoDatahubCall(t *testing.T) {
 	if len(ms.minedCalls) != 1 {
 		t.Errorf("expected 1 SetMinedByTxIDs call, got %d", len(ms.minedCalls))
 	}
-	if len(ms.deletedBlocks) != 1 || ms.deletedBlocks[0] != blockHash {
-		t.Errorf("expected STUMPs for %s pruned, got %v", blockHash, ms.deletedBlocks)
+	// STUMPs are retained after the build (the janitor prunes them after
+	// bump_builder.stump_retention_minutes) so a later merkle-service's
+	// BLOCK_PROCESSED can be compared against the stored BUMP.
+	if len(ms.deletedBlocks) != 0 {
+		t.Errorf("STUMPs must be retained after the build, got deletes %v", ms.deletedBlocks)
 	}
 	if after := testutil.ToFloat64(metrics.BumpBuilderBlockDataSourceTotal.WithLabelValues("callback")); after != before+1 {
 		t.Errorf("block_data_source{source=callback} = %v, want %v", after, before+1)

@@ -11,8 +11,12 @@ The API server SHALL expose a POST `/callback` endpoint that accepts merkle-serv
 - **THEN** the server SHALL publish a message to the `transaction` Kafka topic with the TXID and new state, and return HTTP 200
 
 #### Scenario: Receive STUMP callback
-- **WHEN** merkle-service sends a POST to `/callback` with state `STUMP` including a TXID, block hash, and STUMP data
-- **THEN** the server SHALL publish a message to the `stump` Kafka topic with the full STUMP payload, and return HTTP 200
+- **WHEN** merkle-service sends a POST to `/callback` with state `STUMP` including a block hash, subtree index, and STUMP data
+- **THEN** the server SHALL store the STUMP synchronously keyed by block hash, subtree index and the SHA-256 of the STUMP bytes, and return HTTP 200 only once the write is durable
+
+#### Scenario: Duplicate deliveries from several merkle-services
+- **WHEN** more than one merkle-service delivers the same `SEEN_*`, `STUMP` or `BLOCK_PROCESSED` callback
+- **THEN** the server SHALL accept each delivery with HTTP 200; a `SEEN_*` that does not advance the status lattice SHALL NOT be published, an identical `STUMP` SHALL NOT create a second row, and every `BLOCK_PROCESSED` SHALL be forwarded for the bump-builder to process idempotently
 
 #### Scenario: Receive BLOCK_PROCESSED callback
 - **WHEN** merkle-service sends a POST to `/callback` with state `BLOCK_PROCESSED` and a block hash

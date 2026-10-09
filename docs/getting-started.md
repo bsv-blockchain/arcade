@@ -149,7 +149,9 @@ transaction with every endpoint and each endpoint delivers its own callbacks:
 - Duplicate `SEEN_ON_NETWORK` / `SEEN_MULTIPLE_NODES` callbacks are no-ops;
   each transition is published to SSE/webhook subscribers once. A duplicate
   `BLOCK_PROCESSED` re-uses the stored BUMP and publishes `MINED` only for
-  transactions that were not already mined.
+  transactions that were not already mined; if the later service's STUMPs
+  cover transactions the first build lacked, the BUMP is rebuilt and only
+  those are published.
 - A registration one endpoint accepted but another refused, timed out on,
   or was skipped for is queued and re-sent to that endpoint in the
   background, so every endpoint ends up watching the same set. An endpoint

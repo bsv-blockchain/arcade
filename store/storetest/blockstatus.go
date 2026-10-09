@@ -16,6 +16,7 @@ import (
 type BlockStatusBackend interface {
 	UpsertBlockHeaderSeen(ctx context.Context, blockHash string, blockHeight uint64, seenAt time.Time) error
 	MarkBlockProcessed(ctx context.Context, blockHash string, blockHeight uint64, processedAt time.Time) error
+	ClearBlockProcessed(ctx context.Context, blockHash string) error
 	MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) (int, error)
 	MarkBlocksParked(ctx context.Context, blockHashes []string) error
 	MarkBlockReconciled(ctx context.Context, blockHash string, orphanedAt, at time.Time) (bool, error)
@@ -139,6 +140,51 @@ func RunBlockStatusSuite(t *testing.T, newBackend func(t *testing.T) BlockStatus
 		}
 		return false
 	}
+
+	// ClearBlockProcessed unsets processed_at only: the bump-builder uses
+	// it to hand a block back to the watchdog when a later merkle-service's
+	// BLOCK_PROCESSED proves the finalized build incomplete. Height, status
+	// and the other milestones stay; a missing row is a no-op.
+	t.Run("ClearBlockProcessed", func(t *testing.T) {
+		b := newBackend(t)
+		const hash = "cbp-cbp-cbp-cbp-cbp-cbp-cbp-cbp-cbp-cbp-cbp-cbp-cbp-cbp-cbp-cbp-"
+		height := blockSuiteHeight + 7
+		if err := b.UpsertBlockHeaderSeen(ctx, hash, height, t0); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.MarkBlockProcessed(ctx, hash, height, t0.Add(30*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if got := row(t, b, hash); got.ProcessedAt == nil {
+			t.Fatalf("seed: processed_at must be set, got %+v", got)
+		}
+		if err := b.ClearBlockProcessed(ctx, hash); err != nil {
+			t.Fatalf("ClearBlockProcessed: %v", err)
+		}
+		got := row(t, b, hash)
+		if got.ProcessedAt != nil {
+			t.Fatalf("processed_at must be cleared, got %+v", got)
+		}
+		if got.BlockHeight != height || got.Status != models.BlockStatusActive || !got.HeaderSeenAt.Equal(t0) {
+			t.Fatalf("only processed_at may change, got %+v", got)
+		}
+		if err := b.ClearBlockProcessed(ctx, hash); err != nil {
+			t.Fatalf("clearing twice must be a no-op: %v", err)
+		}
+		if err := b.ClearBlockProcessed(ctx, "missing-"+hash[8:]); err != nil {
+			t.Fatalf("clearing a missing row must be a no-op: %v", err)
+		}
+		if _, err := b.GetBlockProcessingStatus(ctx, "missing-"+hash[8:]); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("clearing a missing row must not create it: err=%v", err)
+		}
+		// Re-stamping works after a clear.
+		if err := b.MarkBlockProcessed(ctx, hash, height, t0.Add(time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+		if got := row(t, b, hash); got.ProcessedAt == nil {
+			t.Fatalf("re-stamp after clear must set processed_at, got %+v", got)
+		}
+	})
 
 	t.Run("ReactivateBlock", func(t *testing.T) {
 		t.Run("AppliesOnMatchingGeneration", func(t *testing.T) {

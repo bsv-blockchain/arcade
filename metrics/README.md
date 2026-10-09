@@ -42,7 +42,7 @@ rate(arcade_bump_builder_build_duration_seconds_count{
 ```
 
 **Do not** negate the successful-build labels (e.g.
-`{outcome!~"finalized_complete_no_grace|grace_waited"}`) — five outcomes are
+`{outcome!~"finalized_complete_no_grace|grace_waited"}`) — six outcomes are
 benign and would fire it:
 
 - `finalized_complete_no_grace` — BUMP built; merkle's expected-STUMP set was
@@ -50,8 +50,14 @@ benign and would fire it:
   case on a healthy deployment.
 - `grace_waited` — BUMP built via the grace-window path (completeness could
   not be verified up-front).
-- `short_circuited` — a BUMP already existed, so a redelivered `BLOCK_PROCESSED`
-  skipped the rebuild. Expected whenever `/reprocess` re-drives a block.
+- `short_circuited` — a BUMP already existed and the redelivered
+  `BLOCK_PROCESSED` added no leaves, so the rebuild was skipped. Expected
+  whenever `/reprocess` re-drives a block and once per extra merkle-service.
+- `rebuilt` — a redelivered `BLOCK_PROCESSED` (another merkle-service) carried
+  STUMPs with leaves the stored BUMP lacked, so the compound was rebuilt and
+  only the newly covered txs were published. Expected after a merkle-service
+  outage; a steady rate means one service is consistently missing
+  registrations.
 - `no_stumps` — the block contained no tracked txs. Expected on most blocks.
 - `context_canceled` — shutdown.
 

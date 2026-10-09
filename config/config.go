@@ -705,6 +705,13 @@ type BumpBuilderConfig struct {
 	// open on any uncertainty. Default true (viper); false restores the
 	// legacy last-writer-wins behavior as an instant rollback lever.
 	AnchorGuardEnabled bool `mapstructure:"anchor_guard_enabled"`
+	// StumpRetentionMinutes is how long STUMP rows are kept after the
+	// block's BUMP was built before the janitor deletes them. STUMPs are no
+	// longer pruned right after a build: with several merkle-services each
+	// one delivers its own STUMP set, and a later BLOCK_PROCESSED must be
+	// able to re-read the full set to decide whether it adds leaves the
+	// stored BUMP lacks. <= 0 selects the default (60).
+	StumpRetentionMinutes int `mapstructure:"stump_retention_minutes"`
 	// Reconciler tunes the anchor reconciler that heals txs anchored to
 	// orphaned blocks (issue #279).
 	Reconciler ReconcilerConfig `mapstructure:"reconciler"`
@@ -1382,6 +1389,7 @@ func setDefaults() {
 	// while still bounding memory against a hostile DataHub. See F-007.
 	viper.SetDefault("bump_builder.datahub_max_block_bytes", int64(1*1024*1024*1024))
 	viper.SetDefault("bump_builder.anchor_guard_enabled", true)
+	viper.SetDefault("bump_builder.stump_retention_minutes", 60)
 	viper.SetDefault("bump_builder.reconciler.enabled", true)
 	viper.SetDefault("bump_builder.reconciler.interval_ms", 30000)
 	viper.SetDefault("bump_builder.reconciler.batch_size", 5000)

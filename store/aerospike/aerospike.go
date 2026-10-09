@@ -65,8 +65,13 @@ const (
 // the manifest/chunk layout. The chunk size is shared with BUMP (bumpChunkSize)
 // since the same namespace write-block-size bounds both record types.
 const (
-	stumpFormatVersion  = 1
-	stumpChunkKeyFormat = "%s:%d:c:%08d"
+	stumpFormatVersion = 1
+	// stumpChunkKeyFormat is the chunk key of a content-addressed STUMP
+	// (block:subtree:content_hash:c:index); stumpChunkKeyFormatLegacy is the
+	// pre-content-addressing layout, still readable so a STUMP written before
+	// the upgrade can be assembled and deleted.
+	stumpChunkKeyFormat       = "%s:%d:%s:c:%08d"
+	stumpChunkKeyFormatLegacy = "%s:%d:c:%08d"
 )
 
 // Ensure Store implements the store interfaces.
@@ -1659,15 +1664,24 @@ func (s *Store) DeleteBUMPByBlockHash(ctx context.Context, blockHash string) err
 // which is the linearization point a concurrent reader keys off.
 
 // stumpManifestKey builds the primary key for a STUMP manifest record.
-func (s *Store) stumpManifestKey(blockHash string, subtreeIndex int) (*aero.Key, error) {
-	return s.key(setStumps, fmt.Sprintf("%s:%d", blockHash, subtreeIndex))
+// stumpManifestKey is content-addressed (see models.Stump); an empty
+// contentHash selects the legacy (block:subtree) key for rows written before
+// the upgrade.
+func (s *Store) stumpManifestKey(blockHash string, subtreeIndex int, contentHash string) (*aero.Key, error) {
+	if contentHash == "" {
+		return s.key(setStumps, fmt.Sprintf("%s:%d", blockHash, subtreeIndex))
+	}
+	return s.key(setStumps, fmt.Sprintf("%s:%d:%s", blockHash, subtreeIndex, contentHash))
 }
 
 // stumpChunkKey builds the primary key for one chunk of a STUMP. The index is
 // zero-padded so chunk keys sort lexicographically and never collide with a
 // manifest key (which has no ":c:" segment).
-func (s *Store) stumpChunkKey(blockHash string, subtreeIndex, idx int) (*aero.Key, error) {
-	return s.key(setStumps, fmt.Sprintf(stumpChunkKeyFormat, blockHash, subtreeIndex, idx))
+func (s *Store) stumpChunkKey(blockHash string, subtreeIndex int, contentHash string, idx int) (*aero.Key, error) {
+	if contentHash == "" {
+		return s.key(setStumps, fmt.Sprintf(stumpChunkKeyFormatLegacy, blockHash, subtreeIndex, idx))
+	}
+	return s.key(setStumps, fmt.Sprintf(stumpChunkKeyFormat, blockHash, subtreeIndex, contentHash, idx))
 }
 
 // InsertStump stores a STUMP as a manifest plus chunk records. Chunks are
@@ -1678,51 +1692,40 @@ func (s *Store) InsertStump(ctx context.Context, stump *models.Stump) error {
 		return fmt.Errorf("insert stump: empty block hash")
 	}
 
-	// Read the previous manifest's chunk count so we can clean up orphan
-	// chunks if this rewrite produces fewer of them. Failure here is non-fatal
-	// — without it we skip cleanup and orphans only waste disk.
-	oldChunkCount := 0
-	if oldKey, err := s.stumpManifestKey(stump.BlockHash, stump.SubtreeIndex); err == nil {
-		if rec, err := s.client.Get(s.readPolicy(ctx), oldKey, "chunk_count"); err == nil && rec != nil {
-			if v, ok := rec.Bins["chunk_count"].(int); ok && v > 0 {
-				oldChunkCount = v
-			}
-		}
-	}
-
-	newChunkCount := 1
-	if len(stump.StumpData) > s.bumpChunkSize {
-		newChunkCount = (len(stump.StumpData) + s.bumpChunkSize - 1) / s.bumpChunkSize
-	}
-
-	if err := s.writeStumpChunks(ctx, stump.BlockHash, stump.SubtreeIndex, stump.StumpData, newChunkCount); err != nil {
-		return fmt.Errorf("write stump chunks for %s:%d: %w", stump.BlockHash, stump.SubtreeIndex, err)
-	}
-
-	manifestKey, err := s.stumpManifestKey(stump.BlockHash, stump.SubtreeIndex)
+	hash := stump.EnsureContentHash()
+	manifestKey, err := s.stumpManifestKey(stump.BlockHash, stump.SubtreeIndex, hash)
 	if err != nil {
 		return err
 	}
+	// Content-addressed: a manifest under this key already references
+	// exactly these bytes, so a redelivery from another merkle-service is
+	// one read instead of a chunk rewrite. A key's content never changes,
+	// which is also why no orphan-chunk cleanup is needed here any more.
+	if exists, err := s.client.Exists(s.readPolicy(ctx), manifestKey); err == nil && exists {
+		return nil
+	}
+
+	chunkCount := 1
+	if len(stump.StumpData) > s.bumpChunkSize {
+		chunkCount = (len(stump.StumpData) + s.bumpChunkSize - 1) / s.bumpChunkSize
+	}
+
+	if err := s.writeStumpChunks(ctx, stump.BlockHash, stump.SubtreeIndex, hash, stump.StumpData, chunkCount); err != nil {
+		return fmt.Errorf("write stump chunks for %s:%d: %w", stump.BlockHash, stump.SubtreeIndex, err)
+	}
+
 	wp := s.writePolicy(ctx)
 	wp.RecordExistsAction = aero.REPLACE
 	bins := aero.BinMap{
 		"block_hash":     stump.BlockHash,
 		"subtree_index":  stump.SubtreeIndex,
-		"chunk_count":    newChunkCount,
+		"content_hash":   hash,
+		"chunk_count":    chunkCount,
 		"total_size":     len(stump.StumpData),
 		"format_version": stumpFormatVersion,
 	}
 	if err := s.client.Put(wp, manifestKey, bins); err != nil {
 		return fmt.Errorf("write stump manifest for %s:%d: %w", stump.BlockHash, stump.SubtreeIndex, err)
-	}
-
-	// Best-effort cleanup of orphan chunks left by a prior larger write for
-	// the same (blockHash, subtreeIndex). They are unreferenced now that the
-	// manifest caps at newChunkCount, so a failure here only wastes disk.
-	if oldChunkCount > newChunkCount {
-		if err := s.deleteStumpChunkRange(ctx, stump.BlockHash, stump.SubtreeIndex, newChunkCount, oldChunkCount); err != nil {
-			_ = err
-		}
 	}
 	return nil
 }
@@ -1732,6 +1735,7 @@ func (s *Store) InsertStump(ctx context.Context, stump *models.Stump) error {
 // DeleteStumpsByBlockHash.
 type stumpManifest struct {
 	subtreeIndex int
+	contentHash  string // empty on manifests written before content addressing
 	chunkCount   int
 	totalSize    int
 }
@@ -1776,6 +1780,9 @@ loop:
 			if v, ok := rec.Record.Bins["subtree_index"].(int); ok {
 				m.subtreeIndex = v
 			}
+			if v, ok := rec.Record.Bins["content_hash"].(string); ok {
+				m.contentHash = v
+			}
 			if v, ok := rec.Record.Bins["chunk_count"].(int); ok {
 				m.chunkCount = v
 			}
@@ -1810,15 +1817,18 @@ func (s *Store) GetStumpsByBlockHash(ctx context.Context, blockHash string) ([]*
 
 	stumps := make([]*models.Stump, 0, len(manifests))
 	for _, m := range manifests {
-		data, err := s.readStumpChunks(ctx, blockHash, m.subtreeIndex, m.chunkCount, m.totalSize)
+		data, err := s.readStumpChunks(ctx, blockHash, m.subtreeIndex, m.contentHash, m.chunkCount, m.totalSize)
 		if err != nil {
 			return nil, fmt.Errorf("get stumps %s: subtree %d: %w", blockHash, m.subtreeIndex, err)
 		}
-		stumps = append(stumps, &models.Stump{
+		st := &models.Stump{
 			BlockHash:    blockHash,
 			SubtreeIndex: m.subtreeIndex,
 			StumpData:    data,
-		})
+			ContentHash:  m.contentHash,
+		}
+		st.EnsureContentHash()
+		stumps = append(stumps, st)
 	}
 	return stumps, nil
 }
@@ -1826,7 +1836,7 @@ func (s *Store) GetStumpsByBlockHash(ctx context.Context, blockHash string) ([]*
 // writeStumpChunks slices stumpData into chunkCount chunk records under the
 // (blockHash, subtreeIndex) namespace and writes them with REPLACE semantics
 // so stale state from a previously failed write at the same key is dropped.
-func (s *Store) writeStumpChunks(ctx context.Context, blockHash string, subtreeIndex int, stumpData []byte, chunkCount int) error {
+func (s *Store) writeStumpChunks(ctx context.Context, blockHash string, subtreeIndex int, contentHash string, stumpData []byte, chunkCount int) error {
 	bwp := aero.NewBatchWritePolicy()
 	bwp.RecordExistsAction = aero.REPLACE
 
@@ -1846,7 +1856,7 @@ func (s *Store) writeStumpChunks(ctx context.Context, blockHash string, subtreeI
 			if tail > len(stumpData) {
 				tail = len(stumpData)
 			}
-			key, err := s.stumpChunkKey(blockHash, subtreeIndex, i)
+			key, err := s.stumpChunkKey(blockHash, subtreeIndex, contentHash, i)
 			if err != nil {
 				return err
 			}
@@ -1874,7 +1884,7 @@ func (s *Store) writeStumpChunks(ctx context.Context, blockHash string, subtreeI
 // readStumpChunks batch-reads chunkCount chunk records and assembles them into
 // a single byte slice of length totalSize, rejecting any missing chunk, index
 // mismatch, or length overflow.
-func (s *Store) readStumpChunks(ctx context.Context, blockHash string, subtreeIndex, chunkCount, totalSize int) ([]byte, error) {
+func (s *Store) readStumpChunks(ctx context.Context, blockHash string, subtreeIndex int, contentHash string, chunkCount, totalSize int) ([]byte, error) {
 	out := make([]byte, totalSize)
 	written := 0
 
@@ -1889,7 +1899,7 @@ func (s *Store) readStumpChunks(ctx context.Context, blockHash string, subtreeIn
 
 		keys := make([]*aero.Key, 0, end-start)
 		for i := start; i < end; i++ {
-			key, err := s.stumpChunkKey(blockHash, subtreeIndex, i)
+			key, err := s.stumpChunkKey(blockHash, subtreeIndex, contentHash, i)
 			if err != nil {
 				return nil, err
 			}
@@ -1934,7 +1944,7 @@ func (s *Store) readStumpChunks(ctx context.Context, blockHash string, subtreeIn
 
 // deleteStumpChunkRange batch-deletes chunk records at indices [fromIdx,
 // toExcl) for one (blockHash, subtreeIndex) STUMP.
-func (s *Store) deleteStumpChunkRange(ctx context.Context, blockHash string, subtreeIndex, fromIdx, toExcl int) error {
+func (s *Store) deleteStumpChunkRange(ctx context.Context, blockHash string, subtreeIndex int, contentHash string, fromIdx, toExcl int) error {
 	if toExcl <= fromIdx {
 		return nil
 	}
@@ -1948,7 +1958,7 @@ func (s *Store) deleteStumpChunkRange(ctx context.Context, blockHash string, sub
 		}
 		records := make([]aero.BatchRecordIfc, 0, end-start)
 		for i := start; i < end; i++ {
-			key, err := s.stumpChunkKey(blockHash, subtreeIndex, i)
+			key, err := s.stumpChunkKey(blockHash, subtreeIndex, contentHash, i)
 			if err != nil {
 				return err
 			}
@@ -1973,14 +1983,14 @@ func (s *Store) DeleteStumpsByBlockHash(ctx context.Context, blockHash string) e
 	}
 
 	for _, m := range manifests {
-		manifestKey, err := s.stumpManifestKey(blockHash, m.subtreeIndex)
+		manifestKey, err := s.stumpManifestKey(blockHash, m.subtreeIndex, m.contentHash)
 		if err != nil {
 			return err
 		}
 		if _, err := s.client.Delete(s.writePolicy(ctx), manifestKey); err != nil {
 			return fmt.Errorf("delete stump manifest %s:%d: %w", blockHash, m.subtreeIndex, err)
 		}
-		if err := s.deleteStumpChunkRange(ctx, blockHash, m.subtreeIndex, 0, m.chunkCount); err != nil {
+		if err := s.deleteStumpChunkRange(ctx, blockHash, m.subtreeIndex, m.contentHash, 0, m.chunkCount); err != nil {
 			return fmt.Errorf("delete stump chunks %s:%d: %w", blockHash, m.subtreeIndex, err)
 		}
 	}
@@ -2429,6 +2439,22 @@ func (s *Store) MarkBlockProcessed(ctx context.Context, blockHash string, blockH
 
 func (s *Store) MarkBlockBUMPBuilt(ctx context.Context, blockHash string, blockHeight uint64, builtAt time.Time) error {
 	return s.markBlockMilestone(ctx, blockHash, blockHeight, builtAt, binBUMPBuiltAt)
+}
+
+// ClearBlockProcessed drops the processed_at bin on an existing row (a nil
+// bin value deletes the bin); a missing row is a no-op, never an upsert.
+func (s *Store) ClearBlockProcessed(ctx context.Context, blockHash string) error {
+	key, err := s.key(setBlockProcessing, blockHash)
+	if err != nil {
+		return err
+	}
+	wp := s.writePolicy(ctx)
+	wp.RecordExistsAction = aero.UPDATE_ONLY
+	_, err = s.client.Operate(wp, key, aero.PutOp(aero.NewBin(binProcessedAt, nil)))
+	if err != nil && !isKeyNotFound(err) {
+		return fmt.Errorf("clear block processed %s: %w", blockHash, err)
+	}
+	return nil
 }
 
 // markBlockMilestone is the shared upsert path for processed_at and
