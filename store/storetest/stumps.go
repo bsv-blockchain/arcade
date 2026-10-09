@@ -3,6 +3,8 @@ package storetest
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"testing"
 
@@ -23,17 +25,20 @@ type StumpBackend interface {
 // missed registrations during an outage) is a second row, reads come back
 // ordered by subtree index with ContentHash set, and the block delete removes
 // every row. newBackend is called once per subtest.
+//
+// Block hashes are derived from the subtest name: Aerospike runs this suite
+// in a namespace shared with every other integration test and never clears
+// it, so each subtest must only ever read back rows it wrote itself.
 func RunStumpSuite(t *testing.T, newBackend func(t *testing.T) StumpBackend) {
 	t.Helper()
 	ctx := context.Background()
-	const block = "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface"
-	const other = "0badf00d0badf00d0badf00d0badf00d0badf00d0badf00d0badf00d0badf00d"
 	variantA := []byte("stump-subtree-3-variant-a")
 	variantB := []byte("stump-subtree-3-variant-b")
 	subtree0 := []byte("stump-subtree-0")
 
 	t.Run("identical bytes collapse to one row", func(t *testing.T) {
 		b := newBackend(t)
+		block := suiteBlockHash(t, "block")
 		for i := 0; i < 3; i++ {
 			if err := b.InsertStump(ctx, models.NewStump(block, 3, variantA)); err != nil {
 				t.Fatalf("insert %d: %v", i, err)
@@ -57,6 +62,7 @@ func RunStumpSuite(t *testing.T, newBackend func(t *testing.T) StumpBackend) {
 
 	t.Run("divergent variants coexist", func(t *testing.T) {
 		b := newBackend(t)
+		block, other := suiteBlockHash(t, "block"), suiteBlockHash(t, "other")
 		for _, st := range []*models.Stump{
 			models.NewStump(block, 3, variantA),
 			models.NewStump(block, 3, variantB),
@@ -97,6 +103,7 @@ func RunStumpSuite(t *testing.T, newBackend func(t *testing.T) StumpBackend) {
 
 	t.Run("delete removes every variant and nothing else", func(t *testing.T) {
 		b := newBackend(t)
+		block, other := suiteBlockHash(t, "block"), suiteBlockHash(t, "other")
 		for _, st := range []*models.Stump{
 			models.NewStump(block, 3, variantA),
 			models.NewStump(block, 3, variantB),
@@ -131,7 +138,7 @@ func RunStumpSuite(t *testing.T, newBackend func(t *testing.T) StumpBackend) {
 
 	t.Run("unknown block reads empty", func(t *testing.T) {
 		b := newBackend(t)
-		got, err := b.GetStumpsByBlockHash(ctx, other)
+		got, err := b.GetStumpsByBlockHash(ctx, suiteBlockHash(t, "never-written"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -139,6 +146,13 @@ func RunStumpSuite(t *testing.T, newBackend func(t *testing.T) StumpBackend) {
 			t.Fatalf("rows = %s", describe(got))
 		}
 	})
+}
+
+// suiteBlockHash derives a 64-hex block hash unique to the calling subtest.
+func suiteBlockHash(t *testing.T, tag string) string {
+	t.Helper()
+	sum := sha256.Sum256([]byte(t.Name() + "/" + tag))
+	return hex.EncodeToString(sum[:])
 }
 
 func describe(stumps []*models.Stump) string {
