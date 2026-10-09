@@ -74,7 +74,16 @@ func Status(status string) zap.Field {
 const (
 	StageIntake  = "intake"
 	StageNetwork = "network"
+	StageMerkle  = "merkle"
 	StageCascade = "cascade"
+)
+
+// Retry-stage values for RetryStage. Merkle registration retries and
+// network propagation retries are independent failure domains: a failed
+// Merkle /watch has not consumed a network propagation attempt.
+const (
+	RetryStageMerkle  = "merkle"
+	RetryStageNetwork = "network"
 )
 
 // Stage returns the canonical field for the pipeline stage a rejection (or
@@ -82,6 +91,14 @@ const (
 // constants above.
 func Stage(stage string) zap.Field {
 	return zap.String("stage", stage)
+}
+
+// RetryStage returns the canonical field naming which fast-path retry
+// budget a requeue debited. stage is RetryStageMerkle or RetryStageNetwork.
+// Do not put a txid in this field — it is safe to mirror onto a metric
+// label, and txids belong on TxID / TxIDs.
+func RetryStage(stage string) zap.Field {
+	return zap.String("retry_stage", stage)
 }
 
 // TxIDBatch returns the canonical field pair for logging a batch of txids
