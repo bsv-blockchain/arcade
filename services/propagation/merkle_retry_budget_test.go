@@ -640,7 +640,7 @@ func TestMerkleWatch_P100IncidentShape(t *testing.T) {
 	const total = 100
 	merkle := &scriptedMerkle{failsLeft: map[string]int{}, calls: map[string]int{}}
 	node := &countingTeranode{hits: map[string]int{}}
-	var txids []string
+	txids := make([]string, 0, total)
 	var wantMerkle float64
 	for i := range total {
 		txid, raw := propPayload(i)
@@ -652,7 +652,7 @@ func TestMerkleWatch_P100IncidentShape(t *testing.T) {
 			wantMerkle += 6
 		case i < 66:
 			merkle.failsLeft[txid] = 1
-			wantMerkle += 1
+			wantMerkle++
 		}
 	}
 	merkleSrv := httptest.NewServer(merkle)
@@ -718,27 +718,32 @@ func TestMerkleRegisterFailureReason_Classifies(t *testing.T) {
 	ctx := context.Background()
 	cases := []struct {
 		name string
-		ctx  context.Context
 		err  error
 		want string
 	}{
-		{"cancel", ctx, context.Canceled, "claim_revoked"},
-		{"dead ctx", func() context.Context { c, cancel := context.WithCancel(context.Background()); cancel(); return c }(), errors.New("wrapped"), "claim_revoked"},
-		{"401", ctx, &merkleservice.RegisterError{StatusCode: http.StatusUnauthorized}, "auth_error"},
-		{"403", ctx, &merkleservice.RegisterError{StatusCode: http.StatusForbidden}, "auth_error"},
-		{"500", ctx, &merkleservice.RegisterError{StatusCode: http.StatusInternalServerError}, "http_5xx"},
-		{"400", ctx, &merkleservice.RegisterError{StatusCode: http.StatusBadRequest}, "register_error"},
-		{"deadline", ctx, context.DeadlineExceeded, "timeout"},
-		{"net timeout", ctx, &net.DNSError{IsTimeout: true, Err: "i/o timeout"}, "timeout"},
-		{"transport", ctx, errors.New("connection refused"), "transport"},
+		{"cancel", context.Canceled, "claim_revoked"},
+		{"401", &merkleservice.RegisterError{StatusCode: http.StatusUnauthorized}, "auth_error"},
+		{"403", &merkleservice.RegisterError{StatusCode: http.StatusForbidden}, "auth_error"},
+		{"500", &merkleservice.RegisterError{StatusCode: http.StatusInternalServerError}, "http_5xx"},
+		{"400", &merkleservice.RegisterError{StatusCode: http.StatusBadRequest}, "register_error"},
+		{"deadline", context.DeadlineExceeded, "timeout"},
+		{"net timeout", &net.DNSError{IsTimeout: true, Err: "i/o timeout"}, "timeout"},
+		{"transport", errors.New("connection refused"), "transport"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := merkleRegisterFailureReason(tc.ctx, tc.err); got != tc.want {
+			if got := merkleRegisterFailureReason(ctx, tc.err); got != tc.want {
 				t.Errorf("reason = %s, want %s", got, tc.want)
 			}
 		})
 	}
+	t.Run("dead ctx", func(t *testing.T) {
+		dead, cancel := context.WithCancel(context.Background())
+		cancel()
+		if got := merkleRegisterFailureReason(dead, errors.New("wrapped")); got != "claim_revoked" {
+			t.Errorf("reason = %s, want claim_revoked", got)
+		}
+	})
 }
 
 func kafkaMessage(payload []byte, offset int64) *kafka.Message {
