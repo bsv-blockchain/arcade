@@ -184,13 +184,13 @@ var PropagationMerkleRegisterDuration = promauto.NewHistogram(prometheus.Histogr
 
 // PropagationMerkleRegisterFailures counts per-tx merkle-service registration
 // failures by reason. Sustained values indicate the merkle service is
-// unhealthy — without this metric a registration outage was previously
-// masked by silent broadcast continuation. The label is kept open so future
-// error-class splits (e.g. "timeout", "5xx", "auth") can be added without
-// renaming the metric.
+// unhealthy. The label set is closed and bounded: claim_revoked (not a
+// real registration failure — the Kafka claim died), auth_error (401/403),
+// http_5xx, timeout, transport, and register_error (any other /watch
+// failure, including other 4xx). Do not add a txid label.
 var PropagationMerkleRegisterFailures = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_propagation_merkle_register_failures_total",
-	Help: "Per-tx merkle-service Register failures, by reason.",
+	Help: "Per-tx merkle-service Register failures, by reason (claim_revoked, auth_error, http_5xx, timeout, transport, register_error).",
 }, []string{"reason"})
 
 // PropagationMerkleRegisterBatchOutcomeTotal counts each flushBatch's merkle
@@ -301,8 +301,10 @@ var PropagationMissingParentTotal = promauto.NewCounterVec(prometheus.CounterOpt
 }, []string{"outcome"}) // requeued, reaper_retry, rejected_ancestor
 
 // PropagationRequeueExhaustedTotal counts transactions parked at PENDING_RETRY
-// because they burned their whole in-memory requeue budget
+// because they burned their whole in-memory NETWORK requeue budget
 // (propagation.retry_max_attempts) without ever producing a network verdict.
+// Merkle /watch exhaustion is PropagationMerkleRetryExhaustedTotal, not this
+// series — a registration outage must not page as "no network verdict".
 //
 // This is the poison-batch escape hatch. Before it existed a batch that
 // permanently failed with no attributable per-tx verdict requeued forever:
@@ -318,7 +320,24 @@ var PropagationMissingParentTotal = promauto.NewCounterVec(prometheus.CounterOpt
 // the reaper rebroadcasts PENDING_RETRY rows — but the fast path has given up.
 var PropagationRequeueExhaustedTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "arcade_propagation_requeue_exhausted_total",
-	Help: "Transactions parked at PENDING_RETRY after exhausting the in-memory requeue budget with no network verdict.",
+	Help: "Transactions parked at PENDING_RETRY after exhausting the in-memory network requeue budget with no network verdict.",
+})
+
+// PropagationRetryTotal counts fast-path retry decisions by stage.
+// stage=merkle is a Merkle /watch requeue and is not a network propagation
+// attempt. stage=network is a Teranode/network requeue only. The label set
+// is closed (two values). Txids must not be added as labels.
+var PropagationRetryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "arcade_propagation_retry_total",
+	Help: "Fast-path retry decisions by stage (merkle registration vs network propagation).",
+}, []string{"stage"})
+
+// PropagationMerkleRetryExhaustedTotal counts transactions parked at
+// PENDING_RETRY after exhausting fast-path Merkle /watch retries. The
+// network propagation budget is not consumed, and the tx is not REJECTED.
+var PropagationMerkleRetryExhaustedTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "arcade_propagation_merkle_retry_exhausted_total",
+	Help: "Transactions parked at PENDING_RETRY after exhausting fast-path Merkle /watch retries. The network propagation budget is not consumed.",
 })
 
 // PropagationPendingRetryTotal counts durable-retry lifecycle events for

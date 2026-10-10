@@ -404,6 +404,8 @@ func TestRunDispatcher_ClaimRevokedMidBatch_FailsFastAndLeavesUncommitted(t *tes
 	requeuesBefore := testutil.ToFloat64(metrics.PropagationPendingRequeues)
 	claimRevokedBefore := testutil.ToFloat64(metrics.PropagationMerkleRegisterFailures.WithLabelValues("claim_revoked"))
 	registerErrBefore := testutil.ToFloat64(metrics.PropagationMerkleRegisterFailures.WithLabelValues("register_error"))
+	merkleRetryBefore := testutil.ToFloat64(metrics.PropagationRetryTotal.WithLabelValues("merkle"))
+	networkRetryBefore := testutil.ToFloat64(metrics.PropagationRetryTotal.WithLabelValues("network"))
 
 	claim, stop := runDispatcherWithClaim(t, p)
 	claim.ch <- &kafka.Message{Offset: 21, Value: makePropMsg("revoked-mid-batch-tx")}
@@ -444,6 +446,12 @@ func TestRunDispatcher_ClaimRevokedMidBatch_FailsFastAndLeavesUncommitted(t *tes
 	}
 	if d := testutil.ToFloat64(metrics.PropagationPendingRequeues) - requeuesBefore; d != 0 {
 		t.Errorf("no delayed-requeue goroutine may park under a revoked claim; gauge delta = %v", d)
+	}
+	if d := testutil.ToFloat64(metrics.PropagationRetryTotal.WithLabelValues("merkle")) - merkleRetryBefore; d != 0 {
+		t.Errorf("claim revocation must not charge the merkle retry budget; delta = %v", d)
+	}
+	if d := testutil.ToFloat64(metrics.PropagationRetryTotal.WithLabelValues("network")) - networkRetryBefore; d != 0 {
+		t.Errorf("claim revocation must not charge the network retry budget; delta = %v", d)
 	}
 }
 
