@@ -254,7 +254,7 @@ func (m *mockStore) BumpRetryCount(_ context.Context, txid string) (int, error) 
 	return m.retryCounts[txid], nil
 }
 
-func (m *mockStore) SetPendingRetryFields(_ context.Context, txid string, rawTx []byte, nextRetryAt time.Time) error {
+func (m *mockStore) SetPendingRetryFields(_ context.Context, txid string, rawTx []byte, nextRetryAt time.Time, lastReason string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.retrySeq[txid]; !ok {
@@ -266,6 +266,7 @@ func (m *mockStore) SetPendingRetryFields(_ context.Context, txid string, rawTx 
 		RawTx:       append([]byte(nil), rawTx...),
 		RetryCount:  m.retryCounts[txid],
 		NextRetryAt: nextRetryAt,
+		LastReason:  lastReason,
 	}
 	// Mirror the write onto the row the scan walk sees. The real statement
 	// updates the transactions row itself, so a later IterateStatusesSince

@@ -29,6 +29,7 @@ import (
 	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/services"
 	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/version"
 )
@@ -55,6 +56,8 @@ const workQueueDepth = 1024
 // every process that should ship callbacks (typically the api-server, but
 // could be a dedicated mode if operators want to scale delivery separately).
 type Service struct {
+	services.ReadyHook
+
 	cfg       config.WebhookConfig
 	logger    *zap.Logger
 	publisher events.Publisher
@@ -219,6 +222,9 @@ func (s *Service) Start(ctx context.Context) error {
 			s.runReaper(ctx)
 		}()
 	}
+	// Subscribe succeeded and the delivery pool is running. The select
+	// below blocks until shutdown, so this is the startup-success point.
+	s.SignalReady()
 	defer func() {
 		close(work)
 		wg.Wait()

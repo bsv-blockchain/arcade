@@ -396,3 +396,50 @@ func TestStatusFrameTimestampWholeSecondsUnchanged(t *testing.T) {
 		t.Errorf("frame %q does not contain %s", frame, want)
 	}
 }
+
+// TestStatusFrameCarriesCompetingTxs pins the double-spend frame: a REJECTED
+// conflict verdict must tell the subscriber which transaction owns the
+// outpoint, the same as GET /tx, without a follow-up read. Frames with no
+// competing txs keep their original shape (omitempty).
+func TestStatusFrameCarriesCompetingTxs(t *testing.T) {
+	spender := strings.Repeat("2b", 32)
+	frame, err := buildStatusFrame(&models.TransactionStatus{
+		TxID:         "ds",
+		Status:       models.StatusRejected,
+		StatusCode:   466,
+		ExtraInfo:    "UTXO_SPENT (70): utxo already spent by tx " + spender + "[0]",
+		CompetingTxs: []string{spender},
+		Timestamp:    time.Unix(1700000000, 0).UTC(),
+	})
+	if err != nil {
+		t.Fatalf("buildStatusFrame: %v", err)
+	}
+	_, data, ok := strings.Cut(frame, "data: ")
+	if !ok {
+		t.Fatalf("no data field in frame %q", frame)
+	}
+	var payload struct {
+		TxStatus     string   `json:"txStatus"`
+		Status       int      `json:"status"`
+		CompetingTxs []string `json:"competingTxs"`
+	}
+	if jsonErr := json.Unmarshal([]byte(strings.TrimSuffix(data, "\n\n")), &payload); jsonErr != nil {
+		t.Fatalf("unmarshal data: %v", jsonErr)
+	}
+	if payload.TxStatus != "REJECTED" || payload.Status != 466 {
+		t.Errorf("txStatus/status = %s/%d, want REJECTED/466", payload.TxStatus, payload.Status)
+	}
+	if len(payload.CompetingTxs) != 1 || payload.CompetingTxs[0] != spender {
+		t.Errorf("competingTxs = %v, want [%s]", payload.CompetingTxs, spender)
+	}
+
+	plain, err := buildStatusFrame(&models.TransactionStatus{
+		TxID: "plain", Status: models.StatusSeenOnNetwork, Timestamp: time.Unix(1700000000, 0).UTC(),
+	})
+	if err != nil {
+		t.Fatalf("buildStatusFrame: %v", err)
+	}
+	if strings.Contains(plain, "competingTxs") {
+		t.Errorf("frame without competing txs must omit the field: %q", plain)
+	}
+}

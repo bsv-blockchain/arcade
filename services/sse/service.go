@@ -22,6 +22,7 @@ import (
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/events"
+	"github.com/bsv-blockchain/arcade/services"
 	"github.com/bsv-blockchain/arcade/services/httpmiddleware"
 	"github.com/bsv-blockchain/arcade/store"
 )
@@ -33,6 +34,8 @@ const jsonKeyError = "error"
 // dedicated port — slow SSE clients can't backpressure /submit on the
 // api-server pod.
 type Service struct {
+	services.ReadyHook
+
 	cfg       *config.Config
 	logger    *zap.Logger
 	publisher events.Publisher
@@ -100,7 +103,7 @@ func (s *Service) Start(ctx context.Context) error {
 		_ = s.Stop() //nolint:contextcheck // Stop uses context.Background() so the 15s drain outlives the parent ctx that just fired.
 	}()
 
-	if err := s.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := services.ListenAndServeReady(ctx, s.server, &s.ReadyHook); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("sse server error: %w", err)
 	}
 	return nil

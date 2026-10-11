@@ -35,9 +35,8 @@ func TestUpdateStatusReturning_AppliedResultContract(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		applied := res.Prev != nil && res.Current == nil
-		if !applied {
-			t.Fatalf("Applied=%v Prev=%+v Current=%+v, want Applied=true", res.Prev != nil, res.Prev, res.Current)
+		if !res.Applied() || res.Current != nil {
+			t.Fatalf("Applied=%v Prev=%+v Current=%+v, want Applied=true", res.Applied(), res.Prev, res.Current)
 		}
 		if res.Prev.Status != models.StatusAcceptedByNetwork {
 			t.Fatalf("Previous=%s, want ACCEPTED_BY_NETWORK", res.Prev.Status)

@@ -342,7 +342,7 @@ func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.Tra
 		return nil
 	}
 
-	const colsPerRow = 8 // txid, status, status_code, block_hash, block_height, extra_info, merkle_path, timestamp_at, disallowed_prev
+	const colsPerRow = 9 // txid, status, status_code, block_hash, block_height, extra_info, merkle_path, competing_txs, timestamp_at, disallowed_prev
 
 	args := make([]any, 0, len(statuses)*(colsPerRow+1))
 	now := time.Now()
@@ -355,14 +355,16 @@ func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.Tra
 		if len(st.MerklePath) > 0 {
 			mp = []byte(st.MerklePath)
 		}
-		// disallowed previous statuses for this row's lattice guard. A nil/
-		// empty slice means "no constraint" — the AND clause uses ALL() so an
-		// empty array is satisfied trivially (status <> ALL('{}'::text[]) is
-		// true for every row).
-		disallowed := disallowedPrevAsStrings(st.Status)
-		if disallowed == nil {
-			disallowed = []string{}
+		competing, err := competingTxsArg(st.CompetingTxs)
+		if err != nil {
+			return fmt.Errorf("marshal competing_txs for %s: %w", st.TxID, err)
 		}
+		// disallowed previous statuses for this row's lattice guard, shared
+		// with UpdateStatusReturning so a same-status re-assert is applied on
+		// both paths (CanTransitionFrom allows it). An empty array means "no
+		// constraint" — the AND clause uses ALL() so it is satisfied
+		// trivially (status <> ALL('{}'::text[]) is true for every row).
+		disallowed := transitionGuardStatuses(st.Status)
 		args = append(
 			args,
 			st.TxID,
@@ -372,6 +374,7 @@ func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.Tra
 			int64(st.BlockHeight), /* #nosec G115 */
 			st.ExtraInfo,
 			mp,
+			competing,
 			ts,
 			disallowed,
 		)
@@ -387,8 +390,8 @@ func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.Tra
 		// right types for the VALUES alias columns.
 		fmt.Fprintf(
 			&values,
-			"($%d::text,$%d::text,$%d::int,$%d::text,$%d::bigint,$%d::text,$%d::bytea,$%d::timestamptz,$%d::text[])",
-			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9,
+			"($%d::text,$%d::text,$%d::int,$%d::text,$%d::bigint,$%d::text,$%d::bytea,$%d::jsonb,$%d::timestamptz,$%d::text[])",
+			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10,
 		)
 	}
 
@@ -404,14 +407,29 @@ UPDATE transactions t SET
     block_height = COALESCE(NULLIF(v.block_height, 0),    t.block_height),
     extra_info   = COALESCE(NULLIF(v.extra_info, ''),     t.extra_info),
     merkle_path  = COALESCE(v.merkle_path,                t.merkle_path),
+    competing_txs = COALESCE(v.competing_txs,             t.competing_txs),
     timestamp_at = v.timestamp_at
-FROM (VALUES ` + values.String() + `) AS v(txid, status, status_code, block_hash, block_height, extra_info, merkle_path, timestamp_at, disallowed_prev)
+FROM (VALUES ` + values.String() + `) AS v(txid, status, status_code, block_hash, block_height, extra_info, merkle_path, competing_txs, timestamp_at, disallowed_prev)
 WHERE t.txid = v.txid AND t.status <> ALL(v.disallowed_prev)`
 
 	if _, err := s.pool.Exec(ctx, q, args...); err != nil {
 		return fmt.Errorf("batch update: %w", err)
 	}
 	return nil
+}
+
+// competingTxsArg renders CompetingTxs for the JSONB competing_txs column: a
+// JSON string so pgx encodes it as JSON rather than BYTEA, or nil for "no
+// competing txs" so COALESCE keeps whatever the row already holds.
+func competingTxsArg(competing []string) (any, error) {
+	if len(competing) == 0 {
+		return nil, nil
+	}
+	b, err := json.Marshal(competing)
+	if err != nil {
+		return nil, err
+	}
+	return string(b), nil
 }
 
 // UpdateStatus updates an existing transaction. If no row exists for
@@ -429,7 +447,9 @@ func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStat
 // lattice check, and the write are one statement: FOR UPDATE holds the row,
 // and the UPDATE matches only when CanTransitionFrom allows the move
 // (including an idempotent re-assert of the same status). A missing row
-// returns ErrNotFound.
+// returns ErrNotFound. Prev and Current carry status metadata only:
+// raw_tx, merkle_path and competing_txs are not read, matching the
+// StatusUpdate contract and the Mongo/Aerospike projections.
 func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.TransactionStatus) (store.StatusUpdate, error) {
 	if status == nil || status.TxID == "" {
 		return store.StatusUpdate{}, store.ErrNotFound
@@ -466,6 +486,15 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 		args = append(args, []byte(status.MerklePath))
 		idx++
 	}
+	if len(status.CompetingTxs) > 0 {
+		competing, err := competingTxsArg(status.CompetingTxs)
+		if err != nil {
+			return store.StatusUpdate{}, fmt.Errorf("marshal competing_txs for %s: %w", status.TxID, err)
+		}
+		sets = append(sets, fmt.Sprintf("competing_txs = $%d::jsonb", idx))
+		args = append(args, competing)
+		idx++
+	}
 	disallowed := transitionGuardStatuses(status.Status)
 	args = append(args, disallowed)
 	guard := fmt.Sprintf("($2 = '' OR old.status = $2 OR NOT (old.status = ANY($%d::text[])))", idx)
@@ -479,9 +508,8 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 	}
 	q := `
 WITH old AS (
-    SELECT txid, status, status_code, block_hash, block_height, merkle_path,
-           extra_info, competing_txs, raw_tx, retry_count, next_retry_at,
-           timestamp_at, created_at, merkle_registered_at
+    SELECT txid, status, status_code, block_hash, block_height, extra_info,
+           retry_count, next_retry_at, timestamp_at, created_at, merkle_registered_at
     FROM transactions
     WHERE txid = $1
     FOR UPDATE
@@ -492,9 +520,8 @@ WITH old AS (
       AND ` + guard + `
     RETURNING t.txid
 )
-SELECT old.txid, old.status, old.status_code, old.block_hash, old.block_height, old.merkle_path,
-       old.extra_info, old.competing_txs, old.raw_tx, old.retry_count, old.next_retry_at,
-       old.timestamp_at, old.created_at, old.merkle_registered_at,
+SELECT old.txid, old.status, old.status_code, old.block_hash, old.block_height, old.extra_info,
+       old.retry_count, old.next_retry_at, old.timestamp_at, old.created_at, old.merkle_registered_at,
        EXISTS (SELECT 1 FROM upd) AS applied
 FROM old`
 
@@ -513,9 +540,10 @@ FROM old`
 }
 
 // transitionGuardStatuses is DisallowedPreviousStatuses without the target
-// itself. CanTransitionFrom allows re-asserting the same status; the SQL
-// guard treats equality as its own allow, and the array is what cannot
-// move to the target.
+// itself, as a text[] for the status-update lattice guards
+// (UpdateStatusReturning and batchUpdateStatusSQL). CanTransitionFrom
+// allows re-asserting the same status, so the array holds only what
+// cannot move to the target. Never nil: an empty array is "no constraint".
 func transitionGuardStatuses(s models.Status) []string {
 	if s == "" {
 		return []string{}
@@ -531,28 +559,27 @@ func transitionGuardStatuses(s models.Status) []string {
 	return out
 }
 
-// scanStatusApplied is scanStatus plus the trailing applied flag from
-// UpdateStatusReturning. applied is false when the row existed but the
-// lattice guard skipped the write; the caller then reports that row as
-// Current.
+// scanStatusApplied decodes the UpdateStatusReturning row: the status
+// metadata the StatusUpdate contract guarantees plus the trailing applied
+// flag. raw_tx, merkle_path and competing_txs are deliberately not read —
+// no caller of the returning path uses them and raw_tx can be megabytes
+// per row on the callback hot path. applied is false when the row existed
+// but the lattice guard skipped the write; the caller then reports that
+// row as Current.
 func scanStatusApplied(row rowScanner) (*models.TransactionStatus, bool, error) {
 	var (
 		st                 models.TransactionStatus
 		statusCode         *int
 		blockHash          *string
 		blockHeight        *int64
-		merklePath         []byte
 		extraInfo          *string
-		competingTxs       []byte
-		rawTx              []byte
 		nextRetry          *time.Time
 		merkleRegisteredAt *time.Time
 		applied            bool
 	)
 	if err := row.Scan(
 		&st.TxID, &st.Status, &statusCode,
-		&blockHash, &blockHeight, &merklePath,
-		&extraInfo, &competingTxs, &rawTx,
+		&blockHash, &blockHeight, &extraInfo,
 		&st.RetryCount, &nextRetry,
 		&st.Timestamp, &st.CreatedAt, &merkleRegisteredAt, &applied,
 	); err != nil {
@@ -567,17 +594,8 @@ func scanStatusApplied(row rowScanner) (*models.TransactionStatus, bool, error) 
 	if blockHeight != nil {
 		st.BlockHeight = uint64(*blockHeight) //nolint:gosec // block height fits in either signed/unsigned 64-bit
 	}
-	if len(merklePath) > 0 {
-		st.MerklePath = merklePath
-	}
 	if extraInfo != nil {
 		st.ExtraInfo = *extraInfo
-	}
-	if len(competingTxs) > 0 {
-		_ = json.Unmarshal(competingTxs, &st.CompetingTxs)
-	}
-	if len(rawTx) > 0 {
-		st.RawTx = rawTx
 	}
 	if nextRetry != nil {
 		st.NextRetryAt = *nextRetry
@@ -588,8 +606,10 @@ func scanStatusApplied(row rowScanner) (*models.TransactionStatus, bool, error) 
 	return &st, applied, nil
 }
 
-// disallowedPrevAsStrings is a small adapter so UpdateStatus / BatchUpdateStatus
-// can drop the lattice into a parameterised text[] clause.
+// disallowedPrevAsStrings drops the full DisallowedPreviousStatuses list,
+// target included, into a parameterised text[] clause. The status-update
+// paths use transitionGuardStatuses instead so a same-status re-assert is
+// applied.
 func disallowedPrevAsStrings(s models.Status) []string {
 	if s == "" {
 		return nil
@@ -989,16 +1009,17 @@ func (s *Store) BumpRetryCount(ctx context.Context, txid string) (int, error) {
 // to PENDING_RETRY, where the reaper would then rebroadcast it. Rows whose
 // current status forbids PENDING_RETRY are skipped, matching
 // BatchUpdateStatusReturning's silent-skip semantics.
-func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time) error {
+func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time, lastReason string) error {
 	const q = `
 UPDATE transactions
-SET status=$2, raw_tx=$3, next_retry_at=$4, timestamp_at=NOW()
+SET status=$2, raw_tx=$3, next_retry_at=$4, timestamp_at=NOW(),
+    retry_reason = NULLIF($6,'')
 WHERE txid=$1 AND status <> ALL($5)`
 	disallowed := disallowedPrevAsStrings(models.StatusPendingRetry)
 	if disallowed == nil {
 		disallowed = []string{}
 	}
-	_, err := s.pool.Exec(ctx, q, txid, string(models.StatusPendingRetry), rawTx, nextRetryAt, disallowed)
+	_, err := s.pool.Exec(ctx, q, txid, string(models.StatusPendingRetry), rawTx, nextRetryAt, disallowed, lastReason)
 	if err != nil {
 		return fmt.Errorf("set pending retry fields %s: %w", txid, err)
 	}
@@ -1020,7 +1041,7 @@ func (s *Store) GetReadyRetries(ctx context.Context, now time.Time, limit int) (
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	const q = `
-SELECT txid, raw_tx, retry_count, next_retry_at
+SELECT txid, raw_tx, retry_count, next_retry_at, COALESCE(retry_reason, '')
 FROM transactions
 WHERE status = 'PENDING_RETRY' AND next_retry_at <= $1
 ORDER BY next_retry_at
@@ -1033,7 +1054,7 @@ FOR UPDATE SKIP LOCKED`
 	var out []*store.PendingRetry
 	for rows.Next() {
 		r := &store.PendingRetry{}
-		if err := rows.Scan(&r.TxID, &r.RawTx, &r.RetryCount, &r.NextRetryAt); err != nil {
+		if err := rows.Scan(&r.TxID, &r.RawTx, &r.RetryCount, &r.NextRetryAt, &r.LastReason); err != nil {
 			rows.Close()
 			return out, err
 		}
@@ -1052,7 +1073,7 @@ FOR UPDATE SKIP LOCKED`
 func (s *Store) ClearRetryState(ctx context.Context, txid string, finalStatus models.Status, extraInfo string) error {
 	const q = `
 UPDATE transactions
-SET status=$2, raw_tx=NULL, next_retry_at=NULL, timestamp_at=NOW(),
+SET status=$2, raw_tx=NULL, next_retry_at=NULL, retry_reason=NULL, timestamp_at=NOW(),
     extra_info = COALESCE(NULLIF($3,''), extra_info)
 WHERE txid=$1`
 	_, err := s.pool.Exec(ctx, q, txid, string(finalStatus), extraInfo)

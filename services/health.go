@@ -14,6 +14,9 @@ import (
 )
 
 // HealthServer provides /health and /ready endpoints for non-API services.
+// /health is liveness and is always 200 once the listener is up. /ready
+// stays 503 until ReadinessGate marks the process ready, which happens only
+// after every supervised service's startup sequence has succeeded.
 type HealthServer struct {
 	server *http.Server
 	ready  atomic.Bool
@@ -81,6 +84,14 @@ func (hs *HealthServer) Start(ctx context.Context) {
 	}()
 }
 
+// SetReady flips the /ready probe. false is the zero state and the shutdown
+// state; true means every service in this process has finished starting.
+//
+// Parameters:
+//   - ready: whether /ready should return 200.
+//
+// Side Effects:
+//   - Changes the status code served by /ready.
 func (hs *HealthServer) SetReady(ready bool) {
 	hs.ready.Store(ready)
 }

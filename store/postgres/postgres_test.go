@@ -204,7 +204,7 @@ func TestPendingRetryLifecycle(t *testing.T) {
 		t.Fatalf("BumpRetryCount: n=%d err=%v", n, err)
 	}
 
-	if err := s.SetPendingRetryFields(ctx, txid, rawTx, nextRetry); err != nil {
+	if err := s.SetPendingRetryFields(ctx, txid, rawTx, nextRetry, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -249,7 +249,7 @@ func TestGetReadyRetries_SkipsFutureEntries(t *testing.T) {
 		if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{TxID: c.txid, Status: models.StatusReceived}); err != nil {
 			t.Fatal(err)
 		}
-		if err := s.SetPendingRetryFields(ctx, c.txid, []byte{0xff}, now.Add(c.delay)); err != nil {
+		if err := s.SetPendingRetryFields(ctx, c.txid, []byte{0xff}, now.Add(c.delay), ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1631,7 +1631,7 @@ func TestSetPendingRetryFields_RespectsStatusLattice(t *testing.T) {
 				t.Fatalf("seed %s: %v", prev, err)
 			}
 
-			err := s.SetPendingRetryFields(ctx, txid, []byte{0xaa}, time.Now().Add(-time.Second))
+			err := s.SetPendingRetryFields(ctx, txid, []byte{0xaa}, time.Now().Add(-time.Second), "")
 			if err != nil {
 				t.Fatalf("SetPendingRetryFields: %v", err)
 			}

@@ -39,6 +39,7 @@ const (
 	fRawTx              = "raw_tx"
 	fRetryCount         = "retry_count"
 	fNextRetryAt        = "next_retry_at"
+	fRetryReason        = "retry_reason"
 	fTimestamp          = "timestamp"
 	fCreatedAt          = "created_at"
 	fMerkleRegisteredAt = "merkle_registered_at"
