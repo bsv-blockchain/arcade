@@ -409,6 +409,33 @@ var APIFinalityPrecheckUnavailableTotal = promauto.NewCounter(prometheus.Counter
 	Help: "Finality pre-checks skipped (failed open) because chain state was unavailable.",
 })
 
+// Received-publish recovery. Once POST /tx has durably inserted RECEIVED,
+// a failed synchronous produce is retried inside the api-server instead of
+// waiting for the one-hour stuck-RECEIVED reaper. Labels stay empty: txids
+// and payloads are not metric dimensions.
+var (
+	ReceivedPublishFailuresTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "arcade_received_publish_failures_total",
+		Help: "Durable RECEIVED rows whose initial Kafka produce failed and were queued for internal recovery.",
+	})
+	ReceivedRecoveryAttemptsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "arcade_received_recovery_attempts_total",
+		Help: "Internal republish attempts for durable RECEIVED rows after the initial produce failed.",
+	})
+	ReceivedRecoverySuccessTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "arcade_received_recovery_success_total",
+		Help: "Durable RECEIVED rows whose internal republish was acknowledged by the broker.",
+	})
+	ReceivedRecoveryPendingDepth = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "arcade_received_recovery_pending_depth",
+		Help: "Durable RECEIVED rows waiting for a successful internal republish.",
+	})
+	ReceivedRecoveryExhaustedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "arcade_received_recovery_exhausted_total",
+		Help: "Durable RECEIVED rows whose internal republish budget was spent. The one-hour reaper remains the backstop.",
+	})
+)
+
 // StuckTransientTxs counts transactions sitting in a transient status
 // (RECEIVED, ACCEPTED_BY_NETWORK) for longer than the stale-transient
 // threshold (1h), within the reaper's 24h scan lookback. Unlike

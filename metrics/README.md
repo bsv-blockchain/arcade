@@ -29,6 +29,8 @@ All metric names start with `arcade_` so they live in their own namespace.
 | All datahubs unhealthy | `sum(arcade_teranode_endpoint_healthy{}) == 0` | for 1m |
 | API errors | `rate(arcade_api_request_duration_seconds_count{status_class="5xx"}[5m])` | `> 0` |
 | Kafka publish failures | `rate(arcade_kafka_produce_errors_total[5m])` | `> 0 for 1m` |
+| RECEIVED rows waiting on internal republish | `arcade_received_recovery_pending_depth` | `> 0 for 2m` |
+| RECEIVED republish budget spent | `rate(arcade_received_recovery_exhausted_total[5m])` | `> 0` |
 | DLQ growth | `rate(arcade_kafka_messages_total{op="dlq"}[5m])` | `> 0` |
 | Network retry budget exhausted | `rate(arcade_propagation_requeue_exhausted_total[5m])` | `> 0` |
 | Merkle registration retry budget exhausted | `rate(arcade_propagation_merkle_retry_exhausted_total[5m])` | `> 0` |

@@ -50,10 +50,11 @@ func collectInputTXIDs(tx *sdkTx.Transaction) []string {
 
 // shouldRepublishExisting reports store rows whose POST /tx retry must
 // re-enter Kafka. REJECTED resubmits re-run broadcast (existing contract).
-// RECEIVED resubmits cover the insert-then-Kafka-fail hole: GetOrInsertStatus
-// already wrote RECEIVED, Send failed, the client retries, and the old
-// duplicate branch echoed 202 without publishing — the tx never left arcade
-// until the one-hour RECEIVED reaper. Seen/accepted/mined rows stay echoed.
+// RECEIVED resubmits cover a row that is still unpublished: the client
+// retried, and echoing 202 without a produce would leave the tx stuck.
+// When received-publish recovery already owns that txid, the handler
+// acknowledges instead of producing a second copy. Seen/accepted/mined
+// rows stay echoed.
 func shouldRepublishExisting(status models.Status) bool {
 	return status == models.StatusRejected || status == models.StatusReceived
 }
@@ -926,7 +927,13 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// Dedup CAS via GetOrInsertStatus. Two submitters racing on the
 	// same txid both attempt the insert; the loser sees inserted=false
 	// and returns 202 idempotently without re-publishing.
+	//
+	// persistedReceived is true only when this call left a durable
+	// RECEIVED row (fresh insert, or an existing RECEIVED row). A produce
+	// failure after that is Arcade's to recover: the client gets 202 and
+	// does not have to guess whether the 500 meant "nothing stored".
 	submitResult := "new"
+	persistedReceived := false
 	if s.store != nil {
 		row := &models.TransactionStatus{
 			TxID:      txid,
@@ -945,12 +952,13 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 			// in-flight set catches duplicates that slip past.
 		case !inserted && existing != nil && shouldRepublishExisting(existing.Status):
 			// REJECTED resubmit: re-run broadcast. RECEIVED resubmit: the
-			// first attempt wrote the row then failed to Kafka-publish
-			// (503/500). Fall through so this retry actually queues.
+			// row is still unpublished. Fall through so this retry queues
+			// unless received-publish recovery already owns it.
 			if existing.Status == models.StatusRejected {
 				submitResult = "retry_rejected"
 			} else {
 				submitResult = "retry_received"
+				persistedReceived = true
 			}
 		case !inserted && existing != nil:
 			// Idempotent re-submit: row already exists at a non-REJECTED
@@ -969,6 +977,10 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 				TxStatus: existing.Status,
 			})
 			return
+		default:
+			if inserted {
+				persistedReceived = true
+			}
 		}
 	}
 
@@ -989,18 +1001,30 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		"raw_tx":      rawTx,
 		"input_txids": collectInputTXIDs(parsedTx),
 	}
-	if err := s.producer.Send(c.Request.Context(), kafka.TopicPropagation, txid, msg); err != nil {
-		if errors.Is(err, kafka.ErrBrokerBackpressure) {
-			// Backpressure → shed load to the client. A RECEIVED row may
-			// already exist; shouldRepublishExisting makes the 503 retry
-			// re-publish instead of echoing 202 with no Kafka message.
-			s.logger.Warn("submit rejected: kafka backpressure", logfields.TxID(txid))
-			c.Header("Retry-After", "1")
-			c.JSON(http.StatusServiceUnavailable, gin.H{jsonKeyError: "service overloaded, retry shortly"})
-			return
-		}
-		s.logger.Error("failed to publish transaction", zap.Error(err))
+	// HTTP contract when the row is durable RECEIVED but the synchronous
+	// produce fails:
+	//   - broker backpressure stays 503 + Retry-After (client load-shed;
+	//     shouldRepublishExisting republishes on the retry)
+	//   - any other produce error (connection refused, Sarama circuit
+	//     breaker open, broker down) is accepted with 202 and txStatus
+	//     RECEIVED. Arcade has the row and republishes internally. The
+	//     client does not retry, and does not have to tell "nothing
+	//     persisted" apart from "persisted but unpublished".
+	// A produce failure before a durable RECEIVED row still returns 500.
+	switch s.publishSingleOrRecover(c.Request.Context(), txid, msg, persistedReceived) {
+	case publishBackpressure:
+		c.Header("Retry-After", "1")
+		c.JSON(http.StatusServiceUnavailable, gin.H{jsonKeyError: "service overloaded, retry shortly"})
+		return
+	case publishFailed:
 		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to submit"})
+		return
+	case publishAcceptedForRecovery:
+		c.JSON(http.StatusAccepted, submitResponse{
+			TxID:     txid,
+			Status:   http.StatusAccepted,
+			TxStatus: models.StatusReceived,
+		})
 		return
 	}
 
@@ -1278,6 +1302,8 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				// handleSubmitTransaction. Seen/accepted rows stay duplicates.
 				if existing.Status == models.StatusRejected {
 					retryRejected++
+				} else {
+					p.durableReceived = true
 				}
 				toPublish = append(toPublish, p)
 			case !inserted && existing != nil:
@@ -1291,6 +1317,9 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				}
 				s.recordSubmission(ctx, p.txid, opts)
 			default:
+				if inserted {
+					p.durableReceived = true
+				}
 				newSubmits++
 				toPublish = append(toPublish, p)
 			}
@@ -1329,31 +1358,15 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	// per-partition order still delivers parents before children.
 	if len(toPublish) > 0 {
 		keyByTxid, inputsByTxid := familyKeysBySubmittedTxid(parsed)
-		msgs := propagationMessages(toPublish, keyByTxid, inputsByTxid)
-		if err := s.producer.SendBatch(ctx, kafka.TopicPropagation, msgs); err != nil {
-			if errors.Is(err, kafka.ErrBrokerBackpressure) {
-				s.logger.Warn("batch submit rejected: kafka backpressure", zap.Int("count", len(msgs)))
-				c.Header("Retry-After", "1")
-				c.JSON(http.StatusServiceUnavailable, gin.H{jsonKeyError: "service overloaded, retry shortly"})
-				return
-			}
-			s.logger.Error("failed to publish transaction batch", zap.Error(err))
+		switch s.publishBatchOrRecover(ctx, toPublish, keyByTxid, inputsByTxid) {
+		case publishBackpressure:
+			c.Header("Retry-After", "1")
+			c.JSON(http.StatusServiceUnavailable, gin.H{jsonKeyError: "service overloaded, retry shortly"})
+			return
+		case publishFailed:
 			c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to submit"})
 			return
 		}
-
-		publishedTxIDs := make([]string, len(toPublish))
-		for i, p := range toPublish {
-			publishedTxIDs[i] = p.txid
-		}
-		// Bounded (TxIDBatch: true count + capped list), NOT chunked: this
-		// runs synchronously before the HTTP response and /txs accepts up to
-		// 256 MiB, so unbounded sequential chunk writes would land in the
-		// client's request latency. Full per-txid coverage arrives shortly
-		// after on the async "transactions accepted by network" line; a tx
-		// rejected at intake is covered by the existing REJECTED line.
-		receivedFields := append([]zap.Field{logfields.Status(string(models.StatusReceived))}, logfields.TxIDBatch(publishedTxIDs)...)
-		telemetry.LoggerWith(ctx, s.logger).Info("transactions received", receivedFields...)
 	}
 
 	c.JSON(http.StatusAccepted, gin.H{
