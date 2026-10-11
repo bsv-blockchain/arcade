@@ -24,12 +24,15 @@ import (
 // staleReceivedAge: a row still at RECEIVED older than this never advanced to
 // a network verdict — its broadcast produced no verdict (downstream timeout /
 // 5xx / no per-slot body) and the in-memory requeue was lost (propagation
-// restart, ctx cancellation), or an intake Kafka-publish failure stranded it
-// and the submitter never retried. Rebroadcast to self-heal: the row carries
-// RawTx and is a validated tx (intake validation failures land at REJECTED,
-// never RECEIVED), so we accepted responsibility to propagate it. Long enough
-// that the normal intake→ACCEPTED path (seconds) and the 2s in-memory requeue
-// are never pre-empted by the reaper.
+// restart, ctx cancellation), or the api-server process died before its
+// prompt received-publish recovery finished. Intake Kafka produce failures
+// are retried by that recovery loop (first attempt within 100ms), and a
+// process restart rediscovers RECEIVED rows younger than this threshold
+// from the store. This one-hour threshold is not that path. Rebroadcast to
+// self-heal: the row carries RawTx and is a validated tx (intake validation failures land at
+// REJECTED, never RECEIVED), so we accepted responsibility to propagate it.
+// Long enough that the normal intake→ACCEPTED path (seconds) and the 2s
+// in-memory requeue are never pre-empted by the reaper.
 //
 // staleAcceptedByNetworkAge: a row at ACCEPTED_BY_NETWORK older than this was
 // accepted into a mempool but never advanced to SEEN — the merkle-service

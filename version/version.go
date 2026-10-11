@@ -6,5 +6,6 @@ package version
 //
 //	-ldflags "-X github.com/bsv-blockchain/arcade/version.Version=<git tag>"
 //
-// (see .github/workflows/build.yml and the Makefile docker-build target).
+// The source commit and dirty-tree bit are not duplicated here. They come
+// from Go buildinfo (`vcs.revision`, `vcs.modified`); see Read.
 var Version = "dev"

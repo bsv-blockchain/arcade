@@ -44,6 +44,12 @@ type Datahub struct {
 	// /block/<hash>, so a dedicated arcade datahub sees zero block fetches.
 	blockFetches   atomic.Int64
 	subtreeFetches atomic.Int64
+
+	// HoldTxPosts, when set, runs at the start of POST /tx and POST /txs
+	// before the acknowledgement is written. A test uses it to observe
+	// that Merkle registration already exists while broadcast is still
+	// in flight. Nil keeps the default acknowledge-immediately behavior.
+	HoldTxPosts func()
 }
 
 // DatahubOptions tunes the announce hostname/IP the datahub publishes
@@ -263,6 +269,9 @@ func (d *Datahub) handle(w http.ResponseWriter, r *http.Request) {
 		// marking the txs themselves REJECTED, blocking the
 		// merkle-proof-return-path scenarios. Returning 200 with no
 		// body satisfies arcade's teranode.Client.Submit*.
+		if d.HoldTxPosts != nil {
+			d.HoldTxPosts()
+		}
 		w.WriteHeader(http.StatusOK)
 	default:
 		http.NotFound(w, r)

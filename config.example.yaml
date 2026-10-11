@@ -275,9 +275,12 @@ health:
 #   # docs/production-kafka.md "Widening an existing deployment".
 #   partitions: 1
 #
-#   # Fast-path requeue: a tx with no network verdict is retried in-memory up
-#   # to retry_max_attempts times, retry_backoff_ms apart, before parking at
-#   # PENDING_RETRY. At the defaults that is a ~10s window.
+#   # Fast-path NETWORK requeue: a tx with no network verdict is retried
+#   # in-memory up to retry_max_attempts times, retry_backoff_ms apart,
+#   # before parking at PENDING_RETRY. At the defaults that is a ~10s
+#   # window. Merkle /watch failures do not consume this budget; registration
+#   # must succeed before broadcast, and those retries are a separate domain
+#   # that reuses this same backoff without a second knob.
 #   retry_max_attempts: 5
 #   retry_backoff_ms: 2000
 #

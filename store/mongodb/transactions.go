@@ -350,6 +350,54 @@ func (s *Store) IterateStatusesSince(ctx context.Context, since time.Time, fn fu
 	return cur.Err()
 }
 
+// receivedReplayDoc is the projection IterateRecentReceived decodes.
+type receivedReplayDoc struct {
+	TxID      string    `bson:"_id"`
+	Status    string    `bson:"status"`
+	RawTx     []byte    `bson:"raw_tx,omitempty"`
+	Timestamp time.Time `bson:"timestamp"`
+}
+
+// IterateRecentReceived streams RECEIVED rows at or after since. The
+// {status, timestamp} index is hinted so this does not scan the collection,
+// and the projection omits merkle_path and the other wide fields (issue #276).
+func (s *Store) IterateRecentReceived(ctx context.Context, since time.Time, fn func(*models.TransactionStatus) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	filter := doc(
+		kv(fStatus, string(models.StatusReceived)),
+		kv(fTimestamp, doc(kv(opGte, msCeil(since)))),
+	)
+	proj := doc(kv(fStatus, 1), kv(fRawTx, 1), kv(fTimestamp, 1))
+	cur, err := s.tx.Find(ctx, filter, options.Find().
+		SetHint(idxTxStatusTS).
+		SetProjection(proj).
+		SetBatchSize(s.cursorBatch()))
+	if err != nil {
+		return fmt.Errorf("iterate recent received: %w", err)
+	}
+	defer closeCursor(ctx, cur)
+	for cur.Next(ctx) {
+		var d receivedReplayDoc
+		if err := cur.Decode(&d); err != nil {
+			return fmt.Errorf("iterate recent received: decode: %w", err)
+		}
+		if len(d.RawTx) == 0 {
+			continue
+		}
+		if err := fn(&models.TransactionStatus{
+			TxID:      d.TxID,
+			Status:    models.Status(d.Status),
+			Timestamp: d.Timestamp,
+			RawTx:     d.RawTx,
+		}); err != nil {
+			return err
+		}
+	}
+	return cur.Err()
+}
+
 // trackerRowDoc is the three-field projection IterateTrackerRows decodes.
 type trackerRowDoc struct {
 	TxID        string `bson:"_id"`

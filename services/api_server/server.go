@@ -72,6 +72,15 @@ type Server struct {
 	submissionStop chan struct{}
 	stopOnce       sync.Once
 
+	// received-publish recovery. Lazily started on the first durable
+	// RECEIVED produce failure. Stop cancels it. recoveryTiming is the
+	// production budget unless a test sets it before the first schedule.
+	recoveryMu      sync.Mutex
+	recovery        *receivedRecovery
+	recoveryCancel  context.CancelFunc
+	recoveryStopped bool
+	recoveryTiming  receivedRecoveryTiming
+
 	// tipMu/tipHeight/tipFetchedAt cache the store's active-tip height for
 	// /health (see activeTipHeight): probes arrive every few seconds and
 	// the underlying read is a store scan we don't want to pay per probe.
@@ -200,6 +209,12 @@ func (s *Server) Start(ctx context.Context) error {
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 
+	// The in-memory republish queue does not survive a restart. Start the
+	// RECEIVED scan now so rows persisted before this process began are
+	// republished without waiting for the one-hour reaper, and without
+	// waiting for the next submit.
+	s.ensureReceivedRecovery()
+
 	s.logger.Info("API server listening", zap.String("addr", addr))
 
 	go func() {
@@ -321,6 +336,7 @@ func (s *Server) Stop() error {
 	// channel close happens exactly once.
 	s.stopOnce.Do(func() {
 		close(s.submissionStop)
+		s.stopReceivedRecovery()
 	})
 	if s.server != nil {
 		s.logger.Info("shutting down API server")

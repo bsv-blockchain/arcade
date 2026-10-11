@@ -1,0 +1,114 @@
+# Isolated Merkle Stage-2 qualification stack.
+#
+# Arcade stays one process (--mode all) on one Pebble volume.
+# Merkle Service is a separate container. Kafka is a separate container.
+# Nothing in this file publishes the callback port. Probes join the
+# private network. Do not point this project at production volumes,
+# credentials, DNS, or the production security group.
+
+name: votari-stage2-isolated
+
+networks:
+  stage2:
+    name: votari-stage2-isolated
+
+volumes:
+  stage2-pebble:
+  stage2-kafka:
+  stage2-merkle-pg:
+
+services:
+  votari-stage2-kafka:
+    image: docker.io/redpandadata/redpanda:v26.1.9
+    command:
+      - redpanda
+      - start
+      - --kafka-addr=internal://0.0.0.0:9092
+      - --advertise-kafka-addr=internal://votari-stage2-kafka:9092
+      - --rpc-addr=votari-stage2-kafka:33145
+      - --advertise-rpc-addr=votari-stage2-kafka:33145
+      - --mode=dev-container
+      - --smp=1
+      - --default-log-level=info
+    volumes:
+      - stage2-kafka:/var/lib/redpanda/data
+    networks:
+      - stage2
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  topic-init:
+    image: docker.io/redpandadata/redpanda:v26.1.9
+    entrypoint: ["/bin/bash", "/topic-init.sh"]
+    volumes:
+      - ./topic-init.sh:/topic-init.sh:ro
+    networks:
+      - stage2
+    depends_on:
+      votari-stage2-kafka:
+        condition: service_healthy
+
+  votari-stage2-merkle-postgres:
+    image: docker.io/library/postgres:17-alpine
+    environment:
+      POSTGRES_DB: stage2merkle
+      POSTGRES_USER: stage2
+      POSTGRES_PASSWORD: synthetic-stage2-merkle-db
+    volumes:
+      - stage2-merkle-pg:/var/lib/postgresql/data
+    networks:
+      - stage2
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stage2 -d stage2merkle"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # merkle-service v0.4.5, linux/amd64 manifest digest. This is the
+  # minimum release that emits expectedSubtreeIndices. The tag is not
+  # used as the pin. v0.2.5 did not have that producer contract.
+  # Private-IP callback support stays an explicit env setting; the
+  # image default is still off.
+  votari-stage2-merkle:
+    image: ghcr.io/bsv-blockchain/merkle-service@sha256:8393a456cac5f5bf24537b519d82a4d96fded0b43005fa0412a7545e43ecf168
+    environment:
+      MODE: all-in-one
+      LOG_LEVEL: info
+      STORE_BACKEND: sql
+      STORE_SQL_DRIVER: postgres
+      STORE_SQL_DSN: postgres://stage2:synthetic-stage2-merkle-db@votari-stage2-merkle-postgres:5432/stage2merkle?sslmode=disable
+      KAFKA_BROKERS: votari-stage2-kafka:9092
+      P2P_NETWORK: regtest
+      P2P_DHT_MODE: "off"
+      P2P_ENABLE_NAT: "false"
+      P2P_ENABLE_MDNS: "false"
+      CALLBACK_ALLOW_PRIVATE_IPS: "true"
+      DATAHUB_ALLOW_PRIVATE_IPS: "true"
+      BLOB_STORE_URL: "memory:"
+    networks:
+      - stage2
+    depends_on:
+      votari-stage2-kafka:
+        condition: service_healthy
+      votari-stage2-merkle-postgres:
+        condition: service_healthy
+      topic-init:
+        condition: service_completed_successfully
+
+  votari-arcade:
+    image: ${ARCADE_IMAGE:-arcade:provenance}
+    user: "0:0"
+    command: ["--mode", "all", "--config", "/etc/arcade/config.yaml"]
+    volumes:
+      - ./arcade-config.yaml:/etc/arcade/config.yaml:ro
+      - stage2-pebble:/var/lib/arcade
+    networks:
+      - stage2
+    restart: on-failure
+    depends_on:
+      topic-init:
+        condition: service_completed_successfully

@@ -1,0 +1,60 @@
+# Isolated Stage-2 qualification config.
+#
+# Synthetic fixtures only. These values are not production secrets and must
+# not be copied onto a production host. The two bearers are distinct on
+# purpose: Arcade presents merkle_service.auth_token to Merkle, and Merkle
+# presents callback_token back to Arcade.
+#
+# Callback hostname votari-arcade is the isolated Compose service name on
+# the private network. It is not the public Arcade DNS name.
+
+mode: all
+log_level: info
+# regtest has no built-in bootstrap peers. teratestnet would dial
+# teratestnet.bootstrap.teranode.bsvb.tech from chaintracks.
+network: regtest
+
+callback_token: synthetic-stage2-callback-bearer
+callback_url: http://votari-arcade:8080/api/v1/merkle-service/callback
+
+api:
+  host: 0.0.0.0
+  port: 8080
+
+health:
+  port: 8081
+
+storage_path: /var/lib/arcade
+
+kafka:
+  backend: sarama
+  brokers:
+    - votari-stage2-kafka:9092
+  consumer_group: arcade-stage2-isolated
+
+store:
+  backend: pebble
+  pebble:
+    path: /var/lib/arcade/pebble
+    memtable_size_mb: 16
+    l0_compaction_threshold: 4
+    sync_writes: true
+
+# Operator switch that skips embedded chaintracks. With it off, mode all
+# does not open the public bootstrap path. The lifecycle run points
+# chaintracks at the isolated harness peer instead of using this file.
+chaintracks_server:
+  enabled: false
+
+p2p:
+  datahub_discovery: false
+  dht_mode: off
+  allow_private_urls: false
+  bootstrap_peers: []
+
+merkle_service:
+  url: http://votari-stage2-merkle:8080
+  auth_token: synthetic-stage2-merkle-auth-bearer
+
+telemetry:
+  enabled: false

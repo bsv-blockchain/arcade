@@ -13,6 +13,8 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	sdkhash "github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/bsv-blockchain/teranode/model"
 	teranode "github.com/bsv-blockchain/teranode/services/p2p"
 )
@@ -176,6 +178,42 @@ func SubtreeRoot(txids []chainhash.Hash) chainhash.Hash {
 		level = next
 	}
 	return level[0]
+}
+
+// coinbaseBUMPFromPlaceholderTree encodes the coinbase's left-spine proof.
+// Leaf 0 is the real coinbase txid. Each sibling is taken from the
+// announced tree, whose leaf 0 is still the coinbase placeholder, which
+// is how a single-subtree header root is defined.
+func coinbaseBUMPFromPlaceholderTree(coinbase chainhash.Hash, announced []chainhash.Hash, height uint32) []byte {
+	levels := 0
+	for n := len(announced); n > 1; n = (n + 1) / 2 {
+		levels++
+	}
+	if levels == 0 {
+		levels = 1
+	}
+	path := make([][]*transaction.PathElement, levels)
+	cb := sdkhash.Hash(coinbase)
+	isTx := true
+	path[0] = []*transaction.PathElement{{
+		Offset: 0,
+		Hash:   &cb,
+		Txid:   &isTx,
+	}}
+	level := append([]chainhash.Hash(nil), announced...)
+	for lvl := 0; lvl < levels; lvl++ {
+		if len(level)%2 == 1 {
+			level = append(level, level[len(level)-1])
+		}
+		sib := sdkhash.Hash(level[1])
+		path[lvl] = append(path[lvl], &transaction.PathElement{Offset: 1, Hash: &sib})
+		next := make([]chainhash.Hash, len(level)/2)
+		for i := 0; i < len(level); i += 2 {
+			next[i/2] = sha256d(level[i][:], level[i+1][:])
+		}
+		level = next
+	}
+	return (&transaction.MerklePath{BlockHeight: height, Path: path}).Bytes()
 }
 
 // MerkleRootFromCoinbaseAndSubtree computes the block-header merkle root
@@ -391,9 +429,14 @@ func BuildSyntheticBlock(spec SyntheticBlockSpec) (*SyntheticBlock, error) {
 	// sizeBytes is advisory — nothing in the pipeline validates it, but
 	// zero looks broken in logs; use a plausible per-tx estimate.
 	sizeBytes := uint64(80 + (len(spec.TxIDs)+1)*256)
+	// merkle-service v0.4.5 leaves the coinbase placeholder in the STUMP.
+	// Arcade folds the real coinbase in only when the block carries a
+	// coinbase BUMP, so the synthetic block must include that left-spine
+	// proof or the compound root stays the placeholder tree.
+	coinbaseBUMP := coinbaseBUMPFromPlaceholderTree(cbID, announcedLeaves, spec.Height)
 	blockBin, builtHash, err := BuildBlockBinary(
 		spec.PrevHash, merkleRoot, spec.Height, spec.Timestamp, bits, nonce,
-		[]chainhash.Hash{subtreeHash}, coinbase, nil,
+		[]chainhash.Hash{subtreeHash}, coinbase, coinbaseBUMP,
 		uint64(len(spec.TxIDs)+1), sizeBytes,
 	)
 	if err != nil {

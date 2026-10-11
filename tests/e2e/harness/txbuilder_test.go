@@ -105,6 +105,18 @@ func TestBuildSyntheticBlock_Composition(t *testing.T) {
 	if !folded.IsEqual(&blk.MerkleRoot) {
 		t.Errorf("coinbase fold: got %s want %s", folded, blk.MerkleRoot)
 	}
+	bump := coinbaseBUMPFromPlaceholderTree(blk.CoinbaseID, append([]chainhash.Hash{coinbasePlaceholder}, txids...), blk.Height)
+	mp, err := sdkTx.NewMerklePathFromBinary(bump)
+	if err != nil {
+		t.Fatalf("coinbase BUMP: %v", err)
+	}
+	gotRoot, err := mp.ComputeRoot(nil)
+	if err != nil {
+		t.Fatalf("coinbase BUMP root: %v", err)
+	}
+	if gotRoot.String() != blk.MerkleRoot.String() {
+		t.Errorf("coinbase BUMP root %s != header %s", gotRoot, blk.MerkleRoot)
+	}
 
 	// Header parses back to the block hash and satisfies the regtest
 	// compact target (top byte of display-order hash <= 0x7f).

@@ -171,6 +171,23 @@ jobs:
         with:
           ref: ${{ steps.resolve_sha.outputs.sha }}
 
+      - name: Reject a dirty source tree
+        run: |
+          set -euo pipefail
+          dirty=$(git status --porcelain)
+          if [[ -n "$dirty" ]]; then
+            echo "refusing to publish an image from a dirty tree"
+            printf '%s\n' "$dirty"
+            exit 1
+          fi
+
+      - name: Resolve image provenance metadata
+        id: image_meta
+        run: |
+          set -euo pipefail
+          echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo "source=https://github.com/${GITHUB_REPOSITORY}" >> "$GITHUB_OUTPUT"
+
       # Step 2: install Go and warm the module / build cache for this runner.
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -200,7 +217,20 @@ jobs:
           VERSION: ${{ needs.get_tag.outputs.deployment_tag }}
         run: |
           mkdir -p dist/linux-${{ matrix.arch }}
-          go build -trimpath -ldflags="-s -w -X github.com/bsv-blockchain/arcade/version.Version=${VERSION}" -o dist/linux-${{ matrix.arch }}/arcade ./cmd/arcade
+          go build -trimpath -buildvcs=true -ldflags="-s -w -X github.com/bsv-blockchain/arcade/version.Version=${VERSION}" -o dist/linux-${{ matrix.arch }}/arcade ./cmd/arcade
+
+      - name: Check embedded VCS metadata
+        env:
+          REVISION: ${{ steps.resolve_sha.outputs.sha }}
+        run: |
+          set -euo pipefail
+          info=$(go version -m "dist/linux-${{ matrix.arch }}/arcade")
+          rev=$(printf '%s\n' "$info" | awk -F= '/[[:space:]]vcs\.revision=/{print $2; exit}')
+          mod=$(printf '%s\n' "$info" | awk -F= '/[[:space:]]vcs\.modified=/{print $2; exit}')
+          if [[ "$rev" != "$REVISION" || "$mod" != "false" ]]; then
+            echo "embedded VCS revision=${rev:-<missing>} modified=${mod:-<missing>}, want ${REVISION} modified=false"
+            exit 1
+          fi
 
       # Step 4: Set up Docker Buildx (no QEMU needed — single-platform build on
       # a native runner of that platform).
@@ -226,6 +256,11 @@ jobs:
           file: ./Dockerfile
           platforms: linux/${{ matrix.arch }}
           push: false
+          build-args: |
+            ARCADE_IMAGE_SOURCE=${{ steps.image_meta.outputs.source }}
+            ARCADE_REVISION=${{ steps.resolve_sha.outputs.sha }}
+            ARCADE_CREATED=${{ steps.image_meta.outputs.created }}
+            ARCADE_VERSION=${{ needs.get_tag.outputs.deployment_tag }}
 
       # Step 6b: non-PR build pushes by digest only (no tag). The merge-manifest
       # job stitches per-arch digests into the final multi-arch tag.
@@ -238,6 +273,11 @@ jobs:
           file: ./Dockerfile
           platforms: linux/${{ matrix.arch }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            ARCADE_IMAGE_SOURCE=${{ steps.image_meta.outputs.source }}
+            ARCADE_REVISION=${{ steps.resolve_sha.outputs.sha }}
+            ARCADE_CREATED=${{ steps.image_meta.outputs.created }}
+            ARCADE_VERSION=${{ needs.get_tag.outputs.deployment_tag }}
 
       # Step 7: write the digest to a file named after itself so the merge job
       # can reconstruct the per-arch image references.
@@ -248,6 +288,46 @@ jobs:
         run: |
           mkdir -p "${RUNNER_TEMP}/digests"
           touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
+
+      - name: Write SBOM and release manifest
+        if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          REVISION: ${{ steps.resolve_sha.outputs.sha }}
+          SOURCE: ${{ steps.image_meta.outputs.source }}
+          CREATED: ${{ steps.image_meta.outputs.created }}
+          VERSION: ${{ needs.get_tag.outputs.deployment_tag }}
+        run: |
+          set -euo pipefail
+          syft=$(bash scripts/install-syft.sh)
+          mkdir -p dist/provenance
+          "$syft" "${REGISTRY}/${IMAGE_NAME}@${DIGEST}" -o spdx-json=dist/provenance/sbom.spdx.json
+          python3 - "$REVISION" "$SOURCE" "$VERSION" "$CREATED" "$DIGEST" "$REGISTRY" "$IMAGE_NAME" <<'PY'
+          import json, sys
+          revision, source, version, created, digest, registry, image = sys.argv[1:]
+          doc = {
+              "revision": revision,
+              "source": source,
+              "version": version,
+              "created": created,
+              "image": f"{registry}/{image}@{digest}",
+              "digest": digest,
+              "sbom": "dist/provenance/sbom.spdx.json",
+              "vcsModified": False,
+          }
+          with open("dist/provenance/release-manifest.json", "w", encoding="utf-8") as fh:
+              json.dump(doc, fh, indent=2)
+              fh.write("\n")
+          PY
+
+      - name: Upload provenance artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: provenance-${{ matrix.arch }}
+          path: dist/provenance/*
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Upload digest artifact
         if: github.event_name != 'pull_request'

@@ -248,3 +248,55 @@ broker's default partition count on first publish. If your broker has
 topics will instead surface as produce errors at first traffic. Either way,
 pre-creating every topic in the table above is the only way to be sure
 partition counts match your deployment.
+
+## Intake produce failure after RECEIVED
+
+`POST /tx` (and `POST /txs`) inserts the status row at `RECEIVED` before the
+synchronous produce to `arcade.propagation`. If that produce fails after the
+row is durable:
+
+- **Broker backpressure** (`ErrBrokerBackpressure`) stays **503** with
+  `Retry-After: 1`. The client retries. A `RECEIVED` resubmit republishes.
+  This path is load-shed, not internal recovery.
+- **Any other produce error** (connection refused, Sarama circuit breaker
+  open, broker down) is **202** with `txStatus=RECEIVED` — the same body as
+  a broker ack. Arcade has the row and republishes it internally. The client
+  does not need to retry, and a 500 is no longer the signal for "persisted
+  but unpublished". A produce that fails before any durable `RECEIVED` row
+  still returns **500**.
+
+The republish loop's first attempt is within 100ms, then exponential backoff
+capped at 2s, four produces at a time, for about ten minutes. After that the
+row stays `RECEIVED` for the existing one-hour propagation reaper. That
+reaper is the last-resort fallback for a row that has aged out of the
+prompt path. It is not the primary recovery path for an intake produce
+failure.
+
+The republish queue is in-process. A restart loses it. On startup, and once
+a second after that, the api server scans `RECEIVED` rows younger than one
+hour (`IterateRecentReceived`: status-filtered, `txid` / `raw_tx` /
+`timestamp` only, at most 64 new txids per pass) and enqueues any this
+process does not already own. That scan is independent of the one-hour
+reaper. Rows older than the lookback stay with the reaper.
+
+A produce that the broker accepted, followed by a crash before this process
+could remember the ack, looks the same as a produce that never happened:
+the row is still `RECEIVED`. The scan republishes it. That second publish is
+safe. The propagation dispatcher drops a txid that is still in flight on the
+same partition, and the status lattice rejects a second
+`ACCEPTED_BY_NETWORK` write. Re-submitting bytes the network already accepted
+is idempotent at the peer.
+
+Repeated recovery of the same txid publishes at most one acknowledged
+message from this process. A row that has already left `RECEIVED` is not
+republished. A backpressure shed is not enqueued in the process that
+returned 503; the client retries. If that process restarts first, the scan
+rediscovers the row because the in-memory shed mark is gone.
+
+Metrics (no txid label, no transaction body in the logs):
+
+- `arcade_received_publish_failures_total`
+- `arcade_received_recovery_attempts_total`
+- `arcade_received_recovery_success_total`
+- `arcade_received_recovery_pending_depth`
+- `arcade_received_recovery_exhausted_total`

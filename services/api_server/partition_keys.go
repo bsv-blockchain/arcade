@@ -108,6 +108,10 @@ type parsedItem struct {
 	tx   *sdkTx.Transaction
 	raw  []byte
 	txid string
+	// durableReceived is set when GetOrInsertStatus persisted this tx at
+	// RECEIVED. A later produce failure can be recovered inside the
+	// api-server. Dedup errors and REJECTED resubmits leave it false.
+	durableReceived bool
 }
 
 // familyKeysBySubmittedTxid computes the dependency-family partition key and

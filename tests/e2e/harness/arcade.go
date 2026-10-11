@@ -34,6 +34,7 @@ type ArcadeRuntime struct {
 	wg      sync.WaitGroup
 	cancel  context.CancelFunc
 	cleanup func()
+	svcs    []services.Service
 }
 
 // ArcadeOptions carries the wiring info the harness threads into arcade
@@ -78,6 +79,16 @@ type ArcadeOptions struct {
 	// LibP2PBootstrap (gateway IP / host.docker.internal) is only
 	// dialable from inside containers.
 	LibP2PLoopback string
+
+	// CallbackURL, when set, is the URL arcade registers with Merkle.
+	// The default is this process's own callback route, reachable from
+	// the Merkle container. A qualification test sets this to a host
+	// proxy that records the callback body and then forwards it here.
+	CallbackURL string
+
+	// SyncWrites makes Pebble flush each write. The lifecycle restart
+	// check needs the row on disk before the process is stopped.
+	SyncWrites bool
 }
 
 // StartArcade boots arcade in-process via the same code path the
@@ -112,42 +123,29 @@ func StartArcade(t *testing.T, opts ArcadeOptions) *ArcadeRuntime {
 		HostURL: fmt.Sprintf("http://%s:%d", callbackHost(), port),
 		cancel:  cancel,
 		cleanup: cleanup,
+		svcs:    svcs,
 	}
-
-	for _, svc := range svcs {
-		rt.wg.Add(1)
-		go func(s services.Service) {
-			defer rt.wg.Done()
-			if err := s.Start(ctx); err != nil {
-				logger.Warn("service exited with error", zap.String("service", s.Name()), zap.Error(err))
-			}
-		}(svc)
-	}
+	rt.startServices(ctx)
 
 	t.Cleanup(func() {
-		rt.cancel()
-		// Stop services explicitly so http.Server.Close runs before we
-		// wait — Start blocks on http.ListenAndServe which only returns
-		// after Stop closes the server.
-		for _, svc := range svcs {
-			_ = svc.Stop()
+		rt.stopServices(t)
+		if rt.cleanup != nil {
+			rt.cleanup()
+			rt.cleanup = nil
 		}
-		// Bound the wait — a stuck service would otherwise hang the
-		// test indefinitely.
-		done := make(chan struct{})
-		go func() { rt.wg.Wait(); close(done) }()
-		select {
-		case <-done:
-		case <-time.After(15 * time.Second):
-			t.Logf("arcade services did not stop within 15s")
-		}
-		rt.cleanup()
 	})
 
 	if err := rt.waitReady(15 * time.Second); err != nil {
 		t.Fatalf("arcade not ready: %v", err)
 	}
 	return rt
+}
+
+func callbackURLFor(port int, opts ArcadeOptions) string {
+	if opts.CallbackURL != "" {
+		return opts.CallbackURL
+	}
+	return fmt.Sprintf("http://%s:%d/api/v1/merkle-service/callback", callbackHost(), port)
 }
 
 func buildArcadeConfig(t *testing.T, port int, opts ArcadeOptions) *config.Config {
@@ -158,7 +156,7 @@ func buildArcadeConfig(t *testing.T, port int, opts ArcadeOptions) *config.Confi
 		LogLevel:      "warn",
 		Network:       config.NetworkRegtest,
 		StoragePath:   t.TempDir(),
-		CallbackURL:   fmt.Sprintf("http://%s:%d/api/v1/merkle-service/callback", callbackHost(), port),
+		CallbackURL:   callbackURLFor(port, opts),
 		CallbackToken: opts.CallbackToken,
 		APIServer: config.API{
 			Host: "0.0.0.0",
@@ -181,7 +179,7 @@ func buildArcadeConfig(t *testing.T, port int, opts ArcadeOptions) *config.Confi
 				Path:                  pebbleDir,
 				MemTableSizeMB:        16,
 				L0CompactionThreshold: 4,
-				SyncWrites:            false,
+				SyncWrites:            opts.SyncWrites,
 			},
 		},
 		Health: config.HealthConfig{Port: 0},
@@ -307,6 +305,62 @@ func buildArcadeConfig(t *testing.T, port int, opts ArcadeOptions) *config.Confi
 	return cfg
 }
 
+func (rt *ArcadeRuntime) startServices(ctx context.Context) {
+	for _, svc := range rt.svcs {
+		rt.wg.Add(1)
+		go func(s services.Service) {
+			defer rt.wg.Done()
+			if err := s.Start(ctx); err != nil {
+				rt.Logger.Warn("service exited with error", zap.String("service", s.Name()), zap.Error(err))
+			}
+		}(svc)
+	}
+}
+
+func (rt *ArcadeRuntime) stopServices(t *testing.T) {
+	t.Helper()
+	if rt.cancel != nil {
+		rt.cancel()
+	}
+	for _, svc := range rt.svcs {
+		_ = svc.Stop()
+	}
+	done := make(chan struct{})
+	go func() { rt.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Logf("arcade services did not stop within 15s")
+	}
+}
+
+// Restart stops this process and opens the same Pebble directory again.
+// The listen port and callback URL stay the same, so a Merkle watch
+// registered against this process still delivers to it.
+func (rt *ArcadeRuntime) Restart(t *testing.T) {
+	t.Helper()
+	rt.stopServices(t)
+	if rt.cleanup != nil {
+		rt.cleanup()
+		rt.cleanup = nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	deps, cleanup, err := app.Bootstrap(ctx, rt.Cfg, rt.Logger)
+	if err != nil {
+		cancel()
+		t.Fatalf("restart bootstrap: %v", err)
+	}
+	rt.Deps = deps
+	rt.cancel = cancel
+	rt.cleanup = cleanup
+	rt.svcs = app.BuildServices(deps)
+	rt.wg = sync.WaitGroup{}
+	rt.startServices(ctx)
+	if err := rt.waitReady(15 * time.Second); err != nil {
+		t.Fatalf("restart not ready: %v", err)
+	}
+}
+
 // callbackHost is the hostname the merkle-service container uses to
 // POST callbacks back to the in-process arcade: podman injects (and
 // correctly maps) host.containers.internal; Docker gets
@@ -318,6 +372,10 @@ func callbackHost() string {
 	}
 	return "host.docker.internal"
 }
+
+// CallbackHost is the hostname a container uses to reach a listener on
+// the test process.
+func CallbackHost() string { return callbackHost() }
 
 // waitReady polls /health until arcade's api-server starts answering
 // or the timeout elapses. Mostly cosmetic — the bump-builder and

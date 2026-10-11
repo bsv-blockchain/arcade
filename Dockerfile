@@ -24,6 +24,18 @@ FROM gcr.io/distroless/cc-debian12
 
 ARG TARGETOS
 ARG TARGETARCH
+# Provenance labels. Empty for an ordinary developer image. A
+# provenance-qualified build passes the source URL, the full git commit,
+# the build time, and the version string, then checks that the image
+# labels match the binary's embedded VCS stamp.
+ARG ARCADE_IMAGE_SOURCE=""
+ARG ARCADE_REVISION=""
+ARG ARCADE_CREATED=""
+ARG ARCADE_VERSION=""
+LABEL org.opencontainers.image.source="${ARCADE_IMAGE_SOURCE}" \
+      org.opencontainers.image.revision="${ARCADE_REVISION}" \
+      org.opencontainers.image.created="${ARCADE_CREATED}" \
+      org.opencontainers.image.version="${ARCADE_VERSION}"
 COPY dist/${TARGETOS}-${TARGETARCH}/arcade /usr/local/bin/arcade
 
 ENTRYPOINT ["/usr/local/bin/arcade"]

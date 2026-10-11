@@ -1,0 +1,105 @@
+name: Merkle Stage-2 isolated qualification
+
+# Builds the provenance-qualified Arcade image locally, starts the isolated
+# Stage-2 Compose stack, and probes the private callback. The image is not
+# pushed. No production registry, host, or secret is used.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - rd/arcade-merkle-stage2-isolated
+    paths-ignore:
+      - "docs/**"
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    name: Qualify isolated Stage-2 stack
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Prove the worktree is clean
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse --verify HEAD)
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$sha" == "${{ github.sha }}" ]]
+          dirty=$(git status --porcelain)
+          if [[ -n "$dirty" ]]; then
+            echo "qualification checkout is dirty"
+            printf '%s\n' "$dirty"
+            exit 1
+          fi
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install C/C++ toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential
+
+      - name: Build provenance image locally
+        env:
+          ARCADE_EXPECTED_REVISION: ${{ github.sha }}
+          ARCADE_IMAGE_SOURCE: https://github.com/${{ github.repository }}
+          ARCADE_VERSION: stage2-isolated-qualification
+        run: bash scripts/provenance-build.sh
+
+      - name: Verify image provenance
+        run: |
+          set -euo pipefail
+          bash scripts/verify-image-provenance.sh arcade:provenance | tee dist/provenance/verification.txt
+
+      - name: Start isolated stack
+        run: docker compose -f compose/stage2-isolated/docker-compose.yml up -d
+
+      - name: Probe private callback
+        run: |
+          set -euo pipefail
+          bash scripts/stage2-isolated-probe.sh | tee dist/provenance/stage2-probe.txt
+
+      - name: Collect stack logs
+        if: always()
+        run: docker compose -f compose/stage2-isolated/docker-compose.yml logs --no-color > dist/provenance/stage2-compose.log || true
+
+      - name: Tear down isolated stack
+        if: always()
+        run: docker compose -f compose/stage2-isolated/docker-compose.yml down -v
+
+      - name: Pre-pull pinned Merkle image
+        run: docker pull ghcr.io/bsv-blockchain/merkle-service@sha256:8393a456cac5f5bf24537b519d82a4d96fded0b43005fa0412a7545e43ecf168
+
+      - name: Run isolated lifecycle qualification
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: "true"
+          STAGE2_EVIDENCE: dist/provenance/stage2-lifecycle.json
+        run: |
+          set -euo pipefail
+          go test -tags=e2e -count=1 -timeout=20m -v -run TestStage2_IsolatedLifecycle ./tests/e2e/ | tee dist/provenance/stage2-lifecycle.txt
+
+      - name: Upload qualification artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stage2-isolated-qualification
+          path: |
+            dist/provenance/sbom.spdx.json
+            dist/provenance/release-manifest.json
+            dist/provenance/verification.txt
+            dist/provenance/stage2-probe.txt
+            dist/provenance/stage2-lifecycle.json
+            dist/provenance/stage2-lifecycle.txt
+            dist/provenance/stage2-compose.log
+          if-no-files-found: warn
+          retention-days: 14

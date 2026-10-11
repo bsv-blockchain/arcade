@@ -408,7 +408,7 @@ func statusFromUpdateBins(rec *aero.Record, txid string) *models.TransactionStat
 		st.Timestamp = time.UnixMilli(int64(ms))
 	}
 	if h := getInt(rec, "block_height"); h > 0 {
-		st.BlockHeight = uint64(h)
+		st.BlockHeight = uint64(h) //nolint:gosec // block height fits
 	}
 	return st
 }
@@ -580,6 +580,57 @@ func (s *Store) IterateStatusesSince(ctx context.Context, _ time.Time, fn func(*
 			}
 			txid := getString(rec.Record, "txid")
 			if err := fn(recordToStatus(rec.Record, txid)); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// IterateRecentReceived queries the status index for RECEIVED and streams
+// txid, timestamp, and raw_tx. Other statuses are not visited.
+func (s *Store) IterateRecentReceived(ctx context.Context, since time.Time, fn func(*models.TransactionStatus) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	stmt := aero.NewStatement(s.namespace, setTransactions, "txid", "status", "timestamp", "raw_tx")
+	_ = stmt.SetFilter(aero.NewEqualFilter("status", string(models.StatusReceived)))
+	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
+	if rs != nil {
+		defer func() { _ = rs.Close() }()
+	}
+	if err != nil {
+		return fmt.Errorf("query recent received: %w", err)
+	}
+	sinceMs := since.UnixMilli()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case rec, ok := <-rs.Results():
+			if !ok {
+				return nil
+			}
+			if rec.Err != nil {
+				return rec.Err
+			}
+			if getString(rec.Record, "status") != string(models.StatusReceived) {
+				continue
+			}
+			tsMs := getInt64(rec.Record, "timestamp")
+			if !since.IsZero() && tsMs < sinceMs {
+				continue
+			}
+			raw, _ := rec.Record.Bins["raw_tx"].([]byte)
+			if len(raw) == 0 {
+				continue
+			}
+			txid := getString(rec.Record, "txid")
+			if err := fn(&models.TransactionStatus{
+				TxID:      txid,
+				Status:    models.StatusReceived,
+				Timestamp: time.UnixMilli(tsMs),
+				RawTx:     raw,
+			}); err != nil {
 				return err
 			}
 		}

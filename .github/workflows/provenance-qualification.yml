@@ -1,0 +1,75 @@
+name: Provenance qualification
+
+# Builds a local Linux image from a clean checkout and verifies OCI labels,
+# Go VCS metadata, the SPDX SBOM, and the release manifest. The image is not
+# pushed. A registry manifest digest is not created.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - rd/arcade-provenance-retrofit
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    name: Qualify local provenance image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Prove the worktree is clean
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse --verify HEAD)
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$sha" == "${{ github.sha }}" ]]
+          dirty=$(git status --porcelain)
+          if [[ -n "$dirty" ]]; then
+            echo "qualification checkout is dirty"
+            printf '%s\n' "$dirty"
+            exit 1
+          fi
+          echo "SOURCE_SHA=$sha"
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install C/C++ toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential
+
+      - name: Reject invalid provenance evidence
+        run: bash scripts/provenance-negative.sh
+
+      - name: Build provenance image locally
+        env:
+          ARCADE_EXPECTED_REVISION: ${{ github.sha }}
+          ARCADE_IMAGE_SOURCE: https://github.com/${{ github.repository }}
+          ARCADE_VERSION: provenance-qualification
+        run: bash scripts/provenance-build.sh
+
+      - name: Verify image provenance
+        run: |
+          set -euo pipefail
+          bash scripts/verify-image-provenance.sh arcade:provenance | tee dist/provenance/verification.txt
+
+      - name: Upload qualification artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: provenance-qualification
+          path: |
+            dist/provenance/sbom.spdx.json
+            dist/provenance/release-manifest.json
+            dist/provenance/verification.txt
+          if-no-files-found: error
+          retention-days: 14

@@ -463,6 +463,10 @@ func (m *mockStore) GetSubmissionsByTxID(_ context.Context, txid string) ([]*mod
 	return m.submissionsByTxID[txid], nil
 }
 
+func (m *mockStore) IterateRecentReceived(context.Context, time.Time, func(*models.TransactionStatus) error) error {
+	return nil
+}
+
 func (m *mockStore) IterateStatusesSince(_ context.Context, since time.Time, fn func(*models.TransactionStatus) error) error {
 	m.mu.Lock()
 	rows := append([]*models.TransactionStatus(nil), m.replayRows...)

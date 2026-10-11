@@ -179,6 +179,10 @@ func (s *fakeStore) IterateStatusesSince(context.Context, time.Time, func(*model
 	return nil
 }
 
+func (s *fakeStore) IterateRecentReceived(context.Context, time.Time, func(*models.TransactionStatus) error) error {
+	return nil
+}
+
 func (s *fakeStore) CensusStatusesSince(context.Context, time.Time, time.Time, []models.Status) (map[models.Status]store.StatusCensus, error) {
 	return map[models.Status]store.StatusCensus{}, nil
 }

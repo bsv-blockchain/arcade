@@ -1,4 +1,4 @@
-.PHONY: build test lint docker-up docker-down docker-build run
+.PHONY: build test lint docker-up docker-down docker-build provenance-build provenance-verify provenance-negative run
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -41,6 +41,21 @@ docker-build:
 	mkdir -p dist/linux-$(GOARCH)
 	CGO_ENABLED=1 GOOS=linux GOARCH=$(GOARCH) go build -trimpath -ldflags="-s -w -X github.com/bsv-blockchain/arcade/version.Version=$(VERSION)" -o dist/linux-$(GOARCH)/arcade ./cmd/arcade
 	docker build --platform=linux/$(GOARCH) -t arcade:local .
+
+# Fail-closed release candidate. Requires a clean full commit, a Linux host,
+# Docker, and syft. See docs/container-build-provenance.md. Does not publish.
+provenance-build:
+	bash scripts/provenance-build.sh
+
+# Inspect a locally built provenance image.
+IMAGE ?= arcade:provenance
+provenance-verify:
+	bash scripts/verify-image-provenance.sh "$(IMAGE)"
+
+# Reject a mismatched revision, a non-SHA revision, and a dirty tree.
+# Restores the worktree. Requires a clean checkout.
+provenance-negative:
+	bash scripts/provenance-negative.sh
 
 run:
 	go run ./cmd/arcade
