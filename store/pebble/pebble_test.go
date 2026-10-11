@@ -657,6 +657,43 @@ func TestMarkMerkleRegisteredByTxIDs_RoundTripsThroughIterate(t *testing.T) {
 	}
 }
 
+func TestIterateRecentReceived_FiltersStatusAndAge(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	seeds := []*models.TransactionStatus{
+		{TxID: "recent", Status: models.StatusReceived, Timestamp: now, RawTx: []byte{0x01}},
+		{TxID: "old", Status: models.StatusReceived, Timestamp: now.Add(-2 * time.Hour), RawTx: []byte{0x02}},
+		{TxID: "accepted", Status: models.StatusAcceptedByNetwork, Timestamp: now, RawTx: []byte{0x03}},
+		{TxID: "nobody", Status: models.StatusReceived, Timestamp: now},
+	}
+	for _, row := range seeds {
+		if _, _, err := s.GetOrInsertStatus(ctx, row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var got []string
+	err := s.IterateRecentReceived(ctx, now.Add(-time.Hour), func(st *models.TransactionStatus) error {
+		if st.Status != models.StatusReceived {
+			t.Errorf("status %s emitted", st.Status)
+		}
+		if len(st.RawTx) == 0 {
+			t.Errorf("%s emitted without raw_tx", st.TxID)
+		}
+		if len(st.MerklePath) != 0 {
+			t.Errorf("%s projection included a merkle path", st.TxID)
+		}
+		got = append(got, st.TxID)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "recent" {
+		t.Fatalf("recent received = %v, want [recent]", got)
+	}
+}
+
 func TestSubmissions_InsertAndQueryByTxID(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

@@ -935,6 +935,11 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	submitResult := "new"
 	persistedReceived := false
 	if s.store != nil {
+		// Hold the txid before the row is visible to the restart scan so a
+		// concurrent rediscovery pass cannot publish a second copy of a
+		// request this handler is still producing.
+		s.holdReceivedSubmit(txid)
+		defer s.releaseReceivedSubmit(txid)
 		row := &models.TransactionStatus{
 			TxID:      txid,
 			Status:    models.StatusReceived,
@@ -1281,7 +1286,15 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	newSubmits, retryRejected := 0, 0
 	if s.store != nil {
 		ctx := c.Request.Context()
+		held := make([]string, 0, len(parsed))
+		defer func() {
+			for _, id := range held {
+				s.releaseReceivedSubmit(id)
+			}
+		}()
 		for _, p := range parsed {
+			s.holdReceivedSubmit(p.txid)
+			held = append(held, p.txid)
 			row := &models.TransactionStatus{
 				TxID:      p.txid,
 				Status:    models.StatusReceived,

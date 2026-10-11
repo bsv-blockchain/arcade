@@ -206,6 +206,12 @@ func (s *Server) Start(ctx context.Context) error {
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 
+	// The in-memory republish queue does not survive a restart. Start the
+	// RECEIVED scan now so rows persisted before this process began are
+	// republished without waiting for the one-hour reaper, and without
+	// waiting for the next submit.
+	s.ensureReceivedRecovery()
+
 	s.logger.Info("API server listening", zap.String("addr", addr))
 
 	go func() {

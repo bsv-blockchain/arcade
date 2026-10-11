@@ -47,6 +47,9 @@ func fastRecoveryTiming() receivedRecoveryTiming {
 		tick:         2 * time.Millisecond,
 		stagger:      time.Millisecond,
 		publishedTTL: time.Minute,
+		lookback:     time.Hour,
+		scanEvery:    2 * time.Millisecond,
+		scanBatch:    64,
 	}
 }
 
@@ -111,6 +114,29 @@ func (m *memStatusStore) UpdateStatus(_ context.Context, status *models.Transact
 	}
 	if status.Status != "" {
 		row.Status = status.Status
+	}
+	return nil
+}
+
+func (m *memStatusStore) IterateRecentReceived(_ context.Context, since time.Time, fn func(*models.TransactionStatus) error) error {
+	m.mu.Lock()
+	rows := make([]*models.TransactionStatus, 0, len(m.rows))
+	for _, row := range m.rows {
+		if row.Status != models.StatusReceived || len(row.RawTx) == 0 {
+			continue
+		}
+		if !since.IsZero() && row.Timestamp.Before(since) {
+			continue
+		}
+		cp := *row
+		cp.RawTx = append([]byte(nil), row.RawTx...)
+		rows = append(rows, &cp)
+	}
+	m.mu.Unlock()
+	for _, row := range rows {
+		if err := fn(row); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -734,4 +760,295 @@ func TestReceivedRecovery_LogsOmitRawTransaction(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestReceivedRecovery_RestartRediscoversReceived(t *testing.T) {
+	st := newMemStatusStore()
+	sink := &admitSink{st: st}
+	broker := &scriptedBroker{failErr: connRefusedErr(), onSuccess: sink.admit}
+	srv, router := newRecoveryServer(t, broker, st, fastRecoveryTiming(), zap.NewNop())
+
+	raw := txWithSatoshis(11)
+	txid := txIDOf(t, raw)
+	rec := postRawTx(router, raw)
+	assertAcceptedReceived(t, rec, txid)
+	if !srv.receivedPublishRecoveryOwns(txid) {
+		t.Fatal("recovery ownership was not established before restart")
+	}
+	if broker.successCount() != 0 {
+		t.Fatalf("acked before restart = %d, want 0", broker.successCount())
+	}
+	if st.statusOf(txid) != models.StatusReceived {
+		t.Fatalf("status = %s, want RECEIVED", st.statusOf(txid))
+	}
+
+	// Process death: the queue is gone. No client resubmit.
+	srv.stopReceivedRecovery()
+	broker.setHealthy(true)
+
+	srv2, _ := newRecoveryServer(t, broker, st, fastRecoveryTiming(), zap.NewNop())
+	if srv2.ensureReceivedRecovery() == nil {
+		t.Fatal("restarted server did not start received recovery")
+	}
+	waitFor(t, 2*time.Second, func() bool {
+		return sink.count(txid) == 1 && st.statusOf(txid) == models.StatusAcceptedByNetwork && broker.successCount() == 1
+	})
+	time.Sleep(30 * time.Millisecond)
+	if broker.successCount() != 1 {
+		t.Fatalf("acked produces = %d, want 1", broker.successCount())
+	}
+	if sink.count(txid) != 1 || sink.badCount() != 0 {
+		t.Fatalf("admits=%d bad=%d, want 1 and 0", sink.count(txid), sink.badCount())
+	}
+}
+
+func TestReceivedRecovery_CrashAfterProduce_Idempotent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	dir := t.TempDir()
+	st, err := pebble.New(config.Pebble{
+		Path:                  dir,
+		MemTableSizeMB:        4,
+		L0CompactionThreshold: 2,
+		SyncWrites:            false,
+	})
+	if err != nil {
+		t.Fatalf("pebble: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	inner := kafka.NewMemoryBroker(64)
+	broker := &retainingBroker{inner: inner, retain: true}
+	var broadcasts atomic.Int32
+	teranodeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/txs" || r.URL.Path == "/tx" {
+			broadcasts.Add(1)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(teranodeSrv.Close)
+
+	srv, router := newRecoveryServer(t, broker, st, fastRecoveryTiming(), zap.NewNop())
+	cfg := &config.Config{}
+	cfg.Kafka.ConsumerGroup = "received-recovery-crash"
+	tc := teranode.NewClient([]string{teranodeSrv.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
+	prop := propagation.New(cfg, zap.NewNop(), kafka.NewProducer(inner), nil, st, nil, tc, nil)
+	go func() { _ = prop.Start(ctx) }()
+	t.Cleanup(func() { _ = prop.Stop() })
+	t.Cleanup(cancel)
+
+	checker, ok := inner.(kafka.SubscriberChecker)
+	if !ok {
+		t.Fatal("memory broker must report subscribers")
+	}
+	waitFor(t, 2*time.Second, func() bool {
+		return checker.HasSubscriber(kafka.TopicPropagation)
+	})
+
+	raw := txWithSatoshis(12)
+	txid := txIDOf(t, raw)
+	rec := postRawTx(router, raw)
+	assertAcceptedReceived(t, rec, txid)
+	waitFor(t, time.Second, func() bool { return broker.heldCount() >= 1 })
+	row, err := st.GetStatus(context.Background(), txid)
+	if err != nil || row == nil || row.Status != models.StatusReceived {
+		t.Fatalf("status after acked produce = %+v, %v; want RECEIVED", row, err)
+	}
+
+	// The broker accepted the produce. Drop the process before that ack is
+	// remembered, then let a new process see the still-RECEIVED row.
+	srv.stopReceivedRecovery()
+	srv2, _ := newRecoveryServer(t, broker, st, fastRecoveryTiming(), zap.NewNop())
+	if srv2.ensureReceivedRecovery() == nil {
+		t.Fatal("restarted server did not start received recovery")
+	}
+	waitFor(t, 2*time.Second, func() bool { return broker.heldCount() >= 2 })
+
+	if err := broker.release(); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		got, gerr := st.GetStatus(context.Background(), txid)
+		n := broadcasts.Load()
+		return gerr == nil && got != nil && got.Status == models.StatusAcceptedByNetwork && n >= 1 && n <= 2
+	})
+	time.Sleep(40 * time.Millisecond)
+	if n := broadcasts.Load(); n < 1 || n > 2 {
+		t.Fatalf("broadcasts = %d, want 1 or 2 (second publish is the crash ambiguity)", n)
+	}
+	got, err := st.GetStatus(context.Background(), txid)
+	if err != nil || got == nil || got.Status != models.StatusAcceptedByNetwork {
+		t.Fatalf("final status = %+v, %v; want ACCEPTED_BY_NETWORK", got, err)
+	}
+}
+
+func TestReceivedRecovery_FiftyRowRestart(t *testing.T) {
+	const n = 50
+	const failed = 25
+	st := newMemStatusStore()
+	sink := &admitSink{st: st}
+	broker := &scriptedBroker{onSuccess: sink.admit, healthy: true}
+	srv, router := newRecoveryServer(t, broker, st, fastRecoveryTiming(), zap.NewNop())
+
+	raws := make([][]byte, n)
+	ids := make([]string, n)
+	for i := range failed {
+		raws[i] = txWithSatoshis(uint64(200 + i))
+		ids[i] = txIDOf(t, raws[i])
+	}
+	for i := failed; i < n; i++ {
+		raws[i] = txWithSatoshis(uint64(400 + i))
+		ids[i] = txIDOf(t, raws[i])
+		rec := postRawTx(router, raws[i])
+		assertAcceptedReceived(t, rec, ids[i])
+	}
+	waitFor(t, 2*time.Second, func() bool {
+		if broker.successCount() != failed {
+			return false
+		}
+		for i := failed; i < n; i++ {
+			if sink.count(ids[i]) != 1 || st.statusOf(ids[i]) != models.StatusAcceptedByNetwork {
+				return false
+			}
+		}
+		return true
+	})
+
+	broker.setHealthy(false)
+	broker.failErr = connRefusedErr()
+	for i := range failed {
+		rec := postRawTx(router, raws[i])
+		assertAcceptedReceived(t, rec, ids[i])
+		if st.statusOf(ids[i]) != models.StatusReceived {
+			t.Fatalf("failed row %s status = %s", ids[i], st.statusOf(ids[i]))
+		}
+	}
+	if broker.successCount() != failed {
+		t.Fatalf("acks before restart = %d, want %d", broker.successCount(), failed)
+	}
+	srv.stopReceivedRecovery()
+
+	broker.mu.Lock()
+	broker.hold = 8 * time.Millisecond
+	broker.mu.Unlock()
+	broker.setHealthy(true)
+
+	srv2, _ := newRecoveryServer(t, broker, st, fastRecoveryTiming(), zap.NewNop())
+	if srv2.ensureReceivedRecovery() == nil {
+		t.Fatal("restarted server did not start received recovery")
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		if broker.successCount() != n || sink.badCount() != 0 {
+			return false
+		}
+		for _, id := range ids {
+			if sink.count(id) != 1 || st.statusOf(id) != models.StatusAcceptedByNetwork {
+				return false
+			}
+		}
+		return true
+	})
+	broker.mu.Lock()
+	maxInFlight := broker.maxInFlight
+	seen := map[string]int{}
+	for _, send := range broker.successes {
+		var env struct {
+			TxID string `json:"txid"`
+		}
+		if err := json.Unmarshal(send.value, &env); err != nil {
+			broker.mu.Unlock()
+			t.Fatalf("envelope: %v", err)
+		}
+		seen[env.TxID]++
+	}
+	broker.mu.Unlock()
+	if maxInFlight > 4 {
+		t.Fatalf("max in-flight produces = %d, want <= 4", maxInFlight)
+	}
+	if maxInFlight < 2 {
+		t.Fatalf("max in-flight produces = %d, want >= 2", maxInFlight)
+	}
+	if len(seen) != n {
+		t.Fatalf("distinct txids = %d, want %d", len(seen), n)
+	}
+	for id, count := range seen {
+		if count != 1 {
+			t.Fatalf("txid %s published %d times, want 1", id, count)
+		}
+	}
+}
+
+type heldProduce struct {
+	topic string
+	key   string
+	value []byte
+}
+
+// retainingBroker acknowledges produces without delivering them, so a test
+// can drop the api process and then hand both the original ack and the
+// post-restart republish to the consumer together.
+type retainingBroker struct {
+	inner  kafka.Broker
+	mu     sync.Mutex
+	retain bool
+	held   []heldProduce
+}
+
+func (b *retainingBroker) heldCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.held)
+}
+
+func (b *retainingBroker) release() error {
+	b.mu.Lock()
+	held := b.held
+	b.held = nil
+	b.retain = false
+	b.mu.Unlock()
+	for _, msg := range held {
+		if err := b.inner.Send(context.Background(), msg.topic, msg.key, msg.value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *retainingBroker) Send(ctx context.Context, topic, key string, value []byte) error {
+	b.mu.Lock()
+	if b.retain {
+		b.held = append(b.held, heldProduce{topic: topic, key: key, value: append([]byte(nil), value...)})
+		b.mu.Unlock()
+		return nil
+	}
+	b.mu.Unlock()
+	return b.inner.Send(ctx, topic, key, value)
+}
+
+func (b *retainingBroker) SendAsync(ctx context.Context, topic, key string, value []byte) error {
+	return b.Send(ctx, topic, key, value)
+}
+
+func (b *retainingBroker) SendBatch(ctx context.Context, topic string, msgs []kafka.KeyValue) error {
+	for _, msg := range msgs {
+		raw, err := json.Marshal(msg.Value)
+		if err != nil {
+			return err
+		}
+		if err := b.Send(ctx, topic, msg.Key, raw); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *retainingBroker) Subscribe(groupID string, topics []string, start kafka.StartOffset) (kafka.Subscription, error) {
+	return b.inner.Subscribe(groupID, topics, start)
+}
+
+func (b *retainingBroker) PartitionCount(topic string) (int, error) {
+	return b.inner.PartitionCount(topic)
+}
+
+func (b *retainingBroker) Close() error {
+	return b.inner.Close()
 }

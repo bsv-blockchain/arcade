@@ -741,6 +741,42 @@ ORDER BY timestamp_at DESC`
 	return rows.Err()
 }
 
+// IterateRecentReceived streams RECEIVED rows at or after since, projecting
+// txid, raw_tx, and timestamp only. The status index keeps this off the
+// full-table timestamp walk (issue #276).
+func (s *Store) IterateRecentReceived(ctx context.Context, since time.Time, fn func(*models.TransactionStatus) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	const q = `
+SELECT txid, raw_tx, timestamp_at
+FROM transactions
+WHERE status = $1 AND timestamp_at >= $2 AND raw_tx IS NOT NULL`
+	rows, err := s.pool.Query(ctx, q, models.StatusReceived, since)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		st := &models.TransactionStatus{Status: models.StatusReceived}
+		var raw []byte
+		if err := rows.Scan(&st.TxID, &raw, &st.Timestamp); err != nil {
+			return err
+		}
+		if len(raw) == 0 {
+			continue
+		}
+		st.RawTx = raw
+		if err := fn(st); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
 // IterateTrackerRows streams the three columns hydration needs, filtered
 // server-side. Contrast with IterateStatusesSince above, which this replaced
 // for hydration: that query selects 14 columns including raw_tx / merkle_path

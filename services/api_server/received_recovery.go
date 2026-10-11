@@ -11,6 +11,8 @@ import (
 
 	"go.uber.org/zap"
 
+	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
+
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/logfields"
 	"github.com/bsv-blockchain/arcade/metrics"
@@ -47,8 +49,14 @@ const (
 // from initial up to maxDelay. workers caps how many produces run at once
 // so a broker coming back does not get a thundering herd. maxAttempts at
 // a 2s cap is about ten minutes; after that the row stays RECEIVED for the
-// existing one-hour propagation reaper. That reaper is the crash backstop,
-// not the primary produce-failure path.
+// existing one-hour propagation reaper. That reaper is the last-resort
+// backstop, not the primary produce-failure path.
+//
+// lookback, scanEvery, and scanBatch bound the restart scan. The in-memory
+// queue dies with the process, so each start walks RECEIVED rows younger
+// than lookback (the one-hour reaper threshold) and enqueues at most
+// scanBatch new txids per pass. A row this process already published,
+// shed for backpressure, or exhausted is not rediscovered until restart.
 type receivedRecoveryTiming struct {
 	workers      int
 	maxAttempts  int
@@ -57,6 +65,9 @@ type receivedRecoveryTiming struct {
 	tick         time.Duration
 	stagger      time.Duration
 	publishedTTL time.Duration
+	lookback     time.Duration
+	scanEvery    time.Duration
+	scanBatch    int
 }
 
 func defaultReceivedRecoveryTiming() receivedRecoveryTiming {
@@ -68,6 +79,9 @@ func defaultReceivedRecoveryTiming() receivedRecoveryTiming {
 		tick:         50 * time.Millisecond,
 		stagger:      25 * time.Millisecond,
 		publishedTTL: 2 * time.Minute,
+		lookback:     time.Hour,
+		scanEvery:    time.Second,
+		scanBatch:    64,
 	}
 }
 
@@ -101,6 +115,18 @@ type receivedRecovery struct {
 	mu        sync.Mutex
 	items     map[string]*recoveryItem
 	published map[string]time.Time
+	// submitting is the txid set whose POST is between the durable insert
+	// and the produce result. The restart scan skips these so it does not
+	// publish a second copy of a request this process is still sending.
+	submitting map[string]struct{}
+	// shed is a backpressure txid. The client owns the retry; the scan
+	// must not also enqueue it. Cleared on restart with the rest of this
+	// map, so a 503 whose client never came back is still rediscovered.
+	shed map[string]struct{}
+	// exhausted is a txid that spent maxAttempts in this process. The
+	// one-hour reaper is the backstop until restart, which starts a fresh
+	// budget by virtue of this map being empty.
+	exhausted map[string]struct{}
 
 	wg sync.WaitGroup
 }
@@ -112,21 +138,37 @@ func newReceivedRecovery(producer *kafka.Producer, st store.Store, logger *zap.L
 	if timing.workers <= 0 {
 		timing = defaultReceivedRecoveryTiming()
 	}
+	if timing.lookback <= 0 {
+		timing.lookback = time.Hour
+	}
+	if timing.scanEvery <= 0 {
+		timing.scanEvery = time.Second
+	}
+	if timing.scanBatch <= 0 {
+		timing.scanBatch = 64
+	}
 	return &receivedRecovery{
-		producer:  producer,
-		store:     st,
-		logger:    logger,
-		timing:    timing,
-		wake:      make(chan struct{}, 1),
-		items:     make(map[string]*recoveryItem),
-		published: make(map[string]time.Time),
+		producer:   producer,
+		store:      st,
+		logger:     logger,
+		timing:     timing,
+		wake:       make(chan struct{}, 1),
+		items:      make(map[string]*recoveryItem),
+		published:  make(map[string]time.Time),
+		submitting: make(map[string]struct{}),
+		shed:       make(map[string]struct{}),
+		exhausted:  make(map[string]struct{}),
 	}
 }
 
 func (r *receivedRecovery) run(ctx context.Context) {
 	defer r.wg.Done()
+	// First pass is immediate so a restart does not wait for scanEvery.
+	r.rediscover(ctx)
 	ticker := time.NewTicker(r.timing.tick)
 	defer ticker.Stop()
+	scan := time.NewTicker(r.timing.scanEvery)
+	defer scan.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -135,6 +177,8 @@ func (r *receivedRecovery) run(ctx context.Context) {
 			r.pump(ctx)
 		case <-ticker.C:
 			r.pump(ctx)
+		case <-scan.C:
+			r.rediscover(ctx)
 		}
 	}
 }
@@ -269,6 +313,7 @@ func (r *receivedRecovery) failAttempt(item *recoveryItem, cause error) {
 	current.attempts++
 	if current.attempts >= r.timing.maxAttempts {
 		delete(r.items, item.txid)
+		r.exhausted[item.txid] = struct{}{}
 		metrics.ReceivedRecoveryExhaustedTotal.Inc()
 		metrics.ReceivedRecoveryPendingDepth.Set(float64(len(r.items)))
 		r.mu.Unlock()
@@ -326,6 +371,8 @@ func (r *receivedRecovery) schedule(txid, topic, key string, value any) bool {
 	now := time.Now()
 	r.mu.Lock()
 	r.prunePublishedLocked(now)
+	delete(r.shed, txid)
+	delete(r.exhausted, txid)
 	if _, ok := r.published[txid]; ok {
 		r.mu.Unlock()
 		return true
@@ -373,7 +420,157 @@ func (r *receivedRecovery) prunePublishedLocked(now time.Time) {
 	}
 }
 
+// errStopReceivedScan stops IterateRecentReceived once this pass has
+// enqueued scanBatch new txids. The next pass continues with the rows
+// this process does not already own.
+var errStopReceivedScan = errors.New("received rediscovery batch full")
+
+func (r *receivedRecovery) rediscover(ctx context.Context) {
+	if r.store == nil || ctx.Err() != nil {
+		return
+	}
+	since := time.Now().Add(-r.timing.lookback)
+	added := 0
+	err := r.store.IterateRecentReceived(ctx, since, func(st *models.TransactionStatus) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if st == nil || st.Status != models.StatusReceived || st.TxID == "" || len(st.RawTx) == 0 {
+			return nil
+		}
+		if r.skipRediscover(st.TxID) {
+			return nil
+		}
+		env, envErr := receivedPublishEnvelope(st.TxID, st.RawTx)
+		if envErr != nil {
+			r.logger.Warn(
+				"received publish rediscovery skipped undecodable row",
+				logfields.TxID(st.TxID),
+				zap.Error(envErr),
+			)
+			return nil
+		}
+		if !r.enqueueRediscovered(st.TxID, kafka.TopicPropagation, st.TxID, env) {
+			return nil
+		}
+		added++
+		if added >= r.timing.scanBatch {
+			return errStopReceivedScan
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errStopReceivedScan) && !errors.Is(err, context.Canceled) {
+		r.logger.Warn("received publish rediscovery scan failed", zap.Error(err))
+	}
+}
+
+func receivedPublishEnvelope(txid string, raw []byte) (map[string]interface{}, error) {
+	tx, _, err := sdkTx.NewTransactionFromStream(raw)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{
+		"txid":        txid,
+		"raw_tx":      raw,
+		"input_txids": collectInputTXIDs(tx),
+	}, nil
+}
+
+func (r *receivedRecovery) skipRediscover(txid string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.submitting[txid]; ok {
+		return true
+	}
+	if _, ok := r.shed[txid]; ok {
+		return true
+	}
+	if _, ok := r.exhausted[txid]; ok {
+		return true
+	}
+	if _, ok := r.items[txid]; ok {
+		return true
+	}
+	at, ok := r.published[txid]
+	return ok && time.Since(at) < r.timing.publishedTTL
+}
+
+// enqueueRediscovered queues a store row. Unlike schedule, it does not
+// count a publish failure: the row was found after a restart, not after
+// a produce error in this process. False means the txid was not added.
+func (r *receivedRecovery) enqueueRediscovered(txid, topic, key string, value any) bool {
+	now := time.Now()
+	r.mu.Lock()
+	r.prunePublishedLocked(now)
+	if _, ok := r.submitting[txid]; ok {
+		r.mu.Unlock()
+		return false
+	}
+	if _, ok := r.shed[txid]; ok {
+		r.mu.Unlock()
+		return false
+	}
+	if _, ok := r.exhausted[txid]; ok {
+		r.mu.Unlock()
+		return false
+	}
+	if _, ok := r.published[txid]; ok {
+		r.mu.Unlock()
+		return false
+	}
+	if _, ok := r.items[txid]; ok {
+		r.mu.Unlock()
+		return false
+	}
+	stagger := r.timing.stagger
+	var wait time.Duration
+	if stagger > 0 {
+		wait = time.Duration(rand.Int64N(int64(stagger) + 1))
+	}
+	r.items[txid] = &recoveryItem{
+		txid:  txid,
+		topic: topic,
+		key:   key,
+		value: value,
+		next:  now.Add(wait),
+	}
+	metrics.ReceivedRecoveryPendingDepth.Set(float64(len(r.items)))
+	r.mu.Unlock()
+	r.logger.Info("rediscovered received row for publish", logfields.TxID(txid))
+	r.wakeSoon()
+	return true
+}
+
+func (r *receivedRecovery) hold(txid string) {
+	r.mu.Lock()
+	r.submitting[txid] = struct{}{}
+	r.mu.Unlock()
+}
+
+func (r *receivedRecovery) release(txid string) {
+	r.mu.Lock()
+	delete(r.submitting, txid)
+	r.mu.Unlock()
+}
+
+func (r *receivedRecovery) notePublished(txid string) {
+	r.mu.Lock()
+	r.published[txid] = time.Now()
+	delete(r.submitting, txid)
+	delete(r.shed, txid)
+	r.mu.Unlock()
+}
+
+func (r *receivedRecovery) markShed(txid string) {
+	r.mu.Lock()
+	r.shed[txid] = struct{}{}
+	r.mu.Unlock()
+}
+
 func (s *Server) ensureReceivedRecovery() *receivedRecovery {
+	if s.producer == nil || s.store == nil {
+		return nil
+	}
 	s.recoveryMu.Lock()
 	defer s.recoveryMu.Unlock()
 	if s.recoveryStopped {
@@ -419,6 +616,44 @@ func (s *Server) receivedPublishRecoveryOwns(txid string) bool {
 	return r.owns(txid)
 }
 
+func (s *Server) holdReceivedSubmit(txid string) {
+	r := s.ensureReceivedRecovery()
+	if r == nil || txid == "" {
+		return
+	}
+	r.hold(txid)
+}
+
+func (s *Server) releaseReceivedSubmit(txid string) {
+	s.recoveryMu.Lock()
+	r := s.recovery
+	s.recoveryMu.Unlock()
+	if r == nil || txid == "" {
+		return
+	}
+	r.release(txid)
+}
+
+func (s *Server) noteReceivedPublished(txid string) {
+	s.recoveryMu.Lock()
+	r := s.recovery
+	s.recoveryMu.Unlock()
+	if r == nil || txid == "" {
+		return
+	}
+	r.notePublished(txid)
+}
+
+func (s *Server) shedReceivedSubmit(txid string) {
+	s.recoveryMu.Lock()
+	r := s.recovery
+	s.recoveryMu.Unlock()
+	if r == nil || txid == "" {
+		return
+	}
+	r.markShed(txid)
+}
+
 func (s *Server) scheduleReceivedRecovery(txid, topic, key string, value any) bool {
 	if txid == "" || value == nil || s.producer == nil || s.store == nil {
 		return false
@@ -438,9 +673,11 @@ func (s *Server) publishSingleOrRecover(ctx context.Context, txid string, msg ma
 	}
 	err := s.producer.Send(ctx, kafka.TopicPropagation, txid, msg)
 	if err == nil {
+		s.noteReceivedPublished(txid)
 		return publishAcked
 	}
 	if errors.Is(err, kafka.ErrBrokerBackpressure) {
+		s.shedReceivedSubmit(txid)
 		s.logger.Warn("submit rejected: kafka backpressure", logfields.TxID(txid))
 		return publishBackpressure
 	}
@@ -487,9 +724,17 @@ func (s *Server) publishBatchOrRecover(ctx context.Context, toPublish []parsedIt
 		// TxIDBatch is capped; raw transaction bytes are not logged.
 		fields := append([]zap.Field{logfields.Status(string(models.StatusReceived))}, logfields.TxIDBatch(ids)...)
 		telemetry.LoggerWith(ctx, s.logger).Info("transactions received", fields...)
+		for _, id := range ids {
+			s.noteReceivedPublished(id)
+		}
 		return publishAcked
 	}
 	if errors.Is(err, kafka.ErrBrokerBackpressure) {
+		for _, p := range need {
+			if p.durableReceived {
+				s.shedReceivedSubmit(p.txid)
+			}
+		}
 		s.logger.Warn("batch submit rejected: kafka backpressure", zap.Int("count", len(msgs)))
 		return publishBackpressure
 	}

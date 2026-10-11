@@ -693,6 +693,52 @@ func (s *Store) IterateStatusesSince(ctx context.Context, since time.Time, fn fu
 	return nil
 }
 
+// IterateRecentReceived walks the RECEIVED status index and emits rows whose
+// timestamp is at or after since. Other statuses are not visited. The
+// callback receives txid, status, timestamp, and raw_tx; merkle paths are
+// not enriched.
+func (s *Store) IterateRecentReceived(ctx context.Context, since time.Time, fn func(*models.TransactionStatus) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	prefix := idxTxStatusPrefix(string(models.StatusReceived))
+	iter, err := s.db.NewIter(&pebbledb.IterOptions{
+		LowerBound: prefix,
+		UpperBound: endOfPrefix(prefix),
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = iter.Close() }()
+
+	sinceNs := since.UnixNano()
+	for iter.First(); iter.Valid(); iter.Next() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		st, err := s.readStatus(lastSegment(iter.Key()))
+		if err != nil || st == nil {
+			continue
+		}
+		if st.Status != models.StatusReceived || len(st.RawTx) == 0 {
+			continue
+		}
+		if !since.IsZero() && st.Timestamp.UnixNano() < sinceNs {
+			continue
+		}
+		projected := &models.TransactionStatus{
+			TxID:      st.TxID,
+			Status:    st.Status,
+			Timestamp: st.Timestamp,
+			RawTx:     st.RawTx,
+		}
+		if err := fn(projected); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // IterateTrackerRows walks the per-status index (idx:tx:status:<status>:*) for
 // each tracked status, so rows in untracked statuses — REJECTED and IMMUTABLE,
 // the overwhelming majority of a mature store — are never visited at all.

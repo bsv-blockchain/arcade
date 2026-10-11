@@ -339,6 +339,15 @@ type Store interface {
 	// IterateStatusesByToken and CensusStatusesSince.
 	IterateStatusesSince(ctx context.Context, since time.Time, fn func(*models.TransactionStatus) error) error
 
+	// IterateRecentReceived streams RECEIVED rows whose timestamp is at or
+	// after since, projecting txid, status, timestamp, and raw_tx only.
+	// Intake uses it to republish a durable row after the api process
+	// restarts, without the full-table walk IterateStatusesSince is
+	// documented not to serve (issue #276). Rows in any other status are
+	// not visited. fn returning a non-nil error stops iteration. Order is
+	// unspecified. An empty RawTx may be omitted.
+	IterateRecentReceived(ctx context.Context, since time.Time, fn func(*models.TransactionStatus) error) error
+
 	// IterateTrackerRows streams the minimal (txid, status, block_height)
 	// projection TxTracker.LoadFromStore needs, filtering server-side so a
 	// multi-million-row history is never shipped to the client (issue #276).
