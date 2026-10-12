@@ -180,11 +180,13 @@ type Kafka struct {
 	ConsumerGroup string   `mapstructure:"consumer_group"`
 	MaxRetries    int      `mapstructure:"max_retries"`
 	BufferSize    int      `mapstructure:"buffer_size"`
-	// MinPartitions is a soft minimum-partition hint for horizontally-scaled
-	// topics; arcade fails fast at startup when an existing topic has fewer.
+	// MinPartitions is the partition floor CheckPartitions applies when it
+	// is greater than 1. A topic that is missing or narrower than this
+	// floor fails the check: auto-creation would adopt the broker default,
+	// which can be lower than the pod count. Values of 0 or 1 skip the
+	// check (standalone / single replica, including the in-memory broker).
 	// TopicPropagation has its own dedicated knob (propagation.partitions)
 	// with a fail-closed startup check — see PropagationConfig.Partitions.
-	// Leave at 0 or 1 in standalone/single-replica deployments.
 	MinPartitions int `mapstructure:"min_partitions"`
 	// SendTimeoutMs bounds how long the in-process memory broker waits for a
 	// slot in a full mailbox before returning ErrBrokerBackpressure to the
