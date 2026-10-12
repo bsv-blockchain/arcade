@@ -30,6 +30,10 @@ All metric names start with `arcade_` so they live in their own namespace.
 | API errors | `rate(arcade_api_request_duration_seconds_count{status_class="5xx"}[5m])` | `> 0` |
 | Kafka publish failures | `rate(arcade_kafka_produce_errors_total[5m])` | `> 0 for 1m` |
 | DLQ growth | `rate(arcade_kafka_messages_total{op="dlq"}[5m])` | `> 0` |
+| Network retry budget exhausted | `rate(arcade_propagation_requeue_exhausted_total[5m])` | `> 0` |
+| Merkle registration retry budget exhausted | `rate(arcade_propagation_merkle_retry_exhausted_total[5m])` | `> 0` |
+
+Merkle `/watch` failures increment `arcade_propagation_retry_total{stage="merkle"}` and `arcade_propagation_merkle_register_failures_total`. They do not increment `arcade_propagation_retry_total{stage="network"}` or `arcade_propagation_requeue_exhausted_total`. See [propagation retry domains](../docs/propagation-retry-domains.md).
 
 ### Note on `arcade_bump_builder_build_duration_seconds_count{outcome=…}`
 

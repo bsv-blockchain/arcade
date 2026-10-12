@@ -113,4 +113,10 @@ func PreRegisterPropagationRetryOutcomes() {
 	for _, outcome := range []string{"scheduled", "exhausted"} {
 		PropagationPendingRetryTotal.WithLabelValues(outcome)
 	}
+	for _, stage := range []string{"merkle", "network"} {
+		PropagationRetryTotal.WithLabelValues(stage)
+	}
+	for _, reason := range []string{"claim_revoked", "auth_error", "http_5xx", "timeout", "transport", "register_error"} {
+		PropagationMerkleRegisterFailures.WithLabelValues(reason)
+	}
 }
