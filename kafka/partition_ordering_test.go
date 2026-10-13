@@ -128,7 +128,7 @@ func TestMemoryBrokerPartitions_PreservesPerPartitionValueOrder(t *testing.T) {
 func TestNewSyncProducerConfig_RoutesByKeyHash(t *testing.T) {
 	const topic = "arcade.propagation"
 
-	cfg := newSyncProducerConfig()
+	cfg := newSyncProducerConfig(0)
 	if cfg.Producer.Partitioner == nil {
 		t.Fatal("Producer.Partitioner is nil")
 	}
