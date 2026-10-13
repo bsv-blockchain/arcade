@@ -421,3 +421,113 @@ func TestReapOnce_AdoptsLegacyParkedRows(t *testing.T) {
 		t.Errorf("adopted legacy row was not retried to ACCEPTED_BY_NETWORK")
 	}
 }
+
+// TestSchedulePendingRetry_TerminalRowIsNeverBumped pins the give-up as
+// TERMINAL in the scheduler, not only in the status lattice.
+//
+// Production shape (bsv-blockchain/arcade#335): a client re-POSTed a
+// REJECTED txid (handleSubmitTransaction republishes REJECTED rows), the
+// fast-path budget exhausted again, the PENDING_RETRY write was refused by
+// the lattice — and schedulePendingRetry still ran: BumpRetryCount had no
+// status predicate, so retry_count climbed to 1,483 on a row whose
+// extra_info already read "giving up", ClearRetryState re-wrote the same
+// verdict, and a fresh REJECTED event fanned out to every registration on
+// every POST. A terminal row must leave the scheduler untouched.
+func TestSchedulePendingRetry_TerminalRowIsNeverBumped(t *testing.T) {
+	root := strings.Repeat("98", 32)
+	orphan := buildChain(t, root, 1)[0]
+
+	for _, terminal := range []models.Status{
+		models.StatusRejected, models.StatusDoubleSpendAttempted,
+		models.StatusMined, models.StatusImmutable,
+	} {
+		t.Run(string(terminal), func(t *testing.T) {
+			ms := newMockStore()
+			ms.setStatus(orphan.txid, terminal)
+			pub := &recordingPublisher{}
+			p := rejectionPropagator("http://127.0.0.1:0", ms, pub)
+			p.pendingRetryMaxAttempts = 1
+
+			exhaustedBefore := testutil.ToFloat64(metrics.PropagationPendingRetryTotal.WithLabelValues("exhausted"))
+			skippedBefore := testutil.ToFloat64(metrics.PropagationPendingRetryTotal.WithLabelValues("skipped_terminal"))
+
+			for i := 0; i < 3; i++ {
+				p.schedulePendingRetry(context.Background(), orphan.txid, orphan.raw, orphanRetryReason)
+			}
+
+			ms.mu.Lock()
+			bumps := ms.retryCounts[orphan.txid]
+			cleared := len(ms.cleared)
+			_, queued := ms.pendingRetries[orphan.txid]
+			ms.mu.Unlock()
+			if bumps != 0 {
+				t.Errorf("retry_count was bumped %d time(s) on a %s row; the budget of a terminal tx is not spendable", bumps, terminal)
+			}
+			if cleared != 0 {
+				t.Errorf("ClearRetryState ran %d time(s) on a %s row; a terminal verdict must not be re-written", cleared, terminal)
+			}
+			if queued {
+				t.Errorf("a %s row entered the durable retry queue", terminal)
+			}
+			if got := len(pub.bulkSnapshot()); got != 0 {
+				t.Errorf("published %d event(s) for a %s row; a resubmit of a terminal tx must be silent", got, terminal)
+			}
+			if got := testutil.ToFloat64(metrics.PropagationPendingRetryTotal.WithLabelValues("exhausted")); got != exhaustedBefore {
+				t.Errorf("exhausted counter moved on a terminal row: %v -> %v", exhaustedBefore, got)
+			}
+			if got := testutil.ToFloat64(metrics.PropagationPendingRetryTotal.WithLabelValues("skipped_terminal")); got != skippedBefore+3 {
+				t.Errorf("skipped_terminal counter = %v, want %v", got, skippedBefore+3)
+			}
+		})
+	}
+}
+
+// TestApplyTerminalStatuses_LatticeRefusedRowIsNotPublished pins the other
+// half of the same flood: the store hands back the row it DECLINED to move
+// (prev.Status = REJECTED for a PENDING_RETRY input), and the publish pass
+// must treat that exactly like a lattice no-op — no phantom PENDING_RETRY
+// event. The dispatcher notification is unconditional and untouched.
+func TestApplyTerminalStatuses_LatticeRefusedRowIsNotPublished(t *testing.T) {
+	ms := newMockStore()
+	ms.returningPrev = func(s *models.TransactionStatus) *models.TransactionStatus {
+		return &models.TransactionStatus{
+			TxID:      s.TxID,
+			Status:    models.StatusRejected, // the row is terminal; PENDING_RETRY is forbidden over it
+			Timestamp: time.Now().Add(-time.Hour),
+		}
+	}
+	pub := &recordingPublisher{}
+	p := rejectionPropagator("http://127.0.0.1:0", ms, pub)
+
+	txid := strings.Repeat("97", 32)
+	p.applyTerminalStatuses(context.Background(), []*models.TransactionStatus{{
+		TxID:      txid,
+		Status:    models.StatusPendingRetry,
+		Timestamp: time.Now(),
+		ExtraInfo: orphanRetryReason,
+	}}, 0, 0, nil)
+
+	for _, ev := range pub.bulkSnapshot() {
+		if ev.Status == models.StatusPendingRetry {
+			t.Fatalf("a PENDING_RETRY event was published for a row the lattice refused to move (prev REJECTED): %+v", ev)
+		}
+	}
+
+	// A genuine transition (prev RECEIVED) still publishes — the filter is
+	// the lattice, not a blanket silence.
+	ms.returningPrev = func(s *models.TransactionStatus) *models.TransactionStatus {
+		return &models.TransactionStatus{TxID: s.TxID, Status: models.StatusReceived, Timestamp: time.Now()}
+	}
+	p.applyTerminalStatuses(context.Background(), []*models.TransactionStatus{{
+		TxID: txid, Status: models.StatusPendingRetry, Timestamp: time.Now(), ExtraInfo: orphanRetryReason,
+	}}, 0, 0, nil)
+	var parked int
+	for _, ev := range pub.bulkSnapshot() {
+		if ev.Status == models.StatusPendingRetry {
+			parked++
+		}
+	}
+	if parked != 1 {
+		t.Fatalf("published %d PENDING_RETRY event(s) for a real RECEIVED->PENDING_RETRY transition, want 1", parked)
+	}
+}
