@@ -828,7 +828,7 @@ func TestRunMerkleReplay_RegistersOnlyNonTerminal(t *testing.T) {
 	merkleSrv := newMerkleServer(log, http.StatusOK)
 	defer merkleSrv.Close()
 
-	cfg := &config.Config{CallbackURL: "http://arcade/cb", CallbackToken: "tok"}
+	cfg := &config.Config{CallbackURL: testArcadeCallbackURL, CallbackToken: testArcadeCallbackToken}
 	cfg.Propagation.MerkleConcurrency = 4
 	cfg.Propagation.RegisterReplayLookbackHours = 24
 	enabled := true
@@ -866,7 +866,7 @@ func TestRunMerkleReplay_DisabledByConfig(t *testing.T) {
 	merkleSrv := newMerkleServer(log, http.StatusOK)
 	defer merkleSrv.Close()
 
-	cfg := &config.Config{CallbackURL: "http://arcade/cb", CallbackToken: "tok"}
+	cfg := &config.Config{CallbackURL: testArcadeCallbackURL, CallbackToken: testArcadeCallbackToken}
 	disabled := false
 	cfg.Propagation.RegisterReplayOnStart = &disabled
 
@@ -893,7 +893,7 @@ func TestRegisterBatch_AuthFailureClassifiedAndRequeued(t *testing.T) {
 	defer merkleSrv.Close()
 
 	ms := newMockStore()
-	cfg := &config.Config{CallbackURL: "http://arcade/cb", CallbackToken: "tok"}
+	cfg := &config.Config{CallbackURL: testArcadeCallbackURL, CallbackToken: testArcadeCallbackToken}
 	cfg.Propagation.MerkleConcurrency = 4
 	mc := merkleservice.NewClient(merkleSrv.URL, "", 5*time.Second)
 	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, nil, mc)
@@ -931,7 +931,7 @@ func TestRegisterBatch_ClaimRevokedClassifiedDistinctly(t *testing.T) {
 	defer merkleSrv.Close()
 
 	ms := newMockStore()
-	cfg := &config.Config{CallbackURL: "http://arcade/cb", CallbackToken: "tok"}
+	cfg := &config.Config{CallbackURL: testArcadeCallbackURL, CallbackToken: testArcadeCallbackToken}
 	cfg.Propagation.MerkleConcurrency = 4
 	mc := merkleservice.NewClient(merkleSrv.URL, "", 5*time.Second)
 	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, nil, mc)
@@ -964,7 +964,7 @@ func TestRegisterBatch_ClaimRevokedClassifiedDistinctly(t *testing.T) {
 // per-test setup boilerplate small.
 func replayPropagator(t *testing.T, ms *mockStore, merkleURL string, configure func(*config.Config)) *Propagator {
 	t.Helper()
-	cfg := &config.Config{CallbackURL: "http://arcade/cb", CallbackToken: "tok"}
+	cfg := &config.Config{CallbackURL: testArcadeCallbackURL, CallbackToken: testArcadeCallbackToken}
 	cfg.Propagation.MerkleConcurrency = 4
 	cfg.Propagation.RegisterReplayLookbackHours = 24
 	enabled := true

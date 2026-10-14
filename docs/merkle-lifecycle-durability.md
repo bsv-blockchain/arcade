@@ -86,8 +86,11 @@ watches the same txids and each delivers its own callbacks.
 Registration succeeds when **any** endpoint accepts; only a tx refused or
 unreachable on every endpoint is requeued (F-024 still gates broadcast). When
 every endpoint failed, the surfaced error is the most retryable one (context
-error, then network/5xx, then 401/403, then other 4xx), so `auth_error` on the
-registration metrics now means every endpoint rejected the token.
+error, then network/5xx, then 401/403, then other 4xx). So `auth_error` on the
+registration metrics means no endpoint accepted the tx, none failed with a
+network error or 5xx, and at least one rejected the token; the others may have
+answered with another 4xx. A token problem stays visible even when it is not
+the only failure.
 
 A tx the pool reported registered must still reach every endpoint, or the
 endpoints' watch sets diverge and their STUMPs disagree. Every endpoint-
@@ -95,18 +98,33 @@ specific failure behind a pool-level success — a refused or timed-out
 `/watch`, or an endpoint skipped because its breaker was open — is kept in
 that endpoint's in-memory catch-up queue (`arcade_merkle_endpoint_catchup_pending`)
 and re-sent from the pool's background loop once the endpoint answers again,
-500 per 5s tick with backoff; what fails again goes back to the queue. The
+500 per 5s tick with backoff; what fails again goes back to the queue, except
+a registration the endpoint rejected outright (a 4xx other than 401, 403, 408
+or 429), which is dropped with a warning. A 401/403 is kept and logged, since
+the breaker does not count it. The
 queue is bounded (200k entries per endpoint, about half an hour at 100 TPS);
 past that the oldest entries are dropped and, once the queue drains, the
 pool asks propagation to resync that endpoint with a full lookback replay
 (`register_replay_lookback_hours`, ignoring `merkle_registered_at`, since
 the stamp is pool-wide). A `/watch` that fails during the resync goes back
-to the queue. `/watch` is idempotent on merkle-service. The startup replay
-re-registers every in-flight tx with the whole pool, so a restart loses
-nothing durable.
+to the queue. `/watch` is idempotent on merkle-service.
+
+The queue lives in memory, so a restart drops it. With several endpoints the
+startup replay therefore re-registers every non-terminal tx in the lookback
+window with the whole pool: `merkle_replay_skip_recent_minutes` defaults to
+`-1`, which means no recent-row skip with several merkle-services (30 minutes
+with one), because `merkle_registered_at` is stamped once any one endpoint
+accepted. Setting it to a positive value with several endpoints brings the
+skip back, and with it the risk that a lagging endpoint never receives the
+txs registered in that window before the restart.
 
 An endpoint that fails three consecutive transport/5xx requests has its
-breaker opened and is skipped; 4xx answers never trip it. The pool probes
+breaker opened and is skipped; 4xx answers never trip it. Results are recorded
+per request, and nothing more is sent to an endpoint once its breaker opens,
+so a black-holed endpoint delays the batch that trips it by at most the HTTP
+timeout of the requests already in flight; later batches skip it at once.
+Each endpoint's catch-up drain runs on its own goroutine, so a hanging
+endpoint does not hold up the probes or another endpoint's catch-up. The pool probes
 `GET /health` on open endpoints every 5s and closes the breaker on any non-5xx
 answer; the catch-up queue then drains.
 

@@ -567,7 +567,11 @@ func TestValidate_MerkleServiceRejectsEmptyAndMalformedEntries(t *testing.T) {
 		t.Fatal("a blank merkle_service.urls entry must be rejected")
 	}
 
-	for _, bad := range []string{"merkle.local", "ftp://merkle.local", "http://"} {
+	for _, bad := range []string{
+		"merkle.local", "ftp://merkle.local", "http://",
+		// The client string-appends /watch, so these would lose the path.
+		"http://merkle.local?tenant=a", "http://merkle.local?", "http://merkle.local#frag",
+	} {
 		cfg := baseValidConfig()
 		cfg.MerkleService.URL = bad
 		if err := validate(cfg); err == nil {

@@ -592,10 +592,13 @@ type PropagationConfig struct {
 	// MerkleRegisteredAt is within this window. /watch is INSERT ... ON
 	// CONFLICT DO NOTHING on the merkle-service side and does not refresh
 	// expires_at, so re-registering a tx merkle-service already knows about
-	// is wasted work. Default 30 (matches merkle-service postMineTTLSec).
-	// Set to 0 to disable the skip and re-register every non-terminal tx —
-	// useful for forcing a full re-sync after a known merkle-service wipe.
-	// Issue #145.
+	// is wasted work. Default -1 (auto): 30 (matches merkle-service
+	// postMineTTLSec) with a single merkle-service, 0 with several, because
+	// the stamp is set once any one of them accepted the tx and the pool's
+	// queue of registrations owed to a lagging endpoint is in memory, so a
+	// restart must re-send them. Set to 0 to disable the skip and
+	// re-register every non-terminal tx — useful for forcing a full re-sync
+	// after a known merkle-service wipe. Issue #145.
 	MerkleReplaySkipRecentMinutes int `mapstructure:"merkle_replay_skip_recent_minutes"`
 	// MerkleReplayRPS caps the average requests-per-second the startup
 	// replay issues against merkle-service. Implemented as an inter-batch
@@ -1331,7 +1334,7 @@ func setDefaults() {
 	// callbacks for everything in-flight.
 	viper.SetDefault("propagation.register_replay_on_start", true)
 	viper.SetDefault("propagation.register_replay_lookback_hours", 24)
-	viper.SetDefault("propagation.merkle_replay_skip_recent_minutes", 30)
+	viper.SetDefault("propagation.merkle_replay_skip_recent_minutes", -1)
 	viper.SetDefault("propagation.merkle_replay_rps", 50)
 
 	viper.SetDefault("network", NetworkMainnet)
@@ -1474,6 +1477,11 @@ func validateMerkleService(cfg *Config) error {
 		}
 		if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 			return fmt.Errorf("merkle_service url %q must be an absolute http(s) URL", u)
+		}
+		// The client appends /watch, /reprocess and /health to the base URL
+		// as a string, so a query or fragment would swallow the path.
+		if parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+			return fmt.Errorf("merkle_service url %q must not contain a query or fragment", u)
 		}
 	}
 	if cfg.MerkleService.Enabled() && cfg.CallbackToken == "" {

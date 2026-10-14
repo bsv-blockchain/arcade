@@ -207,8 +207,8 @@ var PropagationMerkleRegisterBatchOutcomeTotal = promauto.NewCounterVec(promethe
 // MerkleEndpointRequestsTotal counts every request the merkle-service pool
 // issued to (or skipped for) one endpoint, by operation and outcome. The
 // existing pool-level merkle metrics answer "did the tx get registered";
-// this one answers "which endpoint is failing". op is watch, reprocess or
-// probe; outcome is ok, err_auth, err_4xx, err_5xx, err_network, canceled or
+// this one answers "which endpoint is failing". op is watch, catchup
+// (re-sending a registration the endpoint missed), reprocess or probe; outcome is ok, err_auth, err_4xx, err_5xx, err_network, canceled or
 // skipped_open (breaker open, request not sent). The endpoint label is the
 // configured base URL, so cardinality is bounded by the config.
 var MerkleEndpointRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
