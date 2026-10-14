@@ -228,8 +228,9 @@ var MerkleEndpointCatchupPending = promauto.NewGaugeVec(prometheus.GaugeOpts{
 
 // MerkleEndpointHealthy is 1 while the endpoint's circuit breaker is closed
 // (requests are sent to it) and 0 while it is open (skipped until the
-// background /health probe answers). Alert on sum() falling below the number
-// of configured endpoints.
+// background /health probe answers). Each process runs its own pool, and
+// ones that never send /watch stay at 1, so alert on min by (endpoint) == 0
+// rather than on a sum across pods.
 var MerkleEndpointHealthy = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "arcade_merkle_endpoint_healthy",
 	Help: "1 while the merkle-service endpoint's circuit breaker is closed, 0 while open.",

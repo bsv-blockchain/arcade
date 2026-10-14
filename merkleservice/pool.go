@@ -248,7 +248,8 @@ func WithClock(now func() time.Time) PoolOption {
 // transport/5xx failures it is skipped on the hot path so a black-holed
 // service cannot add its full HTTP timeout to every registration batch. The
 // background loop (Start) GETs /health on open endpoints and closes the
-// breaker on any non-5xx answer.
+// breaker on any non-5xx answer, after one owed registration (if any) also
+// went through as a trial /watch.
 //
 // A Pool with a single endpoint behaves like the Client it wraps, plus the
 // breaker, queue and per-endpoint metrics.
@@ -701,24 +702,71 @@ func (p *Pool) loop(ctx context.Context) {
 	}
 }
 
-// probeOpenEndpoints GETs /health on every open endpoint and closes the
-// breaker of each one that answers with anything but a 5xx. A 4xx (e.g. 404
-// from a build without /health) still proves the process is reachable; a 5xx
-// means the service itself reports unhealthy, so it stays open.
+// probeOpenEndpoints probes every open endpoint concurrently, so several
+// black-holed endpoints cost one probe timeout per tick rather than one each.
 func (p *Pool) probeOpenEndpoints(ctx context.Context) {
+	var wg sync.WaitGroup
 	for _, ep := range p.endpoints {
 		if !ep.isOpen() {
 			continue
 		}
-		err := p.probe(ctx, ep)
-		outcome, _ := classify(ctx, err)
-		metrics.MerkleEndpointRequestsTotal.WithLabelValues(ep.url, opProbe, outcome).Inc()
-		if err != nil {
-			p.logger.Debug("merkle-service probe failed", zap.String("endpoint", ep.url), zap.String("outcome", outcome), zap.Error(err))
-			continue
-		}
-		p.closeBreaker(ep, opProbe)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p.probeEndpoint(ctx, ep)
+		}()
 	}
+	wg.Wait()
+}
+
+// probeEndpoint GETs /health on one open endpoint and closes its breaker when
+// it answers with anything but a 5xx and a trial /watch (see trialWatch) also
+// answers. A 4xx (e.g. 404 from a build without /health) still proves the
+// process is reachable; a 5xx means the service itself reports unhealthy, so
+// it stays open.
+func (p *Pool) probeEndpoint(ctx context.Context, ep *endpoint) {
+	err := p.probe(ctx, ep)
+	outcome, _ := classify(ctx, err)
+	metrics.MerkleEndpointRequestsTotal.WithLabelValues(ep.url, opProbe, outcome).Inc()
+	if err != nil {
+		p.logger.Debug("merkle-service probe failed", zap.String("endpoint", ep.url), zap.String("outcome", outcome), zap.Error(err))
+		return
+	}
+	if !p.trialWatch(ctx, ep) {
+		return
+	}
+	p.closeBreaker(ep, opProbe)
+}
+
+// trialWatch re-sends one registration the endpoint owes, bounded by the
+// probe timeout, before its breaker closes. /health is shallow: an endpoint
+// whose /health answers while /watch hangs would otherwise be closed every
+// probe tick and hold the next hot-path batch for a full HTTP timeout before
+// re-tripping. It reports whether /watch answered below 500. With nothing
+// owed there is nothing to try, and /health alone decides.
+func (p *Pool) trialWatch(ctx context.Context, ep *endpoint) bool {
+	batch := ep.pending.take(1)
+	if len(batch) == 0 {
+		return true
+	}
+	reg := batch[0]
+	trialCtx, cancel := context.WithTimeout(ctx, defaultProbeTimeout)
+	err := ep.client.Register(trialCtx, reg.TxID, reg.CallbackURL, reg.CallbackToken)
+	cancel()
+	// Classified against the parent ctx: the trial's own deadline is the
+	// hanging-/watch signal and must count as a failure.
+	outcome, failure := classify(ctx, err)
+	p.record(ctx, ep, opCatchup, err)
+	if err != nil && !permanentRejection(err) {
+		ep.pending.add(reg)
+	}
+	ep.pending.settle(1)
+	ep.syncPendingGauge()
+	if outcome == outcomeCanceled || failure {
+		p.logger.Debug("merkle-service trial /watch failed; keeping breaker open", zap.String("endpoint", ep.url), zap.String("outcome", outcome), zap.Error(err))
+		return false
+	}
+	return true
 }
 
 // drainCatchup starts, for every closed endpoint that owes registrations and

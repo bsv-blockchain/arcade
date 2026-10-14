@@ -125,8 +125,11 @@ so a black-holed endpoint delays the batch that trips it by at most the HTTP
 timeout of the requests already in flight; later batches skip it at once.
 Each endpoint's catch-up drain runs on its own goroutine, so a hanging
 endpoint does not hold up the probes or another endpoint's catch-up. The pool probes
-`GET /health` on open endpoints every 5s and closes the breaker on any non-5xx
-answer; the catch-up queue then drains.
+`GET /health` on open endpoints every 5s (concurrently) and closes the breaker
+on any non-5xx answer, provided one owed registration re-sent as a trial
+`/watch` (bounded by the 5s probe timeout) also answers below 500, so an
+endpoint whose `/health` is up while `/watch` hangs stays open; the catch-up
+queue then drains.
 
 Duplicate callbacks:
 

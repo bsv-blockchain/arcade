@@ -636,3 +636,44 @@ func TestPool_EndpointsAndEndpoint(t *testing.T) {
 		t.Fatalf("direct call reached endpoint %d times, want 1", a.watchedCount())
 	}
 }
+
+// /health is shallow: an endpoint whose /health answers while /watch hangs
+// must stay open (a trial /watch of one owed registration fails) instead of
+// closing every probe tick and holding the next hot-path batch.
+func TestPool_ProbeKeepsBreakerOpenWhileWatchHangs(t *testing.T) {
+	a := newFakeMerkle(t)
+	var watchOK atomic.Bool
+	release := make(chan struct{})
+	b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" || watchOK.Load() {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(b.Close)
+	t.Cleanup(func() { close(release) })
+
+	p := NewPool([]string{a.url(), b.URL}, "", 100*time.Millisecond, WithFailureThreshold(1))
+	ctx := context.Background()
+	if err := p.Register(ctx, "tx1", testCallbackURL, ""); err != nil {
+		t.Fatalf("register: %v (a accepts)", err)
+	}
+	if st := p.EndpointStatuses()[1]; st.Healthy || st.CatchupPending != 1 {
+		t.Fatalf("b must be open and owe tx1: %+v", st)
+	}
+
+	p.probeOpenEndpoints(ctx)
+	if st := p.EndpointStatuses()[1]; st.Healthy || st.CatchupPending != 1 {
+		t.Fatalf("/health up but /watch hanging must keep b open and owing tx1: %+v", st)
+	}
+
+	watchOK.Store(true)
+	p.probeOpenEndpoints(ctx)
+	if st := p.EndpointStatuses()[1]; !st.Healthy || st.CatchupPending != 0 {
+		t.Fatalf("b must close once the trial /watch lands: %+v", st)
+	}
+}

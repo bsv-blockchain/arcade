@@ -84,8 +84,12 @@ landing.
 
 ### Merkle-service endpoint board
 
-- Per-endpoint `arcade_merkle_endpoint_healthy` (one row per `endpoint`); alert
-  when `sum()` drops below the number of configured endpoints.
+- Per-endpoint `arcade_merkle_endpoint_healthy` (one row per `endpoint` per
+  pod); alert on `min by (endpoint) (arcade_merkle_endpoint_healthy) == 0`.
+  Every arcade process runs its own pool, and processes that never send
+  `/watch` (api-server, watchdog, bump-builder) keep reporting 1, so a
+  `sum()` across pods never drops below the endpoint count. The propagation
+  pods' series are the authoritative view.
 - `sum by (endpoint, outcome) (rate(arcade_merkle_endpoint_requests_total{op="watch",outcome!="ok"}[5m]))`
   — which merkle-service is failing and how (`err_network`, `err_5xx`,
   `err_auth`, `err_4xx`, `skipped_open`).
