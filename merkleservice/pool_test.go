@@ -779,3 +779,52 @@ func TestPool_SlowEndpointWithinGraceIsNotPenalized(t *testing.T) {
 		t.Fatalf("slow endpoint got %d of %d registrations", b.watchedCount(), len(regs))
 	}
 }
+
+// What a canceled straggler owes is not lost: once the endpoint answers again
+// the probe closes its breaker and the catch-up drain delivers every tx.
+func TestPool_CanceledStragglerOwedTxsDrainAfterRecovery(t *testing.T) {
+	a := newFakeMerkle(t)
+	b := newFakeMerkle(t)
+	var hung atomic.Bool
+	hung.Store(true)
+	release := make(chan struct{})
+	flaky := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hung.Load() {
+			select {
+			case <-r.Context().Done():
+			case <-release:
+			}
+			return
+		}
+		b.srv.Config.Handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(flaky.Close)
+	t.Cleanup(func() { close(release) })
+
+	p := NewPool([]string{a.url(), flaky.URL}, "", 10*time.Second,
+		WithFailureThreshold(3), WithStragglerGrace(50*time.Millisecond), WithProbeInterval(20*time.Millisecond))
+	regs := regsN(8)
+	for i, err := range p.RegisterBatchWithResults(context.Background(), regs, 4) {
+		if err != nil {
+			t.Fatalf("errs[%d]=%v", i, err)
+		}
+	}
+	if st := p.EndpointStatuses()[1]; st.Healthy || st.CatchupPending != len(regs) {
+		t.Fatalf("straggler must be open and owe all %d: %+v", len(regs), st)
+	}
+
+	hung.Store(false)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.Start(ctx)
+	waitFor(t, "straggler's owed registrations to drain", func() bool {
+		st := p.EndpointStatuses()[1]
+		return st.Healthy && st.CatchupPending == 0
+	})
+	got := b.watchedSet()
+	for _, r := range regs {
+		if got[r.TxID] == 0 {
+			t.Fatalf("%s never reached the recovered endpoint: %v", r.TxID, got)
+		}
+	}
+}
