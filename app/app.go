@@ -112,10 +112,13 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		_ = producer.Close()
 		return nil, nil, fmt.Errorf("kafka partition check: %w", pErr)
 	}
-	// MinPartitions is a soft hint for horizontally-scaled topics. There
-	// are currently no other hot-path topics that need it (TopicTransaction
-	// was retired with tx_validator) but the knob is retained so a future
-	// fan-out topic can opt into the check without re-introducing config.
+	// MinPartitions is the floor for horizontally-scaled topics other than
+	// TopicPropagation. There are currently no other hot-path topics that
+	// need it (TopicTransaction was retired with tx_validator) but the knob
+	// is retained so a future fan-out topic can opt into the check without
+	// re-introducing config. When the list below is non-empty and
+	// minPartitions > 1, CheckPartitions fails closed on a missing topic;
+	// the <= 1 path (standalone / single replica) stays a no-op.
 	//
 	// Deliberately still passed a nil topic list, which makes CheckPartitions
 	// a no-op. Handing it the real fan-out topics turns a check that has been

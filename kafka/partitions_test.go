@@ -45,6 +45,77 @@ func (b *stubPartitionBroker) PartitionCount(topic string) (int, error) {
 	return 0, ErrTopicNotFound
 }
 
+// TestCheckPartitions_TopicMissing_MinPartitionsGreaterThanOneFails pins
+// the F-013 contract: with a horizontal-scaling floor, a topic the broker
+// does not have is a startup error. Warning and continuing would let
+// auto-creation pick the broker default, which can be narrower than the
+// pod count. An earlier topic that already meets the floor must not hide
+// a later missing one.
+func TestCheckPartitions_TopicMissing_MinPartitionsGreaterThanOneFails(t *testing.T) {
+	br := &stubPartitionBroker{counts: map[string]int{TopicStatusUpdate: 4}}
+	err := CheckPartitions(br, []string{TopicStatusUpdate, TopicBlockProcessed}, 3, zap.NewNop())
+	if err == nil {
+		t.Fatal("expected error for missing topic when minPartitions > 1, got nil")
+	}
+	if !strings.Contains(err.Error(), "not found on broker") {
+		t.Errorf("error %q should reference the not-found state", err.Error())
+	}
+	if !strings.Contains(err.Error(), TopicBlockProcessed) {
+		t.Errorf("error %q should name the missing topic", err.Error())
+	}
+	if !strings.Contains(err.Error(), "at least 3") {
+		t.Errorf("error %q should state the required minimum", err.Error())
+	}
+}
+
+// TestCheckPartitions_TopicMissing_MinPartitionsAtMostOneNoop pins the
+// floor that standalone and single-replica deployments rely on. A missing
+// topic with minPartitions <= 1 must still return nil, and the broker must
+// not be queried: those setups create topics later (in-memory broker on
+// subscribe, or a single partition that does not need a preflight).
+func TestCheckPartitions_TopicMissing_MinPartitionsAtMostOneNoop(t *testing.T) {
+	br := &stubPartitionBroker{err: errors.New("broker must not be queried")}
+	for _, min := range []int{1, 0, -1} {
+		err := CheckPartitions(br, []string{TopicBlockProcessed}, min, zap.NewNop())
+		if err != nil {
+			t.Fatalf("minPartitions=%d: expected nil for missing topic, got %v", min, err)
+		}
+	}
+}
+
+// TestCheckPartitions_MemoryBrokerMinPartitionsAtMostOneUnchanged pins the
+// standalone path at the real in-memory broker. PartitionCount there never
+// returns ErrTopicNotFound, and minPartitions <= 1 still skips the check.
+func TestCheckPartitions_MemoryBrokerMinPartitionsAtMostOneUnchanged(t *testing.T) {
+	b := NewMemoryBroker(8)
+	defer func() { _ = b.Close() }()
+	for _, min := range []int{1, 0} {
+		err := CheckPartitions(b, []string{"not-yet-subscribed"}, min, zap.NewNop())
+		if err != nil {
+			t.Fatalf("minPartitions=%d: memory broker preflight changed, got %v", min, err)
+		}
+	}
+}
+
+// TestCheckPartitions_ExistingTopicStillEnforcesFloor pins the unchanged
+// half of the check: a topic that exists but is narrower than the floor
+// still fails, and one that meets it still passes.
+func TestCheckPartitions_ExistingTopicStillEnforcesFloor(t *testing.T) {
+	narrow := &stubPartitionBroker{counts: map[string]int{TopicBlockProcessed: 1}}
+	err := CheckPartitions(narrow, []string{TopicBlockProcessed}, 3, zap.NewNop())
+	if err == nil {
+		t.Fatal("expected error for 1-partition topic with minPartitions 3, got nil")
+	}
+	if !strings.Contains(err.Error(), "has 1 partitions") {
+		t.Errorf("error %q should report the observed partition count", err.Error())
+	}
+
+	wide := &stubPartitionBroker{counts: map[string]int{TopicBlockProcessed: 4}}
+	if err := CheckPartitions(wide, []string{TopicBlockProcessed}, 3, zap.NewNop()); err != nil {
+		t.Fatalf("expected nil error when actual (4) >= minPartitions (3), got %v", err)
+	}
+}
+
 // TestCheckMinPartitions_ExactMatchOK pins the success contract: when
 // the broker reports exactly the requested minimum, no error.
 func TestCheckMinPartitions_ExactMatchOK(t *testing.T) {

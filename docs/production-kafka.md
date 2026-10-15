@@ -236,15 +236,18 @@ multiple deployments share a Kafka cluster.
 
 - `kafka.CheckMinPartitions(arcade.propagation, propagation.partitions)` — **hard fail** if
   the topic is missing or has fewer partitions than `propagation.partitions`.
-- `kafka.CheckPartitions(...)` — soft warning path used when
-  `kafka.min_partitions > 1`. Existing topics with fewer partitions cause a
-  startup error; missing topics only log a warning ("will be auto-created
-  on first publish").
+- `kafka.CheckPartitions(...)` — when `kafka.min_partitions > 1`, a missing
+  topic or one with fewer partitions is a **hard fail**. Values of 0 or 1
+  skip the check, which is the standalone / single-replica setting (the
+  in-memory broker never reports a topic as missing, and topics there are
+  created on subscribe). Startup currently passes an empty topic list, so
+  this guard stays dormant until a fan-out topic opts in; do not rely on it
+  for `arcade.block_processed` or `arcade.tx_status` today.
 
-This means a forgotten `arcade.propagation` will fail loudly, but a
-forgotten `arcade.block_processed` will silently auto-create with the
-broker's default partition count on first publish. If your broker has
-`auto.create.topics.enable=false` (recommended for production), forgotten
-topics will instead surface as produce errors at first traffic. Either way,
-pre-creating every topic in the table above is the only way to be sure
-partition counts match your deployment.
+A forgotten `arcade.propagation` fails loudly. Other topics are not in the
+startup partition check, so a forgotten `arcade.block_processed` can still
+auto-create with the broker's default partition count on first publish. If
+your broker has `auto.create.topics.enable=false` (recommended for
+production), forgotten topics will instead surface as produce errors at
+first traffic. Either way, pre-creating every topic in the table above is
+the only way to be sure partition counts match your deployment.
