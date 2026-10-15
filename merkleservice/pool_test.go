@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -27,13 +28,14 @@ type fakeMerkle struct {
 	// /health. Both default to 200.
 	watchCode  atomic.Int32
 	healthCode atomic.Int32
-	// failTxIDs are refused with watchCode-independent 500s.
-	failTxIDs map[string]bool
+	// failTxIDs are refused with the mapped status, regardless of
+	// watchCode; setFail uses 500.
+	failTxIDs map[string]int
 }
 
 func newFakeMerkle(t *testing.T) *fakeMerkle {
 	t.Helper()
-	f := &fakeMerkle{failTxIDs: map[string]bool{}}
+	f := &fakeMerkle{failTxIDs: map[string]int{}}
 	f.watchCode.Store(http.StatusOK)
 	f.healthCode.Store(http.StatusOK)
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -47,10 +49,10 @@ func newFakeMerkle(t *testing.T) *fakeMerkle {
 			decodeJSON(r, &req)
 			f.mu.Lock()
 			f.watched = append(f.watched, req.TxID)
-			fail := f.failTxIDs[req.TxID]
+			failCode := f.failTxIDs[req.TxID]
 			f.mu.Unlock()
-			if fail {
-				w.WriteHeader(http.StatusInternalServerError)
+			if failCode != 0 {
+				w.WriteHeader(failCode)
 				return
 			}
 			w.WriteHeader(int(f.watchCode.Load()))
@@ -81,12 +83,21 @@ func (f *fakeMerkle) watchedSet() map[string]int {
 }
 
 func (f *fakeMerkle) setFail(txid string, fail bool) {
+	if fail {
+		f.setFailCode(txid, http.StatusInternalServerError)
+	} else {
+		f.setFailCode(txid, 0)
+	}
+}
+
+// setFailCode refuses txid's /watch with code; 0 clears it.
+func (f *fakeMerkle) setFailCode(txid string, code int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if fail {
-		f.failTxIDs[txid] = true
-	} else {
+	if code == 0 {
 		delete(f.failTxIDs, txid)
+	} else {
+		f.failTxIDs[txid] = code
 	}
 }
 
@@ -135,9 +146,9 @@ func TestPool_RegisterSucceedsWhenAnyEndpointAccepts(t *testing.T) {
 
 func TestPool_RegisterBatchWithResults_MergesPerTx(t *testing.T) {
 	a, b := newFakeMerkle(t), newFakeMerkle(t)
-	a.failTxIDs["tx2"] = true
-	b.failTxIDs["tx2"] = true
-	b.failTxIDs["tx3"] = true // tx3 still lands on a
+	a.failTxIDs["tx2"] = http.StatusInternalServerError
+	b.failTxIDs["tx2"] = http.StatusInternalServerError
+	b.failTxIDs["tx3"] = http.StatusInternalServerError // tx3 still lands on a
 	p := NewPool([]string{a.url(), b.url()}, "", time.Second)
 
 	regs := []Registration{{TxID: "tx1", CallbackURL: testCallbackURL}, {TxID: "tx2", CallbackURL: testCallbackURL}, {TxID: "tx3", CallbackURL: testCallbackURL}}
@@ -325,12 +336,120 @@ func TestPool_EndpointServiceQueuesFailures(t *testing.T) {
 	if got := pendingFor(p, b.url()); got != 4 {
 		t.Fatalf("tx2..tx5 must all be owed to b, pending = %d", got)
 	}
+	if got := testutil.ToFloat64(metrics.MerkleEndpointCatchupPending.WithLabelValues(b.url())); got != 4 {
+		t.Fatalf("catchup_pending gauge = %v, want 4 (refused while open must update it)", got)
+	}
+}
+
+// A catch-up entry the endpoint refuses again goes back to the queue: it is
+// still owed, and dropping it would leave the endpoint missing the txid.
+func TestPool_FailedCatchupIsRequeued(t *testing.T) {
+	a, b := newFakeMerkle(t), newFakeMerkle(t)
+	b.setFail("tx2", true)
+	// A high threshold keeps the breaker out of it: this is about the queue.
+	p := NewPool([]string{a.url(), b.url()}, "", time.Second,
+		WithFailureThreshold(1000), WithProbeInterval(10*time.Millisecond))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.Start(ctx)
+
+	if err := p.Register(ctx, "tx2", testCallbackURL, ""); err != nil {
+		t.Fatalf("register: %v (a accepts)", err)
+	}
+	// A second catch-up attempt can only come from the entry having been
+	// put back after the first one failed.
+	refused := metrics.MerkleEndpointRequestsTotal.WithLabelValues(b.url(), opCatchup, outcome5xx)
+	waitFor(t, "a second catch-up attempt on b", func() bool { return testutil.ToFloat64(refused) >= 2 })
+	if got := pendingFor(p, b.url()); got != 1 {
+		t.Fatalf("tx2 must still be owed to b, pending = %d", got)
+	}
+}
+
+// A registration the endpoint rejects outright (400) is dropped from the
+// catch-up queue; a throttled one (429) is kept and retried.
+func TestPool_CatchupDropsPermanentRejectionsOnly(t *testing.T) {
+	a, b := newFakeMerkle(t), newFakeMerkle(t)
+	b.setFailCode("bad", http.StatusBadRequest)
+	b.setFailCode("slow", http.StatusTooManyRequests)
+	p := NewPool([]string{a.url(), b.url()}, "", time.Second, WithProbeInterval(10*time.Millisecond))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.Start(ctx)
+
+	regs := []Registration{{TxID: "bad", CallbackURL: testCallbackURL}, {TxID: "slow", CallbackURL: testCallbackURL}}
+	for i, err := range p.RegisterBatchWithResults(ctx, regs, 2) {
+		if err != nil {
+			t.Fatalf("errs[%d]=%v, a accepted both", i, err)
+		}
+	}
+	if got := pendingFor(p, b.url()); got != 2 {
+		t.Fatalf("both refusals must be owed to b first, pending = %d", got)
+	}
+	waitFor(t, "a catch-up attempt for both", func() bool {
+		got := b.watchedSet()
+		return got["bad"] >= 2 && got["slow"] >= 2
+	})
+	waitFor(t, "only the 429 to stay owed", func() bool { return pendingFor(p, b.url()) == 1 })
+	time.Sleep(100 * time.Millisecond)
+	if got := b.watchedSet()["bad"]; got != 2 {
+		t.Fatalf("a 400 must not be re-sent after the catch-up attempt, sent %d times", got)
+	}
+
+	b.setFailCode("slow", 0)
+	waitFor(t, "the 429 entry to land", func() bool { return pendingFor(p, b.url()) == 0 })
+}
+
+// An endpoint that hangs (no answer until the HTTP timeout) must cost the
+// batch that trips its breaker no more than the requests already in flight,
+// not one timeout per maxConcurrency entries; everything it did not get is
+// owed to it.
+func TestPool_HangingEndpointDoesNotHoldTheBatch(t *testing.T) {
+	a := newFakeMerkle(t)
+	release := make(chan struct{})
+	hang := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(hang.Close)
+	t.Cleanup(func() { close(release) }) // runs first: unblock handlers so Close returns
+
+	const timeout = 200 * time.Millisecond
+	p := NewPool([]string{a.url(), hang.URL}, "", timeout, WithFailureThreshold(3))
+	regs := make([]Registration, 12)
+	for i := range regs {
+		regs[i] = Registration{TxID: "tx" + strconv.Itoa(i), CallbackURL: testCallbackURL}
+	}
+
+	start := time.Now()
+	errs := p.RegisterBatchWithResults(context.Background(), regs, 2)
+	elapsed := time.Since(start)
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("errs[%d]=%v, a accepted every tx", i, err)
+		}
+	}
+	// Concurrency 2, threshold 3: two rounds of timeouts trip the breaker,
+	// then the other eight are skipped. Sending all twelve would take six.
+	if elapsed > 4*timeout {
+		t.Fatalf("first batch took %v; the breaker must stop the remaining sends (6 rounds = %v)", elapsed, 6*timeout)
+	}
+	if st := p.EndpointStatuses()[1]; st.Healthy || st.CatchupPending != len(regs) {
+		t.Fatalf("hanging endpoint must be open and owed all %d txs: %+v", len(regs), st)
+	}
+
+	start = time.Now()
+	_ = p.RegisterBatchWithResults(context.Background(), regs, 2)
+	if elapsed := time.Since(start); elapsed > timeout {
+		t.Fatalf("with the breaker open the batch must not wait on the endpoint, took %v", elapsed)
+	}
 }
 
 func TestPool_RegisterBatch_ReturnsFirstFailureWithoutFailFast(t *testing.T) {
 	a, b := newFakeMerkle(t), newFakeMerkle(t)
-	a.failTxIDs["tx1"] = true
-	b.failTxIDs["tx1"] = true
+	a.failTxIDs["tx1"] = http.StatusInternalServerError
+	b.failTxIDs["tx1"] = http.StatusInternalServerError
 	p := NewPool([]string{a.url(), b.url()}, "", time.Second)
 
 	regs := []Registration{{TxID: "tx1", CallbackURL: testCallbackURL}, {TxID: "tx2", CallbackURL: testCallbackURL}}
@@ -515,5 +634,46 @@ func TestPool_EndpointsAndEndpoint(t *testing.T) {
 	}
 	if a.watchedCount() != 1 {
 		t.Fatalf("direct call reached endpoint %d times, want 1", a.watchedCount())
+	}
+}
+
+// /health is shallow: an endpoint whose /health answers while /watch hangs
+// must stay open (a trial /watch of one owed registration fails) instead of
+// closing every probe tick and holding the next hot-path batch.
+func TestPool_ProbeKeepsBreakerOpenWhileWatchHangs(t *testing.T) {
+	a := newFakeMerkle(t)
+	var watchOK atomic.Bool
+	release := make(chan struct{})
+	b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" || watchOK.Load() {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(b.Close)
+	t.Cleanup(func() { close(release) })
+
+	p := NewPool([]string{a.url(), b.URL}, "", 100*time.Millisecond, WithFailureThreshold(1))
+	ctx := context.Background()
+	if err := p.Register(ctx, "tx1", testCallbackURL, ""); err != nil {
+		t.Fatalf("register: %v (a accepts)", err)
+	}
+	if st := p.EndpointStatuses()[1]; st.Healthy || st.CatchupPending != 1 {
+		t.Fatalf("b must be open and owe tx1: %+v", st)
+	}
+
+	p.probeOpenEndpoints(ctx)
+	if st := p.EndpointStatuses()[1]; st.Healthy || st.CatchupPending != 1 {
+		t.Fatalf("/health up but /watch hanging must keep b open and owing tx1: %+v", st)
+	}
+
+	watchOK.Store(true)
+	p.probeOpenEndpoints(ctx)
+	if st := p.EndpointStatuses()[1]; !st.Healthy || st.CatchupPending != 0 {
+		t.Fatalf("b must close once the trial /watch lands: %+v", st)
 	}
 }

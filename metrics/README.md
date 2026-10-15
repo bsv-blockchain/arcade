@@ -30,6 +30,10 @@ All metric names start with `arcade_` so they live in their own namespace.
 | API errors | `rate(arcade_api_request_duration_seconds_count{status_class="5xx"}[5m])` | `> 0` |
 | Kafka publish failures | `rate(arcade_kafka_produce_errors_total[5m])` | `> 0 for 1m` |
 | DLQ growth | `rate(arcade_kafka_messages_total{op="dlq"}[5m])` | `> 0` |
+| Network retry budget exhausted | `rate(arcade_propagation_requeue_exhausted_total[5m])` | `> 0` |
+| Merkle registration retry budget exhausted | `rate(arcade_propagation_merkle_retry_exhausted_total[5m])` | `> 0` |
+
+Merkle `/watch` failures increment `arcade_propagation_retry_total{stage="merkle"}` and `arcade_propagation_merkle_register_failures_total`. They do not increment `arcade_propagation_retry_total{stage="network"}` or `arcade_propagation_requeue_exhausted_total`. See [propagation retry domains](../docs/propagation-retry-domains.md).
 
 ### Note on `arcade_bump_builder_build_duration_seconds_count{outcome=…}`
 
@@ -86,15 +90,20 @@ landing.
 
 ### Merkle-service endpoint board
 
-- Per-endpoint `arcade_merkle_endpoint_healthy` (one row per `endpoint`); alert
-  when `sum()` drops below the number of configured endpoints.
+- Per-endpoint `arcade_merkle_endpoint_healthy` (one row per `endpoint` per
+  pod); alert on `min by (endpoint) (arcade_merkle_endpoint_healthy) == 0`.
+  Every arcade process runs its own pool, and processes that never send
+  `/watch` (api-server, watchdog, bump-builder) keep reporting 1, so a
+  `sum()` across pods never drops below the endpoint count. The propagation
+  pods' series are the authoritative view.
 - `sum by (endpoint, outcome) (rate(arcade_merkle_endpoint_requests_total{op="watch",outcome!="ok"}[5m]))`
   — which merkle-service is failing and how (`err_network`, `err_5xx`,
   `err_auth`, `err_4xx`, `skipped_open`).
 - `arcade_merkle_endpoint_catchup_pending` (one row per `endpoint`) —
   registrations another endpoint accepted that this one has not acknowledged
-  yet; the pool re-sends them in the background. Alert when it stays above 0
-  for longer than a few minutes while the endpoint is healthy.
+  yet; the pool re-sends them in the background (`op="catchup"` on the
+  requests counter). Alert when it stays above 0 for longer than a few
+  minutes while the endpoint is healthy.
 - `arcade_propagation_merkle_register_batch_outcome_total` stays the
   pool-level view: `fully_ok` while any endpoint accepts, `all_failed` only
   when every endpoint refused.

@@ -165,7 +165,7 @@ func TestRegisterBatch_ClaimRevoked_SuppressesPartialFailureWarn(t *testing.T) {
 	core, recorded := observer.New(zapcore.WarnLevel)
 	logger := zap.New(core)
 
-	cfg := &config.Config{CallbackURL: "http://arcade/cb", CallbackToken: "tok"}
+	cfg := &config.Config{CallbackURL: testArcadeCallbackURL, CallbackToken: testArcadeCallbackToken}
 	cfg.Propagation.MerkleConcurrency = 4
 	mc := merkleservice.NewClient(merkleSrv.URL, "", 5*time.Second)
 	p := New(cfg, logger, nil, nil, newMockStore(), nil, nil, mc)

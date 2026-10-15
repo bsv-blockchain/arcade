@@ -450,12 +450,15 @@ type PropagationConfig struct {
 	MerkleConcurrency int `mapstructure:"merkle_concurrency"`
 	// RetryMaxAttempts bounds how many times the propagator will push a
 	// transaction back through the in-memory requeue loop when a broadcast
-	// produced no per-tx verdict (no healthy peer, body-less 5xx, merkle
-	// /watch blip, or a conflict-family 409 whose lines could not be
-	// attributed to any submitted tx). After the budget is spent the tx is
-	// parked at PENDING_RETRY, which releases the dispatcher's in-flight
-	// entry so the Kafka commit watermark can advance; the reaper then owns
-	// the durable retry.
+	// produced no per-tx network verdict (no healthy peer, body-less 5xx,
+	// or a conflict-family 409 whose lines could not be attributed to any
+	// submitted tx). Merkle /watch failures do not consume this budget:
+	// registration retries are a separate failure domain, and /watch must
+	// succeed before broadcast (F-024) without counting as a propagation
+	// attempt. After the network budget is spent the tx is parked at
+	// PENDING_RETRY, which releases the dispatcher's in-flight entry so the
+	// Kafka commit watermark can advance; the reaper then owns the durable
+	// retry.
 	//
 	// The bound is not a nicety. On 2026-08-11 (dev-ovh-1, arcade v0.11.5) a
 	// 21-tx batch of stale transactions drew a permanent HTTP 409 from
@@ -589,10 +592,13 @@ type PropagationConfig struct {
 	// MerkleRegisteredAt is within this window. /watch is INSERT ... ON
 	// CONFLICT DO NOTHING on the merkle-service side and does not refresh
 	// expires_at, so re-registering a tx merkle-service already knows about
-	// is wasted work. Default 30 (matches merkle-service postMineTTLSec).
-	// Set to 0 to disable the skip and re-register every non-terminal tx —
-	// useful for forcing a full re-sync after a known merkle-service wipe.
-	// Issue #145.
+	// is wasted work. Default -1 (auto): 30 (matches merkle-service
+	// postMineTTLSec) with a single merkle-service, 0 with several, because
+	// the stamp is set once any one of them accepted the tx and the pool's
+	// queue of registrations owed to a lagging endpoint is in memory, so a
+	// restart must re-send them. Set to 0 to disable the skip and
+	// re-register every non-terminal tx — useful for forcing a full re-sync
+	// after a known merkle-service wipe. Issue #145.
 	MerkleReplaySkipRecentMinutes int `mapstructure:"merkle_replay_skip_recent_minutes"`
 	// MerkleReplayRPS caps the average requests-per-second the startup
 	// replay issues against merkle-service. Implemented as an inter-batch
@@ -1335,7 +1341,7 @@ func setDefaults() {
 	// callbacks for everything in-flight.
 	viper.SetDefault("propagation.register_replay_on_start", true)
 	viper.SetDefault("propagation.register_replay_lookback_hours", 24)
-	viper.SetDefault("propagation.merkle_replay_skip_recent_minutes", 30)
+	viper.SetDefault("propagation.merkle_replay_skip_recent_minutes", -1)
 	viper.SetDefault("propagation.merkle_replay_rps", 50)
 
 	viper.SetDefault("network", NetworkMainnet)
@@ -1479,6 +1485,11 @@ func validateMerkleService(cfg *Config) error {
 		}
 		if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 			return fmt.Errorf("merkle_service url %q must be an absolute http(s) URL", u)
+		}
+		// The client appends /watch, /reprocess and /health to the base URL
+		// as a string, so a query or fragment would swallow the path.
+		if parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+			return fmt.Errorf("merkle_service url %q must not contain a query or fragment", u)
 		}
 	}
 	if cfg.MerkleService.Enabled() && cfg.CallbackToken == "" {

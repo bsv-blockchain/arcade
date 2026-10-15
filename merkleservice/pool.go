@@ -70,8 +70,12 @@ type endpoint struct {
 	lastFailureAt       time.Time
 
 	pending *catchupQueue
+	// draining is set while a catch-up drain for this endpoint is running, so
+	// a slow endpoint never has two drains in flight. Guarded by mu.
+	draining bool
 	// backoffTicks is how many drain ticks to skip after a drain batch in
-	// which nothing landed; doubles up to catchupMaxBackoffTicks.
+	// which nothing landed; doubles up to catchupMaxBackoffTicks. Guarded by
+	// mu, as is skipTicks.
 	backoffTicks int
 	skipTicks    int
 }
@@ -82,18 +86,30 @@ func (ep *endpoint) isOpen() bool {
 	return ep.open
 }
 
+// syncPendingGauge publishes the catch-up queue length. Called after every
+// change to the queue so the gauge agrees with /health, including while the
+// breaker is open.
+func (ep *endpoint) syncPendingGauge() {
+	metrics.MerkleEndpointCatchupPending.WithLabelValues(ep.url).Set(float64(ep.pending.len()))
+}
+
 // catchupQueue is the bounded, deduplicated set of registrations one
 // endpoint still owes. A tx the pool reported registered (some endpoint
 // accepted it) but this endpoint refused, timed out on, or was skipped for
 // (breaker open) lands here and is re-sent once the endpoint answers again.
-// It is in-memory on purpose: the startup replay re-registers every
-// in-flight tx with the whole pool, so a restart loses nothing durable.
+// It is in-memory on purpose: with several endpoints the startup replay
+// re-registers every in-flight tx in the lookback window with the whole pool
+// (the merkle_registered_at skip is off by default, since that stamp is set
+// when any one endpoint accepted), so what a restart drops is re-sent then.
 type catchupQueue struct {
-	mu      sync.Mutex
-	max     int
-	order   []string
-	byTxID  map[string]Registration
-	dropped int
+	mu     sync.Mutex
+	max    int
+	order  []string
+	byTxID map[string]Registration
+	// inflight counts entries taken for a catch-up send and not yet settled;
+	// they still count as owed until the endpoint has answered.
+	inflight int
+	dropped  int
 	// overflowed is set when entries were dropped and cleared when the
 	// queue next drains empty; that transition requests a full resync.
 	overflowed bool
@@ -123,7 +139,8 @@ func (q *catchupQueue) add(reg Registration) {
 	q.byTxID[reg.TxID] = reg
 }
 
-// take removes and returns up to n entries from the front.
+// take removes and returns up to n entries from the front. They stay counted
+// by len until settle is called for them.
 func (q *catchupQueue) take(n int) []Registration {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -136,13 +153,23 @@ func (q *catchupQueue) take(n int) []Registration {
 		delete(q.byTxID, txid)
 	}
 	q.order = q.order[n:]
+	q.inflight += len(out)
 	return out
 }
 
+// settle marks n taken entries as answered; any that failed have been added
+// back by then.
+func (q *catchupQueue) settle(n int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.inflight -= n
+}
+
+// len is how many registrations are owed: queued plus taken but unsettled.
 func (q *catchupQueue) len() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return len(q.order)
+	return len(q.order) + q.inflight
 }
 
 // drainedAfterOverflow reports and clears the overflow flag once the queue
@@ -150,7 +177,7 @@ func (q *catchupQueue) len() int {
 func (q *catchupQueue) drainedAfterOverflow() (int, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if !q.overflowed || len(q.order) > 0 {
+	if !q.overflowed || len(q.order)+q.inflight > 0 {
 		return 0, false
 	}
 	n := q.dropped
@@ -221,7 +248,8 @@ func WithClock(now func() time.Time) PoolOption {
 // transport/5xx failures it is skipped on the hot path so a black-holed
 // service cannot add its full HTTP timeout to every registration batch. The
 // background loop (Start) GETs /health on open endpoints and closes the
-// breaker on any non-5xx answer.
+// breaker on any non-5xx answer, after one owed registration (if any) also
+// went through as a trial /watch.
 //
 // A Pool with a single endpoint behaves like the Client it wraps, plus the
 // breaker, queue and per-endpoint metrics.
@@ -428,10 +456,7 @@ func (p *Pool) RegisterBatchWithResults(ctx context.Context, registrations []Reg
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			res := ep.client.RegisterBatchWithResults(ctx, registrations, maxConcurrency)
-			for _, err := range res {
-				p.record(ctx, ep, opWatch, err)
-			}
+			res := p.runEndpointBatch(ctx, ep, opWatch, registrations, maxConcurrency)
 			mu.Lock()
 			perEndpoint[ep] = res
 			mu.Unlock()
@@ -461,9 +486,57 @@ func (p *Pool) RegisterBatchWithResults(ctx context.Context, registrations []Reg
 				ep.pending.add(registrations[j])
 			}
 		}
-		metrics.MerkleEndpointCatchupPending.WithLabelValues(ep.url).Set(float64(ep.pending.len()))
+		ep.syncPendingGauge()
 	}
 	return out
+}
+
+// runEndpointBatch sends registrations to ep alone, at most maxConcurrency at
+// a time, and records each result as it lands so the breaker can open in the
+// middle of a batch. Once it is open nothing more is sent: the remaining
+// entries come back as ErrNoHealthyEndpoints right away. Without that a
+// black-holed endpoint would hold the caller for one HTTP timeout per
+// maxConcurrency entries, even though another endpoint accepted them all
+// long ago; with it the first batch waits for at most the requests already
+// in flight when the breaker trips. res[i] corresponds to registrations[i].
+func (p *Pool) runEndpointBatch(ctx context.Context, ep *endpoint, op string, registrations []Registration, maxConcurrency int) []error {
+	if maxConcurrency <= 0 {
+		maxConcurrency = 10
+	}
+	res := make([]error, len(registrations))
+	sem := make(chan struct{}, maxConcurrency)
+	var wg sync.WaitGroup
+	skipped := 0
+	for i, reg := range registrations {
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			res[i] = ctx.Err()
+			continue
+		}
+		// Checked after taking a slot: a slot frees only when an earlier
+		// request has finished and been recorded, so a trip it caused is
+		// already visible here.
+		if ep.isOpen() {
+			<-sem
+			res[i] = ErrNoHealthyEndpoints
+			skipped++
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			err := ep.client.Register(ctx, reg.TxID, reg.CallbackURL, reg.CallbackToken)
+			p.record(ctx, ep, op, err)
+			res[i] = err
+		}()
+	}
+	wg.Wait()
+	if skipped > 0 {
+		metrics.MerkleEndpointRequestsTotal.WithLabelValues(ep.url, op, outcomeSkippedOpen).Add(float64(skipped))
+	}
+	return res
 }
 
 // closedEndpoints returns the endpoints whose breaker is closed and counts a
@@ -629,91 +702,225 @@ func (p *Pool) loop(ctx context.Context) {
 	}
 }
 
-// probeOpenEndpoints GETs /health on every open endpoint and closes the
-// breaker of each one that answers with anything but a 5xx. A 4xx (e.g. 404
-// from a build without /health) still proves the process is reachable; a 5xx
-// means the service itself reports unhealthy, so it stays open.
+// probeOpenEndpoints probes every open endpoint concurrently, so several
+// black-holed endpoints cost one probe timeout per tick rather than one each.
 func (p *Pool) probeOpenEndpoints(ctx context.Context) {
+	var wg sync.WaitGroup
 	for _, ep := range p.endpoints {
 		if !ep.isOpen() {
 			continue
 		}
-		err := p.probe(ctx, ep)
-		outcome, _ := classify(ctx, err)
-		metrics.MerkleEndpointRequestsTotal.WithLabelValues(ep.url, opProbe, outcome).Inc()
-		if err != nil {
-			p.logger.Debug("merkle-service probe failed", zap.String("endpoint", ep.url), zap.String("outcome", outcome), zap.Error(err))
-			continue
-		}
-		p.closeBreaker(ep, opProbe)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p.probeEndpoint(ctx, ep)
+		}()
 	}
+	wg.Wait()
 }
 
-// drainCatchup re-sends one batch of queued registrations to every closed
-// endpoint that owes some. Failures go back to the queue (and count toward
-// the breaker); a batch in which nothing landed backs the endpoint off for a
-// growing number of ticks. When a queue that had overflowed drains empty,
-// the resync hooks fire for that endpoint.
+// probeEndpoint GETs /health on one open endpoint and closes its breaker when
+// it answers with anything but a 5xx and a trial /watch (see trialWatch) also
+// answers. A 4xx (e.g. 404 from a build without /health) still proves the
+// process is reachable; a 5xx means the service itself reports unhealthy, so
+// it stays open.
+func (p *Pool) probeEndpoint(ctx context.Context, ep *endpoint) {
+	err := p.probe(ctx, ep)
+	outcome, _ := classify(ctx, err)
+	metrics.MerkleEndpointRequestsTotal.WithLabelValues(ep.url, opProbe, outcome).Inc()
+	if err != nil {
+		p.logger.Debug("merkle-service probe failed", zap.String("endpoint", ep.url), zap.String("outcome", outcome), zap.Error(err))
+		return
+	}
+	if !p.trialWatch(ctx, ep) {
+		return
+	}
+	p.closeBreaker(ep, opProbe)
+}
+
+// trialWatch re-sends one registration the endpoint owes, bounded by the
+// probe timeout, before its breaker closes. /health is shallow: an endpoint
+// whose /health answers while /watch hangs would otherwise be closed every
+// probe tick and hold the next hot-path batch for a full HTTP timeout before
+// re-tripping. It reports whether /watch answered below 500. With nothing
+// owed there is nothing to try, and /health alone decides.
+func (p *Pool) trialWatch(ctx context.Context, ep *endpoint) bool {
+	batch := ep.pending.take(1)
+	if len(batch) == 0 {
+		return true
+	}
+	reg := batch[0]
+	trialCtx, cancel := context.WithTimeout(ctx, defaultProbeTimeout)
+	err := ep.client.Register(trialCtx, reg.TxID, reg.CallbackURL, reg.CallbackToken)
+	cancel()
+	// Classified against the parent ctx: the trial's own deadline is the
+	// hanging-/watch signal and must count as a failure.
+	outcome, failure := classify(ctx, err)
+	p.record(ctx, ep, opCatchup, err)
+	if err != nil && !permanentRejection(err) {
+		ep.pending.add(reg)
+	}
+	ep.pending.settle(1)
+	ep.syncPendingGauge()
+	if outcome == outcomeCanceled || failure {
+		p.logger.Debug("merkle-service trial /watch failed; keeping breaker open", zap.String("endpoint", ep.url), zap.String("outcome", outcome), zap.Error(err))
+		return false
+	}
+	return true
+}
+
+// drainCatchup starts, for every closed endpoint that owes registrations and
+// is not backing off, a drain of one batch. Each endpoint drains on its own
+// goroutine, at most one at a time, so a hanging endpoint cannot hold up the
+// probes or another endpoint's catch-up.
 func (p *Pool) drainCatchup(ctx context.Context) {
 	for _, ep := range p.endpoints {
 		if ctx.Err() != nil {
 			return
 		}
-		if ep.isOpen() {
+		ep.syncPendingGauge()
+		ep.mu.Lock()
+		if ep.open || ep.draining {
+			ep.mu.Unlock()
 			continue
 		}
 		if ep.skipTicks > 0 {
 			ep.skipTicks--
+			ep.mu.Unlock()
 			continue
 		}
-		batch := ep.pending.take(catchupBatchSize)
-		if len(batch) > 0 {
-			landed := p.sendCatchup(ctx, ep, batch)
-			switch {
-			case landed == 0 && ctx.Err() == nil:
-				if ep.backoffTicks == 0 {
-					ep.backoffTicks = 1
-				} else if ep.backoffTicks < catchupMaxBackoffTicks {
-					ep.backoffTicks *= 2
-				}
-				ep.skipTicks = ep.backoffTicks
-			case landed > 0:
-				ep.backoffTicks = 0
-				p.logger.Info(
-					"merkle-service catch-up delivered missed registrations",
-					zap.String("endpoint", ep.url),
-					zap.Int("landed", landed),
-					zap.Int("failed", len(batch)-landed),
-					zap.Int("still_pending", ep.pending.len()),
-				)
-			}
-		}
-		metrics.MerkleEndpointCatchupPending.WithLabelValues(ep.url).Set(float64(ep.pending.len()))
-		if dropped, ok := ep.pending.drainedAfterOverflow(); ok {
-			p.logger.Warn(
-				"merkle-service catch-up queue had overflowed; requesting a full resync of this endpoint",
-				zap.String("endpoint", ep.url),
-				zap.Int("dropped", dropped),
-			)
-			p.fireResync(ep.url)
-		}
+		ep.draining = true
+		ep.mu.Unlock()
+		go func() {
+			defer func() {
+				ep.mu.Lock()
+				ep.draining = false
+				ep.mu.Unlock()
+			}()
+			p.drainEndpoint(ctx, ep)
+		}()
 	}
 }
 
-// sendCatchup registers batch with ep alone, re-queues what failed and
-// returns how many landed.
-func (p *Pool) sendCatchup(ctx context.Context, ep *endpoint, batch []Registration) int {
-	res := ep.client.RegisterBatchWithResults(ctx, batch, catchupConcurrency)
-	landed := 0
-	for i, err := range res {
-		p.record(ctx, ep, opCatchup, err)
-		if err == nil {
-			landed++
-			continue
-		}
-		ep.pending.add(batch[i])
+// drainEndpoint re-sends one batch of ep's queued registrations. Failures go
+// back to the queue (and count toward the breaker) unless the endpoint
+// rejected the registration outright (see permanentRejection); a batch that
+// made no progress backs the endpoint off for a growing number of ticks.
+// When a queue that had overflowed drains empty, the resync hooks fire.
+func (p *Pool) drainEndpoint(ctx context.Context, ep *endpoint) {
+	if batch := ep.pending.take(catchupBatchSize); len(batch) > 0 {
+		p.catchupBatch(ctx, ep, batch)
 	}
-	return landed
+	ep.syncPendingGauge()
+	if dropped, ok := ep.pending.drainedAfterOverflow(); ok {
+		p.logger.Warn(
+			"merkle-service catch-up queue had overflowed; requesting a full resync of this endpoint",
+			zap.String("endpoint", ep.url),
+			zap.Int("dropped", dropped),
+		)
+		p.fireResync(ep.url)
+	}
+}
+
+// catchupBatch sends one taken batch, settles it, adjusts the endpoint's
+// backoff and logs the outcome.
+func (p *Pool) catchupBatch(ctx context.Context, ep *endpoint, batch []Registration) {
+	r := p.sendCatchup(ctx, ep, batch)
+	ep.pending.settle(len(batch))
+	progress := r.landed + r.dropped
+	ep.mu.Lock()
+	switch {
+	case progress == 0 && ctx.Err() == nil:
+		if ep.backoffTicks == 0 {
+			ep.backoffTicks = 1
+		} else if ep.backoffTicks < catchupMaxBackoffTicks {
+			ep.backoffTicks *= 2
+		}
+		ep.skipTicks = ep.backoffTicks
+	case progress > 0:
+		ep.backoffTicks = 0
+	}
+	ep.mu.Unlock()
+	if r.landed > 0 {
+		p.logger.Info(
+			"merkle-service catch-up delivered missed registrations",
+			zap.String("endpoint", ep.url),
+			zap.Int("landed", r.landed),
+			zap.Int("failed", len(batch)-progress),
+			zap.Int("still_pending", ep.pending.len()),
+		)
+	}
+	if r.dropped > 0 {
+		p.logger.Warn(
+			"merkle-service endpoint rejected catch-up registrations; dropped them",
+			zap.String("endpoint", ep.url),
+			zap.Int("dropped", r.dropped),
+			zap.Error(r.sampleDropped),
+		)
+	}
+	if r.auth > 0 {
+		// 401/403 do not count toward the breaker, so this log is the only
+		// signal besides the gauge. They are kept: a token fixed on the
+		// merkle-service side should not need an arcade restart.
+		p.logger.Warn(
+			"merkle-service endpoint rejected the auth token on catch-up; check merkle_service.auth_token",
+			zap.String("endpoint", ep.url),
+			zap.Int("rejected", r.auth),
+			zap.Int("still_pending", ep.pending.len()),
+		)
+	}
+}
+
+// catchupResult summarizes one catch-up batch.
+type catchupResult struct {
+	landed  int // acknowledged by the endpoint
+	dropped int // rejected outright; not re-queued
+	auth    int // refused with 401/403; re-queued
+	// sampleDropped is one of the rejections behind dropped, for the log.
+	sampleDropped error
+}
+
+// sendCatchup registers batch with ep alone and re-queues every failure
+// except an outright rejection.
+func (p *Pool) sendCatchup(ctx context.Context, ep *endpoint, batch []Registration) catchupResult {
+	var r catchupResult
+	for i, err := range p.runEndpointBatch(ctx, ep, opCatchup, batch, catchupConcurrency) {
+		switch outcome, _ := classify(ctx, err); {
+		case err == nil:
+			r.landed++
+		case permanentRejection(err):
+			r.dropped++
+			if r.sampleDropped == nil {
+				r.sampleDropped = err
+			}
+		default:
+			if outcome == outcomeAuth {
+				r.auth++
+			}
+			ep.pending.add(batch[i])
+		}
+	}
+	return r
+}
+
+// permanentRejection reports whether err is a /watch refusal that sending the
+// same registration again cannot fix: a 4xx other than 401/403 (a token
+// problem, fixable on either side), 408 or 429 (the endpoint asked us to
+// slow down or try again).
+func permanentRejection(err error) bool {
+	var regErr *RegisterError
+	if !errors.As(err, &regErr) {
+		return false
+	}
+	switch code := regErr.StatusCode; {
+	case code < http.StatusBadRequest || code >= http.StatusInternalServerError:
+		return false
+	case code == http.StatusUnauthorized, code == http.StatusForbidden,
+		code == http.StatusRequestTimeout, code == http.StatusTooManyRequests:
+		return false
+	default:
+		return true
+	}
 }
 
 func (p *Pool) fireResync(url string) {
@@ -778,27 +985,15 @@ func (s *endpointService) RegisterBatchWithResults(ctx context.Context, registra
 	if len(registrations) == 0 {
 		return nil
 	}
-	out := make([]error, len(registrations))
-	if s.ep.isOpen() {
-		metrics.MerkleEndpointRequestsTotal.WithLabelValues(s.ep.url, opWatch, outcomeSkippedOpen).Inc()
-		for i := range registrations {
-			out[i] = ErrNoHealthyEndpoints
-			s.ep.pending.add(registrations[i])
-		}
-		return out
-	}
-	res := s.ep.client.RegisterBatchWithResults(ctx, registrations, maxConcurrency)
+	// runEndpointBatch refuses fast (ErrNoHealthyEndpoints, nothing sent)
+	// for every entry once the breaker is open, including from the start.
+	out := s.pool.runEndpointBatch(ctx, s.ep, opWatch, registrations, maxConcurrency)
 	for i, reg := range registrations {
-		if i >= len(res) {
-			break
-		}
-		s.pool.record(ctx, s.ep, opWatch, res[i])
-		if res[i] != nil {
+		if out[i] != nil {
 			s.ep.pending.add(reg)
 		}
-		out[i] = res[i]
 	}
-	metrics.MerkleEndpointCatchupPending.WithLabelValues(s.ep.url).Set(float64(s.ep.pending.len()))
+	s.ep.syncPendingGauge()
 	return out
 }
 
