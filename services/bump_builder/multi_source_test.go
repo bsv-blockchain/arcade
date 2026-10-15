@@ -13,6 +13,7 @@ import (
 
 	"github.com/bsv-blockchain/arcade/bump"
 	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/models"
 )
 
@@ -456,5 +457,156 @@ func TestBuilder_PruneOrphanStumps_WalksPastRecencyDepthWhileRowsRetained(t *tes
 	}
 	if len(ms.stumps["deep-fresh"]) != 1 {
 		t.Fatalf("deep-fresh is inside retention and must be kept, got %d", len(ms.stumps["deep-fresh"]))
+	}
+}
+
+// coinbaseSlotFixture is the shape every small block has: one subtree whose
+// offset 0 is the coinbase placeholder and whose tracked tx sits at offset 1,
+// so each service's STUMP carries the placeholder at level 0 while the stored
+// compound carries the real coinbase txid there (the build swaps it in from
+// the coinbase BUMP). Delivered through the enriched BLOCK_PROCESSED path,
+// as merkle-service sends it.
+func coinbaseSlotFixture(t *testing.T) (f *multiSourceFixture, msg func() *kafka.Message) {
+	t.Helper()
+	f = &multiSourceFixture{ms: newMockStore(), pub: &recordingPublisher{}, blockHash: testBlockHash}
+	placeholder := mustHash(t, "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	tracked := mustHash(t, "1111111111111111111111111111111111111111111111111111111111111111")
+	coinbase := mustHash(t, "4444444444444444444444444444444444444444444444444444444444444444")
+	isTx := true
+	stump := (&transaction.MerklePath{BlockHeight: 1, Path: [][]*transaction.PathElement{{
+		{Offset: 0, Hash: &placeholder},
+		{Offset: 1, Hash: &tracked, Txid: &isTx},
+	}}}).Bytes()
+	cbBUMP := (&transaction.MerklePath{BlockHeight: 1, Path: [][]*transaction.PathElement{{
+		{Offset: 0, Hash: &coinbase, Txid: &isTx},
+		{Offset: 1, Hash: &tracked},
+	}}}).Bytes()
+	subtreeHashes := []chainhash.Hash{*transaction.MerkleTreeParent(&placeholder, &tracked)}
+	root := *transaction.MerkleTreeParent(&coinbase, &tracked)
+	f.variantA = stump
+	datahub := newRecordingDatahub(t)
+	f.b = newTestBuilder(f.ms, datahub.server.URL)
+	f.b.publisher = f.pub
+	return f, func() *kafka.Message {
+		return makeBlockProcessedMsgWithEnrichment(t, f.blockHash, root, subtreeHashes, cbBUMP)
+	}
+}
+
+// With several merkle-services every one of them delivers an identical
+// STUMP for the block, placeholder included. The redelivery must be
+// recognised as carrying nothing new: it must not rebuild, must not flag the
+// real coinbase leaf as dropped, and must not clear processed_at (which
+// hands a finished block back to the watchdog on every block).
+func TestBuilder_HandleMessage_IdenticalRedelivery_CoinbaseSlot_ShortCircuits(t *testing.T) {
+	f, msg := coinbaseSlotFixture(t)
+	ctx := context.Background()
+
+	f.ms.addStump(f.blockHash, 0, f.variantA)
+	if err := f.b.handleMessage(ctx, msg()); err != nil {
+		t.Fatalf("first build: %v", err)
+	}
+	stamped := time.Now()
+	f.ms.mu.Lock()
+	if _, ok := f.ms.bumps[f.blockHash]; !ok {
+		f.ms.mu.Unlock()
+		t.Fatal("first delivery must build the compound")
+	}
+	f.ms.blockProc = []*models.BlockProcessingStatus{{BlockHash: f.blockHash, BlockHeight: 1, ProcessedAt: &stamped}}
+	before := string(f.ms.bumps[f.blockHash])
+	f.ms.mu.Unlock()
+
+	// Services B and C deliver the same STUMP.
+	for svc := 0; svc < 2; svc++ {
+		f.ms.addStump(f.blockHash, 0, f.variantA)
+		beforeShort := bumpOutcomeSampleCount(t, "short_circuited")
+		if err := f.b.handleMessage(ctx, msg()); err != nil {
+			t.Fatalf("redelivery %d: %v", svc, err)
+		}
+		if got := bumpOutcomeSampleCount(t, "short_circuited"); got != beforeShort+1 {
+			t.Fatalf("redelivery %d: short_circuited samples = %d, want %d", svc, got, beforeShort+1)
+		}
+	}
+	f.ms.mu.Lock()
+	defer f.ms.mu.Unlock()
+	if len(f.ms.clearedBlocks) != 0 {
+		t.Fatalf("an identical redelivery must not hand the block back to the watchdog, cleared=%v", f.ms.clearedBlocks)
+	}
+	if string(f.ms.bumps[f.blockHash]) != before {
+		t.Fatal("an identical redelivery must not rewrite the stored BUMP")
+	}
+}
+
+// Service B tracks a different pair of the same subtree. Its redelivery adds
+// leaves, so the compound is rebuilt; the rebuild still carries the real
+// coinbase at offset 0 and must not be judged as dropping it (the STUMP-side
+// txids hold the placeholder there).
+func TestBuilder_HandleMessage_RedeliveryNewLeaves_CoinbaseSlot_Rebuilds(t *testing.T) {
+	ms := newMockStore()
+	pub := &recordingPublisher{}
+	blockHash := testBlockHash
+	ph := mustHash(t, "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	t1 := mustHash(t, "1111111111111111111111111111111111111111111111111111111111111111")
+	l2 := mustHash(t, "2222222222222222222222222222222222222222222222222222222222222222")
+	l3 := mustHash(t, "3333333333333333333333333333333333333333333333333333333333333333")
+	cb := mustHash(t, "4444444444444444444444444444444444444444444444444444444444444444")
+	isTx := true
+	p01 := transaction.MerkleTreeParent(&ph, &t1)
+	p23 := transaction.MerkleTreeParent(&l2, &l3)
+	stumpA := (&transaction.MerklePath{BlockHeight: 1, Path: [][]*transaction.PathElement{
+		{{Offset: 0, Hash: &ph}, {Offset: 1, Hash: &t1, Txid: &isTx}},
+		{{Offset: 1, Hash: p23}},
+	}}).Bytes()
+	stumpB := (&transaction.MerklePath{BlockHeight: 1, Path: [][]*transaction.PathElement{
+		{{Offset: 2, Hash: &l2, Txid: &isTx}, {Offset: 3, Hash: &l3}},
+		{{Offset: 0, Hash: p01}},
+	}}).Bytes()
+	cbBUMP := (&transaction.MerklePath{BlockHeight: 1, Path: [][]*transaction.PathElement{
+		{{Offset: 0, Hash: &cb, Txid: &isTx}, {Offset: 1, Hash: &t1}},
+		{{Offset: 1, Hash: p23}},
+	}}).Bytes()
+	subtreeHashes := []chainhash.Hash{*transaction.MerkleTreeParent(p01, p23)}
+	root := *transaction.MerkleTreeParent(transaction.MerkleTreeParent(&cb, &t1), p23)
+	datahub := newRecordingDatahub(t)
+	b := newTestBuilder(ms, datahub.server.URL)
+	b.publisher = pub
+	msg := func() *kafka.Message {
+		return makeBlockProcessedMsgWithEnrichment(t, blockHash, root, subtreeHashes, cbBUMP)
+	}
+	ctx := context.Background()
+
+	ms.addStump(blockHash, 0, stumpA)
+	if err := b.handleMessage(ctx, msg()); err != nil {
+		t.Fatalf("first build: %v", err)
+	}
+	stamped := time.Now()
+	ms.mu.Lock()
+	ms.blockProc = []*models.BlockProcessingStatus{{BlockHash: blockHash, BlockHeight: 1, ProcessedAt: &stamped}}
+	ms.mu.Unlock()
+
+	ms.addStump(blockHash, 0, stumpB)
+	beforeRebuilt := bumpOutcomeSampleCount(t, "rebuilt")
+	if err := b.handleMessage(ctx, msg()); err != nil {
+		t.Fatalf("redelivery: %v", err)
+	}
+	if got := bumpOutcomeSampleCount(t, "rebuilt"); got != beforeRebuilt+1 {
+		t.Fatalf("rebuilt samples = %d, want %d", got, beforeRebuilt+1)
+	}
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if len(ms.clearedBlocks) != 0 {
+		t.Fatalf("a rebuild that keeps every leaf must not be deferred, cleared=%v", ms.clearedBlocks)
+	}
+	leaves, err := levelZeroTxidsFromBUMP(ms.bumps[blockHash])
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, l := range leaves {
+		got[l] = true
+	}
+	for _, want := range []chainhash.Hash{cb, t1, l2, l3} {
+		if !got[want.String()] {
+			t.Fatalf("rebuilt BUMP leaves %v lack %s", leaves, want)
+		}
 	}
 }

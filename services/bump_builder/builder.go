@@ -852,7 +852,10 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	// the fix is the same as for an incomplete expected set — hand the block
 	// back to the watchdog, whose /reprocess fans out to every merkle-service.
 	if storedLeaves != nil {
-		if dropped := leavesNotIn(storedLeaves, txids); dropped > 0 {
+		// Compound against compound: txids comes from the STUMPs and still
+		// carries the coinbase placeholder at subtree 0 offset 0, while the
+		// stored BUMP (like this compound) has the real coinbase txid there.
+		if dropped := leavesNotIn(storedLeaves, compoundLeaves(compound)); dropped > 0 {
 			logger.Error(
 				"rebuilt compound would drop leaves of the stored BUMP; keeping the stored BUMP and deferring to the watchdog",
 				zap.Int("dropped_leaves", dropped),
@@ -1004,6 +1007,21 @@ func (b *Builder) handleRedelivery(ctx context.Context, logger *zap.Logger, bloc
 	return storedLeaves, "", nil
 }
 
+// compoundLeaves lists the level-0 hashes of a built compound BUMP, the same
+// set levelZeroTxidsFromBUMP reads back from a stored one.
+func compoundLeaves(compound *transaction.MerklePath) []string {
+	if len(compound.Path) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(compound.Path[0]))
+	for _, elem := range compound.Path[0] {
+		if elem.Hash != nil {
+			out = append(out, elem.Hash.String())
+		}
+	}
+	return out
+}
+
 // leavesNotIn counts the stored leaves that txids does not cover.
 func leavesNotIn(stored map[string]struct{}, txids []string) int {
 	have := make(map[string]struct{}, len(txids))
@@ -1034,8 +1052,19 @@ func (b *Builder) leavesBeyondStoredBUMP(ctx context.Context, blockHash string, 
 	seen := make(map[string]struct{})
 	var missing []string
 	for _, st := range stumps {
-		for _, h := range bump.ExtractLevel0Hashes(st.StumpData) {
-			txid := h.String()
+		mp, perr := transaction.NewMerklePathFromBinary(st.StumpData)
+		if perr != nil || len(mp.Path) == 0 {
+			continue
+		}
+		for _, leaf := range mp.Path[0] {
+			// Subtree 0 offset 0 is the coinbase slot: every STUMP carries
+			// the placeholder there while the stored compound carries the
+			// real coinbase txid, and arcade never tracks a coinbase. Counting
+			// it would turn every identical redelivery into a rebuild.
+			if leaf.Hash == nil || (st.SubtreeIndex == 0 && leaf.Offset == 0) {
+				continue
+			}
+			txid := leaf.Hash.String()
 			if _, ok := have[txid]; ok {
 				continue
 			}
