@@ -677,3 +677,105 @@ func TestPool_ProbeKeepsBreakerOpenWhileWatchHangs(t *testing.T) {
 		t.Fatalf("b must close once the trial /watch lands: %+v", st)
 	}
 }
+
+// hangingServer answers nothing until the request is canceled or release is
+// closed: a black-holed merkle-service (paused container, dead IP).
+func hangingServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	release := make(chan struct{})
+	hang := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(hang.Close)
+	t.Cleanup(func() { close(release) }) // runs first: unblock handlers so Close returns
+	return hang
+}
+
+func regsN(n int) []Registration {
+	regs := make([]Registration, n)
+	for i := range regs {
+		regs[i] = Registration{TxID: "tx" + strconv.Itoa(i), CallbackURL: testCallbackURL}
+	}
+	return regs
+}
+
+// Found by chaos testing: with one of three merkle-services black-holed, every
+// batch waited out the full HTTP timeout (30s in production) on that endpoint
+// although the other two had accepted every tx in milliseconds, so broadcast
+// stalled for the whole window before the breaker tripped. Once every tx is
+// accepted somewhere, the stragglers get a short grace and are then canceled;
+// the cancellation counts against their breaker and the txs they owe go to
+// the catch-up queue.
+func TestPool_StragglerDoesNotHoldTheBatchOnceEveryTxIsAccepted(t *testing.T) {
+	a := newFakeMerkle(t)
+	hang := hangingServer(t)
+	const timeout, grace = 10 * time.Second, 100 * time.Millisecond
+	p := NewPool([]string{a.url(), hang.URL}, "", timeout, WithFailureThreshold(3), WithStragglerGrace(grace))
+	regs := regsN(12)
+
+	start := time.Now()
+	errs := p.RegisterBatchWithResults(context.Background(), regs, 4)
+	elapsed := time.Since(start)
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("errs[%d]=%v, a accepted every tx", i, err)
+		}
+	}
+	if elapsed > 10*grace {
+		t.Fatalf("batch took %v; it must return about one grace (%v) after a accepted everything, not wait for the %v timeout", elapsed, grace, timeout)
+	}
+	st := p.EndpointStatuses()[1]
+	if st.Healthy {
+		t.Fatalf("the canceled in-flight /watch calls must count against the hanging endpoint's breaker: %+v", st)
+	}
+	if st.CatchupPending != len(regs) {
+		t.Fatalf("hanging endpoint must owe all %d txs, owes %d", len(regs), st.CatchupPending)
+	}
+}
+
+// With no other endpoint to accept, nothing is covered and nothing is cut
+// short: the batch waits for the endpoint's own answer (here its timeout).
+func TestPool_SingleHangingEndpointStillWaitsForItsTimeout(t *testing.T) {
+	hang := hangingServer(t)
+	const timeout, grace = 300 * time.Millisecond, 20 * time.Millisecond
+	p := NewPool([]string{hang.URL}, "", timeout, WithStragglerGrace(grace))
+	start := time.Now()
+	errs := p.RegisterBatchWithResults(context.Background(), regsN(2), 2)
+	if elapsed := time.Since(start); elapsed < timeout {
+		t.Fatalf("returned after %v, before the endpoint's %v timeout", elapsed, timeout)
+	}
+	for i, err := range errs {
+		if err == nil {
+			t.Fatalf("errs[%d] = nil, nothing accepted it", i)
+		}
+	}
+}
+
+// A slower endpoint that answers within the grace keeps its registrations and
+// its health.
+func TestPool_SlowEndpointWithinGraceIsNotPenalized(t *testing.T) {
+	a := newFakeMerkle(t)
+	b := newFakeMerkle(t)
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(50 * time.Millisecond)
+		b.srv.Config.Handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(slow.Close)
+	p := NewPool([]string{a.url(), slow.URL}, "", 5*time.Second, WithStragglerGrace(2*time.Second))
+	regs := regsN(6)
+	for i, err := range p.RegisterBatchWithResults(context.Background(), regs, 6) {
+		if err != nil {
+			t.Fatalf("errs[%d]=%v", i, err)
+		}
+	}
+	st := p.EndpointStatuses()[1]
+	if !st.Healthy || st.CatchupPending != 0 || st.ConsecutiveFailures != 0 {
+		t.Fatalf("slow-but-answering endpoint must be healthy and owe nothing: %+v", st)
+	}
+	if b.watchedCount() != len(regs) {
+		t.Fatalf("slow endpoint got %d of %d registrations", b.watchedCount(), len(regs))
+	}
+}
