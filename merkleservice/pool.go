@@ -39,6 +39,11 @@ const (
 	catchupBatchSize = 500
 	// catchupConcurrency bounds the in-flight /watch calls of one drain.
 	catchupConcurrency = 10
+	// defaultStragglerGrace is how long a /watch batch keeps waiting for the
+	// remaining endpoints once every tx in it has been accepted by some
+	// endpoint. Past it they are canceled and owe the txs via catch-up. Same
+	// bar as the trial /watch before a breaker closes.
+	defaultStragglerGrace = defaultProbeTimeout
 	// catchupMaxBackoffTicks caps how many ticks a drain waits after a batch
 	// in which nothing landed; the breaker handles a fully-down endpoint.
 	catchupMaxBackoffTicks = 12
@@ -218,6 +223,16 @@ func WithCatchupQueueSize(n int) PoolOption {
 	}
 }
 
+// WithStragglerGrace sets how long a /watch batch waits for the remaining
+// endpoints once every tx has been accepted somewhere.
+func WithStragglerGrace(d time.Duration) PoolOption {
+	return func(p *Pool) {
+		if d > 0 {
+			p.stragglerGrace = d
+		}
+	}
+}
+
 // WithClock overrides the pool's clock (tests).
 func WithClock(now func() time.Time) PoolOption {
 	return func(p *Pool) {
@@ -258,9 +273,12 @@ type Pool struct {
 	threshold     int
 	probeInterval time.Duration
 	queueSize     int
-	probeClient   *http.Client
-	now           func() time.Time
-	logger        *zap.Logger
+	// stragglerGrace bounds the wait for slower endpoints once every tx of
+	// a /watch batch is accepted (see RegisterBatchWithResults).
+	stragglerGrace time.Duration
+	probeClient    *http.Client
+	now            func() time.Time
+	logger         *zap.Logger
 
 	hooksMu     sync.Mutex
 	resyncHooks []func(endpoint string)
@@ -272,12 +290,13 @@ type Pool struct {
 // normalizes the list, but NewPool is defensive so tests can pass raw slices.
 func NewPool(baseURLs []string, authToken string, timeout time.Duration, opts ...PoolOption) *Pool {
 	p := &Pool{
-		threshold:     defaultFailureThreshold,
-		probeInterval: defaultProbeInterval,
-		queueSize:     defaultCatchupQueueSize,
-		probeClient:   &http.Client{Timeout: defaultProbeTimeout},
-		now:           time.Now,
-		logger:        zap.NewNop(),
+		threshold:      defaultFailureThreshold,
+		probeInterval:  defaultProbeInterval,
+		queueSize:      defaultCatchupQueueSize,
+		stragglerGrace: defaultStragglerGrace,
+		probeClient:    &http.Client{Timeout: defaultProbeTimeout},
+		now:            time.Now,
+		logger:         zap.NewNop(),
 	}
 	for _, o := range opts {
 		o(p)
@@ -435,7 +454,10 @@ func (p *Pool) RegisterBatch(ctx context.Context, registrations []Registration, 
 // endpoint accepted the tx, otherwise the most retryable of that tx's errors.
 // Every tx the pool reports registered that some endpoint did not accept
 // (refused, timed out, or skipped for an open breaker) is queued for that
-// endpoint. Output length always equals len(registrations).
+// endpoint. A batch that every tx has cleared waits at most stragglerGrace
+// for the remaining endpoints (see collectEndpointBatches), so one hung
+// endpoint does not hold registration — and therefore broadcast — for its
+// full HTTP timeout. Output length always equals len(registrations).
 func (p *Pool) RegisterBatchWithResults(ctx context.Context, registrations []Registration, maxConcurrency int) []error {
 	if len(registrations) == 0 {
 		return nil
@@ -449,20 +471,7 @@ func (p *Pool) RegisterBatchWithResults(ctx context.Context, registrations []Reg
 		return out
 	}
 
-	perEndpoint := make(map[*endpoint][]error, len(targets))
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	for _, ep := range targets {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			res := p.runEndpointBatch(ctx, ep, opWatch, registrations, maxConcurrency)
-			mu.Lock()
-			perEndpoint[ep] = res
-			mu.Unlock()
-		}()
-	}
-	wg.Wait()
+	perEndpoint := p.collectEndpointBatches(ctx, targets, registrations, maxConcurrency)
 
 	candidates := make([]error, 0, len(targets))
 	for j := range registrations {
@@ -491,6 +500,58 @@ func (p *Pool) RegisterBatchWithResults(ctx context.Context, registrations []Reg
 	return out
 }
 
+// collectEndpointBatches runs the batch against every target concurrently
+// and returns each endpoint's per-tx results. It returns as soon as every
+// endpoint has answered, or stragglerGrace after every tx has been accepted
+// by some endpoint, whichever is first: the stragglers' sends are then
+// canceled. Their breakers still learn from it, because results are recorded
+// against the caller's ctx (only the caller's own cancellation is exempt),
+// so a black-holed endpoint trips on its first batch instead of holding every
+// batch for a full HTTP timeout. What the stragglers did not acknowledge
+// lands in their catch-up queue through the caller's usual path.
+func (p *Pool) collectEndpointBatches(ctx context.Context, targets []*endpoint, registrations []Registration, maxConcurrency int) map[*endpoint][]error {
+	sendCtx, cancelSends := context.WithCancel(ctx)
+	defer cancelSends()
+	type endpointResult struct {
+		ep  *endpoint
+		res []error
+	}
+	results := make(chan endpointResult, len(targets))
+	for _, ep := range targets {
+		go func() {
+			results <- endpointResult{ep, p.runEndpointBatch(ctx, sendCtx, ep, opWatch, registrations, maxConcurrency)}
+		}()
+	}
+
+	perEndpoint := make(map[*endpoint][]error, len(targets))
+	accepted := make([]bool, len(registrations))
+	unaccepted := len(registrations)
+	var grace <-chan time.Time
+	for len(perEndpoint) < len(targets) {
+		select {
+		case r := <-results:
+			perEndpoint[r.ep] = r.res
+			for j, err := range r.res {
+				if err == nil && !accepted[j] {
+					accepted[j] = true
+					unaccepted--
+				}
+			}
+			if unaccepted == 0 && grace == nil && len(perEndpoint) < len(targets) {
+				t := time.NewTimer(p.stragglerGrace)
+				defer t.Stop()
+				grace = t.C
+			}
+		case <-grace:
+			// Every tx is registered somewhere; stop waiting on the rest.
+			// Their sends return promptly and are still collected above.
+			cancelSends()
+			grace = nil
+		}
+	}
+	return perEndpoint
+}
+
 // runEndpointBatch sends registrations to ep alone, at most maxConcurrency at
 // a time, and records each result as it lands so the breaker can open in the
 // middle of a batch. Once it is open nothing more is sent: the remaining
@@ -499,7 +560,11 @@ func (p *Pool) RegisterBatchWithResults(ctx context.Context, registrations []Reg
 // maxConcurrency entries, even though another endpoint accepted them all
 // long ago; with it the first batch waits for at most the requests already
 // in flight when the breaker trips. res[i] corresponds to registrations[i].
-func (p *Pool) runEndpointBatch(ctx context.Context, ep *endpoint, op string, registrations []Registration, maxConcurrency int) []error {
+//
+// sendCtx bounds the requests; ctx is the caller's and decides whether a
+// failure was the caller's own cancellation (not the endpoint's fault) when it
+// is recorded. They differ only when the pool cuts a straggler short.
+func (p *Pool) runEndpointBatch(ctx, sendCtx context.Context, ep *endpoint, op string, registrations []Registration, maxConcurrency int) []error {
 	if maxConcurrency <= 0 {
 		maxConcurrency = 10
 	}
@@ -510,8 +575,8 @@ func (p *Pool) runEndpointBatch(ctx context.Context, ep *endpoint, op string, re
 	for i, reg := range registrations {
 		select {
 		case sem <- struct{}{}:
-		case <-ctx.Done():
-			res[i] = ctx.Err()
+		case <-sendCtx.Done():
+			res[i] = sendCtx.Err()
 			continue
 		}
 		// Checked after taking a slot: a slot frees only when an earlier
@@ -527,7 +592,7 @@ func (p *Pool) runEndpointBatch(ctx context.Context, ep *endpoint, op string, re
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			err := ep.client.Register(ctx, reg.TxID, reg.CallbackURL, reg.CallbackToken)
+			err := ep.client.Register(sendCtx, reg.TxID, reg.CallbackURL, reg.CallbackToken)
 			p.record(ctx, ep, op, err)
 			res[i] = err
 		}()
@@ -884,7 +949,7 @@ type catchupResult struct {
 // except an outright rejection.
 func (p *Pool) sendCatchup(ctx context.Context, ep *endpoint, batch []Registration) catchupResult {
 	var r catchupResult
-	for i, err := range p.runEndpointBatch(ctx, ep, opCatchup, batch, catchupConcurrency) {
+	for i, err := range p.runEndpointBatch(ctx, ctx, ep, opCatchup, batch, catchupConcurrency) {
 		switch outcome, _ := classify(ctx, err); {
 		case err == nil:
 			r.landed++
@@ -987,7 +1052,7 @@ func (s *endpointService) RegisterBatchWithResults(ctx context.Context, registra
 	}
 	// runEndpointBatch refuses fast (ErrNoHealthyEndpoints, nothing sent)
 	// for every entry once the breaker is open, including from the start.
-	out := s.pool.runEndpointBatch(ctx, s.ep, opWatch, registrations, maxConcurrency)
+	out := s.pool.runEndpointBatch(ctx, ctx, s.ep, opWatch, registrations, maxConcurrency)
 	for i, reg := range registrations {
 		if out[i] != nil {
 			s.ep.pending.add(reg)
