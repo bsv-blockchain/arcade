@@ -12,8 +12,8 @@ import (
 // handleRedelivery, which also compares the retained STUMPs against the
 // stored BUMP.
 func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, blockHash string) (handled bool, mineFailed bool) {
-	height, txids, ok := b.loadStoredBUMP(ctx, logger, blockHash)
-	if !ok {
+	height, txids, ok, err := b.loadStoredBUMP(ctx, logger, blockHash)
+	if err != nil || !ok {
 		return false, false
 	}
 	return true, b.shortCircuit(ctx, logger, blockHash, height, txids)

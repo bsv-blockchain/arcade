@@ -1034,7 +1034,10 @@ func TestBuilder_HandleMessage_FieldAbsentFromWire_BuildsNormally(t *testing.T) 
 	}
 }
 
-func TestBuilder_HandleMessage_BumpBuiltStoreError_StillSucceeds(t *testing.T) {
+// bump_built_at is the STUMP janitor's retention basis, so a failure to
+// record it fails the message before the BUMP is written: a stored BUMP
+// without the timestamp would leave its STUMPs ineligible for pruning forever.
+func TestBuilder_HandleMessage_BumpBuiltStoreError_FailsBeforeInsert(t *testing.T) {
 	ms := newMockStore()
 	ms.markBumpBuiltErr = errors.New("store down")
 	blockHash := testBlockHash
@@ -1052,14 +1055,17 @@ func TestBuilder_HandleMessage_BumpBuiltStoreError_StillSucceeds(t *testing.T) {
 
 	b := newTestBuilder(ms, datahub.URL)
 
-	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash)); err != nil {
-		t.Fatalf("MarkBlockBUMPBuilt error must not fail handler, got: %v", err)
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash)); err == nil {
+		t.Fatal("a MarkBlockBUMPBuilt failure must fail the message so Kafka retries it")
 	}
 
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
-	if _, ok := ms.bumps[blockHash]; !ok {
-		t.Error("BUMP should still be stored despite the observability write failure")
+	if _, ok := ms.bumps[blockHash]; ok {
+		t.Error("the BUMP must not be stored without its bump_built_at")
+	}
+	if len(ms.minedCalls) != 0 || len(ms.processedCalls) != 0 {
+		t.Errorf("nothing may be mined or stamped: mined=%d stamped=%d", len(ms.minedCalls), len(ms.processedCalls))
 	}
 }
 

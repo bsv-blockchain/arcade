@@ -595,8 +595,10 @@ func TestBuilder_HandleMessage_RedeliveryNewLeaves_CoinbaseSlot_Rebuilds(t *test
 	}
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
-	if len(ms.clearedBlocks) != 0 {
-		t.Fatalf("a rebuild that keeps every leaf must not be deferred, cleared=%v", ms.clearedBlocks)
+	// The rebuild takes the first build's stamp off before overwriting the
+	// BUMP and puts it back once the expanded set is mined.
+	if len(ms.clearedBlocks) != 1 || ms.blockProc[0].ProcessedAt == nil {
+		t.Fatalf("rebuild must clear then re-stamp processed_at, cleared=%v processed_at=%v", ms.clearedBlocks, ms.blockProc[0].ProcessedAt)
 	}
 	leaves, err := levelZeroTxidsFromBUMP(ms.bumps[blockHash])
 	if err != nil {
@@ -646,5 +648,70 @@ func TestBuilder_HandleMessage_RedeliveryOfUnstampedBlock_RepublishesMinedRows(t
 	emitted := pub.snapshot()
 	if len(emitted) != 1 || emitted[0].TxID != testTxidHex || emitted[0].Status != models.StatusMined {
 		t.Fatalf("an unstamped block's MINED rows must be republished, got %+v", emitted)
+	}
+}
+
+// A rebuild whose mine fails must leave the block un-stamped: the first
+// build's stamp comes off before the BUMP is overwritten, and goes back on
+// only after the expanded set is mined, so the watchdog still re-drives the
+// newly covered txs.
+func TestBuilder_HandleMessage_RebuildMineFails_LeavesProcessedAtCleared(t *testing.T) {
+	f := newMultiSourceFixture(t)
+	ctx := context.Background()
+	f.ms.addStump(f.blockHash, 0, f.variantA)
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsg(f.blockHash)); err != nil {
+		t.Fatalf("first build: %v", err)
+	}
+	f.ms.mu.Lock()
+	if len(f.ms.blockProc) != 1 || f.ms.blockProc[0].ProcessedAt == nil {
+		f.ms.mu.Unlock()
+		t.Fatal("first build must stamp processed_at")
+	}
+	f.ms.setMinedErr = errors.New("store down")
+	f.ms.mu.Unlock()
+
+	f.ms.addStump(f.blockHash, 0, f.variantB)
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsg(f.blockHash)); err != nil {
+		t.Fatalf("rebuild with a failed mine returns nil (the watchdog recovers), got %v", err)
+	}
+	f.ms.mu.Lock()
+	defer f.ms.mu.Unlock()
+	if len(f.ms.clearedBlocks) != 1 {
+		t.Fatalf("rebuild must clear the first build's stamp, cleared=%v", f.ms.clearedBlocks)
+	}
+	if f.ms.blockProc[0].ProcessedAt != nil {
+		t.Fatal("processed_at must stay cleared while the expanded set is not mined")
+	}
+}
+
+// Service A built subtree 0 and stamped the block. Service B's delivery adds
+// no retained leaves but expects subtree 1, whose STUMP is still retrying.
+// That must not short-circuit (which would re-stamp the block and retire it
+// from the watchdog): it goes through the completeness gate, which defers the
+// block and clears the stamp.
+func TestBuilder_HandleMessage_NoNewLeavesButExpectedMissing_DefersInsteadOfShortCircuit(t *testing.T) {
+	f := newMultiSourceFixture(t)
+	ctx := context.Background()
+	f.ms.addStump(f.blockHash, 0, f.variantA)
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsg(f.blockHash)); err != nil {
+		t.Fatalf("first build: %v", err)
+	}
+	f.b.cfg.BumpBuilder.GraceWindowMs = 0
+
+	beforeShort := bumpOutcomeSampleCount(t, "short_circuited")
+	beforeDeferred := bumpOutcomeSampleCount(t, "deferred_incomplete")
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsgWithExpected(f.blockHash, []int{0, 1})); err != nil {
+		t.Fatalf("delivery: %v", err)
+	}
+	if got := bumpOutcomeSampleCount(t, "short_circuited"); got != beforeShort {
+		t.Fatal("a delivery expecting an unretained subtree must not short-circuit")
+	}
+	if got := bumpOutcomeSampleCount(t, "deferred_incomplete"); got != beforeDeferred+1 {
+		t.Fatalf("deferred_incomplete samples = %d, want %d", got, beforeDeferred+1)
+	}
+	f.ms.mu.Lock()
+	defer f.ms.mu.Unlock()
+	if f.ms.blockProc[0].ProcessedAt != nil {
+		t.Fatal("processed_at must be cleared so the watchdog re-drives the block")
 	}
 }

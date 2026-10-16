@@ -1330,7 +1330,11 @@ func (s *Store) GetStumpsByBlockHash(ctx context.Context, blockHash string) ([]*
 		}
 		var st models.Stump
 		if err := json.Unmarshal(iter.Value(), &st); err != nil {
-			continue
+			// An unreadable row means the set is incomplete. Skipping it
+			// would let the bump-builder conclude a redelivery adds nothing
+			// and stamp a block it never fully built, so fail the read like
+			// the other backends do and let the caller retry.
+			return nil, fmt.Errorf("get stumps %s: decode %q: %w", blockHash, iter.Key(), err)
 		}
 		st.EnsureContentHash()
 		stumps = append(stumps, &st)
