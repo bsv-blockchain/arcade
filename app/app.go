@@ -57,7 +57,7 @@ type Deps struct {
 	Leaser         store.Leaser
 	TxTracker      *store.TxTracker
 	TeranodeClient *teranode.Client
-	MerkleClient   *merkleservice.Client // nil when MerkleService.URL is unset
+	MerkleClient   merkleservice.Service // nil when no merkle_service endpoint is configured
 	Validator      *validator.Validator
 	// Chaintracks is the shared in-process header tracker. nil when
 	// chaintracks_server is disabled (regtest, or explicit opt-out) — services
@@ -184,10 +184,22 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		seedCancel()
 	}
 
-	var merkleClient *merkleservice.Client
-	if cfg.MerkleService.URL != "" {
-		merkleClient = merkleservice.NewClient(cfg.MerkleService.URL, cfg.MerkleService.AuthToken, 0)
-		merkleClient.SetLogger(logger.Named("merkle-client"))
+	// The interface stays nil when the integration is disabled; a typed-nil
+	// *Pool assigned here would make every consumer's nil guard pass and
+	// dereference it.
+	var merkleClient merkleservice.Service
+	if cfg.MerkleService.Enabled() {
+		endpoints := cfg.MerkleService.Endpoints()
+		// One Pool for every endpoint, single or many: each /watch and
+		// /reprocess fans out to all of them, a tx counts as registered once
+		// any endpoint accepts it, and a per-endpoint breaker keeps a dead
+		// merkle-service from adding its timeout to every batch. Start runs
+		// the /health probe that closes breakers again.
+		pool := merkleservice.NewPool(endpoints, cfg.MerkleService.AuthToken, 0)
+		pool.SetLogger(logger.Named("merkle-client"))
+		pool.Start(ctx)
+		merkleClient = pool
+		logger.Info("merkle-service endpoints configured", zap.Strings("endpoints", endpoints))
 		if cfg.MerkleService.AuthToken == "" {
 			// Not fatal: many merkle-service deployments don't enforce auth, and
 			// the standalone/no-auth profile is legitimate. But if the target
@@ -196,8 +208,8 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 			// this loudly (issue #269) rather than misreporting it as a
 			// consensus problem. Warn at startup so the cause is obvious.
 			logger.Warn(
-				"merkle_service.url is set but merkle_service.auth_token is empty; " +
-					"if the target merkle-service enforces auth, tx registration (/watch) " +
+				"merkle_service endpoints are set but merkle_service.auth_token is empty; " +
+					"if a target merkle-service enforces auth, tx registration (/watch) " +
 					"and block-processed recovery (/reprocess) will fail with 401 at runtime — " +
 					"set merkle_service.auth_token to authenticate",
 			)
@@ -632,7 +644,7 @@ func BuildServices(d *Deps) []services.Service {
 		if wd := watchdog.NewService(cfg, d.Logger, d.Store, d.Leaser, d.MerkleClient); wd != nil {
 			svcs = append(svcs, wd)
 		} else {
-			d.Logger.Info("watchdog skipped: merkle_service.url or leaser not configured")
+			d.Logger.Info("watchdog skipped: merkle_service endpoints or leaser not configured")
 		}
 	}
 	if shouldRun("sse") {

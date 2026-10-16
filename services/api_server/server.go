@@ -50,7 +50,7 @@ type Server struct {
 	store        store.Store
 	txTracker    *store.TxTracker
 	teranode     *teranode.Client      // used by /health for datahub URL inventory; nil in tests
-	merkleClient *merkleservice.Client // nil when merkle_service.url is unset; gates POST /api/v1/blocks/:blockHash/reprocess
+	merkleClient merkleservice.Service // nil when no merkle_service endpoint is configured; gates POST /api/v1/blocks/:blockHash/reprocess
 	// validator runs synchronous policy validation in the submit handler.
 	// Nil-safe: tests that use struct-literal construction may leave it
 	// unset, in which case the handler skips validation. Production
@@ -97,7 +97,7 @@ type submissionRecord struct {
 	sub *models.Submission
 }
 
-func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publisher events.Publisher, st store.Store, tracker *store.TxTracker, tc *teranode.Client, mc *merkleservice.Client, val *validator.Validator, fin *finality.Checker) *Server {
+func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publisher events.Publisher, st store.Store, tracker *store.TxTracker, tc *teranode.Client, mc merkleservice.Service, val *validator.Validator, fin *finality.Checker) *Server {
 	// Export every series this service can emit at 0 from the first scrape —
 	// a series born mid-burst is invisible to increase() until its second
 	// sample, which undercounted submissions after every rollout.

@@ -82,6 +82,29 @@ landing.
 - `histogram_quantile(0.95, ...broadcast_duration_seconds_bucket{path="batch"})` — p95 batch broadcast
 - `histogram_quantile(0.95, ...merkle_register_duration_seconds_bucket)` — merkle is often the bottleneck
 
+### Merkle-service endpoint board
+
+- Per-endpoint `arcade_merkle_endpoint_healthy` (one row per `endpoint` per
+  pod). Every arcade process runs its own pool with its own breakers.
+  Propagation sends `/watch`; api-server, watchdog and bump-builder send
+  `/reprocess`, and a transport/5xx failure there trips the same breaker, so
+  they can report 0 too. Only a process that has made neither call stays at
+  1, which is why a `sum()` across pods says little. The propagation pods
+  carry every registration and are the authoritative view: alert on
+  `min by (endpoint) (arcade_merkle_endpoint_healthy{<propagation pods>}) == 0`,
+  with the selector your scrape config uses for the propagation pods.
+- `sum by (endpoint, outcome) (rate(arcade_merkle_endpoint_requests_total{op="watch",outcome!="ok"}[5m]))`
+  — which merkle-service is failing and how (`err_network`, `err_5xx`,
+  `err_auth`, `err_4xx`, `skipped_open`).
+- `arcade_merkle_endpoint_catchup_pending` (one row per `endpoint`) —
+  registrations another endpoint accepted that this one has not acknowledged
+  yet; the pool re-sends them in the background (`op="catchup"` on the
+  requests counter). Alert when it stays above 0 for longer than a few
+  minutes while the endpoint is healthy.
+- `arcade_propagation_merkle_register_batch_outcome_total` stays the
+  pool-level view: `fully_ok` while any endpoint accepts, `all_failed` only
+  when every endpoint refused.
+
 ### Datahub health board
 
 - Per-endpoint `arcade_teranode_endpoint_healthy` (one row per `endpoint`)

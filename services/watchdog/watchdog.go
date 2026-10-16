@@ -107,7 +107,7 @@ type Config struct {
 type Watchdog struct {
 	store        store.Store
 	leaser       store.Leaser
-	merkleClient *merkleservice.Client
+	merkleClient merkleservice.Service
 	cfg          Config
 	callbackURL  string
 	callbackTok  string
@@ -132,7 +132,7 @@ type Watchdog struct {
 func New(
 	st store.Store,
 	leaser store.Leaser,
-	mc *merkleservice.Client,
+	mc merkleservice.Service,
 	callbackURL, callbackToken string,
 	cfg Config,
 	logger *zap.Logger,

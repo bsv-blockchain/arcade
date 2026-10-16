@@ -2,7 +2,6 @@ package propagation
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"go.uber.org/zap"
@@ -20,14 +19,51 @@ import (
 const defaultReplayLookback = 24 * time.Hour
 
 // defaultReplaySkipRecent is the merkle_registered_at recency window used
-// when MerkleReplaySkipRecentMinutes isn't set. Matches merkle-service's
-// postMineTTLSec (1800s = 30min): if we registered within this window,
-// merkle-service almost certainly still has the row.
+// when MerkleReplaySkipRecentMinutes isn't set and a single merkle-service is
+// configured. Matches merkle-service's postMineTTLSec (1800s = 30min): if we
+// registered within this window, merkle-service almost certainly still has
+// the row.
 const defaultReplaySkipRecent = 30 * time.Minute
+
+// resyncRetryBackoff is the first wait before a resync pass whose store scan
+// failed is run again; it doubles up to resyncRetryMaxBackoff. Variables so
+// tests can shorten them.
+var (
+	resyncRetryBackoff    = 5 * time.Second
+	resyncRetryMaxBackoff = 5 * time.Minute
+)
 
 // defaultReplayRPS caps the average requests-per-second the replay loop
 // issues against merkle-service when MerkleReplayRPS isn't set.
 const defaultReplayRPS = 50
+
+// replayParams parameterizes one replay pass. The startup pass and the
+// per-endpoint resync pass differ only in target, label and the
+// merkle_registered_at skip.
+type replayParams struct {
+	// target receives the /watch calls: the whole pool on startup, a single
+	// endpoint on resync.
+	target merkleservice.Service
+	// since bounds IterateStatusesSince.
+	since time.Time
+	// skipRecent skips rows whose merkle_registered_at is within this
+	// window; 0 disables the skip. The stamp is pool-wide (set when any
+	// endpoint accepted), so the resync pass must pass 0: it cannot tell
+	// which endpoint a recent stamp came from.
+	skipRecent time.Duration
+	// label tags the log lines ("startup" or "resync").
+	label string
+	// endpoint is the resynced endpoint's base URL; empty on startup.
+	endpoint string
+}
+
+// replayLookback is the IterateStatusesSince window for a full replay.
+func (p *Propagator) replayLookback() time.Duration {
+	if lookback := time.Duration(p.cfg.Propagation.RegisterReplayLookbackHours) * time.Hour; lookback > 0 {
+		return lookback
+	}
+	return defaultReplayLookback
+}
 
 // runMerkleReplay re-registers every non-terminal tx in the store with
 // merkle-service /watch. Runs once on startup and exits.
@@ -53,27 +89,70 @@ func (p *Propagator) runMerkleReplay(ctx context.Context) {
 		return
 	}
 
-	lookback := time.Duration(p.cfg.Propagation.RegisterReplayLookbackHours) * time.Hour
-	if lookback <= 0 {
-		lookback = defaultReplayLookback
-	}
-	since := time.Now().Add(-lookback)
-
-	concurrency := p.merkleConcurrency
-	if concurrency <= 0 {
-		concurrency = 10
-	}
 	// skipRecent: rows registered within this window are skipped. 0 disables
 	// the skip — useful for forcing a full re-sync after a known
-	// merkle-service wipe (issue #145).
+	// merkle-service wipe (issue #145). Unset (negative) means no skip with
+	// several merkle-services: the stamp is set once any endpoint accepted,
+	// so a recent stamp does not mean every endpoint has the tx, and the
+	// pool's queue of registrations owed to a lagging endpoint does not
+	// survive the restart.
 	var skipRecent time.Duration
 	switch m := p.cfg.Propagation.MerkleReplaySkipRecentMinutes; {
+	case m < 0 && p.multiEndpoint():
+		skipRecent = 0
 	case m < 0:
 		skipRecent = defaultReplaySkipRecent
 	case m == 0:
 		skipRecent = 0
 	default:
 		skipRecent = time.Duration(m) * time.Minute
+	}
+
+	_ = p.replayTo(ctx, replayParams{
+		target:     p.merkleClient,
+		since:      time.Now().Add(-p.replayLookback()),
+		skipRecent: skipRecent,
+		label:      "startup",
+	})
+}
+
+// multiEndpoint reports whether the merkle client fans out to more than one
+// merkle-service.
+func (p *Propagator) multiEndpoint() bool {
+	rp, ok := p.merkleClient.(merkleservice.Recoverable)
+	return ok && len(rp.Endpoints()) > 1
+}
+
+// runResyncReplay re-registers, with ONE endpoint, every non-terminal tx in
+// the lookback window. The pool normally keeps an endpoint's watch set
+// complete on its own: a tx another endpoint accepted but this one refused,
+// timed out on, or was skipped for (breaker open) sits in the endpoint's
+// catch-up queue until it lands. That queue is bounded; when it overflowed,
+// the dropped registrations are unknown and only a full replay of the
+// in-flight set restores the endpoint's watch set. The target is
+// merkleservice.Recoverable.Endpoint, so a /watch that fails during the pass
+// goes back to that endpoint's queue instead of being lost. The returned
+// error is the store scan's; the caller retries the pass on it.
+func (p *Propagator) runResyncReplay(ctx context.Context, rp merkleservice.Recoverable, endpoint string) error {
+	target := rp.Endpoint(endpoint)
+	if target == nil || p.cfg.CallbackURL == "" {
+		return nil
+	}
+	return p.replayTo(ctx, replayParams{
+		target:   target,
+		since:    time.Now().Add(-p.replayLookback()),
+		label:    "resync",
+		endpoint: endpoint,
+	})
+}
+
+// replayTo is the shared body of the startup and recovery replays. It returns
+// the store scan's error (nil when the scan completed or ctx ended it);
+// per-tx /watch failures are not errors here, see flush.
+func (p *Propagator) replayTo(ctx context.Context, rp replayParams) error {
+	concurrency := p.merkleConcurrency
+	if concurrency <= 0 {
+		concurrency = 10
 	}
 	// rps: average rate cap on RegisterBatch calls. 0 disables throttling.
 	rps := p.cfg.Propagation.MerkleReplayRPS
@@ -86,16 +165,21 @@ func (p *Propagator) runMerkleReplay(ctx context.Context) {
 	// overhead amortizes well.
 	const batchSize = 1000
 
+	logger := p.logger.With(zap.String("replay", rp.label))
+	if rp.endpoint != "" {
+		logger = logger.With(zap.String("endpoint", rp.endpoint))
+	}
+
 	start := time.Now()
-	p.logger.Info(
+	logger.Info(
 		"merkle-service replay starting",
-		zap.Time("since", since),
+		zap.Time("since", rp.since),
 		zap.Int("concurrency", concurrency),
-		zap.Duration("skip_recent", skipRecent),
+		zap.Duration("skip_recent", rp.skipRecent),
 		zap.Int("rps", rps),
 	)
 
-	var scanned, queued, failures, skippedRecent int
+	var scanned, queued, failures, skippedRecent, skippedOld int
 	var throttled time.Duration
 	batch := make([]merkleservice.Registration, 0, batchSize)
 	now := time.Now()
@@ -118,34 +202,57 @@ func (p *Propagator) runMerkleReplay(ctx context.Context) {
 				}
 			}
 		}
-		if err := p.merkleClient.RegisterBatch(ctx, batch, concurrency); err != nil {
-			failures += len(batch)
-			p.logger.Warn(
-				"merkle-service replay batch failed",
+		// Per-tx results, not fail-fast: one refused /watch must not drop
+		// the merkle_registered_at stamp for the rest of the batch, or the
+		// next boot re-registers them all again. A failed entry is not
+		// retried here; the pool keeps it in a catch-up queue instead. The
+		// resync target (one endpoint) queues its own failures. On startup
+		// the pool only queues the endpoints that missed a tx some other
+		// endpoint accepted, so a tx no endpoint accepted is handed back
+		// through Retain, or it would wait for the next restart.
+		errs := rp.target.RegisterBatchWithResults(ctx, batch, concurrency)
+		if rp.endpoint == "" {
+			if r, ok := rp.target.(merkleservice.Recoverable); ok {
+				r.Retain(batch, errs)
+			}
+		}
+		okTxIDs := make([]string, 0, len(batch))
+		var sampleErr error
+		for i, err := range errs {
+			if err != nil {
+				failures++
+				if sampleErr == nil {
+					sampleErr = err
+				}
+				continue
+			}
+			okTxIDs = append(okTxIDs, batch[i].TxID)
+		}
+		if sampleErr != nil {
+			logger.Warn(
+				"merkle-service replay batch partially failed",
 				zap.Int("batch_size", len(batch)),
-				zap.Error(err),
+				zap.Int("failed", len(batch)-len(okTxIDs)),
+				zap.Error(sampleErr),
 			)
-			batch = batch[:0]
-			return
 		}
-		// On success, stamp merkle_registered_at so future replays can skip
-		// these rows. RegisterBatch is fail-fast, so reaching here means
-		// every entry succeeded — mark them all in one round-trip.
-		txids := make([]string, len(batch))
-		for i := range batch {
-			txids[i] = batch[i].TxID
-		}
-		if err := p.store.MarkMerkleRegisteredByTxIDs(ctx, txids, time.Now()); err != nil {
-			p.logger.Warn(
-				"merkle-service replay mark failed",
-				zap.Int("count", len(txids)),
-				zap.Error(err),
-			)
+		// Stamp merkle_registered_at on the rows that landed so future
+		// startup replays can skip them. The stamp is pool-wide: a resync
+		// pass stamping it is harmless (the row IS registered with every
+		// endpoint that is up).
+		if len(okTxIDs) > 0 {
+			if err := p.store.MarkMerkleRegisteredByTxIDs(ctx, okTxIDs, time.Now()); err != nil {
+				logger.Warn(
+					"merkle-service replay mark failed",
+					zap.Int("count", len(okTxIDs)),
+					zap.Error(err),
+				)
+			}
 		}
 		batch = batch[:0]
 	}
 
-	err := p.store.IterateStatusesSince(ctx, since, func(status *models.TransactionStatus) error {
+	err := p.store.IterateStatusesSince(ctx, rp.since, func(status *models.TransactionStatus) error {
 		scanned++
 		// Skip rows that are already terminal — re-registering MINED txs is
 		// wasted bandwidth and risks resurrecting watches merkle-service may
@@ -156,10 +263,16 @@ func (p *Propagator) runMerkleReplay(ctx context.Context) {
 		if status.TxID == "" {
 			return nil
 		}
+		// Not every backend honors since (Aerospike scans the whole set),
+		// so bound the window here too.
+		if !status.Timestamp.IsZero() && status.Timestamp.Before(rp.since) {
+			skippedOld++
+			return nil
+		}
 		// Skip rows we registered recently — merkle-service almost certainly
 		// still has them, and POST /watch doesn't refresh expires_at anyway
 		// (issue #145). skipRecent == 0 disables.
-		if skipRecent > 0 && !status.MerkleRegisteredAt.IsZero() && now.Sub(status.MerkleRegisteredAt) < skipRecent {
+		if rp.skipRecent > 0 && !status.MerkleRegisteredAt.IsZero() && now.Sub(status.MerkleRegisteredAt) < rp.skipRecent {
 			skippedRecent++
 			return nil
 		}
@@ -183,21 +296,105 @@ func (p *Propagator) runMerkleReplay(ctx context.Context) {
 	})
 	flush()
 
-	if err != nil && !errors.Is(err, ctx.Err()) {
-		p.logger.Warn(
+	if err != nil && ctx.Err() != nil {
+		err = nil // shutdown, not a scan failure
+	}
+	if err != nil {
+		logger.Warn(
 			"merkle-service replay scan ended with error",
 			zap.Error(err),
 			zap.Int("scanned", scanned),
 			zap.Int("queued", queued),
 		)
 	}
-	p.logger.Info(
+	logger.Info(
 		"merkle-service replay complete",
 		zap.Duration("elapsed", time.Since(start)),
 		zap.Int("scanned", scanned),
 		zap.Int("queued", queued),
 		zap.Int("skipped_recent", skippedRecent),
+		zap.Int("skipped_old", skippedOld),
 		zap.Int("failures", failures),
 		zap.Duration("throttled", throttled),
 	)
+	return err
+}
+
+// resyncState coalesces resync requests per endpoint: while a resync for an
+// endpoint is running, a second request for the same endpoint only asks the
+// running pass to go again, so a flapping endpoint never stacks concurrent
+// replays.
+type resyncState struct {
+	running bool
+	again   bool
+}
+
+// scheduleResync is the merkleservice.Recoverable hook. It runs on the
+// pool's background goroutine and must not block, so the replay itself is
+// spawned under backgroundWG (Stop waits for it) and guarded by
+// resyncStopped so a hook firing during shutdown cannot Add to a WaitGroup
+// that Stop is already waiting on.
+func (p *Propagator) scheduleResync(ctx context.Context, rp merkleservice.Recoverable, endpoint string) {
+	p.resyncMu.Lock()
+	defer p.resyncMu.Unlock()
+	if p.resyncStopped || ctx.Err() != nil {
+		return
+	}
+	if p.resync == nil {
+		p.resync = make(map[string]*resyncState)
+	}
+	st := p.resync[endpoint]
+	if st == nil {
+		st = &resyncState{}
+		p.resync[endpoint] = st
+	}
+	if st.running {
+		st.again = true
+		return
+	}
+	st.running = true
+	p.backgroundWG.Add(1)
+	go p.resyncLoop(ctx, rp, endpoint, st)
+}
+
+// resyncLoop runs resync passes for one endpoint until no further request
+// arrived while the last pass was running. A pass whose store scan failed is
+// run again after a backoff: the request it served is not consumed until a
+// scan completes, since the endpoint is still missing whatever the
+// overflowed queue dropped.
+func (p *Propagator) resyncLoop(ctx context.Context, rp merkleservice.Recoverable, endpoint string, st *resyncState) {
+	defer p.backgroundWG.Done()
+	backoff := resyncRetryBackoff
+	for {
+		p.resyncMu.Lock()
+		st.again = false
+		p.resyncMu.Unlock()
+
+		if err := p.runResyncReplay(ctx, rp, endpoint); err != nil {
+			p.logger.Warn(
+				"merkle-service resync scan failed; retrying",
+				zap.String("endpoint", endpoint),
+				zap.Duration("backoff", backoff),
+				zap.Error(err),
+			)
+			select {
+			case <-ctx.Done():
+			case <-time.After(backoff):
+			}
+			backoff = min(backoff*2, resyncRetryMaxBackoff)
+			p.resyncMu.Lock()
+			st.again = true
+			p.resyncMu.Unlock()
+		} else {
+			backoff = resyncRetryBackoff
+		}
+
+		p.resyncMu.Lock()
+		if !st.again || ctx.Err() != nil || p.resyncStopped {
+			st.running = false
+			p.resyncMu.Unlock()
+			return
+		}
+		p.resyncMu.Unlock()
+	}
 }

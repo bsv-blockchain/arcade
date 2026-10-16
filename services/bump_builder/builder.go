@@ -318,9 +318,58 @@ func (b *Builder) handleAnchorDenied(ctx context.Context, logger *zap.Logger, bl
 // It reports whether the store write completed in full: false means some of
 // the txids are still SEEN_* and the block must stay un-stamped so the
 // watchdog re-drives it.
-func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, blockHash string, blockHeight uint64, txids []string) bool {
-	_, err := setMinedAndPublish(ctx, logger, b.store, b.publisher, blockHash, blockHeight, txids, "", false)
-	return err == nil
+//
+// onlyChanged suppresses MINED events for rows already MINED against this
+// block. With several merkle-services every block's BLOCK_PROCESSED arrives
+// once per service, and each redelivery re-mines the stored BUMP's level-0
+// set; those rows must not fan out a second MINED event to SSE/webhook
+// subscribers. But "already MINED" only proves the store write landed, not
+// that the event went out: a crash between SetMinedByTxIDs and PublishBulk
+// leaves the rows MINED and unpublished. The build path therefore passes the
+// result of blockFinalized, read before it touches the block: processed_at
+// is stamped only after the publish, so a stamped block's MINED rows were
+// published, and an unstamped one is republished in full (a duplicate event
+// beats a lost one). The short-circuit passes false; see tryShortCircuit.
+//
+// That only holds if a failed publish also withholds the stamp, so a
+// PublishBulk failure reports false like a partial store write: the block
+// stays in the watchdog's stale scan and its re-drive republishes the set.
+func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, blockHash string, blockHeight uint64, txids []string, onlyChanged bool) bool {
+	var publisher events.Publisher
+	var recorder *publishFailureRecorder
+	if b.publisher != nil {
+		recorder = &publishFailureRecorder{Publisher: b.publisher}
+		publisher = recorder
+	}
+	_, err := setMinedAndPublish(ctx, logger, b.store, publisher, blockHash, blockHeight, txids, "", onlyChanged)
+	return err == nil && (recorder == nil || !recorder.failed)
+}
+
+// publishFailureRecorder notes whether any PublishBulk call failed.
+// setMinedAndPublish logs and carries on past a failed chunk (the rows are
+// MINED in the store either way); markMinedAndPublish needs to know so it can
+// keep the block un-stamped. Calls are sequential.
+type publishFailureRecorder struct {
+	events.Publisher
+
+	failed bool
+}
+
+func (r *publishFailureRecorder) PublishBulk(ctx context.Context, template *models.TransactionStatus) error {
+	err := r.Publisher.PublishBulk(ctx, template)
+	if err != nil {
+		r.failed = true
+	}
+	return err
+}
+
+// blockFinalized reports whether the block's processed_at is stamped, which
+// markMinedAndPublish uses as proof that every row an earlier delivery mined
+// against it was also published. Any read failure answers false: the caller
+// then republishes rather than risk withholding an event that never went out.
+func (b *Builder) blockFinalized(ctx context.Context, blockHash string) bool {
+	row, err := b.store.GetBlockProcessingStatus(ctx, blockHash)
+	return err == nil && row != nil && row.ProcessedAt != nil
 }
 
 // setMinedAndPublish is the shared "mark MINED + fan out" core behind the
@@ -684,6 +733,9 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 		return nil
 	}
 
+	// Read before anything below writes the block: see markMinedAndPublish.
+	finalized := b.blockFinalized(ctx, blockHash)
+
 	// Resolve the STUMP set with completeness-first ordering: STUMPs are read
 	// BEFORE any grace-window wait, so a block whose expected-STUMP set is
 	// already complete (or provably empty) finalizes immediately instead of
@@ -810,7 +862,7 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	}
 	minedComplete := true
 	if len(txids) > 0 {
-		minedComplete = b.markMinedAndPublish(ctx, logger, blockHash, blockHeight, txids)
+		minedComplete = b.markMinedAndPublish(ctx, logger, blockHash, blockHeight, txids, finalized)
 	}
 
 	// 7. Finalize: the BUMP is built and validated, every expected STUMP was
@@ -1162,9 +1214,17 @@ func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, block
 		b.handleAnchorDenied(ctx, logger, blockHash, existingHeight, "short_circuit")
 		return true, false
 	}
+	// No dedup on the short-circuit: it republishes every row of the stored
+	// set. Suppressing rows already MINED here is only safe if a mine or
+	// publish failure on an already-stamped block can take the stamp off
+	// again, or the next delivery would read the block as finalized and
+	// filter out MINED rows whose event never went out. That needs a store
+	// operation this branch does not have (ClearBlockProcessed, added with
+	// the multi-source STUMP work), so a duplicate MINED event per extra
+	// delivery is the price here, as on main.
 	minedComplete := true
 	if len(txids) > 0 {
-		minedComplete = b.markMinedAndPublish(ctx, logger, blockHash, existingHeight, txids)
+		minedComplete = b.markMinedAndPublish(ctx, logger, blockHash, existingHeight, txids, false)
 	}
 	// Stamp processed_at on the redelivery too. The typical short-circuit
 	// trigger IS the watchdog re-firing BLOCK_PROCESSED for a block whose BUMP

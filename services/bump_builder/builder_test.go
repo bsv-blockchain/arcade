@@ -56,6 +56,10 @@ type mockStore struct {
 	insertStumpErr   error
 	setMinedErr      error
 	setMinedAttempts int
+	// alreadyMined maps txid → block hash for rows the store already holds
+	// at MINED; SetMinedByTxIDs reports them with a MINED previous status so
+	// tests can drive the onlyChanged filter.
+	alreadyMined     map[string]string
 	deleteStumpsErr  error
 	markBumpBuiltErr error
 	markProcessedErr error
@@ -182,11 +186,17 @@ func (m *mockStore) SetMinedByTxIDs(_ context.Context, blockHash string, blockHe
 	m.minedCalls = append(m.minedCalls, minedCall{blockHash, blockHeight, txids})
 	var prevs, statuses []*models.TransactionStatus
 	for _, txid := range txids {
-		prevs = append(prevs, &models.TransactionStatus{
+		prev := &models.TransactionStatus{
 			TxID:      txid,
 			Status:    models.StatusSeenOnNetwork,
 			Timestamp: time.Now(),
-		})
+		}
+		if bh, ok := m.alreadyMined[txid]; ok {
+			prev.Status = models.StatusMined
+			prev.BlockHash = bh
+			prev.BlockHeight = blockHeight
+		}
+		prevs = append(prevs, prev)
 		statuses = append(statuses, &models.TransactionStatus{
 			TxID:        txid,
 			Status:      models.StatusMined,
@@ -226,6 +236,19 @@ func (m *mockStore) MarkBlockBUMPBuilt(_ context.Context, blockHash string, bloc
 // not the HTTP handler — stamps processed_at, and only on a finalized block.
 // markProcessedErr injects a failure to verify the soft-fail (warn + continue)
 // path that the watchdog backstops.
+// GetBlockProcessingStatus serves rows from blockProc by hash.
+func (m *mockStore) GetBlockProcessingStatus(_ context.Context, blockHash string) (*models.BlockProcessingStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, r := range m.blockProc {
+		if r.BlockHash == blockHash {
+			cp := *r
+			return &cp, nil
+		}
+	}
+	return nil, store.ErrNotFound
+}
+
 func (m *mockStore) MarkBlockProcessed(_ context.Context, blockHash string, blockHeight uint64, _ time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1406,7 +1429,7 @@ func TestBuilder_MarkMinedAndPublish_UsesBulkEvent(t *testing.T) {
 	b := newTestBuilder(ms, "http://unused.example/api/v1")
 	b.publisher = pub
 
-	b.markMinedAndPublish(context.Background(), zap.NewNop(), blockHash, blockHeight, txids)
+	b.markMinedAndPublish(context.Background(), zap.NewNop(), blockHash, blockHeight, txids, false)
 
 	// recordingPublisher.PublishBulk unfans into one entry per TxID for
 	// assertion convenience, so snapshot() shows N entries — but the

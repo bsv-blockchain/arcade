@@ -34,11 +34,11 @@ func NewService(
 	logger *zap.Logger,
 	st store.Store,
 	leaser store.Leaser,
-	mc *merkleservice.Client,
+	mc merkleservice.Service,
 ) *Service {
 	if mc == nil || leaser == nil {
 		// Defensive: app.BuildServices already gates this, but a misconfig
-		// (merkle_service.url unset) should produce a no-op Service rather
+		// (no merkle_service endpoint) should produce a no-op Service rather
 		// than a nil-deref at the first tick.
 		return nil
 	}

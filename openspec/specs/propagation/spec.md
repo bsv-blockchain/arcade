@@ -19,15 +19,19 @@ The propagation service SHALL consume validated transactions and broadcast them 
 - **THEN** the service SHALL log the rejection, retry with backoff, and after max retries route to a dead-letter topic
 
 ### Requirement: Register transaction with merkle-service
-After successful propagation, the propagation service SHALL register the transaction with the merkle-service server, providing the TXID and the arcade callback URL.
+Before broadcasting, the propagation service SHALL register the transaction with every configured merkle-service endpoint, providing the TXID and the arcade callback URL. A transaction counts as registered once at least one endpoint accepted it.
 
 #### Scenario: Successful registration
-- **WHEN** a transaction has been propagated to at least one datahub successfully
-- **THEN** the service SHALL register the TXID and callback URL with the merkle-service
+- **WHEN** a transaction is ready for broadcast and at least one merkle-service endpoint accepts its `/watch`
+- **THEN** the service SHALL broadcast the transaction and stamp `merkle_registered_at`
 
-#### Scenario: Registration failure
-- **WHEN** merkle-service registration fails
-- **THEN** the service SHALL retry with exponential backoff and log the failure
+#### Scenario: Registration failure on every endpoint
+- **WHEN** every merkle-service endpoint refuses or cannot be reached
+- **THEN** the service SHALL NOT broadcast the transaction, SHALL requeue it, and SHALL log the failure
+
+#### Scenario: Endpoint outage
+- **WHEN** one endpoint fails three consecutive requests while others remain healthy
+- **THEN** the service SHALL skip that endpoint until its `/health` answers, keep registering with the healthy endpoints, and on recovery re-register the non-terminal transactions the endpoint missed
 
 ### Requirement: Concurrent datahub broadcasting
 The propagation service SHALL broadcast to multiple datahub URLs concurrently, not sequentially, to minimize latency.
