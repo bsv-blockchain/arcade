@@ -325,11 +325,11 @@ func (b *Builder) handleAnchorDenied(ctx context.Context, logger *zap.Logger, bl
 // set; those rows must not fan out a second MINED event to SSE/webhook
 // subscribers. But "already MINED" only proves the store write landed, not
 // that the event went out: a crash between SetMinedByTxIDs and PublishBulk
-// leaves the rows MINED and unpublished. Callers therefore pass the result
-// of blockFinalized, read before they touch the block: processed_at is
-// stamped only after the publish, so a stamped block's MINED rows were
+// leaves the rows MINED and unpublished. The build path therefore passes the
+// result of blockFinalized, read before it touches the block: processed_at
+// is stamped only after the publish, so a stamped block's MINED rows were
 // published, and an unstamped one is republished in full (a duplicate event
-// beats a lost one).
+// beats a lost one). The short-circuit passes false; see tryShortCircuit.
 //
 // That only holds if a failed publish also withholds the stamp, so a
 // PublishBulk failure reports false like a partial store write: the block
@@ -1214,10 +1214,17 @@ func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, block
 		b.handleAnchorDenied(ctx, logger, blockHash, existingHeight, "short_circuit")
 		return true, false
 	}
+	// No dedup on the short-circuit: it republishes every row of the stored
+	// set. Suppressing rows already MINED here is only safe if a mine or
+	// publish failure on an already-stamped block can take the stamp off
+	// again, or the next delivery would read the block as finalized and
+	// filter out MINED rows whose event never went out. That needs a store
+	// operation this branch does not have (ClearBlockProcessed, added with
+	// the multi-source STUMP work), so a duplicate MINED event per extra
+	// delivery is the price here, as on main.
 	minedComplete := true
 	if len(txids) > 0 {
-		finalized := b.blockFinalized(ctx, blockHash)
-		minedComplete = b.markMinedAndPublish(ctx, logger, blockHash, existingHeight, txids, finalized)
+		minedComplete = b.markMinedAndPublish(ctx, logger, blockHash, existingHeight, txids, false)
 	}
 	// Stamp processed_at on the redelivery too. The typical short-circuit
 	// trigger IS the watchdog re-firing BLOCK_PROCESSED for a block whose BUMP
