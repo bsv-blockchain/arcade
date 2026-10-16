@@ -1475,6 +1475,12 @@ func validateMerkleService(cfg *Config) error {
 		if err != nil {
 			return fmt.Errorf("merkle_service url %q: %w", u, err)
 		}
+		// The URL is shown in /health, metric labels and startup logs, so
+		// credentials in it would leak there; auth_token is the supported
+		// way to authenticate.
+		if parsed.User != nil {
+			return fmt.Errorf("merkle_service url %q must not contain user info; use merkle_service.auth_token for authentication", redactUserinfo(parsed))
+		}
 		if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 			return fmt.Errorf("merkle_service url %q must be an absolute http(s) URL", u)
 		}
@@ -1489,6 +1495,14 @@ func validateMerkleService(cfg *Config) error {
 			"(unauthenticated /api/v1/merkle-service/callback would accept forged callbacks; see issue #76)")
 	}
 	return nil
+}
+
+// redactUserinfo renders u with its user info replaced, so the validation
+// error that rejects it does not print the password it is protecting.
+func redactUserinfo(u *url.URL) string {
+	c := *u
+	c.User = url.User("REDACTED")
+	return c.String()
 }
 
 func validate(cfg *Config) error {
