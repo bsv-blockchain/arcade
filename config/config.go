@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	chaintracksconfig "github.com/bsv-blockchain/go-chaintracks/config"
@@ -1478,24 +1479,28 @@ func validateMerkleService(cfg *Config) error {
 			return fmt.Errorf("merkle_service.urls[%d] is empty; remove the entry or set a URL", i)
 		}
 	}
+	// Every error below names the URL through redactURL: the URL may carry
+	// credentials (user info, a token in the query, or a scheme-less
+	// "user:pass@host" that parses as an opaque URL), and the startup error
+	// is logged.
 	for _, u := range cfg.MerkleService.Endpoints() {
 		parsed, err := url.Parse(u)
 		if err != nil {
-			return fmt.Errorf("merkle_service url %q: %w", u, err)
+			return fmt.Errorf("merkle_service url %s does not parse", redactURL(u))
 		}
 		// The URL is shown in /health, metric labels and startup logs, so
 		// credentials in it would leak there; auth_token is the supported
 		// way to authenticate.
 		if parsed.User != nil {
-			return fmt.Errorf("merkle_service url %q must not contain user info; use merkle_service.auth_token for authentication", redactUserinfo(parsed))
+			return fmt.Errorf("merkle_service url %s must not contain user info; use merkle_service.auth_token for authentication", redactURL(u))
 		}
 		if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
-			return fmt.Errorf("merkle_service url %q must be an absolute http(s) URL", u)
+			return fmt.Errorf("merkle_service url %s must be an absolute http(s) URL", redactURL(u))
 		}
 		// The client appends /watch, /reprocess and /health to the base URL
 		// as a string, so a query or fragment would swallow the path.
 		if parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
-			return fmt.Errorf("merkle_service url %q must not contain a query or fragment", u)
+			return fmt.Errorf("merkle_service url %s must not contain a query or fragment", redactURL(u))
 		}
 	}
 	if cfg.MerkleService.Enabled() && cfg.CallbackToken == "" {
@@ -1505,12 +1510,31 @@ func validateMerkleService(cfg *Config) error {
 	return nil
 }
 
-// redactUserinfo renders u with its user info replaced, so the validation
-// error that rejects it does not print the password it is protecting.
-func redactUserinfo(u *url.URL) string {
+// redactURL renders a configured URL for an error message with everything
+// that may be a secret replaced: user info, an opaque part (a scheme-less
+// "user:pass@host:port" parses with its first segment as the scheme and the
+// rest opaque), the query and the fragment. A URL that does not parse is not
+// echoed at all.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "(unparseable)"
+	}
+	const redacted = "REDACTED"
 	c := *u
-	c.User = url.User("REDACTED")
-	return c.String()
+	if c.User != nil {
+		c.User = url.User(redacted)
+	}
+	if c.Opaque != "" {
+		c.Opaque = redacted
+	}
+	if c.RawQuery != "" {
+		c.RawQuery = redacted
+	}
+	if c.Fragment != "" {
+		c.Fragment, c.RawFragment = redacted, ""
+	}
+	return strconv.Quote(c.String())
 }
 
 func validate(cfg *Config) error {

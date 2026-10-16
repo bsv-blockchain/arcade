@@ -612,3 +612,26 @@ func TestValidate_MerkleServiceRejectsUserinfo(t *testing.T) {
 		}
 	}
 }
+
+// No merkle_service URL validation error echoes a secret: not for a URL that
+// does not parse, a scheme-less user:pass@host (which parses as opaque), a
+// token in the query, or a fragment.
+func TestValidate_MerkleServiceErrorsRedactSecrets(t *testing.T) {
+	for _, bad := range []string{
+		"http://merkle.local/%zz-s3cret",     // does not parse
+		"svc:s3cret@merkle.local:8080",       // scheme-less user info
+		"https://merkle.local/?token=s3cret", // query
+		"https://merkle.local/#s3cret",       // fragment
+		"ftp://user:s3cret@merkle.local",     // user info with a bad scheme
+	} {
+		cfg := baseValidConfig()
+		cfg.MerkleService.URLs = []string{bad}
+		err := validate(cfg)
+		if err == nil {
+			t.Fatalf("merkle_service url %q must be rejected", bad)
+		}
+		if strings.Contains(err.Error(), "s3cret") {
+			t.Fatalf("validation error for %q leaks the secret: %v", bad, err)
+		}
+	}
+}

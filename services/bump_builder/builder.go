@@ -326,11 +326,12 @@ func (b *Builder) handleAnchorDenied(ctx context.Context, logger *zap.Logger, bl
 // set; those rows must not fan out a second MINED event to SSE/webhook
 // subscribers. But "already MINED" only proves the store write landed, not
 // that the event went out: a crash between SetMinedByTxIDs and PublishBulk
-// leaves the rows MINED and unpublished. Callers therefore pass the result
-// of blockFinalized, read before they touch the block: processed_at is
-// stamped only after the publish, so a stamped block's MINED rows were
+// leaves the rows MINED and unpublished. The build path therefore passes the
+// result of blockFinalized, read before it touches the block: processed_at
+// is stamped only after the publish, so a stamped block's MINED rows were
 // published, and an unstamped one is republished in full (a duplicate event
-// beats a lost one).
+// beats a lost one). The short-circuit passes it too, which is safe because
+// it un-stamps the block when its mine or publish fails (see shortCircuit).
 //
 // That only holds if a failed publish also withholds the stamp, so a
 // PublishBulk failure reports false like a partial store write: the block
@@ -1560,6 +1561,10 @@ func (b *Builder) shortCircuit(ctx context.Context, logger *zap.Logger, blockHas
 		b.handleAnchorDenied(ctx, logger, blockHash, existingHeight, "short_circuit")
 		return false, nil
 	}
+	// Rows already MINED against a stamped block are not republished: the
+	// stamp proves their events went out, because a mine or publish failure
+	// below takes it off again (deferStampedBlock) before the next delivery
+	// can read the block as finalized.
 	minedComplete := true
 	if len(txids) > 0 {
 		finalized := b.blockFinalized(ctx, blockHash)
