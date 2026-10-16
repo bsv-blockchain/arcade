@@ -650,17 +650,17 @@ func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, c
 
 	// Several merkle-services may each deliver a STUMP for the same subtree,
 	// and a service that missed registrations delivers one that lacks those
-	// txs' paths. Merge same-index variants into one path per subtree first
+	// txs' paths. Same-index variants are merged into one path per subtree
 	// so the compound covers the union of every tracked tx any service knew.
-	merged, err := mergeStumpVariants(stumps)
-	if err != nil {
-		return nil, nil, err
-	}
 
 	// Single-subtree edge case (and pathological zero-subtree case): the
 	// STUMP IS the full BUMP. Reuse assembleFullPath which handles the
 	// coinbase placeholder swap and odd-leaf padding for us.
 	if numSubtrees <= 1 {
+		merged, err := mergeStumpVariants(stumps)
+		if err != nil {
+			return nil, nil, err
+		}
 		full, _, err := assembleFullPath(merged[0].data, merged[0].index, subtreeHashes, coinbaseBUMP)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to assemble single-subtree BUMP: %w", err)
@@ -668,7 +668,10 @@ func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, c
 		return full, merged[0].txids, nil
 	}
 
-	firstPath := merged[0].path
+	firstPath, err := transaction.NewMerklePathFromBinary(stumps[0].StumpData)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse STUMP for subtree %d: %w", stumps[0].SubtreeIndex, err)
+	}
 	blockHeight := firstPath.BlockHeight
 
 	subtreeRootLayer := int(math.Ceil(math.Log2(float64(numSubtrees))))
@@ -697,6 +700,22 @@ func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, c
 	finalIdx := numSubtrees - 1
 	finalNaturalHeight := internalHeight - liftLevels
 
+	// The lifted final subtree's STUMP is legitimately shorter: its natural
+	// height is internalHeight - liftLevels. Every other subtree is complete
+	// and must cover internalHeight levels.
+	requiredHeightFor := func(index int) int {
+		if index == finalIdx {
+			return finalNaturalHeight
+		}
+		return internalHeight
+	}
+
+	stumps = dropVariantsOffSubtreeRoot(stumps, subtreeHashes, requiredHeightFor, coinbaseTxID, coinbaseBUMP)
+	merged, err := mergeStumpVariants(stumps)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	compound := &transaction.MerklePath{
 		BlockHeight: blockHeight,
 		Path:        make([][]*transaction.PathElement, totalHeight),
@@ -712,13 +731,7 @@ func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, c
 	for _, stump := range merged {
 		haveSTUMP[stump.index] = true
 		path := stump.path
-		// The lifted final subtree's STUMP is legitimately shorter: its
-		// natural height is internalHeight - liftLevels. Every other subtree
-		// is complete and must cover internalHeight levels.
-		requiredHeight := internalHeight
-		if stump.index == finalIdx {
-			requiredHeight = finalNaturalHeight
-		}
+		requiredHeight := requiredHeightFor(stump.index)
 		// A STUMP taller than requiredHeight is tolerated: merkle-service
 		// sometimes delivers a STUMP at full block height, and only its first
 		// requiredHeight levels are the subtree-internal path — the placement
@@ -782,6 +795,83 @@ func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, c
 	computeAndPadCompound(compound, internalHeight, numSubtrees)
 
 	return compound, txids, nil
+}
+
+// dropVariantsOffSubtreeRoot filters the STUMP variants of every subtree that
+// has more than one. mergeStumpVariants only rejects variants that disagree
+// on a slot they share; a variant whose slots are disjoint from the others'
+// is merged as-is, so one bad copy (a misbehaving merkle-service) would put
+// leaves the subtree does not contain into the compound, or fail the whole
+// block's validation and hold back the good variants with it. Each variant's
+// tracked leaves are folded up the subtree's own height and compared with the
+// block's subtree root; when at least one variant matches, the ones that do
+// not are dropped. When none matches, all are kept: the check cannot tell
+// which is wrong, and the compound-root validation still guards what is
+// persisted. A subtree with a single STUMP is left alone.
+func dropVariantsOffSubtreeRoot(stumps []*models.Stump, subtreeHashes []chainhash.Hash, requiredHeight func(index int) int, coinbaseTxID *chainhash.Hash, coinbaseBUMP []byte) []*models.Stump {
+	count := make(map[int]int, len(stumps))
+	for _, st := range stumps {
+		count[st.SubtreeIndex]++
+	}
+	matches := make(map[*models.Stump]bool)
+	anyMatch := make(map[int]bool)
+	for _, st := range stumps {
+		idx := st.SubtreeIndex
+		if count[idx] < 2 || idx < 0 || idx >= len(subtreeHashes) {
+			continue
+		}
+		if variantFoldsToRoot(st, &subtreeHashes[idx], requiredHeight(idx), coinbaseTxID, coinbaseBUMP) {
+			matches[st] = true
+			anyMatch[idx] = true
+		}
+	}
+	out := stumps[:0:0]
+	for _, st := range stumps {
+		idx := st.SubtreeIndex
+		if count[idx] >= 2 && anyMatch[idx] && !matches[st] {
+			continue
+		}
+		out = append(out, st)
+	}
+	return out
+}
+
+// variantFoldsToRoot reports whether every tracked level-0 leaf of st (every
+// leaf when none is marked) folds up height levels to root. It works on a
+// fresh parse so the coinbase swap for subtree 0 does not touch the copy the
+// build places.
+func variantFoldsToRoot(st *models.Stump, root *chainhash.Hash, height int, coinbaseTxID *chainhash.Hash, coinbaseBUMP []byte) bool {
+	path, err := transaction.NewMerklePathFromBinary(st.StumpData)
+	if err != nil || height <= 0 || len(path.Path) < height {
+		return false
+	}
+	if st.SubtreeIndex == 0 && coinbaseTxID != nil {
+		applyCoinbaseToSTUMP(path, coinbaseTxID, coinbaseBUMP)
+	}
+	subtree := &transaction.MerklePath{BlockHeight: path.BlockHeight, Path: path.Path[:height]}
+	var leaves []*chainhash.Hash
+	for _, leaf := range subtree.Path[0] {
+		if leaf.Hash != nil && leaf.Txid != nil && *leaf.Txid {
+			leaves = append(leaves, leaf.Hash)
+		}
+	}
+	if len(leaves) == 0 {
+		for _, leaf := range subtree.Path[0] {
+			if leaf.Hash != nil {
+				leaves = append(leaves, leaf.Hash)
+			}
+		}
+	}
+	if len(leaves) == 0 {
+		return false
+	}
+	for _, leaf := range leaves {
+		got, err := subtree.ComputeRoot(leaf)
+		if err != nil || !got.IsEqual(root) {
+			return false
+		}
+	}
+	return true
 }
 
 // mergedStump is one subtree's STUMP after same-index variants were merged.
