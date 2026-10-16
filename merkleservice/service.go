@@ -41,6 +41,13 @@ type Recoverable interface {
 	// background goroutine) when an endpoint's catch-up queue overflowed and
 	// has since drained. fn must return quickly; spawn work if needed.
 	OnResyncNeeded(fn func(endpoint string))
+	// Retain queues each registration whose /watch failed on every endpoint
+	// into every endpoint's catch-up queue, so the background loop re-sends
+	// it once an endpoint answers. errs[i] is registrations[i]'s pool-level
+	// result; nil entries and outright rejections (a 4xx that a resend cannot
+	// fix) are skipped. Used by the startup replay, which has no other retry
+	// for the entries it could not land.
+	Retain(registrations []Registration, errs []error)
 }
 
 // HealthReporter is the optional surface the api-server's /health uses to
