@@ -331,9 +331,37 @@ func (b *Builder) handleAnchorDenied(ctx context.Context, logger *zap.Logger, bl
 // stamped only after the publish, so a stamped block's MINED rows were
 // published, and an unstamped one is republished in full (a duplicate event
 // beats a lost one).
+//
+// That only holds if a failed publish also withholds the stamp, so a
+// PublishBulk failure reports false like a partial store write: the block
+// stays in the watchdog's stale scan and its re-drive republishes the set.
 func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, blockHash string, blockHeight uint64, txids []string, onlyChanged bool) bool {
-	_, err := setMinedAndPublish(ctx, logger, b.store, b.publisher, blockHash, blockHeight, txids, "", onlyChanged)
-	return err == nil
+	var publisher events.Publisher
+	var recorder *publishFailureRecorder
+	if b.publisher != nil {
+		recorder = &publishFailureRecorder{Publisher: b.publisher}
+		publisher = recorder
+	}
+	_, err := setMinedAndPublish(ctx, logger, b.store, publisher, blockHash, blockHeight, txids, "", onlyChanged)
+	return err == nil && (recorder == nil || !recorder.failed)
+}
+
+// publishFailureRecorder notes whether any PublishBulk call failed.
+// setMinedAndPublish logs and carries on past a failed chunk (the rows are
+// MINED in the store either way); markMinedAndPublish needs to know so it can
+// keep the block un-stamped. Calls are sequential.
+type publishFailureRecorder struct {
+	events.Publisher
+
+	failed bool
+}
+
+func (r *publishFailureRecorder) PublishBulk(ctx context.Context, template *models.TransactionStatus) error {
+	err := r.Publisher.PublishBulk(ctx, template)
+	if err != nil {
+		r.failed = true
+	}
+	return err
 }
 
 // blockFinalized reports whether the block's processed_at is stamped, which

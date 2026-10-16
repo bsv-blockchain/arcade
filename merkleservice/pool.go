@@ -1090,8 +1090,10 @@ func (s *endpointService) RegisterBatchWithResults(ctx context.Context, registra
 	// runEndpointBatch refuses fast (ErrNoHealthyEndpoints, nothing sent)
 	// for every entry once the breaker is open, including from the start.
 	out := s.pool.runEndpointBatch(ctx, ctx, s.ep, opWatch, registrations, maxConcurrency, nil)
+	// An outright rejection is not queued: re-sending it cannot succeed
+	// (same rule as sendCatchup and Retain).
 	for i, reg := range registrations {
-		if out[i] != nil {
+		if out[i] != nil && !permanentRejection(out[i]) {
 			s.ep.pending.add(reg)
 		}
 	}
