@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -1519,6 +1520,75 @@ func (s *Store) ClearBlockProcessed(ctx context.Context, blockHash string) error
 	cur := *prev
 	cur.ProcessedUnixNs = 0
 	return s.writeBlockProc(prev, &cur)
+}
+
+// AddBlockExpectedSubtrees implements store.Store. Read-modify-write under
+// the block's shard lock; a missing block-processing row is a no-op.
+func (s *Store) AddBlockExpectedSubtrees(ctx context.Context, blockHash string, indices []int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(indices) == 0 {
+		return nil
+	}
+	mu := s.shardFor(blockHash)
+	mu.Lock()
+	defer mu.Unlock()
+
+	row, err := s.readBlockProc(blockHash)
+	if err != nil || row == nil {
+		return err
+	}
+	cur, err := s.readBlockExpected(blockHash)
+	if err != nil {
+		return err
+	}
+	merged := append(cur, indices...)
+	slices.Sort(merged)
+	merged = slices.Compact(merged)
+	payload, err := json.Marshal(merged)
+	if err != nil {
+		return err
+	}
+	return s.db.Set(blockExpectedKey(blockHash), payload, s.writeOpts)
+}
+
+// GetBlockExpectedSubtrees implements store.Store.
+func (s *Store) GetBlockExpectedSubtrees(ctx context.Context, blockHash string) ([]int, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.readBlockExpected(blockHash)
+}
+
+// ClearBlockExpectedSubtrees implements store.Store.
+func (s *Store) ClearBlockExpectedSubtrees(ctx context.Context, blockHash string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	mu := s.shardFor(blockHash)
+	mu.Lock()
+	defer mu.Unlock()
+	return s.db.Delete(blockExpectedKey(blockHash), s.writeOpts)
+}
+
+func (s *Store) readBlockExpected(blockHash string) ([]int, error) {
+	v, closer, err := s.db.Get(blockExpectedKey(blockHash))
+	if errors.Is(err, pebbledb.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get block expected subtrees %s: %w", blockHash, err)
+	}
+	defer func() { _ = closer.Close() }()
+	var out []int
+	if err := json.Unmarshal(v, &out); err != nil {
+		return nil, fmt.Errorf("unmarshal block expected subtrees %s: %w", blockHash, err)
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
 }
 
 func (s *Store) MarkBlockBUMPBuilt(ctx context.Context, blockHash string, blockHeight uint64, builtAt time.Time) error {

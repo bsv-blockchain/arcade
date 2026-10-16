@@ -500,6 +500,23 @@ type Store interface {
 	// is left alone.
 	ClearBlockProcessed(ctx context.Context, blockHash string) error
 
+	// AddBlockExpectedSubtrees unions indices into the block's retained set
+	// of expected subtree indices: every subtree index some merkle-service's
+	// BLOCK_PROCESSED announced a STUMP for while the block was incomplete.
+	// Each service only announces the subtrees IT tracks, so the bump-builder
+	// keeps the union to stop a later, smaller announcement from finalizing
+	// a block another service is still owed a STUMP for. No-op (nil) when
+	// the row does not exist.
+	AddBlockExpectedSubtrees(ctx context.Context, blockHash string, indices []int) error
+
+	// GetBlockExpectedSubtrees returns the retained set, ascending; empty
+	// (nil, nil) when none is retained or the row does not exist.
+	GetBlockExpectedSubtrees(ctx context.Context, blockHash string) ([]int, error)
+
+	// ClearBlockExpectedSubtrees drops the retained set once a build has
+	// satisfied it. No-op (nil) when the row does not exist.
+	ClearBlockExpectedSubtrees(ctx context.Context, blockHash string) error
+
 	// MarkBlocksOrphaned transitions every named block to status='orphaned',
 	// stamps orphaned_at and CLEARS reconciled_at. Clearing is required, not
 	// cosmetic: orphaned rows with reconciled_at IS NULL form the anchor

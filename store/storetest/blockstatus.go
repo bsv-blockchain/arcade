@@ -17,6 +17,9 @@ type BlockStatusBackend interface {
 	UpsertBlockHeaderSeen(ctx context.Context, blockHash string, blockHeight uint64, seenAt time.Time) error
 	MarkBlockProcessed(ctx context.Context, blockHash string, blockHeight uint64, processedAt time.Time) error
 	ClearBlockProcessed(ctx context.Context, blockHash string) error
+	AddBlockExpectedSubtrees(ctx context.Context, blockHash string, indices []int) error
+	GetBlockExpectedSubtrees(ctx context.Context, blockHash string) ([]int, error)
+	ClearBlockExpectedSubtrees(ctx context.Context, blockHash string) error
 	MarkBlocksOrphaned(ctx context.Context, blockHashes []string, orphanedAt time.Time) (int, error)
 	MarkBlocksParked(ctx context.Context, blockHashes []string) error
 	MarkBlockReconciled(ctx context.Context, blockHash string, orphanedAt, at time.Time) (bool, error)
@@ -183,6 +186,57 @@ func RunBlockStatusSuite(t *testing.T, newBackend func(t *testing.T) BlockStatus
 		}
 		if got := row(t, b, hash); got.ProcessedAt == nil {
 			t.Fatalf("re-stamp after clear must set processed_at, got %+v", got)
+		}
+	})
+
+	// The expected-subtree set is a union across merkle-services'
+	// announcements: adds merge (deduplicated, ascending), the block's other
+	// columns are untouched, a clear drops it, and a missing row is a no-op
+	// that is not created.
+	t.Run("BlockExpectedSubtrees", func(t *testing.T) {
+		b := newBackend(t)
+		const hash = "bes-bes-bes-bes-bes-bes-bes-bes-bes-bes-bes-bes-bes-bes-bes-bes-"
+		height := blockSuiteHeight + 8
+		if err := b.UpsertBlockHeaderSeen(ctx, hash, height, t0); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := b.GetBlockExpectedSubtrees(ctx, hash); err != nil || len(got) != 0 {
+			t.Fatalf("fresh row: got %v, %v; want empty", got, err)
+		}
+		if err := b.AddBlockExpectedSubtrees(ctx, hash, []int{2, 0}); err != nil {
+			t.Fatalf("add: %v", err)
+		}
+		if err := b.AddBlockExpectedSubtrees(ctx, hash, []int{1, 2}); err != nil {
+			t.Fatalf("add: %v", err)
+		}
+		got, err := b.GetBlockExpectedSubtrees(ctx, hash)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 3 || got[0] != 0 || got[1] != 1 || got[2] != 2 {
+			t.Fatalf("union = %v, want [0 1 2]", got)
+		}
+		if r := row(t, b, hash); r.BlockHeight != height || r.Status != models.BlockStatusActive || !r.HeaderSeenAt.Equal(t0) || r.ProcessedAt != nil {
+			t.Fatalf("adding expected subtrees must not touch the row's other columns, got %+v", r)
+		}
+		if err := b.ClearBlockExpectedSubtrees(ctx, hash); err != nil {
+			t.Fatalf("clear: %v", err)
+		}
+		if got, err := b.GetBlockExpectedSubtrees(ctx, hash); err != nil || len(got) != 0 {
+			t.Fatalf("after clear: got %v, %v; want empty", got, err)
+		}
+		missing := "missing-" + hash[8:]
+		if err := b.AddBlockExpectedSubtrees(ctx, missing, []int{1}); err != nil {
+			t.Fatalf("add on a missing row must be a no-op: %v", err)
+		}
+		if got, err := b.GetBlockExpectedSubtrees(ctx, missing); err != nil || len(got) != 0 {
+			t.Fatalf("missing row: got %v, %v; want empty", got, err)
+		}
+		if err := b.ClearBlockExpectedSubtrees(ctx, missing); err != nil {
+			t.Fatalf("clear on a missing row must be a no-op: %v", err)
+		}
+		if _, err := b.GetBlockProcessingStatus(ctx, missing); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("expected-subtree ops must not create a row: err=%v", err)
 		}
 	})
 

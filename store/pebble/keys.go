@@ -30,6 +30,7 @@ const (
 	prefixIdxSubToken        = "idx:sub:token:" //nolint:gosec // index-prefix string, not a credential
 	prefixIdxStumpBlock      = "idx:stump:block:"
 	prefixBlockProc          = "blkproc:"
+	prefixBlockExpected      = "blkexp:"
 	prefixIdxBlockProcHeight = "idx:blkproc:height:"
 )
 
@@ -123,6 +124,12 @@ func idxStumpBlockPrefix(blockHash string) []byte {
 
 // blockProcKey is the primary record key for a block-processing row.
 func blockProcKey(blockHash string) []byte { return []byte(prefixBlockProc + blockHash) }
+
+// blockExpectedKey holds a block's retained expected-subtree set
+// (store.Store.AddBlockExpectedSubtrees) as a JSON int array. It lives beside
+// the block-processing row rather than in it so the row's many rebuild-from-
+// scratch writers cannot drop it.
+func blockExpectedKey(blockHash string) []byte { return []byte(prefixBlockExpected + blockHash) }
 
 // idxBlockProcHeightKey encodes block_height as the bitwise-inverted uint64
 // rendered as 16 hex digits so a forward iterator over the index prefix

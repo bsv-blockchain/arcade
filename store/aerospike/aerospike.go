@@ -2398,6 +2398,10 @@ const (
 	binStatus       = "status"
 	binOrphanedAt   = "orphaned_at"
 	binReconciledAt = "reconciled_at"
+	// binExpectedSubtrees holds the retained expected-subtree set
+	// (store.Store.AddBlockExpectedSubtrees) as an ordered unique list.
+	// Bin names are capped at 15 bytes.
+	binExpectedSubtrees = "exp_subtrees"
 )
 
 func (s *Store) UpsertBlockHeaderSeen(ctx context.Context, blockHash string, blockHeight uint64, seenAt time.Time) error {
@@ -2438,6 +2442,75 @@ func (s *Store) UpsertBlockHeaderSeen(ctx context.Context, blockHash string, blo
 		if _, err := s.client.Operate(s.writePolicy(ctx), key, setOp); err != nil {
 			return fmt.Errorf("set header_seen_at %s: %w", blockHash, err)
 		}
+	}
+	return nil
+}
+
+// AddBlockExpectedSubtrees implements store.Store with an ordered, unique
+// list append, so the union is applied atomically on the server. UPDATE_ONLY
+// keeps a missing row a no-op.
+func (s *Store) AddBlockExpectedSubtrees(ctx context.Context, blockHash string, indices []int) error {
+	if len(indices) == 0 {
+		return nil
+	}
+	key, err := s.key(setBlockProcessing, blockHash)
+	if err != nil {
+		return err
+	}
+	vals := make([]interface{}, len(indices))
+	for i, v := range indices {
+		vals[i] = v
+	}
+	policy := aero.NewListPolicy(aero.ListOrderOrdered, aero.ListWriteFlagsAddUnique|aero.ListWriteFlagsNoFail|aero.ListWriteFlagsPartial)
+	wp := s.writePolicy(ctx)
+	wp.RecordExistsAction = aero.UPDATE_ONLY
+	_, err = s.client.Operate(wp, key, aero.ListAppendWithPolicyOp(policy, binExpectedSubtrees, vals...))
+	if err != nil && !isKeyNotFound(err) {
+		return fmt.Errorf("add block expected subtrees %s: %w", blockHash, err)
+	}
+	return nil
+}
+
+// GetBlockExpectedSubtrees implements store.Store.
+func (s *Store) GetBlockExpectedSubtrees(ctx context.Context, blockHash string) ([]int, error) {
+	key, err := s.key(setBlockProcessing, blockHash)
+	if err != nil {
+		return nil, err
+	}
+	rec, err := s.client.Get(s.readPolicy(ctx), key, binExpectedSubtrees)
+	if err != nil {
+		if isKeyNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get block expected subtrees %s: %w", blockHash, err)
+	}
+	raw, _ := rec.Bins[binExpectedSubtrees].([]interface{})
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	out := make([]int, 0, len(raw))
+	for _, v := range raw {
+		switch n := v.(type) {
+		case int:
+			out = append(out, n)
+		case int64:
+			out = append(out, int(n))
+		}
+	}
+	return out, nil
+}
+
+// ClearBlockExpectedSubtrees implements store.Store.
+func (s *Store) ClearBlockExpectedSubtrees(ctx context.Context, blockHash string) error {
+	key, err := s.key(setBlockProcessing, blockHash)
+	if err != nil {
+		return err
+	}
+	wp := s.writePolicy(ctx)
+	wp.RecordExistsAction = aero.UPDATE_ONLY
+	_, err = s.client.Operate(wp, key, aero.PutOp(aero.NewBin(binExpectedSubtrees, nil)))
+	if err != nil && !isKeyNotFound(err) {
+		return fmt.Errorf("clear block expected subtrees %s: %w", blockHash, err)
 	}
 	return nil
 }

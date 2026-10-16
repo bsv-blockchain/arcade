@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -71,6 +72,9 @@ type mockStore struct {
 	// (which never set them) see the "fresh deployment" early-exit path.
 	tipHeight uint64
 	blockProc []*models.BlockProcessingStatus
+
+	// expectedSubtrees backs the retained expected-subtree set ops.
+	expectedSubtrees map[string][]int
 }
 
 type bumpBuiltCall struct {
@@ -169,6 +173,34 @@ func (m *mockStore) addStumpLocked(stump *models.Stump) {
 		}
 	}
 	m.stumps[stump.BlockHash] = append(m.stumps[stump.BlockHash], stump)
+}
+
+// AddBlockExpectedSubtrees unions indices into the retained set. Unlike the
+// real backends it does not require a block_processing row, so tests need no
+// fixture row to exercise the union.
+func (m *mockStore) AddBlockExpectedSubtrees(_ context.Context, blockHash string, indices []int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.expectedSubtrees == nil {
+		m.expectedSubtrees = map[string][]int{}
+	}
+	merged := append(slices.Clone(m.expectedSubtrees[blockHash]), indices...)
+	slices.Sort(merged)
+	m.expectedSubtrees[blockHash] = slices.Compact(merged)
+	return nil
+}
+
+func (m *mockStore) GetBlockExpectedSubtrees(_ context.Context, blockHash string) ([]int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.expectedSubtrees[blockHash]), nil
+}
+
+func (m *mockStore) ClearBlockExpectedSubtrees(_ context.Context, blockHash string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.expectedSubtrees, blockHash)
+	return nil
 }
 
 // GetBlockProcessingStatus serves rows from blockProc by hash.

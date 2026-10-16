@@ -62,6 +62,9 @@ const (
 	fOrphanedAt   = "orphaned_at"
 	fOrphanedGen  = "orphaned_gen"
 	fReconciledAt = "reconciled_at"
+	// fExpectedSubtrees is the union of announced expected subtree indices
+	// (store.Store.AddBlockExpectedSubtrees).
+	fExpectedSubtrees = "expected_subtrees"
 
 	fHolder    = "holder"
 	fExpiresAt = "expires_at"
@@ -93,6 +96,8 @@ const (
 	opUnset       = "$unset"
 	opInc         = "$inc"
 	opSetOnInsert = "$setOnInsert"
+	opAddToSet    = "$addToSet"
+	opEach        = "$each"
 	opIn          = "$in"
 	opNin         = "$nin"
 	opNe          = "$ne"

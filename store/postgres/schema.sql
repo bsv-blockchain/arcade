@@ -118,6 +118,9 @@ CREATE INDEX IF NOT EXISTS idx_bp_stale_seen
 -- reconciler once every tx anchored to this orphaned block has been
 -- re-anchored or reverted; reset to NULL when the block is resurrected.
 ALTER TABLE block_processing ADD COLUMN IF NOT EXISTS reconciled_at TIMESTAMPTZ;
+-- Union of the subtree indices merkle-services announced STUMPs for while
+-- the block was incomplete (multi merkle-service). NULL when none retained.
+ALTER TABLE block_processing ADD COLUMN IF NOT EXISTS expected_subtrees INT[];
 -- Partial index over the reconciler's work queue — orphaned rows still
 -- awaiting tx reconciliation. Stays proportional to the (tiny) backlog.
 CREATE INDEX IF NOT EXISTS idx_bp_orphaned_unreconciled

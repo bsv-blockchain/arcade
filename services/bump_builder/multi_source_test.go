@@ -715,3 +715,57 @@ func TestBuilder_HandleMessage_NoNewLeavesButExpectedMissing_DefersInsteadOfShor
 		t.Fatal("processed_at must be cleared so the watchdog re-drives the block")
 	}
 }
+
+// The interleaving from review: A builds subtree 0 (expects {0}); B supplies
+// subtree 1 but expects {1,2} and defers for missing 2; then A's duplicate
+// (expects {0}) arrives. Retained subtree 1 makes it a rebuild, and judged
+// against A's set alone it would stamp the block with subtree 2 still owed.
+// The deferral retained {1,2}, so A's duplicate defers too. Once the block
+// is stamped, the retained set is dropped.
+func TestBuilder_HandleMessage_RetainedExpectedSetOutlivesSmallerAnnouncements(t *testing.T) {
+	f := newMultiSourceFixture(t)
+	ctx := context.Background()
+	f.b.cfg.BumpBuilder.GraceWindowMs = 0
+
+	// A: subtree 0, expects {0}.
+	f.ms.addStump(f.blockHash, 0, f.variantA)
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsgWithExpected(f.blockHash, []int{0})); err != nil {
+		t.Fatalf("A: %v", err)
+	}
+	// B: subtree 1 retained, expects {1,2}: deferred.
+	const lateTx = "5555555555555555555555555555555555555555555555555555555555555555"
+	f.ms.addStump(f.blockHash, 1, makeMinimalSTUMP(lateTx))
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsgWithExpected(f.blockHash, []int{1, 2})); err != nil {
+		t.Fatalf("B: %v", err)
+	}
+	f.ms.mu.Lock()
+	if got := f.ms.expectedSubtrees[f.blockHash]; len(got) != 2 || got[0] != 1 || got[1] != 2 {
+		f.ms.mu.Unlock()
+		t.Fatalf("B's deferral must retain its expected set, got %v", got)
+	}
+	f.ms.mu.Unlock()
+
+	// A's duplicate, expects {0}: must defer, not stamp.
+	beforeDeferred := bumpOutcomeSampleCount(t, "deferred_incomplete")
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsgWithExpected(f.blockHash, []int{0})); err != nil {
+		t.Fatalf("A duplicate: %v", err)
+	}
+	if got := bumpOutcomeSampleCount(t, "deferred_incomplete"); got != beforeDeferred+1 {
+		t.Fatalf("A's duplicate must be held to the retained set and defer, deferred samples %d -> %d", beforeDeferred, got)
+	}
+	f.ms.mu.Lock()
+	if f.ms.blockProc[0].ProcessedAt != nil {
+		f.ms.mu.Unlock()
+		t.Fatal("block must stay un-stamped while subtree 2 is owed")
+	}
+	f.ms.mu.Unlock()
+
+	// Stamping the block (whichever path finally completes it) drops the
+	// retained set: a finalized block owes nothing.
+	f.b.markBlockProcessed(ctx, zap.NewNop(), f.blockHash, 1)
+	f.ms.mu.Lock()
+	defer f.ms.mu.Unlock()
+	if got := f.ms.expectedSubtrees[f.blockHash]; len(got) != 0 {
+		t.Fatalf("stamping must drop the retained set, got %v", got)
+	}
+}

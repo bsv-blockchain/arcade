@@ -1277,6 +1277,56 @@ func (s *Store) ClearBlockProcessed(ctx context.Context, blockHash string) error
 	return nil
 }
 
+// AddBlockExpectedSubtrees implements store.Store in one UPDATE, so the
+// union is computed against the row's current set server-side.
+func (s *Store) AddBlockExpectedSubtrees(ctx context.Context, blockHash string, indices []int) error {
+	if len(indices) == 0 {
+		return nil
+	}
+	const q = `
+UPDATE block_processing SET expected_subtrees = (
+    SELECT array_agg(DISTINCT i ORDER BY i)
+    FROM unnest(COALESCE(expected_subtrees, '{}'::int[]) || $2::int[]) AS i
+)
+WHERE block_hash = $1`
+	vals := make([]int32, len(indices))
+	for i, v := range indices {
+		vals[i] = int32(v) //nolint:gosec // subtree indices are small
+	}
+	if _, err := s.pool.Exec(ctx, q, blockHash, vals); err != nil {
+		return fmt.Errorf("add block expected subtrees %s: %w", blockHash, err)
+	}
+	return nil
+}
+
+// GetBlockExpectedSubtrees implements store.Store.
+func (s *Store) GetBlockExpectedSubtrees(ctx context.Context, blockHash string) ([]int, error) {
+	var vals []int32
+	err := s.pool.QueryRow(ctx, `SELECT expected_subtrees FROM block_processing WHERE block_hash = $1`, blockHash).Scan(&vals)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get block expected subtrees %s: %w", blockHash, err)
+	}
+	if len(vals) == 0 {
+		return nil, nil
+	}
+	out := make([]int, len(vals))
+	for i, v := range vals {
+		out[i] = int(v)
+	}
+	return out, nil
+}
+
+// ClearBlockExpectedSubtrees implements store.Store.
+func (s *Store) ClearBlockExpectedSubtrees(ctx context.Context, blockHash string) error {
+	if _, err := s.pool.Exec(ctx, `UPDATE block_processing SET expected_subtrees = NULL WHERE block_hash = $1`, blockHash); err != nil {
+		return fmt.Errorf("clear block expected subtrees %s: %w", blockHash, err)
+	}
+	return nil
+}
+
 func (s *Store) MarkBlockBUMPBuilt(ctx context.Context, blockHash string, blockHeight uint64, builtAt time.Time) error {
 	const q = `
 INSERT INTO block_processing (block_hash, block_height, header_seen_at, bump_built_at, status)

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"time"
 
@@ -754,6 +755,16 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	// retained STUMP set against the stored BUMP: nothing new ⇒ short-circuit
 	// (re-mine idempotently, re-stamp, publish nothing already MINED);
 	// new leaves ⇒ fall through and rebuild from the full set.
+	// Each merkle-service announces only the subtrees IT tracks, so judge
+	// completeness against every index an earlier, deferred delivery
+	// announced too. Otherwise a later delivery with a smaller set (another
+	// service's duplicate, or its own watchdog re-drive) could stamp a block
+	// that is still owed a STUMP.
+	if err := b.widenExpectedSubtrees(ctx, &callback); err != nil {
+		outcome = "store_failed"
+		return err
+	}
+
 	storedLeaves, handledOutcome, err := b.handleRedelivery(ctx, logger, &callback)
 	if err != nil {
 		// A redelivery whose stored BUMP or STUMP set cannot be read must
@@ -1281,10 +1292,14 @@ func (b *Builder) resolveStumps(ctx context.Context, logger *zap.Logger, callbac
 			zap.Int("expected_stumps", len(expected)),
 			zap.Int("received_stumps", len(stumps)),
 		)
-		// Another merkle-service's build may already have stamped the
-		// block; take the stamp off so the watchdog sees it. If that write
-		// fails the message must be retried, or the stamp stays and the
-		// watchdog never re-drives the block.
+		// Retain the announced set first, so whichever delivery comes next
+		// (in any order) is held to it. Another merkle-service's build may
+		// already have stamped the block; take the stamp off so the watchdog
+		// sees it. If either write fails the message must be retried, or the
+		// block can be finalized while still owed a STUMP.
+		if aerr := b.store.AddBlockExpectedSubtrees(ctx, blockHash, expected); aerr != nil {
+			return nil, "store_failed", false, fmt.Errorf("retaining expected subtrees for deferred block: %w", aerr)
+		}
 		if derr := b.deferStampedBlock(ctx, logger, blockHash); derr != nil {
 			return nil, "store_failed", false, derr
 		}
@@ -1533,7 +1548,8 @@ func (b *Builder) shortCircuit(ctx context.Context, logger *zap.Logger, blockHas
 // MarkBlockProcessed upsert preserves any chaintracks-supplied height on
 // conflict and only writes processed_at.
 func (b *Builder) markBlockProcessed(ctx context.Context, logger *zap.Logger, blockHash string, blockHeight uint64) {
-	if err := b.store.MarkBlockProcessed(ctx, blockHash, blockHeight, time.Now()); err != nil {
+	err := b.store.MarkBlockProcessed(ctx, blockHash, blockHeight, time.Now())
+	if err != nil {
 		// Include the block identity: a sustained stream of these is the signal
 		// that finalized blocks are looping through the watchdog (processed_at
 		// never lands), which an aggregator can only group by block hash.
@@ -1543,7 +1559,33 @@ func (b *Builder) markBlockProcessed(ctx context.Context, logger *zap.Logger, bl
 			logfields.BlockHeight(blockHeight),
 			zap.Error(err),
 		)
+		return
 	}
+	// A stamped block owes nothing, so drop the retained expected set (see
+	// widenExpectedSubtrees). Soft: a leftover set only costs a later
+	// redelivery a deferral round-trip through the watchdog.
+	if err := b.store.ClearBlockExpectedSubtrees(ctx, blockHash); err != nil {
+		logger.Warn("failed to clear retained expected subtrees", logfields.BlockHash(blockHash), zap.Error(err))
+	}
+}
+
+// widenExpectedSubtrees merges the block's retained expected-subtree set
+// (written by an earlier delivery that deferred the block) into the
+// callback's own, ascending and deduplicated. A read failure is returned:
+// judging completeness against a set that may be missing entries could
+// finalize an incomplete block.
+func (b *Builder) widenExpectedSubtrees(ctx context.Context, callback *models.CallbackMessage) error {
+	retained, err := b.store.GetBlockExpectedSubtrees(ctx, callback.BlockHash)
+	if err != nil {
+		return fmt.Errorf("reading retained expected subtrees: %w", err)
+	}
+	if len(retained) == 0 {
+		return nil
+	}
+	merged := append(slices.Clone(callback.ExpectedSubtreeIndices), retained...)
+	slices.Sort(merged)
+	callback.ExpectedSubtreeIndices = slices.Compact(merged)
+	return nil
 }
 
 // missingStumpIndices returns the subtree indices merkle-service expected to
