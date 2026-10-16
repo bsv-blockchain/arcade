@@ -341,6 +341,21 @@ func TestPool_EndpointServiceQueuesFailures(t *testing.T) {
 	}
 }
 
+// An outright 4xx rejection through Endpoint() is not queued: re-sending it
+// cannot succeed.
+func TestPool_EndpointServiceDoesNotQueuePermanentRejections(t *testing.T) {
+	b := newFakeMerkle(t)
+	p := NewPool([]string{b.url()}, "", time.Second)
+	b.setFailCode("tx1", http.StatusBadRequest)
+	errs := p.Endpoint(b.url()).RegisterBatchWithResults(context.Background(), []Registration{{TxID: "tx1"}}, 1)
+	if errs[0] == nil {
+		t.Fatal("tx1 must be refused")
+	}
+	if got := pendingFor(p, b.url()); got != 0 {
+		t.Fatalf("a 400 must not be queued, pending = %d", got)
+	}
+}
+
 // A catch-up entry the endpoint refuses again goes back to the queue: it is
 // still owed, and dropping it would leave the endpoint missing the txid.
 func TestPool_FailedCatchupIsRequeued(t *testing.T) {

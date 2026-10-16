@@ -2,6 +2,7 @@ package bump_builder
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -137,5 +138,42 @@ func TestBuilder_HandleMessage_RedeliveryOfUnstampedBlock_RepublishesMinedRows(t
 	emitted := pub.snapshot()
 	if len(emitted) != 1 || emitted[0].TxID != testTxidHex || emitted[0].Status != models.StatusMined {
 		t.Fatalf("an unstamped block's MINED rows must be republished, got %+v", emitted)
+	}
+}
+
+// failingBulkPublisher refuses every PublishBulk.
+type failingBulkPublisher struct{ recordingPublisher }
+
+func (p *failingBulkPublisher) PublishBulk(context.Context, *models.TransactionStatus) error {
+	return errors.New("kafka down")
+}
+
+// processed_at is the proof blockFinalized relies on that a block's MINED
+// events went out, so a failed PublishBulk must withhold it: the watchdog's
+// re-drive then sees an unstamped block and republishes in full.
+func TestBuilder_HandleMessage_PublishFailure_LeavesBlockUnstamped(t *testing.T) {
+	ms := newMockStore()
+	blockHash := testBlockHash
+	compound, _, err := bump.BuildCompoundBUMP(
+		[]*models.Stump{{BlockHash: blockHash, SubtreeIndex: 0, StumpData: makeMinimalSTUMP(testTxidHex)}},
+		[]chainhash.Hash{mustHash(t, testTxidHex)}, nil, nil,
+	)
+	if err != nil {
+		t.Fatalf("BuildCompoundBUMP: %v", err)
+	}
+	ms.bumps[blockHash] = compound.Bytes()
+	ms.bumpHeights[blockHash] = uint64(compound.BlockHeight)
+
+	b := &Builder{cfg: &config.Config{}, logger: zap.NewNop(), store: ms, publisher: &failingBulkPublisher{}}
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash)); err != nil {
+		t.Fatalf("handleMessage: %v", err)
+	}
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if len(ms.minedCalls) != 1 {
+		t.Fatalf("the rows must still be mined, SetMinedByTxIDs calls = %d", len(ms.minedCalls))
+	}
+	if len(ms.processedCalls) != 0 {
+		t.Fatalf("a failed MINED publish must leave processed_at unset, got %d stamps", len(ms.processedCalls))
 	}
 }
