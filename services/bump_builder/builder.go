@@ -717,6 +717,10 @@ func (b *Builder) Stop() error {
 	return nil
 }
 
+// buildOutcomeStoreFailed is the BumpBuilderBuildDuration outcome for a
+// BLOCK_PROCESSED that could not finish because a store read or write failed.
+const buildOutcomeStoreFailed = "store_failed"
+
 func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	overallStart := time.Now()
 	metrics.BumpBuilderBlocksProcessedTotal.Inc()
@@ -761,7 +765,7 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	// service's duplicate, or its own watchdog re-drive) could stamp a block
 	// that is still owed a STUMP.
 	if err := b.widenExpectedSubtrees(ctx, &callback); err != nil {
-		outcome = "store_failed"
+		outcome = buildOutcomeStoreFailed
 		return err
 	}
 
@@ -773,7 +777,7 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 		// have added leaves to, and rebuilding without the stored leaves
 		// skips the no-drop check. Fail the message so Kafka redelivers it
 		// once the store answers.
-		outcome = "store_failed"
+		outcome = buildOutcomeStoreFailed
 		return fmt.Errorf("reading stored BUMP/STUMPs on redelivery: %w", err)
 	}
 	if handledOutcome != "" {
@@ -890,7 +894,7 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 				zap.Int("rebuilt_leaves", len(txids)),
 			)
 			if err := b.deferStampedBlock(ctx, logger, blockHash); err != nil {
-				outcome = "store_failed"
+				outcome = buildOutcomeStoreFailed
 				return err
 			}
 			outcome = "deferred_incomplete"
@@ -905,7 +909,7 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	// The stamp goes back on below, only once the mine landed.
 	if storedLeaves != nil && finalized {
 		if err := b.store.ClearBlockProcessed(ctx, blockHash); err != nil {
-			outcome = "store_failed"
+			outcome = buildOutcomeStoreFailed
 			return fmt.Errorf("clearing processed_at before rebuild: %w", err)
 		}
 	}
@@ -918,11 +922,11 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	// timestamp, making the STUMPs eligible for pruning straight away. If
 	// InsertBUMP fails after this, the retry rewrites both.
 	if err := b.store.MarkBlockBUMPBuilt(ctx, blockHash, blockHeight, time.Now()); err != nil {
-		outcome = "store_failed"
+		outcome = buildOutcomeStoreFailed
 		return fmt.Errorf("recording bump_built_at: %w", err)
 	}
 	if err := b.store.InsertBUMP(ctx, blockHash, blockHeight, bumpBytes); err != nil {
-		outcome = "store_failed"
+		outcome = buildOutcomeStoreFailed
 		return fmt.Errorf("storing BUMP: %w", err)
 	}
 
@@ -991,7 +995,7 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 		// handler returns nil. Returning the SetMined error would retry
 		// and then dead-letter a message that cannot finish until the
 		// watchdog re-drives the block.
-		outcome = "store_failed"
+		outcome = buildOutcomeStoreFailed
 		logger.Warn(
 			"SetMinedByTxIDs did not complete; leaving processed_at unset so the watchdog can re-drive this block",
 			logfields.BlockHash(blockHash),
@@ -1051,7 +1055,7 @@ func (b *Builder) handleRedelivery(ctx context.Context, logger *zap.Logger, call
 		// processed_at stays unset inside shortCircuit so the watchdog
 		// can re-drive.
 		if b.shortCircuit(ctx, logger, blockHash, height, storedTxIDs) {
-			return nil, "store_failed", nil
+			return nil, buildOutcomeStoreFailed, nil
 		}
 		return nil, "short_circuited", nil
 	}
@@ -1225,7 +1229,7 @@ func (b *Builder) resolveStumps(ctx context.Context, logger *zap.Logger, callbac
 
 	stumps, err = b.store.GetStumpsByBlockHash(ctx, blockHash)
 	if err != nil {
-		return nil, "store_failed", false, fmt.Errorf("getting STUMPs for block: %w", err)
+		return nil, buildOutcomeStoreFailed, false, fmt.Errorf("getting STUMPs for block: %w", err)
 	}
 
 	switch {
@@ -1271,7 +1275,7 @@ func (b *Builder) resolveStumps(ctx context.Context, logger *zap.Logger, callbac
 		// Re-read: catching late arrivals is the whole point of the wait.
 		stumps, err = b.store.GetStumpsByBlockHash(ctx, blockHash)
 		if err != nil {
-			return nil, "store_failed", false, fmt.Errorf("getting STUMPs for block: %w", err)
+			return nil, buildOutcomeStoreFailed, false, fmt.Errorf("getting STUMPs for block: %w", err)
 		}
 	}
 
@@ -1298,10 +1302,10 @@ func (b *Builder) resolveStumps(ctx context.Context, logger *zap.Logger, callbac
 		// sees it. If either write fails the message must be retried, or the
 		// block can be finalized while still owed a STUMP.
 		if aerr := b.store.AddBlockExpectedSubtrees(ctx, blockHash, expected); aerr != nil {
-			return nil, "store_failed", false, fmt.Errorf("retaining expected subtrees for deferred block: %w", aerr)
+			return nil, buildOutcomeStoreFailed, false, fmt.Errorf("retaining expected subtrees for deferred block: %w", aerr)
 		}
 		if derr := b.deferStampedBlock(ctx, logger, blockHash); derr != nil {
-			return nil, "store_failed", false, derr
+			return nil, buildOutcomeStoreFailed, false, derr
 		}
 		return nil, "deferred_incomplete", true, nil
 	}
