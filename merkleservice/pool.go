@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -433,7 +434,14 @@ func (p *Pool) Reprocess(ctx context.Context, blockHash, callbackURL, callbackTo
 	if len(targets) == 0 {
 		return ErrNoHealthyEndpoints
 	}
-	errs := make([]error, len(targets))
+	// One slot per configured endpoint: an endpoint skipped for an open
+	// breaker answers ErrNoHealthyEndpoints, so a terminal answer from the
+	// others (a 404, say) cannot outrank the possibility that the skipped
+	// one is merely down and would have accepted.
+	errs := make([]error, len(p.endpoints))
+	for i := len(targets); i < len(errs); i++ {
+		errs[i] = ErrNoHealthyEndpoints
+	}
 	var wg sync.WaitGroup
 	for i, ep := range targets {
 		wg.Add(1)
@@ -486,11 +494,19 @@ func (p *Pool) RegisterBatchWithResults(ctx context.Context, registrations []Reg
 
 	perEndpoint := p.collectEndpointBatches(ctx, targets, registrations, maxConcurrency)
 
-	candidates := make([]error, 0, len(targets))
+	// Endpoints skipped up front for an open breaker take part in the merge
+	// as ErrNoHealthyEndpoints (transport-class), as mid-batch skips already
+	// do: a 401 or 4xx from the endpoints that answered must not read as the
+	// pool's verdict while another endpoint is merely down.
+	skipped := len(p.endpoints) - len(targets)
+	candidates := make([]error, 0, len(p.endpoints))
 	for j := range registrations {
 		candidates = candidates[:0]
 		for _, ep := range targets {
 			candidates = append(candidates, perEndpoint[ep][j])
+		}
+		for range skipped {
+			candidates = append(candidates, ErrNoHealthyEndpoints)
 		}
 		out[j] = mergeErrors(ctx, candidates)
 	}
@@ -520,10 +536,11 @@ func (p *Pool) RegisterBatchWithResults(ctx context.Context, registrations []Reg
 // canceled. Acceptance is tracked per tx as each /watch lands, not per
 // finished endpoint batch, so complementary coverage counts too: A accepting
 // tx1 while hanging on tx2 and B accepting tx2 while hanging on tx1 still
-// starts the grace timer. The stragglers' breakers still learn from it,
-// because results are recorded against the caller's ctx (only the caller's
-// own cancellation is exempt), so a black-holed endpoint trips on its first
-// batch instead of holding every batch for a full HTTP timeout. What the
+// starts the grace timer. A straggler that acknowledged nothing in the batch
+// has the cancellations recorded against its breaker (see runEndpointBatch),
+// so a black-holed endpoint trips on its first batch instead of holding every
+// batch for a full HTTP timeout; one that acknowledged something is only
+// slower and keeps its health. What the
 // stragglers did not acknowledge lands in their catch-up queue through the
 // caller's usual path.
 func (p *Pool) collectEndpointBatches(ctx context.Context, targets []*endpoint, registrations []Registration, maxConcurrency int) map[*endpoint][]error {
@@ -604,6 +621,13 @@ func (p *Pool) runEndpointBatch(ctx, sendCtx context.Context, ep *endpoint, op s
 	sem := make(chan struct{}, maxConcurrency)
 	var wg sync.WaitGroup
 	skipped := 0
+	// acked counts this batch's acknowledgements. A request the pool cut
+	// short (sendCtx canceled after the straggler grace) is held against the
+	// endpoint only when the endpoint has acknowledged nothing in the batch:
+	// a black-holed endpoint acknowledges nothing and still trips on its
+	// first batch, while one that is merely slower than the others keeps
+	// its health and just owes the rest through catch-up.
+	var acked atomic.Int64
 	for i, reg := range registrations {
 		select {
 		case sem <- struct{}{}:
@@ -625,7 +649,13 @@ func (p *Pool) runEndpointBatch(ctx, sendCtx context.Context, ep *endpoint, op s
 			defer wg.Done()
 			defer func() { <-sem }()
 			err := ep.client.Register(sendCtx, reg.TxID, reg.CallbackURL, reg.CallbackToken)
-			p.record(ctx, ep, op, err)
+			classifyCtx := ctx
+			if err == nil {
+				acked.Add(1)
+			} else if ctx.Err() == nil && sendCtx.Err() != nil && acked.Load() > 0 {
+				classifyCtx = sendCtx // recorded as canceled, not a failure
+			}
+			p.record(classifyCtx, ep, op, err)
 			res[i] = err
 			if err == nil && onAccepted != nil {
 				onAccepted(i)

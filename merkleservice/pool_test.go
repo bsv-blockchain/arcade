@@ -946,3 +946,58 @@ func TestPool_RetainSkipsSuccessesAndPermanentRejections(t *testing.T) {
 		}
 	}
 }
+
+// An endpoint skipped for an open breaker takes part in the merge as
+// ErrNoHealthyEndpoints, so a terminal answer from the others (404 on
+// /reprocess, 401 on /watch) does not become the pool's verdict while the
+// skipped endpoint may merely be down.
+func TestPool_SkippedOpenEndpointOutranksTerminalAnswers(t *testing.T) {
+	a := newFakeMerkle(t)
+	b := newFakeMerkle(t)
+	p := NewPool([]string{a.url(), b.url()}, "", time.Second, WithFailureThreshold(1))
+	a.watchCode.Store(http.StatusInternalServerError)
+	_ = p.Register(context.Background(), "trip", testCallbackURL, "")
+	if p.EndpointStatuses()[0].Healthy {
+		t.Fatal("a's breaker must be open")
+	}
+
+	b.watchCode.Store(http.StatusNotFound)
+	if err := p.Reprocess(context.Background(), "blockhash", testCallbackURL, ""); !errors.Is(err, ErrNoHealthyEndpoints) {
+		t.Fatalf("Reprocess with a open and b 404 = %v, want ErrNoHealthyEndpoints", err)
+	}
+	b.watchCode.Store(http.StatusUnauthorized)
+	errs := p.RegisterBatchWithResults(context.Background(), regsN(2), 2)
+	for i, err := range errs {
+		if !errors.Is(err, ErrNoHealthyEndpoints) {
+			t.Fatalf("errs[%d] with a open and b 401 = %v, want ErrNoHealthyEndpoints", i, err)
+		}
+	}
+}
+
+// An endpoint that is only slower than the others, and acknowledged requests
+// in this batch before the straggler grace cut it short, keeps its health:
+// the cancellations are the pool's doing, not evidence the endpoint is down.
+// It still owes what it did not acknowledge.
+func TestPool_SlowerEndpointCutByGraceKeepsItsHealth(t *testing.T) {
+	a := newFakeMerkle(t)
+	b := newFakeMerkle(t)
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(60 * time.Millisecond)
+		b.srv.Config.Handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(slow.Close)
+	p := NewPool([]string{a.url(), slow.URL}, "", 5*time.Second, WithFailureThreshold(3), WithStragglerGrace(100*time.Millisecond))
+	regs := regsN(40)
+	for i, err := range p.RegisterBatchWithResults(context.Background(), regs, 2) {
+		if err != nil {
+			t.Fatalf("errs[%d]=%v", i, err)
+		}
+	}
+	st := p.EndpointStatuses()[1]
+	if !st.Healthy || st.ConsecutiveFailures != 0 {
+		t.Fatalf("a slower endpoint that acknowledged requests must keep its health: %+v", st)
+	}
+	if st.CatchupPending == 0 || st.CatchupPending >= len(regs) {
+		t.Fatalf("the slower endpoint must owe only what it did not acknowledge, owes %d of %d", st.CatchupPending, len(regs))
+	}
+}
