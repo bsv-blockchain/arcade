@@ -701,6 +701,13 @@ func (b *Builder) pruneOrphanStumps(ctx context.Context) {
 			if r.BUMPBuiltAt == nil {
 				continue
 			}
+			// An un-stamped block is still being driven: deferred by a later
+			// delivery, or mid re-drive by the watchdog, whose /reprocess
+			// re-sends STUMPs the next build needs. bump_built_at can be old
+			// by then, so its age alone is no reason to prune.
+			if r.ProcessedAt == nil {
+				continue
+			}
 			if now.Sub(*r.BUMPBuiltAt) < retention {
 				pageMayHoldRetained = true
 				continue
@@ -921,7 +928,7 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 				zap.Int("dropped_leaves", dropped),
 				zap.Int("rebuilt_leaves", len(txids)),
 			)
-			if err := b.deferStampedBlock(ctx, logger, blockHash); err != nil {
+			if err := b.deferIncompleteBlock(ctx, logger, blockHash, callback.ExpectedSubtreeIndices); err != nil {
 				outcome = buildOutcomeStoreFailed
 				return err
 			}
@@ -1076,7 +1083,15 @@ func (b *Builder) handleRedelivery(ctx context.Context, logger *zap.Logger, call
 	// watchdog, so such a delivery takes the rebuild path instead, whose
 	// grace window and completeness gate defer the block if the STUMP does
 	// not show up.
-	missing := missingStumpIndices(callback.ExpectedSubtreeIndices, stumps)
+	//
+	// Only while STUMPs are retained, though: once the janitor has pruned
+	// them (the block was finalized long enough ago), every index would read
+	// as missing and a plain redelivery (Kafka retry, DLQ redrive) would
+	// un-stamp a complete block.
+	var missing []int
+	if len(stumps) > 0 {
+		missing = missingStumpIndices(callback.ExpectedSubtreeIndices, stumps)
+	}
 	if len(newLeaves) == 0 && len(missing) == 0 {
 		// A failed mine on this path is still a persistence failure:
 		// record store_failed, not the benign short_circuited label.
@@ -1183,6 +1198,19 @@ func errEmptyMerklePath(mp *transaction.MerklePath) error {
 		return errors.New("empty merkle path")
 	}
 	return nil
+}
+
+// deferIncompleteBlock leaves a block un-finalized for the watchdog. It
+// retains this delivery's expected-subtree set first, so whichever delivery
+// comes next (in any order) is held to it, then takes off any stamp an
+// earlier build left. A failed write is returned and callers fail the Kafka
+// message: committing it could let the block be finalized while it is still
+// owed a STUMP.
+func (b *Builder) deferIncompleteBlock(ctx context.Context, logger *zap.Logger, blockHash string, expected []int) error {
+	if err := b.store.AddBlockExpectedSubtrees(ctx, blockHash, expected); err != nil {
+		return fmt.Errorf("retaining expected subtrees for deferred block: %w", err)
+	}
+	return b.deferStampedBlock(ctx, logger, blockHash)
 }
 
 // deferStampedBlock hands a block back to the watchdog after an earlier
@@ -1324,15 +1352,7 @@ func (b *Builder) resolveStumps(ctx context.Context, logger *zap.Logger, callbac
 			zap.Int("expected_stumps", len(expected)),
 			zap.Int("received_stumps", len(stumps)),
 		)
-		// Retain the announced set first, so whichever delivery comes next
-		// (in any order) is held to it. Another merkle-service's build may
-		// already have stamped the block; take the stamp off so the watchdog
-		// sees it. If either write fails the message must be retried, or the
-		// block can be finalized while still owed a STUMP.
-		if aerr := b.store.AddBlockExpectedSubtrees(ctx, blockHash, expected); aerr != nil {
-			return nil, buildOutcomeStoreFailed, false, fmt.Errorf("retaining expected subtrees for deferred block: %w", aerr)
-		}
-		if derr := b.deferStampedBlock(ctx, logger, blockHash); derr != nil {
+		if derr := b.deferIncompleteBlock(ctx, logger, blockHash, expected); derr != nil {
 			return nil, buildOutcomeStoreFailed, false, derr
 		}
 		return nil, "deferred_incomplete", true, nil

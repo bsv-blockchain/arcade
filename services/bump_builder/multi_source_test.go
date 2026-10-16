@@ -442,8 +442,8 @@ func TestBuilder_PruneOrphanStumps_WalksPastRecencyDepthWhileRowsRetained(t *tes
 		ms.blockProc = append(ms.blockProc, &models.BlockProcessingStatus{BlockHash: fmt.Sprintf("inflight-%d", h), BlockHeight: h, HeaderSeenAt: recent})
 	}
 	ms.blockProc = append(ms.blockProc,
-		&models.BlockProcessingStatus{BlockHash: "deep-fresh", BlockHeight: 700, HeaderSeenAt: old, BUMPBuiltAt: &recent}, // late build, keep
-		&models.BlockProcessingStatus{BlockHash: "deep-old", BlockHeight: 690, HeaderSeenAt: old, BUMPBuiltAt: &old},      // aged out, prune
+		&models.BlockProcessingStatus{BlockHash: "deep-fresh", BlockHeight: 700, HeaderSeenAt: old, BUMPBuiltAt: &recent, ProcessedAt: &recent}, // late build, keep
+		&models.BlockProcessingStatus{BlockHash: "deep-old", BlockHeight: 690, HeaderSeenAt: old, BUMPBuiltAt: &old, ProcessedAt: &old},         // aged out, prune
 	)
 	ms.addStump("deep-fresh", 0, []byte("fresh"))
 	ms.addStump("deep-old", 0, []byte("old"))
@@ -804,5 +804,38 @@ func TestBuilder_HandleMessage_PublishFailure_LeavesBlockUnstamped(t *testing.T)
 	}
 	if len(ms.processedCalls) != 0 {
 		t.Fatalf("a failed MINED publish must leave processed_at unset, got %d stamps", len(ms.processedCalls))
+	}
+}
+
+// Once the janitor has pruned a finalized block's STUMPs, a plain redelivery
+// (Kafka retry, DLQ redrive) carrying an expected set must still
+// short-circuit: with nothing retained every index would read as missing,
+// and taking the completeness gate would un-stamp a complete block.
+func TestBuilder_HandleMessage_RedeliveryAfterPrune_ShortCircuitsDespiteExpectedSet(t *testing.T) {
+	ms := newMockStore()
+	blockHash := testBlockHash
+	compound, _, err := bump.BuildCompoundBUMP(
+		[]*models.Stump{{BlockHash: blockHash, SubtreeIndex: 0, StumpData: makeMinimalSTUMP(testTxidHex)}},
+		[]chainhash.Hash{mustHash(t, testTxidHex)}, nil, nil,
+	)
+	if err != nil {
+		t.Fatalf("BuildCompoundBUMP: %v", err)
+	}
+	ms.bumps[blockHash] = compound.Bytes()
+	ms.bumpHeights[blockHash] = uint64(compound.BlockHeight)
+	stampedBlock(ms, blockHash)
+
+	b := &Builder{cfg: &config.Config{}, logger: zap.NewNop(), store: ms, publisher: &recordingPublisher{}}
+	before := bumpOutcomeSampleCount(t, "short_circuited")
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsgWithExpected(blockHash, []int{0})); err != nil {
+		t.Fatalf("handleMessage: %v", err)
+	}
+	if got := bumpOutcomeSampleCount(t, "short_circuited"); got != before+1 {
+		t.Fatalf("short_circuited samples = %d, want %d", got, before+1)
+	}
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if ms.blockProc[0].ProcessedAt == nil {
+		t.Fatal("a complete block must stay stamped")
 	}
 }

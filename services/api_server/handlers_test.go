@@ -1600,7 +1600,7 @@ func TestHandleCallback_Stump_StorageError_Returns500(t *testing.T) {
 	payload := models.CallbackMessage{
 		Type:      models.CallbackStump,
 		BlockHash: "abc123",
-		Stump:     []byte{0x01, 0x02},
+		Stump:     validStumpBytes(0, 0x01),
 	}
 	body := mustMarshalJSON(t, payload)
 
@@ -1614,6 +1614,27 @@ func TestHandleCallback_Stump_StorageError_Returns500(t *testing.T) {
 	}
 	if got := totalMessages(broker); got != 0 {
 		t.Errorf("expected 0 Kafka messages after storage failure, got %d", got)
+	}
+}
+
+// A STUMP that does not parse is refused with 400 and never stored: rows are
+// content-addressed, so a stored bad copy would sit beside every good resend
+// and fail each build of the block.
+func TestHandleCallback_Stump_Malformed_Returns400(t *testing.T) {
+	var stored int
+	ms := &mockStore{insertStumpFn: func(*models.Stump) error { stored++; return nil }}
+	_, router := setupServerWithStore(&kafka.RecordingBroker{}, ms)
+
+	for _, stump := range [][]byte{{0x01, 0x02}, make([]byte, 64)} {
+		payload := models.CallbackMessage{Type: models.CallbackStump, BlockHash: "abc123", Stump: stump}
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, authedCallbackRequest(t, mustMarshalJSON(t, payload)))
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("stump %x: expected 400, got %d: %s", stump, w.Code, w.Body.String())
+		}
+	}
+	if stored != 0 {
+		t.Fatalf("a malformed STUMP must not be stored, InsertStump calls = %d", stored)
 	}
 }
 
@@ -1676,8 +1697,8 @@ func TestHandleCallback_FullBlockFlow_20Subtrees(t *testing.T) {
 	// Deterministic per-subtree payload so byte-level assertions are stable.
 	stumpPayloads := make([][]byte, numSubtrees)
 	for i := range stumpPayloads {
-		buf := make([]byte, stumpSize)
-		for j := range buf {
+		buf := validStumpBytes(stumpSize, byte(i))
+		for j := minimalStumpLen; j < len(buf); j++ {
 			buf[j] = byte((i*31 + j) & 0xFF)
 		}
 		stumpPayloads[i] = buf
@@ -1863,8 +1884,8 @@ func TestHandleCallback_FullBlockFlow_PartialStumpFailure(t *testing.T) {
 
 	stumpPayloads := make([][]byte, numSubtrees)
 	for i := range stumpPayloads {
-		buf := make([]byte, stumpSize)
-		for j := range buf {
+		buf := validStumpBytes(stumpSize, byte(i))
+		for j := minimalStumpLen; j < len(buf); j++ {
 			buf[j] = byte((i*31 + j) & 0xFF)
 		}
 		stumpPayloads[i] = buf
@@ -2255,10 +2276,7 @@ func TestHandleCallback_BodySizeLimit_UnderLimitSucceeds(t *testing.T) {
 	// hex-encodes the bytes via models.HexBytes — is just under the cap. Hex
 	// roughly doubles the byte count, so half the limit (less envelope
 	// overhead) leaves headroom for the JSON wrapper.
-	stumpBytes := make([]byte, limit/2-1024)
-	for i := range stumpBytes {
-		stumpBytes[i] = byte(i & 0xFF)
-	}
+	stumpBytes := validStumpBytes(limit/2-1024, 0x01)
 	payload := models.CallbackMessage{
 		Type:      models.CallbackStump,
 		BlockHash: "0000000000000000000000000000000000000000000000000000000000000001",
@@ -2514,4 +2532,25 @@ func TestSubmitCounters_SingleDedupResults(t *testing.T) {
 	if got := counterVal("/tx", "new") - beforeNew; got != 0 {
 		t.Errorf("duplicate resubmit must not count as new (delta %v)", got)
 	}
+}
+
+// minimalStumpLen is the size of the smallest parseable BRC-74 STUMP: block
+// height, tree height, leaf count, offset and flags (one byte each) plus one
+// 32-byte hash.
+const minimalStumpLen = 37
+
+// validStumpBytes returns a STUMP the callback handler accepts, size bytes
+// long (at least minimalStumpLen): a one-leaf merkle path whose hash is seed
+// repeated, padded with zeros. The parser ignores trailing bytes, which lets
+// size-sensitive tests keep their payload sizes.
+func validStumpBytes(size int, seed byte) []byte {
+	if size < minimalStumpLen {
+		size = minimalStumpLen
+	}
+	buf := make([]byte, size)
+	copy(buf, []byte{0x01, 0x01, 0x01, 0x00, 0x02})
+	for i := 5; i < minimalStumpLen; i++ {
+		buf[i] = seed
+	}
+	return buf
 }

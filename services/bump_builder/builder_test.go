@@ -741,16 +741,18 @@ func TestBuilder_PruneOrphanStumps_DeletesAfterSuccess(t *testing.T) {
 	built := time.Now().Add(-2 * time.Hour)
 	recent := time.Now().Add(-time.Minute)
 	ms.blockProc = []*models.BlockProcessingStatus{
-		{BlockHash: "done-1", BlockHeight: 999, BUMPBuiltAt: &built}, // BUMP built, aged out — prune
-		{BlockHash: "done-2", BlockHeight: 998, BUMPBuiltAt: &built}, // BUMP built, aged out — prune
-		{BlockHash: "in-flight", BlockHeight: 997, BUMPBuiltAt: nil}, // still pending — keep
-		{BlockHash: "fresh", BlockHeight: 996, BUMPBuiltAt: &recent}, // built, within retention — keep
+		{BlockHash: "done-1", BlockHeight: 999, BUMPBuiltAt: &built, ProcessedAt: &built},  // BUMP built, aged out — prune
+		{BlockHash: "done-2", BlockHeight: 998, BUMPBuiltAt: &built, ProcessedAt: &built},  // BUMP built, aged out — prune
+		{BlockHash: "in-flight", BlockHeight: 997, BUMPBuiltAt: nil},                       // still pending — keep
+		{BlockHash: "fresh", BlockHeight: 996, BUMPBuiltAt: &recent, ProcessedAt: &recent}, // built, within retention — keep
+		{BlockHash: "deferred", BlockHeight: 995, BUMPBuiltAt: &built},                     // built long ago, un-stamped (deferred / re-driven) — keep
 	}
-	// Seed stumps for all four so we can verify the kept ones survive.
+	// Seed stumps for every row so we can verify the kept ones survive.
 	ms.addStump("done-1", 0, []byte("orphan-1"))
 	ms.addStump("done-2", 0, []byte("orphan-2"))
 	ms.addStump("in-flight", 0, []byte("pending"))
 	ms.addStump("fresh", 0, []byte("fresh"))
+	ms.addStump("deferred", 0, []byte("deferred"))
 
 	b := &Builder{
 		cfg:    &config.Config{},
@@ -772,6 +774,9 @@ func TestBuilder_PruneOrphanStumps_DeletesAfterSuccess(t *testing.T) {
 	}
 	if len(ms.stumps["in-flight"]) != 1 {
 		t.Errorf("in-flight STUMPs should have been preserved, got %d", len(ms.stumps["in-flight"]))
+	}
+	if len(ms.stumps["deferred"]) != 1 {
+		t.Errorf("an un-stamped block's STUMPs must be kept whatever bump_built_at says, got %d", len(ms.stumps["deferred"]))
 	}
 	if len(ms.stumps["fresh"]) != 1 {
 		t.Errorf("STUMPs of a block built within the retention window must be kept, got %d", len(ms.stumps["fresh"]))

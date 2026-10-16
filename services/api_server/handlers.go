@@ -645,6 +645,21 @@ func (s *Server) handleStump(c *gin.Context, msg models.CallbackMessage, logger 
 		return
 	}
 
+	// Refuse a STUMP that does not parse. Rows are content-addressed, so a
+	// bad copy is never overwritten by a good resend; it would sit beside
+	// the good one and fail every build and redelivery of the block until
+	// the Kafka message dead-letters. Rejecting it here surfaces the problem
+	// at the sending merkle-service instead.
+	if mp, err := sdkTx.NewMerklePathFromBinary(msg.Stump); err != nil || len(mp.Path) == 0 {
+		logger.Warn("malformed STUMP callback",
+			logfields.BlockHash(msg.BlockHash),
+			zap.Int("subtree_index", msg.SubtreeIndex),
+			zap.Error(err),
+		)
+		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "stump is not a valid BRC-74 merkle path"})
+		return
+	}
+
 	// Store STUMP keyed by (blockHash, subtreeIndex, contentHash). Synchronous
 	// write so that a 200 to merkle-service is a durability guarantee —
 	// merkle-service only fires BLOCK_PROCESSED after all STUMPs succeed, so
