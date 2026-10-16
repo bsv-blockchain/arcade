@@ -259,3 +259,34 @@ func TestResyncLoop_RetriesFailedScan(t *testing.T) {
 		t.Fatalf("resynced endpoint registrations=%d, want 1 after two failed scans", n)
 	}
 }
+
+// A startup-replay tx that no endpoint accepted is handed back to the pool,
+// which queues it for every endpoint and re-sends it once they answer,
+// instead of dropping it until the next restart. It is not stamped
+// merkle_registered_at: it has not landed anywhere yet.
+func TestRunMerkleReplay_RetainsTxsEveryEndpointRefused(t *testing.T) {
+	logA, logB := &eventLog{}, &eventLog{}
+	srvA := newMerkleServer(logA, http.StatusServiceUnavailable)
+	defer srvA.Close()
+	srvB := newMerkleServer(logB, http.StatusServiceUnavailable)
+	defer srvB.Close()
+	pool := merkleservice.NewPool([]string{srvA.URL, srvB.URL}, "", 2*time.Second, merkleservice.WithFailureThreshold(100))
+	cfg := &config.Config{CallbackURL: testArcadeCallbackURL, CallbackToken: testArcadeCallbackToken}
+	ms := newMockStore()
+	ms.replayRows = []*models.TransactionStatus{
+		{TxID: "tx-a", Status: models.StatusSeenOnNetwork},
+		{TxID: "tx-b", Status: models.StatusAcceptedByNetwork},
+	}
+	New(cfg, zap.NewNop(), nil, nil, ms, nil, nil, pool).runMerkleReplay(context.Background())
+
+	for _, st := range pool.EndpointStatuses() {
+		if st.CatchupPending != 2 {
+			t.Fatalf("endpoint %s must owe both refused txs, got %+v", st.URL, st)
+		}
+	}
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if len(ms.merkleMarks) != 0 {
+		t.Fatalf("refused txs must not be stamped merkle_registered_at, marks=%v", ms.merkleMarks)
+	}
+}

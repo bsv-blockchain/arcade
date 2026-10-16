@@ -828,3 +828,106 @@ func TestPool_CanceledStragglerOwedTxsDrainAfterRecovery(t *testing.T) {
 		}
 	}
 }
+
+// selectiveHangServer accepts /watch for the txids in accept and hangs on
+// every other one until the request is canceled.
+func selectiveHangServer(t *testing.T, accept ...string) *httptest.Server {
+	t.Helper()
+	ok := make(map[string]bool, len(accept))
+	for _, id := range accept {
+		ok[id] = true
+	}
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			TxID string `json:"txid"`
+		}
+		decodeJSON(r, &req)
+		if ok[req.TxID] {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+	return srv
+}
+
+// Neither endpoint finishes its own batch, but between them every tx is
+// accepted: A takes tx0 and hangs on tx1, B the reverse. The grace timer must
+// start from the per-tx acceptances, not wait for a whole endpoint batch.
+func TestPool_ComplementaryAcceptanceStartsTheGrace(t *testing.T) {
+	a := selectiveHangServer(t, "tx0")
+	b := selectiveHangServer(t, "tx1")
+	const timeout, grace = 10 * time.Second, 100 * time.Millisecond
+	p := NewPool([]string{a.URL, b.URL}, "", timeout, WithFailureThreshold(3), WithStragglerGrace(grace))
+	regs := regsN(2)
+
+	start := time.Now()
+	errs := p.RegisterBatchWithResults(context.Background(), regs, 2)
+	elapsed := time.Since(start)
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("errs[%d]=%v, one endpoint accepted each tx", i, err)
+		}
+	}
+	if elapsed > 10*grace {
+		t.Fatalf("batch took %v; complementary coverage must return about one grace (%v) after the last acceptance, not wait for the %v timeout", elapsed, grace, timeout)
+	}
+	if got := pendingFor(p, a.URL); got != 1 {
+		t.Fatalf("a must owe tx1, owes %d", got)
+	}
+	if got := pendingFor(p, b.URL); got != 1 {
+		t.Fatalf("b must owe tx0, owes %d", got)
+	}
+}
+
+// An endpoint skipped because its breaker is already open counts one
+// skipped_open per registration it would have received, matching the
+// per-request help text and mid-batch skips; /reprocess counts one.
+func TestPool_SkippedOpenCountsEveryRegistration(t *testing.T) {
+	a := newFakeMerkle(t)
+	b := newFakeMerkle(t)
+	b.watchCode.Store(http.StatusInternalServerError)
+	p := NewPool([]string{a.url(), b.url()}, "", time.Second, WithFailureThreshold(1))
+	if err := p.Register(context.Background(), "trip", testCallbackURL, ""); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if p.EndpointStatuses()[1].Healthy {
+		t.Fatal("b's breaker must be open after one failure")
+	}
+	watch := metrics.MerkleEndpointRequestsTotal.WithLabelValues(b.url(), opWatch, outcomeSkippedOpen)
+	before := testutil.ToFloat64(watch)
+	p.RegisterBatchWithResults(context.Background(), regsN(25), 5)
+	if got := testutil.ToFloat64(watch) - before; got != 25 {
+		t.Fatalf("skipped_open grew by %v for a 25-entry batch, want 25", got)
+	}
+	reprocess := metrics.MerkleEndpointRequestsTotal.WithLabelValues(b.url(), opReprocess, outcomeSkippedOpen)
+	before = testutil.ToFloat64(reprocess)
+	_ = p.Reprocess(context.Background(), "blockhash", testCallbackURL, "")
+	if got := testutil.ToFloat64(reprocess) - before; got != 1 {
+		t.Fatalf("skipped_open grew by %v for one /reprocess, want 1", got)
+	}
+}
+
+// Retain queues only retryable failures, and queues them for every endpoint.
+func TestPool_RetainSkipsSuccessesAndPermanentRejections(t *testing.T) {
+	a := newFakeMerkle(t)
+	b := newFakeMerkle(t)
+	p := NewPool([]string{a.url(), b.url()}, "", time.Second)
+	regs := regsN(3)
+	p.Retain(regs, []error{
+		nil,
+		&RegisterError{StatusCode: http.StatusBadRequest},
+		&RegisterError{StatusCode: http.StatusServiceUnavailable},
+	})
+	for _, st := range p.EndpointStatuses() {
+		if st.CatchupPending != 1 {
+			t.Fatalf("endpoint %s must owe only the 503'd tx, got %+v", st.URL, st)
+		}
+	}
+}

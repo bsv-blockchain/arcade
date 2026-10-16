@@ -205,10 +205,17 @@ func (p *Propagator) replayTo(ctx context.Context, rp replayParams) error {
 		// Per-tx results, not fail-fast: one refused /watch must not drop
 		// the merkle_registered_at stamp for the rest of the batch, or the
 		// next boot re-registers them all again. A failed entry is not
-		// retried here: the pool keeps it in the endpoint's catch-up queue
-		// (startup: for every endpoint that did not accept it; resync: for
-		// the single target endpoint).
+		// retried here; the pool keeps it in a catch-up queue instead. The
+		// resync target (one endpoint) queues its own failures. On startup
+		// the pool only queues the endpoints that missed a tx some other
+		// endpoint accepted, so a tx no endpoint accepted is handed back
+		// through Retain, or it would wait for the next restart.
 		errs := rp.target.RegisterBatchWithResults(ctx, batch, concurrency)
+		if rp.endpoint == "" {
+			if r, ok := rp.target.(merkleservice.Recoverable); ok {
+				r.Retain(batch, errs)
+			}
+		}
 		okTxIDs := make([]string, 0, len(batch))
 		var sampleErr error
 		for i, err := range errs {

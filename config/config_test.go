@@ -595,3 +595,20 @@ func TestMerkleServiceURLsBindFromEnv(t *testing.T) {
 		t.Fatalf("Endpoints() from env = %v", got)
 	}
 }
+
+// Credentials in a merkle_service URL would surface in /health, metric
+// labels and startup logs; auth_token is the supported mechanism. The error
+// must not echo the password either.
+func TestValidate_MerkleServiceRejectsUserinfo(t *testing.T) {
+	for _, bad := range []string{"https://user:s3cret@merkle.local", "http://user@merkle.local"} {
+		cfg := baseValidConfig()
+		cfg.MerkleService.URLs = []string{"http://merkle-a.local", bad}
+		err := validate(cfg)
+		if err == nil {
+			t.Fatalf("merkle_service url %q must be rejected", bad)
+		}
+		if strings.Contains(err.Error(), "s3cret") {
+			t.Fatalf("validation error leaks the password: %v", err)
+		}
+	}
+}

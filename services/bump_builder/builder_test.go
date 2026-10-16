@@ -287,6 +287,16 @@ func (m *mockStore) MarkBlockProcessed(_ context.Context, blockHash string, bloc
 		return m.markProcessedErr
 	}
 	m.processedCalls = append(m.processedCalls, bumpBuiltCall{blockHash: blockHash, blockHeight: blockHeight})
+	// Upsert processed_at on the fixture row like the real backends, so a
+	// later delivery's blockFinalized sees the stamp.
+	now := time.Now()
+	for _, r := range m.blockProc {
+		if r.BlockHash == blockHash {
+			r.ProcessedAt = &now
+			return nil
+		}
+	}
+	m.blockProc = append(m.blockProc, &models.BlockProcessingStatus{BlockHash: blockHash, BlockHeight: blockHeight, ProcessedAt: &now})
 	return nil
 }
 
@@ -1467,7 +1477,7 @@ func TestBuilder_MarkMinedAndPublish_UsesBulkEvent(t *testing.T) {
 	b := newTestBuilder(ms, "http://unused.example/api/v1")
 	b.publisher = pub
 
-	b.markMinedAndPublish(context.Background(), zap.NewNop(), blockHash, blockHeight, txids)
+	b.markMinedAndPublish(context.Background(), zap.NewNop(), blockHash, blockHeight, txids, false)
 
 	// recordingPublisher.PublishBulk unfans into one entry per TxID for
 	// assertion convenience, so snapshot() shows N entries — but the

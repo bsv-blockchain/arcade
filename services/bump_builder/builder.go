@@ -319,17 +319,29 @@ func (b *Builder) handleAnchorDenied(ctx context.Context, logger *zap.Logger, bl
 // the txids are still SEEN_* and the block must stay un-stamped so the
 // watchdog re-drives it.
 //
-// onlyChanged is always true on the builder's paths. With several
-// merkle-services every block's BLOCK_PROCESSED arrives once per service, and
-// each redelivery re-mines the stored BUMP's level-0 set through
-// shortCircuit; rows already MINED against this block must not fan out a
-// second MINED event to SSE/webhook subscribers. On the fresh-build path the
-// filter is a no-op (every previous status is SEEN_*), and a tx registered
-// after the original build still publishes on redelivery because its previous
-// status is not MINED.
-func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, blockHash string, blockHeight uint64, txids []string) bool {
-	_, err := setMinedAndPublish(ctx, logger, b.store, b.publisher, blockHash, blockHeight, txids, "", true)
+// onlyChanged suppresses MINED events for rows already MINED against this
+// block. With several merkle-services every block's BLOCK_PROCESSED arrives
+// once per service, and each redelivery re-mines the stored BUMP's level-0
+// set; those rows must not fan out a second MINED event to SSE/webhook
+// subscribers. But "already MINED" only proves the store write landed, not
+// that the event went out: a crash between SetMinedByTxIDs and PublishBulk
+// leaves the rows MINED and unpublished. Callers therefore pass the result
+// of blockFinalized, read before they touch the block: processed_at is
+// stamped only after the publish, so a stamped block's MINED rows were
+// published, and an unstamped one is republished in full (a duplicate event
+// beats a lost one).
+func (b *Builder) markMinedAndPublish(ctx context.Context, logger *zap.Logger, blockHash string, blockHeight uint64, txids []string, onlyChanged bool) bool {
+	_, err := setMinedAndPublish(ctx, logger, b.store, b.publisher, blockHash, blockHeight, txids, "", onlyChanged)
 	return err == nil
+}
+
+// blockFinalized reports whether the block's processed_at is stamped, which
+// markMinedAndPublish uses as proof that every row an earlier delivery mined
+// against it was also published. Any read failure answers false: the caller
+// then republishes rather than risk withholding an event that never went out.
+func (b *Builder) blockFinalized(ctx context.Context, blockHash string) bool {
+	row, err := b.store.GetBlockProcessingStatus(ctx, blockHash)
+	return err == nil && row != nil && row.ProcessedAt != nil
 }
 
 // setMinedAndPublish is the shared "mark MINED + fan out" core behind the
@@ -756,6 +768,9 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 		return nil
 	}
 
+	// Read before anything below writes the block: see markMinedAndPublish.
+	finalized := b.blockFinalized(ctx, blockHash)
+
 	// Resolve the STUMP set with completeness-first ordering: STUMPs are read
 	// BEFORE any grace-window wait, so a block whose expected-STUMP set is
 	// already complete (or provably empty) finalizes immediately instead of
@@ -905,7 +920,7 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	}
 	minedComplete := true
 	if len(txids) > 0 {
-		minedComplete = b.markMinedAndPublish(ctx, logger, blockHash, blockHeight, txids)
+		minedComplete = b.markMinedAndPublish(ctx, logger, blockHash, blockHeight, txids, finalized)
 	}
 
 	// 7. Finalize: the BUMP is built and validated, every expected STUMP was
@@ -1416,7 +1431,8 @@ func (b *Builder) shortCircuit(ctx context.Context, logger *zap.Logger, blockHas
 	}
 	minedComplete := true
 	if len(txids) > 0 {
-		minedComplete = b.markMinedAndPublish(ctx, logger, blockHash, existingHeight, txids)
+		finalized := b.blockFinalized(ctx, blockHash)
+		minedComplete = b.markMinedAndPublish(ctx, logger, blockHash, existingHeight, txids, finalized)
 	}
 	// Stamp processed_at on the redelivery too. The typical short-circuit
 	// trigger IS the watchdog re-firing BLOCK_PROCESSED for a block whose BUMP

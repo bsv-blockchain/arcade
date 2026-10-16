@@ -54,7 +54,7 @@ func TestBuilder_MarkMinedAndPublish_ChunksLargeTxidList(t *testing.T) {
 		txids[i] = fmt.Sprintf("tx%064d", i)
 	}
 
-	b.markMinedAndPublish(context.Background(), zap.NewNop(), "blkD", 4242, txids)
+	b.markMinedAndPublish(context.Background(), zap.NewNop(), "blkD", 4242, txids, false)
 
 	wantChunks := (n + maxTxIDsPerBulkEvent - 1) / maxTxIDsPerBulkEvent
 	if len(pub.chunks) != wantChunks {

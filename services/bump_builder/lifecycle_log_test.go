@@ -35,7 +35,7 @@ func TestMarkMinedAndPublish_LogsTransactionsMinedLevelSplit(t *testing.T) {
 		txids[i] = fmt.Sprintf("mined-tx-%05d", i)
 	}
 
-	b.markMinedAndPublish(context.Background(), logger, "block-hash-mined-test", 777, txids)
+	b.markMinedAndPublish(context.Background(), logger, "block-hash-mined-test", 777, txids, false)
 
 	// Info: exactly one bounded line, TRUE total in txid_count, list capped.
 	infoEntries := recorded.FilterMessage("transactions mined").
@@ -118,7 +118,7 @@ func TestMarkMinedAndPublish_LogsTransactionsMinedSingleChunk(t *testing.T) {
 	logger := zap.New(core)
 
 	txids := []string{"tx-a", "tx-b", "tx-c"}
-	b.markMinedAndPublish(context.Background(), logger, "block-hash-small", 42, txids)
+	b.markMinedAndPublish(context.Background(), logger, "block-hash-small", 42, txids, false)
 
 	infoEntries := recorded.FilterMessage("transactions mined").
 		FilterLevelExact(zapcore.InfoLevel).All()
