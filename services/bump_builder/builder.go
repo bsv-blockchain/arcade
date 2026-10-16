@@ -1095,9 +1095,14 @@ func (b *Builder) handleRedelivery(ctx context.Context, logger *zap.Logger, call
 	if len(newLeaves) == 0 && len(missing) == 0 {
 		// A failed mine on this path is still a persistence failure:
 		// record store_failed, not the benign short_circuited label.
-		// processed_at stays unset inside shortCircuit so the watchdog
-		// can re-drive.
-		if b.shortCircuit(ctx, logger, blockHash, height, storedTxIDs) {
+		// shortCircuit leaves the block un-stamped (clearing an earlier
+		// stamp) so the watchdog can re-drive; a failure to clear is
+		// returned and fails the message.
+		mineFailed, err := b.shortCircuit(ctx, logger, blockHash, height, storedTxIDs)
+		if err != nil {
+			return nil, buildOutcomeStoreFailed, err
+		}
+		if mineFailed {
 			return nil, buildOutcomeStoreFailed, nil
 		}
 		return nil, "short_circuited", nil
@@ -1210,14 +1215,15 @@ func (b *Builder) deferIncompleteBlock(ctx context.Context, logger *zap.Logger, 
 	if err := b.store.AddBlockExpectedSubtrees(ctx, blockHash, expected); err != nil {
 		return fmt.Errorf("retaining expected subtrees for deferred block: %w", err)
 	}
-	return b.deferStampedBlock(ctx, logger, blockHash)
+	return b.deferStampedBlock(ctx, logger, blockHash, "an earlier build finalized this block but a later STUMP set is incomplete")
 }
 
 // deferStampedBlock hands a block back to the watchdog after an earlier
 // build already finalized it. With several merkle-services the first
 // service's BLOCK_PROCESSED builds and stamps processed_at; if a later
 // service's delivery then proves incomplete (its expected STUMP set is not
-// satisfied, or a rebuild would drop leaves) the stamp must come off, or
+// satisfied, or a rebuild would drop leaves), or a short-circuit's re-mine or
+// MINED publish does not land, the stamp must come off, or
 // ListStaleBlockProcessingStatus never surfaces the block and the txs only
 // that service tracked stay SEEN_* forever. The watchdog's /reprocess fans
 // out to every merkle-service, so the re-drive carries every variant.
@@ -1226,7 +1232,9 @@ func (b *Builder) deferIncompleteBlock(ctx context.Context, logger *zap.Logger, 
 // committing the message with the old stamp still set would leave the block
 // known-incomplete and invisible to the watchdog, the exact gap this helper
 // closes. A missing row is a no-op (nothing is stamped).
-func (b *Builder) deferStampedBlock(ctx context.Context, logger *zap.Logger, blockHash string) error {
+//
+// reason completes the log line: why the stamp is coming off.
+func (b *Builder) deferStampedBlock(ctx context.Context, logger *zap.Logger, blockHash, reason string) error {
 	row, err := b.store.GetBlockProcessingStatus(ctx, blockHash)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -1240,7 +1248,7 @@ func (b *Builder) deferStampedBlock(ctx context.Context, logger *zap.Logger, blo
 	if err := b.store.ClearBlockProcessed(ctx, blockHash); err != nil {
 		return fmt.Errorf("clearing processed_at on deferred block: %w", err)
 	}
-	logger.Warn("cleared processed_at: an earlier build finalized this block but a later STUMP set is incomplete; the watchdog will re-drive it via /reprocess")
+	logger.Warn("cleared processed_at; the watchdog will re-drive this block via /reprocess", zap.String("reason", reason))
 	return nil
 }
 
@@ -1537,7 +1545,7 @@ func (b *Builder) loadStoredBUMP(ctx context.Context, logger *zap.Logger, blockH
 
 // shortCircuit re-mines the stored BUMP's level-0 set and re-stamps
 // processed_at. It reports whether the mine failed to land in full.
-func (b *Builder) shortCircuit(ctx context.Context, logger *zap.Logger, blockHash string, existingHeight uint64, txids []string) (mineFailed bool) {
+func (b *Builder) shortCircuit(ctx context.Context, logger *zap.Logger, blockHash string, existingHeight uint64, txids []string) (mineFailed bool, err error) {
 	metrics.BumpBuilderShortCircuitTotal.Inc()
 	logger.Info(
 		"BUMP already built — skipping datahub fetch on redelivery",
@@ -1550,7 +1558,7 @@ func (b *Builder) shortCircuit(ctx context.Context, logger *zap.Logger, blockHas
 	// block is finalized + orphan-marked exactly like the fresh-build path.
 	if b.anchorDecision(ctx, logger, blockHash, existingHeight) == anchorDeny {
 		b.handleAnchorDenied(ctx, logger, blockHash, existingHeight, "short_circuit")
-		return false
+		return false, nil
 	}
 	minedComplete := true
 	if len(txids) > 0 {
@@ -1565,26 +1573,34 @@ func (b *Builder) shortCircuit(ctx context.Context, logger *zap.Logger, blockHas
 	// since the stale query keys on processed_at IS NULL and a built block can
 	// never be re-detected as incomplete.
 	//
-	// A partial mine withholds the stamp for the same reason the build path
-	// does: this IS the recovery path, so retiring the block from the stale
-	// scan while some of its txids are still SEEN_* would strand them.
+	// A partial mine or a failed publish withholds the stamp for the same
+	// reason the build path does: this IS the recovery path, so retiring the
+	// block from the stale scan while some of its txids are still SEEN_*, or
+	// their MINED events unsent, would strand them.
+	//
+	// Withholding is not enough when an earlier delivery already stamped the
+	// block (every extra merkle-service's BLOCK_PROCESSED lands here): the
+	// stamp would stay, the watchdog would never re-drive the block, and the
+	// next delivery would read it as finalized and filter the now-MINED rows
+	// out of the publish. So take the stamp off; a failure to do that fails
+	// the message so Kafka retries.
 	if minedComplete {
 		b.markBlockProcessed(ctx, logger, blockHash, existingHeight)
 	} else {
-		// Same contract as the build path: Kafka redelivery is not the
-		// recovery path (the caller returns nil and the offset is
-		// committed). processed_at stays unset so the watchdog re-drives.
 		logger.Warn(
-			"SetMinedByTxIDs did not complete; leaving processed_at unset so the watchdog can re-drive this block",
+			"SetMinedByTxIDs or the MINED publish did not complete; leaving the block un-stamped so the watchdog can re-drive it",
 			logfields.BlockHash(blockHash),
 			logfields.BlockHeight(existingHeight),
 			zap.Int("requested", len(txids)),
 		)
+		if err := b.deferStampedBlock(ctx, logger, blockHash, "short-circuit mine or publish did not complete"); err != nil {
+			return true, err
+		}
 	}
 	// STUMP rows are left for the janitor (bump_builder.stump_retention_minutes):
 	// a later merkle-service's BLOCK_PROCESSED compares its STUMPs against
 	// the stored BUMP, and that needs the full retained set.
-	return !minedComplete
+	return !minedComplete, nil
 }
 
 // markBlockProcessed stamps processed_at on the block-processing row — the

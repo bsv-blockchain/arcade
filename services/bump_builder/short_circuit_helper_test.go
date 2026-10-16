@@ -16,5 +16,6 @@ func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, block
 	if err != nil || !ok {
 		return false, false
 	}
-	return true, b.shortCircuit(ctx, logger, blockHash, height, txids)
+	mineFailed, _ = b.shortCircuit(ctx, logger, blockHash, height, txids)
+	return true, mineFailed
 }

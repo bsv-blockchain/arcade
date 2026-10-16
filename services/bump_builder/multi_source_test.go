@@ -9,11 +9,13 @@ import (
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/bump"
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 )
 
@@ -837,5 +839,129 @@ func TestBuilder_HandleMessage_RedeliveryAfterPrune_ShortCircuitsDespiteExpected
 	defer ms.mu.Unlock()
 	if ms.blockProc[0].ProcessedAt == nil {
 		t.Fatal("a complete block must stay stamped")
+	}
+}
+
+// stampedShortCircuitFixture is a block whose BUMP is stored and whose
+// processed_at an earlier delivery stamped, with no retained STUMPs: the next
+// BLOCK_PROCESSED takes the short-circuit. The stored row is not yet MINED
+// (e.g. registered after the first build), so the re-mine has work to do.
+func stampedShortCircuitFixture(t *testing.T) *mockStore {
+	t.Helper()
+	ms := newMockStore()
+	compound, _, err := bump.BuildCompoundBUMP(
+		[]*models.Stump{{BlockHash: testBlockHash, SubtreeIndex: 0, StumpData: makeMinimalSTUMP(testTxidHex)}},
+		[]chainhash.Hash{mustHash(t, testTxidHex)}, nil, nil,
+	)
+	if err != nil {
+		t.Fatalf("BuildCompoundBUMP: %v", err)
+	}
+	ms.bumps[testBlockHash] = compound.Bytes()
+	ms.bumpHeights[testBlockHash] = uint64(compound.BlockHeight)
+	stampedBlock(ms, testBlockHash)
+	return ms
+}
+
+// On an already-stamped block, a short-circuit whose re-mine fails must take
+// the stamp off, or the watchdog never re-drives the block and the rows the
+// mine missed stay SEEN_*.
+func TestBuilder_ShortCircuit_StampedBlockMineFails_ClearsProcessedAt(t *testing.T) {
+	ms := stampedShortCircuitFixture(t)
+	ms.setMinedErr = errors.New("store down")
+	b := &Builder{cfg: &config.Config{}, logger: zap.NewNop(), store: ms, publisher: &recordingPublisher{}}
+
+	before := bumpOutcomeSampleCount(t, "store_failed")
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(testBlockHash)); err != nil {
+		t.Fatalf("a failed mine returns nil (the watchdog recovers), got %v", err)
+	}
+	if got := bumpOutcomeSampleCount(t, "store_failed"); got != before+1 {
+		t.Fatalf("store_failed samples = %d, want %d", got, before+1)
+	}
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if ms.blockProc[0].ProcessedAt != nil {
+		t.Fatal("processed_at must be cleared so the watchdog re-drives the block")
+	}
+}
+
+// On an already-stamped block, a short-circuit whose MINED publish fails must
+// take the stamp off too: left stamped, the next delivery reads the block as
+// finalized and filters the now-MINED rows out of the publish for good.
+func TestBuilder_ShortCircuit_StampedBlockPublishFails_ClearsProcessedAtAndRepublishes(t *testing.T) {
+	ms := stampedShortCircuitFixture(t)
+	b := &Builder{cfg: &config.Config{}, logger: zap.NewNop(), store: ms, publisher: &failingBulkPublisher{}}
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(testBlockHash)); err != nil {
+		t.Fatalf("handleMessage: %v", err)
+	}
+	ms.mu.Lock()
+	if ms.blockProc[0].ProcessedAt != nil {
+		ms.mu.Unlock()
+		t.Fatal("processed_at must be cleared after a failed MINED publish")
+	}
+	// The row is MINED in the store now; the watchdog's re-drive must still
+	// publish it.
+	ms.alreadyMined = map[string]string{testTxidHex: testBlockHash}
+	ms.mu.Unlock()
+
+	pub := &recordingPublisher{}
+	b.publisher = pub
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(testBlockHash)); err != nil {
+		t.Fatalf("re-drive: %v", err)
+	}
+	if emitted := pub.snapshot(); len(emitted) != 1 || emitted[0].TxID != testTxidHex {
+		t.Fatalf("the re-drive must republish the MINED row, got %+v", emitted)
+	}
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if ms.blockProc[0].ProcessedAt == nil {
+		t.Fatal("a successful re-drive re-stamps the block")
+	}
+}
+
+// If the stamp cannot be taken off, the message fails so Kafka retries
+// rather than committing a stamped block the watchdog will never re-drive.
+func TestBuilder_ShortCircuit_StampedBlockMineFails_ClearFailureFailsMessage(t *testing.T) {
+	ms := stampedShortCircuitFixture(t)
+	ms.setMinedErr = errors.New("store down")
+	ms.clearProcessedErr = errors.New("still down")
+	b := &Builder{cfg: &config.Config{}, logger: zap.NewNop(), store: ms, publisher: &recordingPublisher{}}
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(testBlockHash)); err == nil {
+		t.Fatal("a failed ClearBlockProcessed must fail the message")
+	}
+}
+
+// A rebuild waits the grace window even when the callback's expected index
+// set already looks complete: the index can be covered by the earlier
+// service's STUMP while the later service's own variant for it is still
+// retrying. Here subtree 0 is covered on arrival, so without the rebuild case
+// the builder would skip the window (finalized_complete_no_grace).
+func TestBuilder_HandleMessage_RebuildWaitsGraceEvenWhenExpectedSetComplete(t *testing.T) {
+	f := newMultiSourceFixture(t)
+	ctx := context.Background()
+	f.ms.addStump(f.blockHash, 0, f.variantA)
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsgWithExpected(f.blockHash, []int{0})); err != nil {
+		t.Fatalf("first build: %v", err)
+	}
+
+	const grace = 150 * time.Millisecond
+	f.b.cfg.BumpBuilder.GraceWindowMs = int(grace / time.Millisecond)
+	f.ms.addStump(f.blockHash, 0, f.variantB) // new leaves ⇒ rebuild; {0} already covered
+	waitsBefore := testutil.ToFloat64(metrics.BumpBuilderGraceWaitTotal)
+	noGraceBefore := bumpOutcomeSampleCount(t, "finalized_complete_no_grace")
+	start := time.Now()
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsgWithExpected(f.blockHash, []int{0})); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < grace {
+		t.Fatalf("rebuild returned after %v, before the %v grace window", elapsed, grace)
+	}
+	if got := testutil.ToFloat64(metrics.BumpBuilderGraceWaitTotal) - waitsBefore; got != 1 {
+		t.Fatalf("grace waits = %v, want 1", got)
+	}
+	if got := bumpOutcomeSampleCount(t, "finalized_complete_no_grace"); got != noGraceBefore {
+		t.Fatal("a rebuild must not take the complete-set fast path")
+	}
+	if got := f.storedLeafCount(t); got != 4 {
+		t.Fatalf("rebuilt BUMP leaves = %d, want 4", got)
 	}
 }
