@@ -1,5 +1,10 @@
 package models
 
+import (
+	"crypto/sha256"
+	"encoding/hex"
+)
+
 // CallbackType represents the type of callback message from Merkle Service
 type CallbackType string
 
@@ -74,9 +79,44 @@ func (msg *CallbackMessage) ResolveSeenTxIDs() []string {
 	return nil
 }
 
-// Stump represents a stored STUMP (Subtree Unified Merkle Path), keyed by subtree.
+// Stump represents a stored STUMP (Subtree Unified Merkle Path). Rows are
+// keyed by (block_hash, subtree_index, content_hash): a STUMP's bytes depend
+// on which txids the emitting merkle-service had registrations for, so two
+// merkle-services can legitimately deliver different STUMPs for the same
+// subtree (one of them missed registrations during an outage). Content
+// addressing lets identical deliveries collapse to one row while variants
+// coexist for the bump-builder to merge.
 type Stump struct {
 	BlockHash    string `json:"block_hash"`
 	SubtreeIndex int    `json:"subtree_index"`
 	StumpData    []byte `json:"stump_data"`
+	// ContentHash is hex(sha256(StumpData)). Stores compute it when empty;
+	// NewStump fills it in.
+	ContentHash string `json:"content_hash,omitempty"`
+}
+
+// NewStump builds a Stump with its ContentHash set.
+func NewStump(blockHash string, subtreeIndex int, data []byte) *Stump {
+	return &Stump{
+		BlockHash:    blockHash,
+		SubtreeIndex: subtreeIndex,
+		StumpData:    data,
+		ContentHash:  StumpContentHash(data),
+	}
+}
+
+// StumpContentHash returns the content address of STUMP bytes.
+func StumpContentHash(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// EnsureContentHash fills ContentHash from StumpData when it is empty and
+// returns it. Store backends call this so a caller that built the struct by
+// hand still lands on the content-addressed key.
+func (s *Stump) EnsureContentHash() string {
+	if s.ContentHash == "" {
+		s.ContentHash = StumpContentHash(s.StumpData)
+	}
+	return s.ContentHash
 }

@@ -3,24 +3,28 @@ package bump_builder
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/bsv-blockchain/go-sdk/transaction"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/bump"
 	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 )
 
 // With several merkle-services every block's BLOCK_PROCESSED arrives once
-// per service, and each redelivery takes the short-circuit, which re-mines the
-// stored BUMP's level-0 set. Without a way to un-stamp a block whose re-mine
-// or publish fails, the short-circuit cannot safely suppress rows already
-// MINED (see tryShortCircuit), so it republishes the whole set, even on a
-// stamped block: a duplicate event rather than a lost one.
-func TestBuilder_HandleMessage_DuplicateBlockProcessed_RepublishesStoredSet(t *testing.T) {
+// per service. The redelivery takes the short-circuit path, which re-mines
+// the stored BUMP's level-0 set; rows already MINED against this block must
+// not fan out a second MINED event, while a tx that was still SEEN_* (e.g.
+// registered after the first build) must still publish.
+func TestBuilder_HandleMessage_DuplicateBlockProcessed_PublishesOnlyNewlyMined(t *testing.T) {
 	const alreadyMinedTx = testTxidHex
 	const lateTx = "2222222222222222222222222222222222222222222222222222222222222222"
 	ms := newMockStore()
@@ -70,15 +74,546 @@ func TestBuilder_HandleMessage_DuplicateBlockProcessed_RepublishesStoredSet(t *t
 		t.Fatalf("processed_at must be (re)stamped on the redelivery, got %d calls", processed)
 	}
 
-	got := map[string]bool{}
-	for _, st := range pub.snapshot() {
-		if st.Status != models.StatusMined || st.BlockHash != blockHash {
-			t.Fatalf("unexpected event %+v", st)
-		}
-		got[st.TxID] = true
+	emitted := pub.snapshot()
+	if len(emitted) != 1 {
+		t.Fatalf("expected exactly one MINED event (the late tx), got %d: %+v", len(emitted), emitted)
 	}
-	if len(got) != 2 || !got[alreadyMinedTx] || !got[lateTx] {
-		t.Fatalf("the short-circuit must republish the whole stored set, got %v", got)
+	if emitted[0].TxID != lateTx || emitted[0].Status != models.StatusMined || emitted[0].BlockHash != blockHash {
+		t.Fatalf("published = %+v, want MINED %s@%s", emitted[0], lateTx, blockHash)
+	}
+}
+
+// A redelivery where every row is already MINED against this block is a pure
+// no-op for subscribers: no MINED event at all.
+func TestBuilder_HandleMessage_DuplicateBlockProcessed_AllMined_PublishesNothing(t *testing.T) {
+	ms := newMockStore()
+	blockHash := testBlockHash
+	compound, _, err := bump.BuildCompoundBUMP(
+		[]*models.Stump{{BlockHash: blockHash, SubtreeIndex: 0, StumpData: makeMinimalSTUMP(testTxidHex)}},
+		[]chainhash.Hash{mustHash(t, testTxidHex)}, nil, nil,
+	)
+	if err != nil {
+		t.Fatalf("BuildCompoundBUMP: %v", err)
+	}
+	ms.bumps[blockHash] = compound.Bytes()
+	ms.bumpHeights[blockHash] = uint64(compound.BlockHeight)
+	ms.alreadyMined = map[string]string{testTxidHex: blockHash}
+	stampedBlock(ms, blockHash)
+
+	pub := &recordingPublisher{}
+	b := &Builder{cfg: &config.Config{}, logger: zap.NewNop(), store: ms, publisher: pub}
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash)); err != nil {
+		t.Fatalf("handleMessage: %v", err)
+	}
+	if emitted := pub.snapshot(); len(emitted) != 0 {
+		t.Fatalf("already-MINED rows must not be re-published, got %+v", emitted)
+	}
+}
+
+// fourLeafVariant encodes a BRC-74 STUMP for a 4-leaf subtree that tracks
+// leaves[tracked]: level 0 holds the tracked leaf (Txid marker) and its
+// sibling, level 1 the other pair's parent. It is what one merkle-service
+// emits when it only has a registration for that one tx.
+func fourLeafVariant(leaves [4]chainhash.Hash, tracked int) []byte {
+	sibling := tracked ^ 1
+	otherPair := (tracked / 2) ^ 1
+	parent := transaction.MerkleTreeParent(&leaves[otherPair*2], &leaves[otherPair*2+1])
+	isTx := true
+	tl, sl := leaves[tracked], leaves[sibling]
+	mp := &transaction.MerklePath{
+		BlockHeight: 1,
+		Path: [][]*transaction.PathElement{
+			{
+				{Offset: uint64(tracked), Hash: &tl, Txid: &isTx}, //nolint:gosec // tiny test index
+				{Offset: uint64(sibling), Hash: &sl},              //nolint:gosec // tiny test index
+			},
+			{{Offset: uint64(otherPair), Hash: parent}}, //nolint:gosec // tiny test index
+		},
+	}
+	return mp.Bytes()
+}
+
+func fourLeafRoot(leaves [4]chainhash.Hash) chainhash.Hash {
+	p01 := transaction.MerkleTreeParent(&leaves[0], &leaves[1])
+	p23 := transaction.MerkleTreeParent(&leaves[2], &leaves[3])
+	return *transaction.MerkleTreeParent(p01, p23)
+}
+
+// multiSourceFixture is a single-subtree block of four txs. Service A had
+// registrations for L0 only; service B (down while L2 was registered, so it
+// never learned about L0) tracks L2. The datahub serves the block so the
+// build path has subtree hashes and a header root to validate against.
+type multiSourceFixture struct {
+	ms        *mockStore
+	b         *Builder
+	pub       *recordingPublisher
+	blockHash string
+	leaves    [4]chainhash.Hash
+	variantA  []byte
+	variantB  []byte
+}
+
+func newMultiSourceFixture(t *testing.T) *multiSourceFixture {
+	t.Helper()
+	f := &multiSourceFixture{ms: newMockStore(), pub: &recordingPublisher{}, blockHash: testBlockHash}
+	hexes := [4]string{
+		"1111111111111111111111111111111111111111111111111111111111111111",
+		"2222222222222222222222222222222222222222222222222222222222222222",
+		"3333333333333333333333333333333333333333333333333333333333333333",
+		"4444444444444444444444444444444444444444444444444444444444444444",
+	}
+	for i, h := range hexes {
+		f.leaves[i] = mustHash(t, h)
+	}
+	f.variantA = fourLeafVariant(f.leaves, 0)
+	f.variantB = fourLeafVariant(f.leaves, 2)
+	root := fourLeafRoot(f.leaves)
+	datahub := newDatahubServer(root.CloneBytes(), []chainhash.Hash{root})
+	t.Cleanup(datahub.Close)
+	f.b = newTestBuilder(f.ms, datahub.URL)
+	f.b.publisher = f.pub
+	return f
+}
+
+func (f *multiSourceFixture) storedLeafCount(t *testing.T) int {
+	t.Helper()
+	f.ms.mu.Lock()
+	data := f.ms.bumps[f.blockHash]
+	f.ms.mu.Unlock()
+	txids, err := levelZeroTxidsFromBUMP(data)
+	if err != nil {
+		t.Fatalf("stored BUMP: %v", err)
+	}
+	return len(txids)
+}
+
+// Service A's BLOCK_PROCESSED builds from its STUMP alone. Service B's
+// delivery then carries leaves the stored BUMP lacks: the compound is rebuilt
+// from both variants, the BUMP is overwritten, and only the newly covered txs
+// are published. A third delivery (identical set) short-circuits silently.
+func TestBuilder_HandleMessage_RedeliveryWithNewLeaves_RebuildsAndPublishesOnlyNew(t *testing.T) {
+	f := newMultiSourceFixture(t)
+	ctx := context.Background()
+
+	// 1. Service A: STUMP tracking L0, then BLOCK_PROCESSED.
+	f.ms.addStump(f.blockHash, 0, f.variantA)
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsg(f.blockHash)); err != nil {
+		t.Fatalf("first build: %v", err)
+	}
+	if got := f.storedLeafCount(t); got != 2 {
+		t.Fatalf("first build leaves = %d, want 2 (L0 + sibling)", got)
+	}
+	if got := len(f.pub.snapshot()); got != 2 {
+		t.Fatalf("first build published %d, want 2", got)
+	}
+	f.ms.mu.Lock()
+	if len(f.ms.stumps[f.blockHash]) != 1 || len(f.ms.deletedBlocks) != 0 {
+		t.Fatalf("STUMPs must be retained after the build: stumps=%d deletes=%v", len(f.ms.stumps[f.blockHash]), f.ms.deletedBlocks)
+	}
+	// The rows the first build mined are now MINED in the store.
+	f.ms.alreadyMined = map[string]string{f.leaves[0].String(): f.blockHash, f.leaves[1].String(): f.blockHash}
+	f.ms.mu.Unlock()
+
+	// 2. Service B: STUMP tracking L2 (a different variant), then BLOCK_PROCESSED.
+	f.ms.addStump(f.blockHash, 0, f.variantB)
+	beforeRebuilt := bumpOutcomeSampleCount(t, "rebuilt")
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsg(f.blockHash)); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if got := bumpOutcomeSampleCount(t, "rebuilt"); got != beforeRebuilt+1 {
+		t.Fatalf("rebuilt samples = %d, want %d", got, beforeRebuilt+1)
+	}
+	if got := f.storedLeafCount(t); got != 4 {
+		t.Fatalf("rebuilt BUMP leaves = %d, want 4", got)
+	}
+	emitted := f.pub.snapshot()
+	if len(emitted) != 4 {
+		t.Fatalf("after rebuild published total = %d, want 4 (2 from the first build + L2, L3)", len(emitted))
+	}
+	newly := map[string]bool{}
+	for _, st := range emitted[2:] {
+		newly[st.TxID] = true
+	}
+	if !newly[f.leaves[2].String()] || !newly[f.leaves[3].String()] {
+		t.Fatalf("rebuild must publish exactly the newly covered txs, got %v", newly)
+	}
+	f.ms.mu.Lock()
+	if len(f.ms.processedCalls) != 2 {
+		t.Fatalf("processed_at must be stamped on the rebuild too, got %d stamps", len(f.ms.processedCalls))
+	}
+	f.ms.alreadyMined[f.leaves[2].String()] = f.blockHash
+	f.ms.alreadyMined[f.leaves[3].String()] = f.blockHash
+	f.ms.mu.Unlock()
+
+	// 3. Service C delivers the same STUMP as B: nothing new, short-circuit.
+	f.ms.addStump(f.blockHash, 0, f.variantB)
+	beforeShort := bumpOutcomeSampleCount(t, "short_circuited")
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsg(f.blockHash)); err != nil {
+		t.Fatalf("third delivery: %v", err)
+	}
+	if got := bumpOutcomeSampleCount(t, "short_circuited"); got != beforeShort+1 {
+		t.Fatalf("short_circuited samples = %d, want %d", got, beforeShort+1)
+	}
+	if got := len(f.pub.snapshot()); got != 4 {
+		t.Fatalf("short-circuit must publish nothing, total = %d", got)
+	}
+	if got := f.storedLeafCount(t); got != 4 {
+		t.Fatalf("short-circuit must not rewrite the BUMP, leaves = %d", got)
+	}
+}
+
+// Both variants are present before the first build (the common ordering when
+// services run in lockstep): one build, one BUMP covering the union.
+func TestBuilder_HandleMessage_VariantsBeforeFirstBuild_SingleBuildCoversUnion(t *testing.T) {
+	f := newMultiSourceFixture(t)
+	f.ms.addStump(f.blockHash, 0, f.variantA)
+	f.ms.addStump(f.blockHash, 0, f.variantB)
+	if err := f.b.handleMessage(context.Background(), makeBlockProcessedMsg(f.blockHash)); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if got := f.storedLeafCount(t); got != 4 {
+		t.Fatalf("leaves = %d, want 4", got)
+	}
+	if got := len(f.pub.snapshot()); got != 4 {
+		t.Fatalf("published = %d, want 4", got)
+	}
+}
+
+// Service A's build stamped processed_at. Service B's STUMP for a new subtree
+// arrived, but B's expected set names another subtree whose STUMP is still
+// missing after the grace window: the block is deferred AND the stamp is
+// cleared so the watchdog re-drives it. The stored BUMP is untouched.
+func TestBuilder_HandleMessage_DeferredAfterStamp_ClearsProcessedAt(t *testing.T) {
+	f := newMultiSourceFixture(t)
+	ctx := context.Background()
+	f.ms.addStump(f.blockHash, 0, f.variantA)
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsg(f.blockHash)); err != nil {
+		t.Fatalf("first build: %v", err)
+	}
+	stamped := time.Now()
+	f.ms.mu.Lock()
+	f.ms.blockProc = []*models.BlockProcessingStatus{{BlockHash: f.blockHash, BlockHeight: 1, ProcessedAt: &stamped}}
+	f.ms.mu.Unlock()
+	f.b.cfg.BumpBuilder.GraceWindowMs = 0
+
+	const lateTx = "5555555555555555555555555555555555555555555555555555555555555555"
+	f.ms.addStump(f.blockHash, 1, makeMinimalSTUMP(lateTx)) // new leaf ⇒ rebuild path
+	beforeDeferred := bumpOutcomeSampleCount(t, "deferred_incomplete")
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsgWithExpected(f.blockHash, []int{1, 2})); err != nil {
+		t.Fatalf("deferred delivery must return nil (watchdog recovers), got %v", err)
+	}
+	if got := bumpOutcomeSampleCount(t, "deferred_incomplete"); got != beforeDeferred+1 {
+		t.Fatalf("deferred_incomplete samples = %d, want %d", got, beforeDeferred+1)
+	}
+	f.ms.mu.Lock()
+	defer f.ms.mu.Unlock()
+	if len(f.ms.clearedBlocks) != 1 || f.ms.clearedBlocks[0] != f.blockHash {
+		t.Fatalf("ClearBlockProcessed calls = %v, want [%s]", f.ms.clearedBlocks, f.blockHash)
+	}
+	if f.ms.blockProc[0].ProcessedAt != nil {
+		t.Fatal("processed_at must be cleared on the fixture row")
+	}
+	if got := len(f.pub.snapshot()); got != 2 {
+		t.Fatalf("deferral must publish nothing new, total = %d", got)
+	}
+}
+
+// If the janitor already pruned service A's STUMP, a rebuild from B alone
+// would drop L0/L1 from the stored BUMP. The builder keeps the stored BUMP,
+// publishes nothing, and hands the block back to the watchdog.
+func TestBuilder_HandleMessage_RebuildWouldDropLeaves_KeepsBUMPAndDefers(t *testing.T) {
+	f := newMultiSourceFixture(t)
+	ctx := context.Background()
+	f.ms.addStump(f.blockHash, 0, f.variantA)
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsg(f.blockHash)); err != nil {
+		t.Fatalf("first build: %v", err)
+	}
+	stamped := time.Now()
+	f.ms.mu.Lock()
+	f.ms.blockProc = []*models.BlockProcessingStatus{{BlockHash: f.blockHash, BlockHeight: 1, ProcessedAt: &stamped}}
+	delete(f.ms.stumps, f.blockHash) // janitor pruned A's STUMP
+	f.ms.alreadyMined = map[string]string{f.leaves[0].String(): f.blockHash, f.leaves[1].String(): f.blockHash}
+	before := f.ms.bumps[f.blockHash]
+	f.ms.mu.Unlock()
+
+	f.ms.addStump(f.blockHash, 0, f.variantB)
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsg(f.blockHash)); err != nil {
+		t.Fatalf("delivery: %v", err)
+	}
+	f.ms.mu.Lock()
+	defer f.ms.mu.Unlock()
+	if string(f.ms.bumps[f.blockHash]) != string(before) {
+		t.Fatal("stored BUMP must not be overwritten by a compound that drops leaves")
+	}
+	if len(f.ms.clearedBlocks) != 1 {
+		t.Fatalf("block must be handed back to the watchdog, cleared=%v", f.ms.clearedBlocks)
+	}
+	if got := len(f.pub.snapshot()); got != 2 {
+		t.Fatalf("nothing new may be published, total = %d", got)
+	}
+}
+
+// A redelivery whose STUMP set cannot be read must not take the
+// short-circuit: that would re-stamp processed_at and retire a block this
+// delivery may have added leaves to. The message fails so Kafka retries it.
+func TestBuilder_HandleMessage_RedeliveryStumpReadError_FailsMessage(t *testing.T) {
+	f := newMultiSourceFixture(t)
+	ctx := context.Background()
+	f.ms.addStump(f.blockHash, 0, f.variantA)
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsg(f.blockHash)); err != nil {
+		t.Fatalf("first build: %v", err)
+	}
+	f.ms.mu.Lock()
+	f.ms.getStumpsErr = errors.New("store: read timeout")
+	minedBefore, stampedBefore := len(f.ms.minedCalls), len(f.ms.processedCalls)
+	f.ms.mu.Unlock()
+
+	before := bumpOutcomeSampleCount(t, "store_failed")
+	err := f.b.handleMessage(ctx, makeBlockProcessedMsg(f.blockHash))
+	if err == nil {
+		t.Fatal("a STUMP read failure on redelivery must fail the message")
+	}
+	if got := bumpOutcomeSampleCount(t, "store_failed"); got != before+1 {
+		t.Fatalf("store_failed samples = %d, want %d", got, before+1)
+	}
+	f.ms.mu.Lock()
+	defer f.ms.mu.Unlock()
+	if len(f.ms.minedCalls) != minedBefore || len(f.ms.processedCalls) != stampedBefore {
+		t.Fatalf("nothing may be mined or stamped on a failed read: mined %d->%d stamped %d->%d",
+			minedBefore, len(f.ms.minedCalls), stampedBefore, len(f.ms.processedCalls))
+	}
+}
+
+// If clearing processed_at fails, the deferral must fail the message too:
+// committing it with the old stamp still set would leave the block
+// known-incomplete and invisible to the watchdog.
+func TestBuilder_HandleMessage_DeferralClearFails_FailsMessage(t *testing.T) {
+	f := newMultiSourceFixture(t)
+	ctx := context.Background()
+	f.ms.addStump(f.blockHash, 0, f.variantA)
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsg(f.blockHash)); err != nil {
+		t.Fatalf("first build: %v", err)
+	}
+	stamped := time.Now()
+	f.ms.mu.Lock()
+	f.ms.blockProc = []*models.BlockProcessingStatus{{BlockHash: f.blockHash, BlockHeight: 1, ProcessedAt: &stamped}}
+	f.ms.clearProcessedErr = errors.New("store: write timeout")
+	f.ms.mu.Unlock()
+	f.b.cfg.BumpBuilder.GraceWindowMs = 0
+
+	const lateTx = "5555555555555555555555555555555555555555555555555555555555555555"
+	f.ms.addStump(f.blockHash, 1, makeMinimalSTUMP(lateTx))
+	beforeDeferred := bumpOutcomeSampleCount(t, "deferred_incomplete")
+	beforeFailed := bumpOutcomeSampleCount(t, "store_failed")
+	err := f.b.handleMessage(ctx, makeBlockProcessedMsgWithExpected(f.blockHash, []int{1, 2}))
+	if err == nil {
+		t.Fatal("a failed ClearBlockProcessed must fail the message")
+	}
+	if got := bumpOutcomeSampleCount(t, "deferred_incomplete"); got != beforeDeferred {
+		t.Fatalf("deferred_incomplete must not be recorded when the clear failed, got %d want %d", got, beforeDeferred)
+	}
+	if got := bumpOutcomeSampleCount(t, "store_failed"); got != beforeFailed+1 {
+		t.Fatalf("store_failed samples = %d, want %d", got, beforeFailed+1)
+	}
+
+	// The rebuild-would-drop path fails the same way.
+	f.ms.mu.Lock()
+	delete(f.ms.stumps, f.blockHash)
+	f.ms.alreadyMined = map[string]string{f.leaves[0].String(): f.blockHash, f.leaves[1].String(): f.blockHash}
+	f.ms.mu.Unlock()
+	f.ms.addStump(f.blockHash, 0, f.variantB)
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsg(f.blockHash)); err == nil {
+		t.Fatal("a failed ClearBlockProcessed on the rebuild-would-drop path must fail the message")
+	}
+}
+
+// The janitor walks by height but prunes by bump_built_at age, so it must
+// keep walking below the watchdog's recency depth while a page may still
+// hold retained rows, or a block that ages out after dropping below the
+// depth is never visited again.
+func TestBuilder_PruneOrphanStumps_WalksPastRecencyDepthWhileRowsRetained(t *testing.T) {
+	ms := newMockStore()
+	ms.tipHeight = 1000
+	old := time.Now().Add(-3 * time.Hour)
+	recent := time.Now().Add(-time.Minute)
+	// 200 in-flight rows fill the first page down to height 801, below the
+	// 144-block recency depth (horizon 856). Their headers are recent, so
+	// the page may still hold retained rows and the walk continues to the
+	// deep built rows.
+	for h := uint64(1000); h >= 801; h-- {
+		ms.blockProc = append(ms.blockProc, &models.BlockProcessingStatus{BlockHash: fmt.Sprintf("inflight-%d", h), BlockHeight: h, HeaderSeenAt: recent})
+	}
+	ms.blockProc = append(ms.blockProc,
+		&models.BlockProcessingStatus{BlockHash: "deep-fresh", BlockHeight: 700, HeaderSeenAt: old, BUMPBuiltAt: &recent, ProcessedAt: &recent}, // late build, keep
+		&models.BlockProcessingStatus{BlockHash: "deep-old", BlockHeight: 690, HeaderSeenAt: old, BUMPBuiltAt: &old, ProcessedAt: &old},         // aged out, prune
+	)
+	ms.addStump("deep-fresh", 0, []byte("fresh"))
+	ms.addStump("deep-old", 0, []byte("old"))
+
+	b := &Builder{cfg: &config.Config{}, logger: zap.NewNop(), store: ms}
+	b.cfg.Watchdog.RecencyDepth = 144
+	b.pruneOrphanStumps(context.Background())
+
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if len(ms.stumps["deep-old"]) != 0 {
+		t.Fatalf("deep-old aged out and must be pruned even below the recency depth, still has %d", len(ms.stumps["deep-old"]))
+	}
+	if len(ms.stumps["deep-fresh"]) != 1 {
+		t.Fatalf("deep-fresh is inside retention and must be kept, got %d", len(ms.stumps["deep-fresh"]))
+	}
+}
+
+// coinbaseSlotFixture is the shape every small block has: one subtree whose
+// offset 0 is the coinbase placeholder and whose tracked tx sits at offset 1,
+// so each service's STUMP carries the placeholder at level 0 while the stored
+// compound carries the real coinbase txid there (the build swaps it in from
+// the coinbase BUMP). Delivered through the enriched BLOCK_PROCESSED path,
+// as merkle-service sends it.
+func coinbaseSlotFixture(t *testing.T) (f *multiSourceFixture, msg func() *kafka.Message) {
+	t.Helper()
+	f = &multiSourceFixture{ms: newMockStore(), pub: &recordingPublisher{}, blockHash: testBlockHash}
+	placeholder := mustHash(t, "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	tracked := mustHash(t, "1111111111111111111111111111111111111111111111111111111111111111")
+	coinbase := mustHash(t, "4444444444444444444444444444444444444444444444444444444444444444")
+	isTx := true
+	stump := (&transaction.MerklePath{BlockHeight: 1, Path: [][]*transaction.PathElement{{
+		{Offset: 0, Hash: &placeholder},
+		{Offset: 1, Hash: &tracked, Txid: &isTx},
+	}}}).Bytes()
+	cbBUMP := (&transaction.MerklePath{BlockHeight: 1, Path: [][]*transaction.PathElement{{
+		{Offset: 0, Hash: &coinbase, Txid: &isTx},
+		{Offset: 1, Hash: &tracked},
+	}}}).Bytes()
+	subtreeHashes := []chainhash.Hash{*transaction.MerkleTreeParent(&placeholder, &tracked)}
+	root := *transaction.MerkleTreeParent(&coinbase, &tracked)
+	f.variantA = stump
+	datahub := newRecordingDatahub(t)
+	f.b = newTestBuilder(f.ms, datahub.server.URL)
+	f.b.publisher = f.pub
+	return f, func() *kafka.Message {
+		return makeBlockProcessedMsgWithEnrichment(t, f.blockHash, root, subtreeHashes, cbBUMP)
+	}
+}
+
+// With several merkle-services every one of them delivers an identical
+// STUMP for the block, placeholder included. The redelivery must be
+// recognised as carrying nothing new: it must not rebuild, must not flag the
+// real coinbase leaf as dropped, and must not clear processed_at (which
+// hands a finished block back to the watchdog on every block).
+func TestBuilder_HandleMessage_IdenticalRedelivery_CoinbaseSlot_ShortCircuits(t *testing.T) {
+	f, msg := coinbaseSlotFixture(t)
+	ctx := context.Background()
+
+	f.ms.addStump(f.blockHash, 0, f.variantA)
+	if err := f.b.handleMessage(ctx, msg()); err != nil {
+		t.Fatalf("first build: %v", err)
+	}
+	stamped := time.Now()
+	f.ms.mu.Lock()
+	if _, ok := f.ms.bumps[f.blockHash]; !ok {
+		f.ms.mu.Unlock()
+		t.Fatal("first delivery must build the compound")
+	}
+	f.ms.blockProc = []*models.BlockProcessingStatus{{BlockHash: f.blockHash, BlockHeight: 1, ProcessedAt: &stamped}}
+	before := string(f.ms.bumps[f.blockHash])
+	f.ms.mu.Unlock()
+
+	// Services B and C deliver the same STUMP.
+	for svc := 0; svc < 2; svc++ {
+		f.ms.addStump(f.blockHash, 0, f.variantA)
+		beforeShort := bumpOutcomeSampleCount(t, "short_circuited")
+		if err := f.b.handleMessage(ctx, msg()); err != nil {
+			t.Fatalf("redelivery %d: %v", svc, err)
+		}
+		if got := bumpOutcomeSampleCount(t, "short_circuited"); got != beforeShort+1 {
+			t.Fatalf("redelivery %d: short_circuited samples = %d, want %d", svc, got, beforeShort+1)
+		}
+	}
+	f.ms.mu.Lock()
+	defer f.ms.mu.Unlock()
+	if len(f.ms.clearedBlocks) != 0 {
+		t.Fatalf("an identical redelivery must not hand the block back to the watchdog, cleared=%v", f.ms.clearedBlocks)
+	}
+	if string(f.ms.bumps[f.blockHash]) != before {
+		t.Fatal("an identical redelivery must not rewrite the stored BUMP")
+	}
+}
+
+// Service B tracks a different pair of the same subtree. Its redelivery adds
+// leaves, so the compound is rebuilt; the rebuild still carries the real
+// coinbase at offset 0 and must not be judged as dropping it (the STUMP-side
+// txids hold the placeholder there).
+func TestBuilder_HandleMessage_RedeliveryNewLeaves_CoinbaseSlot_Rebuilds(t *testing.T) {
+	ms := newMockStore()
+	pub := &recordingPublisher{}
+	blockHash := testBlockHash
+	ph := mustHash(t, "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	t1 := mustHash(t, "1111111111111111111111111111111111111111111111111111111111111111")
+	l2 := mustHash(t, "2222222222222222222222222222222222222222222222222222222222222222")
+	l3 := mustHash(t, "3333333333333333333333333333333333333333333333333333333333333333")
+	cb := mustHash(t, "4444444444444444444444444444444444444444444444444444444444444444")
+	isTx := true
+	p01 := transaction.MerkleTreeParent(&ph, &t1)
+	p23 := transaction.MerkleTreeParent(&l2, &l3)
+	stumpA := (&transaction.MerklePath{BlockHeight: 1, Path: [][]*transaction.PathElement{
+		{{Offset: 0, Hash: &ph}, {Offset: 1, Hash: &t1, Txid: &isTx}},
+		{{Offset: 1, Hash: p23}},
+	}}).Bytes()
+	stumpB := (&transaction.MerklePath{BlockHeight: 1, Path: [][]*transaction.PathElement{
+		{{Offset: 2, Hash: &l2, Txid: &isTx}, {Offset: 3, Hash: &l3}},
+		{{Offset: 0, Hash: p01}},
+	}}).Bytes()
+	cbBUMP := (&transaction.MerklePath{BlockHeight: 1, Path: [][]*transaction.PathElement{
+		{{Offset: 0, Hash: &cb, Txid: &isTx}, {Offset: 1, Hash: &t1}},
+		{{Offset: 1, Hash: p23}},
+	}}).Bytes()
+	subtreeHashes := []chainhash.Hash{*transaction.MerkleTreeParent(p01, p23)}
+	root := *transaction.MerkleTreeParent(transaction.MerkleTreeParent(&cb, &t1), p23)
+	datahub := newRecordingDatahub(t)
+	b := newTestBuilder(ms, datahub.server.URL)
+	b.publisher = pub
+	msg := func() *kafka.Message {
+		return makeBlockProcessedMsgWithEnrichment(t, blockHash, root, subtreeHashes, cbBUMP)
+	}
+	ctx := context.Background()
+
+	ms.addStump(blockHash, 0, stumpA)
+	if err := b.handleMessage(ctx, msg()); err != nil {
+		t.Fatalf("first build: %v", err)
+	}
+	stamped := time.Now()
+	ms.mu.Lock()
+	ms.blockProc = []*models.BlockProcessingStatus{{BlockHash: blockHash, BlockHeight: 1, ProcessedAt: &stamped}}
+	ms.mu.Unlock()
+
+	ms.addStump(blockHash, 0, stumpB)
+	beforeRebuilt := bumpOutcomeSampleCount(t, "rebuilt")
+	if err := b.handleMessage(ctx, msg()); err != nil {
+		t.Fatalf("redelivery: %v", err)
+	}
+	if got := bumpOutcomeSampleCount(t, "rebuilt"); got != beforeRebuilt+1 {
+		t.Fatalf("rebuilt samples = %d, want %d", got, beforeRebuilt+1)
+	}
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	// The rebuild takes the first build's stamp off before overwriting the
+	// BUMP and puts it back once the expanded set is mined.
+	if len(ms.clearedBlocks) != 1 || ms.blockProc[0].ProcessedAt == nil {
+		t.Fatalf("rebuild must clear then re-stamp processed_at, cleared=%v processed_at=%v", ms.clearedBlocks, ms.blockProc[0].ProcessedAt)
+	}
+	leaves, err := levelZeroTxidsFromBUMP(ms.bumps[blockHash])
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, l := range leaves {
+		got[l] = true
+	}
+	for _, want := range []chainhash.Hash{cb, t1, l2, l3} {
+		if !got[want.String()] {
+			t.Fatalf("rebuilt BUMP leaves %v lack %s", leaves, want)
+		}
 	}
 }
 
@@ -118,6 +653,125 @@ func TestBuilder_HandleMessage_RedeliveryOfUnstampedBlock_RepublishesMinedRows(t
 	}
 }
 
+// A rebuild whose mine fails must leave the block un-stamped: the first
+// build's stamp comes off before the BUMP is overwritten, and goes back on
+// only after the expanded set is mined, so the watchdog still re-drives the
+// newly covered txs.
+func TestBuilder_HandleMessage_RebuildMineFails_LeavesProcessedAtCleared(t *testing.T) {
+	f := newMultiSourceFixture(t)
+	ctx := context.Background()
+	f.ms.addStump(f.blockHash, 0, f.variantA)
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsg(f.blockHash)); err != nil {
+		t.Fatalf("first build: %v", err)
+	}
+	f.ms.mu.Lock()
+	if len(f.ms.blockProc) != 1 || f.ms.blockProc[0].ProcessedAt == nil {
+		f.ms.mu.Unlock()
+		t.Fatal("first build must stamp processed_at")
+	}
+	f.ms.setMinedErr = errors.New("store down")
+	f.ms.mu.Unlock()
+
+	f.ms.addStump(f.blockHash, 0, f.variantB)
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsg(f.blockHash)); err != nil {
+		t.Fatalf("rebuild with a failed mine returns nil (the watchdog recovers), got %v", err)
+	}
+	f.ms.mu.Lock()
+	defer f.ms.mu.Unlock()
+	if len(f.ms.clearedBlocks) != 1 {
+		t.Fatalf("rebuild must clear the first build's stamp, cleared=%v", f.ms.clearedBlocks)
+	}
+	if f.ms.blockProc[0].ProcessedAt != nil {
+		t.Fatal("processed_at must stay cleared while the expanded set is not mined")
+	}
+}
+
+// Service A built subtree 0 and stamped the block. Service B's delivery adds
+// no retained leaves but expects subtree 1, whose STUMP is still retrying.
+// That must not short-circuit (which would re-stamp the block and retire it
+// from the watchdog): it goes through the completeness gate, which defers the
+// block and clears the stamp.
+func TestBuilder_HandleMessage_NoNewLeavesButExpectedMissing_DefersInsteadOfShortCircuit(t *testing.T) {
+	f := newMultiSourceFixture(t)
+	ctx := context.Background()
+	f.ms.addStump(f.blockHash, 0, f.variantA)
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsg(f.blockHash)); err != nil {
+		t.Fatalf("first build: %v", err)
+	}
+	f.b.cfg.BumpBuilder.GraceWindowMs = 0
+
+	beforeShort := bumpOutcomeSampleCount(t, "short_circuited")
+	beforeDeferred := bumpOutcomeSampleCount(t, "deferred_incomplete")
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsgWithExpected(f.blockHash, []int{0, 1})); err != nil {
+		t.Fatalf("delivery: %v", err)
+	}
+	if got := bumpOutcomeSampleCount(t, "short_circuited"); got != beforeShort {
+		t.Fatal("a delivery expecting an unretained subtree must not short-circuit")
+	}
+	if got := bumpOutcomeSampleCount(t, "deferred_incomplete"); got != beforeDeferred+1 {
+		t.Fatalf("deferred_incomplete samples = %d, want %d", got, beforeDeferred+1)
+	}
+	f.ms.mu.Lock()
+	defer f.ms.mu.Unlock()
+	if f.ms.blockProc[0].ProcessedAt != nil {
+		t.Fatal("processed_at must be cleared so the watchdog re-drives the block")
+	}
+}
+
+// The interleaving from review: A builds subtree 0 (expects {0}); B supplies
+// subtree 1 but expects {1,2} and defers for missing 2; then A's duplicate
+// (expects {0}) arrives. Retained subtree 1 makes it a rebuild, and judged
+// against A's set alone it would stamp the block with subtree 2 still owed.
+// The deferral retained {1,2}, so A's duplicate defers too. Once the block
+// is stamped, the retained set is dropped.
+func TestBuilder_HandleMessage_RetainedExpectedSetOutlivesSmallerAnnouncements(t *testing.T) {
+	f := newMultiSourceFixture(t)
+	ctx := context.Background()
+	f.b.cfg.BumpBuilder.GraceWindowMs = 0
+
+	// A: subtree 0, expects {0}.
+	f.ms.addStump(f.blockHash, 0, f.variantA)
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsgWithExpected(f.blockHash, []int{0})); err != nil {
+		t.Fatalf("A: %v", err)
+	}
+	// B: subtree 1 retained, expects {1,2}: deferred.
+	const lateTx = "5555555555555555555555555555555555555555555555555555555555555555"
+	f.ms.addStump(f.blockHash, 1, makeMinimalSTUMP(lateTx))
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsgWithExpected(f.blockHash, []int{1, 2})); err != nil {
+		t.Fatalf("B: %v", err)
+	}
+	f.ms.mu.Lock()
+	if got := f.ms.expectedSubtrees[f.blockHash]; len(got) != 2 || got[0] != 1 || got[1] != 2 {
+		f.ms.mu.Unlock()
+		t.Fatalf("B's deferral must retain its expected set, got %v", got)
+	}
+	f.ms.mu.Unlock()
+
+	// A's duplicate, expects {0}: must defer, not stamp.
+	beforeDeferred := bumpOutcomeSampleCount(t, "deferred_incomplete")
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsgWithExpected(f.blockHash, []int{0})); err != nil {
+		t.Fatalf("A duplicate: %v", err)
+	}
+	if got := bumpOutcomeSampleCount(t, "deferred_incomplete"); got != beforeDeferred+1 {
+		t.Fatalf("A's duplicate must be held to the retained set and defer, deferred samples %d -> %d", beforeDeferred, got)
+	}
+	f.ms.mu.Lock()
+	if f.ms.blockProc[0].ProcessedAt != nil {
+		f.ms.mu.Unlock()
+		t.Fatal("block must stay un-stamped while subtree 2 is owed")
+	}
+	f.ms.mu.Unlock()
+
+	// Stamping the block (whichever path finally completes it) drops the
+	// retained set: a finalized block owes nothing.
+	f.b.markBlockProcessed(ctx, zap.NewNop(), f.blockHash, 1)
+	f.ms.mu.Lock()
+	defer f.ms.mu.Unlock()
+	if got := f.ms.expectedSubtrees[f.blockHash]; len(got) != 0 {
+		t.Fatalf("stamping must drop the retained set, got %v", got)
+	}
+}
+
 // failingBulkPublisher refuses every PublishBulk.
 type failingBulkPublisher struct{ recordingPublisher }
 
@@ -152,5 +806,162 @@ func TestBuilder_HandleMessage_PublishFailure_LeavesBlockUnstamped(t *testing.T)
 	}
 	if len(ms.processedCalls) != 0 {
 		t.Fatalf("a failed MINED publish must leave processed_at unset, got %d stamps", len(ms.processedCalls))
+	}
+}
+
+// Once the janitor has pruned a finalized block's STUMPs, a plain redelivery
+// (Kafka retry, DLQ redrive) carrying an expected set must still
+// short-circuit: with nothing retained every index would read as missing,
+// and taking the completeness gate would un-stamp a complete block.
+func TestBuilder_HandleMessage_RedeliveryAfterPrune_ShortCircuitsDespiteExpectedSet(t *testing.T) {
+	ms := newMockStore()
+	blockHash := testBlockHash
+	compound, _, err := bump.BuildCompoundBUMP(
+		[]*models.Stump{{BlockHash: blockHash, SubtreeIndex: 0, StumpData: makeMinimalSTUMP(testTxidHex)}},
+		[]chainhash.Hash{mustHash(t, testTxidHex)}, nil, nil,
+	)
+	if err != nil {
+		t.Fatalf("BuildCompoundBUMP: %v", err)
+	}
+	ms.bumps[blockHash] = compound.Bytes()
+	ms.bumpHeights[blockHash] = uint64(compound.BlockHeight)
+	stampedBlock(ms, blockHash)
+
+	b := &Builder{cfg: &config.Config{}, logger: zap.NewNop(), store: ms, publisher: &recordingPublisher{}}
+	before := bumpOutcomeSampleCount(t, "short_circuited")
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsgWithExpected(blockHash, []int{0})); err != nil {
+		t.Fatalf("handleMessage: %v", err)
+	}
+	if got := bumpOutcomeSampleCount(t, "short_circuited"); got != before+1 {
+		t.Fatalf("short_circuited samples = %d, want %d", got, before+1)
+	}
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if ms.blockProc[0].ProcessedAt == nil {
+		t.Fatal("a complete block must stay stamped")
+	}
+}
+
+// stampedShortCircuitFixture is a block whose BUMP is stored and whose
+// processed_at an earlier delivery stamped, with no retained STUMPs: the next
+// BLOCK_PROCESSED takes the short-circuit. The stored row is not yet MINED
+// (e.g. registered after the first build), so the re-mine has work to do.
+func stampedShortCircuitFixture(t *testing.T) *mockStore {
+	t.Helper()
+	ms := newMockStore()
+	compound, _, err := bump.BuildCompoundBUMP(
+		[]*models.Stump{{BlockHash: testBlockHash, SubtreeIndex: 0, StumpData: makeMinimalSTUMP(testTxidHex)}},
+		[]chainhash.Hash{mustHash(t, testTxidHex)}, nil, nil,
+	)
+	if err != nil {
+		t.Fatalf("BuildCompoundBUMP: %v", err)
+	}
+	ms.bumps[testBlockHash] = compound.Bytes()
+	ms.bumpHeights[testBlockHash] = uint64(compound.BlockHeight)
+	stampedBlock(ms, testBlockHash)
+	return ms
+}
+
+// On an already-stamped block, a short-circuit whose re-mine fails must take
+// the stamp off, or the watchdog never re-drives the block and the rows the
+// mine missed stay SEEN_*.
+func TestBuilder_ShortCircuit_StampedBlockMineFails_ClearsProcessedAt(t *testing.T) {
+	ms := stampedShortCircuitFixture(t)
+	ms.setMinedErr = errors.New("store down")
+	b := &Builder{cfg: &config.Config{}, logger: zap.NewNop(), store: ms, publisher: &recordingPublisher{}}
+
+	before := bumpOutcomeSampleCount(t, "store_failed")
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(testBlockHash)); err != nil {
+		t.Fatalf("a failed mine returns nil (the watchdog recovers), got %v", err)
+	}
+	if got := bumpOutcomeSampleCount(t, "store_failed"); got != before+1 {
+		t.Fatalf("store_failed samples = %d, want %d", got, before+1)
+	}
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if ms.blockProc[0].ProcessedAt != nil {
+		t.Fatal("processed_at must be cleared so the watchdog re-drives the block")
+	}
+}
+
+// On an already-stamped block, a short-circuit whose MINED publish fails must
+// take the stamp off too: left stamped, the next delivery reads the block as
+// finalized and filters the now-MINED rows out of the publish for good.
+func TestBuilder_ShortCircuit_StampedBlockPublishFails_ClearsProcessedAtAndRepublishes(t *testing.T) {
+	ms := stampedShortCircuitFixture(t)
+	b := &Builder{cfg: &config.Config{}, logger: zap.NewNop(), store: ms, publisher: &failingBulkPublisher{}}
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(testBlockHash)); err != nil {
+		t.Fatalf("handleMessage: %v", err)
+	}
+	ms.mu.Lock()
+	if ms.blockProc[0].ProcessedAt != nil {
+		ms.mu.Unlock()
+		t.Fatal("processed_at must be cleared after a failed MINED publish")
+	}
+	// The row is MINED in the store now; the watchdog's re-drive must still
+	// publish it.
+	ms.alreadyMined = map[string]string{testTxidHex: testBlockHash}
+	ms.mu.Unlock()
+
+	pub := &recordingPublisher{}
+	b.publisher = pub
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(testBlockHash)); err != nil {
+		t.Fatalf("re-drive: %v", err)
+	}
+	if emitted := pub.snapshot(); len(emitted) != 1 || emitted[0].TxID != testTxidHex {
+		t.Fatalf("the re-drive must republish the MINED row, got %+v", emitted)
+	}
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if ms.blockProc[0].ProcessedAt == nil {
+		t.Fatal("a successful re-drive re-stamps the block")
+	}
+}
+
+// If the stamp cannot be taken off, the message fails so Kafka retries
+// rather than committing a stamped block the watchdog will never re-drive.
+func TestBuilder_ShortCircuit_StampedBlockMineFails_ClearFailureFailsMessage(t *testing.T) {
+	ms := stampedShortCircuitFixture(t)
+	ms.setMinedErr = errors.New("store down")
+	ms.clearProcessedErr = errors.New("still down")
+	b := &Builder{cfg: &config.Config{}, logger: zap.NewNop(), store: ms, publisher: &recordingPublisher{}}
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(testBlockHash)); err == nil {
+		t.Fatal("a failed ClearBlockProcessed must fail the message")
+	}
+}
+
+// A rebuild waits the grace window even when the callback's expected index
+// set already looks complete: the index can be covered by the earlier
+// service's STUMP while the later service's own variant for it is still
+// retrying. Here subtree 0 is covered on arrival, so without the rebuild case
+// the builder would skip the window (finalized_complete_no_grace).
+func TestBuilder_HandleMessage_RebuildWaitsGraceEvenWhenExpectedSetComplete(t *testing.T) {
+	f := newMultiSourceFixture(t)
+	ctx := context.Background()
+	f.ms.addStump(f.blockHash, 0, f.variantA)
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsgWithExpected(f.blockHash, []int{0})); err != nil {
+		t.Fatalf("first build: %v", err)
+	}
+
+	const grace = 150 * time.Millisecond
+	f.b.cfg.BumpBuilder.GraceWindowMs = int(grace / time.Millisecond)
+	f.ms.addStump(f.blockHash, 0, f.variantB) // new leaves ⇒ rebuild; {0} already covered
+	waitsBefore := testutil.ToFloat64(metrics.BumpBuilderGraceWaitTotal)
+	noGraceBefore := bumpOutcomeSampleCount(t, "finalized_complete_no_grace")
+	start := time.Now()
+	if err := f.b.handleMessage(ctx, makeBlockProcessedMsgWithExpected(f.blockHash, []int{0})); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < grace {
+		t.Fatalf("rebuild returned after %v, before the %v grace window", elapsed, grace)
+	}
+	if got := testutil.ToFloat64(metrics.BumpBuilderGraceWaitTotal) - waitsBefore; got != 1 {
+		t.Fatalf("grace waits = %v, want 1", got)
+	}
+	if got := bumpOutcomeSampleCount(t, "finalized_complete_no_grace"); got != noGraceBefore {
+		t.Fatal("a rebuild must not take the complete-set fast path")
+	}
+	if got := f.storedLeafCount(t); got != 4 {
+		t.Fatalf("rebuilt BUMP leaves = %d, want 4", got)
 	}
 }

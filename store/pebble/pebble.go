@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -1293,16 +1294,17 @@ func (s *Store) InsertStump(ctx context.Context, stump *models.Stump) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	hash := stump.EnsureContentHash()
 	payload, err := json.Marshal(stump)
 	if err != nil {
 		return err
 	}
 	b := s.db.NewBatch()
 	defer func() { _ = b.Close() }()
-	if err := b.Set(stumpKey(stump.BlockHash, stump.SubtreeIndex), payload, nil); err != nil {
+	if err := b.Set(stumpKey(stump.BlockHash, stump.SubtreeIndex, hash), payload, nil); err != nil {
 		return err
 	}
-	if err := b.Set(idxStumpBlockKey(stump.BlockHash, stump.SubtreeIndex), nil, nil); err != nil {
+	if err := b.Set(idxStumpBlockKey(stump.BlockHash, stump.SubtreeIndex, hash), nil, nil); err != nil {
 		return err
 	}
 	return b.Commit(s.writeOpts)
@@ -1329,8 +1331,13 @@ func (s *Store) GetStumpsByBlockHash(ctx context.Context, blockHash string) ([]*
 		}
 		var st models.Stump
 		if err := json.Unmarshal(iter.Value(), &st); err != nil {
-			continue
+			// An unreadable row means the set is incomplete. Skipping it
+			// would let the bump-builder conclude a redelivery adds nothing
+			// and stamp a block it never fully built, so fail the read like
+			// the other backends do and let the caller retry.
+			return nil, fmt.Errorf("get stumps %s: decode %q: %w", blockHash, iter.Key(), err)
 		}
+		st.EnsureContentHash()
 		stumps = append(stumps, &st)
 	}
 	return stumps, nil
@@ -1494,6 +1501,94 @@ func (s *Store) MarkBlockProcessed(ctx context.Context, blockHash string, blockH
 		cur.HeaderSeenUnixNs = processedAt.UnixNano()
 	}
 	return s.writeBlockProc(prev, &cur)
+}
+
+// ClearBlockProcessed unsets processed_at on an existing row; a missing row
+// is a no-op.
+func (s *Store) ClearBlockProcessed(ctx context.Context, blockHash string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	mu := s.shardFor(blockHash)
+	mu.Lock()
+	defer mu.Unlock()
+
+	prev, err := s.readBlockProc(blockHash)
+	if err != nil || prev == nil {
+		return err
+	}
+	cur := *prev
+	cur.ProcessedUnixNs = 0
+	return s.writeBlockProc(prev, &cur)
+}
+
+// AddBlockExpectedSubtrees implements store.Store. Read-modify-write under
+// the block's shard lock; a missing block-processing row is a no-op.
+func (s *Store) AddBlockExpectedSubtrees(ctx context.Context, blockHash string, indices []int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(indices) == 0 {
+		return nil
+	}
+	mu := s.shardFor(blockHash)
+	mu.Lock()
+	defer mu.Unlock()
+
+	row, err := s.readBlockProc(blockHash)
+	if err != nil || row == nil {
+		return err
+	}
+	cur, err := s.readBlockExpected(blockHash)
+	if err != nil {
+		return err
+	}
+	merged := append(cur, indices...)
+	slices.Sort(merged)
+	merged = slices.Compact(merged)
+	payload, err := json.Marshal(merged)
+	if err != nil {
+		return err
+	}
+	return s.db.Set(blockExpectedKey(blockHash), payload, s.writeOpts)
+}
+
+// GetBlockExpectedSubtrees implements store.Store.
+func (s *Store) GetBlockExpectedSubtrees(ctx context.Context, blockHash string) ([]int, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.readBlockExpected(blockHash)
+}
+
+// ClearBlockExpectedSubtrees implements store.Store.
+func (s *Store) ClearBlockExpectedSubtrees(ctx context.Context, blockHash string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	mu := s.shardFor(blockHash)
+	mu.Lock()
+	defer mu.Unlock()
+	return s.db.Delete(blockExpectedKey(blockHash), s.writeOpts)
+}
+
+func (s *Store) readBlockExpected(blockHash string) ([]int, error) {
+	v, closer, err := s.db.Get(blockExpectedKey(blockHash))
+	if errors.Is(err, pebbledb.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get block expected subtrees %s: %w", blockHash, err)
+	}
+	defer func() { _ = closer.Close() }()
+	var out []int
+	if err := json.Unmarshal(v, &out); err != nil {
+		return nil, fmt.Errorf("unmarshal block expected subtrees %s: %w", blockHash, err)
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
 }
 
 func (s *Store) MarkBlockBUMPBuilt(ctx context.Context, blockHash string, blockHeight uint64, builtAt time.Time) error {
@@ -2007,23 +2102,35 @@ func (s *Store) DeleteStumpsByBlockHash(ctx context.Context, blockHash string) e
 		return err
 	}
 
-	var toDelete []*models.Stump
+	// Delete the keys as found rather than recomputing them: rows written
+	// before content addressing carry the old two-part key, and a block's
+	// rows must all go regardless of which layout wrote them.
+	var toDelete [][]byte
 	for iter.First(); iter.Valid(); iter.Next() {
-		var st models.Stump
-		if err := json.Unmarshal(iter.Value(), &st); err != nil {
-			continue
-		}
-		toDelete = append(toDelete, &st)
+		toDelete = append(toDelete, append([]byte(nil), iter.Key()...))
 	}
-	if err := iter.Close(); err != nil {
+	if cerr := iter.Close(); cerr != nil {
+		return cerr
+	}
+	idxPrefix := idxStumpBlockPrefix(blockHash)
+	idxIter, err := s.db.NewIter(&pebbledb.IterOptions{
+		LowerBound: idxPrefix,
+		UpperBound: endOfPrefix(idxPrefix),
+	})
+	if err != nil {
 		return err
+	}
+	for idxIter.First(); idxIter.Valid(); idxIter.Next() {
+		toDelete = append(toDelete, append([]byte(nil), idxIter.Key()...))
+	}
+	if cerr := idxIter.Close(); cerr != nil {
+		return cerr
 	}
 
 	b := s.db.NewBatch()
 	defer func() { _ = b.Close() }()
-	for _, st := range toDelete {
-		_ = b.Delete(stumpKey(st.BlockHash, st.SubtreeIndex), nil)
-		_ = b.Delete(idxStumpBlockKey(st.BlockHash, st.SubtreeIndex), nil)
+	for _, key := range toDelete {
+		_ = b.Delete(key, nil)
 	}
 	return b.Commit(s.writeOpts)
 }

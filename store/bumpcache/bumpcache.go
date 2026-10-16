@@ -14,6 +14,7 @@ package bumpcache
 
 import (
 	"sync"
+	"time"
 
 	"github.com/hashicorp/golang-lru/v2/simplelru"
 	"golang.org/x/sync/singleflight"
@@ -33,6 +34,14 @@ const maxEntries = 16
 // fan-out must be able to reuse one parse, and one resident compound is the
 // floor the process pays anyway while serving it.
 const maxTotalLeaves = 512 * 1024
+
+// refreshInterval bounds how often a block's cached index is re-fetched
+// because a lookup missed a leaf (see pathFor).
+const refreshInterval = 5 * time.Second
+
+// maxRefreshTracked bounds the per-block refresh timestamps kept for that
+// throttle.
+const maxRefreshTracked = 256
 
 // Cache is a bounded, singleflight-guarded cache of bump.CompoundIndex per
 // block hash. The zero value is not usable; construct with New.
@@ -69,6 +78,12 @@ type Cache struct {
 	// leaving the cache permanently empty exactly when it is load-bearing.
 	gen      map[string]uint64
 	inflight map[string]int
+
+	// refreshed records when a block's index was last re-fetched for a
+	// missing leaf, so a txid that is legitimately not in the block cannot
+	// turn every lookup into a fetch. Guarded by mu.
+	refreshed *simplelru.LRU[string, time.Time]
+	now       func() time.Time
 }
 
 // New constructs an empty cache with the package's production bounds.
@@ -79,10 +94,16 @@ func New() *Cache {
 // newWithLimits is the constructor proper, split out so tests can exercise
 // eviction without building half-million-leaf compounds.
 func newWithLimits(entries, leaves int) *Cache {
+	refreshed, err := simplelru.NewLRU[string, time.Time](maxRefreshTracked, nil)
+	if err != nil {
+		panic(err) // unreachable: positive constant size
+	}
 	c := &Cache{
 		maxLeaves: leaves,
 		gen:       make(map[string]uint64),
 		inflight:  make(map[string]int),
+		refreshed: refreshed,
+		now:       time.Now,
 	}
 	l, err := simplelru.NewLRU(entries, func(_ string, v *bump.CompoundIndex) {
 		c.totalLeaves -= v.Leaves()
@@ -109,11 +130,7 @@ func (c *Cache) Enrich(status *models.TransactionStatus, fetch func() ([]byte, e
 	if status.Status != models.StatusMined && status.Status != models.StatusImmutable {
 		return
 	}
-	idx := c.index(status.BlockHash, fetch)
-	if idx == nil {
-		return
-	}
-	status.MerklePath = idx.MinimalPathBytes(status.TxID)
+	status.MerklePath = c.pathFor(status.BlockHash, status.TxID, fetch)
 }
 
 // MinimalPath returns txid's BRC-74 minimal path from blockHash's compound
@@ -126,11 +143,49 @@ func (c *Cache) MinimalPath(blockHash, txid string, fetch func() ([]byte, error)
 	if blockHash == "" || txid == "" {
 		return nil
 	}
-	idx := c.index(blockHash, fetch)
+	return c.pathFor(blockHash, txid, fetch)
+}
+
+// pathFor extracts txid's minimal path from blockHash's index. A cached
+// index that lacks the leaf may be stale rather than final: a bump-builder
+// rebuild (a later merkle-service's STUMPs adding leaves) overwrites the
+// stored compound, and InsertBUMP only invalidates the WRITER's cache. Every
+// other process keeps serving the earlier compound, so a newly covered tx
+// would stay MINED without a proof until eviction. So a miss on a cached
+// index drops it and reads the store once more, at most once per block per
+// refreshInterval so an absent txid cannot turn into a fetch per lookup.
+func (c *Cache) pathFor(blockHash, txid string, fetch func() ([]byte, error)) []byte {
+	idx, cached := c.lookup(blockHash)
+	if !cached {
+		idx = c.index(blockHash, fetch)
+	}
 	if idx == nil {
 		return nil
 	}
+	if path := idx.MinimalPathBytes(txid); path != nil || !cached {
+		return path
+	}
+	if !c.claimRefresh(blockHash) {
+		return nil
+	}
+	c.Remove(blockHash)
+	if idx = c.index(blockHash, fetch); idx == nil {
+		return nil
+	}
 	return idx.MinimalPathBytes(txid)
+}
+
+// claimRefresh reports whether blockHash may be re-fetched for a missing
+// leaf now, and if so records the attempt.
+func (c *Cache) claimRefresh(blockHash string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := c.now()
+	if last, ok := c.refreshed.Get(blockHash); ok && now.Sub(last) < refreshInterval {
+		return false
+	}
+	c.refreshed.Add(blockHash, now)
+	return true
 }
 
 // Remove invalidates a block's cached index. Called by InsertBUMP: a rebuild

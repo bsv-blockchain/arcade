@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"time"
 
@@ -329,7 +330,8 @@ func (b *Builder) handleAnchorDenied(ctx context.Context, logger *zap.Logger, bl
 // result of blockFinalized, read before it touches the block: processed_at
 // is stamped only after the publish, so a stamped block's MINED rows were
 // published, and an unstamped one is republished in full (a duplicate event
-// beats a lost one). The short-circuit passes false; see tryShortCircuit.
+// beats a lost one). The short-circuit passes it too, which is safe because
+// it un-stamps the block when its mine or publish fails (see shortCircuit).
 //
 // That only holds if a failed publish also withholds the stamp, so a
 // PublishBulk failure reports false like a partial store write: the block
@@ -577,12 +579,13 @@ func (b *Builder) Start(ctx context.Context) error {
 		zap.Int("grace_window_ms", b.cfg.BumpBuilder.GraceWindowMs),
 	)
 
-	// One-shot startup janitor: drop orphan STUMPs left behind by blocks
-	// whose BUMP build already succeeded (bump_built_at IS NOT NULL). The
-	// happy-path DeleteStumpsByBlockHash at the end of handleMessage is
-	// best-effort — any transient store error there leaves orphans that
-	// never get cleaned up by the normal flow.
-	go b.pruneOrphanStumps(ctx)
+	// STUMP janitor: drops STUMP rows of blocks whose BUMP was built more
+	// than bump_builder.stump_retention_minutes ago. The build path no
+	// longer prunes right away — every merkle-service delivers its own
+	// STUMP set and a later BLOCK_PROCESSED re-reads the full set to decide
+	// whether it adds leaves — so retention is what bounds the stumps table.
+	// Runs once at startup and then periodically.
+	go b.runStumpJanitor(ctx)
 
 	// Readiness: the consumer group is constructed (brokers reachable); Run
 	// blocks until shutdown, so the signal precedes the actual group join
@@ -592,10 +595,51 @@ func (b *Builder) Start(ctx context.Context) error {
 	return consumer.Run(ctx)
 }
 
+// defaultStumpRetention is used when bump_builder.stump_retention_minutes
+// is unset.
+const defaultStumpRetention = 60 * time.Minute
+
+// stumpRetention is how long a block's STUMPs outlive its BUMP build.
+func (b *Builder) stumpRetention() time.Duration {
+	if m := b.cfg.BumpBuilder.StumpRetentionMinutes; m > 0 {
+		return time.Duration(m) * time.Minute
+	}
+	return defaultStumpRetention
+}
+
+// runStumpJanitor runs pruneOrphanStumps at startup and then every quarter
+// of the retention window (at least once a minute) until ctx is canceled.
+func (b *Builder) runStumpJanitor(ctx context.Context) {
+	b.pruneOrphanStumps(ctx)
+	interval := b.stumpRetention() / 4
+	if interval < time.Minute {
+		interval = time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			b.pruneOrphanStumps(ctx)
+		}
+	}
+}
+
 // pruneOrphanStumps walks the most recent block_processing rows and deletes
-// STUMP rows for any block that already has bump_built_at set. Bounded by
-// the watchdog's recency window so a long-running deployment doesn't
-// repeatedly scan ancient history. Runs once at startup and exits.
+// STUMP rows for any block whose bump_built_at is older than the retention
+// window.
+//
+// Eligibility is by bump_built_at age while the walk is by height, so the
+// horizon has to cover every block that may still be inside the retention
+// window: the walk continues past the watchdog's recency depth while the
+// page just read holds a built row younger than retention or a row whose
+// header was seen within retention plus an hour of slack. Only once a page
+// below the depth has neither does the walk stop, which keeps a long-running
+// deployment from scanning ancient history every tick. A block built by a
+// late /reprocess long after its header was seen and already below that
+// horizon is the residual case and leaks a few STUMP rows at most.
 //
 // This catches the "happy-path delete failed transiently" orphan case. The
 // "perma-failure" case (BUMP build never validates, stumps stuck forever
@@ -624,9 +668,14 @@ func (b *Builder) pruneOrphanStumps(ctx context.Context) {
 
 	const pageSize = 200
 	var (
-		cursor  = tip + 1 // exclusive upper bound; first page starts strictly below tip+1
-		scanned int
-		pruned  int
+		cursor    = tip + 1 // exclusive upper bound; first page starts strictly below tip+1
+		scanned   int
+		pruned    int
+		now       = time.Now()
+		retention = b.stumpRetention()
+		// timeHorizon is the oldest header_seen_at a page may hold before
+		// the walk is allowed to stop below the recency depth.
+		timeHorizon = now.Add(-retention - time.Hour)
 	)
 	for {
 		if err := ctx.Err(); err != nil {
@@ -644,9 +693,24 @@ func (b *Builder) pruneOrphanStumps(ctx context.Context) {
 		if len(rows) == 0 {
 			break
 		}
+		pageMayHoldRetained := false
 		for _, r := range rows {
 			scanned++
+			if r.HeaderSeenAt.After(timeHorizon) {
+				pageMayHoldRetained = true
+			}
 			if r.BUMPBuiltAt == nil {
+				continue
+			}
+			// An un-stamped block is still being driven: deferred by a later
+			// delivery, or mid re-drive by the watchdog, whose /reprocess
+			// re-sends STUMPs the next build needs. bump_built_at can be old
+			// by then, so its age alone is no reason to prune.
+			if r.ProcessedAt == nil {
+				continue
+			}
+			if now.Sub(*r.BUMPBuiltAt) < retention {
+				pageMayHoldRetained = true
 				continue
 			}
 			// Idempotent: no-op when there are no stumps for the block.
@@ -660,9 +724,10 @@ func (b *Builder) pruneOrphanStumps(ctx context.Context) {
 			}
 			pruned++
 		}
-		// Stop when we've stepped outside the recency window.
+		// Stop once we are below the recency window AND this page holds
+		// nothing that may still be inside the retention window.
 		oldest := rows[len(rows)-1]
-		if tip > depth && oldest.BlockHeight <= tip-depth {
+		if tip > depth && oldest.BlockHeight <= tip-depth && !pageMayHoldRetained {
 			break
 		}
 		// Advance the keyset cursor strictly below the oldest row we saw.
@@ -687,6 +752,10 @@ func (b *Builder) Stop() error {
 	}
 	return nil
 }
+
+// buildOutcomeStoreFailed is the BumpBuilderBuildDuration outcome for a
+// BLOCK_PROCESSED that could not finish because a store read or write failed.
+const buildOutcomeStoreFailed = "store_failed"
 
 func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	overallStart := time.Now()
@@ -717,19 +786,38 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 
 	logger := telemetry.LoggerWith(ctx, b.logger.With(logfields.BlockHash(blockHash)))
 
-	// Short-circuit: if a compound BUMP already exists for this block, skip
-	// the datahub fetch + recompute path entirely. See tryShortCircuit for
-	// the full contract.
-	if handled, mineFailed := b.tryShortCircuit(ctx, logger, blockHash); handled {
-		// A stored BUMP means the rebuild was skipped. A failed mine on
-		// that path is still a persistence failure: record store_failed,
-		// not the benign short_circuited label. processed_at stays unset
-		// inside tryShortCircuit so the watchdog can re-drive.
-		if mineFailed {
-			outcome = "store_failed"
-		} else {
-			outcome = "short_circuited"
-		}
+	// A stored compound BUMP means this BLOCK_PROCESSED is a redelivery:
+	// another merkle-service's copy, a watchdog /reprocess, or a DLQ
+	// redrive. Every merkle-service builds its STUMPs from the txids IT has
+	// registrations for, so a redelivery may carry leaves the stored BUMP
+	// lacks (a service that was down while those txs were registered has a
+	// smaller set; the one that was up has the larger one). Compare the
+	// retained STUMP set against the stored BUMP: nothing new ⇒ short-circuit
+	// (re-mine idempotently, re-stamp, publish nothing already MINED);
+	// new leaves ⇒ fall through and rebuild from the full set.
+	// Each merkle-service announces only the subtrees IT tracks, so judge
+	// completeness against every index an earlier, deferred delivery
+	// announced too. Otherwise a later delivery with a smaller set (another
+	// service's duplicate, or its own watchdog re-drive) could stamp a block
+	// that is still owed a STUMP.
+	if err := b.widenExpectedSubtrees(ctx, &callback); err != nil {
+		outcome = buildOutcomeStoreFailed
+		return err
+	}
+
+	storedLeaves, handledOutcome, err := b.handleRedelivery(ctx, logger, &callback)
+	if err != nil {
+		// A redelivery whose stored BUMP or STUMP set cannot be read must
+		// not short-circuit or rebuild: re-mining the stored BUMP and
+		// re-stamping processed_at would retire a block this delivery may
+		// have added leaves to, and rebuilding without the stored leaves
+		// skips the no-drop check. Fail the message so Kafka redelivers it
+		// once the store answers.
+		outcome = buildOutcomeStoreFailed
+		return fmt.Errorf("reading stored BUMP/STUMPs on redelivery: %w", err)
+	}
+	if handledOutcome != "" {
+		outcome = handledOutcome
 		return nil
 	}
 
@@ -741,7 +829,7 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	// already complete (or provably empty) finalizes immediately instead of
 	// burning the window. Only an unverifiable set still waits + re-reads.
 	// See resolveStumps for the full contract.
-	stumps, disposition, done, err := b.resolveStumps(ctx, logger, &callback)
+	stumps, disposition, done, err := b.resolveStumps(ctx, logger, &callback, storedLeaves != nil)
 	if err != nil {
 		outcome = disposition
 		return err
@@ -825,16 +913,57 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 		return fmt.Errorf("compound BUMP root mismatch for block %s: %w", blockHash, err)
 	}
 
-	// 5. Store compound BUMP as binary
-	if err := b.store.InsertBUMP(ctx, blockHash, blockHeight, bumpBytes); err != nil {
-		outcome = "store_failed"
-		return fmt.Errorf("storing BUMP: %w", err)
+	// 5. Store compound BUMP as binary. On a rebuild the new compound must
+	// cover every leaf of the stored one: overwriting with a smaller set
+	// would silently drop proofs. That is only reachable if the janitor
+	// pruned the first service's STUMPs before this redelivery arrived, and
+	// the fix is the same as for an incomplete expected set — hand the block
+	// back to the watchdog, whose /reprocess fans out to every merkle-service.
+	if storedLeaves != nil {
+		// Compound against compound: txids comes from the STUMPs and still
+		// carries the coinbase placeholder at subtree 0 offset 0, while the
+		// stored BUMP (like this compound) has the real coinbase txid there.
+		if dropped := leavesNotIn(storedLeaves, compoundLeaves(compound)); dropped > 0 {
+			logger.Error(
+				"rebuilt compound would drop leaves of the stored BUMP; keeping the stored BUMP and deferring to the watchdog",
+				zap.Int("dropped_leaves", dropped),
+				zap.Int("rebuilt_leaves", len(txids)),
+			)
+			if err := b.deferIncompleteBlock(ctx, logger, blockHash, callback.ExpectedSubtreeIndices); err != nil {
+				outcome = buildOutcomeStoreFailed
+				return err
+			}
+			outcome = "deferred_incomplete"
+			return nil
+		}
+	}
+	// A rebuild of a block an earlier build finalized takes the old stamp
+	// off before touching the BUMP. Until the expanded set is mined in full,
+	// the block must stay visible to the watchdog's stale scan: if the mine
+	// below fails or partially lands, or the process dies between the
+	// overwrite and the mine, the newly covered txs have no other way back.
+	// The stamp goes back on below, only once the mine landed.
+	if storedLeaves != nil && finalized {
+		if err := b.store.ClearBlockProcessed(ctx, blockHash); err != nil {
+			outcome = buildOutcomeStoreFailed
+			return fmt.Errorf("clearing processed_at before rebuild: %w", err)
+		}
 	}
 
-	// Observability-only: record bump_built_at on the block-processing row.
-	// Failure here must not block the MINED status updates downstream.
+	// bump_built_at is the STUMP janitor's retention basis, so it is written
+	// before the BUMP and a failure fails the message. Written after, a
+	// failed first write would leave the block's STUMPs ineligible forever,
+	// and on a rebuild the Kafka retry would short-circuit (the expanded
+	// BUMP already covers every retained leaf) and never refresh the old
+	// timestamp, making the STUMPs eligible for pruning straight away. If
+	// InsertBUMP fails after this, the retry rewrites both.
 	if err := b.store.MarkBlockBUMPBuilt(ctx, blockHash, blockHeight, time.Now()); err != nil {
-		logger.Warn("failed to record bump_built status", zap.Error(err))
+		outcome = buildOutcomeStoreFailed
+		return fmt.Errorf("recording bump_built_at: %w", err)
+	}
+	if err := b.store.InsertBUMP(ctx, blockHash, blockHeight, bumpBytes); err != nil {
+		outcome = buildOutcomeStoreFailed
+		return fmt.Errorf("storing BUMP: %w", err)
 	}
 
 	// 6. Set tracked transactions to MINED — unless the anchor guard has
@@ -880,9 +1009,13 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	// txids. Withholding the stamp is the retry signal — the watchdog re-fires
 	// BLOCK_PROCESSED, tryShortCircuit re-mines the stored BUMP's full level-0
 	// set (idempotent: rows already MINED here are a no-op), and stamps.
-	if minedComplete {
+	switch {
+	case minedComplete && storedLeaves != nil:
 		b.markBlockProcessed(ctx, logger, blockHash, blockHeight)
-	} else {
+		outcome = "rebuilt"
+	case minedComplete:
+		b.markBlockProcessed(ctx, logger, blockHash, blockHeight)
+	default:
 		// Not a terminal lifecycle success. The histogram must not keep
 		// the benign build disposition (finalized_complete_no_grace or
 		// grace_waited): those labels mean the block finished. store_failed
@@ -890,7 +1023,7 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 		// ListStaleBlockProcessingStatus (processed_at IS NULL, status
 		// active, header already seen) still returns this block and the
 		// watchdog re-drives it via /reprocess. The stored BUMP is what
-		// that re-drive mines; tryShortCircuit is idempotent for rows
+		// that re-drive mines; shortCircuit is idempotent for rows
 		// already MINED.
 		//
 		// Kafka redelivery is not that recovery path. This handler returns
@@ -898,7 +1031,7 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 		// handler returns nil. Returning the SetMined error would retry
 		// and then dead-letter a message that cannot finish until the
 		// watchdog re-drives the block.
-		outcome = "store_failed"
+		outcome = buildOutcomeStoreFailed
 		logger.Warn(
 			"SetMinedByTxIDs did not complete; leaving processed_at unset so the watchdog can re-drive this block",
 			logfields.BlockHash(blockHash),
@@ -907,16 +1040,216 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 		)
 	}
 
-	// 8. Prune STUMPs
-	if err := b.store.DeleteStumpsByBlockHash(ctx, blockHash); err != nil {
-		logger.Warn("failed to clean up STUMPs", zap.Error(err))
-	}
-
+	// STUMPs are NOT pruned here. Every configured merkle-service delivers
+	// its own STUMP set for the block, and the next BLOCK_PROCESSED decides
+	// whether it adds leaves by re-reading the full retained set (see the
+	// top of this function). The janitor deletes them once the BUMP is older
+	// than bump_builder.stump_retention_minutes.
 	logger.Info(
 		"BUMP built successfully",
 		zap.Int("level0_count", len(txids)),
-		zap.Int("stumps_pruned", len(stumps)),
+		zap.Int("stump_count", len(stumps)),
+		zap.Bool("rebuilt", storedLeaves != nil),
 	)
+	return nil
+}
+
+// handleRedelivery decides what a BLOCK_PROCESSED for a block that already
+// has a compound BUMP means. It returns a non-empty outcome when the
+// delivery was fully handled by the short-circuit (nothing new; the stored
+// level-0 set was re-mined and the block re-stamped), or the stored BUMP's
+// leaf set when the caller must go through resolveStumps as a rebuild: the
+// retained STUMPs add leaves, or the callback expects a subtree index with
+// no retained STUMP yet. Both are nil/"" when no BUMP exists yet. A read
+// failure is returned as an error: without the stored BUMP and the STUMP set
+// there is no telling whether this delivery adds leaves, so neither path may
+// run.
+func (b *Builder) handleRedelivery(ctx context.Context, logger *zap.Logger, callback *models.CallbackMessage) (storedLeaves map[string]struct{}, outcome string, err error) {
+	blockHash := callback.BlockHash
+	height, storedTxIDs, ok, err := b.loadStoredBUMP(ctx, logger, blockHash)
+	if err != nil || !ok {
+		return nil, "", err
+	}
+	stumps, err := b.store.GetStumpsByBlockHash(ctx, blockHash)
+	if err != nil {
+		return nil, "", err
+	}
+	newLeaves, err := leavesBeyondStoredBUMP(stumps, storedTxIDs)
+	if err != nil {
+		return nil, "", err
+	}
+	// Nothing new retained is not the same as nothing new coming: this
+	// service may expect a subtree whose STUMP is still retrying. The
+	// short-circuit would re-stamp the block and retire it from the
+	// watchdog, so such a delivery takes the rebuild path instead, whose
+	// grace window and completeness gate defer the block if the STUMP does
+	// not show up.
+	//
+	// Only while STUMPs are retained, though: once the janitor has pruned
+	// them (the block was finalized long enough ago), every index would read
+	// as missing and a plain redelivery (Kafka retry, DLQ redrive) would
+	// un-stamp a complete block.
+	var missing []int
+	if len(stumps) > 0 {
+		missing = missingStumpIndices(callback.ExpectedSubtreeIndices, stumps)
+	}
+	if len(newLeaves) == 0 && len(missing) == 0 {
+		// A failed mine on this path is still a persistence failure:
+		// record store_failed, not the benign short_circuited label.
+		// shortCircuit leaves the block un-stamped (clearing an earlier
+		// stamp) so the watchdog can re-drive; a failure to clear is
+		// returned and fails the message.
+		mineFailed, err := b.shortCircuit(ctx, logger, blockHash, height, storedTxIDs)
+		if err != nil {
+			return nil, buildOutcomeStoreFailed, err
+		}
+		if mineFailed {
+			return nil, buildOutcomeStoreFailed, nil
+		}
+		return nil, "short_circuited", nil
+	}
+	if len(newLeaves) > 0 {
+		logger.Info(
+			"redelivered STUMP set carries leaves the stored BUMP lacks; rebuilding the compound",
+			zap.Int("new_leaves", len(newLeaves)),
+			zap.Int("stored_leaves", len(storedTxIDs)),
+		)
+	} else {
+		logger.Info(
+			"redelivery expects STUMPs that are not retained yet; checking completeness before re-stamping",
+			zap.Ints("missing_subtree_indices", missing),
+			zap.Int("stored_leaves", len(storedTxIDs)),
+		)
+	}
+	storedLeaves = make(map[string]struct{}, len(storedTxIDs))
+	for _, txid := range storedTxIDs {
+		storedLeaves[txid] = struct{}{}
+	}
+	return storedLeaves, "", nil
+}
+
+// compoundLeaves lists the level-0 hashes of a built compound BUMP, the same
+// set levelZeroTxidsFromBUMP reads back from a stored one.
+func compoundLeaves(compound *transaction.MerklePath) []string {
+	if len(compound.Path) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(compound.Path[0]))
+	for _, elem := range compound.Path[0] {
+		if elem.Hash != nil {
+			out = append(out, elem.Hash.String())
+		}
+	}
+	return out
+}
+
+// leavesNotIn counts the stored leaves that txids does not cover.
+func leavesNotIn(stored map[string]struct{}, txids []string) int {
+	have := make(map[string]struct{}, len(txids))
+	for _, txid := range txids {
+		have[txid] = struct{}{}
+	}
+	missing := 0
+	for txid := range stored {
+		if _, ok := have[txid]; !ok {
+			missing++
+		}
+	}
+	return missing
+}
+
+// leavesBeyondStoredBUMP returns the level-0 hashes present in the block's
+// retained STUMPs that the stored BUMP does not cover. Empty means the
+// retained set carries nothing new.
+func leavesBeyondStoredBUMP(stumps []*models.Stump, storedTxIDs []string) ([]string, error) {
+	have := make(map[string]struct{}, len(storedTxIDs))
+	for _, txid := range storedTxIDs {
+		have[txid] = struct{}{}
+	}
+	seen := make(map[string]struct{})
+	var missing []string
+	for _, st := range stumps {
+		mp, perr := transaction.NewMerklePathFromBinary(st.StumpData)
+		if perr != nil || len(mp.Path) == 0 {
+			// Reading an unparseable STUMP as "adds nothing" would let the
+			// short-circuit stamp a block it never built from it. Fail the
+			// message instead, as the build path does for the same STUMP.
+			return nil, fmt.Errorf("stored STUMP for subtree %d does not parse: %w", st.SubtreeIndex, errors.Join(perr, errEmptyMerklePath(mp)))
+		}
+		for _, leaf := range mp.Path[0] {
+			// Subtree 0 offset 0 is the coinbase slot: every STUMP carries
+			// the placeholder there while the stored compound carries the
+			// real coinbase txid, and arcade never tracks a coinbase. Counting
+			// it would turn every identical redelivery into a rebuild.
+			if leaf.Hash == nil || (st.SubtreeIndex == 0 && leaf.Offset == 0) {
+				continue
+			}
+			txid := leaf.Hash.String()
+			if _, ok := have[txid]; ok {
+				continue
+			}
+			if _, dup := seen[txid]; dup {
+				continue
+			}
+			seen[txid] = struct{}{}
+			missing = append(missing, txid)
+		}
+	}
+	return missing, nil
+}
+
+// errEmptyMerklePath reports a STUMP that parsed but has no levels.
+func errEmptyMerklePath(mp *transaction.MerklePath) error {
+	if mp != nil && len(mp.Path) == 0 {
+		return errors.New("empty merkle path")
+	}
+	return nil
+}
+
+// deferIncompleteBlock leaves a block un-finalized for the watchdog. It
+// retains this delivery's expected-subtree set first, so whichever delivery
+// comes next (in any order) is held to it, then takes off any stamp an
+// earlier build left. A failed write is returned and callers fail the Kafka
+// message: committing it could let the block be finalized while it is still
+// owed a STUMP.
+func (b *Builder) deferIncompleteBlock(ctx context.Context, logger *zap.Logger, blockHash string, expected []int) error {
+	if err := b.store.AddBlockExpectedSubtrees(ctx, blockHash, expected); err != nil {
+		return fmt.Errorf("retaining expected subtrees for deferred block: %w", err)
+	}
+	return b.deferStampedBlock(ctx, logger, blockHash, "an earlier build finalized this block but a later STUMP set is incomplete")
+}
+
+// deferStampedBlock hands a block back to the watchdog after an earlier
+// build already finalized it. With several merkle-services the first
+// service's BLOCK_PROCESSED builds and stamps processed_at; if a later
+// service's delivery then proves incomplete (its expected STUMP set is not
+// satisfied, or a rebuild would drop leaves), or a short-circuit's re-mine or
+// MINED publish does not land, the stamp must come off, or
+// ListStaleBlockProcessingStatus never surfaces the block and the txs only
+// that service tracked stay SEEN_* forever. The watchdog's /reprocess fans
+// out to every merkle-service, so the re-drive carries every variant.
+//
+// A store failure is returned, and callers fail the Kafka message on it:
+// committing the message with the old stamp still set would leave the block
+// known-incomplete and invisible to the watchdog, the exact gap this helper
+// closes. A missing row is a no-op (nothing is stamped).
+//
+// reason completes the log line: why the stamp is coming off.
+func (b *Builder) deferStampedBlock(ctx context.Context, logger *zap.Logger, blockHash, reason string) error {
+	row, err := b.store.GetBlockProcessingStatus(ctx, blockHash)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("reading block_processing for deferral: %w", err)
+	}
+	if row.ProcessedAt == nil {
+		return nil
+	}
+	if err := b.store.ClearBlockProcessed(ctx, blockHash); err != nil {
+		return fmt.Errorf("clearing processed_at on deferred block: %w", err)
+	}
+	logger.Warn("cleared processed_at; the watchdog will re-drive this block via /reprocess", zap.String("reason", reason))
 	return nil
 }
 
@@ -948,16 +1281,25 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 // return nil; otherwise it is the benign label the successful build lands
 // under. BumpBuilderStumpCount is observed exactly once per message, on the
 // STUMP set that reaches the decision.
-func (b *Builder) resolveStumps(ctx context.Context, logger *zap.Logger, callback *models.CallbackMessage) (stumps []*models.Stump, disposition string, done bool, err error) {
+//
+// rebuild is set when a compound BUMP already exists and the redelivery adds
+// leaves. The expected set then names subtree indices, not which
+// merkle-service's variant satisfies them: an index can be covered by the
+// earlier service's STUMP while the later service's own variant for it is
+// still retrying. So a rebuild always waits the grace window before reading
+// the set it builds from, even when the index set already looks complete.
+func (b *Builder) resolveStumps(ctx context.Context, logger *zap.Logger, callback *models.CallbackMessage, rebuild bool) (stumps []*models.Stump, disposition string, done bool, err error) {
 	blockHash := callback.BlockHash
 	expected := callback.ExpectedSubtreeIndices
 
 	stumps, err = b.store.GetStumpsByBlockHash(ctx, blockHash)
 	if err != nil {
-		return nil, "store_failed", false, fmt.Errorf("getting STUMPs for block: %w", err)
+		return nil, buildOutcomeStoreFailed, false, fmt.Errorf("getting STUMPs for block: %w", err)
 	}
 
 	switch {
+	case rebuild:
+		// Fall through to the grace window below.
 	case len(expected) > 0 && len(missingStumpIndices(expected, stumps)) == 0:
 		// Complete: every subtree index merkle told us to expect already has
 		// a stored STUMP — there is nothing left to wait for.
@@ -981,7 +1323,7 @@ func (b *Builder) resolveStumps(ctx context.Context, logger *zap.Logger, callbac
 	// set to verify against): completeness cannot be established from the
 	// first read, so the grace window is still the only defense against late
 	// STUMP retries.
-	if len(expected) == 0 {
+	if len(expected) == 0 && !rebuild {
 		logger.Warn(
 			"BLOCK_PROCESSED lacks expected-STUMP set but STUMPs exist — cannot verify completeness; waiting grace window",
 			zap.Int("received_stumps", len(stumps)),
@@ -998,7 +1340,7 @@ func (b *Builder) resolveStumps(ctx context.Context, logger *zap.Logger, callbac
 		// Re-read: catching late arrivals is the whole point of the wait.
 		stumps, err = b.store.GetStumpsByBlockHash(ctx, blockHash)
 		if err != nil {
-			return nil, "store_failed", false, fmt.Errorf("getting STUMPs for block: %w", err)
+			return nil, buildOutcomeStoreFailed, false, fmt.Errorf("getting STUMPs for block: %w", err)
 		}
 	}
 
@@ -1019,6 +1361,9 @@ func (b *Builder) resolveStumps(ctx context.Context, logger *zap.Logger, callbac
 			zap.Int("expected_stumps", len(expected)),
 			zap.Int("received_stumps", len(stumps)),
 		)
+		if derr := b.deferIncompleteBlock(ctx, logger, blockHash, expected); derr != nil {
+			return nil, buildOutcomeStoreFailed, false, derr
+		}
 		return nil, "deferred_incomplete", true, nil
 	}
 
@@ -1162,35 +1507,31 @@ func callbackBlockData(callback *models.CallbackMessage, minSubtrees int, logger
 	return hashes, []byte(callback.CoinbaseBUMP), root, true
 }
 
-// tryShortCircuit attempts the BUMP-already-exists redelivery path.
-// handled is true when the short-circuit consumed the message and the
-// caller must not rebuild. mineFailed is true only when handled is true
-// and SetMinedByTxIDs did not complete: the caller records store_failed,
-// and processed_at is left unset so the watchdog can re-drive. A denied
-// anchor is handled but not a mine failure.
-//
-// Returns handled=false when no usable BUMP exists and the caller should
-// fall through to the normal rebuild.
-//
-// Errors at the store-read step (not-found, etc.) are intentionally
-// swallowed — they're indistinguishable from "no BUMP" and we want the
-// rebuild path to handle both. A parseErr on a corrupt stored BUMP is
-// logged so operators can see the divergence; the rebuild still proceeds.
-//
-// Extracted from processBlockProcessed to reduce nesting depth (nestif).
-// The short-circuit is exercised on /reprocess redeliveries of
-// BLOCK_PROCESSED — typical case is the watchdog re-firing after a missed
-// callback. The SetMinedByTxIDs UPDATE is idempotent so repeated calls are
-// safe; the value is letting a tx registered after the original build still
-// get marked MINED on the redelivery.
-func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, blockHash string) (handled bool, mineFailed bool) {
+// Redelivery path: a BLOCK_PROCESSED for a block whose compound BUMP is
+// already stored (another merkle-service's copy, a watchdog /reprocess, a
+// DLQ redrive). handleRedelivery decides between shortCircuit (nothing new)
+// and a rebuild (the retained STUMPs add leaves). shortCircuit's
+// SetMinedByTxIDs is idempotent, so repeated calls are safe; its value is
+// letting a tx registered after the original build still get marked MINED,
+// and re-stamping processed_at on a block whose first stamp never landed.
+// loadStoredBUMP reads and parses the block's stored compound BUMP. ok is
+// false when there is none, or when the stored bytes are empty or do not
+// parse (a corrupt BUMP is rebuilt rather than pinning the block); the caller
+// then takes the full build path. Any other read failure is returned: an
+// unanswered read is not proof of absence, and treating it as such would
+// rebuild from whatever STUMPs are still retained and overwrite a complete
+// BUMP without the no-drop check.
+func (b *Builder) loadStoredBUMP(ctx context.Context, logger *zap.Logger, blockHash string) (height uint64, txids []string, ok bool, err error) {
 	existingHeight, bumpBytes, getErr := b.store.GetBUMP(ctx, blockHash)
+	if errors.Is(getErr, store.ErrNotFound) {
+		return 0, nil, false, nil
+	}
 	if getErr != nil {
-		// not-found / transient store error — fall through to rebuild
-		return false, false
+		return 0, nil, false, fmt.Errorf("reading stored BUMP: %w", getErr)
 	}
 	if len(bumpBytes) == 0 {
-		return false, false
+		logger.Warn("stored BUMP is empty on redelivery — rebuilding")
+		return 0, nil, false, nil
 	}
 	txids, parseErr := levelZeroTxidsFromBUMP(bumpBytes)
 	if parseErr != nil {
@@ -1198,8 +1539,14 @@ func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, block
 		// path so an upstream corruption doesn't pin a block in a broken
 		// state forever.
 		logger.Warn("stored BUMP failed to parse on redelivery — rebuilding", zap.Error(parseErr))
-		return false, false
+		return 0, nil, false, nil
 	}
+	return existingHeight, txids, true, nil
+}
+
+// shortCircuit re-mines the stored BUMP's level-0 set and re-stamps
+// processed_at. It reports whether the mine failed to land in full.
+func (b *Builder) shortCircuit(ctx context.Context, logger *zap.Logger, blockHash string, existingHeight uint64, txids []string) (mineFailed bool, err error) {
 	metrics.BumpBuilderShortCircuitTotal.Inc()
 	logger.Info(
 		"BUMP already built — skipping datahub fetch on redelivery",
@@ -1212,19 +1559,16 @@ func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, block
 	// block is finalized + orphan-marked exactly like the fresh-build path.
 	if b.anchorDecision(ctx, logger, blockHash, existingHeight) == anchorDeny {
 		b.handleAnchorDenied(ctx, logger, blockHash, existingHeight, "short_circuit")
-		return true, false
+		return false, nil
 	}
-	// No dedup on the short-circuit: it republishes every row of the stored
-	// set. Suppressing rows already MINED here is only safe if a mine or
-	// publish failure on an already-stamped block can take the stamp off
-	// again, or the next delivery would read the block as finalized and
-	// filter out MINED rows whose event never went out. That needs a store
-	// operation this branch does not have (ClearBlockProcessed, added with
-	// the multi-source STUMP work), so a duplicate MINED event per extra
-	// delivery is the price here, as on main.
+	// Rows already MINED against a stamped block are not republished: the
+	// stamp proves their events went out, because a mine or publish failure
+	// below takes it off again (deferStampedBlock) before the next delivery
+	// can read the block as finalized.
 	minedComplete := true
 	if len(txids) > 0 {
-		minedComplete = b.markMinedAndPublish(ctx, logger, blockHash, existingHeight, txids, false)
+		finalized := b.blockFinalized(ctx, blockHash)
+		minedComplete = b.markMinedAndPublish(ctx, logger, blockHash, existingHeight, txids, finalized)
 	}
 	// Stamp processed_at on the redelivery too. The typical short-circuit
 	// trigger IS the watchdog re-firing BLOCK_PROCESSED for a block whose BUMP
@@ -1234,29 +1578,34 @@ func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, block
 	// since the stale query keys on processed_at IS NULL and a built block can
 	// never be re-detected as incomplete.
 	//
-	// A partial mine withholds the stamp for the same reason the build path
-	// does: this IS the recovery path, so retiring the block from the stale
-	// scan while some of its txids are still SEEN_* would strand them.
+	// A partial mine or a failed publish withholds the stamp for the same
+	// reason the build path does: this IS the recovery path, so retiring the
+	// block from the stale scan while some of its txids are still SEEN_*, or
+	// their MINED events unsent, would strand them.
+	//
+	// Withholding is not enough when an earlier delivery already stamped the
+	// block (every extra merkle-service's BLOCK_PROCESSED lands here): the
+	// stamp would stay, the watchdog would never re-drive the block, and the
+	// next delivery would read it as finalized and filter the now-MINED rows
+	// out of the publish. So take the stamp off; a failure to do that fails
+	// the message so Kafka retries.
 	if minedComplete {
 		b.markBlockProcessed(ctx, logger, blockHash, existingHeight)
 	} else {
-		// Same contract as the build path: Kafka redelivery is not the
-		// recovery path (the caller returns nil and the offset is
-		// committed). processed_at stays unset so the watchdog re-drives.
 		logger.Warn(
-			"SetMinedByTxIDs did not complete; leaving processed_at unset so the watchdog can re-drive this block",
+			"SetMinedByTxIDs or the MINED publish did not complete; leaving the block un-stamped so the watchdog can re-drive it",
 			logfields.BlockHash(blockHash),
 			logfields.BlockHeight(existingHeight),
 			zap.Int("requested", len(txids)),
 		)
+		if err := b.deferStampedBlock(ctx, logger, blockHash, "short-circuit mine or publish did not complete"); err != nil {
+			return true, err
+		}
 	}
-	// STUMP rows for this block should already have been pruned at the end
-	// of the original build; ensure stragglers are cleared in case a STUMP
-	// arrived after pruning ran.
-	if delErr := b.store.DeleteStumpsByBlockHash(ctx, blockHash); delErr != nil {
-		logger.Warn("failed to clean up STUMPs on short-circuit", zap.Error(delErr))
-	}
-	return true, !minedComplete
+	// STUMP rows are left for the janitor (bump_builder.stump_retention_minutes):
+	// a later merkle-service's BLOCK_PROCESSED compares its STUMPs against
+	// the stored BUMP, and that needs the full retained set.
+	return !minedComplete, nil
 }
 
 // markBlockProcessed stamps processed_at on the block-processing row — the
@@ -1272,7 +1621,8 @@ func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, block
 // MarkBlockProcessed upsert preserves any chaintracks-supplied height on
 // conflict and only writes processed_at.
 func (b *Builder) markBlockProcessed(ctx context.Context, logger *zap.Logger, blockHash string, blockHeight uint64) {
-	if err := b.store.MarkBlockProcessed(ctx, blockHash, blockHeight, time.Now()); err != nil {
+	err := b.store.MarkBlockProcessed(ctx, blockHash, blockHeight, time.Now())
+	if err != nil {
 		// Include the block identity: a sustained stream of these is the signal
 		// that finalized blocks are looping through the watchdog (processed_at
 		// never lands), which an aggregator can only group by block hash.
@@ -1282,7 +1632,33 @@ func (b *Builder) markBlockProcessed(ctx context.Context, logger *zap.Logger, bl
 			logfields.BlockHeight(blockHeight),
 			zap.Error(err),
 		)
+		return
 	}
+	// A stamped block owes nothing, so drop the retained expected set (see
+	// widenExpectedSubtrees). Soft: a leftover set only costs a later
+	// redelivery a deferral round-trip through the watchdog.
+	if err := b.store.ClearBlockExpectedSubtrees(ctx, blockHash); err != nil {
+		logger.Warn("failed to clear retained expected subtrees", logfields.BlockHash(blockHash), zap.Error(err))
+	}
+}
+
+// widenExpectedSubtrees merges the block's retained expected-subtree set
+// (written by an earlier delivery that deferred the block) into the
+// callback's own, ascending and deduplicated. A read failure is returned:
+// judging completeness against a set that may be missing entries could
+// finalize an incomplete block.
+func (b *Builder) widenExpectedSubtrees(ctx context.Context, callback *models.CallbackMessage) error {
+	retained, err := b.store.GetBlockExpectedSubtrees(ctx, callback.BlockHash)
+	if err != nil {
+		return fmt.Errorf("reading retained expected subtrees: %w", err)
+	}
+	if len(retained) == 0 {
+		return nil
+	}
+	merged := append(slices.Clone(callback.ExpectedSubtreeIndices), retained...)
+	slices.Sort(merged)
+	callback.ExpectedSubtreeIndices = slices.Compact(merged)
+	return nil
 }
 
 // missingStumpIndices returns the subtree indices merkle-service expected to

@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/arcade/bump"
 	"github.com/bsv-blockchain/arcade/internal/synthblock"
@@ -493,5 +494,73 @@ func TestFill_PanicDoesNotPinTheBlock(t *testing.T) {
 	c.mu.Unlock()
 	if inflight != 0 || gens != 0 {
 		t.Fatalf("panicking fetch leaked bookkeeping: inflight=%d gen=%d", inflight, gens)
+	}
+}
+
+// A rebuild in another process (the bump-builder writing an expanded
+// compound) does not invalidate this process's cache. A lookup that misses a
+// leaf on a cached index re-reads the store once, so the newly covered tx
+// gets its proof; a txid that is not in the block either way is throttled to
+// one re-read per refreshInterval.
+func TestPathFor_StaleCachedIndexIsRefreshedOnLeafMiss(t *testing.T) {
+	// Txids depend only on the leaf index, so the 4-leaf compound is the
+	// 8-leaf one before a rebuild added leaves 4..7.
+	before, err := synthblock.Build(4, 900300)
+	if err != nil {
+		t.Fatalf("synthblock.Build: %v", err)
+	}
+	after, err := synthblock.Build(8, 900300)
+	if err != nil {
+		t.Fatalf("synthblock.Build: %v", err)
+	}
+	var (
+		mu     sync.Mutex
+		stored = before.BumpBytes
+		calls  atomic.Int64
+	)
+	fetch := func() ([]byte, error) {
+		calls.Add(1)
+		mu.Lock()
+		defer mu.Unlock()
+		return stored, nil
+	}
+
+	reader := New()
+	clock := time.Unix(1_700_000_000, 0)
+	reader.now = func() time.Time { return clock }
+	reader.Enrich(minedStatus(before.Txids[0]), fetch)
+	if !reader.Contains(testBlockHash) || calls.Load() != 1 {
+		t.Fatalf("first lookup must fill the cache once, fetches=%d", calls.Load())
+	}
+
+	// The writer rebuilds the stored compound; nothing invalidates reader.
+	mu.Lock()
+	stored = after.BumpBytes
+	mu.Unlock()
+
+	st := minedStatus(after.Txids[5])
+	reader.Enrich(st, fetch)
+	if len(st.MerklePath) == 0 {
+		t.Fatal("a leaf missing from the cached index must trigger one re-read of the store")
+	}
+	if vErr := synthblock.VerifyMerklePath(st.MerklePath, after.Txids[5], after.Root); vErr != nil {
+		t.Fatalf("refreshed path does not verify: %v", vErr)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("fetches = %d, want 2", got)
+	}
+
+	// An absent txid within refreshInterval: no further fetch.
+	const absent = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	if p := reader.MinimalPath(testBlockHash, absent, fetch); p != nil {
+		t.Fatal("absent txid must have no path")
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("a refresh within refreshInterval must be throttled, fetches = %d", got)
+	}
+	clock = clock.Add(refreshInterval)
+	_ = reader.MinimalPath(testBlockHash, absent, fetch)
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("after refreshInterval the miss may re-read once more, fetches = %d", got)
 	}
 }
