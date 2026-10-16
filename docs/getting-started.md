@@ -148,16 +148,23 @@ transaction with every endpoint and each endpoint delivers its own callbacks:
   endpoint accepts it. Only when every endpoint refuses is the tx requeued.
 - Duplicate `SEEN_ON_NETWORK` / `SEEN_MULTIPLE_NODES` callbacks are no-ops;
   each transition is published to SSE/webhook subscribers once. A duplicate
-  `BLOCK_PROCESSED` re-uses the stored BUMP and publishes `MINED` only for
-  transactions that were not already mined.
+  `BLOCK_PROCESSED` re-uses the stored BUMP and re-mines its transactions;
+  subscribers may see a repeated `MINED` event for a transaction already
+  mined in that block.
 - A registration one endpoint accepted but another refused, timed out on,
   or was skipped for is queued and re-sent to that endpoint in the
   background, so every endpoint ends up watching the same set. An endpoint
   that fails three consecutive requests is skipped until its `GET /health`
-  answers again. `/health` on the api-server lists each endpoint under
-  `merkle_endpoints` (breaker state and queued registrations), and
-  `arcade_merkle_endpoint_healthy` / `arcade_merkle_endpoint_catchup_pending`
-  expose the same.
+  answers again. `/health` lists each endpoint under `merkle_endpoints`
+  (breaker state and queued registrations) as the answering process sees
+  it; every process runs its own pool, and the propagation pods carry the
+  registrations, so their `arcade_merkle_endpoint_healthy` /
+  `arcade_merkle_endpoint_catchup_pending` series are the authoritative
+  view.
+- The breaker applies to a single `url` too. After three consecutive
+  transport/5xx failures, registrations are refused locally (propagation
+  requeues them) until the next probe, every 5s, finds the service healthy.
+  Before, each batch waited out the 30s HTTP timeout instead.
 - `/reprocess` (watchdog and `POST /api/v1/blocks/:hash/reprocess`) is sent
   to every endpoint and succeeds if any accepts.
 
