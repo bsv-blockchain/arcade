@@ -3,6 +3,7 @@ package bump_builder
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"go.uber.org/zap"
@@ -38,6 +39,7 @@ func TestBuilder_HandleMessage_DuplicateBlockProcessed_PublishesOnlyNewlyMined(t
 	ms.bumps[blockHash] = compound.Bytes()
 	ms.bumpHeights[blockHash] = uint64(compound.BlockHeight)
 	ms.alreadyMined = map[string]string{alreadyMinedTx: blockHash}
+	stampedBlock(ms, blockHash)
 
 	pub := &recordingPublisher{}
 	b := &Builder{
@@ -90,6 +92,7 @@ func TestBuilder_HandleMessage_DuplicateBlockProcessed_AllMined_PublishesNothing
 	ms.bumps[blockHash] = compound.Bytes()
 	ms.bumpHeights[blockHash] = uint64(compound.BlockHeight)
 	ms.alreadyMined = map[string]string{testTxidHex: blockHash}
+	stampedBlock(ms, blockHash)
 
 	pub := &recordingPublisher{}
 	b := &Builder{cfg: &config.Config{}, logger: zap.NewNop(), store: ms, publisher: pub}
@@ -98,5 +101,41 @@ func TestBuilder_HandleMessage_DuplicateBlockProcessed_AllMined_PublishesNothing
 	}
 	if emitted := pub.snapshot(); len(emitted) != 0 {
 		t.Fatalf("already-MINED rows must not be re-published, got %+v", emitted)
+	}
+}
+
+// stampedBlock gives blockHash a block_processing row with processed_at set:
+// an earlier delivery finalized the block, so its MINED rows were published.
+func stampedBlock(ms *mockStore, blockHash string) {
+	now := time.Now()
+	ms.blockProc = append(ms.blockProc, &models.BlockProcessingStatus{BlockHash: blockHash, ProcessedAt: &now})
+}
+
+// A crash between SetMinedByTxIDs and PublishBulk leaves rows MINED but
+// unpublished, and the block un-stamped. The redelivery must not take "already
+// MINED" as "already published": with processed_at unset it republishes the
+// whole stored set.
+func TestBuilder_HandleMessage_RedeliveryOfUnstampedBlock_RepublishesMinedRows(t *testing.T) {
+	ms := newMockStore()
+	blockHash := testBlockHash
+	compound, _, err := bump.BuildCompoundBUMP(
+		[]*models.Stump{{BlockHash: blockHash, SubtreeIndex: 0, StumpData: makeMinimalSTUMP(testTxidHex)}},
+		[]chainhash.Hash{mustHash(t, testTxidHex)}, nil, nil,
+	)
+	if err != nil {
+		t.Fatalf("BuildCompoundBUMP: %v", err)
+	}
+	ms.bumps[blockHash] = compound.Bytes()
+	ms.bumpHeights[blockHash] = uint64(compound.BlockHeight)
+	ms.alreadyMined = map[string]string{testTxidHex: blockHash}
+
+	pub := &recordingPublisher{}
+	b := &Builder{cfg: &config.Config{}, logger: zap.NewNop(), store: ms, publisher: pub}
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash)); err != nil {
+		t.Fatalf("handleMessage: %v", err)
+	}
+	emitted := pub.snapshot()
+	if len(emitted) != 1 || emitted[0].TxID != testTxidHex || emitted[0].Status != models.StatusMined {
+		t.Fatalf("an unstamped block's MINED rows must be republished, got %+v", emitted)
 	}
 }
