@@ -250,7 +250,7 @@ func TestHandleStump_LogsStumpStored(t *testing.T) {
 		Type:         models.CallbackStump,
 		BlockHash:    "blockhash-stump-test",
 		SubtreeIndex: 3,
-		Stump:        []byte{0x01, 0x02},
+		Stump:        validStumpBytes(0, 0x03),
 	}
 	req := authedCallbackRequest(t, mustMarshalJSON(t, payload))
 	w := httptest.NewRecorder()

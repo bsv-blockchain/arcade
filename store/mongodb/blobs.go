@@ -88,6 +88,7 @@ const (
 	metaBlockHash    = "block_hash"
 	metaBlockHeight  = "block_height"
 	metaSubtreeIndex = "subtree_index"
+	metaContentHash  = "content_hash"
 
 	// staleUploadAge is how long an upload must have been complete and
 	// unreferenced before a later write for the same key sweeps it as a
@@ -130,6 +131,7 @@ type stumpManifest struct {
 	Key          string        `bson:"_id"`
 	BlockHash    string        `bson:"block_hash"`
 	SubtreeIndex int64         `bson:"subtree_index"`
+	ContentHash  string        `bson:"content_hash,omitempty"`
 	FileID       bson.ObjectID `bson:"file_id"`
 	Length       int64         `bson:"length"`
 	UpdatedAt    time.Time     `bson:"updated_at"`
@@ -148,8 +150,11 @@ type blobRef struct {
 
 var projBlobRef = doc(kv(fFileID, 1), kv(fLength, 1), kv(fBlockHeight, 1))
 
-func stumpKey(blockHash string, subtreeIndex int64) string {
-	return fmt.Sprintf("%s:%d", blockHash, subtreeIndex)
+// stumpKey is content-addressed (see models.Stump): identical STUMP bytes
+// from several merkle-services share one manifest; a divergent variant for
+// the same subtree gets its own.
+func stumpKey(blockHash string, subtreeIndex int64, contentHash string) string {
+	return fmt.Sprintf("%s:%d:%s", blockHash, subtreeIndex, contentHash)
 }
 
 // --- GridFS primitives ---
@@ -600,9 +605,23 @@ func (s *Store) InsertStump(ctx context.Context, stump *models.Stump) error {
 		return errors.New("insert stump: empty block hash")
 	}
 	idx := int64(stump.SubtreeIndex)
-	key := stumpKey(stump.BlockHash, idx)
-	meta := doc(kv(metaBlockHash, stump.BlockHash), kv(metaSubtreeIndex, idx))
-	manifest := doc(kv(fBlockHash, stump.BlockHash), kv(fSubtreeIndex, idx))
+	hash := stump.EnsureContentHash()
+	key := stumpKey(stump.BlockHash, idx, hash)
+	// Content-addressed: a manifest under this key already holds exactly
+	// these bytes, so a redelivery from another merkle-service is one cheap
+	// read instead of a GridFS upload, swap and delete.
+	octx, cancel := s.opCtx(ctx)
+	err := s.stumps.manifests.FindOne(octx, idFilter(key), options.FindOne().SetProjection(doc(kv(fID, 1)))).Err()
+	cancel()
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, mongo.ErrNoDocuments):
+	default:
+		return fmt.Errorf("insert stump %s/%d: %w", stump.BlockHash, stump.SubtreeIndex, err)
+	}
+	meta := doc(kv(metaBlockHash, stump.BlockHash), kv(metaSubtreeIndex, idx), kv(metaContentHash, hash))
+	manifest := doc(kv(fBlockHash, stump.BlockHash), kv(fSubtreeIndex, idx), kv(fContentHash, hash))
 	if err := s.replaceBlob(ctx, &s.stumps, key, key, meta, manifest, stump.StumpData); err != nil {
 		return fmt.Errorf("insert stump %s/%d: %w", stump.BlockHash, stump.SubtreeIndex, err)
 	}
@@ -633,11 +652,14 @@ func (s *Store) GetStumpsByBlockHash(ctx context.Context, blockHash string) ([]*
 		if ferr != nil {
 			return fmt.Errorf("get stumps %s/%d: %w", blockHash, m.SubtreeIndex, ferr)
 		}
-		out[i] = &models.Stump{
+		st := &models.Stump{
 			BlockHash:    blockHash,
 			SubtreeIndex: int(m.SubtreeIndex),
 			StumpData:    data,
+			ContentHash:  m.ContentHash,
 		}
+		st.EnsureContentHash()
+		out[i] = st
 		return nil
 	}); err != nil {
 		return nil, err
@@ -685,7 +707,7 @@ func (s *Store) DeleteStumpsByBlockHash(ctx context.Context, blockHash string) e
 // reorg cleanup every time it is attempted, which is the failure mode the
 // GetTxIDsByBlockHash and CensusStatusesSince changes already removed.
 func (s *Store) stumpManifestsFor(ctx context.Context, blockHash string) ([]stumpManifest, error) {
-	cur, err := s.stumps.manifests.Find(ctx, doc(kv(fBlockHash, blockHash)), options.Find().SetSort(doc(kv(fSubtreeIndex, 1))))
+	cur, err := s.stumps.manifests.Find(ctx, doc(kv(fBlockHash, blockHash)), options.Find().SetSort(doc(kv(fSubtreeIndex, 1), kv(fContentHash, 1))))
 	if err != nil {
 		return nil, err
 	}

@@ -492,6 +492,31 @@ type Store interface {
 	// MarkBlockProcessed.
 	MarkBlockBUMPBuilt(ctx context.Context, blockHash string, blockHeight uint64, builtAt time.Time) error
 
+	// ClearBlockProcessed unsets processed_at on an existing row so the block
+	// re-enters ListStaleBlockProcessingStatus and the watchdog re-drives it.
+	// The bump-builder calls it when a later merkle-service's BLOCK_PROCESSED
+	// turns out incomplete for a block an earlier service's build already
+	// finalized. No-op (nil) when the row does not exist; every other column
+	// is left alone.
+	ClearBlockProcessed(ctx context.Context, blockHash string) error
+
+	// AddBlockExpectedSubtrees unions indices into the block's retained set
+	// of expected subtree indices: every subtree index some merkle-service's
+	// BLOCK_PROCESSED announced a STUMP for while the block was incomplete.
+	// Each service only announces the subtrees IT tracks, so the bump-builder
+	// keeps the union to stop a later, smaller announcement from finalizing
+	// a block another service is still owed a STUMP for. No-op (nil) when
+	// the row does not exist.
+	AddBlockExpectedSubtrees(ctx context.Context, blockHash string, indices []int) error
+
+	// GetBlockExpectedSubtrees returns the retained set, ascending; empty
+	// (nil, nil) when none is retained or the row does not exist.
+	GetBlockExpectedSubtrees(ctx context.Context, blockHash string) ([]int, error)
+
+	// ClearBlockExpectedSubtrees drops the retained set once a build has
+	// satisfied it. No-op (nil) when the row does not exist.
+	ClearBlockExpectedSubtrees(ctx context.Context, blockHash string) error
+
 	// MarkBlocksOrphaned transitions every named block to status='orphaned',
 	// stamps orphaned_at and CLEARS reconciled_at. Clearing is required, not
 	// cosmetic: orphaned rows with reconciled_at IS NULL form the anchor
@@ -686,10 +711,16 @@ type Store interface {
 
 	// STUMP operations for Merkle Service integration
 
-	// InsertStump stores a STUMP for a subtree in a specific block.
+	// InsertStump stores a STUMP keyed by (block_hash, subtree_index,
+	// content_hash). Inserting identical bytes again is a no-op; a different
+	// STUMP for the same subtree (another merkle-service with a different
+	// registered set) is stored as a second row. ContentHash is computed from
+	// StumpData when the caller left it empty.
 	InsertStump(ctx context.Context, stump *models.Stump) error
 
-	// GetStumpsByBlockHash retrieves all STUMPs for a given block hash.
+	// GetStumpsByBlockHash retrieves every STUMP row for a block, ordered by
+	// subtree index. There may be several rows per subtree index; callers
+	// merge them (bump.BuildCompoundBUMP does).
 	GetStumpsByBlockHash(ctx context.Context, blockHash string) ([]*models.Stump, error)
 
 	// DeleteStumpsByBlockHash removes all STUMPs for a given block hash (used during reorg cleanup).

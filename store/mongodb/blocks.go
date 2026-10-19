@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -65,6 +66,69 @@ func (s *Store) MarkBlockProcessed(ctx context.Context, blockHash string, blockH
 // MarkBlockBUMPBuilt implements store.Store.
 func (s *Store) MarkBlockBUMPBuilt(ctx context.Context, blockHash string, blockHeight uint64, builtAt time.Time) error {
 	return s.markBlockMilestone(ctx, blockHash, blockHeight, builtAt, fBUMPBuiltAt)
+}
+
+// ClearBlockProcessed implements store.Store: unsets processed_at on an
+// existing row; a missing row is a no-op (no upsert).
+func (s *Store) ClearBlockProcessed(ctx context.Context, blockHash string) error {
+	octx, cancel := s.opCtx(ctx)
+	defer cancel()
+	_, err := s.blocks.UpdateOne(octx, idFilter(blockHash), doc(kv(opUnset, doc(kv(fProcessedAt, "")))))
+	if err != nil {
+		return fmt.Errorf("clear block processed %s: %w", blockHash, err)
+	}
+	return nil
+}
+
+// AddBlockExpectedSubtrees implements store.Store with $addToSet, so the
+// union is applied atomically on the server; a missing row is a no-op.
+func (s *Store) AddBlockExpectedSubtrees(ctx context.Context, blockHash string, indices []int) error {
+	if len(indices) == 0 {
+		return nil
+	}
+	octx, cancel := s.opCtx(ctx)
+	defer cancel()
+	each := make(bson.A, len(indices))
+	for i, v := range indices {
+		each[i] = int32(v) //nolint:gosec // subtree indices are small
+	}
+	_, err := s.blocks.UpdateOne(octx, idFilter(blockHash), doc(kv(opAddToSet, doc(kv(fExpectedSubtrees, doc(kv(opEach, each)))))))
+	if err != nil {
+		return fmt.Errorf("add block expected subtrees %s: %w", blockHash, err)
+	}
+	return nil
+}
+
+// GetBlockExpectedSubtrees implements store.Store.
+func (s *Store) GetBlockExpectedSubtrees(ctx context.Context, blockHash string) ([]int, error) {
+	octx, cancel := s.opCtx(ctx)
+	defer cancel()
+	var d struct {
+		Expected []int `bson:"expected_subtrees"`
+	}
+	err := s.blocks.FindOne(octx, idFilter(blockHash), options.FindOne().SetProjection(doc(kv(fExpectedSubtrees, 1)))).Decode(&d)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get block expected subtrees %s: %w", blockHash, err)
+	}
+	if len(d.Expected) == 0 {
+		return nil, nil
+	}
+	slices.Sort(d.Expected)
+	return d.Expected, nil
+}
+
+// ClearBlockExpectedSubtrees implements store.Store.
+func (s *Store) ClearBlockExpectedSubtrees(ctx context.Context, blockHash string) error {
+	octx, cancel := s.opCtx(ctx)
+	defer cancel()
+	_, err := s.blocks.UpdateOne(octx, idFilter(blockHash), doc(kv(opUnset, doc(kv(fExpectedSubtrees, "")))))
+	if err != nil {
+		return fmt.Errorf("clear block expected subtrees %s: %w", blockHash, err)
+	}
+	return nil
 }
 
 // MarkBlocksOrphaned implements store.Store; hashes without a row are skipped.
