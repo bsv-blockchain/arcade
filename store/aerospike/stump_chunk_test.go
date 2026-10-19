@@ -13,8 +13,10 @@ import (
 
 // TestInsertGetStump_Chunked exercises the manifest+chunk STUMP layout: a STUMP
 // larger than a single Aerospike record (the case that previously failed with
-// RECORD_TOO_BIG) must round-trip byte-identical, alongside a small one, and a
-// shrinking rewrite must not leave stale chunk data behind.
+// RECORD_TOO_BIG) must round-trip byte-identical, alongside a small one. Rows
+// are content-addressed, so a second, different STUMP for the same subtree is
+// a second variant with its own chunks (never a rewrite of the first), an
+// identical re-insert is a no-op, and the block delete removes every variant.
 func TestInsertGetStump_Chunked(t *testing.T) {
 	s := integrationStore(t)
 	ctx := context.Background()
@@ -58,19 +60,34 @@ func TestInsertGetStump_Chunked(t *testing.T) {
 		}
 	}
 
-	// Rewrite the large STUMP smaller — orphan chunks from the first write
-	// must be cleaned up so the reassembled payload is exactly the new data.
+	// An identical re-insert of the large STUMP is a no-op; a different
+	// STUMP for subtree 0 is a second variant. Both must read back
+	// byte-identical: the big one's chunks are not disturbed by the small
+	// variant's write.
+	if err := s.InsertStump(ctx, &models.Stump{BlockHash: blockHash, SubtreeIndex: 0, StumpData: big}); err != nil {
+		t.Fatalf("InsertStump identical re-insert: %v", err)
+	}
 	if err := s.InsertStump(ctx, &models.Stump{BlockHash: blockHash, SubtreeIndex: 0, StumpData: small}); err != nil {
-		t.Fatalf("InsertStump rewrite: %v", err)
+		t.Fatalf("InsertStump variant: %v", err)
 	}
 	got, err = s.GetStumpsByBlockHash(ctx, blockHash)
 	if err != nil {
-		t.Fatalf("GetStumpsByBlockHash after rewrite: %v", err)
+		t.Fatalf("GetStumpsByBlockHash after variant insert: %v", err)
 	}
+	if len(got) != 3 {
+		t.Fatalf("after variant insert got %d stumps, want 3 (big@0, small@0, small@1)", len(got))
+	}
+	variants0 := map[string]bool{}
 	for _, st := range got {
-		if st.SubtreeIndex == 0 && !bytes.Equal(st.StumpData, small) {
-			t.Fatalf("subtree 0 after rewrite: got %d bytes, want %d", len(st.StumpData), len(small))
+		if st.ContentHash != models.StumpContentHash(st.StumpData) {
+			t.Fatalf("subtree %d: content hash does not match the bytes", st.SubtreeIndex)
 		}
+		if st.SubtreeIndex == 0 {
+			variants0[st.ContentHash] = bytes.Equal(st.StumpData, big) || bytes.Equal(st.StumpData, small)
+		}
+	}
+	if len(variants0) != 2 || !variants0[models.StumpContentHash(big)] || !variants0[models.StumpContentHash(small)] {
+		t.Fatalf("subtree 0 must hold both variants byte-identical, got %v", variants0)
 	}
 
 	if err := s.DeleteStumpsByBlockHash(ctx, blockHash); err != nil {

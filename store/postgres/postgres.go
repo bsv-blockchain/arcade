@@ -1193,10 +1193,13 @@ func (s *Store) GetBUMP(ctx context.Context, blockHash string) (uint64, []byte, 
 }
 
 func (s *Store) InsertStump(ctx context.Context, stump *models.Stump) error {
+	// Content-addressed: the same bytes from a second merkle-service hit the
+	// conflict and do nothing; different bytes for the same subtree land as
+	// a second row for the bump-builder to merge.
 	const q = `
-INSERT INTO stumps (block_hash, subtree_index, stump_data) VALUES ($1,$2,$3)
-ON CONFLICT (block_hash, subtree_index) DO UPDATE SET stump_data=EXCLUDED.stump_data`
-	_, err := s.pool.Exec(ctx, q, stump.BlockHash, stump.SubtreeIndex, stump.StumpData)
+INSERT INTO stumps (block_hash, subtree_index, content_hash, stump_data) VALUES ($1,$2,$3,$4)
+ON CONFLICT (block_hash, subtree_index, content_hash) DO NOTHING`
+	_, err := s.pool.Exec(ctx, q, stump.BlockHash, stump.SubtreeIndex, stump.EnsureContentHash(), stump.StumpData)
 	if err != nil {
 		return fmt.Errorf("insert stump: %w", err)
 	}
@@ -1204,7 +1207,7 @@ ON CONFLICT (block_hash, subtree_index) DO UPDATE SET stump_data=EXCLUDED.stump_
 }
 
 func (s *Store) GetStumpsByBlockHash(ctx context.Context, blockHash string) ([]*models.Stump, error) {
-	const q = `SELECT block_hash, subtree_index, stump_data FROM stumps WHERE block_hash = $1 ORDER BY subtree_index`
+	const q = `SELECT block_hash, subtree_index, content_hash, stump_data FROM stumps WHERE block_hash = $1 ORDER BY subtree_index, content_hash`
 	rows, err := s.pool.Query(ctx, q, blockHash)
 	if err != nil {
 		return nil, err
@@ -1213,9 +1216,10 @@ func (s *Store) GetStumpsByBlockHash(ctx context.Context, blockHash string) ([]*
 	var out []*models.Stump
 	for rows.Next() {
 		st := &models.Stump{}
-		if err := rows.Scan(&st.BlockHash, &st.SubtreeIndex, &st.StumpData); err != nil {
+		if err := rows.Scan(&st.BlockHash, &st.SubtreeIndex, &st.ContentHash, &st.StumpData); err != nil {
 			return out, err
 		}
+		st.EnsureContentHash()
 		out = append(out, st)
 	}
 	return out, rows.Err()
@@ -1259,6 +1263,66 @@ ON CONFLICT (block_hash) DO UPDATE SET
 	_, err := s.pool.Exec(ctx, q, blockHash, int64(blockHeight), processedAt) //nolint:gosec // block height fits in int64
 	if err != nil {
 		return fmt.Errorf("mark block processed %s: %w", blockHash, err)
+	}
+	return nil
+}
+
+// ClearBlockProcessed unsets processed_at so the watchdog's stale scan
+// (processed_at IS NULL) picks the block up again.
+func (s *Store) ClearBlockProcessed(ctx context.Context, blockHash string) error {
+	const q = `UPDATE block_processing SET processed_at = NULL WHERE block_hash = $1`
+	if _, err := s.pool.Exec(ctx, q, blockHash); err != nil {
+		return fmt.Errorf("clear block processed %s: %w", blockHash, err)
+	}
+	return nil
+}
+
+// AddBlockExpectedSubtrees implements store.Store in one UPDATE, so the
+// union is computed against the row's current set server-side.
+func (s *Store) AddBlockExpectedSubtrees(ctx context.Context, blockHash string, indices []int) error {
+	if len(indices) == 0 {
+		return nil
+	}
+	const q = `
+UPDATE block_processing SET expected_subtrees = (
+    SELECT array_agg(DISTINCT i ORDER BY i)
+    FROM unnest(COALESCE(expected_subtrees, '{}'::int[]) || $2::int[]) AS i
+)
+WHERE block_hash = $1`
+	vals := make([]int32, len(indices))
+	for i, v := range indices {
+		vals[i] = int32(v) //nolint:gosec // subtree indices are small
+	}
+	if _, err := s.pool.Exec(ctx, q, blockHash, vals); err != nil {
+		return fmt.Errorf("add block expected subtrees %s: %w", blockHash, err)
+	}
+	return nil
+}
+
+// GetBlockExpectedSubtrees implements store.Store.
+func (s *Store) GetBlockExpectedSubtrees(ctx context.Context, blockHash string) ([]int, error) {
+	var vals []int32
+	err := s.pool.QueryRow(ctx, `SELECT expected_subtrees FROM block_processing WHERE block_hash = $1`, blockHash).Scan(&vals)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get block expected subtrees %s: %w", blockHash, err)
+	}
+	if len(vals) == 0 {
+		return nil, nil
+	}
+	out := make([]int, len(vals))
+	for i, v := range vals {
+		out[i] = int(v)
+	}
+	return out, nil
+}
+
+// ClearBlockExpectedSubtrees implements store.Store.
+func (s *Store) ClearBlockExpectedSubtrees(ctx context.Context, blockHash string) error {
+	if _, err := s.pool.Exec(ctx, `UPDATE block_processing SET expected_subtrees = NULL WHERE block_hash = $1`, blockHash); err != nil {
+		return fmt.Errorf("clear block expected subtrees %s: %w", blockHash, err)
 	}
 	return nil
 }

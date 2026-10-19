@@ -521,3 +521,117 @@ func TestValidate_MongoDBBounds(t *testing.T) {
 		t.Fatalf("store.mongodb.index_timeout_ms default = %d, want 300000 (matches postgres schema_apply_timeout_ms)", got)
 	}
 }
+
+// Multi-endpoint merkle_service: `urls` extends `url`, and Endpoints() is
+// the single normalized view every consumer uses.
+func TestMerkleServiceEndpoints_MergesURLAndURLs(t *testing.T) {
+	cfg := MerkleServiceConfig{
+		URL:  "http://merkle-a.local/",
+		URLs: []string{" http://merkle-b.local ", "http://merkle-a.local", "http://merkle-b.local/"},
+	}
+	got := cfg.Endpoints()
+	want := []string{"http://merkle-a.local", "http://merkle-b.local"}
+	if len(got) != len(want) {
+		t.Fatalf("Endpoints() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("Endpoints()[%d] = %q, want %q (full: %v)", i, got[i], want[i], got)
+		}
+	}
+	if !cfg.Enabled() {
+		t.Fatal("Enabled() must be true with endpoints")
+	}
+	if (MerkleServiceConfig{}).Enabled() {
+		t.Fatal("Enabled() must be false with no endpoints")
+	}
+}
+
+func TestValidate_MerkleServiceURLsOnlyRequiresCallbackToken(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.MerkleService.URL = ""
+	cfg.MerkleService.URLs = []string{"http://merkle-a.local", "http://merkle-b.local"}
+	if err := validate(cfg); err != nil {
+		t.Fatalf("urls-only config should validate, got: %v", err)
+	}
+	cfg.CallbackToken = ""
+	if err := validate(cfg); err == nil {
+		t.Fatal("callback_token must be required when merkle_service.urls is set")
+	}
+}
+
+func TestValidate_MerkleServiceRejectsEmptyAndMalformedEntries(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.MerkleService.URLs = []string{"http://merkle-b.local", "  "}
+	if err := validate(cfg); err == nil {
+		t.Fatal("a blank merkle_service.urls entry must be rejected")
+	}
+
+	for _, bad := range []string{
+		"merkle.local", "ftp://merkle.local", "http://",
+		// The client string-appends /watch, so these would lose the path.
+		"http://merkle.local?tenant=a", "http://merkle.local?", "http://merkle.local#frag",
+	} {
+		cfg := baseValidConfig()
+		cfg.MerkleService.URL = bad
+		if err := validate(cfg); err == nil {
+			t.Fatalf("merkle_service.url %q must be rejected", bad)
+		}
+	}
+}
+
+// ARCADE_MERKLE_SERVICE_URLS is the env form of the list; viper splits it
+// on commas the same way it does ARCADE_KAFKA_BROKERS. This only works
+// because setDefaults registers the key.
+func TestMerkleServiceURLsBindFromEnv(t *testing.T) {
+	t.Setenv("ARCADE_MERKLE_SERVICE_URLS", "http://merkle-a.local,http://merkle-b.local/")
+	t.Setenv("ARCADE_CALLBACK_TOKEN", "tok")
+	cfg, err := Load(&cobra.Command{})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	got := cfg.MerkleService.Endpoints()
+	if len(got) != 2 || got[0] != "http://merkle-a.local" || got[1] != "http://merkle-b.local" {
+		t.Fatalf("Endpoints() from env = %v", got)
+	}
+}
+
+// Credentials in a merkle_service URL would surface in /health, metric
+// labels and startup logs; auth_token is the supported mechanism. The error
+// must not echo the password either.
+func TestValidate_MerkleServiceRejectsUserinfo(t *testing.T) {
+	for _, bad := range []string{"https://user:s3cret@merkle.local", "http://user@merkle.local"} {
+		cfg := baseValidConfig()
+		cfg.MerkleService.URLs = []string{"http://merkle-a.local", bad}
+		err := validate(cfg)
+		if err == nil {
+			t.Fatalf("merkle_service url %q must be rejected", bad)
+		}
+		if strings.Contains(err.Error(), "s3cret") {
+			t.Fatalf("validation error leaks the password: %v", err)
+		}
+	}
+}
+
+// No merkle_service URL validation error echoes a secret: not for a URL that
+// does not parse, a scheme-less user:pass@host (which parses as opaque), a
+// token in the query, or a fragment.
+func TestValidate_MerkleServiceErrorsRedactSecrets(t *testing.T) {
+	for _, bad := range []string{
+		"http://merkle.local/%zz-s3cret",     // does not parse
+		"svc:s3cret@merkle.local:8080",       // scheme-less user info
+		"https://merkle.local/?token=s3cret", // query
+		"https://merkle.local/#s3cret",       // fragment
+		"ftp://user:s3cret@merkle.local",     // user info with a bad scheme
+	} {
+		cfg := baseValidConfig()
+		cfg.MerkleService.URLs = []string{bad}
+		err := validate(cfg)
+		if err == nil {
+			t.Fatalf("merkle_service url %q must be rejected", bad)
+		}
+		if strings.Contains(err.Error(), "s3cret") {
+			t.Fatalf("validation error for %q leaks the secret: %v", bad, err)
+		}
+	}
+}

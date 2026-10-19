@@ -52,6 +52,10 @@ validator:
 
 merkle_service:
   url: http://merkle-service:8080
+  # Add further merkle-service instances for redundancy; every tx is
+  # registered with all of them and duplicate callbacks are no-ops.
+  # urls:
+  #   - http://merkle-service-2:8080
 
 # Every chaintracks consumer (bump-builder header lookups, the validator
 # finality gate in api-server) reads headers from the chaintracks service

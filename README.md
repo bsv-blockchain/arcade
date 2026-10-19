@@ -169,6 +169,8 @@ store:
 
 merkle_service:
   url: "https://merkle-service-us-1.bsvb.tech"
+  # optional extra instances for redundancy; see docs/getting-started.md
+  # urls: ["https://merkle-service-us-2.bsvb.tech"]
 
 p2p:
   datahub_discovery: true

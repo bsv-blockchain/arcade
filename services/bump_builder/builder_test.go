@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -49,6 +50,7 @@ type mockStore struct {
 	bumpHeights      map[string]uint64          // blockHash → blockHeight
 	minedCalls       []minedCall
 	deletedBlocks    []string
+	clearedBlocks    []string
 	bumpBuiltCalls   []bumpBuiltCall
 	processedCalls   []bumpBuiltCall
 	getStumpsErr     error
@@ -56,15 +58,23 @@ type mockStore struct {
 	insertStumpErr   error
 	setMinedErr      error
 	setMinedAttempts int
-	deleteStumpsErr  error
-	markBumpBuiltErr error
-	markProcessedErr error
+	// alreadyMined maps txid → block hash for rows the store already holds
+	// at MINED; SetMinedByTxIDs reports them with a MINED previous status so
+	// tests can drive the onlyChanged filter.
+	alreadyMined      map[string]string
+	deleteStumpsErr   error
+	markBumpBuiltErr  error
+	markProcessedErr  error
+	clearProcessedErr error
 
 	// Janitor fixtures: tipHeight feeds GetActiveTipBlockHeight; blockProc
 	// feeds ListBlockProcessingStatus. Both default empty so existing tests
 	// (which never set them) see the "fresh deployment" early-exit path.
 	tipHeight uint64
 	blockProc []*models.BlockProcessingStatus
+
+	// expectedSubtrees backs the retained expected-subtree set ops.
+	expectedSubtrees map[string][]int
 }
 
 type bumpBuiltCall struct {
@@ -143,13 +153,83 @@ func (m *mockStore) ListBlockProcessingStatus(_ context.Context, beforeHeight ui
 
 func (m *mockStore) EnsureIndexes(context.Context) error { return nil }
 
+// InsertStump mirrors the store contract: rows are content-addressed, so
+// the same bytes for the same subtree are one row and a variant is another.
 func (m *mockStore) InsertStump(_ context.Context, stump *models.Stump) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.insertStumpErr != nil {
 		return m.insertStumpErr
 	}
+	m.addStumpLocked(stump)
+	return nil
+}
+
+func (m *mockStore) addStumpLocked(stump *models.Stump) {
+	stump.EnsureContentHash()
+	for _, have := range m.stumps[stump.BlockHash] {
+		if have.SubtreeIndex == stump.SubtreeIndex && have.ContentHash == stump.ContentHash {
+			return
+		}
+	}
 	m.stumps[stump.BlockHash] = append(m.stumps[stump.BlockHash], stump)
+}
+
+// AddBlockExpectedSubtrees unions indices into the retained set. Unlike the
+// real backends it does not require a block_processing row, so tests need no
+// fixture row to exercise the union.
+func (m *mockStore) AddBlockExpectedSubtrees(_ context.Context, blockHash string, indices []int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.expectedSubtrees == nil {
+		m.expectedSubtrees = map[string][]int{}
+	}
+	merged := append(slices.Clone(m.expectedSubtrees[blockHash]), indices...)
+	slices.Sort(merged)
+	m.expectedSubtrees[blockHash] = slices.Compact(merged)
+	return nil
+}
+
+func (m *mockStore) GetBlockExpectedSubtrees(_ context.Context, blockHash string) ([]int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.expectedSubtrees[blockHash]), nil
+}
+
+func (m *mockStore) ClearBlockExpectedSubtrees(_ context.Context, blockHash string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.expectedSubtrees, blockHash)
+	return nil
+}
+
+// GetBlockProcessingStatus serves rows from blockProc by hash.
+func (m *mockStore) GetBlockProcessingStatus(_ context.Context, blockHash string) (*models.BlockProcessingStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, r := range m.blockProc {
+		if r.BlockHash == blockHash {
+			cp := *r
+			return &cp, nil
+		}
+	}
+	return nil, store.ErrNotFound
+}
+
+// ClearBlockProcessed records the call and unsets processed_at on the
+// blockProc fixture row, if any.
+func (m *mockStore) ClearBlockProcessed(_ context.Context, blockHash string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.clearProcessedErr != nil {
+		return m.clearProcessedErr
+	}
+	m.clearedBlocks = append(m.clearedBlocks, blockHash)
+	for _, r := range m.blockProc {
+		if r.BlockHash == blockHash {
+			r.ProcessedAt = nil
+		}
+	}
 	return nil
 }
 
@@ -182,11 +262,17 @@ func (m *mockStore) SetMinedByTxIDs(_ context.Context, blockHash string, blockHe
 	m.minedCalls = append(m.minedCalls, minedCall{blockHash, blockHeight, txids})
 	var prevs, statuses []*models.TransactionStatus
 	for _, txid := range txids {
-		prevs = append(prevs, &models.TransactionStatus{
+		prev := &models.TransactionStatus{
 			TxID:      txid,
 			Status:    models.StatusSeenOnNetwork,
 			Timestamp: time.Now(),
-		})
+		}
+		if bh, ok := m.alreadyMined[txid]; ok {
+			prev.Status = models.StatusMined
+			prev.BlockHash = bh
+			prev.BlockHeight = blockHeight
+		}
+		prevs = append(prevs, prev)
 		statuses = append(statuses, &models.TransactionStatus{
 			TxID:        txid,
 			Status:      models.StatusMined,
@@ -233,17 +319,23 @@ func (m *mockStore) MarkBlockProcessed(_ context.Context, blockHash string, bloc
 		return m.markProcessedErr
 	}
 	m.processedCalls = append(m.processedCalls, bumpBuiltCall{blockHash: blockHash, blockHeight: blockHeight})
+	// Upsert processed_at on the fixture row like the real backends, so a
+	// later delivery's blockFinalized sees the stamp.
+	now := time.Now()
+	for _, r := range m.blockProc {
+		if r.BlockHash == blockHash {
+			r.ProcessedAt = &now
+			return nil
+		}
+	}
+	m.blockProc = append(m.blockProc, &models.BlockProcessingStatus{BlockHash: blockHash, BlockHeight: blockHeight, ProcessedAt: &now})
 	return nil
 }
 
 func (m *mockStore) addStump(blockHash string, subtreeIndex int, stumpData []byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.stumps[blockHash] = append(m.stumps[blockHash], &models.Stump{
-		BlockHash:    blockHash,
-		SubtreeIndex: subtreeIndex,
-		StumpData:    stumpData,
-	})
+	m.addStumpLocked(models.NewStump(blockHash, subtreeIndex, stumpData))
 }
 
 // --- Helpers ---
@@ -643,16 +735,24 @@ func TestBuilder_HandleMessage_ShortCircuit_BUMPAlreadyExists(t *testing.T) {
 func TestBuilder_PruneOrphanStumps_DeletesAfterSuccess(t *testing.T) {
 	ms := newMockStore()
 	ms.tipHeight = 1000
-	built := time.Now()
+	// Older than the default retention: STUMPs now outlive the build by
+	// bump_builder.stump_retention_minutes so a later merkle-service's
+	// BLOCK_PROCESSED can re-read the full set.
+	built := time.Now().Add(-2 * time.Hour)
+	recent := time.Now().Add(-time.Minute)
 	ms.blockProc = []*models.BlockProcessingStatus{
-		{BlockHash: "done-1", BlockHeight: 999, BUMPBuiltAt: &built}, // BUMP built — prune
-		{BlockHash: "done-2", BlockHeight: 998, BUMPBuiltAt: &built}, // BUMP built — prune
-		{BlockHash: "in-flight", BlockHeight: 997, BUMPBuiltAt: nil}, // still pending — keep
+		{BlockHash: "done-1", BlockHeight: 999, BUMPBuiltAt: &built, ProcessedAt: &built},  // BUMP built, aged out — prune
+		{BlockHash: "done-2", BlockHeight: 998, BUMPBuiltAt: &built, ProcessedAt: &built},  // BUMP built, aged out — prune
+		{BlockHash: "in-flight", BlockHeight: 997, BUMPBuiltAt: nil},                       // still pending — keep
+		{BlockHash: "fresh", BlockHeight: 996, BUMPBuiltAt: &recent, ProcessedAt: &recent}, // built, within retention — keep
+		{BlockHash: "deferred", BlockHeight: 995, BUMPBuiltAt: &built},                     // built long ago, un-stamped (deferred / re-driven) — keep
 	}
-	// Seed stumps for all three so we can verify the in-flight one survives.
+	// Seed stumps for every row so we can verify the kept ones survive.
 	ms.addStump("done-1", 0, []byte("orphan-1"))
 	ms.addStump("done-2", 0, []byte("orphan-2"))
 	ms.addStump("in-flight", 0, []byte("pending"))
+	ms.addStump("fresh", 0, []byte("fresh"))
+	ms.addStump("deferred", 0, []byte("deferred"))
 
 	b := &Builder{
 		cfg:    &config.Config{},
@@ -674,6 +774,12 @@ func TestBuilder_PruneOrphanStumps_DeletesAfterSuccess(t *testing.T) {
 	}
 	if len(ms.stumps["in-flight"]) != 1 {
 		t.Errorf("in-flight STUMPs should have been preserved, got %d", len(ms.stumps["in-flight"]))
+	}
+	if len(ms.stumps["deferred"]) != 1 {
+		t.Errorf("an un-stamped block's STUMPs must be kept whatever bump_built_at says, got %d", len(ms.stumps["deferred"]))
+	}
+	if len(ms.stumps["fresh"]) != 1 {
+		t.Errorf("STUMPs of a block built within the retention window must be kept, got %d", len(ms.stumps["fresh"]))
 	}
 }
 
@@ -718,9 +824,11 @@ func TestBuilder_HandleMessage_HappyPath_SingleSubtree(t *testing.T) {
 		t.Error("expected BUMP to be stored")
 	}
 
-	// Verify STUMPs were pruned
-	if len(ms.deletedBlocks) != 1 || ms.deletedBlocks[0] != blockHash {
-		t.Errorf("expected STUMPs for %s to be deleted, got: %v", blockHash, ms.deletedBlocks)
+	// STUMPs are retained after the build for the janitor's retention
+	// window, so a redelivered BLOCK_PROCESSED from another merkle-service
+	// can be compared against the stored BUMP.
+	if len(ms.deletedBlocks) != 0 || len(ms.stumps[blockHash]) == 0 {
+		t.Errorf("STUMPs must be retained after the build, deletes=%v stumps=%d", ms.deletedBlocks, len(ms.stumps[blockHash]))
 	}
 
 	// Verify the block-processing observability row was updated.
@@ -963,7 +1071,10 @@ func TestBuilder_HandleMessage_FieldAbsentFromWire_BuildsNormally(t *testing.T) 
 	}
 }
 
-func TestBuilder_HandleMessage_BumpBuiltStoreError_StillSucceeds(t *testing.T) {
+// bump_built_at is the STUMP janitor's retention basis, so a failure to
+// record it fails the message before the BUMP is written: a stored BUMP
+// without the timestamp would leave its STUMPs ineligible for pruning forever.
+func TestBuilder_HandleMessage_BumpBuiltStoreError_FailsBeforeInsert(t *testing.T) {
 	ms := newMockStore()
 	ms.markBumpBuiltErr = errors.New("store down")
 	blockHash := testBlockHash
@@ -981,14 +1092,17 @@ func TestBuilder_HandleMessage_BumpBuiltStoreError_StillSucceeds(t *testing.T) {
 
 	b := newTestBuilder(ms, datahub.URL)
 
-	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash)); err != nil {
-		t.Fatalf("MarkBlockBUMPBuilt error must not fail handler, got: %v", err)
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash)); err == nil {
+		t.Fatal("a MarkBlockBUMPBuilt failure must fail the message so Kafka retries it")
 	}
 
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
-	if _, ok := ms.bumps[blockHash]; !ok {
-		t.Error("BUMP should still be stored despite the observability write failure")
+	if _, ok := ms.bumps[blockHash]; ok {
+		t.Error("the BUMP must not be stored without its bump_built_at")
+	}
+	if len(ms.minedCalls) != 0 || len(ms.processedCalls) != 0 {
+		t.Errorf("nothing may be mined or stamped: mined=%d stamped=%d", len(ms.minedCalls), len(ms.processedCalls))
 	}
 }
 
@@ -1142,9 +1256,9 @@ func TestBuilder_E2E_InsertStump_GetStumps_BuildBUMP(t *testing.T) {
 		t.Error("expected non-empty BUMP data")
 	}
 
-	// Verify STUMPs were cleaned up
-	if len(ms.deletedBlocks) != 1 || ms.deletedBlocks[0] != blockHash {
-		t.Errorf("expected STUMPs for %s to be deleted, got: %v", blockHash, ms.deletedBlocks)
+	// STUMPs are retained after the build (janitor-pruned later).
+	if len(ms.deletedBlocks) != 0 {
+		t.Errorf("STUMPs must be retained after the build, got deletes: %v", ms.deletedBlocks)
 	}
 }
 
@@ -1406,7 +1520,7 @@ func TestBuilder_MarkMinedAndPublish_UsesBulkEvent(t *testing.T) {
 	b := newTestBuilder(ms, "http://unused.example/api/v1")
 	b.publisher = pub
 
-	b.markMinedAndPublish(context.Background(), zap.NewNop(), blockHash, blockHeight, txids)
+	b.markMinedAndPublish(context.Background(), zap.NewNop(), blockHash, blockHeight, txids, false)
 
 	// recordingPublisher.PublishBulk unfans into one entry per TxID for
 	// assertion convenience, so snapshot() shows N entries — but the

@@ -22,6 +22,7 @@ import (
 	arcerrors "github.com/bsv-blockchain/arcade/errors"
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/logfields"
+	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
@@ -205,6 +206,10 @@ type healthResponse struct {
 	Status      string          `json:"status"`
 	BlockHeight uint64          `json:"blockHeight,omitempty"`
 	DatahubURLs []datahubStatus `json:"datahub_urls"`
+	// MerkleEndpoints is the per-endpoint breaker view of the configured
+	// merkle-services (url, healthy, consecutive failures, open since).
+	// Omitted when the Merkle integration is disabled.
+	MerkleEndpoints []merkleservice.EndpointStatus `json:"merkle_endpoints,omitempty"`
 }
 
 // datahubStatus is one entry of health.datahub_urls: the circuit-breaker view
@@ -333,6 +338,9 @@ func (s *Server) handleHealth(c *gin.Context) {
 		Status:      "ok",
 		BlockHeight: s.activeTipHeight(c.Request.Context()),
 		DatahubURLs: []datahubStatus{},
+	}
+	if hr, ok := s.merkleClient.(merkleservice.HealthReporter); ok {
+		resp.MerkleEndpoints = hr.EndpointStatuses()
 	}
 	if s.teranode != nil {
 		statuses := s.teranode.GetEndpointStatuses()
@@ -637,15 +645,28 @@ func (s *Server) handleStump(c *gin.Context, msg models.CallbackMessage, logger 
 		return
 	}
 
-	// Store STUMP keyed by (blockHash, subtreeIndex). Synchronous write so that
-	// a 200 to merkle-service is a durability guarantee — merkle-service only
-	// fires BLOCK_PROCESSED after all STUMPs succeed, so the bump builder can
-	// then rely on finding them all in Aerospike.
-	stump := &models.Stump{
-		BlockHash:    msg.BlockHash,
-		SubtreeIndex: msg.SubtreeIndex,
-		StumpData:    msg.Stump,
+	// Refuse a STUMP that does not parse. Rows are content-addressed, so a
+	// bad copy is never overwritten by a good resend; it would sit beside
+	// the good one and fail every build and redelivery of the block until
+	// the Kafka message dead-letters. Rejecting it here surfaces the problem
+	// at the sending merkle-service instead.
+	if mp, err := sdkTx.NewMerklePathFromBinary(msg.Stump); err != nil || len(mp.Path) == 0 {
+		logger.Warn("malformed STUMP callback",
+			logfields.BlockHash(msg.BlockHash),
+			zap.Int("subtree_index", msg.SubtreeIndex),
+			zap.Error(err),
+		)
+		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "stump is not a valid BRC-74 merkle path"})
+		return
 	}
+
+	// Store STUMP keyed by (blockHash, subtreeIndex, contentHash). Synchronous
+	// write so that a 200 to merkle-service is a durability guarantee —
+	// merkle-service only fires BLOCK_PROCESSED after all STUMPs succeed, so
+	// the bump builder can then rely on finding them all. Content addressing
+	// makes the same STUMP from a second merkle-service a no-op and keeps a
+	// divergent one (a service that missed registrations) as its own row.
+	stump := models.NewStump(msg.BlockHash, msg.SubtreeIndex, msg.Stump)
 	if err := s.store.InsertStump(c.Request.Context(), stump); err != nil {
 		logger.Error("failed to store STUMP", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to store stump"})

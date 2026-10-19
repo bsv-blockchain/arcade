@@ -76,3 +76,112 @@ tracked subtree. If that field is omitted, a dropped STUMP set is
 indistinguishable from an empty block and `finalizeEmptyBlock` stamps
 `processed_at`. Confirm this for a deployment's Merkle before enabling
 callbacks.
+
+## Multiple merkle-services
+
+`merkle_service.urls` lists additional endpoints. The `merkleservice.Pool`
+fans every `/watch` and `/reprocess` out to all of them, so each service
+watches the same txids and each delivers its own callbacks.
+
+Registration succeeds when **any** endpoint accepts; only a tx refused or
+unreachable on every endpoint is requeued (F-024 still gates broadcast). When
+every endpoint failed, the surfaced error is the most retryable one (context
+error, then network/5xx, then 401/403, then other 4xx). So `auth_error` on the
+registration metrics means no endpoint accepted the tx, none failed with a
+network error or 5xx, and at least one rejected the token; the others may have
+answered with another 4xx. A token problem stays visible even when it is not
+the only failure.
+
+A tx the pool reported registered must still reach every endpoint, or the
+endpoints' watch sets diverge and their STUMPs disagree. Every endpoint-
+specific failure behind a pool-level success — a refused or timed-out
+`/watch`, or an endpoint skipped because its breaker was open — is kept in
+that endpoint's in-memory catch-up queue (`arcade_merkle_endpoint_catchup_pending`)
+and re-sent from the pool's background loop once the endpoint answers again,
+500 per 5s tick with backoff; what fails again goes back to the queue, except
+a registration the endpoint rejected outright (a 4xx other than 401, 403, 408
+or 429), which is dropped with a warning. A 401/403 is kept and logged, since
+the breaker does not count it. The
+queue is bounded (200k entries per endpoint, about half an hour at 100 TPS);
+past that the oldest entries are dropped and, once the queue drains, the
+pool asks propagation to resync that endpoint with a full lookback replay
+(`register_replay_lookback_hours`, ignoring `merkle_registered_at`, since
+the stamp is pool-wide). A `/watch` that fails during the resync goes back
+to the queue. `/watch` is idempotent on merkle-service.
+
+The queue lives in memory, so a restart drops it. With several endpoints the
+startup replay therefore re-registers every non-terminal tx in the lookback
+window with the whole pool: `merkle_replay_skip_recent_minutes` defaults to
+`-1`, which means no recent-row skip with several merkle-services (30 minutes
+with one), because `merkle_registered_at` is stamped once any one endpoint
+accepted. Setting it to a positive value with several endpoints brings the
+skip back, and with it the risk that a lagging endpoint never receives the
+txs registered in that window before the restart.
+
+An endpoint that fails three consecutive transport/5xx requests has its
+breaker opened and is skipped; 4xx answers never trip it. Results are recorded
+per request, and nothing more is sent to an endpoint once its breaker opens,
+so a black-holed endpoint delays the batch that trips it by at most the HTTP
+timeout of the requests already in flight; later batches skip it at once.
+Each endpoint's catch-up drain runs on its own goroutine, so a hanging
+endpoint does not hold up the probes or another endpoint's catch-up. The pool probes
+`GET /health` on open endpoints every 5s (concurrently) and closes the breaker
+on any non-5xx answer, provided one owed registration re-sent as a trial
+`/watch` (bounded by the 5s probe timeout) also answers below 500, so an
+endpoint whose `/health` is up while `/watch` hangs stays open; the catch-up
+queue then drains.
+
+Duplicate callbacks:
+
+- `SEEN_ON_NETWORK` / `SEEN_MULTIPLE_NODES` from a second service hit the
+  tracker prefilter or the lattice re-assert path and are not published. A
+  forward move (`SEEN_ON_NETWORK` → `SEEN_MULTIPLE_NODES`) from whichever
+  service reports it first is applied and published once; a late
+  `SEEN_ON_NETWORK` after that is a lattice skip.
+- `STUMP` rows are content-addressed: the key is
+  `(block_hash, subtree_index, sha256(stump_data))`. Identical bytes from a
+  second service are a no-op; a different STUMP for the same subtree is a
+  second row. The difference is real: each merkle-service builds its STUMP
+  from the txids *it* has registrations for, so a service that was down while
+  txs were registered delivers a STUMP that lacks those txs' paths.
+  `bump.BuildCompoundBUMP` merges same-subtree variants by `(level, offset)`
+  union (hashes must agree; the tracked marker is OR-ed).
+- `BLOCK_PROCESSED` is processed every time. When a compound BUMP already
+  exists, the builder reads the retained STUMP set and diffs its level-0
+  hashes against the stored BUMP:
+  - nothing new ⇒ short-circuit: re-mine the stored level-0 set with
+    `onlyChanged=true` (rows already `MINED` against this block are not
+    re-published; a tx registered after the first build still publishes),
+    re-stamp `processed_at`. Outcome `short_circuited`, once per extra
+    service.
+  - new leaves ⇒ rebuild from the full STUMP set, overwrite the BUMP, mine the
+    union with `onlyChanged=true` so only the newly covered txs are
+    published. Outcome `rebuilt`. A rebuild always waits the grace window
+    first: the expected set names subtree indices, and an index covered by
+    the earlier service's variant says nothing about whether the later
+    service's own STUMP for it has landed. The rebuilt compound must cover
+    every leaf of the stored one; if it would not (only possible if the
+    janitor pruned the earlier STUMPs), the stored BUMP is kept and the block
+    is deferred.
+
+  Residual window: a later service's STUMP that straggles past the grace
+  window for an index the earlier service already covered is not detected
+  (the index looks satisfied and no further `BLOCK_PROCESSED` follows). It
+  needs both a partial registration and a STUMP retry slower than
+  `grace_window_ms`; `/reprocess` on the block recovers it.
+
+## STUMP retention and deferral with several sources
+
+STUMPs are no longer pruned right after a build. The janitor
+(`pruneOrphanStumps`, run at startup and every quarter of the window) deletes
+a block's STUMP rows once its `bump_built_at` is older than
+`bump_builder.stump_retention_minutes` (default 60). Anchor-denied and
+reconciler cleanups still delete immediately.
+
+`processed_at` is still the watchdog's signal. The first service's build
+stamps it. If a later service's `BLOCK_PROCESSED` then defers the block (its
+expected STUMP set is still missing after the grace window, or a rebuild would
+drop leaves), `deferStampedBlock` clears the stamp with the new store method
+`ClearBlockProcessed`, so `ListStaleBlockProcessingStatus` surfaces the block
+and the watchdog's `/reprocess` (fanned out to every merkle-service) re-drives
+it. `ClearBlockProcessed` only unsets `processed_at` and never creates a row.

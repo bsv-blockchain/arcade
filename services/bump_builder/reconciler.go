@@ -94,7 +94,7 @@ type Reconciler struct {
 	store       store.Store
 	publisher   events.Publisher
 	chainHeader ChainHeaderReader
-	merkle      *merkleservice.Client // nil ⇒ the /reprocess defer path is disabled
+	merkle      merkleservice.Service // nil ⇒ the /reprocess defer path is disabled
 	leaser      store.Leaser          // nil ⇒ single-replica mode, no lease gating
 	holderID    string
 
@@ -154,7 +154,7 @@ func NewReconciler(
 	st store.Store,
 	publisher events.Publisher,
 	chainHeader ChainHeaderReader,
-	merkle *merkleservice.Client,
+	merkle merkleservice.Service,
 	leaser store.Leaser,
 ) *Reconciler {
 	if !cfg.BumpBuilder.Reconciler.Enabled {
