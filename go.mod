@@ -11,7 +11,7 @@ require (
 	github.com/bsv-blockchain/go-p2p-message-bus v0.2.0
 	github.com/bsv-blockchain/go-sdk v1.7.2
 	github.com/bsv-blockchain/go-teranode-p2p-client v0.3.2
-	github.com/bsv-blockchain/teranode v0.16.1-beta-1
+	github.com/bsv-blockchain/teranode v0.16.1-beta-txmeta-2
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/fergusstrange/embedded-postgres v1.34.0
 	github.com/gin-gonic/gin v1.12.0
@@ -74,12 +74,12 @@ require (
 	github.com/aws/smithy-go v1.28.4 // indirect
 	github.com/benbjohnson/clock v1.3.5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
-	github.com/bitcoin-sv/bdk/module/gobdk v1.2.5-0.20260918043653-4eab3acdbbb9 // indirect
+	github.com/bitcoin-sv/bdk/module/gobdk v1.3.0 // indirect
 	github.com/bsv-blockchain/aerospike-client-go/v8 v8.7.1-bsv6 // indirect
 	github.com/bsv-blockchain/go-batcher/v2 v2.1.1 // indirect
 	github.com/bsv-blockchain/go-lockfree-queue v1.2.0 // indirect
 	github.com/bsv-blockchain/go-safe-conversion v1.2.0 // indirect
-	github.com/bsv-blockchain/go-subtree v1.6.0 // indirect
+	github.com/bsv-blockchain/go-subtree v1.6.1 // indirect
 	github.com/bsv-blockchain/go-tx-map v1.5.0 // indirect
 	github.com/bsv-blockchain/go-wire v1.4.0 // indirect
 	github.com/bytedance/gopkg v0.1.4 // indirect
@@ -311,7 +311,7 @@ require (
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/arch v0.31.0 // indirect
-	golang.org/x/crypto v0.57.0 // indirect
+	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/exp v0.0.0-20261007192929-f45ad48fbe92 // indirect
 	golang.org/x/mod v0.41.0 // indirect
 	golang.org/x/net v0.60.0 // indirect
