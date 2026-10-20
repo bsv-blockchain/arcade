@@ -7,7 +7,7 @@ require (
 	github.com/aerospike/aerospike-client-go/v7 v7.10.2
 	github.com/bsv-blockchain/go-bt/v2 v2.7.4
 	github.com/bsv-blockchain/go-chaincfg v1.7.0
-	github.com/bsv-blockchain/go-chaintracks v1.4.3
+	github.com/bsv-blockchain/go-chaintracks v1.4.5
 	github.com/bsv-blockchain/go-p2p-message-bus v0.2.0
 	github.com/bsv-blockchain/go-sdk v1.7.2
 	github.com/bsv-blockchain/go-teranode-p2p-client v0.3.2
