@@ -132,9 +132,11 @@ func (s *Server) refreshPolicyOnce(ctx context.Context) {
 		s.logger.Info("intake policy updated from network observations",
 			zap.Uint64("prev_fee_sat_per_kb", prevFee),
 			zap.Uint64("new_fee_sat_per_kb", newFee),
-			// Which peer set the floor. Without it, "why is the floor 1?" can
-			// only be answered by querying the store by hand.
+			// Which peer set the floor, and how many fresh peers advertised no
+			// fee at all. Without these, "why is the floor 1?" can only be
+			// answered by querying the store by hand.
 			zap.String("cheapest_peer_id", cheapest),
+			zap.Int("fee_unadvertised_peers", countUnadvertisedFees(peers, ttl, now)),
 			zap.Int("prev_max_tx_size", prevTxSize),
 			zap.Int("new_max_tx_size", newTxSize),
 			zap.Int("prev_max_script_size", prevScriptSize),
@@ -163,33 +165,45 @@ func discoveredLimit(peers []store.PeerPolicy, ttl time.Duration, now time.Time,
 	return observed
 }
 
-// minDiscoveredFeePerKB is the floor under the network-observed fee: discovery
-// may track the cheapest node all the way down to 1 sat/kB, but never to 0.
-//
-// This is the fee's counterpart to the floor discoveredLimit applies to the
-// size limits, and it exists for the same reason: node_status is
-// unauthenticated gossip and the rule is a bare minimum, so a single peer
-// advertising 0 — misconfigured, or simply a node with nil policy settings,
-// which teranode advertises as min_mining_tx_fee=0 — silently disabled fee
-// enforcement for an entire arcade instance. Accepting zero-fee transactions is
-// a deliberate operator decision, so accept_zero_fee is the only thing that may
-// produce a 0 floor.
-const minDiscoveredFeePerKB = 1
-
 // discoveredFeePerKB resolves the network-tracked fee floor: the lowest rate a
-// fresh peer will accept, bounded below by minDiscoveredFeePerKB, or the
-// built-in default when nothing fresh has been observed. It also returns the id
-// of the peer that set the floor, so the change is explainable in a log line
-// rather than only by querying the store.
+// fresh peer actually advertised, or the built-in default when no fresh peer
+// advertised one at all. It also returns the id of the peer that set the floor,
+// so the value is explainable from a log line rather than only by querying the
+// store.
 func discoveredFeePerKB(peers []store.PeerPolicy, ttl time.Duration, now time.Time) (uint64, string) {
 	observed, peerID, ok := lowestObservedFeePerKB(peers, ttl, now)
 	if !ok {
 		return uint64(config.DefaultValidatorMinFeePerKB), ""
 	}
-	if observed < minDiscoveredFeePerKB {
-		return minDiscoveredFeePerKB, peerID
-	}
 	return observed, peerID
+}
+
+// isFreshObservation reports whether a peer row is a live observation: re-heard
+// within the TTL.
+//
+// A row with no LastSeen at all is stale, not fresh. An observation that cannot
+// be dated cannot be shown to be current, and the TTL is the only thing that
+// stops a departed peer from pinning the network policy forever — every backend
+// can produce an undated row (a missing aerospike bin, a zero pebble timestamp,
+// a postgres zero-value date), and treating one as perpetually fresh makes it
+// immortal. Shared by both aggregators so they cannot drift on the question.
+func isFreshObservation(p store.PeerPolicy, cutoff time.Time) bool {
+	return !p.LastSeen.Before(cutoff)
+}
+
+// countUnadvertisedFees reports how many fresh peers advertised no fee at all.
+// It exists for the log line: it is the number that explains why the floor is
+// what it is, and its absence is what made a production report of a 1 sat/kB
+// floor unanswerable without a store query.
+func countUnadvertisedFees(peers []store.PeerPolicy, ttl time.Duration, now time.Time) int {
+	cutoff := now.Add(-ttl)
+	var n int
+	for _, p := range peers {
+		if isFreshObservation(p, cutoff) && p.MiningFeeSatoshis == 0 {
+			n++
+		}
+	}
+	return n
 }
 
 // lowestObservedFeePerKB returns the minimum mining fee rate (in satoshis per
@@ -199,9 +213,6 @@ func discoveredFeePerKB(peers []store.PeerPolicy, ttl time.Duration, now time.Ti
 // rounds the enforced floor *below* what the peer requires (e.g. 1 sat / 1001
 // bytes must map to 1 sat/kB, not 0, or arcade would accept fee=0 that no node
 // would).
-//
-// Callers should use discoveredFeePerKB rather than this directly: the raw
-// minimum is unbounded below and must not reach the validator unfloored.
 func lowestObservedFeePerKB(peers []store.PeerPolicy, ttl time.Duration, now time.Time) (uint64, string, bool) {
 	cutoff := now.Add(-ttl)
 	var (
@@ -210,10 +221,24 @@ func lowestObservedFeePerKB(peers []store.PeerPolicy, ttl time.Duration, now tim
 		found  bool
 	)
 	for _, p := range peers {
+		if p.MiningFeeSatoshis == 0 {
+			// 0 satoshis is not an observation of a node that mines for free,
+			// it is the absence of an advertisement: teranode reports
+			// min_mining_tx_fee=0 whenever its policy settings are nil, and the
+			// legacy BSV/kB path converts that 0.0 straight through. Counting
+			// it as a real rate makes one silent non-advertisement the network
+			// minimum for the whole instance — which is what production did,
+			// first as a 0 sat/kB floor and then, once the 0 was clamped rather
+			// than discarded, as 1 sat/kB while every peer in /health required
+			// 100. This is the same sentinel highestObservedLimit applies to
+			// the size limits. A network that really does mine for free is an
+			// operator decision: that is what accept_zero_fee is for.
+			continue
+		}
 		if p.MiningFeeBytes == 0 {
 			continue // avoid divide-by-zero on a malformed row
 		}
-		if !p.LastSeen.IsZero() && p.LastSeen.Before(cutoff) {
+		if !isFreshObservation(p, cutoff) {
 			continue // peer not re-heard within TTL
 		}
 		perKB := ceilFeePerKB(p.MiningFeeSatoshis, p.MiningFeeBytes)
@@ -248,7 +273,7 @@ func highestObservedLimit(peers []store.PeerPolicy, ttl time.Duration, now time.
 		if v == 0 {
 			continue // peer did not advertise this limit
 		}
-		if !p.LastSeen.IsZero() && p.LastSeen.Before(cutoff) {
+		if !isFreshObservation(p, cutoff) {
 			continue // peer not re-heard within TTL
 		}
 		if !found || v > best {
