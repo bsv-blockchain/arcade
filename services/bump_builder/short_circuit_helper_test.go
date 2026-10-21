@@ -11,7 +11,7 @@ import (
 // loadStoredBUMP followed by shortCircuit; production goes through
 // handleRedelivery, which also compares the retained STUMPs against the
 // stored BUMP.
-func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, blockHash string) (handled bool, mineFailed bool) {
+func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, blockHash string) (handled, mineFailed bool) {
 	height, txids, ok, err := b.loadStoredBUMP(ctx, logger, blockHash)
 	if err != nil || !ok {
 		return false, false
