@@ -9,7 +9,7 @@ import (
 
 	teranode "github.com/bsv-blockchain/teranode/services/p2p"
 
-	"github.com/bsv-blockchain/arcade/tests/e2e/harness"
+	"github.com/bsv-blockchain/bsv-broadcaster/tests/e2e/harness"
 )
 
 // TestSmoke_RealBlockMined_SingleSubtree drives the full
@@ -36,23 +36,23 @@ func TestSmoke_RealBlockMined_SingleSubtree(t *testing.T) {
 	// #195) without ever fetching the block itself:
 	//   - msDatahub serves /block + /subtree to merkle-service (which MUST
 	//     fetch them to compute STUMPs and the enrichment fields).
-	//   - arcadeDatahub is arcade's only datahub. With v0.2.4 emitting the
+	//   - broadcasterDatahub is arcade's only datahub. With v0.2.4 emitting the
 	//     enrichment, arcade never GETs /block here, so its BlockFetches()
 	//     stays 0. We still stage the fixture on it so that, were arcade to
 	//     fall back, the build would succeed (and only the assertion below
 	//     would flag the regression) rather than 404-cascading.
 	msDatahub := h.NewDatahub(t)
 	msDatahub.StageFixture(fix)
-	arcadeDatahub := h.NewDatahub(t)
-	arcadeDatahub.StageFixture(fix)
+	broadcasterDatahub := h.NewDatahub(t)
+	broadcasterDatahub.StageFixture(fix)
 
-	rt := harness.StartArcade(t, harness.ArcadeOptions{
+	rt := harness.StartBroadcaster(t, harness.BroadcasterOptions{
 		MerkleServiceURL: h.Containers.MerkleHostURL,
 		// arcade runs on the host; from here the datahub is reachable
 		// via loopback. merkle-service inside its container reaches
 		// its own datahub via the gateway IP — that URL goes into
 		// the libp2p BlockMessage / SubtreeMessage payloads below.
-		DatahubURL:      arcadeDatahub.LocalURL(),
+		DatahubURL:      broadcasterDatahub.LocalURL(),
 		LibP2PBootstrap: h.LibP2P.BootstrapMultiaddr(),
 		MerkleAuthToken: "e2e-watch-token",
 		CallbackToken:   "e2e-callback-token",
@@ -131,11 +131,11 @@ func TestSmoke_RealBlockMined_SingleSubtree(t *testing.T) {
 
 	// 6. Issue #195: with v0.2.4 enriching BLOCK_PROCESSED, arcade builds the
 	//    compound BUMP straight from the callback fields and never fetches the
-	//    block. arcadeDatahub is arcade's only datahub, so it must have served
+	//    block. broadcasterDatahub is arcade's only datahub, so it must have served
 	//    ZERO /block/<hash> GETs. A non-zero count means arcade fell back to
 	//    the datahub — either the image regressed and stopped emitting the
 	//    enrichment (esp. coinbaseBump), or the consume path broke.
-	if got := arcadeDatahub.BlockFetches(); got != 0 {
+	if got := broadcasterDatahub.BlockFetches(); got != 0 {
 		t.Fatalf("arcade made %d datahub /block fetches; want 0 — the compound BUMP "+
 			"should be built from the merkle-service callback enrichment (issue #195), "+
 			"not a datahub fetch. Check that the pinned merkle-service image emits "+

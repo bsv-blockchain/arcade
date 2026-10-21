@@ -14,7 +14,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"github.com/bsv-blockchain/arcade/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
 )
 
 // fakeMerkle is one merkle-service endpoint whose /watch, /reprocess and

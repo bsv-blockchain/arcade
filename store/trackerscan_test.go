@@ -3,7 +3,7 @@ package store
 import (
 	"testing"
 
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
 )
 
 // legacyKeep is a literal copy of the pre-#276 hydration filter from

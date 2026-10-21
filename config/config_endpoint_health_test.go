@@ -11,7 +11,7 @@ func loadEndpointHealthDefaults(t *testing.T) EndpointHealthConfig {
 	t.Helper()
 	viper.Reset()
 	t.Cleanup(viper.Reset)
-	viper.SetEnvPrefix("ARCADE")
+	viper.SetEnvPrefix("BSV_BROADCASTER")
 	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	viper.AutomaticEnv()
 	setDefaults()
@@ -30,7 +30,7 @@ func TestEndpointHealthDiscoveredTTLDefault(t *testing.T) {
 }
 
 func TestEndpointHealthDiscoveredTTLEnvOverride(t *testing.T) {
-	t.Setenv("ARCADE_PROPAGATION_ENDPOINT_HEALTH_DISCOVERED_TTL_MS", "600000")
+	t.Setenv("BSV_BROADCASTER_PROPAGATION_ENDPOINT_HEALTH_DISCOVERED_TTL_MS", "600000")
 
 	if got := loadEndpointHealthDefaults(t).DiscoveredTTLMs; got != 600000 {
 		t.Fatalf("DiscoveredTTLMs = %d, want 600000", got)

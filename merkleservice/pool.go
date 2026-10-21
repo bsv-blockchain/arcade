@@ -12,7 +12,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
 )
 
 // ErrNoHealthyEndpoints is returned when every endpoint's breaker is open,

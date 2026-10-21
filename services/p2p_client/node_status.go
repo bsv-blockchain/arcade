@@ -7,8 +7,8 @@ import (
 
 	teranodep2p "github.com/bsv-blockchain/teranode/services/p2p"
 
-	"github.com/bsv-blockchain/arcade/ssrfguard"
-	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/ssrfguard"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
 )
 
 // legacyMiningFeeBytesBasis is the byte basis the legacy MinMiningTxFee field

@@ -8,9 +8,9 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/kafka"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
 )
 
 // The dispatcher is a single-goroutine engine that owns all dep-aware

@@ -16,11 +16,11 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 
-	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
 )
 
 // These tests pin the #295 missing-parent safety net end-to-end: with a
-// multi-partition arcade.propagation topic, a child submitted in a LATER
+// multi-partition bsv-broadcaster.propagation topic, a child submitted in a LATER
 // HTTP request than its parent has no ordering guarantee — it can reach
 // teranode first and draw TX_MISSING_PARENT. Arcade must treat that as a
 // retryable condition (requeue → eventual accept once the parent lands, or
@@ -178,8 +178,8 @@ func (d *dependencyAwareTeranode) waitForMissingParentResponse(t *testing.T, n i
 	t.Fatalf("teranode never answered %d missing-parent responses within %s", n, timeout)
 }
 
-// arcadeTxStatus fetches GET /tx/:txid and returns the persisted status.
-func arcadeTxStatus(t *testing.T, rt *arcadeRuntime, txid string) string {
+// broadcasterTxStatus fetches GET /tx/:txid and returns the persisted status.
+func broadcasterTxStatus(t *testing.T, rt *broadcasterRuntime, txid string) string {
 	t.Helper()
 	resp, err := http.Get(rt.baseURL + "/tx/" + txid)
 	if err != nil {
@@ -195,13 +195,13 @@ func arcadeTxStatus(t *testing.T, rt *arcadeRuntime, txid string) string {
 	return out.Status
 }
 
-// waitForArcadeStatus polls GET /tx/:txid until it reports want.
-func waitForArcadeStatus(t *testing.T, rt *arcadeRuntime, txid, want string, timeout time.Duration) {
+// waitForBroadcasterStatus polls GET /tx/:txid until it reports want.
+func waitForBroadcasterStatus(t *testing.T, rt *broadcasterRuntime, txid, want string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	last := ""
 	for time.Now().Before(deadline) {
-		last = arcadeTxStatus(t, rt, txid)
+		last = broadcasterTxStatus(t, rt, txid)
 		if last == want {
 			return
 		}
@@ -220,7 +220,7 @@ func waitForArcadeStatus(t *testing.T, rt *arcadeRuntime, txid, want string, tim
 // ever co-housed parent and child, and NOTHING was marked REJECTED.
 func TestSmoke_OutOfOrderChild_RecoversViaMissingParentRetry(t *testing.T) {
 	teranode := newDependencyAwareTeranode(t)
-	rt := startArcadeSmoke(t, smokeOptions{
+	rt := startBroadcasterSmoke(t, smokeOptions{
 		TeranodeURL:           teranode.URL(),
 		PropagationPartitions: 4,
 		MutateConfig: func(cfg *config.Config) {
@@ -249,11 +249,11 @@ func TestSmoke_OutOfOrderChild_RecoversViaMissingParentRetry(t *testing.T) {
 	teranode.waitForAccepted(t, parent.TxID(), 10*time.Second)
 	teranode.waitForAccepted(t, child.TxID(), 15*time.Second)
 
-	waitForArcadeStatus(t, rt, parent.TxID(), "ACCEPTED_BY_NETWORK", 10*time.Second)
-	waitForArcadeStatus(t, rt, child.TxID(), "ACCEPTED_BY_NETWORK", 10*time.Second)
+	waitForBroadcasterStatus(t, rt, parent.TxID(), "ACCEPTED_BY_NETWORK", 10*time.Second)
+	waitForBroadcasterStatus(t, rt, child.TxID(), "ACCEPTED_BY_NETWORK", 10*time.Second)
 
 	// The ordering artifact must never have produced a verdict.
-	if got := arcadeTxStatus(t, rt, child.TxID()); got == "REJECTED" {
+	if got := broadcasterTxStatus(t, rt, child.TxID()); got == "REJECTED" {
 		t.Fatalf("child ended REJECTED — the missing-parent safety net failed")
 	}
 	assertParentChildNeverCohabits(t, teranode.snapshotBatches(), [][]*bt.Tx{chain})
@@ -265,7 +265,7 @@ func TestSmoke_OutOfOrderChild_RecoversViaMissingParentRetry(t *testing.T) {
 // unrelated traffic keeps flowing through the same partitioned pipeline.
 func TestSmoke_OrphanChild_ParksWithoutWedgingPipeline(t *testing.T) {
 	teranode := newDependencyAwareTeranode(t)
-	rt := startArcadeSmoke(t, smokeOptions{
+	rt := startBroadcasterSmoke(t, smokeOptions{
 		TeranodeURL:           teranode.URL(),
 		PropagationPartitions: 4,
 		// Harness defaults: RetryMaxAttempts=1, RetryBackoffMs=50 — the
@@ -278,7 +278,7 @@ func TestSmoke_OrphanChild_ParksWithoutWedgingPipeline(t *testing.T) {
 	if err := postTxs(rt, []*bt.Tx{orphanChild}); err != nil {
 		t.Fatalf("submit orphan child: %v", err)
 	}
-	waitForArcadeStatus(t, rt, orphanChild.TxID(), "PENDING_RETRY", 15*time.Second)
+	waitForBroadcasterStatus(t, rt, orphanChild.TxID(), "PENDING_RETRY", 15*time.Second)
 
 	// The pipeline must not be wedged: an unrelated tx submitted after the
 	// orphan still broadcasts and terminalizes.
@@ -286,9 +286,9 @@ func TestSmoke_OrphanChild_ParksWithoutWedgingPipeline(t *testing.T) {
 	if err := postTxs(rt, []*bt.Tx{unrelated}); err != nil {
 		t.Fatalf("submit unrelated: %v", err)
 	}
-	waitForArcadeStatus(t, rt, unrelated.TxID(), "ACCEPTED_BY_NETWORK", 15*time.Second)
+	waitForBroadcasterStatus(t, rt, unrelated.TxID(), "ACCEPTED_BY_NETWORK", 15*time.Second)
 
-	if got := arcadeTxStatus(t, rt, orphanChild.TxID()); got == "REJECTED" {
+	if got := broadcasterTxStatus(t, rt, orphanChild.TxID()); got == "REJECTED" {
 		t.Fatalf("orphan child was REJECTED — missing-parent must park, never reject")
 	}
 }
@@ -317,7 +317,7 @@ func TestSmoke_DeepChainAcrossSubmissions_ConvergesViaReaper(t *testing.T) {
 	const depth = 12
 
 	teranode := newDependencyAwareTeranode(t)
-	rt := startArcadeSmoke(t, smokeOptions{
+	rt := startBroadcasterSmoke(t, smokeOptions{
 		TeranodeURL:           teranode.URL(),
 		PropagationPartitions: 4,
 		MutateConfig: func(cfg *config.Config) {
@@ -347,8 +347,8 @@ func TestSmoke_DeepChainAcrossSubmissions_ConvergesViaReaper(t *testing.T) {
 
 	start := time.Now()
 	for i, tx := range chain {
-		waitForArcadeStatus(t, rt, tx.TxID(), "ACCEPTED_BY_NETWORK", 30*time.Second)
-		if got := arcadeTxStatus(t, rt, tx.TxID()); got == "REJECTED" {
+		waitForBroadcasterStatus(t, rt, tx.TxID(), "ACCEPTED_BY_NETWORK", 30*time.Second)
+		if got := broadcasterTxStatus(t, rt, tx.TxID()); got == "REJECTED" {
 			t.Fatalf("chain[%d] was REJECTED; a missing parent is a condition, not a verdict", i)
 		}
 	}

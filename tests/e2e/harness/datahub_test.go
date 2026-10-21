@@ -12,7 +12,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/bump"
+	"github.com/bsv-blockchain/bsv-broadcaster/bump"
 )
 
 // TestDatahub_StageAndServe is a fast self-test on the in-process

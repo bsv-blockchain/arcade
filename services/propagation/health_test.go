@@ -17,9 +17,9 @@ import (
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/teranode"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/teranode"
 )
 
 // TestBroadcastSingle_WaitsForSlowPeer verifies that once one endpoint

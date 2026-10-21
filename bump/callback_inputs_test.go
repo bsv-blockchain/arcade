@@ -5,7 +5,7 @@ import (
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
 )
 
 // TestBuildCompoundBUMP_CallbackInputs_16Subtrees is the issue #195 acceptance

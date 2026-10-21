@@ -15,7 +15,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/bsv-blockchain/arcade/services/api_server"
+	"github.com/bsv-blockchain/bsv-broadcaster/services/api_server"
 )
 
 func main() {

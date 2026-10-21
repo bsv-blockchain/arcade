@@ -7,7 +7,7 @@ import (
 	"math"
 	"time"
 
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
 )
 
 // ErrNotFound is returned when a requested record does not exist.
@@ -625,7 +625,7 @@ type Store interface {
 	// it exists after. Only txids that were actually updated appear in either
 	// slice — unknown-txid skips produce no entry on either side. The prevs
 	// slice exists so callers can observe the
-	// arcade_status_transition_age_seconds{from=*,to=MINED} metric without an
+	// bsv_broadcaster_status_transition_age_seconds{from=*,to=MINED} metric without an
 	// extra round-trip.
 	SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeight uint64, txids []string) (prevs, mined []*models.TransactionStatus, err error)
 

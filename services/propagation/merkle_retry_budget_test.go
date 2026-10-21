@@ -20,10 +20,10 @@ import (
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 
-	"github.com/bsv-blockchain/arcade/kafka"
-	"github.com/bsv-blockchain/arcade/merkleservice"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
+	"github.com/bsv-blockchain/bsv-broadcaster/merkleservice"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
 )
 
 // scriptedMerkle fails /watch with HTTP 500 for a per-txid quota, then

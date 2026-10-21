@@ -17,10 +17,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/events"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/events"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
 )
 
 // Client is a single connected SSE consumer. The handler goroutine
@@ -1041,7 +1041,7 @@ const (
 // trust; everything after it, up to the live stream, may be missing.
 //
 // Unknown event types are ignored by every conformant SSE client (including
-// go-arcade-toolbox, which skips any `event:` other than "status"), so this
+// go-bsv-broadcaster-toolbox, which skips any `event:` other than "status"), so this
 // frame is purely additive and safe to emit at any protocol version.
 type gapPayload struct {
 	// Reason is machine-readable and matches the SSEGapEventsTotal label.

@@ -33,7 +33,7 @@ func TestIsTransactionFinal(t *testing.T) {
 		wantHeightBased bool
 	}{
 		{
-			// Regression vector from bsv-blockchain/arcade#245: timestamp
+			// Regression vector from bsv-blockchain/bsv-broadcaster#245: timestamp
 			// locktime ahead of MTP with a non-final input sequence.
 			name:            "issue 245 timestamp locktime ahead of MTP is not final",
 			tx:              txWith(1783806110, nonFinalSeq, finalSeq),

@@ -13,7 +13,7 @@ import (
 	tnerr "github.com/bsv-blockchain/teranode/errors"
 	tnvalidator "github.com/bsv-blockchain/teranode/services/validator"
 
-	arcerrors "github.com/bsv-blockchain/arcade/errors"
+	arcerrors "github.com/bsv-blockchain/bsv-broadcaster/errors"
 )
 
 // --- construction --------------------------------------------------------

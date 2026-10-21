@@ -8,8 +8,8 @@ Need help with **arcade**? You're in the right place. Here’s how to get suppor
 
 Before asking, check the existing threads:
 
-* 🔍 Search [Issues](https://github.com/bsv-blockchain/arcade/issues) or [Pull Requests](https://github.com/bsv-blockchain/arcade/pulls?q=is%3Apr+is%3Aopen+is%3Aclosed)
-* 🆕 Can’t find what you need? Start a [new issue](https://github.com/bsv-blockchain/arcade/issues/new?template=question.yml).
+* 🔍 Search [Issues](https://github.com/bsv-blockchain/bsv-broadcaster/issues) or [Pull Requests](https://github.com/bsv-blockchain/bsv-broadcaster/pulls?q=is%3Apr+is%3Aopen+is%3Aclosed)
+* 🆕 Can’t find what you need? Start a [new issue](https://github.com/bsv-blockchain/bsv-broadcaster/issues/new?template=question.yml).
 
 <br/>
 
@@ -17,7 +17,7 @@ Before asking, check the existing threads:
 
 Found a bug?
 
-1. Check the [issue tracker](https://github.com/bsv-blockchain/arcade/issues) to avoid duplicates.
+1. Check the [issue tracker](https://github.com/bsv-blockchain/bsv-broadcaster/issues) to avoid duplicates.
 2. If it’s new, open an issue with:
 
 	* Clear steps to reproduce

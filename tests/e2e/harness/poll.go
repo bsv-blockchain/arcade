@@ -25,7 +25,7 @@ import (
 // fee verification against the per-input source data EF carries; raw
 // (non-EF) bytes would be rejected for "PreviousTx not supplied".
 // Returns the txid arcade derived from the parsed transaction.
-func BroadcastTx(ctx context.Context, t *testing.T, rt *ArcadeRuntime, tx *bt.Tx) (string, error) {
+func BroadcastTx(ctx context.Context, t *testing.T, rt *BroadcasterRuntime, tx *bt.Tx) (string, error) {
 	t.Helper()
 	body := bytes.NewReader(tx.ExtendedBytes())
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rt.BaseURL+"/tx", body)
@@ -92,7 +92,7 @@ func (r txStatusResponse) GetOrphanedProof(wantBlock string) (OrphanedProof, boo
 
 // GetTxStatus fetches a single tx's status from arcade. Returns
 // (status, true) on 200, (zero, false) on 404, error otherwise.
-func GetTxStatus(ctx context.Context, rt *ArcadeRuntime, txid string) (txStatusResponse, bool, error) {
+func GetTxStatus(ctx context.Context, rt *BroadcasterRuntime, txid string) (txStatusResponse, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rt.BaseURL+"/tx/"+txid, nil)
 	if err != nil {
 		return txStatusResponse{}, false, err
@@ -123,7 +123,7 @@ func GetTxStatus(ctx context.Context, rt *ArcadeRuntime, txid string) (txStatusR
 //
 // txids in the returned slice are sorted so callers can pass them to
 // WaitForMined without worrying about map iteration order.
-func BroadcastRawTxs(ctx context.Context, t *testing.T, rt *ArcadeRuntime, rawTxs map[string][]byte) ([]string, error) {
+func BroadcastRawTxs(ctx context.Context, t *testing.T, rt *BroadcasterRuntime, rawTxs map[string][]byte) ([]string, error) {
 	t.Helper()
 	got := make([]string, 0, len(rawTxs))
 	for id, raw := range rawTxs {
@@ -236,7 +236,7 @@ func WaitForMerkleRegistration(ctx context.Context, merkleHostURL, txid string, 
 //
 // expectedHeaderRoot is the display-order hex string from
 // fixture.MerkleRoot.
-func AssertMerklePathsMatchHeaderRoot(t *testing.T, rt *ArcadeRuntime, expectedHeaderRoot string, txids []string) {
+func AssertMerklePathsMatchHeaderRoot(t *testing.T, rt *BroadcasterRuntime, expectedHeaderRoot string, txids []string) {
 	t.Helper()
 	wantBytes, err := hex.DecodeString(expectedHeaderRoot)
 	if err != nil {
@@ -299,7 +299,7 @@ func AssertMerklePathsMatchHeaderRoot(t *testing.T, rt *ArcadeRuntime, expectedH
 // MINED (or IMMUTABLE) with a non-empty merklePath AND blockHash equal to
 // wantBlockHash. Use in reorg scenarios where plain WaitForMined would
 // accept an anchor to either competing block.
-func WaitForMinedInBlock(ctx context.Context, t *testing.T, rt *ArcadeRuntime, txids []string, wantBlockHash string, timeout time.Duration) error {
+func WaitForMinedInBlock(ctx context.Context, t *testing.T, rt *BroadcasterRuntime, txids []string, wantBlockHash string, timeout time.Duration) error {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	pending := make(map[string]struct{}, len(txids))
@@ -343,7 +343,7 @@ func WaitForMinedInBlock(ctx context.Context, t *testing.T, rt *ArcadeRuntime, t
 
 // WaitForStatus polls /tx/:txid until it reports wantStatus (e.g.
 // SEEN_ON_NETWORK after a reorg revert) or the timeout elapses.
-func WaitForStatus(ctx context.Context, rt *ArcadeRuntime, txid, wantStatus string, timeout time.Duration) error {
+func WaitForStatus(ctx context.Context, rt *BroadcasterRuntime, txid, wantStatus string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	last := ""
 	for {
@@ -373,7 +373,7 @@ func WaitForStatus(ctx context.Context, rt *ArcadeRuntime, txid, wantStatus stri
 // announcing competing blocks: the losing block's BUMP being persisted
 // proves bump-builder fully processed its BLOCK_PROCESSED before the
 // test moves on.
-func WaitForBUMPStored(ctx context.Context, rt *ArcadeRuntime, blockHash string, timeout time.Duration) error {
+func WaitForBUMPStored(ctx context.Context, rt *BroadcasterRuntime, blockHash string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
 		_, data, err := rt.Deps.Store.GetBUMP(ctx, blockHash)
@@ -397,7 +397,7 @@ func WaitForBUMPStored(ctx context.Context, rt *ArcadeRuntime, blockHash string,
 // STUMPs re-anchor already-MINED txs to it within a second or two, so a
 // short window catches the flip with a crisp message; on fixed code the
 // window passes quietly.
-func AssertAnchorsStable(ctx context.Context, t *testing.T, rt *ArcadeRuntime, txids []string, forbiddenBlock string, window time.Duration) {
+func AssertAnchorsStable(ctx context.Context, t *testing.T, rt *BroadcasterRuntime, txids []string, forbiddenBlock string, window time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(window)
 	for time.Now().Before(deadline) {
@@ -469,9 +469,9 @@ func publishBlockUntil(ctx context.Context, lp *LibP2PHost, msgs []teranode.Bloc
 // PublishBlockUntilTracked publishes msg until arcade's embedded
 // chaintracks knows the header (by hash) — regardless of whether it
 // became tip. Use for the same-height alternate in reorg scenarios.
-func PublishBlockUntilTracked(ctx context.Context, rt *ArcadeRuntime, lp *LibP2PHost, msg teranode.BlockMessage, timeout time.Duration) error {
+func PublishBlockUntilTracked(ctx context.Context, rt *BroadcasterRuntime, lp *LibP2PHost, msg teranode.BlockMessage, timeout time.Duration) error {
 	if rt.Deps.Chaintracks == nil {
-		return fmt.Errorf("chaintracks not enabled on this arcade runtime (set ArcadeOptions.EnableChaintracks)")
+		return fmt.Errorf("chaintracks not enabled on this arcade runtime (set BroadcasterOptions.EnableChaintracks)")
 	}
 	want, err := chainhash.NewHashFromHex(msg.Hash)
 	if err != nil {
@@ -485,7 +485,7 @@ func PublishBlockUntilTracked(ctx context.Context, rt *ArcadeRuntime, lp *LibP2P
 
 // PublishBlockUntilTip publishes msg until arcade's embedded chaintracks
 // reports it as the chain tip.
-func PublishBlockUntilTip(ctx context.Context, rt *ArcadeRuntime, lp *LibP2PHost, msg teranode.BlockMessage, timeout time.Duration) error {
+func PublishBlockUntilTip(ctx context.Context, rt *BroadcasterRuntime, lp *LibP2PHost, msg teranode.BlockMessage, timeout time.Duration) error {
 	return PublishBlockVariantsUntilTip(ctx, rt, lp, []teranode.BlockMessage{msg}, timeout)
 }
 
@@ -495,9 +495,9 @@ func PublishBlockUntilTip(ctx context.Context, rt *ArcadeRuntime, lp *LibP2PHost
 // container-reachable URL for merkle-service AND a host-reachable URL
 // for chaintracks' backward header crawl (the reorg-trigger path
 // C-on-orphaned-parent, where chaintracks HTTP-GETs /headers/<hash>).
-func PublishBlockVariantsUntilTip(ctx context.Context, rt *ArcadeRuntime, lp *LibP2PHost, msgs []teranode.BlockMessage, timeout time.Duration) error {
+func PublishBlockVariantsUntilTip(ctx context.Context, rt *BroadcasterRuntime, lp *LibP2PHost, msgs []teranode.BlockMessage, timeout time.Duration) error {
 	if rt.Deps.Chaintracks == nil {
-		return fmt.Errorf("chaintracks not enabled on this arcade runtime (set ArcadeOptions.EnableChaintracks)")
+		return fmt.Errorf("chaintracks not enabled on this arcade runtime (set BroadcasterOptions.EnableChaintracks)")
 	}
 	if len(msgs) == 0 {
 		return fmt.Errorf("no block message variants")
@@ -518,7 +518,7 @@ func PublishBlockVariantsUntilTip(ctx context.Context, rt *ArcadeRuntime, lp *Li
 // reports MINED (or IMMUTABLE) with a non-empty merklePath, or the
 // timeout elapses. On failure, the first stuck txid is reported with
 // its last-observed status so debugging starts with a concrete signal.
-func WaitForMined(ctx context.Context, t *testing.T, rt *ArcadeRuntime, txids []string, timeout time.Duration) error {
+func WaitForMined(ctx context.Context, t *testing.T, rt *BroadcasterRuntime, txids []string, timeout time.Duration) error {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	pending := make(map[string]struct{}, len(txids))
@@ -575,7 +575,7 @@ type BlockStatusResponse struct {
 
 // GetBlockProcessingStatus fetches one block_processing row over the public
 // API. Returns (row, true) on 200, (zero, false) on 404, error otherwise.
-func GetBlockProcessingStatus(ctx context.Context, rt *ArcadeRuntime, blockHash string) (BlockStatusResponse, bool, error) {
+func GetBlockProcessingStatus(ctx context.Context, rt *BroadcasterRuntime, blockHash string) (BlockStatusResponse, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rt.BaseURL+"/api/v1/blocks/processing-status/"+blockHash, nil)
 	if err != nil {
 		return BlockStatusResponse{}, false, err
@@ -603,7 +603,7 @@ func GetBlockProcessingStatus(ctx context.Context, rt *ArcadeRuntime, blockHash 
 // for blockHash reports wantStatus, or timeout elapses. The last observed
 // row rides along in the timeout error so a stuck projection reads crisply
 // (issue #339: "still orphaned").
-func WaitForBlockStatus(ctx context.Context, rt *ArcadeRuntime, blockHash, wantStatus string, timeout time.Duration) (BlockStatusResponse, error) {
+func WaitForBlockStatus(ctx context.Context, rt *BroadcasterRuntime, blockHash, wantStatus string, timeout time.Duration) (BlockStatusResponse, error) {
 	deadline := time.Now().Add(timeout)
 	var last BlockStatusResponse
 	found := false
@@ -637,7 +637,7 @@ func WaitForBlockStatus(ctx context.Context, rt *ArcadeRuntime, blockHash, wantS
 // whole window and fails the moment the row for blockHash reports anything
 // other than wantStatus. Use after a reorg has been projected to prove no
 // stale scan or late reconciler tick flips the canonical block back.
-func AssertBlockStatusStable(ctx context.Context, t *testing.T, rt *ArcadeRuntime, blockHash, wantStatus string, window time.Duration) {
+func AssertBlockStatusStable(ctx context.Context, t *testing.T, rt *BroadcasterRuntime, blockHash, wantStatus string, window time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(window)
 	for time.Now().Before(deadline) {
@@ -663,7 +663,7 @@ func AssertBlockStatusStable(ctx context.Context, t *testing.T, rt *ArcadeRuntim
 // (status='orphaned' AND reconciled_at IS NULL) before the competition
 // flips — the state the mainnet incident of issue #339 was in, and the one
 // the reconciler's own resurrection short-circuit can no longer reach.
-func WaitForBlockReconciled(ctx context.Context, rt *ArcadeRuntime, blockHash string, timeout time.Duration) error {
+func WaitForBlockReconciled(ctx context.Context, rt *BroadcasterRuntime, blockHash string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
 		row, err := rt.Deps.Store.GetBlockProcessingStatus(ctx, blockHash)

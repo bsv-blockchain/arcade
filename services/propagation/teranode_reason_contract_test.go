@@ -16,8 +16,8 @@ import (
 	tnerr "github.com/bsv-blockchain/teranode/errors"
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 
-	arcerrors "github.com/bsv-blockchain/arcade/errors"
-	"github.com/bsv-blockchain/arcade/models"
+	arcerrors "github.com/bsv-blockchain/bsv-broadcaster/errors"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
 )
 
 // The arcade ↔ teranode rejection-reason contract.

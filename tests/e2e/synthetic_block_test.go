@@ -9,7 +9,7 @@ import (
 
 	teranode "github.com/bsv-blockchain/teranode/services/p2p"
 
-	"github.com/bsv-blockchain/arcade/tests/e2e/harness"
+	"github.com/bsv-blockchain/bsv-broadcaster/tests/e2e/harness"
 )
 
 // TestSmoke_SyntheticBlockMined proves the synthetic-block path end to
@@ -28,11 +28,11 @@ func TestSmoke_SyntheticBlockMined(t *testing.T) {
 	h := harness.New(t)
 
 	msDatahub := h.NewDatahub(t)
-	arcadeDatahub := h.NewDatahub(t)
+	broadcasterDatahub := h.NewDatahub(t)
 
-	rt := harness.StartArcade(t, harness.ArcadeOptions{
+	rt := harness.StartBroadcaster(t, harness.BroadcasterOptions{
 		MerkleServiceURL:  h.Containers.MerkleHostURL,
-		DatahubURL:        arcadeDatahub.LocalURL(),
+		DatahubURL:        broadcasterDatahub.LocalURL(),
 		LibP2PBootstrap:   h.LibP2P.BootstrapMultiaddr(),
 		LibP2PLoopback:    h.LibP2P.LoopbackMultiaddr(),
 		MerkleAuthToken:   "e2e-watch-token",
@@ -73,7 +73,7 @@ func TestSmoke_SyntheticBlockMined(t *testing.T) {
 		t.Fatalf("build synthetic block: %v", err)
 	}
 	blk.Stage(msDatahub)
-	blk.Stage(arcadeDatahub)
+	blk.Stage(broadcasterDatahub)
 	t.Logf("synthetic block %s (subtree %s, root %s)", blk.Hash, blk.SubtreeHash, blk.MerkleRoot)
 
 	// 3. Announce subtree then block; republish the block until arcade's

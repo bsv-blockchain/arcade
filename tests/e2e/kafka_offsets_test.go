@@ -11,7 +11,7 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/redpanda"
 
-	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
 )
 
 // TestKafkaStartOffset proves the StartOffset contract against real Kafka

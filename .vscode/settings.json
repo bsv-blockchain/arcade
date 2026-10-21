@@ -80,7 +80,7 @@
             "-.mage-cache"
         ],
         "formatting.gofumpt": true,
-        "formatting.local": "github.com/bsv-blockchain/arcade",
+        "formatting.local": "github.com/bsv-blockchain/bsv-broadcaster",
         "symbolMatcher": "fastfuzzy",
         "symbolStyle": "full",
         "ui.completion.completeFunctionCalls": true,

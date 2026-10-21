@@ -6,8 +6,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
 )
 
 // miningFeeBytesBasis is the byte basis arcade advertises fee rates against:

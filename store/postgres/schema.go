@@ -29,8 +29,10 @@ var schemaChecksum = func() string {
 
 // schemaLockKey serializes schema application across replicas via
 // pg_advisory_lock. Advisory locks are per-database, so the constant only has
-// to be unique among arcade's own advisory locks. "arcade" in ASCII hex;
-// changing it would let two versions apply concurrently — never change it.
+// to be unique among our own advisory locks. "arcade" (the project's former
+// name) in ASCII hex,
+// deliberately kept across the rebrand: changing it would let two versions
+// apply concurrently — never change it.
 const schemaLockKey = int64(0x617263616465)
 
 // defaultSchemaApplyTimeout bounds the slow path when

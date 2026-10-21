@@ -8,7 +8,7 @@ import (
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
 )
 
 // fakeIterStore is a minimal TrackerRowIterator stub that yields a fixed set of

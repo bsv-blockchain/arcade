@@ -6,8 +6,8 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/merkleservice"
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/merkleservice"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
 )
 
 // defaultReplayLookback is the IterateStatusesSince window used when the

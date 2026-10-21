@@ -9,7 +9,7 @@ At the end you'll have:
 
 - One `arcade` process serving the Arc-compatible HTTP API on `:8080`
 - A `/health` endpoint on `:8081`
-- All state under `~/.arcade/` (Pebble DB, chaintracks headers, libp2p key)
+- All state under `~/.bsv-broadcaster/` (Pebble DB, chaintracks headers, libp2p key)
 - No external services running
 
 For full configuration, see [`config.example.standalone.yaml`](../config.example.standalone.yaml).
@@ -27,9 +27,9 @@ profile.
 ## Build
 
 ```bash
-git clone https://github.com/bsv-blockchain/arcade.git
+git clone https://github.com/bsv-blockchain/bsv-broadcaster.git
 cd arcade
-go build -o arcade ./cmd/arcade
+go build -o arcade ./cmd/bsv-broadcaster
 ```
 
 ## Base config
@@ -42,7 +42,7 @@ production-transaction risk.
 mode: all
 log_level: info
 network: teratestnet
-storage_path: ~/.arcade
+storage_path: ~/.bsv-broadcaster
 
 api:
   host: 0.0.0.0
@@ -58,7 +58,7 @@ kafka:
 store:
   backend: pebble
   pebble:
-    path: ~/.arcade/pebble
+    path: ~/.bsv-broadcaster/pebble
     memtable_size_mb: 64
     l0_compaction_threshold: 4
     sync_writes: false
@@ -141,7 +141,7 @@ Configure Merkle Service whenever you want real status progression.
 ### Running against several Merkle Services
 
 List additional instances under `merkle_service.urls` (or set
-`ARCADE_MERKLE_SERVICE_URLS` to a comma-separated list). Arcade registers every
+`BSV_BROADCASTER_MERKLE_SERVICE_URLS` to a comma-separated list). Arcade registers every
 transaction with every endpoint and each endpoint delivers its own callbacks:
 
 - A transaction is registered, and therefore broadcast, as soon as **one**
@@ -159,8 +159,8 @@ transaction with every endpoint and each endpoint delivers its own callbacks:
   answers again. `/health` lists each endpoint under `merkle_endpoints`
   (breaker state and queued registrations) as the answering process sees
   it; every process runs its own pool, and the propagation pods carry the
-  registrations, so their `arcade_merkle_endpoint_healthy` /
-  `arcade_merkle_endpoint_catchup_pending` series are the authoritative
+  registrations, so their `bsv_broadcaster_merkle_endpoint_healthy` /
+  `bsv_broadcaster_merkle_endpoint_catchup_pending` series are the authoritative
   view.
 - The breaker applies to a single `url` too. After three consecutive
   transport/5xx failures, registrations are refused locally (propagation
@@ -205,7 +205,7 @@ Service POSTs status updates here, so it must be resolvable and routable
 
 Examples:
 
-- Public deployment: `https://arcade.example.com/api/v1/merkle-service/callback`
+- Public deployment: `https://broadcaster.example.com/api/v1/merkle-service/callback`
 - Local dev with Merkle Service running in Docker on the same host:
   `http://host.docker.internal:8080/api/v1/merkle-service/callback`
 
@@ -216,7 +216,7 @@ Append the following to your `config.yaml`. Note that `callback_url` and
 under `merkle_service:`.
 
 ```yaml
-callback_url: "https://arcade.example.com/api/v1/merkle-service/callback"
+callback_url: "https://broadcaster.example.com/api/v1/merkle-service/callback"
 callback_token: "<output of openssl rand -hex 32>"
 
 merkle_service:
@@ -270,7 +270,7 @@ curl http://localhost:8080/tx/<txid>
   [`config.example.yaml`](../config.example.yaml), which uses external Kafka
   brokers and an Aerospike cluster. Pre-create Kafka topics per
   [`docs/production-kafka.md`](production-kafka.md) — arcade does not create
-  them and `arcade.propagation` has a hard partition-count constraint.
+  them and `bsv-broadcaster.propagation` has a hard partition-count constraint.
 
 Any value above can be overridden by an environment variable prefixed with
-`ARCADE_`, e.g. `ARCADE_LOG_LEVEL=debug` or `ARCADE_NETWORK=mainnet`.
+`BSV_BROADCASTER_`, e.g. `BSV_BROADCASTER_LOG_LEVEL=debug` or `BSV_BROADCASTER_NETWORK=mainnet`.

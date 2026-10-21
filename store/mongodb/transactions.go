@@ -10,9 +10,9 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
 )
 
 // blockRewritePasses bounds SetStatusByBlockHash's drain. Each pass retires

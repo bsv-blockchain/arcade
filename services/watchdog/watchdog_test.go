@@ -15,10 +15,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/merkleservice"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/merkleservice"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
 )
 
 // watchdogStore is a hand-rolled store fake. Embeds the real store.Store
@@ -231,7 +231,7 @@ func newTestWatchdog(t *testing.T, st *watchdogStore, leaser *watchdogLeaser, mc
 		MaxBackoff:      30 * time.Minute,
 		TerminalBackoff: 4 * time.Hour,
 	}
-	w := New(st, leaser, mc, "http://arcade/callback", "tok", cfg, zap.NewNop())
+	w := New(st, leaser, mc, "http://broadcaster/callback", "tok", cfg, zap.NewNop())
 	// Tests assert on exact backoff values; pin jitter to identity so the
 	// production ±20% spread doesn't bleed into per-test equality checks.
 	w.jitter = identityJitter
@@ -260,7 +260,7 @@ func TestWatchdog_TriggersReprocessForStaleRow(t *testing.T) {
 		t.Fatalf("reprocess calls=%d want 1", srv.callCount())
 	}
 	calls := srv.capturedCalls()
-	if calls[0].blockHash != "blk-1" || calls[0].callbackURL != "http://arcade/callback" {
+	if calls[0].blockHash != "blk-1" || calls[0].callbackURL != "http://broadcaster/callback" {
 		t.Errorf("got call=%+v", calls[0])
 	}
 }

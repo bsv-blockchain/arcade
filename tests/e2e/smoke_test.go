@@ -17,7 +17,7 @@ import (
 
 	"github.com/testcontainers/testcontainers-go"
 
-	"github.com/bsv-blockchain/arcade/tests/e2e/harness"
+	"github.com/bsv-blockchain/bsv-broadcaster/tests/e2e/harness"
 )
 
 // TestSmoke_TxRegistersWithMerkleService is the v1 smoke test: it
@@ -49,7 +49,7 @@ func TestSmoke_TxRegistersWithMerkleService(t *testing.T) {
 
 	h := harness.New(t)
 
-	rt := harness.StartArcade(t, harness.ArcadeOptions{
+	rt := harness.StartBroadcaster(t, harness.BroadcasterOptions{
 		MerkleServiceURL: h.Containers.MerkleHostURL,
 		DatahubURL:       datahub.HostURL(),
 		LibP2PBootstrap:  h.LibP2P.BootstrapMultiaddr(),

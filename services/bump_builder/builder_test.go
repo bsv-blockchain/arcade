@@ -21,12 +21,12 @@ import (
 	"github.com/bsv-blockchain/go-sdk/util"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/bump"
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/kafka"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
-	"github.com/bsv-blockchain/arcade/teranode"
+	"github.com/bsv-blockchain/bsv-broadcaster/bump"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/teranode"
 )
 
 // testBlockHash is a synthetic block hash reused across the table-style tests
@@ -351,7 +351,7 @@ func makeBlockProcessedMsg(blockHash string) *kafka.Message {
 		panic(err)
 	}
 	return &kafka.Message{
-		Topic: "arcade.block_processed",
+		Topic: "bsv-broadcaster.block_processed",
 		Value: data,
 	}
 }
@@ -370,7 +370,7 @@ func makeBlockProcessedMsgWithExpected(blockHash string, expected []int) *kafka.
 		panic(err)
 	}
 	return &kafka.Message{
-		Topic: "arcade.block_processed",
+		Topic: "bsv-broadcaster.block_processed",
 		Value: data,
 	}
 }
@@ -1056,7 +1056,7 @@ func TestBuilder_HandleMessage_FieldAbsentFromWire_BuildsNormally(t *testing.T) 
 		t.Fatalf("absent field must decode to nil, got %v", decoded.ExpectedSubtreeIndices)
 	}
 
-	msg := &kafka.Message{Topic: "arcade.block_processed", Value: rawWire}
+	msg := &kafka.Message{Topic: "bsv-broadcaster.block_processed", Value: rawWire}
 	if err := b.handleMessage(context.Background(), msg); err != nil {
 		t.Fatalf("old-merkle BLOCK_PROCESSED must build normally, got: %v", err)
 	}
@@ -1127,7 +1127,7 @@ func TestBuilder_HandleMessage_InvalidJSON_ReturnsError(t *testing.T) {
 	b := newTestBuilder(ms, datahub.URL)
 
 	msg := &kafka.Message{
-		Topic: "arcade.block_processed",
+		Topic: "bsv-broadcaster.block_processed",
 		Value: []byte("not json"),
 	}
 	err := b.handleMessage(context.Background(), msg)

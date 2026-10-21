@@ -20,7 +20,7 @@ Response is `Content-Type: text/event-stream` and stays open until either side d
 Pick any opaque string as your token (`crypto.randomUUID()` works) and send it as a header on every submit:
 
 ```bash
-curl -X POST https://arcade.example.com/tx \
+curl -X POST https://broadcaster.example.com/tx \
   -H "Content-Type: application/octet-stream" \
   -H "X-CallbackToken: my-session-abc123" \
   --data-binary @tx.bin
@@ -83,7 +83,7 @@ Every ~15 seconds the server emits a `: keepalive` comment frame so idle proxies
 
 ```js
 const es = new EventSource(
-  'https://arcade.example.com/events?callbackToken=my-session-abc123'
+  'https://broadcaster.example.com/events?callbackToken=my-session-abc123'
 );
 
 es.addEventListener('status', (ev) => {
@@ -106,7 +106,7 @@ es.onerror = (err) => console.error('SSE error', err);
 - read the response stream directly:
 
 ```ts
-const res = await fetch('https://arcade.example.com/events?callbackToken=my-session-abc123', {
+const res = await fetch('https://broadcaster.example.com/events?callbackToken=my-session-abc123', {
   headers: { 'Last-Event-ID': lastSeenID ?? '' },
 });
 
@@ -135,7 +135,7 @@ When implementing manually, remember to:
 ## `curl` for sanity checks
 
 ```bash
-curl -N "https://arcade.example.com/events?callbackToken=my-session-abc123"
+curl -N "https://broadcaster.example.com/events?callbackToken=my-session-abc123"
 ```
 
 `-N` disables curl's output buffering so you see frames live as they arrive.

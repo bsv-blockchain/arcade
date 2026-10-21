@@ -12,11 +12,11 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: arcade-sse
-  namespace: arcade
+  name: bsv-broadcaster-sse
+  namespace: bsv-broadcaster
   labels:
     app.kubernetes.io/name: sse
-    app.kubernetes.io/part-of: arcade
+    app.kubernetes.io/part-of: bsv-broadcaster
 spec:
   replicas: 1
   selector:
@@ -26,11 +26,11 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: sse
-        app.kubernetes.io/part-of: arcade
+        app.kubernetes.io/part-of: bsv-broadcaster
     spec:
       containers:
-        - name: arcade
-          image: ghcr.io/bsv-blockchain/arcade:latest
+        - name: bsv-broadcaster
+          image: ghcr.io/bsv-blockchain/bsv-broadcaster:latest
           args: ["--mode", "sse"]
           ports:
             - containerPort: 8082
@@ -40,16 +40,16 @@ spec:
               name: health
               protocol: TCP
           env:
-            - name: ARCADE_KAFKA_BROKERS
-              value: "kafka-0.kafka.arcade.svc.cluster.local:9092"
-            - name: ARCADE_AEROSPIKE_HOSTS
-              value: "aerospike-0.aerospike.arcade.svc.cluster.local:3000"
-            - name: ARCADE_AEROSPIKE_NAMESPACE
-              value: "arcade"
+            - name: BSV_BROADCASTER_KAFKA_BROKERS
+              value: "kafka-0.kafka.bsv-broadcaster.svc.cluster.local:9092"
+            - name: BSV_BROADCASTER_AEROSPIKE_HOSTS
+              value: "aerospike-0.aerospike.bsv-broadcaster.svc.cluster.local:3000"
+            - name: BSV_BROADCASTER_AEROSPIKE_NAMESPACE
+              value: "bsv_broadcaster"
             # HOST_IP feeds OTEL_EXPORTER_OTLP_ENDPOINT below to reach the
             # node-local OTLP collector via the Kubernetes downward API; it
             # MUST be defined before its $(HOST_IP) use. Telemetry itself
-            # stays off (ARCADE_TELEMETRY_ENABLED=false) until an operator
+            # stays off (BSV_BROADCASTER_TELEMETRY_ENABLED=false) until an operator
             # opts in — see docs/observability.md.
             - name: HOST_IP
               valueFrom:
@@ -61,9 +61,9 @@ spec:
                   fieldPath: metadata.name
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: "http://$(HOST_IP):4317"
-            - name: ARCADE_TELEMETRY_ENABLED
+            - name: BSV_BROADCASTER_TELEMETRY_ENABLED
               value: "false"
-            - name: ARCADE_TELEMETRY_INSECURE
+            - name: BSV_BROADCASTER_TELEMETRY_INSECURE
               value: "true"
           readinessProbe:
             httpGet:
@@ -88,11 +88,11 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: arcade-sse
-  namespace: arcade
+  name: bsv-broadcaster-sse
+  namespace: bsv-broadcaster
   labels:
     app.kubernetes.io/name: sse
-    app.kubernetes.io/part-of: arcade
+    app.kubernetes.io/part-of: bsv-broadcaster
 spec:
   type: ClusterIP
   selector:

@@ -18,12 +18,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/kafka"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
-	"github.com/bsv-blockchain/arcade/teranode"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/teranode"
 )
 
 // These tests reproduce the 2026-08-11 dev-ovh-1 propagation wedge (arcade
@@ -41,7 +41,7 @@ import (
 // round again into the identical 409. ~2,410 failures in two minutes, 42 of 43
 // batches requeued, 4,679 txs stuck in the dispatcher's inFlight map pinning
 // Kafka offsets, and 337,247 messages of lag on the single-partition
-// arcade.propagation topic completely stationary while the leader pod burned
+// bsv-broadcaster.propagation topic completely stationary while the leader pod burned
 // 4.2 CPU cores. Nothing new could propagate.
 //
 // Fix 1 (attribution): the conflict line's outpoint is matched against the
@@ -460,7 +460,7 @@ func TestPoisonBatch_MultiTxOpaque409_ParksInsteadOfLoopingForever(t *testing.T)
 // whole batch requeued for another attempt, forever. Pre-fix the tx stayed in
 // inFlight, its offset kept pinning offsetTracker.LowestUnfinished(),
 // advanceMarks never marked it, and on the single-partition
-// arcade.propagation topic every later message queued behind it — 337,247 of
+// bsv-broadcaster.propagation topic every later message queued behind it — 337,247 of
 // them, stationary, on dev-ovh-1.
 func TestRunDispatcher_PoisonBatch_ExhaustsRetriesAndAdvancesWatermark(t *testing.T) {
 	const out = "256fc7143c6ef5436cd5258ade24b68c43d0f8268c086bd9fa90055dd5a7ae43"

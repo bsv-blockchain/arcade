@@ -11,8 +11,8 @@ import (
 	"github.com/bsv-blockchain/go-sdk/script"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 
-	"github.com/bsv-blockchain/arcade/kafka"
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
 )
 
 // parentChildWithParentLowest builds a parent/child pair whose parent txid

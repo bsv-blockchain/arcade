@@ -343,7 +343,7 @@ func newWOCClient(cfg config) (whatsonchain.ClientInterface, error) {
 		whatsonchain.WithRequestTimeout(60*time.Second),
 		whatsonchain.WithRequestRetryCount(4),
 		whatsonchain.WithBackoff(time.Second, 16*time.Second, 2.0, 250*time.Millisecond),
-		whatsonchain.WithUserAgent("arcade-fetch-block-fixture"),
+		whatsonchain.WithUserAgent("bsv-broadcaster-fetch-block-fixture"),
 	)
 }
 

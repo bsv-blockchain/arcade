@@ -11,7 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/bsv-blockchain/arcade/store/bumpcache"
+	"github.com/bsv-blockchain/bsv-broadcaster/store/bumpcache"
 )
 
 // isolatedDBSeq numbers throwaway databases.
@@ -29,7 +29,7 @@ func newIsolatedStore(t *testing.T) *Store {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	name := fmt.Sprintf("arcade_schema_test_%d", isolatedDBSeq.Add(1))
+	name := fmt.Sprintf("bsv_broadcaster_schema_test_%d", isolatedDBSeq.Add(1))
 	if _, err := sharedStore.pool.Exec(ctx, "CREATE DATABASE "+name); err != nil {
 		t.Skipf("cannot create isolated database (external DSN without CREATEDB?): %v", err)
 	}

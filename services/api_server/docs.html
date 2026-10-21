@@ -587,7 +587,7 @@
       <div class="meta-grid">
         <div class="meta-card">
           <div class="label">Default listener</div>
-          <div class="value">http://&lt;arcade-host&gt;:8083</div>
+          <div class="value">http://&lt;bsv-broadcaster-host&gt;:8083</div>
         </div>
         <div class="meta-card">
           <div class="label">Availability check</div>
@@ -651,7 +651,7 @@ curl -fsS http://localhost:8083/chaintracks/v2/tip</code></pre>
         </table>
       </div>
 
-      <p class="note"><strong>Need schemas and response details?</strong> The <a href="https://github.com/bsv-blockchain/arcade/blob/main/openapi/arcade.openapi.yaml">OpenAPI reference</a> covers the legacy v1 RPC endpoints and most v2 operations. This page also records the v1 direct-path compatibility aliases, <code>/headers.bin</code>, and stored-header-file download paths that are not represented there.</p>
+      <p class="note"><strong>Need schemas and response details?</strong> The <a href="https://github.com/bsv-blockchain/bsv-broadcaster/blob/main/openapi/arcade.openapi.yaml">OpenAPI reference</a> covers the legacy v1 RPC endpoints and most v2 operations. This page also records the v1 direct-path compatibility aliases, <code>/headers.bin</code>, and stored-header-file download paths that are not represented there.</p>
     </section>
 
     <div class="routes">
@@ -729,7 +729,7 @@ curl -fsS http://localhost:8083/chaintracks/v2/tip</code></pre>
   <script>
     (function () {
       try {
-        var stored = localStorage.getItem("arcade-theme");
+        var stored = localStorage.getItem("bsv-broadcaster-theme");
         if (stored === "light" || stored === "dark") {
           document.documentElement.setAttribute("data-theme", stored);
         }
@@ -746,7 +746,7 @@ curl -fsS http://localhost:8083/chaintracks/v2/tip</code></pre>
       }
       var next = current === "dark" ? "light" : "dark";
       document.documentElement.setAttribute("data-theme", next);
-      try { localStorage.setItem("arcade-theme", next); } catch (e) { /* ignore */ }
+      try { localStorage.setItem("bsv-broadcaster-theme", next); } catch (e) { /* ignore */ }
     }
 
     function toggleRoute(btn) {

@@ -22,7 +22,7 @@ Both stale predicates key on `processed_at` being unset (`store/postgres/postgre
 
 ## Decision 3: outcome label migration
 
-`arcade_bump_builder_build_duration_seconds{outcome}` has a closed, pre-registered label set (PR #244: `metrics/preregister.go` `bumpBuildOutcomes`, doc-comment contract on the metric, positively-enumerated failure regex in `metrics/README.md`). A flat `success` can no longer say whether the window was paid, and keeping it while adding a sibling would make `outcome="success"` silently undercount. So:
+`bsv_broadcaster_bump_builder_build_duration_seconds{outcome}` has a closed, pre-registered label set (PR #244: `metrics/preregister.go` `bumpBuildOutcomes`, doc-comment contract on the metric, positively-enumerated failure regex in `metrics/README.md`). A flat `success` can no longer say whether the window was paid, and keeping it while adding a sibling would make `outcome="success"` silently undercount. So:
 
 | Old | New | Class |
 |---|---|---|

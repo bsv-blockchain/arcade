@@ -11,7 +11,7 @@ import (
 	"github.com/bsv-blockchain/go-sdk/script"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 
-	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
 )
 
 // txidA < txidB < txidC … lexicographically; realistic 64-hex shapes so the

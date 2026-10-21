@@ -6,7 +6,7 @@
 #   - optional libp2p peer discovery using embedded teranode bootstrap peers
 #
 # Copy to config.yaml and adjust. Environment variables prefixed with
-# ARCADE_ override any value (e.g. ARCADE_LOG_LEVEL, ARCADE_STORE_BACKEND).
+# BSV_BROADCASTER_ override any value (e.g. BSV_BROADCASTER_LOG_LEVEL, BSV_BROADCASTER_STORE_BACKEND).
 
 mode: all
 log_level: info
@@ -19,7 +19,7 @@ network: teratestnet
 
 # All on-disk state goes under this root (Pebble DB, chaintracks headers,
 # libp2p key/peer cache). The binary creates subdirectories as needed.
-storage_path: ~/.arcade
+storage_path: ~/.bsv-broadcaster
 
 api:
   host: 0.0.0.0
@@ -58,7 +58,7 @@ health:
 # which is fine for single-node evaluation and local development.
 kafka:
   backend: memory
-  consumer_group: arcade
+  consumer_group: bsv-broadcaster
   max_retries: 5
   buffer_size: 10000
 
@@ -67,7 +67,7 @@ kafka:
 store:
   backend: pebble
   pebble:
-    path: ~/.arcade/pebble
+    path: ~/.bsv-broadcaster/pebble
     memtable_size_mb: 64
     l0_compaction_threshold: 4
     sync_writes: false # flushed on shutdown; leave off for throughput

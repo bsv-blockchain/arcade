@@ -48,7 +48,7 @@ var callbackSubscriptionHeaders = []RouteHeader{
 	{
 		Name:        "X-CallbackUrl",
 		Requirement: "Optional",
-		Description: "Webhook URL Arcade should POST status events to as this transaction progresses through the network. Must be a public HTTPS endpoint; private/loopback hosts are rejected unless the deployment is configured to allow them. Every POST carries User-Agent: arcade-webhook/<version> — allowlist the arcade-webhook/ prefix so edge bot rules don't reject deliveries; per-submission delivery health is inspectable via GET /tx/:txid?callbackToken=<token>.",
+		Description: "Webhook URL Arcade should POST status events to as this transaction progresses through the network. Must be a public HTTPS endpoint; private/loopback hosts are rejected unless the deployment is configured to allow them. Every POST carries User-Agent: bsv-broadcaster-webhook/<version> — allowlist the bsv-broadcaster-webhook/ prefix so edge bot rules don't reject deliveries; per-submission delivery health is inspectable via GET /tx/:txid?callbackToken=<token>.",
 	},
 	{
 		Name:        "X-CallbackToken",
@@ -130,12 +130,12 @@ var routeDocs = []RouteDoc{
 			{
 				ContentType: "(browser, EventSource)",
 				Description: "Open a stream from JavaScript. Last-Event-ID is handled automatically by the browser on reconnect.",
-				Example:     "const es = new EventSource(\n  \"https://arcade.example.com/events?callbackToken=my-token\"\n);\nes.addEventListener(\"status\", (e) => {\n  const status = JSON.parse(e.data);\n  console.log(status.txid, status.txStatus);\n});",
+				Example:     "const es = new EventSource(\n  \"https://broadcaster.example.com/events?callbackToken=my-token\"\n);\nes.addEventListener(\"status\", (e) => {\n  const status = JSON.parse(e.data);\n  console.log(status.txid, status.txStatus);\n});",
 			},
 			{
 				ContentType: "(cli, curl)",
 				Description: "Tail the stream from a shell.",
-				Example:     "curl -N \"https://arcade.example.com/events?callbackToken=my-token\"",
+				Example:     "curl -N \"https://broadcaster.example.com/events?callbackToken=my-token\"",
 			},
 		},
 		ResponseStatus: "200 OK · text/event-stream",

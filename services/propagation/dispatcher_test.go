@@ -11,15 +11,15 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"github.com/bsv-blockchain/arcade/kafka"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
 )
 
 // These tests pin the dispatcher's Kafka offset accounting: every offset
 // Add'ed to the offsetTracker on admission must be matched by a Done on
 // the tx's terminal outcome, or LowestUnfinished() — the commit
-// watermark — pins and the arcade-propagation consumer group never
+// watermark — pins and the bsv-broadcaster-propagation consumer group never
 // commits (it shows "-" in kafka-consumer-groups --describe and re-reads
 // the whole topic on every restart).
 //
@@ -318,7 +318,7 @@ func TestRunDispatcher_TerminalTx_AdvancesCommitWatermark(t *testing.T) {
 // new.Status). Pre-fix, applyTerminalStatuses filtered those out of the
 // dispatcher notification, so handleTerminal never ran, the offset was
 // never Done'd, and LowestUnfinished() pinned forever — the
-// arcade-propagation group's committed offset stuck at "-".
+// bsv-broadcaster-propagation group's committed offset stuck at "-".
 func TestRunDispatcher_AlreadyTerminalTx_AdvancesCommitWatermark(t *testing.T) {
 	teranodeSrv := newTeranodeServer(&eventLog{}, http.StatusOK)
 	defer teranodeSrv.Close()

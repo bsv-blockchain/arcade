@@ -4,7 +4,7 @@ package version
 // Version is the arcade build version. It defaults to "dev" for local builds
 // and `go run`, and is overridden at release/CI build time via
 //
-//	-ldflags "-X github.com/bsv-blockchain/arcade/version.Version=<git tag>"
+//	-ldflags "-X github.com/bsv-blockchain/bsv-broadcaster/version.Version=<git tag>"
 //
 // (see .github/workflows/build.yml and the Makefile docker-build target).
 var Version = "dev"

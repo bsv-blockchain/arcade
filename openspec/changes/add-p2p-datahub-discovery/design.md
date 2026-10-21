@@ -1,6 +1,6 @@
 ## Context
 
-Arcade's propagation path broadcasts each accepted transaction to every URL returned by `teranode.Client.GetEndpoints()`. That list is frozen at `cmd/arcade/main.go` startup from `cfg.DatahubURLs`. When the teranode fleet rotates, operators manually edit config and restart.
+Arcade's propagation path broadcasts each accepted transaction to every URL returned by `teranode.Client.GetEndpoints()`. That list is frozen at `cmd/bsv-broadcaster/main.go` startup from `cfg.DatahubURLs`. When the teranode fleet rotates, operators manually edit config and restart.
 
 Meanwhile, teranode nodes already publish a `NodeStatusMessage` JSON payload every ten seconds to the libp2p pubsub topic `teranode/bitcoin/1.0.0/{network}-node_status` (e.g., `teranode/bitcoin/1.0.0/mainnet-node_status`). That message carries `BaseURL` (the datahub HTTP endpoint) and an optional `PropagationURL` — exactly the URL arcade needs to broadcast to. Two existing references inform the implementation:
 
@@ -42,7 +42,7 @@ Usage:
 ```go
 cfg := p2pclient.Config{
     Network:     "main",
-    StoragePath: "<arcade-storage>/p2p",
+    StoragePath: "<bsv-broadcaster-storage>/p2p",
     MsgBus:      msgbus.Config{Port, Logger, DHTMode, ...},
 }
 client, err := cfg.Initialize(ctx, "arcade")

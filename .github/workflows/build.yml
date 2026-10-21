@@ -45,7 +45,7 @@ permissions: {}
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: bsv-blockchain/arcade
+  IMAGE_NAME: bsv-blockchain/bsv-broadcaster
 
 jobs:
   # --------------------------------------------------------------------------------
@@ -105,7 +105,7 @@ jobs:
 
   # --------------------------------------------------------------------------------
   # Per-arch native build. Each matrix entry runs on a native runner of its target
-  # architecture, cross-compiles the Go binary into dist/linux-<arch>/arcade, then
+  # architecture, cross-compiles the Go binary into dist/linux-<arch>/bsv-broadcaster, then
   # uses buildx to assemble a single-arch image from the thin runtime Dockerfile
   # and pushes it to GHCR by digest only. PRs build for verification but don't push.
   # --------------------------------------------------------------------------------
@@ -192,7 +192,7 @@ jobs:
       # version.Version is stamped from the deployment tag computed by the
       # get_tag job (vX.Y.Z on tag pushes, "latest" otherwise) so GET /health
       # reports the running build (issue #208).
-      - name: Build arcade binary
+      - name: Build bsv-broadcaster binary
         env:
           CGO_ENABLED: '1'
           GOOS: linux
@@ -200,7 +200,7 @@ jobs:
           VERSION: ${{ needs.get_tag.outputs.deployment_tag }}
         run: |
           mkdir -p dist/linux-${{ matrix.arch }}
-          go build -trimpath -ldflags="-s -w -X github.com/bsv-blockchain/arcade/version.Version=${VERSION}" -o dist/linux-${{ matrix.arch }}/arcade ./cmd/arcade
+          go build -trimpath -ldflags="-s -w -X github.com/bsv-blockchain/bsv-broadcaster/version.Version=${VERSION}" -o dist/linux-${{ matrix.arch }}/bsv-broadcaster ./cmd/bsv-broadcaster
 
       # Step 4: Set up Docker Buildx (no QEMU needed — single-platform build on
       # a native runner of that platform).

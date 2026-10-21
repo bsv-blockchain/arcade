@@ -39,7 +39,7 @@ node-local OTLP collector  (http://$(HOST_IP):4317, one per k8s node)
   endpoint (see [`metrics/README.md`](../metrics/README.md)) keeps running
   unconditionally, independent of the telemetry flag. When
   `telemetry.enabled` and `telemetry.metrics` are both true, the **same**
-  `arcade_*` instruments in `metrics/metrics.go` are *also* read via the
+  `bsv_broadcaster_*` instruments in `metrics/metrics.go` are *also* read via the
   OTEL contrib Prometheus bridge (`go.opentelemetry.io/contrib/bridges/prometheus`)
   and pushed over OTLP. No metric name, label, or semantic changes — the
   bridge just re-reads the Prometheus default registry on each OTLP export
@@ -51,10 +51,10 @@ node-local OTLP collector  (http://$(HOST_IP):4317, one per k8s node)
   boundaries the instrumentation advises to 8. The values are seconds (the
   instrument's unit) and are a subset of the latency buckets in
   `metrics/metrics.go`, so a quantile off this histogram and one off
-  `arcade_teranode_request_duration_seconds` land on shared bucket edges; the
+  `bsv_broadcaster_teranode_request_duration_seconds` land on shared bucket edges; the
   top boundary is the 30s client timeout, so a timed-out request stays
   distinguishable from a merely slow one. Views reach only instruments
-  created through the OTEL metric API — the bridged `arcade_*` families are
+  created through the OTEL metric API — the bridged `bsv_broadcaster_*` families are
   appended by the producer at collection time and never pass through view
   resolution, so their promauto bucket definitions stay authoritative.
 - Arcade never talks to Coralogix directly. It only ever dials the
@@ -77,22 +77,22 @@ redeploy of different code, and turning it back off is the kill switch.
 ### Config / env reference
 
 All keys live under `telemetry:` in `config.example.yaml` and follow
-arcade's standard `ARCADE_<SECTION>_<KEY>` env override convention
-(`viper.SetEnvPrefix("ARCADE")` + `.` → `_`).
+arcade's standard `BSV_BROADCASTER_<SECTION>_<KEY>` env override convention
+(`viper.SetEnvPrefix("BSV_BROADCASTER")` + `.` → `_`).
 
 | Config key (`telemetry.*`) | Env override | Default | Notes |
 |---|---|---|---|
-| `enabled` | `ARCADE_TELEMETRY_ENABLED` | `false` | Master switch. `false` ⇒ no-op providers, no network I/O, nothing below applies. |
-| `endpoint` | `ARCADE_TELEMETRY_ENDPOINT` | `""` | `host:port` of the OTLP collector — **no scheme**. A `http://`/`https://` prefix is rejected by `config.validate()` for *both* `protocol` values (the HTTP exporter's `WithEndpoint` also wants bare `host:port`; scheme is controlled by `insecure`, not the URL). Left empty, falls back to the standard `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_{TRACES,METRICS}_ENDPOINT` env vars (resolved inside `telemetry.Init`, not `validate()`) — those *do* carry a scheme, per the OTEL env var spec. |
-| `protocol` | `ARCADE_TELEMETRY_PROTOCOL` | `grpc` | `grpc` (port 4317) or `http` (port 4318). Selects which exporter package arcade constructs (`otlptracegrpc`/`otlpmetricgrpc` vs `otlptracehttp`/`otlpmetrichttp`) — arcade does **not** read the generic `OTEL_EXPORTER_OTLP_PROTOCOL` env var; this config/env key is the only way to choose transport. |
-| `insecure` | `ARCADE_TELEMETRY_INSECURE` | `false` | Skip TLS when dialing the collector (typical for an in-cluster/node-local collector). Applies whenever `insecure: true`, regardless of whether the endpoint came from `telemetry.endpoint` or an `OTEL_EXPORTER_OTLP_*_ENDPOINT` env var. |
-| `service_name` | `ARCADE_TELEMETRY_SERVICE_NAME` | `arcade` | `service.name` resource attribute. Overridden by `OTEL_SERVICE_NAME` if that env var is set (env wins — see Resource attributes below). |
-| `namespace` | `ARCADE_TELEMETRY_NAMESPACE` | `""` | `service.namespace` resource attribute (e.g. the downstream solution's name). Omitted from the resource entirely when empty. |
-| `traces` | `ARCADE_TELEMETRY_TRACES` | `true` | Enables the OTLP trace pipeline. Only consulted when `enabled: true`. |
-| `metrics` | `ARCADE_TELEMETRY_METRICS` | `true` | Enables the OTLP metric pipeline (Prometheus bridge). Only consulted when `enabled: true`. |
-| `logs` | `ARCADE_TELEMETRY_LOGS` | `false` | **Not implemented.** `true` only logs a startup warning; logs always ship via stdout JSON regardless of this flag. |
-| `sample_ratio` | `ARCADE_TELEMETRY_SAMPLE_RATIO` | `1.0` | Ratio (0.0–1.0) fed to a `ParentBased(TraceIDRatioBased(...))` sampler. |
-| `export_timeout_ms` | `ARCADE_TELEMETRY_EXPORT_TIMEOUT_MS` | `10000` | Bounds `Shutdown`'s `ForceFlush` + `Shutdown` of every provider at process exit. |
+| `enabled` | `BSV_BROADCASTER_TELEMETRY_ENABLED` | `false` | Master switch. `false` ⇒ no-op providers, no network I/O, nothing below applies. |
+| `endpoint` | `BSV_BROADCASTER_TELEMETRY_ENDPOINT` | `""` | `host:port` of the OTLP collector — **no scheme**. A `http://`/`https://` prefix is rejected by `config.validate()` for *both* `protocol` values (the HTTP exporter's `WithEndpoint` also wants bare `host:port`; scheme is controlled by `insecure`, not the URL). Left empty, falls back to the standard `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_{TRACES,METRICS}_ENDPOINT` env vars (resolved inside `telemetry.Init`, not `validate()`) — those *do* carry a scheme, per the OTEL env var spec. |
+| `protocol` | `BSV_BROADCASTER_TELEMETRY_PROTOCOL` | `grpc` | `grpc` (port 4317) or `http` (port 4318). Selects which exporter package arcade constructs (`otlptracegrpc`/`otlpmetricgrpc` vs `otlptracehttp`/`otlpmetrichttp`) — arcade does **not** read the generic `OTEL_EXPORTER_OTLP_PROTOCOL` env var; this config/env key is the only way to choose transport. |
+| `insecure` | `BSV_BROADCASTER_TELEMETRY_INSECURE` | `false` | Skip TLS when dialing the collector (typical for an in-cluster/node-local collector). Applies whenever `insecure: true`, regardless of whether the endpoint came from `telemetry.endpoint` or an `OTEL_EXPORTER_OTLP_*_ENDPOINT` env var. |
+| `service_name` | `BSV_BROADCASTER_TELEMETRY_SERVICE_NAME` | `arcade` | `service.name` resource attribute. Overridden by `OTEL_SERVICE_NAME` if that env var is set (env wins — see Resource attributes below). |
+| `namespace` | `BSV_BROADCASTER_TELEMETRY_NAMESPACE` | `""` | `service.namespace` resource attribute (e.g. the downstream solution's name). Omitted from the resource entirely when empty. |
+| `traces` | `BSV_BROADCASTER_TELEMETRY_TRACES` | `true` | Enables the OTLP trace pipeline. Only consulted when `enabled: true`. |
+| `metrics` | `BSV_BROADCASTER_TELEMETRY_METRICS` | `true` | Enables the OTLP metric pipeline (Prometheus bridge). Only consulted when `enabled: true`. |
+| `logs` | `BSV_BROADCASTER_TELEMETRY_LOGS` | `false` | **Not implemented.** `true` only logs a startup warning; logs always ship via stdout JSON regardless of this flag. |
+| `sample_ratio` | `BSV_BROADCASTER_TELEMETRY_SAMPLE_RATIO` | `1.0` | Ratio (0.0–1.0) fed to a `ParentBased(TraceIDRatioBased(...))` sampler. |
+| `export_timeout_ms` | `BSV_BROADCASTER_TELEMETRY_EXPORT_TIMEOUT_MS` | `10000` | Bounds `Shutdown`'s `ForceFlush` + `Shutdown` of every provider at process exit. |
 
 Standard OTEL environment variables layer on top of (and can override) the
 config above:
@@ -116,9 +116,9 @@ Every signal (trace or metric) carries the same OTEL `Resource`:
 | `service.namespace` | `telemetry.namespace`, omitted when empty |
 | `service.version` | the build version (`version.Version`) |
 | `service.instance.id` | `POD_NAME` env, falling back to `os.Hostname()` |
-| `arcade.mode` | the running `--mode` (`all`, `api-server`, `bump-builder`, `propagation`, `p2p-client`, `chaintracks`, `sse`, `watchdog`) |
+| `bsv_broadcaster.mode` | the running `--mode` (`all`, `api-server`, `bump-builder`, `propagation`, `p2p-client`, `chaintracks`, `sse`, `watchdog`) |
 
-`arcade.mode` is the arcade-specific attribute matching `merkle-service`'s
+`bsv_broadcaster.mode` is the bsv-broadcaster-specific attribute matching `merkle-service`'s
 own `merkle.mode` — both let you slice traces/metrics by which per-mode pod
 emitted them, mapping directly onto the Deployments in `deploy/`.
 `OTEL_RESOURCE_ATTRIBUTES` / `OTEL_SERVICE_NAME` are merged in *after* these
@@ -131,7 +131,7 @@ overrides config defaults.
   (`services/api_server/server.go`), installed unconditionally (cheap no-op
   when telemetry is disabled) and placed *outside* the panic-recovery
   middleware so a panic is still captured on a live span.
-- **Outbound HTTP**: every arcade-owned `http.Client` (Teranode broadcast,
+- **Outbound HTTP**: every bsv-broadcaster-owned `http.Client` (Teranode broadcast,
   merkle-service client, DataHub client, webhook delivery) wraps its
   transport with `otelhttp.NewTransport`, so client spans and `traceparent`
   injection happen automatically wherever the call already threads a

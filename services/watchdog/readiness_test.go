@@ -7,7 +7,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/merkleservice"
+	"github.com/bsv-blockchain/bsv-broadcaster/merkleservice"
 )
 
 func TestService_StartSignalsReadyWhileRunning(t *testing.T) {

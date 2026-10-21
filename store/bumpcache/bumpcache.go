@@ -19,8 +19,8 @@ import (
 	"github.com/hashicorp/golang-lru/v2/simplelru"
 	"golang.org/x/sync/singleflight"
 
-	"github.com/bsv-blockchain/arcade/bump"
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/bump"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
 )
 
 // maxEntries bounds how many blocks' parsed+indexed compound BUMPs stay

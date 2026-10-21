@@ -6,7 +6,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
 )
 
 // gatherFamily returns the MetricFamily with the given name from the default
@@ -38,9 +38,9 @@ func labelValue(m *dto.Metric, name string) string {
 func TestPreRegisterStatusTransitionsCreatesLatticeValidChildrenAtZero(t *testing.T) {
 	PreRegisterStatusTransitions(models.StatusMined)
 
-	fam := gatherFamily(t, "arcade_status_transition_age_seconds")
+	fam := gatherFamily(t, "bsv_broadcaster_status_transition_age_seconds")
 	if fam == nil {
-		t.Fatal("arcade_status_transition_age_seconds has no series after pre-registration")
+		t.Fatal("bsv_broadcaster_status_transition_age_seconds has no series after pre-registration")
 	}
 
 	found := map[[2]string]*dto.Metric{}
@@ -74,9 +74,9 @@ func TestPreRegisterStatusTransitionsCreatesLatticeValidChildrenAtZero(t *testin
 func TestPreRegisterTxSubmissionsCreatesAllRouteResultChildrenAtZero(t *testing.T) {
 	PreRegisterTxSubmissions()
 
-	fam := gatherFamily(t, "arcade_api_txs_submitted_total")
+	fam := gatherFamily(t, "bsv_broadcaster_api_txs_submitted_total")
 	if fam == nil {
-		t.Fatal("arcade_api_txs_submitted_total has no series after pre-registration")
+		t.Fatal("bsv_broadcaster_api_txs_submitted_total has no series after pre-registration")
 	}
 
 	found := map[[2]string]*dto.Metric{}
@@ -127,9 +127,9 @@ func TestBumpOutcomesIncludeGraceDispositions(t *testing.T) {
 func TestPreRegisterBumpOutcomesCreatesEveryOutcomeChildAtZero(t *testing.T) {
 	PreRegisterBumpOutcomes()
 
-	fam := gatherFamily(t, "arcade_bump_builder_build_duration_seconds")
+	fam := gatherFamily(t, "bsv_broadcaster_bump_builder_build_duration_seconds")
 	if fam == nil {
-		t.Fatal("arcade_bump_builder_build_duration_seconds has no series after pre-registration")
+		t.Fatal("bsv_broadcaster_bump_builder_build_duration_seconds has no series after pre-registration")
 	}
 
 	found := map[string]*dto.Metric{}
@@ -154,9 +154,9 @@ func TestPreRegisterBumpOutcomesCreatesEveryOutcomeChildAtZero(t *testing.T) {
 func TestPreRegisterBlockStatusTransitionsCreatesEveryPairAtZero(t *testing.T) {
 	PreRegisterBlockStatusTransitions()
 
-	fam := gatherFamily(t, "arcade_block_status_transitions_total")
+	fam := gatherFamily(t, "bsv_broadcaster_block_status_transitions_total")
 	if fam == nil {
-		t.Fatal("arcade_block_status_transitions_total has no series after pre-registration")
+		t.Fatal("bsv_broadcaster_block_status_transitions_total has no series after pre-registration")
 	}
 
 	found := map[[2]string]*dto.Metric{}

@@ -10,9 +10,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/kafka"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
 )
 
 func TestKafkaPublisherRoundtrip(t *testing.T) {
@@ -86,8 +86,8 @@ func TestSubscriberGroupIDIsUniqueAndAttributable(t *testing.T) {
 			t.Fatalf("duplicate group id %q: two subscribers would split partitions and each silently miss events", id)
 		}
 		seen[id] = true
-		if !strings.HasPrefix(id, "arcade-events-"+caller+"-") {
-			t.Errorf("group id %q is not matchable by caller (want prefix arcade-events-%s-)", id, caller)
+		if !strings.HasPrefix(id, "bsv-broadcaster-events-"+caller+"-") {
+			t.Errorf("group id %q is not matchable by caller (want prefix bsv-broadcaster-events-%s-)", id, caller)
 		}
 	}
 
@@ -145,7 +145,7 @@ func TestKafkaPublisherFanOut(t *testing.T) {
 }
 
 // TestKafkaPublisherDropMetricByCaller verifies that a slow subscriber's
-// dropped messages bump arcade_events_subscriber_dropped_total with the
+// dropped messages bump bsv_broadcaster_events_subscriber_dropped_total with the
 // caller label the subscriber registered with. This is the observability
 // hook an operator uses to tell which subscriber (sse vs webhook) is
 // failing to keep up.

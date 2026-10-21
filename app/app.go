@@ -1,10 +1,10 @@
 // Package app builds and wires the shared dependencies arcade's services
 // need (kafka broker + producer, store, teranode client, merkle-service
 // client, events publisher, validator) and turns them into a slice of
-// runnable services. cmd/arcade/main.go is a thin wrapper that loads
+// runnable services. cmd/bsv-broadcaster/main.go is a thin wrapper that loads
 // config, calls Bootstrap, then BuildServices, and supervises the lifecycle.
 //
-// Splitting this out of cmd/arcade lets the e2e test harness reuse the same
+// Splitting this out of cmd/bsv-broadcaster lets the e2e test harness reuse the same
 // boot path without invoking the binary or duplicating wiring.
 package app
 
@@ -23,26 +23,26 @@ import (
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/events"
-	"github.com/bsv-blockchain/arcade/finality"
-	"github.com/bsv-blockchain/arcade/kafka"
-	"github.com/bsv-blockchain/arcade/merkleservice"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/services"
-	"github.com/bsv-blockchain/arcade/services/api_server"
-	"github.com/bsv-blockchain/arcade/services/bump_builder"
-	"github.com/bsv-blockchain/arcade/services/chaintracks_server"
-	"github.com/bsv-blockchain/arcade/services/p2p_client"
-	"github.com/bsv-blockchain/arcade/services/propagation"
-	"github.com/bsv-blockchain/arcade/services/sse"
-	"github.com/bsv-blockchain/arcade/services/watchdog"
-	"github.com/bsv-blockchain/arcade/services/webhook"
-	"github.com/bsv-blockchain/arcade/ssrfguard"
-	"github.com/bsv-blockchain/arcade/store"
-	storefactory "github.com/bsv-blockchain/arcade/store/factory"
-	"github.com/bsv-blockchain/arcade/teranode"
-	"github.com/bsv-blockchain/arcade/validator"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/events"
+	"github.com/bsv-blockchain/bsv-broadcaster/finality"
+	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
+	"github.com/bsv-blockchain/bsv-broadcaster/merkleservice"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/services"
+	"github.com/bsv-blockchain/bsv-broadcaster/services/api_server"
+	"github.com/bsv-blockchain/bsv-broadcaster/services/bump_builder"
+	"github.com/bsv-blockchain/bsv-broadcaster/services/chaintracks_server"
+	"github.com/bsv-blockchain/bsv-broadcaster/services/p2p_client"
+	"github.com/bsv-blockchain/bsv-broadcaster/services/propagation"
+	"github.com/bsv-blockchain/bsv-broadcaster/services/sse"
+	"github.com/bsv-blockchain/bsv-broadcaster/services/watchdog"
+	"github.com/bsv-blockchain/bsv-broadcaster/services/webhook"
+	"github.com/bsv-blockchain/bsv-broadcaster/ssrfguard"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	storefactory "github.com/bsv-blockchain/bsv-broadcaster/store/factory"
+	"github.com/bsv-blockchain/bsv-broadcaster/teranode"
+	"github.com/bsv-blockchain/bsv-broadcaster/validator"
 )
 
 // Deps is the set of process-wide dependencies arcade's services share.
@@ -76,11 +76,16 @@ type Deps struct {
 // probes terminate when ctx is canceled.
 func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*Deps, func(), error) {
 	logger.Info(
-		"starting arcade",
+		"starting bsv-broadcaster",
 		zap.String("mode", cfg.Mode),
 		zap.String("kafka_backend", cfg.Kafka.Backend),
+		zap.String("kafka_topic_prefix", cfg.Kafka.TopicPrefix),
 		zap.String("store_backend", cfg.Store.Backend),
 	)
+
+	// Must precede every topic lookup below and in the services: topic names
+	// are fixed for the life of the process once the broker exists.
+	kafka.SetTopicPrefix(cfg.Kafka.TopicPrefix)
 
 	// The memory backend provisions its own topics, so it takes the
 	// propagation partition count directly; the sarama backend ignores the
@@ -121,7 +126,7 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 	// a no-op. Handing it the real fan-out topics turns a check that has been
 	// dead since TopicTransaction was retired into a live boot-blocking one:
 	// any deployment carrying a leftover kafka.min_partitions greater than
-	// its actual arcade.tx_status / arcade.block_processed width would
+	// its actual bsv-broadcaster.tx_status / bsv-broadcaster.block_processed width would
 	// crash-loop on upgrade, for a reason unrelated to multi-partition
 	// propagation. Enabling it is its own change, with its own release note.
 	if cfg.Kafka.MinPartitions > 1 {
@@ -440,7 +445,7 @@ func chainReader(ctx context.Context, cfg *config.Config, chainTracks chaintrack
 	if cfg.Chaintracks.Mode != chaintracksconfig.ModeRemote || cfg.Chaintracks.URL == "" {
 		return nil
 	}
-	remote, err := cfg.Chaintracks.Initialize(ctx, "arcade-chain-reader", nil)
+	remote, err := cfg.Chaintracks.Initialize(ctx, "bsv-broadcaster-chain-reader", nil)
 	if err != nil {
 		logger.Warn(
 			"remote chaintracks init failed: finality pre-check degrades to height-only and "+
@@ -595,7 +600,7 @@ func initChaintracks(ctx context.Context, cfg *config.Config, logger *zap.Logger
 	cfg.Chaintracks.P2P.Network = config.ResolveChaintracksNetwork(cfg.Network)
 	cfg.Chaintracks.P2P.MsgBus.BootstrapPeers = resolveChaintracksBootstrapPeers(cfg)
 
-	ct, err := cfg.Chaintracks.Initialize(ctx, "arcade", nil)
+	ct, err := cfg.Chaintracks.Initialize(ctx, "bsv-broadcaster", nil)
 	if err != nil {
 		return nil, fmt.Errorf("chaintracks initialize: %w", err)
 	}
@@ -611,7 +616,7 @@ func initChaintracks(ctx context.Context, cfg *config.Config, logger *zap.Logger
 
 // BuildServices returns the services that should run for the configured mode.
 // Each service's lifetime is tied to the ctx passed to its Start method by
-// the caller — the supervisor in cmd/arcade or the test harness.
+// the caller — the supervisor in cmd/bsv-broadcaster or the test harness.
 func BuildServices(d *Deps) []services.Service {
 	cfg := d.Cfg
 	var svcs []services.Service

@@ -99,7 +99,7 @@ The chaintracks instance's lifecycle SHALL be driven by the `context.Context` pa
 The config schema SHALL expose the following new fields, all with safe defaults so an operator can start arcade with no chaintracks config at all:
 
 - `chaintracks_server.enabled` (`bool`, default `true`) — gates whether routes and the instance run.
-- `chaintracks.*` — delegated in full to `github.com/bsv-blockchain/go-chaintracks/config.Config.SetDefaults`, with our `storage_path` defaulting to `<arcade_storage_path>/chaintracks`.
+- `chaintracks.*` — delegated in full to `github.com/bsv-blockchain/go-chaintracks/config.Config.SetDefaults`, with our `storage_path` defaulting to `<bsv_broadcaster_storage_path>/chaintracks`.
 
 #### Scenario: Missing chaintracks block in config.yaml uses library defaults
 - **WHEN** arcade starts with no `chaintracks:` section in config.yaml
@@ -109,4 +109,4 @@ The config schema SHALL expose the following new fields, all with safe defaults 
 #### Scenario: Operator overrides storage path
 - **GIVEN** `chaintracks.storage_path=/srv/arcade/chaintracks` is set
 - **WHEN** arcade starts
-- **THEN** headers are written to `/srv/arcade/chaintracks/`, NOT `<arcade_storage_path>/chaintracks/`
+- **THEN** headers are written to `/srv/arcade/chaintracks/`, NOT `<bsv_broadcaster_storage_path>/chaintracks/`

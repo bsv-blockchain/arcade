@@ -3,7 +3,7 @@
 //
 // Conventions
 //
-//   - Every metric is prefixed `arcade_` so a multi-tenant Prometheus can
+//   - Every metric is prefixed `bsv_broadcaster_` so a multi-tenant Prometheus can
 //     filter on it cleanly.
 //   - Counters end in `_total`. Histograms end in `_seconds` (latency) or
 //     `_bytes` (sizes). Gauges end in a noun (e.g. `_depth`, `_count`).
@@ -68,7 +68,7 @@ var bytesBuckets = []float64{
 // PropagationBatchSize measures how many txs landed in each processBatch call
 // — i.e. the size at the entrypoint to the broadcast pipeline.
 var PropagationBatchSize = promauto.NewHistogram(prometheus.HistogramOpts{
-	Name:    "arcade_propagation_batch_size",
+	Name:    "bsv_broadcaster_propagation_batch_size",
 	Help:    "Number of txs in each processBatch call.",
 	Buckets: sizeBuckets,
 })
@@ -84,7 +84,7 @@ var PropagationBatchSize = promauto.NewHistogram(prometheus.HistogramOpts{
 // {fallback="size_rejected"}) cast no verdict and is excluded: a broadcast
 // every responder refused by shape counts under no verdict label at all.
 var PropagationBroadcastConsensus = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_propagation_broadcast_consensus_total",
+	Name: "bsv_broadcaster_propagation_broadcast_consensus_total",
 	Help: "Per-broadcast consensus outcome across all responding endpoints.",
 }, []string{"verdict"}) // accepted, unanimous_reject, mixed, unreachable
 
@@ -96,7 +96,7 @@ var PropagationBroadcastConsensus = promauto.NewCounterVec(prometheus.CounterOpt
 // Sustained growth indicates downstream (teranode broadcast or
 // merkle-service register) is not keeping up with ingest.
 var PropagationPendingDepth = promauto.NewGauge(prometheus.GaugeOpts{
-	Name: "arcade_propagation_pending_depth",
+	Name: "bsv_broadcaster_propagation_pending_depth",
 	Help: "Propagation messages buffered awaiting flush, summed across this pod's partition dispatchers.",
 })
 
@@ -109,7 +109,7 @@ var PropagationPendingDepth = promauto.NewGauge(prometheus.GaugeOpts{
 // Dec'd via defer regardless of whether the goroutine exits via timer
 // or ctx.Done.
 var PropagationPendingRequeues = promauto.NewGauge(prometheus.GaugeOpts{
-	Name: "arcade_propagation_pending_requeues",
+	Name: "bsv_broadcaster_propagation_pending_requeues",
 	Help: "Number of requeueAfterDelay goroutines currently awaiting their delay before re-admitting messages.",
 })
 
@@ -119,21 +119,21 @@ var PropagationPendingRequeues = promauto.NewGauge(prometheus.GaugeOpts{
 // pipeline cannot keep up with the kafka drain rate and pendingMsgs will
 // grow until backpressure forces the consumer to block.
 var PropagationInflightBatches = promauto.NewGauge(prometheus.GaugeOpts{
-	Name: "arcade_propagation_inflight_batches",
+	Name: "bsv_broadcaster_propagation_inflight_batches",
 	Help: "Number of propagation batches currently mid-pipeline.",
 })
 
 // PropagationBroadcastDuration measures end-to-end wall time of broadcasting
 // a single chunk to all healthy endpoints (the inner /tx or /txs path).
 var PropagationBroadcastDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
-	Name:    "arcade_propagation_broadcast_duration_seconds",
+	Name:    "bsv_broadcaster_propagation_broadcast_duration_seconds",
 	Help:    "Wall time of one chunk broadcast across all healthy endpoints.",
 	Buckets: latencyBuckets,
 }, []string{"path"}) // batch, single
 
 // PropagationOutcomeTotal counts per-tx outcomes from the propagation step.
 var PropagationOutcomeTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_propagation_outcome_total",
+	Name: "bsv_broadcaster_propagation_outcome_total",
 	Help: "Per-tx propagation outcome counts.",
 }, []string{labelOutcome}) // accepted, rejected, retryable, no_verdict
 
@@ -145,7 +145,7 @@ var PropagationOutcomeTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 // shape (too many txs, too many bytes, or a 413) — a non-zero rate means the
 // configured caps are above what some peer accepts.
 var PropagationChunkTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_propagation_chunk_total",
+	Name: "bsv_broadcaster_propagation_chunk_total",
 	Help: "Number of chunk broadcasts issued, by fallback decision.",
 }, []string{"fallback"}) // none, narrowed, size_rejected
 
@@ -166,7 +166,7 @@ var chunkBytesBuckets = []float64{
 // the cap means bytes, not teranode_max_batch_size, decide where chunks end.
 // Observed per POST, including the halves produced by narrowing.
 var PropagationChunkBytes = promauto.NewHistogram(prometheus.HistogramOpts{
-	Name:    "arcade_propagation_chunk_bytes",
+	Name:    "bsv_broadcaster_propagation_chunk_bytes",
 	Help:    "Payload bytes (concatenated raw txs) of each POST /txs chunk broadcast.",
 	Buckets: chunkBytesBuckets,
 })
@@ -177,7 +177,7 @@ var PropagationChunkBytes = promauto.NewHistogram(prometheus.HistogramOpts{
 // common bottleneck; under burst ingest this histogram is the canonical
 // p50/p99 signal.
 var PropagationMerkleRegisterDuration = promauto.NewHistogram(prometheus.HistogramOpts{
-	Name:    "arcade_propagation_merkle_register_duration_seconds",
+	Name:    "bsv_broadcaster_propagation_merkle_register_duration_seconds",
 	Help:    "Wall time of one batched merkle-service registration fan-out.",
 	Buckets: latencyBuckets,
 })
@@ -189,7 +189,7 @@ var PropagationMerkleRegisterDuration = promauto.NewHistogram(prometheus.Histogr
 // http_5xx, timeout, transport, and register_error (any other /watch
 // failure, including other 4xx). Do not add a txid label.
 var PropagationMerkleRegisterFailures = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_propagation_merkle_register_failures_total",
+	Name: "bsv_broadcaster_propagation_merkle_register_failures_total",
 	Help: "Per-tx merkle-service Register failures, by reason (claim_revoked, auth_error, http_5xx, timeout, transport, register_error).",
 }, []string{"reason"})
 
@@ -200,7 +200,7 @@ var PropagationMerkleRegisterFailures = promauto.NewCounterVec(prometheus.Counte
 // (single "partial" tick) from a sustained outage (rising "all_failed"
 // rate) — a signal the per-tx failure counter alone obscures.
 var PropagationMerkleRegisterBatchOutcomeTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_propagation_merkle_register_batch_outcome_total",
+	Name: "bsv_broadcaster_propagation_merkle_register_batch_outcome_total",
 	Help: "Per-batch merkle-service registration outcome.",
 }, []string{labelOutcome}) // fully_ok, partial, all_failed
 
@@ -212,7 +212,7 @@ var PropagationMerkleRegisterBatchOutcomeTotal = promauto.NewCounterVec(promethe
 // skipped_open (breaker open, request not sent). The endpoint label is the
 // configured base URL, so cardinality is bounded by the config.
 var MerkleEndpointRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_merkle_endpoint_requests_total",
+	Name: "bsv_broadcaster_merkle_endpoint_requests_total",
 	Help: "Per-endpoint merkle-service request outcomes by operation.",
 }, []string{"endpoint", "op", labelOutcome})
 
@@ -222,7 +222,7 @@ var MerkleEndpointRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 // The pool re-sends them in the background; a value that never returns to 0
 // means the endpoint keeps refusing /watch.
 var MerkleEndpointCatchupPending = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "arcade_merkle_endpoint_catchup_pending",
+	Name: "bsv_broadcaster_merkle_endpoint_catchup_pending",
 	Help: "Registrations queued for re-delivery to a merkle-service endpoint that missed them.",
 }, []string{"endpoint"})
 
@@ -232,20 +232,20 @@ var MerkleEndpointCatchupPending = promauto.NewGaugeVec(prometheus.GaugeOpts{
 // ones that never send /watch stay at 1, so alert on min by (endpoint) == 0
 // rather than on a sum across pods.
 var MerkleEndpointHealthy = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "arcade_merkle_endpoint_healthy",
+	Name: "bsv_broadcaster_merkle_endpoint_healthy",
 	Help: "1 while the merkle-service endpoint's circuit breaker is closed, 0 while open.",
 }, []string{"endpoint"})
 
 // PropagationReaperLease is 1 when this pod holds the reaper lease, 0 otherwise.
 // In K8s, sum across pods should always equal 1 (or 0 during failover).
 var PropagationReaperLease = promauto.NewGauge(prometheus.GaugeOpts{
-	Name: "arcade_propagation_reaper_lease_held",
+	Name: "bsv_broadcaster_propagation_reaper_lease_held",
 	Help: "1 if this pod holds the reaper lease, 0 otherwise.",
 })
 
 // PropagationReaperTickTotal tracks reaper ticks by outcome.
 var PropagationReaperTickTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_propagation_reaper_tick_total",
+	Name: "bsv_broadcaster_propagation_reaper_tick_total",
 	Help: "Reaper tick outcomes.",
 }, []string{labelOutcome}) // ran, skipped_no_leader, lease_error
 
@@ -257,7 +257,7 @@ var PropagationReaperTickTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 // (datahubs flapping, merkle slow) blocking SEEN_ON_NETWORK txs from
 // reaching ACCEPTED.
 var PropagationReaperReadyDepth = promauto.NewGauge(prometheus.GaugeOpts{
-	Name: "arcade_propagation_reaper_ready_depth",
+	Name: "bsv_broadcaster_propagation_reaper_ready_depth",
 	Help: "Number of stale SEEN_ON_NETWORK rows ready for rebroadcast at the last reaper tick.",
 })
 
@@ -270,7 +270,7 @@ var PropagationReaperReadyDepth = promauto.NewGauge(prometheus.GaugeOpts{
 // sustained rate means macro-batch cycles are overrunning the consumer-group
 // session timeout and the group is thrashing.
 var PropagationClaimRevokedBatchesTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "arcade_propagation_claim_revoked_batches_total",
+	Name: "bsv_broadcaster_propagation_claim_revoked_batches_total",
 	Help: "Propagation batches aborted mid-pipeline because the Kafka claim was revoked; their txs stay uncommitted for replay.",
 })
 
@@ -285,7 +285,7 @@ var PropagationClaimRevokedBatchesTotal = promauto.NewCounter(prometheus.Counter
 // offset below its partition's commit watermark, so this depth also
 // approximates the pod's uncommitted-offset backlog.
 var PropagationInflightDepth = promauto.NewGauge(prometheus.GaugeOpts{
-	Name: "arcade_propagation_inflight_depth",
+	Name: "bsv_broadcaster_propagation_inflight_depth",
 	Help: "Transactions in the in-flight set (admitted but not yet terminal), summed across this pod's partition dispatchers; each pins an uncommitted Kafka offset.",
 })
 
@@ -308,13 +308,13 @@ var PropagationInflightDepth = promauto.NewGauge(prometheus.GaugeOpts{
 // exactly the shape that wedged the dev-ovh-1 propagation consumer on
 // 2026-08-11 at 337,247 frozen messages of Kafka lag.
 var PropagationConflictAttributionTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_propagation_conflict_attribution_total",
+	Name: "bsv_broadcaster_propagation_conflict_attribution_total",
 	Help: "Conflict-family Teranode failure lines by whether the spent outpoint resolved to a submitted transaction.",
 }, []string{"result"}) // attributed, unattributable
 
 // PropagationMissingParentTotal counts Teranode missing-parent responses
 // (TX_MISSING_PARENT / TX_NOT_FOUND) by how arcade resolved them. With a
-// multi-partition arcade.propagation topic (#295) a child submitted in a
+// multi-partition bsv-broadcaster.propagation topic (#295) a child submitted in a
 // later request than its parent can reach Teranode first; that condition is
 // retryable, never a verdict on its own (#254).
 //
@@ -328,7 +328,7 @@ var PropagationConflictAttributionTotal = promauto.NewCounterVec(prometheus.Coun
 // standard cascade reason — the cross-partition analog of the
 // dispatcher's same-partition cascade.
 var PropagationMissingParentTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_propagation_missing_parent_total",
+	Name: "bsv_broadcaster_propagation_missing_parent_total",
 	Help: "Teranode missing-parent responses by resolution (requeued vs durable reaper retry vs rejected via a REJECTED ancestor in arcade's store).",
 }, []string{"outcome"}) // requeued, reaper_retry, rejected_ancestor
 
@@ -341,7 +341,7 @@ var PropagationMissingParentTotal = promauto.NewCounterVec(prometheus.CounterOpt
 // This is the poison-batch escape hatch. Before it existed a batch that
 // permanently failed with no attributable per-tx verdict requeued forever:
 // every tx stayed in the dispatcher's inFlight map, so its Kafka offset kept
-// pinning LowestUnfinished() and the single-partition arcade.propagation topic
+// pinning LowestUnfinished() and the single-partition bsv-broadcaster.propagation topic
 // could not commit. Observed live on dev-ovh-1 (2026-08-11, arcade v0.11.5):
 // 337,247 messages of lag frozen for minutes, 4,679 txs in-flight, ~2,410
 // UTXO_SPENT 409s in two minutes across 43 batches of which 42 requeued, while
@@ -351,7 +351,7 @@ var PropagationMissingParentTotal = promauto.NewCounterVec(prometheus.CounterOpt
 // no verdict from any peer. They are NOT lost — the row keeps its raw bytes and
 // the reaper rebroadcasts PENDING_RETRY rows — but the fast path has given up.
 var PropagationRequeueExhaustedTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "arcade_propagation_requeue_exhausted_total",
+	Name: "bsv_broadcaster_propagation_requeue_exhausted_total",
 	Help: "Transactions parked at PENDING_RETRY after exhausting the in-memory network requeue budget with no network verdict.",
 })
 
@@ -360,7 +360,7 @@ var PropagationRequeueExhaustedTotal = promauto.NewCounter(prometheus.CounterOpt
 // attempt. stage=network is a Teranode/network requeue only. The label set
 // is closed (two values). Txids must not be added as labels.
 var PropagationRetryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_propagation_retry_total",
+	Name: "bsv_broadcaster_propagation_retry_total",
 	Help: "Fast-path retry decisions by stage (merkle registration vs network propagation).",
 }, []string{"stage"})
 
@@ -368,7 +368,7 @@ var PropagationRetryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 // PENDING_RETRY after exhausting fast-path Merkle /watch retries. The
 // network propagation budget is not consumed, and the tx is not REJECTED.
 var PropagationMerkleRetryExhaustedTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "arcade_propagation_merkle_retry_exhausted_total",
+	Name: "bsv_broadcaster_propagation_merkle_retry_exhausted_total",
 	Help: "Transactions parked at PENDING_RETRY after exhausting fast-path Merkle /watch retries. The network propagation budget is not consumed.",
 })
 
@@ -385,7 +385,7 @@ var PropagationMerkleRetryExhaustedTotal = promauto.NewCounter(prometheus.Counte
 // all: their timestamp_at never moved, so at 24h they fell out of the reaper's
 // scan window and stayed PENDING_RETRY permanently, invisible to every gauge.
 var PropagationPendingRetryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_propagation_pending_retry_total",
+	Name: "bsv_broadcaster_propagation_pending_retry_total",
 	Help: "Durable-retry lifecycle events for PENDING_RETRY transactions (scheduled for another attempt vs terminalized after exhausting the budget).",
 }, []string{"outcome"}) // scheduled, exhausted
 
@@ -400,11 +400,11 @@ var PropagationPendingRetryTotal = promauto.NewCounterVec(prometheus.CounterOpts
 // chains rather than a poison-batch rarity.
 var (
 	PropagationParkedDepth = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "arcade_propagation_parked_depth",
+		Name: "bsv_broadcaster_propagation_parked_depth",
 		Help: "Transactions currently parked at PENDING_RETRY awaiting durable reaper rebroadcast.",
 	})
 	PropagationParkedOldestAgeSeconds = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "arcade_propagation_parked_oldest_age_seconds",
+		Name: "bsv_broadcaster_propagation_parked_oldest_age_seconds",
 		Help: "Age of the oldest transaction parked at PENDING_RETRY.",
 	})
 )
@@ -418,7 +418,7 @@ var (
 // retry_rejected = resubmit of a previously rejected txid (re-enters the
 // broadcast pipeline).
 var APITxsSubmittedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_api_txs_submitted_total",
+	Name: "bsv_broadcaster_api_txs_submitted_total",
 	Help: "Transactions submitted via the API by route and dedup result (new|duplicate|retry_rejected). Counted per transaction, not per request.",
 }, []string{"route", "result"})
 
@@ -427,7 +427,7 @@ var APITxsSubmittedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 // verdicts with an actionable reason; the submitter is expected to resubmit
 // once the lock expires (issue #245).
 var APIFinalityRejectionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_api_finality_rejections_total",
+	Name: "bsv_broadcaster_api_finality_rejections_total",
 	Help: "Transactions rejected at intake as non-final (nLockTime/BIP113), by route.",
 }, []string{"route"})
 
@@ -437,7 +437,7 @@ var APIFinalityRejectionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 // here means non-final txs are once again bouncing off the network with
 // generic errors instead of being caught at intake.
 var APIFinalityPrecheckUnavailableTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "arcade_api_finality_precheck_unavailable_total",
+	Name: "bsv_broadcaster_api_finality_precheck_unavailable_total",
 	Help: "Finality pre-checks skipped (failed open) because chain state was unavailable.",
 })
 
@@ -451,7 +451,7 @@ var APIFinalityPrecheckUnavailableTotal = promauto.NewCounter(prometheus.Counter
 // state-transfer for those txs never arrived — the primary alerting signal
 // for a stalled subtree-callback pipeline.
 var StuckTransientTxs = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "arcade_stuck_transient_txs",
+	Name: "bsv_broadcaster_stuck_transient_txs",
 	Help: "Transactions stuck in a transient status for over 1h (24h lookback), by status. Leader-computed; aggregate with max().",
 }, []string{"status"})
 
@@ -459,7 +459,7 @@ var StuckTransientTxs = promauto.NewGaugeVec(prometheus.GaugeOpts{
 // currently stuck in each transient status (0 when none). Same computation
 // cadence and aggregation semantics as StuckTransientTxs.
 var OldestTransientTxAge = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "arcade_oldest_transient_tx_age_seconds",
+	Name: "bsv_broadcaster_oldest_transient_tx_age_seconds",
 	Help: "Age of the oldest transaction stuck in each transient status (seconds; 0 when none). Leader-computed; aggregate with max().",
 }, []string{"status"})
 
@@ -474,8 +474,8 @@ var OldestTransientTxAge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 // (stuckAttributionCap) to bound the per-tick submission lookups — the
 // uncapped totals stay on StuckTransientTxs.
 var StuckTransientTxsByCallback = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "arcade_stuck_transient_txs_by_callback",
-	Help: "Stuck transient txs (see arcade_stuck_transient_txs) attributed to the submitting client's callback host. Leader-computed, reset each tick; aggregate with max().",
+	Name: "bsv_broadcaster_stuck_transient_txs_by_callback",
+	Help: "Stuck transient txs (see bsv_broadcaster_stuck_transient_txs) attributed to the submitting client's callback host. Leader-computed, reset each tick; aggregate with max().",
 }, []string{"status", "callback_host"})
 
 // ---------------------------------------------------------------------------
@@ -509,35 +509,35 @@ var StuckTransientTxsByCallback = promauto.NewGaugeVec(prometheus.GaugeOpts{
 // matching any new benign outcome someone adds. Keep this list and the rule
 // in README.md in sync when adding an outcome.
 var BumpBuilderBuildDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
-	Name:    "arcade_bump_builder_build_duration_seconds",
+	Name:    "bsv_broadcaster_bump_builder_build_duration_seconds",
 	Help:    "Time to build and persist one compound BUMP, by outcome.",
 	Buckets: latencyBuckets,
 }, []string{labelOutcome})
 
 // BumpBuilderBlocksProcessedTotal counts BLOCK_PROCESSED messages handled.
 var BumpBuilderBlocksProcessedTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "arcade_bump_builder_blocks_processed_total",
+	Name: "bsv_broadcaster_bump_builder_blocks_processed_total",
 	Help: "BLOCK_PROCESSED messages handled by bump-builder.",
 })
 
 // BumpBuilderStumpCount is the histogram of how many STUMPs each block had.
 // Useful for spotting blocks with unusual tracking patterns.
 var BumpBuilderStumpCount = promauto.NewHistogram(prometheus.HistogramOpts{
-	Name:    "arcade_bump_builder_stump_count",
+	Name:    "bsv_broadcaster_bump_builder_stump_count",
 	Help:    "Number of STUMPs per block at BUMP construction time.",
 	Buckets: sizeBuckets,
 })
 
 // BumpBuilderTxidsMined counts the txs marked MINED across all builds.
 var BumpBuilderTxidsMinedTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "arcade_bump_builder_txids_mined_total",
+	Name: "bsv_broadcaster_bump_builder_txids_mined_total",
 	Help: "Tracked transactions marked MINED via BUMP construction.",
 })
 
 // BumpBuilderDatahubFetchDuration measures the round-trip to the datahub for
 // subtree hashes + coinbase BUMP + header merkle root.
 var BumpBuilderDatahubFetchDuration = promauto.NewHistogram(prometheus.HistogramOpts{
-	Name:    "arcade_bump_builder_datahub_fetch_seconds",
+	Name:    "bsv_broadcaster_bump_builder_datahub_fetch_seconds",
 	Help:    "Datahub fetch latency for block data needed by BUMP construction.",
 	Buckets: latencyBuckets,
 })
@@ -550,7 +550,7 @@ var BumpBuilderDatahubFetchDuration = promauto.NewHistogram(prometheus.Histogram
 // sustained source="datahub" rate signals an un-upgraded merkle-service or
 // blocks whose enrichment fields couldn't be built/validated upstream.
 var BumpBuilderBlockDataSourceTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_bump_builder_block_data_source_total",
+	Name: "bsv_broadcaster_bump_builder_block_data_source_total",
 	Help: "Block data source used for compound BUMP construction, by source (callback|datahub).",
 }, []string{"source"})
 
@@ -562,7 +562,7 @@ var BumpBuilderBlockDataSourceTotal = promauto.NewCounterVec(prometheus.CounterO
 // this counter to blocks_processed_total tracks how often the window still
 // earns its latency cost.
 var BumpBuilderGraceWaitTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "arcade_bump_builder_grace_window_waits_total",
+	Name: "bsv_broadcaster_bump_builder_grace_window_waits_total",
 	Help: "BLOCK_PROCESSED handlers that waited the grace window before re-reading STUMPs.",
 })
 
@@ -574,7 +574,7 @@ var BumpBuilderGraceWaitTotal = promauto.NewCounter(prometheus.CounterOpts{
 // callback URL outage). Surfaces silent drops that would otherwise only show
 // up as "tx stuck in SEEN_MULTIPLE_NODES" days later.
 var BumpBuilderEmptyStumpBlocksTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "arcade_bump_builder_empty_stump_blocks_total",
+	Name: "bsv_broadcaster_bump_builder_empty_stump_blocks_total",
 	Help: "BLOCK_PROCESSED messages handled with zero STUMPs in the store for the block.",
 })
 
@@ -590,7 +590,7 @@ var BumpBuilderEmptyStumpBlocksTotal = promauto.NewCounter(prometheus.CounterOpt
 // (empty_stump_blocks_total), a block missing only SOME of its STUMPs used to
 // build a valid-looking BUMP and lose the absent subtree's txs with no signal.
 var BumpBuilderIncompleteStumpsTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "arcade_bump_builder_incomplete_stumps_total",
+	Name: "bsv_broadcaster_bump_builder_incomplete_stumps_total",
 	Help: "BLOCK_PROCESSED messages left un-finalized because expected STUMPs were still missing after the grace window.",
 })
 
@@ -599,7 +599,7 @@ var BumpBuilderIncompleteStumpsTotal = promauto.NewCounter(prometheus.CounterOpt
 // redelivery (typically from /reprocess re-emitting BLOCK_PROCESSED). Tracks
 // how much work the short-circuit saves vs. re-fetching datahub.
 var BumpBuilderShortCircuitTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "arcade_bump_builder_short_circuit_total",
+	Name: "bsv_broadcaster_bump_builder_short_circuit_total",
 	Help: "BLOCK_PROCESSED messages skipped because a compound BUMP already exists for the block.",
 })
 
@@ -609,7 +609,7 @@ var BumpBuilderShortCircuitTotal = promauto.NewCounter(prometheus.CounterOpts{
 // distinguishes the fresh-build path from the short-circuit redelivery
 // path. Each denial routes the block into the anchor reconciler's queue.
 var BumpBuilderAnchorGuardDeniedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_bump_builder_anchor_guard_denied_total",
+	Name: "bsv_broadcaster_bump_builder_anchor_guard_denied_total",
 	Help: "Blocks refused MINED anchoring because the active chain has a different block at their height.",
 }, []string{"path"})
 
@@ -626,21 +626,21 @@ var BumpBuilderAnchorGuardDeniedTotal = promauto.NewCounterVec(prometheus.Counte
 // stale (the reconciled_at compare-and-set found the row reactivated or
 // orphaned again mid-pass — nothing stamped; issue #339), error.
 var ReconcilerBlocksTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_reconciler_blocks_total",
+	Name: "bsv_broadcaster_reconciler_blocks_total",
 	Help: "Orphaned blocks processed by the anchor reconciler, by outcome.",
 }, []string{"outcome"})
 
 // ReconcilerTxsReanchoredTotal counts transactions the reconciler moved from
 // an orphaned block to the active-chain block containing them.
 var ReconcilerTxsReanchoredTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "arcade_reconciler_txs_reanchored_total",
+	Name: "bsv_broadcaster_reconciler_txs_reanchored_total",
 	Help: "Transactions re-anchored from an orphaned block to a canonical block.",
 })
 
 // ReconcilerTxsRevertedTotal counts transactions the reconciler reverted to
 // SEEN_ON_NETWORK because no canonical block contains them.
 var ReconcilerTxsRevertedTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "arcade_reconciler_txs_reverted_total",
+	Name: "bsv_broadcaster_reconciler_txs_reverted_total",
 	Help: "Transactions reverted to SEEN_ON_NETWORK because their only block was orphaned.",
 })
 
@@ -651,7 +651,7 @@ var ReconcilerTxsRevertedTotal = promauto.NewCounter(prometheus.CounterOpts{
 // path. A steady climb here means canonical BUMPs are not arriving (see the
 // merkle-service /reprocess dependency, bsv-blockchain/merkle-service#208).
 var ReconcilerTxsParkedTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "arcade_reconciler_txs_parked_total",
+	Name: "bsv_broadcaster_reconciler_txs_parked_total",
 	Help: "Transactions left MINED against an orphan because no canonical BUMP was available (not reverted).",
 })
 
@@ -666,7 +666,7 @@ var ReconcilerTxsParkedTotal = promauto.NewCounter(prometheus.CounterOpts{
 // the next pass re-mines it and reactivates it. Non-zero is worth a look:
 // it means a store call failed while a reorg was being healed.
 var ReconcilerRemineRequeuedTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "arcade_reconciler_remine_requeue_total",
+	Name: "bsv_broadcaster_reconciler_remine_requeue_total",
 	Help: "Canonical block rows re-orphaned to retry a partial re-mine after a concurrent reactivation.",
 })
 
@@ -678,7 +678,7 @@ var ReconcilerRemineRequeuedTotal = promauto.NewCounter(prometheus.CounterOpts{
 // non-zero count during an outage is the signal to check
 // ReconcilerRemineHandoffPending before restarting the process.
 var ReconcilerRemineHandoffFailedTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "arcade_reconciler_remine_handoff_failed_total",
+	Name: "bsv_broadcaster_reconciler_remine_handoff_failed_total",
 	Help: "Failed re-mines whose durable hand-off the store refused after retries; the block fell back to the in-memory pending set.",
 })
 
@@ -689,13 +689,13 @@ var ReconcilerRemineHandoffFailedTotal = promauto.NewCounter(prometheus.CounterO
 // re-orphaning it would be wrong. Should be 0 in steady state and drain to
 // 0 as soon as the store recovers.
 var ReconcilerRemineHandoffPending = promauto.NewGauge(prometheus.GaugeOpts{
-	Name: "arcade_reconciler_remine_handoff_pending",
+	Name: "bsv_broadcaster_reconciler_remine_handoff_pending",
 	Help: "Blocks awaiting a re-mine retry that only the reconciler's in-memory pending set holds.",
 })
 
 // ReconcilerBlockDuration observes wall time per reconciled block.
 var ReconcilerBlockDuration = promauto.NewHistogram(prometheus.HistogramOpts{
-	Name:    "arcade_reconciler_block_duration_seconds",
+	Name:    "bsv_broadcaster_reconciler_block_duration_seconds",
 	Help:    "Wall time spent reconciling one orphaned block's transactions.",
 	Buckets: prometheus.ExponentialBuckets(0.01, 4, 8), // 10ms .. ~11m
 })
@@ -733,7 +733,7 @@ const (
 // anchor guard's write-time denials are counted separately by
 // BumpBuilderAnchorGuardDeniedTotal.
 var BlockStatusTransitionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_block_status_transitions_total",
+	Name: "bsv_broadcaster_block_status_transitions_total",
 	Help: "block_processing status transitions by direction (orphaned|reactivated) and detection edge (reorg_event|tie_scan|full_scan|reconciler).",
 }, []string{"transition", "source"})
 
@@ -743,20 +743,20 @@ var BlockStatusTransitionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 
 // WatchdogTickTotal tracks watchdog tick outcomes.
 var WatchdogTickTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_watchdog_tick_total",
+	Name: "bsv_broadcaster_watchdog_tick_total",
 	Help: "Watchdog tick outcomes.",
 }, []string{labelOutcome}) // ran, skipped_no_leader, lease_error
 
 // WatchdogStaleCount is the number of stale block_processing rows the last
 // tick observed (post-recency-window filter, pre-backoff filter).
 var WatchdogStaleCount = promauto.NewGauge(prometheus.GaugeOpts{
-	Name: "arcade_watchdog_stale_count",
+	Name: "bsv_broadcaster_watchdog_stale_count",
 	Help: "Stale block_processing rows observed by the last watchdog tick.",
 })
 
 // WatchdogReprocessTotal counts /reprocess outcomes by reason.
 var WatchdogReprocessTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_watchdog_reprocess_total",
+	Name: "bsv_broadcaster_watchdog_reprocess_total",
 	Help: "Watchdog /reprocess call outcomes.",
 }, []string{labelOutcome}) // success, err_auth, err_4xx, err_5xx, err_network
 
@@ -764,7 +764,7 @@ var WatchdogReprocessTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 // Sustained growth implies blocks are persistently failing to recover —
 // inspect logs for the 4xx/5xx outcome breakdown.
 var WatchdogBackoffDepth = promauto.NewGauge(prometheus.GaugeOpts{
-	Name: "arcade_watchdog_backoff_depth",
+	Name: "bsv_broadcaster_watchdog_backoff_depth",
 	Help: "Number of blocks currently held in the watchdog's in-memory backoff map.",
 })
 
@@ -773,7 +773,7 @@ var WatchdogBackoffDepth = promauto.NewGauge(prometheus.GaugeOpts{
 // blocks are permanently un-finalizable — inspect bump-builder for the
 // underlying reason (e.g. incomplete STUMPs / merkle-root mismatch).
 var WatchdogParkedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_watchdog_parked_total",
+	Name: "bsv_broadcaster_watchdog_parked_total",
 	Help: "Blocks parked by the watchdog (reprocessing stopped), by reason.",
 }, []string{"reason"}) // max_attempts, max_age
 
@@ -785,7 +785,7 @@ var WatchdogParkedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 // route is the gin route pattern (not the resolved URL) so cardinality stays
 // bounded.
 var APIRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
-	Name:    "arcade_api_request_duration_seconds",
+	Name:    "bsv_broadcaster_api_request_duration_seconds",
 	Help:    "API request latency by route + method + status class.",
 	Buckets: latencyBuckets,
 }, []string{"route", "method", "status_class"}) // status_class = 2xx, 3xx, 4xx, 5xx
@@ -796,19 +796,19 @@ var APIRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 // pool is undersized relative to the inbound submit rate — raise worker
 // count or queue depth in server.go.
 var APISubmissionRecorderDropTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "arcade_api_submission_recorder_drop_total",
+	Name: "bsv_broadcaster_api_submission_recorder_drop_total",
 	Help: "Submission rows dropped because the async recorder queue was full.",
 })
 
 // APIRequestsInFlight tracks how many requests are currently being handled.
 var APIRequestsInFlight = promauto.NewGauge(prometheus.GaugeOpts{
-	Name: "arcade_api_requests_in_flight",
+	Name: "bsv_broadcaster_api_requests_in_flight",
 	Help: "API requests currently being handled.",
 })
 
 // APIRequestBytes tracks request body size — surfaces oversized clients early.
 var APIRequestBytes = promauto.NewHistogramVec(prometheus.HistogramOpts{
-	Name:    "arcade_api_request_bytes",
+	Name:    "bsv_broadcaster_api_request_bytes",
 	Help:    "API request body size in bytes, by route.",
 	Buckets: bytesBuckets,
 }, []string{"route"})
@@ -826,7 +826,7 @@ var APIRequestBytes = promauto.NewHistogramVec(prometheus.HistogramOpts{
 //
 // A non-zero "client_gone" rate is normal under churn.
 var APISSEDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_api_sse_dropped_total",
+	Name: "bsv_broadcaster_api_sse_dropped_total",
 	Help: "SSE fan-out events dropped without delivery, by reason.",
 }, []string{"reason"}) // slow_client, client_gone
 
@@ -842,7 +842,7 @@ var APISSEDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 // any consumer drains. It is the metric that was missing when 1.6M drops were
 // attributed to a "slow SSE client" that was idle.
 var SSEFanoutDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
-	Name:    "arcade_sse_fanout_duration_seconds",
+	Name:    "bsv_broadcaster_sse_fanout_duration_seconds",
 	Help:    "Time the SSE fan-out goroutine spent dispatching one event, by kind.",
 	Buckets: latencyBuckets,
 }, []string{"kind"}) // single, bulk
@@ -851,7 +851,7 @@ var SSEFanoutDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 // this pod. Fan-out cost per event scales with this, and it disambiguates
 // "one chronically slow consumer" from "many consumers".
 var SSEConnectedClients = promauto.NewGauge(prometheus.GaugeOpts{
-	Name: "arcade_sse_connected_clients",
+	Name: "bsv_broadcaster_sse_connected_clients",
 	Help: "SSE /events clients currently registered on this pod.",
 })
 
@@ -861,7 +861,7 @@ var SSEConnectedClients = promauto.NewGauge(prometheus.GaugeOpts{
 // the store's contribution to fan-out latency. Bulk events bypass the cache
 // by design and are not counted here.
 var SSETokenCacheTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_sse_token_cache_total",
+	Name: "bsv_broadcaster_sse_token_cache_total",
 	Help: "SSE fan-out txid→token-set cache lookups, by result.",
 }, []string{"result"}) // hit, miss
 
@@ -870,7 +870,7 @@ var SSETokenCacheTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 // being lost to eviction; sitting well below it while the byte budget binds
 // means unusually large token strings.
 var SSETokenCacheEntries = promauto.NewGauge(prometheus.GaugeOpts{
-	Name: "arcade_sse_token_cache_entries",
+	Name: "bsv_broadcaster_sse_token_cache_entries",
 	Help: "Entries resident in the SSE fan-out txid→token-set cache.",
 })
 
@@ -879,7 +879,7 @@ var SSETokenCacheEntries = promauto.NewGauge(prometheus.GaugeOpts{
 // bulk event's chunked resolution). This is the per-event probe latency that
 // had to be measured out-of-band before.
 var SSETokenLookupDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
-	Name:    "arcade_sse_token_lookup_duration_seconds",
+	Name:    "bsv_broadcaster_sse_token_lookup_duration_seconds",
 	Help:    "Store.TokensForTxIDs latency from the SSE fan-out path, by kind.",
 	Buckets: latencyBuckets,
 }, []string{"kind"}) // single, batch
@@ -892,7 +892,7 @@ var SSETokenLookupDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 // than the publish rate and is being served store-paced replay instead of
 // live frames.
 var SSEMidstreamCatchupsTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "arcade_sse_midstream_catchups_total",
+	Name: "bsv_broadcaster_sse_midstream_catchups_total",
 	Help: "Mid-stream SSE catchup rounds run after a client's send buffer overflowed.",
 })
 
@@ -901,7 +901,7 @@ var SSEMidstreamCatchupsTotal = promauto.NewCounter(prometheus.CounterOpts{
 // received live (the replay window is deliberately rewound past the drop
 // boundary; clients dedupe by txid+status).
 var SSEMidstreamCatchupFramesTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "arcade_sse_midstream_catchup_frames_total",
+	Name: "bsv_broadcaster_sse_midstream_catchup_frames_total",
 	Help: "Frames replayed from the store by mid-stream SSE catchup rounds.",
 })
 
@@ -919,7 +919,7 @@ var SSEMidstreamCatchupFramesTotal = promauto.NewCounter(prometheus.CounterOpts{
 // SSEConnectedClients and the publish rate: it is a "is the stream keeping
 // up" signal, not a liveness check.
 var SSEClientLagSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
-	Name:    "arcade_sse_client_lag_seconds",
+	Name:    "bsv_broadcaster_sse_client_lag_seconds",
 	Help:    "Age of the last frame delivered to an SSE client, sampled per keepalive tick.",
 	Buckets: []float64{.05, .1, .25, .5, 1, 2.5, 5, 10, 30, 60, 300},
 })
@@ -933,7 +933,7 @@ var SSEClientLagSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
 // with outcome="write_error" is a very different problem from one with
 // outcome="drain", and before this the two were indistinguishable.
 var SSEConnectionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_sse_connections_total",
+	Name: "bsv_broadcaster_sse_connections_total",
 	Help: "Finished SSE /events connections, by how they ended.",
 }, []string{"outcome"}) // client_closed, drain, write_error
 
@@ -955,7 +955,7 @@ var SSEConnectionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 // impossible to miss. The client's contract on receiving one is to reconcile
 // the window over REST.
 var SSEGapEventsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_sse_gap_events_total",
+	Name: "bsv_broadcaster_sse_gap_events_total",
 	Help: "SSE `event: gap` frames written, by reason.",
 }, []string{"reason"}) // catchup_truncated, firehose_drop, replay_unavailable
 
@@ -967,7 +967,7 @@ var SSEGapEventsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 // subscriber's downstream draining slower than the producer rate — typical
 // causes are synchronous I/O in the channel reader or a CPU-pressured pod.
 var EventsSubscriberDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_events_subscriber_dropped_total",
+	Name: "bsv_broadcaster_events_subscriber_dropped_total",
 	Help: "events.Publisher subscriber-channel drops, labeled by caller (e.g. sse, webhook).",
 }, []string{"caller"})
 
@@ -978,10 +978,10 @@ var EventsSubscriberDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts
 // callbacks: workers are blocked on http.Client.Do and incoming statuses
 // pile up faster than the work channel can hold them. Distinguishes
 // pool-pressure drops from upstream subscriber-channel drops
-// (arcade_events_subscriber_dropped_total{caller="webhook"}) so the two
+// (bsv_broadcaster_events_subscriber_dropped_total{caller="webhook"}) so the two
 // failure modes can be tuned independently.
 var WebhookPoolSaturatedTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "arcade_webhook_pool_saturated_total",
+	Name: "bsv_broadcaster_webhook_pool_saturated_total",
 	Help: "Status updates dropped by the webhook service because its delivery worker pool was full.",
 })
 
@@ -994,7 +994,7 @@ var WebhookPoolSaturatedTotal = promauto.NewCounter(prometheus.CounterOpts{
 // are not actually flowing through CAS — either the schema migration is
 // missing or only one pod is producing events.
 var WebhookCASLostTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "arcade_webhook_cas_lost_total",
+	Name: "bsv_broadcaster_webhook_cas_lost_total",
 	Help: "Webhook deliveries skipped because another replica won the LastDeliveredStatus CAS.",
 })
 
@@ -1005,7 +1005,7 @@ var WebhookCASLostTotal = promauto.NewCounter(prometheus.CounterOpts{
 // cache-eviction/reorg race or a missing/unparseable BUMP — the proof is still
 // recoverable via GET /tx/:txid, but a sustained rate warrants investigation.
 var MinedPushWithoutMerklePathTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_mined_push_without_merkle_path_total",
+	Name: "bsv_broadcaster_mined_push_without_merkle_path_total",
 	Help: "MINED/IMMUTABLE statuses pushed without a merklePath after enrichment, by channel.",
 }, []string{"channel"})
 
@@ -1019,14 +1019,14 @@ var MinedPushWithoutMerklePathTotal = promauto.NewCounterVec(prometheus.CounterO
 // backends stay comparable. Postgres and Pebble propagate infra errors
 // through the function's `err` return and the caller already logs those.
 var WebhookCASErrorTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "arcade_webhook_cas_error_total",
+	Name: "bsv_broadcaster_webhook_cas_error_total",
 	Help: "Webhook CAS writes that failed with an infra error (distinct from generation mismatch).",
 })
 
 // WebhookReaperLease is 1 when this pod holds the webhook-reaper lease, 0
 // otherwise. With N replicas, exactly one is expected to be 1 at any time.
 var WebhookReaperLease = promauto.NewGauge(prometheus.GaugeOpts{
-	Name: "arcade_webhook_reaper_lease",
+	Name: "bsv_broadcaster_webhook_reaper_lease",
 	Help: "1 when this pod holds the webhook-reaper lease, 0 otherwise.",
 })
 
@@ -1035,7 +1035,7 @@ var WebhookReaperLease = promauto.NewGauge(prometheus.GaugeOpts{
 // state on N-1 replicas; a sustained lease_error rate points at the store
 // backend being unhealthy.
 var WebhookReaperTickTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_webhook_reaper_tick_total",
+	Name: "bsv_broadcaster_webhook_reaper_tick_total",
 	Help: "Webhook reaper ticks by outcome (ran / skipped_no_leader / lease_error).",
 }, []string{labelOutcome})
 
@@ -1043,7 +1043,7 @@ var WebhookReaperTickTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 // tick observed as ready-for-retry. A sustained non-zero value means the
 // backlog of failed POSTs is growing faster than the reaper can drain it.
 var WebhookReaperReadyDepth = promauto.NewGauge(prometheus.GaugeOpts{
-	Name: "arcade_webhook_reaper_ready_depth",
+	Name: "bsv_broadcaster_webhook_reaper_ready_depth",
 	Help: "Submissions the last webhook-reaper tick observed as ready-for-retry.",
 })
 
@@ -1054,7 +1054,7 @@ var WebhookReaperReadyDepth = promauto.NewGauge(prometheus.GaugeOpts{
 // TeranodeRequestDuration measures HTTP latency for outbound calls to a
 // datahub endpoint, by op and status code class.
 var TeranodeRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
-	Name:    "arcade_teranode_request_duration_seconds",
+	Name:    "bsv_broadcaster_teranode_request_duration_seconds",
 	Help:    "HTTP request latency from arcade to a datahub endpoint, by op and status class.",
 	Buckets: latencyBuckets,
 }, []string{"op", "status_class"}) // op = submit_tx, submit_txs, probe; status_class = 2xx/4xx/5xx/transport_error
@@ -1063,14 +1063,14 @@ var TeranodeRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 // 0 = unhealthy. Endpoint URL is the label so dashboards can per-endpoint
 // alert; URL count is bounded by the size of the datahub fleet.
 var TeranodeEndpointHealth = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "arcade_teranode_endpoint_healthy",
+	Name: "bsv_broadcaster_teranode_endpoint_healthy",
 	Help: "1 if the endpoint is currently in the healthy set, 0 if circuit-breaker tripped.",
 }, []string{"endpoint", "source"}) // source = configured, discovered
 
 // TeranodeEndpointCount is the total count of registered endpoints, separated
 // by source. Surfaces whether p2p discovery is finding peers.
 var TeranodeEndpointCount = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "arcade_teranode_endpoint_count",
+	Name: "bsv_broadcaster_teranode_endpoint_count",
 	Help: "Number of registered datahub endpoints, by source.",
 }, []string{"source"})
 
@@ -1080,7 +1080,7 @@ var TeranodeEndpointCount = promauto.NewGaugeVec(prometheus.GaugeOpts{
 // validation (or a peer's DNS broke after registration) — candidates for
 // pruning.
 var TeranodeEndpointRefreshRejectedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_teranode_endpoint_refresh_rejected_total",
+	Name: "bsv_broadcaster_teranode_endpoint_refresh_rejected_total",
 	Help: "Registry datahub endpoints rejected at refresh time by URL validation.",
 }, []string{labelOutcome}) // blocked, invalid
 
@@ -1090,13 +1090,13 @@ var TeranodeEndpointRefreshRejectedTotal = promauto.NewCounterVec(prometheus.Cou
 
 // KafkaMessagesTotal counts produce / consume / DLQ events by topic.
 var KafkaMessagesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_kafka_messages_total",
+	Name: "bsv_broadcaster_kafka_messages_total",
 	Help: "Kafka messages produced, consumed, or DLQ-routed, by topic and op.",
 }, []string{"topic", "op"}) // op = produce, consume, dlq
 
 // KafkaMessageBytes measures message payload size.
 var KafkaMessageBytes = promauto.NewHistogramVec(prometheus.HistogramOpts{
-	Name:    "arcade_kafka_message_bytes",
+	Name:    "bsv_broadcaster_kafka_message_bytes",
 	Help:    "Kafka message size in bytes, by topic and op.",
 	Buckets: bytesBuckets,
 }, []string{"topic", "op"})
@@ -1106,13 +1106,13 @@ var KafkaMessageBytes = promauto.NewHistogramVec(prometheus.HistogramOpts{
 // slow to keep up with the producer at the broker's configured buffer/timeout
 // — investigate the corresponding consumer's pending-depth gauge.
 var KafkaBackpressureTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_kafka_backpressure_total",
+	Name: "bsv_broadcaster_kafka_backpressure_total",
 	Help: "Producer Send calls that returned ErrBrokerBackpressure, by topic.",
 }, []string{"topic"})
 
 // KafkaProduceErrors counts producer failures by topic.
 var KafkaProduceErrors = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_kafka_produce_errors_total",
+	Name: "bsv_broadcaster_kafka_produce_errors_total",
 	Help: "Kafka producer error count, by topic.",
 }, []string{"topic"})
 
@@ -1122,7 +1122,7 @@ var KafkaProduceErrors = promauto.NewCounterVec(prometheus.CounterOpts{
 // so they correlate with rising consumer lag on the primary topic until
 // publishing recovers.
 var KafkaDLQPublishFailures = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_kafka_dlq_publish_failures_total",
+	Name: "bsv_broadcaster_kafka_dlq_publish_failures_total",
 	Help: "Kafka DLQ publish failure count, by original topic.",
 }, []string{"topic"})
 
@@ -1133,19 +1133,19 @@ var KafkaDLQPublishFailures = promauto.NewCounterVec(prometheus.CounterOpts{
 // P2PNodeStatusMessagesTotal counts node_status messages received from the
 // teranode pubsub topic.
 var P2PNodeStatusMessagesTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "arcade_p2p_node_status_messages_total",
+	Name: "bsv_broadcaster_p2p_node_status_messages_total",
 	Help: "node_status messages received from teranode peers.",
 })
 
 // P2PEndpointDiscoveryTotal counts datahub URL discovery outcomes.
 var P2PEndpointDiscoveryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_p2p_endpoint_discovery_total",
+	Name: "bsv_broadcaster_p2p_endpoint_discovery_total",
 	Help: "Datahub URL discovery outcomes from peer announcements.",
 }, []string{labelOutcome}) // registered, invalid, blocked, no_url, no_store, error
 
 // P2PPeerBestHeight reports the best block height each datahub peer
 // advertises in its node_status messages. Compared against
-// arcade_chain_tip_height (arcade's own processed tip) this is the
+// bsv_broadcaster_chain_tip_height (arcade's own processed tip) this is the
 // height-lag signal that was previously invisible: a reachable-but-stalled
 // peer showed healthy on every existing metric while its chain view froze
 // 50+ blocks behind (issue #254). Labelled by the peer's base_url — the
@@ -1153,7 +1153,7 @@ var P2PEndpointDiscoveryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 // restart-churn would grow the series set unboundedly; peers announcing no
 // base_url are skipped.
 var P2PPeerBestHeight = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "arcade_p2p_peer_best_height",
+	Name: "bsv_broadcaster_p2p_peer_best_height",
 	Help: "Best block height advertised by a datahub peer via p2p node_status, by base_url.",
 }, []string{"base_url"})
 
@@ -1164,7 +1164,7 @@ var P2PPeerBestHeight = promauto.NewGaugeVec(prometheus.GaugeOpts{
 // bounded-cardinality reason as P2PPeerBestHeight; peers with no base_url are
 // still persisted for the minimum but not surfaced here.
 var P2PPeerMinMiningFee = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "arcade_p2p_peer_min_mining_fee",
+	Name: "bsv_broadcaster_p2p_peer_min_mining_fee",
 	Help: "Minimum mining fee (satoshis per 1000 bytes) advertised by a peer via p2p node_status, by base_url.",
 }, []string{"base_url"})
 
@@ -1178,23 +1178,23 @@ var P2PPeerMinMiningFee = promauto.NewGaugeVec(prometheus.GaugeOpts{
 // actually advertise a limit: a legacy peer's absent limit would otherwise show
 // as 0, reading as "accepts nothing".
 var P2PPeerMaxTxSizePolicy = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "arcade_p2p_peer_max_tx_size_policy",
+	Name: "bsv_broadcaster_p2p_peer_max_tx_size_policy",
 	Help: "Maximum transaction size (bytes) advertised by a peer via p2p node_status, by base_url.",
 }, []string{"base_url"})
 
 var P2PPeerMaxScriptSizePolicy = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "arcade_p2p_peer_max_script_size_policy",
+	Name: "bsv_broadcaster_p2p_peer_max_script_size_policy",
 	Help: "Maximum script size (bytes) advertised by a peer via p2p node_status, by base_url.",
 }, []string{"base_url"})
 
 // ChainTipHeight reports arcade's own view of the active chain tip — the
 // highest block_processing row marked active. Refreshed by the api-server's
 // /health handler (which also returns it as blockHeight); alert on this
-// flatlining, or on arcade_p2p_peer_best_height pulling ahead of it, to
+// flatlining, or on bsv_broadcaster_p2p_peer_best_height pulling ahead of it, to
 // catch stale-chain-view conditions before they surface as non-final
 // rejections (issue #254).
 var ChainTipHeight = promauto.NewGauge(prometheus.GaugeOpts{
-	Name: "arcade_chain_tip_height",
+	Name: "bsv_broadcaster_chain_tip_height",
 	Help: "Arcade's active processed chain-tip height (max active block_processing row).",
 })
 
@@ -1219,7 +1219,7 @@ var statusTransitionAgeBuckets = []float64{
 // other transitions (RECEIVED→REJECTED, SEEN_ON_NETWORK→MINED, ...) without
 // new metric definitions.
 var StatusTransitionAge = promauto.NewHistogramVec(prometheus.HistogramOpts{
-	Name:    "arcade_status_transition_age_seconds",
+	Name:    "bsv_broadcaster_status_transition_age_seconds",
 	Help:    "Wall-clock age of the previous status row at the moment a new transition is applied.",
 	Buckets: statusTransitionAgeBuckets,
 }, []string{"from", "to"})
@@ -1229,7 +1229,7 @@ var StatusTransitionAge = promauto.NewHistogramVec(prometheus.HistogramOpts{
 // callback type so a slow STUMP path doesn't get conflated with a slow
 // SEEN_ON_NETWORK path. result ∈ {success, partial, error}.
 var CallbackHandlerDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
-	Name:    "arcade_callback_handler_duration_seconds",
+	Name:    "bsv_broadcaster_callback_handler_duration_seconds",
 	Help:    "End-to-end duration of one inbound merkle-service callback handler, by type.",
 	Buckets: latencyBuckets,
 }, []string{"type", "result"})
@@ -1238,7 +1238,7 @@ var CallbackHandlerDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 // how aggressively the upstream is batching. Informs whether bulk-publish
 // optimizations are paying off.
 var CallbackBatchSize = promauto.NewHistogramVec(prometheus.HistogramOpts{
-	Name:    "arcade_callback_batch_size",
+	Name:    "bsv_broadcaster_callback_batch_size",
 	Help:    "Number of txids in one inbound merkle-service callback, by type.",
 	Buckets: sizeBuckets,
 }, []string{"type"})
@@ -1247,7 +1247,7 @@ var CallbackBatchSize = promauto.NewHistogramVec(prometheus.HistogramOpts{
 // arcade's store has no record of. Already logged at WARN; the counter
 // makes the rate scrapable so an operator can spot upstream drift.
 var CallbackUnknownTxIDTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_callback_unknown_txid_total",
+	Name: "bsv_broadcaster_callback_unknown_txid_total",
 	Help: "Inbound callbacks that named a txid arcade's store doesn't know.",
 }, []string{"type"})
 
@@ -1261,7 +1261,7 @@ var CallbackUnknownTxIDTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 // operators can tell apart "callback for already-mined tx" from "duplicate
 // SEEN_ON_NETWORK".
 var CallbackStaleTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_callback_stale_total",
+	Name: "bsv_broadcaster_callback_stale_total",
 	Help: "Inbound callbacks whose target status was already eclipsed by the stored row's status.",
 }, []string{"type", "prev_status"})
 
@@ -1274,7 +1274,7 @@ var CallbackStaleTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 // publish cost. from_status/to_status label cardinality is bounded by the
 // status lattice (~10 values each) so the matrix stays small.
 var StoreUpdateStatusDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
-	Name:    "arcade_store_updatestatus_duration_seconds",
+	Name:    "bsv_broadcaster_store_updatestatus_duration_seconds",
 	Help:    "Duration of one store.UpdateStatus call, by from/to status and outcome.",
 	Buckets: latencyBuckets,
 }, []string{"from_status", "to_status", labelOutcome}) // outcome: applied, skipped_lattice, not_found, error
@@ -1288,7 +1288,7 @@ var StoreUpdateStatusDuration = promauto.NewHistogramVec(prometheus.HistogramOpt
 // applies backpressure (a stalled consumer makes Send take 2s), nothing
 // surfaces in metrics. kind ∈ {single, bulk}.
 var EventsPublishDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
-	Name:    "arcade_events_publish_duration_seconds",
+	Name:    "bsv_broadcaster_events_publish_duration_seconds",
 	Help:    "Duration of one Publisher.Publish/PublishBulk call.",
 	Buckets: latencyBuckets,
 }, []string{"kind", labelOutcome}) // outcome: success, error

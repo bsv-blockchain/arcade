@@ -1,27 +1,55 @@
 package kafka
 
-const (
+// DefaultTopicPrefix namespaces every topic unless kafka.topic_prefix says
+// otherwise. Deployments that predate the BSV Broadcaster rebrand run with
+// prefix "arcade" so they keep consuming their existing topics.
+const DefaultTopicPrefix = "bsv-broadcaster"
+
+// Topic names, "<prefix>.<name>". They are variables only so SetTopicPrefix
+// can apply kafka.topic_prefix at startup; treat them as constants otherwise.
+var (
 	// TopicBlock is retained only for the p2p_client scaffold (which is not
 	// registered in main). It is not created by AllTopics() and has no consumers.
-	TopicBlock          = "arcade.block"
-	TopicBlockProcessed = "arcade.block_processed"
-	TopicTransaction    = "arcade.transaction"
-	TopicPropagation    = "arcade.propagation"
+	TopicBlock          string
+	TopicBlockProcessed string
+	TopicTransaction    string
+	TopicPropagation    string
 	// TopicStatusUpdate carries transaction status mutations from every
 	// service that writes to the store (validator, propagation, bump-builder,
 	// api-server). It exists so the api-server SSE handler and webhook
 	// service can fan out updates to clients without depending on which pod
 	// the mutation originated from.
-	TopicStatusUpdate = "arcade.tx_status"
+	TopicStatusUpdate string
 
 	// Dead-letter queue topics
-	TopicBlockProcessedDLQ = "arcade.block_processed.dlq"
-	TopicTransactionDLQ    = "arcade.transaction.dlq"
-	TopicPropagationDLQ    = "arcade.propagation.dlq"
-	TopicStatusUpdateDLQ   = "arcade.tx_status.dlq"
+	TopicBlockProcessedDLQ string
+	TopicTransactionDLQ    string
+	TopicPropagationDLQ    string
+	TopicStatusUpdateDLQ   string
 )
 
-// AllTopics returns all primary topics created/managed by arcade.
+func init() { SetTopicPrefix(DefaultTopicPrefix) }
+
+// SetTopicPrefix renames every topic to "<prefix>.<name>"; an empty prefix
+// means DefaultTopicPrefix. It is not safe for concurrent use: app.Bootstrap
+// calls it once, before any broker, producer or consumer exists.
+func SetTopicPrefix(prefix string) {
+	if prefix == "" {
+		prefix = DefaultTopicPrefix
+	}
+	TopicBlock = prefix + ".block"
+	TopicBlockProcessed = prefix + ".block_processed"
+	TopicTransaction = prefix + ".transaction"
+	TopicPropagation = prefix + ".propagation"
+	TopicStatusUpdate = prefix + ".tx_status"
+
+	TopicBlockProcessedDLQ = DLQTopic(TopicBlockProcessed)
+	TopicTransactionDLQ = DLQTopic(TopicTransaction)
+	TopicPropagationDLQ = DLQTopic(TopicPropagation)
+	TopicStatusUpdateDLQ = DLQTopic(TopicStatusUpdate)
+}
+
+// AllTopics returns all primary topics created/managed by BSV Broadcaster.
 func AllTopics() []string {
 	return []string{
 		TopicBlockProcessed,

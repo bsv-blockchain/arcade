@@ -38,7 +38,7 @@ Stakeholders: SPV validators that hit `/chaintracks/*` for block metadata; merkl
 **Choice:** Add a `chaintracks.Chaintracks` field to `api_server.Server`. Construct it in `Server.Start(ctx)` before `router.ListenAndServe`, passing `ctx` so subscriptions and the P2P client shut down when the service does. Skip initialization if `cfg.ChaintracksServer.Enabled == false`.
 
 **Alternatives considered:**
-- **Initialize in `cmd/arcade/main.go` and inject.** Would share the instance with other services if they ever need it. Rejected because no other service does; premature coupling.
+- **Initialize in `cmd/bsv-broadcaster/main.go` and inject.** Would share the instance with other services if they ever need it. Rejected because no other service does; premature coupling.
 - **Separate `chaintracks` service (Service interface).** Clean separation, but the chaintracks routes need to live on the same router as the api-server, which means either a shared router (weird service boundary) or the duplicated-port problem from Decision 1's alternatives.
 
 **Rationale:** Chaintracks is consumed only through HTTP here. Co-locating it with the only consumer keeps wiring simple. The `Service` interface already supports this — `Start(ctx)` is the natural integration point, and `Stop` just lets ctx cancel.

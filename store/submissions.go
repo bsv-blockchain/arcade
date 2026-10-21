@@ -3,7 +3,7 @@ package store
 import (
 	"context"
 
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
 )
 
 // DistinctTokens collects the distinct non-empty callback tokens carried by a

@@ -7,8 +7,8 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
 )
 
 // pagingStore implements just ListBlockProcessingStatus over a canned row

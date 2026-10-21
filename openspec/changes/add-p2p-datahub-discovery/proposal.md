@@ -23,7 +23,7 @@ Teranode nodes already gossip their own `BaseURL` on the libp2p `node_status` to
 
 ## Impact
 
-- **New service**: `services/p2p_client` gains a real libp2p integration (the stub is replaced, not kept). It becomes a long-lived service with its own `Start`/`Stop` in `cmd/arcade/main.go`.
+- **New service**: `services/p2p_client` gains a real libp2p integration (the stub is replaced, not kept). It becomes a long-lived service with its own `Start`/`Stop` in `cmd/bsv-broadcaster/main.go`.
 - **teranode client**: `teranode.Client` grows a `sync.RWMutex` and an `AddEndpoints` method. `GetEndpoints` becomes a snapshot under read-lock. Callers already invoke `GetEndpoints()` per-broadcast, so no caller changes.
 - **Config**: `p2p.datahub_discovery`, `p2p.bootstrap_peers`, `p2p.listen_port`, `p2p.dht_mode`, `p2p.private_key_path`, `p2p.topic_prefix` added to `P2PConfig`. `datahub_urls` semantics change from "the full list" to "the statically configured seed list that gets merged with discovered URLs".
 - **Dependencies**: Direct imports `github.com/bsv-blockchain/go-p2p-message-bus` (v0.1.16+) and its transitive libp2p stack (`go-libp2p`, `libp2p-pubsub`, `libp2p-kad-dht`). Adds ~20MB to the final binary.

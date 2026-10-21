@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
-	"github.com/bsv-blockchain/arcade/store/storetest"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/store/storetest"
 )
 
 func TestIterateTrackerRows_Conformance(t *testing.T) {

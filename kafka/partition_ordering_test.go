@@ -126,7 +126,7 @@ func TestMemoryBrokerPartitions_PreservesPerPartitionValueOrder(t *testing.T) {
 // The existing memory-broker test compares partitionForKey against a local
 // re-implementation of the same arithmetic, so it cannot catch any of these.
 func TestNewSyncProducerConfig_RoutesByKeyHash(t *testing.T) {
-	const topic = "arcade.propagation"
+	const topic = "bsv-broadcaster.propagation"
 
 	cfg := newSyncProducerConfig()
 	if cfg.Producer.Partitioner == nil {

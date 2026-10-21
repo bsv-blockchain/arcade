@@ -23,22 +23,22 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/callbackurl"
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/events"
-	"github.com/bsv-blockchain/arcade/logfields"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/services"
-	"github.com/bsv-blockchain/arcade/store"
-	"github.com/bsv-blockchain/arcade/version"
+	"github.com/bsv-blockchain/bsv-broadcaster/callbackurl"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/events"
+	"github.com/bsv-blockchain/bsv-broadcaster/logfields"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/services"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/version"
 )
 
-// webhookUserAgent identifies arcade's callback POSTs. The "arcade-webhook/"
+// webhookUserAgent identifies arcade's callback POSTs. The "bsv-broadcaster-webhook/"
 // prefix is a documented, stable string receivers can allowlist at their
 // edge — Go's default Go-http-client UA is a common bot-rule target and got
 // every callback to one production receiver silently 403'd (issue #249).
-var webhookUserAgent = "arcade-webhook/" + version.Version
+var webhookUserAgent = "bsv-broadcaster-webhook/" + version.Version
 
 // defaultMaxConcurrentDeliveries is the fallback pool size when
 // WebhookConfig.MaxConcurrentDeliveries is unset or non-positive.
@@ -198,7 +198,7 @@ func (s *Service) Start(ctx context.Context) error {
 	// store.GetSubmissionsByTxID plus up to N synchronous HTTP POSTs;
 	// running it on the channel-reader goroutine would let a single slow
 	// callback stall the entire upstream subscription and trigger drops
-	// at the publisher (arcade_events_subscriber_dropped_total).
+	// at the publisher (bsv_broadcaster_events_subscriber_dropped_total).
 	work := make(chan *models.TransactionStatus, workQueueDepth)
 	var wg sync.WaitGroup
 	wg.Add(workers)

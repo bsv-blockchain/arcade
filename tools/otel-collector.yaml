@@ -5,7 +5,7 @@
 # confirm arcade is actually shipping data end to end.
 #
 # Point arcade at this collector with either:
-#   ARCADE_TELEMETRY_ENABLED=true ARCADE_TELEMETRY_ENDPOINT=localhost:4317
+#   BSV_BROADCASTER_TELEMETRY_ENABLED=true BSV_BROADCASTER_TELEMETRY_ENDPOINT=localhost:4317
 # or the standard OTEL env vars:
 #   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
 receivers:

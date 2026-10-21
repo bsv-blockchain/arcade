@@ -70,7 +70,7 @@ func newLockTimeTx(lockTime, sequence uint32) *bt.Tx {
 
 // postSingleTx POSTs one tx in EF encoding to arcade's /tx endpoint and
 // returns the status code and response body.
-func postSingleTx(rt *arcadeRuntime, tx *bt.Tx) (int, string, error) {
+func postSingleTx(rt *broadcasterRuntime, tx *bt.Tx) (int, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rt.baseURL+"/tx", bytes.NewReader(tx.ExtendedBytes()))
@@ -87,7 +87,7 @@ func postSingleTx(rt *arcadeRuntime, tx *bt.Tx) (int, string, error) {
 	return resp.StatusCode, string(body), nil
 }
 
-func getTxStatus(rt *arcadeRuntime, txid string) (int, string, error) {
+func getTxStatus(rt *broadcasterRuntime, txid string) (int, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rt.baseURL+"/tx/"+txid, nil)
@@ -115,7 +115,7 @@ func getTxStatus(rt *arcadeRuntime, txid string) (int, string, error) {
 func TestSmoke_NonFinalTxRejectedAtIntake(t *testing.T) {
 	recorder := newRecordingTeranode(t)
 	stub := newStubChaintracks(t)
-	rt := startArcadeSmoke(t, smokeOptions{
+	rt := startBroadcasterSmoke(t, smokeOptions{
 		TeranodeURL:          recorder.URL(),
 		ChaintracksRemoteURL: stub.URL,
 	})

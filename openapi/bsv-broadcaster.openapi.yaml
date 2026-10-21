@@ -31,12 +31,12 @@ info:
   version: "1.0.0"
   license:
     name: Open BSV License
-    url: https://github.com/bsv-blockchain/arcade/blob/main/LICENSE
+    url: https://github.com/bsv-blockchain/bsv-broadcaster/blob/main/LICENSE
 
 servers:
   - url: http://localhost:8080
     description: api-server (local default)
-  - url: https://arcade.example.com
+  - url: https://broadcaster.example.com
     description: Production api-server (behind ingress)
 
 # Endpoints are unauthenticated by default; the Merkle Service callback
@@ -643,7 +643,7 @@ paths:
       servers:
         - url: http://localhost:8082
           description: sse service (local default)
-        - url: https://arcade.example.com
+        - url: https://broadcaster.example.com
           description: Production sse service (behind ingress)
       parameters:
         - name: callbackToken
@@ -1126,8 +1126,8 @@ components:
         blockHeight, and merklePath (the tx's BUMP), so the proof arrives on the
         callback without a follow-up GET.
 
-        Every callback POST carries `User-Agent: arcade-webhook/<version>` —
-        allowlist the `arcade-webhook/` prefix at your edge so bot/WAF rules
+        Every callback POST carries `User-Agent: bsv-broadcaster-webhook/<version>` —
+        allowlist the `bsv-broadcaster-webhook/` prefix at your edge so bot/WAF rules
         for generic HTTP clients don't silently reject deliveries. Delivery
         health per submission (attempts, last result) is inspectable via
         `GET /tx/{txid}?callbackToken=…`.

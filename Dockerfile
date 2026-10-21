@@ -3,7 +3,7 @@
 # Runtime-only image. The arcade binary is built in CI on a native runner per
 # architecture and copied in here, so this Dockerfile contains no Go toolchain
 # and no cross-compilation. To build locally, run `make docker-build` (which
-# produces the dist/linux-<arch>/arcade layout this Dockerfile expects).
+# produces the dist/linux-<arch>/bsv-broadcaster layout this Dockerfile expects).
 #
 # The binary is built with CGO_ENABLED=1 — it links the BSV BDK C++ consensus
 # library used by the transaction validator (see the validator package), so it
@@ -24,6 +24,6 @@ FROM gcr.io/distroless/cc-debian12
 
 ARG TARGETOS
 ARG TARGETARCH
-COPY dist/${TARGETOS}-${TARGETARCH}/arcade /usr/local/bin/arcade
+COPY dist/${TARGETOS}-${TARGETARCH}/bsv-broadcaster /usr/local/bin/bsv-broadcaster
 
-ENTRYPOINT ["/usr/local/bin/arcade"]
+ENTRYPOINT ["/usr/local/bin/bsv-broadcaster"]

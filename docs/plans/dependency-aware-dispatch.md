@@ -180,7 +180,7 @@ This plan depends on two upstream Teranode PRs:
 - [bsv-blockchain/teranode#879](https://github.com/bsv-blockchain/teranode/pull/879) — `/txs` processes the batch concurrently with per-submission slots.
 - [bsv-blockchain/teranode#881](https://github.com/bsv-blockchain/teranode/pull/881) — `/txs` response body emits per-slot lines in submission order so arcade can attribute results to specific txids. Also unifies the single-tx and batch error format on Teranode error codes (`"NAME (num)"`).
 
-The arcade-side parsing in `teranode/client.go` is written against the post-#881 format. If #881 isn't merged at deploy time, the parsing falls back to treating the batch result as binary (any 500 → retry), which is degraded but not broken.
+The bsv-broadcaster-side parsing in `teranode/client.go` is written against the post-#881 format. If #881 isn't merged at deploy time, the parsing falls back to treating the batch result as binary (any 500 → retry), which is degraded but not broken.
 
 ## Install base note
 

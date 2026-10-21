@@ -111,7 +111,7 @@ func NewLibP2PHostWith(t *testing.T, opts LibP2PHostOptions) (*LibP2PHost, error
 	announceAddr := announceMultiaddr(announceHost, listenPort)
 
 	cfg := msgbus.Config{
-		Name:            "arcade-e2e-harness",
+		Name:            "bsv-broadcaster-e2e-harness",
 		PrivateKey:      privKey,
 		Port:            listenPort,
 		AnnounceAddrs:   []string{announceAddr},

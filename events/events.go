@@ -14,7 +14,7 @@ package events
 import (
 	"context"
 
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
 )
 
 // Publisher is the contract every status-update fan-out backend implements.

@@ -16,15 +16,15 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
 
-	"github.com/bsv-blockchain/arcade/app"
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/services"
+	"github.com/bsv-blockchain/bsv-broadcaster/app"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/services"
 )
 
-// ArcadeRuntime is the in-process arcade instance the harness drives.
+// BroadcasterRuntime is the in-process arcade instance the harness drives.
 // Lifetime is tied to the *testing.T used to build it: t.Cleanup
 // cancels the run context and waits for every service goroutine.
-type ArcadeRuntime struct {
+type BroadcasterRuntime struct {
 	Cfg     *config.Config
 	Deps    *app.Deps
 	Logger  *zap.Logger
@@ -36,10 +36,10 @@ type ArcadeRuntime struct {
 	cleanup func()
 }
 
-// ArcadeOptions carries the wiring info the harness threads into arcade
+// BroadcasterOptions carries the wiring info the harness threads into arcade
 // at boot time. All fields are required for a meaningful smoke run; the
 // containers + libp2p + datahub steps produce the values to fill in.
-type ArcadeOptions struct {
+type BroadcasterOptions struct {
 	// MerkleServiceURL is the host-side URL of the merkle-service
 	// container — what arcade hits when it POSTs to /watch.
 	MerkleServiceURL string
@@ -80,10 +80,10 @@ type ArcadeOptions struct {
 	LibP2PLoopback string
 }
 
-// StartArcade boots arcade in-process via the same code path the
+// StartBroadcaster boots arcade in-process via the same code path the
 // production binary uses (app.Bootstrap → app.BuildServices). The
 // harness's t.Cleanup tears everything down.
-func StartArcade(t *testing.T, opts ArcadeOptions) *ArcadeRuntime {
+func StartBroadcaster(t *testing.T, opts BroadcasterOptions) *BroadcasterRuntime {
 	t.Helper()
 
 	port, err := pickFreeTCPPort()
@@ -91,8 +91,8 @@ func StartArcade(t *testing.T, opts ArcadeOptions) *ArcadeRuntime {
 		t.Fatalf("pick arcade port: %v", err)
 	}
 
-	cfg := buildArcadeConfig(t, port, opts)
-	logger := zaptest.NewLogger(t).Named("arcade")
+	cfg := buildBroadcasterConfig(t, port, opts)
+	logger := zaptest.NewLogger(t).Named("bsv-broadcaster")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	deps, cleanup, err := app.Bootstrap(ctx, cfg, logger)
@@ -103,7 +103,7 @@ func StartArcade(t *testing.T, opts ArcadeOptions) *ArcadeRuntime {
 
 	svcs := app.BuildServices(deps)
 
-	rt := &ArcadeRuntime{
+	rt := &BroadcasterRuntime{
 		Cfg:     cfg,
 		Deps:    deps,
 		Logger:  logger,
@@ -150,7 +150,7 @@ func StartArcade(t *testing.T, opts ArcadeOptions) *ArcadeRuntime {
 	return rt
 }
 
-func buildArcadeConfig(t *testing.T, port int, opts ArcadeOptions) *config.Config {
+func buildBroadcasterConfig(t *testing.T, port int, opts BroadcasterOptions) *config.Config {
 	t.Helper()
 	pebbleDir := t.TempDir()
 	cfg := &config.Config{
@@ -171,7 +171,7 @@ func buildArcadeConfig(t *testing.T, port int, opts ArcadeOptions) *config.Confi
 		},
 		Kafka: config.Kafka{
 			Backend:       "memory",
-			ConsumerGroup: "arcade-e2e",
+			ConsumerGroup: "bsv-broadcaster-e2e",
 			MaxRetries:    5,
 			BufferSize:    10000,
 		},
@@ -323,7 +323,7 @@ func callbackHost() string {
 // or the timeout elapses. Mostly cosmetic — the bump-builder and
 // propagation services come up almost instantly with a memory broker,
 // but gin's listener takes ~50ms to bind.
-func (rt *ArcadeRuntime) waitReady(timeout time.Duration) error {
+func (rt *BroadcasterRuntime) waitReady(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
 		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", rt.Port), 250*time.Millisecond)

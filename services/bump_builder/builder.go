@@ -16,17 +16,17 @@ import (
 	"github.com/bsv-blockchain/go-sdk/transaction"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/bump"
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/events"
-	"github.com/bsv-blockchain/arcade/kafka"
-	"github.com/bsv-blockchain/arcade/logfields"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/services"
-	"github.com/bsv-blockchain/arcade/store"
-	"github.com/bsv-blockchain/arcade/telemetry"
-	"github.com/bsv-blockchain/arcade/teranode"
+	"github.com/bsv-blockchain/bsv-broadcaster/bump"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/events"
+	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
+	"github.com/bsv-blockchain/bsv-broadcaster/logfields"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/services"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/telemetry"
+	"github.com/bsv-blockchain/bsv-broadcaster/teranode"
 )
 
 // ChainHeaderReader is the narrow contract bump-builder needs from a chain-
@@ -450,7 +450,7 @@ func setMinedAndPublish(
 	metrics.BumpBuilderTxidsMinedTotal.Add(float64(len(mined)))
 	// Observe the per-tx age of the previous status row so an operator can see
 	// how long each tx sat at SEEN_ON_NETWORK / SEEN_MULTIPLE_NODES before the
-	// block landed. Pairs with arcade_bump_builder_build_duration_seconds for
+	// block landed. Pairs with bsv_broadcaster_bump_builder_build_duration_seconds for
 	// the block-level latency (BLOCK_PROCESSED → BUMP-persisted).
 	for i, prev := range prevs {
 		if prev == nil || prev.Timestamp.IsZero() || i >= len(mined) {
@@ -645,7 +645,7 @@ func (b *Builder) runStumpJanitor(ctx context.Context) {
 // "perma-failure" case (BUMP build never validates, stumps stuck forever
 // after Kafka DLQ) needs a different cleanup path keyed on block age rather
 // than bump_built_at — tracked separately; the metric
-// arcade_bump_builder_empty_stump_blocks_total will surface accumulation if
+// bsv_broadcaster_bump_builder_empty_stump_blocks_total will surface accumulation if
 // it becomes a real issue.
 func (b *Builder) pruneOrphanStumps(ctx context.Context) {
 	// Use the watchdog's RecencyDepth as the scan horizon — anything older

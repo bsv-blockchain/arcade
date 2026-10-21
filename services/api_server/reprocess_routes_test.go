@@ -11,8 +11,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/merkleservice"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/merkleservice"
 )
 
 // reprocessHarness wires a Server with a merkle-service stub the test owns,
@@ -56,7 +56,7 @@ func newReprocessHarness(t *testing.T, status int, respBody string) *reprocessHa
 
 	srv := &Server{
 		cfg: &config.Config{
-			CallbackURL:   "http://arcade/api/v1/merkle-service/callback",
+			CallbackURL:   "http://broadcaster/api/v1/merkle-service/callback",
 			CallbackToken: "cbtoken",
 		},
 		logger:       zap.NewNop(),
@@ -98,7 +98,7 @@ func TestReprocessBlock_AcceptedForwardsCallbackConfig(t *testing.T) {
 	if got.Body["blockHash"] != "000000004ec7cc6848c07caa63dcdd0dbcd3c354eee8e99e998149ad13b530da" {
 		t.Errorf("upstream blockHash=%q want 000000004ec7cc6848c07caa63dcdd0dbcd3c354eee8e99e998149ad13b530da", got.Body["blockHash"])
 	}
-	if got.Body["callbackUrl"] != "http://arcade/api/v1/merkle-service/callback" {
+	if got.Body["callbackUrl"] != "http://broadcaster/api/v1/merkle-service/callback" {
 		t.Errorf("upstream callbackUrl=%q", got.Body["callbackUrl"])
 	}
 	if got.Body["callbackToken"] != "cbtoken" {

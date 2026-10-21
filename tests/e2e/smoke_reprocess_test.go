@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bsv-blockchain/arcade/tests/e2e/harness"
+	"github.com/bsv-blockchain/bsv-broadcaster/tests/e2e/harness"
 )
 
 // TestSmoke_RealBlockMined_ViaReprocess proves merkle-service's
@@ -58,7 +58,7 @@ func TestSmoke_RealBlockMined_ViaReprocess(t *testing.T) {
 	h := harness.New(t, harness.WithReprocessReady())
 	h.Datahub.StageFixture(fix)
 
-	rt := harness.StartArcade(t, harness.ArcadeOptions{
+	rt := harness.StartBroadcaster(t, harness.BroadcasterOptions{
 		MerkleServiceURL: h.Containers.MerkleHostURL,
 		DatahubURL:       h.Datahub.LocalURL(), // arcade hits loopback; merkle-service hits gateway IP
 		LibP2PBootstrap:  h.LibP2P.BootstrapMultiaddr(),

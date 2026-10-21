@@ -317,7 +317,7 @@ type OrphanedAnchor struct {
 const MaxOrphanedAnchors = 5
 
 // ExtraInfo markers carried on reorg-correction status events (issue #279).
-// They ride the bulk event templates on arcade.tx_status so downstream
+// They ride the bulk event templates on bsv-broadcaster.tx_status so downstream
 // consumers (webhook, SSE) can distinguish a reorg correction from a plain
 // transition — in particular, the webhook's same-status dedup makes an
 // exception for a MINED event flagged as a re-anchor, since it carries a

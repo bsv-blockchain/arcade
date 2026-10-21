@@ -11,15 +11,15 @@ import (
 	chaintrackslib "github.com/bsv-blockchain/go-chaintracks/chaintracks"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/bump"
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/events"
-	"github.com/bsv-blockchain/arcade/logfields"
-	"github.com/bsv-blockchain/arcade/merkleservice"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/services"
-	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/bump"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/events"
+	"github.com/bsv-blockchain/bsv-broadcaster/logfields"
+	"github.com/bsv-blockchain/bsv-broadcaster/merkleservice"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/services"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
 )
 
 // ReconcilerLeaseName coordinates a single reconciler across bump-builder
@@ -479,7 +479,7 @@ func (r *Reconciler) runStartupFullScan(ctx context.Context) {
 	if r.startupScanAttempts >= maxStartupFullScanAttempts {
 		r.logger.Error("startup full-scan: still incomplete at the attempt cap; retiring the one-shot. "+
 			"Rows needing repair remain orphaned — re-run with a targeted "+
-			"ARCADE_BUMP_BUILDER_RECONCILER_FULL_SCAN_{MIN,MAX}_HEIGHT window once the cause is cleared",
+			"BSV_BROADCASTER_BUMP_BUILDER_RECONCILER_FULL_SCAN_{MIN,MAX}_HEIGHT window once the cause is cleared",
 			zap.Int("attempts", r.startupScanAttempts),
 			zap.Int("attempt_cap", maxStartupFullScanAttempts))
 		r.startupScanDone = true

@@ -16,7 +16,7 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/bsv-blockchain/arcade/logfields"
+	"github.com/bsv-blockchain/bsv-broadcaster/logfields"
 )
 
 const defaultTimeout = 30 * time.Second

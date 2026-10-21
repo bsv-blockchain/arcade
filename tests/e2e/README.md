@@ -102,7 +102,7 @@ disabling Ryuk only matters if a test process is `kill -9`'d.
    ```go
    h := harness.New(t)              // containers + libp2p host
    datahub := h.NewDatahub(t)       // gateway-IP-aware datahub
-   rt := harness.StartArcade(t, harness.ArcadeOptions{
+   rt := harness.StartBroadcaster(t, harness.BroadcasterOptions{
        MerkleServiceURL: h.Containers.MerkleHostURL,
        DatahubURL:       datahub.LocalURL(),  // arcade reaches via loopback
        LibP2PBootstrap:  h.LibP2P.BootstrapMultiaddr(),

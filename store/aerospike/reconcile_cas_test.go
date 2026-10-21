@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
 )
 
 // TestMarkBlockReconciled_GenerationCheck pins the CAS semantics of the

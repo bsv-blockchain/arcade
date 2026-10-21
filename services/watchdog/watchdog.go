@@ -31,11 +31,11 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/bsv-blockchain/arcade/logfields"
-	"github.com/bsv-blockchain/arcade/merkleservice"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/logfields"
+	"github.com/bsv-blockchain/bsv-broadcaster/merkleservice"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
 )
 
 // backoffJitterFraction is the maximum proportional deviation from the
@@ -300,7 +300,7 @@ func (w *Watchdog) filterEligible(rows []*models.BlockProcessingStatus, now time
 		// Cap reprocessing: a block re-driven MaxReprocessAttempts times (or
 		// stale longer than MaxStaleAge, after at least one attempt) is
 		// parked — we stop issuing /reprocess so a permanently un-finalizable
-		// block can't soak the arcade.block_processed topic indefinitely (the
+		// block can't soak the bsv-broadcaster.block_processed topic indefinitely (the
 		// reprocess storm that saturates the single bump-builder consumer).
 		// The park is persisted as status='parked' by the caller, so the row
 		// stops surfacing here at all; a redeploy re-tries once then re-parks.

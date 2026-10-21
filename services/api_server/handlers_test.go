@@ -21,12 +21,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/kafka"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
-	"github.com/bsv-blockchain/arcade/validator"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/validator"
 )
 
 // mockStore implements store.Store for testing callback handlers.
@@ -1683,7 +1683,7 @@ func TestHandleCallback_SeenMultipleNodes_EmptyTxIDs(t *testing.T) {
 //     byte-identical payload (hex round-trip through models.HexBytes)
 //   - Kafka is not touched for STUMPs (they go to the store only)
 //   - BLOCK_PROCESSED produces exactly one Kafka message on
-//     arcade.block_processed, keyed by block hash, with the full
+//     bsv-broadcaster.block_processed, keyed by block hash, with the full
 //     CallbackMessage JSON as the value
 //   - retry semantics: a duplicated STUMP delivery still returns 200 and
 //     overwrites cleanly, because merkle-service retries on any non-2xx
@@ -1774,7 +1774,7 @@ func TestHandleCallback_FullBlockFlow_20Subtrees(t *testing.T) {
 	}
 
 	// STUMPs must not produce Kafka traffic — the bump_builder consumes
-	// arcade.block_processed only, and STUMPs are writes to the store.
+	// bsv-broadcaster.block_processed only, and STUMPs are writes to the store.
 	if got := totalMessages(broker); got != 0 {
 		t.Fatalf("expected 0 Kafka messages after STUMP phase, got %d", got)
 	}
@@ -1797,7 +1797,7 @@ func TestHandleCallback_FullBlockFlow_20Subtrees(t *testing.T) {
 		t.Fatalf("BLOCK_PROCESSED: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 
-	// Exactly one Kafka message on arcade.block_processed, keyed by block
+	// Exactly one Kafka message on bsv-broadcaster.block_processed, keyed by block
 	// hash, with the full CallbackMessage JSON as the value — this is what
 	// the bump_builder consumer expects (services/bump_builder/builder.go).
 	if got := totalMessages(broker); got != 1 {
@@ -2397,7 +2397,7 @@ func TestHandleCallback_BodySizeLimit_DefaultsToConfigConstant(t *testing.T) {
 
 // TestHandleCallback_BlockProcessed_ForwardsEnrichmentFields pins issue #195's
 // wire contract: a BLOCK_PROCESSED carrying merkleRoot + subtreeCount +
-// subtreeHashes + coinbaseBump is forwarded to the arcade.block_processed Kafka
+// subtreeHashes + coinbaseBump is forwarded to the bsv-broadcaster.block_processed Kafka
 // topic with all four fields intact, so the bump_builder consumer can build a
 // datahub-independent compound BUMP. Guards against accidental field stripping
 // in the producer/serialization path.
@@ -2433,7 +2433,7 @@ func TestHandleCallback_BlockProcessed_ForwardsEnrichmentFields(t *testing.T) {
 	broker.Lock()
 	defer broker.Unlock()
 	if len(broker.Sends) != 1 {
-		t.Fatalf("expected 1 Send on arcade.block_processed, got %d", len(broker.Sends))
+		t.Fatalf("expected 1 Send on bsv-broadcaster.block_processed, got %d", len(broker.Sends))
 	}
 	sent := broker.Sends[0]
 	if sent.Topic != kafka.TopicBlockProcessed {
@@ -2466,7 +2466,7 @@ func counterVal(route, result string) float64 {
 // TestSubmitCounters_BatchCountsPerTransaction is the regression for the
 // submissions-metric bug: the HTTP request histogram counts one sample per
 // request, so a 3-tx /txs batch read as ONE submission on dashboards.
-// arcade_api_txs_submitted_total must count per transaction.
+// bsv_broadcaster_api_txs_submitted_total must count per transaction.
 func TestSubmitCounters_BatchCountsPerTransaction(t *testing.T) {
 	broker := &kafka.RecordingBroker{}
 	_, router := setupServer(broker) // no store: every parsed tx counts as new

@@ -15,7 +15,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 
-	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
 )
 
 // TestSmoke_ChainedTxBatchOrdering is the load-bearing smoke test for
@@ -43,7 +43,7 @@ func TestSmoke_ChainedTxBatchOrdering(t *testing.T) {
 }
 
 // TestSmoke_ChainedTxBatchOrdering_MultiPartition is the #295 variant: the
-// same forest, the same four invariants, but arcade.propagation runs 4
+// same forest, the same four invariants, but bsv-broadcaster.propagation runs 4
 // partitions with one dep-aware dispatcher each. The invariants only hold
 // because intake keys every submission's dependency family to one
 // partition (familyPartitionKeys) — key by txid instead (the pre-#295
@@ -68,7 +68,7 @@ func runChainedTxBatchOrdering(t *testing.T, partitions int) {
 	)
 
 	recorder := newRecordingTeranode(t)
-	rt := startArcadeSmoke(t, smokeOptions{
+	rt := startBroadcasterSmoke(t, smokeOptions{
 		TeranodeURL:           recorder.URL(),
 		PropagationPartitions: partitions,
 	})
@@ -177,7 +177,7 @@ func buildSubmissionBatches(chains [][]*bt.Tx, batchSize int) [][]*bt.Tx {
 // unconditionally, which needs each input's PreviousTxScript +
 // PreviousTxSatoshis. Those bins live on the wire only in EF; sending
 // standard-format bytes is rejected with "'PreviousTx' not supplied".
-func postTxs(rt *arcadeRuntime, txs []*bt.Tx) error {
+func postTxs(rt *broadcasterRuntime, txs []*bt.Tx) error {
 	var body bytes.Buffer
 	for _, tx := range txs {
 		body.Write(tx.ExtendedBytes())

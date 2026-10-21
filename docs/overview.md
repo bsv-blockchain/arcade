@@ -235,7 +235,7 @@ Recovery is client-driven by design — arcade keeps no rejected-tx tracker (a t
 - **Resubmitting a `REJECTED` transaction re-validates and re-broadcasts it.** If the original cause has cleared (e.g. a parent has since confirmed), the row advances through the normal `SEEN_ON_NETWORK → MINED` flow; the lattice permits every forward transition out of `REJECTED`.
 - **Cascade rejections are queue state, not verdicts about the child.** A child held behind a rejected ancestor gets `extraInfo` prefixed `parent rejected`, naming the ancestor — resubmit the child after the ancestor is accepted.
 
-Operators can detect the stale-chain-view condition before it causes non-final rejections: `GET /health` reports `blockHeight` (arcade's processed tip), and the `arcade_chain_tip_height` / `arcade_p2p_peer_best_height` gauges expose height lag between arcade and its datahub peers.
+Operators can detect the stale-chain-view condition before it causes non-final rejections: `GET /health` reports `blockHeight` (arcade's processed tip), and the `bsv_broadcaster_chain_tip_height` / `bsv_broadcaster_p2p_peer_best_height` gauges expose height lag between arcade and its datahub peers.
 
 ## Storage layout
 
@@ -272,7 +272,7 @@ This is what makes Teranode-native broadcast and proof retrieval practical at th
 ## Resources
 
 - **Merkle Service:** https://github.com/bsv-blockchain/merkle-service
-- **Arcade v2:** https://github.com/bsv-blockchain/arcade-refactor
+- **Arcade v2:** https://github.com/bsv-blockchain/bsv-broadcaster-refactor
 - **Full design document:** https://github.com/bsv-blockchain/merkle-service/blob/master/docs/design.md
 - **ARC (the predecessor Arcade was built to replace):** https://github.com/bsv-blockchain/arc
-- **Swimlane Diagram** https://github.com/bsv-blockchain/arcade/blob/main/docs/swimlanes.png
+- **Swimlane Diagram** https://github.com/bsv-blockchain/bsv-broadcaster/blob/main/docs/swimlanes.png

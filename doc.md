@@ -22,18 +22,18 @@ Pass `--mode all` (the default) to run every service in one process.
                                ┌──────────────┐
         merkle-service ◀──────▶│  api_server  │──── /chaintracks/v1, v2
                                └──────┬───────┘
-                                      │ Kafka: arcade.transaction
+                                      │ Kafka: bsv-broadcaster.transaction
                                       ▼
                                 ┌─────────────┐
                                 │ tx_validator│
                                 └──────┬──────┘
-                                       │ Kafka: arcade.propagation
+                                       │ Kafka: bsv-broadcaster.propagation
                                        ▼
         Teranode datahubs ◀──────┬─────────────┐
                                  │ propagation │─── circuit-breaker per endpoint
         merkle-service     ◀─────┴─────────────┘    reaper for retryables
                                        ▲
-                                       │ Kafka: arcade.block_processed
+                                       │ Kafka: bsv-broadcaster.block_processed
                                 ┌──────┴──────┐
                                 │ bump_builder│─── reads STUMPs after grace window
                                 └─────────────┘
@@ -41,9 +41,9 @@ Pass `--mode all` (the default) to run every service in one process.
 
 ### Topics
 
-- `arcade.transaction` — submitted transactions awaiting validation
-- `arcade.propagation` — validated transactions awaiting broadcast
-- `arcade.block_processed` — fan-out trigger for BUMP construction
+- `bsv-broadcaster.transaction` — submitted transactions awaiting validation
+- `bsv-broadcaster.propagation` — validated transactions awaiting broadcast
+- `bsv-broadcaster.block_processed` — fan-out trigger for BUMP construction
 - Each topic has a `.dlq` companion for poison messages
 
 ### Stores
@@ -67,7 +67,7 @@ The propagation client treats endpoints as circuit-breakers: `failure_threshold`
 
 ```bash
 cp config.example.standalone.yaml config.yaml
-go run ./cmd/arcade --config config.yaml
+go run ./cmd/bsv-broadcaster --config config.yaml
 ```
 
 This profile uses:
@@ -83,12 +83,12 @@ the seven arcade services (`api-server`, `propagation`, `bump-builder`, `sse`,
 `chaintracks`, `watchdog`, `p2p-client`) as separate `--mode` containers, plus
 Redpanda (topics pre-created by `compose/topic-init.sh`), Postgres,
 merkle-service (with its own Postgres), and the OTel collector. The shared
-service config lives in `compose/arcade-config.yaml`, mounted at
-`/etc/arcade/config.yaml` in every arcade container.
+service config lives in `compose/bsv-broadcaster-config.yaml`, mounted at
+`/etc/bsv-broadcaster/config.yaml` in every arcade container.
 
 ```bash
-make docker-up                            # published ghcr.io/bsv-blockchain/arcade:latest
-ARCADE_IMAGE=arcade:local make docker-up  # your working tree, after `make docker-build`
+make docker-up                            # published ghcr.io/bsv-blockchain/bsv-broadcaster:latest
+BSV_BROADCASTER_IMAGE=bsv-broadcaster:local make docker-up  # your working tree, after `make docker-build`
 make docker-down
 ```
 
@@ -109,7 +109,7 @@ make lint              # golangci-lint run
 
 ## Configuration
 
-Configuration is loaded by [Viper](https://github.com/spf13/viper) from `config.yaml` (or `--config <path>`). Every value can be overridden with an `ARCADE_`-prefixed environment variable using underscores for nesting — e.g. `ARCADE_KAFKA_BROKERS`, `ARCADE_STORE_BACKEND`, `ARCADE_LOG_LEVEL`.
+Configuration is loaded by [Viper](https://github.com/spf13/viper) from `config.yaml` (or `--config <path>`). Every value can be overridden with an `BSV_BROADCASTER_`-prefixed environment variable using underscores for nesting — e.g. `BSV_BROADCASTER_KAFKA_BROKERS`, `BSV_BROADCASTER_STORE_BACKEND`, `BSV_BROADCASTER_LOG_LEVEL`.
 
 See [`config.example.yaml`](./config.example.yaml) (production) and [`config.example.standalone.yaml`](./config.example.standalone.yaml) (zero-dependency) for fully-commented references.
 
@@ -161,7 +161,7 @@ service; a delivery that carries nothing new is a no-op (see
 
 ## Observability
 
-Prometheus metrics are exposed at `/metrics` on both the API server (port `api.port`, default 8080) and the per-pod health server (port `health.port`, default 8081). All metric names are namespaced under `arcade_`.
+Prometheus metrics are exposed at `/metrics` on both the API server (port `api.port`, default 8080) and the per-pod health server (port `health.port`, default 8081). All metric names are namespaced under `bsv_broadcaster_`.
 
 A full alerting / dashboarding playbook lives in [`metrics/README.md`](./metrics/README.md), including:
 
@@ -182,7 +182,7 @@ In horizontally-scaled deployments, set `kafka.min_partitions` to at least the r
 ## Repository layout
 
 ```
-cmd/arcade/             entry point, service wiring, signal handling
+cmd/bsv-broadcaster/             entry point, service wiring, signal handling
 config/                 viper-backed config + network resolution
 services/
   api_server/             HTTP, callbacks, chaintracks routes

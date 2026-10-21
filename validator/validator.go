@@ -172,7 +172,7 @@ func NewValidatorForNetwork(network string, policy *Policy) (*Validator, error) 
 		maxSigops = policy.MaxTxSigopsCountsPolicy
 	}
 
-	logger := ulogger.New("arcade-validator")
+	logger := ulogger.New("bsv-broadcaster-validator")
 
 	v := &Validator{logger: logger, params: params}
 	v.eff.Store(&effectivePolicy{

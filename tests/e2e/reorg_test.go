@@ -14,8 +14,8 @@ import (
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 	teranode "github.com/bsv-blockchain/teranode/services/p2p"
 
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/tests/e2e/harness"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/tests/e2e/harness"
 )
 
 // reorgStack is the shared scaffolding for the same-height reorg
@@ -31,9 +31,9 @@ import (
 // block on top of A that resolves the competition in A's favor.
 type reorgStack struct {
 	h             *harness.Harness
-	rt            *harness.ArcadeRuntime
+	rt            *harness.BroadcasterRuntime
 	msDatahub     *harness.Datahub
-	arcadeDatahub *harness.Datahub
+	broadcasterDatahub *harness.Datahub
 
 	shared, aOnly, bOnly []string
 	blkA, blkB, blkC     *harness.SyntheticBlock
@@ -44,11 +44,11 @@ func newReorgStack(ctx context.Context, t *testing.T) *reorgStack {
 
 	s := &reorgStack{h: harness.New(t)}
 	s.msDatahub = s.h.NewDatahub(t)
-	s.arcadeDatahub = s.h.NewDatahub(t)
+	s.broadcasterDatahub = s.h.NewDatahub(t)
 
-	s.rt = harness.StartArcade(t, harness.ArcadeOptions{
+	s.rt = harness.StartBroadcaster(t, harness.BroadcasterOptions{
 		MerkleServiceURL:  s.h.Containers.MerkleHostURL,
-		DatahubURL:        s.arcadeDatahub.LocalURL(),
+		DatahubURL:        s.broadcasterDatahub.LocalURL(),
 		LibP2PBootstrap:   s.h.LibP2P.BootstrapMultiaddr(),
 		LibP2PLoopback:    s.h.LibP2P.LoopbackMultiaddr(),
 		MerkleAuthToken:   "e2e-watch-token",
@@ -105,7 +105,7 @@ func newReorgStack(ctx context.Context, t *testing.T) *reorgStack {
 
 	for _, blk := range []*harness.SyntheticBlock{s.blkA, s.blkB, s.blkC} {
 		blk.Stage(s.msDatahub)
-		blk.Stage(s.arcadeDatahub)
+		blk.Stage(s.broadcasterDatahub)
 	}
 
 	for _, blk := range []*harness.SyntheticBlock{s.blkA, s.blkB} {

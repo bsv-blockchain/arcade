@@ -7,7 +7,7 @@
 # Idempotent: safe across `podman-compose up` re-runs and container restarts.
 #
 # Partition counts are load-bearing:
-#   - arcade.propagation needs at least PROPAGATION_PARTITIONS partitions
+#   - bsv-broadcaster.propagation needs at least PROPAGATION_PARTITIONS partitions
 #     (default 1). arcade enforces the same minimum fail-closed at startup
 #     (kafka.CheckMinPartitions). Any count preserves ordering: producers key
 #     messages by dependency family, so parent/child txs of one submission
@@ -28,12 +28,12 @@ PROPAGATION_PARTITIONS="${PROPAGATION_PARTITIONS:-1}"
 "${RPK[@]}" cluster config set auto_create_topics_enabled true
 
 declare -A TOPICS=(
-  [arcade.block_processed]=8
-  [arcade.block_processed.dlq]=8
-  [arcade.propagation]="$PROPAGATION_PARTITIONS"
-  [arcade.propagation.dlq]="$PROPAGATION_PARTITIONS"
-  [arcade.tx_status]=16
-  [arcade.tx_status.dlq]=16
+  [bsv-broadcaster.block_processed]=8
+  [bsv-broadcaster.block_processed.dlq]=8
+  [bsv-broadcaster.propagation]="$PROPAGATION_PARTITIONS"
+  [bsv-broadcaster.propagation.dlq]="$PROPAGATION_PARTITIONS"
+  [bsv-broadcaster.tx_status]=16
+  [bsv-broadcaster.tx_status.dlq]=16
 )
 
 for topic in "${!TOPICS[@]}"; do
@@ -50,10 +50,10 @@ done
 # between runs. Partitions can only be added, never removed — a topic wider
 # than the target is fine (arcade's startup check is >=, and family keying
 # keeps ordering correct at any width).
-count="$("${RPK[@]}" topic list | awk '$1 == "arcade.propagation" { print $2 }')"
+count="$("${RPK[@]}" topic list | awk '$1 == "bsv-broadcaster.propagation" { print $2 }')"
 if [[ "$count" -lt "$PROPAGATION_PARTITIONS" ]]; then
-  "${RPK[@]}" topic add-partitions arcade.propagation --num "$((PROPAGATION_PARTITIONS - count))"
-  echo "topic-init: widened arcade.propagation ${count} -> ${PROPAGATION_PARTITIONS} partitions"
+  "${RPK[@]}" topic add-partitions bsv-broadcaster.propagation --num "$((PROPAGATION_PARTITIONS - count))"
+  echo "topic-init: widened bsv-broadcaster.propagation ${count} -> ${PROPAGATION_PARTITIONS} partitions"
 fi
 
-echo "topic-init: all arcade topics present; arcade.propagation has >= ${PROPAGATION_PARTITIONS} partition(s)"
+echo "topic-init: all arcade topics present; bsv-broadcaster.propagation has >= ${PROPAGATION_PARTITIONS} partition(s)"

@@ -27,12 +27,12 @@ import (
 // Names follow docker-style snake-case-with-dashes since most CI runners
 // invoke the test under docker; podman accepts the same.
 const (
-	netAliasPostgres = "arcade-e2e-postgres"
-	netAliasRedpanda = "arcade-e2e-redpanda"
-	netAliasMerkle   = "arcade-e2e-merkle"
+	netAliasPostgres = "bsv-broadcaster-e2e-postgres"
+	netAliasRedpanda = "bsv-broadcaster-e2e-redpanda"
+	netAliasMerkle   = "bsv-broadcaster-e2e-merkle"
 
-	postgresUser = "arcade"
-	postgresPass = "arcade"
+	postgresUser = "bsv_broadcaster"
+	postgresPass = "bsv_broadcaster"
 	postgresDB   = "merkle"
 
 	// inNetworkKafkaPort is the port redpanda listens on for the alias
@@ -201,7 +201,7 @@ func newNetworkWithGateway(ctx context.Context) (*testcontainers.DockerNetwork, 
 	nw, err := network.New(
 		ctx,
 		network.WithDriver("bridge"),
-		network.WithLabels(map[string]string{"arcade-e2e": "true"}),
+		network.WithLabels(map[string]string{"bsv-broadcaster-e2e": "true"}),
 	)
 	if err != nil {
 		return nil, "", fmt.Errorf("create network: %w", err)

@@ -14,10 +14,10 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/kafka"
-	"github.com/bsv-blockchain/arcade/logfields"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
+	"github.com/bsv-blockchain/bsv-broadcaster/logfields"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
 )
 
 // dropLogInterval is the minimum time between "subscriber channel full"
@@ -277,7 +277,7 @@ type kafkaSubscription struct {
 // redpanda_kafka_consumer_group_lag effectively unusable: the group label was
 // unrecognizable and changed on every restart, so the most useful broker-side
 // signal could not be matched, aggregated, or alerted on. The id now sorts and
-// regex-matches by caller (`arcade-events-sse-.*`) and names the pod it
+// regex-matches by caller (`bsv-broadcaster-events-sse-.*`) and names the pod it
 // belongs to, so lag joins back to something an operator can go and look at.
 //
 // This is safe with respect to #239 (the StartOldest backlog-replay OOM):
@@ -304,7 +304,7 @@ func (p *KafkaPublisher) subscriberGroupID(caller string) (string, error) {
 	if sanitized == "" || sanitized == "localhost" {
 		return uniqueGroupID(caller)
 	}
-	return fmt.Sprintf("arcade-events-%s-%s-%d", caller, sanitized, seq), nil
+	return fmt.Sprintf("bsv-broadcaster-events-%s-%s-%d", caller, sanitized, seq), nil
 }
 
 // uniqueGroupID returns a random per-call group identifier, used when no
@@ -314,7 +314,7 @@ func uniqueGroupID(caller string) (string, error) {
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", err
 	}
-	return "arcade-events-" + caller + "-" + hex.EncodeToString(b[:]), nil
+	return "bsv-broadcaster-events-" + caller + "-" + hex.EncodeToString(b[:]), nil
 }
 
 // sanitizeGroupComponent reduces a string to characters that are safe in a

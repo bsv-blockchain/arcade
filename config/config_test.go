@@ -19,7 +19,7 @@ func baseValidConfig() *Config {
 	cfg.Mode = "all"
 	cfg.Kafka.Backend = "memory"
 	cfg.Store.Backend = "pebble"
-	cfg.Store.Pebble.Path = "/tmp/arcade-test"
+	cfg.Store.Pebble.Path = "/tmp/bsv-broadcaster-test"
 	cfg.Network = NetworkMainnet
 	cfg.MerkleService.URL = "http://merkle.local"
 	cfg.CallbackToken = "test-callback-token"
@@ -27,7 +27,7 @@ func baseValidConfig() *Config {
 }
 
 // merkle_service.url is optional: URL-presence is the runtime toggle for the
-// Merkle integration. cmd/arcade/main.go only constructs a merkleservice.Client
+// Merkle integration. cmd/bsv-broadcaster/main.go only constructs a merkleservice.Client
 // when the URL is set, and propagation nil-guards every dereference. The
 // documented standalone profile ships with merkle_service.url: "" — validation
 // must accept that, otherwise the standalone binary refuses to start (issue #59
@@ -381,18 +381,18 @@ func TestSSEDrainKnobsBind(t *testing.T) {
 		}
 	}
 
-	t.Setenv("ARCADE_SSE_DRAIN_QUIESCE_MS", "2500")
+	t.Setenv("BSV_BROADCASTER_SSE_DRAIN_QUIESCE_MS", "2500")
 	overridden, err := Load(&cobra.Command{})
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}
 	if overridden.SSE.DrainQuiesceMS != 2500 {
-		t.Errorf("ARCADE_SSE_DRAIN_QUIESCE_MS override = %d, want 2500", overridden.SSE.DrainQuiesceMS)
+		t.Errorf("BSV_BROADCASTER_SSE_DRAIN_QUIESCE_MS override = %d, want 2500", overridden.SSE.DrainQuiesceMS)
 	}
 }
 
 // TestPropagationBatchCapsBind pins the shipped /txs chunk caps (issue #271)
-// and proves both keys have a SetDefault, without which the ARCADE_* env
+// and proves both keys have a SetDefault, without which the BSV_BROADCASTER_* env
 // override is silently ignored by viper.AutomaticEnv.
 func TestPropagationBatchCapsBind(t *testing.T) {
 	if DefaultTeranodeMaxBatchSize != 1000 {
@@ -413,17 +413,17 @@ func TestPropagationBatchCapsBind(t *testing.T) {
 		t.Errorf("propagation.teranode_max_batch_bytes = %d, want %d", cfg.Propagation.TeranodeMaxBatchBytes, DefaultTeranodeMaxBatchBytes)
 	}
 
-	t.Setenv("ARCADE_PROPAGATION_TERANODE_MAX_BATCH_SIZE", "250")
-	t.Setenv("ARCADE_PROPAGATION_TERANODE_MAX_BATCH_BYTES", "4194304")
+	t.Setenv("BSV_BROADCASTER_PROPAGATION_TERANODE_MAX_BATCH_SIZE", "250")
+	t.Setenv("BSV_BROADCASTER_PROPAGATION_TERANODE_MAX_BATCH_BYTES", "4194304")
 	overridden, err := Load(&cobra.Command{})
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}
 	if overridden.Propagation.TeranodeMaxBatchSize != 250 {
-		t.Errorf("ARCADE_PROPAGATION_TERANODE_MAX_BATCH_SIZE override = %d, want 250", overridden.Propagation.TeranodeMaxBatchSize)
+		t.Errorf("BSV_BROADCASTER_PROPAGATION_TERANODE_MAX_BATCH_SIZE override = %d, want 250", overridden.Propagation.TeranodeMaxBatchSize)
 	}
 	if overridden.Propagation.TeranodeMaxBatchBytes != 4194304 {
-		t.Errorf("ARCADE_PROPAGATION_TERANODE_MAX_BATCH_BYTES override = %d, want 4194304", overridden.Propagation.TeranodeMaxBatchBytes)
+		t.Errorf("BSV_BROADCASTER_PROPAGATION_TERANODE_MAX_BATCH_BYTES override = %d, want 4194304", overridden.Propagation.TeranodeMaxBatchBytes)
 	}
 }
 
@@ -434,7 +434,7 @@ func TestValidate_MongoDBBackend(t *testing.T) {
 	cfg := baseValidConfig()
 	cfg.Store.Backend = "mongodb"
 	cfg.Store.Mongo.URI = "mongodb://localhost:27017"
-	cfg.Store.Mongo.Database = "arcade"
+	cfg.Store.Mongo.Database = "bsv_broadcaster"
 	if err := validate(cfg); err != nil {
 		t.Fatalf("mongodb backend with uri+database should be accepted, got: %v", err)
 	}
@@ -459,7 +459,7 @@ func TestValidate_MongoDBBackend(t *testing.T) {
 	}
 }
 
-// Every store.mongodb.* key must have a SetDefault so ARCADE_STORE_MONGODB_*
+// Every store.mongodb.* key must have a SetDefault so BSV_BROADCASTER_STORE_MONGODB_*
 // env overrides are honored by viper's AutomaticEnv (see setDefaults).
 func TestSetDefaults_MongoDBKeysBound(t *testing.T) {
 	viper.Reset()
@@ -472,7 +472,7 @@ func TestSetDefaults_MongoDBKeysBound(t *testing.T) {
 		"store.mongodb.max_pool_size", "store.mongodb.batch_size",
 	} {
 		if !viper.IsSet(key) {
-			t.Errorf("%s has no default; ARCADE_%s would be ignored", key, strings.ToUpper(strings.ReplaceAll(key, ".", "_")))
+			t.Errorf("%s has no default; BSV_BROADCASTER_%s would be ignored", key, strings.ToUpper(strings.ReplaceAll(key, ".", "_")))
 		}
 	}
 }
@@ -487,7 +487,7 @@ func TestValidate_MongoDBBounds(t *testing.T) {
 		cfg := baseValidConfig()
 		cfg.Store.Backend = "mongodb"
 		cfg.Store.Mongo.URI = "mongodb://localhost:27017"
-		cfg.Store.Mongo.Database = "arcade"
+		cfg.Store.Mongo.Database = "bsv_broadcaster"
 		return cfg
 	}
 	if err := validate(base()); err != nil {
@@ -580,12 +580,12 @@ func TestValidate_MerkleServiceRejectsEmptyAndMalformedEntries(t *testing.T) {
 	}
 }
 
-// ARCADE_MERKLE_SERVICE_URLS is the env form of the list; viper splits it
-// on commas the same way it does ARCADE_KAFKA_BROKERS. This only works
+// BSV_BROADCASTER_MERKLE_SERVICE_URLS is the env form of the list; viper splits it
+// on commas the same way it does BSV_BROADCASTER_KAFKA_BROKERS. This only works
 // because setDefaults registers the key.
 func TestMerkleServiceURLsBindFromEnv(t *testing.T) {
-	t.Setenv("ARCADE_MERKLE_SERVICE_URLS", "http://merkle-a.local,http://merkle-b.local/")
-	t.Setenv("ARCADE_CALLBACK_TOKEN", "tok")
+	t.Setenv("BSV_BROADCASTER_MERKLE_SERVICE_URLS", "http://merkle-a.local,http://merkle-b.local/")
+	t.Setenv("BSV_BROADCASTER_CALLBACK_TOKEN", "tok")
 	cfg, err := Load(&cobra.Command{})
 	if err != nil {
 		t.Fatalf("load: %v", err)

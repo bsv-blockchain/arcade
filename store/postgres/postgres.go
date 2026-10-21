@@ -22,10 +22,10 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
-	"github.com/bsv-blockchain/arcade/store/bumpcache"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/store/bumpcache"
 )
 
 var (
@@ -1049,7 +1049,7 @@ WHERE txid=$1`
 
 // SetMinedByTxIDs updates only rows that already exist. A CTE snapshots the
 // pre-update row state so callers can observe the MINED transition age via
-// arcade_status_transition_age_seconds without a second round-trip.
+// bsv_broadcaster_status_transition_age_seconds without a second round-trip.
 // blockHeight is persisted alongside blockHash and echoed back on each
 // returned status so downstream SSE/webhook consumers always see the height
 // that anchors the MINED transition (issue #87 / F-029).

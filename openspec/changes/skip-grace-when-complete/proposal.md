@@ -7,7 +7,7 @@ Every BLOCK_PROCESSED pays the full `bump_builder.grace_window_ms` (default 30s,
 ## What Changes
 
 - **Completeness-first ordering in `handleMessage`**: STUMPs are read BEFORE the grace window. If the expected set is present and fully satisfied, build immediately (grace skipped). If the expected set is absent AND zero STUMPs are stored, finalize immediately as an empty block (absent means "expect zero"). Only an unverifiable shape — expected set unsatisfied, or absent with STUMPs present — still waits the window, re-reads, and re-runs the completeness gate.
-- **Outcome label migration** on `arcade_bump_builder_build_duration_seconds{outcome}`: `success` splits into `finalized_complete_no_grace` (completeness verified pre-grace) and `grace_waited` (every other successful build); `incomplete_stumps` renames to `deferred_incomplete`. Closed set, pre-registration, doc comment, and the README alert recipe updated together.
+- **Outcome label migration** on `bsv_broadcaster_bump_builder_build_duration_seconds{outcome}`: `success` splits into `finalized_complete_no_grace` (completeness verified pre-grace) and `grace_waited` (every other successful build); `incomplete_stumps` renames to `deferred_incomplete`. Closed set, pre-registration, doc comment, and the README alert recipe updated together.
 - **No store change**: both stores' stale predicates key on `processed_at`, which the empty-block finalize already stamps; a pinning regression test guards the predicate.
 
 ## Capabilities

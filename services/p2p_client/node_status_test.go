@@ -8,7 +8,7 @@ import (
 
 	teranodep2p "github.com/bsv-blockchain/teranode/services/p2p"
 
-	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
 )
 
 func TestPickDatahubURL(t *testing.T) {

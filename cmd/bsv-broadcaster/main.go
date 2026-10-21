@@ -13,17 +13,17 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
-	"github.com/bsv-blockchain/arcade/app"
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/services"
-	"github.com/bsv-blockchain/arcade/telemetry"
-	"github.com/bsv-blockchain/arcade/version"
+	"github.com/bsv-blockchain/bsv-broadcaster/app"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/services"
+	"github.com/bsv-blockchain/bsv-broadcaster/telemetry"
+	"github.com/bsv-blockchain/bsv-broadcaster/version"
 )
 
 func main() {
 	rootCmd := &cobra.Command{
-		Use:   "arcade",
-		Short: "Arcade transaction management service",
+		Use:   "bsv-broadcaster",
+		Short: "BSV Broadcaster transaction management service",
 		RunE:  run,
 	}
 	// Errors are logged through zap inside run(); the fmt.Fprintf below
@@ -55,6 +55,10 @@ func run(cmd *cobra.Command, _ []string) error {
 	// text to stderr.
 	undo := zap.RedirectStdLog(logger.Named("stdlog"))
 	defer undo()
+
+	for _, notice := range cfg.Deprecations {
+		logger.Warn("deprecated configuration", zap.String("notice", notice))
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -149,7 +153,7 @@ func run(cmd *cobra.Command, _ []string) error {
 
 	select {
 	case <-done:
-		logger.Info("arcade stopped")
+		logger.Info("bsv-broadcaster stopped")
 	case <-time.After(30 * time.Second):
 		logger.Warn("shutdown timed out after 30s, forcing exit")
 	}

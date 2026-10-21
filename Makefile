@@ -20,7 +20,7 @@ lint:
 	golangci-lint run
 
 # Full microservices stack (see docker-compose.yaml). Runs the published
-# image by default; ARCADE_IMAGE=arcade:local make docker-up runs a working
+# image by default; BSV_BROADCASTER_IMAGE=bsv-broadcaster:local make docker-up runs a working
 # tree build produced by `make docker-build`.
 docker-up:
 	podman-compose up -d
@@ -29,8 +29,8 @@ docker-down:
 	podman-compose down
 
 # Build a single-arch image for local use that matches the CI layout. The
-# Dockerfile expects a binary at dist/linux-<arch>/arcade; this target produces
-# that layout for the host's architecture and tags the image arcade:local.
+# Dockerfile expects a binary at dist/linux-<arch>/bsv-broadcaster; this target produces
+# that layout for the host's architecture and tags the image bsv-broadcaster:local.
 # Requires a Linux host: CGO + gobdk's per-platform static archive cannot
 # cross-compile to linux, so building the binary off-Linux would fail.
 docker-build:
@@ -39,8 +39,8 @@ docker-build:
 		exit 1; \
 	fi
 	mkdir -p dist/linux-$(GOARCH)
-	CGO_ENABLED=1 GOOS=linux GOARCH=$(GOARCH) go build -trimpath -ldflags="-s -w -X github.com/bsv-blockchain/arcade/version.Version=$(VERSION)" -o dist/linux-$(GOARCH)/arcade ./cmd/arcade
-	docker build --platform=linux/$(GOARCH) -t arcade:local .
+	CGO_ENABLED=1 GOOS=linux GOARCH=$(GOARCH) go build -trimpath -ldflags="-s -w -X github.com/bsv-blockchain/bsv-broadcaster/version.Version=$(VERSION)" -o dist/linux-$(GOARCH)/bsv-broadcaster ./cmd/bsv-broadcaster
+	docker build --platform=linux/$(GOARCH) -t bsv-broadcaster:local .
 
 run:
-	go run ./cmd/arcade
+	go run ./cmd/bsv-broadcaster

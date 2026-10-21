@@ -13,7 +13,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 
-	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
 )
 
 // restoreOTELTracerProvider snapshots the global tracer provider and restores
@@ -38,7 +38,7 @@ func newTestRouter(logger *zap.Logger) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	srv := &Server{
 		cfg: &config.Config{
-			Telemetry: config.TelemetryConfig{ServiceName: "arcade-tracing-test"},
+			Telemetry: config.TelemetryConfig{ServiceName: "bsv-broadcaster-tracing-test"},
 		},
 		logger: logger,
 	}

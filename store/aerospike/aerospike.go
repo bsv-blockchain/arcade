@@ -14,11 +14,11 @@ import (
 	aero "github.com/aerospike/aerospike-client-go/v7"
 	"github.com/aerospike/aerospike-client-go/v7/types"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
-	"github.com/bsv-blockchain/arcade/store/bumpcache"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/store/bumpcache"
 )
 
 func isKeyNotFound(err error) bool {
@@ -35,6 +35,9 @@ func isGenerationErr(err error) bool {
 	return false
 }
 
+// Set and secondary-index names keep the legacy "arcade_" prefix from before
+// the BSV Broadcaster rebrand: they name persisted data, so renaming them would
+// orphan every existing record and index.
 const (
 	setTransactions     = "arcade_transactions"
 	setBumps            = "arcade_bumps"

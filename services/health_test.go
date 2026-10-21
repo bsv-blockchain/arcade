@@ -9,7 +9,7 @@ import (
 
 	"go.uber.org/zap/zaptest"
 
-	"github.com/bsv-blockchain/arcade/services/servicetest"
+	"github.com/bsv-blockchain/bsv-broadcaster/services/servicetest"
 )
 
 // TestHealthServer_PprofGating asserts that net/http/pprof routes are only

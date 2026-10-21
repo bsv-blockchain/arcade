@@ -1,8 +1,8 @@
 # Local microservices stack — compose analogue of the Kubernetes deployment in
 # bsva-infra-flux/apps/base/arcade-v2 (teratestnet overlay), one replica each.
 #
-#   make docker-up                            # ghcr.io/bsv-blockchain/arcade:latest
-#   ARCADE_IMAGE=arcade:local make docker-up  # after `make docker-build`
+#   make docker-up                            # ghcr.io/bsv-blockchain/bsv-broadcaster:latest
+#   BSV_BROADCASTER_IMAGE=bsv-broadcaster:local make docker-up  # after `make docker-build`
 #
 # Arcade containers are distroless (no shell/curl) so they cannot carry compose
 # healthchecks; ordering gates on infra healthchecks + topic-init, and
@@ -16,17 +16,17 @@ x-podman:
 
 # Compose analogue of the arcade-v2-env ConfigMap (_base/telemetry-env.yaml)
 # plus per-deployment OTEL env; HOST_IP node agent replaced by otel-collector.
-x-arcade-env: &arcade-env
-  ARCADE_TELEMETRY_ENABLED: "true"
-  ARCADE_TELEMETRY_INSECURE: "true"
-  ARCADE_TELEMETRY_SAMPLE_RATIO: "0.1"
+x-bsv-broadcaster-env: &bsv-broadcaster-env
+  BSV_BROADCASTER_TELEMETRY_ENABLED: "true"
+  BSV_BROADCASTER_TELEMETRY_INSECURE: "true"
+  BSV_BROADCASTER_TELEMETRY_SAMPLE_RATIO: "0.1"
   OTEL_METRIC_EXPORT_INTERVAL: "15000"
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
-  OTEL_RESOURCE_ATTRIBUTES: "service.namespace=arcade-compose"
+  OTEL_RESOURCE_ATTRIBUTES: "service.namespace=bsv-broadcaster-compose"
 
 # Every mode's bootstrap connects to Kafka AND the store and verifies topics
-# (hard-failing unless arcade.propagation has exactly 1 partition).
-x-arcade-depends: &arcade-depends
+# (hard-failing unless bsv-broadcaster.propagation has exactly 1 partition).
+x-bsv-broadcaster-depends: &bsv-broadcaster-depends
   redpanda:
     condition: service_healthy
   topic-init:
@@ -37,15 +37,15 @@ x-arcade-depends: &arcade-depends
 # The shared config mount uses :z (shared SELinux label): it is mounted into
 # seven containers, and :Z's private per-container label would let the
 # last-started container lock the others out. Single-consumer mounts keep :Z.
-x-arcade-common: &arcade-common
-  image: ${ARCADE_IMAGE:-ghcr.io/bsv-blockchain/arcade:latest}
+x-bsv-broadcaster-common: &bsv-broadcaster-common
+  image: ${BSV_BROADCASTER_IMAGE:-ghcr.io/bsv-blockchain/bsv-broadcaster:latest}
   volumes:
-    - ./compose/arcade-config.yaml:/etc/arcade/config.yaml:ro,z
+    - ./compose/bsv-broadcaster-config.yaml:/etc/bsv-broadcaster/config.yaml:ro,z
   networks:
-    - arcade-net
+    - bsv-broadcaster-net
   restart: on-failure
   depends_on:
-    !!merge <<: *arcade-depends
+    !!merge <<: *bsv-broadcaster-depends
 
 services:
   # --- Infrastructure -------------------------------------------------------
@@ -72,7 +72,7 @@ services:
     volumes:
       - redpanda-data:/var/lib/redpanda/data:Z
     networks:
-      - arcade-net
+      - bsv-broadcaster-net
     healthcheck:
       test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
       interval: 10s
@@ -85,7 +85,7 @@ services:
   topic-init:
     image: docker.io/redpandadata/redpanda:v26.1.9
     entrypoint: ["/bin/bash", "/topic-init.sh"]
-    # Keep in step with propagation.partitions in compose/arcade-config.yaml:
+    # Keep in step with propagation.partitions in compose/bsv-broadcaster-config.yaml:
     # arcade hard-fails at boot if the topic has fewer partitions than the
     # service is configured for.
     environment:
@@ -93,7 +93,7 @@ services:
     volumes:
       - ./compose/topic-init.sh:/topic-init.sh:ro,Z
     networks:
-      - arcade-net
+      - bsv-broadcaster-net
     restart: "no"
     depends_on:
       redpanda:
@@ -106,18 +106,18 @@ services:
     image: docker.io/library/postgres:16-alpine
     command: ["-c", "max_connections=500"]
     environment:
-      POSTGRES_DB: arcade
-      POSTGRES_USER: arcade
-      POSTGRES_PASSWORD: arcade
+      POSTGRES_DB: bsv_broadcaster
+      POSTGRES_USER: bsv_broadcaster
+      POSTGRES_PASSWORD: bsv_broadcaster
       PGDATA: /var/lib/postgresql/data/pgdata
     ports:
       - "15432:5432" # 5432 left free for a host postgres
     volumes:
       - postgres-data:/var/lib/postgresql/data:Z
     networks:
-      - arcade-net
+      - bsv-broadcaster-net
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U arcade -d arcade"]
+      test: ["CMD-SHELL", "pg_isready -U bsv_broadcaster -d bsv_broadcaster"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -141,7 +141,7 @@ services:
       - ./compose/aerospike.conf:/opt/aerospike/etc/aerospike.conf:Z
     command: ["--config-file", "/opt/aerospike/etc/aerospike.conf"]
     networks:
-      - arcade-net
+      - bsv-broadcaster-net
     restart: unless-stopped
 
   # merkle-service's own database (never shared with arcade's; postgres:17
@@ -157,7 +157,7 @@ services:
     volumes:
       - merkle-postgres-data:/var/lib/postgresql/data:Z
     networks:
-      - arcade-net
+      - bsv-broadcaster-net
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U merkle -d merkle"]
       interval: 5s
@@ -194,7 +194,7 @@ services:
     ports:
       - "18080:8080" # health/debug from the host (8080 is taken by api-server)
     networks:
-      - arcade-net
+      - bsv-broadcaster-net
     depends_on:
       merkle-postgres:
         condition: service_healthy
@@ -213,56 +213,56 @@ services:
       - "4317:4317"
       - "4318:4318"
     networks:
-      - arcade-net
+      - bsv-broadcaster-net
     restart: unless-stopped
 
   # --- Arcade services: same image, role via --mode (mirrors _base/*.yaml) ---
 
   # http 8080; health/ready/metrics are on 8080 in this mode (not 8081).
   api-server:
-    !!merge <<: *arcade-common
+    !!merge <<: *bsv-broadcaster-common
     command: ["--mode", "api-server"]
     environment:
-      !!merge <<: *arcade-env
-      OTEL_SERVICE_NAME: arcade-api-server
+      !!merge <<: *bsv-broadcaster-env
+      OTEL_SERVICE_NAME: bsv-broadcaster-api-server
     ports:
       - "8080:8080"
     depends_on:
-      !!merge <<: *arcade-depends
+      !!merge <<: *bsv-broadcaster-depends
       chaintracks:
         condition: service_started
       merkle-service:
         condition: service_started
 
   propagation: # health 8081 only (unpublished)
-    !!merge <<: *arcade-common
+    !!merge <<: *bsv-broadcaster-common
     command: ["--mode", "propagation"]
     environment:
-      !!merge <<: *arcade-env
-      OTEL_SERVICE_NAME: arcade-propagation
+      !!merge <<: *bsv-broadcaster-env
+      OTEL_SERVICE_NAME: bsv-broadcaster-propagation
 
   # Mirrors _base/bump-builder.yaml env: header lookups against the
   # chaintracks service instead of an embedded ChainManager.
   bump-builder: # health 8081 (unpublished)
-    !!merge <<: *arcade-common
+    !!merge <<: *bsv-broadcaster-common
     command: ["--mode", "bump-builder"]
     environment:
-      !!merge <<: *arcade-env
-      OTEL_SERVICE_NAME: arcade-bump-builder
-      ARCADE_CHAINTRACKS_MODE: remote
-      ARCADE_CHAINTRACKS_URL: http://chaintracks:8083
+      !!merge <<: *bsv-broadcaster-env
+      OTEL_SERVICE_NAME: bsv-broadcaster-bump-builder
+      BSV_BROADCASTER_CHAINTRACKS_MODE: remote
+      BSV_BROADCASTER_CHAINTRACKS_URL: http://chaintracks:8083
     depends_on:
-      !!merge <<: *arcade-depends
+      !!merge <<: *bsv-broadcaster-depends
       chaintracks:
         condition: service_started
 
   # GOMEMLIMIT mirrors _base/sse.yaml (kafka backlog replay bursts).
   sse: # http 8082 (SSE + /health /ready on same port)
-    !!merge <<: *arcade-common
+    !!merge <<: *bsv-broadcaster-common
     command: ["--mode", "sse"]
     environment:
-      !!merge <<: *arcade-env
-      OTEL_SERVICE_NAME: arcade-sse
+      !!merge <<: *bsv-broadcaster-env
+      OTEL_SERVICE_NAME: bsv-broadcaster-sse
       GOMEMLIMIT: 400MiB
     ports:
       - "8082:8082"
@@ -273,36 +273,36 @@ services:
   # re-syncs per pod restart); cheap local QoL. volumes restated because YAML
   # merge keys do not merge lists.
   chaintracks: # http 8083 (+8081 health, unpublished)
-    !!merge <<: *arcade-common
+    !!merge <<: *bsv-broadcaster-common
     command: ["--mode", "chaintracks"]
     environment:
-      !!merge <<: *arcade-env
-      OTEL_SERVICE_NAME: arcade-chaintracks
-      ARCADE_CHAINTRACKS_MODE: embedded
+      !!merge <<: *bsv-broadcaster-env
+      OTEL_SERVICE_NAME: bsv-broadcaster-chaintracks
+      BSV_BROADCASTER_CHAINTRACKS_MODE: embedded
     ports:
       - "8083:8083"
     volumes:
-      - ./compose/arcade-config.yaml:/etc/arcade/config.yaml:ro,z
-      - chaintracks-data:/root/.arcade:Z
+      - ./compose/bsv-broadcaster-config.yaml:/etc/bsv-broadcaster/config.yaml:ro,z
+      - chaintracks-data:/root/.bsv-broadcaster:Z
 
   watchdog: # health 8081 only (unpublished)
-    !!merge <<: *arcade-common
+    !!merge <<: *bsv-broadcaster-common
     command: ["--mode", "watchdog"]
     environment:
-      !!merge <<: *arcade-env
-      OTEL_SERVICE_NAME: arcade-watchdog
+      !!merge <<: *bsv-broadcaster-env
+      OTEL_SERVICE_NAME: bsv-broadcaster-watchdog
 
   # libp2p 9905 NOT published — k8s exposes no Service for it (outbound-only
   # discovery). Fresh peer key per recreate, same as the no-PVC k8s pod.
   p2p-client:
-    !!merge <<: *arcade-common
+    !!merge <<: *bsv-broadcaster-common
     command: ["--mode", "p2p-client"]
     environment:
-      !!merge <<: *arcade-env
-      OTEL_SERVICE_NAME: arcade-p2p-client
+      !!merge <<: *bsv-broadcaster-env
+      OTEL_SERVICE_NAME: bsv-broadcaster-p2p-client
 
 networks:
-  arcade-net:
+  bsv-broadcaster-net:
     driver: bridge
 
 volumes:

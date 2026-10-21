@@ -6,8 +6,8 @@
 
 <br/>
 
-<a href="https://github.com/bsv-blockchain/arcade/releases"><img src="https://img.shields.io/github/release-pre/bsv-blockchain/arcade?include_prereleases&style=flat-square&logo=github&color=black" alt="Release"></a>
-<a href="https://golang.org/"><img src="https://img.shields.io/github/go-mod/go-version/bsv-blockchain/arcade?style=flat-square&logo=go&color=00ADD8" alt="Go Version"></a>
+<a href="https://github.com/bsv-blockchain/bsv-broadcaster/releases"><img src="https://img.shields.io/github/release-pre/bsv-blockchain/bsv-broadcaster?include_prereleases&style=flat-square&logo=github&color=black" alt="Release"></a>
+<a href="https://golang.org/"><img src="https://img.shields.io/github/go-mod/go-version/bsv-blockchain/bsv-broadcaster?style=flat-square&logo=go&color=00ADD8" alt="Go Version"></a>
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-OpenBSV-blue?style=flat-square&logo=springsecurity&logoColor=white" alt="License"></a>
 
 <br/>
@@ -18,14 +18,14 @@
        <code>CI / CD</code> &nbsp;&nbsp;
     </td>
     <td align="left">
-       <a href="https://github.com/bsv-blockchain/arcade/actions"><img src="https://img.shields.io/github/actions/workflow/status/bsv-blockchain/arcade/fortress.yml?branch=main&label=build&logo=github&style=flat-square" alt="Build"></a>
-       <a href="https://github.com/bsv-blockchain/arcade/actions"><img src="https://img.shields.io/github/last-commit/bsv-blockchain/arcade?style=flat-square&logo=git&logoColor=white&label=last%20update" alt="Last Commit"></a>
+       <a href="https://github.com/bsv-blockchain/bsv-broadcaster/actions"><img src="https://img.shields.io/github/actions/workflow/status/bsv-blockchain/bsv-broadcaster/fortress.yml?branch=main&label=build&logo=github&style=flat-square" alt="Build"></a>
+       <a href="https://github.com/bsv-blockchain/bsv-broadcaster/actions"><img src="https://img.shields.io/github/last-commit/bsv-blockchain/bsv-broadcaster?style=flat-square&logo=git&logoColor=white&label=last%20update" alt="Last Commit"></a>
     </td>
     <td align="right">
        &nbsp;&nbsp;&nbsp;&nbsp; <code>Quality</code> &nbsp;&nbsp;
     </td>
     <td align="left">
-       <a href="https://codecov.io/gh/bsv-blockchain/arcade"><img src="https://codecov.io/gh/bsv-blockchain/arcade/branch/main/graph/badge.svg?style=flat-square" alt="Coverage"></a>
+       <a href="https://codecov.io/gh/bsv-blockchain/bsv-broadcaster"><img src="https://codecov.io/gh/bsv-blockchain/bsv-broadcaster/branch/main/graph/badge.svg?style=flat-square" alt="Coverage"></a>
     </td>
   </tr>
 
@@ -34,15 +34,15 @@
        <code>Security</code> &nbsp;&nbsp;
     </td>
     <td align="left">
-       <a href="https://scorecard.dev/viewer/?uri=github.com/bsv-blockchain/arcade"><img src="https://api.scorecard.dev/projects/github.com/bsv-blockchain/arcade/badge?style=flat-square" alt="Scorecard"></a>
+       <a href="https://scorecard.dev/viewer/?uri=github.com/bsv-blockchain/bsv-broadcaster"><img src="https://api.scorecard.dev/projects/github.com/bsv-blockchain/bsv-broadcaster/badge?style=flat-square" alt="Scorecard"></a>
        <a href=".github/SECURITY.md"><img src="https://img.shields.io/badge/policy-active-success?style=flat-square&logo=security&logoColor=white" alt="Security"></a>
     </td>
     <td align="right">
        &nbsp;&nbsp;&nbsp;&nbsp; <code>Community</code> &nbsp;&nbsp;
     </td>
     <td align="left">
-       <a href="https://github.com/bsv-blockchain/arcade/graphs/contributors"><img src="https://img.shields.io/github/contributors/bsv-blockchain/arcade?style=flat-square&color=orange" alt="Contributors"></a>
-       <a href="https://deepwiki.com/bsv-blockchain/arcade"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
+       <a href="https://github.com/bsv-blockchain/bsv-broadcaster/graphs/contributors"><img src="https://img.shields.io/github/contributors/bsv-blockchain/bsv-broadcaster?style=flat-square&color=orange" alt="Contributors"></a>
+       <a href="https://deepwiki.com/bsv-blockchain/bsv-broadcaster"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
     </td>
   </tr>
 </table>
@@ -120,7 +120,7 @@
 
 **arcade** requires a [supported release of Go](https://golang.org/doc/devel/release.html#policy).
 ```shell script
-go get -u github.com/bsv-blockchain/arcade
+go get -u github.com/bsv-blockchain/bsv-broadcaster
 ```
 
 <br/>
@@ -138,9 +138,9 @@ go get -u github.com/bsv-blockchain/arcade
 ### Build from Source
 
 ```bash
-git clone https://github.com/bsv-blockchain/arcade.git
+git clone https://github.com/bsv-blockchain/bsv-broadcaster.git
 cd arcade
-go build -o arcade cmd/arcade/main.go
+go build -o arcade cmd/bsv-broadcaster/main.go
 ```
 
 ### Configuration
@@ -151,7 +151,7 @@ Create `config.yaml` with your Teranode broadcast URL:
 # Minimal working configuration with no dependencies
 mode: all
 network: main
-storage_path: ~/.arcade
+storage_path: ~/.bsv-broadcaster
 
 callback_url: "https://myhostname.com"
 
@@ -162,7 +162,7 @@ kafka:
 store:
   backend: pebble
   pebble:
-    path: ~/.arcade/pebble
+    path: ~/.bsv-broadcaster/pebble
     memtable_size_mb: 64
     l0_compaction_threshold: 4
     sync_writes: false
@@ -217,7 +217,7 @@ Arcade is a lightweight transaction broadcast service that:
 - **Transaction Validation** - Local validation before network submission
 - **Status Tracking** - Complete audit trail of transaction lifecycle
 - **Extensible** - All packages public, easy to customize
-- **API Reference** – Dive into the godocs at [pkg.go.dev/github.com/bsv-blockchain/arcade](https://pkg.go.dev/github.com/bsv-blockchain/arcade)
+- **API Reference** – Dive into the godocs at [pkg.go.dev/github.com/bsv-blockchain/bsv-broadcaster](https://pkg.go.dev/github.com/bsv-blockchain/bsv-broadcaster)
 
 <br>
 
@@ -293,14 +293,14 @@ DOUBLE_SPEND_ATTEMPTED (from rejected-tx gossip with specific reason)
 | `mode`                      | Operating mode: `embedded`, `remote`         | `embedded`            |
 | `url`                       | Arcade server URL (required for remote mode) | -                     |
 | `network`                   | Bitcoin network: `main`, `test`, `stn`       | `main`                |
-| `storage_path`              | Data directory for persistent files          | `~/.arcade`           |
+| `storage_path`              | Data directory for persistent files          | `~/.bsv-broadcaster`           |
 | `log_level`                 | Log level: `debug`, `info`, `warn`, `error`  | `info`                |
 | `server.address`            | HTTP server listen address                   | `:3011`               |
 | `server.read_timeout`       | HTTP read timeout                            | `30s`                 |
 | `server.write_timeout`      | HTTP write timeout                           | `30s`                 |
 | `server.shutdown_timeout`   | Graceful shutdown timeout                    | `10s`                 |
 | `database.type`             | Storage backend: `sqlite`                    | `sqlite`              |
-| `database.sqlite_path`      | SQLite database file path                    | `~/.arcade/arcade.db` |
+| `database.sqlite_path`      | SQLite database file path                    | `~/.bsv-broadcaster/arcade.db` |
 | `events.type`               | Event backend: `memory`                      | `memory`              |
 | `events.buffer_size`        | Event channel buffer size                    | `1000`                |
 | `teranode.datahub_urls`     | DataHub URLs for fetching block data (array) | -                     |
@@ -352,8 +352,8 @@ When you provide `X-CallbackUrl`, Arcade will POST status updates:
 **Features:**
 - Automatic retries with linear backoff (1min, 2min, 3min, etc.)
 - Configurable max retries via `webhook.max_retries`
-- Every POST carries `User-Agent: arcade-webhook/<version>` — allowlist the
-  `arcade-webhook/` prefix at your edge so bot/WAF rules don't silently
+- Every POST carries `User-Agent: bsv-broadcaster-webhook/<version>` — allowlist the
+  `bsv-broadcaster-webhook/` prefix at your edge so bot/WAF rules don't silently
   reject deliveries
 - Delivery self-diagnosis: `GET /tx/{txid}?callbackToken=<token>` returns a
   `callbacks` array with `attempts`, `lastAttemptAt`, and `lastResult`
@@ -431,9 +431,9 @@ See [examples/sse_client.html](examples/sse_client.html) and [examples/sse_clien
 For applications that need Arcade functionality without running a full server, use the REST client:
 
 ```go
-import "github.com/bsv-blockchain/arcade/client"
+import "github.com/bsv-blockchain/bsv-broadcaster/client"
 
-c := client.New("http://arcade-server:3011")
+c := client.New("http://bsv-broadcaster-server:3011")
 defer c.Close() // Always close when done to clean up SSE connections
 
 // Submit a single transaction
@@ -465,7 +465,7 @@ All packages are public and designed for extension:
 #### Custom Storage Backend
 
 ```go
-import "github.com/bsv-blockchain/arcade/store"
+import "github.com/bsv-blockchain/bsv-broadcaster/store"
 
 type MyStore struct {}
 
@@ -480,7 +480,7 @@ func (s *MyStore) GetOrInsertStatus(ctx context.Context, status *models.Transact
 #### Custom Event Handler
 
 ```go
-import "github.com/bsv-blockchain/arcade/events"
+import "github.com/bsv-blockchain/bsv-broadcaster/events"
 
 type MyHandler struct {
     publisher events.Publisher
@@ -535,7 +535,7 @@ For detailed architecture documentation, see [doc.md](doc.md).
 
 ## 🧪 Examples & Tests
 
-All unit tests and examples run via [GitHub Actions](https://github.com/bsv-blockchain/arcade/actions) and use [Go version 1.27.x](https://go.dev/doc/go1.27). View the [configuration file](.github/workflows/fortress.yml).
+All unit tests and examples run via [GitHub Actions](https://github.com/bsv-blockchain/bsv-broadcaster/actions) and use [Go version 1.27.x](https://go.dev/doc/go1.27). View the [configuration file](.github/workflows/fortress.yml).
 
 Run all tests (fast):
 
@@ -590,7 +590,7 @@ View the [contributing guidelines](.github/CONTRIBUTING.md) and please follow th
 All kinds of contributions are welcome :raised_hands:!
 The most basic way to show your support is to star :star2: the project, or to raise issues :speech_balloon:.
 
-[![Stars](https://img.shields.io/github/stars/bsv-blockchain/arcade?label=Please%20like%20us&style=social&v=1)](https://github.com/bsv-blockchain/arcade/stargazers)
+[![Stars](https://img.shields.io/github/stars/bsv-blockchain/bsv-broadcaster?label=Please%20like%20us&style=social&v=1)](https://github.com/bsv-blockchain/bsv-broadcaster/stargazers)
 
 <br/>
 

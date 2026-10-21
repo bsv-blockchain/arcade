@@ -28,12 +28,12 @@ import (
 	teranodep2p "github.com/bsv-blockchain/teranode/services/p2p"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/kafka"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/services"
-	"github.com/bsv-blockchain/arcade/ssrfguard"
-	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/services"
+	"github.com/bsv-blockchain/bsv-broadcaster/ssrfguard"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
 )
 
 // BlockNotification is retained from the earlier scaffold. It is not used by
@@ -70,7 +70,7 @@ type EndpointWriter interface {
 type clientFactory func(ctx context.Context, cfg p2pclient.Config) (teraClient, error)
 
 func defaultClientFactory(ctx context.Context, cfg p2pclient.Config) (teraClient, error) {
-	return cfg.Initialize(ctx, "arcade")
+	return cfg.Initialize(ctx, "bsv-broadcaster")
 }
 
 // dnsLookupTimeout bounds each DNS resolution performed while validating a
@@ -251,7 +251,7 @@ func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatu
 
 	// Surface the peer's advertised tip height as a gauge instead of
 	// discarding it with the debug log below: alongside
-	// arcade_chain_tip_height it is the datahub height-lag signal operators
+	// bsv_broadcaster_chain_tip_height it is the datahub height-lag signal operators
 	// alert on (issue #254 — peers chain-stalled 50+ blocks while every
 	// reachability probe stayed green). base_url-labelled only, so
 	// restart-churned peer ids can't grow the series set.

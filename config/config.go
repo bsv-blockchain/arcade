@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -134,6 +136,12 @@ type Config struct {
 	// Chaintracks is the upstream go-chaintracks config; defaults delegated
 	// to the library's own SetDefaults so new fields flow through automatically.
 	Chaintracks chaintracksconfig.Config `mapstructure:"chaintracks"`
+
+	// Deprecations lists human-readable notices about legacy (pre-rebrand)
+	// configuration Load honored, e.g. ARCADE_* environment variables or a
+	// config file under /etc/arcade. The caller logs them once a logger
+	// exists; they never affect behavior.
+	Deprecations []string `mapstructure:"-"`
 }
 
 // ChaintracksServerConfig toggles the chaintracks HTTP surface. Separate
@@ -188,6 +196,10 @@ type Kafka struct {
 	// with a fail-closed startup check — see PropagationConfig.Partitions.
 	// Leave at 0 or 1 in standalone/single-replica deployments.
 	MinPartitions int `mapstructure:"min_partitions"`
+	// TopicPrefix namespaces every topic as "<prefix>.<name>" (default
+	// "bsv-broadcaster"). Deployments that predate the BSV Broadcaster
+	// rebrand set it to "arcade" to keep consuming their existing topics.
+	TopicPrefix string `mapstructure:"topic_prefix"`
 	// SendTimeoutMs bounds how long the in-process memory broker waits for a
 	// slot in a full mailbox before returning ErrBrokerBackpressure to the
 	// producer. Only consulted by the memory backend; sarama has its own
@@ -432,7 +444,7 @@ type TelemetryConfig struct {
 
 type PropagationConfig struct {
 	// Partitions is the minimum partition count arcade requires on
-	// arcade.propagation at startup (fail-closed: missing topic or fewer
+	// bsv-broadcaster.propagation at startup (fail-closed: missing topic or fewer
 	// partitions aborts boot; more is fine — extra partitions only cost
 	// idle dispatchers). Set it to at least the propagation replica count
 	// when scaling horizontally, and widen the topic BEFORE rolling the
@@ -469,7 +481,7 @@ type PropagationConfig struct {
 	// requeue arm and looped forever: ~2,410 409s in two minutes, 42 of 43
 	// batches requeued, 4,679 transactions pinned in the dispatcher's
 	// inFlight map and therefore 337,247 messages of Kafka lag frozen on the
-	// single-partition arcade.propagation topic while the leader burned 4.2
+	// single-partition bsv-broadcaster.propagation topic while the leader burned 4.2
 	// cores. Nothing new could propagate until operators seeked the consumer
 	// group past the backlog by hand.
 	//
@@ -847,7 +859,7 @@ type WatchdogConfig struct {
 	TerminalBackoffMs int `mapstructure:"terminal_backoff_ms"`
 	// MaxReprocessAttempts caps total /reprocess dispatches per block; once a
 	// block is re-driven this many times it is parked (reprocessing stops) so a
-	// permanently un-finalizable block can't flood arcade.block_processed and
+	// permanently un-finalizable block can't flood bsv-broadcaster.block_processed and
 	// starve the bump-builder consumer. Default 10; <= 0 disables the cap.
 	MaxReprocessAttempts int `mapstructure:"max_reprocess_attempts"`
 	// MaxStaleAgeMs parks a block whose header_seen_at is older than this,
@@ -946,7 +958,7 @@ type WebhookConfig struct {
 	// filled. Default 32: comfortably above expected concurrent slow
 	// callbacks while staying well under the per-pod TCP/connection
 	// budget. Increase only if pool saturation
-	// (arcade_webhook_pool_saturated_total) shows non-trivial drop rate.
+	// (bsv_broadcaster_webhook_pool_saturated_total) shows non-trivial drop rate.
 	MaxConcurrentDeliveries int `mapstructure:"max_concurrent_deliveries"`
 	// ReaperIntervalMs controls how often the webhook retry sweep runs.
 	// The sweep re-fires deliveries whose POST failed and whose
@@ -1186,10 +1198,13 @@ func Load(cmd *cobra.Command) (*Config, error) {
 		viper.SetConfigName("config")
 		viper.SetConfigType("yaml")
 		viper.AddConfigPath(".")
-		viper.AddConfigPath("/etc/arcade")
+		viper.AddConfigPath("/etc/bsv-broadcaster")
+		viper.AddConfigPath(legacyConfigDir)
 	}
 
-	viper.SetEnvPrefix("ARCADE")
+	legacyEnv := applyLegacyEnv()
+
+	viper.SetEnvPrefix(EnvPrefix)
 	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	viper.AutomaticEnv()
 
@@ -1215,7 +1230,58 @@ func Load(cmd *cobra.Command) (*Config, error) {
 		return nil, err
 	}
 
+	if len(legacyEnv) > 0 {
+		cfg.Deprecations = append(cfg.Deprecations, fmt.Sprintf(
+			"environment variables with the legacy %s_ prefix are deprecated; rename them to %s_*: %s",
+			LegacyEnvPrefix, EnvPrefix, strings.Join(legacyEnv, ", ")))
+	}
+	if used := viper.ConfigFileUsed(); strings.HasPrefix(used, legacyConfigDir+"/") {
+		cfg.Deprecations = append(cfg.Deprecations, fmt.Sprintf(
+			"config file %s is in the legacy directory %s; move it to /etc/bsv-broadcaster", used, legacyConfigDir))
+	}
+
 	return &cfg, nil
+}
+
+const (
+	// EnvPrefix is the prefix for environment-variable overrides: config key
+	// store.backend is read from BSV_BROADCASTER_STORE_BACKEND.
+	EnvPrefix = "BSV_BROADCASTER"
+	// LegacyEnvPrefix is the prefix used before the BSV Broadcaster rebrand.
+	// Variables under it are still honored (see applyLegacyEnv).
+	LegacyEnvPrefix = "ARCADE"
+
+	// legacyConfigDir is the pre-rebrand config directory, searched after
+	// /etc/bsv-broadcaster.
+	legacyConfigDir = "/etc/arcade"
+)
+
+// applyLegacyEnv copies every ARCADE_* environment variable to its
+// BSV_BROADCASTER_* equivalent so deployments configured before the rebrand
+// keep working. An explicitly set BSV_BROADCASTER_* variable always wins. It
+// returns the sorted legacy names it mapped.
+func applyLegacyEnv() []string {
+	var mapped []string
+	for _, kv := range os.Environ() {
+		name, value, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		suffix, ok := strings.CutPrefix(name, LegacyEnvPrefix+"_")
+		if !ok || suffix == "" {
+			continue
+		}
+		newName := EnvPrefix + "_" + suffix
+		if _, set := os.LookupEnv(newName); set {
+			continue
+		}
+		if err := os.Setenv(newName, value); err != nil {
+			continue
+		}
+		mapped = append(mapped, name)
+	}
+	slices.Sort(mapped)
+	return mapped
 }
 
 // expandPaths resolves "~/..." in every filesystem path the config exposes,
@@ -1246,8 +1312,8 @@ func setDefaults() {
 	viper.SetDefault("api.port", 8080)
 	viper.SetDefault("kafka.backend", "sarama")
 	// callback_* and merkle_service.* defaults exist so viper.AutomaticEnv
-	// knows the keys: without a registered key an ARCADE_MERKLE_SERVICE_URLS
-	// or ARCADE_CALLBACK_TOKEN override is silently ignored (see
+	// knows the keys: without a registered key an BSV_BROADCASTER_MERKLE_SERVICE_URLS
+	// or BSV_BROADCASTER_CALLBACK_TOKEN override is silently ignored (see
 	// TestPropagationBatchCapsBind for the same trap). Empty values keep the
 	// integration disabled.
 	viper.SetDefault("callback_url", "")
@@ -1257,33 +1323,34 @@ func setDefaults() {
 	viper.SetDefault("merkle_service.auth_token", "")
 
 	viper.SetDefault("kafka.brokers", []string{"localhost:9092"})
-	viper.SetDefault("kafka.consumer_group", "arcade")
+	viper.SetDefault("kafka.consumer_group", "bsv-broadcaster")
+	viper.SetDefault("kafka.topic_prefix", "bsv-broadcaster")
 	viper.SetDefault("kafka.max_retries", 5)
 	viper.SetDefault("kafka.buffer_size", 10000)
 	viper.SetDefault("kafka.send_timeout_ms", 2000)
 	viper.SetDefault("store.backend", "aerospike")
 	viper.SetDefault("store.aerospike.hosts", []string{"localhost:3000"})
-	viper.SetDefault("store.aerospike.namespace", "arcade")
+	viper.SetDefault("store.aerospike.namespace", "bsv_broadcaster")
 	viper.SetDefault("store.aerospike.batch_size", 500)
 	viper.SetDefault("store.aerospike.pool_size", 256)
 	viper.SetDefault("store.aerospike.query_timeout_ms", 8000)
 	viper.SetDefault("store.aerospike.op_timeout_ms", 3000)
 	viper.SetDefault("store.aerospike.socket_timeout_ms", 5000)
-	viper.SetDefault("store.pebble.path", "~/.arcade/pebble")
+	viper.SetDefault("store.pebble.path", "~/.bsv-broadcaster/pebble")
 	viper.SetDefault("store.pebble.memtable_size_mb", 64)
 	viper.SetDefault("store.pebble.l0_compaction_threshold", 4)
 	viper.SetDefault("store.pebble.sync_writes", false)
 	viper.SetDefault("store.postgres.embedded", false)
 	viper.SetDefault("store.postgres.embedded_port", 0)
-	viper.SetDefault("store.postgres.embedded_user", "arcade")
-	viper.SetDefault("store.postgres.embedded_password", "arcade")
-	viper.SetDefault("store.postgres.embedded_database", "arcade")
-	viper.SetDefault("store.postgres.embedded_data_dir", "~/.arcade/postgres")
-	viper.SetDefault("store.postgres.embedded_cache_dir", "~/.arcade/postgres-cache")
+	viper.SetDefault("store.postgres.embedded_user", "bsv_broadcaster")
+	viper.SetDefault("store.postgres.embedded_password", "bsv_broadcaster")
+	viper.SetDefault("store.postgres.embedded_database", "bsv_broadcaster")
+	viper.SetDefault("store.postgres.embedded_data_dir", "~/.bsv-broadcaster/postgres")
+	viper.SetDefault("store.postgres.embedded_cache_dir", "~/.bsv-broadcaster/postgres-cache")
 	viper.SetDefault("store.postgres.max_conns", 16)
 	viper.SetDefault("store.postgres.schema_apply_timeout_ms", 300000)
 	viper.SetDefault("store.mongodb.uri", "mongodb://localhost:27017")
-	viper.SetDefault("store.mongodb.database", "arcade")
+	viper.SetDefault("store.mongodb.database", "bsv_broadcaster")
 	viper.SetDefault("store.mongodb.connect_timeout_ms", 10000)
 	viper.SetDefault("store.mongodb.op_timeout_ms", 3000)
 	viper.SetDefault("store.mongodb.query_timeout_ms", 8000)
@@ -1295,15 +1362,15 @@ func setDefaults() {
 	// OTEL telemetry export: off by default. See TelemetryConfig doc comment
 	// and docs/plans/otel-integration.md. Every field gets an explicit
 	// SetDefault — including the zero-valued ones — because viper's
-	// AutomaticEnv only recognizes ARCADE_TELEMETRY_* overrides for keys it
+	// AutomaticEnv only recognizes BSV_BROADCASTER_TELEMETRY_* overrides for keys it
 	// already knows about (same reasoning as the chaintracks.url default
-	// below); without these, ARCADE_TELEMETRY_ENDPOINT/NAMESPACE/INSECURE
+	// below); without these, BSV_BROADCASTER_TELEMETRY_ENDPOINT/NAMESPACE/INSECURE
 	// would silently be ignored.
 	viper.SetDefault("telemetry.enabled", false)
 	viper.SetDefault("telemetry.endpoint", "")
 	viper.SetDefault("telemetry.protocol", "grpc")
 	viper.SetDefault("telemetry.insecure", false)
-	viper.SetDefault("telemetry.service_name", "arcade")
+	viper.SetDefault("telemetry.service_name", "bsv-broadcaster")
 	viper.SetDefault("telemetry.namespace", "")
 	viper.SetDefault("telemetry.traces", true)
 	viper.SetDefault("telemetry.metrics", true)
@@ -1375,14 +1442,14 @@ func setDefaults() {
 	// dropping update" warnings can raise this up to ~65536.
 	viper.SetDefault("events.subscriber_buffer", DefaultEventsSubscriberBuffer)
 
-	viper.SetDefault("storage_path", "~/.arcade")
+	viper.SetDefault("storage_path", "~/.bsv-broadcaster")
 	viper.SetDefault("chaintracks_server.enabled", true)
 	// Delegate chaintracks-library defaults (mode, network, bootstrap, p2p, …)
 	// to the upstream SetDefaults so any new fields are picked up automatically.
 	var ct chaintracksconfig.Config
 	ct.SetDefaults(viper.GetViper(), "chaintracks")
 	// go-chaintracks SetDefaults omits chaintracks.url, so viper.AutomaticEnv()
-	// can't see ARCADE_CHAINTRACKS_URL — register the key explicitly here.
+	// can't see BSV_BROADCASTER_CHAINTRACKS_URL — register the key explicitly here.
 	viper.SetDefault("chaintracks.url", "")
 	viper.SetDefault("bump_builder.grace_window_ms", 30000)
 	// 10s covers the observed chaintracks P2P-ingestion lag for a
@@ -1451,7 +1518,7 @@ func setDefaults() {
 	// operator-configured": intake still enforces DefaultValidatorMinFeePerKB
 	// (the validator's built-in floor), while GET /policy advertises the
 	// network-observed minimum (issue #212). SetDefault is required even at 0
-	// so AutomaticEnv honors the ARCADE_VALIDATOR_MIN_FEE_PER_KB override.
+	// so AutomaticEnv honors the BSV_BROADCASTER_VALIDATOR_MIN_FEE_PER_KB override.
 	viper.SetDefault("validator.min_fee_per_kb", 0)
 
 	// ARC-compatible GET /policy fields (issue #212). The two size limits
@@ -1459,7 +1526,7 @@ func setDefaults() {
 	// operator-configured", so they track the most permissive limit the network
 	// advertises, falling back to DefaultValidatorMax*Policy until a peer is
 	// heard. Every key needs an explicit SetDefault for AutomaticEnv to honour
-	// its ARCADE_VALIDATOR_* override (same reasoning as above).
+	// its BSV_BROADCASTER_VALIDATOR_* override (same reasoning as above).
 	viper.SetDefault("validator.max_tx_size_policy", 0)
 	viper.SetDefault("validator.max_script_size_policy", 0)
 	viper.SetDefault("validator.max_tx_sigops_counts_policy", 0)
@@ -1537,6 +1604,9 @@ func redactURL(raw string) string {
 	return strconv.Quote(c.String())
 }
 
+// validTopicPrefix is the Kafka topic-name alphabet.
+var validTopicPrefix = regexp.MustCompile(`^[a-zA-Z0-9._-]*$`)
+
 func validate(cfg *Config) error {
 	switch cfg.Kafka.Backend {
 	case "", "sarama":
@@ -1547,6 +1617,9 @@ func validate(cfg *Config) error {
 		// no external config required
 	default:
 		return fmt.Errorf("unknown kafka.backend %q (expected sarama or memory)", cfg.Kafka.Backend)
+	}
+	if !validTopicPrefix.MatchString(cfg.Kafka.TopicPrefix) {
+		return fmt.Errorf("kafka.topic_prefix %q must contain only letters, digits, '.', '_' or '-'", cfg.Kafka.TopicPrefix)
 	}
 	switch cfg.Store.Backend {
 	case "", "aerospike":

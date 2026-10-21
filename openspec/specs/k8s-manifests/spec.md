@@ -44,11 +44,11 @@ A Kubernetes Service manifest SHALL expose the `api-server` Deployment on port 8
 - **THEN** it SHALL select pods with the `api-server` Deployment's labels and forward port 8080 to container port 8080
 
 ### Requirement: Environment variable configuration
-All Deployments SHALL include environment variables for Kafka brokers (`ARCADE_KAFKA_BROKERS`), Aerospike hosts (`ARCADE_AEROSPIKE_HOSTS`), and Aerospike namespace (`ARCADE_AEROSPIKE_NAMESPACE`) with placeholder values that operators can override.
+All Deployments SHALL include environment variables for Kafka brokers (`BSV_BROADCASTER_KAFKA_BROKERS`), Aerospike hosts (`BSV_BROADCASTER_AEROSPIKE_HOSTS`), and Aerospike namespace (`BSV_BROADCASTER_AEROSPIKE_NAMESPACE`) with placeholder values that operators can override.
 
 #### Scenario: Required env vars present
 - **WHEN** any Deployment manifest is inspected
-- **THEN** the container spec SHALL include `ARCADE_KAFKA_BROKERS`, `ARCADE_AEROSPIKE_HOSTS`, and `ARCADE_AEROSPIKE_NAMESPACE` environment variables
+- **THEN** the container spec SHALL include `BSV_BROADCASTER_KAFKA_BROKERS`, `BSV_BROADCASTER_AEROSPIKE_HOSTS`, and `BSV_BROADCASTER_AEROSPIKE_NAMESPACE` environment variables
 
 ### Requirement: Manifest directory structure
 All Kubernetes manifests SHALL be placed in the `deploy/` directory at the repository root.

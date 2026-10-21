@@ -25,22 +25,22 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	arcerrors "github.com/bsv-blockchain/arcade/errors"
-	"github.com/bsv-blockchain/arcade/events"
-	"github.com/bsv-blockchain/arcade/kafka"
-	"github.com/bsv-blockchain/arcade/logfields"
-	"github.com/bsv-blockchain/arcade/merkleservice"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/services"
-	"github.com/bsv-blockchain/arcade/store"
-	"github.com/bsv-blockchain/arcade/teranode"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	arcerrors "github.com/bsv-blockchain/bsv-broadcaster/errors"
+	"github.com/bsv-blockchain/bsv-broadcaster/events"
+	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
+	"github.com/bsv-blockchain/bsv-broadcaster/logfields"
+	"github.com/bsv-blockchain/bsv-broadcaster/merkleservice"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/services"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/teranode"
 )
 
 // propagationTracerName identifies this package's spans/tracer to the OTEL
 // SDK, per the same package-import-path convention as kafka.tracerName.
-const propagationTracerName = "github.com/bsv-blockchain/arcade/services/propagation"
+const propagationTracerName = "github.com/bsv-blockchain/bsv-broadcaster/services/propagation"
 
 // batchSpanMaxLinks caps the number of producer-span links attached to a
 // propagation.broadcast span. Per OTel's recommended batch-messaging
@@ -2570,7 +2570,7 @@ func (p *Propagator) parkExhaustedMerkleRegistrations(ctx context.Context, msgs 
 // attributable rejection either — every tx fell to the requeue arm. Result:
 // ~2,410 409s in two minutes, 42 of 43 batches requeued, 4,679 txs stuck in
 // the dispatcher's inFlight map pinning offsets, and 337,247 messages of lag
-// on the single-partition arcade.propagation topic frozen solid while the
+// on the single-partition bsv-broadcaster.propagation topic frozen solid while the
 // leader pod burned 4.2 CPU cores. Every newly submitted transaction sat at
 // RECEIVED until operators hand-seeked the consumer group past the backlog.
 //

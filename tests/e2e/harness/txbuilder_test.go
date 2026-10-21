@@ -9,15 +9,15 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 
-	"github.com/bsv-blockchain/arcade/validator"
+	"github.com/bsv-blockchain/bsv-broadcaster/validator"
 )
 
-// TestBuildValidatableTxs_PassesArcadePolicyValidator confirms our
+// TestBuildValidatableTxs_PassesBroadcasterPolicyValidator confirms our
 // synthetic-tx builder produces transactions that survive arcade's
 // structural validator. Without this assertion, smoke_test.go's
 // BroadcastTx would silently route everything to REJECTED before
 // merkle-service ever sees a watch registration.
-func TestBuildValidatableTxs_PassesArcadePolicyValidator(t *testing.T) {
+func TestBuildValidatableTxs_PassesBroadcasterPolicyValidator(t *testing.T) {
 	v := validator.NewValidator(nil)
 	txs := BuildValidatableTxs(5, 100)
 

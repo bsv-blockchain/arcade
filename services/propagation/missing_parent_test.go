@@ -11,10 +11,10 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/kafka"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/teranode"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/teranode"
 )
 
 // newTwoEndpointClient builds a teranode client that fans every broadcast
@@ -23,7 +23,7 @@ func newTwoEndpointClient(urlA, urlB string) *teranode.Client {
 	return teranode.NewClient([]string{urlA, urlB}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
 }
 
-// The missing-parent safety net (#295). With arcade.propagation widened to
+// The missing-parent safety net (#295). With bsv-broadcaster.propagation widened to
 // multiple partitions, a child submitted in a later HTTP request than its
 // parent can reach Teranode before the parent (different partition, different
 // pod). Teranode has no orphan pool: the child draws TX_MISSING_PARENT.
