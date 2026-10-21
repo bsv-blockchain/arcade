@@ -78,7 +78,8 @@ func New(t *testing.T, opts ...Option) *Harness {
 
 	// Step 3: libp2p host with the container-reachable host address baked
 	// into its announce multiaddr (host.containers.internal on podman,
-	// the gateway IP on Docker — see hostFromContainerAddr). Skipped when
+	// the gateway IP on Linux Docker, host.docker.internal on Docker
+	// Desktop — see hostFromContainerAddr). Skipped when
 	// the caller explicitly passed a bootstrap peer string — that mode is
 	// for tests that want to wire their own libp2p configuration.
 	hostAddr := hostFromContainerAddr(gateway)
