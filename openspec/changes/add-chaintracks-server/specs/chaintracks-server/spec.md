@@ -107,6 +107,6 @@ The config schema SHALL expose the following new fields, all with safe defaults 
 - **AND** chaintracks runs with `mode=embedded`, `network=main`, storage under the BSV Broadcaster storage path, and the library's default bootstrap mode
 
 #### Scenario: Operator overrides storage path
-- **GIVEN** `chaintracks.storage_path=/srv/BSV Broadcaster/chaintracks` is set
+- **GIVEN** `chaintracks.storage_path=/srv/bsv-broadcaster/chaintracks` is set
 - **WHEN** BSV Broadcaster starts
-- **THEN** headers are written to `/srv/BSV Broadcaster/chaintracks/`, NOT `<bsv_broadcaster_storage_path>/chaintracks/`
+- **THEN** headers are written to `/srv/bsv-broadcaster/chaintracks/`, NOT `<bsv_broadcaster_storage_path>/chaintracks/`

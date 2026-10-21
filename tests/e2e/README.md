@@ -22,7 +22,7 @@ tests/e2e/
     ├── libp2p_host.go           // in-process libp2p peer + Subtree/Block publishers
     ├── datahub.go               // in-process /block/<hash> + /subtree/<hash> server
     ├── txbuilder.go             // synthetic-tx + synthetic-block builders
-    ├── broadcaster.go                // in-process BSV Broadcaster boot (via app.Bootstrap)
+    ├── broadcaster.go           // in-process BSV Broadcaster boot (via app.Bootstrap)
     ├── poll.go                  // BroadcastTx, WaitForMined, GetTxStatus
     └── harness.go               // top-level Harness type, Option functions
 ```

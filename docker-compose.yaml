@@ -125,7 +125,7 @@ services:
     restart: unless-stopped
 
   # Optional Aerospike for `go test -tags=integration ./store/aerospike/...`
-  # (localhost:3200, namespace BSV Broadcaster). Not used by the default postgres
+  # (localhost:3200, namespace bsv_broadcaster). Not used by the default postgres
   # stack — start with `docker compose --profile aerospike up -d aerospike`.
   # Pin is the current 7.0 line (same as deploy/aerospike.yaml), not :latest
   # (F-038 / #96). Digest is the multi-arch index for 7.0.0.26.

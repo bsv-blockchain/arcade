@@ -57,7 +57,7 @@ store:
   backend: aerospike
   # Alternative: external PostgreSQL. Only read when backend: postgres.
   # postgres:
-  #   dsn: postgres://user:pass@host:5432/BSV Broadcaster
+  #   dsn: postgres://user:pass@host:5432/bsv_broadcaster
   #   max_conns: 16
   #   # Ceiling for the boot-time schema apply when it actually has to run
   #   # (fresh database or schema change). Restarts with a current schema

@@ -139,8 +139,8 @@ go get -u github.com/bsv-blockchain/bsv-broadcaster
 
 ```bash
 git clone https://github.com/bsv-blockchain/bsv-broadcaster.git
-cd BSV Broadcaster
-go build -o BSV Broadcaster cmd/bsv-broadcaster/main.go
+cd bsv-broadcaster
+go build -o bsv-broadcaster cmd/bsv-broadcaster/main.go
 ```
 
 ### Configuration

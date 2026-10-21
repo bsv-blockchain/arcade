@@ -28,8 +28,8 @@ profile.
 
 ```bash
 git clone https://github.com/bsv-blockchain/bsv-broadcaster.git
-cd BSV Broadcaster
-go build -o BSV Broadcaster ./cmd/bsv-broadcaster
+cd bsv-broadcaster
+go build -o bsv-broadcaster ./cmd/bsv-broadcaster
 ```
 
 ## Base config
