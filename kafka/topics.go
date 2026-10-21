@@ -5,30 +5,38 @@ package kafka
 // prefix "arcade" so they keep consuming their existing topics.
 const DefaultTopicPrefix = "bsv-broadcaster"
 
-// Topic names, "<prefix>.<name>". They are variables only so SetTopicPrefix
-// can apply kafka.topic_prefix at startup; treat them as constants otherwise.
+// Topic name suffixes; every topic is "<prefix><suffix>".
+const (
+	suffixBlock          = ".block"
+	suffixBlockProcessed = ".block_processed"
+	suffixTransaction    = ".transaction"
+	suffixPropagation    = ".propagation"
+	suffixStatusUpdate   = ".tx_status"
+	suffixDLQ            = ".dlq"
+)
+
+// Topic names. They are variables only so SetTopicPrefix can apply
+// kafka.topic_prefix at startup; treat them as constants otherwise.
 var (
 	// TopicBlock is retained only for the p2p_client scaffold (which is not
 	// registered in main). It is not created by AllTopics() and has no consumers.
-	TopicBlock          string
-	TopicBlockProcessed string
-	TopicTransaction    string
-	TopicPropagation    string
+	TopicBlock          = DefaultTopicPrefix + suffixBlock
+	TopicBlockProcessed = DefaultTopicPrefix + suffixBlockProcessed
+	TopicTransaction    = DefaultTopicPrefix + suffixTransaction
+	TopicPropagation    = DefaultTopicPrefix + suffixPropagation
 	// TopicStatusUpdate carries transaction status mutations from every
 	// service that writes to the store (validator, propagation, bump-builder,
 	// api-server). It exists so the api-server SSE handler and webhook
 	// service can fan out updates to clients without depending on which pod
 	// the mutation originated from.
-	TopicStatusUpdate string
+	TopicStatusUpdate = DefaultTopicPrefix + suffixStatusUpdate
 
 	// Dead-letter queue topics
-	TopicBlockProcessedDLQ string
-	TopicTransactionDLQ    string
-	TopicPropagationDLQ    string
-	TopicStatusUpdateDLQ   string
+	TopicBlockProcessedDLQ = TopicBlockProcessed + suffixDLQ
+	TopicTransactionDLQ    = TopicTransaction + suffixDLQ
+	TopicPropagationDLQ    = TopicPropagation + suffixDLQ
+	TopicStatusUpdateDLQ   = TopicStatusUpdate + suffixDLQ
 )
-
-func init() { SetTopicPrefix(DefaultTopicPrefix) }
 
 // SetTopicPrefix renames every topic to "<prefix>.<name>"; an empty prefix
 // means DefaultTopicPrefix. It is not safe for concurrent use: app.Bootstrap
@@ -37,11 +45,11 @@ func SetTopicPrefix(prefix string) {
 	if prefix == "" {
 		prefix = DefaultTopicPrefix
 	}
-	TopicBlock = prefix + ".block"
-	TopicBlockProcessed = prefix + ".block_processed"
-	TopicTransaction = prefix + ".transaction"
-	TopicPropagation = prefix + ".propagation"
-	TopicStatusUpdate = prefix + ".tx_status"
+	TopicBlock = prefix + suffixBlock
+	TopicBlockProcessed = prefix + suffixBlockProcessed
+	TopicTransaction = prefix + suffixTransaction
+	TopicPropagation = prefix + suffixPropagation
+	TopicStatusUpdate = prefix + suffixStatusUpdate
 
 	TopicBlockProcessedDLQ = DLQTopic(TopicBlockProcessed)
 	TopicTransactionDLQ = DLQTopic(TopicTransaction)
@@ -61,5 +69,5 @@ func AllTopics() []string {
 
 // DLQTopic returns the dead-letter topic name for a given primary topic.
 func DLQTopic(topic string) string {
-	return topic + ".dlq"
+	return topic + suffixDLQ
 }

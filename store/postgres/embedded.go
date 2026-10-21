@@ -42,7 +42,7 @@ func startEmbedded(cfg config.Postgres) (dsn string, stop func() error, err erro
 	}
 	pass := cfg.EmbeddedPassword
 	if pass == "" {
-		pass = "bsv_broadcaster"
+		pass = "bsv_broadcaster" //nolint:gosec // local embedded-postgres default, not a secret
 	}
 	db := cfg.EmbeddedDatabase
 	if db == "" {
