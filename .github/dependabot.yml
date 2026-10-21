@@ -18,6 +18,9 @@
 #   • Force‑push and delete‑branch disabled via branch‑protection rules.
 #   • PR limit = 10 to avoid queue flooding.
 #   • All dependency PRs require passing CI checks before merging.
+#   • Cooldown – new releases must age before version‑update PRs open (3 days by default;
+#     Go modules: 3 days patch, 7 days minor, 14 days major). First‑party and trusted
+#     publishers are excluded; security updates are never delayed.
 # ────────────────────────────────────────────────────────────────
 
 version: 2
@@ -47,6 +50,12 @@ updates:
     commit-message:
       prefix: "chore"
       include: "scope"
+    cooldown:
+      default-days: 3
+      semver-patch-days: 3
+      semver-minor-days: 7
+      semver-major-days: 14
+      exclude: ["github.com/bsv-blockchain/*", "github.com/mrz1836/*", "golang.org/x/*"]
 
   # ──────────────────────────────────────────────────────────────
   # 2. GitHub Actions Workflows
@@ -70,6 +79,9 @@ updates:
     commit-message:
       prefix: "chore"
       include: "scope"
+    cooldown:
+      default-days: 3
+      exclude: ["actions/*", "github/*", "gitleaks/*", "ossf/*"]
 
   # ──────────────────────────────────────────────────────────────
   # 3. DevContainer (devcontainer.json : base image + features)
@@ -93,6 +105,9 @@ updates:
     commit-message:
       prefix: "chore"
       include: "scope"
+    cooldown:
+      default-days: 3
+      exclude: ["ghcr.io/devcontainers/features/*"]
 
   # ──────────────────────────────────────────────────────────────
   # 4. Dockerfiles (any Dockerfile in repo root or sub‑dirs)
@@ -116,3 +131,30 @@ updates:
     commit-message:
       prefix: "chore"
       include: "scope"
+    cooldown:
+      default-days: 3
+
+  # ──────────────────────────────────────────────────────────────
+  # 5. Docker Compose (docker-compose.yaml service images)
+  # ──────────────────────────────────────────────────────────────
+  - package-ecosystem: "docker-compose"
+    directory: "/"
+    target-branch: "main"
+    schedule:
+      interval: "weekly"
+      day: "tuesday"
+      time: "12:00"
+      timezone: "America/New_York"
+    allow:
+      - dependency-type: "direct"
+    groups:
+      docker-compose-all:
+        patterns: ["*"]
+    open-pull-requests-limit: 5
+    assignees: ["mrz1836"]
+    labels: ["chore", "dependencies", "docker-compose"]
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    cooldown:
+      default-days: 3
