@@ -576,6 +576,7 @@ Read the [AI Usage & Assistant Guidelines](.github/tech-conventions/ai-complianc
 
 ## 📚 Resources
 
+- [Migrating from arcade](docs/migration-arcade-to-bsv-broadcaster.md): upgrade notes for deployments that predate the rename
 - [Architecture Documentation](doc.md)
 - [Observability](docs/observability.md) — OTLP traces/metrics, structured log field canon, and transaction-lifecycle logging
 - [Teranode Documentation](https://docs.bsvblockchain.org/)
