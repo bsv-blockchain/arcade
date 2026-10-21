@@ -28,6 +28,11 @@ Consumer-group base name comes from `kafka.consumer_group` in config (default
 `bsv-broadcaster`). Service-specific suffixes (`-propagation`, `-bump-builder`) are
 applied automatically — operators only configure the base name.
 
+Topic names are `<kafka.topic_prefix>.<name>` (default prefix
+`bsv-broadcaster`). Deployments that predate the BSV Broadcaster rebrand set
+`kafka.topic_prefix: arcade` to keep their existing `arcade.*` topics; see
+[the migration guide](migration-arcade-to-bsv-broadcaster.md).
+
 ## Partition counts
 
 ### `bsv-broadcaster.propagation` — at least `propagation.partitions`

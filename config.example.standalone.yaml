@@ -59,6 +59,9 @@ health:
 kafka:
   backend: memory
   consumer_group: bsv-broadcaster
+  # Every topic is named "<topic_prefix>.<name>". Deployments that predate the
+  # BSV Broadcaster rebrand set topic_prefix (and consumer_group) to "arcade".
+  # topic_prefix: bsv-broadcaster
   max_retries: 5
   buffer_size: 10000
 

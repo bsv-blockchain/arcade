@@ -80,3 +80,10 @@ Then:
 Moving to the new topic names, consumer group or database names is optional.
 It needs a planned data migration (drain and recreate topics, or copy the
 database), and you can do it at any later point by removing the pins.
+
+## Local compose stack
+
+`docker-compose.yaml` now initializes Postgres as user/database
+`bsv_broadcaster`. A Postgres volume created by the old stack was initialized
+as `arcade`, so the services fail to authenticate. Remove the old volume
+before `make docker-up`. The local stack holds no data worth keeping.
