@@ -30,9 +30,9 @@ import (
 // coinbase placeholder = 8 subtree leaves each); C is a coinbase-only
 // block on top of A that resolves the competition in A's favor.
 type reorgStack struct {
-	h             *harness.Harness
-	rt            *harness.BroadcasterRuntime
-	msDatahub     *harness.Datahub
+	h                  *harness.Harness
+	rt                 *harness.BroadcasterRuntime
+	msDatahub          *harness.Datahub
 	broadcasterDatahub *harness.Datahub
 
 	shared, aOnly, bOnly []string
