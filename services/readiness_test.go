@@ -193,7 +193,10 @@ func TestReadinessGate_FailedStartupStaysNotReady(t *testing.T) {
 	cancel()
 	for range 2 {
 		select {
-		case <-errCh:
+		case err := <-errCh:
+			if err != nil && !errors.Is(err, bad.fail) {
+				t.Fatalf("Start: %v", err)
+			}
 		case <-time.After(2 * time.Second):
 			t.Fatal("Start did not return after cancel")
 		}

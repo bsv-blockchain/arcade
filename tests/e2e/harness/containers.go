@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -100,7 +101,8 @@ type Containers struct {
 	// over GatewayIP: on current rootless podman (pasta) the bridge
 	// gateway no longer maps to the host at all — connections are
 	// refused — while the podman-injected host.containers.internal alias
-	// maps correctly. On Docker this is the GatewayIP recipe as before.
+	// maps correctly. On Docker on Linux this is the GatewayIP recipe as
+	// before; on Docker Desktop it is host.docker.internal.
 	HostFromContainer string
 }
 
@@ -109,11 +111,17 @@ type Containers struct {
 // every container's /etc/hosts and maps it through pasta to the host;
 // the bridge-network gateway IP stopped being host-mapped in podman ≥5.8
 // (dials are refused), so the alias is the only reliable route. Docker
-// keeps the gateway recipe (host.docker.internal:host-gateway resolves
-// to it and routes to the host).
+// on Linux keeps the gateway recipe (host.docker.internal:host-gateway
+// resolves to it and routes to the host). Docker Desktop on macOS and
+// Windows runs containers in a VM whose bridge gateway is the VM's, not
+// the test host's (dials are refused there too); its built-in
+// host.docker.internal is what routes to the host.
 func hostFromContainerAddr(gatewayIP string) string {
 	if isPodmanRuntime() {
 		return "host.containers.internal"
+	}
+	if runtime.GOOS != "linux" {
+		return "host.docker.internal"
 	}
 	if gatewayIP != "" {
 		return gatewayIP

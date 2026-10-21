@@ -43,7 +43,10 @@ func TestPropagator_StartSignalsReadyAfterConsumer(t *testing.T) {
 		t.Fatalf("Stop: %v", err)
 	}
 	select {
-	case <-errCh:
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Start did not return")
 	}

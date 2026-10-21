@@ -690,7 +690,10 @@ func TestStartDecouplesSlowDelivery(t *testing.T) {
 	// Cleanly stop the service.
 	cancel()
 	select {
-	case <-startErr:
+	case err := <-startErr:
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Start did not return after ctx cancel")
 	}

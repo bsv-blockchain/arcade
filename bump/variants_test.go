@@ -86,7 +86,8 @@ func TestBuildCompoundBUMP_IdenticalVariantsAreOneSTUMP(t *testing.T) {
 	allLeaves, subtreeHashes, blockRoot := multiSubtreeTestSetup(2, 4)
 	data := buildSTUMP(allLeaves[1], 3, 990000)
 	single, singleTxIDs, err := BuildCompoundBUMP(
-		[]*models.Stump{{BlockHash: "b", SubtreeIndex: 1, StumpData: data}}, subtreeHashes, nil, &blockRoot)
+		[]*models.Stump{{BlockHash: "b", SubtreeIndex: 1, StumpData: data}}, subtreeHashes, nil, &blockRoot,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
