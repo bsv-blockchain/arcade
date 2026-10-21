@@ -1,6 +1,6 @@
 // Package watchdog hosts the block-processing watchdog that compensates
 // for missed BLOCK_PROCESSED deliveries from merkle-service. It runs as a
-// standalone arcade service (mode=watchdog) or alongside other services
+// standalone BSV Broadcaster service (mode=watchdog) or alongside other services
 // when mode=all.
 //
 // Design overview: every interval, the watchdog queries the shared

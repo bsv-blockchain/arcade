@@ -2,7 +2,7 @@
 
 ## Why
 
-The public `/health` endpoint reported `http://asset:8090/api/v1` — a peer's cluster-internal service name, unreachable from arcade — as a healthy discovered DataHub URL. Two gaps compounded: (1) discovery validation was purely syntactic, so any non-IP-literal hostname was accepted without checking that it resolves or where it resolves to, and the URL then persisted forever in the shared registry (no eviction); (2) per-endpoint circuit-breaker state only ever changed in the propagation pod, because the recovery probe targeted already-unhealthy endpoints and only broadcast outcomes recorded failures — so in the api-server pod (which serves `/health`) every endpoint stayed `healthy: true` forever. merkle-service fixed the same announcement-validation bug class in its PR #181; this change mirrors that pattern.
+The public `/health` endpoint reported `http://asset:8090/api/v1` — a peer's cluster-internal service name, unreachable from BSV Broadcaster — as a healthy discovered DataHub URL. Two gaps compounded: (1) discovery validation was purely syntactic, so any non-IP-literal hostname was accepted without checking that it resolves or where it resolves to, and the URL then persisted forever in the shared registry (no eviction); (2) per-endpoint circuit-breaker state only ever changed in the propagation pod, because the recovery probe targeted already-unhealthy endpoints and only broadcast outcomes recorded failures — so in the api-server pod (which serves `/health`) every endpoint stayed `healthy: true` forever. merkle-service fixed the same announcement-validation bug class in its PR #181; this change mirrors that pattern.
 
 ## What Changes
 

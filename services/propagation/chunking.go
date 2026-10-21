@@ -35,7 +35,7 @@ func planChunks(rawTxs [][]byte, maxCount, maxBytes int) []chunkSpan {
 
 // spanFull reports whether adding one more transaction of `next` bytes to a
 // span already holding `count` transactions and `bytes` bytes would breach
-// either cap. Both comparisons are inclusive on arcade's side; the margin
+// either cap. Both comparisons are inclusive on BSV Broadcaster's side; the margin
 // under Teranode's strict "<" limits lives in the shipped defaults
 // (config.DefaultTeranodeMaxBatchSize / DefaultTeranodeMaxBatchBytes).
 func spanFull(count, bytes, next, maxCount, maxBytes int) bool {

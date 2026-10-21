@@ -19,10 +19,10 @@ import (
 )
 
 // TestSmoke_ChainedTxBatchOrdering is the load-bearing smoke test for
-// arcade's propagation dispatcher's parent-child ordering guarantee.
+// BSV Broadcaster's propagation dispatcher's parent-child ordering guarantee.
 //
 // It builds a forest of ~10k chained txs (mixed depths 2–10), submits
-// them via concurrent POST /txs calls, then captures every batch arcade
+// them via concurrent POST /txs calls, then captures every batch BSV Broadcaster
 // sends to a fake teranode and asserts:
 //
 //  1. No batch ever contains both a parent and one of its children.
@@ -171,9 +171,9 @@ func buildSubmissionBatches(chains [][]*bt.Tx, batchSize int) [][]*bt.Tx {
 	return batches
 }
 
-// postTxs POSTs a batch to arcade's /txs endpoint and returns nil on a
+// postTxs POSTs a batch to BSV Broadcaster's /txs endpoint and returns nil on a
 // 2xx response. The body is concatenated raw tx bytes in BSV Extended
-// Format — arcade's validator (post PR #171) calls spv.Verify
+// Format — BSV Broadcaster's validator (post PR #171) calls spv.Verify
 // unconditionally, which needs each input's PreviousTxScript +
 // PreviousTxSatoshis. Those bins live on the wire only in EF; sending
 // standard-format bytes is rejected with "'PreviousTx' not supplied".

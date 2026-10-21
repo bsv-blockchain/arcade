@@ -6,7 +6,7 @@ Live measurements from a sustained 100 TPS broadcast against teratestnet, captur
 
 **RECEIVED → ACCEPTED_BY_NETWORK mean latency: 11.8 s → 1.44 s (−88 %).**
 
-The bsv-broadcaster-controllable portion of the transaction lifecycle is now a small fraction of end-to-end user-visible time. Remaining latency is dominated by merkle-service callback delivery and second-node network gossip — both outside arcade.
+The bsv-broadcaster-controllable portion of the transaction lifecycle is now a small fraction of end-to-end user-visible time. Remaining latency is dominated by merkle-service callback delivery and second-node network gossip — both outside BSV Broadcaster.
 
 ## RECEIVED → ACCEPTED_BY_NETWORK over the session
 
@@ -26,12 +26,12 @@ Each row is the live mean after that stage of work shipped. Bars are scaled to t
 sequenceDiagram
     autonumber
     participant C as Client
-    participant A as Arcade /tx
+    participant A as BSV Broadcaster /tx
     participant K as Kafka (propagation)
     participant P as Propagator
     participant M as merkle-service
     participant T as Teranode datahubs
-    participant CB as Arcade /callback
+    participant CB as BSV Broadcaster /callback
     participant BB as Bump-builder
     participant S as Pebble store
 
@@ -39,7 +39,7 @@ sequenceDiagram
     A->>S: write RECEIVED
     A->>K: enqueue
     A-->>C: 200 OK
-    Note over P: RECEIVED → ACCEPTED_BY_NETWORK (~1.44 s — arcade)
+    Note over P: RECEIVED → ACCEPTED_BY_NETWORK (~1.44 s — BSV Broadcaster)
     K->>P: drain batch (avg 95 tx)
     P->>M: POST /watch × N (concurrency 50)
     P->>T: POST /txs in 4 parallel chunks of 25
@@ -59,14 +59,14 @@ sequenceDiagram
 
 ## Per-stage breakdown
 
-| Stage | Mean | BSV-Broadcaster-controllable? | Why this number |
+| Stage | Mean | Controllable by BSV Broadcaster? | Why this number |
 |---|---|---|---|
 | RECEIVED → ACCEPTED_BY_NETWORK | **1.44 s** | yes | batch-fill + merkle `/watch` + teranode broadcast |
 | ACCEPTED_BY_NETWORK → SEEN_ON_NETWORK | 4.77 s | no | merkle-service must observe the tx on the network and deliver a callback |
 | SEEN_ON_NETWORK → SEEN_MULTIPLE_NODES | 6.83 s | no | a second independent miner needs to gossip-receive the tx |
 | SEEN_MULTIPLE_NODES → MINED | ~55 s | no | block arrival time + 30 s configured BUMP grace window |
 
-Only the **first row** is shaped by arcade code. The rest are physics — network latency, third-party callback turnaround, and BSV block intervals.
+Only the **first row** is shaped by BSV Broadcaster code. The rest are physics — network latency, third-party callback turnaround, and BSV block intervals.
 
 ## Where the 1.44 s bsv-broadcaster-side latency goes
 
@@ -128,7 +128,7 @@ Five distinct ships, in order:
 | Prefiltered at handler (`callback_stale_total`) | 0 | 92,206 | new signal |
 | Useful (applied) callback transitions | 12,493 | 12,493 | unchanged |
 
-Merkle-service still re-fires SEEN_ON_NETWORK callbacks for txs that already moved past it (~91 % of inbound callback rows are stale). Arcade now filters those out in-memory, in O(1), before issuing the store batch — keeping the hot path uncontended.
+Merkle-service still re-fires SEEN_ON_NETWORK callbacks for txs that already moved past it (~91 % of inbound callback rows are stale). BSV Broadcaster now filters those out in-memory, in O(1), before issuing the store batch — keeping the hot path uncontended.
 
 ## What's left
 
@@ -138,4 +138,4 @@ The remaining 1.44 s breaks roughly into:
 - **~0.91 s teranode broadcast floor** — fastest-endpoint round-trip for a 25-tx chunk. Going smaller is unlikely to help: HTTP overhead per chunk would dominate. This is the network + teranode `/txs` validation floor and is not bsv-broadcaster-bound.
 - **~0.43 s merkle register** — bounded by per-call latency × per-worker queue depth. Could be lowered further with a batched `/watch` endpoint on merkle-service (out of scope here — tracked separately).
 
-The remaining ACCEPTED → SEEN_ON_NETWORK (4.77 s) and SEEN_ON_NETWORK → SEEN_MULTIPLE_NODES (6.83 s) gaps are network and merkle-service-side. They are not arcade work.
+The remaining ACCEPTED → SEEN_ON_NETWORK (4.77 s) and SEEN_ON_NETWORK → SEEN_MULTIPLE_NODES (6.83 s) gaps are network and merkle-service-side. They are not BSV Broadcaster work.

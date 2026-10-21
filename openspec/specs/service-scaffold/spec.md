@@ -15,7 +15,7 @@ All services SHALL implement a common `Service` interface with `Start(ctx contex
 - **THEN** each running service's `Stop()` method SHALL be called, allowing in-flight operations to complete before exiting
 
 ### Requirement: All-in-one deployment mode
-The single `arcade` binary SHALL support running all services in one process, configured via environment variables or config file.
+The single `bsv-broadcaster` binary SHALL support running all services in one process, configured via environment variables or config file.
 
 #### Scenario: Run all services
 - **WHEN** the binary is started with `--mode=all` or `BSV_BROADCASTER_MODE=all`
@@ -63,5 +63,5 @@ The project SHALL be organized as a single Go module with `cmd/bsv-broadcaster/m
 
 #### Scenario: Build single binary
 - **WHEN** `go build ./cmd/bsv-broadcaster` is executed
-- **THEN** a single `arcade` binary SHALL be produced containing all service implementations
+- **THEN** a single `bsv-broadcaster` binary SHALL be produced containing all service implementations
 

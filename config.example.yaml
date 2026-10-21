@@ -1,4 +1,4 @@
-# Arcade configuration
+# BSV Broadcaster configuration
 # Copy to config.yaml and adjust for your environment.
 # All values can be overridden with BSV_BROADCASTER_ prefixed env vars
 # (e.g. BSV_BROADCASTER_LOG_LEVEL, BSV_BROADCASTER_KAFKA_BROKERS).
@@ -8,7 +8,7 @@ mode: all
 
 log_level: info
 
-# Bitcoin network everything in arcade attaches to. One of:
+# Bitcoin network everything in BSV Broadcaster attaches to. One of:
 #   mainnet      — production Bitcoin SV
 #   testnet      — public testnet
 #   teratestnet  — teranode scaling testnet
@@ -22,7 +22,7 @@ network: mainnet
 # callback_url: "https://example.com/callback"
 # Bearer token the Merkle Service must present in the Authorization header on
 # every POST /api/v1/merkle-service/callback. REQUIRED when merkle_service.url
-# is set: arcade refuses to start otherwise, since an unset token would let any
+# is set: BSV Broadcaster refuses to start otherwise, since an unset token would let any
 # unauthenticated caller submit forged status updates for any txid. Generate a
 # high-entropy random value (e.g. `openssl rand -hex 32`) and configure the
 # matching token on the Merkle Service. See issue #76 / finding F-018.
@@ -32,10 +32,10 @@ api:
   host: 0.0.0.0
   port: 8080
 
-# Arcade does not create Kafka topics; the broker must already have them
+# BSV Broadcaster does not create Kafka topics; the broker must already have them
 # (auto-create on first publish is typically disabled in production, and
 # bsv-broadcaster.propagation must exist with at least propagation.partitions
-# partitions — arcade fails closed at startup otherwise). See
+# partitions — BSV Broadcaster fails closed at startup otherwise). See
 # docs/production-kafka.md for the full topic list, partition guidance,
 # and ready-to-paste rpk / kafka-topics.sh commands.
 kafka:
@@ -46,7 +46,7 @@ kafka:
   buffer_size: 10000
   # Minimum partitions required on hot-path topics (transaction, propagation).
   # Set to the replica count of the largest horizontally-scaled consumer when
-  # running in Kubernetes so arcade fails fast on misconfigured topics. Leave
+  # running in Kubernetes so BSV Broadcaster fails fast on misconfigured topics. Leave
   # at 0 for standalone / single-replica deployments.
   # min_partitions: 0
 
@@ -57,7 +57,7 @@ store:
   backend: aerospike
   # Alternative: external PostgreSQL. Only read when backend: postgres.
   # postgres:
-  #   dsn: postgres://user:pass@host:5432/arcade
+  #   dsn: postgres://user:pass@host:5432/BSV Broadcaster
   #   max_conns: 16
   #   # Ceiling for the boot-time schema apply when it actually has to run
   #   # (fresh database or schema change). Restarts with a current schema
@@ -71,10 +71,10 @@ store:
   # still-anchored-to-this-block, manifest-versus-file) are read-then-write,
   # so a readPreference of secondary/secondaryPreferred in the URI can let
   # them pass on stale data — losing status transitions and deleting blobs
-  # under concurrency. Arcade warns at startup if the URI asks for one.
+  # under concurrency. BSV Broadcaster warns at startup if the URI asks for one.
   # mongodb:
   #   uri: mongodb://localhost:27017
-  #   database: arcade
+  #   database: bsv_broadcaster
   #   # Connect + server-selection deadline for the initial handshake.
   #   connect_timeout_ms: 10000
   #   # Deadline for single-document reads/writes and counts.
@@ -95,7 +95,7 @@ store:
     # One or more seed hosts. Port is optional and defaults to 3000.
     hosts:
       - localhost:3000
-    # Aerospike namespace arcade writes into. Must exist on the cluster with
+    # Aerospike namespace BSV Broadcaster writes into. Must exist on the cluster with
     # enough storage for arcade_transactions, arcade_bumps, arcade_stumps,
     # arcade_submissions, arcade_leases, and arcade_datahub_endpoints sets.
     namespace: bsv_broadcaster
@@ -123,7 +123,7 @@ teranode:
 merkle_service:
   # Merkle Service base URL(s). Leaving both `url` and `urls` empty disables
   # the Merkle integration (standalone profiles). When at least one endpoint
-  # is set, the top-level `callback_token` becomes REQUIRED — arcade fails to
+  # is set, the top-level `callback_token` becomes REQUIRED — BSV Broadcaster fails to
   # start otherwise so that the inbound callback endpoint never runs
   # unauthenticated. See issue #76 / finding F-018.
   #
@@ -149,7 +149,7 @@ merkle_service:
 
 p2p:
   seeds: []
-  # Peer discovery via go-teranode-p2p-client. When enabled, arcade subscribes
+  # Peer discovery via go-teranode-p2p-client. When enabled, BSV Broadcaster subscribes
   # to the canonical node_status topic (e.g. teranode/bitcoin/1.0.0/mainnet-node_status)
   # and appends each peer's advertised datahub URL to the propagation endpoint
   # list. Statically configured `datahub_urls` remain first in the list;
@@ -189,7 +189,7 @@ health:
 #   endpoint: ""                # host:port of the OTLP collector; see env fallback above
 #   protocol: grpc              # "grpc" (default, port 4317) or "http" (port 4318)
 #   insecure: false             # skip TLS; typically true for an in-cluster/local collector
-#   service_name: arcade
+#   service_name: bsv-broadcaster
 #   namespace: ""                # service.namespace resource attribute (e.g. downstream solution name)
 #   traces: true
 #   metrics: true
@@ -202,7 +202,7 @@ health:
 # intake enforces and what /policy advertises.
 # validator:
 #   # min_fee_per_kb is the intake fee floor in satoshis/kB. Default 0 means
-#   # "not operator-configured": arcade then dynamically tracks the lowest fee
+#   # "not operator-configured": BSV Broadcaster then dynamically tracks the lowest fee
 #   # the network will accept — the minimum advertised across peer node_status
 #   # announcements — and BOTH enforces it at intake and advertises it via
 #   # GET /policy (issue #212). Until a peer is heard it uses the built-in
@@ -221,7 +221,7 @@ health:
 #   # configured to accept zero-fee txs. Leave false on mainnet and testnet.
 #   # accept_zero_fee: false
 #   # GET /policy size limits, in bytes. Default 0 means "not
-#   # operator-configured", exactly as for min_fee_per_kb: arcade then tracks
+#   # operator-configured", exactly as for min_fee_per_kb: BSV Broadcaster then tracks
 #   # the LARGEST limit any peer advertises in its node_status fee_policy, so a
 #   # transaction is rejected at intake only when no node on the network would
 #   # accept it. Observation can only widen the limit from the built-in default
@@ -284,7 +284,7 @@ health:
 #   subscriber_buffer: 4096
 
 # propagation:
-#   # Number of partitions arcade requires on bsv-broadcaster.propagation, and the
+#   # Number of partitions BSV Broadcaster requires on bsv-broadcaster.propagation, and the
 #   # number of propagation replicas that can do work (one dep-aware
 #   # dispatcher per partition claim; extra replicas idle as standbys).
 #   # Checked fail-closed at startup: a topic with FEWER partitions than this
@@ -408,7 +408,7 @@ bump_builder:
   #   # un-mining them. true restores the pre-#282 revert-all-to-SEEN fallback.
   #   revert_when_unreconcilable: false
 
-# Shared on-disk root for arcade state. Chaintracks headers default to
+# Shared on-disk root for BSV Broadcaster state. Chaintracks headers default to
 # <storage_path>/chaintracks/.
 # storage_path: "~/.bsv-broadcaster"
 
@@ -437,7 +437,7 @@ chaintracks_server:
 # subscription. In a microservice deployment every OTHER consumer pod
 # (bump-builder) should run mode="remote" with url pointed at the chaintracks
 # pod's HTTP endpoint — otherwise each pod spins up its own embedded
-# ChainManager and hits the upstream node N times. arcade additionally skips
+# ChainManager and hits the upstream node N times. BSV Broadcaster additionally skips
 # the chaintracks library entirely in modes that don't read from it
 # (api-server, sse, propagation, p2p-client, watchdog), so those pods need no
 # chaintracks config at all.

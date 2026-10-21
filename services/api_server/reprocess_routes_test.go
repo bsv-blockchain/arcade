@@ -23,7 +23,7 @@ type reprocessHarness struct {
 	router *gin.Engine
 	stub   *httptest.Server
 	// requests is populated on every hit to the stub so tests can verify
-	// what arcade actually forwarded.
+	// what BSV Broadcaster actually forwarded.
 	requests []recordedReprocess
 }
 

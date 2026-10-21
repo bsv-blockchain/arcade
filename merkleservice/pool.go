@@ -993,7 +993,7 @@ func (p *Pool) catchupBatch(ctx context.Context, ep *endpoint, batch []Registrat
 	if r.auth > 0 {
 		// 401/403 do not count toward the breaker, so this log is the only
 		// signal besides the gauge. They are kept: a token fixed on the
-		// merkle-service side should not need an arcade restart.
+		// merkle-service side should not need a BSV Broadcaster restart.
 		p.logger.Warn(
 			"merkle-service endpoint rejected the auth token on catch-up; check merkle_service.auth_token",
 			zap.String("endpoint", ep.url),

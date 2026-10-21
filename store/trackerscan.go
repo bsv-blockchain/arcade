@@ -53,7 +53,7 @@ var trackerStatusSet = func() map[models.Status]struct{} {
 // or a downgrade from a future version) is NOT in this set and is therefore
 // dropped. The pre-#276 filter kept such rows, because !IsTerminal() is true
 // for any unrecognized string. This is a deliberate change: the positive
-// status filter is what makes the query selective, and a status arcade does
+// status filter is what makes the query selective, and a status BSV Broadcaster does
 // not know cannot participate in the lattice prefilter anyway — the store
 // remains authoritative for anything the tracker doesn't know about.
 func TrackerStatuses() []models.Status {

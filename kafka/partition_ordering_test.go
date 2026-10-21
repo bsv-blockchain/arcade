@@ -177,6 +177,6 @@ func TestNewSyncProducerConfig_RoutesByKeyHash(t *testing.T) {
 	}
 	if a != b {
 		t.Fatalf("partitioner is not deterministic across instances: %d vs %d — "+
-			"two arcade pods would place the same family on different partitions", a, b)
+			"two BSV Broadcaster pods would place the same family on different partitions", a, b)
 	}
 }

@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🕹&nbsp;&nbsp;arcade
+# 📡&nbsp;&nbsp;BSV Broadcaster
 
 **A P2P-first Bitcoin transaction broadcast client for Teranode with Arc-compatible API**
 
@@ -118,7 +118,7 @@
 
 ## 📦 Installation
 
-**arcade** requires a [supported release of Go](https://golang.org/doc/devel/release.html#policy).
+**BSV Broadcaster** requires a [supported release of Go](https://golang.org/doc/devel/release.html#policy).
 ```shell script
 go get -u github.com/bsv-blockchain/bsv-broadcaster
 ```
@@ -139,8 +139,8 @@ go get -u github.com/bsv-blockchain/bsv-broadcaster
 
 ```bash
 git clone https://github.com/bsv-blockchain/bsv-broadcaster.git
-cd arcade
-go build -o arcade cmd/bsv-broadcaster/main.go
+cd BSV Broadcaster
+go build -o BSV Broadcaster cmd/bsv-broadcaster/main.go
 ```
 
 ### Configuration
@@ -157,7 +157,7 @@ callback_url: "https://myhostname.com"
 
 kafka:
   backend: memory
-  consumer_group: arcade
+  consumer_group: bsv-broadcaster
 
 store:
   backend: pebble
@@ -184,7 +184,7 @@ See `config.example.yaml` for all available options.
 ### Run
 
 ```bash
-arcade --config config.yaml
+bsv-broadcaster --config config.yaml
 ```
 
 You should see output indicating the server is running on port 8080.
@@ -195,14 +195,14 @@ You should see output indicating the server is running on port 8080.
 
 ### Overview
 
-Arcade is a lightweight transaction broadcast service that:
+BSV Broadcaster is a lightweight transaction broadcast service that:
 - Registers transactions with Merkle Service
 - Provides Arc-compatible HTTP API for easy migration
 - Supports pluggable storage and event backends (in-memory)
 - Tracks transaction status through the complete lifecycle
 - Delivers notifications via webhooks and Server-Sent Events (SSE)
 
-**What is [Teranode](https://bsv-blockchain.github.io/teranode/topics/teranodeIntro/)?** Teranode is the next-generation BSV node implementation designed for enterprise-scale transaction processing. Arcade acts as a bridge between your application and the Teranode network, handling transaction submission and status tracking.
+**What is [Teranode](https://bsv-blockchain.github.io/teranode/topics/teranodeIntro/)?** Teranode is the next-generation BSV node implementation designed for enterprise-scale transaction processing. BSV Broadcaster acts as a bridge between your application and the Teranode network, handling transaction submission and status tracking.
 
 <br>
 
@@ -251,7 +251,7 @@ Interactive API documentation (Scalar UI) available at `http://localhost:3011/do
 ### Transaction Status Flow
 
 ```
-Client → Arcade
+Client → BSV Broadcaster
    ↓
 RECEIVED (validated locally)
    ↓
@@ -291,7 +291,7 @@ DOUBLE_SPEND_ATTEMPTED (from rejected-tx gossip with specific reason)
 | Field                       | Description                                  | Default               |
 |-----------------------------|----------------------------------------------|-----------------------|
 | `mode`                      | Operating mode: `embedded`, `remote`         | `embedded`            |
-| `url`                       | Arcade server URL (required for remote mode) | -                     |
+| `url`                       | BSV Broadcaster server URL (required for remote mode) | -                     |
 | `network`                   | Bitcoin network: `main`, `test`, `stn`       | `main`                |
 | `storage_path`              | Data directory for persistent files          | `~/.bsv-broadcaster`           |
 | `log_level`                 | Log level: `debug`, `info`, `warn`, `error`  | `info`                |
@@ -300,7 +300,7 @@ DOUBLE_SPEND_ATTEMPTED (from rejected-tx gossip with specific reason)
 | `server.write_timeout`      | HTTP write timeout                           | `30s`                 |
 | `server.shutdown_timeout`   | Graceful shutdown timeout                    | `10s`                 |
 | `database.type`             | Storage backend: `sqlite`                    | `sqlite`              |
-| `database.sqlite_path`      | SQLite database file path                    | `~/.bsv-broadcaster/arcade.db` |
+| `database.sqlite_path`      | SQLite database file path                    | `~/.bsv-broadcaster/bsv-broadcaster.db` |
 | `events.type`               | Event backend: `memory`                      | `memory`              |
 | `events.buffer_size`        | Event channel buffer size                    | `1000`                |
 | `teranode.datahub_urls`     | DataHub URLs for fetching block data (array) | -                     |
@@ -323,7 +323,7 @@ DOUBLE_SPEND_ATTEMPTED (from rejected-tx gossip with specific reason)
 <details>
 <summary><strong>HTTP Headers</strong></summary>
 
-Arcade supports Arc-compatible headers:
+BSV Broadcaster supports Arc-compatible headers:
 
 - `X-CallbackUrl` - Webhook URL for async status updates
 - `X-CallbackToken` - Token for webhook auth and SSE stream filtering
@@ -336,7 +336,7 @@ Arcade supports Arc-compatible headers:
 <details>
 <summary><strong>Webhook Notifications</strong></summary>
 
-When you provide `X-CallbackUrl`, Arcade will POST status updates:
+When you provide `X-CallbackUrl`, BSV Broadcaster will POST status updates:
 
 ```json
 {
@@ -366,7 +366,7 @@ When you provide `X-CallbackUrl`, Arcade will POST status updates:
 <details>
 <summary><strong>SSE Streaming</strong></summary>
 
-Arcade provides real-time transaction status updates via SSE, offering an alternative to webhook callbacks.
+BSV Broadcaster provides real-time transaction status updates via SSE, offering an alternative to webhook callbacks.
 
 #### How It Works
 
@@ -397,7 +397,7 @@ Arcade provides real-time transaction status updates via SSE, offering an altern
 
 #### Catchup on Reconnect
 
-When the SSE connection drops, the browser's EventSource automatically reconnects and sends the `Last-Event-ID` header. Arcade replays all missed events since that timestamp.
+When the SSE connection drops, the browser's EventSource automatically reconnects and sends the `Last-Event-ID` header. BSV Broadcaster replays all missed events since that timestamp.
 
 **No client code needed** - this is handled automatically by the EventSource API.
 
@@ -428,7 +428,7 @@ See [examples/sse_client.html](examples/sse_client.html) and [examples/sse_clien
 <details>
 <summary><strong>Remote Client</strong></summary>
 
-For applications that need Arcade functionality without running a full server, use the REST client:
+For applications that need BSV Broadcaster functionality without running a full server, use the REST client:
 
 ```go
 import "github.com/bsv-blockchain/bsv-broadcaster/client"
@@ -458,7 +458,7 @@ for status := range statusChan {
 </details>
 
 <details>
-<summary><strong>Extending Arcade</strong></summary>
+<summary><strong>Extending BSV Broadcaster</strong></summary>
 
 All packages are public and designed for extension:
 
@@ -518,7 +518,7 @@ func (h *MyHandler) Start(ctx context.Context) error {
 
 ### Key Components
 
-- **Arcade** (`arcade.go`) - Core P2P listener that subscribes to block, subtree, and rejected-tx gossip topics
+- **P2P client** (`services/p2p_client/`) - Core P2P listener that subscribes to block, subtree, and rejected-tx gossip topics
 - **Store** (`store/`) - SQLite storage for transaction statuses and webhook tracking
 - **TxTracker** (`store/tracker.go`) - In-memory index of transactions being monitored
 - **Event Publisher** (`events/`) - In-memory pub/sub for distributing status updates
@@ -527,7 +527,7 @@ func (h *MyHandler) Start(ctx context.Context) error {
 
 ### Chain Tracking
 
-Arcade uses [go-chaintracks](https://github.com/bsv-blockchain/go-chaintracks) for blockchain header tracking and merkle proof validation. Headers are loaded from embedded checkpoint files on startup and updated via P2P block announcements.
+BSV Broadcaster uses [go-chaintracks](https://github.com/bsv-blockchain/go-chaintracks) for blockchain header tracking and merkle proof validation. Headers are loaded from embedded checkpoint files on startup and updated via P2P block announcements.
 
 For detailed architecture documentation, see [doc.md](doc.md).
 

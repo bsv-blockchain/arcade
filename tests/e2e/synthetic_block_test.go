@@ -16,8 +16,8 @@ import (
 // end: a fully fabricated single-subtree block (teranode composition
 // rules: coinbase placeholder at subtree leaf 0, coinbase-corrected
 // header root, regtest-target nonce) is accepted by merkle-service,
-// drives arcade's watched txs to MINED with verifiable merkle paths,
-// and is tracked as the tip by arcade's embedded chaintracks.
+// drives BSV Broadcaster's watched txs to MINED with verifiable merkle paths,
+// and is tracked as the tip by BSV Broadcaster's embedded chaintracks.
 //
 // This is the go/no-go gate for the reorg scenarios in reorg_test.go,
 // which fabricate two competing synthetic blocks at the same height.
@@ -43,7 +43,7 @@ func TestSmoke_SyntheticBlockMined(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Minute)
 	defer cancel()
 
-	// 1. Broadcast 7 validatable txs through arcade → propagation
+	// 1. Broadcast 7 validatable txs through BSV Broadcaster → propagation
 	//    registers them with merkle-service via /watch.
 	txs := harness.BuildValidatableTxs(7, 1000)
 	txids := make([]string, 0, len(txs))
@@ -76,7 +76,7 @@ func TestSmoke_SyntheticBlockMined(t *testing.T) {
 	blk.Stage(broadcasterDatahub)
 	t.Logf("synthetic block %s (subtree %s, root %s)", blk.Hash, blk.SubtreeHash, blk.MerkleRoot)
 
-	// 3. Announce subtree then block; republish the block until arcade's
+	// 3. Announce subtree then block; republish the block until BSV Broadcaster's
 	//    embedded chaintracks reports it as tip (gossipsub mesh formation
 	//    can swallow early publishes; all consumers dedup by hash).
 	if err := h.LibP2P.PublishSubtree(ctx, teranode.SubtreeMessage{

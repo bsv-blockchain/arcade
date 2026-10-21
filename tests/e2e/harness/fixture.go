@@ -30,7 +30,7 @@ type RealBlockFixture struct {
 	BlockHash chainhash.Hash
 	// BlockBin is the binary served at /block/<hash>. Identical to
 	// teranode's served bytes — header + subtree-hash list +
-	// coinbase tx + height + coinbase BUMP, the format both arcade
+	// coinbase tx + height + coinbase BUMP, the format both BSV Broadcaster
 	// and merkle-service expect.
 	BlockBin []byte
 	// Subtrees lists every subtree in the block in declaration order.
@@ -54,7 +54,7 @@ type RealBlockFixture struct {
 	// merkle-service builds the BLOCK_PROCESSED enrichment (merkleRoot +
 	// coinbaseBump) from them — NOT from a datahub fetch. Tests must feed
 	// these into LibP2P.PublishBlock so merkle-service can emit the
-	// enrichment; otherwise arcade falls back to a datahub fetch (issue #195).
+	// enrichment; otherwise BSV Broadcaster falls back to a datahub fetch (issue #195).
 	HeaderHex   string
 	CoinbaseHex string
 }

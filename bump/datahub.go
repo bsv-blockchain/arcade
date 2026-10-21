@@ -42,7 +42,7 @@ const DefaultMaxBlockBytes int64 = 1 * 1024 * 1024 * 1024 // 1 GiB
 // maxErrorBodyBytes caps how much of a non-200 response body we read into the
 // returned error string. The HTTP status itself carries the diagnostic
 // signal — body is just for human debugging — so a small cap is fine and
-// stops a hostile server from inflating arcade's log lines.
+// stops a hostile server from inflating BSV Broadcaster's log lines.
 const maxErrorBodyBytes int64 = 512
 
 // maxSubtreeCount caps the number of subtree hashes parseBlockBinary will

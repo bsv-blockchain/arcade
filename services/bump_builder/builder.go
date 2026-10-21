@@ -89,7 +89,7 @@ type Builder struct {
 // refreshed from the shared store) used for block fetches.
 //
 // The block-processing watchdog lives in services/watchdog and runs as a
-// separate arcade service (mode=watchdog) — bump-builder is no longer
+// separate BSV Broadcaster service (mode=watchdog) — bump-builder is no longer
 // responsible for stale-block recovery.
 func New(
 	cfg *config.Config,
@@ -649,7 +649,7 @@ func (b *Builder) runStumpJanitor(ctx context.Context) {
 // it becomes a real issue.
 func (b *Builder) pruneOrphanStumps(ctx context.Context) {
 	// Use the watchdog's RecencyDepth as the scan horizon — anything older
-	// than (tip - RecencyDepth) is outside arcade's recovery window anyway.
+	// than (tip - RecencyDepth) is outside BSV Broadcaster's recovery window anyway.
 	// Default to 144 (~24h at 10min blocks) when watchdog is disabled.
 	rd := b.cfg.Watchdog.RecencyDepth
 	if rd <= 0 {
@@ -1179,7 +1179,7 @@ func leavesBeyondStoredBUMP(stumps []*models.Stump, storedTxIDs []string) ([]str
 		for _, leaf := range mp.Path[0] {
 			// Subtree 0 offset 0 is the coinbase slot: every STUMP carries
 			// the placeholder there while the stored compound carries the
-			// real coinbase txid, and arcade never tracks a coinbase. Counting
+			// real coinbase txid, and BSV Broadcaster never tracks a coinbase. Counting
 			// it would turn every identical redelivery into a rebuild.
 			if leaf.Hash == nil || (st.SubtreeIndex == 0 && leaf.Offset == 0) {
 				continue
@@ -1609,7 +1609,7 @@ func (b *Builder) shortCircuit(ctx context.Context, logger *zap.Logger, blockHas
 }
 
 // markBlockProcessed stamps processed_at on the block-processing row — the
-// signal that arcade considers the block fully finalized (all expected STUMPs
+// signal that BSV Broadcaster considers the block fully finalized (all expected STUMPs
 // present, BUMP built and validated, or a legitimate no-tracked-tx block). It
 // is the single chokepoint that moved out of the HTTP handler so that a block
 // stays recoverable (processed_at NULL) until finalization genuinely completes.
@@ -1663,7 +1663,7 @@ func (b *Builder) widenExpectedSubtrees(ctx context.Context, callback *models.Ca
 
 // missingStumpIndices returns the subtree indices merkle-service expected to
 // produce a STUMP for this block (callback.ExpectedSubtreeIndices) that are NOT
-// present among the STUMPs arcade actually stored, preserving the ascending
+// present among the STUMPs BSV Broadcaster actually stored, preserving the ascending
 // order merkle promises. An empty expected set — pre-#162 merkle, or a block
 // with no tracked txs — yields no missing indices, so the caller finalizes
 // normally. Comparison is by set membership, never count: a duplicate or extra

@@ -19,7 +19,7 @@ The propagation service SHALL consume validated transactions and broadcast them 
 - **THEN** the service SHALL log the rejection, retry with backoff, and after max retries route to a dead-letter topic
 
 ### Requirement: Register transaction with merkle-service
-Before broadcasting, the propagation service SHALL register the transaction with every configured merkle-service endpoint, providing the TXID and the arcade callback URL. A transaction counts as registered once at least one endpoint accepted it.
+Before broadcasting, the propagation service SHALL register the transaction with every configured merkle-service endpoint, providing the TXID and the BSV Broadcaster callback URL. A transaction counts as registered once at least one endpoint accepted it.
 
 #### Scenario: Successful registration
 - **WHEN** a transaction is ready for broadcast and at least one merkle-service endpoint accepts its `/watch`

@@ -1,13 +1,13 @@
 ## Context
 
-Arcade's propagation path broadcasts each accepted transaction to every URL returned by `teranode.Client.GetEndpoints()`. That list is frozen at `cmd/bsv-broadcaster/main.go` startup from `cfg.DatahubURLs`. When the teranode fleet rotates, operators manually edit config and restart.
+BSV Broadcaster's propagation path broadcasts each accepted transaction to every URL returned by `teranode.Client.GetEndpoints()`. That list is frozen at `cmd/bsv-broadcaster/main.go` startup from `cfg.DatahubURLs`. When the teranode fleet rotates, operators manually edit config and restart.
 
-Meanwhile, teranode nodes already publish a `NodeStatusMessage` JSON payload every ten seconds to the libp2p pubsub topic `teranode/bitcoin/1.0.0/{network}-node_status` (e.g., `teranode/bitcoin/1.0.0/mainnet-node_status`). That message carries `BaseURL` (the datahub HTTP endpoint) and an optional `PropagationURL` — exactly the URL arcade needs to broadcast to. Two existing references inform the implementation:
+Meanwhile, teranode nodes already publish a `NodeStatusMessage` JSON payload every ten seconds to the libp2p pubsub topic `teranode/bitcoin/1.0.0/{network}-node_status` (e.g., `teranode/bitcoin/1.0.0/mainnet-node_status`). That message carries `BaseURL` (the datahub HTTP endpoint) and an optional `PropagationURL` — exactly the URL BSV Broadcaster needs to broadcast to. Two existing references inform the implementation:
 
 - `/git/merkle-service/internal/p2p/client.go` — idiomatic libp2p client integration for this codebase family: Start/Stop lifecycle, goroutine-per-subscription, context-driven shutdown. Uses `go-teranode-p2p-client`.
 - Teranode's `services/p2p/message_types.go` — canonical `NodeStatusMessage` shape. JSON, no wrapper envelope, peer ID validated against libp2p transport-layer ID.
 
-Arcade already has a stub at `services/p2p_client/client.go` wired through `main.go` but with a `TODO` for the actual libp2p integration. This change replaces the stub with a real implementation.
+BSV Broadcaster already has a stub at `services/p2p_client/client.go` wired through `main.go` but with a `TODO` for the actual libp2p integration. This change replaces the stub with a real implementation.
 
 ## Goals / Non-Goals
 
@@ -45,7 +45,7 @@ cfg := p2pclient.Config{
     StoragePath: "<bsv-broadcaster-storage>/p2p",
     MsgBus:      msgbus.Config{Port, Logger, DHTMode, ...},
 }
-client, err := cfg.Initialize(ctx, "arcade")
+client, err := cfg.Initialize(ctx, "bsv-broadcaster")
 msgs := client.SubscribeNodeStatus(ctx)            // pre-decoded NodeStatusMessage
 for m := range msgs { handle(m) }
 ```
@@ -146,7 +146,7 @@ This means a single compromised peer could inject many URLs over time. In practi
 - **Peer gossiping a malicious URL** → Mitigation: URL validation rejects private/loopback addresses by default, and libp2p's peer scoring gates who can publish. Operators running sensitive deployments keep `datahub_discovery: false`.
 - **libp2p adds a large transitive dependency tree** (~20 MB of Go modules) → Mitigation: the dependency is always linked, but at runtime nothing libp2p runs until `datahub_discovery` is set. Deployments that don't need discovery pay binary-size cost only.
 - **Topic prefix mismatch silently yields no discovery** → Mitigation: log at startup `subscribed to topic {full topic name}` and a debug-level log on every received announcement, so operators can see messages flowing or spot the misconfig quickly.
-- **Bootstrap peer outage means zero discovery** → Mitigation: same fail-open behavior as today (arcade runs fine without discovery). Operators see warnings in logs, static `datahub_urls` keep working.
+- **Bootstrap peer outage means zero discovery** → Mitigation: same fail-open behavior as today (BSV Broadcaster runs fine without discovery). Operators see warnings in logs, static `datahub_urls` keep working.
 
 ## Migration Plan
 
@@ -158,4 +158,4 @@ This means a single compromised peer could inject many URLs over time. In practi
 ## Open Questions
 
 1. **Persist discovered URLs across restart?** Today each restart starts from the static seed list and rebuilds. We could checkpoint discovered URLs to disk for faster warmup. Probably not worth it — a 10-second tick from any live peer rebuilds the list quickly.
-2. **Should `PropagationURL` override `BaseURL` when both are present?** Teranode's convention is that `PropagationURL` is the tx-specific endpoint and `BaseURL` is the general datahub. Arcade uses the URL for tx propagation, so `PropagationURL` is the more correct choice when set. Current proposal: prefer `PropagationURL`, fall back to `BaseURL`. Confirm with a teranode operator before locking in.
+2. **Should `PropagationURL` override `BaseURL` when both are present?** Teranode's convention is that `PropagationURL` is the tx-specific endpoint and `BaseURL` is the general datahub. BSV Broadcaster uses the URL for tx propagation, so `PropagationURL` is the more correct choice when set. Current proposal: prefer `PropagationURL`, fall back to `BaseURL`. Confirm with a teranode operator before locking in.

@@ -122,7 +122,7 @@ func schemaCurrent(ctx context.Context, q rowQuerier) bool {
 //
 // The advisory lock, the apply transaction, and the unlock must all observe
 // the same server session — a transaction-pooling proxy (e.g. pgbouncer in
-// transaction mode) between arcade and Postgres would scatter them across
+// transaction mode) between BSV Broadcaster and Postgres would scatter them across
 // sessions and leak the lock; point the DSN at Postgres (or a session-mode
 // pooler) instead.
 func (s *Store) applySchemaSerialized(ctx context.Context) error {
@@ -178,7 +178,7 @@ func (s *Store) applySchemaSerialized(ctx context.Context) error {
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("timed out after %d attempts waiting for table locks (another session holds a conflicting lock on an arcade table): %w", attempt, ctx.Err())
+			return fmt.Errorf("timed out after %d attempts waiting for table locks (another session holds a conflicting lock on a BSV Broadcaster table): %w", attempt, ctx.Err())
 		case <-time.After(backoff):
 		}
 		backoff = min(backoff*2, schemaRetryBackoffMax)

@@ -1,9 +1,9 @@
 # Observability
 
-Arcade ships two independent, complementary observability surfaces:
+BSV Broadcaster ships two independent, complementary observability surfaces:
 
 1. **OpenTelemetry (OTLP) traces + metrics** — off by default, opt-in via
-   config/env. Push-based: arcade dials out to a collector, typically a
+   config/env. Push-based: BSV Broadcaster dials out to a collector, typically a
    node-local one reached over the Kubernetes downward API.
 2. **Structured JSON logs to stdout** — always on, unaffected by the
    telemetry flag. Every transaction-lifecycle transition is logged with a
@@ -24,7 +24,7 @@ lines, and some Coralogix search recipes.
 ## The OTLP pipeline
 
 ```
-arcade (traces + metrics, OTLP/gRPC or OTLP/HTTP)
+BSV Broadcaster (traces + metrics, OTLP/gRPC or OTLP/HTTP)
    │
    ▼
 node-local OTLP collector  (http://$(HOST_IP):4317, one per k8s node)
@@ -57,10 +57,10 @@ node-local OTLP collector  (http://$(HOST_IP):4317, one per k8s node)
   created through the OTEL metric API — the bridged `bsv_broadcaster_*` families are
   appended by the producer at collection time and never pass through view
   resolution, so their promauto bucket definitions stay authoritative.
-- Arcade never talks to Coralogix directly. It only ever dials the
+- BSV Broadcaster never talks to Coralogix directly. It only ever dials the
   collector endpoint in `telemetry.endpoint` / `OTEL_EXPORTER_OTLP_ENDPOINT`
   — how that collector gets data to Coralogix (or anywhere else) is outside
-  arcade's concern. In the reference deployment that collector is
+  BSV Broadcaster's concern. In the reference deployment that collector is
   node-local, reached via the pod's `HOST_IP` (Kubernetes downward API) on
   port 4317 (gRPC) — see `deploy/*.yaml` and the flux repo
   ([bsva-infra-flux#227](https://github.com/bsv-blockchain/bsva-infra-flux/pull/227))
@@ -77,16 +77,16 @@ redeploy of different code, and turning it back off is the kill switch.
 ### Config / env reference
 
 All keys live under `telemetry:` in `config.example.yaml` and follow
-arcade's standard `BSV_BROADCASTER_<SECTION>_<KEY>` env override convention
+BSV Broadcaster's standard `BSV_BROADCASTER_<SECTION>_<KEY>` env override convention
 (`viper.SetEnvPrefix("BSV_BROADCASTER")` + `.` → `_`).
 
 | Config key (`telemetry.*`) | Env override | Default | Notes |
 |---|---|---|---|
 | `enabled` | `BSV_BROADCASTER_TELEMETRY_ENABLED` | `false` | Master switch. `false` ⇒ no-op providers, no network I/O, nothing below applies. |
 | `endpoint` | `BSV_BROADCASTER_TELEMETRY_ENDPOINT` | `""` | `host:port` of the OTLP collector — **no scheme**. A `http://`/`https://` prefix is rejected by `config.validate()` for *both* `protocol` values (the HTTP exporter's `WithEndpoint` also wants bare `host:port`; scheme is controlled by `insecure`, not the URL). Left empty, falls back to the standard `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_{TRACES,METRICS}_ENDPOINT` env vars (resolved inside `telemetry.Init`, not `validate()`) — those *do* carry a scheme, per the OTEL env var spec. |
-| `protocol` | `BSV_BROADCASTER_TELEMETRY_PROTOCOL` | `grpc` | `grpc` (port 4317) or `http` (port 4318). Selects which exporter package arcade constructs (`otlptracegrpc`/`otlpmetricgrpc` vs `otlptracehttp`/`otlpmetrichttp`) — arcade does **not** read the generic `OTEL_EXPORTER_OTLP_PROTOCOL` env var; this config/env key is the only way to choose transport. |
+| `protocol` | `BSV_BROADCASTER_TELEMETRY_PROTOCOL` | `grpc` | `grpc` (port 4317) or `http` (port 4318). Selects which exporter package BSV Broadcaster constructs (`otlptracegrpc`/`otlpmetricgrpc` vs `otlptracehttp`/`otlpmetrichttp`) — BSV Broadcaster does **not** read the generic `OTEL_EXPORTER_OTLP_PROTOCOL` env var; this config/env key is the only way to choose transport. |
 | `insecure` | `BSV_BROADCASTER_TELEMETRY_INSECURE` | `false` | Skip TLS when dialing the collector (typical for an in-cluster/node-local collector). Applies whenever `insecure: true`, regardless of whether the endpoint came from `telemetry.endpoint` or an `OTEL_EXPORTER_OTLP_*_ENDPOINT` env var. |
-| `service_name` | `BSV_BROADCASTER_TELEMETRY_SERVICE_NAME` | `arcade` | `service.name` resource attribute. Overridden by `OTEL_SERVICE_NAME` if that env var is set (env wins — see Resource attributes below). |
+| `service_name` | `BSV_BROADCASTER_TELEMETRY_SERVICE_NAME` | `bsv-broadcaster` | `service.name` resource attribute. Overridden by `OTEL_SERVICE_NAME` if that env var is set (env wins — see Resource attributes below). |
 | `namespace` | `BSV_BROADCASTER_TELEMETRY_NAMESPACE` | `""` | `service.namespace` resource attribute (e.g. the downstream solution's name). Omitted from the resource entirely when empty. |
 | `traces` | `BSV_BROADCASTER_TELEMETRY_TRACES` | `true` | Enables the OTLP trace pipeline. Only consulted when `enabled: true`. |
 | `metrics` | `BSV_BROADCASTER_TELEMETRY_METRICS` | `true` | Enables the OTLP metric pipeline (Prometheus bridge). Only consulted when `enabled: true`. |
@@ -104,7 +104,7 @@ config above:
 | `OTEL_SERVICE_NAME` | Overrides `telemetry.service_name` in the merged resource. |
 | `OTEL_RESOURCE_ATTRIBUTES` | Comma-separated `key=value` pairs merged into the resource; wins over every config-derived attribute on key conflicts. |
 | `POD_NAME` | Set by the Kubernetes downward API (`fieldRef: metadata.name`). Preferred over `os.Hostname()` for the `service.instance.id` resource attribute — see `deploy/*.yaml`. |
-| `HOST_IP` | Not read by arcade itself; used in `deploy/*.yaml` to build `OTEL_EXPORTER_OTLP_ENDPOINT=http://$(HOST_IP):4317` pointing at the node-local collector. Must be defined before its `$(HOST_IP)` use in the same `env:` list. |
+| `HOST_IP` | Not read by BSV Broadcaster itself; used in `deploy/*.yaml` to build `OTEL_EXPORTER_OTLP_ENDPOINT=http://$(HOST_IP):4317` pointing at the node-local collector. Must be defined before its `$(HOST_IP)` use in the same `env:` list. |
 
 ### Resource attributes
 
@@ -112,7 +112,7 @@ Every signal (trace or metric) carries the same OTEL `Resource`:
 
 | Attribute | Source |
 |---|---|
-| `service.name` | `telemetry.service_name` (default `arcade`), overridden by `OTEL_SERVICE_NAME` |
+| `service.name` | `telemetry.service_name` (default `bsv-broadcaster`), overridden by `OTEL_SERVICE_NAME` |
 | `service.namespace` | `telemetry.namespace`, omitted when empty |
 | `service.version` | the build version (`version.Version`) |
 | `service.instance.id` | `POD_NAME` env, falling back to `os.Hostname()` |
@@ -157,7 +157,7 @@ zap fields from the `logfields` package (`logfields/logfields.go`) instead
 of ad-hoc `zap.String`/`zap.Int` calls. **This field set is shared with
 merkle-service**, so one Coralogix query (e.g. `txid:"<hex>"`) surfaces
 every log line touching that transaction across both services, not just
-arcade's.
+BSV Broadcaster's.
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -166,7 +166,7 @@ arcade's.
 | `txid_count` | int | True size of a txid batch — always the real total, even when `txids` on the same line is capped. |
 | `block_hash` | string | Block hash. |
 | `block_height` | uint64 | Block height. |
-| `subtree_hash` | string | Merkle subtree hash. Declared for parity with merkle-service's field canon; no arcade lifecycle line currently emits it (arcade's STUMP line logs `subtree_index`, not the hash). |
+| `subtree_hash` | string | Merkle subtree hash. Declared for parity with merkle-service's field canon; no BSV Broadcaster lifecycle line currently emits it (BSV Broadcaster's STUMP line logs `subtree_index`, not the hash). |
 | `callback_url` | string | Webhook/callback URL. |
 | `status` | string | Transaction status value (`RECEIVED`, `MINED`, ...). |
 | `stage` | string | Pipeline stage a rejection occurred at: `intake`, `network`, or `cascade`. |
@@ -254,7 +254,7 @@ field set is used by merkle-service:
   `txids:"<hex>"`, since chunked lines carry the array field). Returns
   RECEIVED → the merkle-registration Debug line (if Debug logging is on) →
   ACCEPTED_BY_NETWORK → SEEN_ON_NETWORK / SEEN_MULTIPLE_NODES → MINED, plus
-  any REJECTED line if it never made it that far — from arcade *and*
+  any REJECTED line if it never made it that far — from BSV Broadcaster *and*
   merkle-service in one query, since both use `txid`.
 - **Everything about one block**: search `block_hash:"<hex>"`. Surfaces the
   STUMP lines, `block_processed enqueued`, and the chunked `transactions

@@ -1025,7 +1025,7 @@ func TestBuilder_HandleMessage_EmptyExpectedSet_ZeroStumps_Finalizes(t *testing.
 // merkle-service older than PR #162 emits — rather than relying on Go's
 // omitempty marshalling. A block with tracked txs must still build its compound
 // BUMP and finalize (stamp processed_at) exactly as before: an absent field
-// decodes to a nil slice, the completeness gate is inert, and arcade neither
+// decodes to a nil slice, the completeness gate is inert, and BSV Broadcaster neither
 // crashes nor defers. This pins the graceful-degradation contract so a future
 // change can't accidentally make the expected set load-bearing for decode.
 func TestBuilder_HandleMessage_FieldAbsentFromWire_BuildsNormally(t *testing.T) {

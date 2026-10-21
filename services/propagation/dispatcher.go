@@ -350,7 +350,7 @@ func (p *Propagator) runDispatcher(ctx context.Context, claim kafka.Claim, cfg d
 //     submissions in parallel so we can't trust ordering across
 //     concurrent /txs calls; the child has to wait until every parent
 //     has terminalized.
-//   - Parent not in inFlight → already mined, never seen by Arcade,
+//   - Parent not in inFlight → already mined, never seen by BSV Broadcaster,
 //     or otherwise out of scope. Doesn't block this admit.
 //
 // If ANY input requires holding, the whole tx is held as a waiter on

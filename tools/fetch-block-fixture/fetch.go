@@ -84,13 +84,13 @@ func run(cfg config) error {
 	// 5. Use teranode's served bytes for block.bin verbatim. The
 	//    block already includes a real coinbase BUMP (~hundreds of
 	//    bytes for typical mainnet blocks); recomputing here would
-	//    risk byte-level drift from what arcade's bump-builder
+	//    risk byte-level drift from what BSV Broadcaster's bump-builder
 	//    expects when it parses /block/<hash>.
 	blockBin := teranodeBlock
 
 	// 7. Pick N random non-coinbase txids, then bulk-fetch each picked tx
 	//    plus every input's parent and build Extended Format (EF) bytes so
-	//    arcade's intake validator can execute scripts and verify fees
+	//    BSV Broadcaster's intake validator can execute scripts and verify fees
 	//    without needing a chaintracker. The WhatsOnChain client's bulk
 	//    processor batches requests and paces them by the configured rate
 	//    limit, and retries sporadic 429s, so no manual throttling is needed.
@@ -175,7 +175,7 @@ type teranodeBlock struct {
 	coinbaseTxID  string   // hex string in display (reverse) order
 }
 
-// parseTeranodeBlock decodes a raw block binary the way both arcade and
+// parseTeranodeBlock decodes a raw block binary the way both BSV Broadcaster and
 // merkle-service expect:
 //
 //	header(80) | txCount(varint) | sizeBytes(varint) | subtreeCount(varint) |

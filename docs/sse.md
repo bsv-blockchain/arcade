@@ -1,6 +1,6 @@
 # Integrating with the `/events` SSE endpoint
 
-Arcade exposes a [Server-Sent Events](https://html.spec.whatwg.org/multipage/server-sent-events.html) stream at `GET /events` that pushes a frame every time a tracked transaction changes status. This document covers the wire format, how to scope the stream to your own transactions, and how reconnection / replay works.
+BSV Broadcaster exposes a [Server-Sent Events](https://html.spec.whatwg.org/multipage/server-sent-events.html) stream at `GET /events` that pushes a frame every time a tracked transaction changes status. This document covers the wire format, how to scope the stream to your own transactions, and how reconnection / replay works.
 
 ## Endpoint
 

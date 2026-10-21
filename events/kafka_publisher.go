@@ -194,7 +194,7 @@ func (p *KafkaPublisher) Subscribe(ctx context.Context, caller string) (<-chan *
 				return nil
 			default:
 				// Slow consumer — drop rather than block the broker. Matches the
-				// old arcade's non-blocking fan-out semantics; SSE clients
+				// old BSV Broadcaster's non-blocking fan-out semantics; SSE clients
 				// recover via Last-Event-ID catchup on reconnect.
 				dropCounter.Inc()
 				// Throttle the warn log: every drop bumps the counter (so

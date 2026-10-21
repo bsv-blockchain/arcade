@@ -149,7 +149,7 @@ func (c *Client) Start(ctx context.Context) error {
 	}
 
 	// Derive storage path: explicit p2p.storage_path wins, else nest under
-	// the top-level arcade storage_path, else let the library default to
+	// the top-level BSV Broadcaster storage_path, else let the library default to
 	// ~/.teranode-p2p. The library also persists the libp2p private key
 	// here so the peer ID is stable across restarts.
 	storagePath := c.cfg.P2P.StoragePath
@@ -348,7 +348,7 @@ func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatu
 
 	// Record the peer's advertised policy only once its URL is in the registry,
 	// so the network values GET /policy derives come from exactly the peers
-	// arcade can actually broadcast to — the same set GET /health displays.
+	// BSV Broadcaster can actually broadcast to — the same set GET /health displays.
 	//
 	// This deliberately reverses the original ordering (issue #212), which ran
 	// ahead of the URL gate so a peer advertising a policy but no usable URL
@@ -368,7 +368,7 @@ func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatu
 // limits. Peers advertising neither (older nodes) are skipped.
 //
 // Called only after the peer's datahub URL has been registered, so every row it
-// writes belongs to a peer arcade can broadcast to — see the call site for why
+// writes belongs to a peer BSV Broadcaster can broadcast to — see the call site for why
 // that matters.
 func (c *Client) recordPeerPolicy(ctx context.Context, msg teranodep2p.NodeStatusMessage) {
 	var sats, byts, maxTxSize, maxScriptSize uint64
@@ -492,7 +492,7 @@ func (c *Client) validateDatahubURL(ctx context.Context, peerID, raw string) (st
 
 // zapBusLogger adapts *zap.Logger to the message-bus logger interface, which
 // wants printf-style formatters. Mapping Debugf→Sugar().Debugf keeps the
-// structured logger's output coherent with the rest of arcade.
+// structured logger's output coherent with the rest of BSV Broadcaster.
 type zapBusLogger struct {
 	l *zap.Logger
 }

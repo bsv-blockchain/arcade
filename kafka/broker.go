@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-// Broker is the pluggable messaging abstraction arcade services use to publish
+// Broker is the pluggable messaging abstraction BSV Broadcaster services use to publish
 // and consume. Two implementations ship in this package:
 //   - saramaBroker: real Kafka via IBM Sarama, for horizontally scaled deployments.
 //   - memoryBroker: in-process channels, for single-binary standalone mode.
@@ -106,7 +106,7 @@ type Claim interface {
 }
 
 // Message is the broker-neutral shape services consume. Mirrors the fields of
-// sarama.ConsumerMessage that arcade actually reads, without leaking the
+// sarama.ConsumerMessage that BSV Broadcaster actually reads, without leaking the
 // Sarama type into service code.
 type Message struct {
 	Topic     string

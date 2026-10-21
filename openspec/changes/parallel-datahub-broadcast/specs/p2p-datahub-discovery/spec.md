@@ -25,12 +25,12 @@ The p2p_client service SHALL translate `p2p.network: "ttn"` into `"teratestnet"`
 
 #### Scenario: ttn is translated
 
-- **WHEN** arcade starts with `p2p.network: "ttn"` and `p2p.datahub_discovery: true` (with operator-supplied `bootstrap_peers`)
+- **WHEN** BSV Broadcaster starts with `p2p.network: "ttn"` and `p2p.datahub_discovery: true` (with operator-supplied `bootstrap_peers`)
 - **THEN** the `p2pclient.Config` handed to the library has `Network: "teratestnet"`, so the resulting subscription is `teranode/bitcoin/1.0.0/teratestnet-node_status` — the same topic teratestnet peers publish on.
 
 #### Scenario: Known networks pass through unchanged
 
-- **WHEN** arcade starts with `p2p.network: "stn"` (or `main`, `test`, `teratestnet`, empty)
+- **WHEN** BSV Broadcaster starts with `p2p.network: "stn"` (or `main`, `test`, `teratestnet`, empty)
 - **THEN** the `p2pclient.Config.Network` equals the configured value verbatim; no translation is applied.
 
 #### Scenario: Startup log records both configured and topic network

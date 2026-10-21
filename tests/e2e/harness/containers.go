@@ -49,7 +49,7 @@ const (
 	// `:latest` tag is republished out-of-band by the merkle-service repo
 	// and has regressed the block round-trip in the past (dropped
 	// BLOCK_PROCESSED callbacks → txs never reach MINED), turning every
-	// arcade CI run red regardless of arcade's own changes.
+	// BSV Broadcaster CI run red regardless of BSV Broadcaster's own changes.
 	//
 	// This digest is the merkle-service v0.2.5 release, which both (a) enriches
 	// BLOCK_PROCESSED with merkleRoot + subtreeCount + subtreeHashes +
@@ -58,7 +58,7 @@ const (
 	// now set AllowAutoTopicCreation (#145) and consumers create their topics
 	// before joining the group (#147). v0.2.3/v0.2.4 had the enrichment but a
 	// broken round-trip — produce failed with UNKNOWN_TOPIC_OR_PARTITION ("failed
-	// to enqueue") and /reprocess block messages sat unconsumed. arcade consumes
+	// to enqueue") and /reprocess block messages sat unconsumed. BSV Broadcaster consumes
 	// the enrichment to build the compound BUMP without any datahub fetch — the
 	// e2e TestSmoke_RealBlockMined_SingleSubtree asserts the datahub-free path.
 	// Re-point this at a newer digest once upstream merkle-service is confirmed
@@ -97,7 +97,7 @@ type Containers struct {
 
 	// HostFromContainer is the hostname/IP containers on this network
 	// should use to reach listeners bound on the TEST HOST (the harness
-	// datahub, the libp2p host, arcade's callback receiver). Prefer this
+	// datahub, the libp2p host, BSV Broadcaster's callback receiver). Prefer this
 	// over GatewayIP: on current rootless podman (pasta) the bridge
 	// gateway no longer maps to the host at all — connections are
 	// refused — while the podman-injected host.containers.internal alias
@@ -318,7 +318,7 @@ func startContainersOnNetwork(ctx context.Context, t *testing.T, opts MerkleStar
 		ctx, opts.Image,
 		testcontainers.WithEnv(env),
 		// host-gateway lets the container reach the host (and our in-process
-		// arcade callback receiver + datahub) at host.docker.internal.
+		// BSV Broadcaster callback receiver + datahub) at host.docker.internal.
 		// Recent Linux Docker engines and Docker Desktop honor this; on
 		// rootless podman it requires --network slirp4netns:allow_host_loopback=true
 		// which the README documents.

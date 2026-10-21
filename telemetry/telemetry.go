@@ -1,4 +1,4 @@
-// Package telemetry owns the OpenTelemetry provider lifecycle for arcade:
+// Package telemetry owns the OpenTelemetry provider lifecycle for BSV Broadcaster:
 // building the shared resource, wiring the OTLP trace/metric exporters, and
 // bridging the existing Prometheus `bsv_broadcaster_*` metrics onto the OTLP metric
 // pipeline. See docs/plans/otel-integration.md for the design.
@@ -41,10 +41,10 @@ const defaultExportTimeout = 10 * time.Second
 // itself intentionally omits (config/config.go keeps Telemetry free of
 // process-identity fields so the block stays purely about the OTLP pipeline).
 type Options struct {
-	// Version is the arcade build version (version.Version), recorded as the
+	// Version is the BSV Broadcaster build version (version.Version), recorded as the
 	// resource's service.version attribute.
 	Version string
-	// Mode is the running arcade mode (cfg.Mode: "all", "api-server", …),
+	// Mode is the running BSV Broadcaster mode (cfg.Mode: "all", "api-server", …),
 	// recorded as the bsv_broadcaster.mode resource attribute.
 	Mode string
 	// InstanceID overrides the resource's service.instance.id. When empty,
@@ -219,7 +219,7 @@ func buildResource(ctx context.Context, cfg config.TelemetryConfig, opts Options
 
 // resolveInstanceID implements the service.instance.id precedence documented
 // on Options.InstanceID: explicit override, then POD_NAME (set by the k8s
-// downward API in every arcade Deployment), then os.Hostname().
+// downward API in every BSV Broadcaster Deployment), then os.Hostname().
 func resolveInstanceID(opts Options) string {
 	if opts.InstanceID != "" {
 		return opts.InstanceID

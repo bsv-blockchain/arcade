@@ -1,9 +1,9 @@
 # Production Kafka topics
 
-Arcade does **not** create Kafka topics itself — it relies on broker-side
+BSV Broadcaster does **not** create Kafka topics itself — it relies on broker-side
 auto-creation on first publish, which is typically disabled in production
 clusters. One topic also has a hard correctness constraint (`bsv-broadcaster.propagation`
-must have **at least `propagation.partitions`**) that arcade enforces at startup
+must have **at least `propagation.partitions`**) that BSV Broadcaster enforces at startup
 with a fail-closed check. This guide lists every topic an operator needs to
 pre-create, with partition, replication, and retention guidance.
 
@@ -11,7 +11,7 @@ This guide assumes a production deployment with `kafka.backend: sarama` pointed
 at an external Kafka cluster. Standalone profiles (`kafka.backend: memory`)
 don't need any of this — see [`getting-started.md`](getting-started.md).
 
-## Topics arcade uses
+## Topics BSV Broadcaster uses
 
 | Topic                          | Partitions                | Consumer group(s)                  | Purpose                                                              |
 | ------------------------------ | ------------------------- | ---------------------------------- | -------------------------------------------------------------------- |
@@ -25,7 +25,7 @@ don't need any of this — see [`getting-started.md`](getting-started.md).
 | `bsv-broadcaster.transaction.dlq`       | 1                         | none                               | DLQ for retired topic; safe to skip.                                 |
 
 Consumer-group base name comes from `kafka.consumer_group` in config (default
-`arcade`). Service-specific suffixes (`-propagation`, `-bump-builder`) are
+`bsv-broadcaster`). Service-specific suffixes (`-propagation`, `-bump-builder`) are
 applied automatically — operators only configure the base name.
 
 ## Partition counts
@@ -48,12 +48,12 @@ Chains that span requests have no such guarantee, and that is by design rather
 than an oversight: a child can reach a datahub before its parent and draw
 `TX_MISSING_PARENT`. That is treated as a **condition, not a verdict** — the tx
 rides the bounded requeue, then parks at `PENDING_RETRY` for the reaper's
-durable retry queue. The only path to `REJECTED` is arcade's own store showing
+durable retry queue. The only path to `REJECTED` is BSV Broadcaster's own store showing
 an ancestor terminally rejected. Note this means single-transaction `POST /tx`
 submissions get no cross-request ordering help: they are keyed by their own
 txid.
 
-Arcade enforces the floor at startup with `kafka.CheckMinPartitions`. A missing
+BSV Broadcaster enforces the floor at startup with `kafka.CheckMinPartitions`. A missing
 topic, or a topic with fewer partitions than `propagation.partitions`, aborts
 startup. More partitions than configured is allowed — but note the producer
 hashes over the topic's **actual** partition count, so extra partitions carry
@@ -68,7 +68,7 @@ in-request outputs — serialize regardless of partition count.
 
 ### Widening an existing deployment
 
-Partition counts can be increased in place. Do it **topic first**, so arcade is
+Partition counts can be increased in place. Do it **topic first**, so BSV Broadcaster is
 never configured for more partitions than the topic has (that combination is a
 boot-time hard fail):
 
@@ -116,12 +116,12 @@ the per-subscriber parallelism but does not block additional subscribers.
 ### Dead-letter topics — 1 partition is fine
 
 DLQ topics receive failed messages after the in-process consumer exhausts
-`kafka.max_retries` (default 5). Arcade never reads from them; operators
+`kafka.max_retries` (default 5). BSV Broadcaster never reads from them; operators
 inspect manually. One partition is sufficient.
 
 ## Replication and durability
 
-Arcade's sync producer uses `RequiredAcks: WaitForAll` — every produce
+BSV Broadcaster's sync producer uses `RequiredAcks: WaitForAll` — every produce
 waits for all in-sync replicas. Under-replicated partitions will stall
 writes, so size your replication factor and `min.insync.replicas` for
 your cluster's availability target.
@@ -133,7 +133,7 @@ Suggested for a typical 3-broker production cluster:
 
 ## Retention
 
-Arcade does not enforce or assume any retention policy. Suggested defaults:
+BSV Broadcaster does not enforce or assume any retention policy. Suggested defaults:
 
 - **Hot topics** (`bsv-broadcaster.propagation`, `bsv-broadcaster.block_processed`,
   `bsv-broadcaster.tx_status`) — 24h to 7d. These are operational queues; once
@@ -219,7 +219,7 @@ done
 
 ## Consumer-group naming
 
-Every arcade service derives its consumer group from the single
+Every BSV Broadcaster service derives its consumer group from the single
 `kafka.consumer_group` config value, with a service-specific suffix:
 
 - `<group>-propagation` reads `bsv-broadcaster.propagation`
@@ -232,7 +232,7 @@ Set `kafka.consumer_group` to a value unique per environment
 (e.g. `bsv-broadcaster-mainnet-prod`, `bsv-broadcaster-testnet`) so groups don't collide if
 multiple deployments share a Kafka cluster.
 
-## What arcade checks at startup
+## What BSV Broadcaster checks at startup
 
 - `kafka.CheckMinPartitions(bsv-broadcaster.propagation, propagation.partitions)` — **hard fail** if
   the topic is missing or has fewer partitions than `propagation.partitions`.

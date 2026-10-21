@@ -50,11 +50,11 @@ import (
 // The pre-request snapshot is the important detail, and it is deliberately
 // stricter than tests/smoke's dependencyAwareTeranode (which accepts a child
 // whose parent appears earlier in the same body). It models teranode's
-// parallel bulk processing, which is arcade's own stated assumption in two
+// parallel bulk processing, which is BSV Broadcaster's own stated assumption in two
 // places: handleAdmit's "Teranode's parallel bulk processing means we can't
 // trust same-batch ordering", and #299's "no parent and child in one /txs
 // batch" contract. A fake that resolved a whole chain from one batch would
-// be asserting a guarantee arcade explicitly says it does not have.
+// be asserting a guarantee BSV Broadcaster explicitly says it does not have.
 type depAwareTeranode struct {
 	server *httptest.Server
 

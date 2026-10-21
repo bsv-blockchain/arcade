@@ -34,7 +34,7 @@ import (
 	"github.com/bsv-blockchain/bsv-broadcaster/version"
 )
 
-// webhookUserAgent identifies arcade's callback POSTs. The "bsv-broadcaster-webhook/"
+// webhookUserAgent identifies BSV Broadcaster's callback POSTs. The "bsv-broadcaster-webhook/"
 // prefix is a documented, stable string receivers can allowlist at their
 // edge — Go's default Go-http-client UA is a common bot-rule target and got
 // every callback to one production receiver silently 403'd (issue #249).
@@ -404,7 +404,7 @@ func (s *Service) deliver(ctx context.Context, sub *models.Submission, status *m
 	}
 	req.Header.Set("Content-Type", "application/json")
 	// A distinctive UA (instead of Go's default Go-http-client/…) lets
-	// receivers allowlist arcade's callbacks explicitly — generic-Go-UA
+	// receivers allowlist BSV Broadcaster's callbacks explicitly — generic-Go-UA
 	// bot/WAF rules silently 403'd every POST to one production receiver
 	// while its origin saw nothing (issue #249).
 	req.Header.Set("User-Agent", webhookUserAgent)
@@ -448,7 +448,7 @@ const deliveryResultDelivered = "delivered"
 // recordAttempt stamps the outcome of one POST attempt on the submission row
 // (attempts+1, lastAttemptAt, lastResult) so a client can self-diagnose
 // delivery problems from GET /tx?callbackToken=… — e.g. a WAF 403-ing every
-// callback looks like "arcade never called" from the receiver's side (issue
+// callback looks like "BSV Broadcaster never called" from the receiver's side (issue
 // #249). Orthogonal to retry-state bookkeeping (CAS/recordFailure), and
 // best-effort: a write failure never changes the delivery outcome.
 func (s *Service) recordAttempt(ctx context.Context, sub *models.Submission, logger *zap.Logger, result string) {

@@ -129,7 +129,7 @@ func TestEnsureIndexes_SecondCallIsFastPathNoop(t *testing.T) {
 
 // The issue #278 regression test: with the schema already current, boot-time
 // EnsureIndexes must succeed quickly even while another session holds an
-// ACCESS EXCLUSIVE lock on an arcade table — the fast path takes no DDL
+// ACCESS EXCLUSIVE lock on a BSV Broadcaster table — the fast path takes no DDL
 // locks at all. Today's implementation queues on the lock and times out.
 func TestEnsureIndexes_FastPathSucceedsUnderAccessExclusiveLock(t *testing.T) {
 	st := newIsolatedStore(t)

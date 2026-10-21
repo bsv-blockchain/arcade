@@ -549,7 +549,7 @@ func (p *Propagator) rebroadcastStuck(ctx context.Context, msgs []propagationMsg
 				}
 			case txResultClassMissingParent:
 				// Condition, not verdict (#254/#295): only a REJECTED
-				// ancestor in arcade's own store condemns the child. A
+				// ancestor in BSV Broadcaster's own store condemns the child. A
 				// missing parent that is merely late must never terminalize.
 				cascaded, requeue := p.resolveMissingParents(ctx, []propagationMsg{layer[i]}, []string{res.errMsg}, missingParentOutcomeReaperRetry)
 				if len(cascaded) > 0 {

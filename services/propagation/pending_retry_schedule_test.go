@@ -17,7 +17,7 @@ import (
 // a missing-parent line. schedulePendingRetry quotes it in the give-up reason.
 const orphanRetryReason = "TX_MISSING_PARENT (34): [Validate][child] error getting parent transaction root"
 
-// TestGiveUpReason pins what arcade tells a submitter when the durable-retry
+// TestGiveUpReason pins what BSV Broadcaster tells a submitter when the durable-retry
 // budget runs out. Nothing here is a verdict — the transaction exhausted its
 // attempts precisely because no peer ever returned one — so the reason must
 // quote what was actually heard rather than assert a cause.
@@ -25,7 +25,7 @@ const orphanRetryReason = "TX_MISSING_PARENT (34): [Validate][child] error getti
 // Before this, every exhausted transaction was told the same thing: that a
 // parent it spends had never reached the network. That is true only for the
 // missing-parent case the escape was built for. A transaction parked by a
-// node-side storage fault, or by a verdict arcade could not attribute, was
+// node-side storage fault, or by a verdict BSV Broadcaster could not attribute, was
 // handed a confident explanation of something that never happened — the exact
 // shape of "REJECTED with no reason why" that is worse than silence, because
 // it sends the submitter to look for a parent that was never the problem.
@@ -181,7 +181,7 @@ func TestNextPendingRetryDelay_ExponentialCappedJittered(t *testing.T) {
 //
 // A tx spending an outpoint that does not exist is the most common client
 // mistake there is, and it is unresolvable in both directions: it can never be
-// accepted, and rejectedAncestor can never condemn it because arcade has never
+// accepted, and rejectedAncestor can never condemn it because BSV Broadcaster has never
 // seen the parent at all. Without a bound those rows accumulate forever,
 // consume the reaper's per-tick batch, and re-POST to every healthy endpoint
 // on every cycle indefinitely.

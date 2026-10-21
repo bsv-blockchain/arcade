@@ -1,7 +1,7 @@
-// Package version exposes the arcade build version.
+// Package version exposes the BSV Broadcaster build version.
 package version
 
-// Version is the arcade build version. It defaults to "dev" for local builds
+// Version is the BSV Broadcaster build version. It defaults to "dev" for local builds
 // and `go run`, and is overridden at release/CI build time via
 //
 //	-ldflags "-X github.com/bsv-blockchain/bsv-broadcaster/version.Version=<git tag>"

@@ -136,7 +136,7 @@ func (b *memoryBroker) partitionsFor(topic string) int {
 // partitionForKey mirrors sarama.NewHashPartitioner: FNV-1a 32-bit of the
 // key, cast to int32, mod partition count, absolute value. An empty key is
 // routed to partition 0 (deterministic; the real Sarama randomizes keyless
-// messages, but no arcade producer publishes keyless to a widened topic and
+// messages, but no BSV Broadcaster producer publishes keyless to a widened topic and
 // determinism is worth more to tests than fidelity here).
 func partitionForKey(key string, n int) int32 {
 	if n <= 1 || key == "" {

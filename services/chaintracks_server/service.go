@@ -1,4 +1,4 @@
-// Package chaintracks_server hosts the standalone arcade chaintracks
+// Package chaintracks_server hosts the standalone BSV Broadcaster chaintracks
 // service. It owns the embedded go-chaintracks instance, exposes the
 // HTTP API under `/chaintracks/v1` and `/chaintracks/v2`, and bridges
 // chaintracks's tip + reorg channels into the shared block_processing
@@ -121,7 +121,7 @@ func (s *Service) Start(ctx context.Context) error {
 	return nil
 }
 
-// chaintracksHTTPHandler applies the same public browser contract as Arcade's
+// chaintracksHTTPHandler applies the same public browser contract as BSV Broadcaster's
 // API and SSE listeners. The standalone chaintracks pod has its own listener,
 // so relying on the API server's middleware leaves /chaintracks/v2 without
 // CORS headers and makes Gin return 404 for browser OPTIONS preflights.

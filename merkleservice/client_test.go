@@ -51,7 +51,7 @@ func TestRegister(t *testing.T) {
 }
 
 // TestRegister_ForwardsCallbackToken pins the F-018 fix on the outbound
-// /watch path: when arcade is configured with a callback token, that token
+// /watch path: when BSV Broadcaster is configured with a callback token, that token
 // must round-trip through the watch payload so merkle-service can stamp
 // Authorization on callbacks. The inbound receiver requires it; without
 // forwarding the loop 401s.
@@ -84,7 +84,7 @@ func TestRegister_ForwardsCallbackToken(t *testing.T) {
 }
 
 // TestRegister_OmitsEmptyCallbackToken pins the back-compat half: pre-fix
-// callers (and arcade builds without a configured token) must produce a wire
+// callers (and BSV Broadcaster builds without a configured token) must produce a wire
 // payload with NO callbackToken key, so merkle-service builds that don't yet
 // know the field aren't impacted. The omitempty tag is what enforces this and
 // the test exists specifically to fail loudly if someone removes it.

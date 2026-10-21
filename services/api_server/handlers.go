@@ -53,7 +53,7 @@ func collectInputTXIDs(tx *sdkTx.Transaction) []string {
 // re-enter Kafka. REJECTED resubmits re-run broadcast (existing contract).
 // RECEIVED resubmits cover the insert-then-Kafka-fail hole: GetOrInsertStatus
 // already wrote RECEIVED, Send failed, the client retries, and the old
-// duplicate branch echoed 202 without publishing — the tx never left arcade
+// duplicate branch echoed 202 without publishing — the tx never left BSV Broadcaster
 // until the one-hour RECEIVED reaper. Seen/accepted/mined rows stay echoed.
 func shouldRepublishExisting(status models.Status) bool {
 	return status == models.StatusRejected || status == models.StatusReceived
@@ -71,7 +71,7 @@ type submitOptions struct {
 }
 
 // extractSubmitOptions reads the callback-subscription headers off a submit
-// request. Mirrors the old arcade's header contract so existing clients (and
+// request. Mirrors the old BSV Broadcaster's header contract so existing clients (and
 // the SSE catchup token filter) keep working unchanged.
 func extractSubmitOptions(c *gin.Context) submitOptions {
 	return submitOptions{
@@ -194,7 +194,7 @@ func RenderDocs(w io.Writer) error {
 // out of api-server in the microservice decomposition — its health is now
 // reported by the standalone chaintracks pod's /health endpoint.
 //
-// blockHeight is arcade's own processed active-tip height. It is a freshness
+// blockHeight is BSV Broadcaster's own processed active-tip height. It is a freshness
 // signal, not a liveness gate: datahub_urls[].healthy is reachability-only,
 // so this instance can look green while its chain view is stale — clients
 // comparing blockHeight against the real network tip can detect that and
@@ -221,7 +221,7 @@ type healthResponse struct {
 // and ARC clients parse this, and policy is purely additive.
 //
 // Policy answers "what will this specific endpoint accept", which
-// GET /policy cannot: that reports the single network-wide policy arcade
+// GET /policy cannot: that reports the single network-wide policy BSV Broadcaster
 // enforces, so when a broadcast is refused on policy grounds this is what
 // identifies the strict node. Absent for an endpoint no node_status has
 // announced — a statically configured URL, typically — or one whose node
@@ -261,7 +261,7 @@ func endpointPolicyViewFrom(p *store.EndpointPolicy) *endpointPolicyView {
 // probe fan-in while staying far fresher than block cadence.
 const healthTipTTL = 5 * time.Second
 
-// activeTipHeight returns arcade's processed active-tip height for /health,
+// activeTipHeight returns BSV Broadcaster's processed active-tip height for /health,
 // cached for healthTipTTL. Never fails the probe: on a store error it
 // serves the last known height (a frozen value reads as stale to clients —
 // which is exactly the signal — and the next probe retries the read).
@@ -512,7 +512,7 @@ func (s *Server) applySeenCallback(c *gin.Context, msg models.CallbackMessage, l
 	// eclipses targetStatus. At 100 TPS sustained ~91% of SEEN_ON_NETWORK
 	// callback txids end up lattice-skipped at the store (merkle-service
 	// re-fires after the tx is already past SEEN_ON_NETWORK). The tracker
-	// is updated under the same RWMutex the rest of arcade uses and is
+	// is updated under the same RWMutex the rest of BSV Broadcaster uses and is
 	// always ≤ the store's status, so a prefilter hit is provably safe —
 	// the store-side lattice remains authoritative for anything the
 	// tracker doesn't know about. keptTxIDs maps the post-filter index
@@ -716,7 +716,7 @@ func (s *Server) handleBlockProcessed(c *gin.Context, msg models.CallbackMessage
 
 // callbackDelivery is the wire shape of one subscription's webhook delivery
 // state on GET /tx?callbackToken=… — the self-diagnosis surface for receivers
-// whose edge is rejecting arcade's POSTs (issue #249: a WAF 403'd 24k
+// whose edge is rejecting BSV Broadcaster's POSTs (issue #249: a WAF 403'd 24k
 // callbacks while the receiver's own logs showed nothing). attempts /
 // lastAttemptAt / lastResult are lifetime bookkeeping stamped on every POST;
 // retry-scheduling state (nextRetryAt) is per-transition and cleared when the
@@ -903,7 +903,7 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	txid := parsedTx.TxID().String()
 
 	// Synchronous policy, script, and fee validation. Merkle proofs on
-	// BEEF parents are trusted (arcade doesn't own a chaintracker on the
+	// BEEF parents are trusted (BSV Broadcaster doesn't own a chaintracker on the
 	// intake path); script execution against per-input source data still
 	// runs, which catches malformed unlocking scripts, bad signatures,
 	// and underpaid txs. Failures are a verdict about the transaction
@@ -923,7 +923,7 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// network with an opaque generic error (issue #245). Runs after the
 	// validator so its fail-open behavior can never mask a validation error.
 	//
-	// Unlike a validator failure, a non-final verdict reflects arcade's
+	// Unlike a validator failure, a non-final verdict reflects BSV Broadcaster's
 	// CURRENT CHAIN VIEW (which can trail the network's real tip), not the
 	// transaction bytes — a condition, not a verdict. So it is deliberately
 	// NOT persisted: no REJECTED row, no submission record, no status event
@@ -1072,7 +1072,7 @@ func respondSubmitError(c *gin.Context, txid string, err error) {
 
 // rejectAtIntake is the terminal-rejection counterpart to the intake
 // success sequence, for VALIDATOR failures only — verdicts about the
-// transaction bytes. (Finality failures are conditions of arcade's chain
+// transaction bytes. (Finality failures are conditions of BSV Broadcaster's chain
 // view and deliberately persist nothing; see the finality gate in
 // handleSubmitTransaction.) It persists a REJECTED row, records the
 // submission so SSE/webhook can resolve the callback URL+token on
@@ -1252,7 +1252,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 
 	// nLockTime/BIP113 finality gate per tx; see handleSubmitTransaction for
 	// the rationale — including why a non-final verdict is NOT persisted
-	// (condition of arcade's chain view, not a verdict about the tx; issue
+	// (condition of BSV Broadcaster's chain view, not a verdict about the tx; issue
 	// #254). Aborts the whole batch naming the offending txid — matches the
 	// validation contract above.
 	for _, p := range parsed {

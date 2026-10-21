@@ -1,9 +1,9 @@
 # OpenTelemetry Integration
 
-Plan to integrate OpenTelemetry (OTEL) into Arcade so that telemetry — traces,
+Plan to integrate OpenTelemetry (OTEL) into BSV Broadcaster so that telemetry — traces,
 metrics, and (optionally) logs — can be exported over OTLP to an **external,
 OTEL-based monitoring service** owned by a downstream solution that consumes
-Arcade. Today Arcade is observable only via a Prometheus scrape endpoint and
+BSV Broadcaster. Today BSV Broadcaster is observable only via a Prometheus scrape endpoint and
 stdout JSON logs. This plan adds a first-class OTEL pipeline, migrates the
 existing Prometheus metric surface onto it, and instruments the request paths
 (HTTP server, outbound HTTP clients, Kafka, store) with distributed traces — all
@@ -18,10 +18,10 @@ already made, and the trade-offs behind them.
 
 ## Problem
 
-A downstream solution that embeds/consumes Arcade runs a centralized
+A downstream solution that embeds/consumes BSV Broadcaster runs a centralized
 **OTEL-based monitoring service** (an OTLP collector + backend). It expects the
 components it operates to *push* telemetry to it over OTLP rather than be
-scraped. Arcade currently cannot do this:
+scraped. BSV Broadcaster currently cannot do this:
 
 - **Metrics** are exposed only via a Prometheus **pull** model. `metrics/metrics.go`
   defines ~50 `promauto` instruments registered against the Prometheus default
@@ -31,28 +31,28 @@ scraped. Arcade currently cannot do this:
   as **indirect/transitive** dependencies (pulled in by other modules) — there
   is no direct OTEL usage anywhere in the codebase. There are no spans, no trace
   context propagation across the HTTP → Kafka → HTTP hops, so the downstream
-  service cannot correlate an Arcade request with the rest of a distributed
+  service cannot correlate a BSV Broadcaster request with the rest of a distributed
   trace.
 - **Logs** are zap JSON to stdout (`cmd/bsv-broadcaster/main.go:newLogger`). They carry no
   trace/span IDs, so even once tracing exists logs can't be correlated to traces
   in the monitoring backend.
 
 The goal of the downstream team is a single pane of glass: traces, metrics, and
-logs from Arcade arriving at their collector, correlated, and attributed to the
+logs from BSV Broadcaster arriving at their collector, correlated, and attributed to the
 right service/pod/mode.
 
 ## Goal
 
-1. Stand up an OTEL SDK pipeline inside Arcade that exports over **OTLP** to a
+1. Stand up an OTEL SDK pipeline inside BSV Broadcaster that exports over **OTLP** to a
    configurable endpoint (the external monitoring service's collector).
 2. **Migrate the existing metric entries** so the metrics the team already relies
    on (`bsv_broadcaster_*`) flow to the OTLP endpoint, without losing the Prometheus
    scrape during transition.
-3. Add **distributed tracing** across Arcade's request paths and propagate trace
+3. Add **distributed tracing** across BSV Broadcaster's request paths and propagate trace
    context across process boundaries (HTTP and Kafka).
 4. Correlate **logs** with traces (trace_id/span_id on every log line), and
    optionally export logs over OTLP too.
-5. Ship it **opt-in and off by default**: with no OTEL config, Arcade behaves
+5. Ship it **opt-in and off by default**: with no OTEL config, BSV Broadcaster behaves
    exactly as it does today (Prometheus scrape, stdout logs, no exporter
    connections). Enabling it is a config/env change, not a redeploy of different
    code.
@@ -106,8 +106,8 @@ Export over OTLP. Support both gRPC and HTTP/protobuf, selected by config, since
 the external collector's listener may be either. **Default to gRPC** (`4317`)
 because it is the common collector default and the trace exporter we already
 have transitively (`otlptracehttp`) has a gRPC sibling. Honour the standard
-`OTEL_EXPORTER_OTLP_*` environment variables in addition to Arcade's own config
-block, so the downstream team can configure Arcade the same way they configure
+`OTEL_EXPORTER_OTLP_*` environment variables in addition to BSV Broadcaster's own config
+block, so the downstream team can configure BSV Broadcaster the same way they configure
 their other OTEL components.
 
 > `otlptrace` + `otlptracehttp` are already in `go.sum`. The **metric** and
@@ -154,7 +154,7 @@ independent of this flag and always on (until Phase 5).
 ### D6 — Resource attributes
 
 Every signal carries a shared OTEL `Resource`:
-`service.name=arcade`, `service.namespace` (configurable, e.g. the downstream
+`service.name=bsv-broadcaster`, `service.namespace` (configurable, e.g. the downstream
 solution's name), `service.version` (from the build version `goreleaser`
 injects), `service.instance.id` (pod name / hostname), and
 `bsv_broadcaster.mode=<cfg.Mode>`. This lets the monitoring service slice by deployment
@@ -205,7 +205,7 @@ type Telemetry struct {
     Endpoint      string `mapstructure:"endpoint"`        // host:port of the OTLP collector
     Protocol      string `mapstructure:"protocol"`        // "grpc" (default) | "http"
     Insecure      bool   `mapstructure:"insecure"`        // skip TLS (in-cluster collector)
-    ServiceName   string `mapstructure:"service_name"`    // default "arcade"
+    ServiceName   string `mapstructure:"service_name"`    // default "bsv-broadcaster"
     Namespace     string `mapstructure:"namespace"`       // service.namespace, e.g. downstream solution name
     Traces        bool   `mapstructure:"traces"`          // default true when Enabled
     Metrics       bool   `mapstructure:"metrics"`         // default true when Enabled
@@ -220,7 +220,7 @@ Defaults to add in the `SetDefaults`/`viper.SetDefault` section:
 ```go
 viper.SetDefault("telemetry.enabled", false)
 viper.SetDefault("telemetry.protocol", "grpc")
-viper.SetDefault("telemetry.service_name", "arcade")
+viper.SetDefault("telemetry.service_name", "bsv-broadcaster")
 viper.SetDefault("telemetry.traces", true)
 viper.SetDefault("telemetry.metrics", true)
 viper.SetDefault("telemetry.logs", false)
@@ -367,9 +367,9 @@ wraps the configured backend in `storefactory.New`. Attributes:
 ### 10. Deployment manifests (`deploy/*.yaml`)
 
 Add OTEL env to each Deployment's `env:` block (pattern at
-`deploy/api-server.yaml:39`). Use `BSV_BROADCASTER_TELEMETRY_*` (Arcade config) **or** the
+`deploy/api-server.yaml:39`). Use `BSV_BROADCASTER_TELEMETRY_*` (BSV Broadcaster config) **or** the
 standard `OTEL_EXPORTER_OTLP_*` vars — pick one and document it; recommend the
-`OTEL_*` standard so the downstream team configures Arcade like their other
+`OTEL_*` standard so the downstream team configures BSV Broadcaster like their other
 components:
 
 ```yaml
@@ -439,7 +439,7 @@ deploy because the feature stays off until config enables it.
   already in the tree (`v1.44.0`), pin `contrib` to its matching release, and add
   a `go mod tidy` + build check to CI.
 - **Exporter back-pressure / collector down.** A dead collector must not stall
-  Arcade. *Mitigation:* batch processors with bounded queues drop on overflow
+  BSV Broadcaster. *Mitigation:* batch processors with bounded queues drop on overflow
   (the OTEL SDK default) rather than block; bound export timeout via
   `ExportTimeoutMs`; never put export on the request goroutine.
 - **Double counting metrics.** During the dual-export window both the scrape and
@@ -463,6 +463,6 @@ deploy because the feature stays off until config enables it.
 3. Required **resource attributes / naming** conventions (their `service.name`
    scheme, any mandatory `deployment.environment` attribute)?
 4. Expected **sampling** policy — head sampling ratio here, or tail sampling at
-   their collector (in which case Arcade sends 100%)?
+   their collector (in which case BSV Broadcaster sends 100%)?
 5. Should the `/metrics` Prometheus endpoint be **retired** once OTLP metrics are
    confirmed, or kept for their k8s/Prometheus ops indefinitely?

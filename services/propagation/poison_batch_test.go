@@ -26,7 +26,7 @@ import (
 	"github.com/bsv-blockchain/bsv-broadcaster/teranode"
 )
 
-// These tests reproduce the 2026-08-11 dev-ovh-1 propagation wedge (arcade
+// These tests reproduce the 2026-08-11 dev-ovh-1 propagation wedge (BSV Broadcaster
 // v0.11.5) and pin both halves of the fix.
 //
 // The incident: Teranode answered a 21-tx batch of stale transactions with
@@ -255,13 +255,13 @@ func TestBroadcast_409ConflictLines_AttributedToSubmittedInputs(t *testing.T) {
 }
 
 // TestBroadcast_409UnattributableConflict_NarrowsToPlaceTheVerdict covers the
-// line arcade cannot place from its own knowledge: a 409 naming an outpoint no
+// line BSV Broadcaster cannot place from its own knowledge: a 409 naming an outpoint no
 // submitted tx visibly spends (unparseable raw bytes, a message shape without
 // an outpoint, a conflict about a different input than the one named).
 //
 // #292 stopped here — no fabricated accept, no guessed reject, both txs
 // requeue — because guessing which tx a line condemns is worse than waiting.
-// That property is intact: nothing is guessed. What changed is that arcade no
+// That property is intact: nothing is guessed. What changed is that BSV Broadcaster no
 // longer has to guess. It re-broadcasts the chunk in halves, and the peer's
 // own answers say which transaction is at fault: the half without it comes
 // back 200, the half with it comes back 409 again, until the line is the only
@@ -322,7 +322,7 @@ func TestBroadcast_409UnattributableConflict_NarrowsToPlaceTheVerdict(t *testing
 }
 
 // TestAttributeConflictLines_AmbiguousOutpointDeclines pins the one case
-// where arcade holds enough information to name a tx but must refuse to: two
+// where BSV Broadcaster holds enough information to name a tx but must refuse to: two
 // submitted txs spend the SAME outpoint (an intra-batch double spend), so
 // Teranode's single conflict line cannot say which one lost. Guessing would
 // terminally reject a transaction that may well be the winner.
@@ -363,7 +363,7 @@ func TestAttributeConflictLines_AmbiguousOutpointDeclines(t *testing.T) {
 // An opaque body is what makes this unresolvable, and it is the reason the
 // bounded-requeue escape still has to exist. Its parseable sibling — a 409
 // whose conflict line names an outpoint no submitted tx spends — used to reach
-// this same dead end and now does not: arcade narrows the chunk until the peer
+// this same dead end and now does not: BSV Broadcaster narrows the chunk until the peer
 // itself says which transaction the line is about, and the tx terminalizes
 // with the real verdict instead of parking under a generic reason (see
 // TestBroadcast_409UnattributableConflict_NarrowsToPlaceTheVerdict). Narrowing

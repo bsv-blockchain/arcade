@@ -1,10 +1,10 @@
 // Package finality implements the nLockTime/nSequence transaction-finality
-// check (BIP113) that teranode applies at mempool admission but arcade's
+// check (BIP113) that teranode applies at mempool admission but BSV Broadcaster's
 // embedded BDK validator does not: teranode enforces it one layer above the
-// TxValidator arcade calls (teranode services/validator/Validator.go
+// TxValidator BSV Broadcaster calls (teranode services/validator/Validator.go
 // validateInternal → util.IsTransactionFinal), and its propagation surface
 // strips the UTXO_NON_FINAL reason to a generic "failed to validate
-// transaction". Running the same check at arcade intake turns that opaque
+// transaction". Running the same check at BSV Broadcaster intake turns that opaque
 // terminal rejection into an immediate, actionable error (issue #245).
 //
 // The check is deliberately a pure-Go sibling of the validator package, which

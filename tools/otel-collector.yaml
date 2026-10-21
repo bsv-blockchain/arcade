@@ -1,10 +1,10 @@
-# Local validation collector for the arcade OTEL telemetry pipeline
+# Local validation collector for the BSV Broadcaster OTEL telemetry pipeline
 # (docs/plans/otel-integration.md). Accepts OTLP over both gRPC and
 # HTTP/protobuf and dumps every trace/metric it receives to stdout via the
 # `debug` exporter, so `docker compose logs otel-collector` is enough to
-# confirm arcade is actually shipping data end to end.
+# confirm BSV Broadcaster is actually shipping data end to end.
 #
-# Point arcade at this collector with either:
+# Point BSV Broadcaster at this collector with either:
 #   BSV_BROADCASTER_TELEMETRY_ENABLED=true BSV_BROADCASTER_TELEMETRY_ENDPOINT=localhost:4317
 # or the standard OTEL env vars:
 #   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317

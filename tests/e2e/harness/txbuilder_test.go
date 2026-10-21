@@ -13,7 +13,7 @@ import (
 )
 
 // TestBuildValidatableTxs_PassesBroadcasterPolicyValidator confirms our
-// synthetic-tx builder produces transactions that survive arcade's
+// synthetic-tx builder produces transactions that survive BSV Broadcaster's
 // structural validator. Without this assertion, smoke_test.go's
 // BroadcastTx would silently route everything to REJECTED before
 // merkle-service ever sees a watch registration.
@@ -22,7 +22,7 @@ func TestBuildValidatableTxs_PassesBroadcasterPolicyValidator(t *testing.T) {
 	txs := BuildValidatableTxs(5, 100)
 
 	for i, tx := range txs {
-		// arcade parses txs via go-sdk, not go-bt, and clients POST the
+		// BSV Broadcaster parses txs via go-sdk, not go-bt, and clients POST the
 		// extended (EF) serialization — round-trip via ExtendedBytes so the
 		// parsed tx carries the per-input source script + satoshis the BDK
 		// validator needs (BroadcastTx posts tx.ExtendedBytes() too).

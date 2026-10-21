@@ -1,6 +1,6 @@
 # Metrics
 
-Arcade exposes a Prometheus scrape endpoint at `/metrics` on both the health
+BSV Broadcaster exposes a Prometheus scrape endpoint at `/metrics` on both the health
 server (port `health.port`, default `8081`) and the API server (port
 `api.port`, default `8080`). Either is fine — pick the one your service mode
 runs.
@@ -91,7 +91,7 @@ landing.
 ### Merkle-service endpoint board
 
 - Per-endpoint `bsv_broadcaster_merkle_endpoint_healthy` (one row per `endpoint` per
-  pod). Every arcade process runs its own pool with its own breakers.
+  pod). Every BSV Broadcaster process runs its own pool with its own breakers.
   Propagation sends `/watch`; api-server, watchdog and bump-builder send
   `/reprocess`, and a transport/5xx failure there trips the same breaker, so
   they can report 0 too. Only a process that has made neither call stays at
@@ -159,10 +159,10 @@ A minimal Prometheus scrape config (single-binary deployment):
 
 ```yaml
 scrape_configs:
-  - job_name: arcade
+  - job_name: bsv-broadcaster
     scrape_interval: 15s
     static_configs:
-      - targets: ['arcade:8081']
+      - targets: ['bsv-broadcaster:8081']
 ```
 
 For Kubernetes, point your service monitor at the health port:
@@ -171,10 +171,10 @@ For Kubernetes, point your service monitor at the health port:
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: arcade
+  name: bsv-broadcaster
 spec:
   selector:
-    matchLabels: {app: arcade}
+    matchLabels: {app: bsv-broadcaster}
   endpoints:
     - port: health
       path: /metrics

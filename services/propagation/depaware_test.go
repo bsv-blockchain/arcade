@@ -275,7 +275,7 @@ func TestHandleMessage_NoParents_AdmitsNormally(t *testing.T) {
 }
 
 // TestHandleMessage_ParentNotInFlight_AdmitsChildDirectly verifies
-// that a child whose declared parent isn't tracked by Arcade at all
+// that a child whose declared parent isn't tracked by BSV Broadcaster at all
 // (mined long ago, never seen, whatever) is admitted normally — only
 // IN-FLIGHT parents block.
 func TestHandleMessage_ParentNotInFlight_AdmitsChildDirectly(t *testing.T) {

@@ -1869,7 +1869,7 @@ func TestHandleCallback_FullBlockFlow_20Subtrees(t *testing.T) {
 //   - NO BLOCK_PROCESSED-like Kafka publish happens during the STUMP phase,
 //     so bump_builder never sees a block with missing STUMPs
 //   - sending BLOCK_PROCESSED while one STUMP is still missing DOES still
-//     publish to Kafka — arcade does not validate STUMP completeness here.
+//     publish to Kafka — BSV Broadcaster does not validate STUMP completeness here.
 //     That is intentional: merkle-service's stumpGate is what gates
 //     BLOCK_PROCESSED on upstream 2xx, and if the retry exhausts it falls
 //     into merkle-service's DLQ rather than calling BLOCK_PROCESSED.
@@ -1961,7 +1961,7 @@ func TestHandleCallback_FullBlockFlow_PartialStumpFailure(t *testing.T) {
 		t.Fatalf("expected 0 Kafka messages during STUMP phase, got %d", got)
 	}
 
-	// BLOCK_PROCESSED is still accepted and published. arcade does not check
+	// BLOCK_PROCESSED is still accepted and published. BSV Broadcaster does not check
 	// STUMP completeness — that contract lives in merkle-service's stumpGate.
 	// The bump_builder handles missing STUMPs downstream via its grace window
 	// + GetStumpsByBlockHash retrieval, so this call must not be rejected.

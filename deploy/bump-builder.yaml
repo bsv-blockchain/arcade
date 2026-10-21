@@ -43,7 +43,7 @@ spec:
             # embedded ChainManager + upstream header poller in this pod.
             # The URL must include the /chaintracks path prefix: the
             # go-chaintracks remote client appends /v2/* to the base URL and
-            # arcade's chaintracks pod serves /chaintracks/v2/*. The previous
+            # BSV Broadcaster's chaintracks pod serves /chaintracks/v2/*. The previous
             # suffix-less value 404'd on every request.
             - name: BSV_BROADCASTER_CHAINTRACKS_MODE
               value: "remote"

@@ -1,15 +1,15 @@
 openapi: 3.0.3
 info:
-  title: Arcade API
+  title: BSV Broadcaster API
   description: |
-    REST API for **Arcade** — a Bitcoin SV transaction broadcasting and
+    REST API for **BSV Broadcaster** — a Bitcoin SV transaction broadcasting and
     lifecycle-tracking service. Clients submit transactions, look up their
     status, subscribe to status updates (via webhooks or Server-Sent Events),
     and inspect block-processing milestones.
 
     ## Services and ports
 
-    Arcade is decomposed into independent services, each binding its own HTTP
+    BSV Broadcaster is decomposed into independent services, each binding its own HTTP
     port. The endpoints in this document are split across three of them:
 
     | Service       | Default port | Endpoints                                                                 |
@@ -145,13 +145,13 @@ paths:
       tags: [Operations]
       summary: Discover the current fee and size policy (ARC-compatible)
       description: |
-        Returns Arcade's effective transaction policy in the ARC schema so
+        Returns BSV Broadcaster's effective transaction policy in the ARC schema so
         clients can discover the fee rate and size limits before building
         transactions. Every value reflects exactly what intake enforces.
 
         When the operator hasn't pinned a fee, `miningFee` tracks the lowest fee
         the network will accept — the minimum advertised across peer
-        `node_status` announcements — and Arcade enforces that same floor at
+        `node_status` announcements — and BSV Broadcaster enforces that same floor at
         intake, falling back to the built-in default until a peer is heard.
         `maxtxsigopscountspolicy` of `4294967295` means unlimited (the BSV
         post-Genesis default), matching the ARC convention. Also served at
@@ -248,7 +248,7 @@ paths:
         "202":
           description: |
             Transaction accepted for processing, or an idempotent re-submit of a
-            txid Arcade has already seen.
+            txid BSV Broadcaster has already seen.
           content:
             application/json:
               schema:
@@ -412,10 +412,10 @@ paths:
         `callbacks` array: the webhook delivery state of the submissions
         registered under that token (and only that token — a txid can carry
         subscriptions from multiple clients). `attempts`/`lastAttemptAt`/
-        `lastResult` are stamped on every POST arcade makes, so a receiver
+        `lastResult` are stamped on every POST BSV Broadcaster makes, so a receiver
         whose edge is rejecting callbacks (e.g. a WAF answering 403) can
         self-diagnose: `lastResult: "status 403"` with a climbing `attempts`
-        means arcade is delivering and the receiver's side is refusing. Note
+        means BSV Broadcaster is delivering and the receiver's side is refusing. Note
         the top-level `retryCount`/`nextRetryAt` fields are the transaction's
         BROADCAST retry state — webhook retry state lives inside `callbacks`.
       parameters:
@@ -441,7 +441,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/TransactionStatus"
         "404":
-          description: The txid has never been submitted to this Arcade instance.
+          description: The txid has never been submitted to this BSV Broadcaster instance.
           content:
             application/json:
               schema:
@@ -511,7 +511,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/BlockProcessingStatus"
         "404":
-          description: Arcade has no record of the block hash.
+          description: BSV Broadcaster has no record of the block hash.
           content:
             application/json:
               schema:
@@ -631,11 +631,11 @@ paths:
       description: |
         Long-lived Server-Sent Events stream that pushes lifecycle updates for
         every transaction submitted under the supplied callback token. Hosted by
-        Arcade's standalone SSE service — a separate listener from the main API
+        BSV Broadcaster's standalone SSE service — a separate listener from the main API
         (default port **8082**). CORS is permissive so browsers can connect
         directly with the `EventSource` API.
 
-        Lines prefixed with `:` are SSE comments — Arcade sends a `: keepalive`
+        Lines prefixed with `:` are SSE comments — BSV Broadcaster sends a `: keepalive`
         comment every 15 seconds. The `id` field is the event timestamp in
         nanoseconds; clients reconnecting after a network blip should send it
         back as `Last-Event-ID` to trigger a catchup replay of every status
@@ -1091,7 +1091,7 @@ components:
       type: http
       scheme: bearer
       description: |
-        Bearer token shared between the Merkle Service and Arcade. Compared in
+        Bearer token shared between the Merkle Service and BSV Broadcaster. Compared in
         constant time against the configured callback token.
 
   parameters:
@@ -1119,7 +1119,7 @@ components:
       in: header
       required: false
       description: |
-        Webhook URL Arcade should POST status events to as this transaction
+        Webhook URL BSV Broadcaster should POST status events to as this transaction
         progresses. Must be a public HTTPS endpoint; private/loopback hosts are
         rejected unless the deployment is configured to allow them. The POST body
         is a TransactionStatus; MINED/IMMUTABLE callbacks include blockHash,
@@ -1184,7 +1184,7 @@ components:
     CallbackDelivery:
       type: object
       description: >-
-        Webhook delivery state of one submission, for delivery self-diagnosis. attempts/lastAttemptAt/lastResult are lifetime bookkeeping stamped on every POST arcade makes (never reset); nextRetryAt/lastDeliveredStatus reflect the current transition's retry scheduling.
+        Webhook delivery state of one submission, for delivery self-diagnosis. attempts/lastAttemptAt/lastResult are lifetime bookkeeping stamped on every POST BSV Broadcaster makes (never reset); nextRetryAt/lastDeliveredStatus reflect the current transition's retry scheduling.
       properties:
         callbackUrl:
           type: string
@@ -1478,7 +1478,7 @@ components:
           example: true
         version:
           type: string
-          description: Build version of the running arcade binary (git tag).
+          description: Build version of the running BSV Broadcaster binary (git tag).
           example: v0.8.0
         status:
           type: string
@@ -1515,7 +1515,7 @@ components:
           allOf:
             - $ref: "#/components/schemas/EndpointPolicy"
           description: >-
-            The transaction policy this node advertised when it registered the URL — what this specific endpoint will accept, as opposed to the single network-wide policy arcade enforces and GET /policy reports. Absent for an endpoint no node_status has announced (a statically configured URL, typically) or whose node predates fee_policy.
+            The transaction policy this node advertised when it registered the URL — what this specific endpoint will accept, as opposed to the single network-wide policy BSV Broadcaster enforces and GET /policy reports. Absent for an endpoint no node_status has announced (a statically configured URL, typically) or whose node predates fee_policy.
 
     EndpointPolicy:
       type: object

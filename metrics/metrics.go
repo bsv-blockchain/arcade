@@ -1,4 +1,4 @@
-// Package metrics defines the Prometheus metrics surface arcade exposes for
+// Package metrics defines the Prometheus metrics surface BSV Broadcaster exposes for
 // scrape via the /metrics endpoint on the health server.
 //
 // Conventions
@@ -153,7 +153,7 @@ var PropagationChunkTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 // jumps 4 MiB → 16 MiB → 64 MiB, which cannot tell an 8 MiB chunk from one
 // pinned just under the 16 MiB default of propagation.teranode_max_batch_bytes
 // — and that distinction is the whole tuning question. These add resolution
-// across 1–32 MiB, the band between arcade's default and Teranode's hard
+// across 1–32 MiB, the band between BSV Broadcaster's default and Teranode's hard
 // 32 MiB maxDataPerRequest.
 var chunkBytesBuckets = []float64{
 	4 * 1024, 64 * 1024, 256 * 1024, 1024 * 1024, 2 * 1024 * 1024, 4 * 1024 * 1024,
@@ -290,12 +290,12 @@ var PropagationInflightDepth = promauto.NewGauge(prometheus.GaugeOpts{
 })
 
 // PropagationConflictAttributionTotal counts conflict-family ("alien") Teranode
-// failure lines by whether arcade could resolve them back to a submitted tx.
+// failure lines by whether BSV Broadcaster could resolve them back to a submitted tx.
 //
 // Teranode renders the conflict family (UTXO_SPENT / TX_CONFLICTING /
 // TX_INVALID_DOUBLE_SPEND, HTTP 409) as the deepest public cause, which names
 // the SPENT OUTPOINT and the competing spender — never the submitted txid — so
-// the line keys under a hash that is not in the batch. arcade holds the
+// the line keys under a hash that is not in the batch. BSV Broadcaster holds the
 // submitted raw transactions, so it can usually match "<outpoint>:<vout>"
 // against a submitted tx's inputs and attribute the verdict (result=attributed
 // → terminal REJECTED). result=unattributable means the outpoint matched no
@@ -304,7 +304,7 @@ var PropagationInflightDepth = promauto.NewGauge(prometheus.GaugeOpts{
 // the affected txs fall to the bounded requeue.
 //
 // A sustained unattributable rate is the signal that Teranode changed the
-// conflict-line format (or is reporting on outpoints arcade never submitted) —
+// conflict-line format (or is reporting on outpoints BSV Broadcaster never submitted) —
 // exactly the shape that wedged the dev-ovh-1 propagation consumer on
 // 2026-08-11 at 337,247 frozen messages of Kafka lag.
 var PropagationConflictAttributionTotal = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -313,23 +313,23 @@ var PropagationConflictAttributionTotal = promauto.NewCounterVec(prometheus.Coun
 }, []string{"result"}) // attributed, unattributable
 
 // PropagationMissingParentTotal counts Teranode missing-parent responses
-// (TX_MISSING_PARENT / TX_NOT_FOUND) by how arcade resolved them. With a
+// (TX_MISSING_PARENT / TX_NOT_FOUND) by how BSV Broadcaster resolved them. With a
 // multi-partition bsv-broadcaster.propagation topic (#295) a child submitted in a
 // later request than its parent can reach Teranode first; that condition is
 // retryable, never a verdict on its own (#254).
 //
-// outcome="requeued": the parent wasn't terminally REJECTED in arcade's own
+// outcome="requeued": the parent wasn't terminally REJECTED in BSV Broadcaster's own
 // store, so the child went back through the bounded requeue (and, on budget
 // exhaustion, PENDING_RETRY + reaper). A short burst is expected during a
 // partition-count change (key remap window); a sustained rate at steady
 // state means family keying is not co-locating same-submission chains —
-// check the intake path. outcome="rejected_ancestor": arcade's store showed
+// check the intake path. outcome="rejected_ancestor": BSV Broadcaster's store showed
 // a parent terminally REJECTED, so the child inherited REJECTED via the
 // standard cascade reason — the cross-partition analog of the
 // dispatcher's same-partition cascade.
 var PropagationMissingParentTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "bsv_broadcaster_propagation_missing_parent_total",
-	Help: "Teranode missing-parent responses by resolution (requeued vs durable reaper retry vs rejected via a REJECTED ancestor in arcade's store).",
+	Help: "Teranode missing-parent responses by resolution (requeued vs durable reaper retry vs rejected via a REJECTED ancestor in BSV Broadcaster's store).",
 }, []string{"outcome"}) // requeued, reaper_retry, rejected_ancestor
 
 // PropagationRequeueExhaustedTotal counts transactions parked at PENDING_RETRY
@@ -342,7 +342,7 @@ var PropagationMissingParentTotal = promauto.NewCounterVec(prometheus.CounterOpt
 // permanently failed with no attributable per-tx verdict requeued forever:
 // every tx stayed in the dispatcher's inFlight map, so its Kafka offset kept
 // pinning LowestUnfinished() and the single-partition bsv-broadcaster.propagation topic
-// could not commit. Observed live on dev-ovh-1 (2026-08-11, arcade v0.11.5):
+// could not commit. Observed live on dev-ovh-1 (2026-08-11, BSV Broadcaster v0.11.5):
 // 337,247 messages of lag frozen for minutes, 4,679 txs in-flight, ~2,410
 // UTXO_SPENT 409s in two minutes across 43 batches of which 42 requeued, while
 // the leader pod burned 4.2 cores achieving nothing.
@@ -381,7 +381,7 @@ var PropagationMerkleRetryExhaustedTotal = promauto.NewCounter(prometheus.Counte
 // because a parent it spends never reached the network.
 //
 // A rising "exhausted" rate means clients are submitting transactions whose
-// parents arcade never sees — before #299 those rows were not terminalized at
+// parents BSV Broadcaster never sees — before #299 those rows were not terminalized at
 // all: their timestamp_at never moved, so at 24h they fell out of the reaper's
 // scan window and stayed PENDING_RETRY permanently, invisible to every gauge.
 var PropagationPendingRetryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -569,7 +569,7 @@ var BumpBuilderGraceWaitTotal = promauto.NewCounter(prometheus.CounterOpts{
 // BumpBuilderEmptyStumpBlocksTotal counts BLOCK_PROCESSED messages that
 // arrived with zero stored STUMPs for the block. The "expected" case is a
 // block with no tracked transactions, but a sustained non-zero rate while
-// arcade has watched txs is a strong signal that STUMP callbacks are being
+// BSV Broadcaster has watched txs is a strong signal that STUMP callbacks are being
 // lost upstream (merkle-service callback_dedup suppression, delivery DLQ,
 // callback URL outage). Surfaces silent drops that would otherwise only show
 // up as "tx stuck in SEEN_MULTIPLE_NODES" days later.
@@ -580,7 +580,7 @@ var BumpBuilderEmptyStumpBlocksTotal = promauto.NewCounter(prometheus.CounterOpt
 
 // BumpBuilderIncompleteStumpsTotal counts BLOCK_PROCESSED messages whose
 // merkle-supplied expected-STUMP set (CallbackMessage.ExpectedSubtreeIndices)
-// was NOT fully satisfied by the STUMPs arcade had stored once the grace window
+// was NOT fully satisfied by the STUMPs BSV Broadcaster had stored once the grace window
 // elapsed. Such a block is deliberately left un-finalized (processed_at stays
 // NULL) so the watchdog re-drives it via merkle's /reprocess, which re-emits the
 // missing STUMPs and BLOCK_PROCESSED. On BumpBuilderBuildDuration these land
@@ -1055,7 +1055,7 @@ var WebhookReaperReadyDepth = promauto.NewGauge(prometheus.GaugeOpts{
 // datahub endpoint, by op and status code class.
 var TeranodeRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Name:    "bsv_broadcaster_teranode_request_duration_seconds",
-	Help:    "HTTP request latency from arcade to a datahub endpoint, by op and status class.",
+	Help:    "HTTP request latency from BSV Broadcaster to a datahub endpoint, by op and status class.",
 	Buckets: latencyBuckets,
 }, []string{"op", "status_class"}) // op = submit_tx, submit_txs, probe; status_class = 2xx/4xx/5xx/transport_error
 
@@ -1145,7 +1145,7 @@ var P2PEndpointDiscoveryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 
 // P2PPeerBestHeight reports the best block height each datahub peer
 // advertises in its node_status messages. Compared against
-// bsv_broadcaster_chain_tip_height (arcade's own processed tip) this is the
+// bsv_broadcaster_chain_tip_height (BSV Broadcaster's own processed tip) this is the
 // height-lag signal that was previously invisible: a reachable-but-stalled
 // peer showed healthy on every existing metric while its chain view froze
 // 50+ blocks behind (issue #254). Labelled by the peer's base_url — the
@@ -1187,7 +1187,7 @@ var P2PPeerMaxScriptSizePolicy = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "Maximum script size (bytes) advertised by a peer via p2p node_status, by base_url.",
 }, []string{"base_url"})
 
-// ChainTipHeight reports arcade's own view of the active chain tip — the
+// ChainTipHeight reports BSV Broadcaster's own view of the active chain tip — the
 // highest block_processing row marked active. Refreshed by the api-server's
 // /health handler (which also returns it as blockHeight); alert on this
 // flatlining, or on bsv_broadcaster_p2p_peer_best_height pulling ahead of it, to
@@ -1195,7 +1195,7 @@ var P2PPeerMaxScriptSizePolicy = promauto.NewGaugeVec(prometheus.GaugeOpts{
 // rejections (issue #254).
 var ChainTipHeight = promauto.NewGauge(prometheus.GaugeOpts{
 	Name: "bsv_broadcaster_chain_tip_height",
-	Help: "Arcade's active processed chain-tip height (max active block_processing row).",
+	Help: "BSV Broadcaster's active processed chain-tip height (max active block_processing row).",
 })
 
 // ---------------------------------------------------------------------------
@@ -1214,8 +1214,8 @@ var statusTransitionAgeBuckets = []float64{
 // StatusTransitionAge measures the wall-clock age of the previous status
 // row at the moment a new transition is applied. Wired into the SEEN_ON_NETWORK
 // callback handler so {from="RECEIVED",to="SEEN_ON_NETWORK"} surfaces the
-// time between arcade receiving a tx and the merkle-service callback
-// landing in arcade's store + publish pipeline. Naturally extensible to
+// time between BSV Broadcaster receiving a tx and the merkle-service callback
+// landing in BSV Broadcaster's store + publish pipeline. Naturally extensible to
 // other transitions (RECEIVED→REJECTED, SEEN_ON_NETWORK→MINED, ...) without
 // new metric definitions.
 var StatusTransitionAge = promauto.NewHistogramVec(prometheus.HistogramOpts{
@@ -1244,11 +1244,11 @@ var CallbackBatchSize = promauto.NewHistogramVec(prometheus.HistogramOpts{
 }, []string{"type"})
 
 // CallbackUnknownTxIDTotal counts txids referenced by a callback that
-// arcade's store has no record of. Already logged at WARN; the counter
+// BSV Broadcaster's store has no record of. Already logged at WARN; the counter
 // makes the rate scrapable so an operator can spot upstream drift.
 var CallbackUnknownTxIDTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "bsv_broadcaster_callback_unknown_txid_total",
-	Help: "Inbound callbacks that named a txid arcade's store doesn't know.",
+	Help: "Inbound callbacks that named a txid BSV Broadcaster's store doesn't know.",
 }, []string{"type"})
 
 // CallbackStaleTotal counts txids in inbound callbacks whose store row is

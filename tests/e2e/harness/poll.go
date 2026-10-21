@@ -20,11 +20,11 @@ import (
 	teranode "github.com/bsv-blockchain/teranode/services/p2p"
 )
 
-// BroadcastTx submits a single transaction to arcade via POST /tx in
-// Extended Format. Arcade's intake validator runs script execution and
+// BroadcastTx submits a single transaction to BSV Broadcaster via POST /tx in
+// Extended Format. BSV Broadcaster's intake validator runs script execution and
 // fee verification against the per-input source data EF carries; raw
 // (non-EF) bytes would be rejected for "PreviousTx not supplied".
-// Returns the txid arcade derived from the parsed transaction.
+// Returns the txid BSV Broadcaster derived from the parsed transaction.
 func BroadcastTx(ctx context.Context, t *testing.T, rt *BroadcasterRuntime, tx *bt.Tx) (string, error) {
 	t.Helper()
 	body := bytes.NewReader(tx.ExtendedBytes())
@@ -42,7 +42,7 @@ func BroadcastTx(ctx context.Context, t *testing.T, rt *BroadcasterRuntime, tx *
 	if resp.StatusCode/100 != 2 {
 		return "", fmt.Errorf("POST /tx status %d: %s", resp.StatusCode, respBody)
 	}
-	// arcade returns 202 Accepted with a JSON envelope identifying the
+	// BSV Broadcaster returns 202 Accepted with a JSON envelope identifying the
 	// canonical txid it parsed (which can differ from the caller's
 	// computed txid when the input is in extended format). Prefer the
 	// server-side txid; fall back to the caller's hash.
@@ -90,7 +90,7 @@ func (r txStatusResponse) GetOrphanedProof(wantBlock string) (OrphanedProof, boo
 	return OrphanedProof{}, false
 }
 
-// GetTxStatus fetches a single tx's status from arcade. Returns
+// GetTxStatus fetches a single tx's status from BSV Broadcaster. Returns
 // (status, true) on 200, (zero, false) on 404, error otherwise.
 func GetTxStatus(ctx context.Context, rt *BroadcasterRuntime, txid string) (txStatusResponse, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rt.BaseURL+"/tx/"+txid, nil)
@@ -136,12 +136,12 @@ func BroadcastRawTxs(ctx context.Context, t *testing.T, rt *BroadcasterRuntime, 
 			return nil, fmt.Errorf("broadcast %s: %w", id, err)
 		}
 		if assigned != id {
-			// arcade's POST /tx returns the canonical txid arcade
+			// BSV Broadcaster's POST /tx returns the canonical txid BSV Broadcaster
 			// derived from the parsed bytes; if it disagrees with
 			// our fixture's recorded txid, something is wrong with
 			// the raw-tx fetch (or the tx version differs from
 			// what WoC normalized).
-			return nil, fmt.Errorf("txid mismatch for %s: arcade reports %s", id, assigned)
+			return nil, fmt.Errorf("txid mismatch for %s: BSV Broadcaster reports %s", id, assigned)
 		}
 		got = append(got, id)
 	}
@@ -160,7 +160,7 @@ type ReprocessResponse struct {
 }
 
 // TriggerReprocess POSTs to merkle-service's /reprocess endpoint
-// with the supplied block hash + arcade callback URL + token. It
+// with the supplied block hash + BSV Broadcaster callback URL + token. It
 // expects HTTP 202 and returns the parsed response so callers can
 // assert which datahub URL got picked up. Any non-202 surfaces as
 // an error with the body included for diagnosis.
@@ -227,11 +227,11 @@ func WaitForMerkleRegistration(ctx context.Context, merkleHostURL, txid string, 
 	}
 }
 
-// AssertMerklePathsMatchHeaderRoot fetches each tx's status from arcade,
+// AssertMerklePathsMatchHeaderRoot fetches each tx's status from BSV Broadcaster,
 // parses its merklePath, and asserts ComputeRoot reproduces the header
 // merkle root recorded in the fixture. Catches "MINED happened but the
 // path is wrong" silently — a confused-deputy bug between merkle-service
-// and arcade's compound BUMP build that WaitForMined alone wouldn't
+// and BSV Broadcaster's compound BUMP build that WaitForMined alone wouldn't
 // catch.
 //
 // expectedHeaderRoot is the display-order hex string from
@@ -368,7 +368,7 @@ func WaitForStatus(ctx context.Context, rt *BroadcasterRuntime, txid, wantStatus
 	}
 }
 
-// WaitForBUMPStored polls arcade's store until the compound BUMP for
+// WaitForBUMPStored polls BSV Broadcaster's store until the compound BUMP for
 // blockHash exists. In reorg scenarios this is the gate between
 // announcing competing blocks: the losing block's BUMP being persisted
 // proves bump-builder fully processed its BLOCK_PROCESSED before the
@@ -466,12 +466,12 @@ func publishBlockUntil(ctx context.Context, lp *LibP2PHost, msgs []teranode.Bloc
 	}
 }
 
-// PublishBlockUntilTracked publishes msg until arcade's embedded
+// PublishBlockUntilTracked publishes msg until BSV Broadcaster's embedded
 // chaintracks knows the header (by hash) — regardless of whether it
 // became tip. Use for the same-height alternate in reorg scenarios.
 func PublishBlockUntilTracked(ctx context.Context, rt *BroadcasterRuntime, lp *LibP2PHost, msg teranode.BlockMessage, timeout time.Duration) error {
 	if rt.Deps.Chaintracks == nil {
-		return fmt.Errorf("chaintracks not enabled on this arcade runtime (set BroadcasterOptions.EnableChaintracks)")
+		return fmt.Errorf("chaintracks not enabled on this BSV Broadcaster runtime (set BroadcasterOptions.EnableChaintracks)")
 	}
 	want, err := chainhash.NewHashFromHex(msg.Hash)
 	if err != nil {
@@ -483,7 +483,7 @@ func PublishBlockUntilTracked(ctx context.Context, rt *BroadcasterRuntime, lp *L
 	})
 }
 
-// PublishBlockUntilTip publishes msg until arcade's embedded chaintracks
+// PublishBlockUntilTip publishes msg until BSV Broadcaster's embedded chaintracks
 // reports it as the chain tip.
 func PublishBlockUntilTip(ctx context.Context, rt *BroadcasterRuntime, lp *LibP2PHost, msg teranode.BlockMessage, timeout time.Duration) error {
 	return PublishBlockVariantsUntilTip(ctx, rt, lp, []teranode.BlockMessage{msg}, timeout)
@@ -497,7 +497,7 @@ func PublishBlockUntilTip(ctx context.Context, rt *BroadcasterRuntime, lp *LibP2
 // C-on-orphaned-parent, where chaintracks HTTP-GETs /headers/<hash>).
 func PublishBlockVariantsUntilTip(ctx context.Context, rt *BroadcasterRuntime, lp *LibP2PHost, msgs []teranode.BlockMessage, timeout time.Duration) error {
 	if rt.Deps.Chaintracks == nil {
-		return fmt.Errorf("chaintracks not enabled on this arcade runtime (set BroadcasterOptions.EnableChaintracks)")
+		return fmt.Errorf("chaintracks not enabled on this BSV Broadcaster runtime (set BroadcasterOptions.EnableChaintracks)")
 	}
 	if len(msgs) == 0 {
 		return fmt.Errorf("no block message variants")

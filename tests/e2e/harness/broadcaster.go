@@ -21,7 +21,7 @@ import (
 	"github.com/bsv-blockchain/bsv-broadcaster/services"
 )
 
-// BroadcasterRuntime is the in-process arcade instance the harness drives.
+// BroadcasterRuntime is the in-process BSV Broadcaster instance the harness drives.
 // Lifetime is tied to the *testing.T used to build it: t.Cleanup
 // cancels the run context and waits for every service goroutine.
 type BroadcasterRuntime struct {
@@ -36,29 +36,29 @@ type BroadcasterRuntime struct {
 	cleanup func()
 }
 
-// BroadcasterOptions carries the wiring info the harness threads into arcade
+// BroadcasterOptions carries the wiring info the harness threads into BSV Broadcaster
 // at boot time. All fields are required for a meaningful smoke run; the
 // containers + libp2p + datahub steps produce the values to fill in.
 type BroadcasterOptions struct {
 	// MerkleServiceURL is the host-side URL of the merkle-service
-	// container — what arcade hits when it POSTs to /watch.
+	// container — what BSV Broadcaster hits when it POSTs to /watch.
 	MerkleServiceURL string
 
-	// DatahubURL is the host-side URL of the in-process datahub. Arcade
+	// DatahubURL is the host-side URL of the in-process datahub. BSV Broadcaster
 	// hits this when bump-builder fetches block data.
 	DatahubURL string
 
 	// LibP2PBootstrap is the multiaddr of the harness libp2p host.
-	// Arcade's p2p_client subscribes to NodeStatus; without this the
+	// BSV Broadcaster's p2p_client subscribes to NodeStatus; without this the
 	// service spins up but never sees any peers (which is fine for the
 	// smoke test).
 	LibP2PBootstrap string
 
-	// MerkleAuthToken is the bearer token arcade sends on outbound
+	// MerkleAuthToken is the bearer token BSV Broadcaster sends on outbound
 	// /watch requests. Tests pick anything non-empty.
 	MerkleAuthToken string
 
-	// CallbackToken is the bearer token arcade requires on inbound
+	// CallbackToken is the bearer token BSV Broadcaster requires on inbound
 	// callback requests. Must match what merkle-service is configured
 	// to send.
 	CallbackToken string
@@ -80,7 +80,7 @@ type BroadcasterOptions struct {
 	LibP2PLoopback string
 }
 
-// StartBroadcaster boots arcade in-process via the same code path the
+// StartBroadcaster boots BSV Broadcaster in-process via the same code path the
 // production binary uses (app.Bootstrap → app.BuildServices). The
 // harness's t.Cleanup tears everything down.
 func StartBroadcaster(t *testing.T, opts BroadcasterOptions) *BroadcasterRuntime {
@@ -88,7 +88,7 @@ func StartBroadcaster(t *testing.T, opts BroadcasterOptions) *BroadcasterRuntime
 
 	port, err := pickFreeTCPPort()
 	if err != nil {
-		t.Fatalf("pick arcade port: %v", err)
+		t.Fatalf("pick BSV Broadcaster port: %v", err)
 	}
 
 	cfg := buildBroadcasterConfig(t, port, opts)
@@ -139,13 +139,13 @@ func StartBroadcaster(t *testing.T, opts BroadcasterOptions) *BroadcasterRuntime
 		select {
 		case <-done:
 		case <-time.After(15 * time.Second):
-			t.Logf("arcade services did not stop within 15s")
+			t.Logf("BSV Broadcaster services did not stop within 15s")
 		}
 		rt.cleanup()
 	})
 
 	if err := rt.waitReady(15 * time.Second); err != nil {
-		t.Fatalf("arcade not ready: %v", err)
+		t.Fatalf("BSV Broadcaster not ready: %v", err)
 	}
 	return rt
 }
@@ -250,7 +250,7 @@ func buildBroadcasterConfig(t *testing.T, port int, opts BroadcasterOptions) *co
 			},
 		},
 		// Datahub discovery off: we seeded a static URL into DatahubURLs,
-		// so arcade's bump-builder + propagation see it without needing
+		// so BSV Broadcaster's bump-builder + propagation see it without needing
 		// libp2p NodeStatus messages.
 		P2P: config.P2PConfig{
 			DatahubDiscovery: false,
@@ -282,7 +282,7 @@ func buildBroadcasterConfig(t *testing.T, port int, opts BroadcasterOptions) *co
 		// app.initChaintracks threads cfg.Network → Chaintracks.P2P.Network
 		// and cfg.P2P.BootstrapPeers → Chaintracks.P2P.MsgBus.BootstrapPeers,
 		// BUT go-p2p-message-bus ignores BootstrapPeers entirely when
-		// testing.Testing() is true ("isolated mode") — and arcade runs
+		// testing.Testing() is true ("isolated mode") — and BSV Broadcaster runs
 		// in-process here, so its chaintracks p2p client is inside the test
 		// binary. StaticPeers bypass that test-mode gate: they are dialed
 		// unconditionally and kept alive by a maintenance loop, which is
@@ -308,7 +308,7 @@ func buildBroadcasterConfig(t *testing.T, port int, opts BroadcasterOptions) *co
 }
 
 // callbackHost is the hostname the merkle-service container uses to
-// POST callbacks back to the in-process arcade: podman injects (and
+// POST callbacks back to the in-process BSV Broadcaster: podman injects (and
 // correctly maps) host.containers.internal; Docker gets
 // host.docker.internal via the ExtraHosts host-gateway entry the
 // container start adds.
@@ -319,7 +319,7 @@ func callbackHost() string {
 	return "host.docker.internal"
 }
 
-// waitReady polls /health until arcade's api-server starts answering
+// waitReady polls /health until BSV Broadcaster's api-server starts answering
 // or the timeout elapses. Mostly cosmetic — the bump-builder and
 // propagation services come up almost instantly with a memory broker,
 // but gin's listener takes ~50ms to bind.
@@ -332,7 +332,7 @@ func (rt *BroadcasterRuntime) waitReady(timeout time.Duration) error {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("arcade /health not reachable within %s: %w", timeout, err)
+			return fmt.Errorf("BSV Broadcaster /health not reachable within %s: %w", timeout, err)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}

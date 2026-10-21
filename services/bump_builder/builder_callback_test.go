@@ -25,7 +25,7 @@ import (
 // absent or inconsistent.
 
 // recordingDatahub is an httptest server that counts /block/<hash> GETs and
-// rejects them with 500. Callback-path tests wire it as arcade's only datahub
+// rejects them with 500. Callback-path tests wire it as BSV Broadcaster's only datahub
 // so a regression that wrongly falls back is caught two ways: the counter goes
 // non-zero AND the build fails (the 500 surfaces as a handleMessage error).
 type recordingDatahub struct {

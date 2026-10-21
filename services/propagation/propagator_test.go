@@ -622,7 +622,7 @@ func flushSync(t *testing.T, p *Propagator) error {
 }
 
 // TestHandleMessage_ForwardsCallbackToken pins the propagator → merkle-service
-// half of the F-018 callback-auth loop: the token configured at the arcade
+// half of the F-018 callback-auth loop: the token configured at the BSV Broadcaster
 // side (cfg.CallbackToken) must reach merkle-service via the /watch payload,
 // so merkle-service can attach it as Authorization on outbound delivery. If
 // this test fails, callbacks will 401 even if the inbound receiver and

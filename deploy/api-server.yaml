@@ -47,7 +47,7 @@ spec:
             # (issue #245): the remote client keeps this pod free of an
             # embedded ChainManager. The URL must include the /chaintracks
             # path prefix — the go-chaintracks client appends /v2/* to it
-            # and arcade's chaintracks pod serves /chaintracks/v2/*.
+            # and BSV Broadcaster's chaintracks pod serves /chaintracks/v2/*.
             # Without these vars the gate is skipped (fail-open).
             - name: BSV_BROADCASTER_CHAINTRACKS_MODE
               value: "remote"

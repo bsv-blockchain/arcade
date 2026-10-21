@@ -48,7 +48,7 @@ var callbackSubscriptionHeaders = []RouteHeader{
 	{
 		Name:        "X-CallbackUrl",
 		Requirement: "Optional",
-		Description: "Webhook URL Arcade should POST status events to as this transaction progresses through the network. Must be a public HTTPS endpoint; private/loopback hosts are rejected unless the deployment is configured to allow them. Every POST carries User-Agent: bsv-broadcaster-webhook/<version> — allowlist the bsv-broadcaster-webhook/ prefix so edge bot rules don't reject deliveries; per-submission delivery health is inspectable via GET /tx/:txid?callbackToken=<token>.",
+		Description: "Webhook URL BSV Broadcaster should POST status events to as this transaction progresses through the network. Must be a public HTTPS endpoint; private/loopback hosts are rejected unless the deployment is configured to allow them. Every POST carries User-Agent: bsv-broadcaster-webhook/<version> — allowlist the bsv-broadcaster-webhook/ prefix so edge bot rules don't reject deliveries; per-submission delivery health is inspectable via GET /tx/:txid?callbackToken=<token>.",
 	},
 	{
 		Name:        "X-CallbackToken",
@@ -83,7 +83,7 @@ var routeDocs = []RouteDoc{
 		Method:         "GET",
 		Path:           "/policy",
 		Summary:        "Discover the current fee and size policy (ARC-compatible)",
-		Description:    "Returns Arcade's effective transaction policy in the ARC schema so clients can discover the fee rate and size limits before building transactions. Every value reflects exactly what intake enforces. When the operator hasn't pinned a fee, miningFee tracks the lowest fee the network will accept — the minimum advertised across peer node_status announcements — and Arcade enforces that same floor at intake; it falls back to the built-in default until a peer is heard. Also served at /v1/policy.",
+		Description:    "Returns BSV Broadcaster's effective transaction policy in the ARC schema so clients can discover the fee rate and size limits before building transactions. Every value reflects exactly what intake enforces. When the operator hasn't pinned a fee, miningFee tracks the lowest fee the network will accept — the minimum advertised across peer node_status announcements — and BSV Broadcaster enforces that same floor at intake; it falls back to the built-in default until a peer is heard. Also served at /v1/policy.",
 		ResponseStatus: "200 OK",
 		ResponseBody:   "{\n  \"policy\": {\n    \"miningFee\": { \"satoshis\": 100, \"bytes\": 1000 },\n    \"maxtxsizepolicy\": 10485760,\n    \"maxscriptsizepolicy\": 500000,\n    \"maxtxsigopscountspolicy\": 4294967295,\n    \"standardFormatSupported\": true\n  },\n  \"timestamp\": \"2026-08-07T12:00:00Z\"\n}",
 		Notes:          "maxtxsigopscountspolicy of 4294967295 means unlimited (the BSV post-Genesis default), matching the ARC convention. Always returns 200.",
@@ -92,7 +92,7 @@ var routeDocs = []RouteDoc{
 		Method:      "GET",
 		Path:        "/tx/:txid",
 		Summary:     "Look up transaction status by txid",
-		Description: "Returns the current lifecycle state of a previously submitted transaction, including its merkle path once mined. With ?callbackToken=<token> the response adds a callbacks array: the webhook delivery state (attempts, lastAttemptAt, lastResult, nextRetryAt) of that token's submissions — lastResult \"status 403\" with climbing attempts means arcade is POSTing and the receiver's edge is refusing.",
+		Description: "Returns the current lifecycle state of a previously submitted transaction, including its merkle path once mined. With ?callbackToken=<token> the response adds a callbacks array: the webhook delivery state (attempts, lastAttemptAt, lastResult, nextRetryAt) of that token's submissions — lastResult \"status 403\" with climbing attempts means BSV Broadcaster is POSTing and the receiver's edge is refusing.",
 		Headers: []RouteHeader{
 			{
 				Name:        "Accept",
@@ -102,13 +102,13 @@ var routeDocs = []RouteDoc{
 		},
 		ResponseStatus: "200 OK",
 		ResponseBody:   "{\n  \"txid\": \"<hex>\",\n  \"txStatus\": \"SEEN_ON_NETWORK\",\n  \"status\": \"SEEN_ON_NETWORK\",\n  \"timestamp\": \"2026-05-20T12:00:00Z\",\n  \"blockHash\": \"<hex|null>\",\n  \"blockHeight\": 870123,\n  \"merklePath\": \"<BUMP hex|null>\",\n  \"extraInfo\": \"\",\n  \"competingTxs\": [],\n  \"callbacks\": [\n    {\n      \"callbackUrl\": \"https://...\",\n      \"lastDeliveredStatus\": \"SEEN_ON_NETWORK\",\n      \"attempts\": 14,\n      \"lastAttemptAt\": \"2026-05-20T12:00:00Z\",\n      \"lastResult\": \"status 403\",\n      \"nextRetryAt\": \"2026-05-20T12:05:00Z\"\n    }\n  ]\n}",
-		Notes:          "Returns 404 if the txid has never been submitted to this Arcade instance. The callbacks array appears only with a matching ?callbackToken= and covers only that token's submissions.",
+		Notes:          "Returns 404 if the txid has never been submitted to this BSV Broadcaster instance. The callbacks array appears only with a matching ?callbackToken= and covers only that token's submissions.",
 	},
 	{
 		Method:      "GET",
 		Path:        "/events",
 		Summary:     "Stream status updates over Server-Sent Events · separate service, default port 8082",
-		Description: "Long-lived Server-Sent Events stream that pushes lifecycle updates for every transaction submitted under the supplied callback token. Hosted by Arcade's standalone SSE service — a separate listener from the main API (default port 8082, fronted by its own Kubernetes Service in production). CORS is permissive on this endpoint so browsers can connect directly with the EventSource API.",
+		Description: "Long-lived Server-Sent Events stream that pushes lifecycle updates for every transaction submitted under the supplied callback token. Hosted by BSV Broadcaster's standalone SSE service — a separate listener from the main API (default port 8082, fronted by its own Kubernetes Service in production). CORS is permissive on this endpoint so browsers can connect directly with the EventSource API.",
 		Headers: []RouteHeader{
 			{
 				Name:        "Accept",
@@ -118,7 +118,7 @@ var routeDocs = []RouteDoc{
 			{
 				Name:        "Last-Event-ID",
 				Requirement: "Optional",
-				Description: "Nanosecond timestamp returned by Arcade as the id of the last event the client received. Triggers a catchup replay of every status update that occurred strictly after this timestamp. Omit on first connect to receive the current persisted status of every txid registered under the token.",
+				Description: "Nanosecond timestamp returned by BSV Broadcaster as the id of the last event the client received. Triggers a catchup replay of every status update that occurred strictly after this timestamp. Omit on first connect to receive the current persisted status of every txid registered under the token.",
 			},
 		},
 		RequestBodies: []RouteBody{
@@ -140,7 +140,7 @@ var routeDocs = []RouteDoc{
 		},
 		ResponseStatus: "200 OK · text/event-stream",
 		ResponseBody:   "id: 1716205200123456789\nevent: status\ndata: {\"txid\":\"<hex>\",\"txStatus\":\"SEEN_ON_NETWORK\",\"timestamp\":\"2026-05-20T12:00:00Z\"}\n\nid: 1716205260987654321\nevent: status\ndata: {\"txid\":\"<hex>\",\"txStatus\":\"MINED\",\"timestamp\":\"2026-05-20T12:01:00Z\"}\n\n: keepalive\n\n",
-		Notes:          "Lines prefixed with ':' are SSE comments — Arcade sends a `: keepalive` comment every 15 seconds to hold the connection open through intermediaries. The 'id' field is the event timestamp in nanoseconds; clients reconnecting after a network blip should send it back as Last-Event-ID. The SSE service exposes its own /health and /ready endpoints on the same port. Possible txStatus values: RECEIVED, SEEN_ON_NETWORK, SEEN_MULTIPLE_NODES, MINED, IMMUTABLE, REJECTED.",
+		Notes:          "Lines prefixed with ':' are SSE comments — BSV Broadcaster sends a `: keepalive` comment every 15 seconds to hold the connection open through intermediaries. The 'id' field is the event timestamp in nanoseconds; clients reconnecting after a network blip should send it back as Last-Event-ID. The SSE service exposes its own /health and /ready endpoints on the same port. Possible txStatus values: RECEIVED, SEEN_ON_NETWORK, SEEN_MULTIPLE_NODES, MINED, IMMUTABLE, REJECTED.",
 	},
 	{
 		Method:      "POST",
@@ -175,7 +175,7 @@ var routeDocs = []RouteDoc{
 			},
 		},
 		ResponseStatus: "202 Accepted",
-		ResponseBody:   "{\n  \"txid\": \"<hex>\",\n  \"status\": 202,\n  \"txStatus\": \"RECEIVED\"\n}\n\n// Idempotent re-submit of a txid Arcade has already seen (txStatus echoes the existing state):\n{\n  \"txid\": \"<hex>\",\n  \"status\": 202,\n  \"txStatus\": \"SEEN_ON_NETWORK\"\n}",
+		ResponseBody:   "{\n  \"txid\": \"<hex>\",\n  \"status\": 202,\n  \"txStatus\": \"RECEIVED\"\n}\n\n// Idempotent re-submit of a txid BSV Broadcaster has already seen (txStatus echoes the existing state):\n{\n  \"txid\": \"<hex>\",\n  \"status\": 202,\n  \"txStatus\": \"SEEN_ON_NETWORK\"\n}",
 		Notes:          "Returns 400 with a reason field on validation failure (also persisted as a terminal REJECTED row, so subscribers see the outcome). This includes non-final transactions (nLockTime ahead of the chain's median-time-past with a non-final input sequence): the reason states when the tx becomes final — resubmit it then and it re-enters the broadcast pipeline. 503 with Retry-After: 1 is returned when the broker is under backpressure; the transaction was not queued and a retry is safe.",
 	},
 	{
@@ -261,7 +261,7 @@ var routeDocs = []RouteDoc{
 		Description:    "Returns the block processing milestones for one block, looked up by block hash.",
 		ResponseStatus: "200 OK",
 		ResponseBody:   "{\n  \"blockHash\": \"<hex>\",\n  \"blockHeight\": 870123,\n  \"headerSeenAt\": \"2026-05-20T12:00:00Z\",\n  \"processedAt\": \"2026-05-20T12:00:30Z\",\n  \"bumpBuiltAt\": \"2026-05-20T12:00:45Z\",\n  \"status\": \"compound-bump-built\",\n  \"orphanedAt\": null,\n  \"hasBlockProcessed\": true,\n  \"hasCompoundBUMP\": true\n}",
-		Notes:          "Returns 404 if Arcade has no record of the block hash.",
+		Notes:          "Returns 404 if BSV Broadcaster has no record of the block hash.",
 	},
 	{
 		Method:         "POST",

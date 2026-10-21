@@ -13,9 +13,9 @@ import (
 // TestBroadcasterRuntime_BootsAndServesHealth is the integration smoke test
 // for the full harness stack: containers (Postgres + Redpanda +
 // merkle-service) + in-process libp2p host + in-process datahub +
-// in-process arcade.
+// in-process BSV Broadcaster.
 //
-// Asserts arcade boots without error and answers /health on its
+// Asserts BSV Broadcaster boots without error and answers /health on its
 // host-bound port. Doesn't drive any tx flow yet — that's smoke_test.go.
 func TestBroadcasterRuntime_BootsAndServesHealth(t *testing.T) {
 	skipIfNoDocker(t)
@@ -48,5 +48,5 @@ func TestBroadcasterRuntime_BootsAndServesHealth(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("/health status=%d body=%s", resp.StatusCode, body)
 	}
-	t.Logf("arcade /health: %s", body)
+	t.Logf("BSV Broadcaster /health: %s", body)
 }

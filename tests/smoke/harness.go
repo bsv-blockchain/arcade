@@ -20,7 +20,7 @@ import (
 	"github.com/bsv-blockchain/bsv-broadcaster/services"
 )
 
-// broadcasterRuntime is the in-process arcade instance the smoke tests drive.
+// broadcasterRuntime is the in-process BSV Broadcaster instance the smoke tests drive.
 // Lifetime is tied to the *testing.T used to build it: t.Cleanup cancels
 // the run context and waits for every service goroutine.
 type broadcasterRuntime struct {
@@ -34,11 +34,11 @@ type broadcasterRuntime struct {
 	cleanup func()
 }
 
-// smokeOptions threads test-specific wiring into the in-process arcade
+// smokeOptions threads test-specific wiring into the in-process BSV Broadcaster
 // boot. The smoke suite never talks to a real teranode — TeranodeURL is
 // always a recordingTeranode's httptest URL.
 type smokeOptions struct {
-	// TeranodeURL is the single fake-teranode endpoint arcade sees via
+	// TeranodeURL is the single fake-teranode endpoint BSV Broadcaster sees via
 	// DatahubURLs. Required.
 	TeranodeURL string
 	// ChaintracksRemoteURL, when set, points chaintracks.mode=remote at a
@@ -60,7 +60,7 @@ type smokeOptions struct {
 	MutateConfig func(*config.Config)
 }
 
-// startBroadcasterSmoke boots arcade in-process via app.Bootstrap +
+// startBroadcasterSmoke boots BSV Broadcaster in-process via app.Bootstrap +
 // app.BuildServices with the lightest configuration that still exercises
 // the api-server → kafka → propagation → teranode path: memory broker,
 // Pebble in a temp dir, no merkle-service, no chaintracks, no real p2p.
@@ -73,7 +73,7 @@ func startBroadcasterSmoke(t *testing.T, opts smokeOptions) *broadcasterRuntime 
 
 	port, err := pickFreeTCPPort()
 	if err != nil {
-		t.Fatalf("pick arcade port: %v", err)
+		t.Fatalf("pick BSV Broadcaster port: %v", err)
 	}
 
 	cfg := buildSmokeConfig(t, port, opts)
@@ -119,16 +119,16 @@ func startBroadcasterSmoke(t *testing.T, opts smokeOptions) *broadcasterRuntime 
 		select {
 		case <-done:
 		case <-time.After(15 * time.Second):
-			t.Logf("arcade services did not stop within 15s")
+			t.Logf("BSV Broadcaster services did not stop within 15s")
 		}
 		rt.cleanup()
 	})
 
 	if err := rt.waitReady(15 * time.Second); err != nil {
-		t.Fatalf("arcade not ready: %v", err)
+		t.Fatalf("BSV Broadcaster not ready: %v", err)
 	}
 	if err := rt.waitForPropagationConsumer(15 * time.Second); err != nil {
-		t.Fatalf("arcade not ready: %v", err)
+		t.Fatalf("BSV Broadcaster not ready: %v", err)
 	}
 	return rt
 }
@@ -166,7 +166,7 @@ func (rt *broadcasterRuntime) waitForPropagationConsumer(timeout time.Duration) 
 	}
 }
 
-// buildSmokeConfig is intentionally close to tests/e2e/harness/arcade.go's
+// buildSmokeConfig is intentionally close to tests/e2e/harness/broadcaster.go's
 // buildBroadcasterConfig: the boot path is the same code, the deltas are the
 // container-touching knobs the smoke suite avoids (merkle-service URL
 // empty, libp2p disabled, single in-process teranode URL).
@@ -292,7 +292,7 @@ func (rt *broadcasterRuntime) waitReady(timeout time.Duration) error {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("arcade api-server not reachable within %s: %w", timeout, err)
+			return fmt.Errorf("BSV Broadcaster api-server not reachable within %s: %w", timeout, err)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}

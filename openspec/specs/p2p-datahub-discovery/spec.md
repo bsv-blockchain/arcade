@@ -6,12 +6,12 @@ The p2p_client service SHALL subscribe to the canonical teranode `node_status` t
 
 #### Scenario: Discovery enabled on a known network
 
-- **WHEN** arcade starts with `p2p.datahub_discovery: true` and `p2p.network: main` (or unset)
+- **WHEN** BSV Broadcaster starts with `p2p.datahub_discovery: true` and `p2p.network: main` (or unset)
 - **THEN** the p2p_client service creates a `go-teranode-p2p-client` client using the library's embedded mainnet bootstrap peers, subscribes to `teranode/bitcoin/1.0.0/mainnet-node_status`, and begins processing `NodeStatusMessage` payloads.
 
 #### Scenario: Discovery disabled
 
-- **WHEN** arcade starts with `p2p.datahub_discovery: false` (the default)
+- **WHEN** BSV Broadcaster starts with `p2p.datahub_discovery: false` (the default)
 - **THEN** the p2p_client service's `Start()` returns successfully without creating a libp2p client, opening a port, or subscribing to any topic.
 
 #### Scenario: Alternate network
@@ -102,7 +102,7 @@ The `datahub_urls` configured in the config file SHALL always be present in the 
 
 #### Scenario: Static URLs seeded at startup
 
-- **WHEN** arcade starts with `datahub_urls: ["https://static-1.example", "https://static-2.example"]` and `p2p.datahub_discovery` either true or false
+- **WHEN** BSV Broadcaster starts with `datahub_urls: ["https://static-1.example", "https://static-2.example"]` and `p2p.datahub_discovery` either true or false
 - **THEN** `teranode.Client.GetEndpoints()` returns both static URLs immediately after `NewClient`, in the configured order.
 
 #### Scenario: Discovery does not remove static URLs
@@ -136,7 +136,7 @@ The p2p_client service SHALL implement the `services.Service` interface. `Start`
 #### Scenario: Bootstrap unreachable
 
 - **WHEN** every bootstrap peer is unreachable at startup
-- **THEN** `Start` logs an error but does not block shutdown; the rest of arcade continues running with the static `datahub_urls` only.
+- **THEN** `Start` logs an error but does not block shutdown; the rest of BSV Broadcaster continues running with the static `datahub_urls` only.
 
 ### Requirement: Validate config when discovery is enabled on an unknown network
 
@@ -145,14 +145,14 @@ The p2p_client service SHALL implement the `services.Service` interface. `Start`
 #### Scenario: Discovery enabled on unknown network without bootstrap peers
 
 - **WHEN** `p2p.datahub_discovery: true`, `p2p.network: teratestnet`, and `p2p.bootstrap_peers: []`
-- **THEN** arcade fails to start with an error message identifying the missing `p2p.bootstrap_peers` field.
+- **THEN** BSV Broadcaster fails to start with an error message identifying the missing `p2p.bootstrap_peers` field.
 
 #### Scenario: Discovery enabled on known network without bootstrap peers
 
 - **WHEN** `p2p.datahub_discovery: true`, `p2p.network: main`, and `p2p.bootstrap_peers: []`
-- **THEN** arcade starts normally and uses the library's embedded mainnet bootstrap peers.
+- **THEN** BSV Broadcaster starts normally and uses the library's embedded mainnet bootstrap peers.
 
 #### Scenario: Discovery disabled without bootstrap peers
 
 - **WHEN** `p2p.datahub_discovery: false` and `p2p.bootstrap_peers: []`
-- **THEN** arcade starts normally.
+- **THEN** BSV Broadcaster starts normally.

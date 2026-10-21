@@ -2,7 +2,7 @@
 
 ## 1. ssrfguard package
 
-- [x] 1.1 Port `ssrfguard` from merkle-service as a top-level arcade package: `ValidateURL`, `IsBlockedIP`, `IsBlockedHostname`, `CheckDialAddress`, `ErrInvalidURL`/`ErrBlockedAddress` sentinels.
+- [x] 1.1 Port `ssrfguard` from merkle-service as a top-level BSV Broadcaster package: `ValidateURL`, `IsBlockedIP`, `IsBlockedHostname`, `CheckDialAddress`, `ErrInvalidURL`/`ErrBlockedAddress` sentinels.
 - [x] 1.2 Fix the CGNAT (100.64.0.0/10) doc/code mismatch from the merkle copy: add the explicit range check.
 - [x] 1.3 Port the test table; add CGNAT boundary cases.
 

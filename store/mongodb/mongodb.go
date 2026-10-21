@@ -206,7 +206,7 @@ func New(ctx context.Context, cfg config.Mongo, logger *zap.Logger) (*Store, err
 	// start from zero.
 	//
 	// MinPoolSize is deliberately NOT the rewrite width: these are idle
-	// sockets held open per process, and a deployment runs many arcade pods
+	// sockets held open per process, and a deployment runs many BSV Broadcaster pods
 	// against one deployment, so a floor of ~90 each would cost mongod
 	// thousands of connections to save a ramp that maxConnecting already
 	// shortens from ~46 waves to ~6.

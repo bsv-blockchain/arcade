@@ -114,7 +114,7 @@ func TestValidate_RejectsUnknownNetwork(t *testing.T) {
 	}
 }
 
-// ResolveP2PNetwork is the bridge between arcade's canonical names and the
+// ResolveP2PNetwork is the bridge between BSV Broadcaster's canonical names and the
 // values go-teranode-p2p-client actually accepts. Regressing any of these
 // pairings silently breaks bootstrap or topic subscription.
 func TestResolveP2PNetwork(t *testing.T) {

@@ -1,12 +1,12 @@
-# Arcade
+# BSV Broadcaster
 
-Arcade is a transaction management service for Bitcoin SV. It registers transactions with a [merkle-service](https://github.com/bsv-blockchain/merkle-service), receives state callbacks as transactions move through the network, builds full BUMPs (Bitcoin Unified Merkle Paths) once blocks are processed, and broadcasts transactions to a fleet of [Teranode](https://github.com/bsv-blockchain/teranode) datahubs.
+BSV Broadcaster is a transaction management service for Bitcoin SV. It registers transactions with a [merkle-service](https://github.com/bsv-blockchain/merkle-service), receives state callbacks as transactions move through the network, builds full BUMPs (Bitcoin Unified Merkle Paths) once blocks are processed, and broadcasts transactions to a fleet of [Teranode](https://github.com/bsv-blockchain/teranode) datahubs.
 
 It is designed to scale to blocks containing millions of transactions, subtrees of thousands, and tens of thousands of in-flight registrations per block — but it also runs as a single self-contained binary with zero external dependencies for development.
 
 ## Architecture
 
-Arcade is a microservice binary: one Go binary, several services, selectable via `--mode`. Services communicate over Kafka and share a Store.
+BSV Broadcaster is a microservice binary: one Go binary, several services, selectable via `--mode`. Services communicate over Kafka and share a Store.
 
 | Service        | Mode flag      | Responsibility                                                                                              |
 | -------------- | -------------- | ----------------------------------------------------------------------------------------------------------- |
@@ -79,12 +79,12 @@ This profile uses:
 
 `docker-compose.yaml` mirrors the Kubernetes deployment in
 `bsva-infra-flux/apps/base/arcade-v2` (teratestnet overlay), one replica each:
-the seven arcade services (`api-server`, `propagation`, `bump-builder`, `sse`,
+the seven BSV Broadcaster services (`api-server`, `propagation`, `bump-builder`, `sse`,
 `chaintracks`, `watchdog`, `p2p-client`) as separate `--mode` containers, plus
 Redpanda (topics pre-created by `compose/topic-init.sh`), Postgres,
 merkle-service (with its own Postgres), and the OTel collector. The shared
 service config lives in `compose/bsv-broadcaster-config.yaml`, mounted at
-`/etc/bsv-broadcaster/config.yaml` in every arcade container.
+`/etc/bsv-broadcaster/config.yaml` in every BSV Broadcaster container.
 
 ```bash
 make docker-up                            # published ghcr.io/bsv-blockchain/bsv-broadcaster:latest
@@ -146,7 +146,7 @@ The `api_server` exposes:
 ### Merkle-service callback states
 
 The `/api/v1/merkle-service/callback` endpoint applies SEEN transitions and
-stores STUMPs synchronously (a 2xx from arcade implies durability) and hands
+stores STUMPs synchronously (a 2xx from BSV Broadcaster implies durability) and hands
 `BLOCK_PROCESSED` to Kafka so BUMP construction runs in the bump-builder.
 Recognized callback types:
 
@@ -209,7 +209,7 @@ deploy/                 Kubernetes manifests
 
 ## Related projects
 
-- [Teranode](https://github.com/bsv-blockchain/teranode) — high-throughput Bitcoin SV node; arcade follows its daemon/service patterns
+- [Teranode](https://github.com/bsv-blockchain/teranode) — high-throughput Bitcoin SV node; BSV Broadcaster follows its daemon/service patterns
 - [Merkle Service](https://github.com/bsv-blockchain/merkle-service) — registers transactions and emits state callbacks
 - [go-teranode-p2p-client](https://github.com/bsv-blockchain/go-teranode-p2p-client), [go-p2p-message-bus](https://github.com/bsv-blockchain/go-p2p-message-bus) — libp2p plumbing reused for discovery
 - [BRC-74: BUMP](https://github.com/bitcoin-sv/BRCs/blob/master/transactions/0074.md) — full block merkle-path format

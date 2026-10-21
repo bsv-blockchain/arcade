@@ -2,7 +2,7 @@
 //
 // Validation is delegated to teranode's BDK-backed TxValidator
 // (github.com/bsv-blockchain/teranode/services/validator), the exact validator
-// teranode/svnode use to admit transactions. This guarantees that arcade's
+// teranode/svnode use to admit transactions. This guarantees that BSV Broadcaster's
 // intake decision matches node consensus across protocol upgrades instead of
 // re-implementing the rules in pure Go, which previously drifted (e.g. the
 // Chronicle push-only relaxation had to be hand-patched here). See issue #192.
@@ -27,24 +27,24 @@ import (
 )
 
 const (
-	// allForksActiveHeight is the block height arcade reports to the BDK
+	// allForksActiveHeight is the block height BSV Broadcaster reports to the BDK
 	// validator at intake. It sits above every network's Genesis and Chronicle
 	// activation heights — so all protocol upgrades evaluate as active and
-	// arcade validates against current consensus rules — yet stays below
+	// BSV Broadcaster validates against current consensus rules — yet stays below
 	// math.MaxInt32. The BDK adapter converts the height to int32 and, in policy
 	// mode, evaluates blockHeight-1, so math.MaxUint32 would overflow and reject
-	// every transaction. arcade's intake is height-agnostic post-Genesis, so a
+	// every transaction. BSV Broadcaster's intake is height-agnostic post-Genesis, so a
 	// static height avoids a chain-tip lookup on the hot path.
 	allForksActiveHeight uint32 = 2_000_000_000
 
-	// unknownParentHeight is the per-input source height arcade reports for every
-	// spent output. arcade does not track per-UTXO confirmation heights on the
+	// unknownParentHeight is the per-input source height BSV Broadcaster reports for every
+	// spent output. BSV Broadcaster does not track per-UTXO confirmation heights on the
 	// intake path, so instead of fabricating a concrete height it reports the
 	// "parent height unknown" sentinel — the value of teranode's internal
 	// unconfirmedParentHeight (teranode .../services/validator/Validator.go), which
 	// teranode itself stamps for parents whose height it cannot resolve.
 	//
-	// In policy mode — arcade's only mode; NewDefaultOptions sets
+	// In policy mode — BSV Broadcaster's only mode; NewDefaultOptions sets
 	// SkipPolicyChecks=false — teranode's BDK adapter (substituteUnconfirmedHeights
 	// in .../services/validator/ScriptVerifierGoBDK.go) resolves this sentinel to
 	// the candidate block height (allForksActiveHeight), which is post-Genesis and
@@ -56,13 +56,13 @@ const (
 	// historical 520-byte MAX_SCRIPT_ELEMENT_SIZE_BEFORE_GENESIS limit on modern
 	// post-Genesis spends (issue #214). The per-input UTXO height — not the spending
 	// block height — selects that limit, so reporting a post-Genesis source height is
-	// what lifts it. arcade's path runs no coinbase-maturity or relative-locktime
+	// what lifts it. BSV Broadcaster's path runs no coinbase-maturity or relative-locktime
 	// check, so reporting an "immature" height has no downside here; teranode remains
 	// the authority and re-checks with real heights downstream.
 	//
 	// This is correct only in policy mode: in consensus mode the adapter maps the
 	// sentinel to MEMPOOL_HEIGHT and BDK rejects every transaction as having an
-	// unconfirmed input. arcade never validates in consensus mode.
+	// unconfirmed input. BSV Broadcaster never validates in consensus mode.
 	unknownParentHeight uint32 = math.MaxUint32
 
 	// maxTxSizePolicyConsensusLimit is the BDK consensus ceiling on the policy
@@ -84,7 +84,7 @@ const (
 var DefaultMinFeePerKB = uint64(100)
 
 // Policy defines the operator-facing validation policy. Fields left at their
-// zero value fall back to arcade/teranode defaults.
+// zero value fall back to BSV Broadcaster/teranode defaults.
 type Policy struct {
 	// MaxTxSizePolicy caps transaction size in bytes (0 => defaultMaxTxSizePolicy).
 	MaxTxSizePolicy int
@@ -98,7 +98,7 @@ type Policy struct {
 	MinFeePerKB *uint64
 }
 
-// effectivePolicy is an immutable snapshot of what arcade currently enforces:
+// effectivePolicy is an immutable snapshot of what BSV Broadcaster currently enforces:
 // the two BDK engines plus the resolved values they were built from. It is
 // swapped atomically as a unit so a reader can never observe an engine and a
 // reported limit that disagree — GET /policy advertises exactly what intake
@@ -120,7 +120,7 @@ type effectivePolicy struct {
 // Validator performs intake transaction validation by delegating to teranode's
 // BDK-backed TxValidator.
 //
-// The enforced policy is swappable at runtime via SetNetworkPolicy: arcade
+// The enforced policy is swappable at runtime via SetNetworkPolicy: BSV Broadcaster
 // tracks the lowest fee and the most permissive size limits the network will
 // accept (observed from peer node_status announcements) and rebuilds the
 // engines to match (issue #212). The snapshot sits behind an atomic.Pointer so
@@ -254,7 +254,7 @@ func (v *Validator) SetMinFeePerKB(minFee uint64) {
 // The values may originate in unauthenticated peer gossip, and the BDK engine
 // panics rather than erroring on an out-of-range setting, so the rebuild is
 // both clamped (resolveMaxTxSize / resolveMaxScriptSize) and guarded: if
-// construction panics anyway, the previous policy stays in force and arcade
+// construction panics anyway, the previous policy stays in force and BSV Broadcaster
 // keeps validating rather than taking the pod down.
 func (v *Validator) SetNetworkPolicy(minFee, maxTxSize, maxScriptSize uint64) {
 	v.policyMu.Lock()
@@ -375,7 +375,7 @@ func buildSettings(params *chaincfg.Params, maxTxSize, maxScriptSize int, maxSig
 // defaultPolicySettings returns teranode's canonical BSV policy values.
 // settings.NewPolicySettings() returns an all-zero struct (zeros would make the
 // C++ engine reject memory-bound scripts), so every field the BDK adapter reads
-// is set explicitly. DataCarrier is enabled because arcade accepts OP_RETURN
+// is set explicitly. DataCarrier is enabled because BSV Broadcaster accepts OP_RETURN
 // data transactions; MaxTxSizePolicy and MinMiningTxFee are overwritten by
 // buildSettings.
 func defaultPolicySettings() *settings.PolicySettings {

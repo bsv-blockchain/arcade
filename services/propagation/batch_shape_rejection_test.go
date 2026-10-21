@@ -4,7 +4,7 @@ package propagation
 // request that reaches maxTransactionsPerRequest (1024) or maxDataPerRequest
 // (32 MiB) with a bare 400 text body, and an Echo/proxy body limit answers
 // 413. Neither carries a per-tx line, and Teranode has already dispatched
-// every tx it read before the trip. These tests pin arcade's reaction: narrow
+// every tx it read before the trip. These tests pin BSV Broadcaster's reaction: narrow
 // the chunk (never requeue it blind), never condemn a tx on that basis, keep
 // a sibling's 200 sticky, and leave peer health untouched.
 //
@@ -69,7 +69,7 @@ func shapeLimitServer(t *testing.T, maxBytes int, rej shapeRejection, hits *atom
 	return srv
 }
 
-// newShapeTestPropagator sets arcade's own byte cap far ABOVE the fake peer's
+// newShapeTestPropagator sets BSV Broadcaster's own byte cap far ABOVE the fake peer's
 // limit so the reactive path — not planChunks — is what gets exercised.
 func newShapeTestPropagator(tc *teranode.Client, ms *mockStore, logger *zap.Logger) *Propagator {
 	cfg := &config.Config{}

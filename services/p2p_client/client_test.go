@@ -495,7 +495,7 @@ func TestRecordPeerPolicy_LegacyMinMiningTxFee(t *testing.T) {
 // so a peer with no URL — or one rejected by SSRF validation, which this
 // network really does produce — set the network minimum while appearing nowhere
 // in /health. Recording it after registration means the values /policy derives
-// come from exactly the peers arcade can broadcast to, which is the set /health
+// come from exactly the peers BSV Broadcaster can broadcast to, which is the set /health
 // displays.
 func TestPeerPolicyOnlyRecordedForRegisteredURLs(t *testing.T) {
 	cheap := &teranodep2p.FeePolicy{MiningFee: teranodep2p.FeeAmount{Satoshis: 0, Bytes: 1000}}

@@ -1,4 +1,4 @@
-// Package sse hosts the standalone arcade SSE service. It owns the
+// Package sse hosts the standalone BSV Broadcaster SSE service. It owns the
 // `/events` endpoint, fans transaction-status updates from the shared
 // events.Publisher (a Kafka subscriber per pod) out to connected clients,
 // and serves Last-Event-ID-driven catchup from the shared store.

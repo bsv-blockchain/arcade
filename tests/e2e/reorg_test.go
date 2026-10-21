@@ -19,7 +19,7 @@ import (
 )
 
 // reorgStack is the shared scaffolding for the same-height reorg
-// scenarios (issue #279): containers + arcade with embedded chaintracks,
+// scenarios (issue #279): containers + BSV Broadcaster with embedded chaintracks,
 // two datahubs, and three tx groups broadcast + registered:
 //
 //	shared — mined in BOTH competing blocks (must follow the winner)
@@ -137,7 +137,7 @@ func (s *reorgStack) assertMinedPathsAgainst(ctx context.Context, t *testing.T, 
 // chain-selection layer: the canonical block A is announced (and becomes
 // tip) FIRST, then the same-height competitor B arrives. go-chaintracks
 // files B as an alternate — equal chainwork, no tip change, and
-// crucially NO ReorgEvent. On unfixed arcade, B's STUMP/BLOCK_PROCESSED
+// crucially NO ReorgEvent. On unfixed BSV Broadcaster, B's STUMP/BLOCK_PROCESSED
 // pipeline still unconditionally re-anchors the shared txs to B
 // (SetMinedByTxIDs is last-writer-wins) and falsely mines the B-only
 // txs, with no recovery trigger ever firing — exactly the ~92,700
@@ -157,7 +157,7 @@ func TestReorg_SameHeightTie_OrphanProcessedSecond(t *testing.T) {
 
 	// 2. B arrives second: same height, equal chainwork — an alternate
 	//    that never becomes tip and never triggers a ReorgEvent. Wait
-	//    until chaintracks has the header AND arcade fully processed B's
+	//    until chaintracks has the header AND BSV Broadcaster fully processed B's
 	//    BLOCK_PROCESSED (its compound BUMP is persisted).
 	if err := harness.PublishBlockUntilTracked(ctx, s.rt, s.h.LibP2P, s.blkB.BlockMessage(s.msDatahub.HostURL()), 90*time.Second); err != nil {
 		t.Fatalf("B → tracked: %v", err)
@@ -167,7 +167,7 @@ func TestReorg_SameHeightTie_OrphanProcessedSecond(t *testing.T) {
 	}
 	t.Logf("phase 2: B=%s processed by the full pipeline", s.blkB.Hash)
 
-	// 3. THE core regression assertion (fails on unfixed arcade): no tx
+	// 3. THE core regression assertion (fails on unfixed BSV Broadcaster): no tx
 	//    may be anchored to B — not the shared ones (they were MINED@A
 	//    and must stay), not the B-only ones (B is off the active chain;
 	//    mining them against it is a false MINED).
@@ -201,10 +201,10 @@ func TestReorg_SameHeightTie_OrphanProcessedSecond(t *testing.T) {
 // other ordering: B is announced first and legitimately becomes tip
 // (its MINED anchors are correct at that moment), then A arrives as an
 // alternate, then C extends A — chaintracks emits a ReorgEvent orphaning
-// B. Fixed arcade must re-anchor the shared txs to A (using A's stored
+// B. Fixed BSV Broadcaster must re-anchor the shared txs to A (using A's stored
 // compound BUMP), mine the A-only txs it previously (correctly) refused
 // to anchor, revert the B-only txs to SEEN_ON_NETWORK, publish corrected
-// events, and expose B as an orphaned proof on GET /tx. Unfixed arcade
+// events, and expose B as an orphaned proof on GET /tx. Unfixed BSV Broadcaster
 // leaves the B-only txs MINED@B forever (recordReorg only touches the
 // block_processing table).
 func TestReorg_SameHeightTie_OrphanWasTip_ReanchorsOnReorgEvent(t *testing.T) {
@@ -236,7 +236,7 @@ func TestReorg_SameHeightTie_OrphanWasTip_ReanchorsOnReorgEvent(t *testing.T) {
 	s.assertMinedPathsAgainst(ctx, t, s.blkB, append(append([]string{}, s.shared...), s.bOnly...), 90*time.Second)
 	t.Logf("phase 1: shared+bOnly legitimately MINED@B=%s", s.blkB.Hash)
 
-	// 2. A second: alternate, never tip. Arcade must still fully process
+	// 2. A second: alternate, never tip. BSV Broadcaster must still fully process
 	//    and persist A's compound BUMP — it is the re-anchor fuel.
 	if err := harness.PublishBlockUntilTracked(ctx, s.rt, s.h.LibP2P, s.blkA.BlockMessage(s.msDatahub.HostURL()), 90*time.Second); err != nil {
 		t.Fatalf("A → tracked: %v", err)
@@ -261,7 +261,7 @@ func TestReorg_SameHeightTie_OrphanWasTip_ReanchorsOnReorgEvent(t *testing.T) {
 	}
 	t.Logf("phase 3: tip=C=%s, B orphaned", s.blkC.Hash)
 
-	// 4. Post-reorg convergence (fails on unfixed arcade):
+	// 4. Post-reorg convergence (fails on unfixed BSV Broadcaster):
 	//    shared re-anchored to A with valid A-paths…
 	s.assertMinedPathsAgainst(ctx, t, s.blkA, s.shared, 120*time.Second)
 	//    …aOnly finally mined against A (the write guard correctly
@@ -379,7 +379,7 @@ func assertPathFoldsToRoot(t *testing.T, txid, merklePathHex, wantRoot string) {
 // it and stamps reconciled_at, which takes A off the reconciler's queue for
 // good. When C extends A, chaintracks reorganizes (ReorgEvent{orphaned:
 // [B], newTip: C}) and A is the active-chain block at height 1 again — but
-// on unfixed arcade nothing ever moves A's row back to active: recordReorg
+// on unfixed BSV Broadcaster nothing ever moves A's row back to active: recordReorg
 // touches only the orphaned hashes and the new tip, the tie-scan only
 // demotes 'active' rows, and the reconciler's resurrection short-circuit
 // never sees A again. The public processing-status feed then reports a
@@ -435,7 +435,7 @@ func TestReorg_SameHeightTie_LoserResurrectedByNextBlock(t *testing.T) {
 	}
 	t.Logf("phase 3: tip=C=%s — A is the active-chain block at height 1 again", s.blkC.Hash)
 
-	// 4. THE issue-#339 assertion (fails on unfixed arcade): A's row must
+	// 4. THE issue-#339 assertion (fails on unfixed BSV Broadcaster): A's row must
 	//    return to active with orphanedAt cleared, on the reorg edge itself —
 	//    not if and when some later sweep happens to visit it.
 	row, err := harness.WaitForBlockStatus(ctx, s.rt, s.blkA.Hash.String(), string(models.BlockStatusActive), 45*time.Second)

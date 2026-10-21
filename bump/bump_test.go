@@ -2000,7 +2000,7 @@ func TestAssembleBUMP_SingleSubtree_Unaffected(t *testing.T) {
 // padding layers) and running computeMissingHashes — so memory grew as
 // O(N²) PathElements and time as O(N²·log N) findLeafByOffset scans. For a
 // block of this size that path would either OOM (verified 2026-05-22 against
-// real mainnet block 950028: 24,896 STUMPs drove arcade to 13 GB RAM and
+// real mainnet block 950028: 24,896 STUMPs drove BSV Broadcaster to 13 GB RAM and
 // 100% CPU with no completion after 8+ min) or take many tens of minutes.
 //
 // The current direct-build implementation must finish well inside this

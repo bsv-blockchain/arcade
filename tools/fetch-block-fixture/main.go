@@ -6,7 +6,7 @@
 //     /block/<hash>. Identical to teranode's served
 //     bytes except the trailing coinbase-BUMP slot
 //     is replaced with a real coinbase merkle path
-//     so arcade's bump-builder validates against the
+//     so BSV Broadcaster's bump-builder validates against the
 //     real header merkle root.
 //   - subtrees/<hash>.bin — concatenated 32-byte tx hashes, with the
 //     coinbase placeholder at index 0 of subtree[0]

@@ -13,7 +13,7 @@ import (
 )
 
 // Service is the services.Service-conforming wrapper around Watchdog so
-// the arcade supervisor can manage it like any other mode. The actual
+// the BSV Broadcaster supervisor can manage it like any other mode. The actual
 // recovery logic lives in Watchdog.Run; this layer is purely lifecycle
 // plumbing.
 type Service struct {

@@ -1,6 +1,6 @@
 ## Why
 
-The original arcade (`/git/arcade`) embeds a [`go-chaintracks`](https://github.com/bsv-blockchain/go-chaintracks) block-header tracker and exposes its HTTP API by default under `/chaintracks/v1/*` and `/chaintracks/v2/*`. Clients (SPV validators, block explorers, merkle-path verifiers) rely on that surface for block-height lookups, tip subscriptions, and bulk header downloads. The refactored arcade does not yet run chaintracks at all — consumers that previously depended on a single arcade binary now have to stand up a separate chaintracks service. This change restores the default-on behaviour so the refactor is operationally a drop-in replacement.
+The original arcade (`/git/arcade`) embeds a [`go-chaintracks`](https://github.com/bsv-blockchain/go-chaintracks) block-header tracker and exposes its HTTP API by default under `/chaintracks/v1/*` and `/chaintracks/v2/*`. Clients (SPV validators, block explorers, merkle-path verifiers) rely on that surface for block-height lookups, tip subscriptions, and bulk header downloads. The refactored BSV Broadcaster does not yet run chaintracks at all — consumers that previously depended on a single BSV Broadcaster binary now have to stand up a separate chaintracks service. This change restores the default-on behaviour so the refactor is operationally a drop-in replacement.
 
 ## What Changes
 
@@ -16,7 +16,7 @@ The original arcade (`/git/arcade`) embeds a [`go-chaintracks`](https://github.c
 
 ### New Capabilities
 
-- `chaintracks-server`: embedded block-header tracker running in-process inside arcade's api-server, serving HTTP routes for tip/height/header queries, SSE streams, and bulk header static files. Covers initialization, route registration, default-on behaviour, storage layout, and shutdown.
+- `chaintracks-server`: embedded block-header tracker running in-process inside BSV Broadcaster's api-server, serving HTTP routes for tip/height/header queries, SSE streams, and bulk header static files. Covers initialization, route registration, default-on behaviour, storage layout, and shutdown.
 
 ### Modified Capabilities
 
@@ -25,7 +25,7 @@ The original arcade (`/git/arcade`) embeds a [`go-chaintracks`](https://github.c
 ## Impact
 
 - **New dependency**: `github.com/bsv-blockchain/go-chaintracks v1.1.x` (pulls in `go-p2p-message-bus`, `valyala/fasthttp` transitively). `go mod tidy` will widen the graph; CI cache invalidation expected.
-- **HTTP surface**: adds `/chaintracks/v1/*`, `/chaintracks/v2/*`, plus static file routes under `/chaintracks/`. Must not collide with existing arcade routes (none of our handlers use the `/chaintracks` prefix today).
+- **HTTP surface**: adds `/chaintracks/v1/*`, `/chaintracks/v2/*`, plus static file routes under `/chaintracks/`. Must not collide with existing BSV Broadcaster routes (none of our handlers use the `/chaintracks` prefix today).
 - **Storage**: new on-disk footprint at `<storage_path>/chaintracks/` holding block headers (bounded growth — mainnet header set is ~80 bytes × ~900k blocks ≈ 70 MB).
 - **Network**: chaintracks subscribes to P2P block announcements via `go-teranode-p2p-client`; needs outbound network to BSV peers. In environments without outbound peering, the feature should be disabled via `chaintracks_server.enabled=false` rather than left to fail silently.
 - **Startup latency**: initial header download on first run can be multi-minute. Documented behaviour; not a regression vs. original arcade.

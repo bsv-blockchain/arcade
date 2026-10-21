@@ -10,7 +10,7 @@ import (
 )
 
 // mapTeranodeError translates an error from the BDK-backed TxValidator (or the
-// extended-format conversion) into an arcade ArcError carrying an ARC status
+// extended-format conversion) into a BSV Broadcaster ArcError carrying an ARC status
 // code. The original message is preserved as ExtraInfo so the client-facing
 // reason and the persisted StatusRejected/ExtraInfo are unchanged.
 func mapTeranodeError(err error) error {

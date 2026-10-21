@@ -11,7 +11,7 @@ import (
 )
 
 // webhookReaperLeaseName is the well-known key every replica uses to
-// coordinate retry-sweep ownership. One lease per arcade deployment.
+// coordinate retry-sweep ownership. One lease per BSV Broadcaster deployment.
 const webhookReaperLeaseName = "webhook-reaper"
 
 // webhookReaperBatch caps how many submissions a single tick re-fires. Same

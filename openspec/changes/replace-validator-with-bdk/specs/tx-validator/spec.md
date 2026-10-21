@@ -4,7 +4,7 @@
 
 The TX validator SHALL validate transactions using teranode's BDK-backed
 `TxValidator` (`github.com/bsv-blockchain/teranode/services/validator`) — the
-same engine teranode/svnode use — so that arcade's accept/reject decision
+same engine teranode/svnode use — so that BSV Broadcaster's accept/reject decision
 matches node consensus across protocol upgrades. The validator SHALL NOT
 re-implement consensus or policy script rules in Go. Valid transactions are
 routed to propagation; invalid transactions are rejected with the rejection

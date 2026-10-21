@@ -22,7 +22,7 @@ import (
 // These tests pin the #295 missing-parent safety net end-to-end: with a
 // multi-partition bsv-broadcaster.propagation topic, a child submitted in a LATER
 // HTTP request than its parent has no ordering guarantee — it can reach
-// teranode first and draw TX_MISSING_PARENT. Arcade must treat that as a
+// teranode first and draw TX_MISSING_PARENT. BSV Broadcaster must treat that as a
 // retryable condition (requeue → eventual accept once the parent lands, or
 // PENDING_RETRY park when it never does), and must NEVER mark the child
 // REJECTED for what is purely an ordering artifact.
@@ -30,7 +30,7 @@ import (
 // dependencyAwareTeranode is a stateful fake teranode: it accepts a tx only
 // when every input's source tx is already in its accepted set, and answers
 // HTTP 422 with a real deepest-cause missing-parent failure line for each
-// tx whose parent it hasn't seen — the deployed-teranode behavior arcade's
+// tx whose parent it hasn't seen — the deployed-teranode behavior BSV Broadcaster's
 // parser is built against. Txs absent from the failure list are implicitly
 // accepted, matching teranode's "Failed to process transactions:" contract.
 type dependencyAwareTeranode struct {
@@ -212,8 +212,8 @@ func waitForBroadcasterStatus(t *testing.T, rt *broadcasterRuntime, txid, want s
 
 // TestSmoke_OutOfOrderChild_RecoversViaMissingParentRetry is the #295
 // cross-submission race, end to end on a 4-partition topic: the child is
-// submitted (and broadcast) BEFORE its parent ever reaches arcade. Teranode
-// 422s it with TX_MISSING_PARENT; arcade requeues instead of rejecting;
+// submitted (and broadcast) BEFORE its parent ever reaches BSV Broadcaster. Teranode
+// 422s it with TX_MISSING_PARENT; BSV Broadcaster requeues instead of rejecting;
 // once the parent is submitted and accepted, the child's retry lands.
 // Assertions: both txs end ACCEPTED_BY_NETWORK, the child was genuinely
 // rejected at least once by teranode (the race really happened), no batch

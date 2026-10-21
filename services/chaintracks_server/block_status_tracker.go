@@ -180,7 +180,7 @@ func (t *blockStatusTracker) recordReorg(ctx context.Context, ev *chaintracks.Re
 // new tip — the blocks a ReorgEvent makes canonical without naming them —
 // and resets to active any row a previous detection edge marked orphaned
 // (issue #339: the same-height loser that the next block builds on). It is
-// reactivate-only: rows arcade never recorded are not inserted (the tip
+// reactivate-only: rows BSV Broadcaster never recorded are not inserted (the tip
 // channel owns that), and parked rows stay parked (the watchdog's in-memory
 // park flag would otherwise disagree with the table). Each height is one
 // in-memory header lookup plus one row read; the walk runs nearest-first and

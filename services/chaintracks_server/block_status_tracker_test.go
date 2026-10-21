@@ -620,7 +620,7 @@ func TestRecordReorg_DeepBranchWalksEveryHeight(t *testing.T) {
 
 	assertActiveClean(t, st.row(t, h10.Hash.String()))
 	if st.has(h11.Hash.String()) {
-		t.Fatal("the branch walk must not insert rows for blocks arcade never saw")
+		t.Fatal("the branch walk must not insert rows for blocks BSV Broadcaster never saw")
 	}
 	if got := st.row(t, h12.Hash.String()).Status; got != models.BlockStatusParked {
 		t.Fatalf("parked row must stay parked, got %s", got)

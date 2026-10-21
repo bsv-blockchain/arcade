@@ -4,12 +4,12 @@
 #   make docker-up                            # ghcr.io/bsv-blockchain/bsv-broadcaster:latest
 #   BSV_BROADCASTER_IMAGE=bsv-broadcaster:local make docker-up  # after `make docker-build`
 #
-# Arcade containers are distroless (no shell/curl) so they cannot carry compose
+# BSV Broadcaster containers are distroless (no shell/curl) so they cannot carry compose
 # healthchecks; ordering gates on infra healthchecks + topic-init, and
-# `restart: on-failure` converges the rest (arcade fails fast when
+# `restart: on-failure` converges the rest (BSV Broadcaster fails fast when
 # kafka/store/topics are not ready).
 
-# Never group into a shared pod: all seven arcade services bind 8081 (health)
+# Never group into a shared pod: all seven BSV Broadcaster services bind 8081 (health)
 # and both postgreses bind 5432 — collisions in a shared netns.
 x-podman:
   in_pod: false
@@ -86,7 +86,7 @@ services:
     image: docker.io/redpandadata/redpanda:v26.1.9
     entrypoint: ["/bin/bash", "/topic-init.sh"]
     # Keep in step with propagation.partitions in compose/bsv-broadcaster-config.yaml:
-    # arcade hard-fails at boot if the topic has fewer partitions than the
+    # BSV Broadcaster hard-fails at boot if the topic has fewer partitions than the
     # service is configured for.
     environment:
       PROPAGATION_PARTITIONS: "${PROPAGATION_PARTITIONS:-1}"
@@ -125,7 +125,7 @@ services:
     restart: unless-stopped
 
   # Optional Aerospike for `go test -tags=integration ./store/aerospike/...`
-  # (localhost:3200, namespace arcade). Not used by the default postgres
+  # (localhost:3200, namespace BSV Broadcaster). Not used by the default postgres
   # stack — start with `docker compose --profile aerospike up -d aerospike`.
   # Pin is the current 7.0 line (same as deploy/aerospike.yaml), not :latest
   # (F-038 / #96). Digest is the multi-arch index for 7.0.0.26.
@@ -144,7 +144,7 @@ services:
       - bsv-broadcaster-net
     restart: unless-stopped
 
-  # merkle-service's own database (never shared with arcade's; postgres:17
+  # merkle-service's own database (never shared with BSV Broadcaster's; postgres:17
   # matches tests/e2e/harness/containers.go).
   merkle-postgres:
     image: docker.io/library/postgres:17-alpine
@@ -166,13 +166,13 @@ services:
       start_period: 5s
     restart: unless-stopped
 
-  # In k8s this is a separate app arcade calls over HTTP; included here so the
+  # In k8s this is a separate app BSV Broadcaster calls over HTTP; included here so the
   # tx lifecycle works locally. Env layout proven by
   # tests/e2e/harness/containers.go:227-263; p2p values from the
   # merkle-service teratestnet configmap. Image digest = v0.2.5, same pin as
   # the e2e suite (`:latest` has regressed the BLOCK_PROCESSED round-trip).
   # CALLBACK_ALLOW_PRIVATE_IPS=true is REQUIRED: http://api-server:8080 is
-  # RFC1918 and merkle-service's SSRF guard would otherwise reject it. arcade
+  # RFC1918 and merkle-service's SSRF guard would otherwise reject it. BSV Broadcaster
   # forwards callback_url + callback_token per tx registration.
   merkle-service:
     image: ${MERKLE_IMAGE:-ghcr.io/bsv-blockchain/merkle-service@sha256:ff4ae409df2680c54267c27887dc1744fb3b64e5ddc5636882185ce82b35ced3}
@@ -216,7 +216,7 @@ services:
       - bsv-broadcaster-net
     restart: unless-stopped
 
-  # --- Arcade services: same image, role via --mode (mirrors _base/*.yaml) ---
+  # --- BSV Broadcaster services: same image, role via --mode (mirrors _base/*.yaml) ---
 
   # http 8080; health/ready/metrics are on 8080 in this mode (not 8081).
   api-server:

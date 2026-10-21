@@ -1,7 +1,7 @@
 // Package ssrfguard implements a shared SSRF (Server-Side Request Forgery)
-// blocking predicate for URLs arcade learns from untrusted sources — most
+// blocking predicate for URLs BSV Broadcaster learns from untrusted sources — most
 // importantly DataHub URLs announced by teranode peers over p2p, which
-// arcade later POSTs transactions to from inside the cluster.
+// BSV Broadcaster later POSTs transactions to from inside the cluster.
 //
 // Ported from merkle-service's internal/ssrfguard (see merkle-service PR
 // #181, which fixed the same bug class at its p2p announcement intake) so
@@ -16,7 +16,7 @@
 //	http://169.254.169.254/latest/meta-data/iam/security-credentials/
 //	http://asset:8090/api/v1  (its own cluster-internal service name)
 //
-// and either turn arcade's propagation path into an SSRF primitive against
+// and either turn BSV Broadcaster's propagation path into an SSRF primitive against
 // cloud metadata endpoints / RFC1918 neighbors, or pollute the shared
 // endpoint registry with URLs that can never be reached from this cluster.
 // ValidateURL blocks by destination IP rather than hostname — checking

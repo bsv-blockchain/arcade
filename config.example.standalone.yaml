@@ -1,6 +1,6 @@
-# Arcade — standalone / zero-dependency configuration.
+# BSV Broadcaster — standalone / zero-dependency configuration.
 #
-# This profile runs a single arcade binary with no external infrastructure:
+# This profile runs a single BSV Broadcaster binary with no external infrastructure:
 #   - in-memory Kafka replacement (no broker needed)
 #   - Pebble embedded KV store (no Aerospike needed)
 #   - optional libp2p peer discovery using embedded teranode bootstrap peers
@@ -45,7 +45,7 @@ health:
 #   endpoint: ""                # host:port of the OTLP collector; see env fallback above
 #   protocol: grpc              # "grpc" (default, port 4317) or "http" (port 4318)
 #   insecure: false             # skip TLS; typically true for an in-cluster/local collector
-#   service_name: arcade
+#   service_name: bsv-broadcaster
 #   namespace: ""                # service.namespace resource attribute (e.g. downstream solution name)
 #   traces: true
 #   metrics: true
@@ -63,7 +63,7 @@ kafka:
   buffer_size: 10000
 
 # Embedded Pebble KV store — pure-Go LSM, single-process exclusive access.
-# Point path at a directory inside storage_path; arcade creates it on first run.
+# Point path at a directory inside storage_path; BSV Broadcaster creates it on first run.
 store:
   backend: pebble
   pebble:
@@ -101,7 +101,7 @@ merkle_service:
   urls: []
   auth_token: ""
 
-# P2P discovery via go-teranode-p2p-client. When enabled, arcade joins the
+# P2P discovery via go-teranode-p2p-client. When enabled, BSV Broadcaster joins the
 # pubsub mesh for the top-level `network` above and auto-registers each peer's
 # advertised datahub URL for propagation. Discovered URLs are additive to
 # datahub_urls and deduplicated.

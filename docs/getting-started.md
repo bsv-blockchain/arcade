@@ -1,13 +1,13 @@
 # Getting Started — Standalone Server
 
-A quick path from `git clone` to a running arcade process on the network of your
+A quick path from `git clone` to a running BSV Broadcaster process on the network of your
 choice. "Standalone" means a single binary with no external infrastructure: an
 in-memory Kafka replacement, an embedded Pebble key/value store, and optional
 libp2p peer discovery using built-in bootstrap peers.
 
 At the end you'll have:
 
-- One `arcade` process serving the Arc-compatible HTTP API on `:8080`
+- One `bsv-broadcaster` process serving the Arc-compatible HTTP API on `:8080`
 - A `/health` endpoint on `:8081`
 - All state under `~/.bsv-broadcaster/` (Pebble DB, chaintracks headers, libp2p key)
 - No external services running
@@ -28,8 +28,8 @@ profile.
 
 ```bash
 git clone https://github.com/bsv-blockchain/bsv-broadcaster.git
-cd arcade
-go build -o arcade ./cmd/bsv-broadcaster
+cd BSV Broadcaster
+go build -o BSV Broadcaster ./cmd/bsv-broadcaster
 ```
 
 ## Base config
@@ -53,7 +53,7 @@ health:
 
 kafka:
   backend: memory
-  consumer_group: arcade
+  consumer_group: bsv-broadcaster
 
 store:
   backend: pebble
@@ -73,7 +73,7 @@ chaintracks_server:
 ## Run
 
 ```bash
-./arcade --config config.yaml
+./bsv-broadcaster --config config.yaml
 ```
 
 `mode: all` runs every service (api-server, bump-builder, propagation,
@@ -128,12 +128,12 @@ Two regtest-specific constraints, enforced at config load:
 
 ## Merkle Service
 
-Arcade delegates merkle-proof construction to a separate **Merkle Service**.
-The service watches the network for arcade's registered txids and drives the
+BSV Broadcaster delegates merkle-proof construction to a separate **Merkle Service**.
+The service watches the network for BSV Broadcaster's registered txids and drives the
 transaction lifecycle forward via callbacks
 (`SEEN_ON_NETWORK` → `MINED` → `IMMUTABLE`).
 
-**If `merkle_service.url` and `merkle_service.urls` are both left empty, arcade
+**If `merkle_service.url` and `merkle_service.urls` are both left empty, BSV Broadcaster
 still accepts and broadcasts transactions, but every row stays at `RECEIVED`
 forever** — no callback source means nothing advances the state machine.
 Configure Merkle Service whenever you want real status progression.
@@ -141,7 +141,7 @@ Configure Merkle Service whenever you want real status progression.
 ### Running against several Merkle Services
 
 List additional instances under `merkle_service.urls` (or set
-`BSV_BROADCASTER_MERKLE_SERVICE_URLS` to a comma-separated list). Arcade registers every
+`BSV_BROADCASTER_MERKLE_SERVICE_URLS` to a comma-separated list). BSV Broadcaster registers every
 transaction with every endpoint and each endpoint delivers its own callbacks:
 
 - A transaction is registered, and therefore broadcast, as soon as **one**
@@ -183,7 +183,7 @@ All endpoints share `merkle_service.auth_token` and the top-level
 
 ### Generate a callback auth token
 
-Merkle Service authenticates its inbound callbacks to arcade with a bearer
+Merkle Service authenticates its inbound callbacks to BSV Broadcaster with a bearer
 token. Generate a high-entropy value:
 
 ```bash
@@ -191,7 +191,7 @@ openssl rand -hex 32
 ```
 
 The same value must also be configured on the Merkle Service side so it can
-attach `Authorization: Bearer <token>` to its callback requests. Arcade
+attach `Authorization: Bearer <token>` to its callback requests. BSV Broadcaster
 **refuses to start** when `merkle_service.url` is set without `callback_token`
 — an unauthenticated callback receiver would accept forged status updates for
 any txid.
@@ -199,7 +199,7 @@ any txid.
 ### Set `callback_url`
 
 `callback_url` is the **public URL at which Merkle Service can reach this
-arcade instance**, with path `/api/v1/merkle-service/callback`. Merkle
+BSV Broadcaster instance**, with path `/api/v1/merkle-service/callback`. Merkle
 Service POSTs status updates here, so it must be resolvable and routable
 *from Merkle Service*, not just from your laptop.
 
@@ -221,7 +221,7 @@ callback_token: "<output of openssl rand -hex 32>"
 
 merkle_service:
   url: "https://merkle-service-ttn-us-1.bsvb.tech"  # match your network
-  auth_token: ""  # only if your Merkle Service requires outbound auth from arcade
+  auth_token: ""  # only if your Merkle Service requires outbound auth from BSV Broadcaster
 ```
 
 ## Verify it's running
@@ -264,12 +264,12 @@ curl http://localhost:8080/tx/<txid>
   transactions and keeps BUMP/STUMP payloads in GridFS. Leave the connection
   string reading from the primary — the backend's write guards are
   read-then-write, so a `readPreference` of `secondary`/`secondaryPreferred`
-  can let them pass on stale data; arcade warns at startup if the URI asks
+  can let them pass on stale data; BSV Broadcaster warns at startup if the URI asks
   for one.
 - **Production deployment** — start from
   [`config.example.yaml`](../config.example.yaml), which uses external Kafka
   brokers and an Aerospike cluster. Pre-create Kafka topics per
-  [`docs/production-kafka.md`](production-kafka.md) — arcade does not create
+  [`docs/production-kafka.md`](production-kafka.md) — BSV Broadcaster does not create
   them and `bsv-broadcaster.propagation` has a hard partition-count constraint.
 
 Any value above can be overridden by an environment variable prefixed with

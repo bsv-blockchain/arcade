@@ -25,12 +25,12 @@ import (
 //
 //	500  PROCESSING (4): [ProcessTransaction][<txid>] failed to validate transaction
 //
-// — a line arcade correctly cannot tell apart from a node fault (#313). From
+// — a line BSV Broadcaster correctly cannot tell apart from a node fault (#313). From
 // Teranode #1295/#1595 on, the same submission draws
 //
 //	409  UTXO_SPENT (70): [ProcessTransaction][<txid>] <outpoint>:<vout> utxo already spent by tx <spender>[<vin>]
 //
-// These tests pin what arcade must do once ANY peer gives that answer, while
+// These tests pin what BSV Broadcaster must do once ANY peer gives that answer, while
 // the rest of the fleet still gives the opaque one: REJECTED, ARC 466, the
 // competing spender on the row and on the event subscribers receive.
 

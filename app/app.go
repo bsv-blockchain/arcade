@@ -1,4 +1,4 @@
-// Package app builds and wires the shared dependencies arcade's services
+// Package app builds and wires the shared dependencies BSV Broadcaster's services
 // need (kafka broker + producer, store, teranode client, merkle-service
 // client, events publisher, validator) and turns them into a slice of
 // runnable services. cmd/bsv-broadcaster/main.go is a thin wrapper that loads
@@ -45,7 +45,7 @@ import (
 	"github.com/bsv-blockchain/bsv-broadcaster/validator"
 )
 
-// Deps is the set of process-wide dependencies arcade's services share.
+// Deps is the set of process-wide dependencies BSV Broadcaster's services share.
 // Bootstrap returns one of these fully wired; BuildServices consumes it.
 type Deps struct {
 	Cfg            *config.Config
@@ -554,7 +554,7 @@ func modeNeedsValidator(mode string) bool {
 //     tag, so YAML must use the camelCase-flattened key
 //     ("bootstrappeers", not "bootstrap_peers"); viper matches case-
 //     insensitively but does not translate snake_case.
-//  2. p2p.bootstrap_peers — the well-documented arcade key, shared
+//  2. p2p.bootstrap_peers — the well-documented BSV Broadcaster key, shared
 //     with services/p2p_client. Configuring it once at the p2p block
 //     lets both the p2p-client and chaintracks pick it up, which is
 //     what almost every private-network deployment wants.
@@ -690,7 +690,7 @@ func BuildServices(d *Deps) []services.Service {
 // chaintracksHeaderReader adapts go-chaintracks's Chaintracks interface to
 // the narrower ChainHeaderReader contract bump-builder needs. The library
 // already exposes GetHeaderByHash with the same signature, so this is a
-// trivial passthrough; the wrapper exists only to keep arcade packages from
+// trivial passthrough; the wrapper exists only to keep BSV Broadcaster packages from
 // importing chaintracks types into their public APIs.
 type chaintracksHeaderReader struct {
 	ct chaintrackslib.Chaintracks

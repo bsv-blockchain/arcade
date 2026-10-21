@@ -373,7 +373,7 @@ type FeeAmount struct {
 
 // Policy is the ARC-compatible transaction policy document returned by
 // GET /policy (issue #212). Field names and JSON tags match the ARC contract
-// so arcade is a drop-in target for clients that discover fee/size limits
+// so BSV Broadcaster is a drop-in target for clients that discover fee/size limits
 // before building transactions.
 type Policy struct {
 	MiningFee               FeeAmount `json:"miningFee"`
