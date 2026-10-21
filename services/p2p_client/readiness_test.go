@@ -93,7 +93,10 @@ func TestClient_DiscoverySignalsAfterFactoryReturns(t *testing.T) {
 	cancel()
 	_ = c.Stop()
 	select {
-	case <-errCh:
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Start did not return")
 	}
