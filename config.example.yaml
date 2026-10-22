@@ -31,6 +31,12 @@ network: mainnet
 api:
   host: 0.0.0.0
   port: 8080
+  # trusted_proxies: []       # CIDRs/IPs allowed to set X-Forwarded-For; empty
+  #                           # (default) means it's never trusted and
+  #                           # c.ClientIP() is always the TCP peer.
+  # trusted_platform: ""      # "cloudflare" trusts CF-Connecting-IP from ANY
+  #                           # peer — safe only when Cloudflare (e.g. a
+  #                           # Tunnel) is the sole ingress. See docs/api-keys.md.
 
 # Arcade does not create Kafka topics; the broker must already have them
 # (auto-create on first publish is typically disabled in production, and
@@ -459,3 +465,41 @@ chaintracks_server:
 #     msgbus:
 #       bootstrappeers:
 #         - /dns4/peer.example.cluster.local/tcp/9905/p2p/12D3Koo...
+
+# API keys and tiered rate limiting (docs/api-keys.md). All off by default.
+# api.trusted_platform and api.trusted_proxies live under the api: block
+# above; set trusted_platform to "cloudflare" only when every request
+# arrives through Cloudflare.
+auth:
+  enabled: false
+admin:
+  enabled: false
+  host: 127.0.0.1       # kubectl port-forward works with this; set 0.0.0.0 to opt in to in-cluster tooling reaching it directly
+  port: 8090            # never expose through the public ingress
+  token: ""             # ARCADE_ADMIN_TOKEN
+ratelimit:
+  enabled: false        # requires auth.enabled
+  lease_fraction: 0.10
+  shrink_threshold: 0.80
+  key_cache_ttl_ms: 30000
+  key_cache_stale_max_ms: 600000
+  expected_replicas: 1
+  costs:
+    submit_tx: 10
+    read: 1
+  anonymous:
+    units_per_minute: 50
+    max_in_flight: 5
+    max_batch: 1
+  # free is required whenever ratelimit.enabled: it's the fallback tier for
+  # a key whose configured tier is later removed. Tier names must be
+  # lowercase and match ^[a-z0-9][a-z0-9_-]*$. A bounded tier
+  # (units_per_minute > 0) must be "payable": costs.submit_tx <=
+  # units_per_minute, and, when max_batch > 0, max_batch * costs.submit_tx +
+  # costs.read <= units_per_minute. units_per_minute: 0 (e.g. unlimited
+  # below) has no budget to check.
+  tiers:
+    free:       { units_per_minute: 50,    max_in_flight: 5,   max_batch: 1 }
+    standard:    { units_per_minute: 3000,  max_in_flight: 20,  max_batch: 100 }
+    high:        { units_per_minute: 30000, max_in_flight: 100, max_batch: 1000 }
+    unlimited: { units_per_minute: 0,     max_in_flight: 500, max_batch: 10000 }

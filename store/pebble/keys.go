@@ -13,6 +13,11 @@ import (
 // Index entries store no value — their existence is the payload. We read
 // the referenced txid/id off the end of the key. This keeps index writes
 // to a single Set() per index and avoids a second lookup round-trip.
+//
+// The one exception is idx:apikey:hash:<hash>, which stores the key id as
+// its value: a hash lookup must resolve to the id so GetAPIKeyByHash can
+// fetch the primary row without encoding the id into the key (the hash is
+// already the full key suffix).
 const (
 	prefixTx         = "tx:"
 	prefixBump       = "bump:"
@@ -21,6 +26,9 @@ const (
 	prefixLease      = "lease:"
 	prefixDatahub    = "dh:"
 	prefixPeerPolicy = "pp:"
+
+	prefixAPIKey        = "apikey:"
+	prefixIdxAPIKeyHash = "idx:apikey:hash:" //nolint:gosec // index-prefix string, not a credential
 
 	prefixIdxTxStatus        = "idx:tx:status:"
 	prefixIdxTxBlock         = "idx:tx:block:"
@@ -43,6 +51,10 @@ func datahubEndpointPrefix() []byte        { return []byte(prefixDatahub) }
 
 func peerPolicyKey(peerID string) []byte { return []byte(prefixPeerPolicy + peerID) }
 func peerPolicyPrefix() []byte           { return []byte(prefixPeerPolicy) }
+
+func apiKeyKey(id string) []byte       { return []byte(prefixAPIKey + id) }
+func apiKeyHashKey(hash string) []byte { return []byte(prefixIdxAPIKeyHash + hash) }
+func apiKeyPrefix() []byte             { return []byte(prefixAPIKey) }
 
 // stumpKey is content-addressed: several merkle-services may deliver the
 // same subtree's STUMP, and a service that missed registrations delivers a

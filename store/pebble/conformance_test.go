@@ -55,6 +55,20 @@ func TestRetryReason_Conformance(t *testing.T) {
 	})
 }
 
+func TestAPIKeys_Conformance(t *testing.T) {
+	storetest.RunAPIKeySuite(t, func(t *testing.T) store.APIKeyStore {
+		t.Helper()
+		return newTestStore(t)
+	})
+}
+
+func TestQuota_Conformance(t *testing.T) {
+	storetest.RunQuotaSuite(t, func(t *testing.T) store.QuotaStore {
+		t.Helper()
+		return newTestStore(t)
+	})
+}
+
 func TestIterateTrackerRows_StatusIndexStaysFresh(t *testing.T) {
 	// The walk is driven by idx:tx:status:<status>:*, so a status transition
 	// must move the row out of the old status's index. If it did not, a

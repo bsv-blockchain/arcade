@@ -1,4 +1,5 @@
-// Package mongodb implements store.Store and store.Leaser on MongoDB.
+// Package mongodb implements store.Store, store.Leaser, store.APIKeyStore and
+// store.QuotaStore on MongoDB.
 //
 // Design notes, in the order they matter:
 //
@@ -110,6 +111,8 @@ type Store struct {
 	leases   *mongo.Collection
 	datahubs *mongo.Collection
 	peers    *mongo.Collection
+	apiKeys  *mongo.Collection
+	apiQuota *mongo.Collection
 	// bumps / stumps are the GridFS buckets with the manifest collections
 	// that point at the current file; see blobs.go.
 	bumps  blobBucket
@@ -247,6 +250,8 @@ func newWithClient(client *mongo.Client, database string, cfg config.Mongo) *Sto
 		leases:   db.Collection(collLeases),
 		datahubs: db.Collection(collDatahubEndpoints),
 		peers:    db.Collection(collPeerPolicies),
+		apiKeys:  db.Collection(collAPIKeys),
+		apiQuota: db.Collection(collAPIQuota),
 		bumps: blobBucket{
 			bucket:    db.GridFSBucket(options.GridFSBucket().SetName(bucketBumps).SetChunkSizeBytes(gridfsChunkSize)),
 			manifests: db.Collection(collBumpManifests),

@@ -237,3 +237,31 @@ CREATE INDEX IF NOT EXISTS idx_pp_last_seen ON peer_policies(last_seen);
 -- from a teranode carrying fee_policy fills them in.
 ALTER TABLE peer_policies ADD COLUMN IF NOT EXISTS max_tx_size_policy     BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE peer_policies ADD COLUMN IF NOT EXISTS max_script_size_policy BIGINT NOT NULL DEFAULT 0;
+
+-- API keys (rate-limiting design, 2026-10-21). Only the SHA-256 of the full
+-- key is stored; hash is the lookup path on every authenticated request.
+CREATE TABLE IF NOT EXISTS api_keys (
+    id         TEXT PRIMARY KEY,
+    hash       TEXT NOT NULL UNIQUE,
+    hint       TEXT NOT NULL,
+    name       TEXT NOT NULL DEFAULT '',
+    tier       TEXT NOT NULL,
+    status     TEXT NOT NULL,
+    expires_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    revoked_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_api_keys_created ON api_keys(created_at, id);
+
+-- Shared per-key, per-minute quota counters. last_grant is written by the
+-- same upsert that bumps used, so ReserveQuota learns its grant atomically
+-- without a second read. Rows are swept QuotaRetention after window_start.
+CREATE TABLE IF NOT EXISTS api_quota (
+    key_id       TEXT NOT NULL,
+    window_start TIMESTAMPTZ NOT NULL,
+    used         BIGINT NOT NULL,
+    last_grant   BIGINT NOT NULL,
+    PRIMARY KEY (key_id, window_start)
+);
+CREATE INDEX IF NOT EXISTS idx_api_quota_window ON api_quota(window_start);
