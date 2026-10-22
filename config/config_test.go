@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
@@ -88,7 +89,7 @@ func TestValidate_AllowsEmptyCallbackTokenInStandaloneMode(t *testing.T) {
 // p2p.datahub_discovery=false; the bootstrap-peers requirement only triggers
 // when discovery is on (covered by TestValidate_RegtestRequiresBootstrapPeers).
 func TestValidate_AcceptsCanonicalNetworks(t *testing.T) {
-	for _, net := range []string{"", NetworkMainnet, NetworkTestnet, NetworkTeratestnet, NetworkRegtest} {
+	for _, net := range []string{"", NetworkMainnet, NetworkTestnet, NetworkTeratestnet, NetworkRegtest, NetworkTstn} {
 		cfg := baseValidConfig()
 		cfg.Network = net
 		if err := validate(cfg); err != nil {
@@ -128,6 +129,7 @@ func TestResolveP2PNetwork(t *testing.T) {
 		{NetworkTeratestnet, NetworkTeratestnet, "teratestnet.bootstrap.teranode.bsvb.tech"},
 		{"", NetworkMainnet, "mainnet.bootstrap.teranode.bsvb.tech"},
 		{NetworkRegtest, NetworkRegtest, ""},
+		{NetworkTstn, NetworkTstn, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.network, func(t *testing.T) {
@@ -154,28 +156,31 @@ func TestResolveP2PNetwork(t *testing.T) {
 // Regtest has no canonical bootstrap DNS, so validate() requires the operator
 // to supply p2p.bootstrap_peers when datahub_discovery is on. Catching this at
 // config load is much friendlier than a libp2p host that boots into a vacuum.
+// Tstn has no bootstrap DNS either, so the same requirement applies to it.
 func TestValidate_RegtestRequiresBootstrapPeers(t *testing.T) {
-	t.Run("missing peers errors", func(t *testing.T) {
-		cfg := baseValidConfig()
-		cfg.Network = NetworkRegtest
-		cfg.P2P.DatahubDiscovery = true
-		err := validate(cfg)
-		if err == nil {
-			t.Fatal("expected error when regtest+discovery has no bootstrap_peers")
-		}
-		if !strings.Contains(err.Error(), "bootstrap_peers") {
-			t.Errorf("error should mention bootstrap_peers, got: %v", err)
-		}
-	})
-	t.Run("peers populated passes", func(t *testing.T) {
-		cfg := baseValidConfig()
-		cfg.Network = NetworkRegtest
-		cfg.P2P.DatahubDiscovery = true
-		cfg.P2P.BootstrapPeers = []string{"/ip4/127.0.0.1/tcp/9905/p2p/12D3KooWxyz"}
-		if err := validate(cfg); err != nil {
-			t.Errorf("unexpected error with bootstrap_peers set: %v", err)
-		}
-	})
+	for _, net := range []string{NetworkRegtest, NetworkTstn} {
+		t.Run(net+" missing peers errors", func(t *testing.T) {
+			cfg := baseValidConfig()
+			cfg.Network = net
+			cfg.P2P.DatahubDiscovery = true
+			err := validate(cfg)
+			if err == nil {
+				t.Fatalf("expected error when %s+discovery has no bootstrap_peers", net)
+			}
+			if !strings.Contains(err.Error(), "bootstrap_peers") {
+				t.Errorf("error should mention bootstrap_peers, got: %v", err)
+			}
+		})
+		t.Run(net+" peers populated passes", func(t *testing.T) {
+			cfg := baseValidConfig()
+			cfg.Network = net
+			cfg.P2P.DatahubDiscovery = true
+			cfg.P2P.BootstrapPeers = []string{"/ip4/127.0.0.1/tcp/9905/p2p/12D3KooWxyz"}
+			if err := validate(cfg); err != nil {
+				t.Errorf("unexpected error with bootstrap_peers set: %v", err)
+			}
+		})
+	}
 }
 
 // go-chaintracks now sources the regtest genesis header from go-chaincfg, so
@@ -206,6 +211,7 @@ func TestResolveChaintracksNetwork(t *testing.T) {
 		{NetworkTestnet, "test"},
 		{NetworkTeratestnet, NetworkTeratestnet},
 		{NetworkRegtest, NetworkRegtest},
+		{NetworkTstn, NetworkTstn},
 		{"", "main"},
 	}
 	for _, tc := range cases {
@@ -633,5 +639,20 @@ func TestValidate_MerkleServiceErrorsRedactSecrets(t *testing.T) {
 		if strings.Contains(err.Error(), "s3cret") {
 			t.Fatalf("validation error for %q leaks the secret: %v", bad, err)
 		}
+	}
+}
+
+// Chaintracks seeds its header chain from the go-chaincfg genesis for the
+// network name ResolveChaintracksNetwork hands it. Tstn must resolve to the
+// scaling test network's own genesis — seeding it from regtest's means the
+// chain's headers never connect and chaintracks never syncs.
+func TestResolveChaintracksNetwork_TstnGenesis(t *testing.T) {
+	params, err := chaincfg.GetChainParams(ResolveChaintracksNetwork(NetworkTstn))
+	if err != nil {
+		t.Fatalf("GetChainParams: %v", err)
+	}
+	const want = "000000005d221c0e023cb56b5682cf094f32cd959958b40bc931e5797cae706c"
+	if got := params.GenesisHash.String(); got != want {
+		t.Errorf("tstn genesis: got %s, want %s", got, want)
 	}
 }
