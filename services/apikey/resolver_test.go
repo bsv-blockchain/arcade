@@ -271,8 +271,8 @@ func TestResolveStaleOnlyWhileStoreIsFailing(t *testing.T) {
 		"the stale-eligible callers share exactly one (blocking) store attempt")
 
 	select {
-	case <-results:
-		t.Fatal("a caller returned before the hung lookup was released")
+	case early := <-results:
+		t.Fatalf("a caller returned before the hung lookup was released (err=%v)", early)
 	case <-time.After(50 * time.Millisecond):
 	}
 
