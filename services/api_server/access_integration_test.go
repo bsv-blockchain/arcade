@@ -1,0 +1,100 @@
+package api_server
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/services/ratelimit"
+	"github.com/bsv-blockchain/broadcaster/store/pebble"
+)
+
+// TestAccessControlEndToEnd drives a real Pebble store through the admin
+// router and the public guard chain: create a key, exhaust the free tier,
+// upgrade it, revoke it.
+func TestAccessControlEndToEnd(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	st, err := pebble.New(config.Pebble{Path: t.TempDir(), MemTableSizeMB: 4, L0CompactionThreshold: 2})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	cfg := &config.Config{
+		Auth:  config.AuthConfig{Enabled: true},
+		Admin: config.AdminConfig{Enabled: true, Token: "admin-secret"},
+		RateLimit: config.RateLimitConfig{
+			Enabled: true, LeaseFraction: 0.1, ShrinkThreshold: 0.8,
+			KeyCacheTTLMs: 1, KeyCacheStaleMaxMs: 1000, ExpectedReplicas: 1,
+			Costs:     config.RateLimitCosts{SubmitTx: 10, Read: 1},
+			Anonymous: config.TierConfig{UnitsPerMinute: 2, MaxInFlight: 5, MaxBatch: 1},
+			Tiers: map[string]config.TierConfig{
+				config.TierFree: {UnitsPerMinute: 3, MaxInFlight: 5, MaxBatch: 1},
+				"enterprise":    {UnitsPerMinute: 0, MaxInFlight: 5, MaxBatch: 100},
+			},
+		},
+	}
+	srv := &Server{cfg: cfg, logger: zap.NewNop(), store: st}
+	require.NoError(t, srv.initAccessControl())
+	fixed := time.Date(2026, 10, 21, 12, 0, 30, 0, time.UTC)
+	srv.limiter = ratelimit.New(cfg.RateLimit, st, zap.NewNop(), ratelimit.WithClock(func() time.Time { return fixed }))
+
+	api := gin.New()
+	api.GET("/limited", srv.guarded(1, func(c *gin.Context) { c.Status(http.StatusNoContent) })...)
+	admin := srv.newAdminRouter()
+
+	call := func(key string) *httptest.ResponseRecorder {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/limited", nil)
+		if key != "" {
+			req.Header.Set("Authorization", "Bearer "+key)
+		}
+		w := httptest.NewRecorder()
+		api.ServeHTTP(w, req)
+		return w
+	}
+
+	w := adminDo(t, admin, http.MethodPost, "/admin/v1/keys", "admin-secret", `{"name":"e2e","tier":"free"}`)
+	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
+	var created createKeyResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &created))
+
+	for i := range 3 {
+		w = call(created.Key)
+		require.Equal(t, http.StatusNoContent, w.Code, "request %d", i+1)
+		require.Equal(t, `"free";q=3;w=60`, w.Header().Get("RateLimit-Policy"))
+	}
+	w = call(created.Key)
+	require.Equal(t, http.StatusTooManyRequests, w.Code)
+	require.Equal(t, "30", w.Header().Get("Retry-After"))
+	require.Equal(t, "quota", w.Header().Get(ratelimit.HeaderReason))
+
+	require.Equal(t, http.StatusUnauthorized, call("bsvb_garbage").Code)
+	alt := "a"
+	if strings.HasSuffix(created.Key, "a") {
+		alt = "b"
+	}
+	tampered := created.Key[:len(created.Key)-1] + alt
+	require.Equal(t, http.StatusUnauthorized, call(tampered).Code, "a one-character change fails the checksum")
+
+	require.Equal(t, http.StatusNoContent, call("").Code, "anonymous 1/2")
+	require.Equal(t, http.StatusNoContent, call("").Code, "anonymous 2/2")
+	require.Equal(t, http.StatusTooManyRequests, call("").Code, "anonymous exhausted")
+
+	require.Equal(t, http.StatusOK,
+		adminDo(t, admin, http.MethodPatch, "/admin/v1/keys/"+created.ID, "admin-secret", `{"tier":"enterprise"}`).Code)
+	time.Sleep(5 * time.Millisecond) // key_cache_ttl_ms is 1
+	w = call(created.Key)
+	require.Equal(t, http.StatusNoContent, w.Code, "enterprise has no quota")
+	require.Empty(t, w.Header().Get("RateLimit-Policy"))
+
+	require.Equal(t, http.StatusOK,
+		adminDo(t, admin, http.MethodDelete, "/admin/v1/keys/"+created.ID, "admin-secret", "").Code)
+	time.Sleep(5 * time.Millisecond)
+	require.Equal(t, http.StatusUnauthorized, call(created.Key).Code, "revoked within the cache TTL")
+}

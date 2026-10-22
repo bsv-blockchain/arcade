@@ -21,7 +21,9 @@ import (
 	"github.com/bsv-blockchain/broadcaster/metrics"
 	"github.com/bsv-blockchain/broadcaster/models"
 	"github.com/bsv-blockchain/broadcaster/services"
+	"github.com/bsv-blockchain/broadcaster/services/apikey"
 	"github.com/bsv-blockchain/broadcaster/services/httpmiddleware"
+	"github.com/bsv-blockchain/broadcaster/services/ratelimit"
 	"github.com/bsv-blockchain/broadcaster/store"
 	"github.com/bsv-blockchain/broadcaster/telemetry"
 	"github.com/bsv-blockchain/broadcaster/teranode"
@@ -62,6 +64,17 @@ type Server struct {
 	// Nil-safe: nil (no chain source configured, or disabled) skips the gate.
 	finality *finality.Checker
 	server   *http.Server
+
+	// keyResolver, identify and limiter are built by initAccessControl from
+	// auth.* and ratelimit.*; nil when disabled (the default), in which case
+	// guarded() adds no middleware. identify wraps keyResolver exactly once
+	// (not once per route — see initAccessControl) so its per-client-IP
+	// invalid-key throttle has one shared budget across every guarded route.
+	// adminServer is the admin.* listener.
+	keyResolver *apikey.Resolver
+	identify    gin.HandlerFunc
+	limiter     *ratelimit.RateLimiter
+	adminServer *http.Server
 
 	// submissionCh decouples the InsertSubmission Pebble write from the HTTP
 	// handler tail latency. recordSubmission enqueues onto it via a non-
@@ -151,6 +164,7 @@ func (s *Server) Name() string { return "api-server" }
 // information.
 func (s *Server) newRouter() *gin.Engine {
 	router := gin.New()
+	s.applyTrustedPlatform(router)
 	router.Use(otelgin.Middleware(s.cfg.Telemetry.ServiceName, otelgin.WithGinFilter(func(c *gin.Context) bool {
 		p := c.FullPath()
 		return p != "/health" && p != "/ready" && p != "/metrics"
@@ -164,6 +178,16 @@ func (s *Server) newRouter() *gin.Engine {
 
 func (s *Server) Start(ctx context.Context) error {
 	gin.SetMode(gin.ReleaseMode)
+	if err := s.initAccessControl(); err != nil { //nolint:contextcheck // false positive: contextcheck's call graph walks into apikey.Middleware's inner gin closures (newMiddleware -> authenticated), which use c.Request.Context() -- the correct per-request context -- not a ctx parameter for the linter to compare against; initAccessControl itself takes no ctx.
+		return err
+	}
+	if s.cfg.Admin.Enabled {
+		if err := s.startAdmin(ctx); err != nil {
+			return err
+		}
+	} else {
+		s.logger.Warn("POST /api/v1/blocks/:blockHash/reprocess is served unauthenticated on the public API; enable admin.* to move it behind the admin token")
+	}
 	router := s.newRouter() //nolint:contextcheck // false positive: requestLogger's telemetry.Fields(c.Request.Context()) already uses the correct per-request context; requestLogger is a gin middleware factory with no ctx parameter of its own for the linter to compare against.
 
 	// Spin up the submission recorder pool. Workers exit on submissionStop
@@ -211,6 +235,15 @@ func (s *Server) Start(ctx context.Context) error {
 	// /ready on this listener is served only after the bind succeeds, which is
 	// the same moment the process-wide health gate is signaled.
 	if err := services.ListenAndServeReady(ctx, s.server, &s.ReadyHook); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		// The admin listener (if any) was already started above; nobody else
+		// is going to stop it on this error path, since Stop() is only
+		// invoked by the ctx-watcher goroutine above once ctx is canceled —
+		// which never happens here, because Start is returning on its own.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if adminErr := s.stopAdmin(shutdownCtx); adminErr != nil { //nolint:contextcheck // deliberate: ctx is what just failed/is being torn down, not a parent to derive a shutdown deadline from; context.Background() mirrors Stop()'s own shutdown contexts below.
+			s.logger.Warn("admin listener shutdown failed after public listener error", zap.Error(adminErr))
+		}
 		return fmt.Errorf("server error: %w", err)
 	}
 	return nil
@@ -287,9 +320,30 @@ func (s *Server) requestLogger() gin.HandlerFunc {
 			zap.Duration("latency", time.Since(start)),
 			zap.String("client_ip", c.ClientIP()),
 		}, telemetry.Fields(c.Request.Context())...)
+		fields = append(fields, apikey.LogFields(c)...)
 		switch {
+		case status == http.StatusServiceUnavailable:
+			// Transient unavailability (store down, merkle client not
+			// configured, quota store unreachable, …) is an operational
+			// condition this service reports on, not a bug in it — Warn,
+			// not Error.
+			s.logger.Warn("request", fields...)
 		case status >= 500:
 			s.logger.Error("request", fields...)
+		case status == ratelimit.StatusClientClosedRequest,
+			c.Writer.Header().Get("WWW-Authenticate") != "",
+			c.Writer.Header().Get(apikey.HeaderRateLimitReason) != "":
+			// Expected client behavior under the identify/rate-limit layers
+			// specifically -- an invalid/missing key (WWW-Authenticate) or a
+			// 429 from either of them (X-RateLimit-Reason) -- counted by
+			// bsv_broadcaster_ratelimit_decisions_total; at warn level it would flood
+			// sampled logs. 499 (client hung up mid-identify or mid-charge)
+			// is the same kind of ordinary client behavior, not ours to warn
+			// about. Gating on these response markers, not on status alone,
+			// keeps an unrelated 401 (e.g. the merkle callback's own bearer
+			// check in handleCallback) at Warn: it carries neither header, so
+			// a misconfigured callback token is still reported loudly.
+			s.logger.Debug("request", fields...)
 		case status >= 400:
 			s.logger.Warn("request", fields...)
 		default:
@@ -322,11 +376,34 @@ func (s *Server) Stop() error {
 	s.stopOnce.Do(func() {
 		close(s.submissionStop)
 	})
-	if s.server != nil {
-		s.logger.Info("shutting down API server")
+
+	// The public and admin listeners each get their own 15s shutdown budget
+	// and drain concurrently, so the total wall time Stop can take is 15s,
+	// not 30s — and a slow/stuck admin drain can never delay the public
+	// listener's shutdown (or vice versa).
+	var wg sync.WaitGroup
+	var publicErr, adminErr error
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if s.server == nil {
+			return
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		return s.server.Shutdown(ctx)
-	}
-	return nil
+		s.logger.Info("shutting down API server")
+		publicErr = s.server.Shutdown(ctx)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		adminErr = s.stopAdmin(ctx)
+	}()
+
+	wg.Wait()
+	return errors.Join(publicErr, adminErr)
 }

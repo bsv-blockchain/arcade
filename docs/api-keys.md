@@ -1,0 +1,184 @@
+# API keys and rate limits
+
+Arcade can authenticate clients with API keys and enforce per-tier quotas.
+Everything here is off by default; deployments are unaffected until `auth.enabled` / `ratelimit.enabled` are set.
+
+## For API clients
+
+Send your key as a bearer token, the same header ARC clients already use:
+
+```
+Authorization: Bearer bsvb_…
+```
+
+Requests without a key are served at the anonymous tier, limited per client
+IP by a bucket local to the replica that handled the request (not shared
+across replicas). An IPv6 client is bucketed by its `/64`, not its exact
+address, so rotating addresses within that block (privacy extensions, CGNAT)
+shares one bucket rather than getting fresh quota on every rotation. An
+invalid, revoked or expired key gets `401` — it never
+falls back to anonymous. A client IP that racks up 60 invalid-key attempts in
+a minute gets `429` (`X-RateLimit-Reason: auth_failures`) before the key is
+even looked at, unless the request carries a key already proven good in that
+replica's cache. If the store can't be reached to verify an uncached (or
+fully expired) key, the response is `503` with `Retry-After` — retry.
+
+Quotas are measured in cost units per minute:
+
+| Request | Cost |
+|---|---|
+| `POST /tx` | `submit_tx` (default 10) |
+| `POST /txs` with n transactions | `read` up front, then `n × submit_tx` once the batch is parsed |
+| `GET /tx/:txid`, `/policy`, `/v1/policy`, block processing-status | `read` (default 1) |
+
+For a keyed caller the quota window is a fixed UTC minute, shared globally
+across replicas; the anonymous tier and the fail-open fallback below are
+per-replica token buckets that refill continuously instead. Because of the
+fixed window, a keyed caller can burst up to roughly 2× its per-minute limit
+across a minute boundary, and a small amount of leased-but-unspent quota can
+go undelivered if a replica goes idle mid-window.
+
+A request that reaches a quota decision (allowed or denied by quota) carries
+`RateLimit-Policy` / `RateLimit` (draft-ietf-httpapi-ratelimit-headers-11)
+and `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`
+(seconds until the window resets, not an epoch timestamp). `Remaining` is
+approximate for keyed callers (replicas lease quota in chunks, so it reports
+local state, not the live global total). On `429`, wait `Retry-After`
+seconds; `X-RateLimit-Reason` is `quota`, `concurrency`, or `auth_failures`.
+A `429` for the concurrency cap, and the `auth_failures` throttle, carry
+**no** quota headers — only `Retry-After` and `X-RateLimit-Reason`.
+
+`413` means the request can never succeed as sent, not "try again later":
+
+- A `/txs` batch above the tier's `max_batch` (`maxBatch` in the body).
+- A `/txs` body larger than the tier's byte cap, `max_batch × 32 MiB`
+  (at most 256 MiB). A body over the 256 MiB ceiling gets a plain `413`
+  even with rate limiting off.
+- A single request whose cost is above the tier's entire per-minute
+  quota. For a tier with a configured `max_batch`, this can only happen
+  through misconfiguration (checked at startup). A tier with
+  `max_batch: 0` (unlimited batch size) has no such check, so a large
+  enough `/txs` batch can still hit this at request time.
+
+A disconnect is logged server-side as status `499`, at `Debug` (not `Warn` —
+it's ordinary client behavior, not something this service got wrong); the
+client sees nothing (the connection is just gone). This covers a disconnect
+both while a request is being charged and while a key is still being
+identified (an uncached key, or a stale cache entry mid-refresh, with no
+fresher answer to fall back to). The latter also counts as `canceled`, not
+`error`, in the `bsv_broadcaster_apikey_cache_total` metric — it's the caller giving
+up, not the key store failing.
+
+A tier with `units_per_minute: 0` (unbounded) never carries
+`RateLimit-Policy` / `RateLimit` / `X-RateLimit-*` — there's no quota to
+report, so the headers are omitted rather than sent with meaningless values.
+`max_in_flight` still applies, and its `429`s still carry `Retry-After` and
+`X-RateLimit-Reason: concurrency`.
+
+`SSE /events`, the chaintracks endpoints, and `/metrics` are **not** guarded
+by API keys or rate limits at all, regardless of `auth.enabled` /
+`ratelimit.enabled`: `/events` is served by a separate SSE listener (default
+port 8082, scoped instead by its own callback token), chaintracks is its own
+server, and `/metrics` is exempted on the main API so scrapers never need a
+key. Don't rely on either `auth.enabled` or `ratelimit.enabled` to protect
+them — keep them off the public ingress if that matters for your
+deployment.
+
+## For operators
+
+```yaml
+api:
+  trusted_platform: cloudflare   # only when every request arrives via Cloudflare
+  trusted_proxies: []            # CIDRs/IPs allowed to set X-Forwarded-For
+auth:
+  enabled: true
+admin:
+  enabled: true
+  host: 127.0.0.1                # default; kubectl port-forward works with this.
+                                 # set 0.0.0.0 only to let in-cluster tooling reach it directly
+  port: 8090                     # never route through the public ingress
+  token: ""                      # set via ARCADE_ADMIN_TOKEN
+ratelimit:
+  enabled: true
+  expected_replicas: 3
+  tiers:
+    free:       { units_per_minute: 50,    max_in_flight: 5,   max_batch: 1 }
+    standard:    { units_per_minute: 3000,  max_in_flight: 20,  max_batch: 100 }
+    high:        { units_per_minute: 30000, max_in_flight: 100, max_batch: 1000 }
+    unlimited: { units_per_minute: 0,     max_in_flight: 500, max_batch: 10000 }
+```
+
+**Trust model — read this before setting either option.** `c.ClientIP()`
+(the source of the anonymous tier's bucket key and of every request log's
+`client_ip`) trusts `X-Forwarded-For` only from a peer listed in
+`api.trusted_proxies` (CIDRs or bare IPs; empty by default, so the header is
+never trusted). `api.trusted_platform: cloudflare` is a separate, broader
+trust decision: it honors `CF-Connecting-IP` **from any peer**, regardless of
+`trusted_proxies`. That is only safe when Cloudflare is the sole ingress path
+to the pod (e.g. a Cloudflare Tunnel) — otherwise any caller can set that
+header itself and pick its own anonymous-tier bucket or spoof `client_ip` in
+logs.
+
+- `units_per_minute: 0` means no quota (an unbounded tier); `max_in_flight` still
+  caps concurrency per key, split across `expected_replicas`.
+- Tier names are lowercase and must match `^[a-z0-9][a-z0-9_-]*$` (they're
+  embedded in response headers and used as a metric label). `free` is
+  required whenever `ratelimit.enabled` — it's the fallback for a key whose
+  tier was removed from config, and admin key creation defaults new keys to
+  it. `anonymous` is reserved; configure unkeyed callers under
+  `ratelimit.anonymous` instead.
+- Every tier must be payable: `costs.submit_tx` must fit inside
+  `units_per_minute`, and `max_batch × costs.submit_tx + costs.read` must
+  too (checked at config load; a tier that could never pay for its own
+  batch cap fails startup, not the first request).
+- Revocations and tier changes take effect within `key_cache_ttl_ms`
+  (default 30s) while the key store is healthy. If the store is down, a
+  key already resolved once keeps authenticating on its last known value
+  for up to `key_cache_stale_max_ms` (default 10m); an uncached or fully
+  expired key gets `503` instead.
+- If the quota store is unavailable, keyed callers fail open to a
+  per-replica bucket sized at the tier's own limit
+  (`bsv_broadcaster_ratelimit_store_failopen_total`). A per-key breaker backs this:
+  a reservation gets 2s to succeed, and after any real store error the
+  breaker stays open for 10s (serving fail-open with no further store
+  calls) before trying one half-open probe.
+- Tiers must be declared in the config file; env vars can only override a
+  field that's already present in a configured tier (e.g.
+  `ARCADE_RATELIMIT_TIERS_PRO_UNITS_PER_MINUTE`) — they can add neither a
+  new tier nor a new field on an existing one.
+- With `admin.enabled`, `POST /api/v1/blocks/:blockHash/reprocess` moves to
+  `POST /admin/v1/blocks/:blockHash/reprocess` on the admin listener, behind
+  the admin token. With `admin.enabled: false` it stays public and
+  unauthenticated, same as before this feature.
+- Admin key management works independently of `auth.enabled` /
+  `ratelimit.enabled` (it only needs a store that implements
+  `APIKeyStore`), but a tier assigned to a key must still exist under
+  `ratelimit.tiers` — populate that section even in an admin-only,
+  quota-off deployment if you plan to issue keys on tiers other than `free`.
+
+### Managing keys
+
+```bash
+kubectl port-forward deploy/api-server 8090:8090
+export ARCADE_ADMIN_TOKEN=…
+arcade apikey create --name acme --tier high      # prints the key ONCE
+arcade apikey list
+arcade apikey set-tier key_… unlimited
+arcade apikey revoke key_…
+```
+
+The admin JSON API is strict: unknown fields are rejected, request bodies
+are capped at 64 KiB, `name` is capped at 256 characters, and field names
+are camelCase (`name`, `tier`, `expiresAt`). Tier names are lowercased on
+write. The CLI reads the token from `--admin-token`, then
+`BSV_BROADCASTER_ADMIN_TOKEN`, then `ARCADE_ADMIN_TOKEN` — prefer an env var
+over the flag, since a flag value ends up in shell history. `--expires-in`
+rejects a negative duration.
+
+`BSV_BROADCASTER_ADMIN_TOKEN` is accepted by the **CLI** for forward
+compatibility with the eventual `bsv-broadcaster` rebrand, but the
+**server** still only reads `ARCADE_ADMIN_TOKEN` (via `admin.token`) until
+that rebrand lands — setting only `BSV_BROADCASTER_ADMIN_TOKEN` and not
+`ARCADE_ADMIN_TOKEN` configures the CLI to send a token the server was
+never told about, and every admin request gets `401`. Set both, or just
+`ARCADE_ADMIN_TOKEN`, today.

@@ -165,3 +165,11 @@ func containsStage(stages []string, want string) bool {
 	}
 	return false
 }
+
+func TestAPIKeys_Conformance(t *testing.T) {
+	storetest.RunAPIKeySuite(t, func(t *testing.T) store.APIKeyStore { return newTestStore(t) })
+}
+
+func TestQuota_Conformance(t *testing.T) {
+	storetest.RunQuotaSuite(t, func(t *testing.T) store.QuotaStore { return newTestStore(t) })
+}

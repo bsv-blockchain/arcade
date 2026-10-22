@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -138,6 +139,9 @@ type Config struct {
 	Callback      CallbackConfig      `mapstructure:"callback"`
 	Events        EventsConfig        `mapstructure:"events"`
 	Validator     ValidatorConfig     `mapstructure:"validator"`
+	Auth          AuthConfig          `mapstructure:"auth"`
+	Admin         AdminConfig         `mapstructure:"admin"`
+	RateLimit     RateLimitConfig     `mapstructure:"ratelimit"`
 	// ChaintracksServer gates whether the embedded go-chaintracks HTTP API
 	// runs alongside api-server. Default is on so the refactor is a drop-in
 	// replacement for the original single-binary BSV Broadcaster.
@@ -188,6 +192,83 @@ type ChaintracksServerConfig struct {
 type API struct {
 	Host string `mapstructure:"host"`
 	Port int    `mapstructure:"port"`
+	// TrustedPlatform names the proxy whose client-IP header the API trusts.
+	// "" (default) trusts no forwarding header, so c.ClientIP() is the TCP
+	// peer. "cloudflare" reads CF-Connecting-IP; set it only when every
+	// request reaches the pod through Cloudflare (e.g. a Cloudflare Tunnel),
+	// because the anonymous rate-limit tier is keyed by this address.
+	TrustedPlatform string `mapstructure:"trusted_platform"`
+	// TrustedProxies lists the reverse proxies (CIDRs, or bare IPs) allowed
+	// to set X-Forwarded-For; gin's ClientIP() only reads that header from a
+	// request whose immediate TCP peer matches one of these. Empty (the
+	// default) trusts none, so the header is never honored regardless of
+	// TrustedPlatform.
+	TrustedProxies []string `mapstructure:"trusted_proxies"`
+}
+
+// TrustedPlatformCloudflare is the api.trusted_platform value for
+// deployments fronted by Cloudflare.
+const TrustedPlatformCloudflare = "cloudflare"
+
+// Rate-limit tier names with fixed meaning.
+const (
+	// TierFree must be configured: it is the fallback for a key whose tier
+	// is no longer in config.
+	TierFree = "free"
+	// TierAnonymous is reserved for unkeyed callers (ratelimit.anonymous).
+	TierAnonymous = "anonymous"
+)
+
+// AuthConfig gates API-key identification on the public API.
+type AuthConfig struct {
+	Enabled bool `mapstructure:"enabled"`
+}
+
+// AdminConfig is the admin listener: API-key management and block reprocess.
+// It must never be routed through the public ingress.
+type AdminConfig struct {
+	Enabled bool   `mapstructure:"enabled"`
+	Host    string `mapstructure:"host"`
+	Port    int    `mapstructure:"port"`
+	Token   string `mapstructure:"token"`
+}
+
+// RateLimitConfig is the tiered quota policy. See docs/api-keys.md.
+type RateLimitConfig struct {
+	Enabled bool `mapstructure:"enabled"`
+	// LeaseFraction is the share of a tier's per-minute limit a replica
+	// leases from the shared counter at once.
+	LeaseFraction float64 `mapstructure:"lease_fraction"`
+	// ShrinkThreshold: once a window's shared usage reaches this share of
+	// the limit, replicas lease only the exact cost of each request.
+	ShrinkThreshold float64 `mapstructure:"shrink_threshold"`
+	// KeyCacheTTLMs is how long a resolved key is trusted without a store
+	// read: the worst-case delay before a revocation or tier change applies.
+	KeyCacheTTLMs int `mapstructure:"key_cache_ttl_ms"`
+	// KeyCacheStaleMaxMs is how long a cached key keeps authenticating while
+	// the store is unreachable.
+	KeyCacheStaleMaxMs int `mapstructure:"key_cache_stale_max_ms"`
+	// ExpectedReplicas splits each tier's max_in_flight across api-server
+	// replicas (per-replica cap = ceil(max_in_flight / expected_replicas)).
+	ExpectedReplicas int                   `mapstructure:"expected_replicas"`
+	Costs            RateLimitCosts        `mapstructure:"costs"`
+	Anonymous        TierConfig            `mapstructure:"anonymous"`
+	Tiers            map[string]TierConfig `mapstructure:"tiers"`
+}
+
+// RateLimitCosts are the unit prices charged against a tier's quota.
+type RateLimitCosts struct {
+	// SubmitTx is charged per transaction: POST /tx is one, POST /txs is n.
+	SubmitTx int64 `mapstructure:"submit_tx"`
+	// Read is charged per read request and as the base cost of POST /txs.
+	Read int64 `mapstructure:"read"`
+}
+
+// TierConfig is one tier's limits. Zero means "no limit" for each field.
+type TierConfig struct {
+	UnitsPerMinute int64 `mapstructure:"units_per_minute"`
+	MaxInFlight    int   `mapstructure:"max_in_flight"`
+	MaxBatch       int   `mapstructure:"max_batch"`
 }
 
 // Kafka configures the message broker. Backend picks between a real Sarama
@@ -1319,6 +1400,30 @@ func setDefaults() {
 	viper.SetDefault("log_level", "info")
 	viper.SetDefault("api.host", "0.0.0.0")
 	viper.SetDefault("api.port", 8080)
+	viper.SetDefault("api.trusted_platform", "")
+	viper.SetDefault("api.trusted_proxies", []string{})
+	// API keys, admin and rate limiting all ship off. Only the free tier
+	// and the anonymous tier have defaults: viper deep-merges maps, so a
+	// default "pro" tier could never be removed by an operator's config.
+	viper.SetDefault("auth.enabled", false)
+	viper.SetDefault("admin.enabled", false)
+	viper.SetDefault("admin.host", "127.0.0.1")
+	viper.SetDefault("admin.port", 8090)
+	viper.SetDefault("admin.token", "")
+	viper.SetDefault("ratelimit.enabled", false)
+	viper.SetDefault("ratelimit.lease_fraction", 0.10)
+	viper.SetDefault("ratelimit.shrink_threshold", 0.80)
+	viper.SetDefault("ratelimit.key_cache_ttl_ms", 30000)
+	viper.SetDefault("ratelimit.key_cache_stale_max_ms", 600000)
+	viper.SetDefault("ratelimit.expected_replicas", 1)
+	viper.SetDefault("ratelimit.costs.submit_tx", 10)
+	viper.SetDefault("ratelimit.costs.read", 1)
+	viper.SetDefault("ratelimit.anonymous.units_per_minute", 50)
+	viper.SetDefault("ratelimit.anonymous.max_in_flight", 5)
+	viper.SetDefault("ratelimit.anonymous.max_batch", 1)
+	viper.SetDefault("ratelimit.tiers.free.units_per_minute", 50)
+	viper.SetDefault("ratelimit.tiers.free.max_in_flight", 5)
+	viper.SetDefault("ratelimit.tiers.free.max_batch", 1)
 	viper.SetDefault("kafka.backend", "sarama")
 	// callback_* and merkle_service.* defaults exist so viper.AutomaticEnv
 	// knows the keys: without a registered key a BSV_BROADCASTER_MERKLE_SERVICE_URLS
@@ -1753,6 +1858,132 @@ func validate(cfg *Config) error {
 		// inside telemetry.Init (which errors if neither is set).
 		if cfg.Telemetry.SampleRatio < 0 || cfg.Telemetry.SampleRatio > 1 {
 			return fmt.Errorf("telemetry.sample_ratio must be between 0 and 1, got %v", cfg.Telemetry.SampleRatio)
+		}
+	}
+	return validateAccessControl(cfg)
+}
+
+// validateAdminPortCollisions rejects an admin.port that collides with
+// api.port (always, since the admin listener lives in services/api_server —
+// see the plan's deviation 1) or, under mode=all (the default, so "" counts
+// too), with any other in-process HTTP listener. Under mode=all every
+// listener shares one binary, so a shared port means one of them fails to
+// bind at startup.
+func validateAdminPortCollisions(cfg *Config) error {
+	modeAll := cfg.Mode == "" || cfg.Mode == "all"
+	collisions := []struct {
+		key     string
+		port    int
+		applies bool
+	}{
+		{"api.port", cfg.APIServer.Port, true},
+		{"health.port", cfg.Health.Port, modeAll},
+		{"sse.port", cfg.SSE.Port, modeAll && cfg.SSE.Enabled},
+		{"chaintracks_server.port", cfg.ChaintracksServer.Port, modeAll && cfg.ChaintracksServer.Enabled},
+	}
+	for _, c := range collisions {
+		if c.applies && cfg.Admin.Port == c.port {
+			return fmt.Errorf("admin.port must differ from %s (%d): the admin listener must never share a port with another listener", c.key, c.port)
+		}
+	}
+	return nil
+}
+
+// validateAccessControl checks the API-key, admin and rate-limit settings.
+func validateAccessControl(cfg *Config) error {
+	switch cfg.APIServer.TrustedPlatform {
+	case "", TrustedPlatformCloudflare:
+	default:
+		return fmt.Errorf("api.trusted_platform must be \"\" or %q, got %q", TrustedPlatformCloudflare, cfg.APIServer.TrustedPlatform)
+	}
+	for _, p := range cfg.APIServer.TrustedProxies {
+		if _, _, err := net.ParseCIDR(p); err != nil && net.ParseIP(p) == nil {
+			return fmt.Errorf("api.trusted_proxies: %q is not a valid IP or CIDR", p)
+		}
+	}
+	if cfg.Admin.Enabled {
+		if cfg.Admin.Token == "" {
+			return fmt.Errorf("admin.token is required when admin.enabled")
+		}
+		if cfg.Admin.Port <= 0 {
+			return fmt.Errorf("admin.port must be > 0")
+		}
+		if err := validateAdminPortCollisions(cfg); err != nil {
+			return err
+		}
+	}
+	rl := cfg.RateLimit
+	if cfg.Auth.Enabled && (rl.KeyCacheTTLMs <= 0 || rl.KeyCacheStaleMaxMs < rl.KeyCacheTTLMs) {
+		return fmt.Errorf("ratelimit.key_cache_ttl_ms (%d) must be > 0 and <= ratelimit.key_cache_stale_max_ms (%d)",
+			rl.KeyCacheTTLMs, rl.KeyCacheStaleMaxMs)
+	}
+	if !rl.Enabled {
+		return nil
+	}
+	if !cfg.Auth.Enabled {
+		return fmt.Errorf("ratelimit.enabled requires auth.enabled")
+	}
+	if rl.LeaseFraction <= 0 || rl.LeaseFraction > 1 {
+		return fmt.Errorf("ratelimit.lease_fraction must be in (0, 1], got %v", rl.LeaseFraction)
+	}
+	if rl.ShrinkThreshold <= 0 || rl.ShrinkThreshold > 1 {
+		return fmt.Errorf("ratelimit.shrink_threshold must be in (0, 1], got %v", rl.ShrinkThreshold)
+	}
+	if rl.ExpectedReplicas < 1 {
+		return fmt.Errorf("ratelimit.expected_replicas must be >= 1")
+	}
+	if rl.Costs.SubmitTx <= 0 || rl.Costs.Read <= 0 {
+		return fmt.Errorf("ratelimit.costs.submit_tx and ratelimit.costs.read must be > 0")
+	}
+	if _, ok := rl.Tiers[TierFree]; !ok {
+		return fmt.Errorf("ratelimit.tiers.free is required: it is the fallback for keys whose tier is not configured")
+	}
+	if _, ok := rl.Tiers[TierAnonymous]; ok {
+		return fmt.Errorf("ratelimit.tiers.anonymous is reserved; configure unkeyed callers under ratelimit.anonymous")
+	}
+	check := func(name string, t TierConfig) error {
+		if t.UnitsPerMinute < 0 || t.MaxInFlight < 0 || t.MaxBatch < 0 {
+			return fmt.Errorf("ratelimit tier %q: units_per_minute, max_in_flight and max_batch must be >= 0", name)
+		}
+		return checkTierPayable(name, t, rl.Costs)
+	}
+	if err := check(TierAnonymous, rl.Anonymous); err != nil {
+		return err
+	}
+	for name, t := range rl.Tiers {
+		if !tierNameRe.MatchString(name) {
+			return fmt.Errorf("ratelimit tier name %q is invalid: must match %s", name, tierNameRe.String())
+		}
+		if err := check(name, t); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// tierNameRe bounds configured tier names: they're embedded verbatim in the
+// RateLimit-Policy/RateLimit sf-string headers and used as a metric label
+// value, so anything outside this set risks breaking header syntax or
+// exploding label cardinality.
+var tierNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
+
+// checkTierPayable rejects a bounded tier whose configured batch (or even a
+// single /tx) could never fit in its own per-minute budget — a batch that
+// would always 429 is a config bug, not a runtime condition. Unbounded
+// tiers (units_per_minute == 0) have no budget to check against.
+func checkTierPayable(name string, t TierConfig, costs RateLimitCosts) error {
+	if t.UnitsPerMinute <= 0 {
+		return nil
+	}
+	if costs.SubmitTx > t.UnitsPerMinute {
+		return fmt.Errorf("ratelimit tier %q: costs.submit_tx (%d) exceeds units_per_minute (%d): a single /tx could never succeed",
+			name, costs.SubmitTx, t.UnitsPerMinute)
+	}
+	if t.MaxBatch > 0 {
+		need := int64(t.MaxBatch)*costs.SubmitTx + costs.Read
+		if need > t.UnitsPerMinute {
+			return fmt.Errorf("ratelimit tier %q: max_batch (%d) at costs.submit_tx (%d) plus costs.read (%d) = %d units, above units_per_minute (%d): the largest allowed batch could never succeed",
+				name, t.MaxBatch, costs.SubmitTx, costs.Read, need, t.UnitsPerMinute)
 		}
 	}
 	return nil

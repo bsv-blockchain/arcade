@@ -1312,3 +1312,57 @@ func ObserveStatusClass(statusCode int) string {
 		return "other"
 	}
 }
+
+// ---------------------------------------------------------------------------
+// ratelimit / apikey
+// ---------------------------------------------------------------------------
+
+// RateLimitDecisionsTotal counts rate-limit and API-key decisions by tier and
+// result: allowed | quota | concurrency | unauthorized | batch_too_large |
+// unpayable (a single charge's cost exceeds the tier's entire per-minute
+// budget — a 413, since a 429 here could never resolve itself) |
+// auth_failures (the per-IP invalid-key throttle tripped, before the key was
+// even looked at). Counted per charge, not per request: POST /txs charges
+// twice (its base request cost, then its transactions). tier is "none" for
+// unauthorized and auth_failures.
+var RateLimitDecisionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bsv_broadcaster_ratelimit_decisions_total",
+	Help: "Rate-limit decisions by tier and result (allowed|quota|concurrency|unauthorized|batch_too_large|unpayable|auth_failures), per charge.",
+}, []string{"tier", "result"})
+
+// RateLimitReservationsTotal counts ReserveQuota calls against the shared
+// store by result: granted (in full) | partial | exhausted (zero) | error |
+// canceled (the caller's own context was done, not a store outage).
+var RateLimitReservationsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bsv_broadcaster_ratelimit_reservations_total",
+	Help: "Shared quota reservations by result (granted|partial|exhausted|error|canceled).",
+}, []string{"result"})
+
+// RateLimitReservationDuration is the latency of shared quota reservations —
+// the store round trip a lease miss pays.
+var RateLimitReservationDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+	Name:    "bsv_broadcaster_ratelimit_reservation_duration_seconds",
+	Help:    "Latency of shared quota reservations.",
+	Buckets: prometheus.ExponentialBuckets(0.001, 2, 12),
+})
+
+// RateLimitStoreFailOpenTotal counts keyed charges served from the local
+// fail-open bucket because the quota store errored.
+var RateLimitStoreFailOpenTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "bsv_broadcaster_ratelimit_store_failopen_total",
+	Help: "Keyed rate-limit charges served by the local fail-open bucket because the quota store errored.",
+})
+
+// APIKeyCacheTotal counts API-key resolutions by cache result:
+// hit | miss | negative (cached "no such key") | failing (a synchronous
+// refresh of a stale entry just failed, newly marking the key as failing
+// and falling back to the stale value) | stale (served non-blocking,
+// within key_cache_stale_max, because the key is already known failing) |
+// error (a synchronous attempt failed -- refreshing an uncached key, or a
+// key already past staleMax -- with no stale value available to fall back
+// to) | canceled (same as error, but the caller's own context ended the
+// wait -- a client disconnect, not a store failure).
+var APIKeyCacheTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bsv_broadcaster_apikey_cache_total",
+	Help: "API key resolutions by cache result (hit|miss|negative|failing|stale|error|canceled).",
+}, []string{"result"})

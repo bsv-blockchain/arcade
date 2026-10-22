@@ -36,6 +36,9 @@ const (
 	idxBumpsBlockHash  = "bumps_block_hash"
 	idxStumpsBlockHash = "stumps_block_hash_subtree"
 	idxStumpManifests  = "stump_manifest_block_hash"
+	idxAPIKeyHash      = "api_key_hash" //nolint:gosec // an index name, not a credential
+	idxAPIKeyCreated   = "api_key_created"
+	idxQuotaExpires    = "api_quota_expires_ttl"
 	// The two GridFS-spec indexes keep the driver's default names so a
 	// database the driver (or a restore) already provisioned is recognised as
 	// identical instead of failing createIndexes with a name conflict.
@@ -120,7 +123,8 @@ func (s *Store) EnsureIndexes(ctx context.Context) error {
 	// The TTL indexes each collection declares, keyed by collection name, so
 	// createIndexes can repair a changed expireAfterSeconds (see there).
 	ttlByColl := map[string][]ttlIndex{
-		collLeases: {{idxLeaseExpires, leaseReapGraceSeconds}},
+		collLeases:   {{idxLeaseExpires, leaseReapGraceSeconds}},
+		collAPIQuota: {{idxQuotaExpires, 0}},
 	}
 	specs := []spec{
 		{s.tx, []mongo.IndexModel{
@@ -174,6 +178,17 @@ func (s *Store) EnsureIndexes(ctx context.Context) error {
 			idx(idxPPNetwork, bson.D{{Key: fNetwork, Value: 1}}),
 			idx(idxPPLastSeen, bson.D{{Key: fLastSeen, Value: 1}}),
 		}},
+		{s.apiKeys, []mongo.IndexModel{
+			{Keys: bson.D{{Key: fAPIKeyHash, Value: 1}}, Options: options.Index().SetName(idxAPIKeyHash).SetUnique(true)},
+			idx(idxAPIKeyCreated, bson.D{{Key: fCreatedAt, Value: 1}, {Key: fID, Value: 1}}),
+		}},
+		// expires_at is window_start + QuotaRetention, so a zero TTL reaps a
+		// window once it is past any use; unlike leases, a clock-skewed early
+		// reap here only forgets usage that no longer counts.
+		{s.apiQuota, []mongo.IndexModel{{
+			Keys:    bson.D{{Key: fExpiresAt, Value: 1}},
+			Options: options.Index().SetName(idxQuotaExpires).SetExpireAfterSeconds(0),
+		}}},
 		{s.stumps.manifests, []mongo.IndexModel{
 			idx(idxStumpManifests, bson.D{{Key: fBlockHash, Value: 1}, {Key: fSubtreeIndex, Value: 1}}),
 		}},
@@ -187,16 +202,16 @@ func (s *Store) EnsureIndexes(ctx context.Context) error {
 			idx(idxStumpsBlockHash, bson.D{{Key: fMetaBlockHash, Value: 1}, {Key: fMetaSubtreeIndex, Value: 1}, {Key: fUploadDate, Value: 1}}))},
 		{s.stumps.bucket.GetChunksCollection(), gridfsChunksIndexes()},
 	}
-	// Collections are independent, so provision them concurrently: eleven
-	// sequential createIndexes round-trips are the dominant cost of a boot
-	// against an already-indexed database.
+	// Collections are independent, so provision them concurrently: every
+	// collection's sequential createIndexes round-trip is the dominant cost
+	// of a boot against an already-indexed database.
 	//
 	// Bounded by index_timeout_ms (Postgres's schema_apply_timeout_ms is the
 	// precedent): createIndexes on a restored, populated collection is the
 	// one boot-time operation whose duration scales with data, and without a
 	// deadline a stalled build sits silently past the liveness probe. Every
-	// failure is returned, not just the first — eleven collections can fail
-	// for eleven reasons and the operator should see all of them.
+	// failure is returned, not just the first — every collection can fail
+	// for its own reason and the operator should see all of them.
 	if s.indexTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, s.indexTimeout)

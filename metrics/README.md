@@ -28,6 +28,11 @@ All metric names start with `bsv_broadcaster_` so they live in their own namespa
 | Datahub endpoint flapping | `changes(bsv_broadcaster_teranode_endpoint_healthy[5m])` | `> 4` |
 | All datahubs unhealthy | `sum(bsv_broadcaster_teranode_endpoint_healthy{}) == 0` | for 1m |
 | API errors | `rate(bsv_broadcaster_api_request_duration_seconds_count{status_class="5xx"}[5m])` | `> 0` |
+| Quota store failing open | `rate(bsv_broadcaster_ratelimit_store_failopen_total[5m])` | `> 0 for 5m` (keyed quotas are enforced per-replica only while this fires) |
+| Quota reservation errors | `rate(bsv_broadcaster_ratelimit_reservations_total{result="error"}[5m])` | `> 0 for 5m` |
+| Quota store reservations slow | `histogram_quantile(0.95, rate(bsv_broadcaster_ratelimit_reservation_duration_seconds_bucket[5m]))` | `> 0.5s` |
+| Invalid API key attempts spiking | `rate(bsv_broadcaster_ratelimit_decisions_total{tier="none",result="auth_failures"}[5m])` | `> 0` (credential stuffing or a leaked key) |
+| API key store unhealthy | `sum(rate(bsv_broadcaster_apikey_cache_total{result="error"}[5m])) + sum(rate(bsv_broadcaster_apikey_cache_total{result="failing"}[5m]))` | `> 0 for 5m` |
 | Kafka publish failures | `rate(bsv_broadcaster_kafka_produce_errors_total[5m])` | `> 0 for 1m` |
 | DLQ growth | `rate(bsv_broadcaster_kafka_messages_total{op="dlq"}[5m])` | `> 0` |
 | Network retry budget exhausted | `rate(bsv_broadcaster_propagation_requeue_exhausted_total[5m])` | `> 0` |
