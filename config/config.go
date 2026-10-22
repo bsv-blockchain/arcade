@@ -206,7 +206,22 @@ const (
 // AuthConfig gates API-key identification on the public API.
 type AuthConfig struct {
 	Enabled bool `mapstructure:"enabled"`
+	// Store optionally moves API keys and rate-limit quota counters out of
+	// the main store into a dedicated MongoDB database, so several arcade
+	// deployments (one per network, each with its own store) can share one
+	// key set and one quota window per key. Unset (uri empty) keeps keys and
+	// quota in the main store. See docs/api-keys.md.
+	Store AuthStoreConfig `mapstructure:"store"`
 }
+
+// AuthStoreConfig is auth.store. Only MongoDB is supported.
+type AuthStoreConfig struct {
+	Mongo Mongo `mapstructure:"mongodb"`
+}
+
+// Configured reports whether a dedicated auth store is set; when false the
+// api-server reads keys and quota from the main store.
+func (a AuthStoreConfig) Configured() bool { return a.Mongo.URI != "" }
 
 // AdminConfig is the admin listener: API-key management and block reprocess.
 // It must never be routed through the public ingress.
@@ -1332,6 +1347,17 @@ func setDefaults() {
 	// and the anonymous tier have defaults: viper deep-merges maps, so a
 	// default "pro" tier could never be removed by an operator's config.
 	viper.SetDefault("auth.enabled", false)
+	// auth.store.mongodb ships unset (uri empty = keys and quota live in the
+	// main store). The keys are declared anyway so AutomaticEnv honors
+	// ARCADE_AUTH_STORE_MONGODB_* even when the config file omits the block;
+	// zero timeouts/pool mean the mongodb backend's own defaults.
+	viper.SetDefault("auth.store.mongodb.uri", "")
+	viper.SetDefault("auth.store.mongodb.database", "")
+	viper.SetDefault("auth.store.mongodb.connect_timeout_ms", 0)
+	viper.SetDefault("auth.store.mongodb.op_timeout_ms", 0)
+	viper.SetDefault("auth.store.mongodb.query_timeout_ms", 0)
+	viper.SetDefault("auth.store.mongodb.index_timeout_ms", 0)
+	viper.SetDefault("auth.store.mongodb.max_pool_size", 0)
 	viper.SetDefault("admin.enabled", false)
 	viper.SetDefault("admin.host", "127.0.0.1")
 	viper.SetDefault("admin.port", 8090)
@@ -1808,6 +1834,40 @@ func validateAdminPortCollisions(cfg *Config) error {
 	return nil
 }
 
+// validateAuthStore checks auth.store.mongodb. Unset (no uri, no database)
+// is valid and leaves keys and quota in the main store. Errors never echo
+// the uri: it may carry credentials.
+func validateAuthStore(cfg *Config) error {
+	m := cfg.Auth.Store.Mongo
+	if !cfg.Auth.Store.Configured() {
+		if m.Database != "" {
+			return fmt.Errorf("auth.store.mongodb.database is set but auth.store.mongodb.uri is empty")
+		}
+		return nil
+	}
+	if !cfg.Auth.Enabled {
+		return fmt.Errorf("auth.store.mongodb.uri requires auth.enabled")
+	}
+	if m.Database == "" {
+		return fmt.Errorf("auth.store.mongodb.database is required when auth.store.mongodb.uri is set")
+	}
+	for _, f := range []struct {
+		name string
+		v    int
+	}{
+		{"connect_timeout_ms", m.ConnectTimeoutMs},
+		{"op_timeout_ms", m.OpTimeoutMs},
+		{"query_timeout_ms", m.QueryTimeoutMs},
+		{"index_timeout_ms", m.IndexTimeoutMs},
+		{"max_pool_size", m.MaxPoolSize},
+	} {
+		if f.v < 0 {
+			return fmt.Errorf("auth.store.mongodb.%s must be >= 0 (0 = default)", f.name)
+		}
+	}
+	return nil
+}
+
 // validateAccessControl checks the API-key, admin and rate-limit settings.
 func validateAccessControl(cfg *Config) error {
 	switch cfg.APIServer.TrustedPlatform {
@@ -1830,6 +1890,9 @@ func validateAccessControl(cfg *Config) error {
 		if err := validateAdminPortCollisions(cfg); err != nil {
 			return err
 		}
+	}
+	if err := validateAuthStore(cfg); err != nil {
+		return err
 	}
 	rl := cfg.RateLimit
 	if cfg.Auth.Enabled && (rl.KeyCacheTTLMs <= 0 || rl.KeyCacheStaleMaxMs < rl.KeyCacheTTLMs) {
