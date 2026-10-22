@@ -155,6 +155,21 @@ func New(ctx context.Context, cfg config.Mongo, logger *zap.Logger) (*Store, err
 	if logger == nil {
 		logger = zap.NewNop()
 	}
+	client, err := connect(ctx, cfg, logger, "store.mongodb.uri", maxConnecting)
+	if err != nil {
+		return nil, err
+	}
+	s := newWithClient(client, cfg.Database, cfg)
+	s.logger = logger
+	s.ownsClient = true
+	return s, nil
+}
+
+// connect validates cfg, builds the client and pings the primary (a ping
+// runs on the admin database and needs no privileges). uriKey names the
+// config key in the read-preference warning; minPoolFloor is the idle
+// connection floor (capped by the pool size). It never echoes the URI.
+func connect(ctx context.Context, cfg config.Mongo, logger *zap.Logger, uriKey string, minPoolFloor int) (*mongo.Client, error) {
 	if cfg.URI == "" {
 		return nil, errors.New("mongodb: uri is required")
 	}
@@ -192,7 +207,7 @@ func New(ctx context.Context, cfg config.Mongo, logger *zap.Logger) (*Store, err
 	// so it is recognizable later from the symptom.
 	if rp := opts.ReadPreference; rp != nil && rp.Mode() != readpref.PrimaryMode {
 		logger.Warn(
-			"store.mongodb.uri sets a non-primary read preference; this backend's write guards "+
+			uriKey+" sets a non-primary read preference; this backend's write guards "+
 				"(status lattice, still-anchored-to-this-block, manifest-versus-file) are all "+
 				"read-then-write, and a stale secondary read can let them pass wrongly — expect "+
 				"lost status transitions and deleted blobs under concurrency",
@@ -214,7 +229,9 @@ func New(ctx context.Context, cfg config.Mongo, logger *zap.Logger) (*Store, err
 	// thousands of connections to save a ramp that maxConnecting already
 	// shortens from ~46 waves to ~6.
 	opts.SetMaxConnecting(maxConnecting)
-	opts.SetMinPoolSize(uint64(min(maxConnecting, poolSize)))
+	if floor := min(minPoolFloor, poolSize); floor > 0 {
+		opts.SetMinPoolSize(uint64(floor))
+	}
 	client, err := mongo.Connect(opts)
 	if err != nil {
 		// Never echo the URI: it may carry credentials.
@@ -229,11 +246,7 @@ func New(ctx context.Context, cfg config.Mongo, logger *zap.Logger) (*Store, err
 		_ = client.Disconnect(disconnectCtx)
 		return nil, fmt.Errorf("mongodb ping: %w", err)
 	}
-
-	s := newWithClient(client, cfg.Database, cfg)
-	s.logger = logger
-	s.ownsClient = true
-	return s, nil
+	return client, nil
 }
 
 // newWithClient binds a Store to an existing client. It is the seam New and

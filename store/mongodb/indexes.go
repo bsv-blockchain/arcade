@@ -116,17 +116,13 @@ func createIndexes(ctx context.Context, coll *mongo.Collection, models []mongo.I
 // action, not part of readWrite, so the application user needs dbAdmin (or
 // the collMod privilege) on the database as well as readWrite.
 func (s *Store) EnsureIndexes(ctx context.Context) error {
-	type spec struct {
-		coll   *mongo.Collection
-		models []mongo.IndexModel
-	}
 	// The TTL indexes each collection declares, keyed by collection name, so
 	// createIndexes can repair a changed expireAfterSeconds (see there).
 	ttlByColl := map[string][]ttlIndex{
 		collLeases:   {{idxLeaseExpires, leaseReapGraceSeconds}},
 		collAPIQuota: {{idxQuotaExpires, 0}},
 	}
-	specs := []spec{
+	specs := append(s.authIndexSpecs(), []indexSpec{
 		{s.tx, []mongo.IndexModel{
 			idx(idxTxStatusHeight, bson.D{{Key: fStatus, Value: 1}, {Key: fBlockHeight, Value: 1}, {Key: fID, Value: 1}}),
 			idx(idxTxStatusTS, bson.D{{Key: fStatus, Value: 1}, {Key: fTimestamp, Value: 1}}),
@@ -178,17 +174,6 @@ func (s *Store) EnsureIndexes(ctx context.Context) error {
 			idx(idxPPNetwork, bson.D{{Key: fNetwork, Value: 1}}),
 			idx(idxPPLastSeen, bson.D{{Key: fLastSeen, Value: 1}}),
 		}},
-		{s.apiKeys, []mongo.IndexModel{
-			{Keys: bson.D{{Key: fAPIKeyHash, Value: 1}}, Options: options.Index().SetName(idxAPIKeyHash).SetUnique(true)},
-			idx(idxAPIKeyCreated, bson.D{{Key: fCreatedAt, Value: 1}, {Key: fID, Value: 1}}),
-		}},
-		// expires_at is window_start + QuotaRetention, so a zero TTL reaps a
-		// window once it is past any use; unlike leases, a clock-skewed early
-		// reap here only forgets usage that no longer counts.
-		{s.apiQuota, []mongo.IndexModel{{
-			Keys:    bson.D{{Key: fExpiresAt, Value: 1}},
-			Options: options.Index().SetName(idxQuotaExpires).SetExpireAfterSeconds(0),
-		}}},
 		{s.stumps.manifests, []mongo.IndexModel{
 			idx(idxStumpManifests, bson.D{{Key: fBlockHash, Value: 1}, {Key: fSubtreeIndex, Value: 1}}),
 		}},
@@ -201,7 +186,38 @@ func (s *Store) EnsureIndexes(ctx context.Context) error {
 		{s.stumps.bucket.GetFilesCollection(), append(gridfsFilesIndexes(),
 			idx(idxStumpsBlockHash, bson.D{{Key: fMetaBlockHash, Value: 1}, {Key: fMetaSubtreeIndex, Value: 1}, {Key: fUploadDate, Value: 1}}))},
 		{s.stumps.bucket.GetChunksCollection(), gridfsChunksIndexes()},
+	}...)
+	return s.provisionIndexes(ctx, specs, ttlByColl)
+}
+
+// indexSpec is one collection's wanted index set.
+type indexSpec struct {
+	coll   *mongo.Collection
+	models []mongo.IndexModel
+}
+
+// authIndexSpecs is the index set behind APIKeyStore and QuotaStore, shared
+// by EnsureIndexes and AuthStore.EnsureIndexes so the two produce identical
+// index names and specs and can coexist in one database.
+func (s *Store) authIndexSpecs() []indexSpec {
+	return []indexSpec{
+		{s.apiKeys, []mongo.IndexModel{
+			{Keys: bson.D{{Key: fAPIKeyHash, Value: 1}}, Options: options.Index().SetName(idxAPIKeyHash).SetUnique(true)},
+			idx(idxAPIKeyCreated, bson.D{{Key: fCreatedAt, Value: 1}, {Key: fID, Value: 1}}),
+		}},
+		// expires_at is window_start + QuotaRetention, so a zero TTL reaps a
+		// window once it is past any use; unlike leases, a clock-skewed early
+		// reap here only forgets usage that no longer counts.
+		{s.apiQuota, []mongo.IndexModel{{
+			Keys:    bson.D{{Key: fExpiresAt, Value: 1}},
+			Options: options.Index().SetName(idxQuotaExpires).SetExpireAfterSeconds(0),
+		}}},
 	}
+}
+
+// provisionIndexes creates every spec's indexes, repairing the TTL indexes
+// ttlByColl names (see createIndexes).
+func (s *Store) provisionIndexes(ctx context.Context, specs []indexSpec, ttlByColl map[string][]ttlIndex) error {
 	// Collections are independent, so provision them concurrently: every
 	// collection's sequential createIndexes round-trip is the dominant cost
 	// of a boot against an already-indexed database.
@@ -221,7 +237,7 @@ func (s *Store) EnsureIndexes(ctx context.Context) error {
 	var wg sync.WaitGroup
 	for _, sp := range specs {
 		wg.Add(1)
-		go func(sp spec) {
+		go func(sp indexSpec) {
 			defer wg.Done()
 			if err := createIndexes(ctx, sp.coll, sp.models, ttlByColl[sp.coll.Name()]); err != nil {
 				errs <- fmt.Errorf("mongodb: create indexes on %s: %w", sp.coll.Name(), err)
