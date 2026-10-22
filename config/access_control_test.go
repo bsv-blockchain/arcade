@@ -69,6 +69,29 @@ func TestValidateAccessControl(t *testing.T) {
 			c.Mode = "api-server"
 			c.Health.Port = 8090
 		}, ""},
+		{"auth store with uri and database", func(c *Config) {
+			c.Auth.Store.Mongo = Mongo{URI: "mongodb://auth:27017", Database: "arcade_auth"}
+		}, ""},
+		{"auth store with explicit timeouts", func(c *Config) {
+			c.Auth.Store.Mongo = Mongo{URI: "mongodb://auth:27017", Database: "arcade_auth", ConnectTimeoutMs: 5000, OpTimeoutMs: 2000, MaxPoolSize: 16}
+		}, ""},
+		{"auth store without database", func(c *Config) {
+			c.Auth.Store.Mongo = Mongo{URI: "mongodb://auth:27017"}
+		}, "auth.store.mongodb.database"},
+		{"auth store database without uri", func(c *Config) {
+			c.Auth.Store.Mongo = Mongo{Database: "arcade_auth"}
+		}, "auth.store.mongodb.uri is empty"},
+		{"auth store without auth.enabled", func(c *Config) {
+			c.Auth.Enabled = false
+			c.RateLimit.Enabled = false
+			c.Auth.Store.Mongo = Mongo{URI: "mongodb://auth:27017", Database: "arcade_auth"}
+		}, "auth.store.mongodb.uri requires auth.enabled"},
+		{"auth store negative op timeout", func(c *Config) {
+			c.Auth.Store.Mongo = Mongo{URI: "mongodb://auth:27017", Database: "arcade_auth", OpTimeoutMs: -1}
+		}, "auth.store.mongodb.op_timeout_ms"},
+		{"auth store negative pool size", func(c *Config) {
+			c.Auth.Store.Mongo = Mongo{URI: "mongodb://auth:27017", Database: "arcade_auth", MaxPoolSize: -1}
+		}, "auth.store.mongodb.max_pool_size"},
 		{"ratelimit without auth", func(c *Config) { c.Auth.Enabled = false }, "requires auth.enabled"},
 		{"auth with zero cache ttl", func(c *Config) { c.RateLimit.KeyCacheTTLMs = 0 }, "key_cache_ttl_ms"},
 		{"stale shorter than ttl", func(c *Config) { c.RateLimit.KeyCacheStaleMaxMs = 1 }, "key_cache_ttl_ms"},
@@ -161,5 +184,36 @@ func TestAccessControlDefaults(t *testing.T) {
 	}
 	if overridden.Admin.Token != "from-env" {
 		t.Errorf("ARCADE_ADMIN_TOKEN override = %q", overridden.Admin.Token)
+	}
+}
+
+// TestAuthStoreDefaultsAndEnv pins that auth.store.mongodb ships unset and
+// that ARCADE_AUTH_STORE_MONGODB_* overrides work with no config file at
+// all — AutomaticEnv only honors keys viper already knows about.
+func TestAuthStoreDefaultsAndEnv(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+
+	cfg, err := Load(&cobra.Command{})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Auth.Store.Configured() || cfg.Auth.Store.Mongo != (Mongo{}) {
+		t.Fatalf("auth.store must default unset, got database=%q configured=%v",
+			cfg.Auth.Store.Mongo.Database, cfg.Auth.Store.Configured())
+	}
+
+	viper.Reset()
+	t.Setenv("ARCADE_AUTH_ENABLED", "true")
+	t.Setenv("ARCADE_AUTH_STORE_MONGODB_URI", "mongodb://auth-env:27017")
+	t.Setenv("ARCADE_AUTH_STORE_MONGODB_DATABASE", "arcade_auth")
+	t.Setenv("ARCADE_AUTH_STORE_MONGODB_OP_TIMEOUT_MS", "1500")
+	overridden, err := Load(&cobra.Command{})
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	got := overridden.Auth.Store.Mongo
+	if !overridden.Auth.Store.Configured() || got.URI != "mongodb://auth-env:27017" || got.Database != "arcade_auth" || got.OpTimeoutMs != 1500 {
+		t.Errorf("env override = %+v", got)
 	}
 }

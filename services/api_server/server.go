@@ -72,6 +72,9 @@ type Server struct {
 	// invalid-key throttle has one shared budget across every guarded route.
 	// adminServer is the admin.* listener.
 	keyResolver *apikey.Resolver
+	// authStore, when set (auth.store.mongodb), is where API keys and quota
+	// counters live instead of store. See SetAuthStore.
+	authStore   AuthStore
 	identify    gin.HandlerFunc
 	limiter     *ratelimit.RateLimiter
 	adminServer *http.Server

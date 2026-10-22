@@ -156,6 +156,87 @@ logs.
   `ratelimit.tiers` — populate that section even in an admin-only,
   quota-off deployment if you plan to issue keys on tiers other than `free`.
 
+### Sharing one key set across deployments (`auth.store`)
+
+By default keys (`api_keys`) and quota counters (`api_quota`) live in the main
+store, so every arcade deployment has its own key set. When one service fronts
+several deployments — e.g. one arcade per network (mainnet, testnet,
+teratestnet, tstn), each with its own `store.mongodb` database and possibly on
+different clusters, replicated across regions — point all of them at one
+dedicated MongoDB database instead:
+
+```yaml
+auth:
+  enabled: true                  # required when auth.store is set
+  store:
+    mongodb:
+      uri: ""                    # set via ARCADE_AUTH_STORE_MONGODB_URI
+      database: arcade_auth      # ARCADE_AUTH_STORE_MONGODB_DATABASE
+      # Optional, same meaning as under store.mongodb; 0/unset = the values shown.
+      # connect_timeout_ms: 10000
+      # op_timeout_ms: 3000
+      # query_timeout_ms: 8000
+      # index_timeout_ms: 300000
+      max_pool_size: 16          # unset = driver default 100. Auth traffic is light
+                                 # and every api-server pod of every network shares
+                                 # one cluster, so keep this small.
+```
+
+Every key path is `auth.store.mongodb.*`, and each has an env override
+(`ARCADE_AUTH_STORE_MONGODB_URI`, `…_DATABASE`, `…_OP_TIMEOUT_MS`, …) that
+works even when the config file has no `auth.store` block. With `uri` unset
+(the default) nothing changes: keys and quota stay in the main store. Setting
+`uri` requires `database` and `auth.enabled`; a `database` without a `uri` is
+rejected so a typo'd env var can't silently fall back to the main store.
+
+Only the api-server (`--mode api-server` or `all`) opens it: the auth
+middleware, the rate limiter and the admin key endpoints all use it in place
+of the main store. Its main store is untouched and still holds the
+transactions. The URI is never logged; the startup log names only the
+database.
+
+**Database privileges.** The auth store touches only `<database>.api_keys` and
+`<database>.api_quota`: it never reads or creates any other collection or
+GridFS bucket and never runs a database-wide command (it pings the `admin`
+database, which needs no privileges). It therefore runs under a role scoped to
+just those two collections, e.g. an Atlas custom role with, on **each** of
+`<database>.api_keys` and `<database>.api_quota`:
+
+`find`, `insert`, `update`, `remove`, `createIndex`, `listIndexes`, `createCollection`
+
+and no database-level privileges. On boot it creates the same indexes the main
+store creates on those collections, under the same names (`api_key_hash`
+unique, `api_key_created`, and the `api_quota_expires_ttl` TTL index), so the
+auth database may also be another deployment's main database (e.g. mainnet's)
+and both provision it without conflict. (`collMod` is only needed if a future
+release changes the `api_quota` TTL; this one doesn't.)
+
+When several deployments share one auth store:
+
+- **A key works on every network that shares it.** That is the point, but
+  issue keys knowing a testnet key is also a mainnet key. Manage keys through
+  any one deployment's admin listener; they all see the same set (within
+  `key_cache_ttl_ms`).
+- **Keep `ratelimit.tiers` identical everywhere.** The key stores only its
+  tier name; each deployment applies its own config's limits for that name,
+  and a tier missing from a deployment's config falls back to `free` there.
+- **Quota is one window per key across all of them.** A key's per-minute
+  budget is shared by every api-server replica of every network and region,
+  not granted per network.
+- **Set `expected_replicas` to the total** number of api-server replicas
+  across all deployments sharing the store: `max_in_flight` is divided by it.
+- **Size `lease_fraction` for that total.** Each replica leases
+  `lease_fraction × units_per_minute` at a time until shared usage passes
+  `shrink_threshold`; with N replicas each holding a lease, the window can be
+  overshot by up to N leases before they shrink to exact cost. Keep
+  `lease_fraction ≤ ~shrink_threshold / N` (e.g. 12 replicas with the default
+  `shrink_threshold: 0.8` → `lease_fraction` of about `0.06` or less).
+- **The auth store is on the request path** for uncached keys and quota
+  leases. If it is unreachable the usual degradation applies: cached keys keep
+  working up to `key_cache_stale_max_ms`, uncached keys get `503`, and quota
+  fails open to a per-replica bucket. Host it where every region reaches it
+  within `op_timeout_ms`.
+
 ### Managing keys
 
 ```bash

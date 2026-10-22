@@ -14,6 +14,40 @@ import (
 	"github.com/bsv-blockchain/broadcaster/store"
 )
 
+// AuthStore is a dedicated home for API keys and rate-limit quota counters
+// (auth.store.mongodb), separate from the main transaction store so several
+// deployments — one per network, each with its own store — share one key
+// set and one quota window per key.
+type AuthStore interface {
+	store.APIKeyStore
+	store.QuotaStore
+}
+
+// SetAuthStore makes as the source of API keys and quota for the auth
+// middleware, the rate limiter and the admin key endpoints, in place of the
+// main store. Call before Start; the caller owns as and closes it.
+func (s *Server) SetAuthStore(as AuthStore) { s.authStore = as }
+
+// apiKeyStore is the auth store when one is set, else the main store if it
+// implements APIKeyStore.
+func (s *Server) apiKeyStore() (store.APIKeyStore, bool) {
+	if s.authStore != nil {
+		return s.authStore, true
+	}
+	ks, ok := s.store.(store.APIKeyStore)
+	return ks, ok
+}
+
+// quotaStore is the auth store when one is set, else the main store if it
+// implements QuotaStore.
+func (s *Server) quotaStore() (store.QuotaStore, bool) {
+	if s.authStore != nil {
+		return s.authStore, true
+	}
+	qs, ok := s.store.(store.QuotaStore)
+	return qs, ok
+}
+
 // initAccessControl builds the key resolver and rate limiter the config
 // asks for. Every backend implements APIKeyStore and QuotaStore; the
 // assertions keep a test double that does not from silently disabling auth.
@@ -24,15 +58,21 @@ import (
 // budget. Calling it once per guarded route would give a caller guessing
 // keys one throttle budget per route instead of one for the whole API.
 func (s *Server) initAccessControl() error {
+	// auth.store configured but never wired would silently serve keys and
+	// quota from the main store — a per-network key set instead of the
+	// shared one the operator asked for. Fail closed.
+	if s.cfg.Auth.Store.Configured() && s.authStore == nil {
+		return fmt.Errorf("auth.store.mongodb is configured but no auth store was opened")
+	}
 	if s.cfg.Admin.Enabled {
-		if _, ok := s.store.(store.APIKeyStore); !ok {
+		if _, ok := s.apiKeyStore(); !ok {
 			return fmt.Errorf("admin.enabled: store backend %q does not support api keys", s.cfg.Store.Backend)
 		}
 	}
 	if !s.cfg.Auth.Enabled {
 		return nil
 	}
-	keys, ok := s.store.(store.APIKeyStore)
+	keys, ok := s.apiKeyStore()
 	if !ok {
 		return fmt.Errorf("auth.enabled: store backend %q does not support api keys", s.cfg.Store.Backend)
 	}
@@ -48,7 +88,7 @@ func (s *Server) initAccessControl() error {
 	if !rl.Enabled {
 		return nil
 	}
-	quota, ok := s.store.(store.QuotaStore)
+	quota, ok := s.quotaStore()
 	if !ok {
 		return fmt.Errorf("ratelimit.enabled: store backend %q does not support quotas", s.cfg.Store.Backend)
 	}

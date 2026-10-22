@@ -152,7 +152,7 @@ func (s *Server) startAdmin(ctx context.Context) error {
 }
 
 func (s *Server) keyStore(c *gin.Context) (store.APIKeyStore, bool) {
-	ks, ok := s.store.(store.APIKeyStore)
+	ks, ok := s.apiKeyStore()
 	if !ok {
 		c.JSON(http.StatusServiceUnavailable, gin.H{jsonKeyError: "store backend does not support api keys"})
 	}

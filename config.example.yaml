@@ -475,6 +475,14 @@ chaintracks_server:
 # arrives through Cloudflare.
 auth:
   enabled: false
+  # Optional dedicated MongoDB database for API keys and quota, shared by
+  # several arcade deployments (e.g. one per network) so they serve one key
+  # set and one quota window per key. Unset uri = keys and quota stay in the
+  # main store. Requires auth.enabled. See docs/api-keys.md.
+  # store:
+  #   mongodb:
+  #     uri: ""              # ARCADE_AUTH_STORE_MONGODB_URI
+  #     database: arcade_auth
 admin:
   enabled: false
   host: 127.0.0.1       # kubectl port-forward works with this; set 0.0.0.0 to opt in to in-cluster tooling reaching it directly
