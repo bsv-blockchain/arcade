@@ -40,6 +40,10 @@ const (
 	NetworkTestnet     = "testnet"
 	NetworkTeratestnet = "teratestnet"
 	NetworkRegtest     = "regtest"
+	// NetworkTstn is the Teranode scaling test network. It has its own
+	// genesis (go-chaincfg TeraScalingTestNetParams) and p2p topic prefix
+	// (".../tstn-*"), so it can't be run as regtest.
+	NetworkTstn = "tstn"
 )
 
 // knownNetworks gates validate() and ResolveP2PNetwork.
@@ -48,6 +52,7 @@ var knownNetworks = map[string]struct{}{
 	NetworkTestnet:     {},
 	NetworkTeratestnet: {},
 	NetworkRegtest:     {},
+	NetworkTstn:        {},
 }
 
 // ResolveP2PNetwork maps a canonical BSV Broadcaster network name to the values that
@@ -63,9 +68,9 @@ var knownNetworks = map[string]struct{}{
 // network ("mainnet"/"testnet"/"teratestnet") and injecting the bootstrap peer
 // list ourselves — so topic and peers always agree.
 //
-// Regtest deliberately returns a nil bootstrap list: there is no canonical
-// regtest DNS, so operators must supply p2p.bootstrap_peers themselves.
-// validate() enforces this when datahub_discovery is enabled.
+// Regtest and tstn deliberately return a nil bootstrap list: neither has a
+// canonical bootstrap DNS, so operators must supply p2p.bootstrap_peers
+// themselves. validate() enforces this when datahub_discovery is enabled.
 func ResolveP2PNetwork(network string) (topicNetwork string, bootstrapPeers []string) {
 	switch network {
 	case NetworkTestnet:
@@ -74,6 +79,8 @@ func ResolveP2PNetwork(network string) (topicNetwork string, bootstrapPeers []st
 		return NetworkTeratestnet, []string{"/dnsaddr/teratestnet.bootstrap.teranode.bsvb.tech"}
 	case NetworkRegtest:
 		return NetworkRegtest, nil
+	case NetworkTstn:
+		return NetworkTstn, nil
 	case NetworkMainnet, "":
 		fallthrough
 	default:
@@ -83,9 +90,9 @@ func ResolveP2PNetwork(network string) (topicNetwork string, bootstrapPeers []st
 
 // ResolveChaintracksNetwork maps a canonical BSV Broadcaster network name to the value
 // go-chaintracks accepts at config.P2P.Network. Its chainmanager.getGenesisHeader
-// is an exact-match switch over "main"/"test"/"teratest"/"teratestnet"/"regtest",
-// so we translate at the boundary instead of leaking upstream naming into the
-// BSV Broadcaster config surface.
+// resolves the name through go-chaincfg (accepting "main"/"test"/"teratest" as
+// aliases), so we translate at the boundary instead of leaking upstream naming
+// into the BSV Broadcaster config surface.
 func ResolveChaintracksNetwork(network string) string {
 	switch network {
 	case NetworkTestnet:
@@ -94,6 +101,8 @@ func ResolveChaintracksNetwork(network string) string {
 		return NetworkTeratestnet
 	case NetworkRegtest:
 		return NetworkRegtest
+	case NetworkTstn:
+		return NetworkTstn
 	case NetworkMainnet, "":
 		fallthrough
 	default:
@@ -1693,12 +1702,12 @@ func validate(cfg *Config) error {
 		cfg.Network = NetworkMainnet
 	}
 	if _, ok := knownNetworks[cfg.Network]; !ok {
-		return fmt.Errorf("invalid network %q (expected %s, %s, %s, or %s)",
-			cfg.Network, NetworkMainnet, NetworkTestnet, NetworkTeratestnet, NetworkRegtest)
+		return fmt.Errorf("invalid network %q (expected %s, %s, %s, %s, or %s)",
+			cfg.Network, NetworkMainnet, NetworkTestnet, NetworkTeratestnet, NetworkRegtest, NetworkTstn)
 	}
-	if cfg.Network == NetworkRegtest {
+	if cfg.Network == NetworkRegtest || cfg.Network == NetworkTstn {
 		if cfg.P2P.DatahubDiscovery && len(cfg.P2P.BootstrapPeers) == 0 {
-			return fmt.Errorf("p2p.bootstrap_peers is required when network=regtest and p2p.datahub_discovery=true")
+			return fmt.Errorf("p2p.bootstrap_peers is required when network=%s and p2p.datahub_discovery=true", cfg.Network)
 		}
 	}
 	validModes := map[string]bool{
