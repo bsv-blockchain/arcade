@@ -1001,3 +1001,23 @@ func TestPool_SlowerEndpointCutByGraceKeepsItsHealth(t *testing.T) {
 		t.Fatalf("the slower endpoint must owe only what it did not acknowledge, owes %d of %d", st.CatchupPending, len(regs))
 	}
 }
+
+// A taken entry that is put back on settle is counted once throughout: never
+// as both queued and in flight, which EndpointStatuses and the pending gauge
+// would otherwise briefly report as two owed registrations.
+func TestCatchupQueue_SettleRequeueCountsOnce(t *testing.T) {
+	q := newCatchupQueue(10)
+	q.add(Registration{TxID: "owed"})
+
+	batch := q.take(1)
+	if got := q.len(); got != 1 {
+		t.Fatalf("len after take = %d, want 1 (in flight still owed)", got)
+	}
+	q.settle(len(batch), batch...)
+	if got := q.len(); got != 1 {
+		t.Fatalf("len after settle with requeue = %d, want 1", got)
+	}
+	if again := q.take(1); len(again) != 1 || again[0].TxID != "owed" {
+		t.Fatalf("requeued entry not takeable again: %v", again)
+	}
+}
