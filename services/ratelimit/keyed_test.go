@@ -297,6 +297,10 @@ func TestKeyedConcurrentReplicasRespectGlobalLimit(t *testing.T) {
 type blockingQuota struct {
 	started chan struct{}
 	release chan struct{}
+	// onTimeout, if set, runs once when a call gives up on its context —
+	// on the caller's goroutine, so a test can advance a fake clock by the
+	// time the reserve "spent" without racing the limiter's reads of it.
+	onTimeout func()
 }
 
 func newBlockingQuota() *blockingQuota {
@@ -312,6 +316,10 @@ func (q *blockingQuota) ReserveQuota(ctx context.Context, _ string, _ time.Time,
 	case <-q.release:
 		return 0, 0, errors.New("store still down")
 	case <-ctx.Done():
+		if f := q.onTimeout; f != nil {
+			q.onTimeout = nil
+			f()
+		}
 		return 0, 0, ctx.Err()
 	}
 }
@@ -328,10 +336,14 @@ func (q *blockingQuota) ReserveQuota(ctx context.Context, _ string, _ time.Time,
 func TestKeyedHungStoreOpensForFullBackoffThenProbesExclusively(t *testing.T) {
 	clk := &clock{noon}
 	qb := newBlockingQuota()
+	// The logical clock moves forward by the time the hung reserve spends,
+	// so request-start time (noon) and completion time differ: a deadline
+	// measured from the former lands reserveTimeout short of the latter.
+	qb.onTimeout = func() { clk.t = clk.t.Add(reserveTimeout) }
 	l := newKeyedLimiter(qb, 0.1, 0.8, clk.now)
 
 	// The first reserve hangs until reserveTimeout — real wall time, since
-	// that's what bounds it — while the fixed logical clock stays at noon.
+	// that's what bounds it — and advances the logical clock to match.
 	start := time.Now()
 	_, err := l.take(context.Background(), "key_hung", 50, 10)
 	elapsed := time.Since(start)
@@ -339,12 +351,14 @@ func TestKeyedHungStoreOpensForFullBackoffThenProbesExclusively(t *testing.T) {
 	require.Less(t, elapsed, reserveTimeout+time.Second, "a hung store must not block past reserveTimeout")
 	require.GreaterOrEqual(t, elapsed, reserveTimeout-100*time.Millisecond)
 
-	// The regression check: failUntil is measured from completion (noon,
-	// since the logical clock never moved during that real-time wait), so
-	// it's a full storeBackoff away — not storeBackoff minus the
-	// ~reserveTimeout just spent inside the failing reserve.
+	// The regression check: failUntil is measured from completion
+	// (noon+reserveTimeout), so it's a full storeBackoff away — not
+	// storeBackoff minus the reserveTimeout just spent inside the failing
+	// reserve, which is what measuring from request start would give.
+	done := noon.Add(reserveTimeout)
+	require.Equal(t, done, clk.now(), "the hung reserve advanced the logical clock")
 	b := l.buckets["key_hung"]
-	require.Equal(t, noon.Add(storeBackoff), b.failUntil)
+	require.Equal(t, done.Add(storeBackoff), b.failUntil)
 
 	fastDenials := func() {
 		const n = 8
@@ -365,7 +379,7 @@ func TestKeyedHungStoreOpensForFullBackoffThenProbesExclusively(t *testing.T) {
 	fastDenials()
 
 	// Just under storeBackoff: still fully open.
-	clk.t = noon.Add(storeBackoff - time.Second)
+	clk.t = done.Add(storeBackoff - time.Second)
 	_, err = l.take(context.Background(), "key_hung", 50, 10)
 	require.ErrorIs(t, err, errStoreBackoff)
 
@@ -375,7 +389,7 @@ func TestKeyedHungStoreOpensForFullBackoffThenProbesExclusively(t *testing.T) {
 	case <-qb.started:
 	default:
 	}
-	clk.t = noon.Add(storeBackoff + time.Second)
+	clk.t = done.Add(storeBackoff + time.Second)
 	probeDone := make(chan struct{})
 	go func() {
 		_, _ = l.take(context.Background(), "key_hung", 50, 10)
@@ -524,4 +538,57 @@ func TestKeyedProbeSizedIndependentlyOfStaleRemaining(t *testing.T) {
 	d, err := l.take(context.Background(), "key_probe", limit, cost)
 	require.NoError(t, err)
 	require.True(t, d.Allowed, "the probe must not be shortchanged by remaining that was spent while its lock was released")
+}
+
+// TestKeyedTierDowngradeDropsOldLease checks that a lease taken under a
+// higher limit isn't spent after the key's tier drops mid-window: neither
+// the locally held units nor a refill that was in flight under the old
+// limit when the downgrade was observed.
+func TestKeyedTierDowngradeDropsOldLease(t *testing.T) {
+	const high, low = int64(30_000), int64(50)
+	qs := newFakeQuota()
+	l := newTestKeyed(qs, 0.1, 0.8, &clock{noon}) // baseLease(high) = 3,000
+
+	d, err := l.take(context.Background(), "key_down", high, 10)
+	require.NoError(t, err)
+	require.True(t, d.Allowed)
+	b := l.buckets["key_down"]
+	require.Equal(t, int64(2_990), b.remaining)
+
+	// Downgraded: the 2,990 units leased under 30,000 must not be spent.
+	// The shared window already holds 3,000 > 50, so the store grants
+	// nothing and the request is denied.
+	d, err = l.take(context.Background(), "key_down", low, 10)
+	require.NoError(t, err)
+	require.False(t, d.Allowed, "a lease taken under the old tier must not be spent after a downgrade")
+	require.Zero(t, b.remaining)
+	require.Zero(t, d.Remaining)
+
+	// Same downgrade, but with a refill reserved under the old limit still
+	// in flight when it's observed: its grant must not land as spendable.
+	qs2 := newFakeQuota()
+	l2 := newTestKeyed(qs2, 0.1, 0.8, &clock{noon})
+	var refill func()
+	l2.spawn = func(f func()) { refill = f } // hold the prefetch
+	b2 := l2.bucketFor("key_down", noon)
+	for b2.remaining >= 3_000/4 || refill == nil {
+		d, err = l2.take(context.Background(), "key_down", high, 10)
+		require.NoError(t, err)
+		require.True(t, d.Allowed)
+	}
+	d, err = l2.take(context.Background(), "key_down", low, 10) // observes the downgrade
+	require.NoError(t, err)
+	require.False(t, d.Allowed)
+	refill() // the old-tier refill lands now
+	require.Zero(t, b2.remaining, "a refill reserved under the old tier must be discarded")
+	d, err = l2.take(context.Background(), "key_down", low, 10)
+	require.NoError(t, err)
+	require.False(t, d.Allowed)
+
+	// An upgrade keeps what's already leased.
+	b2.remaining = 100
+	d, err = l2.take(context.Background(), "key_down", high, 10)
+	require.NoError(t, err)
+	require.True(t, d.Allowed)
+	require.Equal(t, int64(90), b2.remaining)
 }

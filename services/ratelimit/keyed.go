@@ -58,6 +58,11 @@ type bucket struct {
 	remaining int64 // units leased to this replica and not yet spent
 	used      int64 // the window's shared total as of our last reservation
 	refilling bool
+	// limit is the tier limit remaining was leased under. Units leased
+	// under a higher limit aren't valid against a lower one: on a
+	// downgrade they're discarded (see take), and so is any grant that
+	// lands from a reserve issued before the downgrade.
+	limit int64
 	// failUntil is the breaker. Zero: never tripped (or reset by a new
 	// window) — normal operation, a miss reserves with the lock held, as
 	// above. Non-zero and in the future: open — take fails open with no
@@ -116,6 +121,16 @@ func (l *keyedLimiter) take(ctx context.Context, keyID string, limit, cost int64
 	if !b.window.Equal(window) {
 		b.window, b.remaining, b.used, b.failUntil, b.probing = window, 0, 0, time.Time{}, false
 	}
+	if limit < b.limit {
+		// A tier downgrade (e.g. 30,000 -> 50) mid-window. The local lease
+		// was sized and granted under the old limit, so spending it would
+		// keep honoring that limit for the rest of the window. The shared
+		// counter only records leases, not spend, so there's no way to tell
+		// how much of the window's usage is actually spent: drop the lease
+		// and re-reserve against the new limit, which the store clamps.
+		b.remaining = 0
+	}
+	b.limit = limit
 	if now.Before(b.failUntil) {
 		// Open: don't even consult local state. A single bad reservation
 		// would otherwise still serve from whatever was locally remaining,
@@ -155,6 +170,9 @@ func (l *keyedLimiter) take(ctx context.Context, keyID string, limit, cost int64
 			// learned (grant or error) no longer applies to this bucket.
 			b.mu.Unlock()
 			return Decision{}, errStoreBackoff
+		}
+		if limit > b.limit {
+			granted = 0 // reserved under a limit since downgraded (see bucket.limit)
 		}
 		if applyErr := l.recordReserve(ctx, b, granted, usedAfter, err); applyErr != nil {
 			b.mu.Unlock()
@@ -265,6 +283,9 @@ func (l *keyedLimiter) prefetch(ctx context.Context, keyID string, window time.T
 		// is never the caller hanging up: always a genuine store problem.
 		b.failUntil = l.now().UTC().Add(storeBackoff)
 		return
+	}
+	if limit > b.limit {
+		granted = 0 // reserved under a limit since downgraded (see bucket.limit)
 	}
 	b.remaining += granted
 	b.used = max(b.used, used)
