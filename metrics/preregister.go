@@ -123,3 +123,35 @@ func PreRegisterPropagationRetryOutcomes() {
 		PropagationMerkleRegisterFailures.WithLabelValues(reason)
 	}
 }
+
+// PreRegisterRateLimit exports every per-tier rate-limit decision series,
+// plus the reservation-result series, at 0 from the first scrape, for the
+// configured tiers. Call PreRegisterAPIKey too whenever auth.enabled -- this
+// helper alone does not cover the apikey-identification series ({none,*}
+// decisions, the cache results), which exist independently of whether
+// ratelimit.enabled is on.
+func PreRegisterRateLimit(tiers []string) {
+	for _, tier := range tiers {
+		for _, result := range []string{"allowed", "quota", "concurrency", "batch_too_large", "unpayable"} {
+			RateLimitDecisionsTotal.WithLabelValues(tier, result)
+		}
+	}
+	for _, result := range []string{"granted", "partial", "exhausted", "error", "canceled"} {
+		RateLimitReservationsTotal.WithLabelValues(result)
+	}
+}
+
+// PreRegisterAPIKey exports every series apikey.Middleware and
+// apikey.Resolver can emit at 0 from the first scrape: the {none,*} decision
+// pairs recorded before any tier is known (an invalid key, or an IP
+// throttled for repeated invalid-key attempts), and every API-key cache
+// result. Call this whenever auth.enabled, independent of whether
+// ratelimit.enabled is also on -- identification runs either way.
+func PreRegisterAPIKey() {
+	for _, result := range []string{"unauthorized", "auth_failures"} {
+		RateLimitDecisionsTotal.WithLabelValues("none", result)
+	}
+	for _, result := range []string{"hit", "miss", "negative", "failing", "stale", "error", "canceled"} {
+		APIKeyCacheTotal.WithLabelValues(result)
+	}
+}

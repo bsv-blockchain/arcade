@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -43,6 +44,9 @@ type Store struct {
 	// schemaApplyTimeout bounds EnsureIndexes' slow path; <=0 means
 	// defaultSchemaApplyTimeout. See schema.go.
 	schemaApplyTimeout time.Duration
+	// quotaSweptAt (unix ns) rate-limits the opportunistic api_quota sweep
+	// in ReserveQuota to one DELETE per minute per process.
+	quotaSweptAt atomic.Int64
 }
 
 // New connects to Postgres (optionally starting the embedded-postgres process

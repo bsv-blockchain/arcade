@@ -119,6 +119,8 @@ func TestEnsureIndexes_Idempotent(t *testing.T) {
 		collStumpManifests:   {"_id_", idxStumpManifests},
 		collDatahubEndpoints: {"_id_", idxDHNetwork, idxDHLastSeen},
 		collPeerPolicies:     {"_id_", idxPPNetwork, idxPPLastSeen},
+		collAPIKeys:          {"_id_", idxAPIKeyHash, idxAPIKeyCreated},
+		collAPIQuota:         {"_id_", idxQuotaExpires},
 		"bumps.files":        {"_id_", idxGridFSFiles, idxBumpsBlockHash},
 		"bumps.chunks":       {"_id_", idxGridFSChunks},
 		"stumps.files":       {"_id_", idxGridFSFiles, idxStumpsBlockHash},

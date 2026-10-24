@@ -29,7 +29,8 @@ func WithCORS(next http.Handler) http.Handler {
 		h.Set("Access-Control-Allow-Origin", "*")
 		h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		h.Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Last-Event-ID, X-Requested-With, X-CallbackURL, X-FullStatusUpdates, X-CallbackToken")
-		h.Set("Access-Control-Expose-Headers", "Content-Type")
+		// Browser clients need the rate-limit fields to back off correctly.
+		h.Set("Access-Control-Expose-Headers", "Content-Type, Retry-After, RateLimit, RateLimit-Policy, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, X-RateLimit-Reason")
 		h.Set("Access-Control-Max-Age", "86400")
 
 		if r.Method == http.MethodOptions {

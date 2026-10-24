@@ -1,12 +1,14 @@
-// Package pebble implements store.Store and store.Leaser on top of
-// github.com/cockroachdb/pebble, a pure-Go LSM KV. It's the recommended
-// backend for arcade's zero-dependency standalone mode: no external
-// services, single binary, durable on disk.
+// Package pebble implements store.Store, store.Leaser, store.APIKeyStore
+// and store.QuotaStore on top of github.com/cockroachdb/pebble, a pure-Go
+// LSM KV. It's the recommended backend for arcade's zero-dependency
+// standalone mode: no external services, single binary, durable on disk.
 //
 // Layout: see keys.go for the key namespaces. Primary records hold
 // JSON-encoded values; secondary indexes are empty-value prefix keys whose
-// suffix names the primary row. All mutations go through an IndexedBatch
-// so stale index entries are removed atomically with the primary write.
+// suffix names the primary row (idx:apikey:hash:<hash> is the one
+// exception: it stores the key id as its value). Mutations that touch more
+// than one key go through a Batch so stale index entries are removed
+// atomically with the primary write.
 //
 // Single-process: Pebble takes an exclusive file lock on its data directory.
 // Running two arcade instances against the same path will fail at Open —
@@ -44,7 +46,8 @@ var (
 	_ store.Leaser = (*Store)(nil)
 )
 
-// Store is a Pebble-backed implementation of store.Store and store.Leaser.
+// Store is a Pebble-backed implementation of store.Store, store.Leaser,
+// store.APIKeyStore and store.QuotaStore.
 type Store struct {
 	db        *pebbledb.DB
 	writeOpts *pebbledb.WriteOptions
@@ -59,6 +62,15 @@ type Store struct {
 	// a single mutex across all submissions is enough — webhook CAS
 	// contention is in the low-Hz range even at peak.
 	submissionMu sync.Mutex
+	// apiKeyMu serializes API-key read-modify-writes (create's uniqueness
+	// checks, tier updates, revocation). Admin traffic only.
+	apiKeyMu sync.Mutex
+	// quota holds the rate limiter's per-window counters in memory: Pebble is
+	// single-process, so they are exact without persistence, and a restart
+	// loses at most the current minute. See apikeys.go.
+	quotaMu      sync.Mutex
+	quota        map[quotaKey]int64
+	quotaSweptAt time.Time
 }
 
 // storedStatus is the persistence shape for TransactionStatus rows. We keep

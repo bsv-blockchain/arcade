@@ -28,6 +28,11 @@ All metric names start with `arcade_` so they live in their own namespace.
 | Datahub endpoint flapping | `changes(arcade_teranode_endpoint_healthy[5m])` | `> 4` |
 | All datahubs unhealthy | `sum(arcade_teranode_endpoint_healthy{}) == 0` | for 1m |
 | API errors | `rate(arcade_api_request_duration_seconds_count{status_class="5xx"}[5m])` | `> 0` |
+| Quota store failing open | `rate(arcade_ratelimit_store_failopen_total[5m])` | `> 0 for 5m` (keyed quotas are enforced per-replica only while this fires) |
+| Quota reservation errors | `rate(arcade_ratelimit_reservations_total{result="error"}[5m])` | `> 0 for 5m` |
+| Quota store reservations slow | `histogram_quantile(0.95, rate(arcade_ratelimit_reservation_duration_seconds_bucket[5m]))` | `> 0.5s` |
+| Invalid API key attempts spiking | `rate(arcade_ratelimit_decisions_total{tier="none",result="auth_failures"}[5m])` | `> 0` (credential stuffing or a leaked key) |
+| API key store unhealthy | `sum(rate(arcade_apikey_cache_total{result="error"}[5m])) + sum(rate(arcade_apikey_cache_total{result="failing"}[5m]))` | `> 0 for 5m` |
 | Kafka publish failures | `rate(arcade_kafka_produce_errors_total[5m])` | `> 0 for 1m` |
 | DLQ growth | `rate(arcade_kafka_messages_total{op="dlq"}[5m])` | `> 0` |
 | Network retry budget exhausted | `rate(arcade_propagation_requeue_exhausted_total[5m])` | `> 0` |

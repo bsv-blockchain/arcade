@@ -3,8 +3,12 @@
 package aerospike
 
 import (
+	"context"
+	"errors"
 	"testing"
+	"time"
 
+	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/store/storetest"
 )
 
@@ -56,4 +60,46 @@ func TestRetryReason_Conformance(t *testing.T) {
 		t.Helper()
 		return integrationStore(t)
 	})
+}
+
+func TestAPIKeys_Conformance(t *testing.T) {
+	storetest.RunAPIKeySuite(t, func(t *testing.T) store.APIKeyStore {
+		t.Helper()
+		return integrationStore(t)
+	})
+}
+
+func TestQuota_Conformance(t *testing.T) {
+	storetest.RunQuotaSuite(t, func(t *testing.T) store.QuotaStore {
+		t.Helper()
+		return integrationStore(t)
+	})
+}
+
+// TestReserveQuota_CancelledCtx_NoSpend pins the ctx-handling fix: remaining()
+// returns 0 for an already-done ctx, which the v7 client treats as "no
+// deadline" rather than "expired", so without an explicit ctx.Err() check
+// ReserveQuota would still issue the Operate call and spend quota against a
+// cancelled request. A cancelled attempt must both report ctx.Err() and
+// leave the window untouched for the next, real reservation.
+func TestReserveQuota_CancelledCtx_NoSpend(t *testing.T) {
+	s := integrationStore(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	keyID := "key_ctxcancel_" + time.Now().Format("150405.000000000")
+	w := time.Now().UTC().Truncate(time.Minute)
+
+	if _, _, err := s.ReserveQuota(ctx, keyID, w, 10, 100); !errors.Is(err, context.Canceled) {
+		t.Fatalf("want context.Canceled, got %v", err)
+	}
+
+	granted, used, err := s.ReserveQuota(context.Background(), keyID, w, 10, 100)
+	if err != nil {
+		t.Fatalf("follow-up reserve: %v", err)
+	}
+	if granted != 10 || used != 10 {
+		t.Fatalf("follow-up reserve after cancelled attempt: granted=%d used=%d, want 10/10", granted, used)
+	}
 }
