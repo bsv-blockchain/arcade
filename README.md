@@ -140,7 +140,7 @@ go get -u github.com/bsv-blockchain/arcade
 ```bash
 git clone https://github.com/bsv-blockchain/arcade.git
 cd arcade
-go build -o arcade cmd/arcade/main.go
+go build -o arcade ./cmd/arcade
 ```
 
 ### Configuration
