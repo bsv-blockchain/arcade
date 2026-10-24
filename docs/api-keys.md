@@ -136,6 +136,10 @@ logs.
   key already resolved once keeps authenticating on its last known value
   for up to `key_cache_stale_max_ms` (default 10m); an uncached or fully
   expired key gets `503` instead.
+- A downgrade applies within the current minute: units a replica already
+  leased under the old, higher limit are discarded rather than spent, so a
+  key that has already leased past its new limit is throttled until the
+  next window.
 - If the quota store is unavailable, keyed callers fail open to a
   per-replica bucket sized at the tier's own limit
   (`arcade_ratelimit_store_failopen_total`). A per-key breaker backs this:
