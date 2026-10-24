@@ -6,7 +6,7 @@
 //     process, data-dir on disk. Intended for single-binary standalone
 //     mode alongside the in-memory Kafka broker.
 //
-// For arcade's sustained hot-path throughput Pebble is the recommended
+// For BSV Broadcaster's sustained hot-path throughput Pebble is the recommended
 // standalone backend; embedded-postgres is here primarily for users who
 // want a real SQL surface for testing migrations, joins, and queries.
 package postgres
@@ -22,10 +22,10 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
-	"github.com/bsv-blockchain/arcade/store/bumpcache"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/store/bumpcache"
 )
 
 var (
@@ -766,7 +766,7 @@ ORDER BY timestamp_at DESC`
 // for hydration: that query selects 14 columns including raw_tx / merkle_path
 // / competing_txs and sorts the whole table by timestamp_at. On a ~5M-row
 // store the planner resolved it with a Seq Scan plus an external merge sort
-// over detoasted wide rows, which drove both arcade and its Postgres out of
+// over detoasted wide rows, which drove both BSV Broadcaster and its Postgres out of
 // memory on every api-server boot (issue #276).
 //
 // Three properties matter here and each is load-bearing:
@@ -992,7 +992,7 @@ WHERE txid=$1 AND status <> ALL($5)`
 
 // GetReadyRetries uses FOR UPDATE SKIP LOCKED so the reaper can run on
 // multiple processes without delivering the same tx twice. Postgres holds
-// the row locks until the enclosing transaction commits; for arcade's
+// the row locks until the enclosing transaction commits; for BSV Broadcaster's
 // single-request reaper that happens as soon as this function returns.
 func (s *Store) GetReadyRetries(ctx context.Context, now time.Time, limit int) ([]*store.PendingRetry, error) {
 	if limit <= 0 {
@@ -1049,7 +1049,7 @@ WHERE txid=$1`
 
 // SetMinedByTxIDs updates only rows that already exist. A CTE snapshots the
 // pre-update row state so callers can observe the MINED transition age via
-// arcade_status_transition_age_seconds without a second round-trip.
+// bsv_broadcaster_status_transition_age_seconds without a second round-trip.
 // blockHeight is persisted alongside blockHash and echoed back on each
 // returned status so downstream SSE/webhook consumers always see the height
 // that anchors the MINED transition (issue #87 / F-029).

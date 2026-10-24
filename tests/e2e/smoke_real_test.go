@@ -9,11 +9,11 @@ import (
 
 	teranode "github.com/bsv-blockchain/teranode/services/p2p"
 
-	"github.com/bsv-blockchain/arcade/tests/e2e/harness"
+	"github.com/bsv-blockchain/bsv-broadcaster/tests/e2e/harness"
 )
 
 // TestSmoke_RealBlockMined_SingleSubtree drives the full
-// arcade ↔ merkle-service round-trip with a real mainnet block and
+// BSV Broadcaster ↔ merkle-service round-trip with a real mainnet block and
 // asserts each watched tx reaches MINED with a merklePath that
 // reproduces the block's real header merkle root.
 //
@@ -31,28 +31,28 @@ func TestSmoke_RealBlockMined_SingleSubtree(t *testing.T) {
 
 	h := harness.New(t)
 
-	// Two independent datahub instances so the test can prove arcade builds
+	// Two independent datahub instances so the test can prove BSV Broadcaster builds
 	// the compound BUMP from the merkle-service callback enrichment (issue
 	// #195) without ever fetching the block itself:
 	//   - msDatahub serves /block + /subtree to merkle-service (which MUST
 	//     fetch them to compute STUMPs and the enrichment fields).
-	//   - arcadeDatahub is arcade's only datahub. With v0.2.4 emitting the
-	//     enrichment, arcade never GETs /block here, so its BlockFetches()
-	//     stays 0. We still stage the fixture on it so that, were arcade to
+	//   - broadcasterDatahub is BSV Broadcaster's only datahub. With v0.2.4 emitting the
+	//     enrichment, BSV Broadcaster never GETs /block here, so its BlockFetches()
+	//     stays 0. We still stage the fixture on it so that, were BSV Broadcaster to
 	//     fall back, the build would succeed (and only the assertion below
 	//     would flag the regression) rather than 404-cascading.
 	msDatahub := h.NewDatahub(t)
 	msDatahub.StageFixture(fix)
-	arcadeDatahub := h.NewDatahub(t)
-	arcadeDatahub.StageFixture(fix)
+	broadcasterDatahub := h.NewDatahub(t)
+	broadcasterDatahub.StageFixture(fix)
 
-	rt := harness.StartArcade(t, harness.ArcadeOptions{
+	rt := harness.StartBroadcaster(t, harness.BroadcasterOptions{
 		MerkleServiceURL: h.Containers.MerkleHostURL,
-		// arcade runs on the host; from here the datahub is reachable
+		// BSV Broadcaster runs on the host; from here the datahub is reachable
 		// via loopback. merkle-service inside its container reaches
 		// its own datahub via the gateway IP — that URL goes into
 		// the libp2p BlockMessage / SubtreeMessage payloads below.
-		DatahubURL:      arcadeDatahub.LocalURL(),
+		DatahubURL:      broadcasterDatahub.LocalURL(),
 		LibP2PBootstrap: h.LibP2P.BootstrapMultiaddr(),
 		MerkleAuthToken: "e2e-watch-token",
 		CallbackToken:   "e2e-callback-token",
@@ -63,9 +63,9 @@ func TestSmoke_RealBlockMined_SingleSubtree(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Minute)
 	defer cancel()
 
-	// 1. Submit each picked tx through arcade. arcade's intake handler
+	// 1. Submit each picked tx through BSV Broadcaster. BSV Broadcaster's intake handler
 	//    structurally validates + propagation calls merkle-service
-	//    /watch with arcade's callback URL + token.
+	//    /watch with BSV Broadcaster's callback URL + token.
 	txids, err := harness.BroadcastRawTxs(ctx, t, rt, fix.PickedRawTxs)
 	if err != nil {
 		t.Fatalf("broadcast: %v", err)
@@ -74,7 +74,7 @@ func TestSmoke_RealBlockMined_SingleSubtree(t *testing.T) {
 
 	// 2. Wait for /watch registrations to land in merkle-service.
 	//    Without this, the next-step block announcement could race
-	//    ahead of arcade's propagation flush and merkle-service
+	//    ahead of BSV Broadcaster's propagation flush and merkle-service
 	//    would emit STUMPs for unwatched txids (i.e., none).
 	for _, id := range txids {
 		if err := harness.WaitForMerkleRegistration(ctx, h.Containers.MerkleHostURL, id, 60*time.Second); err != nil {
@@ -90,8 +90,8 @@ func TestSmoke_RealBlockMined_SingleSubtree(t *testing.T) {
 	//         mainnet hashes, so the lookup hits)
 	//      b. fetches /block/<hash> for the block announcement,
 	//         processes each subtree's STUMP, sends SEEN_ON_NETWORK
-	//         + STUMP + BLOCK_PROCESSED callbacks to arcade
-	//    arcade's bump-builder consumes those, builds compound BUMPs
+	//         + STUMP + BLOCK_PROCESSED callbacks to BSV Broadcaster
+	//    BSV Broadcaster's bump-builder consumes those, builds compound BUMPs
 	//    against the real header merkle root, marks the txs MINED.
 	for _, st := range fix.Subtrees {
 		if err := h.LibP2P.PublishSubtree(ctx, teranode.SubtreeMessage{
@@ -107,7 +107,7 @@ func TestSmoke_RealBlockMined_SingleSubtree(t *testing.T) {
 		DataHubURL: msDatahub.HostURL(),
 		// teranode announces the header + coinbase tx inline; merkle-service
 		// builds the BLOCK_PROCESSED enrichment (merkleRoot + coinbaseBump)
-		// from these, NOT from a datahub fetch. Without them arcade can't take
+		// from these, NOT from a datahub fetch. Without them BSV Broadcaster can't take
 		// the datahub-free callback path and the BlockFetches()==0 assertion
 		// below fails (issue #195).
 		Header:   fix.HeaderHex,
@@ -125,21 +125,21 @@ func TestSmoke_RealBlockMined_SingleSubtree(t *testing.T) {
 	// 5. Sanity-check: the merklePath in each tx status reproduces
 	//    the block header's merkle root via SDK ComputeRoot. Catches
 	//    "MINED happened but the path is wrong" silently — a
-	//    confused-deputy bug between merkle-service and arcade's
+	//    confused-deputy bug between merkle-service and BSV Broadcaster's
 	//    compound BUMP that the MINED-only assertion wouldn't catch.
 	harness.AssertMerklePathsMatchHeaderRoot(t, rt, fix.MerkleRoot, txids)
 
-	// 6. Issue #195: with v0.2.4 enriching BLOCK_PROCESSED, arcade builds the
+	// 6. Issue #195: with v0.2.4 enriching BLOCK_PROCESSED, BSV Broadcaster builds the
 	//    compound BUMP straight from the callback fields and never fetches the
-	//    block. arcadeDatahub is arcade's only datahub, so it must have served
-	//    ZERO /block/<hash> GETs. A non-zero count means arcade fell back to
+	//    block. broadcasterDatahub is BSV Broadcaster's only datahub, so it must have served
+	//    ZERO /block/<hash> GETs. A non-zero count means BSV Broadcaster fell back to
 	//    the datahub — either the image regressed and stopped emitting the
 	//    enrichment (esp. coinbaseBump), or the consume path broke.
-	if got := arcadeDatahub.BlockFetches(); got != 0 {
-		t.Fatalf("arcade made %d datahub /block fetches; want 0 — the compound BUMP "+
+	if got := broadcasterDatahub.BlockFetches(); got != 0 {
+		t.Fatalf("BSV Broadcaster made %d datahub /block fetches; want 0 — the compound BUMP "+
 			"should be built from the merkle-service callback enrichment (issue #195), "+
 			"not a datahub fetch. Check that the pinned merkle-service image emits "+
 			"merkleRoot/subtreeCount/subtreeHashes/coinbaseBump for this block.", got)
 	}
-	t.Logf("datahub-independent: arcade built the BUMP from callback enrichment (0 /block fetches)")
+	t.Logf("datahub-independent: BSV Broadcaster built the BUMP from callback enrichment (0 /block fetches)")
 }

@@ -6,22 +6,22 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
 )
 
-// miningFeeBytesBasis is the byte basis arcade advertises fee rates against:
+// miningFeeBytesBasis is the byte basis BSV Broadcaster advertises fee rates against:
 // satoshis per 1000 bytes (== satoshis/kB), matching the node_status
 // FeePolicy.MiningFee convention.
 const miningFeeBytesBasis = 1000
 
 // arcUnlimitedSigops is the value ARC uses in maxtxsigopscountspolicy to mean
-// "unlimited" (max uint32). Arcade/teranode represent unlimited internally as
+// "unlimited" (max uint32). BSV Broadcaster/teranode represent unlimited internally as
 // 0; the /policy response maps 0 to this so ARC clients don't read it as
 // "zero sigops allowed".
 const arcUnlimitedSigops = 4294967295
 
-// arcSigops maps arcade's internal sigop cap to the ARC wire convention: an
+// arcSigops maps BSV Broadcaster's internal sigop cap to the ARC wire convention: an
 // internal 0 (unlimited, BSV post-Genesis) becomes ARC's unlimited sentinel; a
 // real cap is reported verbatim.
 func arcSigops(internal int64) int64 {
@@ -40,7 +40,7 @@ func firstNonZero(v, fallback uint64) uint64 {
 }
 
 // handlePolicy serves the ARC-compatible GET /policy document (issue #212).
-// It reports arcade's effective transaction policy: the size/sigop limits and
+// It reports BSV Broadcaster's effective transaction policy: the size/sigop limits and
 // mining fee floor the validator actually enforces, plus the standard-format
 // flag from config. The fee and size limits are read straight off the
 // validator, which the policy refresher keeps in step with what the network

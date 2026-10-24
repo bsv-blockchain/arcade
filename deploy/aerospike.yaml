@@ -4,10 +4,10 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: aerospike-config
-  namespace: arcade
+  namespace: bsv-broadcaster
   labels:
     app.kubernetes.io/name: aerospike
-    app.kubernetes.io/part-of: arcade
+    app.kubernetes.io/part-of: bsv-broadcaster
 data:
   aerospike.conf: |
     service {
@@ -31,11 +31,11 @@ data:
         port 3001
       }
     }
-    namespace arcade {
+    namespace bsv_broadcaster {
       replication-factor 1
       memory-size 1G
       storage-engine device {
-        file /opt/aerospike/data/arcade.dat
+        file /opt/aerospike/data/bsv_broadcaster.dat
         filesize 8G
         data-in-memory false
       }
@@ -45,10 +45,10 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: aerospike
-  namespace: arcade
+  namespace: bsv-broadcaster
   labels:
     app.kubernetes.io/name: aerospike
-    app.kubernetes.io/part-of: arcade
+    app.kubernetes.io/part-of: bsv-broadcaster
 spec:
   serviceName: aerospike
   replicas: 1
@@ -59,7 +59,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: aerospike
-        app.kubernetes.io/part-of: arcade
+        app.kubernetes.io/part-of: bsv-broadcaster
     spec:
       containers:
         - name: aerospike
@@ -115,10 +115,10 @@ apiVersion: v1
 kind: Service
 metadata:
   name: aerospike
-  namespace: arcade
+  namespace: bsv-broadcaster
   labels:
     app.kubernetes.io/name: aerospike
-    app.kubernetes.io/part-of: arcade
+    app.kubernetes.io/part-of: bsv-broadcaster
 spec:
   type: ClusterIP
   clusterIP: None

@@ -12,10 +12,10 @@ import (
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/merkleservice"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/teranode"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/merkleservice"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/teranode"
 )
 
 // TestApplyTerminalStatuses_LogsAcceptedByNetwork closes the
@@ -165,7 +165,7 @@ func TestRegisterBatch_ClaimRevoked_SuppressesPartialFailureWarn(t *testing.T) {
 	core, recorded := observer.New(zapcore.WarnLevel)
 	logger := zap.New(core)
 
-	cfg := &config.Config{CallbackURL: testArcadeCallbackURL, CallbackToken: testArcadeCallbackToken}
+	cfg := &config.Config{CallbackURL: testBroadcasterCallbackURL, CallbackToken: testBroadcasterCallbackToken}
 	cfg.Propagation.MerkleConcurrency = 4
 	mc := merkleservice.NewClient(merkleSrv.URL, "", 5*time.Second)
 	p := New(cfg, logger, nil, nil, newMockStore(), nil, nil, mc)

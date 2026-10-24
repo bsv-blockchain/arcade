@@ -13,7 +13,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
 )
 
 // saramaBroker is the production Broker backed by IBM Sarama. It owns both a

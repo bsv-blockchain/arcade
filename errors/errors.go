@@ -56,7 +56,7 @@ const (
 	// for heights) and at least one input sequence is non-final. Resubmitting
 	// the identical transaction after the lock expires is expected to succeed.
 	// 474/475 already extend ARC's published table (which ends at 473); 476
-	// continues that arcade-local range.
+	// continues that bsv-broadcaster-local range.
 	StatusNotFinal StatusCode = 476
 )
 

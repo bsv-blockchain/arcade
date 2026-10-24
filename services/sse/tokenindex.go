@@ -9,9 +9,9 @@ import (
 	"github.com/hashicorp/golang-lru/v2/simplelru"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/logfields"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/logfields"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
 )
 
 // tokenSet is the set of callback tokens subscribed to one txid. It is a

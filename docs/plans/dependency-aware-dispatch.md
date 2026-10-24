@@ -1,6 +1,6 @@
 # Dependency-Aware Dispatch
 
-Plan to add parent-child dependency awareness to Arcade's broadcast pipeline so that transactions in the queue with parent-child relationships are sequenced correctly when sent to Teranode. The redesign also simplifies the pipeline: validation moves to intake, the `tx_validator` service is removed, the `PENDING_RETRY` status is removed (transient infra failures are kept in-memory and requeued through the dispatcher), the reaper is narrowed to rebroadcasting stale `SEEN_ON_NETWORK` rows that the dispatcher's in-flight set can't see, and the dispatcher holds Kafka offsets in flight until each tx terminalizes so a crash replays everything that wasn't done.
+Plan to add parent-child dependency awareness to BSV Broadcaster's broadcast pipeline so that transactions in the queue with parent-child relationships are sequenced correctly when sent to Teranode. The redesign also simplifies the pipeline: validation moves to intake, the `tx_validator` service is removed, the `PENDING_RETRY` status is removed (transient infra failures are kept in-memory and requeued through the dispatcher), the reaper is narrowed to rebroadcasting stale `SEEN_ON_NETWORK` rows that the dispatcher's in-flight set can't see, and the dispatcher holds Kafka offsets in flight until each tx terminalizes so a crash replays everything that wasn't done.
 
 ## Problem
 
@@ -10,9 +10,9 @@ The current mitigation routes those rejections through PENDING_RETRY and the rea
 
 ## Goal
 
-Eliminate the parent-child race within Arcade by tracking which in-flight transactions are parents of other in-flight transactions, and gating the broadcast of children until their parents have reached a terminal state (`ACCEPTED_BY_NETWORK` or `REJECTED`).
+Eliminate the parent-child race within BSV Broadcaster by tracking which in-flight transactions are parents of other in-flight transactions, and gating the broadcast of children until their parents have reached a terminal state (`ACCEPTED_BY_NETWORK` or `REJECTED`).
 
-Scope is limited to parent-child relationships where both transactions came through Arcade. Children whose parents are broadcast through other paths are out of scope — those continue to follow the current "try and let Teranode decide" behavior.
+Scope is limited to parent-child relationships where both transactions came through BSV Broadcaster. Children whose parents are broadcast through other paths are out of scope — those continue to follow the current "try and let Teranode decide" behavior.
 
 ## Architecture
 
@@ -63,7 +63,7 @@ Batching remains. The dispatcher accumulates eligible transactions into `pending
 
 Children of in-flight parents are never co-batched with their parent — held in `heldMsgs` until the parent terminalizes (Teranode is moving to parallel-process `/txs` per [bsv-blockchain/teranode#879](https://github.com/bsv-blockchain/teranode/pull/879), so an in-batch parent-child pair is no longer safe).
 
-Broadcast workers consume flushed batches and post to Teranode in parallel via `/txs`. The per-tx `/tx` fallback is removed — with [bsv-blockchain/teranode#879](https://github.com/bsv-blockchain/teranode/pull/879) and [bsv-blockchain/teranode#881](https://github.com/bsv-blockchain/teranode/pull/881), the `/txs` response itself carries per-slot status (`"OK"` or `"<TERANODE_CODE> (<num>)"` in submission order) and arcade parses those lines for per-tx classification directly.
+Broadcast workers consume flushed batches and post to Teranode in parallel via `/txs`. The per-tx `/tx` fallback is removed — with [bsv-blockchain/teranode#879](https://github.com/bsv-blockchain/teranode/pull/879) and [bsv-blockchain/teranode#881](https://github.com/bsv-blockchain/teranode/pull/881), the `/txs` response itself carries per-slot status (`"OK"` or `"<TERANODE_CODE> (<num>)"` in submission order) and BSV Broadcaster parses those lines for per-tx classification directly.
 
 ### Single partition
 
@@ -105,7 +105,7 @@ A batch-level HTTP 500 with no parseable body is treated as every-slot-infra: ev
 
 **No healthy endpoints / no peer reachable** — same as Teranode infra: requeue every tx in the batch.
 
-No attempt counter, no exhaustion, no terminal REJECTED for infra failures. If merkle-service or Teranode is genuinely down, arcade is correctly stuck — broadcasting without `/watch` registration breaks F-024, and there is no useful work the propagator can do until upstream recovers. Each retry attempt is logged so an operator monitoring the service sees the upstream is unhealthy.
+No attempt counter, no exhaustion, no terminal REJECTED for infra failures. If merkle-service or Teranode is genuinely down, BSV Broadcaster is correctly stuck — broadcasting without `/watch` registration breaks F-024, and there is no useful work the propagator can do until upstream recovers. Each retry attempt is logged so an operator monitoring the service sees the upstream is unhealthy.
 
 The Kafka offset tracker keeps the watermark pinned to the earliest stuck tx so a restart replays everything that wasn't terminalized.
 
@@ -131,9 +131,9 @@ Per-slot Teranode codes are bucketed:
 - **Terminal REJECTED** — `TX_INVALID (31)`, `TX_INVALID_DOUBLE_SPEND (32)`, `TX_CONFLICTING (36)`, `TX_LOCKED (37)`, `TX_LOCK_TIME (35)`, `TX_POLICY (39)`, `TX_COINBASE_IMMATURE (38)`, `TX_MISSING_PARENT (34)`, `UTXO_FROZEN (72)`, `UTXO_SPENT (70)`, `UTXO_NON_FINAL (71)`, `UTXO_INVALID_SIZE (...)`, `INVALID_ARGUMENT (1)`. These are real per-tx rejections; cascade walks waiters.
 - **Infra retry** — batch-level 500 with no per-slot info, network/timeout, or any per-slot line that classifies as infra (e.g. `PROCESSING (4)` from the default branch).
 
-`TX_MISSING_PARENT (34)` is terminal in this design — dep-aware dispatch already gated children on in-flight parents, so a missing-parent rejection from Teranode means a parent that arcade doesn't know about. Wallets resolve it.
+`TX_MISSING_PARENT (34)` is terminal in this design — dep-aware dispatch already gated children on in-flight parents, so a missing-parent rejection from Teranode means a parent that BSV Broadcaster doesn't know about. Wallets resolve it.
 
-Single-tx `/tx` returns the same Teranode code in the response body when there's an error, with the HTTP status mirroring the classification (400/403/409/422/500). Arcade keeps the per-tx `/tx` path for non-batch use cases but the `/txs` failure path no longer falls back to it.
+Single-tx `/tx` returns the same Teranode code in the response body when there's an error, with the HTTP status mirroring the classification (400/403/409/422/500). BSV Broadcaster keeps the per-tx `/tx` path for non-batch use cases but the `/txs` failure path no longer falls back to it.
 
 ## Message format
 
@@ -178,17 +178,17 @@ The old `TopicTransaction` and any prior PENDING_RETRY rows can be cleaned up af
 This plan depends on two upstream Teranode PRs:
 
 - [bsv-blockchain/teranode#879](https://github.com/bsv-blockchain/teranode/pull/879) — `/txs` processes the batch concurrently with per-submission slots.
-- [bsv-blockchain/teranode#881](https://github.com/bsv-blockchain/teranode/pull/881) — `/txs` response body emits per-slot lines in submission order so arcade can attribute results to specific txids. Also unifies the single-tx and batch error format on Teranode error codes (`"NAME (num)"`).
+- [bsv-blockchain/teranode#881](https://github.com/bsv-blockchain/teranode/pull/881) — `/txs` response body emits per-slot lines in submission order so BSV Broadcaster can attribute results to specific txids. Also unifies the single-tx and batch error format on Teranode error codes (`"NAME (num)"`).
 
-The arcade-side parsing in `teranode/client.go` is written against the post-#881 format. If #881 isn't merged at deploy time, the parsing falls back to treating the batch result as binary (any 500 → retry), which is degraded but not broken.
+The bsv-broadcaster-side parsing in `teranode/client.go` is written against the post-#881 format. If #881 isn't merged at deploy time, the parsing falls back to treating the batch result as binary (any 500 → retry), which is degraded but not broken.
 
 ## Install base note
 
-The current Arcade install base is limited (essentially just GorillaPool's production deployment). The cost of breaking backward compatibility is minimal. Anyone running their own Arcade would need to follow the drain + redeploy sequence above; there is no rolling upgrade path.
+The current BSV Broadcaster install base is limited (essentially just GorillaPool's production deployment). The cost of breaking backward compatibility is minimal. Anyone running their own BSV Broadcaster would need to follow the drain + redeploy sequence above; there is no rolling upgrade path.
 
 ## Non-goals
 
-- Handling parent-child relationships where the parent was not submitted through Arcade
+- Handling parent-child relationships where the parent was not submitted through BSV Broadcaster
 - Reordering or holding the merkle-service callback path
 - Replacing the existing JSON message format (deferred to a separate optimization)
 - Continuing to support the existing `tx_validator` service in any form

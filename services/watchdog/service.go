@@ -6,14 +6,14 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/merkleservice"
-	"github.com/bsv-blockchain/arcade/services"
-	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/merkleservice"
+	"github.com/bsv-blockchain/bsv-broadcaster/services"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
 )
 
 // Service is the services.Service-conforming wrapper around Watchdog so
-// the arcade supervisor can manage it like any other mode. The actual
+// the BSV Broadcaster supervisor can manage it like any other mode. The actual
 // recovery logic lives in Watchdog.Run; this layer is purely lifecycle
 // plumbing.
 type Service struct {

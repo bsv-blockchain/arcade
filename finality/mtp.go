@@ -29,7 +29,7 @@ type ChainReader interface {
 	GetHeaders(ctx context.Context, height, count uint32) ([]*chaintracks.BlockHeader, error)
 }
 
-// HeightReader supplies just the current best block height. The arcade store
+// HeightReader supplies just the current best block height. The BSV Broadcaster store
 // satisfies it (GetActiveTipBlockHeight). It backs the height-only fallback:
 // height-based locktimes can be gated from the store alone — no chaintracks
 // required — while timestamp locktimes need MTP and fail open without a full
@@ -78,7 +78,7 @@ type snapshot struct {
 // safe for concurrent use and nil-receiver-safe: a nil *Checker accepts every
 // transaction, so callers need no wiring guards.
 //
-// The verdict uses arcade's view of the tip, which can trail (or, briefly,
+// The verdict uses BSV Broadcaster's view of the tip, which can trail (or, briefly,
 // lead) the view of the teranode that ultimately admits the transaction.
 // Divergence is confined to roughly one block around the finality boundary
 // and self-heals: a false accept falls through to today's generic network

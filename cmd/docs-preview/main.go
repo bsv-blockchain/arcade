@@ -1,4 +1,4 @@
-// Command docs-preview serves the rendered Arcade API docs landing page
+// Command docs-preview serves the rendered BSV Broadcaster API docs landing page
 // at http://localhost:8080/ so it can be inspected in a browser without
 // standing up the full API server (Kafka, store, validator, ...).
 //
@@ -15,7 +15,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/bsv-blockchain/arcade/services/api_server"
+	"github.com/bsv-blockchain/bsv-broadcaster/services/api_server"
 )
 
 func main() {
@@ -51,7 +51,7 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 
-	log.Printf("arcade docs preview listening on http://localhost%s/", addr)
+	log.Printf("BSV Broadcaster docs preview listening on http://localhost%s/", addr)
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}

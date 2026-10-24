@@ -15,9 +15,9 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
 )
 
 const txA = "txA"
@@ -374,10 +374,10 @@ func TestDeliverSuccess(t *testing.T) {
 		t.Errorf("Authorization = %q, want %q", receivedAuth, "Bearer tok-A")
 	}
 	// The documented allowlistable UA (issue #249) — receivers key WAF rules
-	// on the "arcade-webhook/" prefix, so it must never regress to Go's
+	// on the "bsv-broadcaster-webhook/" prefix, so it must never regress to Go's
 	// default UA. version.Version is "dev" outside ldflags builds.
-	if receivedUA != "arcade-webhook/dev" {
-		t.Errorf("User-Agent = %q, want %q", receivedUA, "arcade-webhook/dev")
+	if receivedUA != "bsv-broadcaster-webhook/dev" {
+		t.Errorf("User-Agent = %q, want %q", receivedUA, "bsv-broadcaster-webhook/dev")
 	}
 	if receivedCT != "application/json" {
 		t.Errorf("Content-Type = %q, want application/json", receivedCT)

@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/bsv-blockchain/arcade/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
 )
 
 // Producer is the service-facing convenience wrapper over Broker. It takes Go

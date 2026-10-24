@@ -1,4 +1,4 @@
-// Package httpmiddleware holds HTTP middleware shared across arcade services.
+// Package httpmiddleware holds HTTP middleware shared across BSV Broadcaster services.
 // It exists because in microservice deployments each service (api-server,
 // sse, …) runs in its own pod with its own http.Server, so per-service
 // middleware copies would drift out of sync.
@@ -12,7 +12,7 @@ import "net/http"
 // (method, path) pairs: a browser's `OPTIONS /tx` preflight would otherwise
 // 404 when only `POST /tx` is declared, and the middleware would never run.
 //
-// Arcade exposes a public broadcast/status API reached from browser-based
+// BSV Broadcaster exposes a public broadcast/status API reached from browser-based
 // wallets and explorers across many origins, so the default policy is "allow
 // any origin" with no credentials. The wildcard origin is safe here because
 // auth is Bearer-token based; it cannot be combined with

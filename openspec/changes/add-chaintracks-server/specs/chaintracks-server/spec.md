@@ -5,19 +5,19 @@
 The `api-server` service SHALL initialize an embedded `go-chaintracks` instance on startup whenever `chaintracks_server.enabled` is `true` (the default) AND the active run mode is `all` or `api-server`. Other modes (`tx-validator`, `propagation`, `bump-builder`) MUST NOT initialize chaintracks.
 
 #### Scenario: Default config starts chaintracks alongside api-server
-- **WHEN** arcade is started with `mode=all` and no overrides to `chaintracks_server`
+- **WHEN** BSV Broadcaster is started with `mode=all` and no overrides to `chaintracks_server`
 - **THEN** the api-server logs `Chaintracks HTTP API enabled` at info level
 - **AND** routes under `/chaintracks/v1/*` and `/chaintracks/v2/*` respond with 2xx for valid requests
 - **AND** the chaintracks storage directory is created at `<storage_path>/chaintracks/`
 
 #### Scenario: Explicitly disabled skips initialization
-- **WHEN** arcade is started with `chaintracks_server.enabled: false`
+- **WHEN** BSV Broadcaster is started with `chaintracks_server.enabled: false`
 - **THEN** no chaintracks instance is created
 - **AND** GET `/chaintracks/v1/height` responds with 404
-- **AND** no `go-teranode-p2p-client` connections are established by arcade
+- **AND** no `go-teranode-p2p-client` connections are established by BSV Broadcaster
 
 #### Scenario: Non-api-server modes do not start chaintracks
-- **WHEN** arcade is started with `mode=tx-validator` and default `chaintracks_server.enabled`
+- **WHEN** BSV Broadcaster is started with `mode=tx-validator` and default `chaintracks_server.enabled`
 - **THEN** no chaintracks instance is created and no chaintracks routes are registered
 
 ### Requirement: Chaintracks HTTP routes on Gin router
@@ -96,17 +96,17 @@ The chaintracks instance's lifecycle SHALL be driven by the `context.Context` pa
 
 ### Requirement: Configuration surface
 
-The config schema SHALL expose the following new fields, all with safe defaults so an operator can start arcade with no chaintracks config at all:
+The config schema SHALL expose the following new fields, all with safe defaults so an operator can start BSV Broadcaster with no chaintracks config at all:
 
 - `chaintracks_server.enabled` (`bool`, default `true`) — gates whether routes and the instance run.
-- `chaintracks.*` — delegated in full to `github.com/bsv-blockchain/go-chaintracks/config.Config.SetDefaults`, with our `storage_path` defaulting to `<arcade_storage_path>/chaintracks`.
+- `chaintracks.*` — delegated in full to `github.com/bsv-blockchain/go-chaintracks/config.Config.SetDefaults`, with our `storage_path` defaulting to `<bsv_broadcaster_storage_path>/chaintracks`.
 
 #### Scenario: Missing chaintracks block in config.yaml uses library defaults
-- **WHEN** arcade starts with no `chaintracks:` section in config.yaml
+- **WHEN** BSV Broadcaster starts with no `chaintracks:` section in config.yaml
 - **THEN** config loads without error
-- **AND** chaintracks runs with `mode=embedded`, `network=main`, storage under the arcade storage path, and the library's default bootstrap mode
+- **AND** chaintracks runs with `mode=embedded`, `network=main`, storage under the BSV Broadcaster storage path, and the library's default bootstrap mode
 
 #### Scenario: Operator overrides storage path
-- **GIVEN** `chaintracks.storage_path=/srv/arcade/chaintracks` is set
-- **WHEN** arcade starts
-- **THEN** headers are written to `/srv/arcade/chaintracks/`, NOT `<arcade_storage_path>/chaintracks/`
+- **GIVEN** `chaintracks.storage_path=/srv/bsv-broadcaster/chaintracks` is set
+- **WHEN** BSV Broadcaster starts
+- **THEN** headers are written to `/srv/bsv-broadcaster/chaintracks/`, NOT `<bsv_broadcaster_storage_path>/chaintracks/`

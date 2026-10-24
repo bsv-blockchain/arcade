@@ -8,8 +8,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/logfields"
-	"github.com/bsv-blockchain/arcade/merkleservice"
+	"github.com/bsv-blockchain/bsv-broadcaster/logfields"
+	"github.com/bsv-blockchain/bsv-broadcaster/merkleservice"
 )
 
 // blockHashHexLen is the length of a Bitcoin block hash in hex (32 bytes × 2).
@@ -27,7 +27,7 @@ func validBlockHash(s string) bool {
 }
 
 // handleReprocessBlock asks merkle-service to re-emit STUMP + BLOCK_PROCESSED
-// callbacks for the given block hash. The callbacks land back at arcade's
+// callbacks for the given block hash. The callbacks land back at BSV Broadcaster's
 // /api/v1/merkle-service/callback receiver, so the configured CallbackURL +
 // CallbackToken are forwarded as part of the request.
 //

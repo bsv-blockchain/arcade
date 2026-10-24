@@ -15,10 +15,10 @@ All services SHALL implement a common `Service` interface with `Start(ctx contex
 - **THEN** each running service's `Stop()` method SHALL be called, allowing in-flight operations to complete before exiting
 
 ### Requirement: All-in-one deployment mode
-The single `arcade` binary SHALL support running all services in one process, configured via environment variables or config file.
+The single `bsv-broadcaster` binary SHALL support running all services in one process, configured via environment variables or config file.
 
 #### Scenario: Run all services
-- **WHEN** the binary is started with `--mode=all` or `ARCADE_MODE=all`
+- **WHEN** the binary is started with `--mode=all` or `BSV_BROADCASTER_MODE=all`
 - **THEN** all services (api-server, p2p-client, block-processor, bump-builder, tx-validator, propagation) SHALL start in the same process
 
 #### Scenario: Run single service
@@ -29,7 +29,7 @@ The single `arcade` binary SHALL support running all services in one process, co
 The system SHALL use Viper-based configuration supporting environment variables, config files (YAML), and CLI flags with the following precedence: CLI flags > env vars > config file > defaults.
 
 #### Scenario: Configure via environment variables
-- **WHEN** `ARCADE_KAFKA_BROKERS=broker1:9092,broker2:9092` is set
+- **WHEN** `BSV_BROADCASTER_KAFKA_BROKERS=broker1:9092,broker2:9092` is set
 - **THEN** the Kafka client SHALL connect to both brokers
 
 #### Scenario: Configure via config file
@@ -59,9 +59,9 @@ All services SHALL use structured logging (JSON format) with configurable log le
 - **THEN** all log entries for that processing chain SHALL include `txid: tx123` as a structured field
 
 ### Requirement: Go module setup
-The project SHALL be organized as a single Go module with `cmd/arcade/main.go` as the entrypoint, `services/` for service implementations, `store/` for database access, `kafka/` for messaging, and `models/` for shared data types.
+The project SHALL be organized as a single Go module with `cmd/bsv-broadcaster/main.go` as the entrypoint, `services/` for service implementations, `store/` for database access, `kafka/` for messaging, and `models/` for shared data types.
 
 #### Scenario: Build single binary
-- **WHEN** `go build ./cmd/arcade` is executed
-- **THEN** a single `arcade` binary SHALL be produced containing all service implementations
+- **WHEN** `go build ./cmd/bsv-broadcaster` is executed
+- **THEN** a single `bsv-broadcaster` binary SHALL be produced containing all service implementations
 

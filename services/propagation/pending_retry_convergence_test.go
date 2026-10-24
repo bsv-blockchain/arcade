@@ -14,10 +14,10 @@ import (
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/merkleservice"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/teranode"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/merkleservice"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/teranode"
 )
 
 // These tests pin the convergence properties of the PENDING_RETRY path.
@@ -50,11 +50,11 @@ import (
 // The pre-request snapshot is the important detail, and it is deliberately
 // stricter than tests/smoke's dependencyAwareTeranode (which accepts a child
 // whose parent appears earlier in the same body). It models teranode's
-// parallel bulk processing, which is arcade's own stated assumption in two
+// parallel bulk processing, which is BSV Broadcaster's own stated assumption in two
 // places: handleAdmit's "Teranode's parallel bulk processing means we can't
 // trust same-batch ordering", and #299's "no parent and child in one /txs
 // batch" contract. A fake that resolved a whole chain from one batch would
-// be asserting a guarantee arcade explicitly says it does not have.
+// be asserting a guarantee BSV Broadcaster explicitly says it does not have.
 type depAwareTeranode struct {
 	server *httptest.Server
 

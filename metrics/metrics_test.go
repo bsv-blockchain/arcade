@@ -67,9 +67,9 @@ func TestMetricsHandlerScrapes(t *testing.T) {
 
 	body := readAll(t, resp)
 	for _, expected := range []string{
-		"arcade_bump_builder_blocks_processed_total",
-		"arcade_propagation_outcome_total{outcome=\"accepted\"}",
-		"arcade_propagation_chunk_bytes_bucket",
+		"bsv_broadcaster_bump_builder_blocks_processed_total",
+		"bsv_broadcaster_propagation_outcome_total{outcome=\"accepted\"}",
+		"bsv_broadcaster_propagation_chunk_bytes_bucket",
 	} {
 		if !strings.Contains(body, expected) {
 			t.Errorf("scrape output missing %q\n--- body ---\n%s", expected, body)
@@ -124,14 +124,14 @@ func readAll(t *testing.T, resp *http.Response) string {
 // TestPropagationChunkBytesRegistered — the chunk-payload histogram is the
 // tuning signal for propagation.teranode_max_batch_bytes (issue #271). It
 // must live on the default registry as an unlabeled histogram under the
-// package naming rules (arcade_ prefix, _bytes suffix) so dashboards can
+// package naming rules (bsv_broadcaster_ prefix, _bytes suffix) so dashboards can
 // quantile it against the configured cap.
 func TestPropagationChunkBytesRegistered(t *testing.T) {
 	PropagationChunkBytes.Observe(12345)
 
-	fam := gatherFamily(t, "arcade_propagation_chunk_bytes")
+	fam := gatherFamily(t, "bsv_broadcaster_propagation_chunk_bytes")
 	if fam == nil {
-		t.Fatal("arcade_propagation_chunk_bytes is not registered")
+		t.Fatal("bsv_broadcaster_propagation_chunk_bytes is not registered")
 	}
 	if fam.GetType() != dto.MetricType_HISTOGRAM {
 		t.Errorf("type = %v, want HISTOGRAM", fam.GetType())

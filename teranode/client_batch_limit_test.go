@@ -12,7 +12,7 @@ import (
 // its /txs handler (services/propagation/Server.go handleMultipleTx: the
 // maxTransactionsPerRequest, maxDataPerRequest and submission-slot checks).
 // They are pinned here so a Teranode release that rewords one fails this
-// test instead of silently degrading arcade to the blind requeue path.
+// test instead of silently degrading BSV Broadcaster to the blind requeue path.
 var teranodeBatchLimitBodies = []string{
 	"Invalid request body: too many transactions",
 	"Invalid request body: too much data",

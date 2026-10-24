@@ -1,16 +1,16 @@
-# Shared arcade config for the local podman-compose stack — compose analogue
+# Shared BSV Broadcaster config for the local podman-compose stack — compose analogue
 # of bsva-infra-flux/apps/base/arcade-v2/teratestnet/configmap.yaml, adapted
-# to compose service hostnames. Mounted read-only at /etc/arcade/config.yaml
-# in all seven arcade containers.
+# to compose service hostnames. Mounted read-only at /etc/bsv-broadcaster/config.yaml
+# in all seven BSV Broadcaster containers.
 #
 # Deliberately NOT named config.yaml: .gitignore ignores that name at any
-# depth, and arcade's own config discovery (./config.yaml, /etc/arcade) can
+# depth, and BSV Broadcaster's own config discovery (./config.yaml, /etc/bsv-broadcaster) can
 # never pick this file up from a host-run binary.
 
 log_level: debug
 network: teratestnet
 
-# Dev-only shared secret, distinct from any production token. arcade forwards
+# Dev-only shared secret, distinct from any production token. BSV Broadcaster forwards
 # it to merkle-service per tx registration; merkle-service presents it as
 # `Authorization: Bearer` when delivering callbacks to callback_url below.
 callback_token: 1f2e3d4c5b6a79880102030405060708090a0b0c0d0e0f101112131415161718
@@ -36,7 +36,7 @@ bump_builder:
 store:
   backend: postgres
   postgres:
-    dsn: postgres://arcade:arcade@postgres:5432/arcade?sslmode=disable&pool_max_conn_idle_time=60s&pool_max_conn_lifetime=15m
+    dsn: postgres://bsv_broadcaster:bsv_broadcaster@postgres:5432/bsv_broadcaster?sslmode=disable&pool_max_conn_idle_time=60s&pool_max_conn_lifetime=15m
     max_conns: 25
 
 datahub_urls:
@@ -60,9 +60,9 @@ merkle_service:
 # Every chaintracks consumer (bump-builder header lookups, the validator
 # finality gate in api-server) reads headers from the chaintracks service
 # over HTTP. Base URL only, no path — same shape as the k8s
-# ARCADE_CHAINTRACKS_URL env. In k8s this wiring is env-injected per
+# BSV_BROADCASTER_CHAINTRACKS_URL env. In k8s this wiring is env-injected per
 # deployment; the chaintracks container overrides mode to embedded via
-# ARCADE_CHAINTRACKS_MODE.
+# BSV_BROADCASTER_CHAINTRACKS_MODE.
 chaintracks:
   mode: remote
   url: http://chaintracks:8083

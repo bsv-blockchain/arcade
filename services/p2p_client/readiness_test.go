@@ -9,7 +9,7 @@ import (
 	p2pclient "github.com/bsv-blockchain/go-teranode-p2p-client"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
 )
 
 // TestClient_DisabledDiscoverySignalsReady: discovery being off is a

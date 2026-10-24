@@ -3,7 +3,7 @@ package api_server
 import (
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 
-	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
 )
 
 // familyPartitionKeys returns the Kafka partition key for each tx of a

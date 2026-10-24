@@ -7,7 +7,7 @@
 ## 2. Chaintracks Instance Wiring (api-server only)
 
 - [x] 2.1 Add `chaintracks chaintracks.Chaintracks` field to `api_server.Server`; add nil-checks in code paths that touch it (so `Enabled=false` is safe).
-- [x] 2.2 In `api_server.Server.Start(ctx)`, before `router.ListenAndServe`, construct the chaintracks instance via `cfg.Chaintracks.Initialize(ctx, "arcade", nil)` when `cfg.ChaintracksServer.Enabled` is true. Default `cfg.Chaintracks.StoragePath` to `<arcade storage>/chaintracks` if empty.
+- [x] 2.2 In `api_server.Server.Start(ctx)`, before `router.ListenAndServe`, construct the chaintracks instance via `cfg.Chaintracks.Initialize(ctx, "bsv-broadcaster", nil)` when `cfg.ChaintracksServer.Enabled` is true. Default `cfg.Chaintracks.StoragePath` to `<BSV Broadcaster storage>/chaintracks` if empty.
 - [x] 2.3 Ensure initialization failures propagate from `Start` so `main.go` surfaces them as a fatal startup error (do not silently disable).
 - [x] 2.4 Log `Chaintracks HTTP API enabled` with the storage path + network at info level on success; log `chaintracks disabled` at debug level when `Enabled=false`.
 
@@ -46,6 +46,6 @@
 - [x] 7.1 `go build ./...` clean.
 - [x] 7.2 `go vet ./...` clean.
 - [x] 7.3 `go test ./...` clean.
-- [ ] 7.4 Smoke test: run arcade with `mode=all` against a real or minimal P2P network; `curl http://localhost:<port>/chaintracks/v1/network` returns the configured network; `curl http://localhost:<port>/chaintracks/v1/height` returns the current height (≥ 0, increases over time).
+- [ ] 7.4 Smoke test: run BSV Broadcaster with `mode=all` against a real or minimal P2P network; `curl http://localhost:<port>/chaintracks/v1/network` returns the configured network; `curl http://localhost:<port>/chaintracks/v1/height` returns the current height (≥ 0, increases over time).
 - [ ] 7.5 Smoke test: `curl http://localhost:<port>/chaintracks/v2/tip/stream` stays connected and emits at least one event when a new block arrives.
 - [ ] 7.6 Smoke test: start with `chaintracks_server.enabled=false` and confirm no P2P connections are opened (no outbound traffic from the chaintracks P2P port).

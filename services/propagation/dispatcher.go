@@ -8,9 +8,9 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/kafka"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
 )
 
 // The dispatcher is a single-goroutine engine that owns all dep-aware
@@ -350,7 +350,7 @@ func (p *Propagator) runDispatcher(ctx context.Context, claim kafka.Claim, cfg d
 //     submissions in parallel so we can't trust ordering across
 //     concurrent /txs calls; the child has to wait until every parent
 //     has terminalized.
-//   - Parent not in inFlight → already mined, never seen by Arcade,
+//   - Parent not in inFlight → already mined, never seen by BSV Broadcaster,
 //     or otherwise out of scope. Doesn't block this admit.
 //
 // If ANY input requires holding, the whole tx is held as a waiter on

@@ -16,10 +16,10 @@
 
 ## 3. Background recovery probe
 
-- [x] 3.1 Add a `probe` goroutine launched by `NewClient`, receiving a context supplied by a new `Client.Start(ctx context.Context)` method (call from the composition root in `cmd/arcade/main.go` so the goroutine is tied to the service lifecycle).
+- [x] 3.1 Add a `probe` goroutine launched by `NewClient`, receiving a context supplied by a new `Client.Start(ctx context.Context)` method (call from the composition root in `cmd/bsv-broadcaster/main.go` so the goroutine is tied to the service lifecycle).
 - [x] 3.2 On each tick, build the list of `unhealthy` endpoints under an `RLock`, then issue `GET <url>/health` concurrently with a per-request timeout equal to `probe_timeout_ms`.
 - [x] 3.3 Treat any HTTP response received (including 4xx / 5xx) as `RecordSuccess` — we only care whether the peer is reachable. Treat transport errors and context timeouts as `RecordFailure`.
-- [x] 3.4 Add `Client.Close()` that cancels the probe goroutine's context and waits for it to exit; wire it into service shutdown in `cmd/arcade/main.go`.
+- [x] 3.4 Add `Client.Close()` that cancels the probe goroutine's context and waits for it to exit; wire it into service shutdown in `cmd/bsv-broadcaster/main.go`.
 
 ## 4. Min-healthy warning
 
@@ -53,7 +53,7 @@
 
 ## 8. Wiring and docs
 
-- [x] 8.1 Update `cmd/arcade/main.go` to call `teranode.Client.Start(ctx)` during service startup and `Close()` during shutdown.
+- [x] 8.1 Update `cmd/bsv-broadcaster/main.go` to call `teranode.Client.Start(ctx)` during service startup and `Close()` during shutdown.
 - [x] 8.2 Confirm the `p2p_client` service continues to call `AddEndpoints` unchanged — no changes to that service beyond verifying the new health-seed path is exercised.
 - [x] 8.3 Update `requirements.md` (if present and relevant) and `CLAUDE.md` to mention the new endpoint-health subsystem and its defaults.
 - [x] 8.4 Add a short section to `README.md` (if operator-facing docs exist there) or inline config comments describing when an operator should tune `failure_threshold` or `probe_interval_ms`.

@@ -18,15 +18,15 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/kafka"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
-	"github.com/bsv-blockchain/arcade/teranode"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/teranode"
 )
 
-// These tests reproduce the 2026-08-11 dev-ovh-1 propagation wedge (arcade
+// These tests reproduce the 2026-08-11 dev-ovh-1 propagation wedge (BSV Broadcaster
 // v0.11.5) and pin both halves of the fix.
 //
 // The incident: Teranode answered a 21-tx batch of stale transactions with
@@ -41,7 +41,7 @@ import (
 // round again into the identical 409. ~2,410 failures in two minutes, 42 of 43
 // batches requeued, 4,679 txs stuck in the dispatcher's inFlight map pinning
 // Kafka offsets, and 337,247 messages of lag on the single-partition
-// arcade.propagation topic completely stationary while the leader pod burned
+// bsv-broadcaster.propagation topic completely stationary while the leader pod burned
 // 4.2 CPU cores. Nothing new could propagate.
 //
 // Fix 1 (attribution): the conflict line's outpoint is matched against the
@@ -255,13 +255,13 @@ func TestBroadcast_409ConflictLines_AttributedToSubmittedInputs(t *testing.T) {
 }
 
 // TestBroadcast_409UnattributableConflict_NarrowsToPlaceTheVerdict covers the
-// line arcade cannot place from its own knowledge: a 409 naming an outpoint no
+// line BSV Broadcaster cannot place from its own knowledge: a 409 naming an outpoint no
 // submitted tx visibly spends (unparseable raw bytes, a message shape without
 // an outpoint, a conflict about a different input than the one named).
 //
 // #292 stopped here — no fabricated accept, no guessed reject, both txs
 // requeue — because guessing which tx a line condemns is worse than waiting.
-// That property is intact: nothing is guessed. What changed is that arcade no
+// That property is intact: nothing is guessed. What changed is that BSV Broadcaster no
 // longer has to guess. It re-broadcasts the chunk in halves, and the peer's
 // own answers say which transaction is at fault: the half without it comes
 // back 200, the half with it comes back 409 again, until the line is the only
@@ -322,7 +322,7 @@ func TestBroadcast_409UnattributableConflict_NarrowsToPlaceTheVerdict(t *testing
 }
 
 // TestAttributeConflictLines_AmbiguousOutpointDeclines pins the one case
-// where arcade holds enough information to name a tx but must refuse to: two
+// where BSV Broadcaster holds enough information to name a tx but must refuse to: two
 // submitted txs spend the SAME outpoint (an intra-batch double spend), so
 // Teranode's single conflict line cannot say which one lost. Guessing would
 // terminally reject a transaction that may well be the winner.
@@ -363,7 +363,7 @@ func TestAttributeConflictLines_AmbiguousOutpointDeclines(t *testing.T) {
 // An opaque body is what makes this unresolvable, and it is the reason the
 // bounded-requeue escape still has to exist. Its parseable sibling — a 409
 // whose conflict line names an outpoint no submitted tx spends — used to reach
-// this same dead end and now does not: arcade narrows the chunk until the peer
+// this same dead end and now does not: BSV Broadcaster narrows the chunk until the peer
 // itself says which transaction the line is about, and the tx terminalizes
 // with the real verdict instead of parking under a generic reason (see
 // TestBroadcast_409UnattributableConflict_NarrowsToPlaceTheVerdict). Narrowing
@@ -460,7 +460,7 @@ func TestPoisonBatch_MultiTxOpaque409_ParksInsteadOfLoopingForever(t *testing.T)
 // whole batch requeued for another attempt, forever. Pre-fix the tx stayed in
 // inFlight, its offset kept pinning offsetTracker.LowestUnfinished(),
 // advanceMarks never marked it, and on the single-partition
-// arcade.propagation topic every later message queued behind it — 337,247 of
+// bsv-broadcaster.propagation topic every later message queued behind it — 337,247 of
 // them, stationary, on dev-ovh-1.
 func TestRunDispatcher_PoisonBatch_ExhaustsRetriesAndAdvancesWatermark(t *testing.T) {
 	const out = "256fc7143c6ef5436cd5258ade24b68c43d0f8268c086bd9fa90055dd5a7ae43"

@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bsv-blockchain/arcade/internal/synthblock"
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/internal/synthblock"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
 )
 
 const mpTestBlockHash = "00000000000000000000000000000000000000000000000000000000000000ff"

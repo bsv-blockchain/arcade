@@ -16,19 +16,19 @@ import (
 	tnerr "github.com/bsv-blockchain/teranode/errors"
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 
-	arcerrors "github.com/bsv-blockchain/arcade/errors"
-	"github.com/bsv-blockchain/arcade/models"
+	arcerrors "github.com/bsv-blockchain/bsv-broadcaster/errors"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
 )
 
-// The arcade ↔ teranode rejection-reason contract.
+// The BSV Broadcaster ↔ teranode rejection-reason contract.
 //
-// A transaction arcade marks REJECTED must always carry a reason its submitter
+// A transaction BSV Broadcaster marks REJECTED must always carry a reason its submitter
 // can act on, and a transaction teranode did NOT reject must never be
-// terminalized. Both properties depend on a boundary arcade does not own:
+// terminalized. Both properties depend on a boundary BSV Broadcaster does not own:
 // teranode collapses its wrapped error chain to a single "CODE (n): message"
 // pair (errors.UserMessage → DeepestPublicCause), keeping only the innermost
 // cause whose code is on publicCauseCodes and discarding everything else —
-// including the "[ProcessTransaction][<txid>]" wrapper that is arcade's only
+// including the "[ProcessTransaction][<txid>]" wrapper that is BSV Broadcaster's only
 // reliable way to bind a verdict to a transaction.
 //
 // Every fixture below is therefore GENERATED, not hand-written: each case
@@ -110,7 +110,7 @@ func utxoSpentError(t *testing.T, outpointTxid string, vout uint32, spenderTxid 
 
 // --- the contract table --------------------------------------------------
 
-// boundaryOutcome is what arcade must do with the transaction.
+// boundaryOutcome is what BSV Broadcaster must do with the transaction.
 type boundaryOutcome int
 
 const (
@@ -141,7 +141,7 @@ type boundaryCase struct {
 	build func(t *testing.T, target, other string) error
 	// status is the HTTP status teranode's httpStatusForTxError assigns.
 	status int
-	// want is the outcome arcade must produce.
+	// want is the outcome BSV Broadcaster must produce.
 	want boundaryOutcome
 	// wantReason is a substring the persisted ExtraInfo must contain. Only
 	// meaningful when want == outcomeRejected.
@@ -303,7 +303,7 @@ func boundaryCases() []boundaryCase {
 					tnerr.NewProcessingError("GoBDK fail to ValidateTransaction", bdkScriptFailure("SCRIPT_ERR_CGO_EXCEPTION"))))
 			},
 			// PROCESSING is not on the allowlist, so nothing about the cause
-			// survives; the node classifies it 500, which is arcade's only
+			// survives; the node classifies it 500, which is BSV Broadcaster's only
 			// signal that this is a node fault rather than a verdict.
 			want: outcomeRetry,
 		},
@@ -465,7 +465,7 @@ func newBoundaryFixture(t *testing.T, siblingCount int) boundaryFixture {
 }
 
 // TestTeranodeRejectionReasonContract is the contract: for every teranode
-// failure class, arcade must reach the right outcome, bind it to the right
+// failure class, BSV Broadcaster must reach the right outcome, bind it to the right
 // transaction, and — when the outcome is REJECTED — persist a reason naming
 // the cause. Both broadcast modes, same result.
 func TestTeranodeRejectionReasonContract(t *testing.T) {
@@ -552,7 +552,7 @@ func runBoundaryCase(t *testing.T, tc boundaryCase, chunkCap, siblingCount int) 
 	// Sibling integrity: transactions teranode did not name must keep their
 	// acceptance regardless of what happened to the target. This is the
 	// property an unattributable failure line silently destroys — one bad line
-	// makes arcade discard the whole chunk's verdicts.
+	// makes BSV Broadcaster discard the whole chunk's verdicts.
 	for _, sib := range f.siblings {
 		st := ms.lastUpdateForTxid(sib)
 		if st == nil || st.Status != models.StatusAcceptedByNetwork {
@@ -575,7 +575,7 @@ func admit(t *testing.T, p *Propagator, txid string, raw []byte) {
 // whole contract turns on, so a future teranode bump that changes it is
 // diagnosed here rather than in a dozen downstream assertions: whenever the
 // chain contains an allowlisted cause, teranode surfaces THAT cause alone and
-// the "[ProcessTransaction][<txid>]" wrapper — arcade's only reliable
+// the "[ProcessTransaction][<txid>]" wrapper — BSV Broadcaster's only reliable
 // attribution key — is discarded.
 func TestBoundaryLine_DropsTheProcessTransactionWrapper(t *testing.T) {
 	target := strings.Repeat("f", 64)
@@ -584,7 +584,7 @@ func TestBoundaryLine_DropsTheProcessTransactionWrapper(t *testing.T) {
 		tnerr.NewTxInvalidError("bad-txns-in-belowout"))))
 	if strings.Contains(allowlisted, target) {
 		t.Errorf("teranode now carries the txid on an allowlisted cause (%q) — "+
-			"the upstream attribution fix has landed; relax arcade's narrowing fallback", allowlisted)
+			"the upstream attribution fix has landed; relax BSV Broadcaster's narrowing fallback", allowlisted)
 	}
 	if !strings.Contains(allowlisted, "bad-txns-in-belowout") {
 		t.Errorf("allowlisted cause did not survive the boundary: %q", allowlisted)
@@ -613,7 +613,7 @@ func TestBoundaryLine_DropsTheProcessTransactionWrapper(t *testing.T) {
 
 // TestBoundaryContract_NoTerminalRejectionWithoutReason is the invariant the
 // whole review exists to protect, asserted directly against the store: every
-// REJECTED row arcade writes during broadcast carries a non-empty,
+// REJECTED row BSV Broadcaster writes during broadcast carries a non-empty,
 // non-placeholder reason.
 func TestBoundaryContract_NoTerminalRejectionWithoutReason(t *testing.T) {
 	for _, tc := range boundaryCases() {
@@ -651,7 +651,7 @@ func TestBoundaryContract_NoTerminalRejectionWithoutReason(t *testing.T) {
 
 // TestNarrowChunk_BoundedRoundTripsAndExactAttribution is the cost and safety
 // argument for narrowing. One guilty transaction hidden in a chunk of sixteen,
-// drawing a failure line that names nobody — the shape arcade cannot resolve
+// drawing a failure line that names nobody — the shape BSV Broadcaster cannot resolve
 // from the response alone.
 //
 // It must settle in a bounded number of extra round trips (bisection: at most

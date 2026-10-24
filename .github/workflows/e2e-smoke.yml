@@ -1,10 +1,10 @@
 name: e2e-smoke
 
 # ------------------------------------------------------------------------------------
-#  arcade ↔ merkle-service end-to-end smoke
+#  BSV Broadcaster ↔ merkle-service end-to-end smoke
 # ------------------------------------------------------------------------------------
 # Boots Postgres, Redpanda, and a digest-pinned ghcr.io/bsv-blockchain/merkle-service
-# via testcontainers-go alongside an in-process arcade instance, then drives a
+# via testcontainers-go alongside an in-process BSV Broadcaster instance, then drives a
 # representative tx-flow scenario through both services.
 #
 # Required PR gate: every PR must show a green run before merging. The job

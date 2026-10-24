@@ -7,14 +7,14 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
 )
 
 // feePinned reports whether the operator has fixed the intake fee floor. When
-// pinned, arcade enforces (and /policy advertises) that exact value and the
+// pinned, BSV Broadcaster enforces (and /policy advertises) that exact value and the
 // refresher leaves the fee alone. When unpinned (min_fee_per_kb=0 and
-// accept_zero_fee=false), arcade tracks the network-observed minimum instead.
+// accept_zero_fee=false), BSV Broadcaster tracks the network-observed minimum instead.
 func (s *Server) feePinned() bool {
 	return s.cfg.Validator.AcceptZeroFee || s.cfg.Validator.MinFeePerKB != 0
 }
@@ -88,7 +88,7 @@ func (s *Server) refreshPolicyOnce(ctx context.Context) {
 	ttl := time.Duration(s.observedFeeTTLMs()) * time.Millisecond //nolint:gosec // TTL in ms fits int64
 	now := time.Now()
 
-	// Fee: the lowest any peer will accept, so arcade rejects only what no peer
+	// Fee: the lowest any peer will accept, so BSV Broadcaster rejects only what no peer
 	// would mine. Sizes: the highest any peer will accept, the same rule read
 	// the other way round.
 	var (
@@ -144,12 +144,12 @@ func (s *Server) refreshPolicyOnce(ctx context.Context) {
 }
 
 // discoveredLimit resolves one network-tracked size limit: the highest value
-// advertised by a fresh peer, floored at arcade's built-in default. Returns the
+// advertised by a fresh peer, floored at BSV Broadcaster's built-in default. Returns the
 // default when no peer has advertised one.
 //
 // The floor is what makes observation safe. Peer announcements are
 // unauthenticated gossip, so a hostile or simply misconfigured node advertising
-// a tiny limit must not be able to shrink what arcade accepts — observation may
+// a tiny limit must not be able to shrink what BSV Broadcaster accepts — observation may
 // only ever widen the limit from the built-in default, never narrow it. The
 // ceiling is applied downstream by the validator, which caps at the BDK
 // consensus limit before building an engine.
@@ -171,7 +171,7 @@ func discoveredLimit(peers []store.PeerPolicy, ttl time.Duration, now time.Time,
 // unauthenticated gossip and the rule is a bare minimum, so a single peer
 // advertising 0 — misconfigured, or simply a node with nil policy settings,
 // which teranode advertises as min_mining_tx_fee=0 — silently disabled fee
-// enforcement for an entire arcade instance. Accepting zero-fee transactions is
+// enforcement for an entire BSV Broadcaster instance. Accepting zero-fee transactions is
 // a deliberate operator decision, so accept_zero_fee is the only thing that may
 // produce a 0 floor.
 const minDiscoveredFeePerKB = 1
@@ -197,7 +197,7 @@ func discoveredFeePerKB(peers []store.PeerPolicy, ttl time.Duration, now time.Ti
 // advertising it. ok is false when no fresh observation exists. A peer's rate
 // is normalized to sat/kB using ceil division so a non-1000 byte basis never
 // rounds the enforced floor *below* what the peer requires (e.g. 1 sat / 1001
-// bytes must map to 1 sat/kB, not 0, or arcade would accept fee=0 that no node
+// bytes must map to 1 sat/kB, not 0, or BSV Broadcaster would accept fee=0 that no node
 // would).
 //
 // Callers should use discoveredFeePerKB rather than this directly: the raw

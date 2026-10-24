@@ -109,7 +109,7 @@ func TestSubmitTransactions_FailureList_400(t *testing.T) {
 // aggregate status: since v0.16 the upstream /txs handler returns 409 for
 // UTXO_SPENT / TX_CONFLICTING / TX_INVALID_DOUBLE_SPEND / TX_LOCKED
 // (httpStatusForTxError, services/propagation/Server.go) — the exact status
-// observed on mainnet carrying the UTXO_SPENT verdict that pre-fix Arcade
+// observed on mainnet carrying the UTXO_SPENT verdict that pre-fix BSV Broadcaster
 // dropped.
 func TestSubmitTransactions_FailureList_409(t *testing.T) {
 	testSubmitTransactionsFailureList(t, http.StatusConflict)

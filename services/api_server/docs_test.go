@@ -15,7 +15,7 @@ func TestRenderDocsIncludesChaintracksReference(t *testing.T) {
 
 	page := body.String()
 	for _, expected := range []string{
-		"Chaintracks is a separate Arcade listener",
+		"Chaintracks is a separate BSV Broadcaster listener",
 		"http://localhost:8083/health",
 		"/chaintracks/v2/network",
 		"/chaintracks/v2/height",

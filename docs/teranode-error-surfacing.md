@@ -1,11 +1,11 @@
-# Teranode rejection reasons: what reaches arcade
+# Teranode rejection reasons: what reaches BSV Broadcaster
 
-A transaction arcade marks `REJECTED` must carry a reason its submitter can act on, and a
-transaction teranode did not reject must never be terminalized. Both depend on a boundary arcade
+A transaction BSV Broadcaster marks `REJECTED` must carry a reason its submitter can act on, and a
+transaction teranode did not reject must never be terminalized. Both depend on a boundary BSV Broadcaster
 does not own. This document is the audit of that boundary: for every teranode failure class, what
-arrives on the wire, what arcade does with it, and what is still lost.
+arrives on the wire, what BSV Broadcaster does with it, and what is still lost.
 
-**Revisions audited.** arcade `main`; the pinned dependency
+**Revisions audited.** BSV Broadcaster `main`; the pinned dependency
 `github.com/bsv-blockchain/teranode v0.16.0`.
 
 **Kept honest by** `services/propagation/teranode_reason_contract_test.go`. Every row below is a
@@ -25,7 +25,7 @@ boundary fails those tests instead of silently changing production behaviour.
    `NewProcessingError("[ProcessTransaction][%s] failed to validate transaction", txID, err)`.
    When an allowlisted cause wins, that wrapper — and with it the only guaranteed txid — is
    discarded, and most inner messages name no transaction.
-3. **arcade binds verdicts by reading the line.** `parseTxsFailures` keys each line by
+3. **BSV Broadcaster binds verdicts by reading the line.** `parseTxsFailures` keys each line by
    `[ProcessTransaction][<txid>]`, else the first bare 64-hex string. Lines that key to a hash
    nobody submitted ("alien" — a spent outpoint, a competing spender, a parent record) are
    re-attributed by outpoint against the submitted transactions' own inputs. Lines that key to
@@ -43,7 +43,7 @@ the limit — and answers a bare `400` (`Invalid request body: too many transact
 data` / `too many submissions`); an Echo or proxy body limit answers `413`. Neither carries a per-tx
 line, and Teranode discards the per-tx list it had already built, although every transaction it
 read before the trip was dispatched and may have been accepted. `teranode.Client.SubmitTransactions`
-tags these `ErrBatchTooLarge`; arcade treats the peer as having voted for nobody, narrows the chunk
+tags these `ErrBatchTooLarge`; BSV Broadcaster treats the peer as having voted for nobody, narrows the chunk
 (re-submission of an already-accepted transaction is idempotent), and requeues a chunk of one
 carrying the peer's text as its reason. Peer health is untouched: the peer is reachable and judged
 nothing. The proactive half is `Propagation.TeranodeMaxBatchBytes` (see Broadcast modes).
@@ -97,7 +97,7 @@ Excellent messages, no txid — `TX_INVALID`/`TX_POLICY` are allowlisted, so the
 | B6 | input script too large | `TX_POLICY (39): bad-txns-inputs-too-large` | no | ✅ via narrowing |
 | B7 | unconfirmed input in block | `TX_INVALID (31): bad-txns-unconfirmed-input-in-block` | no | ✅ via narrowing |
 
-B4 is not theoretical. arcade's intake passes the `unknownParentHeight` sentinel for every input
+B4 is not theoretical. BSV Broadcaster's intake passes the `unknownParentHeight` sentinel for every input
 (`validator/validator.go`), so sequence-lock checks are meaningless locally and only teranode
 evaluates them for real.
 
@@ -117,7 +117,7 @@ evaluates them for real.
 | C6 | height/int conversion | as C5 | yes | ⟳ node fault (500) |
 
 C1/C2/C4 are attributed to the right transaction and terminalize, but the reason a wallet reads is
-a constant string. **No arcade change can fix this** — the detail never crosses the boundary.
+a constant string. **No BSV Broadcaster change can fix this** — the detail never crosses the boundary.
 
 ### D. Chain / UTXO state (`services/validator/Validator.go`, `stores/utxo/*`)
 
@@ -144,7 +144,7 @@ D2 matters most. Before teranode v0.16.0, `TX_MISSING_PARENT` was not allowliste
 `lineIsMissingParentCondition` could never match on this path, and every out-of-order child used to
 terminalize as a permanent `REJECTED` — then cascade `parent rejected (ancestor …)` onto its own
 descendants. v0.16.0 allowlists it and the line now matches directly. For peers still running an
-older build, arcade also recovers it from the HTTP status: 422 is reachable from exactly one branch
+older build, BSV Broadcaster also recovers it from the HTTP status: 422 is reachable from exactly one branch
 of teranode's `httpStatusForTxError`, `ErrTxMissingParent`, so a 422 carrying the opaque catch-all
 *is* a missing parent. The status is only consulted when the peer reported a single failure, where
 it describes that one transaction exactly. The same holds for D7 and the 403.

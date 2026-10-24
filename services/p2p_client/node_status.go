@@ -7,8 +7,8 @@ import (
 
 	teranodep2p "github.com/bsv-blockchain/teranode/services/p2p"
 
-	"github.com/bsv-blockchain/arcade/ssrfguard"
-	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/ssrfguard"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
 )
 
 // legacyMiningFeeBytesBasis is the byte basis the legacy MinMiningTxFee field
@@ -49,7 +49,7 @@ func legacyMiningFeeSatPerKB(fee *float64) (uint64, bool) {
 //
 // This is the per-endpoint, operator-facing view — "what will this specific
 // node accept" — and so records what the node advertised verbatim, unlike
-// recordPeerPolicy, which feeds the network-wide aggregate arcade enforces and
+// recordPeerPolicy, which feeds the network-wide aggregate BSV Broadcaster enforces and
 // therefore only keeps values it can compute with. An advertisement too large
 // to store faithfully drops the whole policy rather than the row: the URL
 // registration is the reason the row exists, and a peer sending a garbage size

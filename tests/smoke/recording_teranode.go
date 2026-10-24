@@ -14,7 +14,7 @@ import (
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 )
 
-// BatchRecord captures one POST that arcade made to the fake teranode
+// BatchRecord captures one POST that BSV Broadcaster made to the fake teranode
 // /txs endpoint. Seq is monotonic in the order requests were received
 // (assigned under the recorder's mutex), so assertions can compare two
 // batches' relative positions deterministically. ReceivedAt is wall-clock
@@ -26,11 +26,11 @@ type BatchRecord struct {
 	ReceivedAt time.Time
 }
 
-// recordingTeranode is the httptest.Server stand-in arcade points at via
+// recordingTeranode is the httptest.Server stand-in BSV Broadcaster points at via
 // DatahubURLs. It accepts both POST /tx (single) and POST /txs (batch)
 // because the propagator can fall back to the single-tx path; either way
 // the body is concatenated raw transaction bytes, which we parse back
-// with the same sdkTx.NewTransactionFromStream call arcade's intake uses
+// with the same sdkTx.NewTransactionFromStream call BSV Broadcaster's intake uses
 // — round-trip symmetry guarantees the txids match.
 //
 // Responses are always 200 OK with empty body, matching the existing
@@ -57,7 +57,7 @@ func newRecordingTeranode(t *testing.T) *recordingTeranode {
 	return r
 }
 
-// URL returns the base URL the test feeds into arcade as a DatahubURL.
+// URL returns the base URL the test feeds into BSV Broadcaster as a DatahubURL.
 func (r *recordingTeranode) URL() string {
 	return r.server.URL
 }

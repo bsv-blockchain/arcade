@@ -2,7 +2,7 @@ package services
 
 import "context"
 
-// Service is the common interface all arcade services implement.
+// Service is the common interface all BSV Broadcaster services implement.
 // Follows the Teranode daemon pattern.
 type Service interface {
 	// Start initializes connections and begins processing.

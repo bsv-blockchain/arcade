@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-// Service is the merkle-service surface arcade's services depend on. The
+// Service is the merkle-service surface BSV Broadcaster's services depend on. The
 // single-endpoint *Client and the multi-endpoint *Pool both satisfy it, so a
 // consumer never needs to know how many merkle-services are configured: it
 // registers a tx or asks for a block reprocess, and the implementation decides

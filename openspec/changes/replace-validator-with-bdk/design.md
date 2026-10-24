@@ -10,7 +10,7 @@ can honour `skipFees` without setting `SkipPolicyChecks=true` (which in teranode
 also disables script/standardness checks, turning on consensus mode).
 
 `NewValidatorForNetwork(network, *Policy)` resolves `chaincfg.GetChainParams`
-from arcade's existing `network` config (the param `.Name` values —
+from BSV Broadcaster's existing `network` config (the param `.Name` values —
 `mainnet`/`testnet`/`teratestnet`/`regtest` — map 1:1 to BDK's chain names) and
 returns an error for unknown networks instead of letting the BDK adapter call
 `Fatalf`. The legacy `NewValidator(*Policy)` defaults to mainnet for tests.
@@ -21,7 +21,7 @@ returns an error for unknown networks instead of letting the BDK adapter call
 TODO), and the BDK adapter reads ~14 fields directly. Several zeros are unsafe —
 e.g. `MaxStackMemoryUsagePolicy=0` would reject any memory-using script — so the
 validator sets every field explicitly to teranode's canonical BSV values
-(`defaultPolicySettings`). `DataCarrier` is enabled because arcade accepts
+(`defaultPolicySettings`). `DataCarrier` is enabled because BSV Broadcaster accepts
 OP_RETURN data transactions. The operator-facing `MinFeePerKB` (satoshis/kB) is
 converted to BSV/kB for `SetMinMiningTxFee` (100 sat/kB → 0.000001 BSV/kB;
 teranode converts back via `*1e8/1000`). An explicit `MaxTxSizePolicy` override
@@ -42,15 +42,15 @@ tightening, since BDK cannot compute fees or run scripts without it.
 
 BDK gates fork activation (Genesis, Chronicle) by comparing the supplied block
 height against the per-network activation heights baked into `chaincfg.Params`.
-Arcade passes `allForksActiveHeight = 2_000_000_000`: above every network's
-activation heights (so all upgrades evaluate as active and arcade validates
+BSV Broadcaster passes `allForksActiveHeight = 2_000_000_000`: above every network's
+activation heights (so all upgrades evaluate as active and BSV Broadcaster validates
 against current rules) yet below `math.MaxInt32`. `math.MaxUint32` cannot be
 used — the BDK adapter converts the height to int32 and, in policy mode,
 evaluates `blockHeight-1`, so it would overflow and reject every transaction.
 
-Per-input `utxoHeights` are unknown at intake (arcade does not track per-UTXO
+Per-input `utxoHeights` are unknown at intake (BSV Broadcaster does not track per-UTXO
 confirmation heights), so a full-length slice of a low sentinel height is passed:
-every input appears mature. This matches arcade's prior behaviour of not
+every input appears mature. This matches BSV Broadcaster's prior behaviour of not
 enforcing coinbase maturity / BIP68 at intake — teranode re-checks with real
 heights downstream and remains the authority.
 

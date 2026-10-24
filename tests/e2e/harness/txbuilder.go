@@ -48,7 +48,7 @@ func toChainHashBT(b []byte) *chainhash.Hash {
 }
 
 // We use go-bt/v2 types throughout this file because teranode's
-// model.Block API requires *bt.Tx and bt/chainhash.Hash. arcade itself
+// model.Block API requires *bt.Tx and bt/chainhash.Hash. BSV Broadcaster itself
 // is bilingual (uses both go-bt and go-sdk in different code paths);
 // the harness picks bt because that's what gets us through model.Block.
 
@@ -60,8 +60,8 @@ func toChainHashBT(b []byte) *chainhash.Hash {
 // startNonce lets callers stitch multiple batches into one stream where
 // each tx in the entire stream has a distinct LockTime.
 //
-// These txs DO NOT pass arcade's structural validator (no inputs, no
-// outputs, under-minimum size). For broadcasting through arcade's
+// These txs DO NOT pass BSV Broadcaster's structural validator (no inputs, no
+// outputs, under-minimum size). For broadcasting through BSV Broadcaster's
 // POST /tx, use BuildValidatableTxs.
 func BuildTxs(n int, startNonce uint32) []*bt.Tx {
 	out := make([]*bt.Tx, n)
@@ -74,7 +74,7 @@ func BuildTxs(n int, startNonce uint32) []*bt.Tx {
 }
 
 // BuildValidatableTxs returns n synthetic transactions that pass
-// arcade's intake validator (structural policy + script execution +
+// BSV Broadcaster's intake validator (structural policy + script execution +
 // fee check; merkle proofs on parents are trusted). Each tx has:
 //
 //   - One input pointing at a non-zero source txid + OP_DROP OP_TRUE
@@ -87,7 +87,7 @@ func BuildTxs(n int, startNonce uint32) []*bt.Tx {
 // The OP_0 unlocking script + OP_DROP OP_TRUE locking script evaluate to a
 // single truthy element on a clean stack, which the BDK validator's CLEANSTACK
 // rule requires (see nonDataScript). Callers must serialize these via
-// ExtendedBytes() so arcade's go-sdk parser sees the per-input source script +
+// ExtendedBytes() so BSV Broadcaster's go-sdk parser sees the per-input source script +
 // satoshis (otherwise the fee check fails with "PreviousTx not supplied").
 func BuildValidatableTxs(n int, startNonce uint32) []*bt.Tx {
 	out := make([]*bt.Tx, n)
@@ -197,14 +197,14 @@ func sha256d(left, right []byte) chainhash.Hash {
 // BuildCoinbase returns a synthetic coinbase tx whose hash varies with
 // height. Real Bitcoin coinbases need a unique scriptSig so each block's
 // coinbase txid is distinct; we ensure uniqueness by setting LockTime to
-// the height. The result is parseable by arcade's parseBlockBinary.
+// the height. The result is parseable by BSV Broadcaster's parseBlockBinary.
 func BuildCoinbase(height uint32) *bt.Tx {
 	tx := bt.NewTx()
 	tx.LockTime = height
 	return tx
 }
 
-// BuildBlockBinary constructs the binary block payload that arcade's
+// BuildBlockBinary constructs the binary block payload that BSV Broadcaster's
 // bump.parseBlockBinary and merkle-service's model.NewBlockFromBytes
 // both decode. Layout:
 //
@@ -290,7 +290,7 @@ func EncodeUint32LE(v uint32) []byte {
 // announcing node publishes carries this placeholder at leaf 0; the
 // block header's merkle root is computed with the placeholder replaced
 // by the real coinbase txid. merkle-service's coinbase-BUMP builder and
-// arcade's applyCoinbaseToSTUMP both rely on this convention.
+// BSV Broadcaster's applyCoinbaseToSTUMP both rely on this convention.
 var coinbasePlaceholder = chainhash.Hash{
 	0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
 	0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
@@ -314,7 +314,7 @@ func RegtestGenesisHash() chainhash.Hash {
 
 // SyntheticBlock is a fully fabricated single-subtree block: everything
 // a test needs to stage it on a Datahub and announce it over libp2p so
-// that merkle-service, arcade, and embedded chaintracks all accept it.
+// that merkle-service, BSV Broadcaster, and embedded chaintracks all accept it.
 //
 // Layout is teranode's: the announced subtree's leaf 0 is the coinbase
 // placeholder; the header merkle root is the same tree with leaf 0

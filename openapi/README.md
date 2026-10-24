@@ -1,7 +1,7 @@
 # OpenAPI specification
 
-[`arcade.openapi.yaml`](./arcade.openapi.yaml) is the OpenAPI 3.0.3 description of
-Arcade's HTTP API, derived from the Gin route handlers in `services/`.
+[`bsv-broadcaster.openapi.yaml`](./bsv-broadcaster.openapi.yaml) is the OpenAPI 3.0.3 description of
+BSV Broadcaster's HTTP API, derived from the Gin route handlers in `services/`.
 
 It covers all three HTTP services, each of which binds its own port:
 
@@ -25,13 +25,13 @@ the `models` package. Keep this spec in sync when those change.
 
 ```sh
 # Lint
-npx @redocly/cli lint openapi/arcade.openapi.yaml
+npx @redocly/cli lint openapi/bsv-broadcaster.openapi.yaml
 
 # Bundle (resolve $refs into a single file)
-npx @redocly/cli bundle openapi/arcade.openapi.yaml -o bundle.yaml
+npx @redocly/cli bundle openapi/bsv-broadcaster.openapi.yaml -o bundle.yaml
 
 # Preview rendered docs
-npx @redocly/cli preview-docs openapi/arcade.openapi.yaml
+npx @redocly/cli preview-docs openapi/bsv-broadcaster.openapi.yaml
 ```
 
 The remaining lint warnings are intentional: the `localhost` / `example.com`

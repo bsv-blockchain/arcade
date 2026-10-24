@@ -11,7 +11,7 @@ import (
 
 // errMissingSourceData is returned when an input lacks the previous-output data
 // (satoshis + locking script) required to build an extended transaction. The
-// BDK validator needs this to compute fees and execute scripts; arcade obtains
+// BDK validator needs this to compute fees and execute scripts; BSV Broadcaster obtains
 // it from the EF/BEEF carried with the submission.
 var errMissingSourceData = errors.New("transaction could not be transformed to extended format: missing input source data")
 

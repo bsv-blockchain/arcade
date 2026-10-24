@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
-	"github.com/bsv-blockchain/arcade/store/storetest"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/store/storetest"
 )
 
 func TestIterateTrackerRows_Conformance(t *testing.T) {
@@ -95,7 +95,7 @@ func TestIterateTrackerRows_PlanHasNoSort(t *testing.T) {
 	// The regression guard for issue #276. The query hydration used to run
 	// carried ORDER BY timestamp_at DESC, so on a multi-million-row store the
 	// planner added an external merge sort over 14 detoasted columns — that
-	// sort is what drove arcade and its Postgres out of memory. Hydration
+	// sort is what drove BSV Broadcaster and its Postgres out of memory. Hydration
 	// builds a map, so any ordering in this plan is pure waste.
 	s := newTestStore(t)
 	ctx := context.Background()

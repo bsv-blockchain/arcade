@@ -41,7 +41,7 @@ The service SHALL reject any discovered URL that is structurally invalid (unpars
 
 ### Requirement: Registry rows are re-validated at refresh time
 
-Every pod's endpoint refresh SHALL re-validate `source=discovered` registry rows with the same URL validation (behind the same success-only cache) before registering them into the in-memory endpoint set, so rows persisted before validation existed — or whose DNS has since broken — never enter any pod's broadcast or health surface. Rows with `source=configured` SHALL be exempt: statically configured `datahub_urls` are operator-controlled and may legitimately use cluster-internal names. Rejections SHALL be counted (`arcade_teranode_endpoint_refresh_rejected_total{outcome}`) and logged at WARN once per URL per process, DEBUG thereafter.
+Every pod's endpoint refresh SHALL re-validate `source=discovered` registry rows with the same URL validation (behind the same success-only cache) before registering them into the in-memory endpoint set, so rows persisted before validation existed — or whose DNS has since broken — never enter any pod's broadcast or health surface. Rows with `source=configured` SHALL be exempt: statically configured `datahub_urls` are operator-controlled and may legitimately use cluster-internal names. Rejections SHALL be counted (`bsv_broadcaster_teranode_endpoint_refresh_rejected_total{outcome}`) and logged at WARN once per URL per process, DEBUG thereafter.
 
 #### Scenario: Poisoned registry row is filtered
 

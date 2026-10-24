@@ -17,14 +17,14 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/events"
-	"github.com/bsv-blockchain/arcade/kafka"
-	"github.com/bsv-blockchain/arcade/merkleservice"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
-	"github.com/bsv-blockchain/arcade/teranode"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/events"
+	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
+	"github.com/bsv-blockchain/bsv-broadcaster/merkleservice"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/teranode"
 )
 
 // recordingPublisher captures Publish and PublishBulk calls so tests can
@@ -622,7 +622,7 @@ func flushSync(t *testing.T, p *Propagator) error {
 }
 
 // TestHandleMessage_ForwardsCallbackToken pins the propagator → merkle-service
-// half of the F-018 callback-auth loop: the token configured at the arcade
+// half of the F-018 callback-auth loop: the token configured at the BSV Broadcaster
 // side (cfg.CallbackToken) must reach merkle-service via the /watch payload,
 // so merkle-service can attach it as Authorization on outbound delivery. If
 // this test fails, callbacks will 401 even if the inbound receiver and
@@ -645,7 +645,7 @@ func TestHandleMessage_ForwardsCallbackToken(t *testing.T) {
 
 	cfg := &config.Config{
 		CallbackURL:   "http://localhost:8080/callback",
-		CallbackToken: "secret-arcade-token",
+		CallbackToken: "secret-bsv-broadcaster-token",
 	}
 	cfg.Propagation.MerkleConcurrency = 10
 	mc := merkleservice.NewClient(merkleSrv.URL, "", 5*time.Second)
@@ -656,8 +656,8 @@ func TestHandleMessage_ForwardsCallbackToken(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if gotToken != "secret-arcade-token" {
-		t.Errorf("expected merkle-service to receive callbackToken=secret-arcade-token, got %q", gotToken)
+	if gotToken != "secret-bsv-broadcaster-token" {
+		t.Errorf("expected merkle-service to receive callbackToken=secret-bsv-broadcaster-token, got %q", gotToken)
 	}
 }
 
@@ -828,7 +828,7 @@ func TestRunMerkleReplay_RegistersOnlyNonTerminal(t *testing.T) {
 	merkleSrv := newMerkleServer(log, http.StatusOK)
 	defer merkleSrv.Close()
 
-	cfg := &config.Config{CallbackURL: testArcadeCallbackURL, CallbackToken: testArcadeCallbackToken}
+	cfg := &config.Config{CallbackURL: testBroadcasterCallbackURL, CallbackToken: testBroadcasterCallbackToken}
 	cfg.Propagation.MerkleConcurrency = 4
 	cfg.Propagation.RegisterReplayLookbackHours = 24
 	enabled := true
@@ -866,7 +866,7 @@ func TestRunMerkleReplay_DisabledByConfig(t *testing.T) {
 	merkleSrv := newMerkleServer(log, http.StatusOK)
 	defer merkleSrv.Close()
 
-	cfg := &config.Config{CallbackURL: testArcadeCallbackURL, CallbackToken: testArcadeCallbackToken}
+	cfg := &config.Config{CallbackURL: testBroadcasterCallbackURL, CallbackToken: testBroadcasterCallbackToken}
 	disabled := false
 	cfg.Propagation.RegisterReplayOnStart = &disabled
 
@@ -893,7 +893,7 @@ func TestRegisterBatch_AuthFailureClassifiedAndRequeued(t *testing.T) {
 	defer merkleSrv.Close()
 
 	ms := newMockStore()
-	cfg := &config.Config{CallbackURL: testArcadeCallbackURL, CallbackToken: testArcadeCallbackToken}
+	cfg := &config.Config{CallbackURL: testBroadcasterCallbackURL, CallbackToken: testBroadcasterCallbackToken}
 	cfg.Propagation.MerkleConcurrency = 4
 	mc := merkleservice.NewClient(merkleSrv.URL, "", 5*time.Second)
 	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, nil, mc)
@@ -931,7 +931,7 @@ func TestRegisterBatch_ClaimRevokedClassifiedDistinctly(t *testing.T) {
 	defer merkleSrv.Close()
 
 	ms := newMockStore()
-	cfg := &config.Config{CallbackURL: testArcadeCallbackURL, CallbackToken: testArcadeCallbackToken}
+	cfg := &config.Config{CallbackURL: testBroadcasterCallbackURL, CallbackToken: testBroadcasterCallbackToken}
 	cfg.Propagation.MerkleConcurrency = 4
 	mc := merkleservice.NewClient(merkleSrv.URL, "", 5*time.Second)
 	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, nil, mc)
@@ -964,7 +964,7 @@ func TestRegisterBatch_ClaimRevokedClassifiedDistinctly(t *testing.T) {
 // per-test setup boilerplate small.
 func replayPropagator(t *testing.T, ms *mockStore, merkleURL string, configure func(*config.Config)) *Propagator {
 	t.Helper()
-	cfg := &config.Config{CallbackURL: testArcadeCallbackURL, CallbackToken: testArcadeCallbackToken}
+	cfg := &config.Config{CallbackURL: testBroadcasterCallbackURL, CallbackToken: testBroadcasterCallbackToken}
 	cfg.Propagation.MerkleConcurrency = 4
 	cfg.Propagation.RegisterReplayLookbackHours = 24
 	enabled := true

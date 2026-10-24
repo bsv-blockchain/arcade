@@ -2,7 +2,7 @@
 
 ## 1. ssrfguard package
 
-- [x] 1.1 Port `ssrfguard` from merkle-service as a top-level arcade package: `ValidateURL`, `IsBlockedIP`, `IsBlockedHostname`, `CheckDialAddress`, `ErrInvalidURL`/`ErrBlockedAddress` sentinels.
+- [x] 1.1 Port `ssrfguard` from merkle-service as a top-level BSV Broadcaster package: `ValidateURL`, `IsBlockedIP`, `IsBlockedHostname`, `CheckDialAddress`, `ErrInvalidURL`/`ErrBlockedAddress` sentinels.
 - [x] 1.2 Fix the CGNAT (100.64.0.0/10) doc/code mismatch from the merkle copy: add the explicit range check.
 - [x] 1.3 Port the test table; add CGNAT boundary cases.
 
@@ -10,14 +10,14 @@
 
 - [x] 2.1 `validateURL` delegates to `ssrfguard.ValidateURL` with an injectable lookup; delete `isPrivateHost`.
 - [x] 2.2 Add `lookupIP` seam (default `net.DefaultResolver.LookupIP`, 2s timeout) and a success-only 5-minute TTL cache on `Client`.
-- [x] 2.3 Split the rejection metric outcome: `blocked` (SSRF policy) vs `invalid` (malformed/unresolvable) on `arcade_p2p_endpoint_discovery_total`.
+- [x] 2.3 Split the rejection metric outcome: `blocked` (SSRF policy) vs `invalid` (malformed/unresolvable) on `bsv_broadcaster_p2p_endpoint_discovery_total`.
 - [x] 2.4 Tests: flip the "dns name resolving privately is treated as public" case; unresolvable-hostname (`asset:8090`) rejection; cache skips repeat lookups; upsert-per-announcement preserved.
 
 ## 3. Refresh-time filter (app.endpointSource)
 
 - [x] 3.1 `newEndpointSource` with `datahubLister` seam; discovered rows validated behind the TTL cache, configured rows exempt.
 - [x] 3.2 WARN-once/DEBUG-thereafter log dampening per URL; un-warn on recovery.
-- [x] 3.3 New metric `arcade_teranode_endpoint_refresh_rejected_total{outcome}`.
+- [x] 3.3 New metric `bsv_broadcaster_teranode_endpoint_refresh_rejected_total{outcome}`.
 - [x] 3.4 Tests: configured bypass, unresolvable filtered, cache, rejection-not-cached, allow-private opt-in, discovery-off exclusion.
 
 ## 4. Probe-all (teranode.Client)

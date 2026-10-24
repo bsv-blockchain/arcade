@@ -8,9 +8,9 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/store"
-	"github.com/bsv-blockchain/arcade/validator"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/validator"
 )
 
 func newPolicyServer(ms *mockStore) *Server {
@@ -80,7 +80,7 @@ func TestLowestObservedFeePerKB(t *testing.T) {
 
 	t.Run("rounds up, never below the peer rate", func(t *testing.T) {
 		// 1 sat / 1001 bytes is ~0.999 sat/kB; must round UP to 1, not down to
-		// 0 (which would let arcade accept fee=0 that the peer would reject).
+		// 0 (which would let BSV Broadcaster accept fee=0 that the peer would reject).
 		peers := []store.PeerPolicy{
 			{PeerID: "p1", MiningFeeSatoshis: 1, MiningFeeBytes: 1001, LastSeen: now},
 		}
@@ -178,9 +178,9 @@ func TestHighestObservedLimit(t *testing.T) {
 
 // TestDiscoveredLimit pins the floor, which is what makes it safe to derive a
 // limit from unauthenticated gossip at all: observation may only ever widen the
-// limit from arcade's built-in default, never narrow it. Without the floor a
+// limit from BSV Broadcaster's built-in default, never narrow it. Without the floor a
 // single misconfigured — or hostile — peer advertising a tiny limit would make
-// arcade reject transactions the rest of the network mines happily.
+// BSV Broadcaster reject transactions the rest of the network mines happily.
 func TestDiscoveredLimit(t *testing.T) {
 	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
 	ttl := 15 * time.Minute
@@ -246,7 +246,7 @@ func TestRefreshPolicyOnce_UpdatesValidatorToObservedMin(t *testing.T) {
 }
 
 // TestRefreshPolicyOnce_UpdatesSizesFromObservations is the end of the chain the
-// p2p-client starts: teranode advertises its size policy, arcade records it,
+// p2p-client starts: teranode advertises its size policy, BSV Broadcaster records it,
 // and intake plus GET /policy adopt the most permissive one on the network.
 func TestRefreshPolicyOnce_UpdatesSizesFromObservations(t *testing.T) {
 	ms := &mockStore{peerPolicies: []store.PeerPolicy{
@@ -342,7 +342,7 @@ func TestRefreshPolicyOnce_PinnedDimensionsNotOverwritten(t *testing.T) {
 
 // TestRefreshPolicyOnce_HostilePeerCannotBreakIntake is the safety property in
 // one place: node_status is unauthenticated, so a peer can advertise anything.
-// Whatever it sends, the refresher must leave arcade with a working validator
+// Whatever it sends, the refresher must leave BSV Broadcaster with a working validator
 // whose limits are no worse than the built-in defaults.
 func TestRefreshPolicyOnce_HostilePeerCannotBreakIntake(t *testing.T) {
 	hostile := []store.PeerPolicy{
@@ -515,7 +515,7 @@ func TestRefreshPolicyOnce_ZeroFeePeerDoesNotZeroTheFloor(t *testing.T) {
 
 	if got := s.validator.MinFeePerKB(); got != minDiscoveredFeePerKB {
 		t.Errorf("intake fee floor = %d, want %d — a zero-fee peer must not "+
-			"make arcade accept transactions no node will mine", got, minDiscoveredFeePerKB)
+			"make BSV Broadcaster accept transactions no node will mine", got, minDiscoveredFeePerKB)
 	}
 	// The size limits still track normally.
 	if got := s.validator.MaxTxSizePolicy(); got != 100_000_000 {

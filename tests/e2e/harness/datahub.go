@@ -17,7 +17,7 @@ import (
 )
 
 // Datahub is the in-process HTTP server that stands in for a teranode
-// DataHub during e2e tests. Both arcade's bump-builder and merkle-service
+// DataHub during e2e tests. Both BSV Broadcaster's bump-builder and merkle-service
 // fetch synthetic blocks/subtrees from here:
 //
 //   - GET /block/<hash>   → returns the binary written by Stage(blockHash, ...)
@@ -26,7 +26,7 @@ import (
 // The server listens on 0.0.0.0 and exposes URLs reachable from
 // merkle-service via host.docker.internal — same convention as the libp2p
 // host. Tests Stage block + subtree binaries before publishing the
-// matching libp2p announcement, so by the time merkle-service / arcade
+// matching libp2p announcement, so by the time merkle-service / BSV Broadcaster
 // fetches, the bytes are ready.
 type Datahub struct {
 	server  *httptest.Server
@@ -40,8 +40,8 @@ type Datahub struct {
 
 	// Per-path fetch counters. blockFetches is load-bearing for the issue
 	// #195 datahub-independence assertion: when merkle-service enriches
-	// BLOCK_PROCESSED, arcade builds the compound BUMP without ever fetching
-	// /block/<hash>, so a dedicated arcade datahub sees zero block fetches.
+	// BLOCK_PROCESSED, BSV Broadcaster builds the compound BUMP without ever fetching
+	// /block/<hash>, so a dedicated BSV Broadcaster datahub sees zero block fetches.
 	blockFetches   atomic.Int64
 	subtreeFetches atomic.Int64
 }
@@ -128,7 +128,7 @@ func (d *Datahub) LocalURL() string {
 }
 
 // BlockFetches returns how many GET /block/<hash> requests this datahub has
-// served. Zero on a datahub wired only to arcade proves arcade built the
+// served. Zero on a datahub wired only to BSV Broadcaster proves BSV Broadcaster built the
 // compound BUMP from the merkle-service callback enrichment (issue #195)
 // rather than fetching the block.
 func (d *Datahub) BlockFetches() int64 { return d.blockFetches.Load() }
@@ -138,7 +138,7 @@ func (d *Datahub) BlockFetches() int64 { return d.blockFetches.Load() }
 func (d *Datahub) SubtreeFetches() int64 { return d.subtreeFetches.Load() }
 
 // StageBlock registers a block binary keyed by its hash. The hash must
-// match the hash merkle-service / arcade will GET — typically the block
+// match the hash merkle-service / BSV Broadcaster will GET — typically the block
 // hash the test publishes via libp2p.
 func (d *Datahub) StageBlock(hash chainhash.Hash, payload []byte) {
 	d.mu.Lock()
@@ -256,13 +256,13 @@ func (d *Datahub) handle(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		_, _ = w.Write(payload)
 	case r.Method == http.MethodPost && (r.URL.Path == "/tx" || r.URL.Path == "/txs"):
-		// Arcade's propagation service POSTs validated raw txs here
+		// BSV Broadcaster's propagation service POSTs validated raw txs here
 		// expecting a real teranode would accept them into mempool.
 		// For e2e tests we just acknowledge — the mempool side-effect
-		// isn't observable, and rejecting (404) cascades into arcade
+		// isn't observable, and rejecting (404) cascades into BSV Broadcaster
 		// marking the txs themselves REJECTED, blocking the
 		// merkle-proof-return-path scenarios. Returning 200 with no
-		// body satisfies arcade's teranode.Client.Submit*.
+		// body satisfies BSV Broadcaster's teranode.Client.Submit*.
 		w.WriteHeader(http.StatusOK)
 	default:
 		http.NotFound(w, r)

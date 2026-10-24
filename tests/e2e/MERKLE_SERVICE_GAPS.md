@@ -28,7 +28,7 @@ gated by `MODE=embedded` — would let smoke tests drop Redpanda
 entirely.
 
 **Suggested fix:** add an in-process Kafka backend selectable via
-`KAFKA_BACKEND=memory` (mirroring arcade's pattern). Worth tracking
+`KAFKA_BACKEND=memory` (mirroring BSV Broadcaster's pattern). Worth tracking
 as a feature request.
 
 ## 3. `callback.allowPrivateIPs` defaults to false

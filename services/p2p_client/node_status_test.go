@@ -8,7 +8,7 @@ import (
 
 	teranodep2p "github.com/bsv-blockchain/teranode/services/p2p"
 
-	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
 )
 
 func TestPickDatahubURL(t *testing.T) {
@@ -114,7 +114,7 @@ func TestValidateURL(t *testing.T) {
 // TestEndpointPolicyFrom covers what gets recorded against a peer's datahub URL
 // registration and surfaced per endpoint by GET /health.
 //
-// Unlike recordPeerPolicy, which feeds the network-wide policy arcade enforces
+// Unlike recordPeerPolicy, which feeds the network-wide policy BSV Broadcaster enforces
 // and so keeps only values it can compute with, this path records what the node
 // advertised verbatim — it answers "what will this endpoint accept". The one
 // thing it will not record is a value too large to store faithfully, since

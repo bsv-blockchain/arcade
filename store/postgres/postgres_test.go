@@ -7,7 +7,7 @@
 //
 //	go test -tags=postgres ./store/postgres/...
 //
-// If ARCADE_POSTGRES_DSN is set the tests use that external Postgres instead
+// If BSV_BROADCASTER_POSTGRES_DSN is set the tests use that external Postgres instead
 // of spinning up embedded — useful for CI or running against a real cluster.
 package postgres
 
@@ -22,24 +22,24 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/store"
 )
 
 // newEmbeddedCfg builds a Postgres config that points at either an external
-// DSN (when ARCADE_POSTGRES_DSN is set) or a fresh embedded-postgres data
+// DSN (when BSV_BROADCASTER_POSTGRES_DSN is set) or a fresh embedded-postgres data
 // directory under tempDir. Shared by newTestStore (testing.T) and the
 // *testing.B helper used by benchmarks.
 func newEmbeddedCfg(tempDir string) config.Postgres {
-	if dsn := os.Getenv("ARCADE_POSTGRES_DSN"); dsn != "" {
+	if dsn := os.Getenv("BSV_BROADCASTER_POSTGRES_DSN"); dsn != "" {
 		return config.Postgres{DSN: dsn, MaxConns: 4}
 	}
 	return config.Postgres{
 		Embedded:         true,
-		EmbeddedUser:     "arcade",
-		EmbeddedPassword: "arcade",
-		EmbeddedDatabase: "arcade",
+		EmbeddedUser:     "bsv_broadcaster",
+		EmbeddedPassword: "bsv_broadcaster",
+		EmbeddedDatabase: "bsv_broadcaster",
 		EmbeddedDataDir:  tempDir + "/data",
 		EmbeddedCacheDir: tempDir + "/cache",
 		MaxConns:         4,
@@ -64,7 +64,7 @@ func TestMain(m *testing.M) {
 }
 
 func runWithSharedStore(m *testing.M) (int, func()) {
-	dir, err := os.MkdirTemp("", "arcade-pg-test-")
+	dir, err := os.MkdirTemp("", "bsv-broadcaster-pg-test-")
 	if err != nil {
 		sharedStoreErr = err
 		return m.Run(), func() {}

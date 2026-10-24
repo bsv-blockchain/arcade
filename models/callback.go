@@ -47,7 +47,7 @@ type CallbackMessage struct {
 	// BuildCompoundBUMP.
 	SubtreeHashes []string `json:"subtreeHashes,omitempty"`
 	// CoinbaseBUMP is a BRC-74 merkle path of the coinbase transaction up to the
-	// block merkle root — a drop-in replacement for the coinbase BUMP arcade
+	// block merkle root — a drop-in replacement for the coinbase BUMP BSV Broadcaster
 	// otherwise parses out of the datahub binary response. It is the hex of the
 	// raw BRC-74 bytes, so HexBytes (a plain, non-reversing hex decode) is the
 	// correct type here.
@@ -56,7 +56,7 @@ type CallbackMessage struct {
 	// ExpectedSubtreeIndices is the set of subtree indices (ascending) that
 	// produced a STUMP for THIS callback URL in THIS block, as computed by
 	// merkle-service (merkle PR #162). STUMPs are sparse — only a subtree
-	// containing a tracked tx produces one — so without this set arcade cannot
+	// containing a tracked tx produces one — so without this set BSV Broadcaster cannot
 	// tell a lost STUMP from a legitimately-absent one, and a partial set would
 	// build a compound BUMP that validates while silently dropping the missing
 	// subtree's txs. bump-builder compares this against the STUMPs it actually

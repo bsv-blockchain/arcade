@@ -16,10 +16,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/finality"
-	"github.com/bsv-blockchain/arcade/kafka"
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/bsv-broadcaster/finality"
+	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
 )
 
 // fixedChainReader serves a static 11-block chain whose BIP113
@@ -86,7 +86,7 @@ func newFinalityTestServer(broker *kafka.RecordingBroker, ms *mockStore, pub *re
 // answered with an actionable 400 carrying the ARC 476 code, but NOTHING is
 // persisted or published — no REJECTED row (GET /tx keeps returning 404,
 // "no verdict", so resubmission policies keyed on no-verdict work), no
-// status event, no Kafka publish. A non-final verdict reflects arcade's
+// status event, no Kafka publish. A non-final verdict reflects BSV Broadcaster's
 // current chain view, not the transaction bytes, so it must never become a
 // durable verdict that could stick after the tx mines elsewhere — nor
 // clobber an existing in-flight row on a resubmit under a stale tip.

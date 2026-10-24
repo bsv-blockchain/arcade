@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
 )
 
 // forEachBlockProcessingMaxPage bounds the adaptive page growth in

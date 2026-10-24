@@ -12,9 +12,9 @@ import (
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"github.com/bsv-blockchain/arcade/kafka"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
+	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
+	"github.com/bsv-blockchain/bsv-broadcaster/models"
 )
 
 // These tests cover the datahub-independent callback path added for issue #195:
@@ -25,7 +25,7 @@ import (
 // absent or inconsistent.
 
 // recordingDatahub is an httptest server that counts /block/<hash> GETs and
-// rejects them with 500. Callback-path tests wire it as arcade's only datahub
+// rejects them with 500. Callback-path tests wire it as BSV Broadcaster's only datahub
 // so a regression that wrongly falls back is caught two ways: the counter goes
 // non-zero AND the build fails (the 500 surfaces as a handleMessage error).
 type recordingDatahub struct {
@@ -69,7 +69,7 @@ func makeBlockProcessedMsgWithEnrichment(t *testing.T, blockHash string, merkleR
 	if err != nil {
 		t.Fatalf("marshal enriched callback: %v", err)
 	}
-	return &kafka.Message{Topic: "arcade.block_processed", Value: data}
+	return &kafka.Message{Topic: "bsv-broadcaster.block_processed", Value: data}
 }
 
 // twoSubtreeEnrichmentFixture builds a 2-subtree block with a non-empty
@@ -260,7 +260,7 @@ func TestBuilder_HandleMessage_CallbackInconsistentSubtreeCountFallsBack(t *test
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	msg := &kafka.Message{Topic: "arcade.block_processed", Value: data}
+	msg := &kafka.Message{Topic: "bsv-broadcaster.block_processed", Value: data}
 
 	if err := b.handleMessage(context.Background(), msg); err != nil {
 		t.Fatalf("handleMessage (inconsistent count → fallback): %v", err)
