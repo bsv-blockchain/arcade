@@ -2031,7 +2031,7 @@ func validateAccessControl(cfg *Config) error {
 var tierNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 
 // checkTierPayable rejects a bounded tier whose configured batch (or even a
-// single /tx) could never fit in its own per-minute budget — a batch that
+// single /tx, or a single read) could never fit in its own per-minute budget — a batch that
 // would always 429 is a config bug, not a runtime condition. Unbounded
 // tiers (units_per_minute == 0) have no budget to check against.
 func checkTierPayable(name string, t TierConfig, costs RateLimitCosts) error {
@@ -2042,12 +2042,16 @@ func checkTierPayable(name string, t TierConfig, costs RateLimitCosts) error {
 		return fmt.Errorf("ratelimit tier %q: costs.submit_tx (%d) exceeds units_per_minute (%d): a single /tx could never succeed",
 			name, costs.SubmitTx, t.UnitsPerMinute)
 	}
-	if t.MaxBatch > 0 {
-		need := int64(t.MaxBatch)*costs.SubmitTx + costs.Read
-		if need > t.UnitsPerMinute {
-			return fmt.Errorf("ratelimit tier %q: max_batch (%d) at costs.submit_tx (%d) plus costs.read (%d) = %d units, above units_per_minute (%d): the largest allowed batch could never succeed",
-				name, t.MaxBatch, costs.SubmitTx, costs.Read, need, t.UnitsPerMinute)
-		}
+	// Reads (and /txs's base charge) cost costs.read whatever max_batch is.
+	if costs.Read > t.UnitsPerMinute {
+		return fmt.Errorf("ratelimit tier %q: costs.read (%d) exceeds units_per_minute (%d): a single read could never succeed",
+			name, costs.Read, t.UnitsPerMinute)
+	}
+	// By division, not max_batch*submit_tx, which a huge max_batch could
+	// overflow into passing. Both costs are > 0 (checked by the caller).
+	if t.MaxBatch > 0 && int64(t.MaxBatch) > (t.UnitsPerMinute-costs.Read)/costs.SubmitTx {
+		return fmt.Errorf("ratelimit tier %q: max_batch (%d) at costs.submit_tx (%d) plus costs.read (%d) exceeds units_per_minute (%d): the largest allowed batch could never succeed",
+			name, t.MaxBatch, costs.SubmitTx, costs.Read, t.UnitsPerMinute)
 	}
 	return nil
 }

@@ -108,6 +108,16 @@ func TestValidateAccessControl(t *testing.T) {
 		{"max_batch at the configured costs exceeds units_per_minute", func(c *Config) {
 			c.RateLimit.Tiers["enterprise"] = TierConfig{UnitsPerMinute: 10, MaxBatch: 5} // 5*10+1=51 > 10
 		}, "max_batch"},
+		{"read costs more than the tier's whole budget with no max_batch", func(c *Config) {
+			c.RateLimit.Costs.Read = 100
+			c.RateLimit.Tiers["enterprise"] = TierConfig{UnitsPerMinute: 50}
+		}, "costs.read"},
+		{"max_batch large enough to overflow the batch cost", func(c *Config) {
+			c.RateLimit.Tiers["enterprise"] = TierConfig{UnitsPerMinute: 1000, MaxBatch: 1 << 62}
+		}, "max_batch"},
+		{"max_batch exactly payable", func(c *Config) {
+			c.RateLimit.Tiers["enterprise"] = TierConfig{UnitsPerMinute: 51, MaxBatch: 5} // 5*10+1=51
+		}, ""},
 		{"anonymous max_batch exceeds units_per_minute", func(c *Config) {
 			c.RateLimit.Anonymous = TierConfig{UnitsPerMinute: 10, MaxBatch: 5}
 		}, "max_batch"},
