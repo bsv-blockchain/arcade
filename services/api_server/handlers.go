@@ -1195,12 +1195,13 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	// loop below -- stops parsing as soon as the cap is exceeded, instead
 	// of reading, parsing and holding the whole oversize body in memory
 	// before CheckBatch gets a chance to reject it.
+	// Compared by division, not maxBatch*maxSingleTxBytes, which an
+	// unbounded tier's (unvalidated) max_batch could overflow.
 	bodyLimit := int64(maxBatchBytes)
 	maxBatch := ratelimit.MaxBatch(c)
-	if maxBatch > 0 {
-		if capped := int64(maxBatch) * maxSingleTxBytes; capped < bodyLimit {
-			bodyLimit = capped
-		}
+	tierCapped := maxBatch > 0 && int64(maxBatch) < bodyLimit/maxSingleTxBytes
+	if tierCapped {
+		bodyLimit = int64(maxBatch) * maxSingleTxBytes
 	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, bodyLimit)
 
@@ -1211,7 +1212,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 		// rather than the generic 400 every other read failure gets.
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
-			ratelimit.RejectBatchBytesTooLarge(c)
+			ratelimit.RejectBatchBytesTooLarge(c, tierCapped)
 			return
 		}
 		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "failed to read body"})

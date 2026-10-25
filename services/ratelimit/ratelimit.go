@@ -187,19 +187,20 @@ func MaxBatch(c *gin.Context) int {
 // RejectBatchBytesTooLarge responds 413 for a request body that overran
 // its byte cap before any transaction could even be parsed out of it --
 // http.MaxBytesReader's error on the initial read, not CheckBatch's own
-// per-transaction-count rejection. When the cap in play was derived from
-// the caller's tier (MaxBatch > 0 -- see /txs's per-tier body-size cap in
-// handleSubmitTransactions), the response mirrors CheckBatch's own shape
+// per-transaction-count rejection. tierCapped reports whether the cap in
+// play was derived from the caller's tier (see /txs's per-tier body-size
+// cap in handleSubmitTransactions) -- a large enough max_batch leaves the
+// flat ceiling as the tighter cap, so MaxBatch > 0 alone doesn't say. When
+// it was, the response mirrors CheckBatch's own shape
 // and is metered the same way, so an operator reading
 // bsv_broadcaster_ratelimit_decisions_total can't tell the two rejections apart —
 // they're the same tier limit, just caught at a different point. Without a
-// tier-derived cap in play (no limiter on the route, or the tier's
-// max_batch is 0/unbounded, so the request hit the flat maxBatchBytes
-// ceiling instead), there's no tier or maxBatch to report, so the response
-// is the plain, unmetered message.
-func RejectBatchBytesTooLarge(c *gin.Context) {
+// tier-derived cap in play (the request hit the flat maxBatchBytes ceiling
+// instead), there's no tier limit to report, so the response is the plain,
+// unmetered message.
+func RejectBatchBytesTooLarge(c *gin.Context, tierCapped bool) {
 	tier, ok := tierFromContext(c)
-	if !ok || tier.MaxBatch == 0 {
+	if !tierCapped || !ok || tier.MaxBatch == 0 {
 		c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body too large"})
 		return
 	}

@@ -175,8 +175,9 @@ func TestChargeTxsAndCheckBatch(t *testing.T) {
 // TestRejectBatchBytesTooLarge covers both shapes: a tier-derived cap
 // (max_batch > 0) gets CheckBatch's own response shape, metered the same
 // way as a count-based batch_too_large rejection; the absence of a
-// tier-derived cap -- either no limiter guarding the route at all, or an
-// unbounded tier (max_batch: 0) -- gets the plain, unmetered message.
+// tier-derived cap -- no limiter guarding the route at all, an unbounded
+// tier (max_batch: 0), or a max_batch large enough that the flat ceiling
+// was the tighter cap -- gets the plain, unmetered message.
 func TestRejectBatchBytesTooLarge(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -185,7 +186,7 @@ func TestRejectBatchBytesTooLarge(t *testing.T) {
 	c.Set(ctxTier, Tier{Name: "free", MaxBatch: 3})
 	before := testutil.ToFloat64(metrics.RateLimitDecisionsTotal.WithLabelValues("free", "batch_too_large"))
 
-	RejectBatchBytesTooLarge(c)
+	RejectBatchBytesTooLarge(c, true)
 
 	require.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
 	require.Contains(t, w.Body.String(), "request body exceeds the free tier's batch byte limit")
@@ -195,18 +196,20 @@ func TestRejectBatchBytesTooLarge(t *testing.T) {
 		"must be metered identically to a count-based batch_too_large rejection")
 
 	for _, tc := range []struct {
-		name string
-		set  func(*gin.Context)
+		name       string
+		set        func(*gin.Context)
+		tierCapped bool
 	}{
-		{"unbounded tier", func(c *gin.Context) { c.Set(ctxTier, Tier{Name: "enterprise", MaxBatch: 0}) }},
-		{"no limiter on the route", func(*gin.Context) {}},
+		{"unbounded tier", func(c *gin.Context) { c.Set(ctxTier, Tier{Name: "enterprise", MaxBatch: 0}) }, false},
+		{"no limiter on the route", func(*gin.Context) {}, false},
+		{"flat ceiling tighter than the tier cap", func(c *gin.Context) { c.Set(ctxTier, Tier{Name: "high", MaxBatch: 1000}) }, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(w)
 			tc.set(c)
 
-			RejectBatchBytesTooLarge(c)
+			RejectBatchBytesTooLarge(c, tc.tierCapped)
 
 			require.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
 			require.JSONEq(t, `{"error":"request body too large"}`, w.Body.String())
