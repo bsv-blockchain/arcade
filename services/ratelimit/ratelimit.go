@@ -141,11 +141,7 @@ func ChargeTxs(c *gin.Context, n int) bool {
 	if !ok {
 		return true
 	}
-	tv, ok := c.Get(ctxTier)
-	if !ok {
-		return true
-	}
-	tier, ok := tv.(Tier)
+	tier, ok := tierFromContext(c)
 	if !ok {
 		return true
 	}

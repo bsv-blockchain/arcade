@@ -311,8 +311,8 @@ DOUBLE_SPEND_ATTEMPTED (from rejected-tx gossip with specific reason)
 | `validator.max_tx_sigops_counts_policy` | Maximum signature operations (`0` = unlimited) | `0`         |
 | `validator.min_fee_per_kb`  | Minimum fee per KB (satoshis); `0` tracks the network | `0` (→ `100`)      |
 | `webhook.max_retries`       | Max webhook retry attempts                   | `10`                  |
-| `auth.enabled`              | Enable Bearer token authentication           | `false`               |
-| `auth.token`                | Bearer token (required if auth enabled)      | -                     |
+| `auth.enabled`              | Identify callers by API key (`Authorization: Bearer bsvb_…`); unkeyed callers stay anonymous. See [docs/api-keys.md](docs/api-keys.md) | `false` |
+| `ratelimit.enabled`         | Per-tier rate limits for keyed and anonymous callers (requires `auth.enabled`) | `false` |
 | `auth.store.mongodb.uri`    | Dedicated MongoDB for API keys + quota, shared across deployments (`ARCADE_AUTH_STORE_MONGODB_URI`); unset = main store. See [docs/api-keys.md](docs/api-keys.md) | - |
 | `auth.store.mongodb.database` | Database for `api_keys` / `api_quota` (required with `uri`) | -            |
 
