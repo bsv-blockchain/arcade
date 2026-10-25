@@ -63,12 +63,15 @@ type bucket struct {
 	// downgrade they're discarded (see take), and so is any grant that
 	// lands from a reserve issued before the downgrade.
 	limit int64
-	// failUntil is the breaker. Zero: never tripped (or reset by a new
-	// window) — normal operation, a miss reserves with the lock held, as
+	// failUntil is the breaker. Zero: never tripped (or reset by a
+	// successful reservation) — normal operation, a miss reserves with the lock held, as
 	// above. Non-zero and in the future: open — take fails open with no
 	// store call. Non-zero and in the past: half-open — one probe (guarded
 	// by probing) reserves with the lock released around the store call;
-	// everyone else fails open without waiting on it.
+	// everyone else fails open without waiting on it. It's a wall-clock
+	// deadline, not window state, so a new window doesn't reset it: that
+	// would send the next miss of every key down the lock-held path into a
+	// store that's still hung, once a minute, for the length of an outage.
 	failUntil time.Time
 	probing   bool
 }
@@ -119,7 +122,7 @@ func (l *keyedLimiter) take(ctx context.Context, keyID string, limit, cost int64
 
 	b.mu.Lock()
 	if !b.window.Equal(window) {
-		b.window, b.remaining, b.used, b.failUntil, b.probing = window, 0, 0, time.Time{}, false
+		b.window, b.remaining, b.used = window, 0, 0
 	}
 	if limit < b.limit {
 		// A tier downgrade (e.g. 30,000 -> 50) mid-window. The local lease
@@ -166,8 +169,9 @@ func (l *keyedLimiter) take(ctx context.Context, keyID string, limit, cost int64
 		b.mu.Lock()
 		b.probing = false
 		if !b.window.Equal(window) {
-			// The window moved on while we were unlocked: whatever we
-			// learned (grant or error) no longer applies to this bucket.
+			// The window moved on while we were unlocked: the grant no
+			// longer applies to this bucket, but the store's health does.
+			l.recordHealth(b, err, ctx.Err() != nil)
 			b.mu.Unlock()
 			return Decision{}, errStoreBackoff
 		}
@@ -211,21 +215,30 @@ func (l *keyedLimiter) take(ctx context.Context, keyID string, limit, cost int64
 }
 
 // recordReserve applies a reservation's outcome to b, which the caller
-// holds locked. A genuine store error (ctx.Err() is nil: not the caller
-// hanging up) trips the breaker for storeBackoff measured from now — after
-// the reserve returned, not from when it started, so a reserve that used
-// its full reserveTimeout still leaves a real backoff behind it.
+// holds locked. ctx is the request's own context: an error while it's done
+// is the caller hanging up, not the store failing (see recordHealth).
 func (l *keyedLimiter) recordReserve(ctx context.Context, b *bucket, granted, usedAfter int64, err error) error {
+	l.recordHealth(b, err, ctx.Err() != nil)
 	if err != nil {
-		if ctx.Err() == nil {
-			b.failUntil = l.now().UTC().Add(storeBackoff)
-		}
 		return err
 	}
-	b.failUntil = time.Time{}
 	b.remaining += granted
 	b.used = max(b.used, usedAfter)
 	return nil
+}
+
+// recordHealth updates b's breaker (b locked) from a reserve's outcome. A
+// genuine store error (not callerGone) trips it for storeBackoff measured
+// from now — after the reserve returned, not from when it started, so a
+// reserve that used its full reserveTimeout still leaves a real backoff
+// behind it. Any success closes it.
+func (l *keyedLimiter) recordHealth(b *bucket, err error, callerGone bool) {
+	switch {
+	case err == nil:
+		b.failUntil = time.Time{}
+	case !callerGone:
+		b.failUntil = l.now().UTC().Add(storeBackoff)
+	}
 }
 
 func (l *keyedLimiter) baseLease(limit int64) int64 {
@@ -275,14 +288,11 @@ func (l *keyedLimiter) prefetch(ctx context.Context, keyID string, window time.T
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.refilling = false
-	if !b.window.Equal(window) {
-		return // the window moved on: the grant (or error) is stale, as designed
-	}
-	if err != nil {
-		// Detached from the request that triggered it (see take), so this
-		// is never the caller hanging up: always a genuine store problem.
-		b.failUntil = l.now().UTC().Add(storeBackoff)
-		return
+	// Detached from the request that triggered it (see take), so an error
+	// is never the caller hanging up: always a genuine store problem.
+	l.recordHealth(b, err, false)
+	if err != nil || !b.window.Equal(window) {
+		return // a moved-on window makes the grant stale, as designed
 	}
 	if limit > b.limit {
 		granted = 0 // reserved under a limit since downgraded (see bucket.limit)

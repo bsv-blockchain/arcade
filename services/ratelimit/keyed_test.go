@@ -592,3 +592,45 @@ func TestKeyedTierDowngradeDropsOldLease(t *testing.T) {
 	require.True(t, d.Allowed)
 	require.Equal(t, int64(90), b2.remaining)
 }
+
+// TestKeyedBreakerSurvivesWindowRollover: failUntil is a wall-clock
+// deadline, so a new minute must not close it. Otherwise, against a hung
+// store, the first miss per key per window would block on the lock-held
+// path for reserveTimeout with every other request for the key behind it.
+func TestKeyedBreakerSurvivesWindowRollover(t *testing.T) {
+	qs := newFakeQuota()
+	clk := &clock{time.Date(2026, 10, 21, 12, 0, 55, 0, time.UTC)}
+	l := newTestKeyed(qs, 0.1, 0.8, clk)
+
+	qs.err = errors.New("store down")
+	_, err := l.take(context.Background(), "key_roll", 50, 10)
+	require.Error(t, err)
+	calls := qs.calls()
+
+	clk.t = clk.t.Add(6 * time.Second) // 12:01:01: new window, breaker (until 12:01:05) still open
+	_, err = l.take(context.Background(), "key_roll", 50, 10)
+	require.ErrorIs(t, err, errStoreBackoff)
+	require.Equal(t, calls, qs.calls(), "a new window must not reopen the store path while the breaker is open")
+}
+
+// TestKeyedPrefetchSuccessClosesBreaker: a background refill that succeeds
+// proves the store healthy, just like a synchronous reserve does, so the
+// bucket leaves half-open instead of forcing its next miss through a probe.
+func TestKeyedPrefetchSuccessClosesBreaker(t *testing.T) {
+	qs := newFakeQuota()
+	clk := &clock{noon}
+	l := newTestKeyed(qs, 0.5, 0.8, clk) // baseLease = 20 of 40
+	const limit = 40
+
+	d, err := l.take(context.Background(), "key_pf", limit, 1)
+	require.NoError(t, err)
+	require.True(t, d.Allowed)
+	b := l.buckets["key_pf"]
+	b.failUntil = noon.Add(-time.Second) // tripped earlier, now half-open
+	for b.remaining >= 5 {               // drain to the base/4 prefetch threshold
+		_, err = l.take(context.Background(), "key_pf", limit, 1)
+		require.NoError(t, err)
+	}
+	require.Equal(t, 2, qs.calls(), "the drain triggered a (successful) prefetch")
+	require.True(t, b.failUntil.IsZero(), "a successful prefetch closes the breaker")
+}
