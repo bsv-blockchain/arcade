@@ -106,13 +106,19 @@ type Resolver struct {
 
 // NewResolver builds a Resolver over lookup.
 func NewResolver(lookup Lookup, ttl, staleMax time.Duration) *Resolver {
-	positive, _ := lru.New[string, cacheEntry](positiveCacheSize) // errors only for size <= 0
-	negative, _ := lru.New[string, cacheEntry](negativeCacheSize) // errors only for size <= 0
-	return &Resolver{
+	r := &Resolver{
 		lookup: lookup, ttl: ttl, staleMax: staleMax, now: time.Now,
-		positive: positive, negative: negative,
 		refresh: make(map[string]refreshState),
 	}
+	// Failing state only matters while hash has a positive entry to serve
+	// stale (resolveStale), so it goes with that entry. Otherwise a key
+	// marked failing during an outage and never requested again would
+	// stay in refresh forever; this bounds it by positiveCacheSize. The
+	// callback runs under the LRU's lock, which is safe: nothing holds
+	// refreshMu while touching the caches.
+	r.positive, _ = lru.NewWithEvict(positiveCacheSize, func(hash string, _ cacheEntry) { r.clearFailing(hash) }) // errors only for size <= 0
+	r.negative, _ = lru.New[string, cacheEntry](negativeCacheSize)                                                // errors only for size <= 0
+	return r
 }
 
 // Resolve returns the usable key for raw, ErrUnauthorized, or ErrUnavailable
@@ -289,11 +295,16 @@ func (r *Resolver) maybeRefreshInBackground(hash string, now time.Time) {
 		defer func() {
 			finishedAt := r.now()
 			r.refreshMu.Lock()
-			if fetchErr != nil {
+			s, tracked := r.refresh[hash]
+			if fetchErr != nil && tracked {
 				// Re-arm from completion time, not kickoff time, so the
 				// attempt's own duration (including a full hang up to
-				// lookupTimeout) counts against the backoff too.
-				s := r.refresh[hash]
+				// lookupTimeout) counts against the backoff too. Not if
+				// the entry is gone: clearFailing ran meanwhile (a
+				// concurrent fetch succeeded, or the positive entry was
+				// evicted), and re-creating it would mark a key failing
+				// against a store just seen healthy -- serving it stale
+				// past ttl instead of re-reading it synchronously.
 				s.inFlight = false
 				s.retryAt = finishedAt.Add(staleRetryBackoff)
 				r.refresh[hash] = s

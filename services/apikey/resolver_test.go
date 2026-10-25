@@ -444,3 +444,54 @@ func TestResolveClearsFailingOnSuccessfulFetch(t *testing.T) {
 	require.Equal(t, "key_1", k.ID)
 	require.False(t, r.isFailing(Hash(raw)), "a successful fetch clears the failing marker even outside a background refresh")
 }
+
+// TestResolveFailedRefreshDoesNotRearmAfterClear: a background refresh
+// that fails after a concurrent fetch succeeded (and cleared the failing
+// marker) must not mark the key failing again -- the store was just seen
+// healthy, so the key's next expiry should re-read synchronously, not
+// serve stale.
+func TestResolveFailedRefreshDoesNotRearmAfterClear(t *testing.T) {
+	r, lk, clk, raw := newTestResolver(t)
+	_, err := r.Resolve(context.Background(), raw)
+	require.NoError(t, err)
+
+	lk.set(func(f *fakeLookup) { f.err = errors.New("store down") })
+	clk.advance(31 * time.Second)
+	_, err = r.Resolve(context.Background(), raw) // marks the key failing
+	require.NoError(t, err)
+	require.True(t, r.isFailing(Hash(raw)))
+
+	gate := make(chan struct{})
+	lk.set(func(f *fakeLookup) { f.gate = gate })
+	done := waitForRefresh(r)
+	clk.advance(staleRetryBackoff + time.Millisecond)
+	_, err = r.Resolve(context.Background(), raw) // kicks off the background refresh
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return lk.n() == 3 }, time.Second, time.Millisecond)
+
+	r.clearFailing(Hash(raw)) // a concurrent fetch succeeds meanwhile
+	close(gate)               // ...then the background attempt fails
+	<-done
+	require.False(t, r.isFailing(Hash(raw)), "a stale failure must not re-arm a marker a success cleared")
+}
+
+// TestResolveEvictionDropsFailingState: failing state is bounded by the
+// positive cache -- a key marked failing and never requested again must
+// not stay in the refresh map once its entry leaves the cache.
+func TestResolveEvictionDropsFailingState(t *testing.T) {
+	r, lk, clk, raw := newTestResolver(t)
+	_, err := r.Resolve(context.Background(), raw)
+	require.NoError(t, err)
+
+	lk.set(func(f *fakeLookup) { f.err = errors.New("store down") })
+	clk.advance(31 * time.Second)
+	_, err = r.Resolve(context.Background(), raw)
+	require.NoError(t, err)
+	require.True(t, r.isFailing(Hash(raw)))
+
+	r.positive.Remove(Hash(raw))
+	r.refreshMu.Lock()
+	n := len(r.refresh)
+	r.refreshMu.Unlock()
+	require.Zero(t, n, "evicting the positive entry drops its failing state")
+}
