@@ -15,14 +15,14 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 
-	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/broadcaster/config"
 )
 
 // TestSmoke_ChainedTxBatchOrdering is the load-bearing smoke test for
-// arcade's propagation dispatcher's parent-child ordering guarantee.
+// BSV Broadcaster's propagation dispatcher's parent-child ordering guarantee.
 //
 // It builds a forest of ~10k chained txs (mixed depths 2–10), submits
-// them via concurrent POST /txs calls, then captures every batch arcade
+// them via concurrent POST /txs calls, then captures every batch BSV Broadcaster
 // sends to a fake teranode and asserts:
 //
 //  1. No batch ever contains both a parent and one of its children.
@@ -43,7 +43,7 @@ func TestSmoke_ChainedTxBatchOrdering(t *testing.T) {
 }
 
 // TestSmoke_ChainedTxBatchOrdering_MultiPartition is the #295 variant: the
-// same forest, the same four invariants, but arcade.propagation runs 4
+// same forest, the same four invariants, but bsv-broadcaster.propagation runs 4
 // partitions with one dep-aware dispatcher each. The invariants only hold
 // because intake keys every submission's dependency family to one
 // partition (familyPartitionKeys) — key by txid instead (the pre-#295
@@ -68,7 +68,7 @@ func runChainedTxBatchOrdering(t *testing.T, partitions int) {
 	)
 
 	recorder := newRecordingTeranode(t)
-	rt := startArcadeSmoke(t, smokeOptions{
+	rt := startBroadcasterSmoke(t, smokeOptions{
 		TeranodeURL:           recorder.URL(),
 		PropagationPartitions: partitions,
 	})
@@ -171,13 +171,13 @@ func buildSubmissionBatches(chains [][]*bt.Tx, batchSize int) [][]*bt.Tx {
 	return batches
 }
 
-// postTxs POSTs a batch to arcade's /txs endpoint and returns nil on a
+// postTxs POSTs a batch to BSV Broadcaster's /txs endpoint and returns nil on a
 // 2xx response. The body is concatenated raw tx bytes in BSV Extended
-// Format — arcade's validator (post PR #171) calls spv.Verify
+// Format — BSV Broadcaster's validator (post PR #171) calls spv.Verify
 // unconditionally, which needs each input's PreviousTxScript +
 // PreviousTxSatoshis. Those bins live on the wire only in EF; sending
 // standard-format bytes is rejected with "'PreviousTx' not supplied".
-func postTxs(rt *arcadeRuntime, txs []*bt.Tx) error {
+func postTxs(rt *broadcasterRuntime, txs []*bt.Tx) error {
 	var body bytes.Buffer
 	for _, tx := range txs {
 		body.Write(tx.ExtendedBytes())

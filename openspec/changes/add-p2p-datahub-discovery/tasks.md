@@ -19,10 +19,10 @@
 
 - [x] 3.1 Replace the stub in `services/p2p_client/client.go` — keep the existing `BlockNotification` type and the dedup/cleanup helpers (still useful if we later subscribe to blocks), but wire the lifecycle to a real `go-p2p-message-bus` client.
 - [x] 3.2 Expand the `Client` struct to hold `bus p2p.Client`, `teranode *teranode.Client`, `done chan struct{}` and a `sync.WaitGroup` for subscription goroutines.
-- [x] 3.3 Change `New(...)` signature to also take `*teranode.Client` so the service can call `AddEndpoints`. Update `cmd/arcade/main.go:buildServices` to pass it.
+- [x] 3.3 Change `New(...)` signature to also take `*teranode.Client` so the service can call `AddEndpoints`. Update `cmd/bsv-broadcaster/main.go:buildServices` to pass it.
 - [x] 3.4 In `Start(ctx)`, short-circuit to `return nil` if `cfg.P2P.DatahubDiscovery == false` — no libp2p connect, no goroutines.
 - [x] 3.5 When enabled, load or generate the libp2p private key: read `cfg.P2P.PrivateKeyPath` if set, else generate a fresh key via `p2p.GeneratePrivateKey()` and log the peer ID it corresponds to.
-- [x] 3.6 Construct the `p2p.Client` via `p2p.NewClient(p2p.Config{Name: "arcade", Logger, PrivateKey, Port: cfg.P2P.ListenPort, BootstrapPeers: cfg.P2P.BootstrapPeers, DHTMode: cfg.P2P.DHTMode, ...})`. Propagate errors up.
+- [x] 3.6 Construct the `p2p.Client` via `p2p.NewClient(p2p.Config{Name: "bsv-broadcaster", Logger, PrivateKey, Port: cfg.P2P.ListenPort, BootstrapPeers: cfg.P2P.BootstrapPeers, DHTMode: cfg.P2P.DHTMode, ...})`. Propagate errors up.
 - [x] 3.7 Subscribe to the topic `fmt.Sprintf("%s-node_status", cfg.P2P.TopicPrefix)` and log the full topic string at info level.
 - [x] 3.8 Launch a goroutine reading from the subscription channel; on each message call a new `handleNodeStatus(msg p2p.Message)` method. Guard the loop with `select { case <-ctx.Done(): return }` so shutdown is prompt.
 
@@ -36,7 +36,7 @@
 
 ## 5. Wiring & main.go
 
-- [x] 5.1 In `cmd/arcade/main.go` where `teranodeClient` is constructed, pass the same pointer into the new `p2p_client.New`.
+- [x] 5.1 In `cmd/bsv-broadcaster/main.go` where `teranodeClient` is constructed, pass the same pointer into the new `p2p_client.New`.
 - [x] 5.2 Register the p2p_client service in `buildServices` for the `all` and `propagation` modes. Omit for modes that don't broadcast (e.g. `tx-validator`).
 - [x] 5.3 Confirm the service's `Stop` is invoked during the existing sequential-shutdown loop. Add a 10-second bound on the `p2p.Client.Close()` call to avoid hanging shutdown.
 
@@ -62,5 +62,5 @@
 
 - [x] 8.1 `go build ./...` and `go vet ./...` both clean.
 - [x] 8.2 `go test -race ./...` green, including the new concurrency test on `teranode.Client`. (All packages pass; a pre-existing `services/api_server/chaintracks_routes.go` SSE-writer race fails at HEAD and is unrelated to this change.)
-- [ ] 8.3 End-to-end smoke: run arcade against a local teranode (or a hand-rolled publisher that sends a `NodeStatusMessage` to the topic) and verify the URL shows up in arcade's endpoint list within one tick of the first announcement.
-- [ ] 8.4 Default-config smoke: run arcade with no `p2p` config section — behavior is identical to today (static URLs only, no libp2p listen port opened).
+- [ ] 8.3 End-to-end smoke: run BSV Broadcaster against a local teranode (or a hand-rolled publisher that sends a `NodeStatusMessage` to the topic) and verify the URL shows up in BSV Broadcaster's endpoint list within one tick of the first announcement.
+- [ ] 8.4 Default-config smoke: run BSV Broadcaster with no `p2p` config section — behavior is identical to today (static URLs only, no libp2p listen port opened).

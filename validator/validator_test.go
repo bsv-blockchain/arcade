@@ -13,7 +13,7 @@ import (
 	tnerr "github.com/bsv-blockchain/teranode/errors"
 	tnvalidator "github.com/bsv-blockchain/teranode/services/validator"
 
-	arcerrors "github.com/bsv-blockchain/arcade/errors"
+	arcerrors "github.com/bsv-blockchain/broadcaster/errors"
 )
 
 // --- construction --------------------------------------------------------
@@ -421,7 +421,7 @@ func largePushTx(pushSize int) *sdkTx.Transaction {
 
 // TestValidate_PostGenesisLargePushes is the #214 regression, driven through the
 // real BDK engine. The historical 520-byte MAX_SCRIPT_ELEMENT_SIZE_BEFORE_GENESIS
-// limit is keyed off the *source UTXO height*, not the spending block height. Arcade
+// limit is keyed off the *source UTXO height*, not the spending block height. BSV Broadcaster
 // reported height 1 (pre-Genesis) for every input, so BDK applied the limit to
 // post-Genesis spends and rejected otherwise-valid transactions that push >520-byte
 // elements (the same transactions ARC accepts and miners mine).
@@ -430,7 +430,7 @@ func largePushTx(pushSize int) *sdkTx.Transaction {
 // post-Genesis candidate block height in policy mode — so the limit no longer applies.
 // Each case proves the rejection is purely a function of the reported source height:
 // at pre-Genesis height 1 BDK rejects >520-byte pushes, at a post-Genesis height it
-// accepts them, and arcade's public intake (which now reports the sentinel) accepts.
+// accepts them, and BSV Broadcaster's public intake (which now reports the sentinel) accepts.
 func TestValidate_PostGenesisLargePushes(t *testing.T) {
 	v := NewValidator(nil)
 	ctx := context.Background()
@@ -446,7 +446,7 @@ func TestValidate_PostGenesisLargePushes(t *testing.T) {
 
 			// Root-cause control: call the BDK validator directly, varying only the
 			// source UTXO height. Use the fee-agnostic validator so fees never
-			// interfere; NewDefaultOptions keeps it in policy mode (arcade's mode).
+			// interfere; NewDefaultOptions keeps it in policy mode (BSV Broadcaster's mode).
 			btx, err := toExtendedBT(tx)
 			if err != nil {
 				t.Fatalf("toExtendedBT: %v", err)
@@ -465,10 +465,10 @@ func TestValidate_PostGenesisLargePushes(t *testing.T) {
 				t.Errorf("BDK must accept a %d-byte push at a post-Genesis source height, got %v", size, postGenesisErr)
 			}
 
-			// Regression guard: arcade's public intake must accept all sizes. Before
+			// Regression guard: BSV Broadcaster's public intake must accept all sizes. Before
 			// the fix this fails for 521 and 5210 with a push-value-size error.
 			if err := v.ValidateTransaction(ctx, tx, true); err != nil {
-				t.Errorf("arcade intake must accept a %d-byte post-Genesis push, got %v", size, err)
+				t.Errorf("BSV Broadcaster intake must accept a %d-byte post-Genesis push, got %v", size, err)
 			}
 		})
 	}

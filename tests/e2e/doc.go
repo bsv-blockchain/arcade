@@ -1,5 +1,5 @@
 // Package e2e holds the end-to-end smoke test suite for the
-// arcade ↔ merkle-service integration.
+// BSV Broadcaster ↔ merkle-service integration.
 //
 // All files in this tree carry the `e2e` build tag so the suite stays out
 // of the default `go test ./...` run. Invoke with:

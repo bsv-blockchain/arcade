@@ -46,6 +46,7 @@ peer_cache.json
 *.log
 
 /arcade
+/bsv-broadcaster
 config.yaml
 
 .claude/

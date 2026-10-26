@@ -35,7 +35,7 @@ type ChainOpts struct {
 // populate the propagation envelope's input_txids field.
 //
 // Callers MUST serialize each tx via tx.ExtendedBytes() before posting
-// to arcade — the validator reads the per-input PreviousTxScript +
+// to BSV Broadcaster — the validator reads the per-input PreviousTxScript +
 // PreviousTxSatoshis the EF wire encoding carries to build the extended
 // tx that BDK validates, and rejects standard-format txs that omit it.
 // See validator/validator.go:ValidateTransaction and PR #171.

@@ -25,22 +25,22 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	arcerrors "github.com/bsv-blockchain/arcade/errors"
-	"github.com/bsv-blockchain/arcade/events"
-	"github.com/bsv-blockchain/arcade/kafka"
-	"github.com/bsv-blockchain/arcade/logfields"
-	"github.com/bsv-blockchain/arcade/merkleservice"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/services"
-	"github.com/bsv-blockchain/arcade/store"
-	"github.com/bsv-blockchain/arcade/teranode"
+	"github.com/bsv-blockchain/broadcaster/config"
+	arcerrors "github.com/bsv-blockchain/broadcaster/errors"
+	"github.com/bsv-blockchain/broadcaster/events"
+	"github.com/bsv-blockchain/broadcaster/kafka"
+	"github.com/bsv-blockchain/broadcaster/logfields"
+	"github.com/bsv-blockchain/broadcaster/merkleservice"
+	"github.com/bsv-blockchain/broadcaster/metrics"
+	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/services"
+	"github.com/bsv-blockchain/broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/teranode"
 )
 
 // propagationTracerName identifies this package's spans/tracer to the OTEL
 // SDK, per the same package-import-path convention as kafka.tracerName.
-const propagationTracerName = "github.com/bsv-blockchain/arcade/services/propagation"
+const propagationTracerName = "github.com/bsv-blockchain/broadcaster/services/propagation"
 
 // batchSpanMaxLinks caps the number of producer-span links attached to a
 // propagation.broadcast span. Per OTel's recommended batch-messaging
@@ -309,7 +309,7 @@ const (
 	// the expected signature of a child broadcast before its
 	// cross-submission parent, so per the #254 principle it is a
 	// CONDITION, not a verdict: never terminalize REJECTED on it alone.
-	// processBatch consults arcade's own store first — a parent
+	// processBatch consults BSV Broadcaster's own store first — a parent
 	// terminally REJECTED cascades the child REJECTED (that's a real
 	// verdict); anything else requeues, and budget exhaustion parks at
 	// PENDING_RETRY for the reaper's durable retry. errMsg carries the
@@ -631,7 +631,7 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 	var terminalParked []string
 	// published* drive the bulk publish: only rows whose store status
 	// actually transitioned. publishedRejected carries whole rows, not just
-	// txids, because a rejection's payload (the reason arcade just persisted)
+	// txids, because a rejection's payload (the reason BSV Broadcaster just persisted)
 	// has to ride the event out — see publishRejections.
 	publishedAccepted := make([]string, 0, accepted)
 	publishedRejected := make([]*models.TransactionStatus, 0, rejected)
@@ -814,7 +814,7 @@ func parentTxIDsOf(msg propagationMsg) []string {
 	return parents
 }
 
-// rejectedAncestor consults arcade's own status store for msg's parents
+// rejectedAncestor consults BSV Broadcaster's own status store for msg's parents
 // and returns the first that is terminally REJECTED. This is the ONLY
 // path from a Teranode missing-parent condition to a REJECTED child: the
 // ancestor's rejection is a real verdict, so inheriting it mirrors the
@@ -853,7 +853,7 @@ func (p *Propagator) rejectedAncestor(ctx context.Context, msg propagationMsg) (
 
 			row, err := p.store.GetStatus(ctx, ancestor)
 			if err != nil || row == nil {
-				// Not arcade's tx, or a transient read failure. Either way we
+				// Not BSV Broadcaster's tx, or a transient read failure. Either way we
 				// know nothing about it, and inventing a verdict from silence
 				// is exactly what this function exists to avoid.
 				continue
@@ -1030,7 +1030,7 @@ func (p *Propagator) publishBulkStatus(ctx context.Context, status models.Status
 // MINED) and wrong for REJECTED, the one status whose payload decides what
 // the client does next — UTXO_SPENT means "your view of the chain is stale,
 // resync", TX_INVALID means "these bytes will never be accepted, don't
-// retry". Until this, arcade parsed the Teranode reason, persisted it on the
+// retry". Until this, BSV Broadcaster parsed the Teranode reason, persisted it on the
 // row, logged it, and then published REJECTED with an empty extraInfo.
 //
 // Nothing was lost — the row keeps the reason and GET /tx/<txid> serves it —
@@ -1731,7 +1731,7 @@ func buildSubmittedOutpointIndex(batch []propagationMsg) map[string]int {
 // conflict verdicts name the spent outpoint rather than the submitted txid, so
 // #292 could tell that SOMETHING in the batch had failed but not what — and a
 // tx with neither an accept vote nor an attributable rejection falls to
-// requeue, forever. arcade does hold the submitted raw transactions, so for
+// requeue, forever. BSV Broadcaster does hold the submitted raw transactions, so for
 // the overwhelmingly common shape (one line per genuinely double-spent tx) it
 // can simply look up which submitted tx spends that outpoint and terminalize
 // it REJECTED with the real verdict.
@@ -1843,7 +1843,7 @@ func lineHasNestedTeranodeVerdict(line string) bool {
 //
 // It is therefore the one line shape where the peer's HTTP status carries
 // strictly more information than its message, and the only one for which
-// arcade consults that status. A nested code disqualifies it: a line carrying
+// BSV Broadcaster consults that status. A nested code disqualifies it: a line carrying
 // any named code other than PROCESSING is carrying a verdict, whatever wrapper
 // sits in front of it.
 func lineIsOpaqueProcessing(line string) bool {
@@ -1998,7 +1998,7 @@ func codeNameScore(name string) int {
 //	  verdict about the bytes; resubmitting after the lock expires (or the
 //	  peer's tip catches up) is expected to succeed, so the message gains an
 //	  explicit retryable hint. (Intake's finality gate catches most of these
-//	  against arcade's own tip; a line here means the peer's view trails.)
+//	  against BSV Broadcaster's own tip; a line here means the peer's view trails.)
 //	TX_CONFLICTING (36), UTXO_SPENT (70), TX_INVALID_DOUBLE_SPEND →
 //	  466 StatusConflict (double-spend attempt / input already spent).
 //	  Teranode's own /txs handler groups exactly these under HTTP 409
@@ -2252,7 +2252,7 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg, i
 			}
 		case txResultClassMissingParent:
 			// Condition, not verdict (#254/#295): resolved below against
-			// arcade's own store before anything terminalizes.
+			// BSV Broadcaster's own store before anything terminalizes.
 			missingParentMsgs = append(missingParentMsgs, batch[i])
 			missingParentLines = append(missingParentLines, res.errMsg)
 		default:
@@ -2562,7 +2562,7 @@ func (p *Propagator) parkExhaustedMerkleRegistrations(ctx context.Context, msgs 
 //
 // WHY this has to exist. Before it, "no verdict" meant "requeue", full stop,
 // and a batch that could never succeed simply went round forever. On
-// 2026-08-11 (dev-ovh-1, arcade v0.11.5) Teranode answered a 21-tx batch of
+// 2026-08-11 (dev-ovh-1, BSV Broadcaster v0.11.5) Teranode answered a 21-tx batch of
 // stale transactions with HTTP 409 and 21 conflict lines of the form
 // "UTXO_SPENT (70): <outpoint>:<vout> utxo already spent by tx <spender>[n]".
 // Those lines key under the spent outpoint, not the submitted txid, so
@@ -2570,7 +2570,7 @@ func (p *Propagator) parkExhaustedMerkleRegistrations(ctx context.Context, msgs 
 // attributable rejection either — every tx fell to the requeue arm. Result:
 // ~2,410 409s in two minutes, 42 of 43 batches requeued, 4,679 txs stuck in
 // the dispatcher's inFlight map pinning offsets, and 337,247 messages of lag
-// on the single-partition arcade.propagation topic frozen solid while the
+// on the single-partition bsv-broadcaster.propagation topic frozen solid while the
 // leader pod burned 4.2 CPU cores. Every newly submitted transaction sat at
 // RECEIVED until operators hand-seeked the consumer group past the backlog.
 //
@@ -2742,7 +2742,7 @@ func giveUpReason(maxAttempts int, lastReason string) string {
 // Give-up is the property the PENDING_RETRY path was missing entirely. A tx
 // spending an outpoint that does not exist — the most common client mistake
 // there is — draws TX_MISSING_PARENT forever: rejectedAncestor finds no
-// REJECTED ancestor because arcade has never seen the parent at all, so the
+// REJECTED ancestor because BSV Broadcaster has never seen the parent at all, so the
 // row can never be condemned and can never succeed. Before #299 those rows
 // accumulated without bound, monopolized the reaper's per-tick batch, and
 // were finally abandoned at 24h in a non-terminal state with no signal of
@@ -2753,7 +2753,7 @@ func giveUpReason(maxAttempts int, lastReason string) string {
 // quoted verbatim in the give-up reason. Without it every exhausted tx was
 // told the same story — that a parent it spends had never reached the network
 // — which is true only for the missing-parent case that motivated the escape.
-// A tx parked by a node-side fault, or by a verdict arcade could not attribute,
+// A tx parked by a node-side fault, or by a verdict BSV Broadcaster could not attribute,
 // got a confident explanation of something that never happened.
 func (p *Propagator) schedulePendingRetry(ctx context.Context, txid string, rawTx []byte, lastReason string) {
 	if p.store == nil || len(rawTx) == 0 {
@@ -2777,7 +2777,7 @@ func (p *Propagator) schedulePendingRetry(ctx context.Context, txid string, rawT
 			return
 		}
 		// Same reason string that just went onto the row. A give-up is the
-		// least self-evident rejection arcade issues — no peer ever answered
+		// least self-evident rejection BSV Broadcaster issues — no peer ever answered
 		// for this tx, so there is no verdict to quote and nothing about the
 		// bytes explains it — which makes it the one most worth carrying on
 		// the event rather than leaving to a GET /tx.
@@ -2846,7 +2846,7 @@ func (p *Propagator) broadcastChunk(ctx context.Context, chunk []propagationMsg,
 	if len(chunk) == 1 && p.teranodeBatchBytesCap > 0 && chunkBytes > p.teranodeBatchBytesCap {
 		// planChunks never pairs an oversize tx with another, so this fires
 		// once per oversize tx per broadcast attempt. It is sent regardless:
-		// Teranode, not arcade, rules on per-tx size policy.
+		// Teranode, not BSV Broadcaster, rules on per-tx size policy.
 		p.logger.Warn(
 			"transaction exceeds teranode_max_batch_bytes; broadcasting it alone",
 			logfields.TxID(chunk[0].TXID),
@@ -2863,7 +2863,7 @@ func (p *Propagator) broadcastChunk(ctx context.Context, chunk []propagationMsg,
 }
 
 // narrowChunk re-broadcasts a chunk as two halves after a peer returned a
-// failure line arcade could not bind to any submitted transaction.
+// failure line BSV Broadcaster could not bind to any submitted transaction.
 //
 // Teranode's public error boundary surfaces only the deepest allowlisted
 // cause, discarding the "[ProcessTransaction][<txid>]" wrapper — so for whole
@@ -2975,7 +2975,7 @@ func recordBroadcastOutcomes(tc *teranode.Client, outcomes []endpointOutcome) {
 			tc.RecordSuccess(o.endpoint)
 		case o.shapeRejected:
 			// Neutral. Charging the slow-track breaker would sideline a
-			// healthy peer whose body limit is merely below arcade's chunk
+			// healthy peer whose body limit is merely below BSV Broadcaster's chunk
 			// size; resetting it (the unanimous arm) would launder real
 			// failures the same peer produced earlier.
 		case unanimousReject:
@@ -3305,7 +3305,7 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 		// the remaining accepts would only requeue transactions this peer
 		// demonstrably took — the requeue churn #292 set out to stop.
 		alienCount, bestAlien := alienFailureLines(result.failures.Keyed(), inBatch)
-		// Alien lines are not a dead end. arcade holds the submitted raw
+		// Alien lines are not a dead end. BSV Broadcaster holds the submitted raw
 		// transactions, so the spent "<outpoint>:<vout>" a conflict line names
 		// can be matched against the batch's own inputs and the verdict handed
 		// to the tx that actually spends it. This is what stops the incident

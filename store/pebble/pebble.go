@@ -1,6 +1,6 @@
 // Package pebble implements store.Store and store.Leaser on top of
 // github.com/cockroachdb/pebble, a pure-Go LSM KV. It's the recommended
-// backend for arcade's zero-dependency standalone mode: no external
+// backend for BSV Broadcaster's zero-dependency standalone mode: no external
 // services, single binary, durable on disk.
 //
 // Layout: see keys.go for the key namespaces. Primary records hold
@@ -9,7 +9,7 @@
 // so stale index entries are removed atomically with the primary write.
 //
 // Single-process: Pebble takes an exclusive file lock on its data directory.
-// Running two arcade instances against the same path will fail at Open —
+// Running two BSV Broadcaster instances against the same path will fail at Open —
 // acceptable for standalone, mirrors the plan's single-node constraint.
 package pebble
 
@@ -26,11 +26,11 @@ import (
 
 	pebbledb "github.com/cockroachdb/pebble"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
-	"github.com/bsv-blockchain/arcade/store/bumpcache"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/metrics"
+	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/store/bumpcache"
 )
 
 // getOrInsertShards serializes GetOrInsertStatus per-txid so concurrent

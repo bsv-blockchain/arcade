@@ -6,7 +6,7 @@ import (
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/broadcaster/models"
 )
 
 const (
@@ -304,7 +304,7 @@ func (t *TxTracker) FilterTrackedHashes(hashes []chainhash.Hash) []chainhash.Has
 // FilterTrackedTxids is the hex-string form of FilterTrackedHashes. Returns
 // the subset of txids the tracker knows about (preserving input order) plus
 // the count of unknown txids — callers use the count to surface "STUMP
-// contained N leaves not watched by this arcade" without re-scanning.
+// contained N leaves not watched by this BSV Broadcaster" without re-scanning.
 //
 // Malformed hex inputs are counted as unknown rather than rejected; the
 // caller is the BUMP builder, which receives txids derived from on-disk

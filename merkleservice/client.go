@@ -16,7 +16,7 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/bsv-blockchain/arcade/logfields"
+	"github.com/bsv-blockchain/broadcaster/logfields"
 )
 
 const defaultTimeout = 30 * time.Second
@@ -67,7 +67,7 @@ func (e *RegisterError) Error() string {
 // watchRequest is the payload sent to POST /watch.
 // CallbackToken (when non-empty) tells merkle-service which bearer token to
 // attach as `Authorization: Bearer <token>` on outbound callback delivery to
-// arcade. arcade's /api/v1/merkle-service/callback receiver requires this
+// BSV Broadcaster. BSV Broadcaster's /api/v1/merkle-service/callback receiver requires this
 // header (PR #112 / F-018), so a missing token means callbacks 401. Empty
 // values are omitted from the JSON to preserve back-compat with merkle-service
 // builds that don't yet know the field.
@@ -80,7 +80,7 @@ type watchRequest struct {
 // Register registers a transaction with the Merkle Service for watching.
 // The Merkle Service will send callbacks to callbackURL when the transaction is seen or mined.
 // callbackToken is forwarded so merkle-service can authenticate itself back to
-// arcade on callback delivery; empty string disables forwarding (and the JSON
+// BSV Broadcaster on callback delivery; empty string disables forwarding (and the JSON
 // field is omitted entirely thanks to omitempty).
 func (c *Client) Register(ctx context.Context, txid, callbackURL, callbackToken string) error {
 	body, err := json.Marshal(watchRequest{
@@ -202,7 +202,7 @@ func (c *Client) Reprocess(ctx context.Context, blockHash, callbackURL, callback
 
 // Registration represents a single txid+callbackURL pair for batch registration.
 // CallbackToken is the bearer token merkle-service should use when calling
-// back to arcade for this registration; empty omits the field on the wire.
+// back to BSV Broadcaster for this registration; empty omits the field on the wire.
 type Registration struct {
 	TxID          string
 	CallbackURL   string

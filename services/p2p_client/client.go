@@ -28,12 +28,12 @@ import (
 	teranodep2p "github.com/bsv-blockchain/teranode/services/p2p"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/kafka"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/services"
-	"github.com/bsv-blockchain/arcade/ssrfguard"
-	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/kafka"
+	"github.com/bsv-blockchain/broadcaster/metrics"
+	"github.com/bsv-blockchain/broadcaster/services"
+	"github.com/bsv-blockchain/broadcaster/ssrfguard"
+	"github.com/bsv-blockchain/broadcaster/store"
 )
 
 // BlockNotification is retained from the earlier scaffold. It is not used by
@@ -70,7 +70,7 @@ type EndpointWriter interface {
 type clientFactory func(ctx context.Context, cfg p2pclient.Config) (teraClient, error)
 
 func defaultClientFactory(ctx context.Context, cfg p2pclient.Config) (teraClient, error) {
-	return cfg.Initialize(ctx, "arcade")
+	return cfg.Initialize(ctx, "bsv-broadcaster")
 }
 
 // dnsLookupTimeout bounds each DNS resolution performed while validating a
@@ -149,7 +149,7 @@ func (c *Client) Start(ctx context.Context) error {
 	}
 
 	// Derive storage path: explicit p2p.storage_path wins, else nest under
-	// the top-level arcade storage_path, else let the library default to
+	// the top-level BSV Broadcaster storage_path, else let the library default to
 	// ~/.teranode-p2p. The library also persists the libp2p private key
 	// here so the peer ID is stable across restarts.
 	storagePath := c.cfg.P2P.StoragePath
@@ -251,7 +251,7 @@ func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatu
 
 	// Surface the peer's advertised tip height as a gauge instead of
 	// discarding it with the debug log below: alongside
-	// arcade_chain_tip_height it is the datahub height-lag signal operators
+	// bsv_broadcaster_chain_tip_height it is the datahub height-lag signal operators
 	// alert on (issue #254 — peers chain-stalled 50+ blocks while every
 	// reachability probe stayed green). base_url-labelled only, so
 	// restart-churned peer ids can't grow the series set.
@@ -348,7 +348,7 @@ func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatu
 
 	// Record the peer's advertised policy only once its URL is in the registry,
 	// so the network values GET /policy derives come from exactly the peers
-	// arcade can actually broadcast to — the same set GET /health displays.
+	// BSV Broadcaster can actually broadcast to — the same set GET /health displays.
 	//
 	// This deliberately reverses the original ordering (issue #212), which ran
 	// ahead of the URL gate so a peer advertising a policy but no usable URL
@@ -368,7 +368,7 @@ func (c *Client) handleNodeStatus(ctx context.Context, msg teranodep2p.NodeStatu
 // limits. Peers advertising neither (older nodes) are skipped.
 //
 // Called only after the peer's datahub URL has been registered, so every row it
-// writes belongs to a peer arcade can broadcast to — see the call site for why
+// writes belongs to a peer BSV Broadcaster can broadcast to — see the call site for why
 // that matters.
 func (c *Client) recordPeerPolicy(ctx context.Context, msg teranodep2p.NodeStatusMessage) {
 	var sats, byts, maxTxSize, maxScriptSize uint64
@@ -492,7 +492,7 @@ func (c *Client) validateDatahubURL(ctx context.Context, peerID, raw string) (st
 
 // zapBusLogger adapts *zap.Logger to the message-bus logger interface, which
 // wants printf-style formatters. Mapping Debugf→Sugar().Debugf keeps the
-// structured logger's output coherent with the rest of arcade.
+// structured logger's output coherent with the rest of BSV Broadcaster.
 type zapBusLogger struct {
 	l *zap.Logger
 }

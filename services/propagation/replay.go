@@ -6,8 +6,8 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/merkleservice"
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/broadcaster/merkleservice"
+	"github.com/bsv-blockchain/broadcaster/models"
 )
 
 // defaultReplayLookback is the IterateStatusesSince window used when the
@@ -69,11 +69,11 @@ func (p *Propagator) replayLookback() time.Duration {
 // merkle-service /watch. Runs once on startup and exits.
 //
 // The /watch endpoint is idempotent on merkle-service (ON CONFLICT DO
-// NOTHING on the registrations table), and arcade only resubmits txs that
+// NOTHING on the registrations table), and BSV Broadcaster only resubmits txs that
 // its own store still considers in-flight, so the replay is safe to run
 // every boot without leaking work. The motivation is recovery: when
 // merkle-service loses its registration state (data wipe, recreated
-// namespace, schema migration that drops rows) arcade's in-flight txs are
+// namespace, schema migration that drops rows) BSV Broadcaster's in-flight txs are
 // silently no longer watched and no STUMP callbacks will ever fire. Without
 // replay the only fix is operator action per-tx; with replay every restart
 // resyncs the watch set against the durable state.

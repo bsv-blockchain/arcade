@@ -10,7 +10,7 @@ Both budgets are bounded. When the Merkle registration budget is spent, the tran
 
 Structured logs carry `retry_stage=merkle` or `retry_stage=network`. Prometheus series use the same two stages and never a txid:
 
-- `arcade_propagation_retry_total{stage="merkle"|"network"}`
-- `arcade_propagation_merkle_register_failures_total{reason}` — `claim_revoked`, `auth_error`, `http_5xx`, `timeout`, `transport`, `register_error`
-- `arcade_propagation_merkle_retry_exhausted_total` — Merkle budget spent
-- `arcade_propagation_requeue_exhausted_total` — network budget spent
+- `bsv_broadcaster_propagation_retry_total{stage="merkle"|"network"}`
+- `bsv_broadcaster_propagation_merkle_register_failures_total{reason}` — `claim_revoked`, `auth_error`, `http_5xx`, `timeout`, `transport`, `register_error`
+- `bsv_broadcaster_propagation_merkle_retry_exhausted_total` — Merkle budget spent
+- `bsv_broadcaster_propagation_requeue_exhausted_total` — network budget spent

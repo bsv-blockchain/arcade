@@ -1,6 +1,11 @@
+# The namespace, the chaintracks PVC name, the Aerospike server namespace and
+# its device file, and the Kafka topic prefix / consumer group all keep their
+# pre-rebrand "arcade" names: they identify persisted state, so renaming them
+# would point an upgraded deployment at fresh, empty storage. See
+# docs/migration-arcade-to-bsv-broadcaster.md.
 apiVersion: v1
 kind: Namespace
 metadata:
   name: arcade
   labels:
-    app.kubernetes.io/part-of: arcade
+    app.kubernetes.io/part-of: bsv-broadcaster

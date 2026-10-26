@@ -10,11 +10,11 @@ import (
 	"github.com/bsv-blockchain/go-chaintracks/chaintracks"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/logfields"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/logfields"
+	"github.com/bsv-blockchain/broadcaster/metrics"
+	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/store"
 )
 
 // maxReorgBranchWalk bounds how many heights below the new tip the
@@ -180,7 +180,7 @@ func (t *blockStatusTracker) recordReorg(ctx context.Context, ev *chaintracks.Re
 // new tip — the blocks a ReorgEvent makes canonical without naming them —
 // and resets to active any row a previous detection edge marked orphaned
 // (issue #339: the same-height loser that the next block builds on). It is
-// reactivate-only: rows arcade never recorded are not inserted (the tip
+// reactivate-only: rows BSV Broadcaster never recorded are not inserted (the tip
 // channel owns that), and parked rows stay parked (the watchdog's in-memory
 // park flag would otherwise disagree with the table). Each height is one
 // in-memory header lookup plus one row read; the walk runs nearest-first and

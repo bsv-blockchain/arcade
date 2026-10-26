@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/bsv-blockchain/arcade/bump"
+	"github.com/bsv-blockchain/broadcaster/bump"
 )
 
 // TestBuild_MinimalPathsVerify is the load-bearing sanity check: for a range of

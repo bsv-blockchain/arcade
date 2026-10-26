@@ -1,7 +1,7 @@
 //go:build e2e
 
 // Package e2e_test holds the end-to-end smoke scenarios. Each file
-// drives the harness through a representative arcade ↔ merkle-service
+// drives the harness through a representative BSV Broadcaster ↔ merkle-service
 // flow and asserts the user-visible outcome (tx reaching MINED,
 // callbacks delivered, etc.).
 package e2e_test
@@ -17,17 +17,17 @@ import (
 
 	"github.com/testcontainers/testcontainers-go"
 
-	"github.com/bsv-blockchain/arcade/tests/e2e/harness"
+	"github.com/bsv-blockchain/broadcaster/tests/e2e/harness"
 )
 
 // TestSmoke_TxRegistersWithMerkleService is the v1 smoke test: it
-// verifies that submitting a tx to arcade flows through the broadcast
-// path far enough that arcade calls merkle-service's /watch endpoint
-// with the parsed txid + arcade's callback URL/token.
+// verifies that submitting a tx to BSV Broadcaster flows through the broadcast
+// path far enough that BSV Broadcaster calls merkle-service's /watch endpoint
+// with the parsed txid + BSV Broadcaster's callback URL/token.
 //
 // The check exercises every wiring the harness touches:
 //
-//   - arcade boots in-process and accepts POST /tx
+//   - BSV Broadcaster boots in-process and accepts POST /tx
 //   - the intake handler parses and structurally validates the tx
 //   - the propagation service consumes from kafka and calls
 //     merkleClient.Register
@@ -37,7 +37,7 @@ import (
 //
 // What this test does NOT yet assert (tracked in MERKLE_SERVICE_GAPS):
 // the tx reaching MINED status. That requires constructing blocks
-// whose merkle root composition matches what arcade's
+// whose merkle root composition matches what BSV Broadcaster's
 // ValidateCompoundRoot expects, which is the next step.
 func TestSmoke_TxRegistersWithMerkleService(t *testing.T) {
 	skipIfNoDocker(t)
@@ -49,7 +49,7 @@ func TestSmoke_TxRegistersWithMerkleService(t *testing.T) {
 
 	h := harness.New(t)
 
-	rt := harness.StartArcade(t, harness.ArcadeOptions{
+	rt := harness.StartBroadcaster(t, harness.BroadcasterOptions{
 		MerkleServiceURL: h.Containers.MerkleHostURL,
 		DatahubURL:       datahub.HostURL(),
 		LibP2PBootstrap:  h.LibP2P.BootstrapMultiaddr(),
@@ -67,7 +67,7 @@ func TestSmoke_TxRegistersWithMerkleService(t *testing.T) {
 	}
 	t.Logf("broadcast tx %s", txid)
 
-	// arcade's propagation pipeline is asynchronous.
+	// BSV Broadcaster's propagation pipeline is asynchronous.
 	// Poll merkle-service's lookup endpoint until the registration
 	// shows up.
 	if err := waitForMerkleRegistration(ctx, h.Containers.MerkleHostURL, txid, 30*time.Second); err != nil {

@@ -126,7 +126,7 @@ func TestMemoryBrokerPartitions_PreservesPerPartitionValueOrder(t *testing.T) {
 // The existing memory-broker test compares partitionForKey against a local
 // re-implementation of the same arithmetic, so it cannot catch any of these.
 func TestNewSyncProducerConfig_RoutesByKeyHash(t *testing.T) {
-	const topic = "arcade.propagation"
+	const topic = "bsv-broadcaster.propagation"
 
 	cfg := newSyncProducerConfig()
 	if cfg.Producer.Partitioner == nil {
@@ -177,6 +177,6 @@ func TestNewSyncProducerConfig_RoutesByKeyHash(t *testing.T) {
 	}
 	if a != b {
 		t.Fatalf("partitioner is not deterministic across instances: %d vs %d — "+
-			"two arcade pods would place the same family on different partitions", a, b)
+			"two BSV Broadcaster pods would place the same family on different partitions", a, b)
 	}
 }

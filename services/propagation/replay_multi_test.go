@@ -11,17 +11,17 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/merkleservice"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/merkleservice"
+	"github.com/bsv-blockchain/broadcaster/metrics"
+	"github.com/bsv-blockchain/broadcaster/models"
 )
 
-// testArcadeCallbackURL and testArcadeCallbackToken are the callback_url and
+// testBroadcasterCallbackURL and testBroadcasterCallbackToken are the callback_url and
 // callback_token the propagation tests configure.
 const (
-	testArcadeCallbackURL   = "http://arcade/cb"
-	testArcadeCallbackToken = "tok"
+	testBroadcasterCallbackURL   = "http://broadcaster/cb"
+	testBroadcasterCallbackToken = "tok"
 )
 
 // A tx is registered once any endpoint accepts it: with one merkle-service
@@ -33,7 +33,7 @@ func TestRegisterBatch_PoolWithOneDeadEndpoint_FullyOK(t *testing.T) {
 	defer live.Close()
 
 	pool := merkleservice.NewPool([]string{live.URL, "http://127.0.0.1:1"}, "", 2*time.Second)
-	cfg := &config.Config{CallbackURL: testArcadeCallbackURL, CallbackToken: testArcadeCallbackToken}
+	cfg := &config.Config{CallbackURL: testBroadcasterCallbackURL, CallbackToken: testBroadcasterCallbackToken}
 	cfg.Propagation.MerkleConcurrency = 4
 	ms := newMockStore()
 	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, nil, pool)
@@ -79,7 +79,7 @@ func TestRunResyncReplay_TargetsOnlyThatEndpoint(t *testing.T) {
 	defer srvB.Close()
 
 	pool := merkleservice.NewPool([]string{srvA.URL, srvB.URL}, "", 2*time.Second)
-	cfg := &config.Config{CallbackURL: testArcadeCallbackURL, CallbackToken: testArcadeCallbackToken}
+	cfg := &config.Config{CallbackURL: testBroadcasterCallbackURL, CallbackToken: testBroadcasterCallbackToken}
 	cfg.Propagation.MerkleConcurrency = 4
 	ms := newMockStore()
 	ms.replayRows = []*models.TransactionStatus{
@@ -113,7 +113,7 @@ func TestScheduleResync_CoalescesAndHonorsStop(t *testing.T) {
 	defer srvA.Close()
 
 	pool := merkleservice.NewPool([]string{srvA.URL, srvB.URL}, "", 2*time.Second)
-	cfg := &config.Config{CallbackURL: testArcadeCallbackURL, CallbackToken: testArcadeCallbackToken}
+	cfg := &config.Config{CallbackURL: testBroadcasterCallbackURL, CallbackToken: testBroadcasterCallbackToken}
 	ms := newMockStore()
 	ms.replayRows = []*models.TransactionStatus{{TxID: "tx-1", Status: models.StatusSeenOnNetwork}}
 	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, nil, pool)
@@ -161,7 +161,7 @@ func TestRunMerkleReplay_DefaultSkipDependsOnEndpointCount(t *testing.T) {
 		srvB := newMerkleServer(logB, http.StatusOK)
 		defer srvB.Close()
 		pool := merkleservice.NewPool([]string{srvA.URL, srvB.URL}, "", 2*time.Second)
-		cfg := &config.Config{CallbackURL: testArcadeCallbackURL, CallbackToken: testArcadeCallbackToken}
+		cfg := &config.Config{CallbackURL: testBroadcasterCallbackURL, CallbackToken: testBroadcasterCallbackToken}
 		cfg.Propagation.MerkleReplaySkipRecentMinutes = -1
 		ms := newMockStore()
 		ms.replayRows = rows()
@@ -208,7 +208,7 @@ func TestReplay_BoundsWindowWhenStoreIgnoresSince(t *testing.T) {
 		{TxID: "tx-in-window", Status: models.StatusSeenOnNetwork, Timestamp: time.Now().Add(-time.Hour)},
 		{TxID: "tx-ancient", Status: models.StatusSeenOnNetwork, Timestamp: time.Now().Add(-30 * 24 * time.Hour)},
 	}
-	cfg := &config.Config{CallbackURL: testArcadeCallbackURL, CallbackToken: testArcadeCallbackToken}
+	cfg := &config.Config{CallbackURL: testBroadcasterCallbackURL, CallbackToken: testBroadcasterCallbackToken}
 	cfg.Propagation.MerkleReplaySkipRecentMinutes = 0
 	p := New(cfg, zap.NewNop(), nil, nil, sinceIgnoringStore{ms}, nil, nil, merkleservice.NewClient(srv.URL, "", 2*time.Second))
 	p.runMerkleReplay(context.Background())
@@ -245,7 +245,7 @@ func TestResyncLoop_RetriesFailedScan(t *testing.T) {
 	srvB := newMerkleServer(logB, http.StatusOK)
 	defer srvB.Close()
 	pool := merkleservice.NewPool([]string{srvA.URL, srvB.URL}, "", 2*time.Second)
-	cfg := &config.Config{CallbackURL: testArcadeCallbackURL, CallbackToken: testArcadeCallbackToken}
+	cfg := &config.Config{CallbackURL: testBroadcasterCallbackURL, CallbackToken: testBroadcasterCallbackToken}
 	ms := newMockStore()
 	ms.replayRows = []*models.TransactionStatus{{TxID: "tx-1", Status: models.StatusSeenOnNetwork}}
 	st := &flakyScanStore{mockStore: ms}
@@ -271,7 +271,7 @@ func TestRunMerkleReplay_RetainsTxsEveryEndpointRefused(t *testing.T) {
 	srvB := newMerkleServer(logB, http.StatusServiceUnavailable)
 	defer srvB.Close()
 	pool := merkleservice.NewPool([]string{srvA.URL, srvB.URL}, "", 2*time.Second, merkleservice.WithFailureThreshold(100))
-	cfg := &config.Config{CallbackURL: testArcadeCallbackURL, CallbackToken: testArcadeCallbackToken}
+	cfg := &config.Config{CallbackURL: testBroadcasterCallbackURL, CallbackToken: testBroadcasterCallbackToken}
 	ms := newMockStore()
 	ms.replayRows = []*models.TransactionStatus{
 		{TxID: "tx-a", Status: models.StatusSeenOnNetwork},

@@ -8,9 +8,9 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
-	"github.com/bsv-blockchain/arcade/store/storetest"
+	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/store/storetest"
 )
 
 // Requires a live mongod (newTestStore skips otherwise). Run by hand before

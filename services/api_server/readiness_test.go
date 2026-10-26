@@ -6,15 +6,15 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/services/servicetest"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/services/servicetest"
 )
 
 func newReadinessServer(port int) *Server {
 	cfg := &config.Config{}
 	cfg.APIServer.Host = "127.0.0.1"
 	cfg.APIServer.Port = port
-	cfg.Telemetry.ServiceName = "arcade-test"
+	cfg.Telemetry.ServiceName = "bsv-broadcaster-test"
 	return New(cfg, zap.NewNop(), nil, nil, nil, nil, nil, nil, nil, nil)
 }
 

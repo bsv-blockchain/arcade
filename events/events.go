@@ -6,7 +6,7 @@
 //
 // The default backend is Kafka — every Subscribe call mints a unique consumer
 // group so each subscriber receives every event published after subscription
-// (mirroring the in-memory broadcast semantics of the old arcade's monolithic
+// (mirroring the in-memory broadcast semantics of the old BSV Broadcaster's monolithic
 // Publisher). Groups start at the topic head: subscribers are live-only, and
 // missed history recovers through store-backed paths, never Kafka replay.
 package events
@@ -14,7 +14,7 @@ package events
 import (
 	"context"
 
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/broadcaster/models"
 )
 
 // Publisher is the contract every status-update fan-out backend implements.

@@ -31,7 +31,7 @@ The BUMP builder SHALL read the stored STUMPs for a block BEFORE waiting the con
 
 ### Requirement: Build-outcome labels distinguish the grace dispositions
 
-The BUMP builder SHALL stamp every terminal disposition of a BLOCK_PROCESSED message onto `arcade_bump_builder_build_duration_seconds{outcome}` using a closed, pre-registered label set in which successful builds carry `finalized_complete_no_grace` (grace window skipped after completeness verification) or `grace_waited` (all other successful builds), and completeness deferrals carry `deferred_incomplete`. The labels `success` and `incomplete_stumps` SHALL NOT be emitted.
+The BUMP builder SHALL stamp every terminal disposition of a BLOCK_PROCESSED message onto `bsv_broadcaster_bump_builder_build_duration_seconds{outcome}` using a closed, pre-registered label set in which successful builds carry `finalized_complete_no_grace` (grace window skipped after completeness verification) or `grace_waited` (all other successful builds), and completeness deferrals carry `deferred_incomplete`. The labels `success` and `incomplete_stumps` SHALL NOT be emitted.
 
 #### Scenario: Deferral is stamped with the renamed failure label
 

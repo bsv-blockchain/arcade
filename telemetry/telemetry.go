@@ -1,6 +1,6 @@
-// Package telemetry owns the OpenTelemetry provider lifecycle for arcade:
+// Package telemetry owns the OpenTelemetry provider lifecycle for BSV Broadcaster:
 // building the shared resource, wiring the OTLP trace/metric exporters, and
-// bridging the existing Prometheus `arcade_*` metrics onto the OTLP metric
+// bridging the existing Prometheus `bsv_broadcaster_*` metrics onto the OTLP metric
 // pipeline. See docs/plans/otel-integration.md for the design.
 //
 // The package is off by default. With cfg.Enabled == false, Init installs no
@@ -30,7 +30,7 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/broadcaster/config"
 )
 
 // defaultExportTimeout bounds Shutdown when cfg.ExportTimeoutMs is unset
@@ -41,11 +41,11 @@ const defaultExportTimeout = 10 * time.Second
 // itself intentionally omits (config/config.go keeps Telemetry free of
 // process-identity fields so the block stays purely about the OTLP pipeline).
 type Options struct {
-	// Version is the arcade build version (version.Version), recorded as the
+	// Version is the BSV Broadcaster build version (version.Version), recorded as the
 	// resource's service.version attribute.
 	Version string
-	// Mode is the running arcade mode (cfg.Mode: "all", "api-server", …),
-	// recorded as the arcade.mode resource attribute.
+	// Mode is the running BSV Broadcaster mode (cfg.Mode: "all", "api-server", …),
+	// recorded as the bsv_broadcaster.mode resource attribute.
 	Mode string
 	// InstanceID overrides the resource's service.instance.id. When empty,
 	// Init prefers the POD_NAME environment variable, falling back to
@@ -201,7 +201,7 @@ func buildResource(ctx context.Context, cfg config.TelemetryConfig, opts Options
 		attrs = append(attrs, semconv.ServiceInstanceID(id))
 	}
 	if opts.Mode != "" {
-		attrs = append(attrs, attribute.String("arcade.mode", opts.Mode))
+		attrs = append(attrs, attribute.String("bsv_broadcaster.mode", opts.Mode))
 	}
 	base := resource.NewSchemaless(attrs...)
 
@@ -219,7 +219,7 @@ func buildResource(ctx context.Context, cfg config.TelemetryConfig, opts Options
 
 // resolveInstanceID implements the service.instance.id precedence documented
 // on Options.InstanceID: explicit override, then POD_NAME (set by the k8s
-// downward API in every arcade Deployment), then os.Hostname().
+// downward API in every BSV Broadcaster Deployment), then os.Hostname().
 func resolveInstanceID(opts Options) string {
 	if opts.InstanceID != "" {
 		return opts.InstanceID
@@ -296,7 +296,7 @@ func initTraces(ctx context.Context, cfg config.TelemetryConfig, res *resource.R
 
 // initMetrics builds the OTLP metric exporter, a PeriodicReader that also
 // pulls from the Prometheus default registry via the OTEL contrib bridge
-// (so every promauto arcade_* instrument in metrics/metrics.go flows through
+// (so every promauto bsv_broadcaster_* instrument in metrics/metrics.go flows through
 // without call-site changes), and the resulting MeterProvider.
 func initMetrics(ctx context.Context, cfg config.TelemetryConfig, res *resource.Resource) (*sdkmetric.MeterProvider, func(context.Context) error, func(context.Context) error, error) {
 	if cfg.Endpoint == "" && !hasOTLPEndpointEnv("METRICS") {
@@ -353,7 +353,7 @@ func initMetrics(ctx context.Context, cfg config.TelemetryConfig, res *resource.
 // transport records `durationToSeconds(...)`, so the boundaries are read in
 // the same unit the instrumentation writes. Every value is also an edge of
 // the shared latency buckets in metrics/metrics.go, so a quantile taken off
-// this histogram and one taken off `arcade_teranode_request_duration_seconds`
+// this histogram and one taken off `bsv_broadcaster_teranode_request_duration_seconds`
 // for the same calls interpolate over the same edges rather than different
 // ones.
 //
@@ -369,7 +369,7 @@ var httpClientDurationBoundaries = []float64{0.005, 0.025, 0.1, 0.25, 1, 2.5, 10
 // metricViews returns the SDK Views registered on the MeterProvider.
 //
 // Views only reach instruments created through the OTEL metric API. The
-// `arcade_*` metrics arrive on the same reader through
+// `bsv_broadcaster_*` metrics arrive on the same reader through
 // prometheusbridge.NewMetricProducer, which appends already-aggregated
 // ScopeMetrics at collection time and never passes through view resolution —
 // so their promauto bucket definitions in metrics/metrics.go stay

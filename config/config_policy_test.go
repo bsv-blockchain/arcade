@@ -14,7 +14,7 @@ func loadValidatorDefaults(t *testing.T) ValidatorConfig {
 	t.Helper()
 	viper.Reset()
 	t.Cleanup(viper.Reset)
-	viper.SetEnvPrefix("ARCADE")
+	viper.SetEnvPrefix("BSV_BROADCASTER")
 	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	viper.AutomaticEnv()
 	setDefaults()
@@ -60,13 +60,13 @@ func TestPolicyConfigDefaults(t *testing.T) {
 }
 
 func TestPolicyConfigEnvOverrides(t *testing.T) {
-	t.Setenv("ARCADE_VALIDATOR_MIN_FEE_PER_KB", "250")
-	t.Setenv("ARCADE_VALIDATOR_MAX_TX_SIZE_POLICY", "7777")
-	t.Setenv("ARCADE_VALIDATOR_MAX_SCRIPT_SIZE_POLICY", "8888")
-	t.Setenv("ARCADE_VALIDATOR_MAX_TX_SIGOPS_COUNTS_POLICY", "99")
-	t.Setenv("ARCADE_VALIDATOR_STANDARD_FORMAT_SUPPORTED", "false")
-	t.Setenv("ARCADE_VALIDATOR_OBSERVED_FEE_TTL_MS", "60000")
-	t.Setenv("ARCADE_VALIDATOR_OBSERVED_FEE_REFRESH_MS", "5000")
+	t.Setenv("BSV_BROADCASTER_VALIDATOR_MIN_FEE_PER_KB", "250")
+	t.Setenv("BSV_BROADCASTER_VALIDATOR_MAX_TX_SIZE_POLICY", "7777")
+	t.Setenv("BSV_BROADCASTER_VALIDATOR_MAX_SCRIPT_SIZE_POLICY", "8888")
+	t.Setenv("BSV_BROADCASTER_VALIDATOR_MAX_TX_SIGOPS_COUNTS_POLICY", "99")
+	t.Setenv("BSV_BROADCASTER_VALIDATOR_STANDARD_FORMAT_SUPPORTED", "false")
+	t.Setenv("BSV_BROADCASTER_VALIDATOR_OBSERVED_FEE_TTL_MS", "60000")
+	t.Setenv("BSV_BROADCASTER_VALIDATOR_OBSERVED_FEE_REFRESH_MS", "5000")
 
 	v := loadValidatorDefaults(t)
 

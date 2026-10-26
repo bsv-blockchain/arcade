@@ -1,27 +1,63 @@
 package kafka
 
+// DefaultTopicPrefix namespaces every topic unless kafka.topic_prefix says
+// otherwise. Deployments that predate the BSV Broadcaster rebrand run with
+// prefix "arcade" so they keep consuming their existing topics.
+const DefaultTopicPrefix = "bsv-broadcaster"
+
+// Topic name suffixes; every topic is "<prefix><suffix>".
 const (
+	suffixBlock          = ".block"
+	suffixBlockProcessed = ".block_processed"
+	suffixTransaction    = ".transaction"
+	suffixPropagation    = ".propagation"
+	suffixStatusUpdate   = ".tx_status"
+	suffixDLQ            = ".dlq"
+)
+
+// Topic names. They are variables only so SetTopicPrefix can apply
+// kafka.topic_prefix at startup; treat them as constants otherwise.
+var (
 	// TopicBlock is retained only for the p2p_client scaffold (which is not
 	// registered in main). It is not created by AllTopics() and has no consumers.
-	TopicBlock          = "arcade.block"
-	TopicBlockProcessed = "arcade.block_processed"
-	TopicTransaction    = "arcade.transaction"
-	TopicPropagation    = "arcade.propagation"
+	TopicBlock          = DefaultTopicPrefix + suffixBlock
+	TopicBlockProcessed = DefaultTopicPrefix + suffixBlockProcessed
+	TopicTransaction    = DefaultTopicPrefix + suffixTransaction
+	TopicPropagation    = DefaultTopicPrefix + suffixPropagation
 	// TopicStatusUpdate carries transaction status mutations from every
 	// service that writes to the store (validator, propagation, bump-builder,
 	// api-server). It exists so the api-server SSE handler and webhook
 	// service can fan out updates to clients without depending on which pod
 	// the mutation originated from.
-	TopicStatusUpdate = "arcade.tx_status"
+	TopicStatusUpdate = DefaultTopicPrefix + suffixStatusUpdate
 
 	// Dead-letter queue topics
-	TopicBlockProcessedDLQ = "arcade.block_processed.dlq"
-	TopicTransactionDLQ    = "arcade.transaction.dlq"
-	TopicPropagationDLQ    = "arcade.propagation.dlq"
-	TopicStatusUpdateDLQ   = "arcade.tx_status.dlq"
+	TopicBlockProcessedDLQ = TopicBlockProcessed + suffixDLQ
+	TopicTransactionDLQ    = TopicTransaction + suffixDLQ
+	TopicPropagationDLQ    = TopicPropagation + suffixDLQ
+	TopicStatusUpdateDLQ   = TopicStatusUpdate + suffixDLQ
 )
 
-// AllTopics returns all primary topics created/managed by arcade.
+// SetTopicPrefix renames every topic to "<prefix>.<name>"; an empty prefix
+// means DefaultTopicPrefix. It is not safe for concurrent use: app.Bootstrap
+// calls it once, before any broker, producer or consumer exists.
+func SetTopicPrefix(prefix string) {
+	if prefix == "" {
+		prefix = DefaultTopicPrefix
+	}
+	TopicBlock = prefix + suffixBlock
+	TopicBlockProcessed = prefix + suffixBlockProcessed
+	TopicTransaction = prefix + suffixTransaction
+	TopicPropagation = prefix + suffixPropagation
+	TopicStatusUpdate = prefix + suffixStatusUpdate
+
+	TopicBlockProcessedDLQ = DLQTopic(TopicBlockProcessed)
+	TopicTransactionDLQ = DLQTopic(TopicTransaction)
+	TopicPropagationDLQ = DLQTopic(TopicPropagation)
+	TopicStatusUpdateDLQ = DLQTopic(TopicStatusUpdate)
+}
+
+// AllTopics returns all primary topics created/managed by BSV Broadcaster.
 func AllTopics() []string {
 	return []string{
 		TopicBlockProcessed,
@@ -33,5 +69,5 @@ func AllTopics() []string {
 
 // DLQTopic returns the dead-letter topic name for a given primary topic.
 func DLQTopic(topic string) string {
-	return topic + ".dlq"
+	return topic + suffixDLQ
 }

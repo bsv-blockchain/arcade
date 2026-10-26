@@ -1,46 +1,46 @@
 # Metrics
 
-Arcade exposes a Prometheus scrape endpoint at `/metrics` on both the health
+BSV Broadcaster exposes a Prometheus scrape endpoint at `/metrics` on both the health
 server (port `health.port`, default `8081`) and the API server (port
 `api.port`, default `8080`). Either is fine — pick the one your service mode
 runs.
 
-These same `arcade_*` metrics are also dual-exported over OTLP (bridged
+These same `bsv_broadcaster_*` metrics are also dual-exported over OTLP (bridged
 straight from this Prometheus registry) when telemetry is enabled — see
 [`docs/observability.md`](../docs/observability.md) for the OTLP pipeline,
 config/env reference, and the structured-log field canon used for
 transaction-lifecycle logging.
 
-All metric names start with `arcade_` so they live in their own namespace.
+All metric names start with `bsv_broadcaster_` so they live in their own namespace.
 
 ## What to alert on
 
 | Symptom | Metric | Suggested rule |
 |---|---|---|
-| Validation pipeline backed up | `arcade_tx_validator_pending_depth` | `> 1000 for 1m` |
-| Propagation Kafka publish failing | `arcade_tx_validator_publish_carry_depth` | `> 0 for 30s` (any non-zero is a smell) |
-| Validate flush slowing down | `histogram_quantile(0.95, rate(arcade_tx_validator_flush_duration_seconds_bucket[5m]))` | `> 1s` |
-| Broadcast tail latency | `histogram_quantile(0.95, rate(arcade_propagation_broadcast_duration_seconds_bucket[5m]))` | `> 5s` |
-| Reaper not running anywhere | `sum(arcade_propagation_reaper_lease_held)` | `< 1 for 5m` (failover stuck) |
-| Reaper running on multiple replicas | `sum(arcade_propagation_reaper_lease_held)` | `> 1 for 30s` (split brain) |
-| BUMP build failures | `arcade_bump_builder_build_duration_seconds_count` by `outcome` | copy-pasteable PromQL in the note below (a regex over the failure outcomes; its `\|` chars can't live in a table cell) |
-| Blocks arriving with no STUMPs | `rate(arcade_bump_builder_empty_stump_blocks_total[5m])` | `> 0 for 15m` (see note) |
-| Datahub endpoint flapping | `changes(arcade_teranode_endpoint_healthy[5m])` | `> 4` |
-| All datahubs unhealthy | `sum(arcade_teranode_endpoint_healthy{}) == 0` | for 1m |
-| API errors | `rate(arcade_api_request_duration_seconds_count{status_class="5xx"}[5m])` | `> 0` |
-| Kafka publish failures | `rate(arcade_kafka_produce_errors_total[5m])` | `> 0 for 1m` |
-| DLQ growth | `rate(arcade_kafka_messages_total{op="dlq"}[5m])` | `> 0` |
-| Network retry budget exhausted | `rate(arcade_propagation_requeue_exhausted_total[5m])` | `> 0` |
-| Merkle registration retry budget exhausted | `rate(arcade_propagation_merkle_retry_exhausted_total[5m])` | `> 0` |
+| Validation pipeline backed up | `bsv_broadcaster_tx_validator_pending_depth` | `> 1000 for 1m` |
+| Propagation Kafka publish failing | `bsv_broadcaster_tx_validator_publish_carry_depth` | `> 0 for 30s` (any non-zero is a smell) |
+| Validate flush slowing down | `histogram_quantile(0.95, rate(bsv_broadcaster_tx_validator_flush_duration_seconds_bucket[5m]))` | `> 1s` |
+| Broadcast tail latency | `histogram_quantile(0.95, rate(bsv_broadcaster_propagation_broadcast_duration_seconds_bucket[5m]))` | `> 5s` |
+| Reaper not running anywhere | `sum(bsv_broadcaster_propagation_reaper_lease_held)` | `< 1 for 5m` (failover stuck) |
+| Reaper running on multiple replicas | `sum(bsv_broadcaster_propagation_reaper_lease_held)` | `> 1 for 30s` (split brain) |
+| BUMP build failures | `bsv_broadcaster_bump_builder_build_duration_seconds_count` by `outcome` | copy-pasteable PromQL in the note below (a regex over the failure outcomes; its `\|` chars can't live in a table cell) |
+| Blocks arriving with no STUMPs | `rate(bsv_broadcaster_bump_builder_empty_stump_blocks_total[5m])` | `> 0 for 15m` (see note) |
+| Datahub endpoint flapping | `changes(bsv_broadcaster_teranode_endpoint_healthy[5m])` | `> 4` |
+| All datahubs unhealthy | `sum(bsv_broadcaster_teranode_endpoint_healthy{}) == 0` | for 1m |
+| API errors | `rate(bsv_broadcaster_api_request_duration_seconds_count{status_class="5xx"}[5m])` | `> 0` |
+| Kafka publish failures | `rate(bsv_broadcaster_kafka_produce_errors_total[5m])` | `> 0 for 1m` |
+| DLQ growth | `rate(bsv_broadcaster_kafka_messages_total{op="dlq"}[5m])` | `> 0` |
+| Network retry budget exhausted | `rate(bsv_broadcaster_propagation_requeue_exhausted_total[5m])` | `> 0` |
+| Merkle registration retry budget exhausted | `rate(bsv_broadcaster_propagation_merkle_retry_exhausted_total[5m])` | `> 0` |
 
-Merkle `/watch` failures increment `arcade_propagation_retry_total{stage="merkle"}` and `arcade_propagation_merkle_register_failures_total`. They do not increment `arcade_propagation_retry_total{stage="network"}` or `arcade_propagation_requeue_exhausted_total`. See [propagation retry domains](../docs/propagation-retry-domains.md).
+Merkle `/watch` failures increment `bsv_broadcaster_propagation_retry_total{stage="merkle"}` and `bsv_broadcaster_propagation_merkle_register_failures_total`. They do not increment `bsv_broadcaster_propagation_retry_total{stage="network"}` or `bsv_broadcaster_propagation_requeue_exhausted_total`. See [propagation retry domains](../docs/propagation-retry-domains.md).
 
-### Note on `arcade_bump_builder_build_duration_seconds_count{outcome=…}`
+### Note on `bsv_broadcaster_bump_builder_build_duration_seconds_count{outcome=…}`
 
 Alert on the failure outcomes, enumerated explicitly:
 
 ```promql
-rate(arcade_bump_builder_build_duration_seconds_count{
+rate(bsv_broadcaster_bump_builder_build_duration_seconds_count{
   outcome=~"parse_failed|deferred_incomplete|fetch_failed|no_subtrees|build_failed|validation_failed|store_failed"
 }[5m]) > 0
 ```
@@ -67,8 +67,8 @@ benign and would fire it:
 
 `no_stumps` is benign *per block* but its rate is a real signal: it cannot be
 distinguished from "merkle-service STUMP callbacks were dropped". Alert on
-`arcade_bump_builder_empty_stump_blocks_total` separately, and read it next to
-`arcade_bump_builder_build_duration_seconds_count{outcome=~"finalized_complete_no_grace|grace_waited"}`
+`bsv_broadcaster_bump_builder_empty_stump_blocks_total` separately, and read it next to
+`bsv_broadcaster_bump_builder_build_duration_seconds_count{outcome=~"finalized_complete_no_grace|grace_waited"}`
 — a high empty-stump rate with a near-zero build rate means STUMPs are not
 landing.
 
@@ -76,9 +76,9 @@ landing.
 
 ### Throughput overview
 
-- `rate(arcade_kafka_messages_total{topic="transaction",op="produce"}[1m])` — submitted txs / sec
-- `rate(arcade_tx_validator_outcome_total{outcome="accepted"}[1m])` — validated / sec
-- `rate(arcade_propagation_outcome_total{outcome="accepted"}[1m])` — propagated / sec
+- `rate(bsv_broadcaster_kafka_messages_total{topic="transaction",op="produce"}[1m])` — submitted txs / sec
+- `rate(bsv_broadcaster_tx_validator_outcome_total{outcome="accepted"}[1m])` — validated / sec
+- `rate(bsv_broadcaster_propagation_outcome_total{outcome="accepted"}[1m])` — propagated / sec
 - Diff between these surfaces where the pipeline is leaking.
 
 ### Latency budget
@@ -90,60 +90,60 @@ landing.
 
 ### Merkle-service endpoint board
 
-- Per-endpoint `arcade_merkle_endpoint_healthy` (one row per `endpoint` per
-  pod). Every arcade process runs its own pool with its own breakers.
+- Per-endpoint `bsv_broadcaster_merkle_endpoint_healthy` (one row per `endpoint` per
+  pod). Every BSV Broadcaster process runs its own pool with its own breakers.
   Propagation sends `/watch`; api-server, watchdog and bump-builder send
   `/reprocess`, and a transport/5xx failure there trips the same breaker, so
   they can report 0 too. Only a process that has made neither call stays at
   1, which is why a `sum()` across pods says little. The propagation pods
   carry every registration and are the authoritative view: alert on
-  `min by (endpoint) (arcade_merkle_endpoint_healthy{<propagation pods>}) == 0`,
+  `min by (endpoint) (bsv_broadcaster_merkle_endpoint_healthy{<propagation pods>}) == 0`,
   with the selector your scrape config uses for the propagation pods.
-- `sum by (endpoint, outcome) (rate(arcade_merkle_endpoint_requests_total{op="watch",outcome!="ok"}[5m]))`
+- `sum by (endpoint, outcome) (rate(bsv_broadcaster_merkle_endpoint_requests_total{op="watch",outcome!="ok"}[5m]))`
   — which merkle-service is failing and how (`err_network`, `err_5xx`,
   `err_auth`, `err_4xx`, `skipped_open`).
-- `arcade_merkle_endpoint_catchup_pending` (one row per `endpoint`) —
+- `bsv_broadcaster_merkle_endpoint_catchup_pending` (one row per `endpoint`) —
   registrations another endpoint accepted that this one has not acknowledged
   yet; the pool re-sends them in the background (`op="catchup"` on the
   requests counter). Alert when it stays above 0 for longer than a few
   minutes while the endpoint is healthy.
-- `arcade_propagation_merkle_register_batch_outcome_total` stays the
+- `bsv_broadcaster_propagation_merkle_register_batch_outcome_total` stays the
   pool-level view: `fully_ok` while any endpoint accepts, `all_failed` only
   when every endpoint refused.
 
 ### Datahub health board
 
-- Per-endpoint `arcade_teranode_endpoint_healthy` (one row per `endpoint`)
-- Stacked area: `arcade_teranode_endpoint_count{source}` over time
+- Per-endpoint `bsv_broadcaster_teranode_endpoint_healthy` (one row per `endpoint`)
+- Stacked area: `bsv_broadcaster_teranode_endpoint_count{source}` over time
 
 ### Inline retries (commit 82c0cc7)
 
-- `rate(arcade_propagation_inline_retry_total{outcome="recovered"}[5m])` — saved trips to PENDING_RETRY
-- `rate(arcade_propagation_inline_retry_total{outcome="exhausted"}[5m])` — sustained downstream issues
+- `rate(bsv_broadcaster_propagation_inline_retry_total{outcome="recovered"}[5m])` — saved trips to PENDING_RETRY
+- `rate(bsv_broadcaster_propagation_inline_retry_total{outcome="exhausted"}[5m])` — sustained downstream issues
 
 ### Propagation chunking (issue #271)
 
-- `rate(arcade_propagation_chunk_total{fallback="none"}[5m]) / rate(arcade_propagation_batch_size_count[5m])` — POST /txs per flushed batch; climbing means a cap is binding more often
-- `histogram_quantile(0.99, rate(arcade_propagation_chunk_bytes_bucket[5m]))` — p99 chunk payload; pinned just under `propagation.teranode_max_batch_bytes` means bytes, not `teranode_max_batch_size`, decide chunk edges
-- `rate(arcade_propagation_chunk_total{fallback="size_rejected"}[5m])` — a peer refused a chunk by shape (bare 400 / 413); sustained > 0 means the configured caps exceed what some peer accepts, and every such chunk costs extra narrowing round trips
+- `rate(bsv_broadcaster_propagation_chunk_total{fallback="none"}[5m]) / rate(bsv_broadcaster_propagation_batch_size_count[5m])` — POST /txs per flushed batch; climbing means a cap is binding more often
+- `histogram_quantile(0.99, rate(bsv_broadcaster_propagation_chunk_bytes_bucket[5m]))` — p99 chunk payload; pinned just under `propagation.teranode_max_batch_bytes` means bytes, not `teranode_max_batch_size`, decide chunk edges
+- `rate(bsv_broadcaster_propagation_chunk_total{fallback="size_rejected"}[5m])` — a peer refused a chunk by shape (bare 400 / 413); sustained > 0 means the configured caps exceed what some peer accepts, and every such chunk costs extra narrowing round trips
 
 ### Reaper visibility
 
-- `arcade_propagation_reaper_lease_held` per pod — exactly one should be 1
-- `arcade_propagation_reaper_ready_depth` — sustained > 0 means rebroadcast is keeping up; sustained growth means it isn't
-- `rate(arcade_propagation_reaper_tick_total{outcome="ran"}[5m])` should equal the configured tick rate on the leader
+- `bsv_broadcaster_propagation_reaper_lease_held` per pod — exactly one should be 1
+- `bsv_broadcaster_propagation_reaper_ready_depth` — sustained > 0 means rebroadcast is keeping up; sustained growth means it isn't
+- `rate(bsv_broadcaster_propagation_reaper_tick_total{outcome="ran"}[5m])` should equal the configured tick rate on the leader
 
 ### BUMP builder
 
-- `rate(arcade_bump_builder_blocks_processed_total[5m])` — blocks / sec
-- `histogram_quantile(0.95, rate(arcade_bump_builder_build_duration_seconds_bucket[5m]))` — build wall time
-- `histogram_quantile(0.95, rate(arcade_bump_builder_datahub_fetch_seconds_bucket[5m]))` — datahub fetch p95
-- Stacked area of `arcade_bump_builder_build_duration_seconds_count` by `outcome` — surfaces fetch / validation / store failures
+- `rate(bsv_broadcaster_bump_builder_blocks_processed_total[5m])` — blocks / sec
+- `histogram_quantile(0.95, rate(bsv_broadcaster_bump_builder_build_duration_seconds_bucket[5m]))` — build wall time
+- `histogram_quantile(0.95, rate(bsv_broadcaster_bump_builder_datahub_fetch_seconds_bucket[5m]))` — datahub fetch p95
+- Stacked area of `bsv_broadcaster_bump_builder_build_duration_seconds_count` by `outcome` — surfaces fetch / validation / store failures
 
 ## Cardinality guard rails
 
 - The only high-cardinality label currently emitted is `endpoint` on
-  `arcade_teranode_endpoint_healthy` and `arcade_teranode_request_duration_seconds`.
+  `bsv_broadcaster_teranode_endpoint_healthy` and `bsv_broadcaster_teranode_request_duration_seconds`.
   Cardinality is bounded by the size of the datahub fleet (typically <20). If
   the fleet grows large, drop the per-endpoint label on
   `request_duration_seconds` first — it's the higher-volume metric.
@@ -159,10 +159,10 @@ A minimal Prometheus scrape config (single-binary deployment):
 
 ```yaml
 scrape_configs:
-  - job_name: arcade
+  - job_name: bsv-broadcaster
     scrape_interval: 15s
     static_configs:
-      - targets: ['arcade:8081']
+      - targets: ['bsv-broadcaster:8081']
 ```
 
 For Kubernetes, point your service monitor at the health port:
@@ -171,10 +171,10 @@ For Kubernetes, point your service monitor at the health port:
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: arcade
+  name: bsv-broadcaster
 spec:
   selector:
-    matchLabels: {app: arcade}
+    matchLabels: {app: bsv-broadcaster}
   endpoints:
     - port: health
       path: /metrics

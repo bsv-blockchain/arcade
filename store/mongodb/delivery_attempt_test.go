@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/broadcaster/models"
 )
 
 // TestRecordDeliveryAttempt_RoundTrip pins the delivery-attempt bookkeeping

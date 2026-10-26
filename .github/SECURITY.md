@@ -1,11 +1,11 @@
 # 🔐 Security Policy
 
-Security is a priority. We maintain a proactive stance to identify and fix vulnerabilities in **arcade**.
+Security is a priority. We maintain a proactive stance to identify and fix vulnerabilities in **BSV Broadcaster**.
 
 <br/>
 
 ## 🛠️ Supported & Maintained Versions
-Any released version of **arcade** that is not marked as deprecated is actively supported and maintained.
+Any released version of **BSV Broadcaster** that is not marked as deprecated is actively supported and maintained.
 
 <br/>
 

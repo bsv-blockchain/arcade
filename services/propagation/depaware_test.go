@@ -10,10 +10,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/teranode"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/metrics"
+	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/teranode"
 )
 
 // makePropMsgWithParents builds a propagationMsg envelope with explicit
@@ -275,7 +275,7 @@ func TestHandleMessage_NoParents_AdmitsNormally(t *testing.T) {
 }
 
 // TestHandleMessage_ParentNotInFlight_AdmitsChildDirectly verifies
-// that a child whose declared parent isn't tracked by Arcade at all
+// that a child whose declared parent isn't tracked by BSV Broadcaster at all
 // (mined long ago, never seen, whatever) is admitted normally — only
 // IN-FLIGHT parents block.
 func TestHandleMessage_ParentNotInFlight_AdmitsChildDirectly(t *testing.T) {

@@ -10,7 +10,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/metrics"
+	"github.com/bsv-blockchain/broadcaster/metrics"
 )
 
 // fakeClaim is a Claim that tracks whether MarkMessage was invoked. Tests

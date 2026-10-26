@@ -3,7 +3,7 @@ package webhook
 import (
 	"testing"
 
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/broadcaster/models"
 )
 
 // TestShouldDeliver_ReorgReanchorBypassesSameStatusDedup pins the issue

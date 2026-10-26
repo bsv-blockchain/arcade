@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/store"
 )
 
 // These tests require a running Aerospike instance on localhost:3200
@@ -22,7 +22,7 @@ func integrationStore(t *testing.T) *Store {
 	t.Helper()
 	s, err := New(context.Background(), config.Aero{
 		Hosts:           []string{"localhost:3200"},
-		Namespace:       "arcade",
+		Namespace:       "bsv_broadcaster",
 		BatchSize:       100,
 		PoolSize:        64,
 		QueryTimeoutMs:  8000,

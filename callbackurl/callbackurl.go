@@ -4,12 +4,12 @@
 // two layers from drifting and ensures a host that survives validation
 // can't sneak past delivery via DNS rebinding.
 //
-// Threat model: arcade is reachable by clients that we don't fully trust,
+// Threat model: BSV Broadcaster is reachable by clients that we don't fully trust,
 // and the callback URL they register is dialed from inside our network.
 // Without a guard, an attacker can register a callback that points at
 // loopback (`127.0.0.1`), link-local (`169.254.0.0/16` — including the
 // AWS/GCP/Azure metadata endpoint at `169.254.169.254`), RFC1918 ranges,
-// or `0.0.0.0`/`::`, and turn arcade into a blind SSRF primitive.
+// or `0.0.0.0`/`::`, and turn BSV Broadcaster into a blind SSRF primitive.
 package callbackurl
 
 import (
@@ -60,7 +60,7 @@ func ValidateURL(raw string, allowPrivate bool) error {
 	return nil
 }
 
-// IsBlockedIP reports whether ip falls into a class arcade refuses to
+// IsBlockedIP reports whether ip falls into a class BSV Broadcaster refuses to
 // dial when the SSRF guard is active. The set:
 //
 //   - loopback (127.0.0.0/8, ::1)

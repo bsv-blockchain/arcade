@@ -1,5 +1,5 @@
 // Package bump implements BUMP (Bitcoin Unified Merkle Path) construction from STUMPs.
-// This is ported directly from the reference arcade implementation.
+// This is ported directly from the reference BSV Broadcaster implementation.
 package bump
 
 import (
@@ -11,7 +11,7 @@ import (
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/broadcaster/models"
 )
 
 // AssembleBUMP constructs a minimal BUMP (block-level merkle proof) from a STUMP
@@ -596,14 +596,14 @@ func correctedSubtree0Root(coinbaseBUMP []byte, numSubtrees int) *chainhash.Hash
 // STUMP's tracked-txid markers preserved). The block-level tree is filled in
 // from the STUMP leaves and the supplied subtreeHashes.
 //
-// This is the live arcade hot path. The previous implementation called
+// This is the live BSV Broadcaster hot path. The previous implementation called
 // assembleFullPath once per STUMP — each call building the entire block-level
 // tree (subtree-root layer + log₂(N) climb layers) and then deduping them all
 // through a (level, offset) map. For a tens-of-thousands-of-subtree block
 // that path allocated N copies of the block-level tree (tens of GB of
 // intermediate PathElement pointers) and ran computeMissingHashes once per
 // STUMP at quadratic cost, so the bump-builder would OOM rather than complete
-// (verified 2026-05-22 against block 950028: 24,896 STUMPs drove arcade to
+// (verified 2026-05-22 against block 950028: 24,896 STUMPs drove BSV Broadcaster to
 // 13 GB / 100% CPU with no completion after 8+ min).
 //
 // The current implementation builds the compound directly: each STUMP's

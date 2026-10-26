@@ -1,12 +1,12 @@
-# Arcade — standalone / zero-dependency configuration.
+# BSV Broadcaster — standalone / zero-dependency configuration.
 #
-# This profile runs a single arcade binary with no external infrastructure:
+# This profile runs a single BSV Broadcaster binary with no external infrastructure:
 #   - in-memory Kafka replacement (no broker needed)
 #   - Pebble embedded KV store (no Aerospike needed)
 #   - optional libp2p peer discovery using embedded teranode bootstrap peers
 #
 # Copy to config.yaml and adjust. Environment variables prefixed with
-# ARCADE_ override any value (e.g. ARCADE_LOG_LEVEL, ARCADE_STORE_BACKEND).
+# BSV_BROADCASTER_ override any value (e.g. BSV_BROADCASTER_LOG_LEVEL, BSV_BROADCASTER_STORE_BACKEND).
 
 mode: all
 log_level: info
@@ -19,7 +19,7 @@ network: teratestnet
 
 # All on-disk state goes under this root (Pebble DB, chaintracks headers,
 # libp2p key/peer cache). The binary creates subdirectories as needed.
-storage_path: ~/.arcade
+storage_path: ~/.bsv-broadcaster
 
 api:
   host: 0.0.0.0
@@ -45,7 +45,7 @@ health:
 #   endpoint: ""                # host:port of the OTLP collector; see env fallback above
 #   protocol: grpc              # "grpc" (default, port 4317) or "http" (port 4318)
 #   insecure: false             # skip TLS; typically true for an in-cluster/local collector
-#   service_name: arcade
+#   service_name: bsv-broadcaster
 #   namespace: ""                # service.namespace resource attribute (e.g. downstream solution name)
 #   traces: true
 #   metrics: true
@@ -58,16 +58,19 @@ health:
 # which is fine for single-node evaluation and local development.
 kafka:
   backend: memory
-  consumer_group: arcade
+  consumer_group: bsv-broadcaster
+  # Every topic is named "<topic_prefix>.<name>". Deployments that predate the
+  # BSV Broadcaster rebrand set topic_prefix (and consumer_group) to "arcade".
+  # topic_prefix: bsv-broadcaster
   max_retries: 5
   buffer_size: 10000
 
 # Embedded Pebble KV store — pure-Go LSM, single-process exclusive access.
-# Point path at a directory inside storage_path; arcade creates it on first run.
+# Point path at a directory inside storage_path; BSV Broadcaster creates it on first run.
 store:
   backend: pebble
   pebble:
-    path: ~/.arcade/pebble
+    path: ~/.bsv-broadcaster/pebble
     memtable_size_mb: 64
     l0_compaction_threshold: 4
     sync_writes: false # flushed on shutdown; leave off for throughput
@@ -101,7 +104,7 @@ merkle_service:
   urls: []
   auth_token: ""
 
-# P2P discovery via go-teranode-p2p-client. When enabled, arcade joins the
+# P2P discovery via go-teranode-p2p-client. When enabled, BSV Broadcaster joins the
 # pubsub mesh for the top-level `network` above and auto-registers each peer's
 # advertised datahub URL for propagation. Discovered URLs are additive to
 # datahub_urls and deduplicated.

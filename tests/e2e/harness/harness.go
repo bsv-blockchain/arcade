@@ -137,7 +137,7 @@ func New(t *testing.T, opts ...Option) *Harness {
 	h := &Harness{Containers: containers, LibP2P: libp2p, Datahub: datahub}
 	t.Cleanup(func() {
 		// Post-mortem: on a failed e2e test, dump the merkle-service container
-		// logs before teardown. These round-trips fail upstream of arcade more
+		// logs before teardown. These round-trips fail upstream of BSV Broadcaster more
 		// often than not (merkle-service didn't emit callbacks, /reprocess
 		// errored, …) and the container logs are the only place that's visible.
 		if t.Failed() && containers != nil && containers.Merkle != nil {

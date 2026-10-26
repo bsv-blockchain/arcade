@@ -1,4 +1,4 @@
-// Package sse hosts the standalone arcade SSE service. It owns the
+// Package sse hosts the standalone BSV Broadcaster SSE service. It owns the
 // `/events` endpoint, fans transaction-status updates from the shared
 // events.Publisher (a Kafka subscriber per pod) out to connected clients,
 // and serves Last-Event-ID-driven catchup from the shared store.
@@ -20,11 +20,11 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/events"
-	"github.com/bsv-blockchain/arcade/services"
-	"github.com/bsv-blockchain/arcade/services/httpmiddleware"
-	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/events"
+	"github.com/bsv-blockchain/broadcaster/services"
+	"github.com/bsv-blockchain/broadcaster/services/httpmiddleware"
+	"github.com/bsv-blockchain/broadcaster/store"
 )
 
 const jsonKeyError = "error"

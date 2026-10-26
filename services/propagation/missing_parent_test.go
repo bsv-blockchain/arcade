@@ -11,10 +11,10 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/kafka"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/teranode"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/kafka"
+	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/teranode"
 )
 
 // newTwoEndpointClient builds a teranode client that fans every broadcast
@@ -23,7 +23,7 @@ func newTwoEndpointClient(urlA, urlB string) *teranode.Client {
 	return teranode.NewClient([]string{urlA, urlB}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
 }
 
-// The missing-parent safety net (#295). With arcade.propagation widened to
+// The missing-parent safety net (#295). With bsv-broadcaster.propagation widened to
 // multiple partitions, a child submitted in a later HTTP request than its
 // parent can reach Teranode before the parent (different partition, different
 // pod). Teranode has no orphan pool: the child draws TX_MISSING_PARENT.
@@ -31,7 +31,7 @@ func newTwoEndpointClient(urlA, urlB string) *teranode.Client {
 // ordering artifact into a permanent verdict. Per the #254 principle,
 // missing-parent is a CONDITION, not a verdict: it routes to the bounded
 // requeue and parks at PENDING_RETRY, and the only way it becomes REJECTED is
-// arcade's own store showing an ancestor terminally REJECTED.
+// BSV Broadcaster's own store showing an ancestor terminally REJECTED.
 
 // --- fixtures ------------------------------------------------------------
 
@@ -102,7 +102,7 @@ func TestLineIsMissingParentCondition(t *testing.T) {
 
 // TestBroadcast_MissingParentLine_RequeuesInsteadOfRejects is the core
 // safety-net assertion: a child rejected by Teranode with TX_MISSING_PARENT
-// (parent unknown to arcade's store too) must NOT terminalize REJECTED — it
+// (parent unknown to BSV Broadcaster's store too) must NOT terminalize REJECTED — it
 // requeues through the dispatcher for another attempt.
 func TestBroadcast_MissingParentLine_RequeuesInsteadOfRejects(t *testing.T) {
 	parentTxid := strings.Repeat("a", 64)
@@ -223,7 +223,7 @@ func TestBroadcast_MissingParentPlusAccept_AcceptWins(t *testing.T) {
 // --- store-consult cascade ----------------------------------------------
 
 // TestBroadcast_MissingParent_AncestorRejectedInStore_CascadesRejected pins
-// the one legitimate path from missing-parent to REJECTED: arcade's own
+// the one legitimate path from missing-parent to REJECTED: BSV Broadcaster's own
 // store says a parent is terminally REJECTED, so the child inherits the
 // outcome with the standard cascade reason, and the dispatcher releases the
 // child's offset (commit watermark advances).

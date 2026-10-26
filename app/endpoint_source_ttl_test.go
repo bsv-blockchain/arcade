@@ -13,8 +13,8 @@ import (
 	"go.uber.org/zap/zaptest"
 	"go.uber.org/zap/zaptest/observer"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/store"
 )
 
 func seenAt(ep store.DatahubEndpoint, lastSeen time.Time) store.DatahubEndpoint {

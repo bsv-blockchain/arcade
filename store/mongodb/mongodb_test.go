@@ -2,12 +2,12 @@
 
 // Integration tests for the MongoDB backend. They need a reachable mongod:
 //
-//	podman run -d --name arcade-mongo -p 27017:27017 docker.io/library/mongo:7
+//	podman run -d --name bsv-broadcaster-mongo -p 27017:27017 docker.io/library/mongo:7
 //	go test -tags=mongodb ./store/mongodb/...
 //
-// ARCADE_MONGODB_URI overrides the default mongodb://127.0.0.1:27017. When no
+// BSV_BROADCASTER_MONGODB_URI overrides the default mongodb://127.0.0.1:27017. When no
 // server answers, every test skips rather than fails, unless
-// ARCADE_MONGODB_REQUIRED is set — which .github/workflows/mongodb-store.yml
+// BSV_BROADCASTER_MONGODB_REQUIRED is set — which .github/workflows/mongodb-store.yml
 // does after provisioning a mongo service container, so CI can never pass
 // by skipping.
 package mongodb
@@ -29,7 +29,7 @@ import (
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 
-	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/broadcaster/config"
 )
 
 var (
@@ -39,7 +39,7 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	uri := os.Getenv("ARCADE_MONGODB_URI")
+	uri := os.Getenv("BSV_BROADCASTER_MONGODB_URI")
 	if uri == "" {
 		// 127.0.0.1 rather than localhost: rootless podman forwards the IPv4 port
 		// only, and Go dials ::1 first, which the forwarder resets.
@@ -75,17 +75,17 @@ func connectForTests(uri string) (*mongo.Client, error) {
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
 	if sharedClient == nil {
-		if os.Getenv("ARCADE_MONGODB_REQUIRED") != "" {
+		if os.Getenv("BSV_BROADCASTER_MONGODB_REQUIRED") != "" {
 			// CI provisions a server and must fail loudly, never skip.
-			t.Fatalf("mongodb required but unavailable at ARCADE_MONGODB_URI: %v", sharedErr)
+			t.Fatalf("mongodb required but unavailable at BSV_BROADCASTER_MONGODB_URI: %v", sharedErr)
 		}
-		t.Skipf("mongodb unavailable (set ARCADE_MONGODB_URI), skipping: %v", sharedErr)
+		t.Skipf("mongodb unavailable (set BSV_BROADCASTER_MONGODB_URI), skipping: %v", sharedErr)
 	}
 	var b [6]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		t.Fatal(err)
 	}
-	dbName := fmt.Sprintf("arcade_test_%s", hex.EncodeToString(b[:]))
+	dbName := fmt.Sprintf("bsv_broadcaster_test_%s", hex.EncodeToString(b[:]))
 	s := newWithClient(sharedClient, dbName, config.Mongo{
 		OpTimeoutMs: 5000, QueryTimeoutMs: 15000, BatchSize: 100,
 	})
@@ -164,11 +164,11 @@ func indexNames(t *testing.T, coll *mongo.Collection) map[string]bool {
 // concurrency.
 func TestNew_WarnsOnNonPrimaryReadPreference(t *testing.T) {
 	if sharedClient == nil {
-		if os.Getenv("ARCADE_MONGODB_REQUIRED") != "" {
+		if os.Getenv("BSV_BROADCASTER_MONGODB_REQUIRED") != "" {
 			// CI provisions a server and must fail loudly, never skip.
-			t.Fatalf("mongodb required but unavailable at ARCADE_MONGODB_URI: %v", sharedErr)
+			t.Fatalf("mongodb required but unavailable at BSV_BROADCASTER_MONGODB_URI: %v", sharedErr)
 		}
-		t.Skipf("mongodb unavailable (set ARCADE_MONGODB_URI), skipping: %v", sharedErr)
+		t.Skipf("mongodb unavailable (set BSV_BROADCASTER_MONGODB_URI), skipping: %v", sharedErr)
 	}
 	// A query string needs a path separator after the host: both mongodb://
 	// and mongodb+srv:// carry their own "//", so look past the scheme.
@@ -195,12 +195,12 @@ func TestNew_WarnsOnNonPrimaryReadPreference(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.uri == sharedURI && strings.Contains(strings.ToLower(sharedURI), "readpreference") {
-				t.Skip("ARCADE_MONGODB_URI already sets a read preference; nothing to assert about the unset case")
+				t.Skip("BSV_BROADCASTER_MONGODB_URI already sets a read preference; nothing to assert about the unset case")
 			}
 			core, logs := observer.New(zapcore.WarnLevel)
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			s, err := New(ctx, config.Mongo{URI: tc.uri, Database: "arcade_readpref_probe"}, zap.New(core))
+			s, err := New(ctx, config.Mongo{URI: tc.uri, Database: "bsv_broadcaster_readpref_probe"}, zap.New(core))
 			if err != nil {
 				t.Fatalf("New must not refuse a legal read preference: %v", err)
 			}

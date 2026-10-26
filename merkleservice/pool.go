@@ -12,7 +12,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/metrics"
+	"github.com/bsv-blockchain/broadcaster/metrics"
 )
 
 // ErrNoHealthyEndpoints is returned when every endpoint's breaker is open,
@@ -130,6 +130,10 @@ func newCatchupQueue(capacity int) *catchupQueue {
 func (q *catchupQueue) add(reg Registration) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	q.addLocked(reg)
+}
+
+func (q *catchupQueue) addLocked(reg Registration) {
 	if _, dup := q.byTxID[reg.TxID]; dup {
 		q.byTxID[reg.TxID] = reg
 		return
@@ -163,11 +167,15 @@ func (q *catchupQueue) take(n int) []Registration {
 	return out
 }
 
-// settle marks n taken entries as answered; any that failed have been added
-// back by then.
-func (q *catchupQueue) settle(n int) {
+// settle marks n taken entries as answered and puts the ones still owed
+// (requeue) back in the queue. Both happen under one lock so len never counts
+// a re-queued entry twice, as queued and as in flight.
+func (q *catchupQueue) settle(n int, requeue ...Registration) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	for _, reg := range requeue {
+		q.addLocked(reg)
+	}
 	q.inflight -= n
 }
 
@@ -890,9 +898,10 @@ func (p *Pool) trialWatch(ctx context.Context, ep *endpoint) bool {
 	outcome, failure := classify(ctx, err)
 	p.record(ctx, ep, opCatchup, err)
 	if err != nil && !permanentRejection(err) {
-		ep.pending.add(reg)
+		ep.pending.settle(1, reg)
+	} else {
+		ep.pending.settle(1)
 	}
-	ep.pending.settle(1)
 	ep.syncPendingGauge()
 	if outcome == outcomeCanceled || failure {
 		p.logger.Debug("merkle-service trial /watch failed; keeping breaker open", zap.String("endpoint", ep.url), zap.String("outcome", outcome), zap.Error(err))
@@ -958,7 +967,7 @@ func (p *Pool) drainEndpoint(ctx context.Context, ep *endpoint) {
 // backoff and logs the outcome.
 func (p *Pool) catchupBatch(ctx context.Context, ep *endpoint, batch []Registration) {
 	r := p.sendCatchup(ctx, ep, batch)
-	ep.pending.settle(len(batch))
+	ep.pending.settle(len(batch), r.requeue...)
 	progress := r.landed + r.dropped
 	ep.mu.Lock()
 	switch {
@@ -993,7 +1002,7 @@ func (p *Pool) catchupBatch(ctx context.Context, ep *endpoint, batch []Registrat
 	if r.auth > 0 {
 		// 401/403 do not count toward the breaker, so this log is the only
 		// signal besides the gauge. They are kept: a token fixed on the
-		// merkle-service side should not need an arcade restart.
+		// merkle-service side should not need a BSV Broadcaster restart.
 		p.logger.Warn(
 			"merkle-service endpoint rejected the auth token on catch-up; check merkle_service.auth_token",
 			zap.String("endpoint", ep.url),
@@ -1009,11 +1018,12 @@ type catchupResult struct {
 	dropped int // rejected outright; not re-queued
 	auth    int // refused with 401/403; re-queued
 	// sampleDropped is one of the rejections behind dropped, for the log.
-	sampleDropped error
+	sampleDropped error // requeue holds the registrations still owed, put back on settle.
+	requeue       []Registration
 }
 
-// sendCatchup registers batch with ep alone and re-queues every failure
-// except an outright rejection.
+// sendCatchup registers batch with ep alone and collects every failure
+// except an outright rejection in r.requeue, for the caller to settle.
 func (p *Pool) sendCatchup(ctx context.Context, ep *endpoint, batch []Registration) catchupResult {
 	var r catchupResult
 	for i, err := range p.runEndpointBatch(ctx, ctx, ep, opCatchup, batch, catchupConcurrency, nil) {
@@ -1029,7 +1039,7 @@ func (p *Pool) sendCatchup(ctx context.Context, ep *endpoint, batch []Registrati
 			if outcome == outcomeAuth {
 				r.auth++
 			}
-			ep.pending.add(batch[i])
+			r.requeue = append(r.requeue, batch[i])
 		}
 	}
 	return r

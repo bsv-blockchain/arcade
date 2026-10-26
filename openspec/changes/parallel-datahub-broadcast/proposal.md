@@ -30,6 +30,6 @@ With P2P datahub discovery now able to add dozens of propagation URLs at runtime
 - **services/propagation/reaper.go**: Uses the same helpers — no special-case code for the retry path.
 - **config/config.go**: New `PropagationConfig.EndpointHealth` block with four tunables and defaults documented.
 - **config.example.yaml / config.example.standalone.yaml**: Document the new block.
-- **cmd/arcade/main.go**: Ensure the teranode client's probe loop is started at service startup and stopped on shutdown.
+- **cmd/bsv-broadcaster/main.go**: Ensure the teranode client's probe loop is started at service startup and stopped on shutdown.
 - **No breaking API changes** — external HTTP contracts (`POST /tx`, `POST /txs`, callbacks) are unchanged.
 - **No new external dependencies** — built on `sync`, `context`, `net/http`, and the existing `zap` logger.

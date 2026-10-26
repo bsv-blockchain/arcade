@@ -96,7 +96,7 @@ A tx the pool reported registered must still reach every endpoint, or the
 endpoints' watch sets diverge and their STUMPs disagree. Every endpoint-
 specific failure behind a pool-level success — a refused or timed-out
 `/watch`, or an endpoint skipped because its breaker was open — is kept in
-that endpoint's in-memory catch-up queue (`arcade_merkle_endpoint_catchup_pending`)
+that endpoint's in-memory catch-up queue (`bsv_broadcaster_merkle_endpoint_catchup_pending`)
 and re-sent from the pool's background loop once the endpoint answers again,
 500 per 5s tick with backoff; what fails again goes back to the queue, except
 a registration the endpoint rejected outright (a 4xx other than 401, 403, 408

@@ -7,7 +7,7 @@ metadata:
   namespace: arcade
   labels:
     app.kubernetes.io/name: kafka
-    app.kubernetes.io/part-of: arcade
+    app.kubernetes.io/part-of: bsv-broadcaster
 spec:
   serviceName: kafka
   replicas: 1
@@ -18,7 +18,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: kafka
-        app.kubernetes.io/part-of: arcade
+        app.kubernetes.io/part-of: bsv-broadcaster
     spec:
       containers:
         - name: kafka
@@ -82,7 +82,7 @@ metadata:
   namespace: arcade
   labels:
     app.kubernetes.io/name: kafka
-    app.kubernetes.io/part-of: arcade
+    app.kubernetes.io/part-of: bsv-broadcaster
 spec:
   type: ClusterIP
   clusterIP: None

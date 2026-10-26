@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/broadcaster/config"
 )
 
 // NewBroker dispatches on cfg.Backend:

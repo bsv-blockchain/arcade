@@ -1,4 +1,4 @@
-module github.com/bsv-blockchain/arcade
+module github.com/bsv-blockchain/broadcaster
 
 go 1.27.0
 
@@ -180,7 +180,7 @@ require (
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
-	github.com/labstack/echo/v4 v4.16.0 // indirect
+	github.com/labstack/echo/v4 v4.16.2 // indirect
 	github.com/labstack/gommon v0.5.0 // indirect
 	github.com/leodido/go-urn v1.5.0 // indirect
 	github.com/lib/pq v1.12.3 // indirect
@@ -353,5 +353,5 @@ require (
 //     structured-merge-diff/v7, but k8s.io/apimachinery@v0.37.0 still uses v6
 //     (typecheck failure in managedfields/internal/typeconverter.go).
 // Revisit/remove when apimachinery is upgraded to a version that tracks this
-// upstream. See https://github.com/bsv-blockchain/arcade dependabot config.
+// upstream. See https://github.com/bsv-blockchain/broadcaster dependabot config.
 replace k8s.io/kube-openapi => k8s.io/kube-openapi v0.0.0-20260721132016-d427ff9ee9ad

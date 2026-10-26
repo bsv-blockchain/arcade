@@ -1,9 +1,9 @@
 # End-to-end smoke tests
 
-This directory holds the arcade ↔ merkle-service integration tests. The
+This directory holds the BSV Broadcaster ↔ merkle-service integration tests. The
 suite boots a real, digest-pinned `ghcr.io/bsv-blockchain/merkle-service`
 container alongside Postgres + Redpanda (via testcontainers-go), wires
-arcade in-process against them, and drives representative scenarios.
+BSV Broadcaster in-process against them, and drives representative scenarios.
 
 > **Note:** the merkle-service image is pinned to an immutable digest
 > (`defaultMerkleImage` in `harness/containers.go`) rather than `:latest`.
@@ -16,13 +16,13 @@ arcade in-process against them, and drives representative scenarios.
 ```
 tests/e2e/
 ├── doc.go                       // package marker (e2e build tag)
-├── smoke_test.go                // first scenario: tx → arcade → merkle-service
+├── smoke_test.go                // first scenario: tx → BSV Broadcaster → merkle-service
 └── harness/
     ├── containers.go            // testcontainers wiring (Postgres, Redpanda, merkle-service)
     ├── libp2p_host.go           // in-process libp2p peer + Subtree/Block publishers
     ├── datahub.go               // in-process /block/<hash> + /subtree/<hash> server
     ├── txbuilder.go             // synthetic-tx + synthetic-block builders
-    ├── arcade.go                // in-process arcade boot (via app.Bootstrap)
+    ├── broadcaster.go           // in-process BSV Broadcaster boot (via app.Bootstrap)
     ├── poll.go                  // BroadcastTx, WaitForMined, GetTxStatus
     └── harness.go               // top-level Harness type, Option functions
 ```
@@ -102,9 +102,9 @@ disabling Ryuk only matters if a test process is `kill -9`'d.
    ```go
    h := harness.New(t)              // containers + libp2p host
    datahub := h.NewDatahub(t)       // gateway-IP-aware datahub
-   rt := harness.StartArcade(t, harness.ArcadeOptions{
+   rt := harness.StartBroadcaster(t, harness.BroadcasterOptions{
        MerkleServiceURL: h.Containers.MerkleHostURL,
-       DatahubURL:       datahub.LocalURL(),  // arcade reaches via loopback
+       DatahubURL:       datahub.LocalURL(),  // BSV Broadcaster reaches via loopback
        LibP2PBootstrap:  h.LibP2P.BootstrapMultiaddr(),
        MerkleAuthToken:  "...",
        CallbackToken:    "...",
@@ -159,7 +159,7 @@ lands, drop a fixture under
 
 ## Block-processing watchdog
 
-`services/watchdog/watchdog.go` is a standalone arcade service
+`services/watchdog/watchdog.go` is a standalone BSV Broadcaster service
 (`mode=watchdog`) that periodically queries `block_processing` for
 rows whose chaintracks header arrived but whose BLOCK_PROCESSED
 callback never landed, then calls merkle-service `POST /reprocess` to
@@ -170,7 +170,7 @@ covered by `services/watchdog/watchdog_test.go`.
 
 ## Microservice topology vs. e2e harness
 
-In production, arcade runs each mode (api-server, sse, chaintracks,
+In production, BSV Broadcaster runs each mode (api-server, sse, chaintracks,
 watchdog, bump-builder, propagation, tx-validator, p2p-client) as a
 separate pod — see `deploy/*.yaml`. The e2e harness here boots
 `mode=all`, which launches every service as an in-process goroutine

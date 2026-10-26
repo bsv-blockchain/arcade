@@ -11,16 +11,24 @@
 # coordination. To run hot-standby, set up a separate Deployment with
 # its own PVC and load-balance reads at the Service layer.
 #
+# Single writer across renames too: strategy Recreate only serializes pods
+# of THIS Deployment, and ReadWriteOnce only pins the PVC to one node, so a
+# second, differently named Deployment on the same node can open the same
+# checkpoint directory concurrently and corrupt it. When the Deployment
+# name changes (e.g. arcade-chaintracks -> bsv-broadcaster-chaintracks),
+# delete the old one and wait for its pod to terminate before applying.
+# See docs/migration-arcade-to-bsv-broadcaster.md.
+#
 # Exposes /chaintracks/v1 (legacy RPC-style) and /chaintracks/v2 (JSON +
 # binary + SSE) on port 8083 to external clients.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: arcade-chaintracks
+  name: bsv-broadcaster-chaintracks
   namespace: arcade
   labels:
     app.kubernetes.io/name: chaintracks
-    app.kubernetes.io/part-of: arcade
+    app.kubernetes.io/part-of: bsv-broadcaster
 spec:
   replicas: 1
   strategy:
@@ -32,11 +40,11 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: chaintracks
-        app.kubernetes.io/part-of: arcade
+        app.kubernetes.io/part-of: bsv-broadcaster
     spec:
       containers:
-        - name: arcade
-          image: ghcr.io/bsv-blockchain/arcade:latest
+        - name: bsv-broadcaster
+          image: ghcr.io/bsv-blockchain/broadcaster:latest
           args: ["--mode", "chaintracks"]
           ports:
             - containerPort: 8083
@@ -46,18 +54,22 @@ spec:
               name: health
               protocol: TCP
           env:
-            - name: ARCADE_KAFKA_BROKERS
+            - name: BSV_BROADCASTER_KAFKA_BROKERS
               value: "kafka-0.kafka.arcade.svc.cluster.local:9092"
-            - name: ARCADE_AEROSPIKE_HOSTS
-              value: "aerospike-0.aerospike.arcade.svc.cluster.local:3000"
-            - name: ARCADE_AEROSPIKE_NAMESPACE
+            - name: BSV_BROADCASTER_KAFKA_CONSUMER_GROUP
               value: "arcade"
-            - name: ARCADE_STORAGE_PATH
+            - name: BSV_BROADCASTER_KAFKA_TOPIC_PREFIX
+              value: "arcade"
+            - name: BSV_BROADCASTER_STORE_AEROSPIKE_HOSTS
+              value: "aerospike-0.aerospike.arcade.svc.cluster.local:3000"
+            - name: BSV_BROADCASTER_STORE_AEROSPIKE_NAMESPACE
+              value: "arcade"
+            - name: BSV_BROADCASTER_STORAGE_PATH
               value: "/data"
             # HOST_IP feeds OTEL_EXPORTER_OTLP_ENDPOINT below to reach the
             # node-local OTLP collector via the Kubernetes downward API; it
             # MUST be defined before its $(HOST_IP) use. Telemetry itself
-            # stays off (ARCADE_TELEMETRY_ENABLED=false) until an operator
+            # stays off (BSV_BROADCASTER_TELEMETRY_ENABLED=false) until an operator
             # opts in — see docs/observability.md.
             - name: HOST_IP
               valueFrom:
@@ -69,9 +81,9 @@ spec:
                   fieldPath: metadata.name
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: "http://$(HOST_IP):4317"
-            - name: ARCADE_TELEMETRY_ENABLED
+            - name: BSV_BROADCASTER_TELEMETRY_ENABLED
               value: "false"
-            - name: ARCADE_TELEMETRY_INSECURE
+            - name: BSV_BROADCASTER_TELEMETRY_INSECURE
               value: "true"
           volumeMounts:
             - name: data
@@ -107,7 +119,7 @@ metadata:
   namespace: arcade
   labels:
     app.kubernetes.io/name: chaintracks
-    app.kubernetes.io/part-of: arcade
+    app.kubernetes.io/part-of: bsv-broadcaster
 spec:
   accessModes:
     - ReadWriteOnce
@@ -118,11 +130,11 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: arcade-chaintracks
+  name: bsv-broadcaster-chaintracks
   namespace: arcade
   labels:
     app.kubernetes.io/name: chaintracks
-    app.kubernetes.io/part-of: arcade
+    app.kubernetes.io/part-of: bsv-broadcaster
 spec:
   type: ClusterIP
   selector:

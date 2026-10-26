@@ -1,10 +1,10 @@
-// Package harness provides reusable fixtures for arcade end-to-end tests.
+// Package harness provides reusable fixtures for BSV Broadcaster end-to-end tests.
 //
 // The high-level entry point is harness.New(t), which boots Postgres +
 // Redpanda + merkle-service via testcontainers-go, an in-process libp2p
-// host that arcade and merkle-service treat as a bootstrap peer, an
+// host that BSV Broadcaster and merkle-service treat as a bootstrap peer, an
 // in-process datahub HTTP server that serves synthetic block/subtree
-// binaries, and an in-process arcade instance configured to use all of
+// binaries, and an in-process BSV Broadcaster instance configured to use all of
 // the above.
 //
 // The harness is reusable across scenarios — smoke tests, reorg tests,

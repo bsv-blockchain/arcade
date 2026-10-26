@@ -23,8 +23,8 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/metrics"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/metrics"
 )
 
 // restoreOTELGlobals snapshots the global tracer provider, meter provider,
@@ -169,7 +169,7 @@ func TestInit_HTTPExportsTracesAndBridgedMetrics(t *testing.T) {
 		Endpoint:        endpoint,
 		Protocol:        "http",
 		Insecure:        true,
-		ServiceName:     "arcade-telemetry-test",
+		ServiceName:     "bsv-broadcaster-telemetry-test",
 		Traces:          true,
 		Metrics:         true,
 		SampleRatio:     1.0,
@@ -185,7 +185,7 @@ func TestInit_HTTPExportsTracesAndBridgedMetrics(t *testing.T) {
 	span.End()
 
 	counter := promauto.With(prometheus.DefaultRegisterer).NewCounter(prometheus.CounterOpts{
-		Name: "arcade_telemetry_test_total",
+		Name: "bsv_broadcaster_telemetry_test_total",
 		Help: "Test-only counter incremented by TestInit_HTTPExportsTracesAndBridgedMetrics.",
 	})
 	// The default registry is process-global; without unregistering, a second
@@ -206,10 +206,10 @@ func TestInit_HTTPExportsTracesAndBridgedMetrics(t *testing.T) {
 	if got := collector.hitsFor("/v1/metrics"); got == 0 {
 		t.Error("expected at least one non-empty POST to /v1/metrics, got none")
 	}
-	if body := collector.bodyFor("/v1/metrics"); !bytes.Contains(body, []byte("arcade_telemetry_test_total")) {
+	if body := collector.bodyFor("/v1/metrics"); !bytes.Contains(body, []byte("bsv_broadcaster_telemetry_test_total")) {
 		t.Errorf("/v1/metrics payload does not contain the bridged counter name %q — "+
 			"the Prometheus bridge producer is not wired to the OTLP metric exporter (payload %d bytes)",
-			"arcade_telemetry_test_total", len(body))
+			"bsv_broadcaster_telemetry_test_total", len(body))
 	}
 }
 
@@ -244,7 +244,7 @@ func TestInit_InsecureAppliesToEnvSuppliedEndpoint(t *testing.T) {
 		Enabled:         true,
 		Protocol:        "http",
 		Insecure:        true,
-		ServiceName:     "arcade-telemetry-test",
+		ServiceName:     "bsv-broadcaster-telemetry-test",
 		Traces:          true,
 		SampleRatio:     1.0,
 		ExportTimeoutMs: 5000,
@@ -354,7 +354,7 @@ var otelhttpAdvisedDurationBoundaries = []float64{
 // transport bound to a MeterProvider built with views (none, if views is
 // empty) and the same Prometheus bridge producer initMetrics installs, then
 // returns everything the reader collected — both the SDK-side instruments
-// otelhttp created and the bridged `arcade_*` families.
+// otelhttp created and the bridged `bsv_broadcaster_*` families.
 func collectMetrics(t *testing.T, views ...sdkmetric.View) metricdata.ResourceMetrics {
 	t.Helper()
 
@@ -492,14 +492,14 @@ func TestMetricViews_HTTPClientRequestDuration(t *testing.T) {
 	})
 }
 
-// TestMetricViews_LeaveBridgedArcadeMetricsAlone guards the blast radius. The
-// `arcade_*` families reach the same reader through the Prometheus bridge
+// TestMetricViews_LeaveBridgedBroadcasterMetricsAlone guards the blast radius. The
+// `bsv_broadcaster_*` families reach the same reader through the Prometheus bridge
 // producer, whose ScopeMetrics are appended at collection time and never pass
 // through view resolution — and the View matches one wildcard-free instrument
 // name regardless. This asserts the outcome of both: a bridged histogram
 // keeps the buckets its promauto definition declares.
-func TestMetricViews_LeaveBridgedArcadeMetricsAlone(t *testing.T) {
-	const name = "arcade_teranode_request_duration_seconds"
+func TestMetricViews_LeaveBridgedBroadcasterMetricsAlone(t *testing.T) {
+	const name = "bsv_broadcaster_teranode_request_duration_seconds"
 
 	// A histogram vec has no children until something observes on it, so the
 	// family would be absent from the bridge's output otherwise.
@@ -509,7 +509,7 @@ func TestMetricViews_LeaveBridgedArcadeMetricsAlone(t *testing.T) {
 	want := promHistogramBounds(t, name)
 	if !slices.Equal(got, want) {
 		t.Errorf("%s boundaries after bridging = %v, want its promauto definition %v — "+
-			"a View is rewriting an arcade_* metric", name, got, want)
+			"a View is rewriting an bsv_broadcaster_* metric", name, got, want)
 	}
 	if slices.Equal(got, httpClientDurationBoundaries) {
 		t.Errorf("%s boundaries = %v, which is the http.client.request.duration View's set — "+

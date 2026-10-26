@@ -12,10 +12,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/store"
-	"github.com/bsv-blockchain/arcade/teranode"
-	"github.com/bsv-blockchain/arcade/version"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/teranode"
+	"github.com/bsv-blockchain/broadcaster/version"
 )
 
 const (
@@ -103,7 +103,7 @@ func TestHandleHealth_StructuredResponse(t *testing.T) {
 }
 
 // TestHandleHealth_IncludesBlockHeight pins the chain-freshness field
-// (issue #254): /health reports arcade's own processed active-tip height so
+// (issue #254): /health reports BSV Broadcaster's own processed active-tip height so
 // clients can detect a stale chain view — datahub_urls[].healthy is
 // reachability-only and stays green through a chain stall. The store read
 // is TTL-cached (probes arrive every few seconds), and without a store the
@@ -267,7 +267,7 @@ func advertisedPolicy() *store.EndpointPolicy {
 // TestHandleHealth_ReportsAdvertisedPolicy is the operator-facing end of the
 // chain: a node's node_status policy reaches the registry, and /health reports
 // it against that node's endpoint. GET /policy can only report the single
-// network-wide policy arcade enforces, so this is what identifies which node
+// network-wide policy BSV Broadcaster enforces, so this is what identifies which node
 // refused an oversized transaction.
 func TestHandleHealth_ReportsAdvertisedPolicy(t *testing.T) {
 	ms := &mockStore{datahubEndpoints: []store.DatahubEndpoint{

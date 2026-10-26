@@ -1,9 +1,9 @@
 name: smoke
 
 # ------------------------------------------------------------------------------------
-#  arcade in-process smoke tests
+#  BSV Broadcaster in-process smoke tests
 # ------------------------------------------------------------------------------------
-# Fast, container-free smoke tests for arcade's hot paths. Boots arcade
+# Fast, container-free smoke tests for BSV Broadcaster's hot paths. Boots BSV Broadcaster
 # in-process via app.Bootstrap + app.BuildServices against a memory Kafka
 # broker, Pebble store in tmpfs, and an httptest fake teranode — no
 # Docker, no service containers. Each test runs in a few seconds; the

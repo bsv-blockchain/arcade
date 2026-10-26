@@ -6,7 +6,7 @@ name: mongodb-store
 # store/mongodb's contract, concurrency and conformance tests are gated by
 # the `mongodb` build tag and skip when no server answers, like the postgres
 # and aerospike suites. This workflow provisions a mongo service container
-# and runs them with ARCADE_MONGODB_REQUIRED set, so an unreachable server
+# and runs them with BSV_BROADCASTER_MONGODB_REQUIRED set, so an unreachable server
 # fails the job instead of skipping every test. Scoped to the files that can
 # change the backend's behaviour — the package itself, the store interfaces
 # and shared suite, the shared bumpcache behind its merkle-path enrichment,
@@ -67,6 +67,6 @@ jobs:
 
       - name: Run MongoDB store tests
         env:
-          ARCADE_MONGODB_URI: mongodb://127.0.0.1:27017
-          ARCADE_MONGODB_REQUIRED: "1"
+          BSV_BROADCASTER_MONGODB_URI: mongodb://127.0.0.1:27017
+          BSV_BROADCASTER_MONGODB_REQUIRED: "1"
         run: go test -tags=mongodb -race -timeout=15m ./store/mongodb/...

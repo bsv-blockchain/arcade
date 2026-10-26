@@ -9,8 +9,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/models"
 )
 
 // This file pins the completeness-first grace-window contract:
@@ -29,7 +29,7 @@ import (
 // stay unambiguous under the race detector's slowdown.
 
 // bumpOutcomeSampleCount returns the cumulative sample count of the
-// arcade_bump_builder_build_duration_seconds child carrying the given outcome
+// bsv_broadcaster_bump_builder_build_duration_seconds child carrying the given outcome
 // label, or 0 when that series does not exist yet. The metric is global to
 // the process, so tests must compare before/after deltas rather than absolute
 // values.
@@ -40,7 +40,7 @@ func bumpOutcomeSampleCount(t *testing.T, outcome string) uint64 {
 		t.Fatalf("gather: %v", err)
 	}
 	for _, f := range fams {
-		if f.GetName() != "arcade_bump_builder_build_duration_seconds" {
+		if f.GetName() != "bsv_broadcaster_bump_builder_build_duration_seconds" {
 			continue
 		}
 		for _, m := range f.GetMetric() {

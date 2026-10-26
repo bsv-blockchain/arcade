@@ -133,7 +133,7 @@ func scanForViolations(root string) ([]string, error) {
 	return violations, nil
 }
 
-// repoRoot returns the arcade module root, derived from this test file's
+// repoRoot returns the BSV Broadcaster module root, derived from this test file's
 // own path (logfields/enforce_test.go -> parent directory) so the test
 // works regardless of the working directory `go test` invokes it from.
 func repoRoot(t *testing.T) string {

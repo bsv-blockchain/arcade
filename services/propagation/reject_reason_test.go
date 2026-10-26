@@ -8,14 +8,14 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/events"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
-	"github.com/bsv-blockchain/arcade/teranode"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/events"
+	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/teranode"
 )
 
-// Issue #301. arcade parses Teranode's reject reason, persists it on the row
+// Issue #301. BSV Broadcaster parses Teranode's reject reason, persists it on the row
 // and logs it — and then publishes REJECTED through the payload-free bulk
 // fan-out, so every SSE and webhook subscriber sees a terminal REJECTED with an
 // empty extraInfo. The row keeps the reason and GET /tx/<txid> serves it, so
@@ -28,7 +28,7 @@ import (
 // to learn why.
 //
 // These tests pin the property end to end: every REJECTED event a subscriber
-// can receive carries the SAME reason string arcade wrote to the row.
+// can receive carries the SAME reason string BSV Broadcaster wrote to the row.
 
 // rejectionPropagator wires a propagator with a recording publisher and no
 // merkle client (registerBatch is then a pass-through), so a flush's published
@@ -61,7 +61,7 @@ func publishedReasons(pub *recordingPublisher, status models.Status) map[string]
 	return out
 }
 
-// persistedReasons collects the reason arcade wrote to each REJECTED row, so a
+// persistedReasons collects the reason BSV Broadcaster wrote to each REJECTED row, so a
 // test can assert the published string is that exact string rather than a
 // second rendering of the same idea.
 func persistedReasons(ms *mockStore) map[string]string {

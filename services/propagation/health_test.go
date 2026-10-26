@@ -17,9 +17,9 @@ import (
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/teranode"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/teranode"
 )
 
 // TestBroadcastSingle_WaitsForSlowPeer verifies that once one endpoint
@@ -557,7 +557,7 @@ func TestBroadcast_OpaqueProcessing_RequeuesInsteadOfRejects(t *testing.T) {
 // TestBroadcast_OpaqueProcessing_AmbiguousStatus_RequeuesAlongsideRealVerdict
 // covers the case where the peer's status cannot rescue an opaque line.
 //
-// arcade reads the HTTP status to recover what Teranode's error boundary
+// BSV Broadcaster reads the HTTP status to recover what Teranode's error boundary
 // stripped — 422 means a missing parent, 403 a frozen utxo, 5xx a fault on the
 // node. That mapping is per transaction, so it only holds when the peer
 // reported a single failure. Here it reported two, and the aggregate status
@@ -839,7 +839,7 @@ func TestBroadcast_409AlienConflict_MultiTxNarrowsToTheGuiltyTx(t *testing.T) {
 		cleanOutpoint  = "9d2c1f0e7b5a48361c0e7f2d6b48a91c33e0f8261c086bd9fa90055dd5a7bb11"
 		spender        = "7dfbe0fcacf630066b23036bc007e73d58a61ab9bcb8e66f6b214f8ef5f28489"
 	)
-	// Deliberately vout 2 on an input arcade cannot match: the tx spends
+	// Deliberately vout 2 on an input BSV Broadcaster cannot match: the tx spends
 	// guiltyOutpoint:0, so outpoint attribution declines and only narrowing
 	// can place the verdict.
 	guiltyTxid, guiltyRaw := spendingTx(t, guiltyOutpoint, 0, 21)

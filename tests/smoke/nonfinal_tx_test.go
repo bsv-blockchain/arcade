@@ -68,9 +68,9 @@ func newLockTimeTx(lockTime, sequence uint32) *bt.Tx {
 	return tx
 }
 
-// postSingleTx POSTs one tx in EF encoding to arcade's /tx endpoint and
+// postSingleTx POSTs one tx in EF encoding to BSV Broadcaster's /tx endpoint and
 // returns the status code and response body.
-func postSingleTx(rt *arcadeRuntime, tx *bt.Tx) (int, string, error) {
+func postSingleTx(rt *broadcasterRuntime, tx *bt.Tx) (int, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rt.baseURL+"/tx", bytes.NewReader(tx.ExtendedBytes()))
@@ -87,7 +87,7 @@ func postSingleTx(rt *arcadeRuntime, tx *bt.Tx) (int, string, error) {
 	return resp.StatusCode, string(body), nil
 }
 
-func getTxStatus(rt *arcadeRuntime, txid string) (int, string, error) {
+func getTxStatus(rt *broadcasterRuntime, txid string) (int, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rt.baseURL+"/tx/"+txid, nil)
@@ -105,17 +105,17 @@ func getTxStatus(rt *arcadeRuntime, txid string) (int, string, error) {
 
 // TestSmoke_NonFinalTxRejectedAtIntake exercises the nLockTime/BIP113
 // finality gate end-to-end through the real boot path (issues #245/#254):
-// arcade boots with chaintracks.mode=remote pointed at a stub chain, a
+// BSV Broadcaster boots with chaintracks.mode=remote pointed at a stub chain, a
 // non-final tx is answered synchronously with an actionable 400 carrying
 // ARC code 476 (never reaching teranode) — but NO verdict is persisted:
-// non-finality is a condition of arcade's chain view, so GET /tx/{txid}
+// non-finality is a condition of BSV Broadcaster's chain view, so GET /tx/{txid}
 // keeps returning 404 ("no verdict") and resubmission policies keyed on
 // no-verdict recover once the locktime expires. An otherwise-identical
 // final tx broadcasts normally.
 func TestSmoke_NonFinalTxRejectedAtIntake(t *testing.T) {
 	recorder := newRecordingTeranode(t)
 	stub := newStubChaintracks(t)
-	rt := startArcadeSmoke(t, smokeOptions{
+	rt := startBroadcasterSmoke(t, smokeOptions{
 		TeranodeURL:          recorder.URL(),
 		ChaintracksRemoteURL: stub.URL,
 	})

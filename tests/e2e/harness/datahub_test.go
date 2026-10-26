@@ -12,14 +12,14 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/bump"
+	"github.com/bsv-blockchain/broadcaster/bump"
 )
 
 // TestDatahub_StageAndServe is a fast self-test on the in-process
 // datahub. It stages a synthetic block + subtree, GETs them via the
-// host-side URL, and asserts arcade's bump.FetchBlockDataForBUMP can
+// host-side URL, and asserts BSV Broadcaster's bump.FetchBlockDataForBUMP can
 // round-trip the same block through the binary parser. This confirms
-// the harness produces wire-compatible bytes — both arcade and the
+// the harness produces wire-compatible bytes — both BSV Broadcaster and the
 // merkle-service container see the same shape.
 func TestDatahub_StageAndServe(t *testing.T) {
 	d, err := NewDatahub(t)
@@ -60,7 +60,7 @@ func TestDatahub_StageAndServe(t *testing.T) {
 		t.Errorf("subtree: status=%d len=%d want OK len=%d", resp.StatusCode, len(body), len(subtreeBin))
 	}
 
-	// Round-trip the block through arcade's parser. It exercises
+	// Round-trip the block through BSV Broadcaster's parser. It exercises
 	// parseBlockBinary indirectly via FetchBlockDataForBUMP.
 	hashes, _, gotMerkle, err := bump.FetchBlockDataForBUMP(
 		context.Background(),

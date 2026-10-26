@@ -2,7 +2,7 @@
 
 The original arcade (`/git/arcade`) embeds `github.com/bsv-blockchain/go-chaintracks` v1.1.5 and mounts its Fiber-framework routes under `/chaintracks/v1/*` and `/chaintracks/v2/*`. It runs chaintracks by default unless `chaintracks_server.enabled=false`. Chaintracks itself tracks BSV block headers by subscribing to peers via `go-teranode-p2p-client`, persists headers under a storage directory, and offers both JSON and binary endpoints plus SSE streams for tip/reorg events.
 
-The refactor is service-split and uses the Gin HTTP router, not Fiber. It has no chaintracks integration today. Consumers that previously relied on a single arcade binary for both tx broadcasting and header lookups cannot point at the refactor until this feature is restored.
+The refactor is service-split and uses the Gin HTTP router, not Fiber. It has no chaintracks integration today. Consumers that previously relied on a single BSV Broadcaster binary for both tx broadcasting and header lookups cannot point at the refactor until this feature is restored.
 
 Stakeholders: SPV validators that hit `/chaintracks/*` for block metadata; merkle-path verifiers that need the BUMP builder's `blockHeight`; ops who configure the service via `config.yaml`.
 
@@ -38,7 +38,7 @@ Stakeholders: SPV validators that hit `/chaintracks/*` for block metadata; merkl
 **Choice:** Add a `chaintracks.Chaintracks` field to `api_server.Server`. Construct it in `Server.Start(ctx)` before `router.ListenAndServe`, passing `ctx` so subscriptions and the P2P client shut down when the service does. Skip initialization if `cfg.ChaintracksServer.Enabled == false`.
 
 **Alternatives considered:**
-- **Initialize in `cmd/arcade/main.go` and inject.** Would share the instance with other services if they ever need it. Rejected because no other service does; premature coupling.
+- **Initialize in `cmd/bsv-broadcaster/main.go` and inject.** Would share the instance with other services if they ever need it. Rejected because no other service does; premature coupling.
 - **Separate `chaintracks` service (Service interface).** Clean separation, but the chaintracks routes need to live on the same router as the api-server, which means either a shared router (weird service boundary) or the duplicated-port problem from Decision 1's alternatives.
 
 **Rationale:** Chaintracks is consumed only through HTTP here. Co-locating it with the only consumer keeps wiring simple. The `Service` interface already supports this — `Start(ctx)` is the natural integration point, and `Stop` just lets ctx cancel.
@@ -55,7 +55,7 @@ Stakeholders: SPV validators that hit `/chaintracks/*` for block metadata; merkl
 - `chaintracks_server.enabled bool` (default `true`) — local to the refactor, gates whether routes are mounted.
 - `chaintracks.*` — delegate entirely to `chaintracksconfig.Config` via its own `SetDefaults`, rooted at our top-level storage path (`<storage_path>/chaintracks/`).
 
-**Rationale:** Operators moving from old arcade to refactor should have zero config migration. Using the upstream `chaintracksconfig.Config` means any new fields the library adds flow through without us rewriting defaults.
+**Rationale:** Operators moving from old BSV Broadcaster to refactor should have zero config migration. Using the upstream `chaintracksconfig.Config` means any new fields the library adds flow through without us rewriting defaults.
 
 ### Decision 5 — Static-file serving via Gin's built-in
 

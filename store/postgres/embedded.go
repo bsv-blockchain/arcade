@@ -8,7 +8,7 @@ import (
 
 	embedded "github.com/fergusstrange/embedded-postgres"
 
-	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/broadcaster/config"
 )
 
 // startEmbedded spins up a local Postgres instance using the fergusstrange
@@ -38,15 +38,15 @@ func startEmbedded(cfg config.Postgres) (dsn string, stop func() error, err erro
 
 	user := cfg.EmbeddedUser
 	if user == "" {
-		user = "arcade"
+		user = "bsv_broadcaster"
 	}
 	pass := cfg.EmbeddedPassword
 	if pass == "" {
-		pass = "arcade"
+		pass = "bsv_broadcaster" //nolint:gosec // local embedded-postgres default, not a secret
 	}
 	db := cfg.EmbeddedDatabase
 	if db == "" {
-		db = "arcade"
+		db = "bsv_broadcaster"
 	}
 
 	ep := embedded.NewDatabase(

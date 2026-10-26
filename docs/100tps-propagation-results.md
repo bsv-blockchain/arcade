@@ -6,7 +6,7 @@ Live measurements from a sustained 100 TPS broadcast against teratestnet, captur
 
 **RECEIVED → ACCEPTED_BY_NETWORK mean latency: 11.8 s → 1.44 s (−88 %).**
 
-The arcade-controllable portion of the transaction lifecycle is now a small fraction of end-to-end user-visible time. Remaining latency is dominated by merkle-service callback delivery and second-node network gossip — both outside arcade.
+The bsv-broadcaster-controllable portion of the transaction lifecycle is now a small fraction of end-to-end user-visible time. Remaining latency is dominated by merkle-service callback delivery and second-node network gossip — both outside BSV Broadcaster.
 
 ## RECEIVED → ACCEPTED_BY_NETWORK over the session
 
@@ -26,12 +26,12 @@ Each row is the live mean after that stage of work shipped. Bars are scaled to t
 sequenceDiagram
     autonumber
     participant C as Client
-    participant A as Arcade /tx
+    participant A as BSV Broadcaster /tx
     participant K as Kafka (propagation)
     participant P as Propagator
     participant M as merkle-service
     participant T as Teranode datahubs
-    participant CB as Arcade /callback
+    participant CB as BSV Broadcaster /callback
     participant BB as Bump-builder
     participant S as Pebble store
 
@@ -39,7 +39,7 @@ sequenceDiagram
     A->>S: write RECEIVED
     A->>K: enqueue
     A-->>C: 200 OK
-    Note over P: RECEIVED → ACCEPTED_BY_NETWORK (~1.44 s — arcade)
+    Note over P: RECEIVED → ACCEPTED_BY_NETWORK (~1.44 s — BSV Broadcaster)
     K->>P: drain batch (avg 95 tx)
     P->>M: POST /watch × N (concurrency 50)
     P->>T: POST /txs in 4 parallel chunks of 25
@@ -59,16 +59,16 @@ sequenceDiagram
 
 ## Per-stage breakdown
 
-| Stage | Mean | Arcade-controllable? | Why this number |
+| Stage | Mean | Controllable by BSV Broadcaster? | Why this number |
 |---|---|---|---|
 | RECEIVED → ACCEPTED_BY_NETWORK | **1.44 s** | yes | batch-fill + merkle `/watch` + teranode broadcast |
 | ACCEPTED_BY_NETWORK → SEEN_ON_NETWORK | 4.77 s | no | merkle-service must observe the tx on the network and deliver a callback |
 | SEEN_ON_NETWORK → SEEN_MULTIPLE_NODES | 6.83 s | no | a second independent miner needs to gossip-receive the tx |
 | SEEN_MULTIPLE_NODES → MINED | ~55 s | no | block arrival time + 30 s configured BUMP grace window |
 
-Only the **first row** is shaped by arcade code. The rest are physics — network latency, third-party callback turnaround, and BSV block intervals.
+Only the **first row** is shaped by BSV Broadcaster code. The rest are physics — network latency, third-party callback turnaround, and BSV block intervals.
 
-## Where the 1.44 s arcade-side latency goes
+## Where the 1.44 s bsv-broadcaster-side latency goes
 
 ```
  Batch fill (kafka drain + flush)  ████████████░░░░░░░  ~0.94 s   input rate × batch size
@@ -78,7 +78,7 @@ Only the **first row** is shaped by arcade code. The rest are physics — networ
  With pipeline overlap (8 batches)  ~1.44 s observed end-to-end mean
 ```
 
-Pipeline overlap matters: `max_concurrent_batches=8` lets register and broadcast run for batch *N+1* while batch *N* is still broadcasting, so the per-tx wait is not a simple sum of the three stages. Concretely, `arcade_propagation_inflight_batches` hovers at 1–2 of cap 8 — the pipeline has substantial headroom at 100 TPS.
+Pipeline overlap matters: `max_concurrent_batches=8` lets register and broadcast run for batch *N+1* while batch *N* is still broadcasting, so the per-tx wait is not a simple sum of the three stages. Concretely, `bsv_broadcaster_propagation_inflight_batches` hovers at 1–2 of cap 8 — the pipeline has substantial headroom at 100 TPS.
 
 ## Throughput & headroom
 
@@ -95,7 +95,7 @@ Pipeline overlap matters: `max_concurrent_batches=8` lets register and broadcast
 Five distinct ships, in order:
 
 1. **Callback handler bulk-publish + transition-age metric**
-   - Replaced N per-txid `Publisher.Publish` calls in `handleSeenOnNetwork` / `handleSeenMultipleNodes` with one `PublishBulk` per callback. Added `arcade_status_transition_age_seconds{from,to}` so the user-visible transition latency became measurable for the first time.
+   - Replaced N per-txid `Publisher.Publish` calls in `handleSeenOnNetwork` / `handleSeenMultipleNodes` with one `PublishBulk` per callback. Added `bsv_broadcaster_status_transition_age_seconds{from,to}` so the user-visible transition latency became measurable for the first time.
    - Files: `services/api_server/handlers.go`, `metrics/metrics.go`.
    - Effect: 11.8 s → 9.9 s (callback fan-out work no longer pile-drives the bounded subscriber queue).
 
@@ -111,7 +111,7 @@ Five distinct ships, in order:
 
 4. **Batch pipelining: `max_concurrent_batches` 1 → 8**
    - `flushBatch` used to block on `processBatch`. Now it hands the drained batch to a goroutine and returns; a semaphore (default 4, set to 8 in config) caps in-flight pipelines. Batch N+1's merkle register can begin while batch N is broadcasting.
-   - Files: `config/config.go`, `services/propagation/propagator.go`, `metrics/metrics.go` (new `arcade_propagation_inflight_batches` gauge).
+   - Files: `config/config.go`, `services/propagation/propagator.go`, `metrics/metrics.go` (new `bsv_broadcaster_propagation_inflight_batches` gauge).
    - Effect: 5.02 s → 3.08 s.
 
 5. **Smaller teranode chunks + scaled broadcast worker pool + TxTracker prefilter**
@@ -128,14 +128,14 @@ Five distinct ships, in order:
 | Prefiltered at handler (`callback_stale_total`) | 0 | 92,206 | new signal |
 | Useful (applied) callback transitions | 12,493 | 12,493 | unchanged |
 
-Merkle-service still re-fires SEEN_ON_NETWORK callbacks for txs that already moved past it (~91 % of inbound callback rows are stale). Arcade now filters those out in-memory, in O(1), before issuing the store batch — keeping the hot path uncontended.
+Merkle-service still re-fires SEEN_ON_NETWORK callbacks for txs that already moved past it (~91 % of inbound callback rows are stale). BSV Broadcaster now filters those out in-memory, in O(1), before issuing the store batch — keeping the hot path uncontended.
 
 ## What's left
 
 The remaining 1.44 s breaks roughly into:
 
 - **~0.94 s batch fill** — at 100 TPS with average 95-tx batches, the average tx waits half a batch period for the next flush. The kafka flush interval is already 50 ms; the dominant component is input-rate × batch-size physics, not waitable time.
-- **~0.91 s teranode broadcast floor** — fastest-endpoint round-trip for a 25-tx chunk. Going smaller is unlikely to help: HTTP overhead per chunk would dominate. This is the network + teranode `/txs` validation floor and is not arcade-bound.
+- **~0.91 s teranode broadcast floor** — fastest-endpoint round-trip for a 25-tx chunk. Going smaller is unlikely to help: HTTP overhead per chunk would dominate. This is the network + teranode `/txs` validation floor and is not bsv-broadcaster-bound.
 - **~0.43 s merkle register** — bounded by per-call latency × per-worker queue depth. Could be lowered further with a batched `/watch` endpoint on merkle-service (out of scope here — tracked separately).
 
-The remaining ACCEPTED → SEEN_ON_NETWORK (4.77 s) and SEEN_ON_NETWORK → SEEN_MULTIPLE_NODES (6.83 s) gaps are network and merkle-service-side. They are not arcade work.
+The remaining ACCEPTED → SEEN_ON_NETWORK (4.77 s) and SEEN_ON_NETWORK → SEEN_MULTIPLE_NODES (6.83 s) gaps are network and merkle-service-side. They are not BSV Broadcaster work.

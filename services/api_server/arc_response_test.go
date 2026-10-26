@@ -8,7 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	arcerrors "github.com/bsv-blockchain/arcade/errors"
+	arcerrors "github.com/bsv-blockchain/broadcaster/errors"
 )
 
 // TestRespondSubmitError_ARCFieldsAdditive pins the additive 400 body

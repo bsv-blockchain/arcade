@@ -4,7 +4,7 @@
 
 `services/bump_builder/builder.go:handleMessage` used to run: short-circuit → **wait grace window** → read STUMPs → completeness gate → build/finalize. The grace window (`bump_builder.grace_window_ms`, default 30s) defends against STUMP callbacks whose first HTTP attempt 5xx'd and are retrying asynchronously — merkle's stumpGate only waits for the first attempt of each STUMP before releasing BLOCK_PROCESSED.
 
-Since merkle PR #162, the callback carries `expectedSubtreeIndices` (`models.CallbackMessage.ExpectedSubtreeIndices`), giving arcade a proof of completeness that makes the unconditional wait unnecessary in the common case.
+Since merkle PR #162, the callback carries `expectedSubtreeIndices` (`models.CallbackMessage.ExpectedSubtreeIndices`), giving BSV Broadcaster a proof of completeness that makes the unconditional wait unnecessary in the common case.
 
 ## Decision 1: read-before-grace, three-way dispatch
 
@@ -22,7 +22,7 @@ Both stale predicates key on `processed_at` being unset (`store/postgres/postgre
 
 ## Decision 3: outcome label migration
 
-`arcade_bump_builder_build_duration_seconds{outcome}` has a closed, pre-registered label set (PR #244: `metrics/preregister.go` `bumpBuildOutcomes`, doc-comment contract on the metric, positively-enumerated failure regex in `metrics/README.md`). A flat `success` can no longer say whether the window was paid, and keeping it while adding a sibling would make `outcome="success"` silently undercount. So:
+`bsv_broadcaster_bump_builder_build_duration_seconds{outcome}` has a closed, pre-registered label set (PR #244: `metrics/preregister.go` `bumpBuildOutcomes`, doc-comment contract on the metric, positively-enumerated failure regex in `metrics/README.md`). A flat `success` can no longer say whether the window was paid, and keeping it while adding a sibling would make `outcome="success"` silently undercount. So:
 
 | Old | New | Class |
 |---|---|---|

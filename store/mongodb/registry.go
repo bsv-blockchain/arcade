@@ -7,7 +7,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
-	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/broadcaster/store"
 )
 
 // UpsertDatahubEndpoint implements store.Store. The policy is $set only when

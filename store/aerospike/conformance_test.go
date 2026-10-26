@@ -5,7 +5,7 @@ package aerospike
 import (
 	"testing"
 
-	"github.com/bsv-blockchain/arcade/store/storetest"
+	"github.com/bsv-blockchain/broadcaster/store/storetest"
 )
 
 // Requires a live Aerospike on localhost:3200 (integrationStore skips

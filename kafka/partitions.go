@@ -15,7 +15,7 @@ import (
 // Returns an error only when an existing topic has fewer partitions than
 // minPartitions, because that is an unrecoverable misconfiguration for a
 // horizontally-scaled deployment — more pods than partitions means some
-// pods will never receive messages. Used at startup from cmd/arcade so
+// pods will never receive messages. Used at startup from cmd/bsv-broadcaster so
 // operators see the problem before traffic arrives.
 func CheckPartitions(broker Broker, topics []string, minPartitions int, logger *zap.Logger) error {
 	if minPartitions <= 1 {

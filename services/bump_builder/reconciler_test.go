@@ -15,12 +15,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/merkleservice"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
-	"github.com/bsv-blockchain/arcade/store/pebble"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/merkleservice"
+	"github.com/bsv-blockchain/broadcaster/metrics"
+	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/store/pebble"
 )
 
 // Anchor-reconciler tests (issue #279) run against a REAL pebble store so
@@ -1916,7 +1916,7 @@ func (s *reprocessStub) requested() []string {
 // does: a merkle client plus the callback URL the poke forwards.
 func withReprocess(r *Reconciler, stub *reprocessStub) {
 	r.merkle = merkleservice.NewClient(stub.srv.URL, "", time.Second)
-	r.cfg.CallbackURL = "http://arcade.test/callback"
+	r.cfg.CallbackURL = "http://broadcaster.test/callback"
 }
 
 // TestReconciler_LeaseHeartbeatHonoursAcquireExpiry: the heartbeat must

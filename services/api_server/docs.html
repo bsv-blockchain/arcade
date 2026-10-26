@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Arcade — The world's most scalable transaction broadcast manager</title>
+<title>BSV Broadcaster — The world's most scalable transaction broadcast manager</title>
 <style>
   :root {
     --bg: #ffffff;
@@ -554,7 +554,7 @@
       <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
     </button>
     <div class="hero-inner">
-      <span class="badge"><span class="dot"></span>Arcade · BSV Transaction Broadcaster</span>
+      <span class="badge"><span class="dot"></span>BSV Broadcaster · BSV Transaction Broadcaster</span>
       <h1>The world's most scalable transaction broadcast manager</h1>
       <p class="tagline">A high-throughput, callback-driven gateway for submitting BSV transactions, tracking their lifecycle, and streaming status updates to subscribers in real time.</p>
     </div>
@@ -582,12 +582,12 @@
 
     <section class="service-reference" id="chaintracks-api" aria-labelledby="chaintracks-heading">
       <h2 id="chaintracks-heading">Chaintracks API</h2>
-      <p>Chaintracks is a separate Arcade listener for block-header tracking. Its default local base URL is <code>http://localhost:8083</code>; use the Chaintracks Service or Ingress URL configured by your deployment rather than the API server base URL above. New integrations should use <code>/chaintracks/v2</code>. The <code>/chaintracks/v1</code> surface remains for legacy RPC-compatible clients.</p>
+      <p>Chaintracks is a separate BSV Broadcaster listener for block-header tracking. Its default local base URL is <code>http://localhost:8083</code>; use the Chaintracks Service or Ingress URL configured by your deployment rather than the API server base URL above. New integrations should use <code>/chaintracks/v2</code>. The <code>/chaintracks/v1</code> surface remains for legacy RPC-compatible clients.</p>
 
       <div class="meta-grid">
         <div class="meta-card">
           <div class="label">Default listener</div>
-          <div class="value">http://&lt;arcade-host&gt;:8083</div>
+          <div class="value">http://&lt;bsv-broadcaster-host&gt;:8083</div>
         </div>
         <div class="meta-card">
           <div class="label">Availability check</div>
@@ -651,7 +651,7 @@ curl -fsS http://localhost:8083/chaintracks/v2/tip</code></pre>
         </table>
       </div>
 
-      <p class="note"><strong>Need schemas and response details?</strong> The <a href="https://github.com/bsv-blockchain/arcade/blob/main/openapi/arcade.openapi.yaml">OpenAPI reference</a> covers the legacy v1 RPC endpoints and most v2 operations. This page also records the v1 direct-path compatibility aliases, <code>/headers.bin</code>, and stored-header-file download paths that are not represented there.</p>
+      <p class="note"><strong>Need schemas and response details?</strong> The <a href="https://github.com/bsv-blockchain/broadcaster/blob/main/openapi/bsv-broadcaster.openapi.yaml">OpenAPI reference</a> covers the legacy v1 RPC endpoints and most v2 operations. This page also records the v1 direct-path compatibility aliases, <code>/headers.bin</code>, and stored-header-file download paths that are not represented there.</p>
     </section>
 
     <div class="routes">
@@ -723,13 +723,13 @@ curl -fsS http://localhost:8083/chaintracks/v2/tip</code></pre>
   </main>
 
   <footer>
-    Built for scale · Arcade powers BSV transaction broadcasts on the world's most performant ledger.
+    Built for scale · BSV Broadcaster powers BSV transaction broadcasts on the world's most performant ledger.
   </footer>
 
   <script>
     (function () {
       try {
-        var stored = localStorage.getItem("arcade-theme");
+        var stored = localStorage.getItem("bsv-broadcaster-theme");
         if (stored === "light" || stored === "dark") {
           document.documentElement.setAttribute("data-theme", stored);
         }
@@ -746,7 +746,7 @@ curl -fsS http://localhost:8083/chaintracks/v2/tip</code></pre>
       }
       var next = current === "dark" ? "light" : "dark";
       document.documentElement.setAttribute("data-theme", next);
-      try { localStorage.setItem("arcade-theme", next); } catch (e) { /* ignore */ }
+      try { localStorage.setItem("bsv-broadcaster-theme", next); } catch (e) { /* ignore */ }
     }
 
     function toggleRoute(btn) {

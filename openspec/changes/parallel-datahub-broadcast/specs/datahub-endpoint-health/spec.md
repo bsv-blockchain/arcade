@@ -88,11 +88,11 @@ The client SHALL run a single background probe goroutine that ticks at `probe_in
 
 ### Requirement: Configuration
 
-Arcade SHALL accept a `propagation.endpoint_health` config block with the following fields and defaults: `failure_threshold: 3`, `probe_interval_ms: 30000`, `probe_timeout_ms: 2000`, `min_healthy_endpoints: 0`. Zero or negative values SHALL fall back to the defaults at client construction time.
+BSV Broadcaster SHALL accept a `propagation.endpoint_health` config block with the following fields and defaults: `failure_threshold: 3`, `probe_interval_ms: 30000`, `probe_timeout_ms: 2000`, `min_healthy_endpoints: 0`. Zero or negative values SHALL fall back to the defaults at client construction time.
 
 #### Scenario: Defaults applied when block omitted
 
-- **WHEN** arcade starts with no `propagation.endpoint_health` block in the config
+- **WHEN** BSV Broadcaster starts with no `propagation.endpoint_health` block in the config
 - **THEN** the client uses `failure_threshold = 3`, `probe_interval_ms = 30000`, `probe_timeout_ms = 2000`, and `min_healthy_endpoints = 0`.
 
 #### Scenario: Operator override

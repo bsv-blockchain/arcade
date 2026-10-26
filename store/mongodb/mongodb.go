@@ -45,8 +45,8 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/store/bumpcache"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/store/bumpcache"
 )
 
 const (
@@ -172,7 +172,7 @@ func New(ctx context.Context, cfg config.Mongo, logger *zap.Logger) (*Store, err
 	if err != nil {
 		return nil, fmt.Errorf("mongodb: parsing uri: %w", err)
 	}
-	opts.SetAppName("arcade").
+	opts.SetAppName("bsv-broadcaster").
 		SetConnectTimeout(connectTimeout).
 		SetServerSelectionTimeout(connectTimeout)
 	// Every guard in this package is a read-then-write or a read-back of
@@ -206,7 +206,7 @@ func New(ctx context.Context, cfg config.Mongo, logger *zap.Logger) (*Store, err
 	// start from zero.
 	//
 	// MinPoolSize is deliberately NOT the rewrite width: these are idle
-	// sockets held open per process, and a deployment runs many arcade pods
+	// sockets held open per process, and a deployment runs many BSV Broadcaster pods
 	// against one deployment, so a floor of ~90 each would cost mongod
 	// thousands of connections to save a ramp that maxConnecting already
 	// shortens from ~46 waves to ~6.

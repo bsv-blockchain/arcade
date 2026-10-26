@@ -7,7 +7,7 @@ import (
 	"math"
 	"time"
 
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/broadcaster/models"
 )
 
 // ErrNotFound is returned when a requested record does not exist.
@@ -87,7 +87,7 @@ type DatahubEndpoint struct {
 //
 // It is attached to the URL registration purely so operators can see, per
 // endpoint, what each node enforces — GET /health reports it. The network-wide
-// values arcade itself enforces come from PeerPolicy instead, which is keyed by
+// values BSV Broadcaster itself enforces come from PeerPolicy instead, which is keyed by
 // libp2p PeerID and so also covers peers advertising no URL at all. The two are
 // deliberately separate: same source, different keys, different questions.
 //
@@ -342,7 +342,7 @@ type Store interface {
 	// Postgres, sorts them. It exists for consumers that genuinely need the
 	// whole row — propagation's replay and reaper. Do NOT reach for it from a
 	// new bulk or startup scan: reusing it for TxTracker hydration shipped 14
-	// columns for ~5M rows on every api-server boot and drove both arcade and
+	// columns for ~5M rows on every api-server boot and drove both BSV Broadcaster and
 	// its Postgres out of memory (issue #276). New bulk consumers get a
 	// projected, server-side-filtered method instead — see IterateTrackerRows,
 	// IterateStatusesByToken and CensusStatusesSince.
@@ -600,7 +600,7 @@ type Store interface {
 	// with status='active'. Returns 0 when the table is empty (or every row
 	// is orphaned). The bump-builder watchdog uses this to compute a
 	// recency window — only blocks within N of the active tip are eligible
-	// for /reprocess, so a long arcade outage that floods the table with
+	// for /reprocess, so a long BSV Broadcaster outage that floods the table with
 	// historical headers doesn't trigger thousands of reprocess calls.
 	GetActiveTipBlockHeight(ctx context.Context) (uint64, error)
 
@@ -625,7 +625,7 @@ type Store interface {
 	// it exists after. Only txids that were actually updated appear in either
 	// slice — unknown-txid skips produce no entry on either side. The prevs
 	// slice exists so callers can observe the
-	// arcade_status_transition_age_seconds{from=*,to=MINED} metric without an
+	// bsv_broadcaster_status_transition_age_seconds{from=*,to=MINED} metric without an
 	// extra round-trip.
 	SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeight uint64, txids []string) (prevs, mined []*models.TransactionStatus, err error)
 

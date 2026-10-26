@@ -22,10 +22,10 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/metrics"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/metrics"
+	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/store"
 )
 
 const tokA = "tok-A"
@@ -742,7 +742,7 @@ func TestSSEMidstreamCatchupDeliversDroppedEvents(t *testing.T) {
 	deadline = time.Now().Add(5 * time.Second)
 	for testutil.ToFloat64(metrics.SSEMidstreamCatchupsTotal)-catchupsBefore < 1 {
 		if time.Now().After(deadline) {
-			t.Fatal("arcade_sse_midstream_catchups_total never incremented after a drop")
+			t.Fatal("bsv_broadcaster_sse_midstream_catchups_total never incremented after a drop")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

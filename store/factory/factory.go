@@ -10,12 +10,12 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/config"
-	"github.com/bsv-blockchain/arcade/store"
-	"github.com/bsv-blockchain/arcade/store/aerospike"
-	"github.com/bsv-blockchain/arcade/store/mongodb"
-	"github.com/bsv-blockchain/arcade/store/pebble"
-	"github.com/bsv-blockchain/arcade/store/postgres"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/store/aerospike"
+	"github.com/bsv-blockchain/broadcaster/store/mongodb"
+	"github.com/bsv-blockchain/broadcaster/store/pebble"
+	"github.com/bsv-blockchain/broadcaster/store/postgres"
 )
 
 // New constructs a Store and Leaser pair dispatching on cfg.Store.Backend.

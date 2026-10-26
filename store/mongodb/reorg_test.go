@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bsv-blockchain/arcade/internal/synthblock"
-	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/broadcaster/internal/synthblock"
+	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/store"
 )
 
 // Store-layer reorg semantics for issue #279: IMMUTABLE rows are never

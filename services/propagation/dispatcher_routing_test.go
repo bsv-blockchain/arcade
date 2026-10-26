@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bsv-blockchain/arcade/kafka"
-	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/broadcaster/kafka"
+	"github.com/bsv-blockchain/broadcaster/models"
 )
 
 // waitForInflight polls the propagator's inflight-depth mirror until it

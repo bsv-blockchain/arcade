@@ -1,8 +1,8 @@
 // Package logfields provides canonical zap.Field constructors for the
-// identifiers arcade logs at every transaction-lifecycle transition: txid,
+// identifiers BSV Broadcaster logs at every transaction-lifecycle transition: txid,
 // block_hash, block_height, and friends. Using these constructors instead
 // of ad-hoc zap.String/Strings/Int/Uint64 calls keeps field names
-// consistent across arcade and merkle-service, so searching Coralogix for
+// consistent across BSV Broadcaster and merkle-service, so searching Coralogix for
 // a txid or block_hash surfaces every log line touching that transaction
 // regardless of which component emitted it.
 //
