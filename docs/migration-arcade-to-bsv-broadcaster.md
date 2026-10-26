@@ -18,7 +18,8 @@ existing deployment must do to upgrade without losing state.
 | Kafka consumer group | `arcade` | `bsv-broadcaster` | pin `kafka.consumer_group: arcade` |
 | Prometheus metrics | `arcade_*` | `bsv_broadcaster_*` | **none**: update dashboards and alerts |
 | Storage path | `~/.arcade` | `~/.bsv-broadcaster` | pin `storage_path` / `store.pebble.path` |
-| Embedded Postgres user / password / db | `arcade` | `bsv_broadcaster` | pin `store.postgres.embedded_*` |
+| Embedded Postgres user / password / db | `arcade` | `bsv_broadcaster` | pin `store.postgres.embedded_{user,password,database}` |
+| Embedded Postgres data dir | `~/.arcade/postgres` | `~/.bsv-broadcaster/postgres` | pin `store.postgres.embedded_data_dir` |
 | MongoDB database | `arcade` | `bsv_broadcaster` | pin `store.mongodb.database` |
 | Aerospike namespace | `arcade` | `bsv_broadcaster` | pin `store.aerospike.namespace` |
 | OTel `service.name` | `arcade` | `bsv-broadcaster` | pin `telemetry.service_name` |
@@ -31,6 +32,11 @@ These are **unchanged** because they name persisted state:
 - Aerospike set and secondary-index names (`arcade_transactions`, `arcade_idx_tx_status`, …).
 - The Postgres schema-migration advisory-lock key.
 - Postgres table names and MongoDB collection names. These never carried the old name.
+- In the Kubernetes manifests under `deploy/`: the `arcade` namespace, the
+  `arcade-chaintracks-data` PVC, and the Aerospike server namespace `arcade` with
+  its device file `/opt/aerospike/data/arcade.dat`. The manifests also pin the
+  Kafka topic prefix and consumer group to `arcade`. See
+  [Kubernetes manifests](#kubernetes-manifests-deploy).
 
 ## Upgrading an existing deployment
 
@@ -49,7 +55,8 @@ how badly an unpinned value fails:
 |---|---|
 | `kafka.consumer_group: arcade` | **Fails silently.** Consumers join a brand-new group at `auto.offset.reset` and replay or skip `tx_status` / `block_processed` traffic. |
 | `store.mongodb.database: arcade`, `store.postgres.embedded_{user,password,database}: arcade` | Fails silently. Writes go to a new, empty database. |
-| `storage_path`, `store.pebble.path` (`~/.arcade/...`) | Fails silently. Pebble and chaintracks start from an empty local store. |
+| `store.postgres.embedded_data_dir: ~/.arcade/postgres` | Fails silently. Embedded Postgres initializes a brand-new cluster. This path does not derive from `storage_path`, so pinning `storage_path` alone does not cover it. |
+| `storage_path`, `store.pebble.path` (`~/.arcade/pebble`) | Fails silently. Pebble, chaintracks and the p2p identity start from an empty local store. `storage_path` covers chaintracks and p2p only; Pebble needs its own pin. |
 | `store.aerospike.namespace: arcade` | Fails loudly. Aerospike rejects the unknown namespace, and adding one needs a server restart. |
 | `kafka.topic_prefix: arcade` | Fails loudly. The propagation-topic partition check fails closed at startup. |
 | `telemetry.service_name: arcade` | Cosmetic, but traces and metrics regroup under a new service in your backend. |
@@ -62,9 +69,18 @@ BSV_BROADCASTER_KAFKA_CONSUMER_GROUP=arcade
 BSV_BROADCASTER_KAFKA_TOPIC_PREFIX=arcade
 BSV_BROADCASTER_STORE_MONGODB_DATABASE=arcade
 BSV_BROADCASTER_STORE_AEROSPIKE_NAMESPACE=arcade
+BSV_BROADCASTER_STORE_POSTGRES_EMBEDDED_USER=arcade
+BSV_BROADCASTER_STORE_POSTGRES_EMBEDDED_PASSWORD=arcade
+BSV_BROADCASTER_STORE_POSTGRES_EMBEDDED_DATABASE=arcade
+BSV_BROADCASTER_STORE_POSTGRES_EMBEDDED_DATA_DIR=~/.arcade/postgres
+BSV_BROADCASTER_STORE_PEBBLE_PATH=~/.arcade/pebble
 BSV_BROADCASTER_STORAGE_PATH=~/.arcade
 BSV_BROADCASTER_TELEMETRY_SERVICE_NAME=arcade
 ```
+
+Pin only the backends you run. If you set non-default values for any of these
+before, the env shim already carries them over. `store.postgres.embedded_cache_dir`
+only caches the extracted Postgres binary, so it can move to its new default.
 
 Then:
 
@@ -80,6 +96,43 @@ Then:
 Moving to the new topic names, consumer group or database names is optional.
 It needs a planned data migration (drain and recreate topics, or copy the
 database), and you can do it at any later point by removing the pins.
+
+## Kubernetes manifests (`deploy/`)
+
+The manifests keep every name that identifies stored data, so `kubectl apply -f
+deploy/` upgrades an existing install in place:
+
+- Namespace `arcade`. Kafka's and Aerospike's StatefulSet names are unchanged,
+  so their `volumeClaimTemplates` PVCs (`data-kafka-0`, `data-aerospike-0`) are
+  reused.
+- PVC `arcade-chaintracks-data` for chaintracks headers.
+- Aerospike server namespace `arcade`, backed by
+  `/opt/aerospike/data/arcade.dat`. Every service sets
+  `BSV_BROADCASTER_STORE_AEROSPIKE_NAMESPACE=arcade` to match.
+- `BSV_BROADCASTER_KAFKA_TOPIC_PREFIX=arcade` and
+  `BSV_BROADCASTER_KAFKA_CONSUMER_GROUP=arcade` on every service.
+
+The Deployments and their Services were renamed from `arcade-<service>` to
+`bsv-broadcaster-<service>`. Applying the manifests creates the new ones beside
+the old ones, and the new chaintracks pod stays `Pending` until the old pod
+releases its ReadWriteOnce PVC. Apply, then delete the old objects. They are the
+only ones still labelled `part-of=arcade`, because the apply relabels everything
+it keeps:
+
+```bash
+kubectl apply -f deploy/
+kubectl -n arcade delete deployment,service -l app.kubernetes.io/part-of=arcade
+```
+
+A fresh install that does not need the old names can change them before the
+first apply. Change the namespace (including every `*.arcade.svc.cluster.local`
+host), the PVC name, the Aerospike namespace and device file, and the matching
+env values, all together.
+
+The manifests before this release set `ARCADE_AEROSPIKE_HOSTS` and
+`ARCADE_AEROSPIKE_NAMESPACE`, which never matched a config key, so they had no
+effect. The manifests now use the correct `BSV_BROADCASTER_STORE_AEROSPIKE_*`
+names. Check any copies you maintain.
 
 ## Local compose stack
 

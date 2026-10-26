@@ -97,3 +97,49 @@ func TestValidate_RejectsBadTopicPrefix(t *testing.T) {
 		t.Fatal("validate accepted kafka.topic_prefix with a space")
 	}
 }
+
+// TestMigrationPinsBindFromEnv covers every pin that
+// docs/migration-arcade-to-bsv-broadcaster.md and deploy/ set as an env var.
+// A misspelled key is silently ignored, so the upgrade would quietly come up
+// on the new defaults and fresh storage.
+func TestMigrationPinsBindFromEnv(t *testing.T) {
+	pins := map[string]string{
+		"BSV_BROADCASTER_KAFKA_CONSUMER_GROUP":             "arcade",
+		"BSV_BROADCASTER_KAFKA_TOPIC_PREFIX":               "arcade",
+		"BSV_BROADCASTER_STORE_MONGODB_DATABASE":           "arcade",
+		"BSV_BROADCASTER_STORE_AEROSPIKE_NAMESPACE":        "arcade",
+		"BSV_BROADCASTER_STORE_POSTGRES_EMBEDDED_USER":     "arcade",
+		"BSV_BROADCASTER_STORE_POSTGRES_EMBEDDED_PASSWORD": "arcade",
+		"BSV_BROADCASTER_STORE_POSTGRES_EMBEDDED_DATABASE": "arcade",
+		"BSV_BROADCASTER_STORE_POSTGRES_EMBEDDED_DATA_DIR": "/srv/arcade/postgres",
+		"BSV_BROADCASTER_STORE_PEBBLE_PATH":                "/srv/arcade/pebble",
+		"BSV_BROADCASTER_STORAGE_PATH":                     "/srv/arcade",
+		"BSV_BROADCASTER_TELEMETRY_SERVICE_NAME":           "arcade",
+	}
+	for k, v := range pins {
+		t.Setenv(k, v)
+	}
+
+	cfg, err := Load(&cobra.Command{})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got := map[string]string{
+		"BSV_BROADCASTER_KAFKA_CONSUMER_GROUP":             cfg.Kafka.ConsumerGroup,
+		"BSV_BROADCASTER_KAFKA_TOPIC_PREFIX":               cfg.Kafka.TopicPrefix,
+		"BSV_BROADCASTER_STORE_MONGODB_DATABASE":           cfg.Store.Mongo.Database,
+		"BSV_BROADCASTER_STORE_AEROSPIKE_NAMESPACE":        cfg.Store.Aerospike.Namespace,
+		"BSV_BROADCASTER_STORE_POSTGRES_EMBEDDED_USER":     cfg.Store.Postgres.EmbeddedUser,
+		"BSV_BROADCASTER_STORE_POSTGRES_EMBEDDED_PASSWORD": cfg.Store.Postgres.EmbeddedPassword,
+		"BSV_BROADCASTER_STORE_POSTGRES_EMBEDDED_DATABASE": cfg.Store.Postgres.EmbeddedDatabase,
+		"BSV_BROADCASTER_STORE_POSTGRES_EMBEDDED_DATA_DIR": cfg.Store.Postgres.EmbeddedDataDir,
+		"BSV_BROADCASTER_STORE_PEBBLE_PATH":                cfg.Store.Pebble.Path,
+		"BSV_BROADCASTER_STORAGE_PATH":                     cfg.StoragePath,
+		"BSV_BROADCASTER_TELEMETRY_SERVICE_NAME":           cfg.Telemetry.ServiceName,
+	}
+	for k, want := range pins {
+		if got[k] != want {
+			t.Errorf("%s=%q bound as %q", k, want, got[k])
+		}
+	}
+}

@@ -9,7 +9,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: bsv-broadcaster-bump-builder
-  namespace: bsv-broadcaster
+  namespace: arcade
   labels:
     app.kubernetes.io/name: bump-builder
     app.kubernetes.io/part-of: bsv-broadcaster
@@ -34,11 +34,15 @@ spec:
               protocol: TCP
           env:
             - name: BSV_BROADCASTER_KAFKA_BROKERS
-              value: "kafka-0.kafka.bsv-broadcaster.svc.cluster.local:9092"
-            - name: BSV_BROADCASTER_AEROSPIKE_HOSTS
-              value: "aerospike-0.aerospike.bsv-broadcaster.svc.cluster.local:3000"
-            - name: BSV_BROADCASTER_AEROSPIKE_NAMESPACE
-              value: "bsv_broadcaster"
+              value: "kafka-0.kafka.arcade.svc.cluster.local:9092"
+            - name: BSV_BROADCASTER_KAFKA_CONSUMER_GROUP
+              value: "arcade"
+            - name: BSV_BROADCASTER_KAFKA_TOPIC_PREFIX
+              value: "arcade"
+            - name: BSV_BROADCASTER_STORE_AEROSPIKE_HOSTS
+              value: "aerospike-0.aerospike.arcade.svc.cluster.local:3000"
+            - name: BSV_BROADCASTER_STORE_AEROSPIKE_NAMESPACE
+              value: "arcade"
             # Talk to the chaintracks pod over HTTP instead of running an
             # embedded ChainManager + upstream header poller in this pod.
             # The URL must include the /chaintracks path prefix: the
@@ -48,7 +52,7 @@ spec:
             - name: BSV_BROADCASTER_CHAINTRACKS_MODE
               value: "remote"
             - name: BSV_BROADCASTER_CHAINTRACKS_URL
-              value: "http://chaintracks.bsv-broadcaster.svc.cluster.local:8083/chaintracks"
+              value: "http://bsv-broadcaster-chaintracks.arcade.svc.cluster.local:8083/chaintracks"
             # HOST_IP feeds OTEL_EXPORTER_OTLP_ENDPOINT below to reach the
             # node-local OTLP collector via the Kubernetes downward API; it
             # MUST be defined before its $(HOST_IP) use. Telemetry itself
