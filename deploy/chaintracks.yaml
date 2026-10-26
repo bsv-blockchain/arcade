@@ -11,6 +11,14 @@
 # coordination. To run hot-standby, set up a separate Deployment with
 # its own PVC and load-balance reads at the Service layer.
 #
+# Single writer across renames too: strategy Recreate only serializes pods
+# of THIS Deployment, and ReadWriteOnce only pins the PVC to one node, so a
+# second, differently named Deployment on the same node can open the same
+# checkpoint directory concurrently and corrupt it. When the Deployment
+# name changes (e.g. arcade-chaintracks -> bsv-broadcaster-chaintracks),
+# delete the old one and wait for its pod to terminate before applying.
+# See docs/migration-arcade-to-bsv-broadcaster.md.
+#
 # Exposes /chaintracks/v1 (legacy RPC-style) and /chaintracks/v2 (JSON +
 # binary + SSE) on port 8083 to external clients.
 apiVersion: apps/v1

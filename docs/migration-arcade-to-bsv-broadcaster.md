@@ -113,16 +113,38 @@ deploy/` upgrades an existing install in place:
   `BSV_BROADCASTER_KAFKA_CONSUMER_GROUP=arcade` on every service.
 
 The Deployments and their Services were renamed from `arcade-<service>` to
-`bsv-broadcaster-<service>`. Applying the manifests creates the new ones beside
-the old ones, and the new chaintracks pod stays `Pending` until the old pod
-releases its ReadWriteOnce PVC. Apply, then delete the old objects. They are the
-only ones still labelled `part-of=arcade`, because the apply relabels everything
-it keeps:
+`bsv-broadcaster-<service>`, so applying the manifests creates new Deployments
+beside the old ones. For the stateless services the overlap is harmless.
+Chaintracks is different. Only one process may write to
+`arcade-chaintracks-data`, and nothing in Kubernetes enforces that across the
+rename:
+
+- ReadWriteOnce restricts the volume to one *node*, not one pod. Both pods can
+  mount it when they land on the same node.
+- `strategy: Recreate` serializes pods of a single Deployment. It does not
+  coordinate two differently named Deployments.
+
+Two chaintracks processes writing the same checkpoint directory corrupt it, and
+the result shows up as metadata JSON parse errors. Stop the old writer and wait
+for its pod to terminate *before* the first apply:
 
 ```bash
+# 1. Single-writer handoff: remove the old chaintracks and wait until its pod is gone.
+kubectl -n arcade delete deployment arcade-chaintracks --cascade=foreground --wait
+kubectl -n arcade wait --for=delete pod -l app.kubernetes.io/name=chaintracks --timeout=5m
+
+# 2. Roll out the renamed manifests. Only now does a chaintracks pod start on the PVC.
 kubectl apply -f deploy/
+
+# 3. Remove the remaining old Deployments and Services. They are the only
+#    objects still labelled part-of=arcade, because the apply relabels everything it keeps.
 kubectl -n arcade delete deployment,service -l app.kubernetes.io/part-of=arcade
 ```
+
+Do not continue to step 2 until the `kubectl wait` succeeds. Chaintracks serves
+no headers between steps 1 and 2, so header lookups from the api-server and
+bump-builder (`chaintracks.mode: remote`) fail during that gap. Run the steps
+back to back.
 
 A fresh install that does not need the old names can change them before the
 first apply. Change the namespace (including every `*.arcade.svc.cluster.local`
