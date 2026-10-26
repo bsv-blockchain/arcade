@@ -14,8 +14,8 @@ import (
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 	teranode "github.com/bsv-blockchain/teranode/services/p2p"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
-	"github.com/bsv-blockchain/bsv-broadcaster/tests/e2e/harness"
+	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/tests/e2e/harness"
 )
 
 // reorgStack is the shared scaffolding for the same-height reorg

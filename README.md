@@ -6,8 +6,8 @@
 
 <br/>
 
-<a href="https://github.com/bsv-blockchain/bsv-broadcaster/releases"><img src="https://img.shields.io/github/release-pre/bsv-blockchain/bsv-broadcaster?include_prereleases&style=flat-square&logo=github&color=black" alt="Release"></a>
-<a href="https://golang.org/"><img src="https://img.shields.io/github/go-mod/go-version/bsv-blockchain/bsv-broadcaster?style=flat-square&logo=go&color=00ADD8" alt="Go Version"></a>
+<a href="https://github.com/bsv-blockchain/broadcaster/releases"><img src="https://img.shields.io/github/release-pre/bsv-blockchain/broadcaster?include_prereleases&style=flat-square&logo=github&color=black" alt="Release"></a>
+<a href="https://golang.org/"><img src="https://img.shields.io/github/go-mod/go-version/bsv-blockchain/broadcaster?style=flat-square&logo=go&color=00ADD8" alt="Go Version"></a>
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-OpenBSV-blue?style=flat-square&logo=springsecurity&logoColor=white" alt="License"></a>
 
 <br/>
@@ -18,14 +18,14 @@
        <code>CI / CD</code> &nbsp;&nbsp;
     </td>
     <td align="left">
-       <a href="https://github.com/bsv-blockchain/bsv-broadcaster/actions"><img src="https://img.shields.io/github/actions/workflow/status/bsv-blockchain/bsv-broadcaster/fortress.yml?branch=main&label=build&logo=github&style=flat-square" alt="Build"></a>
-       <a href="https://github.com/bsv-blockchain/bsv-broadcaster/actions"><img src="https://img.shields.io/github/last-commit/bsv-blockchain/bsv-broadcaster?style=flat-square&logo=git&logoColor=white&label=last%20update" alt="Last Commit"></a>
+       <a href="https://github.com/bsv-blockchain/broadcaster/actions"><img src="https://img.shields.io/github/actions/workflow/status/bsv-blockchain/broadcaster/fortress.yml?branch=main&label=build&logo=github&style=flat-square" alt="Build"></a>
+       <a href="https://github.com/bsv-blockchain/broadcaster/actions"><img src="https://img.shields.io/github/last-commit/bsv-blockchain/broadcaster?style=flat-square&logo=git&logoColor=white&label=last%20update" alt="Last Commit"></a>
     </td>
     <td align="right">
        &nbsp;&nbsp;&nbsp;&nbsp; <code>Quality</code> &nbsp;&nbsp;
     </td>
     <td align="left">
-       <a href="https://codecov.io/gh/bsv-blockchain/bsv-broadcaster"><img src="https://codecov.io/gh/bsv-blockchain/bsv-broadcaster/branch/main/graph/badge.svg?style=flat-square" alt="Coverage"></a>
+       <a href="https://codecov.io/gh/bsv-blockchain/broadcaster"><img src="https://codecov.io/gh/bsv-blockchain/broadcaster/branch/main/graph/badge.svg?style=flat-square" alt="Coverage"></a>
     </td>
   </tr>
 
@@ -34,15 +34,15 @@
        <code>Security</code> &nbsp;&nbsp;
     </td>
     <td align="left">
-       <a href="https://scorecard.dev/viewer/?uri=github.com/bsv-blockchain/bsv-broadcaster"><img src="https://api.scorecard.dev/projects/github.com/bsv-blockchain/bsv-broadcaster/badge?style=flat-square" alt="Scorecard"></a>
+       <a href="https://scorecard.dev/viewer/?uri=github.com/bsv-blockchain/broadcaster"><img src="https://api.scorecard.dev/projects/github.com/bsv-blockchain/broadcaster/badge?style=flat-square" alt="Scorecard"></a>
        <a href=".github/SECURITY.md"><img src="https://img.shields.io/badge/policy-active-success?style=flat-square&logo=security&logoColor=white" alt="Security"></a>
     </td>
     <td align="right">
        &nbsp;&nbsp;&nbsp;&nbsp; <code>Community</code> &nbsp;&nbsp;
     </td>
     <td align="left">
-       <a href="https://github.com/bsv-blockchain/bsv-broadcaster/graphs/contributors"><img src="https://img.shields.io/github/contributors/bsv-blockchain/bsv-broadcaster?style=flat-square&color=orange" alt="Contributors"></a>
-       <a href="https://deepwiki.com/bsv-blockchain/bsv-broadcaster"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
+       <a href="https://github.com/bsv-blockchain/broadcaster/graphs/contributors"><img src="https://img.shields.io/github/contributors/bsv-blockchain/broadcaster?style=flat-square&color=orange" alt="Contributors"></a>
+       <a href="https://deepwiki.com/bsv-blockchain/broadcaster"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
     </td>
   </tr>
 </table>
@@ -120,7 +120,7 @@
 
 **BSV Broadcaster** requires a [supported release of Go](https://golang.org/doc/devel/release.html#policy).
 ```shell script
-go get -u github.com/bsv-blockchain/bsv-broadcaster
+go get -u github.com/bsv-blockchain/broadcaster
 ```
 
 <br/>
@@ -138,8 +138,8 @@ go get -u github.com/bsv-blockchain/bsv-broadcaster
 ### Build from Source
 
 ```bash
-git clone https://github.com/bsv-blockchain/bsv-broadcaster.git
-cd bsv-broadcaster
+git clone https://github.com/bsv-blockchain/broadcaster.git
+cd broadcaster
 go build -o bsv-broadcaster cmd/bsv-broadcaster/main.go
 ```
 
@@ -217,7 +217,7 @@ BSV Broadcaster is a lightweight transaction broadcast service that:
 - **Transaction Validation** - Local validation before network submission
 - **Status Tracking** - Complete audit trail of transaction lifecycle
 - **Extensible** - All packages public, easy to customize
-- **API Reference** – Dive into the godocs at [pkg.go.dev/github.com/bsv-blockchain/bsv-broadcaster](https://pkg.go.dev/github.com/bsv-blockchain/bsv-broadcaster)
+- **API Reference** – Dive into the godocs at [pkg.go.dev/github.com/bsv-blockchain/broadcaster](https://pkg.go.dev/github.com/bsv-blockchain/broadcaster)
 
 <br>
 
@@ -431,7 +431,7 @@ See [examples/sse_client.html](examples/sse_client.html) and [examples/sse_clien
 For applications that need BSV Broadcaster functionality without running a full server, use the REST client:
 
 ```go
-import "github.com/bsv-blockchain/bsv-broadcaster/client"
+import "github.com/bsv-blockchain/broadcaster/client"
 
 c := client.New("http://bsv-broadcaster-server:3011")
 defer c.Close() // Always close when done to clean up SSE connections
@@ -465,7 +465,7 @@ All packages are public and designed for extension:
 #### Custom Storage Backend
 
 ```go
-import "github.com/bsv-blockchain/bsv-broadcaster/store"
+import "github.com/bsv-blockchain/broadcaster/store"
 
 type MyStore struct {}
 
@@ -480,7 +480,7 @@ func (s *MyStore) GetOrInsertStatus(ctx context.Context, status *models.Transact
 #### Custom Event Handler
 
 ```go
-import "github.com/bsv-blockchain/bsv-broadcaster/events"
+import "github.com/bsv-blockchain/broadcaster/events"
 
 type MyHandler struct {
     publisher events.Publisher
@@ -535,7 +535,7 @@ For detailed architecture documentation, see [doc.md](doc.md).
 
 ## 🧪 Examples & Tests
 
-All unit tests and examples run via [GitHub Actions](https://github.com/bsv-blockchain/bsv-broadcaster/actions) and use [Go version 1.27.x](https://go.dev/doc/go1.27). View the [configuration file](.github/workflows/fortress.yml).
+All unit tests and examples run via [GitHub Actions](https://github.com/bsv-blockchain/broadcaster/actions) and use [Go version 1.27.x](https://go.dev/doc/go1.27). View the [configuration file](.github/workflows/fortress.yml).
 
 Run all tests (fast):
 
@@ -591,7 +591,7 @@ View the [contributing guidelines](.github/CONTRIBUTING.md) and please follow th
 All kinds of contributions are welcome :raised_hands:!
 The most basic way to show your support is to star :star2: the project, or to raise issues :speech_balloon:.
 
-[![Stars](https://img.shields.io/github/stars/bsv-blockchain/bsv-broadcaster?label=Please%20like%20us&style=social&v=1)](https://github.com/bsv-blockchain/bsv-broadcaster/stargazers)
+[![Stars](https://img.shields.io/github/stars/bsv-blockchain/broadcaster?label=Please%20like%20us&style=social&v=1)](https://github.com/bsv-blockchain/broadcaster/stargazers)
 
 <br/>
 

@@ -1,7 +1,7 @@
 package propagation
 
 import (
-	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
+	"github.com/bsv-blockchain/broadcaster/kafka"
 )
 
 // markQueue holds consumed-but-unmarked Kafka messages awaiting the

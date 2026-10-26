@@ -9,7 +9,7 @@ import (
 
 	teranode "github.com/bsv-blockchain/teranode/services/p2p"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/tests/e2e/harness"
+	"github.com/bsv-blockchain/broadcaster/tests/e2e/harness"
 )
 
 // TestSmoke_SyntheticBlockMined proves the synthetic-block path end to

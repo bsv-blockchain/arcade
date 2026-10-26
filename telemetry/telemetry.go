@@ -30,7 +30,7 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/config"
 )
 
 // defaultExportTimeout bounds Shutdown when cfg.ExportTimeoutMs is unset

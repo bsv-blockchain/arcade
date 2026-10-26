@@ -10,11 +10,11 @@ import (
 	"github.com/bsv-blockchain/go-chaintracks/chaintracks"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/config"
-	"github.com/bsv-blockchain/bsv-broadcaster/logfields"
-	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
-	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/logfields"
+	"github.com/bsv-blockchain/broadcaster/metrics"
+	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/store"
 )
 
 // maxReorgBranchWalk bounds how many heights below the new tip the

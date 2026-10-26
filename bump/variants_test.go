@@ -7,7 +7,7 @@ import (
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/models"
 )
 
 // Two merkle-services deliver the same subtree, each tracking a different tx

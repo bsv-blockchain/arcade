@@ -8,9 +8,9 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/logfields"
-	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/logfields"
+	"github.com/bsv-blockchain/broadcaster/metrics"
+	"github.com/bsv-blockchain/broadcaster/models"
 )
 
 // Stale thresholds for the reaper rebroadcast scan.

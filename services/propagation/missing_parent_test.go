@@ -11,10 +11,10 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/config"
-	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
-	"github.com/bsv-blockchain/bsv-broadcaster/teranode"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/kafka"
+	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/teranode"
 )
 
 // newTwoEndpointClient builds a teranode client that fans every broadcast

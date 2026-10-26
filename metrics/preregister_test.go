@@ -6,7 +6,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/models"
 )
 
 // gatherFamily returns the MetricFamily with the given name from the default

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/models"
 )
 
 // TestListOrphanedBlocksToReconcile_PrioritizesReanchorable pins the work-queue

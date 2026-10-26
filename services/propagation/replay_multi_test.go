@@ -11,10 +11,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/config"
-	"github.com/bsv-blockchain/bsv-broadcaster/merkleservice"
-	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/merkleservice"
+	"github.com/bsv-blockchain/broadcaster/metrics"
+	"github.com/bsv-blockchain/broadcaster/models"
 )
 
 // testBroadcasterCallbackURL and testBroadcasterCallbackToken are the callback_url and

@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/models"
 )
 
 // StumpBackend is the slice of store.Store the STUMP suite drives.

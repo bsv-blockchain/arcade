@@ -272,7 +272,7 @@ This is what makes Teranode-native broadcast and proof retrieval practical at th
 ## Resources
 
 - **Merkle Service:** https://github.com/bsv-blockchain/merkle-service
-- **BSV Broadcaster v2:** https://github.com/bsv-blockchain/bsv-broadcaster-refactor
+- **BSV Broadcaster v2:** https://github.com/bsv-blockchain/arcade-refactor
 - **Full design document:** https://github.com/bsv-blockchain/merkle-service/blob/master/docs/design.md
 - **ARC (the predecessor BSV Broadcaster was built to replace):** https://github.com/bsv-blockchain/arc
-- **Swimlane Diagram** https://github.com/bsv-blockchain/bsv-broadcaster/blob/main/docs/swimlanes.png
+- **Swimlane Diagram** https://github.com/bsv-blockchain/broadcaster/blob/main/docs/swimlanes.png

@@ -28,12 +28,12 @@ import (
 	teranodep2p "github.com/bsv-blockchain/teranode/services/p2p"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/config"
-	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
-	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
-	"github.com/bsv-blockchain/bsv-broadcaster/services"
-	"github.com/bsv-blockchain/bsv-broadcaster/ssrfguard"
-	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/kafka"
+	"github.com/bsv-blockchain/broadcaster/metrics"
+	"github.com/bsv-blockchain/broadcaster/services"
+	"github.com/bsv-blockchain/broadcaster/ssrfguard"
+	"github.com/bsv-blockchain/broadcaster/store"
 )
 
 // BlockNotification is retained from the earlier scaffold. It is not used by

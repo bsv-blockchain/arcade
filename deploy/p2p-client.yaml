@@ -22,7 +22,7 @@ spec:
     spec:
       containers:
         - name: bsv-broadcaster
-          image: ghcr.io/bsv-blockchain/bsv-broadcaster:latest
+          image: ghcr.io/bsv-blockchain/broadcaster:latest
           args: ["--mode", "p2p-client"]
           ports:
             - containerPort: 8081

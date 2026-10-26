@@ -11,9 +11,9 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
-	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/metrics"
+	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/store"
 )
 
 // InsertSubmission implements store.Store; a duplicate submission id is a

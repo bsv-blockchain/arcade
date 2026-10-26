@@ -14,10 +14,10 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/app"
-	"github.com/bsv-blockchain/bsv-broadcaster/config"
-	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
-	"github.com/bsv-blockchain/bsv-broadcaster/services"
+	"github.com/bsv-blockchain/broadcaster/app"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/kafka"
+	"github.com/bsv-blockchain/broadcaster/services"
 )
 
 // broadcasterRuntime is the in-process BSV Broadcaster instance the smoke tests drive.

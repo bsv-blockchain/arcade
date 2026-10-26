@@ -27,8 +27,8 @@ profile.
 ## Build
 
 ```bash
-git clone https://github.com/bsv-blockchain/bsv-broadcaster.git
-cd bsv-broadcaster
+git clone https://github.com/bsv-blockchain/broadcaster.git
+cd broadcaster
 go build -o bsv-broadcaster ./cmd/bsv-broadcaster
 ```
 

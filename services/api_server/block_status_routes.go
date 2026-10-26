@@ -9,9 +9,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/logfields"
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
-	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/logfields"
+	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/store"
 )
 
 const (

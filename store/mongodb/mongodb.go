@@ -45,8 +45,8 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/config"
-	"github.com/bsv-blockchain/bsv-broadcaster/store/bumpcache"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/store/bumpcache"
 )
 
 const (

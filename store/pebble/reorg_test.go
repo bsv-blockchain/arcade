@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/internal/synthblock"
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
-	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/internal/synthblock"
+	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/store"
 )
 
 // testBlockA is the primary anchor block used across these tests.

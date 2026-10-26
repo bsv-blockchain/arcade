@@ -5,8 +5,8 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
-	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/store"
 )
 
 // Collection and GridFS bucket names. Bucket names are prefixes: GridFS

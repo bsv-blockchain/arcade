@@ -6,8 +6,8 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/config"
-	"github.com/bsv-blockchain/bsv-broadcaster/services/servicetest"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/services/servicetest"
 )
 
 func newReadinessService(t *testing.T, port int) *Service {

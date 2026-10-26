@@ -1,7 +1,7 @@
 # Local microservices stack — compose analogue of the Kubernetes deployment in
 # bsva-infra-flux/apps/base/arcade-v2 (teratestnet overlay), one replica each.
 #
-#   make docker-up                            # ghcr.io/bsv-blockchain/bsv-broadcaster:latest
+#   make docker-up                            # ghcr.io/bsv-blockchain/broadcaster:latest
 #   BSV_BROADCASTER_IMAGE=bsv-broadcaster:local make docker-up  # after `make docker-build`
 #
 # BSV Broadcaster containers are distroless (no shell/curl) so they cannot carry compose
@@ -38,7 +38,7 @@ x-bsv-broadcaster-depends: &bsv-broadcaster-depends
 # seven containers, and :Z's private per-container label would let the
 # last-started container lock the others out. Single-consumer mounts keep :Z.
 x-bsv-broadcaster-common: &bsv-broadcaster-common
-  image: ${BSV_BROADCASTER_IMAGE:-ghcr.io/bsv-blockchain/bsv-broadcaster:latest}
+  image: ${BSV_BROADCASTER_IMAGE:-ghcr.io/bsv-blockchain/broadcaster:latest}
   volumes:
     - ./compose/bsv-broadcaster-config.yaml:/etc/bsv-broadcaster/config.yaml:ro,z
   networks:

@@ -7,9 +7,9 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/config"
-	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
-	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/kafka"
+	"github.com/bsv-blockchain/broadcaster/store"
 )
 
 func TestPropagator_StartSignalsReadyAfterConsumer(t *testing.T) {

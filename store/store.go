@@ -7,7 +7,7 @@ import (
 	"math"
 	"time"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/models"
 )
 
 // ErrNotFound is returned when a requested record does not exist.

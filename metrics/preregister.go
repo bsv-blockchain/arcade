@@ -1,6 +1,6 @@
 package metrics
 
-import "github.com/bsv-blockchain/bsv-broadcaster/models"
+import "github.com/bsv-blockchain/broadcaster/models"
 
 // Vec children (labeled series) only come into existence on their first
 // observation. A series born between two scrapes starts at its burst value,

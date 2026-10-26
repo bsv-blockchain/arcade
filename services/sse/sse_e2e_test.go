@@ -11,10 +11,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/config"
-	"github.com/bsv-blockchain/bsv-broadcaster/events"
-	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/events"
+	"github.com/bsv-blockchain/broadcaster/kafka"
+	"github.com/bsv-blockchain/broadcaster/models"
 )
 
 // e2eHarness wires the SSE handler against the real KafkaPublisher

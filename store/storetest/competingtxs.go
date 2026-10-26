@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
-	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/store"
 )
 
 // CompetingTxsBackend is the slice of store.Store the competing-txs suite

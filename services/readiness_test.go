@@ -13,7 +13,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/services/servicetest"
+	"github.com/bsv-blockchain/broadcaster/services/servicetest"
 )
 
 // readyStub is a Service whose startup blocks until release is closed, then

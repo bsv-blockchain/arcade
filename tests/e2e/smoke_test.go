@@ -17,7 +17,7 @@ import (
 
 	"github.com/testcontainers/testcontainers-go"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/tests/e2e/harness"
+	"github.com/bsv-blockchain/broadcaster/tests/e2e/harness"
 )
 
 // TestSmoke_TxRegistersWithMerkleService is the v1 smoke test: it

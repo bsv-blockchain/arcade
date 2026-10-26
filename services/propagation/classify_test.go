@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/teranode"
+	"github.com/bsv-blockchain/broadcaster/teranode"
 )
 
 // TestClassifyFailureLine pins the conservative Teranode-line → ARC-code map

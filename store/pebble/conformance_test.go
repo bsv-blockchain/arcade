@@ -4,9 +4,9 @@ import (
 	"context"
 	"testing"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
-	"github.com/bsv-blockchain/bsv-broadcaster/store"
-	"github.com/bsv-blockchain/bsv-broadcaster/store/storetest"
+	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/store/storetest"
 )
 
 // Pebble is the only backend whose conformance run is untagged, so this is the

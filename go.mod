@@ -1,4 +1,4 @@
-module github.com/bsv-blockchain/bsv-broadcaster
+module github.com/bsv-blockchain/broadcaster
 
 go 1.27.0
 
@@ -353,5 +353,5 @@ require (
 //     structured-merge-diff/v7, but k8s.io/apimachinery@v0.37.0 still uses v6
 //     (typecheck failure in managedfields/internal/typeconverter.go).
 // Revisit/remove when apimachinery is upgraded to a version that tracks this
-// upstream. See https://github.com/bsv-blockchain/bsv-broadcaster dependabot config.
+// upstream. See https://github.com/bsv-blockchain/broadcaster dependabot config.
 replace k8s.io/kube-openapi => k8s.io/kube-openapi v0.0.0-20260721132016-d427ff9ee9ad

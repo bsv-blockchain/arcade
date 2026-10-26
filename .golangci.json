@@ -21,7 +21,7 @@
                 "sections": [
                     "standard",
                     "default",
-                    "prefix(github.com/bsv-blockchain/bsv-broadcaster)"
+                    "prefix(github.com/bsv-blockchain/broadcaster)"
                 ]
             },
             "gofmt": {
@@ -32,7 +32,7 @@
             },
             "goimports": {
                 "local-prefixes": [
-                    "github.com/bsv-blockchain/bsv-broadcaster"
+                    "github.com/bsv-blockchain/broadcaster"
                 ]
             }
         }

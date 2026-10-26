@@ -12,10 +12,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/config"
-	"github.com/bsv-blockchain/bsv-broadcaster/store"
-	"github.com/bsv-blockchain/bsv-broadcaster/teranode"
-	"github.com/bsv-blockchain/bsv-broadcaster/version"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/teranode"
+	"github.com/bsv-blockchain/broadcaster/version"
 )
 
 const (

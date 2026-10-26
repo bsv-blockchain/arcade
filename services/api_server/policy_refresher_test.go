@@ -8,9 +8,9 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/config"
-	"github.com/bsv-blockchain/bsv-broadcaster/store"
-	"github.com/bsv-blockchain/bsv-broadcaster/validator"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/validator"
 )
 
 func newPolicyServer(ms *mockStore) *Server {

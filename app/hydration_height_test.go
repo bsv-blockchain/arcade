@@ -8,7 +8,7 @@ import (
 	"github.com/bsv-blockchain/go-chaintracks/chaintracks"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/store"
 )
 
 // fakeChainReader is a finality.ChainReader whose GetTip can express

@@ -6,7 +6,7 @@ import (
 
 	tnerr "github.com/bsv-blockchain/teranode/errors"
 
-	arcerrors "github.com/bsv-blockchain/bsv-broadcaster/errors"
+	arcerrors "github.com/bsv-blockchain/broadcaster/errors"
 )
 
 // mapTeranodeError translates an error from the BDK-backed TxValidator (or the

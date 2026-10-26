@@ -26,11 +26,11 @@ import (
 
 	pebbledb "github.com/cockroachdb/pebble"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/config"
-	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
-	"github.com/bsv-blockchain/bsv-broadcaster/store"
-	"github.com/bsv-blockchain/bsv-broadcaster/store/bumpcache"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/metrics"
+	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/store/bumpcache"
 )
 
 // getOrInsertShards serializes GetOrInsertStatus per-txid so concurrent

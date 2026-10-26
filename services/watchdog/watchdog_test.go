@@ -15,10 +15,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/merkleservice"
-	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
-	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/merkleservice"
+	"github.com/bsv-blockchain/broadcaster/metrics"
+	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/store"
 )
 
 // watchdogStore is a hand-rolled store fake. Embeds the real store.Store

@@ -13,7 +13,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/config"
 )
 
 // restoreOTELTracerProvider snapshots the global tracer provider and restores

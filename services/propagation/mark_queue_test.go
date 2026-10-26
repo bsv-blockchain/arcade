@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
+	"github.com/bsv-blockchain/broadcaster/kafka"
 )
 
 // markQueue is the #295 replacement for the per-offset pendingMarks map:

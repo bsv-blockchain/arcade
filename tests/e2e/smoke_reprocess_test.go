@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/tests/e2e/harness"
+	"github.com/bsv-blockchain/broadcaster/tests/e2e/harness"
 )
 
 // TestSmoke_RealBlockMined_ViaReprocess proves merkle-service's

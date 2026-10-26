@@ -6,10 +6,10 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/config"
-	"github.com/bsv-blockchain/bsv-broadcaster/merkleservice"
-	"github.com/bsv-blockchain/bsv-broadcaster/services"
-	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/merkleservice"
+	"github.com/bsv-blockchain/broadcaster/services"
+	"github.com/bsv-blockchain/broadcaster/store"
 )
 
 // Service is the services.Service-conforming wrapper around Watchdog so

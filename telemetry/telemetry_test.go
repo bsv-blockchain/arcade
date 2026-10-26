@@ -23,8 +23,8 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/config"
-	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/metrics"
 )
 
 // restoreOTELGlobals snapshots the global tracer provider, meter provider,

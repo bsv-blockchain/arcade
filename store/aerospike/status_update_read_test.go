@@ -6,7 +6,7 @@ import (
 
 	aero "github.com/aerospike/aerospike-client-go/v7"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/models"
 )
 
 func TestStatusUpdateReadBinsAreStatusFieldsOnly(t *testing.T) {

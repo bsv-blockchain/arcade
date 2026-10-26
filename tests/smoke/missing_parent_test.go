@@ -16,7 +16,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/config"
 )
 
 // These tests pin the #295 missing-parent safety net end-to-end: with a

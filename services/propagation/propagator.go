@@ -25,22 +25,22 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/config"
-	arcerrors "github.com/bsv-blockchain/bsv-broadcaster/errors"
-	"github.com/bsv-blockchain/bsv-broadcaster/events"
-	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
-	"github.com/bsv-blockchain/bsv-broadcaster/logfields"
-	"github.com/bsv-blockchain/bsv-broadcaster/merkleservice"
-	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
-	"github.com/bsv-blockchain/bsv-broadcaster/services"
-	"github.com/bsv-blockchain/bsv-broadcaster/store"
-	"github.com/bsv-blockchain/bsv-broadcaster/teranode"
+	"github.com/bsv-blockchain/broadcaster/config"
+	arcerrors "github.com/bsv-blockchain/broadcaster/errors"
+	"github.com/bsv-blockchain/broadcaster/events"
+	"github.com/bsv-blockchain/broadcaster/kafka"
+	"github.com/bsv-blockchain/broadcaster/logfields"
+	"github.com/bsv-blockchain/broadcaster/merkleservice"
+	"github.com/bsv-blockchain/broadcaster/metrics"
+	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/services"
+	"github.com/bsv-blockchain/broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/teranode"
 )
 
 // propagationTracerName identifies this package's spans/tracer to the OTEL
 // SDK, per the same package-import-path convention as kafka.tracerName.
-const propagationTracerName = "github.com/bsv-blockchain/bsv-broadcaster/services/propagation"
+const propagationTracerName = "github.com/bsv-blockchain/broadcaster/services/propagation"
 
 // batchSpanMaxLinks caps the number of producer-span links attached to a
 // propagation.broadcast span. Per OTel's recommended batch-messaging

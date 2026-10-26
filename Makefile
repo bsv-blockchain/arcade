@@ -39,7 +39,7 @@ docker-build:
 		exit 1; \
 	fi
 	mkdir -p dist/linux-$(GOARCH)
-	CGO_ENABLED=1 GOOS=linux GOARCH=$(GOARCH) go build -trimpath -ldflags="-s -w -X github.com/bsv-blockchain/bsv-broadcaster/version.Version=$(VERSION)" -o dist/linux-$(GOARCH)/bsv-broadcaster ./cmd/bsv-broadcaster
+	CGO_ENABLED=1 GOOS=linux GOARCH=$(GOARCH) go build -trimpath -ldflags="-s -w -X github.com/bsv-blockchain/broadcaster/version.Version=$(VERSION)" -o dist/linux-$(GOARCH)/bsv-broadcaster ./cmd/bsv-broadcaster
 	docker build --platform=linux/$(GOARCH) -t bsv-broadcaster:local .
 
 run:

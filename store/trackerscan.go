@@ -1,7 +1,7 @@
 package store
 
 import (
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/models"
 )
 
 // TrackerRow is the projection TxTracker hydration needs and nothing more:

@@ -26,11 +26,11 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/config"
-	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
-	"github.com/bsv-blockchain/bsv-broadcaster/services"
-	"github.com/bsv-blockchain/bsv-broadcaster/services/httpmiddleware"
-	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/metrics"
+	"github.com/bsv-blockchain/broadcaster/services"
+	"github.com/bsv-blockchain/broadcaster/services/httpmiddleware"
+	"github.com/bsv-blockchain/broadcaster/store"
 )
 
 const jsonKeyError = "error"

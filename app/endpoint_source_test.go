@@ -9,7 +9,7 @@ import (
 
 	"go.uber.org/zap/zaptest"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/store"
 )
 
 // fakeDatahubLister returns a fixed endpoint set, mimicking the registry.

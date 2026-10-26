@@ -103,14 +103,15 @@ func TestValidate_RejectsBadTopicPrefix(t *testing.T) {
 // A misspelled key is silently ignored, so the upgrade would quietly come up
 // on the new defaults and fresh storage.
 func TestMigrationPinsBindFromEnv(t *testing.T) {
+	const legacy = "arcade"
 	pins := map[string]string{
 		"BSV_BROADCASTER_KAFKA_CONSUMER_GROUP":             "arcade",
 		"BSV_BROADCASTER_KAFKA_TOPIC_PREFIX":               "arcade",
 		"BSV_BROADCASTER_STORE_MONGODB_DATABASE":           "arcade",
 		"BSV_BROADCASTER_STORE_AEROSPIKE_NAMESPACE":        "arcade",
 		"BSV_BROADCASTER_STORE_POSTGRES_EMBEDDED_USER":     "arcade",
-		"BSV_BROADCASTER_STORE_POSTGRES_EMBEDDED_PASSWORD": "arcade",
-		"BSV_BROADCASTER_STORE_POSTGRES_EMBEDDED_DATABASE": "arcade",
+		"BSV_BROADCASTER_STORE_POSTGRES_EMBEDDED_PASSWORD": legacy,
+		"BSV_BROADCASTER_STORE_POSTGRES_EMBEDDED_DATABASE": legacy,
 		"BSV_BROADCASTER_STORE_POSTGRES_EMBEDDED_DATA_DIR": "/srv/arcade/postgres",
 		"BSV_BROADCASTER_STORE_PEBBLE_PATH":                "/srv/arcade/pebble",
 		"BSV_BROADCASTER_STORAGE_PATH":                     "/srv/arcade",

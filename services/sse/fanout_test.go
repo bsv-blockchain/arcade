@@ -12,8 +12,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/metrics"
+	"github.com/bsv-blockchain/broadcaster/models"
 )
 
 // newFanOutFixture builds a manager whose store has `txids` transactions, each

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/store"
 )
 
 const ppNetMainnet = "mainnet"

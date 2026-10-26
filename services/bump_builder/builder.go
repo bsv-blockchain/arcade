@@ -16,17 +16,17 @@ import (
 	"github.com/bsv-blockchain/go-sdk/transaction"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/bump"
-	"github.com/bsv-blockchain/bsv-broadcaster/config"
-	"github.com/bsv-blockchain/bsv-broadcaster/events"
-	"github.com/bsv-blockchain/bsv-broadcaster/kafka"
-	"github.com/bsv-blockchain/bsv-broadcaster/logfields"
-	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
-	"github.com/bsv-blockchain/bsv-broadcaster/services"
-	"github.com/bsv-blockchain/bsv-broadcaster/store"
-	"github.com/bsv-blockchain/bsv-broadcaster/telemetry"
-	"github.com/bsv-blockchain/bsv-broadcaster/teranode"
+	"github.com/bsv-blockchain/broadcaster/bump"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/events"
+	"github.com/bsv-blockchain/broadcaster/kafka"
+	"github.com/bsv-blockchain/broadcaster/logfields"
+	"github.com/bsv-blockchain/broadcaster/metrics"
+	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/services"
+	"github.com/bsv-blockchain/broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/telemetry"
+	"github.com/bsv-blockchain/broadcaster/teranode"
 )
 
 // ChainHeaderReader is the narrow contract bump-builder needs from a chain-

@@ -13,11 +13,11 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/app"
-	"github.com/bsv-blockchain/bsv-broadcaster/config"
-	"github.com/bsv-blockchain/bsv-broadcaster/services"
-	"github.com/bsv-blockchain/bsv-broadcaster/telemetry"
-	"github.com/bsv-blockchain/bsv-broadcaster/version"
+	"github.com/bsv-blockchain/broadcaster/app"
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/services"
+	"github.com/bsv-blockchain/broadcaster/telemetry"
+	"github.com/bsv-blockchain/broadcaster/version"
 )
 
 func main() {

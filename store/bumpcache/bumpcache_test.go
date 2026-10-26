@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/bump"
-	"github.com/bsv-blockchain/bsv-broadcaster/internal/synthblock"
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/bump"
+	"github.com/bsv-blockchain/broadcaster/internal/synthblock"
+	"github.com/bsv-blockchain/broadcaster/models"
 )
 
 const testBlockHash = "0000000000000000000000000000000000000000000000000000000000000abc"

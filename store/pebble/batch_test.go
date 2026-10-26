@@ -5,7 +5,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/models"
 )
 
 // All-new batch insert: every txid is new, every result is Inserted=true,

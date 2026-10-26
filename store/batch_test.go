@@ -6,8 +6,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
-	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/store"
 )
 
 // fakeStore implements the SingleStore subset the parallel-loop helpers need.

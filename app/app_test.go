@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/config"
 )
 
 func TestModeNeedsChaintracks(t *testing.T) {

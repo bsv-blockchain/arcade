@@ -13,8 +13,8 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
-	"github.com/bsv-blockchain/bsv-broadcaster/store"
+	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/store"
 )
 
 // Blob storage: GridFS files behind a manifest.

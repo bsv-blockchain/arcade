@@ -11,7 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/store/bumpcache"
+	"github.com/bsv-blockchain/broadcaster/store/bumpcache"
 )
 
 // isolatedDBSeq numbers throwaway databases.

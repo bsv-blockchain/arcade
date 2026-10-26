@@ -10,7 +10,7 @@ import (
 // tracerName identifies this package's spans/tracer to the OTEL SDK. Kept as
 // the package import path per OTEL convention (mirrors how otelhttp/otelgin
 // name their own instrumentation scopes).
-const tracerName = "github.com/bsv-blockchain/bsv-broadcaster/kafka"
+const tracerName = "github.com/bsv-blockchain/broadcaster/kafka"
 
 // headerCarrier adapts a Kafka header map (as used by both the neutral
 // Message type and Sarama's []RecordHeader, once translated) to

@@ -12,7 +12,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/metrics"
+	"github.com/bsv-blockchain/broadcaster/metrics"
 )
 
 // ConsumerGroup is the service-facing consumer wrapper. It owns the

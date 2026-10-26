@@ -29,7 +29,7 @@ import (
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/config"
 )
 
 var (

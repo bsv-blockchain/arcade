@@ -16,8 +16,8 @@ import (
 	tnerr "github.com/bsv-blockchain/teranode/errors"
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 
-	arcerrors "github.com/bsv-blockchain/bsv-broadcaster/errors"
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	arcerrors "github.com/bsv-blockchain/broadcaster/errors"
+	"github.com/bsv-blockchain/broadcaster/models"
 )
 
 // The BSV Broadcaster ↔ teranode rejection-reason contract.

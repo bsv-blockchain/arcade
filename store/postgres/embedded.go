@@ -8,7 +8,7 @@ import (
 
 	embedded "github.com/fergusstrange/embedded-postgres"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/config"
 )
 
 // startEmbedded spins up a local Postgres instance using the fergusstrange

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/models"
 )
 
 // All-new batch insert: every txid is fresh, every result has Inserted=true.

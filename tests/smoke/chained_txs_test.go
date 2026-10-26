@@ -15,7 +15,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/config"
 )
 
 // TestSmoke_ChainedTxBatchOrdering is the load-bearing smoke test for

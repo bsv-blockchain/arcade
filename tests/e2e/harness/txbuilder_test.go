@@ -9,7 +9,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 
-	"github.com/bsv-blockchain/bsv-broadcaster/validator"
+	"github.com/bsv-blockchain/broadcaster/validator"
 )
 
 // TestBuildValidatableTxs_PassesBroadcasterPolicyValidator confirms our

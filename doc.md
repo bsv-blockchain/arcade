@@ -87,7 +87,7 @@ service config lives in `compose/bsv-broadcaster-config.yaml`, mounted at
 `/etc/bsv-broadcaster/config.yaml` in every BSV Broadcaster container.
 
 ```bash
-make docker-up                            # published ghcr.io/bsv-blockchain/bsv-broadcaster:latest
+make docker-up                            # published ghcr.io/bsv-blockchain/broadcaster:latest
 BSV_BROADCASTER_IMAGE=bsv-broadcaster:local make docker-up  # your working tree, after `make docker-build`
 make docker-down
 ```

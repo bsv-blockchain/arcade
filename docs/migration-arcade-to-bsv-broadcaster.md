@@ -9,9 +9,9 @@ existing deployment must do to upgrade without losing state.
 
 | What | Before | After | Compat |
 |---|---|---|---|
-| Repository / Go module | `github.com/bsv-blockchain/arcade` | `github.com/bsv-blockchain/bsv-broadcaster` | GitHub redirects the old URL |
+| Repository / Go module | `github.com/bsv-blockchain/arcade` | `github.com/bsv-blockchain/broadcaster` | GitHub redirects the old URL |
 | Binary / `cmd` | `arcade`, `./cmd/arcade` | `bsv-broadcaster`, `./cmd/bsv-broadcaster` | — |
-| Container image | `ghcr.io/bsv-blockchain/arcade` | `ghcr.io/bsv-blockchain/bsv-broadcaster` | — |
+| Container image | `ghcr.io/bsv-blockchain/arcade` | `ghcr.io/bsv-blockchain/broadcaster` | — |
 | Env var prefix | `ARCADE_*` | `BSV_BROADCASTER_*` | `ARCADE_*` still honored (deprecated) |
 | Config directory | `/etc/arcade` | `/etc/bsv-broadcaster` | `/etc/arcade` still searched (deprecated) |
 | Kafka topics | `arcade.<name>` | `bsv-broadcaster.<name>` | pin `kafka.topic_prefix: arcade` |
@@ -84,7 +84,7 @@ only caches the extracted Postgres binary, so it can move to its new default.
 
 Then:
 
-1. Point the image at `ghcr.io/bsv-blockchain/bsv-broadcaster`.
+1. Point the image at `ghcr.io/bsv-blockchain/broadcaster`.
 2. Update Prometheus/Coralogix dashboards and alerts from `arcade_*` to
    `bsv_broadcaster_*` in the same change. Every metric keeps its suffix, labels and
    semantics; only the prefix changes.
