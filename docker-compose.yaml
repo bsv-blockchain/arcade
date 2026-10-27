@@ -55,7 +55,7 @@ services:
   # docker.io mirror of docker.redpanda.com/redpandadata/redpanda — the
   # vendor registry stalls podman pulls from some networks.
   redpanda:
-    image: docker.io/redpandadata/redpanda:v26.2.5
+    image: docker.io/redpandadata/redpanda:v26.2.6
     command:
       - redpanda
       - start
@@ -83,7 +83,7 @@ services:
 
   # One-shot analogue of _base/topics.yaml; see compose/topic-init.sh.
   topic-init:
-    image: docker.io/redpandadata/redpanda:v26.2.5
+    image: docker.io/redpandadata/redpanda:v26.2.6
     entrypoint: ["/bin/bash", "/topic-init.sh"]
     # Keep in step with propagation.partitions in compose/bsv-broadcaster-config.yaml:
     # BSV Broadcaster hard-fails at boot if the topic has fewer partitions than the
@@ -175,7 +175,7 @@ services:
   # RFC1918 and merkle-service's SSRF guard would otherwise reject it. BSV Broadcaster
   # forwards callback_url + callback_token per tx registration.
   merkle-service:
-    image: ${MERKLE_IMAGE:-ghcr.io/bsv-blockchain/merkle-service@sha256:b70d907392e0009210909cd804af1dbfd17c271ce69f593de3d4566410c2e5ad}
+    image: ${MERKLE_IMAGE:-ghcr.io/bsv-blockchain/merkle-service@sha256:d8bb51e30e4e0828a948b8048f58921ee64a86154e99afb69b34ecb287e6c4da}
     environment:
       MODE: all-in-one
       LOG_LEVEL: info
@@ -205,7 +205,7 @@ services:
   # OTLP sink for the telemetry env above (tools/otel-collector.yaml
   # unchanged; debug exporter dumps traces/metrics to its logs).
   otel-collector:
-    image: docker.io/otel/opentelemetry-collector-contrib:0.163.1
+    image: docker.io/otel/opentelemetry-collector-contrib:0.163.2-386
     command: ["--config=/etc/otel-collector.yaml"]
     volumes:
       - ./tools/otel-collector.yaml:/etc/otel-collector.yaml:Z
