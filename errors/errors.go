@@ -4,6 +4,7 @@ package arcerrors
 import (
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // StatusCode represents ARC-compatible HTTP status codes for transaction errors.
@@ -79,12 +80,17 @@ type ArcError struct {
 	ExtraInfo  string
 }
 
-// Error implements the error interface.
+// Error implements the error interface. ExtraInfo is appended only when it
+// adds something: the validator's error mapping (validator/errmap.go) carries
+// the underlying message as ExtraInfo so ToErrorFields can surface it, and
+// rendering that again after the same message produced reasons of the form
+// "<msg>: <msg>" on every intake rejection.
 func (e *ArcError) Error() string {
-	if e.ExtraInfo != "" {
-		return fmt.Sprintf("%s: %s", e.Err.Error(), e.ExtraInfo)
+	msg := e.Err.Error()
+	if e.ExtraInfo != "" && e.ExtraInfo != msg && !strings.Contains(msg, e.ExtraInfo) {
+		return fmt.Sprintf("%s: %s", msg, e.ExtraInfo)
 	}
-	return e.Err.Error()
+	return msg
 }
 
 // Unwrap returns the underlying error.
