@@ -105,3 +105,12 @@ func TestIterateTrackerRows_StatusIndexStaysFresh(t *testing.T) {
 		}
 	}
 }
+
+// A positive network verdict retires the retry bookkeeping, so a recovered
+// transaction stops reporting its park reason and retry schedule.
+func TestRetryRecovery_Conformance(t *testing.T) {
+	storetest.RunRetryRecoverySuite(t, func(t *testing.T) storetest.RetryRecoveryBackend {
+		t.Helper()
+		return newTestStore(t)
+	})
+}

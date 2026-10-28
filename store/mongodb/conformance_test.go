@@ -173,3 +173,12 @@ func TestAPIKeys_Conformance(t *testing.T) {
 func TestQuota_Conformance(t *testing.T) {
 	storetest.RunQuotaSuite(t, func(t *testing.T) store.QuotaStore { return newTestStore(t) })
 }
+
+// A positive network verdict retires the retry bookkeeping, so a recovered
+// transaction stops reporting its park reason and retry schedule.
+func TestRetryRecovery_Conformance(t *testing.T) {
+	storetest.RunRetryRecoverySuite(t, func(t *testing.T) storetest.RetryRecoveryBackend {
+		t.Helper()
+		return newTestStore(t)
+	})
+}

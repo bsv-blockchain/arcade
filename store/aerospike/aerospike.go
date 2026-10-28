@@ -449,6 +449,16 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 	if status.ExtraInfo != "" {
 		bins["extra_info"] = status.ExtraInfo
 	}
+	if status.Status != "" && status.Status.ClearsRetryState() {
+		// A nil bin value deletes the bin. A positive verdict retires the
+		// retry bookkeeping; extra_info keeps only what this write carries.
+		// See models.Status.ClearsRetryState.
+		bins["next_retry_at"] = nil
+		bins["retry_reason"] = nil
+		if status.ExtraInfo == "" {
+			bins["extra_info"] = nil
+		}
+	}
 	if len(status.MerklePath) > 0 {
 		bins["merkle_path"] = []byte(status.MerklePath)
 	}
@@ -1137,6 +1147,11 @@ func minedWrite(rec *aero.Record, txid, blockHash string, blockHeight uint64, no
 		aero.PutOp(aero.NewBin("block_hash", blockHash)),
 		aero.PutOp(aero.NewBin("block_height", int(blockHeight))), //nolint:gosec // block height fits in int on 64-bit platforms
 		aero.PutOp(aero.NewBin("timestamp", now.UnixMilli())),
+		// MINED is a positive verdict: retire the retry bookkeeping (nil
+		// deletes the bin). See models.Status.ClearsRetryState.
+		aero.PutOp(aero.NewBin("extra_info", nil)),
+		aero.PutOp(aero.NewBin("next_retry_at", nil)),
+		aero.PutOp(aero.NewBin("retry_reason", nil)),
 	}
 	if prevStatus == models.StatusMined && prev.BlockHash != "" && prev.BlockHash != blockHash {
 		history := appendOrphanedAnchor(orphanedAnchorsFromRecord(rec), prev.BlockHash, prev.BlockHeight, now)

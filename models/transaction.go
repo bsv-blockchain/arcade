@@ -36,8 +36,11 @@ func (h *HexBytes) UnmarshalJSON(data []byte) error {
 }
 
 // TransactionStatus represents the current status of a transaction.
-// RawTx and NextRetryAt are set only while the tx is in PENDING_RETRY and
-// cleared on any terminal transition; they drive the durable retry reaper.
+// RawTx is carried from intake so the propagation reaper can rebroadcast a
+// stuck row. NextRetryAt (with the store's retry_reason and the park reason in
+// ExtraInfo) is set while the tx waits in PENDING_RETRY and cleared by any
+// write that moves it to ACCEPTED_BY_NETWORK or beyond — see
+// Status.ClearsRetryState.
 type TransactionStatus struct {
 	TxID       string    `json:"txid"`
 	Status     Status    `json:"txStatus"`
@@ -154,6 +157,25 @@ func NonTerminalStatuses() []Status {
 		StatusReceived, StatusSentToNetwork, StatusAcceptedByNetwork,
 		StatusSeenOnNetwork, StatusSeenMultipleNodes,
 		StatusPendingRetry, StatusStumpProcessing,
+	}
+}
+
+// ClearsRetryState reports whether a write to s is a positive network verdict
+// that retires the row's retry bookkeeping. Once the network has accepted,
+// seen or mined the transaction, the park reason in extra_info, the schedule
+// in next_retry_at and the last network response in retry_reason describe a
+// past the row has left; every store clears them on such a write, replacing
+// extra_info with whatever the write itself carries. Without this a row that
+// recovered from PENDING_RETRY kept reporting "parent not yet accepted …
+// retryable" and a nextRetryAt on GET /tx all the way to MINED. retry_count
+// is kept as history and raw_tx because the reaper still rebroadcasts stuck
+// rows from it.
+func (s Status) ClearsRetryState() bool {
+	switch s {
+	case StatusAcceptedByNetwork, StatusSeenOnNetwork, StatusSeenMultipleNodes, StatusMined, StatusImmutable:
+		return true
+	default:
+		return false
 	}
 }
 
