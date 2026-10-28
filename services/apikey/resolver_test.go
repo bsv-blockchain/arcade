@@ -490,8 +490,98 @@ func TestResolveEvictionDropsFailingState(t *testing.T) {
 	require.True(t, r.isFailing(Hash(raw)))
 
 	r.positive.Remove(Hash(raw))
+	require.Zero(t, refreshLen(r), "evicting the positive entry drops its failing state")
+}
+
+// refreshLen is the number of keys currently tracked as failing.
+func refreshLen(r *Resolver) int {
 	r.refreshMu.Lock()
-	n := len(r.refresh)
-	r.refreshMu.Unlock()
-	require.Zero(t, n, "evicting the positive entry drops its failing state")
+	defer r.refreshMu.Unlock()
+	return len(r.refresh)
+}
+
+// TestResolveFailedSyncAttemptAfterEvictionLeavesNoMarker: the synchronous
+// attempt a stale entry triggers can outlive the entry itself (a flood of
+// other keys evicts it while the store hangs), and at eviction time there
+// is no marker yet for the eviction callback to clear. When the attempt
+// then fails, the caller is still served the stale value it already holds,
+// but no failing marker may be left behind: there is no entry to serve
+// stale for, so it would be an orphan nothing clears -- and the bound on
+// the refresh map by positiveCacheSize would not hold.
+func TestResolveFailedSyncAttemptAfterEvictionLeavesNoMarker(t *testing.T) {
+	r, lk, clk, raw := newTestResolver(t)
+	_, err := r.Resolve(context.Background(), raw)
+	require.NoError(t, err)
+
+	gate := make(chan struct{})
+	lk.set(func(f *fakeLookup) { f.gate = gate; f.err = errors.New("store down") })
+	clk.advance(31 * time.Second) // past the 30s TTL; not yet known failing
+
+	type result struct {
+		key *store.APIKey
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		k, resolveErr := r.Resolve(context.Background(), raw)
+		done <- result{k, resolveErr}
+	}()
+	require.Eventually(t, func() bool { return lk.n() == 2 }, time.Second, time.Millisecond,
+		"the synchronous attempt must have started")
+
+	r.positive.Remove(Hash(raw)) // evicted while the attempt hangs...
+	close(gate)                  // ...which then fails
+
+	select {
+	case res := <-done:
+		require.NoError(t, res.err, "the caller is still served the stale value it holds")
+		require.Equal(t, "key_1", res.key.ID)
+	case <-time.After(time.Second):
+		t.Fatal("Resolve did not return after the hung lookup was released")
+	}
+	require.False(t, r.isFailing(Hash(raw)), "a failing marker must not outlive the evicted entry")
+	require.Zero(t, refreshLen(r))
+}
+
+// TestResolveBackgroundKickoffSkipsClearedMarker: between a caller observing
+// a key as failing and its kickoff taking refreshMu, the marker can be
+// cleared -- the entry evicted, or a concurrent fetch succeeded. The kickoff
+// must then do nothing rather than recreate the marker: a refresh started
+// that way would, on failure, re-arm a marker for an entry that is no
+// longer cached (an orphan), and on success only re-fetch a key the next
+// synchronous lookup would fetch anyway.
+func TestResolveBackgroundKickoffSkipsClearedMarker(t *testing.T) {
+	r, lk, clk, raw := newTestResolver(t)
+	_, err := r.Resolve(context.Background(), raw)
+	require.NoError(t, err)
+
+	lk.set(func(f *fakeLookup) { f.err = errors.New("store down") })
+	clk.advance(31 * time.Second)
+	_, err = r.Resolve(context.Background(), raw) // marks the key failing
+	require.NoError(t, err)
+	require.True(t, r.isFailing(Hash(raw)))
+	require.Equal(t, 2, lk.n())
+
+	// The caller has seen isFailing == true. Before its kickoff runs, the
+	// entry is evicted, and the marker cleared with it.
+	r.positive.Remove(Hash(raw))
+	require.False(t, r.isFailing(Hash(raw)))
+
+	// Any attempt started from here on would block in the store, so one
+	// would be visible as a tracked in-flight marker and a third store call.
+	gate := make(chan struct{})
+	lk.set(func(f *fakeLookup) { f.gate = gate })
+	t.Cleanup(func() { close(gate) })
+	done := waitForRefresh(r)
+
+	clk.advance(staleRetryBackoff + time.Millisecond)
+	r.maybeRefreshInBackground(Hash(raw), clk.now())
+
+	require.Zero(t, refreshLen(r), "the kickoff must not recreate a marker for an untracked key")
+	require.Equal(t, 2, lk.n(), "no background attempt is started for an untracked key")
+	select {
+	case <-done:
+		t.Fatal("a background refresh ran for a key that is no longer tracked")
+	case <-time.After(50 * time.Millisecond):
+	}
 }

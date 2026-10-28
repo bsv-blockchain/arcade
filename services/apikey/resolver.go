@@ -111,11 +111,18 @@ func NewResolver(lookup Lookup, ttl, staleMax time.Duration) *Resolver {
 		refresh: make(map[string]refreshState),
 	}
 	// Failing state only matters while hash has a positive entry to serve
-	// stale (resolveStale), so it goes with that entry. Otherwise a key
-	// marked failing during an outage and never requested again would
-	// stay in refresh forever; this bounds it by positiveCacheSize. The
-	// callback runs under the LRU's lock, which is safe: nothing holds
-	// refreshMu while touching the caches.
+	// stale (resolveStale), so it lives and dies with that entry: when the
+	// entry leaves the cache (LRU eviction, or removal on a not-found), so
+	// does its marker. Otherwise a key marked failing during an outage and
+	// never requested again would stay in refresh forever; this bounds it
+	// by positiveCacheSize. The bound holds only because the two paths
+	// that write a marker never leave one behind for an entry that is
+	// already gone: markFailing re-checks the cache after writing (a
+	// synchronous attempt can outlive the stale entry it was refreshing),
+	// and maybeRefreshInBackground declines to start for a hash whose
+	// marker has been cleared since its caller looked. The callback runs
+	// under the LRU's lock, which is safe: nothing holds refreshMu while
+	// touching the caches.
 	r.positive, _ = lru.NewWithEvict(positiveCacheSize, func(hash string, _ cacheEntry) { r.clearFailing(hash) }) // errors only for size <= 0
 	r.negative, _ = lru.New[string, cacheEntry](negativeCacheSize)                                                // errors only for size <= 0
 	return r
@@ -250,12 +257,27 @@ func (r *Resolver) isFailing(hash string) bool {
 // markFailing records hash as failing, with its next eligible background
 // attempt at finishedAt (when the attempt that discovered the failure
 // completed) plus staleRetryBackoff.
+//
+// The attempt may have outlived the positive entry it was refreshing: a
+// stale entry is as evictable as any other while its synchronous attempt
+// hangs, and at eviction time there was no marker yet for the callback to
+// clear. A marker only means something while there is an entry to serve
+// stale, so if the entry is gone the marker is dropped again rather than
+// left as an orphan that nothing would clear until the key happened to be
+// looked up successfully. The cache is checked after the marker is written,
+// not before, so an eviction between the two is covered as well (its
+// callback removes what was just written); and outside refreshMu, because
+// that callback takes refreshMu while the LRU's own lock is held.
 func (r *Resolver) markFailing(hash string, finishedAt time.Time) {
 	r.refreshMu.Lock()
-	defer r.refreshMu.Unlock()
 	st := r.refresh[hash]
 	st.retryAt = finishedAt.Add(staleRetryBackoff)
 	r.refresh[hash] = st
+	r.refreshMu.Unlock()
+
+	if !r.positive.Contains(hash) {
+		r.clearFailing(hash)
+	}
 }
 
 // clearFailing removes any failing-state bookkeeping for hash. fetch calls
@@ -279,10 +301,19 @@ func (r *Resolver) clearFailing(hash string) {
 // refreshMu, before the goroutine starts -- never inside it -- so two
 // callers racing to see the same expired backoff can still only ever
 // result in one goroutine per hash.
+//
+// A hash whose marker is gone by the time refreshMu is taken -- its entry
+// was evicted, or a concurrent fetch succeeded, after the caller's
+// isFailing check -- is left alone. Starting a refresh anyway would recreate
+// the marker (as in flight) for an entry that no longer needs one, and a
+// failed attempt would then re-arm it into exactly the orphan the eviction
+// callback exists to prevent. The caller still serves the stale value it
+// already holds; the next lookup for the key goes through the synchronous
+// path, as an untracked key should.
 func (r *Resolver) maybeRefreshInBackground(hash string, now time.Time) {
 	r.refreshMu.Lock()
-	st := r.refresh[hash]
-	if st.inFlight || now.Before(st.retryAt) {
+	st, tracked := r.refresh[hash]
+	if !tracked || st.inFlight || now.Before(st.retryAt) {
 		r.refreshMu.Unlock()
 		return
 	}
