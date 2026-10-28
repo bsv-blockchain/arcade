@@ -109,9 +109,23 @@ func TestValidateAccessControl(t *testing.T) {
 			c.RateLimit.Tiers["enterprise"] = TierConfig{UnitsPerMinute: 10, MaxBatch: 5} // 5*10+1=51 > 10
 		}, "max_batch"},
 		{"read costs more than the tier's whole budget with no max_batch", func(c *Config) {
+			// Only the tier under test may be unpayable. At costs.read 100
+			// the default anonymous and free tiers (50 units, max_batch 1)
+			// would fail the batch check first, whose message also names
+			// costs.read -- which is how this case used to pass with the
+			// single-read guard removed. The expected error is the guard's
+			// own, for a tier whose max_batch of 0 skips the batch check.
 			c.RateLimit.Costs.Read = 100
+			c.RateLimit.Anonymous = TierConfig{UnitsPerMinute: 1000, MaxInFlight: 5, MaxBatch: 1}
+			c.RateLimit.Tiers[TierFree] = TierConfig{UnitsPerMinute: 1000, MaxInFlight: 5, MaxBatch: 1}
 			c.RateLimit.Tiers["enterprise"] = TierConfig{UnitsPerMinute: 50}
-		}, "costs.read"},
+		}, `tier "enterprise": costs.read (100) exceeds units_per_minute (50): a single read could never succeed`},
+		{"read exactly payable with no max_batch", func(c *Config) {
+			c.RateLimit.Costs.Read = 50
+			c.RateLimit.Anonymous = TierConfig{UnitsPerMinute: 1000, MaxInFlight: 5, MaxBatch: 1}
+			c.RateLimit.Tiers[TierFree] = TierConfig{UnitsPerMinute: 1000, MaxInFlight: 5, MaxBatch: 1}
+			c.RateLimit.Tiers["enterprise"] = TierConfig{UnitsPerMinute: 50}
+		}, ""},
 		{"max_batch large enough to overflow the batch cost", func(c *Config) {
 			c.RateLimit.Tiers["enterprise"] = TierConfig{UnitsPerMinute: 1000, MaxBatch: 1 << 62}
 		}, "max_batch"},
