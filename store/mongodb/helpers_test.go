@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+
 	"github.com/bsv-blockchain/broadcaster/config"
 )
 
@@ -178,27 +180,58 @@ func TestForEach_ReportsCancellationSeenAfterTheSlot(t *testing.T) {
 // process, forever; a floor that tracks max_pool_size (the old
 // min(maxConnecting, max_pool_size)) pinned each pod at its ceiling on all
 // three nodes and took a shared M10 to ~1450 of its 1500 connections.
+//
+// Precedence for each bound is the dedicated setting, then the URI option,
+// then this package's default: a deployment that sizes its pool in the URI
+// and leaves max_pool_size at 0 must keep the URI's ceiling, not silently
+// get defaultMaxPoolSize.
 func TestPoolSettings(t *testing.T) {
 	tests := []struct {
 		name     string
 		cfg      config.Mongo
-		wantMax  int
-		wantMin  int
+		uri      string
+		wantMax  uint64
+		wantMin  uint64
 		wantIdle time.Duration
 	}{
-		{"defaults", config.Mongo{}, defaultMaxPoolSize, defaultMinPoolSize, defaultMaxConnIdle},
-		{"floor stays small under a small ceiling", config.Mongo{MaxPoolSize: 12}, 12, defaultMinPoolSize, defaultMaxConnIdle},
-		{"explicit floor", config.Mongo{MaxPoolSize: 64, MinPoolSize: 6}, 64, 6, defaultMaxConnIdle},
-		{"floor clamped to ceiling", config.Mongo{MaxPoolSize: 4, MinPoolSize: 10}, 4, 4, defaultMaxConnIdle},
-		{"explicit idle", config.Mongo{MaxConnIdleMs: 60000}, defaultMaxPoolSize, defaultMinPoolSize, time.Minute},
+		{"defaults", config.Mongo{}, "", defaultMaxPoolSize, defaultMinPoolSize, defaultMaxConnIdle},
+		{"floor stays small under a small ceiling", config.Mongo{MaxPoolSize: 12}, "", 12, defaultMinPoolSize, defaultMaxConnIdle},
+		{"explicit floor", config.Mongo{MaxPoolSize: 64, MinPoolSize: 6}, "", 64, 6, defaultMaxConnIdle},
+		{"floor clamped to ceiling", config.Mongo{MaxPoolSize: 4, MinPoolSize: 10}, "", 4, 4, defaultMaxConnIdle},
+		{"explicit idle", config.Mongo{MaxConnIdleMs: 60000}, "", defaultMaxPoolSize, defaultMinPoolSize, time.Minute},
+		{"uri ceiling kept when setting is 0", config.Mongo{}, "?maxPoolSize=20", 20, defaultMinPoolSize, defaultMaxConnIdle},
+		{"floor clamped to uri ceiling", config.Mongo{MinPoolSize: 30}, "?maxPoolSize=20", 20, 20, defaultMaxConnIdle},
+		{"uri unlimited ceiling kept, floor unclamped", config.Mongo{MinPoolSize: 30}, "?maxPoolSize=0", 0, 30, defaultMaxConnIdle},
+		{"uri floor and idle kept when settings are 0", config.Mongo{}, "?minPoolSize=5&maxIdleTimeMS=90000", defaultMaxPoolSize, 5, 90 * time.Second},
+		{"settings win over uri", config.Mongo{MaxPoolSize: 12, MinPoolSize: 3, MaxConnIdleMs: 1000}, "?maxPoolSize=50&minPoolSize=10&maxIdleTimeMS=90000", 12, 3, time.Second},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotMax, gotMin, gotIdle := poolSettings(tt.cfg)
+			uri := options.Client().ApplyURI("mongodb://127.0.0.1:27017/" + tt.uri)
+			gotMax, gotMin, gotIdle := poolSettings(tt.cfg, uri)
 			if gotMax != tt.wantMax || gotMin != tt.wantMin || gotIdle != tt.wantIdle {
 				t.Fatalf("poolSettings = (%d, %d, %v), want (%d, %d, %v)",
 					gotMax, gotMin, gotIdle, tt.wantMax, tt.wantMin, tt.wantIdle)
 			}
 		})
+	}
+}
+
+// rowConcurrencyForPool must follow the effective driver ceiling, including a
+// URI-sized pool and the URI's maxPoolSize=0 (unlimited).
+func TestRowConcurrencyForPool(t *testing.T) {
+	for _, tt := range []struct {
+		maxPool uint64
+		want    int
+	}{
+		{0, rowConcurrencyCeiling},
+		{20, 20 - poolHeadroom},
+		{4, 1},
+		{rowConcurrencyCeiling + poolHeadroom, rowConcurrencyCeiling},
+		{1 << 40, rowConcurrencyCeiling},
+	} {
+		if got := rowConcurrencyForPool(tt.maxPool); got != tt.want {
+			t.Errorf("rowConcurrencyForPool(%d) = %d, want %d", tt.maxPool, got, tt.want)
+		}
 	}
 }

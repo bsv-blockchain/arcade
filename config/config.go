@@ -323,6 +323,9 @@ type Pebble struct {
 // replica-set member (not just the primary), per process, for the life of the
 // process — so its cost is pods × members × floor on each mongod. Keep it
 // small; MaxConnIdleMs reaps the connections a burst opened above it.
+// MaxPoolSize, MinPoolSize and MaxConnIdleMs each fall back to the URI's
+// maxPoolSize / minPoolSize / maxIdleTimeMS when set to 0, then to the
+// backend's own default.
 type Mongo struct {
 	URI              string `mapstructure:"uri"`
 	Database         string `mapstructure:"database"`

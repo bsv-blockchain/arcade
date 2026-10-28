@@ -220,9 +220,9 @@ func New(ctx context.Context, cfg config.Mongo, logger *zap.Logger) (*Store, err
 	// against one deployment. The floor this replaced, min(maxConnecting,
 	// max_pool_size), equalled the ceiling whenever max_pool_size <= 16 and
 	// pinned every pod at its full pool on every node.
-	maxPool, minPool, maxIdle := poolSettings(cfg)
-	opts.SetMaxPoolSize(uint64(maxPool)) //nolint:gosec // poolSettings returns >= 1
-	opts.SetMinPoolSize(uint64(minPool)) //nolint:gosec // in [1, maxPool]
+	maxPool, minPool, maxIdle := poolSettings(cfg, opts)
+	opts.SetMaxPoolSize(maxPool)
+	opts.SetMinPoolSize(minPool)
 	opts.SetMaxConnIdleTime(maxIdle)
 	opts.SetMaxConnecting(maxConnecting)
 	client, err := mongo.Connect(opts)
@@ -241,6 +241,7 @@ func New(ctx context.Context, cfg config.Mongo, logger *zap.Logger) (*Store, err
 	}
 
 	s := newWithClient(client, cfg.Database, cfg)
+	s.rowConcurrency = rowConcurrencyForPool(maxPool)
 	s.logger = logger
 	s.ownsClient = true
 	return s, nil
@@ -325,12 +326,47 @@ func msOrDefault(ms int, def time.Duration) time.Duration {
 	return time.Duration(ms) * time.Millisecond
 }
 
-// poolSettings resolves the connection-pool bounds from cfg: the ceiling,
-// the idle floor (clamped to the ceiling), and the idle reap interval.
-func poolSettings(cfg config.Mongo) (maxPool, minPool int, maxIdle time.Duration) {
-	maxPool = intOrDefault(cfg.MaxPoolSize, defaultMaxPoolSize)
-	minPool = min(intOrDefault(cfg.MinPoolSize, defaultMinPoolSize), maxPool)
-	return maxPool, minPool, msOrDefault(cfg.MaxConnIdleMs, defaultMaxConnIdle)
+// poolSettings resolves the connection-pool bounds: the ceiling (0 means
+// unlimited, as in the driver), the idle floor (clamped to a finite
+// ceiling), and the idle reap interval. Each comes from its dedicated
+// setting when that is set, else from the URI option, else from this
+// package's default — so a deployment that sizes its pool in the URI keeps
+// that size when the dedicated settings are left at 0.
+func poolSettings(cfg config.Mongo, uri *options.ClientOptions) (maxPool, minPool uint64, maxIdle time.Duration) {
+	maxPool = defaultMaxPoolSize
+	switch {
+	case cfg.MaxPoolSize > 0:
+		maxPool = uint64(cfg.MaxPoolSize)
+	case uri.MaxPoolSize != nil:
+		maxPool = *uri.MaxPoolSize
+	}
+	minPool = defaultMinPoolSize
+	switch {
+	case cfg.MinPoolSize > 0:
+		minPool = uint64(cfg.MinPoolSize)
+	case uri.MinPoolSize != nil:
+		minPool = *uri.MinPoolSize
+	}
+	if maxPool > 0 {
+		minPool = min(minPool, maxPool)
+	}
+	maxIdle = defaultMaxConnIdle
+	switch {
+	case cfg.MaxConnIdleMs > 0:
+		maxIdle = time.Duration(cfg.MaxConnIdleMs) * time.Millisecond
+	case uri.MaxConnIdleTime != nil:
+		maxIdle = *uri.MaxConnIdleTime
+	}
+	return maxPool, minPool, maxIdle
+}
+
+// rowConcurrencyForPool is rowConcurrencyFor for the effective driver
+// ceiling, where 0 means unlimited and so only rowConcurrencyCeiling binds.
+func rowConcurrencyForPool(maxPool uint64) int {
+	if maxPool == 0 || maxPool > rowConcurrencyCeiling+poolHeadroom {
+		return rowConcurrencyCeiling
+	}
+	return rowConcurrencyFor(int(maxPool))
 }
 
 func intOrDefault(v, def int) int {
