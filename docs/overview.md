@@ -125,7 +125,7 @@ A transaction's journey through BSV Broadcaster v2 has five phases.
 
 ### Phase 1 — Submission
 
-Client calls `SubmitTransaction()`. BSV Broadcaster parses the raw tx (BEEF or raw bytes), deduplicates via `store.GetOrInsertStatus()`, validates against policy (fee rates, script rules, size limits), tracks it in TxTracker (an in-memory O(1) hash map), registers it with every configured Merkle Service via `POST /watch {txid, callbackUrl}` (a tx is registered once any endpoint accepts it; a tx no endpoint accepted is requeued and never broadcast, so a proof can always be delivered for a broadcast tx), and broadcasts concurrently to Teranode endpoints, returning on first success.
+Client calls `SubmitTransaction()`. BSV Broadcaster parses the submitted bytes (Extended Format or BEEF; a plain raw transaction carries no input source data and is rejected with ARC 460, because validation needs each input's parent output), deduplicates via `store.GetOrInsertStatus()`, validates against policy (fee rates, script rules, size limits), tracks it in TxTracker (an in-memory O(1) hash map), registers it with every configured Merkle Service via `POST /watch {txid, callbackUrl}` (a tx is registered once any endpoint accepts it; a tx no endpoint accepted is requeued and never broadcast, so a proof can always be delivered for a broadcast tx), and broadcasts concurrently to Teranode endpoints, returning on first success.
 
 Status: `RECEIVED` → `SENT_TO_NETWORK` → `ACCEPTED_BY_NETWORK`.
 

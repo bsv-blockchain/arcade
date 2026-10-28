@@ -171,7 +171,7 @@ paths:
                   maxtxsizepolicy: 10485760
                   maxscriptsizepolicy: 500000
                   maxtxsigopscountspolicy: 4294967295
-                  standardFormatSupported: true
+                  standardFormatSupported: false
                 timestamp: "2026-08-07T12:00:00Z"
 
   /v1/policy:
@@ -235,11 +235,14 @@ paths:
             schema:
               type: string
               format: binary
-              description: Raw serialized transaction bytes. Supports Extended Format.
+              description: >-
+                Raw serialized transaction bytes in Extended Format (EF) or BEEF. A plain
+                (standard-format) transaction is rejected with ARC 460 because validation needs
+                each input's source output.
           text/plain:
             schema:
               type: string
-              description: Hex-encoded serialized transaction. Whitespace is trimmed before decoding.
+              description: Hex-encoded serialized transaction (EF or BEEF). Whitespace is trimmed before decoding.
               example: "0100000001abc...def00000000"
           application/json:
             schema:
@@ -1302,7 +1305,7 @@ components:
       properties:
         rawTx:
           type: string
-          description: Hex-encoded serialized transaction.
+          description: Hex-encoded serialized transaction in Extended Format (EF) or BEEF; a plain raw transaction is rejected with ARC 460.
           example: "0100000001abc...def00000000"
       required:
         - rawTx
@@ -1581,8 +1584,11 @@ components:
           example: 4294967295
         standardFormatSupported:
           type: boolean
-          description: Whether standard (non-EF) transaction format is accepted at intake.
-          example: true
+          description: >-
+            Whether standard (non-EF) transaction format is accepted at intake. Always false in
+            this release: validation needs each input's source output, which only Extended
+            Format (EF) or BEEF carries, so a plain raw transaction is rejected with ARC 460.
+          example: false
       required:
         - miningFee
         - maxtxsizepolicy

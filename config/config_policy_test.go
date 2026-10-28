@@ -48,8 +48,10 @@ func TestPolicyConfigDefaults(t *testing.T) {
 	if v.MaxTxSigopsCountsPolicy != 0 {
 		t.Errorf("MaxTxSigopsCountsPolicy default = %d, want 0", v.MaxTxSigopsCountsPolicy)
 	}
-	if !v.StandardFormatSupported {
-		t.Errorf("StandardFormatSupported default = false, want true")
+	// Intake rejects standard-format (non-EF) submissions with ARC 460, so
+	// /policy must not advertise them: the default is false.
+	if v.StandardFormatSupported {
+		t.Errorf("StandardFormatSupported default = true, want false (intake rejects non-EF with 460)")
 	}
 	if v.ObservedFeeTTLMs != DefaultValidatorObservedFeeTTLMs {
 		t.Errorf("ObservedFeeTTLMs default = %d, want %d", v.ObservedFeeTTLMs, DefaultValidatorObservedFeeTTLMs)
@@ -64,7 +66,7 @@ func TestPolicyConfigEnvOverrides(t *testing.T) {
 	t.Setenv("BSV_BROADCASTER_VALIDATOR_MAX_TX_SIZE_POLICY", "7777")
 	t.Setenv("BSV_BROADCASTER_VALIDATOR_MAX_SCRIPT_SIZE_POLICY", "8888")
 	t.Setenv("BSV_BROADCASTER_VALIDATOR_MAX_TX_SIGOPS_COUNTS_POLICY", "99")
-	t.Setenv("BSV_BROADCASTER_VALIDATOR_STANDARD_FORMAT_SUPPORTED", "false")
+	t.Setenv("BSV_BROADCASTER_VALIDATOR_STANDARD_FORMAT_SUPPORTED", "true")
 	t.Setenv("BSV_BROADCASTER_VALIDATOR_OBSERVED_FEE_TTL_MS", "60000")
 	t.Setenv("BSV_BROADCASTER_VALIDATOR_OBSERVED_FEE_REFRESH_MS", "5000")
 
@@ -82,8 +84,8 @@ func TestPolicyConfigEnvOverrides(t *testing.T) {
 	if v.MaxTxSigopsCountsPolicy != 99 {
 		t.Errorf("MaxTxSigopsCountsPolicy = %d, want 99", v.MaxTxSigopsCountsPolicy)
 	}
-	if v.StandardFormatSupported {
-		t.Errorf("StandardFormatSupported = true, want false (env override)")
+	if !v.StandardFormatSupported {
+		t.Errorf("StandardFormatSupported = false, want true (env override)")
 	}
 	if v.ObservedFeeTTLMs != 60000 {
 		t.Errorf("ObservedFeeTTLMs = %d, want 60000", v.ObservedFeeTTLMs)
