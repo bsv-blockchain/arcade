@@ -313,7 +313,7 @@ DOUBLE_SPEND_ATTEMPTED (from rejected-tx gossip with specific reason)
 | `webhook.max_retries`       | Max webhook retry attempts                   | `10`                  |
 | `auth.enabled`              | Identify callers by API key (`Authorization: Bearer bsvb_…`); unkeyed callers stay anonymous. See [docs/api-keys.md](docs/api-keys.md) | `false` |
 | `ratelimit.enabled`         | Per-tier rate limits for keyed and anonymous callers (requires `auth.enabled`) | `false` |
-| `auth.store.mongodb.uri`    | Dedicated MongoDB for API keys + quota, shared across deployments (`ARCADE_AUTH_STORE_MONGODB_URI`); unset = main store. See [docs/api-keys.md](docs/api-keys.md) | - |
+| `auth.store.mongodb.uri`    | Dedicated MongoDB for API keys + quota, shared across deployments (`BSV_BROADCASTER_AUTH_STORE_MONGODB_URI`); unset = main store. See [docs/api-keys.md](docs/api-keys.md) | - |
 | `auth.store.mongodb.database` | Database for `api_keys` / `api_quota` (required with `uri`) | -            |
 
 **Planned but not yet implemented:**

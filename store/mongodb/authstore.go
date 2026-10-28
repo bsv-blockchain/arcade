@@ -23,7 +23,7 @@ var (
 const authMinPoolFloor = 1
 
 // AuthStore is a MongoDB-backed APIKeyStore and QuotaStore bound to a
-// dedicated database (auth.store.mongodb), so several arcade deployments —
+// dedicated database (auth.store.mongodb), so several BSV Broadcaster deployments —
 // one per network, each with its own main store — share one key set and one
 // quota window per key.
 //
@@ -31,7 +31,7 @@ const authMinPoolFloor = 1
 // and api_quota collections only, and never runs a database-level command.
 // That lets it run under a role scoped to just those two collections (find,
 // insert, update, remove, createIndex, listIndexes, createCollection), and
-// lets the auth database be one that another arcade's main store also uses:
+// lets the auth database be one that another deployment's main store also uses:
 // the indexes it creates are exactly the ones Store.EnsureIndexes creates on
 // those collections, under the same names.
 type AuthStore struct {

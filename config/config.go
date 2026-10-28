@@ -223,7 +223,7 @@ const (
 type AuthConfig struct {
 	Enabled bool `mapstructure:"enabled"`
 	// Store optionally moves API keys and rate-limit quota counters out of
-	// the main store into a dedicated MongoDB database, so several arcade
+	// the main store into a dedicated MongoDB database, so several BSV Broadcaster
 	// deployments (one per network, each with its own store) can share one
 	// key set and one quota window per key. Unset (uri empty) keeps keys and
 	// quota in the main store. See docs/api-keys.md.
@@ -1423,7 +1423,7 @@ func setDefaults() {
 	viper.SetDefault("auth.enabled", false)
 	// auth.store.mongodb ships unset (uri empty = keys and quota live in the
 	// main store). The keys are declared anyway so AutomaticEnv honors
-	// ARCADE_AUTH_STORE_MONGODB_* even when the config file omits the block;
+	// BSV_BROADCASTER_AUTH_STORE_MONGODB_* even when the config file omits the block;
 	// zero timeouts/pool mean the mongodb backend's own defaults.
 	viper.SetDefault("auth.store.mongodb.uri", "")
 	viper.SetDefault("auth.store.mongodb.database", "")

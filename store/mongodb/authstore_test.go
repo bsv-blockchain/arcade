@@ -23,10 +23,10 @@ import (
 func requireMongo(t *testing.T) {
 	t.Helper()
 	if sharedClient == nil {
-		if os.Getenv("ARCADE_MONGODB_REQUIRED") != "" {
-			t.Fatalf("mongodb required but unavailable at ARCADE_MONGODB_URI: %v", sharedErr)
+		if os.Getenv("BSV_BROADCASTER_MONGODB_REQUIRED") != "" {
+			t.Fatalf("mongodb required but unavailable at BSV_BROADCASTER_MONGODB_URI: %v", sharedErr)
 		}
-		t.Skipf("mongodb unavailable (set ARCADE_MONGODB_URI), skipping: %v", sharedErr)
+		t.Skipf("mongodb unavailable (set BSV_BROADCASTER_MONGODB_URI), skipping: %v", sharedErr)
 	}
 }
 
@@ -84,7 +84,7 @@ func exerciseAuthStore(t *testing.T, a *AuthStore) {
 // other collection, and EnsureIndexes is idempotent.
 func TestAuthStore_OnlyAuthCollections(t *testing.T) {
 	requireMongo(t)
-	dbName := freshDBName(t, "arcade_auth_test_")
+	dbName := freshDBName(t, "bsv_broadcaster_auth_test_")
 	a := newAuthWithClient(sharedClient, dbName, config.Mongo{OpTimeoutMs: 5000})
 	for i := range 2 {
 		if err := a.EnsureIndexes(t.Context()); err != nil {
@@ -109,12 +109,12 @@ func TestAuthStore_OnlyAuthCollections(t *testing.T) {
 	}
 }
 
-// The auth database may be another arcade's main database: the auth store's
+// The auth database may be another deployment's main database: the auth store's
 // indexes must be identical to the ones Store.EnsureIndexes already created,
 // so provisioning either way round succeeds.
 func TestAuthStore_SharesDatabaseWithMainStore(t *testing.T) {
 	requireMongo(t)
-	dbName := freshDBName(t, "arcade_auth_shared_test_")
+	dbName := freshDBName(t, "bsv_broadcaster_auth_shared_test_")
 	mainStore := newWithClient(sharedClient, dbName, config.Mongo{OpTimeoutMs: 5000})
 	if err := mainStore.EnsureIndexes(t.Context()); err != nil {
 		t.Fatalf("main EnsureIndexes: %v", err)
@@ -135,10 +135,10 @@ func TestAuthStore_SharesDatabaseWithMainStore(t *testing.T) {
 // The auth store must work under a role scoped to only <db>.api_keys and
 // <db>.api_quota with no database-level privileges — the Atlas custom role
 // documented in docs/api-keys.md. Needs a mongod started with --auth and an
-// ARCADE_MONGODB_URI user that can create roles and users; skips otherwise.
+// BSV_BROADCASTER_MONGODB_URI user that can create roles and users; skips otherwise.
 func TestAuthStore_CollectionScopedRole(t *testing.T) {
 	requireMongo(t)
-	dbName := freshDBName(t, "arcade_auth_role_test_")
+	dbName := freshDBName(t, "bsv_broadcaster_auth_role_test_")
 	ctx := t.Context()
 	db := sharedClient.Database(dbName)
 
@@ -157,23 +157,23 @@ func TestAuthStore_CollectionScopedRole(t *testing.T) {
 		})
 	}
 	if err := db.RunCommand(ctx, bson.D{
-		{Key: "createRole", Value: "arcadeAuthStore"}, {Key: "privileges", Value: privs}, {Key: "roles", Value: bson.A{}},
+		{Key: "createRole", Value: "bsvBroadcasterAuthStore"}, {Key: "privileges", Value: privs}, {Key: "roles", Value: bson.A{}},
 	}).Err(); err != nil {
-		t.Skipf("cannot create roles with ARCADE_MONGODB_URI (need a --auth mongod and a userAdmin): %v", err)
+		t.Skipf("cannot create roles with BSV_BROADCASTER_MONGODB_URI (need a --auth mongod and a userAdmin): %v", err)
 	}
 	if err := db.RunCommand(ctx, bson.D{
-		{Key: "createUser", Value: "arcade_auth"},
-		{Key: "pwd", Value: "arcade_auth_pw"},
-		{Key: "roles", Value: bson.A{bson.D{{Key: "role", Value: "arcadeAuthStore"}, {Key: "db", Value: dbName}}}},
+		{Key: "createUser", Value: "bsv_broadcaster_auth"},
+		{Key: "pwd", Value: "bsv_broadcaster_auth_pw"},
+		{Key: "roles", Value: bson.A{bson.D{{Key: "role", Value: "bsvBroadcasterAuthStore"}, {Key: "db", Value: dbName}}}},
 	}).Err(); err != nil {
-		t.Skipf("cannot create users with ARCADE_MONGODB_URI: %v", err)
+		t.Skipf("cannot create users with BSV_BROADCASTER_MONGODB_URI: %v", err)
 	}
 
 	u, err := url.Parse(sharedURI)
 	if err != nil {
 		t.Fatal(err)
 	}
-	u.User = url.UserPassword("arcade_auth", "arcade_auth_pw")
+	u.User = url.UserPassword("bsv_broadcaster_auth", "bsv_broadcaster_auth_pw")
 	if u.Path == "" {
 		u.Path = "/"
 	}

@@ -220,7 +220,7 @@ func TestRequestLogger_RestrictsDebugToIdentifyAndRateLimitResponses(t *testing.
 
 	srv := &Server{
 		cfg: &config.Config{
-			Telemetry:     config.TelemetryConfig{ServiceName: "arcade-requestlogger-test"},
+			Telemetry:     config.TelemetryConfig{ServiceName: "bsv-broadcaster-requestlogger-test"},
 			CallbackToken: "cb-token",
 			Auth:          config.AuthConfig{Enabled: true},
 			RateLimit:     config.RateLimitConfig{KeyCacheTTLMs: 60_000, KeyCacheStaleMaxMs: 60_000},

@@ -1,6 +1,6 @@
 # API keys and rate limits
 
-Arcade can authenticate clients with API keys and enforce per-tier quotas.
+BSV Broadcaster can authenticate clients with API keys and enforce per-tier quotas.
 Everything here is off by default; deployments are unaffected until `auth.enabled` / `ratelimit.enabled` are set.
 
 ## For API clients
@@ -97,7 +97,7 @@ admin:
   host: 127.0.0.1                # default; kubectl port-forward works with this.
                                  # set 0.0.0.0 only to let in-cluster tooling reach it directly
   port: 8090                     # never route through the public ingress
-  token: ""                      # set via ARCADE_ADMIN_TOKEN
+  token: ""                      # set via BSV_BROADCASTER_ADMIN_TOKEN
 ratelimit:
   enabled: true
   expected_replicas: 3
@@ -148,7 +148,7 @@ logs.
   calls) before trying one half-open probe.
 - Tiers must be declared in the config file; env vars can only override a
   field that's already present in a configured tier (e.g.
-  `ARCADE_RATELIMIT_TIERS_PRO_UNITS_PER_MINUTE`) — they can add neither a
+  `BSV_BROADCASTER_RATELIMIT_TIERS_PRO_UNITS_PER_MINUTE`) — they can add neither a
   new tier nor a new field on an existing one.
 - With `admin.enabled`, `POST /api/v1/blocks/:blockHash/reprocess` moves to
   `POST /admin/v1/blocks/:blockHash/reprocess` on the admin listener, behind
@@ -163,8 +163,8 @@ logs.
 ### Sharing one key set across deployments (`auth.store`)
 
 By default keys (`api_keys`) and quota counters (`api_quota`) live in the main
-store, so every arcade deployment has its own key set. When one service fronts
-several deployments — e.g. one arcade per network (mainnet, testnet,
+store, so every BSV Broadcaster deployment has its own key set. When one service fronts
+several deployments — e.g. one BSV Broadcaster per network (mainnet, testnet,
 teratestnet, tstn), each with its own `store.mongodb` database and possibly on
 different clusters, replicated across regions — point all of them at one
 dedicated MongoDB database instead:
@@ -174,8 +174,8 @@ auth:
   enabled: true                  # required when auth.store is set
   store:
     mongodb:
-      uri: ""                    # set via ARCADE_AUTH_STORE_MONGODB_URI
-      database: arcade_auth      # ARCADE_AUTH_STORE_MONGODB_DATABASE
+      uri: ""                    # set via BSV_BROADCASTER_AUTH_STORE_MONGODB_URI
+      database: bsv_broadcaster_auth  # BSV_BROADCASTER_AUTH_STORE_MONGODB_DATABASE
       # Optional, same meaning as under store.mongodb; 0/unset = the values shown.
       # connect_timeout_ms: 10000
       # op_timeout_ms: 3000
@@ -187,7 +187,7 @@ auth:
 ```
 
 Every key path is `auth.store.mongodb.*`, and each has an env override
-(`ARCADE_AUTH_STORE_MONGODB_URI`, `…_DATABASE`, `…_OP_TIMEOUT_MS`, …) that
+(`BSV_BROADCASTER_AUTH_STORE_MONGODB_URI`, `…_DATABASE`, `…_OP_TIMEOUT_MS`, …) that
 works even when the config file has no `auth.store` block. With `uri` unset
 (the default) nothing changes: keys and quota stay in the main store. Setting
 `uri` requires `database` and `auth.enabled`; a `database` without a `uri` is
@@ -245,25 +245,20 @@ When several deployments share one auth store:
 
 ```bash
 kubectl port-forward deploy/api-server 8090:8090
-export ARCADE_ADMIN_TOKEN=…
-arcade apikey create --name acme --tier high      # prints the key ONCE
-arcade apikey list
-arcade apikey set-tier key_… unlimited
-arcade apikey revoke key_…
+export BSV_BROADCASTER_ADMIN_TOKEN=…
+bsv-broadcaster apikey create --name acme --tier high      # prints the key ONCE
+bsv-broadcaster apikey list
+bsv-broadcaster apikey set-tier key_… unlimited
+bsv-broadcaster apikey revoke key_…
 ```
 
 The admin JSON API is strict: unknown fields are rejected, request bodies
 are capped at 64 KiB, `name` is capped at 256 characters, and field names
 are camelCase (`name`, `tier`, `expiresAt`). Tier names are lowercased on
 write. The CLI reads the token from `--admin-token`, then
-`BSV_BROADCASTER_ADMIN_TOKEN`, then `ARCADE_ADMIN_TOKEN` — prefer an env var
-over the flag, since a flag value ends up in shell history. `--expires-in`
-rejects a negative duration.
-
-`BSV_BROADCASTER_ADMIN_TOKEN` is accepted by the **CLI** for forward
-compatibility with the eventual `bsv-broadcaster` rebrand, but the
-**server** still only reads `ARCADE_ADMIN_TOKEN` (via `admin.token`) until
-that rebrand lands — setting only `BSV_BROADCASTER_ADMIN_TOKEN` and not
-`ARCADE_ADMIN_TOKEN` configures the CLI to send a token the server was
-never told about, and every admin request gets `401`. Set both, or just
-`ARCADE_ADMIN_TOKEN`, today.
+`BSV_BROADCASTER_ADMIN_TOKEN`, then the pre-rebrand `ARCADE_ADMIN_TOKEN` —
+the same precedence the server applies to `admin.token`, where an `ARCADE_*`
+variable is honored only while its `BSV_BROADCASTER_*` twin is unset (see
+[the migration notes](migration-arcade-to-bsv-broadcaster.md)). Prefer an
+env var over the flag, since a flag value ends up in shell history.
+`--expires-in` rejects a negative duration.

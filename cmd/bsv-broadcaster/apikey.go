@@ -22,7 +22,7 @@ import (
 // response.
 const maxAdminResponseBytes = 1 << 20
 
-// newAPIKeyCmd is `arcade apikey …`: a thin client for the admin API
+// newAPIKeyCmd is `bsv-broadcaster apikey …`: a thin client for the admin API
 // (admin.* listener). Reach the listener with kubectl port-forward or from
 // inside the cluster; it is never exposed publicly.
 func newAPIKeyCmd() *cobra.Command {
@@ -36,6 +36,9 @@ func newAPIKeyCmd() *cobra.Command {
 		"admin bearer token (default $BSV_BROADCASTER_ADMIN_TOKEN or $ARCADE_ADMIN_TOKEN)")
 
 	client := func(c *cobra.Command) (*adminClient, error) {
+		// Same precedence the server applies to admin.token: the
+		// BSV_BROADCASTER_* name wins, and the pre-rebrand ARCADE_* name is
+		// honored while it is the only one set (config.applyLegacyEnv).
 		tok := adminToken
 		if tok == "" {
 			tok = os.Getenv("BSV_BROADCASTER_ADMIN_TOKEN")

@@ -476,18 +476,18 @@ chaintracks_server:
 auth:
   enabled: false
   # Optional dedicated MongoDB database for API keys and quota, shared by
-  # several arcade deployments (e.g. one per network) so they serve one key
+  # several BSV Broadcaster deployments (e.g. one per network) so they serve one key
   # set and one quota window per key. Unset uri = keys and quota stay in the
   # main store. Requires auth.enabled. See docs/api-keys.md.
   # store:
   #   mongodb:
-  #     uri: ""              # ARCADE_AUTH_STORE_MONGODB_URI
-  #     database: arcade_auth
+  #     uri: ""              # BSV_BROADCASTER_AUTH_STORE_MONGODB_URI
+  #     database: bsv_broadcaster_auth
 admin:
   enabled: false
   host: 127.0.0.1       # kubectl port-forward works with this; set 0.0.0.0 to opt in to in-cluster tooling reaching it directly
   port: 8090            # never expose through the public ingress
-  token: ""             # ARCADE_ADMIN_TOKEN
+  token: ""             # BSV_BROADCASTER_ADMIN_TOKEN
 ratelimit:
   enabled: false        # requires auth.enabled
   lease_fraction: 0.10

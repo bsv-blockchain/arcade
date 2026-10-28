@@ -21,7 +21,9 @@ var (
 const (
 	// setAPIKeys holds one record per key, keyed by the key's SHA-256 so the
 	// per-request lookup is a single primary-key read. setAPIKeyIDs maps the
-	// public id to that hash for the admin paths.
+	// public id to that hash for the admin paths. Like every other set in
+	// this backend, the names keep the legacy "arcade_" prefix (see
+	// aerospike.go).
 	setAPIKeys   = "arcade_api_keys"
 	setAPIKeyIDs = "arcade_api_key_ids" //nolint:gosec // Aerospike set name, not a credential
 	setAPIQuota  = "arcade_api_quota"

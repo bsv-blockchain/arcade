@@ -47,7 +47,7 @@ func newPebble(t *testing.T) *pebble.Store {
 func authStoreTestConfig() *config.Config {
 	return &config.Config{
 		Auth: config.AuthConfig{Enabled: true, Store: config.AuthStoreConfig{
-			Mongo: config.Mongo{URI: "mongodb://auth.invalid:27017", Database: "arcade_auth"},
+			Mongo: config.Mongo{URI: "mongodb://auth.invalid:27017", Database: "bsv_broadcaster_auth"},
 		}},
 		Admin: config.AdminConfig{Enabled: true, Token: "admin-secret"},
 		RateLimit: config.RateLimitConfig{
