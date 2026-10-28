@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/bsv-blockchain/broadcaster/config"
 )
 
 // awaitWithin must return ctx's error once the deadline passes even though fn
@@ -168,5 +170,35 @@ func TestForEach_ReportsCancellationSeenAfterTheSlot(t *testing.T) {
 	// for i=1, rather than the test passing via some earlier branch.
 	if got := started.Load(); got != 1 {
 		t.Fatalf("fn called %d times, want 1 — the cancellation was expected at i=1's post-slot check", got)
+	}
+}
+
+// poolSettings must keep the idle floor small and independent of the pool
+// ceiling. The driver holds MinPoolSize open to EVERY replica-set member, per
+// process, forever; a floor that tracks max_pool_size (the old
+// min(maxConnecting, max_pool_size)) pinned each pod at its ceiling on all
+// three nodes and took a shared M10 to ~1450 of its 1500 connections.
+func TestPoolSettings(t *testing.T) {
+	tests := []struct {
+		name     string
+		cfg      config.Mongo
+		wantMax  int
+		wantMin  int
+		wantIdle time.Duration
+	}{
+		{"defaults", config.Mongo{}, defaultMaxPoolSize, defaultMinPoolSize, defaultMaxConnIdle},
+		{"floor stays small under a small ceiling", config.Mongo{MaxPoolSize: 12}, 12, defaultMinPoolSize, defaultMaxConnIdle},
+		{"explicit floor", config.Mongo{MaxPoolSize: 64, MinPoolSize: 6}, 64, 6, defaultMaxConnIdle},
+		{"floor clamped to ceiling", config.Mongo{MaxPoolSize: 4, MinPoolSize: 10}, 4, 4, defaultMaxConnIdle},
+		{"explicit idle", config.Mongo{MaxConnIdleMs: 60000}, defaultMaxPoolSize, defaultMinPoolSize, time.Minute},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotMax, gotMin, gotIdle := poolSettings(tt.cfg)
+			if gotMax != tt.wantMax || gotMin != tt.wantMin || gotIdle != tt.wantIdle {
+				t.Fatalf("poolSettings = (%d, %d, %v), want (%d, %d, %v)",
+					gotMax, gotMin, gotIdle, tt.wantMax, tt.wantMin, tt.wantIdle)
+			}
+		})
 	}
 }

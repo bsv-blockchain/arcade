@@ -77,6 +77,20 @@ const (
 	// not guess when the operator left max_pool_size unset.
 	defaultMaxPoolSize = 100
 
+	// defaultMinPoolSize is the warm idle floor, deliberately decoupled from
+	// the ceiling. The driver keeps MinPoolSize open to every replica-set
+	// member — secondaries included, though nothing here reads from them —
+	// for the life of the process, so each mongod pays pods × floor. Two
+	// keeps a socket warm for the first operation after a quiet spell (a
+	// cross-region TLS + SCRAM handshake is several round trips) without
+	// pinning the pool at its ceiling.
+	defaultMinPoolSize = 2
+
+	// defaultMaxConnIdle reaps the connections a burst opened above the
+	// floor. The driver default is 0, which never reaps: a pool that reached
+	// max_pool_size once would hold it forever.
+	defaultMaxConnIdle = 5 * time.Minute
+
 	// maxConnecting caps how many connections the pool establishes in
 	// parallel. The driver's default is 2, which is sized for a steady
 	// trickle, not for this package: the per-row rewrite loops open dozens of
@@ -196,22 +210,21 @@ func New(ctx context.Context, cfg config.Mongo, logger *zap.Logger) (*Store, err
 			zap.String("read_preference", rp.Mode().String()),
 		)
 	}
-	poolSize := defaultMaxPoolSize
-	if cfg.MaxPoolSize > 0 {
-		poolSize = cfg.MaxPoolSize
-		opts.SetMaxPoolSize(uint64(cfg.MaxPoolSize))
-	}
 	// Establish connections more than two at a time (see maxConnecting), and
 	// keep a small warm floor so the first block after an idle period does not
 	// start from zero.
 	//
-	// MinPoolSize is deliberately NOT the rewrite width: these are idle
-	// sockets held open per process, and a deployment runs many BSV Broadcaster pods
-	// against one deployment, so a floor of ~90 each would cost mongod
-	// thousands of connections to save a ramp that maxConnecting already
-	// shortens from ~46 waves to ~6.
+	// MinPoolSize is deliberately NOT the rewrite width, nor derived from
+	// max_pool_size: these are idle sockets held open per process to every
+	// replica-set member, and a deployment runs many BSV Broadcaster pods
+	// against one deployment. The floor this replaced, min(maxConnecting,
+	// max_pool_size), equalled the ceiling whenever max_pool_size <= 16 and
+	// pinned every pod at its full pool on every node.
+	maxPool, minPool, maxIdle := poolSettings(cfg)
+	opts.SetMaxPoolSize(uint64(maxPool)) //nolint:gosec // poolSettings returns >= 1
+	opts.SetMinPoolSize(uint64(minPool)) //nolint:gosec // in [1, maxPool]
+	opts.SetMaxConnIdleTime(maxIdle)
 	opts.SetMaxConnecting(maxConnecting)
-	opts.SetMinPoolSize(uint64(min(maxConnecting, poolSize)))
 	client, err := mongo.Connect(opts)
 	if err != nil {
 		// Never echo the URI: it may carry credentials.
@@ -310,6 +323,14 @@ func msOrDefault(ms int, def time.Duration) time.Duration {
 		return def
 	}
 	return time.Duration(ms) * time.Millisecond
+}
+
+// poolSettings resolves the connection-pool bounds from cfg: the ceiling,
+// the idle floor (clamped to the ceiling), and the idle reap interval.
+func poolSettings(cfg config.Mongo) (maxPool, minPool int, maxIdle time.Duration) {
+	maxPool = intOrDefault(cfg.MaxPoolSize, defaultMaxPoolSize)
+	minPool = min(intOrDefault(cfg.MinPoolSize, defaultMinPoolSize), maxPool)
+	return maxPool, minPool, msOrDefault(cfg.MaxConnIdleMs, defaultMaxConnIdle)
 }
 
 func intOrDefault(v, def int) int {

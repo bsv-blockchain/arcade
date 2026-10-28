@@ -91,6 +91,12 @@ store:
   #   # schema_apply_timeout_ms).
   #   index_timeout_ms: 300000
   #   max_pool_size: 64
+  #   # Idle connections kept open to EVERY replica-set member, per process.
+  #   # Total cost on each mongod is pods x min_pool_size, so keep it small;
+  #   # max_pool_size is only reached under load and reaped after
+  #   # max_conn_idle_ms.
+  #   min_pool_size: 2
+  #   max_conn_idle_ms: 300000
   #   # Documents per bulk-write chunk and per $in on the write paths (max
   #   # 10000; read-path $in chunks are a fixed 1000).
   #   batch_size: 500
