@@ -49,14 +49,24 @@ smallest member txid, so a shuffled resubmission maps to the same partition).
 A whole family therefore lands on one partition, and per-partition order
 delivers parents before children.
 
-Chains that span requests have no such guarantee, and that is by design rather
-than an oversight: a child can reach a datahub before its parent and draw
-`TX_MISSING_PARENT`. That is treated as a **condition, not a verdict** — the tx
-rides the bounded requeue, then parks at `PENDING_RETRY` for the reaper's
-durable retry queue. The only path to `REJECTED` is BSV Broadcaster's own store showing
-an ancestor terminally rejected. Note this means single-transaction `POST /tx`
-submissions get no cross-request ordering help: they are keyed by their own
-txid.
+Chains that span requests get the same treatment through the store: every row
+persists the partition key its message was published with, and a single
+`POST /tx` whose input spends a transaction still in flight (`RECEIVED` or
+`PENDING_RETRY`) reuses that parent's key (`propagation.parent_key_lookup_max_inputs`
+bounds how many inputs are consulted). A wallet paying out of its own
+unconfirmed change one request at a time therefore lands its whole chain on
+one partition, and each hop is held behind the previous one instead of racing
+it to the datahub. A `POST /txs` family whose parent outside the batch is in
+flight joins that parent's partition the same way.
+
+What remains is the genuine race: a child submitted before its parent, a
+parent that is already `ACCEPTED_BY_NETWORK` (Teranode has it, so the child can
+go anywhere), or a parent submitted through another region. Such a child can
+reach a datahub before its parent and draw `TX_MISSING_PARENT`. That is
+treated as a **condition, not a verdict** — the tx rides the bounded requeue,
+then parks at `PENDING_RETRY` for the reaper's durable retry queue. The only
+path to `REJECTED` is BSV Broadcaster's own store showing an ancestor
+terminally rejected.
 
 BSV Broadcaster enforces the floor at startup with `kafka.CheckMinPartitions`. A missing
 topic, or a topic with fewer partitions than `propagation.partitions`, aborts
