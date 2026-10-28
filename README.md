@@ -253,22 +253,30 @@ Interactive API documentation (Scalar UI) available at `http://localhost:3011/do
 ```
 Client → BSV Broadcaster
    ↓
-RECEIVED (validated locally)
+RECEIVED (validated locally, queued for propagation)
    ↓
-SENT_TO_NETWORK (submitted to Teranode via HTTP)
+ACCEPTED_BY_NETWORK (acknowledged by a Teranode datahub)
    ↓
-ACCEPTED_BY_NETWORK (acknowledged by Teranode)
+SEEN_ON_NETWORK → SEEN_MULTIPLE_NODES (heard in subtree gossip - in mempool)
    ↓
-SEEN_ON_NETWORK (heard in subtree gossip - in mempool)
+MINED (merkle proof delivered - included in a block)
    ↓
-MINED (heard in block gossip - included in block)
+IMMUTABLE (100+ confirmations)
 ```
 
-Or rejected:
+Side states:
 ```
-REJECTED (from rejected-tx gossip)
-DOUBLE_SPEND_ATTEMPTED (from rejected-tx gossip with specific reason)
+PENDING_RETRY   no network verdict yet (for example the parent is not accepted); parked for the
+                propagation reaper, which rebroadcasts it until it gets one
+REJECTED        a verdict on the bytes: a validator failure at intake, or a Teranode rejection.
+                The ARC code is in `status` and the reason in `extraInfo`
 ```
+
+A double spend is reported as `REJECTED` with ARC code `466`, `UTXO_SPENT` in `extraInfo` and the
+winning transaction in `competingTxs`. Both conflicting submissions get `202` - the broadcaster is
+asynchronous and the network decides - so submit order is not a tiebreak: watch the status on
+`GET /tx`, SSE or a webhook. `SENT_TO_NETWORK` and `DOUBLE_SPEND_ATTEMPTED` stay in the status
+enum for ARC compatibility but are not emitted.
 
 ### Differences from Arc
 
@@ -394,7 +402,7 @@ BSV Broadcaster provides real-time transaction status updates via SSE, offering 
    ```
    id: 1699632123456789000
    event: status
-   data: {"txid":"abc123...","status":"SENT_TO_NETWORK","timestamp":"2024-11-10T12:00:00Z"}
+   data: {"txid":"abc123...","txStatus":"ACCEPTED_BY_NETWORK","timestamp":"2024-11-10T12:00:00Z"}
    ```
 
 #### Catchup on Reconnect
@@ -504,9 +512,10 @@ func (h *MyHandler) Start(ctx context.Context) error {
 **Server fails to start with "no teranodes configured"**
 - Ensure `teranode.broadcast_urls` is set in your config file with at least one valid URL
 
-**Transactions stuck in SENT_TO_NETWORK**
-- Check your Teranode broadcast URL is reachable
+**Transactions stuck in RECEIVED or PENDING_RETRY**
+- Check the datahub URLs are reachable (`GET /health` lists each one with its health)
 - Verify network connectivity and firewall rules
+- `GET /tx/{txid}` carries the last network answer in `extraInfo` and, for PENDING_RETRY, the next rebroadcast time in `nextRetryAt`
 
 **SQLite errors**
 - Ensure `storage_path` directory exists and is writable

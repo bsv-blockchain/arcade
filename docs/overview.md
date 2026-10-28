@@ -127,7 +127,7 @@ A transaction's journey through BSV Broadcaster v2 has five phases.
 
 Client calls `SubmitTransaction()`. BSV Broadcaster parses the raw tx (BEEF or raw bytes), deduplicates via `store.GetOrInsertStatus()`, validates against policy (fee rates, script rules, size limits), tracks it in TxTracker (an in-memory O(1) hash map), registers it with every configured Merkle Service via `POST /watch {txid, callbackUrl}` (a tx is registered once any endpoint accepts it; a tx no endpoint accepted is requeued and never broadcast, so a proof can always be delivered for a broadcast tx), and broadcasts concurrently to Teranode endpoints, returning on first success.
 
-Status: `RECEIVED` → `SENT_TO_NETWORK` → `ACCEPTED_BY_NETWORK`.
+Status: `RECEIVED` → `ACCEPTED_BY_NETWORK`.
 
 ### Phase 2 — Network propagation
 
@@ -199,16 +199,17 @@ After 100+ confirmations, `TxTracker.PruneConfirmed()` removes deeply confirmed 
 ## Status state machine
 
 ```
-                    RECEIVED
+                    RECEIVED ────────► REJECTED (intake verdict)
                        │
-                       ▼
-                SENT_TO_NETWORK ─────► REJECTED
-                       │
-                       ▼
-              ACCEPTED_BY_NETWORK      DOUBLE_SPEND_ATTEMPTED
-                       │               (from any pre-mined state)
+                       ├────────────► PENDING_RETRY (no verdict yet; the reaper rebroadcasts)
+                       ▼                   │
+              ACCEPTED_BY_NETWORK ◄────────┘      ─► REJECTED (Teranode verdict,
+                       │                              double spend = 466 + competingTxs)
                        ▼
               SEEN_ON_NETWORK ◄──── (reorg resets MINED)
+                       │
+                       ▼
+              SEEN_MULTIPLE_NODES
                        │
                        ▼
               STUMP_PROCESSING        (TxTracker only, not persisted)
@@ -223,6 +224,8 @@ After 100+ confirmations, `TxTracker.PruneConfirmed()` removes deeply confirmed 
 
 Transitions are guarded by `DisallowedPreviousStatuses()` in the SQL UPDATE query, preventing backward transitions — `MINED` cannot revert to `SEEN_ON_NETWORK` except through explicit reorg handling.
 
+`SENT_TO_NETWORK` and `DOUBLE_SPEND_ATTEMPTED` are part of the status enum for ARC compatibility but no code path emits them: the broadcast is acknowledged straight into `ACCEPTED_BY_NETWORK`, and a double spend surfaces as `REJECTED` (see below). A producer for `DOUBLE_SPEND_ATTEMPTED` would be Teranode's rejected-tx gossip, tracked as issue #325.
+
 ### Rejection semantics: verdicts vs. conditions
 
 BSV Broadcaster distinguishes two kinds of submit failure (issue #254):
@@ -234,6 +237,7 @@ Recovery is client-driven by design — BSV Broadcaster keeps no rejected-tx tra
 
 - **Resubmitting a `REJECTED` transaction re-validates and re-broadcasts it.** If the original cause has cleared (e.g. a parent has since confirmed), the row advances through the normal `SEEN_ON_NETWORK → MINED` flow; the lattice permits every forward transition out of `REJECTED`.
 - **Cascade rejections are queue state, not verdicts about the child.** A child held behind a rejected ancestor gets `extraInfo` prefixed `parent rejected`, naming the ancestor — resubmit the child after the ancestor is accepted.
+- **A double spend is a `REJECTED` verdict with ARC code `466`.** The losing transaction carries Teranode's `UTXO_SPENT` line in `extraInfo` and the transaction that owns the outpoint in `competingTxs`, so a wallet can tell "my inputs are gone" from "my bytes are wrong" without a follow-up query. Both conflicting submissions are answered `202` — intake has no outpoint index and the broadcaster is asynchronous by design — and the network decides which one it keeps. Submit order is therefore not a tiebreak: two conflicting transactions sent milliseconds apart can resolve either way, and only the status (`GET /tx`, SSE, webhook) says which one won.
 
 Operators can detect the stale-chain-view condition before it causes non-final rejections: `GET /health` reports `blockHeight` (BSV Broadcaster's processed tip), and the `bsv_broadcaster_chain_tip_height` / `bsv_broadcaster_p2p_peer_best_height` gauges expose height lag between BSV Broadcaster and its datahub peers.
 

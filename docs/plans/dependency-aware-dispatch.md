@@ -133,6 +133,8 @@ Per-slot Teranode codes are bucketed:
 
 `TX_MISSING_PARENT (34)` is terminal in this design — dep-aware dispatch already gated children on in-flight parents, so a missing-parent rejection from Teranode means a parent that BSV Broadcaster doesn't know about. Wallets resolve it.
 
+> Superseded: since issue #254 a missing parent is a retryable *condition*, not a verdict. The fast path requeues the child a bounded number of times and then parks it at `PENDING_RETRY` for the reaper; see `docs/propagation-retry-domains.md`.
+
 Single-tx `/tx` returns the same Teranode code in the response body when there's an error, with the HTTP status mirroring the classification (400/403/409/422/500). BSV Broadcaster keeps the per-tx `/tx` path for non-batch use cases but the `/txs` failure path no longer falls back to it.
 
 ## Message format

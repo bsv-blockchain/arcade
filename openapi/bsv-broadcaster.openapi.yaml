@@ -1166,7 +1166,12 @@ components:
   schemas:
     Status:
       type: string
-      description: A transaction's lifecycle state.
+      description: >-
+        A transaction's lifecycle state. Emitted in practice: RECEIVED → ACCEPTED_BY_NETWORK →
+        SEEN_ON_NETWORK → SEEN_MULTIPLE_NODES → MINED → IMMUTABLE, with PENDING_RETRY (no network
+        verdict yet; rebroadcast by the reaper) and REJECTED (a verdict on the bytes; a double spend
+        is REJECTED with ARC code 466 and competingTxs) as side states. SENT_TO_NETWORK and
+        DOUBLE_SPEND_ATTEMPTED are reserved for ARC compatibility and are not emitted.
       enum:
         - UNKNOWN
         - RECEIVED
