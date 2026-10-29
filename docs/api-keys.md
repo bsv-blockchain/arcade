@@ -181,6 +181,8 @@ auth:
       # op_timeout_ms: 3000
       # query_timeout_ms: 8000
       # index_timeout_ms: 300000
+      # min_pool_size: 2
+      # max_conn_idle_ms: 300000
       max_pool_size: 16          # unset = driver default 100. Auth traffic is light
                                  # and every api-server pod of every network shares
                                  # one cluster, so keep this small.

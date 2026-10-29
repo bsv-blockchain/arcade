@@ -16,12 +16,6 @@ var (
 	_ store.QuotaStore  = (*AuthStore)(nil)
 )
 
-// authMinPoolFloor is the auth store's idle-connection floor. Its traffic is
-// one point read per key-cache miss and one findAndModify per quota lease,
-// and every api-server of every network shares the one auth deployment, so
-// the main store's warm floor (maxConnecting) would only cost connections.
-const authMinPoolFloor = 1
-
 // AuthStore is a MongoDB-backed APIKeyStore and QuotaStore bound to a
 // dedicated database (auth.store.mongodb), so several BSV Broadcaster deployments —
 // one per network, each with its own main store — share one key set and one
@@ -45,7 +39,7 @@ func NewAuthStore(ctx context.Context, cfg config.Mongo, logger *zap.Logger) (*A
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	client, err := connect(ctx, cfg, logger, "auth.store.mongodb.uri", authMinPoolFloor)
+	client, _, err := connect(ctx, cfg, logger, "auth.store.mongodb.uri")
 	if err != nil {
 		return nil, err
 	}

@@ -414,6 +414,14 @@ type Pebble struct {
 // restored collection is the one boot step that scales with data). BatchSize
 // caps the documents per bulk-write chunk and per $in on the write paths;
 // the txid $in on the read paths is a fixed 1000.
+//
+// MinPoolSize is the idle connection floor the driver keeps open to EVERY
+// replica-set member (not just the primary), per process, for the life of the
+// process — so its cost is pods × members × floor on each mongod. Keep it
+// small; MaxConnIdleMs reaps the connections a burst opened above it.
+// MaxPoolSize, MinPoolSize and MaxConnIdleMs each fall back to the URI's
+// maxPoolSize / minPoolSize / maxIdleTimeMS when set to 0, then to the
+// backend's own default.
 type Mongo struct {
 	URI              string `mapstructure:"uri"`
 	Database         string `mapstructure:"database"`
@@ -422,6 +430,8 @@ type Mongo struct {
 	QueryTimeoutMs   int    `mapstructure:"query_timeout_ms"`
 	IndexTimeoutMs   int    `mapstructure:"index_timeout_ms"`
 	MaxPoolSize      int    `mapstructure:"max_pool_size"`
+	MinPoolSize      int    `mapstructure:"min_pool_size"`
+	MaxConnIdleMs    int    `mapstructure:"max_conn_idle_ms"`
 	BatchSize        int    `mapstructure:"batch_size"`
 }
 
@@ -1432,6 +1442,8 @@ func setDefaults() {
 	viper.SetDefault("auth.store.mongodb.query_timeout_ms", 0)
 	viper.SetDefault("auth.store.mongodb.index_timeout_ms", 0)
 	viper.SetDefault("auth.store.mongodb.max_pool_size", 0)
+	viper.SetDefault("auth.store.mongodb.min_pool_size", 0)
+	viper.SetDefault("auth.store.mongodb.max_conn_idle_ms", 0)
 	viper.SetDefault("admin.enabled", false)
 	viper.SetDefault("admin.host", "127.0.0.1")
 	viper.SetDefault("admin.port", 8090)
@@ -1496,6 +1508,8 @@ func setDefaults() {
 	viper.SetDefault("store.mongodb.query_timeout_ms", 8000)
 	viper.SetDefault("store.mongodb.index_timeout_ms", 300000)
 	viper.SetDefault("store.mongodb.max_pool_size", 64)
+	viper.SetDefault("store.mongodb.min_pool_size", 2)
+	viper.SetDefault("store.mongodb.max_conn_idle_ms", 300000)
 	viper.SetDefault("store.mongodb.batch_size", 500)
 	viper.SetDefault("health.port", 8081)
 
@@ -1790,6 +1804,8 @@ func validate(cfg *Config) error {
 			"query_timeout_ms":   cfg.Store.Mongo.QueryTimeoutMs,
 			"index_timeout_ms":   cfg.Store.Mongo.IndexTimeoutMs,
 			"max_pool_size":      cfg.Store.Mongo.MaxPoolSize,
+			"min_pool_size":      cfg.Store.Mongo.MinPoolSize,
+			"max_conn_idle_ms":   cfg.Store.Mongo.MaxConnIdleMs,
 		} {
 			if v < 0 {
 				return fmt.Errorf("store.mongodb.%s must be >= 0 (0 = default)", name)
@@ -1941,6 +1957,8 @@ func validateAuthStore(cfg *Config) error {
 		{"query_timeout_ms", m.QueryTimeoutMs},
 		{"index_timeout_ms", m.IndexTimeoutMs},
 		{"max_pool_size", m.MaxPoolSize},
+		{"min_pool_size", m.MinPoolSize},
+		{"max_conn_idle_ms", m.MaxConnIdleMs},
 	} {
 		if f.v < 0 {
 			return fmt.Errorf("auth.store.mongodb.%s must be >= 0 (0 = default)", f.name)

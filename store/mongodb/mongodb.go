@@ -78,6 +78,20 @@ const (
 	// not guess when the operator left max_pool_size unset.
 	defaultMaxPoolSize = 100
 
+	// defaultMinPoolSize is the warm idle floor, deliberately decoupled from
+	// the ceiling. The driver keeps MinPoolSize open to every replica-set
+	// member — secondaries included, though nothing here reads from them —
+	// for the life of the process, so each mongod pays pods × floor. Two
+	// keeps a socket warm for the first operation after a quiet spell (a
+	// cross-region TLS + SCRAM handshake is several round trips) without
+	// pinning the pool at its ceiling.
+	defaultMinPoolSize = 2
+
+	// defaultMaxConnIdle reaps the connections a burst opened above the
+	// floor. The driver default is 0, which never reaps: a pool that reached
+	// max_pool_size once would hold it forever.
+	defaultMaxConnIdle = 5 * time.Minute
+
 	// maxConnecting caps how many connections the pool establishes in
 	// parallel. The driver's default is 2, which is sized for a steady
 	// trickle, not for this package: the per-row rewrite loops open dozens of
@@ -155,11 +169,12 @@ func New(ctx context.Context, cfg config.Mongo, logger *zap.Logger) (*Store, err
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	client, err := connect(ctx, cfg, logger, "store.mongodb.uri", maxConnecting)
+	client, maxPool, err := connect(ctx, cfg, logger, "store.mongodb.uri")
 	if err != nil {
 		return nil, err
 	}
 	s := newWithClient(client, cfg.Database, cfg)
+	s.rowConcurrency = rowConcurrencyForPool(maxPool)
 	s.logger = logger
 	s.ownsClient = true
 	return s, nil
@@ -167,14 +182,16 @@ func New(ctx context.Context, cfg config.Mongo, logger *zap.Logger) (*Store, err
 
 // connect validates cfg, builds the client and pings the primary (a ping
 // runs on the admin database and needs no privileges). uriKey names the
-// config key in the read-preference warning; minPoolFloor is the idle
-// connection floor (capped by the pool size). It never echoes the URI.
-func connect(ctx context.Context, cfg config.Mongo, logger *zap.Logger, uriKey string, minPoolFloor int) (*mongo.Client, error) {
+// config key in the read-preference warning. The pool bounds come from
+// poolSettings; the effective ceiling (0 = unlimited) is returned alongside
+// the client so New can size its row concurrency from it. It never echoes
+// the URI.
+func connect(ctx context.Context, cfg config.Mongo, logger *zap.Logger, uriKey string) (*mongo.Client, uint64, error) {
 	if cfg.URI == "" {
-		return nil, errors.New("mongodb: uri is required")
+		return nil, 0, errors.New("mongodb: uri is required")
 	}
 	if cfg.Database == "" {
-		return nil, errors.New("mongodb: database is required")
+		return nil, 0, errors.New("mongodb: database is required")
 	}
 	connectTimeout := msOrDefault(cfg.ConnectTimeoutMs, defaultConnectTimeout)
 
@@ -188,7 +205,7 @@ func connect(ctx context.Context, cfg config.Mongo, logger *zap.Logger, uriKey s
 		return options.Client().ApplyURI(cfg.URI)
 	})
 	if err != nil {
-		return nil, fmt.Errorf("mongodb: parsing uri: %w", err)
+		return nil, 0, fmt.Errorf("mongodb: parsing uri: %w", err)
 	}
 	opts.SetAppName("bsv-broadcaster").
 		SetConnectTimeout(connectTimeout).
@@ -214,28 +231,25 @@ func connect(ctx context.Context, cfg config.Mongo, logger *zap.Logger, uriKey s
 			zap.String("read_preference", rp.Mode().String()),
 		)
 	}
-	poolSize := defaultMaxPoolSize
-	if cfg.MaxPoolSize > 0 {
-		poolSize = cfg.MaxPoolSize
-		opts.SetMaxPoolSize(uint64(cfg.MaxPoolSize))
-	}
 	// Establish connections more than two at a time (see maxConnecting), and
 	// keep a small warm floor so the first block after an idle period does not
 	// start from zero.
 	//
-	// MinPoolSize is deliberately NOT the rewrite width: these are idle
-	// sockets held open per process, and a deployment runs many BSV Broadcaster pods
-	// against one deployment, so a floor of ~90 each would cost mongod
-	// thousands of connections to save a ramp that maxConnecting already
-	// shortens from ~46 waves to ~6.
+	// MinPoolSize is deliberately NOT the rewrite width, nor derived from
+	// max_pool_size: these are idle sockets held open per process to every
+	// replica-set member, and a deployment runs many BSV Broadcaster pods
+	// against one deployment. The floor this replaced, min(maxConnecting,
+	// max_pool_size), equalled the ceiling whenever max_pool_size <= 16 and
+	// pinned every pod at its full pool on every node.
+	maxPool, minPool, maxIdle := poolSettings(cfg, opts)
+	opts.SetMaxPoolSize(maxPool)
+	opts.SetMinPoolSize(minPool)
+	opts.SetMaxConnIdleTime(maxIdle)
 	opts.SetMaxConnecting(maxConnecting)
-	if floor := min(minPoolFloor, poolSize); floor > 0 {
-		opts.SetMinPoolSize(uint64(floor))
-	}
 	client, err := mongo.Connect(opts)
 	if err != nil {
 		// Never echo the URI: it may carry credentials.
-		return nil, fmt.Errorf("mongodb connect: %w", err)
+		return nil, 0, fmt.Errorf("mongodb connect: %w", err)
 	}
 
 	pingCtx, cancel := context.WithTimeout(ctx, connectTimeout)
@@ -244,9 +258,9 @@ func connect(ctx context.Context, cfg config.Mongo, logger *zap.Logger, uriKey s
 		disconnectCtx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), closeTimeout)
 		defer dcancel()
 		_ = client.Disconnect(disconnectCtx)
-		return nil, fmt.Errorf("mongodb ping: %w", err)
+		return nil, 0, fmt.Errorf("mongodb ping: %w", err)
 	}
-	return client, nil
+	return client, maxPool, nil
 }
 
 // newWithClient binds a Store to an existing client. It is the seam New and
@@ -328,6 +342,49 @@ func msOrDefault(ms int, def time.Duration) time.Duration {
 		return def
 	}
 	return time.Duration(ms) * time.Millisecond
+}
+
+// poolSettings resolves the connection-pool bounds: the ceiling (0 means
+// unlimited, as in the driver), the idle floor (clamped to a finite
+// ceiling), and the idle reap interval. Each comes from its dedicated
+// setting when that is set, else from the URI option, else from this
+// package's default — so a deployment that sizes its pool in the URI keeps
+// that size when the dedicated settings are left at 0.
+func poolSettings(cfg config.Mongo, uri *options.ClientOptions) (maxPool, minPool uint64, maxIdle time.Duration) {
+	maxPool = defaultMaxPoolSize
+	switch {
+	case cfg.MaxPoolSize > 0:
+		maxPool = uint64(cfg.MaxPoolSize)
+	case uri.MaxPoolSize != nil:
+		maxPool = *uri.MaxPoolSize
+	}
+	minPool = defaultMinPoolSize
+	switch {
+	case cfg.MinPoolSize > 0:
+		minPool = uint64(cfg.MinPoolSize)
+	case uri.MinPoolSize != nil:
+		minPool = *uri.MinPoolSize
+	}
+	if maxPool > 0 {
+		minPool = min(minPool, maxPool)
+	}
+	maxIdle = defaultMaxConnIdle
+	switch {
+	case cfg.MaxConnIdleMs > 0:
+		maxIdle = time.Duration(cfg.MaxConnIdleMs) * time.Millisecond
+	case uri.MaxConnIdleTime != nil:
+		maxIdle = *uri.MaxConnIdleTime
+	}
+	return maxPool, minPool, maxIdle
+}
+
+// rowConcurrencyForPool is rowConcurrencyFor for the effective driver
+// ceiling, where 0 means unlimited and so only rowConcurrencyCeiling binds.
+func rowConcurrencyForPool(maxPool uint64) int {
+	if maxPool == 0 || maxPool > rowConcurrencyCeiling+poolHeadroom {
+		return rowConcurrencyCeiling
+	}
+	return rowConcurrencyFor(int(maxPool))
 }
 
 func intOrDefault(v, def int) int {
