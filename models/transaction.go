@@ -56,16 +56,19 @@ type TransactionStatus struct {
 	// propagation.publishRejections). omitempty so the HTTP API surface
 	// (single-tx status reads) is unaffected — TxIDs is never set on rows
 	// read from the store, only on transient events on the publisher channel.
-	TxIDs        []string  `json:"txids,omitempty"`
-	BlockHash    string    `json:"blockHash,omitempty"`
-	BlockHeight  uint64    `json:"blockHeight,omitempty"`
-	MerklePath   HexBytes  `json:"merklePath,omitempty"`
-	ExtraInfo    string    `json:"extraInfo,omitempty"`
-	CompetingTxs []string  `json:"competingTxs,omitempty"`
-	RawTx        HexBytes  `json:"rawTx,omitempty"`
-	RetryCount   int       `json:"retryCount,omitempty"`
-	NextRetryAt  time.Time `json:"nextRetryAt,omitempty"`
-	CreatedAt    time.Time `json:"-"`
+	TxIDs        []string `json:"txids,omitempty"`
+	BlockHash    string   `json:"blockHash,omitempty"`
+	BlockHeight  uint64   `json:"blockHeight,omitempty"`
+	MerklePath   HexBytes `json:"merklePath,omitempty"`
+	ExtraInfo    string   `json:"extraInfo,omitempty"`
+	CompetingTxs []string `json:"competingTxs,omitempty"`
+	RawTx        HexBytes `json:"rawTx,omitempty"`
+	RetryCount   int      `json:"retryCount,omitempty"`
+	// omitzero, not omitempty: omitempty never omits a struct, so a zero
+	// time.Time used to serialize as "0001-01-01T00:00:00Z" on every row
+	// that had no retry scheduled.
+	NextRetryAt time.Time `json:"nextRetryAt,omitzero"`
+	CreatedAt   time.Time `json:"-"`
 	// OrphanedProofs preserves every block this tx was once MINED against
 	// before a reorg superseded the anchor (issue #279). Stores append an
 	// entry whenever an existing MINED anchor is overwritten with a
@@ -80,7 +83,7 @@ type TransactionStatus struct {
 	// value means "never registered" (or registered before this field was
 	// added). The startup replay loop reads this to skip rows registered
 	// within MerkleReplaySkipRecentMinutes — see issue #145.
-	MerkleRegisteredAt time.Time `json:"merkleRegisteredAt,omitempty"`
+	MerkleRegisteredAt time.Time `json:"merkleRegisteredAt,omitzero"`
 }
 
 // Status represents the various states a transaction can be in

@@ -1255,12 +1255,18 @@ components:
           description: Raw transaction bytes, hex-encoded. Set only while in PENDING_RETRY.
         retryCount:
           type: integer
+          description: Number of durable (reaper) rebroadcast attempts so far. Kept as history after a recovery.
         nextRetryAt:
           type: string
           format: date-time
+          description: When the propagation reaper will next rebroadcast a PENDING_RETRY transaction. Absent when no retry is scheduled.
         merkleRegisteredAt:
           type: string
           format: date-time
+          description: >-
+            Time of the most recent successful merkle-service registration for this txid. Registration
+            happens before the first broadcast (so a proof can always be delivered), which is why it is
+            also present on a transaction the network later REJECTED. Absent when never registered.
         orphanedProofs:
           type: array
           description: >-

@@ -26,6 +26,28 @@ func TestNewArcErrorWithInfo(t *testing.T) {
 	}
 }
 
+// TestArcError_NoDuplicateReason pins the fix for the doubled reason strings
+// clients saw on 460/461/465 rejections: the validator mapping passes the
+// error's own text as ExtraInfo, and Error() must not render it twice.
+func TestArcError_NoDuplicateReason(t *testing.T) {
+	const msg = "transaction could not be transformed to extended format: missing input source data: input 0"
+	same := NewArcErrorWithInfo(errors.New(msg), StatusTxFormat, msg)
+	if got := same.Error(); got != msg {
+		t.Errorf("identical ExtraInfo rendered twice: %q", got)
+	}
+	wrapped := NewArcErrorWithInfo(fmt.Errorf("%s: input 0", "missing input source data"), StatusTxFormat, "missing input source data")
+	if got, want := wrapped.Error(), "missing input source data: input 0"; got != want {
+		t.Errorf("ExtraInfo already contained in message rendered twice: %q, want %q", got, want)
+	}
+	distinct := NewArcErrorWithInfo(errors.New("fee low"), StatusFees, "need 100 sat/kb")
+	if got, want := distinct.Error(), "fee low: need 100 sat/kb"; got != want {
+		t.Errorf("distinct ExtraInfo dropped: %q, want %q", got, want)
+	}
+	if fields := same.ToErrorFields(); fields.ExtraInfo == nil || *fields.ExtraInfo != msg {
+		t.Errorf("ToErrorFields must still carry ExtraInfo: %+v", fields)
+	}
+}
+
 func TestGetArcError(t *testing.T) {
 	arcErr := NewArcError(errors.New("inner"), StatusMalformed)
 	wrapped := fmt.Errorf("outer: %w", arcErr)
