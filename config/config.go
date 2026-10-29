@@ -1239,7 +1239,7 @@ type ValidatorConfig struct {
 	// data, so the BDK validator cannot compute fees or run scripts for it.
 	// Such a submission is rejected with ARC 460 (validator/convert.go); there
 	// is no fallback that fetches parent outputs from the network, so clients
-	// must submit EF or BEEF. The flag exists only so an operator who adds
+	// must submit EF (intake does not decode BEEF). The flag exists only so an operator who adds
 	// such a fallback can advertise it without a code change. Default false.
 	StandardFormatSupported bool `mapstructure:"standard_format_supported"`
 

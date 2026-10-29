@@ -225,9 +225,10 @@ BSV Broadcaster is a lightweight transaction broadcast service that:
 
 #### Submit Transaction (`POST /tx`)
 
-Submissions must be in Extended Format (EF) or BEEF: validation needs each input's source
-output, and a plain raw transaction is rejected with ARC code 460. `GET /policy` advertises this
-as `standardFormatSupported: false`.
+Submissions must be in Extended Format (EF): validation needs each input's source output, and a
+plain raw transaction is rejected with ARC code 460. BEEF is not accepted; intake does not decode
+it, so a BEEF body is rejected with HTTP 400. `GET /policy` advertises this as
+`standardFormatSupported: false`.
 
 ```bash
 curl -X POST http://localhost:3011/tx \

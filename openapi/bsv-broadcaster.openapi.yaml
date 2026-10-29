@@ -236,13 +236,13 @@ paths:
               type: string
               format: binary
               description: >-
-                Raw serialized transaction bytes in Extended Format (EF) or BEEF. A plain
+                Raw serialized transaction bytes in Extended Format (EF). A plain
                 (standard-format) transaction is rejected with ARC 460 because validation needs
-                each input's source output.
+                each input's source output. BEEF is not accepted and is rejected with 400.
           text/plain:
             schema:
               type: string
-              description: Hex-encoded serialized transaction (EF or BEEF). Whitespace is trimmed before decoding.
+              description: Hex-encoded serialized transaction in Extended Format (EF). Whitespace is trimmed before decoding.
               example: "0100000001abc...def00000000"
           application/json:
             schema:
@@ -1305,7 +1305,7 @@ components:
       properties:
         rawTx:
           type: string
-          description: Hex-encoded serialized transaction in Extended Format (EF) or BEEF; a plain raw transaction is rejected with ARC 460.
+          description: Hex-encoded serialized transaction in Extended Format (EF); a plain raw transaction is rejected with ARC 460. BEEF is not accepted.
           example: "0100000001abc...def00000000"
       required:
         - rawTx
@@ -1586,8 +1586,9 @@ components:
           type: boolean
           description: >-
             Whether standard (non-EF) transaction format is accepted at intake. Always false in
-            this release: validation needs each input's source output, which only Extended
-            Format (EF) or BEEF carries, so a plain raw transaction is rejected with ARC 460.
+            this release: validation needs each input's source output, which of the accepted
+            encodings only Extended Format (EF) carries, so a plain raw transaction is rejected
+            with ARC 460. BEEF is not accepted.
           example: false
       required:
         - miningFee
