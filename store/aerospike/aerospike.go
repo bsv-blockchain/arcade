@@ -3517,6 +3517,12 @@ func recordToStatus(rec *aero.Record, txid string) *models.TransactionStatus {
 			status.MerkleRegisteredAt = time.UnixMilli(int64(ms))
 		}
 	}
+	// The durable-retry bookkeeping, surfaced on reads as the other backends
+	// do. A cleared bin is absent, so NextRetryAt stays zero.
+	status.RetryCount = int(getInt64(rec, "retry_count"))
+	if ms := getInt64(rec, "next_retry_at"); ms > 0 {
+		status.NextRetryAt = time.UnixMilli(ms)
+	}
 	for _, a := range orphanedAnchorsFromRecord(rec) {
 		status.OrphanedProofs = append(status.OrphanedProofs, models.OrphanedAnchor{
 			BlockHash:   a.BlockHash,
