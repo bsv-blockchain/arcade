@@ -41,6 +41,7 @@ import (
 	"github.com/bsv-blockchain/broadcaster/ssrfguard"
 	"github.com/bsv-blockchain/broadcaster/store"
 	storefactory "github.com/bsv-blockchain/broadcaster/store/factory"
+	"github.com/bsv-blockchain/broadcaster/store/mongodb"
 	"github.com/bsv-blockchain/broadcaster/teranode"
 	"github.com/bsv-blockchain/broadcaster/validator"
 )
@@ -68,6 +69,9 @@ type Deps struct {
 	// nil (no chain source, or validator.disable_finality_check) disables
 	// the gate; the checker itself is nil-receiver-safe.
 	FinalityChecker *finality.Checker
+	// AuthStore holds API keys and quota counters when auth.store.mongodb is
+	// configured; nil means they live in Store. Only api-server reads it.
+	AuthStore api_server.AuthStore
 }
 
 // Bootstrap creates every shared dependency the services rely on, in the
@@ -145,6 +149,26 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		_ = st.Close()
 		_ = producer.Close()
 		return nil, nil, fmt.Errorf("ensuring store indexes: %w", idxErr)
+	}
+
+	// auth.store.mongodb moves API keys and quota out of the main store so
+	// several deployments (one per network) share one key set. Opened right
+	// after the main store so a misconfigured auth database fails boot before
+	// the slow work below (tx tracker hydration, chaintracks).
+	var authStore closableAuthStore
+	if cfg.Auth.Store.Configured() && modeNeedsAuthStore(cfg.Mode) {
+		as, asErr := openAuthStore(ctx, cfg.Auth.Store.Mongo, logger)
+		if asErr != nil {
+			_ = st.Close()
+			_ = producer.Close()
+			return nil, nil, asErr
+		}
+		authStore = as
+	}
+	closeAuthStore := func() {
+		if authStore != nil {
+			_ = authStore.Close()
+		}
 	}
 
 	// Align store batch-helper concurrency with config. Zero falls back to
@@ -231,6 +255,7 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 	if modeNeedsValidator(cfg.Mode) {
 		v, verr := validator.NewValidatorForNetwork(cfg.Network, validatorPolicyFromConfig(cfg))
 		if verr != nil {
+			closeAuthStore()
 			_ = st.Close()
 			_ = producer.Close()
 			return nil, nil, fmt.Errorf("creating validator: %w", verr)
@@ -257,6 +282,7 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 	if cfg.ChaintracksServer.Enabled && modeNeedsChaintracks(cfg.Mode) {
 		ct, ctErr := initChaintracks(ctx, cfg, logger)
 		if ctErr != nil {
+			closeAuthStore()
 			_ = st.Close()
 			_ = producer.Close()
 			return nil, nil, fmt.Errorf("chaintracks init: %w", ctErr)
@@ -334,10 +360,15 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		Chaintracks:     chainTracks,
 		FinalityChecker: finalityChecker,
 	}
+	// Nil (keys and quota in the main store) unless auth.store was opened.
+	if authStore != nil {
+		deps.AuthStore = authStore
+	}
 
 	cleanup := func() {
 		_ = publisher.Close()
 		teranodeClient.Close()
+		closeAuthStore()
 		_ = st.Close()
 		_ = producer.Close()
 	}
@@ -531,6 +562,50 @@ func modeNeedsTxTracker(mode string) bool {
 	}
 }
 
+// modeNeedsAuthStore reports whether the configured mode constructs the
+// api-server, the only service that reads API keys and quota (auth
+// middleware, rate limiter, admin key endpoints). Other modes never open the
+// auth database. Keep in sync with BuildServices.
+func modeNeedsAuthStore(mode string) bool {
+	switch mode {
+	case "all", "api-server":
+		return true
+	default:
+		return false
+	}
+}
+
+// closableAuthStore is the dedicated auth store as Bootstrap holds it: what
+// the api-server needs plus Close for the cleanup func.
+type closableAuthStore interface {
+	api_server.AuthStore
+	Close() error
+}
+
+// openAuthStore connects to the dedicated auth database and provisions only
+// the api_keys / api_quota indexes, so no transaction collections appear in
+// it. The outer ceiling mirrors the main store factory's: server selection
+// is bounded by connect_timeout_ms, this guards a stuck TLS handshake or SRV
+// lookup. Neither the log line nor the errors carry the uri (credentials).
+//
+// It touches only <database>.api_keys and <database>.api_quota, so it runs
+// under a role scoped to those two collections (see docs/api-keys.md).
+func openAuthStore(ctx context.Context, cfg config.Mongo, logger *zap.Logger) (closableAuthStore, error) {
+	octx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	as, err := mongodb.NewAuthStore(octx, cfg, logger.Named("auth-store"))
+	if err != nil {
+		return nil, fmt.Errorf("creating auth store (auth.store.mongodb): %w", err)
+	}
+	if err := as.EnsureIndexes(ctx); err != nil {
+		_ = as.Close() //nolint:contextcheck // Close bounds the disconnect with its own timeout so it outlives an expiring boot ctx, like st.Close() above.
+		return nil, fmt.Errorf("ensuring auth store indexes (auth.store.mongodb): %w", err)
+	}
+	logger.Info("api keys and quota served from dedicated auth store",
+		zap.String("auth_store_database", cfg.Database))
+	return as, nil
+}
+
 // modeNeedsValidator reports whether the configured mode constructs a service
 // that calls deps.Validator.ValidateTransaction. Only api-server does (see
 // BuildServices). NewValidatorForNetwork builds two cgo/BDK script-verification
@@ -626,7 +701,11 @@ func BuildServices(d *Deps) []services.Service {
 	}
 
 	if shouldRun("api-server") {
-		svcs = append(svcs, api_server.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.TxTracker, d.TeranodeClient, d.MerkleClient, d.Validator, d.FinalityChecker))
+		apiSrv := api_server.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.TxTracker, d.TeranodeClient, d.MerkleClient, d.Validator, d.FinalityChecker)
+		if d.AuthStore != nil {
+			apiSrv.SetAuthStore(d.AuthStore)
+		}
+		svcs = append(svcs, apiSrv)
 	}
 	if shouldRun("bump-builder") {
 		// chainHeader is nil when chaintracks is disabled — bump-builder

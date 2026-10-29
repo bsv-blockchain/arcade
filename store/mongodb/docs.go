@@ -22,6 +22,8 @@ const (
 	collStumpManifests   = "stump_manifests"
 	bucketBumps          = "bumps"
 	bucketStumps         = "stumps"
+	collAPIKeys          = "api_keys"
+	collAPIQuota         = "api_quota"
 )
 
 // Field names. Every filter and update spells fields through these so a typo
@@ -88,6 +90,13 @@ const (
 	fFileID       = "file_id"
 	fSubtreeIndex = "subtree_index"
 	fUpdatedAt    = "updated_at"
+
+	// API key and quota fields.
+	fAPIKeyHash      = "hash"
+	fAPIKeyTier      = "tier"
+	fAPIKeyRevokedAt = "revoked_at"
+	fQuotaUsed       = "used"
+	fQuotaLastGrant  = "last_grant"
 )
 
 // Query and update operators.
@@ -111,6 +120,7 @@ const (
 	opGroup       = "$group"
 	opSum         = "$sum"
 	opMin         = "$min"
+	opMax         = "$max"
 	// Aggregation expressions used by the pipeline-form updates.
 	opIfNull   = "$ifNull"
 	opCond     = "$cond"

@@ -25,6 +25,7 @@ import (
 	"github.com/bsv-blockchain/broadcaster/merkleservice"
 	"github.com/bsv-blockchain/broadcaster/metrics"
 	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/services/ratelimit"
 	"github.com/bsv-blockchain/broadcaster/store"
 	"github.com/bsv-blockchain/broadcaster/telemetry"
 	"github.com/bsv-blockchain/broadcaster/teranode"
@@ -1189,10 +1190,31 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 		return
 	}
 
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBatchBytes)
+	// maxBatch caps the body itself (when the caller's tier bounds the
+	// batch) on top of the flat maxBatchBytes ceiling, and -- in the parse
+	// loop below -- stops parsing as soon as the cap is exceeded, instead
+	// of reading, parsing and holding the whole oversize body in memory
+	// before CheckBatch gets a chance to reject it.
+	// Compared by division, not maxBatch*maxSingleTxBytes, which an
+	// unbounded tier's (unvalidated) max_batch could overflow.
+	bodyLimit := int64(maxBatchBytes)
+	maxBatch := ratelimit.MaxBatch(c)
+	tierCapped := maxBatch > 0 && int64(maxBatch) < bodyLimit/maxSingleTxBytes
+	if tierCapped {
+		bodyLimit = int64(maxBatch) * maxSingleTxBytes
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, bodyLimit)
 
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
+		// http.MaxBytesReader surfaces a *http.MaxBytesError once bodyLimit
+		// is exceeded; map it to 413, the same way handleCallback does,
+		// rather than the generic 400 every other read failure gets.
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			ratelimit.RejectBatchBytesTooLarge(c, tierCapped)
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "failed to read body"})
 		return
 	}
@@ -1227,9 +1249,27 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 			txid: tx.TxID().String(),
 		})
 		offset += bytesUsed
+		if maxBatch > 0 && len(parsed) > maxBatch {
+			// Abort parsing the instant the batch cap is exceeded -- no
+			// need to parse the rest of a body that's already rejected --
+			// and reuse CheckBatch's own response so the body and the
+			// batch_too_large metric stay identical to the full-batch
+			// rejection below.
+			ratelimit.CheckBatch(c, len(parsed))
+			return
+		}
 	}
 	if len(parsed) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "no transactions parsed"})
+		return
+	}
+
+	// Tier batch cap, then the per-transaction quota charge, both before
+	// validation: a rejected batch costs no validation CPU and publishes
+	// nothing. No-ops when rate limiting is off. Batches at or under
+	// maxBatch reach here; CheckBatch is otherwise a no-op repeat of the
+	// cutoff above.
+	if !ratelimit.CheckBatch(c, len(parsed)) || !ratelimit.ChargeTxs(c, len(parsed)) {
 		return
 	}
 

@@ -1,4 +1,5 @@
-// Package mongodb implements store.Store and store.Leaser on MongoDB.
+// Package mongodb implements store.Store, store.Leaser, store.APIKeyStore and
+// store.QuotaStore on MongoDB.
 //
 // Design notes, in the order they matter:
 //
@@ -124,6 +125,8 @@ type Store struct {
 	leases   *mongo.Collection
 	datahubs *mongo.Collection
 	peers    *mongo.Collection
+	apiKeys  *mongo.Collection
+	apiQuota *mongo.Collection
 	// bumps / stumps are the GridFS buckets with the manifest collections
 	// that point at the current file; see blobs.go.
 	bumps  blobBucket
@@ -166,11 +169,29 @@ func New(ctx context.Context, cfg config.Mongo, logger *zap.Logger) (*Store, err
 	if logger == nil {
 		logger = zap.NewNop()
 	}
+	client, maxPool, err := connect(ctx, cfg, logger, "store.mongodb.uri")
+	if err != nil {
+		return nil, err
+	}
+	s := newWithClient(client, cfg.Database, cfg)
+	s.rowConcurrency = rowConcurrencyForPool(maxPool)
+	s.logger = logger
+	s.ownsClient = true
+	return s, nil
+}
+
+// connect validates cfg, builds the client and pings the primary (a ping
+// runs on the admin database and needs no privileges). uriKey names the
+// config key in the read-preference warning. The pool bounds come from
+// poolSettings; the effective ceiling (0 = unlimited) is returned alongside
+// the client so New can size its row concurrency from it. It never echoes
+// the URI.
+func connect(ctx context.Context, cfg config.Mongo, logger *zap.Logger, uriKey string) (*mongo.Client, uint64, error) {
 	if cfg.URI == "" {
-		return nil, errors.New("mongodb: uri is required")
+		return nil, 0, errors.New("mongodb: uri is required")
 	}
 	if cfg.Database == "" {
-		return nil, errors.New("mongodb: database is required")
+		return nil, 0, errors.New("mongodb: database is required")
 	}
 	connectTimeout := msOrDefault(cfg.ConnectTimeoutMs, defaultConnectTimeout)
 
@@ -184,7 +205,7 @@ func New(ctx context.Context, cfg config.Mongo, logger *zap.Logger) (*Store, err
 		return options.Client().ApplyURI(cfg.URI)
 	})
 	if err != nil {
-		return nil, fmt.Errorf("mongodb: parsing uri: %w", err)
+		return nil, 0, fmt.Errorf("mongodb: parsing uri: %w", err)
 	}
 	opts.SetAppName("bsv-broadcaster").
 		SetConnectTimeout(connectTimeout).
@@ -203,7 +224,7 @@ func New(ctx context.Context, cfg config.Mongo, logger *zap.Logger) (*Store, err
 	// so it is recognizable later from the symptom.
 	if rp := opts.ReadPreference; rp != nil && rp.Mode() != readpref.PrimaryMode {
 		logger.Warn(
-			"store.mongodb.uri sets a non-primary read preference; this backend's write guards "+
+			uriKey+" sets a non-primary read preference; this backend's write guards "+
 				"(status lattice, still-anchored-to-this-block, manifest-versus-file) are all "+
 				"read-then-write, and a stale secondary read can let them pass wrongly — expect "+
 				"lost status transitions and deleted blobs under concurrency",
@@ -228,7 +249,7 @@ func New(ctx context.Context, cfg config.Mongo, logger *zap.Logger) (*Store, err
 	client, err := mongo.Connect(opts)
 	if err != nil {
 		// Never echo the URI: it may carry credentials.
-		return nil, fmt.Errorf("mongodb connect: %w", err)
+		return nil, 0, fmt.Errorf("mongodb connect: %w", err)
 	}
 
 	pingCtx, cancel := context.WithTimeout(ctx, connectTimeout)
@@ -237,14 +258,9 @@ func New(ctx context.Context, cfg config.Mongo, logger *zap.Logger) (*Store, err
 		disconnectCtx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), closeTimeout)
 		defer dcancel()
 		_ = client.Disconnect(disconnectCtx)
-		return nil, fmt.Errorf("mongodb ping: %w", err)
+		return nil, 0, fmt.Errorf("mongodb ping: %w", err)
 	}
-
-	s := newWithClient(client, cfg.Database, cfg)
-	s.rowConcurrency = rowConcurrencyForPool(maxPool)
-	s.logger = logger
-	s.ownsClient = true
-	return s, nil
+	return client, maxPool, nil
 }
 
 // newWithClient binds a Store to an existing client. It is the seam New and
@@ -261,6 +277,8 @@ func newWithClient(client *mongo.Client, database string, cfg config.Mongo) *Sto
 		leases:   db.Collection(collLeases),
 		datahubs: db.Collection(collDatahubEndpoints),
 		peers:    db.Collection(collPeerPolicies),
+		apiKeys:  db.Collection(collAPIKeys),
+		apiQuota: db.Collection(collAPIQuota),
 		bumps: blobBucket{
 			bucket:    db.GridFSBucket(options.GridFSBucket().SetName(bucketBumps).SetChunkSizeBytes(gridfsChunkSize)),
 			manifests: db.Collection(collBumpManifests),

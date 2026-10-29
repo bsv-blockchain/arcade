@@ -91,6 +91,20 @@ func TestIterateTrackerRows_NullBlockHeightKept(t *testing.T) {
 	}
 }
 
+func TestAPIKeys_Conformance(t *testing.T) {
+	storetest.RunAPIKeySuite(t, func(t *testing.T) store.APIKeyStore {
+		t.Helper()
+		return newTestStore(t)
+	})
+}
+
+func TestQuota_Conformance(t *testing.T) {
+	storetest.RunQuotaSuite(t, func(t *testing.T) store.QuotaStore {
+		t.Helper()
+		return newTestStore(t)
+	})
+}
+
 func TestIterateTrackerRows_PlanHasNoSort(t *testing.T) {
 	// The regression guard for issue #276. The query hydration used to run
 	// carried ORDER BY timestamp_at DESC, so on a multi-million-row store the

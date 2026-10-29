@@ -3,17 +3,22 @@ package api_server
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/codes"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/kafka"
+	"github.com/bsv-blockchain/broadcaster/store/pebble"
 )
 
 // restoreOTELTracerProvider snapshots the global tracer provider and restores
@@ -196,4 +201,71 @@ func TestNewRouter_HealthReadyMetricsAreNotTraced(t *testing.T) {
 	if spans := exporter.GetSpans(); len(spans) != 0 {
 		t.Fatalf("expected no spans for /health, /ready, /metrics, got %d: %+v", len(spans), spans)
 	}
+}
+
+// TestRequestLogger_RestrictsDebugToIdentifyAndRateLimitResponses pins the
+// requestLogger log-level split: a 401 carrying WWW-Authenticate (apikey's
+// own) logs at Debug, while handleCallback's unrelated 401 (a misconfigured
+// or absent callback token -- no WWW-Authenticate, no X-RateLimit-Reason)
+// must still log at Warn. Before this split, every 401/429/499 logged at
+// Debug regardless of origin, silently demoting the callback case too.
+func TestRequestLogger_RestrictsDebugToIdentifyAndRateLimitResponses(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	st, err := pebble.New(config.Pebble{Path: t.TempDir(), MemTableSizeMB: 4, L0CompactionThreshold: 2})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	core, logs := observer.New(zapcore.DebugLevel)
+	logger := zap.New(core)
+
+	srv := &Server{
+		cfg: &config.Config{
+			Telemetry:     config.TelemetryConfig{ServiceName: "bsv-broadcaster-requestlogger-test"},
+			CallbackToken: "cb-token",
+			Auth:          config.AuthConfig{Enabled: true},
+			RateLimit:     config.RateLimitConfig{KeyCacheTTLMs: 60_000, KeyCacheStaleMaxMs: 60_000},
+		},
+		logger:         logger,
+		producer:       kafka.NewProducer(&kafka.RecordingBroker{}),
+		store:          st,
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
+	}
+	require.NoError(t, srv.initAccessControl())
+	router := srv.newRouter()
+
+	// handleCallback's own bearer check: wrong/missing token. No
+	// WWW-Authenticate, no X-RateLimit-Reason -- an ordinary 4xx.
+	cbReq := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/merkle-service/callback", strings.NewReader(`{}`))
+	cbReq.Header.Set("Content-Type", "application/json")
+	cbW := httptest.NewRecorder()
+	router.ServeHTTP(cbW, cbReq)
+	require.Equal(t, http.StatusUnauthorized, cbW.Code)
+
+	// apikey.Middleware's 401: malformed bearer token, carries
+	// WWW-Authenticate.
+	txReq := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/tx", nil)
+	txReq.Header.Set("Authorization", "Bearer garbage")
+	txW := httptest.NewRecorder()
+	router.ServeHTTP(txW, txReq)
+	require.Equal(t, http.StatusUnauthorized, txW.Code)
+	require.NotEmpty(t, txW.Header().Get("WWW-Authenticate"))
+
+	entries := logs.FilterMessage("request").All()
+	require.Len(t, entries, 2)
+
+	levelFor := func(path string) zapcore.Level {
+		t.Helper()
+		for _, e := range entries {
+			if e.ContextMap()["path"] == path {
+				return e.Level
+			}
+		}
+		t.Fatalf("no \"request\" log line for path %q", path)
+		return 0
+	}
+	require.Equal(t, zapcore.WarnLevel, levelFor("/api/v1/merkle-service/callback"),
+		"handleCallback's 401 must stay at Warn")
+	require.Equal(t, zapcore.DebugLevel, levelFor("/tx"),
+		"apikey's 401 (WWW-Authenticate) must log at Debug")
 }

@@ -206,3 +206,102 @@ func TestPreRegisterBlockStatusTransitionsCreatesEveryPairAtZero(t *testing.T) {
 		}
 	}
 }
+
+// TestPreRegisterRateLimitCreatesEveryChildAtZero mirrors the other
+// pre-registration tests: every {tier, result} decision pair for the
+// configured tiers, and every reservation result, must exist at zero after
+// calling PreRegisterRateLimit -- so a first-occurrence quota rejection is
+// countable by increase() immediately instead of being swallowed as the
+// series' birth sample. The apikey-identification series ({none,*}
+// decisions, cache results) are covered by PreRegisterAPIKey, not this
+// helper -- see TestPreRegisterAPIKeyCreatesEveryChildAtZero.
+func TestPreRegisterRateLimitCreatesEveryChildAtZero(t *testing.T) {
+	tiers := []string{"free", "pro"}
+	PreRegisterRateLimit(tiers)
+
+	decisionsFam := gatherFamily(t, "bsv_broadcaster_ratelimit_decisions_total")
+	if decisionsFam == nil {
+		t.Fatal("bsv_broadcaster_ratelimit_decisions_total has no series after pre-registration")
+	}
+	foundDecisions := map[[2]string]*dto.Metric{}
+	for _, m := range decisionsFam.GetMetric() {
+		foundDecisions[[2]string{labelValue(m, "tier"), labelValue(m, "result")}] = m
+	}
+	for _, tier := range tiers {
+		for _, result := range []string{"allowed", "quota", "concurrency", "batch_too_large", "unpayable"} {
+			m, ok := foundDecisions[[2]string{tier, result}]
+			if !ok {
+				t.Errorf("child {tier=%s,result=%s} not pre-registered", tier, result)
+				continue
+			}
+			if got := m.GetCounter().GetValue(); got != 0 {
+				t.Errorf("child {tier=%s,result=%s} = %v, want 0", tier, result, got)
+			}
+		}
+	}
+
+	reservationsFam := gatherFamily(t, "bsv_broadcaster_ratelimit_reservations_total")
+	if reservationsFam == nil {
+		t.Fatal("bsv_broadcaster_ratelimit_reservations_total has no series after pre-registration")
+	}
+	foundReservations := map[string]*dto.Metric{}
+	for _, m := range reservationsFam.GetMetric() {
+		foundReservations[labelValue(m, "result")] = m
+	}
+	for _, result := range []string{"granted", "partial", "exhausted", "error", "canceled"} {
+		m, ok := foundReservations[result]
+		if !ok {
+			t.Errorf("reservation result %q not pre-registered", result)
+			continue
+		}
+		if got := m.GetCounter().GetValue(); got != 0 {
+			t.Errorf("reservation result %q = %v, want 0", result, got)
+		}
+	}
+}
+
+// TestPreRegisterAPIKeyCreatesEveryChildAtZero checks the apikey-
+// identification series PreRegisterAPIKey owns: the {none,*} decision pairs
+// recorded before any tier is known, and every API-key cache result
+// (including "canceled", the caller's own context ending the wait).
+func TestPreRegisterAPIKeyCreatesEveryChildAtZero(t *testing.T) {
+	PreRegisterAPIKey()
+
+	decisionsFam := gatherFamily(t, "bsv_broadcaster_ratelimit_decisions_total")
+	if decisionsFam == nil {
+		t.Fatal("bsv_broadcaster_ratelimit_decisions_total has no series after pre-registration")
+	}
+	foundDecisions := map[[2]string]*dto.Metric{}
+	for _, m := range decisionsFam.GetMetric() {
+		foundDecisions[[2]string{labelValue(m, "tier"), labelValue(m, "result")}] = m
+	}
+	for _, result := range []string{"unauthorized", "auth_failures"} {
+		m, ok := foundDecisions[[2]string{"none", result}]
+		if !ok {
+			t.Errorf("child {tier=none,result=%s} not pre-registered", result)
+			continue
+		}
+		if got := m.GetCounter().GetValue(); got != 0 {
+			t.Errorf("child {tier=none,result=%s} = %v, want 0", result, got)
+		}
+	}
+
+	cacheFam := gatherFamily(t, "bsv_broadcaster_apikey_cache_total")
+	if cacheFam == nil {
+		t.Fatal("bsv_broadcaster_apikey_cache_total has no series after pre-registration")
+	}
+	foundCache := map[string]*dto.Metric{}
+	for _, m := range cacheFam.GetMetric() {
+		foundCache[labelValue(m, "result")] = m
+	}
+	for _, result := range []string{"hit", "miss", "negative", "failing", "stale", "error", "canceled"} {
+		m, ok := foundCache[result]
+		if !ok {
+			t.Errorf("cache result %q not pre-registered", result)
+			continue
+		}
+		if got := m.GetCounter().GetValue(); got != 0 {
+			t.Errorf("cache result %q = %v, want 0", result, got)
+		}
+	}
+}

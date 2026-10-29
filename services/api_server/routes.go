@@ -270,7 +270,7 @@ var routeDocs = []RouteDoc{
 		Description:    "Requests that the upstream Merkle Service re-emit STUMP and BLOCK_PROCESSED callbacks for the given block hash. Useful for healing a deployment whose callback stream missed a block.",
 		ResponseStatus: "202 Accepted",
 		ResponseBody:   "{\n  \"status\": \"accepted\",\n  \"blockHash\": \"<hex>\"\n}",
-		Notes:          "Returns 503 if Merkle Service is not configured for this deployment.",
+		Notes:          "Returns 503 if Merkle Service is not configured for this deployment. When admin.enabled, this route is served only on the admin listener as POST /admin/v1/blocks/{blockHash}/reprocess and requires the admin token.",
 	},
 }
 
@@ -284,15 +284,26 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 	// metrics.
 	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
+	// Internal: authenticated by callback_token, never rate limited.
 	r.POST("/api/v1/merkle-service/callback", s.handleCallback)
-	r.GET("/api/v1/blocks/processing-status", s.handleListBlockProcessingStatus)
-	r.GET("/api/v1/blocks/processing-status/:blockHash", s.handleGetBlockProcessingStatus)
-	r.POST("/api/v1/blocks/:blockHash/reprocess", s.handleReprocessBlock)
-	r.GET("/tx/:txid", s.handleGetTransaction)
-	r.POST("/tx", s.handleSubmitTransaction)
-	r.POST("/txs", s.handleSubmitTransactions)
+
+	// Public routes. guarded() adds API-key identification and the tier
+	// quota when auth/ratelimit are enabled, charging the given cost units.
+	read := s.cfg.RateLimit.Costs.Read
+	r.GET("/api/v1/blocks/processing-status", s.guarded(read, s.handleListBlockProcessingStatus)...)
+	r.GET("/api/v1/blocks/processing-status/:blockHash", s.guarded(read, s.handleGetBlockProcessingStatus)...)
+	// With the admin listener enabled, reprocess is served only there
+	// (admin.go), behind the admin token.
+	if !s.cfg.Admin.Enabled {
+		r.POST("/api/v1/blocks/:blockHash/reprocess", s.handleReprocessBlock)
+	}
+	r.GET("/tx/:txid", s.guarded(read, s.handleGetTransaction)...)
+	r.POST("/tx", s.guarded(s.cfg.RateLimit.Costs.SubmitTx, s.handleSubmitTransaction)...)
+	// /txs pays the read cost up front, then ChargeTxs(n × submit_tx) once
+	// the batch is parsed (handleSubmitTransactions).
+	r.POST("/txs", s.guarded(read, s.handleSubmitTransactions)...)
 	// ARC-compatible policy discovery (issue #212). Bare /policy matches the
 	// path clients 404'd on; /v1/policy is the alias used by the ARC spec.
-	r.GET("/policy", s.handlePolicy)
-	r.GET("/v1/policy", s.handlePolicy)
+	r.GET("/policy", s.guarded(read, s.handlePolicy)...)
+	r.GET("/v1/policy", s.guarded(read, s.handlePolicy)...)
 }
