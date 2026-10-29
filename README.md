@@ -260,23 +260,34 @@ ACCEPTED_BY_NETWORK (acknowledged by a Teranode datahub)
 SEEN_ON_NETWORK → SEEN_MULTIPLE_NODES (heard in subtree gossip - in mempool)
    ↓
 MINED (merkle proof delivered - included in a block)
-   ↓
-IMMUTABLE (100+ confirmations)
 ```
 
 Side states:
 ```
 PENDING_RETRY   no network verdict yet (for example the parent is not accepted); parked for the
-                propagation reaper, which rebroadcasts it until it gets one
-REJECTED        a verdict on the bytes: a validator failure at intake, or a Teranode rejection.
-                The ARC code is in `status` and the reason in `extraInfo`
+                propagation reaper, which rebroadcasts it until it gets a verdict or exhausts
+                its retry budget (propagation.pending_retry_max_attempts, default 288 - about
+                24h at the 5-minute backoff cap)
+REJECTED        a validator failure at intake, a Teranode rejection, or an exhausted retry
+                budget. The ARC code, when there is one, is in `status` and the reason in
+                `extraInfo`
 ```
 
-A double spend is reported as `REJECTED` with ARC code `466`, `UTXO_SPENT` in `extraInfo` and the
-winning transaction in `competingTxs`. Both conflicting submissions get `202` - the broadcaster is
-asynchronous and the network decides - so submit order is not a tiebreak: watch the status on
-`GET /tx`, SSE or a webhook. `SENT_TO_NETWORK` and `DOUBLE_SPEND_ATTEMPTED` stay in the status
-enum for ARC compatibility but are not emitted.
+`REJECTED` is not always a verdict on the bytes. When the durable retry budget runs out the
+reaper stops rebroadcasting, clears the retry state and writes `REJECTED` even though no peer
+gave a verdict; `extraInfo` then starts with `no network verdict after N durable retry attempts`
+and quotes the last network response, if any.
+
+A double spend is reported as `REJECTED` with ARC code `466` - the conflict signal. Teranode's
+reason line is in `extraInfo`; when that line names the spender (`UTXO_SPENT ... already spent by
+tx <txid>`), the spending transaction is in `competingTxs`. `TX_CONFLICTING`,
+`TX_INVALID_DOUBLE_SPEND` and `TX_LOCKED` also map to `466` but do not name a spender, so
+`competingTxs` is omitted: do not rely on the winner being in the payload. Both conflicting
+submissions get `202` - the broadcaster is asynchronous and the network decides - so submit order
+is not a tiebreak: watch the status on `GET /tx`, SSE or a webhook. `SENT_TO_NETWORK` and
+`DOUBLE_SPEND_ATTEMPTED` stay in the status enum for ARC compatibility but are not emitted.
+`IMMUTABLE` is also in the enum but has no producer today: transactions stay `MINED`, so do not
+wait for an `IMMUTABLE` event after 100 confirmations.
 
 ### Differences from Arc
 

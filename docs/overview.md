@@ -194,17 +194,17 @@ After storing the compound BUMP, BSV Broadcaster marks transactions `MINED` via 
 
 As new blocks arrive via the P2P client, Chaintracks tip updates mark blocks `on_chain` (canonical). Reorg detection identifies orphaned blocks: STUMPs for orphaned blocks are deleted, affected transactions reset to `SEEN_ON_NETWORK`, block hash associations cleared.
 
-After 100+ confirmations, `TxTracker.PruneConfirmed()` removes deeply confirmed transactions from memory and the store marks them `IMMUTABLE`.
+`MINED` is the last status emitted today. `TxTracker.PruneConfirmed()` exists to drop transactions with 100+ confirmations from memory, but nothing calls it outside tests and no code path writes `IMMUTABLE` (see [observability](observability.md)), so clients must not wait for an `IMMUTABLE` event.
 
 ## Status state machine
 
 ```
                     RECEIVED ────────► REJECTED (intake verdict)
                        │
-                       ├────────────► PENDING_RETRY (no verdict yet; the reaper rebroadcasts)
-                       ▼                   │
+                       ├────────────► PENDING_RETRY (no verdict yet; rebroadcast until a verdict,
+                       ▼                   │   or REJECTED once the retry cap is spent)
               ACCEPTED_BY_NETWORK ◄────────┘      ─► REJECTED (Teranode verdict,
-                       │                              double spend = 466 + competingTxs)
+                       │                              double spend = 466, competingTxs if named)
                        ▼
               SEEN_ON_NETWORK ◄──── (reorg resets MINED)
                        │
@@ -215,16 +215,15 @@ After 100+ confirmations, `TxTracker.PruneConfirmed()` removes deeply confirmed 
               STUMP_PROCESSING        (TxTracker only, not persisted)
                        │
                        ▼
-                     MINED
-                       │
+                     MINED            (last status emitted today)
+                       ┆
                        ▼
-                   IMMUTABLE          (100+ confirmations,
-                                       removed from TxTracker)
+                   IMMUTABLE          (reserved: no producer yet)
 ```
 
 Transitions are guarded by `DisallowedPreviousStatuses()` in the SQL UPDATE query, preventing backward transitions — `MINED` cannot revert to `SEEN_ON_NETWORK` except through explicit reorg handling.
 
-`SENT_TO_NETWORK` and `DOUBLE_SPEND_ATTEMPTED` are part of the status enum for ARC compatibility but no code path emits them: the broadcast is acknowledged straight into `ACCEPTED_BY_NETWORK`, and a double spend surfaces as `REJECTED` (see below). A producer for `DOUBLE_SPEND_ATTEMPTED` would be Teranode's rejected-tx gossip, tracked as issue #325.
+`SENT_TO_NETWORK` and `DOUBLE_SPEND_ATTEMPTED` are part of the status enum for ARC compatibility but no code path emits them: the broadcast is acknowledged straight into `ACCEPTED_BY_NETWORK`, and a double spend surfaces as `REJECTED` (see below). A producer for `DOUBLE_SPEND_ATTEMPTED` would be Teranode's rejected-tx gossip, tracked as issue #325. `IMMUTABLE` is in the enum and the lattice as well, but has no producer yet (see Phase 5).
 
 ### Rejection semantics: verdicts vs. conditions
 
@@ -236,8 +235,9 @@ BSV Broadcaster distinguishes two kinds of submit failure (issue #254):
 Recovery is client-driven by design — BSV Broadcaster keeps no rejected-tx tracker (a tx that mined before BSV Broadcaster ever saw it has no oracle to consult):
 
 - **Resubmitting a `REJECTED` transaction re-validates and re-broadcasts it.** If the original cause has cleared (e.g. a parent has since confirmed), the row advances through the normal `SEEN_ON_NETWORK → MINED` flow; the lattice permits every forward transition out of `REJECTED`.
+- **Retry exhaustion is a `REJECTED` without a verdict.** A `PENDING_RETRY` row is rebroadcast until a peer gives a verdict or the durable budget (`propagation.pending_retry_max_attempts`, default 288 — about 24h at the 5-minute backoff cap) runs out. On exhaustion `schedulePendingRetry` clears the retry state and writes `REJECTED` with no peer verdict behind it; `extraInfo` begins `no network verdict after N durable retry attempts` and quotes the last network response, if there was one.
 - **Cascade rejections are queue state, not verdicts about the child.** A child held behind a rejected ancestor gets `extraInfo` prefixed `parent rejected`, naming the ancestor — resubmit the child after the ancestor is accepted.
-- **A double spend is a `REJECTED` verdict with ARC code `466`.** The losing transaction carries Teranode's `UTXO_SPENT` line in `extraInfo` and the transaction that owns the outpoint in `competingTxs`, so a wallet can tell "my inputs are gone" from "my bytes are wrong" without a follow-up query. Both conflicting submissions are answered `202` — intake has no outpoint index and the broadcaster is asynchronous by design — and the network decides which one it keeps. Submit order is therefore not a tiebreak: two conflicting transactions sent milliseconds apart can resolve either way, and only the status (`GET /tx`, SSE, webhook) says which one won.
+- **A double spend is a `REJECTED` verdict with ARC code `466`.** `466` is the conflict signal, so a wallet can tell "my inputs are gone" from "my bytes are wrong" without a follow-up query. The losing transaction carries Teranode's reason line in `extraInfo`. Only a line that names the spender — `UTXO_SPENT … already spent by tx <txid>` — fills `competingTxs`; `TX_CONFLICTING`, `TX_INVALID_DOUBLE_SPEND` and `TX_LOCKED` also map to `466` but name no spender, so `competingTxs` is omitted and the winner is not in the payload. Both conflicting submissions are answered `202` — intake has no outpoint index and the broadcaster is asynchronous by design — and the network decides which one it keeps. Submit order is therefore not a tiebreak: two conflicting transactions sent milliseconds apart can resolve either way, and only the status (`GET /tx`, SSE, webhook) says which one won.
 
 Operators can detect the stale-chain-view condition before it causes non-final rejections: `GET /health` reports `blockHeight` (BSV Broadcaster's processed tip), and the `bsv_broadcaster_chain_tip_height` / `bsv_broadcaster_p2p_peer_best_height` gauges expose height lag between BSV Broadcaster and its datahub peers.
 
