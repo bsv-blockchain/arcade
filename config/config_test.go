@@ -475,7 +475,8 @@ func TestSetDefaults_MongoDBKeysBound(t *testing.T) {
 		"store.mongodb.uri", "store.mongodb.database", "store.mongodb.connect_timeout_ms",
 		"store.mongodb.op_timeout_ms", "store.mongodb.query_timeout_ms",
 		"store.mongodb.index_timeout_ms",
-		"store.mongodb.max_pool_size", "store.mongodb.batch_size",
+		"store.mongodb.max_pool_size", "store.mongodb.min_pool_size",
+		"store.mongodb.max_conn_idle_ms", "store.mongodb.batch_size",
 	} {
 		if !viper.IsSet(key) {
 			t.Errorf("%s has no default; BSV_BROADCASTER_%s would be ignored", key, strings.ToUpper(strings.ReplaceAll(key, ".", "_")))
