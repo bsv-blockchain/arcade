@@ -20,15 +20,21 @@ type RetryRecoveryBackend interface {
 	SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time, lastReason string) error
 	GetReadyRetries(ctx context.Context, now time.Time, limit int) ([]*store.PendingRetry, error)
 	SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeight uint64, txids []string) ([]*models.TransactionStatus, []*models.TransactionStatus, error)
+	// StoredRetryReason reads the row's persisted retry_reason straight from
+	// the backend ("" when absent). No store read path exposes it outside the
+	// ready-retry queue, and that queue excludes a recovered row whether or
+	// not the reason was cleared, so each conformance test supplies this.
+	StoredRetryReason(ctx context.Context, txid string) (string, error)
 }
 
 // RunRetryRecoverySuite asserts that a positive network verdict retires a
 // row's retry bookkeeping (models.Status.ClearsRetryState): once a parked
 // transaction is ACCEPTED_BY_NETWORK, SEEN_* or MINED, GET /tx must show
-// neither the park reason in extraInfo nor a nextRetryAt, and the reaper must
-// not see it as ready. Before this contract a transaction that recovered from
-// PENDING_RETRY carried "parent not yet accepted … retryable" and a retry
-// schedule all the way to MINED (hosted-service report, issue 3).
+// neither the park reason in extraInfo nor a nextRetryAt, the persisted
+// retry_reason must be gone, and the reaper must not see it as ready. Before
+// this contract a transaction that recovered from PENDING_RETRY carried
+// "parent not yet accepted … retryable" and a retry schedule all the way to
+// MINED (hosted-service report, issue 3).
 //
 // Txids carry a per-run prefix and the suite reads back only its own rows, so
 // it is safe in a namespace shared with other integration tests.
@@ -42,6 +48,14 @@ func RunRetryRecoverySuite(t *testing.T, newBackend func(t *testing.T) RetryReco
 	base := time.Now().UnixNano()
 	newTxid := func(tag byte) string { return fmt.Sprintf("%048x%016x", base, tag) }
 
+	storedReason := func(t *testing.T, txid string) string {
+		t.Helper()
+		reason, err := b.StoredRetryReason(ctx, txid)
+		if err != nil {
+			t.Fatalf("StoredRetryReason: %v", err)
+		}
+		return reason
+	}
 	get := func(t *testing.T, txid string) *models.TransactionStatus {
 		t.Helper()
 		row, err := b.GetStatus(ctx, txid)
@@ -83,6 +97,9 @@ func RunRetryRecoverySuite(t *testing.T, newBackend func(t *testing.T) RetryReco
 		if row.Status != models.StatusPendingRetry || row.ExtraInfo != parkReason || row.NextRetryAt.IsZero() {
 			t.Fatalf("park precondition not met: status=%s extraInfo=%q nextRetryAt=%v", row.Status, row.ExtraInfo, row.NextRetryAt)
 		}
+		if got := storedReason(t, txid); got != netLine {
+			t.Fatalf("park precondition not met: stored retry_reason = %q, want %q", got, netLine)
+		}
 		if !ready(t, txid) {
 			t.Fatalf("parked row %s not returned by GetReadyRetries", txid)
 		}
@@ -98,6 +115,9 @@ func RunRetryRecoverySuite(t *testing.T, newBackend func(t *testing.T) RetryReco
 		}
 		if !row.NextRetryAt.IsZero() {
 			t.Errorf("%s: nextRetryAt = %v, want zero", step, row.NextRetryAt)
+		}
+		if got := storedReason(t, txid); got != "" {
+			t.Errorf("%s: stored retry_reason = %q, want empty", step, got)
 		}
 		if ready(t, txid) {
 			t.Errorf("%s: row still returned by GetReadyRetries", step)
@@ -170,6 +190,9 @@ func RunRetryRecoverySuite(t *testing.T, newBackend func(t *testing.T) RetryReco
 		}
 		if row.NextRetryAt.IsZero() {
 			t.Errorf("REJECTED: nextRetryAt cleared by a non-positive write")
+		}
+		if got := storedReason(t, txid); got != netLine {
+			t.Errorf("REJECTED: stored retry_reason = %q, want %q kept by a non-positive write", got, netLine)
 		}
 	})
 }

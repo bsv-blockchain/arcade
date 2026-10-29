@@ -179,6 +179,18 @@ func TestQuota_Conformance(t *testing.T) {
 func TestRetryRecovery_Conformance(t *testing.T) {
 	storetest.RunRetryRecoverySuite(t, func(t *testing.T) storetest.RetryRecoveryBackend {
 		t.Helper()
-		return newTestStore(t)
+		return retryRecoveryStore{newTestStore(t)}
 	})
+}
+
+// retryRecoveryStore adds the suite's direct read of the persisted
+// retry_reason, which no store read path exposes for a recovered row.
+type retryRecoveryStore struct{ *Store }
+
+func (s retryRecoveryStore) StoredRetryReason(ctx context.Context, txid string) (string, error) {
+	var d struct {
+		RetryReason string `bson:"retry_reason"`
+	}
+	err := s.tx.FindOne(ctx, idFilter(txid)).Decode(&d)
+	return d.RetryReason, err
 }
