@@ -1166,7 +1166,19 @@ components:
   schemas:
     Status:
       type: string
-      description: A transaction's lifecycle state.
+      description: >-
+        A transaction's lifecycle state. Emitted in practice: RECEIVED → ACCEPTED_BY_NETWORK →
+        SEEN_ON_NETWORK → SEEN_MULTIPLE_NODES → MINED, with PENDING_RETRY and REJECTED as side
+        states. PENDING_RETRY means no network verdict yet; the reaper rebroadcasts until a peer
+        gives one or the durable retry budget (propagation.pending_retry_max_attempts, default 288)
+        runs out, at which point the tx becomes REJECTED with no peer verdict behind it and
+        extraInfo starting "no network verdict after N durable retry attempts". Otherwise REJECTED
+        is a validator or Teranode verdict on the bytes. A double spend is REJECTED with ARC code
+        466, the conflict signal; competingTxs names the spender only when Teranode's reason does
+        (UTXO_SPENT), and is omitted for TX_CONFLICTING, TX_INVALID_DOUBLE_SPEND and TX_LOCKED.
+        SENT_TO_NETWORK and DOUBLE_SPEND_ATTEMPTED are reserved for ARC compatibility and are not
+        emitted. IMMUTABLE is reserved: nothing emits it yet, so MINED is the last status a
+        client receives.
       enum:
         - UNKNOWN
         - RECEIVED
@@ -1248,6 +1260,10 @@ components:
             $ref: "#/components/schemas/CallbackDelivery"
         competingTxs:
           type: array
+          description: >-
+            For a REJECTED double spend (ARC code 466), the transaction(s) that already spent the
+            outpoints, when Teranode's reason names them (UTXO_SPENT). Omitted when the reason does
+            not name a spender (TX_CONFLICTING, TX_INVALID_DOUBLE_SPEND, TX_LOCKED).
           items:
             type: string
         rawTx:

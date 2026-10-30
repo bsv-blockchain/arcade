@@ -131,7 +131,7 @@ Two regtest-specific constraints, enforced at config load:
 BSV Broadcaster delegates merkle-proof construction to a separate **Merkle Service**.
 The service watches the network for BSV Broadcaster's registered txids and drives the
 transaction lifecycle forward via callbacks
-(`SEEN_ON_NETWORK` → `MINED` → `IMMUTABLE`).
+(`SEEN_ON_NETWORK` → `MINED`).
 
 **If `merkle_service.url` and `merkle_service.urls` are both left empty, BSV Broadcaster
 still accepts and broadcasts transactions, but every row stays at `RECEIVED`

@@ -253,22 +253,41 @@ Interactive API documentation (Scalar UI) available at `http://localhost:3011/do
 ```
 Client → BSV Broadcaster
    ↓
-RECEIVED (validated locally)
+RECEIVED (validated locally, queued for propagation)
    ↓
-SENT_TO_NETWORK (submitted to Teranode via HTTP)
+ACCEPTED_BY_NETWORK (acknowledged by a Teranode datahub)
    ↓
-ACCEPTED_BY_NETWORK (acknowledged by Teranode)
+SEEN_ON_NETWORK → SEEN_MULTIPLE_NODES (heard in subtree gossip - in mempool)
    ↓
-SEEN_ON_NETWORK (heard in subtree gossip - in mempool)
-   ↓
-MINED (heard in block gossip - included in block)
+MINED (merkle proof delivered - included in a block)
 ```
 
-Or rejected:
+Side states:
 ```
-REJECTED (from rejected-tx gossip)
-DOUBLE_SPEND_ATTEMPTED (from rejected-tx gossip with specific reason)
+PENDING_RETRY   no network verdict yet (for example the parent is not accepted); parked for the
+                propagation reaper, which rebroadcasts it until it gets a verdict or exhausts
+                its retry budget (propagation.pending_retry_max_attempts, default 288 - about
+                24h at the 5-minute backoff cap)
+REJECTED        a validator failure at intake, a Teranode rejection, or an exhausted retry
+                budget. The ARC code, when there is one, is in `status` and the reason in
+                `extraInfo`
 ```
+
+`REJECTED` is not always a verdict on the bytes. When the durable retry budget runs out the
+reaper stops rebroadcasting, clears the retry state and writes `REJECTED` even though no peer
+gave a verdict; `extraInfo` then starts with `no network verdict after N durable retry attempts`
+and quotes the last network response, if any.
+
+A double spend is reported as `REJECTED` with ARC code `466` - the conflict signal. Teranode's
+reason line is in `extraInfo`; when that line names the spender (`UTXO_SPENT ... already spent by
+tx <txid>`), the spending transaction is in `competingTxs`. `TX_CONFLICTING`,
+`TX_INVALID_DOUBLE_SPEND` and `TX_LOCKED` also map to `466` but do not name a spender, so
+`competingTxs` is omitted: do not rely on the winner being in the payload. Both conflicting
+submissions get `202` - the broadcaster is asynchronous and the network decides - so submit order
+is not a tiebreak: watch the status on `GET /tx`, SSE or a webhook. `SENT_TO_NETWORK` and
+`DOUBLE_SPEND_ATTEMPTED` stay in the status enum for ARC compatibility but are not emitted.
+`IMMUTABLE` is also in the enum but has no producer today: transactions stay `MINED`, so do not
+wait for an `IMMUTABLE` event after 100 confirmations.
 
 ### Differences from Arc
 
@@ -394,7 +413,7 @@ BSV Broadcaster provides real-time transaction status updates via SSE, offering 
    ```
    id: 1699632123456789000
    event: status
-   data: {"txid":"abc123...","status":"SENT_TO_NETWORK","timestamp":"2024-11-10T12:00:00Z"}
+   data: {"txid":"abc123...","txStatus":"ACCEPTED_BY_NETWORK","timestamp":"2024-11-10T12:00:00Z"}
    ```
 
 #### Catchup on Reconnect
@@ -504,9 +523,10 @@ func (h *MyHandler) Start(ctx context.Context) error {
 **Server fails to start with "no teranodes configured"**
 - Ensure `teranode.broadcast_urls` is set in your config file with at least one valid URL
 
-**Transactions stuck in SENT_TO_NETWORK**
-- Check your Teranode broadcast URL is reachable
+**Transactions stuck in RECEIVED or PENDING_RETRY**
+- Check the datahub URLs are reachable (`GET /health` lists each one with its health)
 - Verify network connectivity and firewall rules
+- `GET /tx/{txid}` carries the last network answer in `extraInfo` and, for PENDING_RETRY, the next rebroadcast time in `nextRetryAt`
 
 **SQLite errors**
 - Ensure `storage_path` directory exists and is writable
