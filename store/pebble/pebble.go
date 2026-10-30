@@ -94,6 +94,7 @@ type storedStatus struct {
 	RetryReason            string                 `json:"retry_reason,omitempty"`
 	MerkleRegisteredUnixNs int64                  `json:"merkle_registered_at,omitempty"`
 	OrphanedAnchors        []storedOrphanedAnchor `json:"orphaned_anchors,omitempty"`
+	PartitionKey           string                 `json:"partition_key,omitempty"`
 }
 
 // storedOrphanedAnchor is the persisted form of models.OrphanedAnchor —
@@ -139,6 +140,7 @@ func (s storedStatus) toModel() *models.TransactionStatus {
 		CompetingTxs: s.CompetingTxs,
 		RawTx:        models.HexBytes(s.RawTx),
 		RetryCount:   s.RetryCount,
+		PartitionKey: s.PartitionKey,
 	}
 	if s.TimestampUnixNs != 0 {
 		out.Timestamp = time.Unix(0, s.TimestampUnixNs)
@@ -174,6 +176,7 @@ func fromModel(m *models.TransactionStatus) storedStatus {
 		CompetingTxs: m.CompetingTxs,
 		RawTx:        []byte(m.RawTx),
 		RetryCount:   m.RetryCount,
+		PartitionKey: m.PartitionKey,
 	}
 	if !m.Timestamp.IsZero() {
 		out.TimestampUnixNs = m.Timestamp.UnixNano()
@@ -593,6 +596,9 @@ func mergeStatus(existing *storedStatus, update *models.TransactionStatus) store
 	}
 	if update.RetryCount > 0 {
 		out.RetryCount = update.RetryCount
+	}
+	if update.PartitionKey != "" {
+		out.PartitionKey = update.PartitionKey
 	}
 	if !update.Timestamp.IsZero() {
 		out.TimestampUnixNs = update.Timestamp.UnixNano()
@@ -2787,4 +2793,24 @@ func (s *Store) enrichOrphanedProofs(ctx context.Context, status *models.Transac
 			return bumpData, err
 		})
 	}
+}
+
+// LookupPartitionKeys implements store.Store. Pebble reads the row whole
+// either way, so this is one point read per txid.
+func (s *Store) LookupPartitionKeys(ctx context.Context, txids []string) (map[string]store.ParentKey, error) {
+	out := make(map[string]store.ParentKey, len(txids))
+	for _, txid := range txids {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		st, err := s.readStoredStatus(txid)
+		if err != nil {
+			return nil, err
+		}
+		if st == nil {
+			continue
+		}
+		out[txid] = store.ParentKey{Status: models.Status(st.Status), PartitionKey: st.PartitionKey}
+	}
+	return out, nil
 }
