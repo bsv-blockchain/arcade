@@ -950,6 +950,10 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// same txid both attempt the insert; the loser sees inserted=false
 	// and returns 202 idempotently without re-publishing.
 	submitResult := "new"
+	// inserted reports whether THIS request's CAS created the row; only then
+	// does it publish RECEIVED (see below). Without a store there is no CAS
+	// to coordinate with, so every submission counts as the first.
+	inserted := s.store == nil
 	if s.store != nil {
 		row := &models.TransactionStatus{
 			TxID:      txid,
@@ -960,7 +964,9 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 			// states without re-fetching from Kafka or the API caller.
 			RawTx: rawTx,
 		}
-		existing, inserted, dedupErr := s.store.GetOrInsertStatus(c.Request.Context(), row)
+		var existing *models.TransactionStatus
+		var dedupErr error
+		existing, inserted, dedupErr = s.store.GetOrInsertStatus(c.Request.Context(), row)
 		switch {
 		case dedupErr != nil:
 			s.logger.Error("dedup CAS failed", logfields.TxID(txid), zap.Error(dedupErr))
@@ -1007,6 +1013,19 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// any status events fired on this txid can find a matching row.
 	s.recordSubmission(c.Request.Context(), txid, opts)
 
+	// RECEIVED goes out BEFORE the propagation message: once that message is
+	// queued the propagator can publish ACCEPTED_BY_NETWORK or REJECTED, and a
+	// RECEIVED published after it could reach a live stream as a stale frame
+	// behind the verdict. Only the request whose CAS created the row publishes
+	// it. Any other attempt — a REJECTED resubmit, a retry of a stranded
+	// RECEIVED row, an attempt whose CAS errored — may run after an earlier
+	// attempt's verdict was already published, and its RECEIVED would then
+	// follow that verdict; a repeat rejection is not a transition, so nothing
+	// would correct it.
+	if inserted {
+		s.publishReceived(c.Request.Context(), []string{txid}, opts)
+	}
+
 	msg := map[string]interface{}{
 		"txid":        txid,
 		"raw_tx":      rawTx,
@@ -1038,6 +1057,41 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		Status:   http.StatusAccepted,
 		TxStatus: models.StatusReceived,
 	})
+}
+
+// publishReceived fans the RECEIVED status onto the events publisher once the
+// RECEIVED row is durable and before the propagation message is queued, so a
+// subscriber that opened its stream before submitting sees the lifecycle from
+// its first state rather than from ACCEPTED_BY_NETWORK (hosted-service
+// report, issue 6d), and never sees RECEIVED behind a verdict. The request's callback token rides
+// along as a hint because the submission row is written by the asynchronous
+// recorder and may not exist yet when the SSE pod resolves the txid's
+// subscribers. Callers pass only txids whose row this request's CAS inserted:
+// the first attempt is the one attempt no verdict for the txid can precede.
+// Best-effort: the row is already durable, and connect-time catchup covers a
+// lost event. A failed Kafka send after this leaves the row at RECEIVED, which
+// the client's retry re-queues without a second RECEIVED, so the frame stays
+// true.
+func (s *Server) publishReceived(ctx context.Context, txids []string, opts submitOptions) {
+	if s.publisher == nil || len(txids) == 0 {
+		return
+	}
+	st := &models.TransactionStatus{
+		Status:            models.StatusReceived,
+		Timestamp:         time.Now(),
+		CallbackTokenHint: opts.CallbackToken,
+	}
+	var err error
+	if len(txids) == 1 {
+		st.TxID = txids[0]
+		err = s.publisher.Publish(ctx, st)
+	} else {
+		st.TxIDs = txids
+		err = s.publisher.PublishBulk(ctx, st)
+	}
+	if err != nil {
+		s.logger.Warn("RECEIVED publish failed", zap.Int("count", len(txids)), zap.Error(err))
+	}
 }
 
 // arcStatusCodeOf extracts the numeric ARC status code (460-476 taxonomy,
@@ -1110,6 +1164,8 @@ func (s *Server) rejectAtIntake(ctx context.Context, txid, reason string, status
 		StatusCode: statusCode,
 		ExtraInfo:  reason,
 		Timestamp:  time.Now(),
+		// Same race as publishReceived: the submission row may not exist yet.
+		CallbackTokenHint: opts.CallbackToken,
 	}
 	if err := s.publisher.Publish(ctx, status); err != nil {
 		s.logger.Warn(
@@ -1315,6 +1371,11 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	// A dedup error logs but doesn't drop the tx — matches single-tx
 	// best-effort behavior.
 	toPublish := make([]parsedItem, 0, len(parsed))
+	// receivedTxIDs is the subset of toPublish whose row this request's CAS
+	// inserted: only the first attempt publishes RECEIVED, since any other
+	// attempt can run after an earlier attempt's verdict was published (see
+	// handleSubmitTransaction).
+	receivedTxIDs := make([]string, 0, len(parsed))
 	duplicates := 0
 	newSubmits, retryRejected := 0, 0
 	if s.store != nil {
@@ -1352,14 +1413,24 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 					s.txTracker.Add(p.txid, existing.Status)
 				}
 				s.recordSubmission(ctx, p.txid, opts)
+			case !inserted:
+				// Neither inserted nor an existing row: the row state is
+				// unknown, so queue best-effort (as for a CAS error) but
+				// leave RECEIVED to whichever attempt created the row.
+				newSubmits++
+				toPublish = append(toPublish, p)
 			default:
 				newSubmits++
 				toPublish = append(toPublish, p)
+				receivedTxIDs = append(receivedTxIDs, p.txid)
 			}
 		}
 	} else {
 		toPublish = parsed
 		newSubmits = len(parsed)
+		for _, p := range parsed {
+			receivedTxIDs = append(receivedTxIDs, p.txid)
+		}
 	}
 	metrics.APITxsSubmittedTotal.WithLabelValues("/txs", "new").Add(float64(newSubmits))
 	metrics.APITxsSubmittedTotal.WithLabelValues("/txs", "duplicate").Add(float64(duplicates))
@@ -1390,6 +1461,9 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	// multi-partition topic a whole family lands on one partition and
 	// per-partition order still delivers parents before children.
 	if len(toPublish) > 0 {
+		// Before SendBatch, for the ordering reason in handleSubmitTransaction.
+		s.publishReceived(ctx, receivedTxIDs, opts)
+
 		keyByTxid, inputsByTxid := familyKeysBySubmittedTxid(parsed)
 		msgs := propagationMessages(toPublish, keyByTxid, inputsByTxid)
 		if err := s.producer.SendBatch(ctx, kafka.TopicPropagation, msgs); err != nil {

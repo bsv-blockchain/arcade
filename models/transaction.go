@@ -87,6 +87,13 @@ type TransactionStatus struct {
 	// added). The startup replay loop reads this to skip rows registered
 	// within MerkleReplaySkipRecentMinutes — see issue #145.
 	MerkleRegisteredAt time.Time `json:"merkleRegisteredAt,omitzero"`
+	// CallbackTokenHint is an event-only field. Intake sets it on the RECEIVED
+	// (and intake-REJECTED) events it publishes so a token-scoped SSE
+	// subscriber can be matched before the submission row that normally
+	// resolves tokens has been written by the asynchronous recorder. Stores
+	// never persist it, the SSE frame builder never serializes it, and the
+	// webhook service blanks it before posting a status to a receiver.
+	CallbackTokenHint string `json:"callbackTokenHint,omitempty"`
 }
 
 // Status represents the various states a transaction can be in
