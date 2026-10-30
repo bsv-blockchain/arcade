@@ -560,6 +560,15 @@ func mergeStatus(existing *storedStatus, update *models.TransactionStatus) store
 	out.TxID = update.TxID
 	if update.Status != "" {
 		out.Status = string(update.Status)
+		if update.Status.ClearsRetryState() {
+			// A positive verdict retires the retry bookkeeping: the park
+			// reason, the schedule and the last network response describe a
+			// past the row has left. ExtraInfo becomes what this write
+			// carries (possibly nothing). See models.Status.ClearsRetryState.
+			out.ExtraInfo = update.ExtraInfo
+			out.NextRetryUnixNs = 0
+			out.RetryReason = ""
+		}
 	}
 	if update.StatusCode != 0 {
 		out.StatusCode = update.StatusCode
@@ -1171,6 +1180,11 @@ func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, blockHeig
 		updated.BlockHash = blockHash
 		updated.BlockHeight = blockHeight
 		updated.TimestampUnixNs = now.UnixNano()
+		// MINED is a positive verdict: retire the retry bookkeeping (see
+		// models.Status.ClearsRetryState).
+		updated.ExtraInfo = ""
+		updated.NextRetryUnixNs = 0
+		updated.RetryReason = ""
 
 		payload, err := json.Marshal(updated)
 		if err != nil {

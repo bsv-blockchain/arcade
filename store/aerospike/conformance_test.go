@@ -103,3 +103,28 @@ func TestReserveQuota_CancelledCtx_NoSpend(t *testing.T) {
 		t.Fatalf("follow-up reserve after cancelled attempt: granted=%d used=%d, want 10/10", granted, used)
 	}
 }
+
+// A positive network verdict retires the retry bookkeeping, so a recovered
+// transaction stops reporting its park reason and retry schedule.
+func TestRetryRecovery_Conformance(t *testing.T) {
+	storetest.RunRetryRecoverySuite(t, func(t *testing.T) storetest.RetryRecoveryBackend {
+		t.Helper()
+		return retryRecoveryStore{integrationStore(t)}
+	})
+}
+
+// retryRecoveryStore adds the suite's direct read of the persisted
+// retry_reason, which no store read path exposes for a recovered row.
+type retryRecoveryStore struct{ *Store }
+
+func (s retryRecoveryStore) StoredRetryReason(ctx context.Context, txid string) (string, error) {
+	key, err := s.key(setTransactions, txid)
+	if err != nil {
+		return "", err
+	}
+	rec, err := s.client.Get(s.readPolicy(ctx), key, "retry_reason")
+	if err != nil {
+		return "", err
+	}
+	return getString(rec, "retry_reason"), nil
+}

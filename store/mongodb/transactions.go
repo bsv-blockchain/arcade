@@ -176,7 +176,17 @@ func statusUpdate(st *models.TransactionStatus, now time.Time) bson.D {
 	if !st.MerkleRegisteredAt.IsZero() {
 		set = append(set, kv(fMerkleRegisteredAt, st.MerkleRegisteredAt))
 	}
-	return doc(kv(opSet, set), incVersion())
+	update := doc(kv(opSet, set), incVersion())
+	if st.Status != "" && st.Status.ClearsRetryState() {
+		// A positive verdict retires the retry bookkeeping; extra_info keeps
+		// only what this write carries. See models.Status.ClearsRetryState.
+		unset := doc(kv(fNextRetryAt, ""), kv(fRetryReason, ""))
+		if st.ExtraInfo == "" {
+			unset = append(unset, kv(fExtraInfo, ""))
+		}
+		update = append(update, kv(opUnset, unset))
+	}
+	return update
 }
 
 // UpdateStatus implements store.Store. Returns store.ErrNotFound for an
@@ -561,6 +571,9 @@ func minedPipeline(blockHash string, blockHeight uint64, now time.Time) mongo.Pi
 			kv(fTimestamp, now),
 			kv(fVersion, versionBump()),
 		))),
+		// MINED is a positive verdict: retire the retry bookkeeping (see
+		// models.Status.ClearsRetryState).
+		doc(kv(opUnset, bson.A{fExtraInfo, fNextRetryAt, fRetryReason})),
 	}
 }
 

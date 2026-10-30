@@ -105,3 +105,24 @@ func TestIterateTrackerRows_StatusIndexStaysFresh(t *testing.T) {
 		}
 	}
 }
+
+// A positive network verdict retires the retry bookkeeping, so a recovered
+// transaction stops reporting its park reason and retry schedule.
+func TestRetryRecovery_Conformance(t *testing.T) {
+	storetest.RunRetryRecoverySuite(t, func(t *testing.T) storetest.RetryRecoveryBackend {
+		t.Helper()
+		return retryRecoveryStore{newTestStore(t)}
+	})
+}
+
+// retryRecoveryStore adds the suite's direct read of the persisted
+// retry_reason, which no store read path exposes for a recovered row.
+type retryRecoveryStore struct{ *Store }
+
+func (s retryRecoveryStore) StoredRetryReason(_ context.Context, txid string) (string, error) {
+	st, err := s.readStoredStatus(txid)
+	if err != nil || st == nil {
+		return "", err
+	}
+	return st.RetryReason, nil
+}

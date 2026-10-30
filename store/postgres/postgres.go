@@ -346,7 +346,7 @@ func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.Tra
 		return nil
 	}
 
-	const colsPerRow = 9 // txid, status, status_code, block_hash, block_height, extra_info, merkle_path, competing_txs, timestamp_at, disallowed_prev
+	const colsPerRow = 10 // txid, status, status_code, block_hash, block_height, extra_info, merkle_path, competing_txs, timestamp_at, clears_retry, disallowed_prev
 
 	args := make([]any, 0, len(statuses)*(colsPerRow+1))
 	now := time.Now()
@@ -380,6 +380,7 @@ func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.Tra
 			mp,
 			competing,
 			ts,
+			st.Status.ClearsRetryState(),
 			disallowed,
 		)
 	}
@@ -394,8 +395,8 @@ func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.Tra
 		// right types for the VALUES alias columns.
 		fmt.Fprintf(
 			&values,
-			"($%d::text,$%d::text,$%d::int,$%d::text,$%d::bigint,$%d::text,$%d::bytea,$%d::jsonb,$%d::timestamptz,$%d::text[])",
-			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10,
+			"($%d::text,$%d::text,$%d::int,$%d::text,$%d::bigint,$%d::text,$%d::bytea,$%d::jsonb,$%d::timestamptz,$%d::boolean,$%d::text[])",
+			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10, base+11,
 		)
 	}
 
@@ -403,17 +404,26 @@ func (s *Store) batchUpdateStatusSQL(ctx context.Context, statuses []*models.Tra
 	// WHERE clause: rows whose existing status appears in the per-row disallowed
 	// list are silently skipped. See models.Status.DisallowedPreviousStatuses
 	// and #61 / F-003.
+	//
+	// A positive verdict (v.clears_retry, models.Status.ClearsRetryState)
+	// retires the retry bookkeeping: extra_info becomes exactly what the write
+	// carries (so a park or rejection reason does not outlive its cause), and
+	// next_retry_at / retry_reason are cleared. Every other write keeps the
+	// row's existing values when it carries none.
 	q := `
 UPDATE transactions t SET
     status       = v.status,
     status_code  = COALESCE(NULLIF(v.status_code, 0),     t.status_code),
     block_hash   = COALESCE(NULLIF(v.block_hash, ''),     t.block_hash),
     block_height = COALESCE(NULLIF(v.block_height, 0),    t.block_height),
-    extra_info   = COALESCE(NULLIF(v.extra_info, ''),     t.extra_info),
+    extra_info   = CASE WHEN v.clears_retry THEN NULLIF(v.extra_info, '')
+                        ELSE COALESCE(NULLIF(v.extra_info, ''), t.extra_info) END,
+    next_retry_at = CASE WHEN v.clears_retry THEN NULL ELSE t.next_retry_at END,
+    retry_reason  = CASE WHEN v.clears_retry THEN NULL ELSE t.retry_reason END,
     merkle_path  = COALESCE(v.merkle_path,                t.merkle_path),
     competing_txs = COALESCE(v.competing_txs,             t.competing_txs),
     timestamp_at = v.timestamp_at
-FROM (VALUES ` + values.String() + `) AS v(txid, status, status_code, block_hash, block_height, extra_info, merkle_path, competing_txs, timestamp_at, disallowed_prev)
+FROM (VALUES ` + values.String() + `) AS v(txid, status, status_code, block_hash, block_height, extra_info, merkle_path, competing_txs, timestamp_at, clears_retry, disallowed_prev)
 WHERE t.txid = v.txid AND t.status <> ALL(v.disallowed_prev)`
 
 	if _, err := s.pool.Exec(ctx, q, args...); err != nil {
@@ -479,6 +489,14 @@ func (s *Store) UpdateStatusReturning(ctx context.Context, status *models.Transa
 		sets = append(sets, fmt.Sprintf("extra_info = $%d", idx))
 		args = append(args, status.ExtraInfo)
 		idx++
+	}
+	if status.Status.ClearsRetryState() {
+		// A positive verdict retires the retry bookkeeping; see
+		// models.Status.ClearsRetryState and batchUpdateStatusSQL.
+		sets = append(sets, "next_retry_at = NULL", "retry_reason = NULL")
+		if status.ExtraInfo == "" {
+			sets = append(sets, "extra_info = NULL")
+		}
 	}
 	if status.StatusCode != 0 {
 		sets = append(sets, fmt.Sprintf("status_code = $%d", idx))
@@ -1077,6 +1095,7 @@ WITH prev AS (
 )
 UPDATE transactions t
 SET status=$1, block_hash=$2, block_height=$3, timestamp_at=$4,
+    extra_info=NULL, next_retry_at=NULL, retry_reason=NULL,
     orphaned_anchors = CASE
       WHEN prev.status = 'MINED' AND prev.block_hash IS NOT NULL AND prev.block_hash <> $2
            AND COALESCE(prev.orphaned_anchors -> -1 ->> 'blockHash', '') <> prev.block_hash

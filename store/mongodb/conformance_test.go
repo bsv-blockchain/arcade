@@ -173,3 +173,24 @@ func TestAPIKeys_Conformance(t *testing.T) {
 func TestQuota_Conformance(t *testing.T) {
 	storetest.RunQuotaSuite(t, func(t *testing.T) store.QuotaStore { return newTestStore(t) })
 }
+
+// A positive network verdict retires the retry bookkeeping, so a recovered
+// transaction stops reporting its park reason and retry schedule.
+func TestRetryRecovery_Conformance(t *testing.T) {
+	storetest.RunRetryRecoverySuite(t, func(t *testing.T) storetest.RetryRecoveryBackend {
+		t.Helper()
+		return retryRecoveryStore{newTestStore(t)}
+	})
+}
+
+// retryRecoveryStore adds the suite's direct read of the persisted
+// retry_reason, which no store read path exposes for a recovered row.
+type retryRecoveryStore struct{ *Store }
+
+func (s retryRecoveryStore) StoredRetryReason(ctx context.Context, txid string) (string, error) {
+	var d struct {
+		RetryReason string `bson:"retry_reason"`
+	}
+	err := s.tx.FindOne(ctx, idFilter(txid)).Decode(&d)
+	return d.RetryReason, err
+}
