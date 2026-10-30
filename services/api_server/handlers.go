@@ -981,6 +981,9 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 			} else {
 				submitResult = "retry_received"
 			}
+			// Republish under the key the row was stored with: a concurrent
+			// identical submission may have won the CAS with a different key.
+			partitionKey = s.storedPartitionKey(c.Request.Context(), txid, partitionKey)
 		case !inserted && existing != nil:
 			// Idempotent re-submit: row already exists at a non-REJECTED
 			// status. Register the txid with the in-process TxTracker so
@@ -1318,16 +1321,20 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 
 	// Partition keys, computed over the FULL parsed batch (see
 	// familyKeysBySubmittedTxid) and before the CAS so every row persists the
-	// key its message will carry. A family whose parent outside this batch is
-	// still in flight joins that parent's partition (inheritExternalParentKeys).
+	// key its message will carry. A family keeps a member's stored key (a
+	// retry rejoins its earlier messages), else joins the partition of an
+	// in-flight parent outside this batch (inheritStoredPartitionKeys).
 	keyByTxid, inputsByTxid := familyKeysBySubmittedTxid(parsed)
-	s.inheritExternalParentKeys(c.Request.Context(), keyByTxid, inputsByTxid)
+	s.inheritStoredPartitionKeys(c.Request.Context(), keyByTxid, inputsByTxid)
 
 	// Phase 3: dedup CAS per tx. Duplicates are skipped from the
 	// publish but counted in the response so the caller can reconcile.
 	// A dedup error logs but doesn't drop the tx — matches single-tx
 	// best-effort behavior.
 	toPublish := make([]parsedItem, 0, len(parsed))
+	// republished collects CAS losers re-entering toPublish; their stored
+	// keys win over this request's choice (adoptStoredFamilyKeys).
+	var republished []string
 	duplicates := 0
 	newSubmits, retryRejected := 0, 0
 	if s.store != nil {
@@ -1356,6 +1363,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 					retryRejected++
 				}
 				toPublish = append(toPublish, p)
+				republished = append(republished, p.txid)
 			case !inserted && existing != nil:
 				duplicates++
 				// Idempotent re-submit at a non-REJECTED status: register
@@ -1404,6 +1412,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	// multi-partition topic a whole family lands on one partition and
 	// per-partition order still delivers parents before children.
 	if len(toPublish) > 0 {
+		s.adoptStoredFamilyKeys(ctx, keyByTxid, republished)
 		msgs := propagationMessages(toPublish, keyByTxid, inputsByTxid)
 		if err := s.producer.SendBatch(ctx, kafka.TopicPropagation, msgs); err != nil {
 			if errors.Is(err, kafka.ErrBrokerBackpressure) {

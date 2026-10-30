@@ -23,7 +23,7 @@ import (
 //
 // Only same-submission edges join a family here. A parent submitted in an
 // earlier HTTP request is handled by partitionKeyForSubmit /
-// inheritExternalParentKeys (partition_inherit.go), which reuse the key an
+// inheritStoredPartitionKeys (partition_inherit.go), which reuse the key an
 // in-flight parent's row persisted; what that cannot cover (child before
 // parent, parent already on the network) is absorbed by the propagator's
 // missing-parent safety net (see PropagationConfig.Partitions).

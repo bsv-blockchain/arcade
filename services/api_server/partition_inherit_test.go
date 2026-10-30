@@ -147,7 +147,7 @@ func TestPartitionKeyForSubmit_CapsLookups(t *testing.T) {
 	}
 }
 
-func TestInheritExternalParentKeys(t *testing.T) {
+func TestInheritStoredPartitionKeys(t *testing.T) {
 	st := &keyLookupStore{rows: map[string]store.ParentKey{
 		"P": {Status: models.StatusReceived, PartitionKey: "kP"},
 		"Q": {Status: models.StatusSeenOnNetwork, PartitionKey: "kQ"},
@@ -159,7 +159,7 @@ func TestInheritExternalParentKeys(t *testing.T) {
 		"d":  {"Q"},  // external but already on the network: keep own key
 		"e":  {},     // nothing to inherit
 	}
-	keyingServer(st, 8).inheritExternalParentKeys(context.Background(), keyByTxid, inputsByTxid)
+	keyingServer(st, 8).inheritStoredPartitionKeys(context.Background(), keyByTxid, inputsByTxid)
 	want := map[string]string{"c1": "kP", "c2": "kP", "d": "d", "e": "e"}
 	for txid, k := range want {
 		if keyByTxid[txid] != k {
@@ -171,11 +171,78 @@ func TestInheritExternalParentKeys(t *testing.T) {
 	}
 }
 
-func TestInheritExternalParentKeys_NoExternalParentsSkipsStore(t *testing.T) {
+// With no external parents only the batch's own rows are consulted, in one
+// lookup, and a family with no stored key keeps its natural key.
+func TestInheritStoredPartitionKeys_NoExternalParentsLooksUpOwnRowsOnly(t *testing.T) {
 	st := &keyLookupStore{}
 	keyByTxid := map[string]string{"a": "a", "b": "a"}
-	keyingServer(st, 8).inheritExternalParentKeys(context.Background(), keyByTxid, map[string][]string{"a": {}, "b": {"a"}})
+	keyingServer(st, 8).inheritStoredPartitionKeys(context.Background(), keyByTxid, map[string][]string{"a": {}, "b": {"a"}})
+	if len(st.asked) != 1 || len(st.asked[0]) != 2 || st.asked[0][0] != "a" || st.asked[0][1] != "b" {
+		t.Fatalf("asked = %v, want one lookup of [a b]", st.asked)
+	}
+	if keyByTxid["a"] != "a" || keyByTxid["b"] != "a" {
+		t.Fatalf("keys changed with nothing stored: %v", keyByTxid)
+	}
+}
+
+// A member's own stored key binds its family ahead of an external parent,
+// but only while that row is in flight or will be republished.
+func TestInheritStoredPartitionKeys_OwnStoredKeyBindsFamily(t *testing.T) {
+	st := &keyLookupStore{rows: map[string]store.ParentKey{
+		"P":  {Status: models.StatusReceived, PartitionKey: "kP"},
+		"c1": {Status: models.StatusReceived, PartitionKey: "kOld"}, // retry: keeps its key
+		"d1": {Status: models.StatusRejected, PartitionKey: "kD"},   // republished: keeps its key
+		"e1": {Status: models.StatusMined, PartitionKey: "kE"},      // on the network: does not bind
+	}}
+	keyByTxid := map[string]string{"c1": "c1", "c2": "c1", "d1": "d1", "e1": "e1", "e2": "e1"}
+	inputsByTxid := map[string][]string{
+		"c1": {"P"}, "c2": {"c1"},
+		"d1": {},
+		"e1": {"P"}, "e2": {"e1"},
+	}
+	keyingServer(st, 8).inheritStoredPartitionKeys(context.Background(), keyByTxid, inputsByTxid)
+	want := map[string]string{"c1": "kOld", "c2": "kOld", "d1": "kD", "e1": "kP", "e2": "kP"}
+	for txid, k := range want {
+		if keyByTxid[txid] != k {
+			t.Errorf("%s: key = %q, want %q", txid, keyByTxid[txid], k)
+		}
+	}
+}
+
+func TestAdoptStoredFamilyKeys(t *testing.T) {
+	st := &keyLookupStore{rows: map[string]store.ParentKey{
+		"c1": {Status: models.StatusReceived, PartitionKey: "kP"},
+		"d1": {Status: models.StatusReceived}, // stored before keys were persisted
+	}}
+	keyByTxid := map[string]string{"c1": "c1", "c2": "c1", "d1": "d1", "e1": "e1"}
+	keyingServer(st, 8).adoptStoredFamilyKeys(context.Background(), keyByTxid, []string{"d1", "c1"})
+	want := map[string]string{"c1": "kP", "c2": "kP", "d1": "d1", "e1": "e1"}
+	for txid, k := range want {
+		if keyByTxid[txid] != k {
+			t.Errorf("%s: key = %q, want %q", txid, keyByTxid[txid], k)
+		}
+	}
+
+	st.asked = nil
+	keyingServer(st, 0).adoptStoredFamilyKeys(context.Background(), keyByTxid, []string{"c1"})
 	if len(st.asked) != 0 {
-		t.Fatalf("store consulted with no external parents: %v", st.asked)
+		t.Errorf("disabled lookup still asked the store: %v", st.asked)
+	}
+}
+
+func TestStoredPartitionKey(t *testing.T) {
+	st := &keyLookupStore{rows: map[string]store.ParentKey{
+		"a": {Status: models.StatusReceived, PartitionKey: "kA"},
+		"b": {Status: models.StatusReceived},
+	}}
+	srv := keyingServer(st, 8)
+	for _, tc := range []struct{ txid, want string }{{"a", "kA"}, {"b", "fallback"}, {"z", "fallback"}} {
+		if got := srv.storedPartitionKey(context.Background(), tc.txid, "fallback"); got != tc.want {
+			t.Errorf("%s: key = %q, want %q", tc.txid, got, tc.want)
+		}
+	}
+	st.err = errors.New("down")
+	if got := srv.storedPartitionKey(context.Background(), "a", "fallback"); got != "fallback" {
+		t.Errorf("lookup error: key = %q, want fallback", got)
 	}
 }

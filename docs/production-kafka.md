@@ -59,6 +59,15 @@ one partition, and each hop is held behind the previous one instead of racing
 it to the datahub. A `POST /txs` family whose parent outside the batch is in
 flight joins that parent's partition the same way.
 
+A resubmission keeps the key its row was stored with, so it rejoins its earlier
+message even if a parent has been accepted in between: a single `POST /tx`
+retry, the loser of two identical concurrent submissions (it republishes under
+the winner's stored key), and a `POST /txs` retry, whose whole family follows
+any member still in flight or being republished. The one gap is two concurrent
+batches that straddle a parent's acceptance and share a family: a member the
+losing batch inserted keeps the key it chose, and a later child following it
+falls back to the safety net below.
+
 What remains is the genuine race: a child submitted before its parent, a
 parent that is already `ACCEPTED_BY_NETWORK` (Teranode has it, so the child can
 go anywhere), or a parent submitted through another region. Such a child can

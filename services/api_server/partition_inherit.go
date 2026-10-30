@@ -10,8 +10,9 @@ import (
 	"github.com/bsv-blockchain/broadcaster/models"
 )
 
-// maxBatchParentLookups caps the external parents one POST /txs consults, so
-// a very wide batch costs one bounded projected read, never an unbounded one.
+// maxBatchParentLookups caps the external parents one POST /txs consults. The
+// batch's own txids are always looked up (their stored keys bind resubmits),
+// so one projected read covers at most the batch plus this many parents.
 const maxBatchParentLookups = 256
 
 // partitionKeyForSubmit decides the propagation partition key of a single
@@ -63,11 +64,23 @@ func (s *Server) partitionKeyForSubmit(ctx context.Context, txid string, inputs 
 	return txid
 }
 
-// inheritExternalParentKeys re-keys the dependency families of a POST /txs
-// batch whose parents OUTSIDE the batch are still in flight, so a family
-// joins the partition its external parent is on. keyByTxid is updated in
-// place; families with no pending external parent keep their own key.
-func (s *Server) inheritExternalParentKeys(ctx context.Context, keyByTxid map[string]string, inputsByTxid map[string][]string) {
+// inheritStoredPartitionKeys re-keys the dependency families of a POST /txs
+// batch from the store, before the CAS, so every row persists the key its
+// message will carry. keyByTxid is updated in place, by family:
+//
+//  1. A member whose own row is still in flight or will be republished keeps
+//     the key its earlier message went out under, and its family follows it.
+//     An unchanged retry of a batch whose first send failed therefore
+//     publishes under the stored keys even if an external parent has since
+//     been accepted, rather than recomputing a natural key that a child
+//     following the stored key would miss.
+//  2. Otherwise a family whose parent OUTSIDE the batch is still in flight
+//     joins that parent's partition.
+//  3. Otherwise the family keeps its natural key.
+//
+// A row inserted by a concurrent request between this lookup and the CAS is
+// caught after the CAS by adoptStoredFamilyKeys.
+func (s *Server) inheritStoredPartitionKeys(ctx context.Context, keyByTxid map[string]string, inputsByTxid map[string][]string) {
 	maxInputs := s.cfg.Propagation.ParentKeyLookupMaxInputs
 	if s.store == nil || maxInputs <= 0 || len(keyByTxid) == 0 {
 		return
@@ -95,16 +108,25 @@ func (s *Server) inheritExternalParentKeys(ctx context.Context, keyByTxid map[st
 		}
 		parentsOf[txid] = ext
 	}
-	if len(external) == 0 {
-		return
-	}
-	rows, err := s.store.LookupPartitionKeys(ctx, external)
+	rows, err := s.store.LookupPartitionKeys(ctx, append(append(make([]string, 0, len(txids)+len(external)), txids...), external...))
 	if err != nil {
-		s.logger.Warn("batch parent partition-key lookup failed; keying by family", zap.Int("parents", len(external)), zap.Error(err))
+		s.logger.Warn("batch partition-key lookup failed; keying by family", zap.Int("txs", len(txids)), zap.Int("parents", len(external)), zap.Error(err))
 		return
 	}
-	remap := make(map[string]string) // family key -> inherited key, first pending parent wins
-	for _, txid := range txids {
+	remap := make(map[string]string) // family key -> inherited key
+	for _, txid := range txids {     // 1: a member's own stored key
+		fam, ok := keyByTxid[txid]
+		if !ok {
+			continue
+		}
+		if _, done := remap[fam]; done {
+			continue
+		}
+		if r, ok := rows[txid]; ok && r.PartitionKey != "" && ownKeyBinds(r.Status) {
+			remap[fam] = r.PartitionKey
+		}
+	}
+	for _, txid := range txids { // 2: the first in-flight external parent
 		fam, ok := keyByTxid[txid]
 		if !ok {
 			continue
@@ -117,6 +139,70 @@ func (s *Server) inheritExternalParentKeys(ctx context.Context, keyByTxid map[st
 				remap[fam] = pk.PartitionKey
 				break
 			}
+		}
+	}
+	for txid, fam := range keyByTxid {
+		if nk, ok := remap[fam]; ok {
+			keyByTxid[txid] = nk
+		}
+	}
+}
+
+// storedPartitionKey returns the key txid's row was persisted with, or
+// fallback when the row has none (written before keys were persisted) or the
+// lookup fails or is disabled. A CAS loser that republishes uses it: a
+// concurrent identical submission may have chosen — and stored — a different
+// key across a parent's acceptance, and republishing under the loser's own
+// choice would put the same tx on two partitions. GetOrInsertStatus's
+// existing row is not used because not every backend's status read carries the
+// key; LookupPartitionKeys is the one read path for it.
+func (s *Server) storedPartitionKey(ctx context.Context, txid, fallback string) string {
+	if s.store == nil || s.cfg.Propagation.ParentKeyLookupMaxInputs <= 0 {
+		return fallback
+	}
+	rows, err := s.store.LookupPartitionKeys(ctx, []string{txid})
+	if err != nil {
+		s.logger.Warn("own partition-key lookup failed; keeping computed key", logfields.TxID(txid), zap.Error(err))
+		return fallback
+	}
+	if r, ok := rows[txid]; ok && r.PartitionKey != "" {
+		return r.PartitionKey
+	}
+	return fallback
+}
+
+// adoptStoredFamilyKeys runs after the POST /txs CAS for the txids that lost
+// it and are being republished. A row inserted by a concurrent request after
+// inheritStoredPartitionKeys' lookup may carry a different key; the loser's
+// whole family moves to the stored key so the republish rejoins the earlier
+// message and the family stays together. keyByTxid is updated in place.
+//
+// Residual: a member of that family that THIS request inserted has already
+// persisted the pre-CAS key, and a child later following it can miss the
+// dispatcher. That needs two concurrent batches straddling a parent's
+// acceptance, and falls back to the missing-parent safety net.
+func (s *Server) adoptStoredFamilyKeys(ctx context.Context, keyByTxid map[string]string, republished []string) {
+	if s.store == nil || s.cfg.Propagation.ParentKeyLookupMaxInputs <= 0 || len(republished) == 0 {
+		return
+	}
+	ids := append([]string(nil), republished...)
+	sort.Strings(ids) // deterministic precedence when members disagree
+	rows, err := s.store.LookupPartitionKeys(ctx, ids)
+	if err != nil {
+		s.logger.Warn("republish partition-key lookup failed; keeping computed keys", zap.Int("txs", len(ids)), zap.Error(err))
+		return
+	}
+	remap := make(map[string]string) // computed family key -> stored key
+	for _, txid := range ids {
+		fam, ok := keyByTxid[txid]
+		if !ok {
+			continue
+		}
+		if _, done := remap[fam]; done {
+			continue
+		}
+		if r, ok := rows[txid]; ok && r.PartitionKey != "" && r.PartitionKey != fam {
+			remap[fam] = r.PartitionKey
 		}
 	}
 	for txid, fam := range keyByTxid {
@@ -145,6 +231,15 @@ func distinctParents(txid string, inputs []string, limit int) []string {
 		out = append(out, p)
 	}
 	return out
+}
+
+// ownKeyBinds reports whether a batch member's stored key must carry over to
+// this submission: its earlier message may still be in flight (a child in the
+// family must follow it), or the row is republished (RECEIVED, REJECTED) and
+// must keep the key it went out under. An ACCEPTED-or-later member is on the
+// network and does not hold its family.
+func ownKeyBinds(st models.Status) bool {
+	return parentStillPending(st) || st == models.StatusRejected
 }
 
 // parentStillPending reports whether a parent's row is at a status the network
