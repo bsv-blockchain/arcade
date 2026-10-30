@@ -1233,9 +1233,14 @@ type ValidatorConfig struct {
 	// means "unlimited" here, so it cannot double as an "unset" sentinel.
 	MaxTxSigopsCountsPolicy int64 `mapstructure:"max_tx_sigops_counts_policy"`
 
-	// StandardFormatSupported reports whether standard (non-EF) transaction
-	// format is accepted at intake. BSV Broadcaster parses standard raw txs (see
-	// handleSubmitTransaction), so this defaults to true.
+	// StandardFormatSupported is advertised verbatim in GET /policy. It must
+	// stay false: intake converts every submission to extended format before
+	// validation, and a standard (non-EF) transaction carries no input source
+	// data, so the BDK validator cannot compute fees or run scripts for it.
+	// Such a submission is rejected with ARC 460 (validator/convert.go); there
+	// is no fallback that fetches parent outputs from the network, so clients
+	// must submit EF (intake does not decode BEEF). The flag exists only so an operator who adds
+	// such a fallback can advertise it without a code change. Default false.
 	StandardFormatSupported bool `mapstructure:"standard_format_supported"`
 
 	// ObservedFeeTTLMs bounds how long a policy observed from a peer's
@@ -1684,7 +1689,7 @@ func setDefaults() {
 	viper.SetDefault("validator.max_tx_size_policy", 0)
 	viper.SetDefault("validator.max_script_size_policy", 0)
 	viper.SetDefault("validator.max_tx_sigops_counts_policy", 0)
-	viper.SetDefault("validator.standard_format_supported", true)
+	viper.SetDefault("validator.standard_format_supported", false)
 	viper.SetDefault("validator.observed_fee_ttl_ms", DefaultValidatorObservedFeeTTLMs)
 	viper.SetDefault("validator.observed_fee_refresh_ms", DefaultValidatorObservedFeeRefreshMs)
 }

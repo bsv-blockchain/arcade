@@ -248,7 +248,11 @@ health:
 #   # means unlimited here (the BSV post-Genesis default), so it cannot double
 #   # as an "unset" sentinel.
 #   # max_tx_sigops_counts_policy: 0
-#   # standard_format_supported: true
+#   # standard_format_supported is what GET /policy advertises. Keep it false:
+#   # intake validates each input against its source output, which only an
+#   # Extended Format (EF) submission carries (BEEF is not decoded), so a plain
+#   # raw transaction is rejected with ARC 460. Nothing fetches parents.
+#   # standard_format_supported: false
 #   # observed_fee_ttl_ms bounds how long a peer's node_status-advertised policy
 #   # stays eligible for the network computation (default 15 min). A peer not
 #   # re-heard within this window is dropped.
